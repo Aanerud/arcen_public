@@ -19,6 +19,7 @@
 #[cfg(feature = "native-tablet")]
 pub mod bridged_hid;
 pub mod keymap;
+pub mod layout;
 pub mod pen;
 pub mod virtual_keyboard;
 
@@ -399,8 +400,14 @@ unsafe fn annotate_tablet_point(event: CGEventRef, point: pen::TabletPoint) {
             point.rotation_degrees,
         );
         // What `-[NSEvent pressure]` reads. Left alone it is 1.0 on every
-        // press and drag, which made every stroke full pressure.
-        CGEventSetDoubleValueField(event, pen::K_CG_MOUSE_EVENT_PRESSURE, point.pressure);
+        // press and drag, which made every stroke full pressure. The window
+        // server keeps 8 bits and truncates: posted as the middle of the
+        // nearest step, 0.25 reads 64/255 rather than 63/255.
+        CGEventSetDoubleValueField(
+            event,
+            pen::K_CG_MOUSE_EVENT_PRESSURE,
+            arcen_input::pen_axes::appkit_mouse_pressure(point.pressure),
+        );
     }
 }
 

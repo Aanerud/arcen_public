@@ -62,6 +62,11 @@ pub enum HidPublishPolicy {
     /// Pen digitizers and vendor-defined interfaces only (a host whose
     /// published devices are system-wide, as `IOHIDUserDevice` is on macOS).
     PenAndVendorOnly,
+    /// None: a host that reads the pen itself and has no device of its own
+    /// to publish (the Windows Pier injects the pen through Windows Ink;
+    /// Windows offers no virtual HID device without a kernel driver). Only
+    /// the host-read interface is polled.
+    Nothing,
 }
 
 /// Why an interface is not published.
@@ -79,6 +84,8 @@ pub enum PublishRefusal {
     /// An Apple vendor page that macOS turns into events
     /// ([`APPLE_EVENT_PAGES`]).
     ApplePage { usage_page: u16, usage: u16 },
+    /// The host publishes no device at all ([`HidPublishPolicy::Nothing`]).
+    HostPublishesNone,
 }
 
 impl Display for PublishRefusal {
@@ -98,6 +105,9 @@ impl Display for PublishRefusal {
                 "it uses Apple vendor usage {usage_page:#06x}:{usage:#04x}, which macOS turns into \
                  events"
             ),
+            Self::HostPublishesNone => {
+                formatter.write_str("this host reads the pen itself and publishes no device")
+            }
         }
     }
 }
@@ -112,6 +122,7 @@ pub fn publishable(policy: HidPublishPolicy, descriptor: &[u8]) -> Result<(), Pu
     match policy {
         HidPublishPolicy::AllAuthorized => Ok(()),
         HidPublishPolicy::PenAndVendorOnly => pen_or_vendor(descriptor),
+        HidPublishPolicy::Nothing => Err(PublishRefusal::HostPublishesNone),
     }
 }
 

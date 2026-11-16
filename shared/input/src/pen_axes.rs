@@ -141,6 +141,51 @@ pub fn tilt_degrees_to_unit(degrees: f32) -> f64 {
     }
 }
 
+/// The wire's tilt Y (W3C: positive toward the user) as `AppKit`'s
+/// `-[NSEvent tilt].y` / `kCGTabletEventTiltY` unit, which tablet drivers
+/// report the other way round: positive toward the top of the tablet. Both
+/// Chromium (`web_input_event_builders_mac.mm`: "tiltY needs to be reversed")
+/// and Qt (`qnsview_tablet.mm`: `tilt.y * -60.0`) negate it; a host that
+/// posts the wire value unchanged has every macOS application see the pen
+/// tilted the other way (measured on a macOS Pier: 30/-20 arrived 30/20).
+#[must_use]
+pub fn appkit_tilt_y_unit(degrees: f32) -> f64 {
+    -tilt_degrees_to_unit(degrees)
+}
+
+/// `-[NSEvent tilt].y` as wire degrees (positive toward the user): the
+/// inverse of [`appkit_tilt_y_unit`], for a Deck reading `AppKit` tablet
+/// events.
+#[must_use]
+pub fn appkit_tilt_y_degrees(unit: f64) -> f32 {
+    let degrees = tilt_unit_to_degrees(unit);
+    if degrees == 0.0 { 0.0 } else { -degrees }
+}
+
+/// Steps of `-[NSEvent pressure]` on a mouse event: the window server keeps
+/// a mouse event's pressure in 8 bits (`NXEventData.mouse.pressure`, a
+/// `UInt8`) and truncates what `kCGMouseEventPressure` is given.
+pub const APPKIT_MOUSE_PRESSURE_STEPS: u32 = 255;
+
+/// The `kCGMouseEventPressure` to post for `pressure`, so the pressure an
+/// application reads is the nearest of the 255 steps rather than the one
+/// below it (truncation turned 0.25 into 63/255 = 0.2471 and 0.1 into
+/// 0.0980): the middle of the nearest step, which truncates to that step.
+/// No pressure stays exactly 0 and full pressure exactly 1.
+#[must_use]
+pub fn appkit_mouse_pressure(pressure: f64) -> f64 {
+    let pressure = f64::from(clamp_pressure(pressure));
+    let steps = f64::from(APPKIT_MOUSE_PRESSURE_STEPS);
+    let step = (pressure * steps).round();
+    if step <= 0.0 {
+        0.0
+    } else if step >= steps {
+        1.0
+    } else {
+        (step + 0.5) / steps
+    }
+}
+
 /// Converts a raw device tilt to degrees.
 ///
 /// When the device declares its physical extent in degrees, that extent is
@@ -300,6 +345,46 @@ mod tests {
         assert!((tilt_degrees_to_unit(45.0) - 0.5).abs() < f64::EPSILON);
         assert!((tilt_degrees_to_unit(-200.0) + 1.0).abs() < f64::EPSILON);
         assert!(tilt_degrees_to_unit(f32::NAN).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn appkit_tilt_y_is_the_wire_tilt_reversed_and_back() {
+        assert!((appkit_tilt_y_unit(-20.0) - 20.0 / 90.0).abs() < 1e-6);
+        assert!((appkit_tilt_y_unit(45.0) + 0.5).abs() < f64::EPSILON);
+        assert!(appkit_tilt_y_unit(f32::NAN).abs() < f64::EPSILON);
+        for degrees in [-90.0_f32, -60.0, -20.0, 0.0, 5.0, 45.0, 90.0] {
+            let back = appkit_tilt_y_degrees(appkit_tilt_y_unit(degrees));
+            assert!((back - degrees).abs() < 1e-4, "{degrees} came back {back}");
+        }
+        assert!((appkit_tilt_y_degrees(0.5) + 45.0).abs() < f32::EPSILON);
+        assert!(appkit_tilt_y_degrees(0.0).to_bits() == 0.0_f32.to_bits());
+    }
+
+    /// What an application reads is the window server's truncation of what
+    /// was posted (`floor(p * 255) / 255`).
+    fn appkit_reads(posted: f64) -> f64 {
+        (posted * f64::from(APPKIT_MOUSE_PRESSURE_STEPS)).floor()
+            / f64::from(APPKIT_MOUSE_PRESSURE_STEPS)
+    }
+
+    #[test]
+    fn appkit_mouse_pressure_lands_on_the_nearest_step() {
+        // Measured truncation of the plain value, and the compensated one.
+        assert!((appkit_reads(0.25) - 63.0 / 255.0).abs() < 1e-9);
+        assert!((appkit_reads(appkit_mouse_pressure(0.25)) - 64.0 / 255.0).abs() < 1e-9);
+        assert!((appkit_reads(appkit_mouse_pressure(0.1)) - 26.0 / 255.0).abs() < 1e-9);
+        for index in 0..=10_000 {
+            let pressure = f64::from(index) / 10_000.0;
+            let read = appkit_reads(appkit_mouse_pressure(pressure));
+            assert!(
+                (read - pressure).abs() <= 0.5 / 255.0 + 1e-9,
+                "{pressure} read as {read}"
+            );
+        }
+        assert!(appkit_mouse_pressure(0.0).abs() < f64::EPSILON);
+        assert!((appkit_mouse_pressure(1.0) - 1.0).abs() < f64::EPSILON);
+        assert!(appkit_mouse_pressure(f64::NAN).abs() < f64::EPSILON);
+        assert!((appkit_mouse_pressure(3.0) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

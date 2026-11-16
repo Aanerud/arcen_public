@@ -97,10 +97,14 @@ contract is a bounded client QoS/network snapshot on the macOS Deck's existing
 QoS reporting, and mandatory `HEALTH_SNAPSHOT` (1806) proof of life every 60
 seconds at every profile. Piers evaluate host delivery together with fresh
 client experience. [`health.rs`](../../shared/telemetry/src/health.rs) owns validated
-thresholds and two-window hysteresis; product bookkeeping lives in the
-[macOS](../../clients/macos/src/observability.rs),
-[Linux](../../hosts/linux/src/observability.rs), and
-[Windows](../../hosts/windows/src/observability.rs) adapters.
+thresholds, the host window tracker and two-window hysteresis; every Pier
+(Linux, Windows, macOS) runs the same per-session bookkeeping on top of it,
+[`session_health.rs`](../../shared/observability/src/session_health.rs):
+window counts in `health_stats` (never session totals), a monotonic clock,
+the `HEALTH_OK`/`HEALTH_DEGRADED`/`HEALTH_CRITICAL` transition fields, the
+60-second `HEALTH_SNAPSHOT` and the 10-second window summary. The Deck's
+client telemetry is recorded in
+[`client_telemetry.rs`](../../shared/deck-core/src/client_telemetry.rs).
 
 Client telemetry can inform a Pier's local assessment, but it cannot alter the
 Pier's profile or sinks. Stale client samples become unavailable. Host and

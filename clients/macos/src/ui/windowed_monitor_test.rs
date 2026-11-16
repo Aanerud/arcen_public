@@ -51,7 +51,7 @@ pub enum WindowedMonitorTestEnv {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayBoundsPts {
-    pub cg_display_id: u32,
+    pub display_id: u32,
     pub origin_x: f32,
     pub origin_y: f32,
     pub width: f32,
@@ -413,9 +413,9 @@ pub fn primary_display_bounds() -> Option<DisplayBoundsPts> {
     let info = crate::ui::multi_window_runtime::live_active_displays()
         .into_iter()
         .next()?;
-    let bounds = core_graphics::display::CGDisplay::new(info.cg_display_id).bounds();
+    let bounds = core_graphics::display::CGDisplay::new(info.display_id).bounds();
     Some(DisplayBoundsPts {
-        cg_display_id: info.cg_display_id,
+        display_id: info.display_id,
         origin_x: bounds.origin.x as f32,
         origin_y: bounds.origin.y as f32,
         width: bounds.size.width as f32,
@@ -435,7 +435,7 @@ mod tests {
 
     fn display() -> DisplayBoundsPts {
         DisplayBoundsPts {
-            cg_display_id: 42,
+            display_id: 42,
             origin_x: 10.0,
             origin_y: 20.0,
             width: 1_800.0,
@@ -566,7 +566,7 @@ mod tests {
             SessionMonitorId::new(2).unwrap(),
         ];
         assert!(
-            MultiWindowPlan::build(&ids, &[42, 42]).is_err(),
+            build_plan(&ids, &[42, 42]).is_err(),
             "dev-tools windowed mode must not weaken production duplicate-display invariants"
         );
     }

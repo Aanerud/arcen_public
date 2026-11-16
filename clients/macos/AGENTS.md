@@ -28,6 +28,22 @@ strict Clippy gates. There is no single-platform `--workspace` build.
 - Reconnect creates a fresh decoder/inbox and waits for a fresh keyframe.
   Teardown must discard queued frames rather than let stale data delay resume.
 
+## Presentation timing
+
+When a frame is shown is the served pipeline's shared rule
+(`arcen_media::video::PresentTiming`, carried by every `PresentableFrame`
+from the shared media worker;
+[`docs/architecture/deck-presentation-timing.md`](../../docs/architecture/deck-presentation-timing.md)).
+The eight-bit Metal layer renders an Auto frame the moment it arrives
+(display sync on, one drawable in flight, the pacer keeps only the newest;
+the `CVDisplayLink` tick is the retry path), and Speed also turns
+`displaySyncEnabled` off, keeps two drawables in flight and presents without
+a minimum duration, so it may tear. Grading and HDR keep the `CVDisplayLink`-paced ten-bit layer with
+display sync, EDR and colour handling unchanged. Do not add a local preset
+or tearing rule here: change the shared contract. Fullscreen draws nothing
+over the video: the system menu bar auto-hides and drops down at the top
+edge.
+
 ## Input never waits for the UI pass
 
 Pen samples leave from the AppKit monitor callback the moment they are

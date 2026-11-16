@@ -144,7 +144,9 @@ pub async fn serve_in_process(deck: SessionLaneSocket) -> PierSocket {
     let connection = deck.lanes().connection().clone();
     let (session_end, relay_end) = tokio::io::duplex(IN_PROCESS_BUFFER);
     tokio::spawn(async move {
-        match crate::relay::relay_lanes(deck, relay_end, 0, None, false).await {
+        match crate::relay::relay_lanes(deck, relay_end, 0, None, false, crate::refine::COMPILED)
+            .await
+        {
             Ok(stats) => tracing::debug!(target: "arcen::net", ?stats, "lane relay ended"),
             Err(error) => tracing::debug!(target: "arcen::net", %error, "lane relay ended"),
         }
@@ -247,66 +249,39 @@ impl std::fmt::Display for ServeError {
 
 impl std::error::Error for ServeError {}
 
-/// Builds the QUIC server configuration from PEM material on disk.
+/// Builds the QUIC server configuration from PEM material on disk, read and
+/// validated by the shared host TLS loader every Pier uses.
 ///
 /// # Errors
 ///
 /// Returns [`ServeError::Material`] when the certificate or key cannot be
-/// read, and [`ServeError::Tls`] when rustls or Quinn refuse the result.
+/// read or is refused, and [`ServeError::Tls`] when rustls or Quinn refuse the
+/// result.
 pub fn server_config(
     certificate_path: &Path,
     key_path: &Path,
 ) -> Result<quinn::ServerConfig, ServeError> {
-    let certificate_pem = std::fs::read(certificate_path).map_err(|error| {
-        ServeError::Material(format!("read {}: {error}", certificate_path.display()))
-    })?;
-    let key_pem = std::fs::read(key_path)
-        .map_err(|error| ServeError::Material(format!("read {}: {error}", key_path.display())))?;
-
-    let certificates: Vec<rustls_pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut certificate_pem.as_slice())
-            .collect::<Result<_, _>>()
-            .map_err(|error| ServeError::Material(format!("parse certificate: {error}")))?;
-    if certificates.is_empty() {
-        return Err(ServeError::Material(
-            "certificate file holds no certificate".to_owned(),
-        ));
-    }
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|error| ServeError::Material(format!("parse key: {error}")))?
-        .ok_or_else(|| ServeError::Material("key file holds no private key".to_owned()))?;
-
-    let mut rustls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates, key)
-        .map_err(|error| ServeError::Tls(format!("certificate and key do not match: {error}")))?;
-    // Pinning the ALPN means a browser or generic QUIC client is refused during
-    // the handshake rather than after it has spoken to the session layer.
-    rustls_config.alpn_protocols = vec![arcen_transport::quic::DIRECT_QUIC_ALPN_PROTOCOL.to_vec()];
-
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
-        .map_err(|error| ServeError::Tls(format!("QUIC crypto: {error}")))?;
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    // Grants the Deck the lanes it opens (control, input/cursor, bulk,
-    // microphone) plus one replacement of each shape (ADR 0014).
-    config.transport_config(arcen_transport::quic::lane_transport_config_arc(
-        &arcen_transport::BoundedTransportPolicy::default(),
-        LaneEndpoint::Pier,
-    ));
-    arcen_transport::quic::apply_direct_server_limits(&mut config);
-    Ok(config)
+    let material = crate::tls_material::load(certificate_path, key_path)
+        .map_err(|error| ServeError::Material(error.to_string()))?;
+    let tls = material
+        .server_config()
+        .map_err(|error| ServeError::Tls(error.to_string()))?;
+    arcen_transport::quic::pier_server_config(tls).map_err(ServeError::Tls)
 }
 
 /// How long a peer has to establish TLS, open its stream, and send a preface.
 ///
 /// Generous, because a slow or distant link is not a fault and refusing a
-/// legitimate Deck is worse than waiting for it. Bounded, because the accept
-/// loop serves one connection at a time and every pre-session stage has the
-/// same denial shape: traffic can keep one adjacent wait alive forever while
-/// every other Deck stays outside the host.
+/// legitimate Deck is worse than waiting for it. Bounded, because every
+/// pre-session stage has the same denial shape: traffic can keep one adjacent
+/// wait alive forever, holding a pre-sign-in place (the service) or the
+/// accept loop itself ([`Listener::accept`], which admits one at a time).
 const ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
-fn admission_deadline() -> Duration {
+/// The admission budget [`Listener::admit`] is given: [`ADMISSION_DEADLINE`],
+/// or the test override in milliseconds.
+#[must_use]
+pub fn admission_deadline() -> Duration {
     std::env::var(ADMISSION_DEADLINE_ENV)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -386,87 +361,111 @@ impl Listener {
         admission_budget: Duration,
     ) -> Result<(SessionLaneSocket, SocketAddr), ServeError> {
         loop {
-            let incoming = self
-                .endpoint
-                .accept()
-                .await
-                .ok_or_else(|| ServeError::Accept("endpoint closed".to_owned()))?;
-
-            let peer = incoming.remote_address();
-            let connecting = match incoming.accept() {
-                Ok(connecting) => connecting,
-                Err(error) => {
-                    tracing::debug!(target: "arcen::net", %peer, %error, "refused a connection");
-                    continue;
-                }
-            };
-            let deadline = TokioInstant::now() + admission_budget;
-            let connection = match connecting.into_0rtt() {
-                Ok((connection, _accepted)) => connection,
-                Err(connecting) => match tokio::time::timeout_at(deadline, connecting).await {
-                    Ok(Ok(connection)) => connection,
-                    Ok(Err(error)) => {
-                        tracing::debug!(target: "arcen::net", %peer, %error, "refused a connection");
-                        continue;
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            target: "arcen::net",
-                            %peer,
-                            timeout_secs = admission_budget.as_secs(),
-                            "connection did not complete admission before its deadline"
-                        );
-                        continue;
-                    }
-                },
-            };
-            let peer = connection.remote_address();
-            if let Err(error) = wait_for_tls(&connection, deadline).await {
-                connection.close(0_u32.into(), b"admission deadline exceeded");
-                tracing::debug!(
-                    target: "arcen::net",
-                    %peer,
-                    %error,
-                    "connection did not complete TLS admission"
-                );
-                continue;
+            let incoming = self.next_incoming().await?;
+            if let Some(admitted) = Self::admit(incoming, admission_budget).await {
+                return Ok(admitted);
             }
-            let close_on_timeout = connection.clone();
-            let remaining = deadline.saturating_duration_since(TokioInstant::now());
-            let opened = arcen_transport::quic::accept_session_lanes(
-                connection,
-                LaneRuntimeConfig::new(LaneEndpoint::Pier),
-                remaining,
-            )
-            .await;
-            match opened {
-                Ok((lanes, control)) => return Ok((SessionLaneSocket::new(lanes, control), peer)),
-                Err(SessionLaneSetupError::Timeout) => {
-                    close_on_timeout.close(0_u32.into(), b"admission deadline exceeded");
+        }
+    }
+
+    /// Waits for the next connection attempt, before any handshake, for a
+    /// service that admits several at once (see [`Listener::admit`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServeError::Accept`] only when the endpoint is closed.
+    pub async fn next_incoming(&self) -> Result<quinn::Incoming, ServeError> {
+        self.endpoint
+            .accept()
+            .await
+            .ok_or_else(|| ServeError::Accept("endpoint closed".to_owned()))
+    }
+
+    /// Completes one connection attempt's admission within
+    /// `admission_budget`: the QUIC and TLS handshake, then the Deck's
+    /// control lane and preface. A peer that fails any stage is logged and
+    /// closed, and `None` is returned.
+    pub async fn admit(
+        incoming: quinn::Incoming,
+        admission_budget: Duration,
+    ) -> Option<(SessionLaneSocket, SocketAddr)> {
+        let peer = incoming.remote_address();
+        let connecting = match incoming.accept() {
+            Ok(connecting) => connecting,
+            Err(error) => {
+                tracing::debug!(target: "arcen::net", %peer, %error, "refused a connection");
+                return None;
+            }
+        };
+        let deadline = TokioInstant::now() + admission_budget;
+        let connection = match connecting.into_0rtt() {
+            Ok((connection, _accepted)) => connection,
+            Err(connecting) => match tokio::time::timeout_at(deadline, connecting).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => {
+                    tracing::debug!(target: "arcen::net", %peer, %error, "refused a connection");
+                    return None;
+                }
+                Err(_) => {
                     tracing::debug!(
                         target: "arcen::net",
                         %peer,
                         timeout_secs = admission_budget.as_secs(),
-                        "connection opened no control lane before its admission deadline"
+                        "connection did not complete admission before its deadline"
                     );
+                    return None;
                 }
-                Err(SessionLaneSetupError::Mismatch(mismatch)) => {
-                    // The lane runtime told the Deck why before closing.
-                    tracing::warn!(
-                        target: "arcen::net",
-                        %peer,
-                        reason = %mismatch,
-                        "refused a Deck running an incompatible Arcen release"
-                    );
-                }
-                Err(error) => {
-                    tracing::info!(
-                        target: "arcen::net",
-                        %peer,
-                        %error,
-                        "connection opened no usable control lane"
-                    );
-                }
+            },
+        };
+        let peer = connection.remote_address();
+        if let Err(error) = wait_for_tls(&connection, deadline).await {
+            connection.close(0_u32.into(), b"admission deadline exceeded");
+            tracing::debug!(
+                target: "arcen::net",
+                %peer,
+                %error,
+                "connection did not complete TLS admission"
+            );
+            return None;
+        }
+        let close_on_timeout = connection.clone();
+        let remaining = deadline.saturating_duration_since(TokioInstant::now());
+        let opened = arcen_transport::quic::accept_session_lanes(
+            connection,
+            LaneRuntimeConfig::new(LaneEndpoint::Pier),
+            remaining,
+        )
+        .await;
+        match opened {
+            Ok((lanes, control)) => Some((SessionLaneSocket::new(lanes, control), peer)),
+            Err(SessionLaneSetupError::Timeout) => {
+                close_on_timeout.close(0_u32.into(), b"admission deadline exceeded");
+                tracing::debug!(
+                    target: "arcen::net",
+                    %peer,
+                    timeout_secs = admission_budget.as_secs(),
+                    "connection opened no control lane before its admission deadline"
+                );
+                None
+            }
+            Err(SessionLaneSetupError::Mismatch(mismatch)) => {
+                // The lane runtime told the Deck why before closing.
+                tracing::warn!(
+                    target: "arcen::net",
+                    %peer,
+                    reason = %mismatch,
+                    "refused a Deck running an incompatible Arcen release"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::info!(
+                    target: "arcen::net",
+                    %peer,
+                    %error,
+                    "connection opened no usable control lane"
+                );
+                None
             }
         }
     }
@@ -654,6 +653,11 @@ mod tests {
             .expect("cert");
         std::fs::write(&cert, certificate.pem()).expect("write cert");
         std::fs::write(&key, key_pair.serialize_pem()).expect("write key");
+        std::fs::set_permissions(
+            &key,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("key mode");
 
         let listener = Listener::bind(
             "127.0.0.1:0".parse().expect("addr"),

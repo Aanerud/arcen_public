@@ -1,0 +1,32 @@
+{
+  "connections": [
+    {
+      "host": "pier-linux.example.internal",
+      "id": "connection-d7bd0d6b6f977b539c688cdc2dde882f",
+      "kind": "direct",
+      "name": "pier-linux.example.internal",
+      "port": 18444,
+      "settings": {
+        "remembered_username": null,
+        "tablet_mode_requested": "local_termination",
+        "version": 1
+      },
+      "transport": "quic"
+    },
+    {
+      "host": "203.0.113.10",
+      "id": "connection-127e77e2a6c87b9e93e578fec0a94a18",
+      "kind": "direct",
+      "name": "Studio",
+      "port": 18444,
+      "security_mode": "high",
+      "settings": {
+        "remembered_username": null,
+        "tablet_mode_requested": "local_termination",
+        "version": 1
+      },
+      "transport": "quic"
+    }
+  ],
+  "version": 2
+}

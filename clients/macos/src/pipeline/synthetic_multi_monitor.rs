@@ -154,8 +154,11 @@ pub fn run_isolation_harness(
     }
     let generation = TopologyGeneration::new(1).unwrap_or_else(|_| unreachable!("1 != 0"));
     let monitor_ids = synthetic_monitor_ids(monitor_count);
-    let mut router = MonitorFrameRouter::new(generation, &monitor_ids)
-        .unwrap_or_else(|_| unreachable!("harness roster is always 1..=MAX_MULTI_MONITOR_COUNT"));
+    let mut router = MonitorFrameRouter::<crate::pipeline::video_decoder::NativeVideoDecoder>::new(
+        generation,
+        &monitor_ids,
+    )
+    .unwrap_or_else(|_| unreachable!("harness roster is always 1..=MAX_MULTI_MONITOR_COUNT"));
 
     for sequence in 0..frames_per_monitor {
         for monitor_id in &monitor_ids {
@@ -377,7 +380,12 @@ mod tests {
         // kind `run_isolation_harness` builds -- never admits wire id 0.
         let generation = TopologyGeneration::new(1).expect("nonzero generation");
         let monitor_ids = synthetic_monitor_ids(2);
-        let mut router = MonitorFrameRouter::new(generation, &monitor_ids).expect("valid roster");
+        let mut router =
+            MonitorFrameRouter::<crate::pipeline::video_decoder::NativeVideoDecoder>::new(
+                generation,
+                &monitor_ids,
+            )
+            .expect("valid roster");
         let error = router
             .route_decoded_frame_legacy_primary(generation, legacy_primary_synthetic_frame(0))
             .unwrap_err();

@@ -22,7 +22,13 @@
 //!    every submission the shared packed-RGB10 conversion stages NVENC's
 //!    P16 input from that host frame (the Xorg Grading mechanism);
 //! 5. `READY` after the first access unit, framed access units, a stats line
-//!    every second.
+//!    every second;
+//! 6. with `refine=on` (ADR 0016), exact still image: the shared
+//!    `RefineRuntime` over a `PackedRgb10Source` that mirrors the very
+//!    words NVENC's staging reads, with the encoder's own pre-matrix signal
+//!    (`Encoder::wide_signal`): BT.709/sRGB SDR codes for Grading, PQ /
+//!    BT.2020 codes for HDR. The shared plan refuses any other served
+//!    contract, and the eight-bit compositions never refine.
 //!
 //! With `fidelity-probe`, the epoch measures the first frame instead of
 //! serving it: a drawn ramp's distinct codes and error, and the SDR white
@@ -34,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arcen_keel::SubmissionMode;
-use arcen_media::annexb::{annex_b_is_keyframe, NalCodec};
+use arcen_media::annexb::{access_unit_is_keyframe, NalCodec};
 use arcen_media::video::compositor_fidelity::{
     channel_order_verified, channel_patch_at, measure_ramp, precision_from_ramp, white_patch_at,
     FidelityRoute,
@@ -479,6 +485,55 @@ const fn served_wide_source(transform: SourceTransform) -> Option<crate::nvenc_c
     }
 }
 
+/// The refinement source of a wide epoch: the packed words NVENC's staging
+/// reads (the read-back's `XBGR2101010`, a shared-memory frame's own order,
+/// or the half floats normalised once by the shared conversion), mapped by
+/// the signal the encoder applies before its matrix. The shared plan, run
+/// again on the served contract, refuses anything but a ten-bit 4:4:4
+/// stream; the source depth must be the stream's.
+fn start_refine(
+    args: &arcen_media::refine::CapencRefineArgs,
+    video: &arcen_media::VideoConfiguration,
+    encoder: &crate::nvenc_cuda::Encoder,
+    frame: &HostWideFrame,
+    layout: PackedRgb10Layout,
+) -> Option<
+    arcen_media::refine::runtime::RefineRuntime<arcen_media::refine::source::PackedRgb10Source>,
+> {
+    let grid = arcen_media::refine::tile::RefineGrid {
+        width: u32::try_from(frame.width).ok()?,
+        height: u32::try_from(frame.height).ok()?,
+    };
+    let signal = encoder.wide_signal();
+    match arcen_media::refine::runtime::RefineRuntime::start(
+        args,
+        arcen_media::refine::runtime::RefineStream {
+            depth: video.bit_depth,
+            chroma: video.chroma,
+            transfer: video.transfer,
+            primaries: video.primaries,
+        },
+        arcen_media::refine::source::PackedRgb10Source::new(grid, layout, signal),
+    ) {
+        Ok(mut runtime) => {
+            // The floor until the Pier's link budget sets the rate.
+            runtime.cap_rate(encoder.average_bitrate_bps());
+            let (packed, _) = frame.packed();
+            runtime.observe_whole(packed, frame.width * 4);
+            log(&format!(
+                "lossless refinement on: scope={:?} still_ms={} max_mbps={} source=wayland-wide \
+                 words={layout:?} signal={signal:?} contract={:?}/{:?}",
+                args.scope, args.still_ms, args.max_mbps, video.transfer, video.primaries
+            ));
+            Some(runtime)
+        }
+        Err(error) => {
+            log(&format!("lossless refinement off: {error}"));
+            None
+        }
+    }
+}
+
 /// Runs one wide epoch.
 ///
 /// # Safety
@@ -771,6 +826,11 @@ pub unsafe fn run_native(
         },
     ));
 
+    let refine_layout = frame.packed().1;
+    let mut refine = request
+        .refine
+        .as_ref()
+        .and_then(|args| start_refine(args, &plan.video, &encoder, &frame, refine_layout));
     let control = crate::spawn_control_thread("NVENC-Wayland-wide");
     let mut stdout = std::io::stdout();
     let mut target_dt = crate::frame_interval_from_fps(plan.fps);
@@ -804,6 +864,11 @@ pub unsafe fn run_native(
         if ready_announced && epoch_output.cursor(&mut stdout, &source.cursor()).is_err() {
             break 'epoch 0;
         }
+        if let Some(runtime) = refine.as_mut() {
+            if runtime.pump(&mut stdout).is_err() {
+                break 'epoch 0;
+            }
+        }
         let now = Instant::now();
         if now < next {
             std::thread::sleep((next - now).min(Duration::from_millis(50)));
@@ -830,6 +895,19 @@ pub unsafe fn run_native(
                         if let Err(error) = frame.normalise(signal, workers) {
                             log(&format!("ERROR: half-float conversion: {error}"));
                             break 5;
+                        }
+                        if let Some(runtime) = refine.as_mut() {
+                            let (packed, layout) = frame.packed();
+                            if layout != refine_layout {
+                                // The mirror reads words in one order only.
+                                log(&format!(
+                                    "ERROR: the wide frame's word order changed from {refine_layout:?} \
+                                     to {layout:?}; exact still image cannot follow it, the epoch \
+                                     ends"
+                                ));
+                                break 3;
+                            }
+                            runtime.observe_whole(packed, frame.width * 4);
                         }
                         let ms = elapsed.as_secs_f64() * 1000.0;
                         imports += 1;
@@ -890,6 +968,23 @@ pub unsafe fn run_native(
             stage_ms_sum += stage_started.elapsed().as_secs_f64() * 1000.0;
             let requested_idr = idr_pending && control.take_idr();
             let force = mode == SubmissionMode::FirstFrame || requested_idr;
+            if let Some(runtime) = refine.as_mut() {
+                // A requested keyframe is a recovery: refinement starts a
+                // new generation behind its barrier (ADR 0016 R3).
+                if requested_idr && mode != SubmissionMode::FirstFrame {
+                    runtime.recovery();
+                }
+                if control.take_refine_reset() {
+                    log("lossless refinement: the Deck asked to start over");
+                    runtime.reset_request();
+                }
+                if let Some(enabled) = control.take_refine_enabled() {
+                    log(&format!(
+                        "lossless refinement: the Deck set enabled={enabled}"
+                    ));
+                    runtime.set_enabled(enabled);
+                }
+            }
             if let Some(fps) = control.take_framerate_fps() {
                 let fps = plan.live_fps(fps);
                 target_dt = crate::frame_interval_from_fps(fps);
@@ -903,6 +998,16 @@ pub unsafe fn run_native(
             if let Some(bps) = control.take_bitrate_bps() {
                 if let Err(error) = encoder.reconfigure_bitrate(bps) {
                     log(&format!("ERROR: live bitrate reconfigure failed: {error}"));
+                }
+                // The refinement floor until the link budget's first rate.
+                if let Some(runtime) = refine.as_mut() {
+                    runtime.cap_rate(bps);
+                }
+            }
+            if let Some((bps, hold)) = control.take_refine_rate() {
+                // The Pier's link budget (ADR 0016 R6).
+                if let Some(runtime) = refine.as_mut() {
+                    runtime.set_link_rate(bps, hold);
                 }
             }
             let encode_started = Instant::now();
@@ -949,11 +1054,19 @@ pub unsafe fn run_native(
                             }
                             ready_announced = true;
                         }
-                        if nal_codec.is_some_and(|nal| annex_b_is_keyframe(&access_unit, nal)) {
+                        if nal_codec.is_some_and(|nal| access_unit_is_keyframe(&access_unit, nal)) {
                             keyframes += 1;
                         }
                         stream_truth.observe(&access_unit);
-                        if epoch_output.access_unit(&mut stdout, &access_unit).is_err() {
+                        let written = match refine.as_mut() {
+                            // Fences and barriers ride in front of the access
+                            // unit they describe.
+                            Some(runtime) => runtime
+                                .before_access_unit(&mut stdout)
+                                .and_then(|()| epoch_output.access_unit(&mut stdout, &access_unit)),
+                            None => epoch_output.access_unit(&mut stdout, &access_unit),
+                        };
+                        if written.is_err() {
                             break 'epoch 0;
                         }
                         emitted += 1;
@@ -989,7 +1102,7 @@ pub unsafe fn run_native(
                 "enc_fps={emitted} encode_submitted={submitted} source_fps={} \
                  avg_import_ms={:.2} max_import_ms={:.2} avg_stage_ms={:.2} avg_encode_ms={:.2} \
                  kbps={} keyframes={keyframes} capture_backend=pipewire copy_path=host-copy \
-                 memory={} served={} fps_ceiling={} transform={}{}{}",
+                 memory={} served={} fps_ceiling={} transform={}{}{}{}",
                 rate.last_window().unwrap_or(0),
                 average(import_ms_sum, imports),
                 import_ms_max,
@@ -1008,6 +1121,10 @@ pub unsafe fn run_native(
                         (import_ms_sum + stage_ms_sum + encode_ms_sum).max(0.0) / 1000.0,
                     ),
                     now.duration_since(second),
+                ),
+                refine.as_ref().map_or_else(
+                    String::new,
+                    arcen_media::refine::runtime::RefineRuntime::log_fields
                 ),
             ));
             pacing = crate::linux_policy::PacingWindow::default();

@@ -7,11 +7,40 @@
   "assets": ["tests/fixtures/runtime/region_input.json"],
   "consumers": [
     {
+      "package": "arcen-deck-core",
+      "dependency_kind": "normal",
+      "contracts": [
+        "crate"
+      ]
+    },
+    {
+      "package": "arcen-deck-windows",
+      "dependency_kind": "normal",
+      "contracts": ["crate", "cursor", "deck_events", "deck_pen", "deck_wheel", "gestures", "host_pointer", "keyboard", "text", "touchpad"],
+      "paths": [
+        {
+          "id": "windows-deck-platform",
+          "entry_points": ["clients/windows/src/platform/mod.rs", "clients/windows/src/audio/mod.rs", "clients/windows/src/clipboard/mod.rs", "clients/windows/src/display/mod.rs", "clients/windows/src/logging/mod.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test", "windows-deck-session-lab"],
+          "owner": "Windows Client"
+        },
+        {
+          "id": "windows-deck-input",
+          "entry_points": ["clients/windows/src/input/mod.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test", "windows-deck-session-lab"],
+          "owner": "Windows Client"
+        }
+      ]
+    },
+    {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
       "contracts": [
         "crate",
         "cursor",
+        "gestures",
         "host_pointer",
         "keyboard",
         "lane_outbox",
@@ -51,7 +80,7 @@
         },
         {
           "id": "macos-deck-transport",
-          "entry_points": ["clients/macos/src/transport/websocket.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs"],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
           "owner": "macOS Client"
@@ -70,6 +99,7 @@
       "dependency_kind": "normal",
       "contracts": [
         "crate",
+        "compositor_pressure",
         "cursor",
         "host_pointer",
         "pen_axes",
@@ -108,7 +138,9 @@
             "hosts/linux/src/session/launcher.rs",
             "hosts/linux/src/cursor_watcher.rs",
             "hosts/linux/src/usb_bridge/tablet_pointer.rs",
-            "hosts/linux/src/media/desktop_pointer.rs"
+            "hosts/linux/src/media/desktop_pointer.rs",
+            "hosts/linux/src/input/keymap.rs",
+            "hosts/linux/src/input/x11_text.rs"
           ],
           "build_profiles": ["linux-pier"],
           "validation": ["linux-pier-test", "linux-av-input-lab"],
@@ -168,7 +200,8 @@
             "hosts/macos/src/input/pen.rs",
             "hosts/macos/src/input_session.rs",
             "hosts/macos/src/bridged_tablet.rs",
-            "hosts/macos/src/virtual_hid.rs"
+            "hosts/macos/src/virtual_hid.rs",
+            "hosts/macos/src/input/layout.rs"
           ],
           "build_profiles": ["macos-pier"],
           "validation": ["macos-pier-test", "macos-pier-av-input-lab"],
@@ -193,7 +226,7 @@
     {
       "package": "arcen-pier-windows",
       "dependency_kind": "normal",
-      "contracts": ["crate", "keyboard", "region", "region_pipeline", "region_state"],
+      "contracts": ["bridged_pen", "crate", "keyboard", "region", "region_pipeline", "region_state"],
       "paths": [
         {
           "id": "windows-grading",
@@ -213,7 +246,8 @@
           "id": "windows-input",
           "entry_points": [
             "hosts/windows/src/multi_monitor_input.rs",
-            "hosts/windows/src/input.rs"
+            "hosts/windows/src/input.rs",
+            "hosts/windows/src/keymap_watcher.rs"
           ],
           "build_profiles": ["windows-pier"],
           "validation": ["windows-pier-test", "windows-av-input-lab"],
@@ -312,6 +346,23 @@
           "build_profiles": ["windows-pier-installer"],
           "validation": ["windows-pier-installer-build"],
           "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-usb-client",
+      "dependency_kind": "dev",
+      "contracts": ["crate"],
+      "paths": [
+        {
+          "id": "windows-usb-client-lab",
+          "entry_points": ["clients/windows/usb/client/examples/forward_lab.rs"],
+          "build_profiles": ["windows-usb-client"],
+          "validation": [
+            "windows-usb-client-typecheck",
+            "windows-usb-component-lab"
+          ],
+          "owner": "Windows Client"
         }
       ]
     }

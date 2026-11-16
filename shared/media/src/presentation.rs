@@ -43,6 +43,19 @@ impl Default for FramePacerConfig {
 }
 
 impl FramePacerConfig {
+    /// How many frames wait for the display under a pipeline's presentation
+    /// timing: a refresh-paced fidelity contract keeps up to three in order
+    /// (no frame skipped); a timing that presents each frame at once keeps
+    /// only the newest, an older one is replaced ("mailbox").
+    #[must_use]
+    pub const fn queue_cap_for(timing: crate::video::PresentTiming) -> usize {
+        if timing.waits_for_vsync() {
+            DEFAULT_QUEUE_CAP
+        } else {
+            1
+        }
+    }
+
     #[must_use]
     pub fn bounded(mut self) -> Self {
         self.queue_cap = self.queue_cap.clamp(1, DEFAULT_QUEUE_CAP);
@@ -163,6 +176,36 @@ impl<T> FramePacer<T> {
 
     pub fn enqueue_replay(&mut self, frame: T, original_arrival: Duration, admission: Duration) {
         self.enqueue_with_admission(frame, original_arrival, admission);
+    }
+
+    /// Applies a pipeline's presentation timing
+    /// ([`FramePacerConfig::queue_cap_for`]); frames beyond the new cap are
+    /// dropped oldest first, as overflow.
+    pub fn set_present_timing(&mut self, timing: crate::video::PresentTiming) {
+        self.config.queue_cap = FramePacerConfig::queue_cap_for(timing);
+        while self.queue.len() > self.config.queue_cap {
+            let _ = self.drop_oldest(FramePacerDropReason::Overflow);
+        }
+    }
+
+    /// Takes the newest queued frame for presenting at once (a timing that
+    /// does not wait for the refresh), dropping any older one as overflow.
+    /// `now` is on the arrival clock. The refresh sequence is not advanced:
+    /// presenting on arrival is not a refresh.
+    pub fn take_newest(&mut self, now: Duration) -> Option<PacedFrame<T>> {
+        while self.queue.len() > 1 {
+            let _ = self.drop_oldest(FramePacerDropReason::Overflow);
+        }
+        let queued = self.queue.pop_front()?;
+        self.counters.frames_presented = self.counters.frames_presented.saturating_add(1);
+        self.last_present_callback = Some(now);
+        Some(PacedFrame {
+            queued_for: now.checked_sub(queued.arrival).unwrap_or(Duration::ZERO),
+            frame: queued.frame,
+            arrival: queued.arrival,
+            refresh_seq: self.last_refresh_seq.unwrap_or(0),
+            callback_host_time: now,
+        })
     }
 
     pub fn set_source_fps(&mut self, fps: Option<u32>) {
@@ -525,6 +568,43 @@ pub const fn presented_frames_for_health(
         timestamped
     } else {
         timestamped.saturating_add(untimestamped)
+    }
+}
+
+#[cfg(test)]
+mod present_timing_tests {
+    use super::*;
+    use crate::video::PresentTiming;
+
+    #[test]
+    fn a_frame_presented_at_once_keeps_only_the_newest_waiting() {
+        assert_eq!(FramePacerConfig::queue_cap_for(PresentTiming::Vsync), 3);
+        assert_eq!(FramePacerConfig::queue_cap_for(PresentTiming::Newest), 1);
+        assert_eq!(FramePacerConfig::queue_cap_for(PresentTiming::Tearing), 1);
+
+        let mut pacer = FramePacer::new();
+        for (frame, at) in [(1, 0), (2, 5), (3, 10)] {
+            pacer.enqueue(frame, Duration::from_millis(at));
+        }
+        pacer.set_present_timing(PresentTiming::Newest);
+        assert_eq!(pacer.queue_depth(), 1);
+        pacer.enqueue(4, Duration::from_millis(15));
+        assert_eq!(pacer.queue_depth(), 1);
+        let taken = pacer
+            .take_newest(Duration::from_millis(16))
+            .expect("newest frame");
+        assert_eq!(taken.frame, 4);
+        assert_eq!(taken.queued_for, Duration::from_millis(1));
+        assert!(pacer.take_newest(Duration::from_millis(17)).is_none());
+        let counters = pacer.counters();
+        assert_eq!(counters.frames_presented, 1);
+        assert_eq!(counters.dropped_overflow, 3);
+
+        // Back on the refresh: frames keep their order again.
+        pacer.set_present_timing(PresentTiming::Vsync);
+        pacer.enqueue(5, Duration::from_millis(20));
+        pacer.enqueue(6, Duration::from_millis(21));
+        assert_eq!(pacer.queue_depth(), 2);
     }
 }
 

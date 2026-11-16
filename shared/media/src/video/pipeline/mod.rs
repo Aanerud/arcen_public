@@ -501,6 +501,62 @@ impl Default for DecodeLatencyPolicy {
     }
 }
 
+/// When a Deck shows a decoded frame: the presentation half of a pipeline
+/// contract. Every Deck's presenter reads it from the served pipeline
+/// ([`operational_present_timing`]) and maps it onto its display API; no
+/// Deck decides it on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentTiming {
+    /// Wait for the display's refresh. Every frame is shown whole and none is
+    /// skipped: a fidelity contract shows exactly what was encoded (Grading,
+    /// HDR).
+    Vsync,
+    /// Hand each frame to the display the moment it is decoded, without
+    /// tearing: the newest frame wins at the next refresh or composition and
+    /// an older one still waiting there is discarded ("mailbox"). The
+    /// default for interactive pipelines (Auto).
+    Newest,
+    /// Like [`Self::Newest`], and a frame may also replace the one being
+    /// scanned out mid-refresh (a tear) where the display path allows it:
+    /// speed over the last 1 % of picture quality (Speed).
+    Tearing,
+}
+
+impl PresentTiming {
+    /// Whether a present waits for the display's refresh.
+    #[must_use]
+    pub const fn waits_for_vsync(self) -> bool {
+        matches!(self, Self::Vsync)
+    }
+
+    /// Whether a frame may tear.
+    #[must_use]
+    pub const fn allows_tearing(self) -> bool {
+        matches!(self, Self::Tearing)
+    }
+
+    /// The timing a presenter applies to a picture of `depth`. A deeper than
+    /// eight-bit picture belongs to a fidelity contract and always waits for
+    /// the refresh, whatever the stream was served as.
+    #[must_use]
+    pub const fn for_depth(self, depth: BitDepth) -> Self {
+        match depth {
+            BitDepth::Eight => self,
+            BitDepth::Ten | BitDepth::Twelve => Self::Vsync,
+        }
+    }
+
+    /// Stable log token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Vsync => "vsync",
+            Self::Newest => "newest",
+            Self::Tearing => "tearing",
+        }
+    }
+}
+
 /// Complete portable contract for one stream pipeline.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PipelineContract {
@@ -517,6 +573,8 @@ pub struct PipelineContract {
     pub keel: KeelPolicy,
     pub queue: QueuePolicy,
     pub decode_latency: DecodeLatencyPolicy,
+    /// When the Deck presents each decoded frame.
+    pub present_timing: PresentTiming,
     pub keyframe: KeyframePolicy,
     pub favours: &'static str,
     pub gives_up: &'static str,
@@ -892,6 +950,18 @@ pub fn operational_encode_intent(
     match operational_pipeline(served) {
         OperationalPipeline::Contract(pipeline) => pipeline_contract(pipeline).intent,
         OperationalPipeline::Legacy => fallback,
+    }
+}
+
+/// When a Deck presents the frames of the stream the host is actually
+/// serving. A custom, unknown or unreported pipeline presents like Auto
+/// (newest frame, no tearing); [`PresentTiming::for_depth`] still keeps a
+/// ten-bit picture on the refresh.
+#[must_use]
+pub fn operational_present_timing(served: Option<&ServedStreamPipeline>) -> PresentTiming {
+    match operational_pipeline(served) {
+        OperationalPipeline::Contract(pipeline) => pipeline_contract(pipeline).present_timing,
+        OperationalPipeline::Legacy => PresentTiming::Newest,
     }
 }
 
@@ -1717,6 +1787,81 @@ mod tests {
             "Speed's unproven clean-path ceiling is the true 60 fps shape"
         );
         assert_eq!(ceiling, start * 2 * PROVEN_PATH_HEADROOM);
+    }
+
+    #[test]
+    fn present_timing_follows_the_contract_and_keeps_fidelity_on_the_refresh() {
+        assert_eq!(
+            pipeline_contract(PipelineId::Auto).present_timing,
+            PresentTiming::Newest
+        );
+        assert_eq!(
+            pipeline_contract(PipelineId::Speed).present_timing,
+            PresentTiming::Tearing
+        );
+        assert_eq!(
+            pipeline_contract(PipelineId::Software).present_timing,
+            PresentTiming::Newest
+        );
+        for fidelity in [PipelineId::Grading, PipelineId::Hdr] {
+            let timing = pipeline_contract(fidelity).present_timing;
+            assert_eq!(timing, PresentTiming::Vsync, "{fidelity:?}");
+            assert!(timing.waits_for_vsync() && !timing.allows_tearing());
+        }
+        // Only Speed may tear; only the fidelity contracts wait.
+        for id in PipelineId::ALL {
+            let timing = pipeline_contract(*id).present_timing;
+            assert_eq!(timing.allows_tearing(), *id == PipelineId::Speed, "{id:?}");
+            assert_eq!(
+                timing.waits_for_vsync(),
+                matches!(id, PipelineId::Grading | PipelineId::Hdr),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn present_timing_is_read_from_what_the_host_serves() {
+        assert_eq!(
+            operational_present_timing(Some(&ServedStreamPipeline::Speed)),
+            PresentTiming::Tearing
+        );
+        assert_eq!(
+            operational_present_timing(Some(&ServedStreamPipeline::Grading)),
+            PresentTiming::Vsync
+        );
+        assert_eq!(
+            operational_present_timing(Some(&ServedStreamPipeline::Hdr)),
+            PresentTiming::Vsync
+        );
+        // A Speed request the software fallback served as Software.
+        assert_eq!(
+            operational_present_timing(Some(&ServedStreamPipeline::Software)),
+            PresentTiming::Newest
+        );
+        for legacy in [
+            None,
+            Some(ServedStreamPipeline::Custom),
+            Some(ServedStreamPipeline::Unknown("future".into())),
+        ] {
+            assert_eq!(
+                operational_present_timing(legacy.as_ref()),
+                PresentTiming::Newest
+            );
+        }
+    }
+
+    #[test]
+    fn a_ten_bit_picture_always_waits_for_the_refresh() {
+        for timing in [
+            PresentTiming::Vsync,
+            PresentTiming::Newest,
+            PresentTiming::Tearing,
+        ] {
+            assert_eq!(timing.for_depth(BitDepth::Eight), timing);
+            assert_eq!(timing.for_depth(BitDepth::Ten), PresentTiming::Vsync);
+            assert_eq!(timing.for_depth(BitDepth::Twelve), PresentTiming::Vsync);
+        }
     }
 
     #[test]

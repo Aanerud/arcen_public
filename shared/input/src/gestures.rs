@@ -1,17 +1,132 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! OS-free native gesture validation, ordering, and coalescing.
+//! OS-free native gesture validation, ordering, and coalescing, and the
+//! gesture samples a Deck captures (an `NSEvent` monitor on a Mac,
+//! `DirectManipulation` on Windows) with the one way both send them.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use arcen_protocol::messages::{
     GESTURE_MAGNIFY, GESTURE_ROTATE, GESTURE_SMART_ZOOM, GESTURE_SWIPE, GestureMagnifyMsg,
-    GestureRotateMsg, GestureSmartZoomMsg, GestureSwipeMsg, GestureValidationError,
+    GestureRotateMsg, GestureSmartZoomMsg, GestureSwipeMsg, GestureValidationError, ScrollPhaseMsg,
     SwipeDirectionMsg,
 };
 
 use crate::ScrollPhase;
+
+/// One trackpad gesture step as a Deck's platform reports it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GestureSample {
+    /// A pinch: the scale changed by `scale_delta` (new / old − 1).
+    Magnify {
+        scale_delta: f64,
+        phase: ScrollPhaseMsg,
+    },
+    /// A two-finger rotation by `degrees_delta`.
+    Rotate {
+        degrees_delta: f64,
+        phase: ScrollPhaseMsg,
+    },
+    /// A two-finger double tap.
+    SmartZoom,
+    /// A multi-finger swipe.
+    Swipe {
+        direction: SwipeDirectionMsg,
+        fingers: u8,
+        phase: ScrollPhaseMsg,
+    },
+}
+
+impl GestureSample {
+    /// The message a Deck sends for this sample (to a host that advertised
+    /// gestures), with the session's next input `sequence`. Continuous
+    /// steps are coalescable: a host may keep only the latest.
+    #[must_use]
+    pub fn wire(self, sequence: u64, timestamp_ns: u64) -> GestureWire {
+        match self {
+            Self::Magnify { scale_delta, phase } => GestureWire::Magnify(GestureMagnifyMsg {
+                scale_delta,
+                phase,
+                sequence,
+                timestamp_ns,
+                coalescable: true,
+                ..GestureMagnifyMsg::default()
+            }),
+            Self::Rotate {
+                degrees_delta,
+                phase,
+            } => GestureWire::Rotate(GestureRotateMsg {
+                degrees_delta,
+                phase,
+                sequence,
+                timestamp_ns,
+                coalescable: true,
+                ..GestureRotateMsg::default()
+            }),
+            Self::SmartZoom => GestureWire::SmartZoom(GestureSmartZoomMsg {
+                sequence,
+                timestamp_ns,
+                ..GestureSmartZoomMsg::default()
+            }),
+            Self::Swipe {
+                direction,
+                fingers,
+                phase,
+            } => GestureWire::Swipe(GestureSwipeMsg {
+                direction,
+                fingers,
+                phase,
+                sequence,
+                timestamp_ns,
+                coalescable: true,
+                ..GestureSwipeMsg::default()
+            }),
+        }
+    }
+}
+
+/// One gesture-v1 message a Deck sends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GestureWire {
+    Magnify(GestureMagnifyMsg),
+    Rotate(GestureRotateMsg),
+    SmartZoom(GestureSmartZoomMsg),
+    Swipe(GestureSwipeMsg),
+}
+
+impl GestureWire {
+    /// The message's `type`, as input statistics count it.
+    #[must_use]
+    pub const fn input_type(&self) -> &'static str {
+        self.as_ref().input_type()
+    }
+
+    /// The borrowed DTO.
+    #[must_use]
+    pub const fn as_ref(&self) -> GestureWireRef<'_> {
+        match self {
+            Self::Magnify(message) => GestureWireRef::Magnify(message),
+            Self::Rotate(message) => GestureWireRef::Rotate(message),
+            Self::SmartZoom(message) => GestureWireRef::SmartZoom(message),
+            Self::Swipe(message) => GestureWireRef::Swipe(message),
+        }
+    }
+
+    /// The JSON the session lane carries.
+    ///
+    /// # Errors
+    ///
+    /// A value JSON cannot hold (a non-finite delta).
+    pub fn to_value(&self) -> serde_json::Result<serde_json::Value> {
+        match self {
+            Self::Magnify(message) => serde_json::to_value(message),
+            Self::Rotate(message) => serde_json::to_value(message),
+            Self::SmartZoom(message) => serde_json::to_value(message),
+            Self::Swipe(message) => serde_json::to_value(message),
+        }
+    }
+}
 
 /// One borrowed gesture-v1 protocol DTO.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -226,4 +341,45 @@ pub fn coalesce_gestures(events: &[GestureEvent]) -> Vec<GestureEvent> {
         retained.push(event);
     }
     retained
+}
+
+#[cfg(test)]
+mod sample_tests {
+    use super::*;
+
+    #[test]
+    fn a_sample_goes_as_the_message_the_mac_deck_always_sent() {
+        let magnify = GestureSample::Magnify {
+            scale_delta: 0.1,
+            phase: ScrollPhaseMsg::Began,
+        }
+        .wire(7, 99);
+        let value = magnify.to_value().expect("serializes");
+        assert_eq!(value["type"], "gesture_magnify");
+        assert_eq!(value["scale_delta"], 0.1);
+        assert_eq!(value["phase"], "began");
+        assert_eq!(value["sequence"], 7);
+        assert_eq!(value["timestamp_ns"], 99);
+        assert_eq!(value["coalescable"], true);
+        assert_eq!(magnify.input_type(), GESTURE_MAGNIFY);
+        assert!(magnify.as_ref().validate().is_ok());
+
+        let swipe = GestureSample::Swipe {
+            direction: SwipeDirectionMsg::Left,
+            fingers: 3,
+            phase: ScrollPhaseMsg::Changed,
+        }
+        .wire(8, 100);
+        assert_eq!(swipe.input_type(), GESTURE_SWIPE);
+        assert_eq!(swipe.to_value().expect("serializes")["fingers"], 3);
+        let zoom = GestureSample::SmartZoom.wire(9, 101);
+        assert_eq!(zoom.input_type(), GESTURE_SMART_ZOOM);
+        assert_eq!(zoom.to_value().expect("serializes")["sequence"], 9);
+        let rotate = GestureSample::Rotate {
+            degrees_delta: -4.0,
+            phase: ScrollPhaseMsg::Ended,
+        }
+        .wire(10, 102);
+        assert_eq!(rotate.input_type(), GESTURE_ROTATE);
+    }
 }

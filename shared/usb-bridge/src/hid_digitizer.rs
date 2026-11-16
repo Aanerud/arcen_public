@@ -746,6 +746,22 @@ impl DescriptorParser {
     }
 }
 
+/// Whether a top-level collection's usage names a pen digitizer: Digitizer,
+/// Pen or Light Pen on the Digitizers page or its vendor mirror `0xFF0D`.
+///
+/// For a platform that sees each top-level collection on its own (Windows
+/// lists a HID collection's usage page and usage), so it offers every pen
+/// tablet, whoever made it, including those that publish their pen on the
+/// vendor mirror (the Intuos family). The descriptor-level admission is
+/// still [`classify_pen_tablet`].
+#[must_use]
+pub const fn names_pen_digitizer(usage_page: u16, usage: u16) -> bool {
+    matches!(
+        usage_page,
+        USAGE_PAGE_DIGITIZER | USAGE_PAGE_VENDOR_DIGITIZER
+    ) && matches!(usage, DIGITIZER_DIGITIZER | DIGITIZER_PEN | 0x03)
+}
+
 /// Parses one HID report descriptor into a bounded collection summary.
 ///
 /// # Errors

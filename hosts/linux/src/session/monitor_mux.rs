@@ -194,6 +194,22 @@ impl VideoSource {
         }
     }
 
+    /// [`Self::dequeue`] with the lossless-refinement records to write
+    /// before the frame. Only a single-monitor session refines.
+    pub async fn dequeue_refined(&self) -> Option<crate::session::client::DequeuedFrame> {
+        match self {
+            Self::Single(queue) => queue.dequeue_refined().await,
+            Self::Muxed(mux) => {
+                mux.dequeue()
+                    .await
+                    .map(|frame| crate::session::client::DequeuedFrame {
+                        refine: Vec::new(),
+                        frame,
+                    })
+            }
+        }
+    }
+
     pub fn take_wait_stats(&self) -> VideoQueueWaitStats {
         match self {
             Self::Single(queue) => queue.take_wait_stats(),

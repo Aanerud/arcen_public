@@ -59,11 +59,7 @@ use arcen_protocol::messages::{
     PenToolMsg, PointerMotionMode, ScrollUnitMsg, TextCommitMsg,
 };
 
-const MOD_SHIFT: u32 = 0x01;
-const MOD_CTRL: u32 = 0x02;
-const MOD_ALT: u32 = 0x04;
-const MOD_META: u32 = 0x08;
-const MOD_KEYPAD: u32 = 0x10;
+use arcen_protocol::keys::{MOD_ALT, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT};
 
 fn wheel_delta_from_scroll(value: f64, unit: ScrollUnitMsg) -> i32 {
     if value == 0.0 || !value.is_finite() {

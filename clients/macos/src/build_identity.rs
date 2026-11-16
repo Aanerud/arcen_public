@@ -24,6 +24,7 @@ pub struct DeckBuildFacts {
 impl DeckBuildFacts {
     /// The facts of the running process.
     #[must_use]
+    #[cfg(target_os = "macos")]
     pub fn running() -> Self {
         use objc2_foundation::{NSBundle, NSString};
         let bundle = NSBundle::mainBundle();
@@ -39,6 +40,25 @@ impl DeckBuildFacts {
             &current(),
             &bundle.bundlePath().to_string(),
             std::env::var_os("HOME").as_deref().map(Path::new),
+        )
+    }
+
+    /// The facts of the running process: no bundle outside macOS.
+    #[cfg(not(target_os = "macos"))]
+    #[must_use]
+    pub fn running() -> Self {
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        Self::from_parts(
+            None,
+            None,
+            &current(),
+            &executable,
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .as_deref()
+                .map(Path::new),
         )
     }
 

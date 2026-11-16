@@ -9,8 +9,9 @@
 > `arcen-transport`'s opt-in QUIC feature is active in the Linux, Windows and
 > macOS Piers and the macOS Deck while its default dependency graph stays
 > Quinn-free. Shipped transport is
-> **direct QUIC only**, using the shared TLS trust lifecycle. Dormant WSS source
-> is isolated behind `wss-compat` and is not enabled by product builds.
+> **direct QUIC only**, using the shared TLS trust lifecycle. The Decks carry no
+> WSS code; the Piers' dormant WSS listener is isolated behind `wss-compat` and
+> is not enabled by product builds.
 > Current status is the repository `README.md`; see
 > [`observability.md`](observability.md) for the direct Pier/Deck observability
 > implementation. This is not a release claim.
@@ -37,8 +38,9 @@ Direct products use QUIC (Quinn + rustls TLS 1.3). Since 0.17.0 one
 authenticated connection carries isolated lanes — control, video, audio out,
 microphone, input/cursor and bulk — each on its own stream with its own worker, declared
 by a bounded lane preface (protocol v5,
-[ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md)). WSS network
-code is dormant behind `wss-compat` and absent from product feature graphs.
+[ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md)). The Decks
+have no WSS network code; the Piers' is dormant behind `wss-compat` and absent
+from product feature graphs.
 The products do not use QUIC datagrams. See
 [`transport.md`](transport.md) for API usage and known gaps, and
 [`../adr/0007-quic-only-product-transport.md`](../adr/0007-quic-only-product-transport.md)
@@ -99,6 +101,14 @@ path must pass when that crate changes is the generated
 `shared/<crate>/consumers.json`, `scripts/ci/validation-profiles.toml` and
 `cargo metadata` by `scripts/check_shared_contracts.py`.
 
+Every difference between products must be earned: an operating-system API or
+behaviour forces it. The generated
+[earned-differences ledger](platform-differences.md) lists each earned
+difference with its OS reason and code, and each open gap with its owner;
+`scripts/check_shared_contracts.py` fails when the code and the ledger
+disagree or cross-product copies grow. The Shared Adoption Index trend is in
+[`shared-adoption-history.md`](shared-adoption-history.md).
+
 ## Documents in this directory
 
 | Document | Covers |
@@ -110,6 +120,7 @@ path must pass when that crate changes is the generated
 | [`media-plan-resolution.md`](media-plan-resolution.md) | How a requested preset becomes a served pipeline; portable software H.264 |
 | [`color-fidelity.md`](color-fidelity.md) | Ten-bit, 4:4:4, full range, Grading and HDR from capture to the Deck |
 | [`encode-intent.md`](encode-intent.md) | Interactive versus grading encoder intent |
+| [`deck-presentation-timing.md`](deck-presentation-timing.md) | When each Deck shows a decoded frame, per pipeline; pixel-perfect fullscreen |
 | [`rate-control.md`](rate-control.md) | Live bitrate control |
 | [`qp-maps.md`](qp-maps.md) | Keel's damage grid as NVENC QP maps |
 | [`arcen-keel.md`](arcen-keel.md) | Keel, the content-adaptive engine (planning document) |
@@ -119,11 +130,14 @@ path must pass when that crate changes is the generated
 | [`pen-tablet-input.md`](pen-tablet-input.md) | Typed pen and tablet input (local termination) |
 | [`linux-wayland-provider.md`](linux-wayland-provider.md) | The Linux Wayland provider, with lab evidence; qualification records in [`wayland-qualification/`](wayland-qualification) |
 | [`windows-console-policy.md`](windows-console-policy.md) | What the Windows Pier does with the physical console |
+| [`display-lifecycle.md`](display-lifecycle.md) | What a session leaves behind: displays removed or restored, stranded windows moved back |
 | [`timezone-redirection.md`](timezone-redirection.md) | The session following the Deck's time zone |
 | [`disclaimer-banner.md`](disclaimer-banner.md) | The pre-session notice a host can require |
 | [`macos-peripheral-access.md`](macos-peripheral-access.md) | Webcams and other peripherals from a Mac: which route |
 | [`observability.md`](observability.md), [`ObservabilityStandard.md`](ObservabilityStandard.md) | Logging, QoS telemetry and monitoring |
 | [`shared-consumers.md`](shared-consumers.md) | Generated register of which product path uses each shared crate |
+| [`platform-differences.md`](platform-differences.md) | Generated ledger of earned differences between products, open gaps, the capability matrix and the clone baseline |
+| [`shared-adoption-history.md`](shared-adoption-history.md) | Shared Adoption Index per product over time |
 
 Decisions are in [`../adr/`](../adr); running and configuring a Pier is in
 [`../operations/`](../operations).

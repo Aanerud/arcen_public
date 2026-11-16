@@ -58,11 +58,62 @@ const CAPENC_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const CAPENC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PRE_READY_DIAGNOSTICS: usize = 32;
 
+/// Whether this Pier contains capenc's exact-still-image producer.
+pub const REFINE_COMPILED: bool = cfg!(feature = "lossless-refine");
+/// capenc's refinement scope: the one refined monitor; every capenc process
+/// starts its own generation (`process_unique_generation`).
+pub(crate) const REFINE_SCOPE: (u16, u64, u64) = (arcen_media::refine::PRIMARY_MONITOR, 1, 1);
+/// Refine-lane records (tiles, digests) read from capenc and not yet handed
+/// to the broker. A still desktop's first pass fits; beyond it the reader
+/// asks capenc to start over.
+pub(crate) const REFINE_LANE_RECORDS: usize = 256;
+/// Video-lane refinement records capenc may write before one access unit
+/// (a barrier and a fence; anything more is a broken producer).
+const MAX_REFINE_PREFIX_RECORDS: usize = 8;
+
+/// What the exact-still-image plan of one capture needs from the session
+/// (ADR 0016). Present only for a single-monitor capture.
+#[derive(Debug, Clone)]
+pub struct RefineForward {
+    /// `video.lossless_refinement`.
+    pub operator_enabled: bool,
+    /// What the Deck asked for (`AuthResponse.lossless_refine_v1`).
+    pub deck: Option<arcen_protocol::refine::LosslessRefineCapability>,
+}
+
+/// The video-lane refinement records of one capenc, carried until the
+/// access unit they precede (or a later one, when it was dropped) is
+/// written: [`arcen_protocol::refine::carry`].
+pub type RefineCarry = Arc<std::sync::Mutex<arcen_protocol::refine::carry::RefineVideoCarry>>;
+
+/// Where an encoded frame's refinement records wait.
+#[derive(Debug, Clone)]
+pub struct RefineTag {
+    /// The capenc's carry.
+    pub carry: RefineCarry,
+    /// The frame's sequence number in it.
+    pub seq: u64,
+}
+
+impl RefineTag {
+    /// The records to write immediately before this frame: its own and
+    /// those of every earlier frame that was dropped, merged.
+    pub fn take(&self) -> Vec<Vec<u8>> {
+        self.carry
+            .lock()
+            .map(|mut carry| carry.take_through(self.seq))
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub keyframe: bool,
     pub timestamp_ms: u32,
+    /// Exact still image: where this frame's refinement records wait;
+    /// `None` unless the capture refines.
+    pub refine: Option<RefineTag>,
 }
 
 pub struct CapencConfig {
@@ -98,66 +149,46 @@ pub struct CapencConfig {
     /// Encoder backend selection passed to `arcen-capenc` as `encoder=<v>`.
     /// `None` preserves the engine's default (auto: NVENC if available, else
     /// source-built OpenH264).
-    pub encoder: Option<EncoderSelection>,
+    pub encoder: Option<EncoderRequest>,
     pub cursor_mode: CursorMode,
     pub session_log_id: CorrelationId,
+    /// Exact still image (ADR 0016): the operator's switch and the Deck's
+    /// capability. `None` for probes and multi-monitor pipelines. Whether
+    /// this capture refines is [`Self::refine_plan`], decided by the
+    /// shared plan.
+    pub refine: Option<RefineForward>,
 }
 
-/// Encoder backend the pier asks the capenc engine to use.
-///
-/// The shipped Pier accepts `encoder=auto|nvenc|software-h264`. Auto probes
-/// the NVIDIA encode API. Typed pre-READY NVENC unavailability is returned to
-/// the parent so it can retarget OpenH264 geometry before retrying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncoderSelection {
-    Auto,
-    Nvenc,
-    SoftwareH264,
-}
-
-impl EncoderSelection {
-    pub fn as_arg(self) -> &'static str {
-        match self {
-            EncoderSelection::Auto => "encoder=auto",
-            EncoderSelection::Nvenc => "encoder=nvenc",
-            EncoderSelection::SoftwareH264 => "encoder=software-h264",
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            EncoderSelection::Auto => "auto",
-            EncoderSelection::Nvenc => "nvenc",
-            EncoderSelection::SoftwareH264 => "software-h264",
-        }
-    }
-
-    /// Resolve `Auto` against the selected adapter: direct NVENC only for an
-    /// NVIDIA-owned output with the encode runtime present, the OpenH264
-    /// software path otherwise. Concrete selections pass through.
-    ///
-    /// The pier resolves `Auto` BEFORE spawning capenc so that display
-    /// alignment, the advertised ServerHello capabilities, and the eventual
-    /// concrete child all agree.
-    pub fn resolve_auto(self, adapter_is_nvidia: bool, nvenc_runtime: bool) -> EncoderSelection {
-        match self {
-            EncoderSelection::Auto => {
-                if adapter_is_nvidia && nvenc_runtime {
-                    EncoderSelection::Nvenc
-                } else {
-                    EncoderSelection::SoftwareH264
-                }
-            }
-            concrete => concrete,
-        }
-    }
-
-    const fn request(self) -> EncoderRequest {
-        match self {
-            Self::Auto => EncoderRequest::Auto,
-            Self::Nvenc => EncoderRequest::NativeNvenc,
-            Self::SoftwareH264 => EncoderRequest::SoftwareH264,
-        }
+impl CapencConfig {
+    /// The shared exact-still-image plan for this capture (ADR 0016).
+    #[must_use]
+    pub fn refine_plan(&self) -> arcen_media::refine::RefinePlan {
+        let Some(forward) = self.refine.as_ref() else {
+            return arcen_media::refine::RefinePlan::Off(
+                arcen_media::refine::RefineOffReason::MultiMonitor,
+            );
+        };
+        arcen_media::refine::plan_for_capture(
+            REFINE_COMPILED,
+            forward.operator_enabled,
+            forward.deck.as_ref(),
+            arcen_media::refine::CaptureRefineFacts {
+                depth: self.bit_depth,
+                chroma: Capenc::media_chroma(self.chroma),
+                transfer: self.transfer,
+                primaries: self.color_primaries,
+                // Every ten-bit contract is an FP16 WGC capture that capenc
+                // maps or reads back into host memory; eight-bit captures
+                // stay on the GPU (and are never refined).
+                source: match self.bit_depth {
+                    BitDepth::Eight => arcen_media::refine::RefineSourceKind::GpuOnly,
+                    BitDepth::Ten | BitDepth::Twelve => {
+                        arcen_media::refine::RefineSourceKind::CpuRgb
+                    }
+                },
+                single_monitor: true,
+            },
+        )
     }
 }
 
@@ -168,6 +199,9 @@ pub struct Capenc {
     idr: IdrRequester,
     control: mpsc::Sender<StdinCommand>,
     pipeline_telemetry: Arc<PipelineTelemetry>,
+    refine_plan: arcen_media::refine::RefinePlan,
+    refine_lane: Option<mpsc::Receiver<Vec<u8>>>,
+    refine_control: mpsc::UnboundedSender<arcen_media::capenc_control::CapencControlCommand>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -647,7 +681,7 @@ impl Capenc {
             codec = codec_name(cfg.codec),
             chroma = chroma_name(cfg.chroma),
             fps = cfg.fps,
-            encoder = cfg.encoder.map(EncoderSelection::name).unwrap_or("engine-default"),
+            encoder = cfg.encoder.map(EncoderRequest::as_arg).unwrap_or("engine-default"),
             cursor = ?cfg.cursor_mode,
             "spawning capture+encode engine"
         );
@@ -725,6 +759,7 @@ impl Capenc {
             FRAME_QUEUE_CAPACITY
         }));
         let (stdin_tx, stdin_rx) = mpsc::channel(1);
+        let (refine_tx, refine_rx) = mpsc::unbounded_channel();
         let (idr_tx, idr_rx) = mpsc::unbounded_channel();
         let idr = IdrRequester::new(idr_tx);
         let pipeline_telemetry = Arc::new(PipelineTelemetry::default());
@@ -742,14 +777,34 @@ impl Capenc {
             output = cfg.output_index,
             device = cfg.device_name.as_deref().unwrap_or("<resolved-by-engine>"),
         );
-        tokio::spawn(
-            read_length_prefixed(stdout, codec, frames.clone(), idr.clone())
-                .instrument(helper_span.clone()),
-        );
+        let refine_plan = cfg.refine_plan();
+        let refine_lane = if refine_plan.is_on() {
+            let (lane_tx, lane_rx) = mpsc::channel(REFINE_LANE_RECORDS);
+            let target = RefineTarget {
+                carry: Arc::new(std::sync::Mutex::new(
+                    arcen_protocol::refine::carry::RefineVideoCarry::new(),
+                )),
+                lane: lane_tx,
+                control: refine_tx.clone(),
+            };
+            tokio::spawn(
+                read_framed_v2(stdout, codec, frames.clone(), idr.clone(), target)
+                    .instrument(helper_span.clone()),
+            );
+            Some(lane_rx)
+        } else {
+            tokio::spawn(
+                read_length_prefixed(stdout, codec, frames.clone(), idr.clone())
+                    .instrument(helper_span.clone()),
+            );
+            None
+        };
         tokio::spawn(
             retry_pending_idr(frames.clone(), idr.clone()).instrument(helper_span.clone()),
         );
-        tokio::spawn(write_stdin(stdin, idr_rx, stdin_rx).instrument(helper_span.clone()));
+        tokio::spawn(
+            write_stdin(stdin, idr_rx, stdin_rx, refine_rx).instrument(helper_span.clone()),
+        );
         tokio::spawn(
             forward_stderr(stderr_lines, Arc::clone(&pipeline_telemetry)).instrument(helper_span),
         );
@@ -760,6 +815,9 @@ impl Capenc {
                 idr,
                 control: stdin_tx,
                 pipeline_telemetry,
+                refine_plan,
+                refine_lane,
+                refine_control: refine_tx,
             },
             frames,
             plan,
@@ -841,7 +899,7 @@ impl Capenc {
         if cfg.width == 0 || cfg.height == 0 || cfg.fps == 0 {
             return Err("capenc READY expectation has invalid geometry".to_string());
         }
-        let encoder = cfg.encoder.unwrap_or(EncoderSelection::Auto).request();
+        let encoder = cfg.encoder.unwrap_or(EncoderRequest::Auto);
         let allowed_backends: &'static [EncoderBackend] = match encoder {
             EncoderRequest::Auto => &[EncoderBackend::NativeNvenc, EncoderBackend::OpenH264],
             EncoderRequest::NativeNvenc => &[EncoderBackend::NativeNvenc],
@@ -1025,9 +1083,17 @@ impl Capenc {
         if cfg.qp_map != arcen_media::video::QpMapPolicy::default() {
             args.push(format!("qp-map={}", cfg.qp_map.token()));
         }
-        args.push("framed-v1".to_string());
+        // Exact still image: only on a plan the shared rule grants (never
+        // an eight-bit capture); its records need framed-v2 (ADR 0016).
+        let refine = cfg.refine_plan();
+        args.push(if refine.is_on() {
+            arcen_media::capenc_stream::FRAMED_OUTPUT_V2.to_string()
+        } else {
+            "framed-v1".to_string()
+        });
+        args.extend(refine.capenc_args(REFINE_SCOPE));
         if let Some(encoder) = cfg.encoder {
-            args.push(encoder.as_arg().to_string());
+            args.push(format!("encoder={}", encoder.as_arg()));
         }
         if let Some(adapter_name) = cfg.adapter_name.as_deref() {
             args.push(format!("adapter={adapter_name}"));
@@ -1046,6 +1112,36 @@ impl Capenc {
             }
         ));
         args
+    }
+
+    /// The exact-still-image plan this capenc was started with.
+    pub fn refine_plan(&self) -> arcen_media::refine::RefinePlan {
+        self.refine_plan
+    }
+
+    /// The refine-lane records (tiles, digests) of a refining capenc, for
+    /// the attachment's writer; `None` once taken or when it does not
+    /// refine.
+    pub fn take_refine_lane(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        self.refine_lane.take()
+    }
+
+    /// Where the session's link budget sends `REFINE-RATE` (ADR 0016 R6);
+    /// `None` when this capenc does not refine.
+    pub fn refine_requester(
+        &self,
+    ) -> Option<mpsc::UnboundedSender<arcen_media::capenc_control::CapencControlCommand>> {
+        self.refine_plan
+            .is_on()
+            .then(|| self.refine_control.clone())
+    }
+
+    /// A Deck refinement control (`refine_reset` / `refine_control`) for
+    /// this capenc; ignored when it does not refine.
+    pub fn request_refine(&self, command: arcen_media::capenc_control::CapencControlCommand) {
+        if self.refine_plan.is_on() {
+            let _ = self.refine_control.send(command);
+        }
     }
 
     /// Real IDR-on-demand: one line on the engine's stdin, no restart.
@@ -1186,7 +1282,7 @@ async fn read_length_prefixed_inner<R>(
             );
             break;
         }
-        let keyframe = is_keyframe(codec, &au);
+        let keyframe = arcen_media::annexb::video_unit_is_keyframe(&au, media_codec(codec));
         frame_count += 1;
         // Stamped when read from the engine, so the Deck's frame age counts
         // every wait on this side.
@@ -1194,6 +1290,7 @@ async fn read_length_prefixed_inner<R>(
             data: au,
             keyframe,
             timestamp_ms: now_ms(),
+            refine: None,
         };
         // Back-pressure, not loss: while the router is held back by the
         // outbound backlog budget the engine stalls on its pipe. Past the
@@ -1205,6 +1302,150 @@ async fn read_length_prefixed_inner<R>(
         }
         if !enqueue_encoded_frame(&frames, &idr, frame) {
             break;
+        }
+    }
+    frames.close();
+}
+
+/// Where a refining capenc's records go (ADR 0016).
+struct RefineTarget {
+    carry: RefineCarry,
+    lane: mpsc::Sender<Vec<u8>>,
+    control: mpsc::UnboundedSender<arcen_media::capenc_control::CapencControlCommand>,
+}
+
+/// Read framed-v2 records from a refining engine: access units into the
+/// frame queue, each tagged with the video-lane records (fences, barriers)
+/// that precede it in the carry, and refine-lane records (tiles, digests)
+/// into the attachment's bounded queue. The engine runs as the signed-in
+/// user, so every record is bounded before it is read; a malformed one ends
+/// the stream.
+async fn read_framed_v2<R>(
+    stdout: R,
+    codec: VideoCodec,
+    frames: Arc<VideoQueue<EncodedFrame>>,
+    idr: IdrRequester,
+    refine: RefineTarget,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    read_framed_v2_inner(stdout, codec, frames.clone(), idr, refine).await;
+    frames.close();
+}
+
+async fn read_framed_v2_inner<R>(
+    stdout: R,
+    codec: VideoCodec,
+    frames: Arc<VideoQueue<EncodedFrame>>,
+    idr: IdrRequester,
+    refine: RefineTarget,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use arcen_media::capenc_stream::{record_body_length, record_kind, CapencRecordKind};
+    let mut r = BufReader::new(stdout);
+    let mut frame_count: u64 = 0;
+    let mut prefix: Vec<Vec<u8>> = Vec::new();
+    let mut next_seq: u64 = 0;
+    let mut last_overflow_reset: Option<std::time::Instant> = None;
+    loop {
+        let mut length = [0u8; arcen_media::capenc_stream::RECORD_LENGTH_BYTES];
+        if r.read_exact(&mut length).await.is_err() {
+            tracing::info!(
+                target: CAPENC,
+                reason_class = "stdout_closed",
+                frames = frame_count,
+                "engine stdout closed"
+            );
+            break;
+        }
+        let body_length = match record_body_length(length) {
+            Ok(body_length) => body_length,
+            Err(error) => {
+                tracing::error!(target: CAPENC, %error, "invalid framed-v2 record length — stopping reader");
+                break;
+            }
+        };
+        let mut kind = [0u8; 1];
+        if r.read_exact(&mut kind).await.is_err() {
+            break;
+        }
+        let kind = match record_kind(kind[0], body_length) {
+            Ok(kind) => kind,
+            Err(error) => {
+                tracing::error!(target: CAPENC, %error, "invalid framed-v2 record — stopping reader");
+                break;
+            }
+        };
+        let mut body = vec![0u8; body_length];
+        if r.read_exact(&mut body).await.is_err() {
+            tracing::warn!(
+                target: CAPENC,
+                reason_class = "short_access_unit",
+                expected_bytes = body_length,
+                "short framed-v2 record — engine gone"
+            );
+            break;
+        }
+        match kind {
+            CapencRecordKind::AccessUnit => {
+                if body.is_empty() || body.len() > MAX_AU_BYTES as usize {
+                    tracing::error!(target: CAPENC, len = body.len(), "invalid AU length — stopping reader");
+                    break;
+                }
+                let seq = next_seq;
+                next_seq = next_seq.wrapping_add(1);
+                if !prefix.is_empty() {
+                    if let Ok(mut carry) = refine.carry.lock() {
+                        carry.push(seq, std::mem::take(&mut prefix));
+                    }
+                }
+                let keyframe =
+                    arcen_media::annexb::video_unit_is_keyframe(&body, media_codec(codec));
+                frame_count += 1;
+                let frame = EncodedFrame {
+                    data: body,
+                    keyframe,
+                    timestamp_ms: now_ms(),
+                    refine: Some(RefineTag {
+                        carry: Arc::clone(&refine.carry),
+                        seq,
+                    }),
+                };
+                if !crate::latest::video_backlog_legacy() {
+                    frames
+                        .wait_for_room(Some(arcen_media::video::VIDEO_ROOM_WAIT))
+                        .await;
+                }
+                if !enqueue_encoded_frame(&frames, &idr, frame) {
+                    break;
+                }
+            }
+            CapencRecordKind::RefineVideo => {
+                if prefix.len() < MAX_REFINE_PREFIX_RECORDS {
+                    prefix.push(body);
+                }
+            }
+            CapencRecordKind::RefineLane => {
+                if refine.lane.try_send(body).is_err() {
+                    // A dropped tile leaves the Deck's digest incomplete:
+                    // start a new generation instead, at most once a second.
+                    let due =
+                        last_overflow_reset.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+                    if due {
+                        last_overflow_reset = Some(std::time::Instant::now());
+                        let _ = refine
+                            .control
+                            .send(arcen_media::capenc_control::CapencControlCommand::RefineReset);
+                        tracing::info!(
+                            target: CAPENC,
+                            "refine queue full — exact still image starts over"
+                        );
+                    }
+                }
+            }
+            // Cursor events and positions are Wayland-only; ignore them.
+            CapencRecordKind::Cursor | CapencRecordKind::CursorPosition => {}
         }
     }
     frames.close();
@@ -1279,9 +1520,29 @@ async fn write_stdin(
     mut stdin: ChildStdin,
     mut idr_requests: mpsc::UnboundedReceiver<&'static str>,
     mut commands: mpsc::Receiver<StdinCommand>,
+    mut refine: mpsc::UnboundedReceiver<arcen_media::capenc_control::CapencControlCommand>,
 ) {
+    let mut refine_open = true;
     loop {
         tokio::select! {
+            command = refine.recv(), if refine_open => {
+                let Some(command) = command else {
+                    refine_open = false;
+                    continue;
+                };
+                let line = command.as_wire_line();
+                let write = async {
+                    stdin.write_all(line.as_bytes()).await?;
+                    stdin.flush().await
+                };
+                if tokio::time::timeout(CAPENC_WRITE_TIMEOUT, write)
+                    .await
+                    .map_or(true, |written| written.is_err())
+                {
+                    tracing::warn!(target: CAPENC, "capenc refine control write failed");
+                    return;
+                }
+            }
             reason = idr_requests.recv() => {
                 let Some(reason) = reason else {
                     if commands.is_closed() {
@@ -1647,46 +1908,6 @@ fn now_ms() -> u32 {
         & 0xFFFF_FFFF) as u32
 }
 
-/// AU-aware keyframe detection — ported from `video_encoder.py`. Scans every
-/// three- or four-byte Annex-B NAL (an AU may be `[VPS][SPS][PPS][SEI][IDR]`).
-fn is_keyframe(codec: VideoCodec, au: &[u8]) -> bool {
-    match codec {
-        VideoCodec::H264 => scan_nals(au, |b0| (b0 & 0x1F) == 5),
-        VideoCodec::H265 => scan_nals(au, |b0| matches!((b0 >> 1) & 0x3F, 19 | 20 | 21)),
-        VideoCodec::Av1 => arcen_media::video::av1_low_overhead_has_sequence_header(au),
-        VideoCodec::Jpeg | VideoCodec::Vp9 => false,
-    }
-}
-
-fn scan_nals(data: &[u8], is_idr: impl Fn(u8) -> bool) -> bool {
-    let mut pos = 0usize;
-    while let Some((idx, start_code_len)) = find_start_code(data, pos) {
-        let hdr = idx + start_code_len;
-        if hdr >= data.len() {
-            return false;
-        }
-        if is_idr(data[hdr]) {
-            return true;
-        }
-        pos = hdr;
-    }
-    false
-}
-
-fn find_start_code(data: &[u8], offset: usize) -> Option<(usize, usize)> {
-    let mut index = offset;
-    while index + 3 <= data.len() {
-        if index + 4 <= data.len() && data[index..index + 4] == [0, 0, 0, 1] {
-            return Some((index, 4));
-        }
-        if data[index..index + 3] == [0, 0, 1] {
-            return Some((index, 3));
-        }
-        index += 1;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1765,9 +1986,10 @@ mod tests {
             fps: 30,
             width: 1920,
             height: 1080,
-            encoder: Some(EncoderSelection::SoftwareH264),
+            encoder: Some(EncoderRequest::SoftwareH264),
             cursor_mode: CursorMode::Host,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
+            refine: None,
         }
     }
 
@@ -1899,22 +2121,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_resolves_to_nvenc_only_for_nvidia_with_runtime() {
-        use EncoderSelection::*;
-        assert_eq!(Auto.resolve_auto(true, true), Nvenc);
-        assert_eq!(Auto.resolve_auto(true, false), SoftwareH264);
-        assert_eq!(Auto.resolve_auto(false, true), SoftwareH264);
-        assert_eq!(Auto.resolve_auto(false, false), SoftwareH264);
-    }
-
-    #[test]
-    fn concrete_encoder_selections_pass_through_resolution() {
-        use EncoderSelection::*;
-        assert_eq!(Nvenc.resolve_auto(false, false), Nvenc);
-        assert_eq!(SoftwareH264.resolve_auto(true, true), SoftwareH264);
-    }
-
-    #[test]
     fn capenc_args_pin_the_resolved_adapter_output_and_device() {
         let args = Capenc::build_args(&test_config());
 
@@ -1938,7 +2144,7 @@ mod tests {
     #[tokio::test]
     async fn auto_expectation_accepts_openh264_after_parent_geometry_transaction() {
         let mut config = test_config();
-        config.encoder = Some(EncoderSelection::Auto);
+        config.encoder = Some(EncoderRequest::Auto);
         let args = Capenc::build_args(&config);
         assert!(args.iter().any(|argument| argument == "encoder=auto"));
 
@@ -2014,7 +2220,7 @@ mod tests {
     #[tokio::test]
     async fn typed_native_unavailable_is_preserved_for_parent_fallback() {
         let mut config = test_config();
-        config.encoder = Some(EncoderSelection::Auto);
+        config.encoder = Some(EncoderRequest::Auto);
         let notice = BackendUnavailableNotice {
             backend: EncoderBackend::NativeNvenc,
             reason: BackendUnavailableReason::SessionLimit,
@@ -2068,70 +2274,6 @@ mod tests {
         .await
         .expect_err("bounded READY wait must time out");
         assert!(matches!(error, CapencStartError::ReadyTimeout { .. }));
-    }
-
-    #[test]
-    fn h264_idr_detected_behind_sps_pps() {
-        // [SPS type7][PPS type8][IDR type5]
-        let au = [
-            0, 0, 0, 1, 0x67, 0xAA, // SPS
-            0, 0, 0, 1, 0x68, 0xBB, // PPS
-            0, 0, 0, 1, 0x65, 0xCC, // IDR (0x65 & 0x1F == 5)
-        ];
-        assert!(is_keyframe(VideoCodec::H264, &au));
-    }
-
-    #[test]
-    fn h264_pframe_not_keyframe() {
-        let au = [0, 0, 0, 1, 0x61, 0xCC]; // non-IDR slice
-        assert!(!is_keyframe(VideoCodec::H264, &au));
-    }
-
-    #[test]
-    fn h264_mixed_start_codes_detect_idr() {
-        let au = [
-            0, 0, 0, 1, 0x67, 0xAA, // four-byte SPS
-            0, 0, 1, 0x68, 0xBB, // three-byte PPS
-            0, 0, 1, 0x65, 0xCC, // three-byte IDR
-        ];
-        assert!(is_keyframe(VideoCodec::H264, &au));
-    }
-
-    #[test]
-    fn hevc_idr_w_radl_detected() {
-        // nal type 19 (IDR_W_RADL): (b0 >> 1) & 0x3F == 19 → b0 = 19<<1 = 0x26
-        let au = [0, 0, 0, 1, 0x40, 0x01, 0, 0, 0, 1, 0x26, 0x01];
-        assert!(is_keyframe(VideoCodec::H265, &au));
-    }
-
-    #[test]
-    fn hevc_mixed_start_codes_detect_idr() {
-        let au = [
-            0, 0, 1, 0x40, 0x01, // three-byte VPS
-            0, 0, 0, 1, 0x42, 0x01, // four-byte SPS
-            0, 0, 1, 0x26, 0x01, // three-byte IDR_W_RADL
-        ];
-        assert!(is_keyframe(VideoCodec::H265, &au));
-    }
-
-    #[test]
-    fn hevc_pframe_not_keyframe() {
-        let au = [0, 0, 0, 1, 0x02, 0x01]; // nal type 1 (TRAIL_R)
-        assert!(!is_keyframe(VideoCodec::H265, &au));
-    }
-
-    #[test]
-    fn av1_repeated_sequence_header_is_a_recovery_keyframe() {
-        let obu = |obu_type: u8, payload: &[u8]| {
-            let mut output = vec![(obu_type << 3) | 0x02, payload.len() as u8];
-            output.extend_from_slice(payload);
-            output
-        };
-        let mut temporal_unit = obu(2, &[]);
-        temporal_unit.extend(obu(1, &[0x10, 0x20]));
-        temporal_unit.extend(obu(6, &[0x30]));
-        assert!(is_keyframe(VideoCodec::Av1, &temporal_unit));
-        assert!(!is_keyframe(VideoCodec::Av1, &obu(6, &[0x30])));
     }
 
     #[test]
@@ -2331,6 +2473,7 @@ mod tests {
             data: vec![value],
             keyframe,
             timestamp_ms: 0,
+            refine: None,
         };
         assert!(enqueue_encoded_frame(&queue, &idr, frame(1, false)));
         assert!(enqueue_encoded_frame(&queue, &idr, frame(2, false)));
@@ -2449,6 +2592,141 @@ mod tests {
         task.await.unwrap();
     }
 
+    fn refine_forward(operator_enabled: bool) -> RefineForward {
+        RefineForward {
+            operator_enabled,
+            deck: Some(arcen_protocol::refine::LosslessRefineCapability {
+                domains: vec!["rgb".into()],
+                codecs: vec!["delta-zstd1".into()],
+            }),
+        }
+    }
+
+    /// Exact still image reaches capenc only on a plan the shared rule
+    /// grants: a ten-bit 4:4:4 capture, the operator's switch on and a Deck
+    /// that asked. Every other capture keeps its framed-v1 argv.
+    #[test]
+    fn capenc_gets_refinement_arguments_only_on_a_granted_plan() {
+        let grading = CapencConfig {
+            codec: VideoCodec::H265,
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: BitDepth::Ten,
+            color_range: ColorRange::Full,
+            encoder: Some(EncoderRequest::Auto),
+            refine: Some(refine_forward(true)),
+            ..test_config()
+        };
+        let argv = Capenc::build_args(&grading);
+        if REFINE_COMPILED {
+            assert!(grading.refine_plan().is_on());
+            for token in ["framed-v2", "refine=on", "refine-scope=1:1:1"] {
+                assert!(argv.iter().any(|arg| arg == token), "{token}: {argv:?}");
+            }
+            assert!(!argv.iter().any(|arg| arg == "framed-v1"), "{argv:?}");
+        }
+        let hdr = CapencConfig {
+            transfer: arcen_media::TransferCharacteristics::Pq,
+            color_primaries: arcen_media::ColorPrimaries::Bt2020,
+            color_matrix: ColorMatrix::Bt2020Ncl,
+            refine: Some(refine_forward(true)),
+            ..grading
+        };
+        assert_eq!(hdr.refine_plan().is_on(), REFINE_COMPILED);
+        let off = |config: &CapencConfig| {
+            let argv = Capenc::build_args(config);
+            assert!(argv.iter().any(|arg| arg == "framed-v1"), "{argv:?}");
+            assert!(
+                !argv.iter().any(|arg| arg.starts_with("refine")),
+                "{argv:?}"
+            );
+            config.refine_plan()
+        };
+        let operator_off = CapencConfig {
+            refine: Some(refine_forward(false)),
+            ..test_config()
+        };
+        let mut eight_bit = test_config();
+        eight_bit.refine = Some(refine_forward(true));
+        let multi = CapencConfig {
+            bit_depth: BitDepth::Ten,
+            chroma: ChromaSubsampling::Yuv444,
+            refine: None,
+            ..test_config()
+        };
+        if REFINE_COMPILED {
+            assert_eq!(
+                off(&operator_off),
+                arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::OperatorOff
+                )
+            );
+            assert_eq!(
+                off(&eight_bit),
+                arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::EightBit
+                )
+            );
+        }
+        assert_eq!(
+            off(&multi),
+            arcen_media::refine::RefinePlan::Off(
+                arcen_media::refine::RefineOffReason::MultiMonitor
+            )
+        );
+    }
+
+    /// A refining capenc's fences ride with the frame they precede, and a
+    /// frame that was dropped downstream hands its fences to the next one
+    /// written (ADR 0016 R2); tiles go to the refine queue.
+    #[tokio::test]
+    async fn the_framed_v2_reader_never_loses_a_fence() {
+        use arcen_media::capenc_stream::{encode_record, CapencRecordKind};
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let frames = Arc::new(VideoQueue::new(4));
+        let (tx, _idr_rx) = mpsc::unbounded_channel();
+        let (lane_tx, mut lane_rx) = mpsc::channel(4);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let target = RefineTarget {
+            carry: Arc::new(std::sync::Mutex::new(
+                arcen_protocol::refine::carry::RefineVideoCarry::new(),
+            )),
+            lane: lane_tx,
+            control: control_tx,
+        };
+        let task = tokio::spawn(read_framed_v2(
+            reader,
+            VideoCodec::H264,
+            frames.clone(),
+            IdrRequester::new(tx),
+            target,
+        ));
+        let records = [
+            encode_record(CapencRecordKind::RefineVideo, &[0x0D, 1, 1]).unwrap(),
+            encode_record(CapencRecordKind::AccessUnit, &[0, 0, 0, 1, 0x65]).unwrap(),
+            encode_record(CapencRecordKind::RefineLane, &[0x0B, 7]).unwrap(),
+            encode_record(CapencRecordKind::RefineVideo, &[0x0A, 2]).unwrap(),
+            encode_record(CapencRecordKind::AccessUnit, &[0, 0, 0, 1, 0x41]).unwrap(),
+            encode_record(CapencRecordKind::AccessUnit, &[0, 0, 0, 1, 0x41]).unwrap(),
+        ];
+        for record in records {
+            writer.write_all(&record).await.unwrap();
+        }
+        drop(writer);
+        task.await.unwrap();
+        let first = frames.pop().await.expect("first frame");
+        assert_eq!(
+            first.refine.as_ref().expect("tagged").take(),
+            vec![vec![0x0D, 1, 1]],
+            "a barrier precedes its own frame"
+        );
+        assert_eq!(lane_rx.recv().await.unwrap(), vec![0x0B, 7]);
+        // The second frame is dropped before it is written: the third one
+        // written carries its fence.
+        let _dropped = frames.pop().await.expect("second frame");
+        let third = frames.pop().await.expect("third frame");
+        assert_eq!(third.refine.expect("tagged").take(), vec![vec![0x0A, 2]]);
+    }
+
     async fn spawn_shutdown_fixture(script: &str) -> (Child, mpsc::Sender<StdinCommand>) {
         let mut child = Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", script])
@@ -2461,7 +2739,8 @@ mod tests {
         let (idr_tx, idr_rx) = mpsc::unbounded_channel();
         drop(idr_tx);
         let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(write_stdin(stdin, idr_rx, rx));
+        let (_refine_tx, refine_rx) = mpsc::unbounded_channel();
+        tokio::spawn(write_stdin(stdin, idr_rx, rx, refine_rx));
         (child, tx)
     }
 

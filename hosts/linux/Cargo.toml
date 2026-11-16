@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-pier-linux"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 description = "Arcen Pier (Linux) — native Rust QUIC control plane, PAM auth, session/display management, and capenc supervision."
 publish.workspace = true
@@ -29,7 +29,7 @@ name = "wayland_clipboard_harness"
 required-features = ["wayland-provider"]
 
 [features]
-default = ["native-tablet"]
+default = ["native-tablet", "lossless-refine"]
 # SEC-001. Restores the unauthenticated listener for an isolated lab network.
 # Never enable this in a release artifact: it disables the product's only trust
 # boundary. There is no runtime flag or config key that can turn it on.
@@ -62,9 +62,11 @@ native-tablet = []
 # which links libpipewire-0.3, so the Pier can capture the sessions it
 # starts.
 wayland-provider = ["dep:zbus", "dep:reis", "dep:xkbcommon-dl", "dep:xkeysym", "arcen-capenc/wayland"]
-# Lossless refinement producer in the fused capenc (ADR 0016, first slice).
-# Off by default; the Pier does not negotiate or forward refinement yet, so
-# this only enables `arcen-pier capenc … framed-v2 refine=on` for lab proof.
+# Exact still image (lossless refinement, ADR 0016): the producer in the
+# fused capenc (native libzstd). On by default and in release builds; at
+# run time it is offered unless the administrator sets
+# `video.lossless_refinement = "disabled"`, and engages only when the Deck
+# asks for it on an eligible session.
 lossless-refine = ["arcen-capenc/lossless-refine"]
 # Dormant source compatibility only. Release/package builds must not enable
 # this feature; shipped Pier binaries expose QUIC exclusively.
@@ -89,7 +91,7 @@ arcen-protocol = { path = "../../shared/protocol", default-features = false }
 arcen-identity.workspace = true
 arcen-session.workspace = true
 arcen-telemetry.workspace = true
-arcen-observability.workspace = true
+arcen-observability = { workspace = true, features = ["support-bundle"] }
 arcen-outputs.workspace = true
 arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
 arcen-usb-bridge.workspace = true
@@ -117,8 +119,6 @@ tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 tokio-tungstenite = { version = "0.24", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
-rustls-pki-types = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 ring = "0.17"
 

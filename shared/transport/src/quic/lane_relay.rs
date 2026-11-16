@@ -40,6 +40,15 @@
 //!   before anything a replacement lane carries.
 //! - Microphone frames are forwarded with a bounded backlog; the agent keeps
 //!   its own consent and generation, which no lane recovery touches.
+//! - Exact still image (ADR 0016), only when started with
+//!   [`PierLaneRelay::start_with`] for an attachment whose grant included the `refine` role: fences and
+//!   barriers ride with the next video frame the relay actually sends,
+//!   merged through [`RefineVideoCarry`] when frames were dropped, so a
+//!   dropped frame never loses an invalidation; tiles and digests go on the
+//!   refine lane through a bounded backlog. A full backlog asks the agent to
+//!   start a new generation (`refine_reset`), a refine lane that cannot be
+//!   opened or ends turns refinement off (`refine_control`), and neither
+//!   ever ends the attachment. Without it, refinement records are dropped.
 //!
 //! Everything the relay needs from the caller arrives through
 //! [`PierLaneRelay::route_to_deck`] and [`PierLaneRelay::next_event`]; both
@@ -62,6 +71,8 @@ use arcen_protocol::messages::{
     AudioStreamReason, AudioStreamResultMsg, ClipboardTransferFailedMsg, ClipboardTransferFailure,
     KeyResetModifiersMsg, MicrophoneStreamReason, MicrophoneStreamStopMsg, RequestFullFrameMsg,
 };
+use arcen_protocol::refine::RefineControlMsg;
+use arcen_protocol::refine::carry::RefineVideoCarry;
 use arcen_protocol::wire::{FrameType, decode_microphone_frame, decode_video_header};
 use bytes::Bytes;
 use tokio::sync::{mpsc, watch};
@@ -89,6 +100,17 @@ pub const RELAY_BULK_BACKLOG: usize = 64;
 /// outstanding (one control and one interrupt transfer per interface, with
 /// their cancellations).
 pub const RELAY_USB_BACKLOG: usize = 256;
+/// Refine-lane records (tiles, digests) waiting for the refine lane. A
+/// still desktop's first pass fits; beyond it the relay drops and asks the
+/// agent to start a new generation.
+pub const RELAY_REFINE_BACKLOG: usize = 256;
+/// Minimum spacing of the relay's own `refine_reset` requests.
+const REFINE_RESET_SPACING: Duration = Duration::from_secs(1);
+/// The one monitor a split Pier refines (the first slice refines a single
+/// display, `arcen_media::refine::PRIMARY_MONITOR`).
+const REFINED_MONITOR: u16 = 1;
+/// Reason token of a relay-requested refinement restart.
+pub const RELAY_REFINE_RESET_REASON: &str = "relay_refine_backlog";
 /// Deck input records waiting for the agent.
 pub const RELAY_INPUT_BACKLOG: usize = 256;
 /// Deck microphone frames waiting for the agent.
@@ -169,6 +191,12 @@ pub struct LaneRelayStats {
     pub microphone_frames: u64,
     /// Deck microphone frames dropped (full backlog).
     pub microphone_dropped: u64,
+    /// Refinement records queued (fences and barriers carried with video,
+    /// tiles and digests on the refine lane).
+    pub refine_records: u64,
+    /// Refinement records dropped (refine backlog full, or the attachment
+    /// does not carry refinement).
+    pub refine_dropped: u64,
 }
 
 #[derive(Default)]
@@ -188,6 +216,8 @@ struct Counters {
     input_records: AtomicU64,
     microphone_frames: AtomicU64,
     microphone_dropped: AtomicU64,
+    refine_records: AtomicU64,
+    refine_dropped: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -213,6 +243,8 @@ impl Counters {
             input_records: read(&self.input_records),
             microphone_frames: read(&self.microphone_frames),
             microphone_dropped: read(&self.microphone_dropped),
+            refine_records: read(&self.refine_records),
+            refine_dropped: read(&self.refine_dropped),
         }
     }
 }
@@ -273,6 +305,27 @@ fn keyframe_request() -> Option<SessionRecord> {
     session_text_record(&RequestFullFrameMsg::default())
 }
 
+fn refine_control(command: &RefineControlMsg) -> Option<SessionRecord> {
+    session_text_record(command)
+}
+
+/// One video frame and the refinement records that go immediately before
+/// it on the video lane.
+#[derive(Debug)]
+struct VideoItem {
+    refine: Vec<Bytes>,
+    frame: Bytes,
+}
+
+/// The relay's refinement state for an attachment that carries it.
+struct RelayRefine {
+    lane: mpsc::Sender<Bytes>,
+    carry: RefineVideoCarry,
+    /// Sequence number the next video frame gets.
+    next_seq: u64,
+    last_reset: Option<Instant>,
+}
+
 fn input_release() -> Option<SessionRecord> {
     session_text_record(&KeyResetModifiersMsg {
         reason: RELAY_INPUT_RELEASE_REASON.to_owned(),
@@ -283,7 +336,7 @@ fn input_release() -> Option<SessionRecord> {
 /// The network half of a Pier whose session runs behind a local socket.
 /// Dropping it aborts every lane task it started.
 pub struct PierLaneRelay {
-    video: mpsc::Sender<Bytes>,
+    video: mpsc::Sender<VideoItem>,
     video_released: Arc<watch::Sender<u64>>,
     audio: mpsc::Sender<Bytes>,
     bulk: mpsc::Sender<BulkRecord>,
@@ -302,6 +355,8 @@ pub struct PierLaneRelay {
     bulk_in: mpsc::Receiver<SessionRecord>,
     counters: Arc<Counters>,
     tasks: Vec<JoinHandle<()>>,
+    refine: Option<RelayRefine>,
+    refine_meter: Arc<crate::RefineLaneMeter>,
 }
 
 impl std::fmt::Debug for PierLaneRelay {
@@ -327,6 +382,14 @@ impl PierLaneRelay {
     /// the video and audio lanes open as soon as their first frame arrives.
     #[must_use]
     pub fn start(lanes: &LaneConnection) -> Self {
+        Self::start_with(lanes, false)
+    }
+
+    /// [`Self::start`], also carrying exact still image (ADR 0016) when
+    /// `refine` is set — only for an attachment whose grant included
+    /// [`LaneRole::Refine`]. The refine lane opens with the first tile.
+    #[must_use]
+    pub fn start_with(lanes: &LaneConnection, refine: bool) -> Self {
         let counters = Arc::new(Counters::default());
         let (video_tx, video_rx) = mpsc::channel(RELAY_VIDEO_BACKLOG);
         let video_released = Arc::new(watch::Sender::new(0));
@@ -339,12 +402,14 @@ impl PierLaneRelay {
         let (bulk_in_tx, bulk_in_rx) = mpsc::channel(RELAY_BULK_INBOUND_BACKLOG);
         let input_slot = LaneSenderSlot::new(LaneRole::InputCursor);
         let bulk_slot = LaneSenderSlot::new(LaneRole::BulkAux);
-        let tasks = vec![
+        let refine_meter = Arc::new(crate::RefineLaneMeter::default());
+        let tasks: Vec<JoinHandle<()>> = vec![
             tokio::spawn(video_writer(
                 lanes.clone(),
                 video_rx,
                 events_tx.clone(),
                 Arc::clone(&video_released),
+                Arc::clone(&refine_meter),
             )),
             tokio::spawn(audio_writer(
                 lanes.clone(),
@@ -372,8 +437,29 @@ impl PierLaneRelay {
                 events_tx.clone(),
                 Arc::clone(&counters),
             )),
-            tokio::spawn(bulk_reader(lanes.clone(), bulk_slot, bulk_in_tx, events_tx)),
+            tokio::spawn(bulk_reader(
+                lanes.clone(),
+                bulk_slot,
+                bulk_in_tx,
+                events_tx.clone(),
+            )),
         ];
+        let mut tasks = tasks;
+        let refine = refine.then(|| {
+            let (lane_tx, lane_rx) = mpsc::channel(RELAY_REFINE_BACKLOG);
+            tasks.push(tokio::spawn(refine_writer(
+                lanes.clone(),
+                lane_rx,
+                events_tx,
+                Arc::clone(&refine_meter),
+            )));
+            RelayRefine {
+                lane: lane_tx,
+                carry: RefineVideoCarry::new(),
+                next_seq: 0,
+                last_reset: None,
+            }
+        });
         let mut cursor_retry = tokio::time::interval(CURSOR_RETRY);
         cursor_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Self {
@@ -396,7 +482,23 @@ impl PierLaneRelay {
             bulk_in: bulk_in_rx,
             counters,
             tasks,
+            refine,
+            refine_meter,
         }
+    }
+
+    /// This attachment's refine-lane meter: the bytes refinement handed to
+    /// its lane and the link budget's hold (ADR 0016 R6). The refine writer
+    /// waits while it is held or video is queued.
+    #[must_use]
+    pub fn refine_meter(&self) -> Arc<crate::RefineLaneMeter> {
+        Arc::clone(&self.refine_meter)
+    }
+
+    /// Whether this relay carries exact still image.
+    #[must_use]
+    pub const fn carries_refinement(&self) -> bool {
+        self.refine.is_some()
     }
 
     /// Counters so far.
@@ -444,14 +546,21 @@ impl PierLaneRelay {
                 {
                     self.route_cursor_position(&bytes)
                 }
+                // Fences and barriers ride with the next video frame sent.
+                Some(LaneRole::Video)
+                    if bytes.first() == Some(&(FrameType::RefineFence as u8))
+                        || bytes.first() == Some(&(FrameType::RefineBarrier as u8)) =>
+                {
+                    self.route_refine_video(bytes)
+                }
                 Some(LaneRole::Video) => self.route_video(bytes),
                 Some(LaneRole::AudioOutput) => self.route_audio(bytes),
                 Some(LaneRole::BulkAux) => self.route_bulk(&SessionRecord::Binary(bytes)),
                 // Microphone frames flow Deck to Pier only.
                 Some(LaneRole::Microphone) => RelayRoute::Dropped(LaneRole::Microphone),
-                // The relay never carries refinement: a relayed session
-                // does not grant the refine lane (ADR 0016 R7).
-                Some(LaneRole::Refine) => RelayRoute::Dropped(LaneRole::Refine),
+                // Tiles and digests, only for an attachment that carries
+                // refinement (its grant included the refine role).
+                Some(LaneRole::Refine) => self.route_refine_lane(bytes),
                 _ => RelayRoute::Control(SessionRecord::Binary(bytes)),
             },
             other => RelayRoute::Control(other),
@@ -464,6 +573,13 @@ impl PierLaneRelay {
             self.release_video();
             return RelayRoute::Dropped(LaneRole::Video);
         };
+        // Every frame the agent sends takes a sequence number, sent or not:
+        // the fences that preceded a dropped frame go with the next one.
+        let seq = self.refine.as_mut().map(|refine| {
+            let seq = refine.next_seq;
+            refine.next_seq = refine.next_seq.wrapping_add(1);
+            seq
+        });
         let keyframe = header.is_keyframe();
         if !self.resync.admits(header.monitor_id, keyframe) {
             bump(&self.counters.video_dropped);
@@ -471,7 +587,23 @@ impl PierLaneRelay {
             self.request_keyframe_if_due();
             return RelayRoute::Dropped(LaneRole::Video);
         }
-        if self.video.try_send(Bytes::from(frame)).is_ok() {
+        if let Ok(permit) = self.video.try_reserve() {
+            let refine = match (self.refine.as_mut(), seq) {
+                (Some(refine), Some(seq)) => refine
+                    .carry
+                    .take_through(seq)
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            // Counted before the writer can take it, so the count never
+            // trails the writer.
+            self.refine_meter.note_video_queued();
+            permit.send(VideoItem {
+                refine,
+                frame: Bytes::from(frame),
+            });
             bump(&self.counters.video_frames);
             RelayRoute::Queued(LaneRole::Video)
         } else {
@@ -480,6 +612,50 @@ impl PierLaneRelay {
             self.break_video_chain(header.monitor_id);
             RelayRoute::Dropped(LaneRole::Video)
         }
+    }
+
+    /// A fence or barrier from the agent: kept for the next video frame
+    /// (ADR 0016 R2), never dropped while the attachment carries
+    /// refinement.
+    fn route_refine_video(&mut self, record: Vec<u8>) -> RelayRoute {
+        let Some(refine) = self.refine.as_mut() else {
+            bump(&self.counters.refine_dropped);
+            return RelayRoute::Dropped(LaneRole::Refine);
+        };
+        refine.carry.push(refine.next_seq, [record]);
+        bump(&self.counters.refine_records);
+        RelayRoute::Queued(LaneRole::Video)
+    }
+
+    /// A tile or digest from the agent, for the refine lane. A full
+    /// backlog drops it and asks the agent to start over (the Deck could
+    /// never verify a generation with a missing tile), at most once a
+    /// second.
+    fn route_refine_lane(&mut self, record: Vec<u8>) -> RelayRoute {
+        let Some(refine) = self.refine.as_mut() else {
+            bump(&self.counters.refine_dropped);
+            return RelayRoute::Dropped(LaneRole::Refine);
+        };
+        if refine.lane.try_send(Bytes::from(record)).is_ok() {
+            bump(&self.counters.refine_records);
+            return RelayRoute::Queued(LaneRole::Refine);
+        }
+        bump(&self.counters.refine_dropped);
+        let now = Instant::now();
+        let due = refine
+            .last_reset
+            .is_none_or(|last| now.duration_since(last) >= REFINE_RESET_SPACING);
+        if due {
+            refine.last_reset = Some(now);
+            if let Some(reset) = refine_control(&RefineControlMsg::RefineReset {
+                monitor_id: REFINED_MONITOR,
+                stream_epoch: 0,
+                reason: RELAY_REFINE_RESET_REASON.to_owned(),
+            }) {
+                self.owed.push_back(LaneRelayEvent::ToSession(reset));
+            }
+        }
+        RelayRoute::Dropped(LaneRole::Refine)
     }
 
     fn break_video_chain(&mut self, monitor: u16) {
@@ -677,6 +853,7 @@ impl PierLaneRelay {
                 self.clipboard_failed(sequence, ClipboardTransferFailure::BulkLaneUnavailable);
                 None
             }
+            TaskEvent::Refine(command) => refine_control(&command).map(LaneRelayEvent::ToSession),
         }
     }
 }
@@ -689,6 +866,8 @@ enum TaskEvent {
     VideoReopened,
     /// The bulk writer could not deliver part of this clipboard transfer.
     ClipboardUndelivered(u64),
+    /// The refine lane asks the agent to start over or to stop.
+    Refine(RefineControlMsg),
 }
 
 /// One bulk record and the clipboard transfer it belongs to, if any.
@@ -708,12 +887,14 @@ fn release(released: &watch::Sender<u64>) {
 
 async fn video_writer(
     lanes: LaneConnection,
-    mut frames: mpsc::Receiver<Bytes>,
+    mut frames: mpsc::Receiver<VideoItem>,
     events: mpsc::Sender<TaskEvent>,
     released: Arc<watch::Sender<u64>>,
+    meter: Arc<crate::RefineLaneMeter>,
 ) {
     let mut writer: Option<LocalLaneWriter> = None;
-    while let Some(frame) = frames.recv().await {
+    while let Some(VideoItem { refine, frame }) = frames.recv().await {
+        meter.note_video_taken();
         if writer.is_none() {
             match LocalLaneWriter::open(&lanes, LaneRole::Video).await {
                 Ok(opened) => writer = Some(opened),
@@ -723,20 +904,111 @@ async fn video_writer(
         let Some(lane) = writer.as_mut() else {
             continue;
         };
-        let sent = lane.send(frame).await;
-        release(&released);
-        match sent {
-            Ok(LaneWriteOutcome::Reopened { request_keyframe }) => {
-                if request_keyframe {
-                    let _ = events.send(TaskEvent::VideoReopened).await;
+        // A fence immediately precedes its frame (ADR 0016 R2). Whichever
+        // record finds the lane replaced reports it: the new lane needs a
+        // keyframe whether a fence or the frame reopened it (the Deck clears
+        // its overlay on the lost lane).
+        let mut reopened = false;
+        let mut failed = None;
+        for record in refine.into_iter().chain(std::iter::once(frame)) {
+            match lane.send(record).await {
+                Ok(LaneWriteOutcome::Reopened { request_keyframe }) => {
+                    reopened |= request_keyframe;
+                }
+                Ok(_) => {}
+                Err(terminal) => {
+                    failed = Some(terminal);
+                    break;
                 }
             }
-            Ok(_) => {}
-            Err(terminal) => return report(&events, LaneRelayEvent::Ended(terminal)).await,
+        }
+        release(&released);
+        if let Some(terminal) = failed {
+            return report(&events, LaneRelayEvent::Ended(terminal)).await;
+        }
+        if reopened {
+            let _ = events.send(TaskEvent::VideoReopened).await;
         }
     }
     if let Some(writer) = writer {
         writer.finish();
+    }
+}
+
+/// Exact still image (ADR 0016): tiles and digests on the refine lane, the
+/// lowest-priority lane, opened with the first record. Waits only for its
+/// own lane. A lane that cannot be opened or ends turns refinement off for
+/// the attachment (`refine_control`) and never ends it; a replaced lane
+/// lost what was queued on it, so the agent starts over (`refine_reset`).
+async fn refine_writer(
+    lanes: LaneConnection,
+    mut records: mpsc::Receiver<Bytes>,
+    events: mpsc::Sender<TaskEvent>,
+    meter: Arc<crate::RefineLaneMeter>,
+) {
+    let off = || {
+        TaskEvent::Refine(RefineControlMsg::RefineControl {
+            monitor_id: REFINED_MONITOR,
+            enabled: false,
+        })
+    };
+    let mut writer: Option<LocalLaneWriter> = None;
+    while let Some(record) = records.recv().await {
+        if writer.is_none() {
+            if let Ok(opened) = LocalLaneWriter::open(&lanes, LaneRole::Refine).await {
+                writer = Some(opened);
+            } else {
+                let _ = events.send(off()).await;
+                break;
+            }
+        }
+        let Some(lane) = writer.as_mut() else {
+            continue;
+        };
+        wait_for_refine_turn(&meter, || false).await;
+        let bytes = record.len() as u64;
+        let sent = lane.send(record).await;
+        if sent.is_ok() {
+            meter.note_written(bytes);
+        }
+        match sent {
+            Ok(LaneWriteOutcome::Reopened { .. }) => {
+                while records.try_recv().is_ok() {}
+                let _ = events
+                    .send(TaskEvent::Refine(RefineControlMsg::RefineReset {
+                        monitor_id: REFINED_MONITOR,
+                        stream_epoch: 0,
+                        reason: "refine_lane_reopened".to_owned(),
+                    }))
+                    .await;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                let _ = events.send(off()).await;
+                break;
+            }
+        }
+    }
+    // Drain without sending: refinement never ends the attachment, and a
+    // full channel must not hold the relay. The relay's events no longer
+    // need this task.
+    drop(events);
+    while records.recv().await.is_some() {}
+}
+
+/// How often a held refine writer looks again.
+const REFINE_TURN_POLL: Duration = Duration::from_millis(5);
+
+/// Waits until refinement may hand its next record to the refine lane:
+/// the link budget does not hold it, and no video frame is waiting for its
+/// writer (`video_backlog` covers a Pier whose video queue is not counted
+/// in the meter). Motion always goes first (ADR 0016 R6).
+pub async fn wait_for_refine_turn(
+    meter: &crate::RefineLaneMeter,
+    video_backlog: impl Fn() -> bool,
+) {
+    while !meter.may_send() || video_backlog() {
+        tokio::time::sleep(REFINE_TURN_POLL).await;
     }
 }
 
@@ -1099,6 +1371,8 @@ mod tests {
             bulk_in,
             counters: std::sync::Arc::new(Counters::default()),
             tasks: Vec::new(),
+            refine: None,
+            refine_meter: std::sync::Arc::default(),
         }
     }
 

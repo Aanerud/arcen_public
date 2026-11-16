@@ -1,6 +1,7 @@
 # ADR 0007: QUIC-Only Product Transport
 
-**Status:** Accepted (2026-07-31) — implemented 2026-07-31
+**Status:** Accepted (2026-07-31) — implemented 2026-07-31; amended
+2026-11-15 (the Decks' dormant WSS connector removed)
 
 **Fleet validation:**
 - pier-linux.example.internal (Linux): 8,881 frames decoded, keyboard + mouse + scroll, UDP 18444, RTT ~35 ms
@@ -34,10 +35,16 @@ and a fallback path that could quietly reverse that decision.
   resolve to QUIC; legacy port `18443` migrates to `18444`.
 - The old `listen.quic_port` key remains a read-only migration alias for
   existing configurations. New templates and documentation must not emit it.
-- Direct WSS network connector, listener, capability, TLS 1.2, and handshake
-  support may remain in source only behind the default-off `wss-compat` Cargo
-  feature. Packaging, CI product builds, and release automation must never
-  enable that feature.
+- The Decks have no WSS connector at all (amendment, 2026-11-15): the macOS
+  Deck's and `arcen-deck-core`'s dormant `wss-compat` feature, the connector,
+  the transport selector and the WSS choice on the Add connection screen are
+  removed, and a connection saved as `"wss"` loads and is saved again as QUIC
+  (port `18443` becomes `18444`; every other field is kept).
+- The Piers' direct WSS listener, capability, TLS 1.2, and handshake support
+  may remain in source only behind the default-off `wss-compat` Cargo feature
+  (with the matching `arcen-protocol` and `arcen-transport` features).
+  Packaging, CI product builds, and release automation must never enable that
+  feature.
 - Installers open only UDP `18444` and remove the legacy TCP `18443` firewall
   rule when upgrading.
 - CI verifies product feature graphs contain no `wss-compat`, TLS 1.2,
@@ -56,8 +63,9 @@ protocol optimization and is not required to enforce this transport boundary.
   transport tuning.
 - Operators expose one inbound UDP port instead of parallel TCP and UDP ports.
 - A QUIC regression fails visibly rather than silently downgrading to WSS.
-- Dormant WSS source can still be compiled deliberately for isolated migration
-  work, but such binaries are not releasable.
+- Dormant Pier WSS source can still be compiled deliberately for isolated
+  migration work, but such binaries are not releasable. No Deck can connect
+  to such a Pier over WSS.
 - Existing WSS-specific ADR wording remains historical context only. This ADR
   supersedes the compatibility-default and fallback decisions in
   [ADR 0002](0002-transport-evolution.md) and generalizes the transport-specific

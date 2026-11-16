@@ -112,18 +112,22 @@
       ]
     },
     {
+      "package": "arcen-deck-core",
+      "dependency_kind": "normal",
+      "contracts": [
+        "crate",
+        "messages",
+        "wire"
+      ]
+    },
+    {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
       "contracts": ["auth", "build_identity", "clipboard", "crate", "cursor", "cursor_position", "fsm", "lanes", "messages", "wire"],
-      "forwarded_features": {
-        "wss-compat": [
-          "wss-compat"
-        ]
-      },
       "paths": [
         {
           "id": "macos-deck-apple-silicon-sdr",
-          "entry_points": ["clients/macos/src/ui/media_worker.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs"],
           "build_profiles": ["macos-deck-apple-silicon"],
           "validation": [
             "macos-deck-test-apple-silicon",
@@ -134,7 +138,7 @@
         },
         {
           "id": "macos-deck-apple-silicon-10bit",
-          "entry_points": ["clients/macos/src/ui/media_worker.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs"],
           "build_profiles": ["macos-deck-apple-silicon"],
           "validation": [
             "macos-deck-test-apple-silicon",
@@ -145,7 +149,7 @@
         },
         {
           "id": "macos-deck-intel-sdr",
-          "entry_points": ["clients/macos/src/ui/media_worker.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs"],
           "build_profiles": ["macos-deck-intel"],
           "validation": [
             "macos-deck-build-intel",
@@ -156,7 +160,7 @@
         },
         {
           "id": "macos-deck-intel-10bit",
-          "entry_points": ["clients/macos/src/ui/media_worker.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs"],
           "build_profiles": ["macos-deck-intel"],
           "validation": [
             "macos-deck-build-intel",
@@ -168,8 +172,8 @@
         {
           "id": "macos-deck-audio",
           "entry_points": [
-            "clients/macos/src/ui/media_worker.rs",
-            "clients/macos/src/pipeline/frame_queue.rs"
+            "clients/macos/src/pipeline/frame_queue.rs",
+            "clients/macos/src/ui/app.rs"
           ],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": [
@@ -181,7 +185,7 @@
         },
         {
           "id": "macos-deck-microphone",
-          "entry_points": ["clients/macos/src/ui/media_worker.rs"],
+          "entry_points": ["clients/macos/src/ui/app.rs"],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": [
             "macos-deck-test-apple-silicon",
@@ -227,7 +231,7 @@
           "id": "macos-deck-transport",
           "entry_points": [
             "clients/macos/src/transport/connector.rs",
-            "clients/macos/src/transport/websocket.rs"
+            "clients/macos/src/ui/app.rs"
           ],
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": [
@@ -258,6 +262,11 @@
       "package": "arcen-media",
       "dependency_kind": "normal",
       "contracts": ["cursor", "messages", "wire"]
+    },
+    {
+      "package": "arcen-observability",
+      "dependency_kind": "normal",
+      "contracts": ["messages"]
     },
     {
       "package": "arcen-pier-linux",
@@ -610,7 +619,6 @@
         {
           "id": "windows-multi-monitor",
           "entry_points": [
-            "hosts/windows/src/multi_monitor_topology.rs",
             "hosts/windows/src/multi_monitor_capenc.rs",
             "hosts/windows/src/multi_monitor_gate.rs",
             "hosts/windows/src/main.rs"
@@ -630,6 +638,26 @@
           "wss-compat"
         ]
       }
+    },
+    {
+      "package": "arcen-usb-service",
+      "dependency_kind": "normal",
+      "contracts": ["wire"],
+      "paths": [
+        {
+          "id": "windows-usb-component",
+          "entry_points": [
+            "clients/windows/usb/service/src/codec.rs"
+          ],
+          "build_profiles": ["windows-usb-component"],
+          "validation": [
+            "windows-usb-component-typecheck",
+            "windows-usb-component-test",
+            "windows-usb-component-lab"
+          ],
+          "owner": "Windows Client"
+        }
+      ]
     },
     {
       "package": "arcen-usb-helper",
@@ -685,6 +713,61 @@
           "build_profiles": ["windows-pier-installer"],
           "validation": ["windows-pier-installer-build"],
           "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-deck-windows",
+      "dependency_kind": "normal",
+      "contracts": ["build_identity", "crate", "keys", "messages", "refine", "wire"],
+      "paths": [
+        {
+          "id": "windows-deck-decode",
+          "entry_points": ["clients/windows/src/decode/backend.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test"],
+          "owner": "Windows Client"
+        },
+        {
+          "id": "windows-deck-session",
+          "entry_points": ["clients/windows/src/present/compose.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test", "windows-deck-session-lab"],
+          "owner": "Windows Client"
+        },
+        {
+          "id": "windows-deck-platform",
+          "entry_points": ["clients/windows/src/platform/mod.rs", "clients/windows/src/audio/mod.rs", "clients/windows/src/clipboard/mod.rs", "clients/windows/src/display/mod.rs", "clients/windows/src/logging/mod.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test", "windows-deck-session-lab"],
+          "owner": "Windows Client"
+        },
+        {
+          "id": "windows-deck-input",
+          "entry_points": ["clients/windows/src/input/mod.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-typecheck", "windows-deck-test", "windows-deck-session-lab"],
+          "owner": "Windows Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-usb-client",
+      "dependency_kind": "dev",
+      "contracts": [
+        "messages",
+        "build_identity"
+      ],
+      "paths": [
+        {
+          "id": "windows-usb-client-lab",
+          "entry_points": ["clients/windows/usb/client/examples/forward_lab.rs"],
+          "build_profiles": ["windows-usb-client"],
+          "validation": [
+            "windows-usb-client-typecheck",
+            "windows-usb-component-lab"
+          ],
+          "owner": "Windows Client"
         }
       ]
     }

@@ -25,6 +25,7 @@ pub mod pipeline;
 mod plan;
 mod policy;
 pub mod pq_white;
+pub mod present;
 mod preset;
 mod qpmap;
 #[cfg(feature = "software-av1-source")]
@@ -73,15 +74,16 @@ pub use capture_surface::{
     SourceFact, SourcePrecision, SourceTransfer, ValidatedCaptureSurface, compare_gpus,
 };
 pub use convert::{
-    ColorTransform, ConversionError, FrameRegion, PackedRgb10Layout, Rgb10Signal,
-    SCRGB_CONVERSION_TEST_VECTORS, ScrgbConversionTestVector, ScrgbPqTransform, ScrgbSdrTransform,
-    WIDE_INPUT_MAX, convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_bgra_to_i444,
+    BT2020_TO_BT709, ColorTransform, ConversionError, FrameRegion, PQ_PEAK_NITS, PackedRgb10Layout,
+    Rgb10Signal, SCRGB_CONVERSION_TEST_VECTORS, SCRGB_REFERENCE_WHITE_NITS,
+    ScrgbConversionTestVector, ScrgbPqTransform, ScrgbSdrTransform, WIDE_INPUT_MAX,
+    convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_bgra_to_i444,
     convert_bgra_to_i444_p16, convert_bgra_to_i444_p16_rows, convert_bgra_to_i444_rows,
     convert_bgra_to_nv12, convert_bgra_to_nv12_rows, convert_packed_rgb10_region_to_i444_p16,
     convert_packed_rgb10_to_bgra8, convert_packed_rgb10_to_i444_p16, convert_packed_rgb10_to_p010,
     convert_rgba_f16_pq_to_packed_rgb10, convert_scrgb_to_pq_i444_p16,
     convert_scrgb_to_sdr_i444_p16, half_to_f32, linear_nits_to_pq_signal, linear_to_bt709,
-    linear_to_srgb, scrgb_component_to_pq_code,
+    linear_to_srgb, pq_bt2020_to_scrgb, pq_signal_to_linear_nits, scrgb_component_to_pq_code,
 };
 pub use desktop_depth::{
     DepthDecision, DepthReason, DesktopDepth, DesktopDepthPolicy, FixedDepthOutcome,
@@ -116,14 +118,15 @@ pub use pipeline::{
     BitratePolicy, CodecPolicy, DecodeLatencyPolicy, EncodedFrameOverflowDisposition,
     EncodedFrameOverflowPolicy, FidelityRefusal, KeelPolicy, KeyframePolicy,
     PROVEN_PATH_CEILING_BPS, PROVEN_PATH_HEADROOM, PipelineContract, PipelineId,
-    PipelineQpMapDefault, QueuePolicy, RawFrameOverflowDisposition, RawFrameOverflowPolicy,
-    ServedPipelineContext, SoftwareFallbackDecision, aggregate_encoder_backend,
-    aggregate_plan_encoder_backend, clamp_live_bitrate_target, coded_fidelity_refusal,
-    operational_bitrate_bounds, operational_encode_intent, operational_encoder_bitrate_bounds,
-    operational_keyframe_policy, operational_motion_priority, operational_pipeline,
-    operational_rate_control_policy, pipeline_codec_ladder, pipeline_contract,
-    pipeline_for_request, proven_path_ceiling_bps, resolve_request_pipeline, served_pipeline,
-    served_pipeline_wants_display_hdr, session_wants_display_hdr, software_fallback_decision,
+    PipelineQpMapDefault, PresentTiming, QueuePolicy, RawFrameOverflowDisposition,
+    RawFrameOverflowPolicy, ServedPipelineContext, SoftwareFallbackDecision,
+    aggregate_encoder_backend, aggregate_plan_encoder_backend, clamp_live_bitrate_target,
+    coded_fidelity_refusal, operational_bitrate_bounds, operational_encode_intent,
+    operational_encoder_bitrate_bounds, operational_keyframe_policy, operational_motion_priority,
+    operational_pipeline, operational_present_timing, operational_rate_control_policy,
+    pipeline_codec_ladder, pipeline_contract, pipeline_for_request, proven_path_ceiling_bps,
+    resolve_request_pipeline, served_pipeline, served_pipeline_wants_display_hdr,
+    session_wants_display_hdr, software_fallback_decision,
     software_fallback_decision_after_hardware,
 };
 pub use plan::{
@@ -138,9 +141,9 @@ pub use plan::{
 pub use policy::{
     ClientColorRequest, ColorCeiling, ColorMatrixCapabilities, ColorPolicy, HostInitialVideoError,
     HostInitialVideoPolicy, ResolvedHostInitialVideo, adaptive_codec_ladder,
-    cap_bit_depth_to_client, color_contract_is_servable, resolve_client_color_request,
-    resolve_client_color_request_with_matrix_caps, resolve_host_initial_video,
-    resolve_host_initial_video_with_supported_codecs,
+    cap_bit_depth_to_client, client_can_decode, color_contract_is_servable,
+    resolve_client_color_request, resolve_client_color_request_with_matrix_caps,
+    resolve_host_initial_video, resolve_host_initial_video_with_supported_codecs,
 };
 pub use preset::{
     MotionPriority, PresetContract, StreamingPreset, contract, encoder_buffer_frames,

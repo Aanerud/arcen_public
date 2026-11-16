@@ -150,7 +150,9 @@ Three facts constrain the fix:
   links are gone, so they cannot reopen anything), and Native tablet is
   refused on it ("needs a new desktop").
 - Native tablet on X11 is for tablets the kernel `wacom` driver serves, with
-  xf86-input-wacom installed; others are refused with a reason.
+  xf86-input-wacom installed; others are refused with a reason. *(Amended
+  2026-11-15: any pen node, whichever kernel driver serves it; ADR 0023
+  amendment.)*
 - **Follow-up:** removing the sign-out step without a protocol change would
   need the Pier to enumerate a remembered tablet itself before the Deck
   attaches (answering standard requests from recorded descriptors, holding
@@ -249,7 +251,7 @@ Native tablet must work on an X11 desktop on the first connection.
   a reboot). Until then the Pier refuses Native tablet on X11.
 - A desktop an earlier Pier started does not admit the tablet. It is refused
   with a reason; desktops this Pier starts take it.
-- Native tablet on X11 still needs a tablet the kernel `wacom` driver serves
+- *(Amended 2026-11-15, ADR 0023: any pen node now.)* Native tablet on X11 still needs a tablet the kernel `wacom` driver serves
   and xf86-input-wacom.
 
 ### Routes considered

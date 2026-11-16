@@ -78,6 +78,29 @@ fn permille(part: u64, whole: u32) -> u32 {
     }
 }
 
+/// `"100%"`, or one decimal below it (`"99.7%"`), from tenths of a percent.
+#[must_use]
+pub fn percent_text(permille: u32) -> String {
+    if permille >= 1000 {
+        "100%".to_owned()
+    } else {
+        format!("{}.{}%", permille / 10, permille % 10)
+    }
+}
+
+/// The Stream Statistics line for a verified picture (ADR 0016 R4, scoped
+/// wording): the share of the picture whose exact pixels were verified,
+/// and how far — 1 the decoded codes, 2 the GPU overlay, 3 the rendered
+/// picture.
+#[must_use]
+pub fn exact_status_text(coverage_permille: u32, level: VerificationLevel) -> String {
+    format!(
+        "Exact: {} of picture verified (level {})",
+        percent_text(coverage_permille),
+        level as u8
+    )
+}
+
 /// Why a record was not used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefineDrop {
@@ -106,7 +129,17 @@ pub enum RefineDrop {
 pub enum RefineDisabled {
     /// Too many malformed records.
     MalformedRecords,
+    /// Too many generations started (barriers) in a short time.
+    TooManyBarriers,
 }
+
+/// Barriers accepted per [`BARRIER_WINDOW`] before refinement is disabled
+/// for the session: each barrier reallocates a monitor's state, and an
+/// honest Pier starts a generation only on recovery, reset or geometry
+/// change.
+pub const MAX_BARRIERS_PER_WINDOW: usize = 16;
+/// Window of [`MAX_BARRIERS_PER_WINDOW`].
+pub const BARRIER_WINDOW: Duration = Duration::from_secs(10);
 
 /// What a video-lane record meant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +176,9 @@ pub struct TileTicket {
     pub depth: u8,
     /// Expanded bytes the decoder must produce.
     pub expanded_bytes: usize,
+    /// The grid the tile was admitted under; a commit under another grid
+    /// (a later generation reusing the identity) is refused.
+    grid: RefineGrid,
 }
 
 /// Result of [`DeckRefineSession::on_refine_record`].
@@ -296,6 +332,9 @@ pub struct DeckRefineSession {
     disabled: Option<RefineDisabled>,
     resets: Vec<RefineControlMsg>,
     stats: DeckRefineStats,
+    barriers: SlidingCount,
+    /// Monitors this Deck refines at most; `None`: [`MAX_REFINE_MONITORS`].
+    monitor_cap: Option<usize>,
 }
 
 impl DeckRefineSession {
@@ -309,6 +348,18 @@ impl DeckRefineSession {
     #[must_use]
     pub const fn stats(&self) -> DeckRefineStats {
         self.stats
+    }
+
+    /// Refines at most `monitors` monitors (a presenter that composites one
+    /// picture sets 1); barriers for others are refused.
+    #[must_use]
+    pub fn with_max_monitors(mut self, monitors: usize) -> Self {
+        self.monitor_cap = Some(monitors.min(MAX_REFINE_MONITORS));
+        self
+    }
+
+    fn monitor_limit(&self) -> usize {
+        self.monitor_cap.unwrap_or(MAX_REFINE_MONITORS)
     }
 
     /// Session-wide disable, if any.
@@ -350,7 +401,7 @@ impl DeckRefineSession {
     /// ten-bit layer falls back to eight bits). Disabling clears the
     /// overlay at once; re-enabling asks the Pier for a new generation.
     pub fn set_monitor_enabled(&mut self, monitor_id: u16, enabled: bool) {
-        if !self.monitors.contains_key(&monitor_id) && self.monitors.len() >= MAX_REFINE_MONITORS {
+        if !self.monitors.contains_key(&monitor_id) && self.monitors.len() >= self.monitor_limit() {
             return;
         }
         let state = self.monitors.entry(monitor_id).or_default();
@@ -448,8 +499,12 @@ impl DeckRefineSession {
             width: barrier.source_width,
             height: barrier.source_height,
         };
-        if !self.monitors.contains_key(&monitor_id) && self.monitors.len() >= MAX_REFINE_MONITORS {
+        if !self.monitors.contains_key(&monitor_id) && self.monitors.len() >= self.monitor_limit() {
             return Err(self.note_malformed(RefineRecordError::Value, now));
+        }
+        if self.barriers.note(now, BARRIER_WINDOW) > MAX_BARRIERS_PER_WINDOW {
+            self.disable_session(RefineDisabled::TooManyBarriers);
+            return Ok(VideoRecord::Ignored);
         }
         let others: u64 = self
             .monitors
@@ -635,6 +690,7 @@ impl DeckRefineSession {
             rect,
             depth: header.depth,
             expanded_bytes: expanded,
+            grid: generation.grid,
         })
     }
 
@@ -660,6 +716,89 @@ impl DeckRefineSession {
             }
             None => false,
         }
+    }
+
+    /// Whether one more tile of the largest size would exceed the pending
+    /// bounds ([`MAX_PENDING_JOBS`], [`MAX_PENDING_DECODED_BYTES`]). A lane
+    /// reader waits while this holds instead of reading — and having to
+    /// drop — the next tile: the refine lane's own flow control then holds
+    /// the Pier back, and video, on its own lane, is not affected.
+    #[must_use]
+    pub fn backlog_full(&self) -> bool {
+        self.jobs.len() >= MAX_PENDING_JOBS
+            || self.pending_bytes + arcen_protocol::refine::MAX_TILE_EXPANDED_BYTES
+                > MAX_PENDING_DECODED_BYTES
+    }
+
+    /// The tile was not handed to a decoder (a full worker queue): release
+    /// its pending bytes without counting it as malformed.
+    pub fn forget(&mut self, ticket: &TileTicket) {
+        if self.release(ticket) {
+            self.stats.dropped += 1;
+        }
+    }
+
+    /// Whether the presenter has overlay work for `monitor_id` that would
+    /// change the picture now (new valid blocks to upload, blocks to clear,
+    /// or a clear-all): a still screen re-presents its last frame for it.
+    #[must_use]
+    pub fn overlay_dirty(&self, monitor_id: u16) -> bool {
+        let Some(state) = self.monitors.get(&monitor_id) else {
+            return false;
+        };
+        state.clear_all
+            || state
+                .overlay
+                .iter()
+                .zip(&state.on_gpu)
+                .any(|(block, on_gpu)| match block {
+                    None => *on_gpu,
+                    Some(block) if block.fence > state.presented_fence => *on_gpu,
+                    Some(block) => block.staged.is_some(),
+                })
+    }
+
+    /// The level the current verdict of `monitor_id` still lacks (2 or 3),
+    /// with the fence and blocks to read back; `None` when there is no
+    /// verdict or it is already at its top level: 3 for R′G′B′ tiles, 2 for
+    /// Y′CbCr tiles, whose rendered pixel is the presenter's matrix of the
+    /// verified codes rather than the codes themselves (ADR 0016 R1).
+    #[must_use]
+    pub fn readback_due(&self, monitor_id: u16) -> Option<(VerificationLevel, u64, Vec<TileRect>)> {
+        let state = self.monitors.get(&monitor_id)?;
+        let verdict = state.verdict.as_ref()?;
+        let level = match verdict.level {
+            VerificationLevel::SourceCodes => VerificationLevel::GpuOverlay,
+            VerificationLevel::GpuOverlay => VerificationLevel::RenderedRgb,
+            VerificationLevel::RenderedRgb => return None,
+        };
+        if level > Self::top_level(state.generation?.contract) {
+            return None;
+        }
+        // Only once every covered block is on the GPU.
+        if verdict
+            .coverage
+            .indices()
+            .any(|index| !state.on_gpu.get(index as usize).copied().unwrap_or(false))
+        {
+            return None;
+        }
+        let (fence, blocks) = self.verdict_blocks(monitor_id)?;
+        Some((level, fence, blocks))
+    }
+
+    /// The source grid and contract depth of `monitor_id`'s generation.
+    #[must_use]
+    pub fn grid(&self, monitor_id: u16) -> Option<(RefineGrid, u8)> {
+        let generation = self.monitors.get(&monitor_id)?.generation?;
+        Some((generation.grid, generation.contract.depth))
+    }
+
+    /// The colour contract `monitor_id`'s generation refines in (its
+    /// barrier's), for [`super::RefineContract::describes_stream`].
+    #[must_use]
+    pub fn contract(&self, monitor_id: u16) -> Option<RefineContractBytes> {
+        Some(self.monitors.get(&monitor_id)?.generation?.contract)
     }
 
     /// The worker could not decode a tile (malformed payload).
@@ -699,10 +838,11 @@ impl DeckRefineSession {
         let Some(state) = self.monitors.get_mut(&ticket.monitor_id) else {
             return Err(self.drop_with(RefineDrop::NoGeneration));
         };
-        let Some(generation) = state
-            .generation
-            .filter(|generation| generation.scope == ticket.scope)
-        else {
+        let Some(generation) = state.generation.filter(|generation| {
+            generation.scope == ticket.scope
+                && generation.grid == ticket.grid
+                && generation.grid.check(ticket.rect).is_ok()
+        }) else {
             return Err(self.drop_with(RefineDrop::StaleGeneration));
         };
         let mut committed = 0;
@@ -873,6 +1013,12 @@ impl DeckRefineSession {
                     state.on_gpu[index] = false;
                     delta.clear.push(rect);
                 }
+                // A newer tile replaced what the GPU holds but is not valid
+                // at this fence yet: the old texels must not stay visible.
+                Some(block) if block.fence > presenting_fence && state.on_gpu[index] => {
+                    state.on_gpu[index] = false;
+                    delta.clear.push(rect);
+                }
                 Some(block) if block.fence <= presenting_fence && budget > 0 => {
                     if let Some(planar) = block.staged.take() {
                         delta.set.push((rect, planar));
@@ -897,17 +1043,25 @@ impl DeckRefineSession {
         fence: u64,
         readback: &[(u32, u128)],
     ) -> bool {
+        let needed = match level {
+            VerificationLevel::SourceCodes => return false,
+            VerificationLevel::GpuOverlay => VerificationLevel::SourceCodes,
+            VerificationLevel::RenderedRgb => VerificationLevel::GpuOverlay,
+        };
+        let top = self
+            .monitors
+            .get(&monitor_id)
+            .and_then(|state| state.generation)
+            .map(|generation| Self::top_level(generation.contract));
+        if top.is_none_or(|top| level > top) {
+            return false;
+        }
         let Some(verdict) = self
             .monitors
             .get_mut(&monitor_id)
             .and_then(|state| state.verdict.as_mut())
         else {
             return false;
-        };
-        let needed = match level {
-            VerificationLevel::SourceCodes => return false,
-            VerificationLevel::GpuOverlay => VerificationLevel::SourceCodes,
-            VerificationLevel::RenderedRgb => VerificationLevel::GpuOverlay,
         };
         if verdict.fence != fence
             || verdict.level < needed
@@ -917,6 +1071,18 @@ impl DeckRefineSession {
         }
         verdict.level = verdict.level.max(level);
         true
+    }
+
+    /// The highest level a generation's tiles can be verified at: the
+    /// rendered composite holds R′G′B′ codes as they are (level 3), but a
+    /// Y′CbCr code's rendered pixel is the matrix of it, so Y′CbCr stops at
+    /// the GPU overlay (level 2).
+    fn top_level(contract: RefineContractBytes) -> VerificationLevel {
+        if contract.domain == arcen_protocol::refine::RefineDomain::YCbCr.wire() {
+            VerificationLevel::GpuOverlay
+        } else {
+            VerificationLevel::RenderedRgb
+        }
     }
 
     /// Covered blocks of the current verdict, for a readback.
@@ -944,27 +1110,28 @@ impl DeckRefineSession {
             verdict: None,
             text: text.to_string(),
         };
-        if self.disabled.is_some() {
-            return off("Refinement disabled (malformed records)");
+        match self.disabled {
+            Some(RefineDisabled::MalformedRecords) => {
+                return off("Exact: stopped (the host sent malformed data)");
+            }
+            Some(RefineDisabled::TooManyBarriers) => {
+                return off("Exact: stopped (the host restarted it too often)");
+            }
+            None => {}
         }
         let Some(state) = self.monitors.get(&monitor_id) else {
-            return off("Refinement off");
+            return off("Exact: waiting for a still picture");
         };
         if state.disabled {
-            return off("Refinement off for this display");
+            return off("Exact: off for this display");
         }
         let Some(generation) = state.generation else {
-            return off("Refinement off");
+            return off("Exact: waiting for a still picture");
         };
         let refined = permille(state.visible_blocks(), generation.grid.block_count());
         let text = match &state.verdict {
-            Some(verdict) => format!(
-                "Source codes verified (pre-display transforms); {}.{}% coverage; level {}",
-                verdict.coverage_permille() / 10,
-                verdict.coverage_permille() % 10,
-                verdict.level as u8
-            ),
-            None => format!("Refining {}.{}%", refined / 10, refined % 10),
+            Some(verdict) => exact_status_text(verdict.coverage_permille(), verdict.level),
+            None => format!("Exact: arriving, {} of picture", percent_text(refined)),
         };
         MonitorRefineStatus {
             active: true,

@@ -141,7 +141,7 @@
 //!    negotiated [`arcen_media::BitDepth`].
 //! 2. Builds [`MetalVideoUniform`] -- the matrix/range/identity uniform,
 //!    built by calling
-//!    [`super::video_render::VideoUniform::from_contract`] **directly**
+//!    [`arcen_media::video::present::VideoUniform::from_contract`] **directly**
 //!    (not a re-derivation: see that struct's own doc for exactly why this
 //!    guarantees the two shaders' colour maths can never silently diverge
 //!    on the shared fields) and appending one Metal-only field, described
@@ -210,8 +210,7 @@
 //! the *next* call re-attaches cleanly rather than silently limping along
 //! against a possibly-wedged layer. Nothing in this module ever panics on
 //! a runtime/data condition (only `debug_assert_eq!` on this module's own
-//! internal byte-layout arithmetic, identical in spirit to
-//! `video_render.rs`'s own `VideoUniform::to_bytes`).
+//! internal byte-layout arithmetic).
 //!
 //! # Compile status
 //!
@@ -290,9 +289,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+pub(crate) use super::video_layer_status::*;
+
 use arcen_media::presentation::{
     FramePacer, FramePacerCounters, FramePacerDropReason, FramePacerRefresh,
 };
+use arcen_media::video::PresentTiming;
 use block2::RcBlock;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
@@ -330,11 +332,11 @@ use super::video_render::{
 /// also what Windows composites its own `AdvancedColor` desktop against, so
 /// a desktop captured in scRGB and encoded to PQ is already effectively
 /// graded to them.
-const HDR10_MIN_LUMINANCE_NITS: f32 = 0.005;
-const HDR10_MAX_LUMINANCE_NITS: f32 = 1000.0;
+const HDR10_MIN_LUMINANCE_NITS: f32 = arcen_media::video::present::HDR10_MASTERING_MIN_NITS;
+const HDR10_MAX_LUMINANCE_NITS: f32 = arcen_media::video::present::HDR10_MASTERING_MAX_NITS;
 /// Apple requires normalized PQ pixel formats to use the ST 2084 reference
 /// peak as their optical-output scale: normalized code `1.0` means 10,000 nits.
-const HDR10_NORMALIZED_OPTICAL_OUTPUT_SCALE: f32 = 10_000.0;
+const HDR10_NORMALIZED_OPTICAL_OUTPUT_SCALE: f32 = arcen_media::video::PQ_PEAK_NITS;
 const FALLBACK_REFRESH_PERIOD: Duration = Duration::from_nanos(16_666_667);
 
 fn host_clock_frequency() -> f64 {
@@ -617,6 +619,9 @@ pub struct DedicatedLayerFrame {
     pub arrival_host_time: Duration,
     /// Negotiated source cadence used only for underrun accounting.
     pub source_fps: Option<u32>,
+    /// Exact still image: the refinement fence this frame's access unit
+    /// carried. `None` (no fence, or no refinement) never shows tiles.
+    pub refine: Option<RefineFrameTag>,
 }
 
 /// A decoded 8-bit frame for the Auto/Speed layer. This is deliberately
@@ -629,6 +634,10 @@ pub struct DedicatedEightBitLayerFrame {
     pub contract: VideoColorContract,
     pub arrival_host_time: Duration,
     pub source_fps: Option<u32>,
+    /// When to show it: the served pipeline's shared timing
+    /// (`arcen_media::video::PresentTiming`). Auto presents on arrival and
+    /// never tears, Speed presents on arrival with display sync off.
+    pub timing: PresentTiming,
 }
 
 // ============================================================================
@@ -731,7 +740,7 @@ impl MetalVideoUniform {
     /// vector/struct/array *members*, none of which appear in this
     /// uniform).
     fn to_bytes(self) -> Vec<u8> {
-        let mut bytes = self.shared.to_bytes();
+        let mut bytes = self.shared.to_bytes().to_vec();
         bytes.extend_from_slice(&self.code_unnormalize_scale.to_le_bytes());
         debug_assert_eq!(bytes.len(), 52);
         bytes
@@ -741,141 +750,6 @@ impl MetalVideoUniform {
 // ============================================================================
 // Pure logic: fail-safe outcome + log-once fallback bookkeeping
 // ============================================================================
-
-/// The result of one attempt to establish or render through the dedicated
-/// 10-bit video layer. Every non-[`Ready`][Self::Ready] variant is a
-/// distinct, precise reason -- mirroring
-/// [`super::video_render::ColorspaceOutcome`]'s own "always diagnosable,
-/// never a single opaque failure" shape exactly -- so a fallback to the
-/// existing wgpu/egui path is always explainable; see the module doc's
-/// "fail safe and loud" section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DedicatedLayerOutcome {
-    /// The frame was rendered into the dedicated layer successfully.
-    Ready,
-    /// Not called from the main thread; every AppKit/window call here
-    /// requires it.
-    NotMainThread,
-    /// No open `NSWindow` currently has
-    /// [`crate::ui::multi_window_runtime::ROOT_WINDOW_TITLE`] as its title.
-    NoRootWindow,
-    /// The root window currently has no content view.
-    NoContentView,
-    /// `-[NSView layer]` returned `nil` (the view is not yet layer-backed).
-    NoRootLayer,
-    /// `MTLCreateSystemDefaultDevice()` returned `nil`.
-    NoMetalDevice,
-    /// `-[MTLDevice newCommandQueue]` returned `nil`.
-    CommandQueueCreationFailed,
-    /// `CVMetalTextureCacheCreate`-equivalent (this module's
-    /// `apple_cf::cv::CVMetalTextureCache::system_default`) returned
-    /// `nil`. One of the three failure categories the task's own
-    /// description names explicitly ("the texture cache[...] cannot be
-    /// established").
-    TextureCacheCreationFailed,
-    /// Compiling `video_metal_layer.metal` from source, or looking up
-    /// `vs_main`/`fs_convert` within it, failed.
-    ShaderCompilationFailed,
-    /// `-[MTLDevice newRenderPipelineStateWithDescriptor:error:]` failed.
-    PipelineStateCreationFailed,
-    /// The layer or a drawable texture read back a format other than
-    /// `RGB10A2Unorm` after configuration.
-    PixelFormatMismatch,
-    /// `CVMetalTextureCacheCreateTextureFromImage` failed (or returned a
-    /// null texture) for either plane. The other of the three failure
-    /// categories the task's own description names explicitly ("the
-    /// texture cache[...] cannot be established" -- this is that same
-    /// texture cache, failing to vend a texture rather than failing to be
-    /// created at all).
-    PlaneTextureCreationFailed,
-    /// `-[CAMetalLayer nextDrawable]` returned `nil`. This is also the
-    /// only observable symptom this module can name if
-    /// `MTLPixelFormatRGB10A2Unorm` (the third of the task's three named
-    /// failure categories, "the 10-bit pixel format[...] cannot be
-    /// established") turns out to be unsupported: `CAMetalLayer`'s
-    /// `pixelFormat` setter cannot itself fail or report rejection, so an
-    /// unsupported format's only observable symptom is a drawable that
-    /// never becomes available.
-    NoDrawableAvailable,
-    /// `-[MTLDevice newBufferWithBytes:length:options:]` (for the uniform
-    /// buffer) returned `nil`.
-    UniformBufferCreationFailed,
-    /// `-[MTLCommandQueue commandBuffer]` returned `nil`.
-    CommandBufferCreationFailed,
-    /// `-[MTLCommandBuffer renderCommandEncoderWithDescriptor:]` returned
-    /// `nil`.
-    RenderEncoderCreationFailed,
-}
-
-/// The presentation truth the app needs for a 10-bit frame.
-///
-/// `FallbackToEightBit` is deliberately distinct from `Inactive`: the latter
-/// means no ten-bit dedicated presentation was attempted, while the former
-/// means RGB10A2Unorm was attempted and the existing 8-bit wgpu path must be
-/// used for this frame.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum DedicatedPresentationStatus {
-    #[default]
-    Inactive,
-    DedicatedTenBit,
-    SkippedOccluded,
-    DroppedFrame,
-    FallbackToEightBit(DedicatedLayerOutcome),
-}
-
-impl DedicatedPresentationStatus {
-    const fn from_outcome(outcome: DedicatedLayerOutcome) -> Self {
-        match outcome {
-            DedicatedLayerOutcome::Ready => Self::DedicatedTenBit,
-            DedicatedLayerOutcome::NoDrawableAvailable => Self::DroppedFrame,
-            other => Self::FallbackToEightBit(other),
-        }
-    }
-
-    pub(crate) const fn is_dedicated_ten_bit(self) -> bool {
-        matches!(self, Self::DedicatedTenBit)
-    }
-
-    pub(crate) const fn is_eight_bit_fallback(self) -> bool {
-        matches!(self, Self::FallbackToEightBit(_))
-    }
-
-    pub(crate) const fn is_transient_drop_or_skip(self) -> bool {
-        matches!(self, Self::SkippedOccluded | Self::DroppedFrame)
-    }
-
-    pub(crate) const fn is_dropped_frame(self) -> bool {
-        matches!(self, Self::DroppedFrame)
-    }
-
-    pub(crate) const fn is_skipped_occluded(self) -> bool {
-        matches!(self, Self::SkippedOccluded)
-    }
-
-    pub(crate) const fn preserve_established_on_transient(
-        self,
-        incoming: Self,
-        has_presented_picture: bool,
-    ) -> Self {
-        if has_presented_picture
-            && self.is_dedicated_ten_bit()
-            && incoming.is_transient_drop_or_skip()
-        {
-            self
-        } else {
-            incoming
-        }
-    }
-
-    pub(crate) const fn fallback_reason(self) -> Option<DedicatedLayerOutcome> {
-        match self {
-            Self::FallbackToEightBit(reason) => Some(reason),
-            Self::Inactive | Self::DedicatedTenBit | Self::SkippedOccluded | Self::DroppedFrame => {
-                None
-            }
-        }
-    }
-}
 
 /// Log-once-per-distinct-reason bookkeeping for [`DedicatedVideoPresenter`],
 /// mirroring [`super::video_render::ColorspaceApplication`]'s identical
@@ -908,15 +782,6 @@ impl DedicatedLayerFallback {
         Some(outcome)
     }
 }
-
-/// Marker set on this module's own `CAMetalLayer` sublayer (`CALayer.name`)
-/// so [`super::video_render::apply_reference_colorspace`]'s sublayer
-/// search -- written before this module existed, to find a *different*,
-/// implicitly-created `CAMetalLayer` -- can tell the two apart and skip
-/// this one. See that function's own doc for exactly why this matters.
-pub(crate) const DEDICATED_VIDEO_LAYER_NAME: &str = "arcen-dedicated-video-layer";
-pub(crate) const DEDICATED_EIGHT_BIT_VIDEO_LAYER_NAME: &str =
-    "arcen-dedicated-eight-bit-video-layer";
 
 fn build_pipeline_state(
     device: &ProtocolObject<dyn MTLDevice>,
@@ -957,6 +822,15 @@ fn build_pipeline_state_for(
         .map_err(|_| DedicatedLayerOutcome::PipelineStateCreationFailed)
 }
 
+/// The refined conversion pipeline, for the overlay's own tests.
+#[cfg(test)]
+pub(crate) fn refined_pipeline_for_tests(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
+    build_pipeline_state_for(device, MTLPixelFormat::RGB10A2Unorm, "fs_convert_refined")
+        .expect("shader compiles")
+}
+
 // ============================================================================
 // Live AppKit/Metal code (not unit-tested; see the module doc)
 // ============================================================================
@@ -977,7 +851,31 @@ pub struct DedicatedVideoLayer {
     in_flight: Arc<Mutex<LayerInFlightGate>>,
     /// When the decoded planes were last sampled for the log.
     plane_statistics_logged_at: Option<std::time::Instant>,
+    /// Exact still image overlay, created with the first refined frame.
+    refine: Option<super::refine_overlay::MetalRefineOverlay>,
+    /// The Y′CbCr composite pass, created with the first Y′CbCr tile frame.
+    refine_ycbcr_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
+    /// The current frame took overlay changes from the hub; if it then
+    /// fails, the overlay is no longer known and refinement starts over.
+    refine_composed: bool,
+    refine_mismatch_logged: bool,
 }
+
+/// What a refined frame's command buffer must keep alive and report.
+struct RefineInFlight {
+    tag: RefineFrameTag,
+    readbacks: Vec<(
+        arcen_media::refine::hub::ReadbackRequest,
+        Retained<ProtocolObject<dyn MTLBuffer>>,
+    )>,
+    _keep: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    _textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+}
+
+// SAFETY: as `TenBitInFlightFrame`: retain-counted Metal objects kept alive
+// for the completion handler, which reads the CPU-visible readback buffers
+// only after the GPU completed and otherwise just releases them.
+unsafe impl Send for RefineInFlight {}
 
 impl DedicatedVideoLayer {
     /// Creates the layer, configures it for 10-bit SDR reference viewing,
@@ -1041,6 +939,10 @@ impl DedicatedVideoLayer {
             applied_scaling: None,
             in_flight: Arc::new(Mutex::new(LayerInFlightGate::default())),
             plane_statistics_logged_at: None,
+            refine: None,
+            refine_composed: false,
+            refine_mismatch_logged: false,
+            refine_ycbcr_pipeline: None,
         })
     }
 
@@ -1356,6 +1258,7 @@ impl DedicatedVideoLayer {
         {
             return Err(DedicatedLayerOutcome::NoDrawableAvailable);
         }
+        self.refine_composed = false;
         let result = autoreleasepool(|_| {
             self.render_inner(
                 frame,
@@ -1370,6 +1273,10 @@ impl DedicatedVideoLayer {
                 .lock()
                 .expect("in-flight gate poisoned")
                 .completed();
+            if let Some(tag) = frame.refine.as_ref().filter(|_| self.refine_composed) {
+                tag.hub
+                    .decoder_reset(tag.monitor_id, "overlay_frame_failed");
+            }
         }
         result
     }
@@ -1479,10 +1386,104 @@ impl DedicatedVideoLayer {
             .command_queue
             .commandBuffer()
             .ok_or(DedicatedLayerOutcome::CommandBufferCreationFailed)?;
+        // Exact still image (ADR 0016): overlay writes valid at this frame's
+        // fence go into this command buffer, before the conversion pass.
+        // Only a generation of exactly this picture's size, depth and coding
+        // domain is composited: the overlay is never larger than the decoded
+        // video, whatever a barrier claimed, and PQ codes never land on an
+        // SDR picture (nor SDR codes on a PQ one under EDR).
+        let source_grid = arcen_media::refine::tile::RefineGrid {
+            width: luma_width as u32,
+            height: luma_height as u32,
+        };
+        let refine_tag = frame.refine.as_ref().filter(|tag| {
+            let grid = tag.hub.grid(tag.monitor_id);
+            let contract = tag.hub.contract(tag.monitor_id);
+            // Y′CbCr tiles also need the picture's own matrix and range,
+            // which their codes pass through.
+            let matches = arcen_media::refine::compositor::composites_over(
+                grid,
+                contract,
+                frame.contract,
+                source_grid,
+            );
+            if !matches && grid.is_some() && !self.refine_mismatch_logged {
+                self.refine_mismatch_logged = true;
+                tracing::warn!(
+                    target: crate::logging::target::VIDEO,
+                    ?grid,
+                    ?contract,
+                    width = source_grid.width,
+                    height = source_grid.height,
+                    transfer = frame.contract.transfer.token(),
+                    primaries = frame.contract.primaries.token(),
+                    matrix = ?frame.contract.matrix,
+                    range = ?frame.contract.range,
+                    "exact still image refused: its grid or coding domain is not the decoded picture's"
+                );
+            }
+            matches
+        });
+        let mut refine_work = super::refine_overlay::OverlayWork::default();
+        let refine_active = refine_tag
+            .is_some_and(|tag| tag.hub.compose(&mut refine_work, tag.monitor_id, tag.fence));
+        self.refine_composed = refine_tag.is_some();
+        let mut refine_keep = Vec::new();
+        if refine_tag.is_some() && self.refine.is_none() {
+            self.refine = build_pipeline_state_for(
+                &self.device,
+                MTLPixelFormat::RGB10A2Unorm,
+                "fs_convert_refined",
+            )
+            .ok()
+            .map(super::refine_overlay::MetalRefineOverlay::new);
+        }
+        // Y′CbCr tiles (a macOS Pier) are composited by their own pass,
+        // which feeds the codes through the video's range and matrix.
+        let ycbcr_tiles = refine_tag.is_some_and(|tag| {
+            tag.hub.contract(tag.monitor_id).is_some_and(|bytes| {
+                bytes.domain == arcen_protocol::refine::RefineDomain::YCbCr.wire()
+            })
+        });
+        if ycbcr_tiles && self.refine_ycbcr_pipeline.is_none() {
+            self.refine_ycbcr_pipeline = build_pipeline_state_for(
+                &self.device,
+                MTLPixelFormat::RGB10A2Unorm,
+                "fs_convert_refined_ycbcr",
+            )
+            .ok();
+        }
+        let refined_pipeline = if ycbcr_tiles {
+            self.refine_ycbcr_pipeline.clone()
+        } else {
+            self.refine.as_ref().map(|overlay| overlay.pipeline.clone())
+        };
+        let overlay_texture = match self.refine.as_mut() {
+            Some(overlay) if refine_tag.is_some() => overlay.encode_updates(
+                &self.device,
+                &command_buffer,
+                &refine_work,
+                source_grid,
+                &mut refine_keep,
+            ),
+            _ => None,
+        };
+        if let Some(tag) = refine_tag
+            .filter(|_| refine_active && (overlay_texture.is_none() || refined_pipeline.is_none()))
+        {
+            // The changes were taken but could not be encoded: the GPU
+            // overlay no longer matches the hub, so start over.
+            tag.hub
+                .decoder_reset(tag.monitor_id, "overlay_upload_failed");
+        }
+        let refined = refine_active && overlay_texture.is_some() && refined_pipeline.is_some();
         let encoder = command_buffer
             .renderCommandEncoderWithDescriptor(&render_pass)
             .ok_or(DedicatedLayerOutcome::RenderEncoderCreationFailed)?;
-        encoder.setRenderPipelineState(&self.pipeline_state);
+        match (refined, refined_pipeline.as_ref()) {
+            (true, Some(pipeline)) => encoder.setRenderPipelineState(pipeline),
+            _ => encoder.setRenderPipelineState(&self.pipeline_state),
+        }
         // SAFETY: the raw texture pointers are valid while `_luma_cv` and
         // `_chroma_cv` retain their CoreVideo owners in this stack frame.
         let luma_texture: &ProtocolObject<dyn MTLTexture> =
@@ -1493,10 +1494,77 @@ impl DedicatedVideoLayer {
         unsafe {
             encoder.setFragmentTexture_atIndex(Some(luma_texture), 0);
             encoder.setFragmentTexture_atIndex(Some(chroma_texture), 1);
+            if refined {
+                encoder.setFragmentTexture_atIndex(overlay_texture.as_deref(), 2);
+            }
             encoder.setFragmentBuffer_offset_atIndex(Some(&*uniform_buffer), 0, 0);
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
         encoder.endEncoding();
+        // Verification levels 2 and 3: the overlay itself, or an unscaled
+        // composite drawn exactly as the drawable was, read back after the
+        // GPU finished.
+        let mut refine_readbacks = Vec::new();
+        let mut refine_textures = Vec::new();
+        if refined {
+            for request in std::mem::take(&mut refine_work.readbacks) {
+                if !super::refine_overlay::inside(&request.blocks, source_grid) {
+                    continue;
+                }
+                let source = if super::refine_overlay::needs_composite(&request) {
+                    let Some(pipeline) = refined_pipeline.as_ref() else {
+                        continue;
+                    };
+                    let Some(target) = super::refine_overlay::private_texture(
+                        &self.device,
+                        MTLPixelFormat::RGB10A2Unorm,
+                        source_grid,
+                        objc2_metal::MTLTextureUsage::RenderTarget,
+                    ) else {
+                        continue;
+                    };
+                    let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+                    // SAFETY: colour attachment 0 is valid on every pass.
+                    let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+                    attachment.setTexture(Some(&*target));
+                    attachment.setLoadAction(MTLLoadAction::Clear);
+                    attachment.setStoreAction(MTLStoreAction::Store);
+                    let Some(composite) = command_buffer.renderCommandEncoderWithDescriptor(&pass)
+                    else {
+                        continue;
+                    };
+                    composite.setRenderPipelineState(pipeline);
+                    // SAFETY: as the drawable's pass above.
+                    unsafe {
+                        composite.setFragmentTexture_atIndex(Some(luma_texture), 0);
+                        composite.setFragmentTexture_atIndex(Some(chroma_texture), 1);
+                        composite.setFragmentTexture_atIndex(overlay_texture.as_deref(), 2);
+                        composite.setFragmentBuffer_offset_atIndex(Some(&*uniform_buffer), 0, 0);
+                        composite.drawPrimitives_vertexStart_vertexCount(
+                            MTLPrimitiveType::Triangle,
+                            0,
+                            3,
+                        );
+                    }
+                    composite.endEncoding();
+                    refine_textures.push(target.clone());
+                    target
+                } else {
+                    match overlay_texture.as_ref() {
+                        Some(texture) => texture.clone(),
+                        None => continue,
+                    }
+                };
+                if let Some(buffer) = super::refine_overlay::MetalRefineOverlay::encode_readback(
+                    &self.device,
+                    &command_buffer,
+                    &source,
+                    &request,
+                ) {
+                    refine_readbacks.push((request, buffer));
+                }
+            }
+        }
         let drawable_for_present: &ProtocolObject<dyn MTLDrawable> =
             ProtocolObject::from_ref(&*drawable);
         command_buffer.presentDrawable_afterMinimumDuration(
@@ -1518,12 +1586,37 @@ impl DedicatedVideoLayer {
             _uniform_buffer: uniform_buffer,
         };
         let retained_frame = Arc::new(Mutex::new(Some(retained_frame)));
+        if let Some(texture) = overlay_texture.clone() {
+            refine_textures.push(texture);
+        }
+        let refine_in_flight =
+            Arc::new(Mutex::new(refine_tag.cloned().map(|tag| RefineInFlight {
+                tag,
+                readbacks: refine_readbacks,
+                _keep: refine_keep,
+                _textures: refine_textures,
+            })));
         let completion = RcBlock::new(
             move |_buffer: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 retained_frame
                     .lock()
                     .expect("retained frame poisoned")
                     .take();
+                // The frame carrying this fence is on its way to the glass:
+                // report it, then deliver any readback (ADR 0016 R4).
+                let in_flight = refine_in_flight
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(in_flight) = in_flight {
+                    let tag = &in_flight.tag;
+                    tag.hub.presented(tag.monitor_id, tag.fence);
+                    for (request, buffer) in &in_flight.readbacks {
+                        let result =
+                            super::refine_overlay::readback_result(request.clone(), buffer);
+                        let _ = tag.hub.complete_readback(&result);
+                    }
+                }
             },
         );
         // SAFETY: Metal copies completion handlers and invokes them after GPU use.
@@ -1570,71 +1663,6 @@ impl Drop for DedicatedVideoLayer {
 // ============================================================================
 // Dedicated 8-bit Auto/Speed layer
 // ============================================================================
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum DedicatedEightBitPresentationStatus {
-    #[default]
-    Inactive,
-    DedicatedEightBit,
-    SkippedOccluded,
-    DroppedFrame,
-    FallbackToEgui(DedicatedLayerOutcome),
-}
-
-impl DedicatedEightBitPresentationStatus {
-    const fn from_outcome(outcome: DedicatedLayerOutcome) -> Self {
-        match outcome {
-            DedicatedLayerOutcome::Ready => Self::DedicatedEightBit,
-            DedicatedLayerOutcome::NoDrawableAvailable => Self::DroppedFrame,
-            other => Self::FallbackToEgui(other),
-        }
-    }
-
-    pub(crate) const fn is_dedicated_eight_bit(self) -> bool {
-        matches!(self, Self::DedicatedEightBit)
-    }
-
-    pub(crate) const fn is_fallback(self) -> bool {
-        matches!(self, Self::FallbackToEgui(_))
-    }
-
-    pub(crate) const fn is_transient_drop_or_skip(self) -> bool {
-        matches!(self, Self::SkippedOccluded | Self::DroppedFrame)
-    }
-
-    pub(crate) const fn is_dropped_frame(self) -> bool {
-        matches!(self, Self::DroppedFrame)
-    }
-
-    pub(crate) const fn is_skipped_occluded(self) -> bool {
-        matches!(self, Self::SkippedOccluded)
-    }
-
-    pub(crate) const fn preserve_established_on_transient(
-        self,
-        incoming: Self,
-        has_presented_picture: bool,
-    ) -> Self {
-        if has_presented_picture
-            && self.is_dedicated_eight_bit()
-            && incoming.is_transient_drop_or_skip()
-        {
-            self
-        } else {
-            incoming
-        }
-    }
-
-    pub(crate) const fn fallback_reason(self) -> Option<DedicatedLayerOutcome> {
-        match self {
-            Self::FallbackToEgui(reason) => Some(reason),
-            Self::Inactive
-            | Self::DedicatedEightBit
-            | Self::SkippedOccluded
-            | Self::DroppedFrame => None,
-        }
-    }
-}
 
 const fn retained_handle_detach_before_install(has_retained_handle: bool) -> bool {
     has_retained_handle
@@ -1691,6 +1719,49 @@ pub struct DedicatedEightBitVideoLayer {
     /// Frame, drawable and filter last applied by `sync_source_drawable_and_scaling`.
     applied_scaling: Option<(CGSize, CGSize, LayerScaling)>,
     in_flight: Arc<Mutex<LayerInFlightGate>>,
+    /// The presentation timing applied to the layer ([`Self::apply_timing`]).
+    timing: PresentTiming,
+}
+
+/// How the eight-bit layer presents under a pipeline's timing.
+///
+/// `displaySyncEnabled` is off only where the timing allows tearing
+/// (Speed): Core Animation then shows a drawable as soon as it is ready
+/// instead of at the next refresh, "possibly with brief visual artifacts
+/// (tearing)" (`CAMetalLayer.displaySyncEnabled`). Auto keeps one drawable
+/// in flight, so a newer frame waits as the newest in the pacer instead of
+/// queueing behind an older drawable (Core Animation shows display-synced
+/// drawables in order, each for a refresh). Speed keeps two: without
+/// display sync a drawable is shown as soon as it is ready, so a second one
+/// does not wait behind the first, and fewer frames are replaced unseen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EightBitLayerTiming {
+    pub(crate) display_sync: bool,
+    pub(crate) max_in_flight: u8,
+    /// Present without a minimum on-screen time for the previous drawable.
+    pub(crate) present_at_once: bool,
+}
+
+impl EightBitLayerTiming {
+    pub(crate) const fn for_timing(timing: PresentTiming) -> Self {
+        match timing {
+            PresentTiming::Vsync => Self {
+                display_sync: true,
+                max_in_flight: 2,
+                present_at_once: false,
+            },
+            PresentTiming::Newest => Self {
+                display_sync: true,
+                max_in_flight: 1,
+                present_at_once: false,
+            },
+            PresentTiming::Tearing => Self {
+                display_sync: false,
+                max_in_flight: 2,
+                present_at_once: true,
+            },
+        }
+    }
 }
 
 struct EightBitInFlightFrame {
@@ -1767,7 +1838,30 @@ impl DedicatedEightBitVideoLayer {
             last_colorspace: None,
             applied_scaling: None,
             in_flight: Arc::new(Mutex::new(LayerInFlightGate::default())),
+            timing: PresentTiming::Vsync,
         })
+    }
+
+    /// Applies the served pipeline's timing to the layer
+    /// ([`EightBitLayerTiming`]).
+    fn apply_timing(&mut self, timing: PresentTiming) {
+        if timing == self.timing {
+            return;
+        }
+        let plan = EightBitLayerTiming::for_timing(timing);
+        self.layer.setDisplaySyncEnabled(plan.display_sync);
+        self.in_flight
+            .lock()
+            .expect("in-flight gate poisoned")
+            .max_in_flight = plan.max_in_flight;
+        self.timing = timing;
+        tracing::info!(
+            target: crate::logging::target::VIDEO,
+            timing = timing.token(),
+            display_sync = self.layer.displaySyncEnabled(),
+            max_in_flight = plan.max_in_flight,
+            "eight-bit video layer presentation timing applied",
+        );
     }
 
     fn ensure_colorspace(
@@ -1850,6 +1944,7 @@ impl DedicatedEightBitVideoLayer {
         if frame.contract.depth != arcen_media::BitDepth::Eight {
             return Err(DedicatedLayerOutcome::PlaneTextureCreationFailed);
         }
+        self.apply_timing(frame.timing);
         let in_flight = Arc::clone(&self.in_flight);
         if !in_flight
             .lock()
@@ -1980,10 +2075,14 @@ impl DedicatedEightBitVideoLayer {
         encoder.endEncoding();
         let drawable_for_present: &ProtocolObject<dyn MTLDrawable> =
             ProtocolObject::from_ref(&*drawable);
-        command_buffer.presentDrawable_afterMinimumDuration(
-            drawable_for_present,
-            present_minimum_duration_s(refresh_period),
-        );
+        if EightBitLayerTiming::for_timing(self.timing).present_at_once {
+            command_buffer.presentDrawable(drawable_for_present);
+        } else {
+            command_buffer.presentDrawable_afterMinimumDuration(
+                drawable_for_present,
+                present_minimum_duration_s(refresh_period),
+            );
+        }
         telemetry.record_submitted(target_host_time, frame.arrival_host_time, refresh_period);
         install_presented_handler(
             drawable_for_present,
@@ -2153,6 +2252,11 @@ type DedicatedThreadShared<L, F, S> = Arc<(Mutex<DedicatedPresenterThreadState<L
 
 trait DedicatedPacedFrame {
     fn source_fps(&self) -> Option<u32>;
+    /// When the frame is shown; a fidelity (ten-bit) frame always waits for
+    /// the refresh.
+    fn timing(&self) -> PresentTiming {
+        PresentTiming::Vsync
+    }
 }
 
 impl DedicatedPacedFrame for DedicatedLayerFrame {
@@ -2164,6 +2268,10 @@ impl DedicatedPacedFrame for DedicatedLayerFrame {
 impl DedicatedPacedFrame for DedicatedEightBitLayerFrame {
     fn source_fps(&self) -> Option<u32> {
         self.source_fps
+    }
+
+    fn timing(&self) -> PresentTiming {
+        self.timing.for_depth(arcen_media::BitDepth::Eight)
     }
 }
 
@@ -2213,39 +2321,6 @@ struct DedicatedPresenterTelemetry {
     last_submitted_host_time_us: AtomicU64,
     last_refresh_period_us: AtomicU64,
     latest_refresh_period_us: AtomicU64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DedicatedPresenterTelemetryDelta {
-    pub(crate) drops: u64,
-    pub(crate) skips: u64,
-    /// Refreshes that found every drawable slot busy and left the next frame
-    /// queued for the following refresh.
-    pub(crate) slot_waits: u64,
-    pub(crate) frames_received: u64,
-    pub(crate) frames_submitted: u64,
-    pub(crate) frames_confirmed: u64,
-    pub(crate) metal_dropped: u64,
-    pub(crate) presented_time_unconfirmed: u64,
-    pub(crate) dropped_overflow: u64,
-    pub(crate) dropped_stale: u64,
-    pub(crate) dropped_hidden: u64,
-    pub(crate) underruns: u64,
-    pub(crate) queue_depth_samples: u64,
-    pub(crate) queue_depth_total: u64,
-    pub(crate) queue_depth_max: u64,
-    pub(crate) interval_1x: u64,
-    pub(crate) interval_2x: u64,
-    pub(crate) interval_3x_plus: u64,
-    pub(crate) latency_p50_us: Option<u64>,
-    pub(crate) latency_p99_us: Option<u64>,
-    /// Frame arrival to the drawable's confirmed on-glass time.
-    pub(crate) on_glass_latency_p50_us: Option<u64>,
-    pub(crate) on_glass_latency_p99_us: Option<u64>,
-    pub(crate) presented_after_target_p50_us: Option<u64>,
-    pub(crate) submitted_presented_at: Vec<std::time::Instant>,
-    pub(crate) confirmed_presented_at: Vec<std::time::Instant>,
-    pub(crate) refresh_period_us: Option<u64>,
 }
 
 impl DedicatedPresenterTelemetry {
@@ -2532,6 +2607,10 @@ where
     async_status: Option<S>,
     wake: Option<egui::Context>,
     accepted_frames: u64,
+    /// The served pipeline's timing, from the last submitted frame.
+    timing: PresentTiming,
+    /// The display's refresh period, from the last display-link tick.
+    refresh_period: Duration,
 }
 
 impl<L, F, S> Default for DedicatedPresenterThreadState<L, F, S>
@@ -2556,6 +2635,8 @@ where
             async_status: None,
             wake: None,
             accepted_frames: 0,
+            timing: PresentTiming::Vsync,
+            refresh_period: FALLBACK_REFRESH_PERIOD,
         }
     }
 }
@@ -2804,7 +2885,7 @@ fn drive_display_link_vsync_at<L, F, S>(
     F: DedicatedPacedFrame + Clone + Send + 'static,
     S: DedicatedThreadStatus,
 {
-    let (mut layer, decision, stopping, layer_generation) = {
+    let (layer, decision, stopping, layer_generation) = {
         let (lock, _cvar) = &**shared;
         let mut state = lock
             .lock()
@@ -2812,10 +2893,13 @@ fn drive_display_link_vsync_at<L, F, S>(
         if state.stopping || !state.visible {
             return;
         }
+        state.refresh_period = refresh_period;
+        // No layer to take: not installed, or a frame presented on arrival
+        // is drawing into it now; the frame waits for the next refresh.
         if state
             .layer
             .as_ref()
-            .is_some_and(|layer| !layer.ready_for_frame())
+            .is_none_or(|layer| !layer.ready_for_frame())
         {
             let before = state.pacer.counters();
             state.pacer.on_refresh_blocked(refresh_seq);
@@ -2840,50 +2924,125 @@ fn drive_display_link_vsync_at<L, F, S>(
     if stopping {
         return;
     }
-    match decision {
-        FramePacerRefresh::Present(frame) => {
-            if let Some(layer_ref) = layer.as_mut() {
-                match layer_ref.render_at(
-                    &frame.frame,
-                    target_time,
-                    refresh_period,
-                    Arc::clone(&telemetry),
-                ) {
-                    Ok(()) => {
-                        let (lock, _) = &**shared;
-                        let mut state = lock
-                            .lock()
-                            .expect("dedicated presenter thread state poisoned");
-                        if state.layer_generation == layer_generation && state.layer_installed {
-                            state.has_presented_picture = true;
-                        }
+    let frame = match decision {
+        FramePacerRefresh::Present(frame) => Some(frame.frame),
+        FramePacerRefresh::Idle => None,
+    };
+    render_and_return_layer(
+        shared,
+        telemetry,
+        layer,
+        frame.as_ref(),
+        layer_generation,
+        target_time,
+        refresh_period,
+    );
+}
+
+/// Presents the newest queued frame the moment it arrives, for a timing
+/// that does not wait for the refresh (`PresentTiming::Newest`,
+/// `PresentTiming::Tearing`). The display link stays the retry path: a frame
+/// that finds the drawable slot busy waits in the pacer (which keeps only the
+/// newest) for the next refresh.
+fn present_on_arrival<L, F, S>(
+    shared: &DedicatedThreadShared<L, F, S>,
+    telemetry: Arc<DedicatedPresenterTelemetry>,
+) where
+    L: DedicatedRenderableLayer<F>,
+    F: DedicatedPacedFrame + Clone + Send + 'static,
+    S: DedicatedThreadStatus,
+{
+    let now = current_host_time();
+    let (layer, frame, layer_generation, refresh_period) = {
+        let (lock, _cvar) = &**shared;
+        let mut state = lock
+            .lock()
+            .expect("dedicated presenter thread state poisoned");
+        if state.stopping || !state.visible || state.timing.waits_for_vsync() {
+            return;
+        }
+        if !state
+            .layer
+            .as_ref()
+            .is_some_and(DedicatedRenderableLayer::ready_for_frame)
+        {
+            return;
+        }
+        let before = state.pacer.counters();
+        let Some(paced) = state.pacer.take_newest(now) else {
+            return;
+        };
+        let after = state.pacer.counters();
+        telemetry.add_pacer_delta(before, after);
+        (
+            state.layer.take(),
+            paced.frame,
+            state.layer_generation,
+            state.refresh_period,
+        )
+    };
+    render_and_return_layer(
+        shared,
+        telemetry,
+        layer,
+        Some(&frame),
+        layer_generation,
+        now,
+        refresh_period,
+    );
+}
+
+/// Renders `frame` (if any) into the layer taken from the state, records the
+/// outcome, and puts the layer back unless it was replaced meanwhile.
+fn render_and_return_layer<L, F, S>(
+    shared: &DedicatedThreadShared<L, F, S>,
+    telemetry: Arc<DedicatedPresenterTelemetry>,
+    mut layer: Option<L>,
+    frame: Option<&F>,
+    layer_generation: u64,
+    target_time: Duration,
+    refresh_period: Duration,
+) where
+    L: DedicatedRenderableLayer<F>,
+    F: DedicatedPacedFrame + Clone + Send + 'static,
+    S: DedicatedThreadStatus,
+{
+    if let Some(frame) = frame {
+        if let Some(layer_ref) = layer.as_mut() {
+            match layer_ref.render_at(frame, target_time, refresh_period, Arc::clone(&telemetry)) {
+                Ok(()) => {
+                    let (lock, _) = &**shared;
+                    let mut state = lock
+                        .lock()
+                        .expect("dedicated presenter thread state poisoned");
+                    if state.layer_generation == layer_generation && state.layer_installed {
+                        state.has_presented_picture = true;
                     }
-                    Err(outcome) => {
-                        let status = S::from_outcome(outcome);
-                        if status.is_dropped_frame() {
-                            telemetry.drops.fetch_add(1, Ordering::Relaxed);
-                        } else if status.is_skipped_occluded() {
-                            telemetry.skips.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(outcome) => {
+                    let status = S::from_outcome(outcome);
+                    if status.is_dropped_frame() {
+                        telemetry.drops.fetch_add(1, Ordering::Relaxed);
+                    } else if status.is_skipped_occluded() {
+                        telemetry.skips.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let (lock, _) = &**shared;
+                    let mut state = lock
+                        .lock()
+                        .expect("dedicated presenter thread state poisoned");
+                    if state.layer_generation == layer_generation {
+                        state.async_status = Some(status);
+                        if let Some(wake) = state.wake.as_ref() {
+                            wake.request_repaint();
                         }
-                        let (lock, _) = &**shared;
-                        let mut state = lock
-                            .lock()
-                            .expect("dedicated presenter thread state poisoned");
-                        if state.layer_generation == layer_generation {
-                            state.async_status = Some(status);
-                            if let Some(wake) = state.wake.as_ref() {
-                                wake.request_repaint();
-                            }
-                            if status.is_fallback() {
-                                state.layer_installed = false;
-                                state.has_presented_picture = false;
-                            }
+                        if status.is_fallback() {
+                            state.layer_installed = false;
+                            state.has_presented_picture = false;
                         }
                     }
                 }
             }
         }
-        FramePacerRefresh::Idle => {}
     }
     let (lock, _) = &**shared;
     let mut state = lock
@@ -3137,11 +3296,30 @@ where
             "dedicated presenter frame arrival"
         );
         state.pacer.set_source_fps(frame.source_fps());
+        let timing = frame.timing();
         let before = state.pacer.counters();
+        if timing != state.timing {
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                timing = timing.token(),
+                "dedicated video presentation timing: {}",
+                match timing {
+                    PresentTiming::Vsync => "on the display link, display sync on",
+                    PresentTiming::Newest => "each frame on arrival, newest wins, display sync on",
+                    PresentTiming::Tearing => "each frame on arrival, display sync off (may tear)",
+                }
+            );
+            state.timing = timing;
+            state.pacer.set_present_timing(timing);
+        }
         state.pacer.enqueue(frame, arrival_host_time);
         let after = state.pacer.counters();
         self.telemetry.add_pacer_delta(before, after);
         state.accepted_frames = state.accepted_frames.saturating_add(1);
+        drop(state);
+        if !timing.waits_for_vsync() {
+            present_on_arrival(&self.shared, Arc::clone(&self.telemetry));
+        }
         true
     }
 
@@ -3608,6 +3786,15 @@ impl DedicatedVideoPresenter {
         self.thread.take_async_status()
     }
 
+    /// Presents the retained ten-bit frame again: a still screen whose exact
+    /// overlay changed shows the change without waiting for a new frame.
+    pub(crate) fn represent_last(&mut self) -> Option<DedicatedPresentationStatus> {
+        let mut frame = self.thread.last_presented()?;
+        frame.refine.as_ref()?;
+        frame.arrival_host_time = current_host_time();
+        Some(self.present(&frame))
+    }
+
     pub(crate) fn has_presented_picture(&self) -> bool {
         self.thread.has_presented_picture()
     }
@@ -3662,15 +3849,6 @@ impl DedicatedVideoPresenter {
     pub(crate) fn last_presented(&self) -> Option<DedicatedLayerFrame> {
         self.thread.last_presented()
     }
-}
-
-/// A presentation layer's colour state, read back from Core Animation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LayerColourState {
-    /// `wantsExtendedDynamicRangeContent`.
-    pub edr: bool,
-    /// The layer's colour space name, without the `kCGColorSpace` prefix.
-    pub colour_space: Option<String>,
 }
 
 #[cfg(test)]
@@ -4203,6 +4381,136 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct TimedFrame {
+        id: u32,
+        timing: PresentTiming,
+    }
+
+    impl DedicatedPacedFrame for TimedFrame {
+        fn source_fps(&self) -> Option<u32> {
+            Some(30)
+        }
+
+        fn timing(&self) -> PresentTiming {
+            self.timing
+        }
+    }
+
+    impl DedicatedRenderableLayer<TimedFrame> for FakeGeometryLayer {
+        fn render_at(
+            &mut self,
+            frame: &TimedFrame,
+            target_host_time: Duration,
+            refresh_period: Duration,
+            telemetry: Arc<DedicatedPresenterTelemetry>,
+        ) -> Result<(), DedicatedLayerOutcome> {
+            DedicatedRenderableLayer::<u32>::render_at(
+                self,
+                &frame.id,
+                target_host_time,
+                refresh_period,
+                telemetry,
+            )
+        }
+
+        fn layer_handle(&self) -> Retained<CAMetalLayer> {
+            panic!("fake layer handle is never read by this unit test")
+        }
+
+        fn ready_for_frame(&self) -> bool {
+            DedicatedRenderableLayer::<u32>::ready_for_frame(self)
+        }
+    }
+
+    fn timed_thread(
+        layer: FakeGeometryLayer,
+    ) -> DedicatedPresenterThread<FakeGeometryLayer, TimedFrame, DedicatedPresentationStatus> {
+        let thread = DedicatedPresenterThread::default();
+        {
+            let (lock, _cvar) = &*thread.shared;
+            let mut state = lock.lock().expect("state");
+            state.layer_installed = true;
+            state.visible = true;
+            state.layer = Some(layer);
+        }
+        thread
+    }
+
+    #[test]
+    fn auto_and_speed_frames_are_presented_on_arrival_and_the_newest_wins() {
+        for timing in [PresentTiming::Newest, PresentTiming::Tearing] {
+            let layer = FakeGeometryLayer::default();
+            let probe = layer.clone();
+            let thread = timed_thread(layer);
+            let frame = |id| TimedFrame { id, timing };
+            // No display-link tick needed: drawn the moment it arrives.
+            assert!(thread.submit(frame(1), current_host_time()));
+            assert_eq!(probe.rendered(), vec![1]);
+            // The drawable slot is busy: newer frames replace older ones.
+            probe.set_slots_busy(true);
+            assert!(thread.submit(frame(2), current_host_time()));
+            assert!(thread.submit(frame(3), current_host_time()));
+            assert_eq!(thread.queue_depth_for_test(), 1);
+            probe.set_slots_busy(false);
+            drive_display_link_vsync(
+                &thread.shared,
+                Arc::clone(&thread.telemetry),
+                1,
+                current_host_time().saturating_add(Duration::from_millis(16)),
+                Duration::from_millis(16),
+            );
+            assert_eq!(probe.rendered(), vec![1, 3], "{timing:?}");
+            assert_eq!(thread.pacer_counters_for_test().dropped_overflow, 1);
+        }
+    }
+
+    #[test]
+    fn grading_and_hdr_frames_wait_for_the_display_link_in_order() {
+        let layer = FakeGeometryLayer::default();
+        let probe = layer.clone();
+        let thread = timed_thread(layer);
+        let frame = |id| TimedFrame {
+            id,
+            timing: PresentTiming::Vsync,
+        };
+        assert!(thread.submit(frame(1), current_host_time()));
+        assert!(thread.submit(frame(2), current_host_time()));
+        assert!(probe.rendered().is_empty());
+        for refresh in 1..=2 {
+            drive_display_link_vsync(
+                &thread.shared,
+                Arc::clone(&thread.telemetry),
+                refresh,
+                current_host_time().saturating_add(Duration::from_millis(16)),
+                Duration::from_millis(16),
+            );
+        }
+        assert_eq!(probe.rendered(), vec![1, 2]);
+    }
+
+    #[test]
+    fn only_speed_turns_display_sync_off() {
+        let vsync = EightBitLayerTiming::for_timing(PresentTiming::Vsync);
+        let newest = EightBitLayerTiming::for_timing(PresentTiming::Newest);
+        let tearing = EightBitLayerTiming::for_timing(PresentTiming::Tearing);
+        assert!(vsync.display_sync && newest.display_sync && !tearing.display_sync);
+        assert_eq!(
+            (
+                vsync.max_in_flight,
+                newest.max_in_flight,
+                tearing.max_in_flight
+            ),
+            (2, 1, 2)
+        );
+        assert!(!vsync.present_at_once && !newest.present_at_once && tearing.present_at_once);
+        // A ten-bit frame never leaves the refresh, whatever was served.
+        assert_eq!(
+            PresentTiming::Tearing.for_depth(arcen_media::BitDepth::Ten),
+            PresentTiming::Vsync
+        );
+    }
+
     // ---- RGB10A2Unorm: the task-brief correction -------------------------
 
     #[test]
@@ -4535,6 +4843,7 @@ mod shader_tests {
         MTLTextureUsage,
     };
 
+    #[derive(Clone)]
     struct Picture {
         width: usize,
         height: usize,
@@ -4714,10 +5023,21 @@ mod shader_tests {
         contract: VideoColorContract,
         overlay: Option<&[[u16; 4]]>,
     ) -> Option<Vec<[u16; 3]>> {
+        render_rgb10_through(picture, contract, overlay, "fs_convert_refined")
+    }
+
+    /// [`render_rgb10`] with the refined pass `refined` (`fs_convert_refined`
+    /// or `fs_convert_refined_ycbcr`) when an overlay is given.
+    fn render_rgb10_through(
+        picture: &Picture,
+        contract: VideoColorContract,
+        overlay: Option<&[[u16; 4]]>,
+        refined: &str,
+    ) -> Option<Vec<[u16; 3]>> {
         let device = MTLCreateSystemDefaultDevice()?;
         let queue = device.newCommandQueue().expect("command queue");
         let fragment = if overlay.is_some() {
-            "fs_convert_refined"
+            refined
         } else {
             "fs_convert"
         };
@@ -4862,8 +5182,93 @@ mod shader_tests {
     /// every unrefined pixel is bit-identical to `fs_convert`'s.
     #[test]
     fn refined_rgb_codes_reach_the_ten_bit_target_exactly() {
+        let grading = contract(ChromaSubsampling::Yuv444, BitDepth::Ten, ColorRange::Full);
+        // HDR: PQ / BT.2020 codes go into the same RGB10A2 target the PQ/EDR
+        // layer presents; the overlay stores the codes, not light.
+        let hdr = VideoColorContract {
+            matrix: ColorMatrix::Bt2020Ncl,
+            primaries: arcen_media::ColorPrimaries::Bt2020,
+            transfer: arcen_media::TransferCharacteristics::Pq,
+            ..grading
+        };
+        for contract in [grading, hdr] {
+            refined_codes_are_exact_for(contract);
+        }
+    }
+
+    /// ADR 0016 R1, Y′CbCr domain (the macOS Pier's tiles): a refined
+    /// pixel is exactly what the presenter makes of a decoded pixel holding
+    /// the tile's Y′, Cb, Cr codes -- the same range and matrix, SDR BT.709
+    /// and PQ BT.2020 alike -- and every unrefined pixel is `fs_convert`'s.
+    #[test]
+    fn refined_ycbcr_codes_take_the_presenters_own_range_and_matrix() {
+        let grading = contract(ChromaSubsampling::Yuv444, BitDepth::Ten, ColorRange::Full);
+        let hdr = VideoColorContract {
+            matrix: ColorMatrix::Bt2020Ncl,
+            primaries: arcen_media::ColorPrimaries::Bt2020,
+            transfer: arcen_media::TransferCharacteristics::Pq,
+            ..grading
+        };
+        for contract in [grading, hdr] {
+            let picture = fringed_text(ChromaSubsampling::Yuv444, BitDepth::Ten);
+            let code = |x: usize, y: usize| -> [u16; 3] {
+                [
+                    ((x * 97 + y * 13) % 1024) as u16,
+                    ((y * 131 + 7) % 1024) as u16,
+                    (1023 - x * 50 % 1024) as u16,
+                ]
+            };
+            let overlay: Vec<[u16; 4]> = (0..picture.height)
+                .flat_map(|y| {
+                    (0..picture.width).map(move |x| {
+                        let [a, b, c] = code(x, y);
+                        [a, b, c, u16::from(x < 9 || (x + y) % 5 == 0)]
+                    })
+                })
+                .collect();
+            // The same codes as a decoded picture.
+            let as_video = Picture {
+                luma: (0..picture.height)
+                    .flat_map(|y| (0..picture.width).map(move |x| code(x, y)[0]))
+                    .collect(),
+                chroma: (0..picture.height)
+                    .flat_map(|y| {
+                        (0..picture.width).map(move |x| {
+                            let [_, cb, cr] = code(x, y);
+                            [cb, cr]
+                        })
+                    })
+                    .collect(),
+                ..picture.clone()
+            };
+            let Some(plain) = render_rgb10(&picture, contract, None) else {
+                return;
+            };
+            let video_of_codes = render_rgb10(&as_video, contract, None).expect("device");
+            let refined = render_rgb10_through(
+                &picture,
+                contract,
+                Some(&overlay),
+                "fs_convert_refined_ycbcr",
+            )
+            .expect("device");
+            for (index, cell) in overlay.iter().enumerate() {
+                let expected = if cell[3] != 0 {
+                    video_of_codes[index]
+                } else {
+                    plain[index]
+                };
+                assert_eq!(refined[index], expected, "pixel {index} ({contract:?})");
+            }
+            assert_ne!(
+                refined, plain,
+                "the overlay must change the picture for this test to mean anything"
+            );
+        }
+    }
+
+    fn refined_codes_are_exact_for(contract: VideoColorContract) {
         let picture = fringed_text(ChromaSubsampling::Yuv444, BitDepth::Ten);
-        let contract = contract(ChromaSubsampling::Yuv444, BitDepth::Ten, ColorRange::Full);
         let overlay: Vec<[u16; 4]> = (0..picture.height)
             .flat_map(|y| {
                 (0..picture.width).map(move |x| {

@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "crate": "arcen-deck-core",
+  "owner": "Shared/Architecture",
+  "description": "The portable Deck: platform seams (DeckServices, VideoDecoderBackend, VideoPresenterSink), settings and, behind features, the session runtime and shared screens.",
+  "validation": [
+    "shared-deck-core-test",
+    "shared-deck-core-clippy",
+    "shared-deck-core-all-test",
+    "shared-deck-core-all-clippy",
+    "shared-deck-core-windows-typecheck",
+    "shared-deck-core-tree-purity",
+    "workspace-boundaries"
+  ],
+  "consumers": [
+    {
+      "package": "arcen-deck-macos",
+      "dependency_kind": "normal",
+      "contracts": [
+        "about",
+        "client_telemetry",
+        "clipboard",
+        "config",
+        "connect_plan",
+        "connection_draft",
+        "decode",
+        "decode_report",
+        "directories",
+        "display",
+        "display_fit",
+        "input",
+        "keymap",
+        "logging",
+        "microphone",
+        "multi_window",
+        "network",
+        "paste_keys",
+        "present",
+        "reconnect",
+        "reconnect_flow",
+        "runtime",
+        "screens",
+        "services",
+        "session_truth",
+        "settings",
+        "support_bundle",
+        "trusted_pins"
+      ],
+      "features": [
+        "egui",
+        "runtime"
+      ],
+      "forwarded_features": {
+        "dev-tools": [
+          "dev-tools"
+        ],
+        "experimental-raw-hid": [
+          "experimental-raw-hid"
+        ],
+        "native-tablet": [
+          "native-tablet"
+        ]
+      },
+      "paths": [
+        {
+          "id": "macos-deck-session",
+          "entry_points": [
+            "clients/macos/src/reconnect.rs",
+            "clients/macos/src/ui/trusted_pins.rs"
+          ],
+          "build_profiles": [
+            "macos-deck-apple-silicon",
+            "macos-deck-intel"
+          ],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-windows-typecheck",
+            "macos-deck-session-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-clipboard",
+          "entry_points": [
+            "clients/macos/src/clipboard.rs",
+            "clients/macos/src/platform_services.rs"
+          ],
+          "build_profiles": [
+            "macos-deck-apple-silicon",
+            "macos-deck-intel"
+          ],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-av-input-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-input",
+          "entry_points": [
+            "clients/macos/src/ui/paste_keys.rs",
+            "clients/macos/src/protocol/keymap.rs"
+          ],
+          "build_profiles": [
+            "macos-deck-apple-silicon",
+            "macos-deck-intel"
+          ],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-av-input-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-statistics",
+          "entry_points": [
+            "clients/macos/src/ui/session_truth.rs",
+            "clients/macos/src/ui/display_fit.rs"
+          ],
+          "build_profiles": [
+            "macos-deck-apple-silicon",
+            "macos-deck-intel"
+          ],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-apple-silicon-sdr-lab",
+            "macos-deck-apple-silicon-10bit-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-settings",
+          "entry_points": [
+            "clients/macos/src/ui/app.rs",
+            "clients/macos/src/ui/connection_test.rs",
+            "clients/macos/src/ui/home.rs",
+            "clients/macos/src/ui/theme.rs",
+            "clients/macos/src/support.rs"
+          ],
+          "build_profiles": [
+            "macos-deck-apple-silicon",
+            "macos-deck-intel"
+          ],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-session-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-transport",
+          "entry_points": [
+            "clients/macos/src/logging/mod.rs",
+            "clients/macos/src/pipeline/audio.rs",
+            "clients/macos/src/pipeline/frame_queue.rs",
+            "clients/macos/src/pipeline/monitor_router.rs",
+            "clients/macos/src/platform_services.rs",
+            "clients/macos/src/transport/tls.rs",
+            "clients/macos/src/ui/audio_worker.rs",
+            "clients/macos/src/ui/media_worker.rs"
+          ],
+          "build_profiles": [
+            "macos-deck-apple-silicon",
+            "macos-deck-intel"
+          ],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-windows-typecheck",
+            "macos-deck-session-lab",
+            "macos-deck-av-input-lab",
+            "macos-deck-apple-silicon-sdr-lab",
+            "macos-deck-apple-silicon-10bit-lab"
+          ],
+          "owner": "macOS Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-deck-windows",
+      "dependency_kind": "normal",
+      "contracts": [
+        "clipboard",
+        "config",
+        "connect_plan",
+        "connection_draft",
+        "decode",
+        "decode_report",
+        "directories",
+        "display",
+        "display_fit",
+        "input",
+        "log_target",
+        "logging",
+        "microphone",
+        "multi_window",
+        "network",
+        "present",
+        "reconnect",
+        "reconnect_flow",
+        "runtime",
+        "screens",
+        "services",
+        "settings",
+        "support_bundle"
+      ],
+      "features": [
+        "egui",
+        "runtime"
+      ],
+      "production_uses": [
+        {
+          "id": "fullscreen-bar-on-demand",
+          "symbol": "render_connection_bar",
+          "reason": "Fullscreen draws nothing over the video; the shared bar opens only at the top edge or with Ctrl+Alt+Home."
+        },
+        {
+          "id": "fullscreen-bar-pointer-routing",
+          "symbol": "route_pointer",
+          "reason": "The session window lets the Deck's UI see the pointer at the top-edge strip and on the open bar through the shared routing rule."
+        }
+      ],
+      "paths": [
+        {
+          "id": "windows-deck-platform",
+          "entry_points": [
+            "clients/windows/src/platform/mod.rs",
+            "clients/windows/src/audio/mod.rs",
+            "clients/windows/src/clipboard/mod.rs",
+            "clients/windows/src/display/mod.rs",
+            "clients/windows/src/logging/mod.rs",
+            "clients/windows/src/platform/support.rs"
+          ],
+          "build_profiles": [
+            "windows-deck"
+          ],
+          "validation": [
+            "windows-deck-typecheck",
+            "windows-deck-test",
+            "windows-deck-session-lab"
+          ],
+          "owner": "Windows Client"
+        },
+        {
+          "id": "windows-deck-session",
+          "entry_points": [
+            "clients/windows/src/lib.rs",
+            "clients/windows/src/media.rs",
+            "clients/windows/src/show.rs"
+          ],
+          "build_profiles": [
+            "windows-deck"
+          ],
+          "validation": [
+            "windows-deck-typecheck",
+            "windows-deck-test",
+            "windows-deck-session-lab"
+          ],
+          "owner": "Windows Client"
+        },
+        {
+          "id": "windows-deck-shell",
+          "entry_points": [
+            "clients/windows/src/shell/mod.rs",
+            "clients/windows/src/shell/launcher.rs",
+            "clients/windows/src/shell/displays.rs",
+            "clients/windows/src/shell/secondary.rs"
+          ],
+          "build_profiles": [
+            "windows-deck"
+          ],
+          "validation": [
+            "windows-deck-typecheck",
+            "windows-deck-test",
+            "windows-deck-session-lab"
+          ],
+          "owner": "Windows Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-usb-client",
+      "dependency_kind": "normal",
+      "contracts": [
+        "about",
+        "log_target",
+        "runtime",
+        "services"
+      ],
+      "features": [
+        "native-tablet"
+      ],
+      "paths": [
+        {
+          "id": "windows-usb-client",
+          "entry_points": [
+            "clients/windows/usb/client/src/lib.rs",
+            "clients/windows/usb/client/src/win/pipe.rs",
+            "clients/windows/usb/client/src/win/mod.rs"
+          ],
+          "build_profiles": [
+            "windows-usb-client"
+          ],
+          "validation": [
+            "windows-usb-client-typecheck",
+            "windows-usb-client-test",
+            "windows-usb-component-lab"
+          ],
+          "owner": "Windows Client"
+        }
+      ]
+    }
+  ]
+}

@@ -10,7 +10,10 @@ pub const MAX_MONITORS_U32: u32 = 4;
 pub const MAX_MODES_PER_MONITOR: usize = 8;
 pub const MAX_MODES_PER_MONITOR_U32: u32 = 8;
 pub const EDID_BYTES: usize = 128;
-pub const EDID_MANUFACTURER_ID: u16 = (1 << 10) | (18 << 5) | 3;
+/// `ARN`, the manufacturer of every Arcen display (`arcen_outputs::edid`).
+pub const EDID_MANUFACTURER_ID: u16 = arcen_outputs::edid::EDID_MANUFACTURER_ID;
+/// The monitor name the Pier recognises an Arcen `IddCx` display by.
+pub const MONITOR_NAME: &str = "Arcen IDD";
 pub const PRODUCT_CODE_BASE: u16 = 0xa100;
 pub const MIN_WIDTH: u32 = 320;
 pub const MAX_WIDTH: u32 = 4_095;

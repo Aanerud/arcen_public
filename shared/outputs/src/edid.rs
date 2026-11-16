@@ -80,13 +80,26 @@ impl DetailedTiming {
 /// that this code is unassigned before general availability.
 const MANUFACTURER_ID: [u8; 3] = *b"ARN";
 
+/// The packed manufacturer ID (bytes 8..10, big-endian) of every display
+/// Arcen synthesizes.
+pub const EDID_MANUFACTURER_ID: u16 = manufacturer_id(MANUFACTURER_ID);
+
+/// The monitor name descriptor of an Arcen display.
+pub const MONITOR_NAME: &str = "Arcen";
+
 pub fn generate(request: EdidRequest) -> Result<[u8; EDID_LEN], String> {
+    generate_named(request, MONITOR_NAME)
+}
+
+/// [`generate`] with a provider's own monitor name (up to 12 characters are
+/// kept), for a provider that recognises its displays by name.
+pub fn generate_named(request: EdidRequest, monitor_name: &str) -> Result<[u8; EDID_LEN], String> {
     let timing = cvt_reduced_blanking(request.width, request.height, request.refresh_hz)?;
     let (width_mm, height_mm) = physical_size_mm(request);
     let mut edid = [0u8; EDID_LEN];
 
     edid[..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
-    edid[8..10].copy_from_slice(&manufacturer_id(MANUFACTURER_ID).to_be_bytes());
+    edid[8..10].copy_from_slice(&EDID_MANUFACTURER_ID.to_be_bytes());
     edid[10..12].copy_from_slice(&request.product_id.to_le_bytes());
     edid[12..16].copy_from_slice(&request.serial.to_le_bytes());
     edid[16] = 1;
@@ -118,7 +131,7 @@ pub fn generate(request: EdidRequest) -> Result<[u8; EDID_LEN], String> {
         width_mm,
         height_mm,
     )?;
-    encode_text_descriptor(&mut edid[72..90], 0xfc, "Arcen");
+    encode_text_descriptor(&mut edid[72..90], 0xfc, monitor_name);
     encode_range_descriptor(&mut edid[90..108], timing);
     encode_text_descriptor(
         &mut edid[108..126],
@@ -256,8 +269,10 @@ fn cvt_vertical_sync(width: u32, height: u32) -> u32 {
     .map_or(10, |(_, sync)| sync)
 }
 
-fn manufacturer_id(code: [u8; 3]) -> u16 {
-    let letter = |byte: u8| u16::from(byte.to_ascii_uppercase().saturating_sub(b'@') & 0x1f);
+const fn manufacturer_id(code: [u8; 3]) -> u16 {
+    const fn letter(byte: u8) -> u16 {
+        (byte.to_ascii_uppercase().saturating_sub(b'@') & 0x1f) as u16
+    }
     (letter(code[0]) << 10) | (letter(code[1]) << 5) | letter(code[2])
 }
 

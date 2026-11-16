@@ -1,12 +1,256 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Shared capacity-one Pier admission and bounded reconnect hold.
+//! Shared Pier admission: the pre-sign-in limits and deadlines every Pier
+//! applies, capacity-one session admission and the bounded reconnect hold.
 
+use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Maximum reconnect hold retained by one local session admission.
 pub const MAX_RECONNECT_HOLD_SECONDS: u64 = 2 * 60 * 60;
+
+/// Connections a Pier holds at once before they have signed in.
+///
+/// Each costs a socket, a TLS or QUIC handshake and a bounded inbound message
+/// buffer; a connection past this is refused before any of that is spent.
+pub const PREAUTH_CAPACITY: usize = 16;
+
+/// How long a Deck has to answer the sign-in prompt (`auth_request`).
+///
+/// A Deck shows its sign-in sheet only when the prompt arrives, so this is a
+/// person's time to type a user name and password, or fetch them from a
+/// password manager. Sixty seconds is what the macOS Pier was qualified with
+/// against real Decks (Linux and Windows allowed thirty), and it is the same
+/// for every Pier because typing a password does not depend on the host's
+/// operating system. The cost is that an idle connection holds one of
+/// [`PREAUTH_CAPACITY`] places for up to this long.
+pub const AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// [`AUTH_RESPONSE_TIMEOUT`] when the Pier shows an operator disclaimer that
+/// must be read and accepted before signing in.
+pub const INTERACTIVE_AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Connections one source may hold at once before they have signed in, so
+/// one machine cannot take every one of the [`PREAUTH_CAPACITY`] places.
+///
+/// Two, not one: a Deck that reconnects while its previous connection is
+/// still timing out needs a second place. A source is an address, and an
+/// IPv6 address counts as its /64 ([`source_network`]).
+pub const PREAUTH_PER_SOURCE: usize = 2;
+
+/// How long a Deck has to send each message of the handshake that is not a
+/// person's answer: the `client_hello` and the quality settings. The Deck
+/// sends them at once, so this bounds a peer that connects and says nothing.
+pub const HANDSHAKE_MESSAGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The whole application handshake, for a Pier that bounds it as one wait:
+/// the sign-in prompt plus a [`HANDSHAKE_MESSAGE_TIMEOUT`] for the messages
+/// on either side of it.
+pub const APPLICATION_HANDSHAKE_TIMEOUT: Duration = AUTH_RESPONSE_TIMEOUT
+    .saturating_add(HANDSHAKE_MESSAGE_TIMEOUT)
+    .saturating_add(HANDSHAKE_MESSAGE_TIMEOUT);
+
+/// How long a Pier waits for the operating system to check a password.
+///
+/// The check may consult a directory server on every Pier (PAM through
+/// `sssd` or `pam_krb5`, `LogonUserW`, Open Directory), and a directory that
+/// does not answer is the slow case on each: Windows' Kerberos client waits
+/// `KdcWaitTime` (10 s) for each of `KdcSendRetries` (3) attempts before it
+/// falls back to cached credentials, while `sssd` gives up on a KDC after
+/// `krb5_auth_timeout` (6 s) and goes offline. One bound covers both; a
+/// check that outlives it is answered as a failure without being counted
+/// against the person asking.
+pub const CREDENTIAL_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The network a connection comes from, as admission and the sign-in
+/// throttle count it: an IPv4-mapped IPv6 address is its IPv4 address, and
+/// any other IPv6 address is its /64, because one host is normally given a
+/// whole /64 and could otherwise take a fresh place with every address.
+#[must_use]
+pub fn source_network(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let mut segments = v6.segments();
+            segments[4..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(segments))
+        }
+        address => address.to_canonical(),
+    }
+}
+
+/// Why a connection was refused a pre-sign-in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreauthRefusal {
+    /// Every place is held.
+    Full,
+    /// This source already holds its [`PREAUTH_PER_SOURCE`] places.
+    SourceBusy,
+    /// The connection must prove its address first (a QUIC Retry), see
+    /// [`PreauthAdmission::try_enter_unproved`].
+    AddressUnproved,
+}
+
+impl PreauthRefusal {
+    /// Stable code for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "preauth_full",
+            Self::SourceBusy => "preauth_source_busy",
+            Self::AddressUnproved => "preauth_address_unproved",
+        }
+    }
+}
+
+impl Display for PreauthRefusal {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Full => "pre-authentication capacity exhausted",
+            Self::SourceBusy => "too many connections from this address are signing in",
+            Self::AddressUnproved => "the connection has not proved its address",
+        })
+    }
+}
+
+impl std::error::Error for PreauthRefusal {}
+
+/// The places connections hold between arriving and signing in: at most
+/// `capacity` in all and `per_source` from one [`source_network`].
+#[derive(Debug)]
+pub struct PreauthAdmission {
+    capacity: usize,
+    per_source: usize,
+    held: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl Default for PreauthAdmission {
+    /// [`PREAUTH_CAPACITY`] places, [`PREAUTH_PER_SOURCE`] per source.
+    fn default() -> Self {
+        Self::new(PREAUTH_CAPACITY, PREAUTH_PER_SOURCE)
+    }
+}
+
+impl PreauthAdmission {
+    /// Places for `capacity` connections, `per_source` from one source.
+    #[must_use]
+    pub fn new(capacity: usize, per_source: usize) -> Self {
+        Self {
+            capacity,
+            per_source,
+            held: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Takes a place for a connection from `peer`, held until the returned
+    /// place is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreauthRefusal::Full`] when every place is held and
+    /// [`PreauthRefusal::SourceBusy`] when `peer`'s source holds its share.
+    pub fn try_enter(self: &Arc<Self>, peer: IpAddr) -> Result<PreauthPlace, PreauthRefusal> {
+        self.enter(peer, true)
+    }
+
+    /// [`Self::try_enter`] for a connection whose source address may be
+    /// forged: a QUIC Initial that `address_validated` says carries no Retry
+    /// token.
+    ///
+    /// Such a connection must prove its address first when its source
+    /// already holds a place or half the places are held. Without this, a
+    /// forger could hold another machine's places, or every place, with
+    /// handshakes it never completes. With it, a forged source holds at most
+    /// one place and forged sources at most half; a real Deck answers the
+    /// Retry and takes the place left for it. A Deck's first connection to an
+    /// idle Pier costs no extra round trip. The check and the place are taken
+    /// under one lock, so a burst of connections cannot all pass the check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PreauthRefusal::AddressUnproved`] when the caller must send a
+    /// stateless Retry instead, otherwise as [`Self::try_enter`].
+    pub fn try_enter_unproved(
+        self: &Arc<Self>,
+        peer: IpAddr,
+        address_validated: bool,
+    ) -> Result<PreauthPlace, PreauthRefusal> {
+        self.enter(peer, address_validated)
+    }
+
+    fn enter(
+        self: &Arc<Self>,
+        peer: IpAddr,
+        address_validated: bool,
+    ) -> Result<PreauthPlace, PreauthRefusal> {
+        let source = source_network(peer);
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total = held.values().sum::<usize>();
+        let from_source = held.get(&source).copied().unwrap_or(0);
+        if !address_validated && (from_source > 0 || total * 2 >= self.capacity) {
+            return Err(PreauthRefusal::AddressUnproved);
+        }
+        if total >= self.capacity {
+            return Err(PreauthRefusal::Full);
+        }
+        if from_source >= self.per_source {
+            return Err(PreauthRefusal::SourceBusy);
+        }
+        *held.entry(source).or_insert(0) += 1;
+        Ok(PreauthPlace {
+            admission: Arc::clone(self),
+            source,
+        })
+    }
+
+    /// Places held now.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .sum()
+    }
+
+    fn release(&self, source: IpAddr) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = held.get_mut(&source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                held.remove(&source);
+            }
+        }
+    }
+}
+
+/// One connection's pre-sign-in place, given back when dropped.
+pub struct PreauthPlace {
+    admission: Arc<PreauthAdmission>,
+    source: IpAddr,
+}
+
+impl Debug for PreauthPlace {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreauthPlace")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PreauthPlace {
+    fn drop(&mut self) {
+        self.admission.release(self.source);
+    }
+}
 
 /// Validated reconnect-hold policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +518,128 @@ impl DetachedTakeoverRefusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn address(text: &str) -> IpAddr {
+        text.parse().expect("address")
+    }
+
+    #[test]
+    fn a_third_connection_from_one_source_is_refused_and_others_still_enter() {
+        let admission = Arc::new(PreauthAdmission::default());
+        let first = admission.try_enter(address("203.0.113.7")).expect("first");
+        let _second = admission.try_enter(address("203.0.113.7")).expect("second");
+        assert_eq!(
+            admission.try_enter(address("203.0.113.7")).err(),
+            Some(PreauthRefusal::SourceBusy)
+        );
+        let _other = admission
+            .try_enter(address("203.0.113.8"))
+            .expect("another source");
+        drop(first);
+        let _again = admission
+            .try_enter(address("203.0.113.7"))
+            .expect("place given back");
+        assert_eq!(admission.held(), 3);
+    }
+
+    #[test]
+    fn an_ipv6_64_is_one_source_and_a_mapped_ipv4_is_its_ipv4() {
+        let admission = Arc::new(PreauthAdmission::default());
+        let _a = admission.try_enter(address("2001:db8:1:2::1")).expect("a");
+        let _b = admission
+            .try_enter(address("2001:db8:1:2:ffff:ffff:ffff:ffff"))
+            .expect("b");
+        assert_eq!(
+            admission.try_enter(address("2001:db8:1:2::99")).err(),
+            Some(PreauthRefusal::SourceBusy)
+        );
+        let _neighbour = admission
+            .try_enter(address("2001:db8:1:3::1"))
+            .expect("next /64");
+
+        let _v4 = admission.try_enter(address("198.51.100.4")).expect("v4");
+        let _mapped = admission
+            .try_enter(address("::ffff:198.51.100.4"))
+            .expect("mapped");
+        assert_eq!(
+            admission.try_enter(address("198.51.100.4")).err(),
+            Some(PreauthRefusal::SourceBusy)
+        );
+    }
+
+    #[test]
+    fn the_capacity_holds_across_sources() {
+        let admission = Arc::new(PreauthAdmission::default());
+        let held = (0..PREAUTH_CAPACITY)
+            .map(|index| {
+                admission
+                    .try_enter(IpAddr::from([
+                        198,
+                        51,
+                        100,
+                        u8::try_from(index).expect("index"),
+                    ]))
+                    .expect("place")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            admission.try_enter(address("203.0.113.200")).err(),
+            Some(PreauthRefusal::Full)
+        );
+        drop(held);
+        assert_eq!(admission.held(), 0);
+    }
+
+    #[test]
+    fn unproved_addresses_prove_themselves_once_a_source_or_half_the_pier_is_busy() {
+        let admission = Arc::new(PreauthAdmission::default());
+        let victim = address("203.0.113.7");
+        let forged = admission
+            .try_enter_unproved(victim, false)
+            .expect("an idle Pier costs no round trip");
+        for same_source in [victim, address("::ffff:203.0.113.7")] {
+            assert_eq!(
+                admission.try_enter_unproved(same_source, false).err(),
+                Some(PreauthRefusal::AddressUnproved)
+            );
+        }
+        let proved = admission
+            .try_enter_unproved(victim, true)
+            .expect("a Deck that answered the Retry takes its second place");
+        drop(proved);
+
+        let held = (2..=PREAUTH_CAPACITY / 2)
+            .map(|index| {
+                admission
+                    .try_enter_unproved(
+                        IpAddr::from([198, 51, 100, u8::try_from(index).expect("index")]),
+                        false,
+                    )
+                    .expect("place")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(admission.held(), PREAUTH_CAPACITY / 2);
+        assert_eq!(
+            admission
+                .try_enter_unproved(address("203.0.113.8"), false)
+                .err(),
+            Some(PreauthRefusal::AddressUnproved),
+            "forged sources hold at most half the places"
+        );
+        assert!(
+            admission
+                .try_enter_unproved(address("203.0.113.8"), true)
+                .is_ok()
+        );
+        drop((forged, held));
+        assert_eq!(admission.held(), 0);
+    }
+
+    #[test]
+    fn handshake_bounds_are_derived_from_one_another() {
+        assert_eq!(APPLICATION_HANDSHAKE_TIMEOUT, Duration::from_secs(90));
+        assert!(CREDENTIAL_CHECK_TIMEOUT < AUTH_RESPONSE_TIMEOUT);
+    }
 
     #[test]
     fn enforces_capacity_one_until_completion() {

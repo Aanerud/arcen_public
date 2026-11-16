@@ -123,6 +123,14 @@ pub struct AgentConfig {
     iddcx: crate::config::WindowsIddCxConfig,
     #[serde(default)]
     multi_monitor: crate::config::WindowsMultiMonitorConfig,
+    /// `video.lossless_refinement` (exact still image); absent = enabled,
+    /// as in `pier.json`.
+    #[serde(default = "default_lossless_refinement")]
+    lossless_refinement: bool,
+}
+
+const fn default_lossless_refinement() -> bool {
+    true
 }
 
 fn default_bit_depth() -> String {
@@ -174,10 +182,11 @@ impl AgentConfig {
             variant_pinned: config.variant_pinned,
             auth_video_request: config.auth_video_request.clone(),
             fps: config.fps,
-            encoder: Some(config.encoder.name().to_string()),
+            encoder: Some(config.encoder.as_arg().to_string()),
             audio_enabled: config.audio_enabled,
             audio_compressed: config.audio_compressed,
             microphone_input_enabled: config.microphone_input_enabled,
+            lossless_refinement: config.lossless_refinement,
             clipboard_policy: config.clipboard_policy,
             timezone_redirection: config.timezone_redirection,
             font_smoothing: config.font_smoothing,
@@ -235,14 +244,14 @@ impl AgentConfig {
         let qp_map = arcen_media::video::QpMapPolicy::from_token(&self.qp_map)
             .ok_or_else(|| format!("agent start has unsupported qp-map policy {}", self.qp_map))?;
         let encoder = match self.encoder.as_deref() {
-            None | Some("") | Some("auto") => crate::capenc::EncoderSelection::Auto,
-            Some("nvenc") => crate::capenc::EncoderSelection::Nvenc,
+            None | Some("") | Some("auto") => arcen_media::video::EncoderRequest::Auto,
+            Some("nvenc") => arcen_media::video::EncoderRequest::NativeNvenc,
             Some("software-h264") | Some("openh264") => {
-                crate::capenc::EncoderSelection::SoftwareH264
+                arcen_media::video::EncoderRequest::SoftwareH264
             }
             Some(other) => return Err(format!("agent start has unsupported encoder {other}")),
         };
-        if encoder == crate::capenc::EncoderSelection::SoftwareH264
+        if encoder == arcen_media::video::EncoderRequest::SoftwareH264
             && (codec != VideoCodec::H264 || chroma != ChromaSubsampling::Yuv420)
             && (self.codec_pinned || self.variant_pinned)
         {
@@ -298,6 +307,8 @@ impl AgentConfig {
             deskside: self.deskside,
             iddcx: self.iddcx,
             multi_monitor: self.multi_monitor,
+            lossless_refinement: self.lossless_refinement,
+            deck_refine: None,
         };
         config.apply_software_h264_backend(encoder)?;
         Ok(config)
@@ -2538,6 +2549,7 @@ mod tests {
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
+            lossless_refinement: true,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
@@ -3614,6 +3626,7 @@ mod tests {
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
+            lossless_refinement: true,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
@@ -3650,6 +3663,7 @@ mod tests {
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
+            lossless_refinement: true,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
@@ -3686,6 +3700,7 @@ mod tests {
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
+            lossless_refinement: true,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
@@ -3697,7 +3712,7 @@ mod tests {
         };
         assert_eq!(
             software.into_host().unwrap().encoder,
-            crate::capenc::EncoderSelection::SoftwareH264
+            arcen_media::video::EncoderRequest::SoftwareH264
         );
     }
 }

@@ -12,7 +12,7 @@ A finished release leaves exactly this, for the current version only:
 | `dist/README.md` | This file (the only tracked file) |
 | `dist/SHA256SUMS.txt` | A copy of the current release's checksums |
 | `dist/linux/` | `install-arcen-pier-<version>-linux-x86_64`, copied back from the Linux build host |
-| `dist/windows/` | `install-arcen-pier-<version>-windows-x64.exe`, copied back from the Windows build host |
+| `dist/windows/` | `install-arcen-pier-<version>-windows-x64.exe`, and the Windows Deck's `Arcen-Deck-<version>-windows-x64.msi` and `Arcen-USB-Component-<version>-windows-x64.msi` with their `build-manifest.json` as `windows-deck-build-manifest.json`, copied back from the Windows build host |
 | `dist/macos/` | `ArcenPier-<version>.pkg`, `Arcen-Deck-<version>-macOS.zip`, `Arcen-Deck-Intel-<version>-macOS.zip`, and `Arcen Deck.app` (Apple silicon) unzipped from the release zip for hand testing |
 | `dist/releases/<version>/` | Exactly the files attached to that GitHub release, flat, plus `SHA256SUMS.txt` and the `rustc -Vv` of each build machine (`rustc-macos.txt`, `rustc-linux.txt`, `rustc-windows.txt`) |
 
@@ -29,7 +29,8 @@ belongs here: signing profiles and keys live outside the repository (see
 There is one Pier installer per host OS (a single-file installer for Linux and
 Windows, an installer package for macOS) and one Deck archive per Mac
 architecture: `Arcen Deck.app` for Apple silicon and `Arcen Deck Intel.app` for
-Intel, built from the same source. Auto, Speed,
+Intel, built from the same source; and one Windows Deck MSI for Windows 11
+x64, with the optional USB component (Native tablet) as a second MSI. Auto, Speed,
 Grading, and HDR support are built into those same artifacts; there is no HDR
 add-on or separate fidelity package. The Linux Pier binary contains both the
 NvFBC eight-bit and XShm ten-bit paths. The Windows Pier binary contains the
@@ -48,6 +49,7 @@ Build them with:
 | `install-arcen-pier-<version>-windows-x64.exe` | On a Windows host: `hosts\windows\build.cmd`, which enters the MSVC environment itself and produces `target\arcen-windows-x64\install-arcen-pier.exe`; copy it to `dist/windows/` |
 | `ArcenPier-<version>.pkg` | On macOS: `packaging/macos/build-pier-pkg.sh --identity "Developer ID Application: …" --installer-identity "Developer ID Installer: …" --with-virtual-hid --provisioning-profile <file> --notary-profile <profile>`, which signs the app and package, notarises, staples and writes `dist/macos/ArcenPier-<version>.pkg`. The macOS Pier is a preview, not yet a supported host release (see [Features and status](../docs/features.md#what-works-today)). |
 | `Arcen-Deck-<version>-macOS.zip` | On the Apple-silicon release Mac: `packaging/macos/build-deck-app.sh --arch arm64 --release`, which signs, notarises, staples and writes `dist/macos/Arcen-Deck-<version>-macOS.zip` (`Arcen Deck.app`) |
+| `Arcen-Deck-<version>-windows-x64.msi`, `Arcen-USB-Component-<version>-windows-x64.msi` | On a Windows x64 host: `packaging\windows-deck\build.ps1 -OutputDirectory … -CargoTargetDirectory … -ToolsDirectory … -BuildId <id> -SourceRevision <full commit> -SourceTreeState clean` (see `packaging/windows-deck/README.md`), which writes `Arcen Deck.msi`, `Arcen USB Component.msi`, `SHA256SUMS.txt` and `build-manifest.json`; it must say `release_candidate: true`. Copy them to `dist/windows/` under the versioned names (GitHub turns spaces in asset names into dots) |
 | `Arcen-Deck-Intel-<version>-macOS.zip` | On the same Mac: `packaging/macos/build-deck-app.sh --arch x86_64 --release`, which cross-compiles for `x86_64-apple-darwin` (`rustup target add x86_64-apple-darwin` once), signs, notarises, staples and writes `dist/macos/Arcen-Deck-Intel-<version>-macOS.zip` (`Arcen Deck Intel.app`) |
 
 All of them must be built from the same source identity and build ID, with the
@@ -62,7 +64,7 @@ releases.
 Regenerate after every rebuild, inside the release directory:
 
 ```sh
-cd dist/releases/<version> && shasum -a 256 install-arcen-pier-* ArcenPier-*.pkg Arcen-Deck-*.zip > SHA256SUMS.txt
+cd dist/releases/<version> && shasum -a 256 install-arcen-pier-* ArcenPier-*.pkg Arcen-Deck-*.zip Arcen-Deck-*.msi Arcen-USB-Component-*.msi > SHA256SUMS.txt
 ```
 
 Publish `SHA256SUMS.txt` alongside the binaries so a downloader can verify what
@@ -70,8 +72,8 @@ they got.
 
 ## Signing
 
-The Linux and Windows installers are **not signed**. Windows SmartScreen will
-warn; that is expected for an unsigned binary from a project with no
+The Linux and Windows installers and the Windows Deck MSIs are **not
+signed**. Windows SmartScreen will warn; that is expected for an unsigned binary from a project with no
 code-signing certificate, and the checksum is how you verify it instead.
 
 The macOS Deck **must** be signed with a Developer ID identity, notarised and

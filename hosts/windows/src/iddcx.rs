@@ -12,10 +12,10 @@ use arcen_iddcx_provider::abi::{Capabilities, PRODUCT_CODE_BASE};
 use arcen_iddcx_provider::{resolve_render_adapter, AdapterCandidate, CapabilityGate};
 
 use crate::config::WindowsIddCxConfig;
-use crate::multi_monitor_topology::{
+use crate::nvapi::AdapterLuid;
+use arcen_outputs::windows_topology::{
     AvailableOutput, OutputModeCapability, PhysicalOutputInventory,
 };
-use crate::nvapi::AdapterLuid;
 
 pub(crate) const CONTROL_PATH: &str = r"\\.\Global\ArcenIddCx";
 
@@ -294,7 +294,7 @@ fn validate_operation_response(
 }
 
 pub(crate) fn topology_request(
-    plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+    plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
 ) -> Result<arcen_iddcx_provider::abi::ApplyRequest, String> {
     let first = plan
         .monitors
@@ -362,8 +362,8 @@ pub(crate) fn active_inventory(
 #[cfg(windows)]
 pub(crate) fn rebind_applied_plan(
     config: &WindowsIddCxConfig,
-    plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
-) -> Result<crate::multi_monitor_topology::WindowsTopologyPlan, String> {
+    plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
+) -> Result<arcen_outputs::windows_topology::WindowsTopologyPlan, String> {
     let outputs = active_outputs(config)?;
     if outputs.len() != plan.monitors.len() {
         return Err(format!(
@@ -411,7 +411,7 @@ pub(crate) fn rebind_applied_plan(
 
 #[cfg(windows)]
 fn active_outputs(config: &WindowsIddCxConfig) -> Result<Vec<(u32, AvailableOutput)>, String> {
-    use crate::multi_monitor_topology::{OutputMode, OutputModeCapability};
+    use arcen_outputs::windows_topology::{OutputMode, OutputModeCapability};
 
     let _selected = resolve_configured_render_adapter(config)?;
     let report = crate::gpu_probe::probe()?;
@@ -429,10 +429,10 @@ fn active_outputs(config: &WindowsIddCxConfig) -> Result<Vec<(u32, AvailableOutp
                 let connector = product.checked_sub(PRODUCT_CODE_BASE)?;
                 if connector >= arcen_iddcx_provider::abi::MAX_MONITORS as u16
                     || !manufacturer_matches(output.edid_manufacture_id?)
-                    || !output
-                        .monitor_friendly_name
-                        .as_deref()
-                        .is_some_and(|name| name.trim().eq_ignore_ascii_case("Arcen IDD"))
+                    || !output.monitor_friendly_name.as_deref().is_some_and(|name| {
+                        name.trim()
+                            .eq_ignore_ascii_case(arcen_iddcx_provider::abi::MONITOR_NAME)
+                    })
                 {
                     return None;
                 }
@@ -576,13 +576,13 @@ mod tests {
 
     #[test]
     fn topology_request_preserves_affinity_geometry_and_rotation() {
-        let plan = crate::multi_monitor_topology::WindowsTopologyPlan {
+        let plan = arcen_outputs::windows_topology::WindowsTopologyPlan {
             generation: TopologyGeneration::new(9).expect("generation"),
             desktop_x: 0,
             desktop_y: 0,
             desktop_width: 1_920,
             desktop_height: 1_080,
-            monitors: vec![crate::multi_monitor_topology::WindowsMonitorPlan {
+            monitors: vec![arcen_outputs::windows_topology::WindowsMonitorPlan {
                 session_monitor_id: SessionMonitorId::new(1).expect("monitor"),
                 client_display_id: "main".to_string(),
                 adapter_luid: AdapterLuid {

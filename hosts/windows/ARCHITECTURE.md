@@ -134,8 +134,10 @@ The common Windows/Linux schema and Windows platform section are documented in
 - `main.rs` — entry (broker vs agent role).
 - `config.rs` — strict JSON schema, relative-path resolution, defaults + CLI override merge.
 - `service.rs` — SCM dispatcher, LocalSystem service status/control, graceful stop.
-- `tls.rs` — bounded opened-handle PEM loading and ACL enforcement, rustls
-  posture/certificate validation, atomic reload, and expiration state.
+- `tls.rs` — the Windows file checks (reparse-point-free ancestor walk,
+  local-disk paths, the key's protected DACL) behind the shared
+  `arcen_transport::host_material` loader, which does the bounded reading,
+  validation, atomic reload and expiration state.
 - `log_maintenance.rs` — bounded recognized-file enumeration and host actions
   over the pure `arcen-telemetry` maintenance plan.
 - `logon_activation.rs` — active-console lookup + System32-only `SendSAS`.
@@ -167,14 +169,18 @@ The common Windows/Linux schema and Windows platform section are documented in
   (exact mode + topology isolation for NVENC, negotiated ladder for MF/VMware), full-snapshot
   restore, EDID generation/purge, display-recovery journal + crash watchdog. All of it exists
   because the fallback host path mutates the *physical* display and must put it back.
-- `multi_monitor_topology.rs` — the pure physical multi-monitor planner: stable
-  `(adapter_luid, target_id)` output inventory/binding, exact CCD/NVAPI mode and
-  rotation matching, the bounding-desktop ceiling, and plan→region-set
-  construction. The rotation-aware footprint math, edge-aware mixed-scale
-  placement, origin policy, and region-set construction it uses live in the
-  shared `arcen_media::topology_placement` module. This host passes
-  `TransformConvention::NativeNeedsTransform` (outputs are driven at their
-  native pre-rotation mode and Windows applies the rotation) and
+- `arcen_outputs::windows_topology` (shared, no OS calls) — the pure physical
+  multi-monitor planner: stable `(adapter_luid, target_id)` output
+  inventory/binding, exact CCD/NVAPI mode and rotation matching, the
+  bounding-desktop ceiling, and plan→region-set construction; its versioned
+  full-topology recovery model is `arcen_outputs::windows_recovery`. This Pier
+  only enumerates outputs (`gpu_probe.rs`, `display.rs`) and applies plans
+  (CCD, NVAPI, IddCx). The rotation-aware footprint math, edge-aware mixed-scale
+  placement, origin policy, and region-set construction the planner uses live in the
+  shared `arcen_media::topology_placement` module. The planner passes
+  `TransformConvention::AlreadyCompositorOriented` (CCD source modes are already
+  in rotated desktop coordinates; the target keeps its native mode plus
+  `DISPLAYCONFIG_PATH_TARGET_INFO::rotation`) and
   `OriginPolicy::PreserveSigned` (the Windows virtual desktop is natively
   signed and the OS anchors the primary at `(0, 0)`, so a layout is never
   translated). Monitors that logically touch are placed flush against their
@@ -186,7 +192,10 @@ The common Windows/Linux schema and Windows platform section are documented in
   capability contracts, exact adapter-affinity resolution, inherited
   broker-to-agent control ownership, dynamic one-to-four monitor
   create/configure/depart, verified output rebinding, swapchain draining, and
-  explicit/final-handle rollback. Both the IddCx and multi-monitor config gates
+  explicit/final-handle rollback. Its monitors' EDIDs come from the shared
+  `arcen_outputs::edid` builder every Pier uses (manufacturer `ARN`, CVT
+  reduced blanking), named `Arcen IDD` so the Pier can tell them from NVAPI
+  headless displays. Both the IddCx and multi-monitor config gates
   default off, and a missing or under-capable driver withholds the pre-auth
   offer. The source compiles unsigned with WDK 10.0.26100, but no driver is
   packaged, signed, installed, or deployment-approved. See

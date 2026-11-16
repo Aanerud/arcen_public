@@ -25,6 +25,7 @@ pub mod polkit_remote;
 pub mod restore_lease;
 pub mod session_admission;
 pub mod session_locale;
+pub mod session_setup;
 pub mod setup_budget;
 pub mod wayland_outputs;
 pub mod wayland_qualification;

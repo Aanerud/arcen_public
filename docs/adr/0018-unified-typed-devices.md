@@ -161,7 +161,7 @@ newer Deck can announce a richer device to an older Pier.
 | Device decoded by | the Deck's OS and its driver | the host's driver |
 | On the wire | typed descriptor and state records | USB requests and HID reports |
 | Host sees | an Arcen virtual device | the physical device's own identity |
-| Windows host | yes, within user-mode APIs | not offered (ADR 0017) |
+| Windows host | yes, within user-mode APIs | pen only: the Pier reads the bridged pen and injects Windows Ink (ADR 0023 amendment); no virtual USB device (ADR 0017) |
 | Network | WAN-safe, coalescable | LAN only, latency-sensitive |
 | For | everything with a typed class | vendor protocols: driver pressure curves, vendor control panels |
 

@@ -30,7 +30,7 @@
 // The two non-passthrough `fs_main` branches mirror, field for field and
 // formula for formula, `arcen_media::video::convert::ColorTransform::to_bgr8`
 // -- the canonical CPU reference this shader must never numerically
-// disagree with. See `VideoUniform::from_contract` in `video_render.rs` for
+// disagree with. See `arcen_media::video::present::VideoUniform::from_contract` for
 // exactly how the uniform fields below are derived from a negotiated
 // chroma/range/depth/matrix contract.
 //
@@ -78,7 +78,7 @@ struct VideoUniform {
     chroma_height: f32,
 }
 
-// Keep in sync with `ShaderMode` in `video_render.rs`.
+// Keep in sync with `arcen_media::video::present::MODE_*`.
 const MODE_MATRIX: u32 = 0u;
 const MODE_IDENTITY_GBR: u32 = 1u;
 const MODE_PACKED_RGBA: u32 = 2u;
@@ -117,7 +117,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
 
 // The WGSL twin of `video_metal_layer.metal`'s `chroma_codes` (luma-guided
 // "chroma from luma" reconstruction); see that function for the siting, the
-// fit and why. `VideoUniform::chroma_reference_codes` in `video_render.rs`
+// fit and why. `arcen_media::video::present::VideoUniform::chroma_reference_codes`
 // is the CPU reference both are tested against -- change all three
 // together. Integer code planes cannot be filtered, so each chroma sample's
 // block-mean luma is gathered with explicit loads here.

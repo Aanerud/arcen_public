@@ -92,6 +92,7 @@ pub(crate) struct ProbeReport {
     pub schema_version: u32,
     pub display_id: u32,
     pub output_id: u32,
+    #[serde(with = "crate::nvapi::AdapterLuidSerde")]
     pub adapter_luid: AdapterLuid,
     pub width: u32,
     pub height: u32,
@@ -145,6 +146,7 @@ impl PreparedEdidProvision {
 pub(crate) struct HeadlessEdidRecovery {
     pub display_id: u32,
     pub output_id: u32,
+    #[serde(with = "crate::nvapi::AdapterLuidSerde")]
     pub adapter_luid: AdapterLuid,
     pub original_edid: Option<Vec<u8>>,
     pub intended_edid_sha256: String,

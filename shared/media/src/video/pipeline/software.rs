@@ -35,6 +35,7 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     keel: KEEL_IDLE_QP_OFF,
     queue: DEFAULT_QUEUE_POLICY,
     decode_latency: super::DecodeLatencyPolicy::DEFAULT,
+    present_timing: super::PresentTiming::Newest,
     keyframe: KeyframePolicy::SOFTWARE_FALLBACK,
     favours: "CPU-only VM compatibility with H.264 4:2:0 at up to 30 fps",
     gives_up: "60 fps Speed, Grading, HDR, host cursor composition, and GPU encoder efficiency",

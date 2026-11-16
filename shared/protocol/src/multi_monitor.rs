@@ -1586,6 +1586,20 @@ impl From<AuthMultiMonitorRequestMsg> for AuthMultiMonitorRequestWire {
 pub struct AdvertisedMultiMonitorOffer<'a>(&'a AuthMultiMonitorOfferMsg);
 
 impl<'a> AdvertisedMultiMonitorOffer<'a> {
+    /// Evidence for the offer a host attached to this connection's
+    /// `AuthRequest`, checked as a Deck would check it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation error when the offer is internally
+    /// inconsistent (monitor count, rotations or carriers).
+    pub fn from_offer(
+        offer: &'a AuthMultiMonitorOfferMsg,
+    ) -> Result<Self, MultiMonitorValidationError> {
+        offer.validate()?;
+        Ok(Self(offer))
+    }
+
     #[must_use]
     pub const fn max_monitors(self) -> u8 {
         self.0.max_monitors()
@@ -2001,10 +2015,8 @@ pub(crate) fn required_auth_request_multi_monitor_v1_offer(
         .multi_monitor_v1
         .as_ref()
         .ok_or(AuthRequestMultiMonitorOfferError::Missing)?;
-    offer
-        .validate()
-        .map_err(AuthRequestMultiMonitorOfferError::Invalid)?;
-    Ok(AdvertisedMultiMonitorOffer(offer))
+    AdvertisedMultiMonitorOffer::from_offer(offer)
+        .map_err(AuthRequestMultiMonitorOfferError::Invalid)
 }
 
 pub(crate) fn attach_auth_response_multi_monitor_v1(
@@ -2073,6 +2085,19 @@ mod tests {
 
     fn sample_client_display_id(value: &str) -> ClientDisplayId {
         ClientDisplayId::try_from(value).expect("client display id")
+    }
+
+    #[test]
+    fn offer_evidence_comes_from_the_offer_itself() {
+        let offer = AuthMultiMonitorOfferMsg::new(
+            2,
+            vec![RotationMsg::Degrees0],
+            vec![MultiMonitorCarrierMsg::MuxedReliableStream],
+        )
+        .expect("offer");
+        let advertised = AdvertisedMultiMonitorOffer::from_offer(&offer).expect("evidence");
+        assert_eq!(advertised.max_monitors(), 2);
+        assert_eq!(advertised.supported_rotations(), [RotationMsg::Degrees0]);
     }
 
     fn sample_legacy_server_monitors() -> Vec<Value> {

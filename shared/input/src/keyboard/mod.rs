@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Keyboard policy between a Mac client's keys and a host's keys.
+//! Keyboard policy between a client's keys (a Mac's or a PC's) and a host's keys.
 //!
 //! A Mac keyboard has Command, Control and two Option keys; a Windows or
 //! Linux desktop has Control, Alt, `AltGr` and the Windows (Super) key. Which
@@ -13,12 +13,32 @@
 //!   producing the host key edges and modifier masks to send;
 //! - [`scancode`] maps key identifiers to PC scan codes for a host that
 //!   injects physical keys (Windows).
+//!
+//! A PC keyboard (a Windows Deck's) has the same policy in its PC flavour:
+//!
+//! - [`pc`] names a PC keyboard's keys by position, the inverse of
+//!   [`scancode`] plus the keypad, locks and input method keys;
+//! - [`windows`] reads Windows key messages into those keys;
+//! - [`resolve_pc_keyboard_policy`] and [`PcKeyboardInput`] turn its key
+//!   edges into the same host key edges, so a shortcut lands on the host
+//!   alike from either Deck;
+//! - [`DeckShortcut`] lists the chords both Decks keep for themselves, and
+//!   [`grab_takes`] what a PC Deck's keyboard grab takes from its system.
 
+mod deck_shortcuts;
+pub mod pc;
+mod pc_input;
 pub mod scancode;
 mod shortcuts;
+pub mod windows;
 
 use arcen_protocol::messages::HostPlatform;
 
+pub use deck_shortcuts::{DeckShortcut, MacChord, PcChord, PcModifierState};
+pub use pc_input::{
+    AltGrKey, HookRoute, HookRouter, KeyboardGrab, MacHostCommandKey, PcKeyAction, PcKeyEvent,
+    PcKeyboardInput, PcKeyboardSettings, SystemChord, grab_takes, resolve_pc_keyboard_policy,
+};
 pub use shortcuts::{
     DeckKey, DeckModifiers, HostKeyEdge, ShortcutTranslator, WINDOWS_APP_CONTROL_KEYS,
 };

@@ -216,7 +216,7 @@ pub fn lab_admission(raw: Option<&str>, window_count: usize) -> Result<(), Virtu
 /// origin, in the same coordinate space winit/`egui` position windows in.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayBoundsPts {
-    pub cg_display_id: u32,
+    pub display_id: u32,
     pub origin_x: f32,
     pub origin_y: f32,
     pub width: f32,
@@ -972,7 +972,7 @@ pub fn expected_paint_plan(
             let viewport_id = if index == 0 {
                 egui::ViewportId::ROOT
             } else {
-                MonitorWindowAssignment::viewport_id_for(monitor_id)
+                viewport_id_for(monitor_id)
             };
             (viewport_id, monitor_id)
         })
@@ -1008,10 +1008,10 @@ pub fn build_lab_router(
 pub struct VirtualMonitorLabReport {
     pub window_count: usize,
     /// The single real display every tile was placed inside.
-    pub cg_display_id: u32,
+    pub display_id: u32,
     pub tiles: Vec<TilePlacement>,
     /// Virtual monitor ids whose decorated window was observed genuinely
-    /// windowed on `cg_display_id` (see [`evaluate_tile_bind`]).
+    /// windowed on `display_id` (see [`evaluate_tile_bind`]).
     pub bound_session_monitor_ids: Vec<u16>,
     pub unbound_session_monitor_ids: Vec<u16>,
     /// Every tile's own paint callback claimed exactly its assigned virtual
@@ -1071,7 +1071,7 @@ impl std::fmt::Display for VirtualMonitorLabReport {
             formatter,
             "windows={} display={} bound={:?} unbound={:?} isolation_verified={} traced_events={}",
             self.window_count,
-            self.cg_display_id,
+            self.display_id,
             self.bound_session_monitor_ids,
             self.unbound_session_monitor_ids,
             self.isolation_verified,
@@ -1180,9 +1180,9 @@ mod macos {
     /// only reads the origin (which that helper does not expose) directly.
     fn lab_display_bounds() -> Option<DisplayBoundsPts> {
         let info = live_active_displays().into_iter().next()?;
-        let bounds = core_graphics::display::CGDisplay::new(info.cg_display_id).bounds();
+        let bounds = core_graphics::display::CGDisplay::new(info.display_id).bounds();
         Some(DisplayBoundsPts {
-            cg_display_id: info.cg_display_id,
+            display_id: info.display_id,
             origin_x: bounds.origin.x as f32,
             origin_y: bounds.origin.y as f32,
             width: info.width_pts,
@@ -1298,7 +1298,7 @@ mod macos {
             }
             let report = VirtualMonitorLabReport {
                 window_count: self.monitor_ids.len(),
-                cg_display_id: self.expected_display_id,
+                display_id: self.expected_display_id,
                 tiles: self.tiles.clone(),
                 bound_session_monitor_ids: bound,
                 unbound_session_monitor_ids: unbound,
@@ -1310,7 +1310,7 @@ mod macos {
                 Err(poisoned) => *poisoned.into_inner() = Some(report),
             }
             for index in 1..self.monitor_ids.len() {
-                let viewport_id = MonitorWindowAssignment::viewport_id_for(self.monitor_ids[index]);
+                let viewport_id = viewport_id_for(self.monitor_ids[index]);
                 ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1330,7 +1330,7 @@ mod macos {
             for index in 1..self.monitor_ids.len() {
                 let monitor_id = self.monitor_ids[index];
                 let tile = self.tiles[index];
-                let viewport_id = MonitorWindowAssignment::viewport_id_for(monitor_id);
+                let viewport_id = viewport_id_for(monitor_id);
                 // Snapshot exactly the frame this monitor id currently routes
                 // to *before* opening the viewport and move it into the
                 // closure, so the closure's paint and its acknowledgement both
@@ -1446,7 +1446,7 @@ mod macos {
                     tiles,
                     router,
                     trace,
-                    expected_display_id: display.cg_display_id,
+                    expected_display_id: display.display_id,
                     started_at: Instant::now(),
                     timeout,
                     frame_index: 0,
@@ -1465,7 +1465,7 @@ mod macos {
         };
         Ok(outcome.unwrap_or(VirtualMonitorLabReport {
             window_count,
-            cg_display_id: display.cg_display_id,
+            display_id: display.display_id,
             tiles: fallback_tiles,
             bound_session_monitor_ids: Vec::new(),
             unbound_session_monitor_ids: (1..=u16::try_from(window_count).unwrap_or(u16::MAX))
@@ -1489,7 +1489,7 @@ mod tests {
     /// for both tilings.
     fn laptop_display() -> DisplayBoundsPts {
         DisplayBoundsPts {
-            cg_display_id: 7,
+            display_id: 7,
             origin_x: 0.0,
             origin_y: 0.0,
             width: 1_728.0,
@@ -1499,7 +1499,7 @@ mod tests {
 
     fn display_of(width: f32, height: f32) -> DisplayBoundsPts {
         DisplayBoundsPts {
-            cg_display_id: 7,
+            display_id: 7,
             origin_x: 0.0,
             origin_y: 0.0,
             width,
@@ -1718,7 +1718,7 @@ mod tests {
     fn tiling_honours_a_non_zero_display_origin() {
         let insets = TilingInsets::MACOS_DEFAULT;
         let display = DisplayBoundsPts {
-            cg_display_id: 9,
+            display_id: 9,
             origin_x: -1_920.0,
             origin_y: 240.0,
             width: 1_728.0,
@@ -1807,10 +1807,7 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>();
             assert_eq!(unique.len(), window_count);
             for (index, (viewport_id, monitor_id)) in plan.iter().enumerate().skip(1) {
-                assert_eq!(
-                    *viewport_id,
-                    MonitorWindowAssignment::viewport_id_for(monitor_ids[index])
-                );
+                assert_eq!(*viewport_id, viewport_id_for(monitor_ids[index]));
                 assert_eq!(*monitor_id, monitor_ids[index]);
             }
         }

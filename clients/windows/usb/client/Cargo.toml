@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
+[package]
+name = "arcen-usb-client"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.89"
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "The Windows Deck's side of the Arcen USB component: its state, its actions and the verified pipe client for Native tablet."
+
+# Runs inside the unprivileged Deck. The privileged half is arcen-usb-service.
+[dependencies]
+arcen-deck-core = { workspace = true, features = ["native-tablet"] }
+arcen-usb-bridge.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_Properties",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+arcen-input.workspace = true
+arcen-protocol.workspace = true
+serde_json.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry", "std"] }
+
+[features]
+default = []
+# Lab only: accept a pipe server that is not the installed service (the
+# service's `console --emulate` mode over SSH) and build the `forward_lab`
+# example. The Deck never enables it.
+lab = []
+
+[[example]]
+name = "forward_lab"
+required-features = ["lab"]
+
+[lints]
+workspace = true

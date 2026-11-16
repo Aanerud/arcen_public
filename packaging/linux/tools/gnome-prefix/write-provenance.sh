@@ -33,5 +33,8 @@ src=${2:?usage: write-provenance.sh <prefix> <src-dir>}
   echo "| 5358.patch | https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/5358 | $(sha256sum "$src/dl/5358.patch" | cut -d' ' -f1) | merged on main 2026-10-14 (after 51.1) |"
   echo "| 5224.patch | https://gitlab.gnome.org/GNOME/mutter/-/merge_requests/5224 | $(sha256sum "$src/dl/5224.patch" | cut -d' ' -f1) | open |"
   echo "| patch-headless-seat-51.py | Arcen lab: headless libinput only when ARCEN_LAB_HEADLESS_INPUT_SEAT names the udev seat | $(sha256sum "$src/patch-headless-seat-51.py" | cut -d' ' -f1) | not upstream |"
+  if [[ -f "$src/patch-pressure-curve-51.py" ]]; then
+    echo "| patch-pressure-curve-51.py | Arcen lab: tablet pressure is the pressure curve's value; curve lookup interpolates by the fraction (https://gitlab.gnome.org/GNOME/mutter/-/issues/5077) | $(sha256sum "$src/patch-pressure-curve-51.py" | cut -d' ' -f1) | issue open, no merge request |"
+  fi
 } > "$prefix/PROVENANCE.md"
 echo "wrote $prefix/PROVENANCE.md"

@@ -3,11 +3,13 @@
 
 [workspace]
 # The public workspace is scoped to the components that actually build and run:
-# the shared crates, the Linux and Windows Piers, and the macOS Deck.
+# the shared crates, the Linux and Windows Piers, the macOS Deck and the
+# Windows Deck (under construction, ADR 0024).
 # Internal tools are explicit members for CI but stay out of default/product
 # builds and every product package.
 members = [
     "tools/region-patch-benchmark",
+    "shared/deck-core",
     "shared/identity",
     "shared/input",
     "shared/media",
@@ -23,6 +25,10 @@ members = [
     "clients/macos/usb-helper",
     "clients/macos/secure-dir",
     "clients/macos/usb-iousbhost",
+    "clients/windows",
+    "clients/windows/usb/client",
+    "clients/windows/usb/prepare",
+    "clients/windows/usb/service",
     "hosts/linux",
     "hosts/capenc",
     "hosts/audiocap",
@@ -40,6 +46,7 @@ members = [
 # anywhere: the pure shared crates + the macOS Deck. Internal tools and host crates are
 # platform-gated and built on their target OS with an explicit `-p <crate>`.
 default-members = [
+    "shared/deck-core",
     "shared/identity",
     "shared/input",
     "shared/media",
@@ -56,7 +63,7 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -65,18 +72,19 @@ authors = ["TUTTIFRUTTI AS"]
 repository = "https://github.com/Aanerud/arcen_public"
 
 [workspace.dependencies]
-arcen-identity = { path = "shared/identity", version = "=0.19.0" }
-arcen-input = { path = "shared/input", version = "=0.19.0" }
-arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.19.0" }
-arcen-keel = { path = "shared/keel", version = "=0.19.0" }
-arcen-media = { path = "shared/media", version = "=0.19.0" }
-arcen-observability = { path = "shared/observability", version = "=0.19.0" }
-arcen-outputs = { path = "shared/outputs", version = "=0.19.0" }
-arcen-protocol = { path = "shared/protocol", version = "=0.19.0", default-features = false }
-arcen-session = { path = "shared/session", version = "=0.19.0" }
-arcen-telemetry = { path = "shared/telemetry", version = "=0.19.0" }
-arcen-transport = { path = "shared/transport", version = "=0.19.0", default-features = false }
-arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.19.0" }
+arcen-deck-core = { path = "shared/deck-core", version = "=0.20.0" }
+arcen-identity = { path = "shared/identity", version = "=0.20.0" }
+arcen-input = { path = "shared/input", version = "=0.20.0" }
+arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.20.0" }
+arcen-keel = { path = "shared/keel", version = "=0.20.0" }
+arcen-media = { path = "shared/media", version = "=0.20.0" }
+arcen-observability = { path = "shared/observability", version = "=0.20.0" }
+arcen-outputs = { path = "shared/outputs", version = "=0.20.0" }
+arcen-protocol = { path = "shared/protocol", version = "=0.20.0", default-features = false }
+arcen-session = { path = "shared/session", version = "=0.20.0" }
+arcen-telemetry = { path = "shared/telemetry", version = "=0.20.0" }
+arcen-transport = { path = "shared/transport", version = "=0.20.0", default-features = false }
+arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.20.0" }
 bytes = "1.10.1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["pkcs8", "rand_core", "std"] }
 ed25519 = { version = "=2.2.3", default-features = false, features = ["pkcs8", "std"] }
@@ -94,7 +102,7 @@ ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 zstd = { version = "0.14.3", default-features = false }
 ring = "=0.17.14"
 rustix = { version = "=1.1.4", features = ["fs", "process"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tracing = "0.1"

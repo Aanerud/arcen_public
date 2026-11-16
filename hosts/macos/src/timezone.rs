@@ -406,7 +406,7 @@ fn ensure_supported_process() -> Result<(), String> {
     }
 }
 
-fn current_euid() -> u32 {
+pub(crate) fn current_euid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
     unsafe { libc::geteuid() }
 }

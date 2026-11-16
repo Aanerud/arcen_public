@@ -43,9 +43,9 @@ use std::time::Duration;
 
 use arcen_input::pen_emulation::{PenCapabilityTruth, StylusUnavailable};
 use arcen_protocol::messages::{
-    validate_commit_text, HostKeyCharsMsg, HostKeymapMsg, KeyEventMsg, MouseButtonMsg,
-    MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenToolMsg, PointerMotionMode,
-    TextCommitMsg, TextCommitResultMsg, TextRefusalReason, MAX_HOST_KEYMAP_KEYS,
+    validate_commit_text, HostKeymapMsg, KeyEventMsg, MouseButtonMsg, MouseMoveMsg,
+    MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenToolMsg, PointerMotionMode,
+    TextCommitMsg, TextCommitResultMsg, TextRefusalReason,
 };
 use arcen_session::desktop_provider::{CapabilityFact, WaylandCapabilityFacts};
 use arcen_session::wayland_session::{device_type, MutterInputCapabilities, RemoteDesktopEvidence};
@@ -108,14 +108,6 @@ pub const MAX_TEXT_PARTS_PER_SECOND: u32 = 64;
 /// Text and layout notices waiting for the Deck's input lane.
 const TEXT_NOTICE_CAPACITY: usize = 32;
 
-/// The Qt key positions a Deck sends for printable keys, the positions a
-/// [`HostKeymapMsg`] describes.
-const PRINTABLE_QT_KEYS: &[u32] = &[
-    0x20, 0x27, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-    0x3B, 0x3D, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E,
-    0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x60,
-];
-
 /// The notice a Deck is told about one commit, when something was refused
 /// or typed without proof.
 #[must_use]
@@ -161,27 +153,19 @@ pub fn text_refusal_notice(
 /// The Deck's view of the session's layout: characters per Qt key position.
 #[must_use]
 pub fn host_keymap_notice(keymap: &SessionKeymap) -> HostKeymapMsg {
-    let keys = PRINTABLE_QT_KEYS
-        .iter()
-        .filter_map(|&qt_key| {
-            let evdev = u32::from(qt_key_to_evdev(qt_key, 0)?);
-            let position = keymap.keys.iter().find(|key| key.evdev == evdev)?;
-            Some(HostKeyCharsMsg {
-                qt_key,
-                base: position.base.clone(),
-                shift: position.shift.clone(),
-            })
-        })
-        .take(MAX_HOST_KEYMAP_KEYS)
-        .collect();
-    HostKeymapMsg {
-        generation: keymap.generation,
-        source: "compositor_keymap".to_owned(),
-        layouts: keymap.layouts.clone(),
-        active_layout: keymap.active_layout.clone(),
-        keys,
-        ..HostKeymapMsg::default()
-    }
+    super::keymap::host_keymap_msg(
+        "compositor_keymap",
+        keymap.generation,
+        keymap.layouts.clone(),
+        keymap.active_layout.clone(),
+        |evdev| {
+            let position = keymap
+                .keys
+                .iter()
+                .find(|key| key.evdev == u32::from(evdev))?;
+            Some((position.base.clone(), position.shift.clone()))
+        },
+    )
 }
 
 fn send_notice(notices: &tokio::sync::mpsc::Sender<String>, notice: &impl serde::Serialize) {
@@ -2141,6 +2125,7 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arcen_protocol::messages::HostKeyCharsMsg;
 
     fn stream() -> ReadyStream {
         ReadyStream {

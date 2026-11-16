@@ -1179,6 +1179,13 @@ pub struct AuthResponse {
     /// existing peer, which keeps the previous refuse-and-explain behaviour.
     #[serde(default, skip_serializing_if = "is_false")]
     pub replace_incompatible_desktop: bool,
+    /// The client can apply exact still-image tiles (lossless refinement,
+    /// ADR 0016) and the user has it switched on. Sent at authentication
+    /// because the host starts its encoder before the hellos. Absent for
+    /// every older client and whenever the client's switch is off; the host
+    /// then never grants the refine lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_refine_v1: Option<crate::refine::LosslessRefineCapability>,
 }
 
 impl std::fmt::Debug for AuthResponse {
@@ -1213,6 +1220,7 @@ impl std::fmt::Debug for AuthResponse {
             .field("cursor_preference", &self.cursor_preference)
             .field("cursor_image_v1", &self.cursor_image_v1)
             .field("cursor_position_v1", &self.cursor_position_v1)
+            .field("lossless_refine_v1", &self.lossless_refine_v1)
             .finish()
     }
 }
@@ -1260,6 +1268,7 @@ impl AuthResponse {
             cursor_image_v1: false,
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
+            lossless_refine_v1: None,
         }
     }
 
@@ -1285,6 +1294,7 @@ impl AuthResponse {
             cursor_image_v1: false,
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
+            lossless_refine_v1: None,
         }
     }
 
@@ -1310,6 +1320,7 @@ impl AuthResponse {
             cursor_image_v1: false,
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
+            lossless_refine_v1: None,
         }
     }
 
@@ -1336,6 +1347,7 @@ impl AuthResponse {
             cursor_image_v1: false,
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
+            lossless_refine_v1: None,
         }
     }
 
@@ -1457,6 +1469,25 @@ pub struct AuthResult {
     /// an authentication refusal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub session_setup_failed: bool,
+}
+
+impl AuthResult {
+    /// The answer of a host that accepted the credentials and then could not
+    /// start the session: unsuccessful, with `session_setup_failed`, so the
+    /// Deck reports a host problem rather than a wrong password.
+    #[must_use]
+    pub fn session_setup_refused(message: impl Into<String>) -> Self {
+        Self {
+            msg_type: AUTH_RESULT.to_owned(),
+            success: false,
+            message: message.into(),
+            resume_grant: None,
+            resume_window_secs: None,
+            resumed: false,
+            error_code: None,
+            session_setup_failed: true,
+        }
+    }
 }
 
 impl std::fmt::Debug for AuthResult {
@@ -2507,6 +2538,11 @@ pub struct ServerHelloMsg {
     /// `arcen-transport` (`"transport:quic-v1"` in product builds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negotiated_transport: Option<String>,
+    /// Whether this session refines still pictures to exact source pixels
+    /// (lossless refinement, ADR 0016), and why not when it does not.
+    /// Present only when the client asked for it; absent from older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lossless_refine: Option<crate::refine::LosslessRefineStatusMsg>,
 }
 
 /// A host's operating system, as its hello tells it.
@@ -5364,16 +5400,9 @@ mod tests {
         )
         .unwrap();
         assert!(!legacy.session_setup_failed);
-        let setup = AuthResult {
-            msg_type: AUTH_RESULT.to_owned(),
-            success: false,
-            message: "capenc READY failed".to_owned(),
-            resume_grant: None,
-            resume_window_secs: None,
-            resumed: false,
-            error_code: None,
-            session_setup_failed: true,
-        };
+        let setup = AuthResult::session_setup_refused("capenc READY failed");
+        assert!(!setup.success);
+        assert!(setup.resume_grant.is_none());
         let json = serde_json::to_value(&setup).unwrap();
         assert_eq!(json["session_setup_failed"], true);
         assert_eq!(serde_json::from_value::<AuthResult>(json).unwrap(), setup);

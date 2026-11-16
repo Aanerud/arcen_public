@@ -932,6 +932,74 @@ fn a_host_without_seats_publishes_only_the_pen_and_vendor_interfaces() {
 }
 
 #[test]
+fn a_host_read_interface_is_polled_for_the_host_but_never_published() {
+    let mut adapter = HidHostAdapter::new(WacomIntuos5::identity(), claims(), generation())
+        .with_publish_policy(HidPublishPolicy::PenAndVendorOnly)
+        .with_host_read_interface(2);
+    let mut deck = Deck::new();
+    let start = adapter.start(Instant::now()).unwrap();
+    let rest = deck.run(&mut adapter, start).unwrap();
+    let [HidHostOutput::CreateDevices(devices)] = rest.as_slice() else {
+        panic!("expected the device plan, got {rest:?}");
+    };
+    // Still withheld from publication, and its index follows the published
+    // devices.
+    let interfaces: Vec<(u8, u8)> = devices
+        .iter()
+        .map(|device| (device.index, device.interface))
+        .collect();
+    assert_eq!(interfaces, vec![(0, 0)]);
+    assert_eq!(adapter.host_read_index(), Some(1));
+    assert_eq!(adapter.withheld().len(), 2);
+    let outputs = adapter.devices_created(Instant::now()).unwrap();
+    deck.run(&mut adapter, outputs).unwrap();
+    let mut polled: Vec<EndpointAddress> = deck.held.iter().map(|urb| urb.endpoint).collect();
+    polled.sort_by_key(|endpoint| endpoint.0);
+    assert_eq!(polled, vec![INTUOS5_PEN_IN, INTUOS5_MOUSE_IN]);
+    let delivered = deck
+        .report(&mut adapter, INTUOS5_MOUSE_IN, &[0x01, 0x10, 0x20, 0x30])
+        .unwrap();
+    assert_eq!(
+        delivered,
+        vec![HidHostOutput::Report {
+            index: 1,
+            report: vec![0x01, 0x10, 0x20, 0x30]
+        }]
+    );
+    // An interface nobody reads stays unpolled: the touch interface.
+    assert!(!deck.held.iter().any(|urb| urb.endpoint == INTUOS5_TOUCH_IN));
+
+    // Nothing publishable but the host-read interface: planned with no
+    // published device, rather than ended as nothing publishable.
+    let mouse = WacomIntuos5::report_descriptor(2).unwrap();
+    let all_mice = (0..3)
+        .map(|interface| InterfaceReportDescriptor {
+            interface,
+            descriptor: mouse.to_vec(),
+        })
+        .collect();
+    let mut adapter = HidHostAdapter::new(WacomIntuos5::identity(), all_mice, generation())
+        .with_publish_policy(HidPublishPolicy::PenAndVendorOnly)
+        .with_host_read_interface(1);
+    assert_eq!(adapter.host_read_index(), None, "not planned yet");
+    let ControlResponse::Data(configuration) = WacomIntuos5::new().control(
+        SetupPacket {
+            request_type: 0x80,
+            request: 0x06,
+            value: 0x0200,
+            index: 0,
+            length: 4096,
+        },
+        &[],
+    ) else {
+        panic!("the emulated tablet serves its configuration");
+    };
+    assert_eq!(adapter.absorb_configuration(&configuration), Ok(()));
+    assert_eq!(adapter.host_read_index(), Some(0));
+    assert!(adapter.plan().is_empty());
+}
+
+#[test]
 fn an_interrupt_transfer_that_went_silent_is_cancelled_and_renewed() {
     let (mut adapter, mut deck, _) = enumerated();
     let now = Instant::now();

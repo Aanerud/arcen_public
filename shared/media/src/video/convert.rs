@@ -957,9 +957,12 @@ pub const WIDE_INPUT_MAX: u16 = 1023;
 /// Windows' Advanced Color composition space fixes scRGB reference white at
 /// 80 cd/m². Values above `1.0` therefore carry real HDR headroom and must not
 /// be clamped before the PQ transfer.
-const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
+pub const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 
-const PQ_PEAK_NITS: f32 = 10_000.0;
+/// SMPTE ST 2084 reference peak: PQ signal `1.0` is 10,000 cd/m². A
+/// presenter of normalised PQ pixels scales by it (the Mac's EDR optical
+/// output scale).
+pub const PQ_PEAK_NITS: f32 = 10_000.0;
 const PQ_CODE_COUNT: usize = WIDE_INPUT_MAX as usize + 1;
 
 /// One FP16 scRGB sample used to prove that GPU conversion code and the CPU
@@ -1041,7 +1044,8 @@ pub fn linear_nits_to_pq_signal(nits: f32) -> f32 {
 }
 
 /// SMPTE ST 2084 EOTF: PQ signal to absolute luminance in nits.
-fn pq_signal_to_linear_nits(signal: f64) -> f64 {
+#[must_use]
+pub fn pq_signal_to_linear_nits(signal: f64) -> f64 {
     if !signal.is_finite() || signal <= 0.0 {
         return 0.0;
     }
@@ -1132,6 +1136,15 @@ impl ScrgbPqTransform {
     #[must_use]
     pub const fn white_gain(self) -> f32 {
         self.white_gain
+    }
+
+    /// The ten-bit R′G′B′ PQ codes of one FP16 scRGB pixel (half-float
+    /// bits, alpha ignored): target primaries, white gain and PQ, before the
+    /// matrix. These are the codes [`convert_scrgb_to_pq_i444_p16`] hands
+    /// the matrix, and the exact-still-image source of a Windows HDR stream.
+    #[must_use]
+    pub fn rgb_codes(self, r: u16, g: u16, b: u16) -> [u16; 3] {
+        self.pq_rgb(half_to_f32(r), half_to_f32(g), half_to_f32(b))
     }
 
     fn pq_rgb(self, r: f32, g: f32, b: f32) -> [u16; 3] {
@@ -1227,13 +1240,23 @@ impl ScrgbSdrTransform {
         self.transfer
     }
 
-    fn convert_half_pixel(self, r: u16, g: u16, b: u16) -> [u16; 3] {
+    /// The ten-bit R′G′B′ codes of one FP16 scRGB pixel (half-float bits,
+    /// alpha ignored): clamped to SDR and encoded with the served transfer,
+    /// before the matrix. These are the codes
+    /// [`convert_scrgb_to_sdr_i444_p16`] hands the matrix, and the
+    /// exact-still-image source of a Windows Grading stream.
+    #[must_use]
+    pub fn rgb_codes(self, r: u16, g: u16, b: u16) -> [u16; 3] {
         let table = scrgb_sdr_code_table(self.transfer);
-        let [r, g, b] = [
+        [
             table[usize::from(r)],
             table[usize::from(g)],
             table[usize::from(b)],
-        ];
+        ]
+    }
+
+    fn convert_half_pixel(self, r: u16, g: u16, b: u16) -> [u16; 3] {
+        let [r, g, b] = self.rgb_codes(r, g, b);
         [
             self.ycbcr.pack_p16(self.ycbcr.luma_wide(b, g, r)),
             self.ycbcr.pack_p16(self.ycbcr.cb_wide(b, g, r)),
@@ -1406,11 +1429,32 @@ pub enum Rgb10Signal {
 const SDR_OETF_STEPS: usize = 1 << 14;
 
 /// ITU-R BT.2087 linear BT.2020 to linear BT.709 (D65).
-const BT2020_TO_BT709: [[f32; 3]; 3] = [
+///
+/// Six decimals of the matrix derived from the two sets of primaries
+/// (`-0.124_550_47` exactly in the second row); `-0.124_551` keeps that row
+/// summing to one, so white stays white.
+pub const BT2020_TO_BT709: [[f32; 3]; 3] = [
     [1.660_491, -0.587_641, -0.072_850],
     [-0.124_551, 1.132_9, -0.008_349],
     [-0.018_151, -0.100_579, 1.118_73],
 ];
+
+/// PQ BT.2020 R′G′B′ (signal `0..=1`) to linear BT.709 scRGB (`1.0` =
+/// [`SCRGB_REFERENCE_WHITE_NITS`]), in `f64`: the CPU reference of a
+/// presenter that shows a PQ picture on an FP16 scRGB surface.
+#[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "an f32 result is the point"
+)]
+pub fn pq_bt2020_to_scrgb(rgb: [f32; 3]) -> [f32; 3] {
+    let nits = rgb.map(|signal| pq_signal_to_linear_nits(f64::from(signal)));
+    BT2020_TO_BT709.map(|row| {
+        let linear =
+            f64::from(row[0]) * nits[0] + f64::from(row[1]) * nits[1] + f64::from(row[2]) * nits[2];
+        (linear / f64::from(SCRGB_REFERENCE_WHITE_NITS)) as f32
+    })
+}
 
 /// Ten-bit PQ code to linear light relative to 203-nit graphics white.
 fn pq_code_to_graphics_white_linear() -> &'static [f32; PQ_CODE_COUNT] {

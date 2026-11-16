@@ -1,0 +1,968 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+#
+# The earned-differences ledger. Every difference between products (Piers,
+# Decks) must be earned: an operating-system API or behaviour forces it.
+# Anything else is an open gap to close or logic to move to shared/.
+#
+# Checked by scripts/check_shared_contracts.py (scripts/platform_differences.py)
+# and rendered to docs/architecture/platform-differences.md
+# (`scripts/check_shared_contracts.py --write-report`).
+#
+# [[difference]]  PD-NNN, an EARNED difference.
+#   products    product directories it applies to
+#   difference  what differs
+#   earned_by   the named OS API or behaviour that forces it
+#   code        citations {path, symbol}: the path must exist and, when a
+#               symbol is given, show it in code (comments never count)
+#   decision    optional ADR or document recording the decision
+#   cfg_sites   OS-conditional cfg sites in shared/ it licenses,
+#               {path, function, count}; every such site needs a row
+#   config      packaged pier.json `platform` keys it explains,
+#               "<product>:platform.<key>" (fnmatch); every key needs a row
+# [[gap]]       GAP-NNN, an UNEARNED difference: work with an owner. Same
+#               keys, with why_open and owner instead of earned_by/decision.
+# [[capability]] parity matrix. `status` per product is "present" or the
+#               PD/GAP id explaining its absence; the check proves "present"
+#               with the `proof` regex (or `proofs` per product, searched in
+#               `paths` per product when given) in production code, and fails
+#               when a PD/GAP cell's proof matches.
+# [[local_copy]] a local copy of a shared constant or type: `pattern` must
+#               not match production code under `paths` outside `known`.
+
+schema_version = 1
+
+# --- Earned differences ---------------------------------------------------------
+
+[[difference]]
+id = "PD-001"
+area = "auth"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "How a Pier checks a credential."
+earned_by = "Linux PAM (pam-client2, the configured service); macOS PAM through pam_opendirectory; Windows LogonUserW."
+code = [
+  { path = "hosts/linux/src/net/server.rs", symbol = "pam_authenticate" },
+  { path = "hosts/macos/src/auth.rs", symbol = "pam_start" },
+  { path = "hosts/windows/src/auth.rs", symbol = "LogonUserW" },
+]
+config = ["hosts/linux:platform.auth.*"]
+
+[[difference]]
+id = "PD-002"
+area = "session model"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "The Linux Pier creates and owns a desktop session; the Windows Pier attaches to the console session; the macOS Pier serves the logged-in Aqua session."
+earned_by = "Linux: PAM and logind session creation, Xorg or Wayland compositor spawn. Windows: one interactive console session (WTSConnectSessionW). macOS: one Aqua session per GUI user, owned by loginwindow."
+code = [
+  { path = "hosts/linux/src/session/launcher.rs", symbol = "DedicatedXorg" },
+  { path = "hosts/windows/src/windows_session.rs", symbol = "WTSConnectSessionW" },
+  { path = "hosts/macos/src/session.rs" },
+]
+config = [
+  "hosts/linux:platform.session.desktop",
+  "hosts/linux:platform.session.display",
+  "hosts/linux:platform.session.gpu_head",
+  "hosts/linux:platform.session.xorg_bin",
+  "hosts/linux:platform.session.xorg_config_template",
+  "hosts/linux:platform.session.wayland_x11_apps",
+  "hosts/linux:platform.session.runtime_root",
+]
+
+[[difference]]
+id = "PD-003"
+area = "sign-in screen"
+products = ["hosts/windows", "hosts/macos"]
+difference = "Entry from the operating system's sign-in screen."
+earned_by = "Windows: an ICredentialProvider in LogonUI, reached over a SYSTEM-only named pipe, and a wait for the first console logon. macOS: the LoginWindow handover. Linux creates the session itself (PD-002) and has no sign-in screen to enter."
+code = [
+  { path = "hosts/windows/credential-provider/src/factory.rs", symbol = "ICredentialProvider" },
+  { path = "hosts/windows/src/cp_pipe.rs", symbol = "ConvertStringSecurityDescriptorToSecurityDescriptorW" },
+  { path = "shared/session/src/login_window_handover.rs", symbol = "HandoverSchedule" },
+]
+config = ["hosts/windows:platform.first_login_timeout_secs"]
+
+[[difference]]
+id = "PD-004"
+area = "session lifetime"
+products = ["hosts/linux"]
+difference = "Only the Linux Pier has a disconnected-session idle timeout."
+earned_by = "Follows PD-002: only the Linux Pier owns the lifetime of the session it serves; Windows and macOS sessions belong to the operating system."
+code = [{ path = "hosts/linux/src/config.rs", symbol = "disconnected_idle_timeout_secs" }]
+config = ["hosts/linux:platform.session.disconnected_idle_timeout_secs"]
+
+[[difference]]
+id = "PD-005"
+area = "capture"
+products = ["hosts/linux", "hosts/windows", "hosts/macos", "hosts/capenc"]
+difference = "Capture source and how the captured output is selected."
+earned_by = "Xorg: NvFBC and XShm (XShmGetImage). Wayland: Mutter ScreenCast over PipeWire. Windows: DXGI Desktop Duplication and Windows.Graphics.Capture, outputs by DXGI index. macOS: ScreenCaptureKit (SCStream)."
+code = [
+  { path = "hosts/capenc/src/linux.rs", symbol = "NvFBCCreateInstance" },
+  { path = "hosts/capenc/src/linux_x11.rs", symbol = "shm_get_image" },
+  { path = "hosts/capenc/src/wayland/pipewire.rs" },
+  { path = "hosts/capenc/src/win.rs", symbol = "IDXGIOutputDuplication" },
+  { path = "hosts/capenc/src/wgc.rs", symbol = "GraphicsCaptureItem" },
+  { path = "hosts/macos/src/capture.rs", symbol = "SCStream" },
+]
+config = ["hosts/linux:platform.capture.*", "hosts/windows:platform.desktop.output_index"]
+
+[[difference]]
+id = "PD-006"
+area = "encode"
+products = ["hosts/linux", "hosts/windows", "hosts/macos", "hosts/capenc"]
+difference = "Hardware encoder. The OpenH264 software encoder is shared."
+earned_by = "NVENC with CUDA (Linux, Windows); Media Foundation H.264 MFT (Windows); VideoToolbox VTCompressionSession (macOS)."
+code = [
+  { path = "hosts/capenc/src/nvenc.rs", symbol = "nvEncOpenEncodeSessionEx" },
+  { path = "hosts/capenc/src/mf_encoder.rs", symbol = "MFTEnumEx" },
+  { path = "hosts/macos/src/encode.rs", symbol = "VTCompressionSessionCreate" },
+]
+
+[[difference]]
+id = "PD-007"
+area = "virtual displays"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "How a Pier creates outputs for a Deck's displays."
+earned_by = "Linux: Xorg screens on NVIDIA heads. Windows: the Arcen IddCx driver and NVAPI headless EDIDs (NvAPI_GPU_SetEDID). macOS: CGVirtualDisplay."
+code = [
+  { path = "hosts/linux/src/session/xorg_multihead.rs" },
+  { path = "hosts/windows/src/iddcx.rs", symbol = "IOCTL_APPLY_TOPOLOGY" },
+  { path = "hosts/windows/src/nvapi_headless.rs" },
+  { path = "hosts/macos/src/virtual_display.rs", symbol = "CGVirtualDisplayDescriptor" },
+]
+decision = "docs/adr/0008-virtual-display-for-windows-hosts.md"
+config = ["hosts/windows:platform.iddcx.*", "hosts/windows:platform.multi_monitor.nvidia_headless_enabled"]
+
+[[difference]]
+id = "PD-008"
+area = "HDR"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Xorg serves an HDR request as Grading unless the desktop is declared Rec.2100 PQ; Wayland HDR needs Mutter 50 or later; Windows needs proven advanced colour; macOS uses an EDR virtual panel."
+earned_by = "Xorg has no HDR output model; Mutter before 50 has no HDR screen sharing; Windows advanced colour (DisplayConfig); macOS EDR headroom and Core Image 203-nit white."
+code = [
+  { path = "hosts/windows/src/advanced_color.rs", symbol = "AdvancedColorRecoveryEntry" },
+  { path = "hosts/macos/src/hdr_white.rs", symbol = "kCIContextWorkingColorSpace" },
+]
+decision = "AGENTS.md"
+
+[[difference]]
+id = "PD-010"
+area = "input injection"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "How pointer, keyboard and pen input is injected."
+earned_by = "Linux: uinput devices, or libei (ei_stylus) where the Wayland compositor owns input. Windows: SendInput and Windows Ink synthetic pointers (CreateSyntheticPointerDevice, PT_PEN). macOS: CGEventPost and IOHIDUserDevice."
+code = [
+  { path = "hosts/linux/src/input/uinput.rs", symbol = "VirtualDeviceBuilder" },
+  { path = "hosts/linux/src/input/eis.rs" },
+  { path = "hosts/windows/src/input.rs", symbol = "CreateSyntheticPointerDevice" },
+  { path = "hosts/macos/src/input/mod.rs", symbol = "CGEventPost" },
+]
+decision = "docs/adr/0017-forward-only-pen-input.md"
+config = ["hosts/linux:platform.input.mode", "hosts/macos:platform.input_backend"]
+
+[[difference]]
+id = "PD-011"
+area = "keyboard"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Key injection vocabulary."
+earned_by = "Linux evdev key codes, with SysRq filtered because the kernel acts on it (kernel_safe_key); Windows set-1 scan codes through SendInput (shared set1_scancode); macOS virtual key codes."
+code = [
+  { path = "hosts/linux/src/input/keymap.rs", symbol = "kernel_safe_key" },
+  { path = "hosts/windows/src/input.rs", symbol = "set1_scancode" },
+  { path = "hosts/macos/src/input/keymap.rs", symbol = "qt_key_to_macos" },
+]
+
+[[difference]]
+id = "PD-012"
+area = "text rendering"
+products = ["hosts/windows", "hosts/macos"]
+difference = "The Windows Pier can switch the desktop to grayscale font smoothing while streaming; the macOS Pier needs no switch."
+earned_by = "ClearType subpixel anti-aliasing fringes after chroma subsampling (SystemParametersInfoW SPI_SETFONTSMOOTHINGTYPE); macOS has had no subpixel anti-aliasing by default since 10.14."
+code = [{ path = "hosts/windows/src/font_smoothing.rs", symbol = "SPI_SETFONTSMOOTHINGTYPE" }]
+
+[[difference]]
+id = "PD-013"
+area = "sleep"
+products = ["hosts/linux", "hosts/windows"]
+difference = "Keep-awake mechanism while serving. The behaviour itself must match."
+earned_by = "Linux: a logind sleep:idle inhibitor. Windows: SetThreadExecutionState(ES_DISPLAY_REQUIRED) in the capture process."
+code = [
+  { path = "hosts/linux/src/session/sleep_inhibitor.rs", symbol = "SleepInhibitor" },
+  { path = "hosts/capenc/src/win.rs", symbol = "SetThreadExecutionState" },
+]
+
+[[difference]]
+id = "PD-014"
+area = "time zone"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "How the Deck's time zone is applied."
+earned_by = "Linux: process-scoped TZ validated against the zoneinfo tree. Windows: system-wide SetDynamicTimeZoneInformation, so the change needs a recovery journal. macOS: launchctl setenv in the user's GUI launchd domain."
+code = [
+  { path = "hosts/linux/src/session/timezone.rs", symbol = "arcen_session::zoneinfo" },
+  { path = "hosts/windows/src/timezone.rs", symbol = "SetDynamicTimeZoneInformation" },
+  { path = "hosts/macos/src/timezone.rs", symbol = "LAUNCHCTL" },
+]
+config = ["hosts/linux:platform.session.zoneinfo_root"]
+
+[[difference]]
+id = "PD-015"
+area = "logging"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Native log sink."
+earned_by = "journald (its native socket); Windows Event Log (RegisterEventSourceW, ReportEventW); /Library/Logs on macOS."
+code = [
+  { path = "hosts/linux/src/eventlog.rs", symbol = "JOURNAL_SOCKET" },
+  { path = "hosts/windows/src/eventlog.rs", symbol = "ReportEventW" },
+  { path = "hosts/macos/src/support_bundle.rs", symbol = "DEFAULT_LOG_DIRECTORY" },
+]
+
+[[difference]]
+id = "PD-016"
+area = "audio"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Audio capture, playback control and microphone injection."
+earned_by = "Linux: PipeWire and PulseAudio (pactl) in the session user's audio server. Windows: WASAPI loopback (IAudioClient) and the Arcen virtual audio driver. macOS: Core Audio, ScreenCaptureKit audio and an AudioServerPlugIn driver."
+code = [
+  { path = "hosts/linux/src/media/pipewire_bridge.rs", symbol = "PIPEWIRE" },
+  { path = "hosts/windows/src/audio.rs", symbol = "IAudioClient" },
+  { path = "hosts/macos/microphone-driver/src/lib.rs", symbol = "AudioServerPlugInDriverInterface" },
+]
+config = ["hosts/linux:platform.audio.*"]
+
+[[difference]]
+id = "PD-017"
+area = "clipboard"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Native clipboard I/O."
+earned_by = "X11 selections with XFIXES (x11rb); Win32 clipboard on a message-only window (OpenClipboard); NSPasteboard."
+code = [
+  { path = "hosts/linux/src/clipboard/native.rs", symbol = "SelectionEventMask" },
+  { path = "hosts/windows/src/clipboard.rs", symbol = "OpenClipboard" },
+  { path = "hosts/macos/src/clipboard.rs", symbol = "NSPasteboard" },
+]
+
+[[difference]]
+id = "PD-018"
+area = "file security"
+products = ["hosts/windows", "clients/macos", "clients/windows", "shared/deck-core", "shared/observability"]
+difference = "Private-file checks and creation modes."
+earned_by = "POSIX mode bits, owner and O_NOFOLLOW on Unix; security descriptors, owners and reparse points on Windows, where files inherit an ACL instead of taking a mode. A file without a name while open (a sealed support bundle's plaintext) is unlink-while-open on Unix and FILE_FLAG_DELETE_ON_CLOSE on Windows, which cannot unlink an open file; FILE_FLAG_OPEN_REPARSE_POINT opens a reparse point instead of following it."
+code = [
+  { path = "clients/windows/src/platform/password_file.rs", symbol = "OWNER_SECURITY_INFORMATION" },
+  { path = "hosts/windows/src/tls.rs", symbol = "FILE_ATTRIBUTE_REPARSE_POINT" },
+  { path = "clients/macos/secure-dir/src/lib.rs" },
+  { path = "shared/deck-core/src/config.rs", symbol = "PermissionsExt" },
+  { path = "shared/observability/src/support_bundle.rs", symbol = "FILE_ATTRIBUTE_REPARSE_POINT" },
+  { path = "shared/observability/src/support_bundle.rs", symbol = "FILE_FLAG_OPEN_REPARSE_POINT" },
+  { path = "shared/observability/src/support_bundle/seal.rs", symbol = "FILE_FLAG_DELETE_ON_CLOSE" },
+]
+cfg_sites = [
+  { path = "shared/deck-core/src/config.rs", function = "atomic_write_json_with_hook", count = 1 },
+  { path = "shared/observability/src/support_bundle.rs", function = "create_private_new", count = 2 },
+  { path = "shared/observability/src/support_bundle.rs", function = "is_unsafe_source", count = 1 },
+  { path = "shared/observability/src/support_bundle.rs", function = "open_without_following", count = 1 },
+  { path = "shared/observability/src/support_bundle/seal.rs", function = "create_unnamed_private", count = 3 },
+]
+
+[[difference]]
+id = "PD-019"
+area = "durability"
+products = ["shared/deck-core"]
+difference = "No directory fsync after an atomic rename on Windows."
+earned_by = "Windows refuses to open a directory as a file (access denied) and commits the rename through the file-system journal."
+code = [{ path = "shared/deck-core/src/config.rs", symbol = "atomic_write_json_with_hook" }]
+cfg_sites = [
+  { path = "shared/deck-core/src/config.rs", function = "atomic_write_json_with_hook", count = 1 },
+]
+
+[[difference]]
+id = "PD-020"
+area = "Deck decode and present"
+products = ["clients/macos", "clients/windows"]
+difference = "Video decoder and presenter."
+earned_by = "macOS: VideoToolbox (VTDecompressionSession), Metal and CAMetalLayer EDR. Windows: D3D11 video decode (DXVA), DXGI flip-model swap chains and DirectComposition."
+code = [
+  { path = "clients/macos/src/pipeline/video_decoder.rs", symbol = "VTDecompressionSessionCreate" },
+  { path = "clients/macos/src/ui/video_metal_layer.rs", symbol = "CAMetalLayer" },
+  { path = "clients/windows/src/decode/session.rs", symbol = "ID3D11VideoDecoder" },
+  { path = "clients/windows/src/present/swapchain.rs", symbol = "IDXGISwapChain4" },
+  { path = "clients/windows/src/present/composition.rs", symbol = "IDCompositionDevice" },
+]
+
+[[difference]]
+id = "PD-021"
+area = "Deck depth facts"
+products = ["clients/macos", "clients/windows"]
+difference = "The facts behind \"ten bits at the glass\" (the decision drawn from them is GAP-031)."
+earned_by = "Windows: DWM composes windowed swap chains at desktop depth unless advanced colour or independent flip applies. macOS: CAMetalLayer EDR and pixel-format facts."
+code = [
+  { path = "clients/windows/src/present/depth.rs", symbol = "DepthFacts" },
+  { path = "clients/macos/src/ui/video_metal_layer.rs", symbol = "setWantsExtendedDynamicRangeContent" },
+]
+
+[[difference]]
+id = "PD-022"
+area = "Deck audio"
+products = ["clients/windows"]
+difference = "Playback adapts to the output device's mix format."
+earned_by = "WASAPI shared mode plays only the device mix format; the adaptation itself is the shared DeviceFormatAdapter."
+code = [{ path = "clients/windows/src/audio/output.rs", symbol = "DeviceFormatAdapter" }]
+
+[[difference]]
+id = "PD-023"
+area = "Deck USB"
+products = ["clients/macos", "clients/windows"]
+difference = "USB capture route for the Native tablet."
+earned_by = "macOS: IOUSBHost behind a privileged launchd helper. Windows: WinUSB behind a service."
+code = [
+  { path = "clients/macos/usb-iousbhost/src/platform.rs", symbol = "IOUSBHostDevice" },
+  { path = "clients/windows/usb/service/src/win/winusb.rs", symbol = "WinUsb_ControlTransfer" },
+]
+decision = "docs/adr/0019-iousbhost-usb-backend.md"
+
+[[difference]]
+id = "PD-024"
+area = "Deck keyboard"
+products = ["clients/macos", "clients/windows"]
+difference = "Key capture."
+earned_by = "macOS: NSEvent key codes and Option-key composition. Windows: a low-level keyboard hook (SetWindowsHookExW, WH_KEYBOARD_LL) and scan codes."
+code = [
+  { path = "clients/macos/src/ui/option_keys.rs", symbol = "virtual_key_code" },
+  { path = "clients/windows/src/input/hook.rs", symbol = "SetWindowsHookExW" },
+]
+
+[[difference]]
+id = "PD-025"
+area = "Deck time zone"
+products = ["clients/windows"]
+difference = "The Windows Deck maps its zone name to IANA before sending it."
+earned_by = "Windows names zones its own way; the in-box ICU ucal_getTimeZoneIDForWindowsID maps them."
+code = [{ path = "clients/windows/src/platform/timezone.rs", symbol = "ucal_getTimeZoneIDForWindowsID" }]
+
+[[difference]]
+id = "PD-026"
+area = "transport"
+products = ["clients/windows", "shared/transport"]
+difference = "QUIC segmentation offload is off by default for a Deck on Windows."
+earned_by = "Windows UDP segmentation offload hands the NIC driver one large datagram to split, and a driver that mis-splits it loses every segment silently (virtio-win kvm-guest-drivers-windows#1525)."
+code = [{ path = "shared/transport/src/quic/config.rs", symbol = "segmentation_offload_default" }]
+cfg_sites = [
+  { path = "shared/transport/src/quic/config.rs", function = "lane_transport_config", count = 1 },
+]
+
+[[difference]]
+id = "PD-027"
+area = "deskside privacy"
+products = ["hosts/linux", "hosts/windows"]
+difference = "Which local devices deskside privacy blanks and grabs, and how they are named."
+earned_by = "Linux names evdev input devices and DRM outputs (with the firmware they run); Windows names its monitors. The policy is shared (arcen_session::deskside)."
+code = [
+  { path = "hosts/linux/src/deskside.rs", symbol = "deskside" },
+  { path = "hosts/windows/src/deskside.rs" },
+]
+config = ["hosts/linux:platform.deskside.*", "hosts/windows:platform.desktop.deskside.*"]
+
+[[difference]]
+id = "PD-028"
+area = "multi-monitor"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "What a Pier knows before authentication when it builds the multi-monitor offer. The policy is shared (arcen_outputs::admission::offer_max_monitors: carrier, operator switch, outputs, then the encoder; the least of capacity, operator ceiling and the protocol's four): the Linux Pier passes its resolved encoder and its head or proven virtual-output count, the Windows Pier its configured encoder (resolved per session) and no capacity, the macOS Pier its one native encoder and its concurrent-capture limit."
+earned_by = "Windows builds the offer in session 0, which cannot see the interactive desktop's outputs or the adapter that owns them (WTS session isolation), so Auto is resolved per session (EncoderRequest::resolve_auto) and admission checks the probed inventory. macOS encodes every output with VideoToolbox. Linux knows its NVIDIA heads or qualified virtual outputs from configuration and resolves Auto before the offer."
+code = [
+  { path = "shared/outputs/src/admission.rs", symbol = "offer_max_monitors" },
+  { path = "hosts/linux/src/session/multi_monitor.rs", symbol = "OfferEncoder::Resolved" },
+  { path = "hosts/windows/src/multi_monitor_gate.rs", symbol = "OfferEncoder::PerSession" },
+  { path = "hosts/macos/src/multi_monitor.rs", symbol = "OfferEncoder::Native" },
+]
+
+[[difference]]
+id = "PD-029"
+area = "TLS material"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "How a Pier opens and judges its certificate and key files; reading, validation, pinning, reload and expiry are shared (arcen_transport::host_material)."
+earned_by = "Linux: every path component opened with openat(O_NOFOLLOW) and the fstat owner/mode rule. macOS: the same owner/mode rule but only the file itself opened with O_NOFOLLOW, because macOS's own /etc, /tmp and /var are symbolic links into /private. Windows: no mode bits; ancestors opened without following reparse points and held without FILE_SHARE_DELETE, local-disk paths only, and the key's protected DACL must grant only SYSTEM and Administrators."
+code = [
+  { path = "hosts/linux/src/net/tls.rs", symbol = "linux_open_without_symlinks" },
+  { path = "hosts/macos/src/tls_material.rs", symbol = "O_NOFOLLOW" },
+  { path = "hosts/windows/src/tls.rs", symbol = "validate_restricted_key_acl" },
+  { path = "shared/transport/src/host_material.rs", symbol = "SecureFileSystem" },
+]
+
+[[difference]]
+id = "PD-030"
+area = "TLS material"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Where the certificate directory is: /etc/arcen, %ProgramData%\\Arcen\\tls, /Library/Application Support/Arcen. The file names, pin files and ownership marker inside it are shared (arcen_transport::cert_store)."
+earned_by = "Each operating system's place for system-wide service configuration: the FHS /etc on Linux, ProgramData on Windows, the system Application Support folder on macOS."
+code = [
+  { path = "hosts/linux/src/host_cert.rs", symbol = "DEFAULT_DIRECTORY" },
+  { path = "packaging/windows/installer/src/main.rs", symbol = "programdata.join(\"tls\")" },
+  { path = "hosts/macos/src/host_cert.rs", symbol = "DEFAULT_DIRECTORY" },
+  { path = "shared/transport/src/cert_store.rs", symbol = "MaterialPaths" },
+]
+
+[[difference]]
+id = "PD-031"
+area = "auth"
+products = ["hosts/macos"]
+difference = "The macOS Pier's pre-sign-in capacity is its agents' sign-in slots (3), held for the whole relay, rather than PREAUTH_CAPACITY (16); the per-source limit and its counting are the shared PreauthAdmission."
+earned_by = "Follows PD-002: sign-in and the session run in a LaunchAgent inside the console user's Aqua session (screen capture, input and TCC grants belong to that session), and the service only relays Decks to it, so a relay holds an agent slot from connection to session end."
+code = [
+  { path = "hosts/macos/src/main.rs", symbol = "RELAY_LIMIT" },
+  { path = "shared/session/src/session_admission.rs", symbol = "PreauthAdmission" },
+]
+
+[[difference]]
+id = "PD-032"
+area = "display lifecycle"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Only the Windows Pier records the pre-session windows, moves the windows a session stranded and replays a left-over display journal from a process it starts in the console session. The policy (when to restore, what to remove, which windows move) is shared: arcen_outputs::display_lease."
+earned_by = "Windows: the Pier attaches to the console session (PD-002) and changes displays it did not create (CCD SetDisplayConfig isolation, NVAPI EDIDs); Windows does not move windows back onto a path that is re-activated, and SetDisplayConfig is refused in session 0. Linux: every output belongs to the private Xorg or headless Mutter the Pier owns (OutputSurface::DedicatedPhysical, RecordVirtual) and goes with it, together with its windows. macOS: CGVirtualDisplay objects belong to a child that exits when the Pier's pipe closes, and macOS moves windows off a display that departs; no display the Pier did not create is changed."
+code = [
+  { path = "hosts/windows/src/window_layout.rs", symbol = "plan_window_repatriation" },
+  { path = "hosts/windows/src/console_recovery.rs", symbol = "SetTokenInformation" },
+  { path = "hosts/linux/src/session/output_provider.rs", symbol = "DedicatedPhysical" },
+  { path = "hosts/macos/src/virtual_display.rs", symbol = "read_line" },
+]
+decision = "docs/architecture/display-lifecycle.md"
+
+# --- Open gaps (unearned) -------------------------------------------------------
+
+[[gap]]
+id = "GAP-003"
+area = "resume"
+products = ["hosts/macos"]
+difference = "The macOS Pier has no direct session resume (AUTH_METHOD_RESUME)."
+why_open = "Not implemented yet; the Linux and Windows registries are copies of one another and are the candidate shared implementation."
+owner = "macOS Host"
+code = [
+  { path = "hosts/linux/src/session/resume.rs", symbol = "AUTH_METHOD_RESUME" },
+  { path = "hosts/windows/src/resume.rs", symbol = "AUTH_METHOD_RESUME" },
+]
+
+[[gap]]
+id = "GAP-004"
+area = "auth"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Every handshake bound is shared (arcen_session::session_admission: HANDSHAKE_MESSAGE_TIMEOUT 15 s, AUTH_RESPONSE_TIMEOUT 60 s, CREDENTIAL_CHECK_TIMEOUT 30 s), but the shape differs: Linux and Windows bound each handshake message, the macOS Pier bounds the whole handshake as one wait (APPLICATION_HANDSHAKE_TIMEOUT, derived from the same constants)."
+why_open = "The same budgets in two shapes; no OS reason. Closes with the shared negotiation core (P1)."
+owner = "Shared/Architecture"
+code = [
+  { path = "shared/session/src/session_admission.rs", symbol = "APPLICATION_HANDSHAKE_TIMEOUT" },
+  { path = "hosts/linux/src/net/server.rs", symbol = "HANDSHAKE_MESSAGE_TIMEOUT" },
+  { path = "hosts/windows/src/session.rs", symbol = "HANDSHAKE_MESSAGE_TIMEOUT" },
+  { path = "hosts/macos/src/session.rs", symbol = "APPLICATION_HANDSHAKE_TIMEOUT" },
+]
+
+[[gap]]
+id = "GAP-007"
+area = "negotiation"
+products = ["hosts/windows"]
+difference = "The Windows Pier does not validate the active transport during negotiation; the Linux Pier does."
+why_open = "Diverged copies of negotiate_client_transport."
+owner = "Windows Host"
+code = [
+  { path = "hosts/linux/src/session/handshake.rs", symbol = "negotiate_client_transport" },
+  { path = "hosts/windows/src/session.rs", symbol = "negotiate_client_transport" },
+]
+
+[[gap]]
+id = "GAP-009"
+area = "multi-monitor"
+products = ["hosts/windows"]
+difference = "Only the Windows Pier has operator multi-monitor settings (a monitor ceiling, adapter allow and deny lists, an NVENC session limit, a software fallback switch)."
+why_open = "Linux and macOS have the same kinds of limits with no setting; no OS reason recorded."
+owner = "Shared/Architecture"
+code = [{ path = "hosts/windows/src/config.rs", symbol = "max_monitors" }]
+config = [
+  "hosts/windows:platform.multi_monitor.max_monitors",
+  "hosts/windows:platform.multi_monitor.allowed_adapters",
+  "hosts/windows:platform.multi_monitor.excluded_adapters",
+  "hosts/windows:platform.multi_monitor.nvenc_session_limit",
+  "hosts/windows:platform.multi_monitor.allow_software_fallback",
+]
+
+[[gap]]
+id = "GAP-010"
+area = "multi-monitor"
+products = ["hosts/macos"]
+difference = "The macOS Pier offers 0° rotation only."
+why_open = "Undetermined: whether CGVirtualDisplay can present rotated modes has not been researched."
+owner = "macOS Host"
+code = [{ path = "hosts/macos/src/multi_monitor.rs", symbol = "SUPPORTED_ROTATIONS" }]
+
+[[gap]]
+id = "GAP-012"
+area = "audio"
+products = ["hosts/windows"]
+difference = "The Windows Pier does not mute local playback while streaming."
+why_open = "IAudioEndpointVolume::SetMute exists; arcen_session::local_playback is unused on Windows."
+owner = "Windows Host"
+code = [{ path = "shared/session/src/local_playback.rs" }, { path = "hosts/macos/src/audio.rs", symbol = "local_playback" }]
+
+[[gap]]
+id = "GAP-013"
+area = "sleep"
+products = ["hosts/macos"]
+difference = "The macOS Pier does not keep the machine awake while serving."
+why_open = "IOPMAssertionCreateWithName exists; not implemented yet."
+owner = "macOS Host"
+code = [{ path = "hosts/linux/src/session/sleep_inhibitor.rs", symbol = "SleepInhibitor" }]
+
+[[gap]]
+id = "GAP-014"
+area = "deskside privacy"
+products = ["hosts/macos"]
+difference = "The macOS Pier has no deskside privacy (blank the console, grab local input)."
+why_open = "Not implemented yet; CGDisplayCapture and event taps have not been researched."
+owner = "macOS Host"
+code = [{ path = "shared/session/src/deskside.rs" }]
+
+[[gap]]
+id = "GAP-015"
+area = "text rendering"
+products = ["hosts/linux"]
+difference = "The Linux Pier has no grayscale font-smoothing switch for streaming."
+why_open = "Xft/fontconfig rgba and the GNOME font-antialiasing setting can be set per session."
+owner = "Linux Host"
+code = [{ path = "hosts/windows/src/font_smoothing.rs", symbol = "SPI_SETFONTSMOOTHINGTYPE" }]
+
+[[gap]]
+id = "GAP-016"
+area = "locale"
+products = ["hosts/windows", "hosts/macos"]
+difference = "Only the Linux Pier makes the session locale follow the Deck."
+why_open = "arcen_session::session_locale is used only by Linux; not researched on Windows or macOS."
+owner = "Shared/Architecture"
+code = [{ path = "shared/session/src/session_locale.rs" }]
+
+[[gap]]
+id = "GAP-017"
+area = "time zone"
+products = ["hosts/macos"]
+difference = "The macOS Pier follows the Deck's zone without a durable restore lease."
+why_open = "Undetermined: macOS keeps the zone in the user's GUI launchd domain, which may end with the session and earn the difference; not recorded."
+owner = "macOS Host"
+code = [{ path = "shared/session/src/restore_lease.rs" }, { path = "hosts/macos/src/timezone.rs", symbol = "ARCEN_SESSION_TZ" }]
+
+[[gap]]
+id = "GAP-018"
+area = "transport"
+products = ["hosts/linux", "hosts/windows"]
+difference = "The Linux and Windows Piers keep an optional WSS transport (wss-compat); the macOS Pier has none."
+why_open = "Product scope, not an OS reason: the product transport is QUIC only. Record a sunset or remove it."
+owner = "Release/Security"
+code = [{ path = "hosts/linux/Cargo.toml", symbol = "wss-compat" }, { path = "hosts/windows/Cargo.toml", symbol = "wss-compat" }]
+
+[[gap]]
+id = "GAP-020"
+area = "duplication"
+products = ["hosts/linux", "hosts/windows"]
+difference = "The Linux and Windows Piers carry verbatim copies of the direct-resume registry and session negotiation."
+why_open = "Portable logic copied between products; tracked by the clone baseline below."
+owner = "Shared/Architecture"
+code = [
+  { path = "hosts/linux/src/session/resume.rs" },
+  { path = "hosts/windows/src/resume.rs" },
+]
+
+[[gap]]
+id = "GAP-023"
+area = "Deck clipboard"
+products = ["clients/windows"]
+difference = "The Windows Deck has no paste-as-keystrokes."
+why_open = "Not implemented yet; arcen_deck_core::paste_keys is used by the macOS Deck only."
+owner = "Windows Client"
+code = [{ path = "clients/macos/src/ui/paste_keys.rs" }]
+
+[[gap]]
+id = "GAP-024"
+area = "Deck screens"
+products = ["clients/windows"]
+difference = "The Windows Deck has no connection test or colour check screen."
+why_open = "Not implemented yet; both screens are in arcen_deck_core::screens."
+owner = "Windows Client"
+code = [{ path = "clients/macos/src/ui/connection_test.rs", symbol = "ConnectionTest" }]
+
+[[gap]]
+id = "GAP-026"
+area = "Deck audio"
+products = ["clients/macos"]
+difference = "The macOS Deck plays 48 kHz stereo on the device it opened and does not follow default-device changes; the Windows Deck follows them."
+why_open = "Both use cpal and Core Audio changes its default device too; the format adaptation alone is earned (PD-022)."
+owner = "macOS Client"
+code = [{ path = "clients/macos/src/pipeline/audio.rs" }, { path = "clients/windows/src/audio/output.rs" }]
+
+[[gap]]
+id = "GAP-027"
+area = "Deck present"
+products = ["clients/macos", "clients/windows"]
+difference = "Video fit rounding: the macOS Deck snaps to physical pixels, the Windows Deck rounds offsets only."
+why_open = "Two local policies for pointer-accurate letterboxing."
+owner = "Shared/Architecture"
+code = [{ path = "clients/macos/src/ui/app.rs" }, { path = "clients/windows/src/present/composition.rs" }]
+
+[[gap]]
+id = "GAP-028"
+area = "Deck input"
+products = ["clients/macos"]
+difference = "The macOS Deck accumulates wheel and scroll locally; the Windows Deck uses arcen_input::deck_wheel."
+why_open = "Not a verbatim copy: the Mac buckets egui's smoothed f32 scroll points per 120 (its precise path never accumulates); deck_wheel takes integer wheel travel in 120ths per message. The truncate-with-remainder rule is the same; adopting needs a float-travel entry in deck_wheel first, or sub-point travel is lost."
+owner = "macOS Client"
+code = [
+  { path = "clients/macos/src/ui/app.rs", symbol = "accumulate_scroll_ticks" },
+  { path = "shared/input/src/deck_wheel.rs", symbol = "WheelAccumulator" },
+]
+
+[[gap]]
+id = "GAP-030"
+area = "file security"
+products = ["clients/windows", "shared/deck-core"]
+difference = "Shared Deck config refuses to replace a symbolic link only on Unix."
+why_open = "std::fs::symlink_metadata and is_symlink work on Windows; only the mode bits are earned (PD-018)."
+owner = "Shared/Architecture"
+code = [{ path = "shared/deck-core/src/config.rs", symbol = "refusing to replace a symbolic-link configuration file" }]
+
+[[gap]]
+id = "GAP-031"
+area = "Deck present"
+products = ["clients/macos", "clients/windows"]
+difference = "Each Deck decides \"ten bits at the glass\" from its depth facts in its own code."
+why_open = "The facts are earned (PD-021); the decision is portable."
+owner = "Shared/Architecture"
+code = [{ path = "clients/windows/src/present/depth.rs", symbol = "EffectiveDepth" }]
+
+[[gap]]
+id = "GAP-032"
+area = "Deck diagnostics"
+products = ["clients/windows"]
+difference = "Debug switches (ARCEN_SHOW_STREAM_STATS, ARCEN_SHOW_LOSSLESS_TILES) exist only on the macOS Deck."
+why_open = "Minor; no OS reason."
+owner = "Windows Client"
+code = [{ path = "clients/macos/src/ui/app.rs", symbol = "ARCEN_SHOW_STREAM_STATS" }]
+
+[[gap]]
+id = "GAP-034"
+area = "configuration"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "multi_monitor.advertise_enabled sits in every Pier's platform section."
+why_open = "The same key on every Pier is a common setting, not a platform difference."
+owner = "Shared/Architecture"
+code = [{ path = "packaging/macos/arcen-pier.json", symbol = "advertise_enabled" }]
+config = ["*:platform.multi_monitor.advertise_enabled"]
+
+[[gap]]
+id = "GAP-035"
+area = "logging"
+products = ["hosts/linux", "hosts/windows"]
+difference = "Log file location and rotation are per-platform keys (a managed log path on Linux, a rotation size on Windows)."
+why_open = "Rotation and retention are portable policy; only the native sink is earned (PD-015)."
+owner = "Shared/Architecture"
+code = [{ path = "packaging/windows/pier.json", symbol = "rotate_mb" }]
+config = ["hosts/linux:platform.logging.*", "hosts/windows:platform.logging.*"]
+
+[[gap]]
+id = "GAP-037"
+area = "file security"
+products = ["clients/windows", "hosts/windows", "shared/observability"]
+difference = "The support-bundle collector checks that a source file did not change between inspection and open only on Unix (device and inode)."
+why_open = "Windows has file identities (GetFileInformationByHandle volume serial and file index); std does not expose them on stable, so the check needs a Windows adaptor."
+owner = "Shared/Architecture"
+code = [{ path = "shared/observability/src/support_bundle.rs", symbol = "Replaced" }]
+cfg_sites = [
+  { path = "shared/observability/src/support_bundle.rs", function = "open_source", count = 1 },
+]
+
+[[gap]]
+id = "GAP-038"
+area = "TLS material"
+products = ["hosts/linux", "hosts/windows", "hosts/macos", "packaging"]
+difference = "Certificates are issued three ways: the openssl CLI (Linux Pier new-host-cert, Linux installer, new-host-cert.sh; SEC1 keys, CN \"Arcen Pier\", CA:FALSE, digitalSignature), rcgen in the macOS Pier (no key usage, no backdate) and rcgen in the Windows installer (digitalSignature, five-minute backdate); the journalled publish and recovery is written twice (macOS Pier, Linux installer)."
+why_open = "Portable: the decision, file names, inspection and pin files are already shared (cert_provisioning, cert_store). One shared issuer needs to renew over the SEC1 keys deployed Linux Piers hold, which rcgen with ring cannot read; a SEC1-to-PKCS #8 wrap (tested in host_material) is the route."
+owner = "Shared/Architecture"
+code = [
+  { path = "hosts/linux/src/host_cert.rs", symbol = "ecparam" },
+  { path = "hosts/macos/src/host_cert.rs", symbol = "self_signed" },
+  { path = "packaging/windows/installer/src/main.rs", symbol = "certificate_params" },
+  { path = "packaging/linux/installer/src/main.rs", symbol = "recover_interrupted" },
+]
+
+[[gap]]
+id = "GAP-039"
+area = "TLS material"
+products = ["hosts/macos"]
+difference = "The macOS Pier reads its TLS material once at start: no reload and no certificate lifecycle events (active, expiring, expired, reloaded); Linux reloads on SIGHUP and Windows on its reload request, both emitting the shared events."
+why_open = "Not implemented yet; HostTlsMaterial::reload and startup_event/status_events are shared and need only a trigger and an emitter."
+owner = "macOS Host"
+code = [
+  { path = "hosts/macos/src/tls_material.rs", symbol = "HostTlsMaterial::load" },
+  { path = "shared/transport/src/host_material.rs", symbol = "fn reload" },
+]
+
+[[gap]]
+id = "GAP-040"
+area = "support bundle"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "A Deck's support bundle can include its crash reports when asked (Settings checkbox, `--include-crash-dumps`); a Pier records the request as `crash_reports_not_collected` and includes none."
+why_open = "Each OS keeps a Pier's crash reports where the Pier can read them (systemd-coredump, WER LocalDumps, DiagnosticReports); only that source adapter is OS-specific. The opt-in, the manifest record and the scrubbing are shared."
+owner = "Shared/Architecture"
+code = [{ path = "shared/observability/src/support_bundle.rs", symbol = "CrashReportsNotCollected" }]
+
+# --- Capability matrix ----------------------------------------------------------
+
+[[capability]]
+id = "host_keymap"
+description = "Sends host_keymap"
+proof = 'HostKeymapMsg'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
+id = "auth_throttle"
+description = "Throttles failed sign-ins"
+proof = 'AuthThrottle\b'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
+id = "preauth_per_source"
+description = "Limits pre-sign-in connections per source address"
+proof = 'PreauthAdmission'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
+id = "setup_refusal_reason"
+description = "Refuses an unservable video request after the password, with its reason, not as a failed sign-in"
+proof = 'SetupRefusal::video_request'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
+id = "shared_tls_material"
+description = "Loads TLS material through arcen_transport::host_material"
+proof = 'host_material::'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
+id = "direct_resume"
+description = "Direct session resume"
+proof = 'AUTH_METHOD_RESUME'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "GAP-003" }
+
+[[capability]]
+id = "native_tablet"
+description = "Native (USB-bridged) tablet"
+proof = 'arcen_usb_bridge::'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
+id = "local_playback_mute"
+description = "Mutes local playback while streaming"
+proof = 'local_playback'
+status = { "hosts/linux" = "present", "hosts/windows" = "GAP-012", "hosts/macos" = "present" }
+
+[[capability]]
+id = "keep_awake"
+description = "Keeps the machine awake while serving"
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "GAP-013" }
+proofs = { "hosts/linux" = 'SleepInhibitor', "hosts/windows" = 'SetThreadExecutionState', "hosts/macos" = 'IOPMAssertion|caffeinate' }
+paths = { "hosts/windows" = ["hosts/capenc/src/win.rs"] }
+
+[[capability]]
+id = "deskside"
+description = "Deskside privacy"
+proof = 'deskside::'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "GAP-014" }
+
+[[capability]]
+id = "grayscale_font_smoothing"
+description = "Grayscale font smoothing while streaming"
+proof = 'SPI_SETFONTSMOOTHINGTYPE|font_smoothing'
+status = { "hosts/linux" = "GAP-015", "hosts/windows" = "present", "hosts/macos" = "PD-012" }
+
+[[capability]]
+id = "session_locale"
+description = "Session locale follows the Deck"
+proof = 'session_locale'
+status = { "hosts/linux" = "present", "hosts/windows" = "GAP-016", "hosts/macos" = "GAP-016" }
+
+[[capability]]
+id = "timezone_restore_lease"
+description = "Time zone restored through a durable lease"
+proof = 'restore_lease'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "GAP-017" }
+
+[[capability]]
+id = "wss_compat"
+description = "Optional WSS transport"
+proof = 'wss-compat'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "GAP-018" }
+
+[[capability]]
+id = "disconnected_idle_timeout"
+description = "Disconnected-session idle timeout"
+proof = 'disconnected_idle_timeout'
+status = { "hosts/linux" = "present", "hosts/windows" = "PD-004", "hosts/macos" = "PD-004" }
+
+[[capability]]
+id = "deck_reconnect"
+description = "Reconnects after a loss"
+proof = 'arcen_deck_core::reconnect'
+status = { "clients/macos" = "present", "clients/windows" = "present" }
+
+[[capability]]
+id = "deck_follow_login_window"
+description = "Follows the host's sign-in screen into its desktop"
+proof = 'HandoverSchedule'
+status = { "clients/macos" = "present", "clients/windows" = "present" }
+
+[[capability]]
+id = "deck_multi_window"
+description = "Multi-monitor windows"
+proof = '\bmulti_window'
+status = { "clients/macos" = "present", "clients/windows" = "present" }
+
+[[capability]]
+id = "deck_paste_keys"
+description = "Paste as keystrokes"
+proof = 'paste_keys'
+status = { "clients/macos" = "present", "clients/windows" = "GAP-023" }
+
+[[capability]]
+id = "deck_connection_test"
+description = "Connection test screen"
+proof = 'screens::connection_test'
+status = { "clients/macos" = "present", "clients/windows" = "GAP-024" }
+
+[[capability]]
+id = "deck_colour_check"
+description = "Colour check screen"
+proof = 'colour_check::'
+status = { "clients/macos" = "present", "clients/windows" = "GAP-024" }
+
+[[capability]]
+id = "stranded_window_repatriation"
+description = "Moves windows a session stranded back to a visible display"
+proof = 'display_lease::'
+status = { "hosts/linux" = "PD-032", "hosts/windows" = "present", "hosts/macos" = "PD-032" }
+
+[[capability]]
+id = "deck_truth_badge"
+description = "Session-truth badge"
+proof = 'truth_badge_text'
+status = { "clients/macos" = "present", "clients/windows" = "present" }
+
+[[capability]]
+id = "deck_present_timing"
+description = "Presentation timing from the shared pipeline contract (Auto newest frame, Speed may tear, Grading/HDR on the refresh)"
+proof = 'PresentTiming'
+status = { "clients/macos" = "present", "clients/windows" = "present" }
+
+[[capability]]
+id = "deck_shared_wheel"
+description = "Wheel accumulation through arcen_input::deck_wheel"
+proof = 'deck_wheel'
+status = { "clients/macos" = "GAP-028", "clients/windows" = "present" }
+
+[[capability]]
+id = "deck_shared_colour_uniform"
+description = "Colour uniform from arcen_media::video::present"
+proof = 'video::present'
+status = { "clients/macos" = "present", "clients/windows" = "present" }
+
+[[capability]]
+id = "deck_stream_stats"
+description = "Stream statistics debug overlay"
+proof = 'ARCEN_SHOW_STREAM_STATS'
+status = { "clients/macos" = "present", "clients/windows" = "GAP-032" }
+
+# --- Local copies of shared constants and types ---------------------------------
+
+[[local_copy]]
+id = "local-modifier-constants"
+pattern = '\bconst\s+MOD_(?:SHIFT|CTRL|ALT|META|KEYPAD)\b'
+paths = ["hosts", "clients"]
+shared = "arcen_protocol::keys::MOD_*"
+known = []
+
+[[local_copy]]
+id = "local-auth-timeouts"
+pattern = '\bconst\s+(?:PREAUTH_CAPACITY|PREAUTH_PER_SOURCE|RELAY_LIMIT_PER_SOURCE|AUTH_RESPONSE_TIMEOUT|INTERACTIVE_AUTH_RESPONSE_TIMEOUT|CLIENT_HELLO_TIMEOUT|QUALITY_SETTINGS_TIMEOUT|APPLICATION_HANDSHAKE_TIMEOUT|HANDSHAKE_RECEIVE_TIMEOUT|HANDSHAKE_MESSAGE_TIMEOUT|PAM_OPERATION_TIMEOUT|AUTH_VERIFY_TIMEOUT|CREDENTIAL_CHECK_TIMEOUT)\b|\bstruct\s+RelayCount\b'
+paths = ["hosts"]
+shared = "arcen_session::session_admission (PREAUTH_CAPACITY, PREAUTH_PER_SOURCE, PreauthAdmission, AUTH_RESPONSE_TIMEOUT, INTERACTIVE_AUTH_RESPONSE_TIMEOUT, HANDSHAKE_MESSAGE_TIMEOUT, APPLICATION_HANDSHAKE_TIMEOUT, CREDENTIAL_CHECK_TIMEOUT)"
+known = []
+
+[[local_copy]]
+id = "local-tls-material"
+pattern = '\bfn\s+(?:parse_material|load_validated|certificate_fields|emit_reload_failed|build_quic_server_config|marker_matches|legacy_arcen_evidence|write_pins)\b|\bstruct\s+(?:TlsFileSource|FileSnapshot|TlsPaths)\b|\benum\s+TlsLoadError\b|"sha256 Fingerprint='
+paths = ["hosts", "packaging"]
+shared = "arcen_transport::{host_material, cert_store, quic::pier_server_config}"
+gap = "GAP-038"
+known = ["packaging/linux/installer/src/main.rs"]
+
+[[local_copy]]
+id = "local-annexb-scan"
+pattern = '\bfn\s+(?:find_start_code|scan_nals|avcc_to_annexb|parse_avc_decoder_config)\b'
+paths = ["hosts", "clients"]
+shared = "arcen_media::annexb"
+known = []
+
+[[local_copy]]
+id = "local-offer-wrapper"
+pattern = '\bfn\s+offer_wrapper\b'
+paths = ["hosts"]
+shared = "arcen_protocol AdvertisedMultiMonitorOffer::from_offer and arcen_outputs::admission::offer_max_monitors"
+known = []
+
+[[local_copy]]
+id = "local-encoder-selection"
+pattern = '\benum\s+EncoderSelection\b'
+paths = ["hosts"]
+shared = "arcen_media::EncoderRequest"
+known = []
+
+[[local_copy]]
+id = "local-edid-builder"
+pattern = '\bfn\s+(?:detailed_timing|encode_detailed_timing|cvt_reduced_blanking|write_range_descriptor|encode_range_descriptor|write_text_descriptor|encode_text_descriptor)\b|0x00,\s*0xff,\s*0xff,\s*0xff,\s*0xff,\s*0xff,\s*0xff,\s*0x00'
+paths = ["hosts", "clients"]
+shared = "arcen_outputs::edid (generate, generate_named, generate_hdr10)"
+known = []
+
+[[local_copy]]
+id = "local-video-uniform"
+pattern = '\bstruct\s+VideoUniform\b'
+paths = ["clients", "hosts"]
+shared = "arcen_media::video::present::VideoUniform"
+known = []
+
+[[local_copy]]
+id = "local-clipboard-controller"
+pattern = '\bstruct\s+ClipboardController\b'
+paths = ["clients"]
+shared = "arcen_deck_core::runtime::ClipboardController"
+known = []
+
+[[local_copy]]
+id = "local-pq-references"
+pattern = '\blet\s+m[12]\s*=\s*(?:2610|2523)\.0|\b1\.660_?491\b'
+paths = ["clients", "hosts"]
+shared = "arcen_media::video::{pq_signal_to_linear_nits, linear_nits_to_pq_signal, BT2020_TO_BT709, pq_bt2020_to_scrgb}"
+known = []
+
+[[capability]]
+id = "bundle_address_pseudonyms"
+description = "Support bundles pseudonymise host names and addresses by one shared rule"
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present", "clients/macos" = "present", "clients/windows" = "present" }
+proofs = { "hosts/linux" = 'collect_canonical_logs', "hosts/windows" = 'collect_canonical_logs', "hosts/macos" = 'collect_canonical_logs', "clients/macos" = 'pseudonymize_address', "clients/windows" = 'pseudonymize_address' }
+paths = { "clients/macos" = ["shared/deck-core/src/support_bundle"], "clients/windows" = ["shared/deck-core/src/support_bundle"] }
+
+[[capability]]
+id = "bundle_crash_reports_opt_in"
+description = "Crash reports enter a support bundle only when asked, and the manifest records the choice"
+proof = 'crash_report_choice'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present", "clients/macos" = "present", "clients/windows" = "present" }
+paths = { "clients/macos" = ["shared/deck-core/src/support_bundle"], "clients/windows" = ["shared/deck-core/src/support_bundle"] }
+
+[[capability]]
+id = "bundle_crash_reports"
+description = "A support bundle can include the product's own crash reports"
+proof = 'CrashReportSource'
+status = { "hosts/linux" = "GAP-040", "hosts/windows" = "GAP-040", "hosts/macos" = "GAP-040", "clients/macos" = "present", "clients/windows" = "present" }
+paths = { "clients/macos" = ["shared/deck-core/src/support_bundle"], "clients/windows" = ["shared/deck-core/src/support_bundle"] }

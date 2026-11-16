@@ -188,6 +188,183 @@ pub fn png_to_dibv5(encoded: &[u8], limits: ImageLimits) -> Result<Vec<u8>, Clip
     Ok(dib)
 }
 
+/// Converts any packed device-independent bitmap a Windows application
+/// offers (`CF_DIB` or `CF_DIBV5`) to a bounded PNG.
+///
+/// The Windows twin of the macOS Deck's TIFF → PNG: a Deck reads it when an
+/// application offers no `PNG` format. Accepts `BITMAPINFOHEADER`,
+/// `BITMAPV4HEADER` and `BITMAPV5HEADER`; 24-bit `BI_RGB` and 32-bit
+/// `BI_RGB` or `BI_BITFIELDS` with the standard BGR(A) masks; top-down or
+/// bottom-up rows padded to four bytes; an optional colour table, skipped.
+/// A 32-bit `BI_RGB` image whose alpha bytes are all zero is opaque (the
+/// field is reserved there and most writers leave it zero). The colour space
+/// must be sRGB or the Windows default; a linked profile is refused, an
+/// embedded one is ignored. Everything else (palettes, 16-bit, RLE, JPEG or
+/// PNG inside a DIB) is [`ClipboardImageError::UnsupportedFormat`].
+///
+/// # Errors
+///
+/// Rejects malformed, truncated, unsupported, oversize or unencodable input.
+pub fn dib_to_png(dib: &[u8], limits: ImageLimits) -> Result<Vec<u8>, ClipboardImageError> {
+    let (info, mut rgba) = decode_dib_rgba(dib, limits)?;
+    let encoded = encode_png_rgba(info, &rgba, limits.max_encoded_bytes);
+    rgba.zeroize();
+    encoded
+}
+
+const BITMAPINFOHEADER_BYTES: u32 = 40;
+const BITMAPV4HEADER_BYTES: u32 = 108;
+const LCS_WINDOWS_COLOR_SPACE: u32 = 0x5769_6E20;
+const PROFILE_EMBEDDED: u32 = 0x4D42_4544;
+const MAX_DIB_COLOR_TABLE_ENTRIES: u32 = 256;
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one bounded parse, kept in one place for review"
+)]
+fn decode_dib_rgba(
+    dib: &[u8],
+    limits: ImageLimits,
+) -> Result<(ImageInfo, Vec<u8>), ClipboardImageError> {
+    let header_bytes = read_u32(dib, 0)?;
+    if !matches!(
+        header_bytes,
+        BITMAPINFOHEADER_BYTES | BITMAPV4HEADER_BYTES | DIBV5_HEADER_SIZE_FIELD
+    ) {
+        return Err(ClipboardImageError::UnsupportedFormat);
+    }
+    let header_len =
+        usize::try_from(header_bytes).map_err(|_| ClipboardImageError::ArithmeticOverflow)?;
+    if dib.len() < header_len {
+        return Err(ClipboardImageError::MalformedInput);
+    }
+    let width_signed = read_i32(dib, 4)?;
+    let height_signed = read_i32(dib, 8)?;
+    let planes = read_u16(dib, 12)?;
+    let bits = read_u16(dib, 14)?;
+    let compression = read_u32(dib, 16)?;
+    let declared_size = read_u32(dib, 20)?;
+    let colors_used = read_u32(dib, 32)?;
+    if planes != 1 || !matches!(bits, 24 | 32) || colors_used > MAX_DIB_COLOR_TABLE_ENTRIES {
+        return Err(ClipboardImageError::UnsupportedFormat);
+    }
+    if width_signed <= 0 || height_signed == 0 || height_signed == i32::MIN {
+        return Err(ClipboardImageError::UnsupportedFormat);
+    }
+
+    // BITMAPINFOHEADER keeps its three BI_BITFIELDS masks after the header;
+    // the V4/V5 headers carry four masks inside.
+    let mut pixels_offset = header_len;
+    let masks = if compression == BI_BITFIELDS {
+        if bits != 32 {
+            return Err(ClipboardImageError::UnsupportedFormat);
+        }
+        if header_bytes == BITMAPINFOHEADER_BYTES {
+            pixels_offset += 12;
+            (
+                read_u32(dib, 40)?,
+                read_u32(dib, 44)?,
+                read_u32(dib, 48)?,
+                0,
+            )
+        } else {
+            (
+                read_u32(dib, 40)?,
+                read_u32(dib, 44)?,
+                read_u32(dib, 48)?,
+                read_u32(dib, 52)?,
+            )
+        }
+    } else if compression == BI_RGB {
+        (0, 0, 0, 0)
+    } else {
+        return Err(ClipboardImageError::UnsupportedFormat);
+    };
+    let has_alpha_mask = match (compression, masks) {
+        (BI_RGB, _) | (_, (RED_MASK, GREEN_MASK, BLUE_MASK, 0)) => false,
+        (_, (RED_MASK, GREEN_MASK, BLUE_MASK, ALPHA_MASK)) => true,
+        _ => return Err(ClipboardImageError::UnsupportedFormat),
+    };
+    if header_bytes != BITMAPINFOHEADER_BYTES {
+        let color_space = read_u32(dib, 56)?;
+        if !matches!(
+            color_space,
+            LCS_SRGB | LCS_WINDOWS_COLOR_SPACE | PROFILE_EMBEDDED
+        ) {
+            return Err(ClipboardImageError::UnsupportedFormat);
+        }
+    }
+    let table_bytes = usize::try_from(colors_used)
+        .ok()
+        .and_then(|entries| entries.checked_mul(4))
+        .ok_or(ClipboardImageError::ArithmeticOverflow)?;
+    pixels_offset = pixels_offset
+        .checked_add(table_bytes)
+        .ok_or(ClipboardImageError::ArithmeticOverflow)?;
+
+    let width = u32::try_from(width_signed).map_err(|_| ClipboardImageError::ArithmeticOverflow)?;
+    let height = height_signed.unsigned_abs();
+    let info = image_info(width, height, limits)?;
+    let width_px = usize::try_from(width).map_err(|_| ClipboardImageError::ArithmeticOverflow)?;
+    let height_px = usize::try_from(height).map_err(|_| ClipboardImageError::ArithmeticOverflow)?;
+    let source_pixel_bytes = usize::from(bits / 8);
+    let stride = width_px
+        .checked_mul(source_pixel_bytes)
+        .and_then(|bytes| bytes.checked_add(3))
+        .map(|bytes| bytes & !3)
+        .ok_or(ClipboardImageError::ArithmeticOverflow)?;
+    let image_bytes = stride
+        .checked_mul(height_px)
+        .ok_or(ClipboardImageError::ArithmeticOverflow)?;
+    let pixels_end = pixels_offset
+        .checked_add(image_bytes)
+        .ok_or(ClipboardImageError::ArithmeticOverflow)?;
+    if dib.len() < pixels_end {
+        return Err(ClipboardImageError::MalformedInput);
+    }
+    if declared_size != 0
+        && usize::try_from(declared_size).map_err(|_| ClipboardImageError::ArithmeticOverflow)?
+            < image_bytes
+    {
+        return Err(ClipboardImageError::MalformedInput);
+    }
+
+    let source = &dib[pixels_offset..pixels_end];
+    let row_bytes = width_px * 4;
+    let mut rgba = Vec::new();
+    rgba.try_reserve_exact(info.rgba_bytes)
+        .map_err(|_| ClipboardImageError::AllocationFailed)?;
+    rgba.resize(info.rgba_bytes, 0);
+    let mut any_alpha = false;
+    for output_row in 0..height_px {
+        let source_row = if height_signed < 0 {
+            output_row
+        } else {
+            height_px - 1 - output_row
+        };
+        let row = &source[source_row * stride..source_row * stride + width_px * source_pixel_bytes];
+        let target = &mut rgba[output_row * row_bytes..(output_row + 1) * row_bytes];
+        for (pixel, out) in row
+            .chunks_exact(source_pixel_bytes)
+            .zip(target.chunks_exact_mut(4))
+        {
+            let alpha = if source_pixel_bytes == 4 && (has_alpha_mask || compression == BI_RGB) {
+                pixel[3]
+            } else {
+                u8::MAX
+            };
+            any_alpha |= alpha != 0;
+            out.copy_from_slice(&[pixel[2], pixel[1], pixel[0], alpha]);
+        }
+    }
+    if source_pixel_bytes == 4 && compression == BI_RGB && !any_alpha {
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel[3] = u8::MAX;
+        }
+    }
+    Ok((info, rgba))
+}
+
 pub(crate) fn image_info(
     width: u32,
     height: u32,
@@ -702,6 +879,116 @@ mod tests {
                 }
             ),
             Err(ClipboardImageError::DecoderLimit)
+        );
+    }
+
+    fn info_header(width: i32, height: i32, bits: u16, compression: u32, colors: u32) -> Vec<u8> {
+        let mut header = vec![0_u8; 40];
+        write_u32(&mut header, 0, 40);
+        write_i32(&mut header, 4, width);
+        write_i32(&mut header, 8, height);
+        write_u16(&mut header, 12, 1);
+        write_u16(&mut header, 14, bits);
+        write_u32(&mut header, 16, compression);
+        write_u32(&mut header, 32, colors);
+        header
+    }
+
+    fn decoded(png: &[u8]) -> Vec<u8> {
+        decode_png_rgba(png, ImageLimits::default())
+            .expect("PNG decodes")
+            .1
+    }
+
+    #[test]
+    fn a_bottom_up_24_bit_dib_with_row_padding_and_a_colour_table_converts() {
+        let mut dib = info_header(3, 2, 24, BI_RGB, 1);
+        dib.extend_from_slice(&[1, 2, 3, 0]);
+        // Bottom row first; each 9-byte row is padded to 12.
+        dib.extend_from_slice(&[10, 20, 30, 11, 21, 31, 12, 22, 32, 0, 0, 0]);
+        dib.extend_from_slice(&[40, 50, 60, 41, 51, 61, 42, 52, 62, 0, 0, 0]);
+        dib.extend_from_slice(&[0xAA; 7]);
+        let png = dib_to_png(&dib, ImageLimits::default()).expect("converts");
+        assert_eq!(
+            decoded(&png),
+            [
+                60, 50, 40, 255, 61, 51, 41, 255, 62, 52, 42, 255, 30, 20, 10, 255, 31, 21, 11,
+                255, 32, 22, 12, 255
+            ]
+        );
+    }
+
+    #[test]
+    fn thirty_two_bit_dibs_keep_declared_alpha_and_treat_zero_reserved_bytes_as_opaque() {
+        let mut fields = info_header(1, -1, 32, BI_BITFIELDS, 0);
+        for mask in [RED_MASK, GREEN_MASK, BLUE_MASK] {
+            fields.extend_from_slice(&mask.to_le_bytes());
+        }
+        fields.extend_from_slice(&[1, 2, 3, 9]);
+        let png = dib_to_png(&fields, ImageLimits::default()).expect("converts");
+        assert_eq!(decoded(&png), [3, 2, 1, 255]);
+
+        let mut reserved = info_header(2, -1, 32, BI_RGB, 0);
+        reserved.extend_from_slice(&[1, 2, 3, 0, 4, 5, 6, 0]);
+        let png = dib_to_png(&reserved, ImageLimits::default()).expect("converts");
+        assert_eq!(decoded(&png), [3, 2, 1, 255, 6, 5, 4, 255]);
+
+        let source = rgba_png(1, 1, &[9, 8, 7, 100]);
+        let v5 = png_to_dibv5(&source, ImageLimits::default()).expect("DIB");
+        let png = dib_to_png(&v5, ImageLimits::default()).expect("converts");
+        assert_eq!(decoded(&png), [9, 8, 7, 100]);
+    }
+
+    #[test]
+    fn unsupported_or_hostile_dibs_are_refused_before_allocation() {
+        let limits = ImageLimits::default();
+        let mut palette = info_header(1, 1, 8, BI_RGB, 0);
+        palette.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            dib_to_png(&palette, limits),
+            Err(ClipboardImageError::UnsupportedFormat)
+        );
+        let mut odd_masks = info_header(1, 1, 32, BI_BITFIELDS, 0);
+        for mask in [0x0000_00ff_u32, 0x0000_ff00, 0x00ff_0000] {
+            odd_masks.extend_from_slice(&mask.to_le_bytes());
+        }
+        odd_masks.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            dib_to_png(&odd_masks, limits),
+            Err(ClipboardImageError::UnsupportedFormat)
+        );
+        let truncated = info_header(4, 4, 32, BI_RGB, 0);
+        assert_eq!(
+            dib_to_png(&truncated, limits),
+            Err(ClipboardImageError::MalformedInput)
+        );
+        let huge = info_header(i32::MAX, i32::MAX, 32, BI_RGB, 0);
+        assert!(matches!(
+            dib_to_png(&huge, limits),
+            Err(ClipboardImageError::Dimensions { .. })
+        ));
+        let many_colours = info_header(1, 1, 24, BI_RGB, u32::MAX);
+        assert_eq!(
+            dib_to_png(&many_colours, limits),
+            Err(ClipboardImageError::UnsupportedFormat)
+        );
+        let source = rgba_png(1, 1, &[9, 8, 7, 100]);
+        let mut linked = png_to_dibv5(&source, limits).expect("DIB");
+        write_u32(&mut linked, 56, 0x4C49_4E4B);
+        assert_eq!(
+            dib_to_png(&linked, limits),
+            Err(ClipboardImageError::UnsupportedFormat)
+        );
+        assert_eq!(
+            dib_to_png(&[40, 0, 0], limits),
+            Err(ClipboardImageError::MalformedInput)
+        );
+        let mut understated = info_header(1, 1, 32, BI_RGB, 0);
+        write_u32(&mut understated, 20, 2);
+        understated.extend_from_slice(&[0; 4]);
+        assert_eq!(
+            dib_to_png(&understated, limits),
+            Err(ClipboardImageError::MalformedInput)
         );
     }
 }

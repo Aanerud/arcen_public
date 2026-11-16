@@ -22,11 +22,11 @@ use arcen_media::{
 use arcen_protocol::messages::MonitorQualityIntentMsg;
 use arcen_protocol::{ChromaSubsampling, VideoCodec};
 
-use crate::capenc::EncoderSelection;
 use crate::multi_monitor_capenc::{
     build_pipeline_specs, MonitorPipelineSpec, MonitorPipelineTemplate, MultiCapencConfigError,
 };
-use crate::multi_monitor_topology::WindowsTopologyPlan;
+use arcen_media::video::EncoderRequest;
+use arcen_outputs::windows_topology::WindowsTopologyPlan;
 
 #[derive(Debug)]
 pub enum WindowsEncoderAdmissionError {
@@ -250,7 +250,7 @@ impl WindowsEncoderAdmissionPlan {
     pub fn admit_runtime(
         &self,
         thresholds: EncoderAdmissionThresholds,
-        inventory: &crate::multi_monitor_topology::PhysicalOutputInventory,
+        inventory: &arcen_outputs::windows_topology::PhysicalOutputInventory,
     ) -> Result<EncoderSetDecision, WindowsEncoderAdmissionError> {
         let adapter = WindowsChildProbeAdapter {
             plan: self,
@@ -262,7 +262,7 @@ impl WindowsEncoderAdmissionPlan {
 
 struct WindowsChildProbeAdapter<'a> {
     plan: &'a WindowsEncoderAdmissionPlan,
-    inventory: &'a crate::multi_monitor_topology::PhysicalOutputInventory,
+    inventory: &'a arcen_outputs::windows_topology::PhysicalOutputInventory,
 }
 
 impl EncoderMeasurementAdapter for WindowsChildProbeAdapter<'_> {
@@ -313,7 +313,7 @@ impl EncoderMeasurementAdapter for WindowsChildProbeAdapter<'_> {
 /// topology binding before any candidate is returned.
 ///
 /// A host whose resolved session encoder is the OpenH264 software path
-/// (`capenc::EncoderSelection::SoftwareH264` — every host without direct NVENC)
+/// (`capenc::EncoderRequest::SoftwareH264` — every host without direct NVENC)
 /// has no hardware encode sessions at all, so it plans exactly one
 /// all-software candidate. That is the same exact OpenH264/YUV420 region plan
 /// this function already produces for hardware-exhausted regions, and it is
@@ -347,9 +347,15 @@ pub fn plan_encoder_sets(
         }
     }
     let hardware_encode = match template.encoder {
-        Some(EncoderSelection::Nvenc) => true,
-        Some(EncoderSelection::SoftwareH264) => false,
-        Some(EncoderSelection::Auto) | None => {
+        Some(EncoderRequest::NativeNvenc) => true,
+        Some(EncoderRequest::SoftwareH264) => false,
+        // The Windows Pier never parses an MF or AV1 request (`parse_encoder`).
+        Some(
+            EncoderRequest::Auto
+            | EncoderRequest::WindowsMediaFoundation
+            | EncoderRequest::SoftwareAv1,
+        )
+        | None => {
             return Err(WindowsEncoderAdmissionError::ConcreteEncoderRequired);
         }
     };
@@ -429,7 +435,7 @@ pub fn plan_encoder_sets(
 }
 
 fn adaptive_codec_templates(template: &MonitorPipelineTemplate) -> Vec<MonitorPipelineTemplate> {
-    if template.encoder != Some(EncoderSelection::Nvenc)
+    if template.encoder != Some(EncoderRequest::NativeNvenc)
         || template.video_selection
             != arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance
     {
@@ -563,7 +569,7 @@ impl QualityIntentExt for MonitorQualityIntentMsg {
 }
 
 fn quality_intent(
-    monitor: &crate::multi_monitor_topology::WindowsMonitorPlan,
+    monitor: &arcen_outputs::windows_topology::WindowsMonitorPlan,
     quality_intents: &BTreeMap<String, MonitorQualityIntentMsg>,
 ) -> MonitorQualityIntentMsg {
     quality_intents
@@ -607,7 +613,7 @@ fn specs_for_hardware_count(
                 });
             }
             spec.set_media_policy(
-                EncoderSelection::Nvenc,
+                EncoderRequest::NativeNvenc,
                 template.codec,
                 if intent == MonitorQualityIntentMsg::BandwidthOptimized {
                     ChromaSubsampling::Yuv420
@@ -633,7 +639,7 @@ fn specs_for_hardware_count(
             });
         }
         spec.set_media_policy(
-            EncoderSelection::SoftwareH264,
+            EncoderRequest::SoftwareH264,
             VideoCodec::H264,
             ChromaSubsampling::Yuv420,
         );
@@ -672,10 +678,10 @@ fn candidate_from_specs(
             });
         }
         let (backend, codec, chroma) = match (spec.encoder, spec.codec, spec.chroma) {
-            (Some(EncoderSelection::Nvenc), Some(codec), Some(chroma)) => {
+            (Some(EncoderRequest::NativeNvenc), Some(codec), Some(chroma)) => {
                 (EncoderBackend::NativeNvenc, codec, chroma)
             }
-            (Some(EncoderSelection::SoftwareH264), Some(codec), Some(chroma)) => {
+            (Some(EncoderRequest::SoftwareH264), Some(codec), Some(chroma)) => {
                 (EncoderBackend::OpenH264, codec, chroma)
             }
             _ => {
@@ -762,8 +768,8 @@ mod tests {
     use arcen_telemetry::CorrelationId;
 
     use super::*;
-    use crate::multi_monitor_topology::WindowsMonitorPlan;
     use crate::nvapi::AdapterLuid;
+    use arcen_outputs::windows_topology::WindowsMonitorPlan;
 
     fn sid(value: u16) -> SessionMonitorId {
         SessionMonitorId::new(value).expect("monitor id")
@@ -835,7 +841,7 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
-            encoder: Some(EncoderSelection::Nvenc),
+            encoder: Some(EncoderRequest::NativeNvenc),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
@@ -911,9 +917,12 @@ mod tests {
         assert_eq!(plan.candidate_count(), 2);
         assert_eq!(
             plan.sets[1].specs[0].encoder,
-            Some(EncoderSelection::SoftwareH264)
+            Some(EncoderRequest::SoftwareH264)
         );
-        assert_eq!(plan.sets[1].specs[1].encoder, Some(EncoderSelection::Nvenc));
+        assert_eq!(
+            plan.sets[1].specs[1].encoder,
+            Some(EncoderRequest::NativeNvenc)
+        );
         assert_eq!(
             plan.sets[1].specs[1].chroma,
             Some(ChromaSubsampling::Yuv444)
@@ -1019,8 +1028,8 @@ mod tests {
             }
         ));
         let selected = plan.selected_specs(&decision).expect("reassigned specs");
-        assert_eq!(selected[0].encoder, Some(EncoderSelection::SoftwareH264));
-        assert_eq!(selected[1].encoder, Some(EncoderSelection::Nvenc));
+        assert_eq!(selected[0].encoder, Some(EncoderRequest::SoftwareH264));
+        assert_eq!(selected[1].encoder, Some(EncoderRequest::NativeNvenc));
         assert!(matches!(
             decision.attempts()[0].outcome,
             EncoderSetAttemptOutcome::ThresholdFailed { .. }
@@ -1045,7 +1054,7 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
-            encoder: Some(EncoderSelection::SoftwareH264),
+            encoder: Some(EncoderRequest::SoftwareH264),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
@@ -1120,10 +1129,16 @@ mod tests {
         assert_eq!(plan.candidate_count(), 1);
         assert_eq!(
             plan.sets[0].specs[0].encoder,
-            Some(EncoderSelection::SoftwareH264)
+            Some(EncoderRequest::SoftwareH264)
         );
-        assert_eq!(plan.sets[0].specs[1].encoder, Some(EncoderSelection::Nvenc));
-        assert_eq!(plan.sets[0].specs[2].encoder, Some(EncoderSelection::Nvenc));
+        assert_eq!(
+            plan.sets[0].specs[1].encoder,
+            Some(EncoderRequest::NativeNvenc)
+        );
+        assert_eq!(
+            plan.sets[0].specs[2].encoder,
+            Some(EncoderRequest::NativeNvenc)
+        );
     }
 
     /// Regression for `regress-comaintenance-multimon`: a host whose resolved
@@ -1143,7 +1158,7 @@ mod tests {
         .expect("plan");
         assert_eq!(plan.candidate_count(), 1);
         for spec in &plan.sets[0].specs {
-            assert_eq!(spec.encoder, Some(EncoderSelection::SoftwareH264));
+            assert_eq!(spec.encoder, Some(EncoderRequest::SoftwareH264));
             assert_eq!(spec.codec, Some(VideoCodec::H264));
             assert_eq!(spec.chroma, Some(ChromaSubsampling::Yuv420));
         }
@@ -1200,7 +1215,7 @@ mod tests {
             assert_eq!(plan.candidate_count(), 1);
             assert_eq!(
                 plan.sets[0].specs[0].encoder,
-                Some(EncoderSelection::SoftwareH264)
+                Some(EncoderRequest::SoftwareH264)
             );
         }
     }
@@ -1224,7 +1239,7 @@ mod tests {
 
     #[test]
     fn an_unresolved_encoder_template_is_still_rejected() {
-        for encoder in [None, Some(EncoderSelection::Auto)] {
+        for encoder in [None, Some(EncoderRequest::Auto)] {
             let mut template = software_template();
             template.encoder = encoder;
             let error = plan_encoder_sets(
@@ -1257,10 +1272,13 @@ mod tests {
         )
         .expect("plan");
         assert_eq!(plan.candidate_count(), 3);
-        assert_eq!(plan.sets[0].specs[0].encoder, Some(EncoderSelection::Nvenc));
+        assert_eq!(
+            plan.sets[0].specs[0].encoder,
+            Some(EncoderRequest::NativeNvenc)
+        );
         assert_eq!(
             plan.sets[2].specs[0].encoder,
-            Some(EncoderSelection::SoftwareH264)
+            Some(EncoderRequest::SoftwareH264)
         );
     }
 
@@ -1284,7 +1302,7 @@ mod tests {
             .find(|set| {
                 set.specs
                     .iter()
-                    .any(|spec| spec.encoder == Some(EncoderSelection::SoftwareH264))
+                    .any(|spec| spec.encoder == Some(EncoderRequest::SoftwareH264))
             })
             .expect("software candidate");
         for region in software_set.candidate.roster().plans() {

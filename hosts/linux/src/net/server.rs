@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arcen_session::session_setup::SetupRefusal;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "wss-compat")]
 use tokio::net::{TcpListener, TcpStream};
@@ -43,7 +44,6 @@ use crate::input::{InputBackendChoice, InputController, InputError, InputStats, 
 use crate::logging::target::TLS;
 use crate::logging::target::{AUDIO, AUTH, CAPENC, DISPLAY, HEALTH, INPUT, MEDIA, NET, SESSION};
 use crate::logging::LogController;
-use crate::media::annexb::NalCodec;
 use crate::media::audio::{self as audiocap, AudioConfig};
 use crate::media::capenc::{self, BitrateRequester, IdrRequester, ResolvedMediaPlan};
 use crate::media::encoder_admission;
@@ -111,11 +111,15 @@ use arcen_protocol::messages::{
     REQUEST_FULL_FRAME, TEXT_COMMIT,
 };
 use arcen_protocol::{decode_clipboard_chunk, decode_microphone_frame, AudioCodec, FrameType};
+use arcen_session::auth_throttle::{AttemptOutcome, HostAuthThrottle, THROTTLED_MESSAGE};
 use arcen_session::direct_reconnect::{
     DirectReconnect, MonotonicMillis, ReconnectEvent, ReconnectPolicy, ReconnectState,
 };
 use arcen_session::restore_lease::IanaTimeZone;
-use arcen_session::session_admission::DetachedTakeoverRefusal;
+use arcen_session::session_admission::{
+    DetachedTakeoverRefusal, PreauthAdmission, PreauthPlace, PreauthRefusal, AUTH_RESPONSE_TIMEOUT,
+    CREDENTIAL_CHECK_TIMEOUT, HANDSHAKE_MESSAGE_TIMEOUT, INTERACTIVE_AUTH_RESPONSE_TIMEOUT,
+};
 use arcen_telemetry::{
     CorrelationId, FieldValue, LifecycleEventKind, OperationalProfile, QosSample, QosTargets,
     StructuredFields, TelemetryTarget,
@@ -347,8 +351,26 @@ const CONTROL_CHANNEL_CAPACITY: usize = 8;
 /// anything faster, latest wins).
 const RESIZE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const CRITICAL_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-const AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-const INTERACTIVE_AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Failed sign-ins, per source address and per account, shared by every
+/// connection this Pier serves (the policy is `arcen_session::auth_throttle`,
+/// the same on every Pier).
+static AUTH_THROTTLE: std::sync::LazyLock<HostAuthThrottle> =
+    std::sync::LazyLock::new(HostAuthThrottle::default);
+
+/// What the throttle learns from the launcher's answer. Only PAM refusing
+/// the credential or the account (`pam_authenticate`/`pam_acct_mgmt`)
+/// counts; a launcher that failed or timed out has learned nothing about
+/// the person asking.
+const fn throttle_outcome<T>(
+    result: &Result<Result<T, LauncherError>, tokio::time::error::Elapsed>,
+) -> AttemptOutcome {
+    match result {
+        Ok(Ok(_)) => AttemptOutcome::Accepted,
+        Ok(Err(LauncherError::Rejected)) => AttemptOutcome::Refused,
+        Ok(Err(_)) | Err(_) => AttemptOutcome::Undecided,
+    }
+}
 
 /// Every live session's shared Pier lifecycle. Steps are reported where this
 /// host already emits its session lifecycle telemetry; ordering and the
@@ -398,20 +420,13 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const PAM_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const PAM_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAM_OPERATION_CAPACITY: usize = 4;
-const PREAUTH_CAPACITY: usize = 16;
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bulk-lane messages (clipboard, USB) waiting for the dispatcher. The bulk
 /// reader waits for room, so back-pressure stays on the bulk lane.
 const BULK_FORWARD_CAPACITY: usize = 8;
 const READ_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
-// Deadline for the initial client_hello / quality_settings handshake
-// receives. Kept as a named constant (rather than inline) so tests can pass
-// a short explicit override to `receive_client_hello`/`receive_quality_settings`
-// instead of waiting out the real deadline.
-const HANDSHAKE_RECEIVE_TIMEOUT: Duration = Duration::from_secs(15);
 // Covers the serialized bounded microphone, media, and display restoration steps.
 const SHUTDOWN_DISPLAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(130);
 
@@ -1194,6 +1209,44 @@ where
     send_auth_result_with_resume(sink, success, message, None, None, false, None).await
 }
 
+/// Answers a signed-in Deck whose session this host will not start: an
+/// unsuccessful `auth_result` with `session_setup_failed` and the refusal's
+/// coded reason (`arcen_session::session_setup`).
+async fn send_session_setup_refusal<S>(sink: &mut S, refusal: &SetupRefusal) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    match serde_json::to_string(&AuthResult::session_setup_refused(refusal.message())) {
+        Ok(json) => send_critical_control(sink, Message::Text(json), "auth_result").await,
+        Err(error) => {
+            warn!(target: AUTH, %error, "failed to serialize auth_result");
+            false
+        }
+    }
+}
+
+/// [`send_session_setup_refusal`], recorded as the sign-in's end.
+async fn refuse_session_setup<S>(
+    sink: &mut S,
+    emitter: &LifecycleEmitter,
+    session_log_id: CorrelationId,
+    remote_host: &str,
+    refusal: &SetupRefusal,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    send_session_setup_refusal(sink, refusal).await;
+    emit_session_auth_fail(
+        emitter,
+        session_log_id,
+        Some(remote_host),
+        refusal.log_stage(),
+        refusal.log_reason_class(),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_auth_result_with_resume<S>(
     sink: &mut S,
@@ -1440,6 +1493,7 @@ fn config_with_initial_video_request(
     if let Some(request) = response.initial_video.as_ref() {
         resolved.apply_initial_video_request(request)?;
     }
+    resolved.deck_refine = response.lossless_refine_v1.clone();
     Ok(resolved)
 }
 
@@ -1845,79 +1899,30 @@ where
             return Err(());
         }
     };
-    let session_config = match config_with_initial_video_request(cfg, &response) {
-        Ok(config) => config,
-        Err(error) => {
+    let username = response.username.clone();
+    let throttle_attempt = match AUTH_THROTTLE.begin(
+        arcen_session::auth_throttle::peer_address(remote_host),
+        &username,
+    ) {
+        Ok(attempt) => attempt,
+        Err(refusal) => {
             warn!(
                 target: AUTH,
-                %error,
-                "auth-time video request rejected before display or encoder creation"
+                peer = remote_host,
+                retry_after_secs = refusal.retry_after.as_secs(),
+                "sign-in refused without checking the password: too many recent failures"
             );
-            send_auth_result(sink, false, &format!("Video request rejected: {error}")).await;
+            send_auth_result(sink, false, THROTTLED_MESSAGE).await;
             emit_session_auth_fail(
                 emitter,
                 session_log_id,
                 Some(remote_host),
-                "validate_video_request",
-                "invalid_request",
+                "throttle",
+                "too_many_attempts",
             );
             return Err(());
         }
     };
-    if let Some(requested) = response.multi_monitor_v1.as_ref() {
-        let full_color_required = requested
-            .requested_topology()
-            .monitors()
-            .iter()
-            .filter(|monitor| {
-                monitor.quality_intent
-                    == arcen_protocol::messages::MonitorQualityIntentMsg::FullColorRequired
-            })
-            .count();
-        if full_color_required > 0 && session_config.chroma != "yuv444" {
-            let error = format!(
-                "multi-monitor quality admission failed: {full_color_required} display(s) require \
-                 full-color 4:4:4, but this host profile is configured for yuv420"
-            );
-            warn!(target: AUTH, %error, "rejected multi-monitor quality request");
-            send_auth_result(sink, false, &error).await;
-            return Err(());
-        }
-    }
-    let multi_monitor_gate = multi_monitor_gate(&session_config);
-    let multi_monitor_offer = multi_monitor::build_offer(&multi_monitor_gate);
-    let multi_monitor_outcome = multi_monitor::admit_requested_topology(
-        &multi_monitor_gate,
-        multi_monitor_offer.as_ref(),
-        response.multi_monitor_v1.as_ref(),
-    );
-    // A Grading or HDR request on a multi-monitor Wayland desktop: the
-    // record's wide proof is a single-output one, so the session is resolved
-    // again and served visibly as Auto.
-    let session_config = match wayland_multi_output_config(cfg, &response, &multi_monitor_outcome) {
-        Some(Ok(config)) => config,
-        Some(Err(error)) => {
-            warn!(target: AUTH, %error, "auth-time video request rejected for a multi-monitor Wayland desktop");
-            send_auth_result(sink, false, &format!("Video request rejected: {error}")).await;
-            return Err(());
-        }
-        None => session_config,
-    };
-    if let multi_monitor::MultiMonitorOutcome::Planned { plan, .. } = &multi_monitor_outcome {
-        if let Err(error) = multi_capenc::validate_monitor_resource_policy(
-            plan,
-            session_config.multi_monitor.nvenc_session_limit,
-            session_config.multi_monitor.allow_software_fallback
-                && session_config.exact_pins_allow_software_h264(),
-        ) {
-            let error = format!("multi-monitor resource admission failed: {error}");
-            warn!(target: AUTH, %error, "rejected multi-monitor resource request");
-            send_auth_result(sink, false, &error).await;
-            return Err(());
-        }
-    }
-
-    let username = response.username.clone();
     let pam_permit = match tokio::time::timeout(PAM_QUEUE_TIMEOUT, pam_slots.acquire_owned()).await
     {
         Ok(Ok(permit)) => permit,
@@ -1996,7 +2001,7 @@ where
         first_login_setup: cfg.first_login_setup,
     };
     let launcher_result = tokio::time::timeout(
-        PAM_OPERATION_TIMEOUT,
+        CREDENTIAL_CHECK_TIMEOUT,
         AuthenticatedLauncher::authenticate(
             &launcher_config,
             &username,
@@ -2007,6 +2012,7 @@ where
         ),
     )
     .await;
+    throttle_attempt.finish(throttle_outcome(&launcher_result));
     match launcher_result {
         Err(_) => {
             warn!(target: AUTH, %username, service = %cfg.pam_service, "PAM authentication timed out");
@@ -2021,6 +2027,107 @@ where
             Err(())
         }
         Ok(Ok(mut launcher)) => {
+            // The video request, only now that the password is proved and
+            // before the Deck is answered (`arcen_session::session_setup`): a
+            // request this host cannot serve is refused with its reason and
+            // is not a failed sign-in.
+            let session_config = match config_with_initial_video_request(cfg, &response) {
+                Ok(config) => config,
+                Err(error) => {
+                    warn!(
+                        target: AUTH,
+                        %error,
+                        "auth-time video request rejected before display or encoder creation"
+                    );
+                    refuse_session_setup(
+                        sink,
+                        emitter,
+                        session_log_id,
+                        remote_host,
+                        &SetupRefusal::video_request(error),
+                    )
+                    .await;
+                    return Err(());
+                }
+            };
+            if let Some(requested) = response.multi_monitor_v1.as_ref() {
+                let full_color_required = requested
+                    .requested_topology()
+                    .monitors()
+                    .iter()
+                    .filter(|monitor| {
+                        monitor.quality_intent
+                            == arcen_protocol::messages::MonitorQualityIntentMsg::FullColorRequired
+                    })
+                    .count();
+                if full_color_required > 0 && session_config.chroma != "yuv444" {
+                    let error = format!(
+                        "multi-monitor quality admission failed: {full_color_required} display(s) \
+                         require full-color 4:4:4, but this host profile is configured for yuv420"
+                    );
+                    warn!(target: AUTH, %error, "rejected multi-monitor quality request");
+                    refuse_session_setup(
+                        sink,
+                        emitter,
+                        session_log_id,
+                        remote_host,
+                        &SetupRefusal::multi_monitor(error),
+                    )
+                    .await;
+                    return Err(());
+                }
+            }
+            let multi_monitor_gate = multi_monitor_gate(&session_config);
+            let multi_monitor_offer = multi_monitor::build_offer(&multi_monitor_gate);
+            let multi_monitor_outcome = multi_monitor::admit_requested_topology(
+                &multi_monitor_gate,
+                multi_monitor_offer.as_ref(),
+                response.multi_monitor_v1.as_ref(),
+            );
+            // A Grading or HDR request on a multi-monitor Wayland desktop: the
+            // record's wide proof is a single-output one, so the session is
+            // resolved again and served visibly as Auto.
+            let session_config = match wayland_multi_output_config(
+                cfg,
+                &response,
+                &multi_monitor_outcome,
+            ) {
+                Some(Ok(config)) => config,
+                Some(Err(error)) => {
+                    warn!(target: AUTH, %error, "auth-time video request rejected for a multi-monitor Wayland desktop");
+                    refuse_session_setup(
+                        sink,
+                        emitter,
+                        session_log_id,
+                        remote_host,
+                        &SetupRefusal::video_request(error),
+                    )
+                    .await;
+                    return Err(());
+                }
+                None => session_config,
+            };
+            if let multi_monitor::MultiMonitorOutcome::Planned { plan, .. } = &multi_monitor_outcome
+            {
+                if let Err(error) = multi_capenc::validate_monitor_resource_policy(
+                    plan,
+                    session_config.multi_monitor.nvenc_session_limit,
+                    session_config.multi_monitor.allow_software_fallback
+                        && session_config.exact_pins_allow_software_h264(),
+                ) {
+                    let error = format!("multi-monitor resource admission failed: {error}");
+                    warn!(target: AUTH, %error, "rejected multi-monitor resource request");
+                    refuse_session_setup(
+                        sink,
+                        emitter,
+                        session_log_id,
+                        remote_host,
+                        &SetupRefusal::multi_monitor(error),
+                    )
+                    .await;
+                    return Err(());
+                }
+            }
             launcher.set_timezone(validated_requested_timezone(cfg, &response));
             info!(
                 target: AUTH,
@@ -2590,7 +2697,10 @@ fn emit_session_end_or_interrupted(
         let _ = fields.insert("duration_ms", FieldValue::Integer(duration_ms));
         let _ = fields.insert("frames_sent", FieldValue::Integer(frames_sent));
         let _ = fields.insert("frames_dropped", FieldValue::Integer(frames_dropped));
-        crate::observability::insert_client_network_fields(&mut fields, client_network);
+        arcen_observability::session_health::insert_client_network_fields(
+            &mut fields,
+            client_network,
+        );
         crate::emit_lifecycle_event_with_context(
             emitter,
             LifecycleEventKind::SessionEnd,
@@ -2607,7 +2717,10 @@ fn emit_session_end_or_interrupted(
         let _ = fields.insert("duration_ms", FieldValue::Integer(duration_ms));
         let _ = fields.insert("frames_sent", FieldValue::Integer(frames_sent));
         let _ = fields.insert("frames_dropped", FieldValue::Integer(frames_dropped));
-        crate::observability::insert_client_network_fields(&mut fields, client_network);
+        arcen_observability::session_health::insert_client_network_fields(
+            &mut fields,
+            client_network,
+        );
         crate::emit_lifecycle_event_with_context(
             emitter,
             LifecycleEventKind::SessionInterrupted,
@@ -2945,7 +3058,7 @@ pub async fn serve(
             "UNSAFE DEVELOPMENT MODE: exposing an unauthenticated host to remote clients"
         );
     }
-    let source = tls::TlsFileSource::from_config(&cfg).ok_or_else(|| {
+    let source = tls::source_from_config(&cfg).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "direct QUIC requires TLS certificate and key material",
@@ -2962,14 +3075,18 @@ pub async fn serve(
             return Err(error);
         }
     };
-    let quic_addr = crate::net::quic::resolve_bind_addr(&cfg.host, quic_port)
+    let quic_addr = arcen_transport::quic::resolve_pier_bind_address(&cfg.host, quic_port)
         .await
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, error))?;
-    let quic_config = crate::net::quic::build_quic_server_config(&tls_lifecycle)
+    let quic_config = tls_lifecycle
+        .rustls_server_config_for_quic()
+        .map_err(|error| format!("build QUIC rustls config: {error}"))
+        .and_then(arcen_transport::quic::pier_server_config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let quic_endpoint = match crate::net::quic::bind_endpoint(quic_addr, quic_config) {
+    let quic_endpoint = match quinn::Endpoint::server(quic_config, quic_addr) {
         Ok(endpoint) => endpoint,
         Err(error) => {
+            let error = format!("bind QUIC endpoint: {error}");
             let error = std::io::Error::new(std::io::ErrorKind::AddrInUse, error);
             emit_service_failed(&emitter, "quic_bind", &error);
             return Err(error);
@@ -3014,7 +3131,7 @@ pub async fn serve(
     let session_slot = Arc::new(Semaphore::new(1));
     let session_registry = SessionRegistry::new(cfg.disconnected_idle_lifetime)
         .map_err(|_| std::io::Error::other("initialize process-local resume authority"))?;
-    let preauth_slots = Arc::new(Semaphore::new(PREAUTH_CAPACITY));
+    let preauth_slots = Arc::new(PreauthAdmission::default());
     let pam_slots = Arc::new(Semaphore::new(PAM_OPERATION_CAPACITY));
     let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
     let service_health = Arc::new(AtomicU8::new(0));
@@ -3362,7 +3479,7 @@ fn reject_browser_origin(request: &Request, response: Response) -> Result<Respon
 struct ServerState {
     cfg: Arc<Config>,
     tls_lifecycle: Arc<tls::TlsLifecycle>,
-    preauth_slots: Arc<Semaphore>,
+    preauth_slots: Arc<PreauthAdmission>,
     pam_slots: Arc<Semaphore>,
     session_slot: Arc<Semaphore>,
     session_registry: Arc<SessionRegistry>,
@@ -3411,11 +3528,7 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true).ok();
     let config = ws_config();
-    let preauth_permit = state
-        .preauth_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| "pre-authentication capacity exhausted")?;
+    let preauth_permit = state.preauth_slots.try_enter(peer.ip())?;
 
     let selected_host_identity = state
         .tls_lifecycle
@@ -3473,9 +3586,21 @@ async fn handle_quic_connection(
     state: ServerState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let peer = incoming.remote_address();
-    let preauth_permit = match state.preauth_slots.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
+    let preauth_permit = match state
+        .preauth_slots
+        .try_enter_unproved(peer.ip(), incoming.remote_address_validated())
+    {
+        Ok(place) => place,
+        Err(PreauthRefusal::AddressUnproved) => {
+            // A stateless Retry: a forged source cannot answer it, so it
+            // cannot hold another machine's pre-sign-in places.
+            if let Err(error) = incoming.retry() {
+                error.into_incoming().refuse();
+            }
+            return Ok(());
+        }
+        Err(refusal) => {
+            info!(target: NET, %peer, reason = refusal.as_str(), "QUIC connection refused before TLS: {refusal}");
             incoming.refuse();
             return Ok(());
         }
@@ -3608,7 +3733,7 @@ impl Drop for SessionAdmissionGuard {
 async fn run_ws(
     mut ws: DirectSessionSocket,
     cfg: Arc<Config>,
-    preauth_permit: OwnedSemaphorePermit,
+    preauth_permit: PreauthPlace,
     pam_slots: Arc<Semaphore>,
     session_slot: Arc<Semaphore>,
     session_registry: Arc<SessionRegistry>,
@@ -3907,6 +4032,7 @@ async fn run_ws(
                 // its own seat (real pen) when the host proved it, one per
                 // host; otherwise it is headless and says why.
                 launcher.set_desktop_seat_plan(authenticated_config.desktop_seat_plan());
+                launcher.set_seat_pen_pressure(authenticated_config.seat_pen_pressure());
                 // A dedicated Xorg desktop this sign-in creates gets its
                 // depth now, for its whole life: ten bits only for ten-bit
                 // work, so every other desktop's applications keep the GPU.
@@ -4133,10 +4259,9 @@ async fn run_ws(
                                     %error,
                                     "the video request could not be resolved for this eight-bit desktop"
                                 );
-                                send_critical_control(
+                                send_session_setup_refusal(
                                     &mut ws,
-                                    close_with_reason(&format!("Video request rejected: {error}")),
-                                    "desktop_depth_resolution_close",
+                                    &SetupRefusal::video_request(error),
                                 )
                                 .await;
                                 return;
@@ -5416,6 +5541,14 @@ async fn run_attachment(
         initial_capenc.width = stream.width;
         initial_capenc.height = stream.height;
     }
+    // Exact still image (ADR 0016): a single-monitor attachment carries the
+    // facts the shared plan needs into every capenc it spawns.
+    let (refine_lane_tx, refine_lane_rx) = mpsc::channel(capenc::REFINE_LANE_RECORDS);
+    initial_capenc.refine = Some(capenc::RefineForward {
+        operator_enabled: cfg.lossless_refinement,
+        deck: cfg.deck_refine.clone(),
+        lane: refine_lane_tx,
+    });
     // Committed at admission (`session::multi_monitor::admit_requested_topology`)
     // and persisted onto this session's lease (`session::lifecycle`); fixed
     // for this session's lifetime — a reconnect reuses the exact same plan,
@@ -6029,13 +6162,45 @@ async fn run_attachment(
             }
         };
     }
+    // Exact still image: the shared plan for what capenc actually serves.
+    // The refine lane is granted, and the hello says so, only when it is on;
+    // the hello carries the plan only to a Deck that asked for it.
+    let refine_plan = arcen_media::refine::plan_for_capture(
+        capenc::REFINE_COMPILED,
+        cfg.lossless_refinement,
+        cfg.deck_refine.as_ref(),
+        arcen_media::refine::CaptureRefineFacts {
+            depth: media_plan.video.bit_depth,
+            chroma: media_plan.video.chroma,
+            transfer: media_plan.video.transfer,
+            primaries: media_plan.video.primaries,
+            source: arcen_media::refine::RefineSourceKind::for_linux_capture(
+                media_plan.video.bit_depth,
+            ),
+            single_monitor: matches!(capenc, CapencHandle::Single(_)),
+        },
+    );
+    if cfg.deck_refine.is_some() {
+        hello.lossless_refine = Some(refine_plan.hello_status());
+    }
+    info!(
+        target: MEDIA,
+        state = if refine_plan.is_on() { "on" } else { "off" },
+        reason = match refine_plan {
+            arcen_media::refine::RefinePlan::Off(reason) => reason.token(),
+            arcen_media::refine::RefinePlan::On { .. } => "",
+        },
+        deck_asked = cfg.deck_refine.is_some(),
+        "{}",
+        arcen_telemetry::names::refine::PLAN
+    );
     // Authorize this attachment's lanes before the hello: the Deck learns
     // the binding first, and the Pier opens video and audio only after it
     // sent the grant.
     let lane_grant = match arcen_transport::quic::grant_attachment(
         &lanes,
         arcen_transport::quic::next_attachment_generation(),
-        arcen_protocol::lanes::LaneRoleSet::BASE,
+        arcen_protocol::lanes::LaneRoleSet::for_grant(refine_plan.is_on()),
     )
     .map_err(|error| error.to_string())
     .and_then(|grant| serde_json::to_string(&grant).map_err(|error| error.to_string()))
@@ -6065,7 +6230,7 @@ async fn run_attachment(
         }
     }
     debug!(target: SESSION, "server_hello sent");
-    let client_hello = match receive_client_hello(&mut stream, HANDSHAKE_RECEIVE_TIMEOUT).await {
+    let client_hello = match receive_client_hello(&mut stream, HANDSHAKE_MESSAGE_TIMEOUT).await {
         Ok(hello) => {
             info!(
                 target: SESSION,
@@ -6153,7 +6318,7 @@ async fn run_attachment(
             }
         };
     let initial_quality =
-        match receive_quality_settings(&mut stream, HANDSHAKE_RECEIVE_TIMEOUT).await {
+        match receive_quality_settings(&mut stream, HANDSHAKE_MESSAGE_TIMEOUT).await {
             Ok(quality) => quality,
             Err(error) => {
                 warn!(target: SESSION, %error, "initial quality settings rejected");
@@ -6875,26 +7040,26 @@ async fn run_attachment(
         requested: cursor_preference,
         active: media_plan.cursor_mode,
         accepted: cursor_preference == media_plan.cursor_mode,
-        reason: wayland_cursor_reason(
+        reason: cursor_authority_reason(
             cursor_preference,
             media_plan.cursor_mode,
             wayland_stream_cursor.as_ref().map(|(mode, _)| *mode),
+            media_plan.bit_depth_token() != "8",
         ),
         cursor_images: (wayland_cursor_hub.is_some() || x11_cursor_watcher) && deck_cursor_images,
         cursor_positions: deck_cursor_positions,
         ..CursorModeResultMsg::default()
     };
-    if let Some((mode, _)) = &wayland_stream_cursor {
-        info!(
-            target: INPUT,
-            stream_cursor_mode = mode.token(),
-            requested = ?cursor_preference,
-            active = ?media_plan.cursor_mode,
-            deck_cursor_images,
-            cursor_images = cursor_result.cursor_images,
-            "Wayland cursor authority for this attachment"
-        );
-    }
+    info!(
+        target: INPUT,
+        stream_cursor_mode = wayland_stream_cursor.as_ref().map(|(mode, _)| mode.token()),
+        requested = ?cursor_preference,
+        active = ?media_plan.cursor_mode,
+        reason = cursor_result.reason.as_str(),
+        deck_cursor_images,
+        cursor_images = cursor_result.cursor_images,
+        "cursor authority for this attachment"
+    );
     let cursor_result =
         serde_json::to_string(&cursor_result).expect("CursorModeResultMsg must serialize");
     if !send_critical_control(
@@ -7494,7 +7659,7 @@ async fn run_attachment(
     // than `cfg`'s startup snapshot, so a session started before a reload
     // still begins with the latest validated thresholds.
     let session_health = Arc::new(Mutex::new(
-        crate::observability::SessionHealth::new_with_fps_warmup(
+        arcen_observability::session_health::SessionHealth::new_with_fps_warmup(
             qos_targets
                 .read()
                 .map(|targets| *targets)
@@ -7716,6 +7881,9 @@ async fn run_attachment(
         arcen_transport::quic::LaneSenderSlot::new(arcen_protocol::lanes::LaneRole::InputCursor);
     let bulk_slot =
         arcen_transport::quic::LaneSenderSlot::new(arcen_protocol::lanes::LaneRole::BulkAux);
+    // Exact still image's lane budget (ADR 0016 R6): the refine writer
+    // counts and waits on it, the rate task below sets it from the link.
+    let refine_meter = Arc::new(arcen_transport::RefineLaneMeter::default());
     let mut sender = lane_workers::spawn_lane_writers(lane_workers::LaneWriters {
         lanes: lanes.clone(),
         control_sink: sink,
@@ -7732,6 +7900,12 @@ async fn run_attachment(
         clipboard_notices: ctrl_tx.clone(),
         input_slot: input_slot.clone(),
         bulk_slot: bulk_slot.clone(),
+        refine: refine_plan.is_on().then(|| lane_workers::RefineLane {
+            records: refine_lane_rx,
+            control: idr.clone(),
+            meter: Arc::clone(&refine_meter),
+            video: Arc::clone(&queue),
+        }),
     });
     let microphone_state = Arc::new(Mutex::new(lane_workers::MicrophoneIngressState::new(
         microphone_agent
@@ -8401,6 +8575,16 @@ async fn run_attachment(
         let bitrate_senders = all_monitor_bitrates.clone();
         let rate_queues = rate_queues.clone();
         let video_write_wait_micros = Arc::clone(&video_write_wait_micros);
+        // The refinement budget from the link (ADR 0016 R6), only for an
+        // attachment that refines.
+        let mut refine_budget = match refine_plan {
+            arcen_media::refine::RefinePlan::On { max_mbps, .. } => Some((
+                arcen_media::refine::budget::RefineBudgetSampler::new(max_mbps),
+                Arc::clone(&refine_meter),
+                idr.clone(),
+            )),
+            arcen_media::refine::RefinePlan::Off(_) => None,
+        };
         let plan = media_plan;
         let served_pipeline = active_served_pipeline.clone();
         let motion_priority = arcen_media::video::operational_motion_priority(
@@ -8489,8 +8673,25 @@ async fn run_attachment(
                         &connection,
                     )),
                 };
+                let refine_tick = refine_budget.as_mut().map(|(sampler, meter, capenc)| {
+                    let tick = sampler.window(arcen_media::refine::budget::RefineBudgetInputs {
+                        elapsed: Duration::from_secs(1),
+                        path: sample.path,
+                        interactive_bytes: sample.delivered_bytes,
+                        refine_bytes_total: meter.written_bytes(),
+                        video_backlog: rate_queues.iter().any(|queue| queue.has_backlog()),
+                        video_frame_wait: sample.mean_frame_wait,
+                        video_target_bps: controller.target_bps(),
+                    });
+                    meter.set_held(tick.decision.hold.is_some());
+                    if let Some(command) = tick.decision.capenc_command() {
+                        let _ = capenc.request_refine(command);
+                    }
+                    tick
+                });
                 let hints = arcen_media::rate_control::RateHints {
                     keyframe_bytes: keyframe_bytes.saturating_sub(last_keyframe_bytes),
+                    refine_active: refine_tick.is_some_and(|tick| tick.decision.refine_active),
                 };
                 last_bytes = bytes;
                 last_frames = frames;
@@ -8498,6 +8699,11 @@ async fn run_attachment(
                 last_pipeline_bytes = pipeline_bytes_now;
                 if rate_control_enabled {
                     let change = controller.observe_with(sample, hints);
+                    if controller.last_refine_deferral().is_some() {
+                        if let Some((sampler, _, _)) = refine_budget.as_mut() {
+                            sampler.note_video_deferral();
+                        }
+                    }
                     let want_bps = controller.target_bps();
                     let detail = (motion_priority == arcen_media::video::MotionPriority::Detail)
                         .then(|| controller.detail_framerate(plan.fps));
@@ -8529,6 +8735,7 @@ async fn run_attachment(
                             loss_rate_permille =
                                 loss.map(|loss| (loss.rate * 1000.0).round() as u64),
                             loss_sample_packets = loss.map(|loss| loss.sent_packets),
+                            refine_deferred = controller.last_refine_deferral().map(|reason| reason.token()),
                             "encoder bitrate follows QUIC path"
                         );
                     }
@@ -8548,6 +8755,14 @@ async fn run_attachment(
                             );
                         }
                         last_detail_framerate = detail;
+                    }
+                }
+                if let (Some(tick), Some((sampler, _, _))) = (refine_tick, refine_budget.as_ref()) {
+                    let summary = sampler.summary(&tick);
+                    if tick.changed {
+                        info!(target: CAPENC, "{} {summary}", arcen_telemetry::names::refine::BUDGET);
+                    } else {
+                        debug!(target: CAPENC, "{} {summary}", arcen_telemetry::names::refine::BUDGET);
                     }
                 }
             }
@@ -8629,7 +8844,7 @@ async fn run_attachment(
                         .saturating_add(stats.scroll_events())
                         .saturating_add(stats.pen_events())
                 });
-                let counters = crate::observability::HostCounters {
+                let counters = arcen_observability::session_health::HostCounters {
                     frames_sent: health_queue.frames_sent(),
                     frames_dropped: health_queue.frames_dropped(),
                     bytes_sent: health_queue.bytes_sent(),
@@ -8638,7 +8853,9 @@ async fn run_attachment(
                     // a documented scoped gap rather than a fabricated value.
                     last_input_sequence: 0,
                     last_input_type: "",
-                    content_fps: current_content_fps(&health_content_stats),
+                    content: arcen_observability::ContentEvidence::Rate(current_content_fps(
+                        &health_content_stats,
+                    )),
                 };
                 // SIGHUP may have replaced the validated thresholds since the
                 // last tick; apply the shared cell's current value before
@@ -8672,7 +8889,7 @@ async fn run_attachment(
                          not silently swallowed"
                     );
                 }
-                let mut stats = crate::observability::SessionHealth::health_stats(
+                let mut stats = arcen_observability::session_health::SessionHealth::health_stats(
                     &observation,
                     counters,
                     health_media_plan.fps,
@@ -8734,7 +8951,7 @@ async fn run_attachment(
                         &health_emitter,
                         LifecycleEventKind::HealthSnapshot,
                         context,
-                        crate::observability::snapshot_fields(
+                        arcen_observability::session_health::snapshot_fields(
                             &observation.sample,
                             &observation.assessment,
                             client_network.as_ref(),
@@ -8791,7 +9008,7 @@ async fn run_attachment(
                             .expect("HEALTH is a canonical arcen:: target"),
                         "session health 10s summary",
                         OperationalProfile::Info,
-                        crate::observability::window_summary_fields(
+                        arcen_observability::session_health::window_summary_fields(
                             window_ticks,
                             window_frames_sent,
                             window_frames_dropped,
@@ -10246,13 +10463,17 @@ fn spawn_frame_pump(
     let span = tracing::Span::current();
     tokio::spawn(
         async move {
-            while let Some(au) = frames_rx.recv().await {
+            while let Some(mut au) = frames_rx.recv().await {
+                // Lossless-refinement records that precede this access unit
+                // (ADR 0016); empty unless the session refines.
+                let refine = std::mem::take(&mut au.refine);
                 let classify_recovery =
                     generation_keyframe.is_some() || queue.requires_generation_recovery();
                 let generation_recovery = classify_recovery
-                    && NalCodec::from_codec_token(plan.codec_token()).is_some_and(|codec| {
-                        crate::media::annexb::access_unit_is_recovery_point(&au.data, codec)
-                    });
+                    && arcen_media::annexb::video_unit_is_recovery_point(
+                        &au.data,
+                        plan.video.codec,
+                    );
                 let frame = media::build_video_frame(
                     &plan,
                     &au,
@@ -10262,7 +10483,7 @@ fn spawn_frame_pump(
                     stream_epoch,
                 );
                 if generation_recovery && generation_keyframe.is_some() {
-                    if queue.pin_generation_recovery(frame) {
+                    if queue.pin_generation_recovery(frame, refine) {
                         if let Some(ready) = generation_keyframe.take() {
                             let _ = ready.send(());
                         }
@@ -10271,7 +10492,7 @@ fn spawn_frame_pump(
                     if !au.is_keyframe {
                         queue.wait_for_room(crate::session::client::ROOM_WAIT).await;
                     }
-                    queue.enqueue_classified(frame, au.is_keyframe, generation_recovery);
+                    queue.enqueue_classified(frame, au.is_keyframe, generation_recovery, refine);
                 }
             }
             debug!(target: MEDIA, "frame pump ended (capenc frames closed)");
@@ -10923,7 +11144,7 @@ fn handle_control_json(
     full_frame_requests: &mut arcen_media::video::FullFrameRequestCoalescer,
     input_sequence: &mut InputSequenceTracker,
     active_cursor_mode: CursorMode,
-    session_health: &Mutex<crate::observability::SessionHealth>,
+    session_health: &Mutex<arcen_observability::session_health::SessionHealth>,
     session_started_at: Instant,
 ) {
     let value: serde_json::Value = match serde_json::from_str(text) {
@@ -10942,6 +11163,33 @@ fn handle_control_json(
     }
 
     match msg_type {
+        // Exact still image (ADR 0016): the Deck asks capenc to start a new
+        // generation, or turns refinement off/on for its (only) monitor.
+        "refine_reset" | "refine_control" => {
+            use arcen_media::capenc_control::CapencControlCommand;
+            use arcen_protocol::refine::RefineControlMsg;
+            let command = match serde_json::from_str::<RefineControlMsg>(text) {
+                Ok(RefineControlMsg::RefineReset { reason, .. }) => {
+                    debug!(target: MEDIA, reason = %reason.chars().take(64).collect::<String>(), "Deck asked exact still image to start over");
+                    CapencControlCommand::RefineReset
+                }
+                Ok(RefineControlMsg::RefineControl { enabled, .. }) => {
+                    info!(target: MEDIA, enabled, "Deck switched exact still image for its display");
+                    if enabled {
+                        CapencControlCommand::RefineResume
+                    } else {
+                        CapencControlCommand::RefinePause
+                    }
+                }
+                Err(error) => {
+                    debug!(target: NET, %error, "invalid refine control message");
+                    return;
+                }
+            };
+            if let Some(primary) = idr.first() {
+                primary.request_refine(command);
+            }
+        }
         REQUEST_FULL_FRAME => {
             if let Err(error) = serde_json::from_str::<RequestFullFrameMsg>(text) {
                 debug!(target: NET, %error, "invalid request_full_frame message");
@@ -11613,12 +11861,20 @@ fn x11_cursor_display(
     (display.to_owned(), xauthority.map(str::to_owned))
 }
 
-fn wayland_cursor_reason(
+/// Why the active cursor authority differs from the requested one; empty
+/// only when they agree. `wide_capture`: the stream carries more than eight
+/// bits (an Xorg desktop then captures through XShm, which cannot draw the
+/// cursor).
+fn cursor_authority_reason(
     requested: CursorMode,
     active: CursorMode,
     stream: Option<crate::session::wayland::StreamCursorMode>,
+    wide_capture: bool,
 ) -> CursorModeReason {
     use crate::session::wayland::StreamCursorMode;
+    if requested == active {
+        return CursorModeReason::default();
+    }
     let reason = match (requested, active, stream) {
         (CursorMode::Host, CursorMode::Local, Some(StreamCursorMode::Metadata)) => {
             "this desktop reports its cursor separately; start a new desktop to have it drawn into the video"
@@ -11629,7 +11885,16 @@ fn wayland_cursor_reason(
         (CursorMode::Local, CursorMode::Host, Some(StreamCursorMode::Embedded)) => {
             "this desktop draws its cursor into the video; start a new desktop to have the Deck draw it"
         }
-        _ => return CursorModeReason::default(),
+        (CursorMode::Host, CursorMode::Local, None) if wide_capture => {
+            "ten-bit capture of this desktop cannot draw the cursor into the video; the Deck draws the host's cursor"
+        }
+        (CursorMode::Host, CursorMode::Local, _) => {
+            "this stream cannot have the cursor drawn into the video; the Deck draws the host's cursor"
+        }
+        (CursorMode::Local, CursorMode::Host, _) => {
+            "this stream draws the cursor into the video; the Deck shows the host's cursor there"
+        }
+        _ => "this host serves another cursor authority than the one asked for",
     };
     CursorModeReason::try_from(reason.to_owned()).unwrap_or_default()
 }
@@ -11682,45 +11947,51 @@ mod tests {
     }
 
     #[test]
-    fn wayland_cursor_authority_mismatches_are_explained() {
+    fn every_cursor_authority_mismatch_is_explained() {
         use crate::session::wayland::StreamCursorMode;
-        let reason = wayland_cursor_reason(
+        let reason = |requested, active, stream, wide| {
+            cursor_authority_reason(requested, active, stream, wide)
+                .as_str()
+                .to_owned()
+        };
+        assert!(reason(
             CursorMode::Host,
             CursorMode::Local,
             Some(StreamCursorMode::Metadata),
-        );
-        assert!(reason.as_str().contains("reports its cursor separately"));
-        let reason = wayland_cursor_reason(
+            false
+        )
+        .contains("reports its cursor separately"));
+        assert!(reason(
             CursorMode::Local,
             CursorMode::Host,
             Some(StreamCursorMode::Embedded),
-        );
-        assert!(reason.as_str().contains("draws its cursor into the video"));
-        let reason = wayland_cursor_reason(
+            false
+        )
+        .contains("draws its cursor into the video"));
+        assert!(reason(
             CursorMode::Host,
             CursorMode::Local,
             Some(StreamCursorMode::Hidden),
-        );
-        assert!(reason.as_str().contains("leaves its cursor to the Deck"));
-        assert!(wayland_cursor_reason(
-            CursorMode::Local,
-            CursorMode::Local,
-            Some(StreamCursorMode::Hidden)
+            true
         )
-        .as_str()
-        .is_empty());
-        assert!(wayland_cursor_reason(
-            CursorMode::Local,
-            CursorMode::Local,
-            Some(StreamCursorMode::Metadata)
-        )
-        .as_str()
-        .is_empty());
-        assert!(
-            wayland_cursor_reason(CursorMode::Host, CursorMode::Local, None)
-                .as_str()
-                .is_empty()
-        );
+        .contains("leaves its cursor to the Deck"));
+        // An Xorg desktop's ten-bit (XShm) capture: the macval-4 refusal
+        // that came with an empty reason.
+        assert!(reason(CursorMode::Host, CursorMode::Local, None, true).contains("ten-bit capture"));
+        assert!(!reason(CursorMode::Host, CursorMode::Local, None, false).is_empty());
+        assert!(!reason(CursorMode::Local, CursorMode::Host, None, false).is_empty());
+        for (mode, stream) in [
+            (CursorMode::Local, Some(StreamCursorMode::Hidden)),
+            (CursorMode::Local, Some(StreamCursorMode::Metadata)),
+            (CursorMode::Host, Some(StreamCursorMode::Embedded)),
+            (CursorMode::Host, None),
+            (CursorMode::Local, None),
+        ] {
+            assert!(
+                reason(mode, mode, stream, true).is_empty(),
+                "{mode:?} {stream:?}"
+            );
+        }
     }
     use crate::media::capenc::{test_support::fake_idr, ResolvedMediaPlan};
     use arcen_protocol::messages::{
@@ -12275,7 +12546,7 @@ mod tests {
                 .expect("HEALTH is a canonical arcen:: target"),
             "session health 10s summary",
             OperationalProfile::Info,
-            crate::observability::window_summary_fields(
+            arcen_observability::session_health::window_summary_fields(
                 5,
                 500,
                 12,
@@ -12347,7 +12618,7 @@ mod tests {
                 .expect("HEALTH is a canonical arcen:: target"),
             "session health 10s summary",
             OperationalProfile::Info,
-            crate::observability::window_summary_fields(
+            arcen_observability::session_health::window_summary_fields(
                 5,
                 500,
                 12,
@@ -13892,6 +14163,88 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_video_request_is_resolved_only_after_the_password() {
+        use arcen_protocol::messages::{
+            ClientVideoCapabilitiesMsg, InitialVideoRequestMsg, QualitySettings,
+            VideoSelectionIntent,
+        };
+        use arcen_session::auth_throttle::{AttemptOutcome, THROTTLED_MESSAGE};
+
+        // An account already backing off: its password is never checked.
+        let account = "refusal-order-test";
+        for _ in 0..8 {
+            if let Ok(attempt) = AUTH_THROTTLE.begin(None, account) {
+                attempt.finish(AttemptOutcome::Refused);
+            }
+        }
+        let mut response = AuthResponse::pam(account, "password");
+        response.initial_video = Some(InitialVideoRequestMsg {
+            quality: QualitySettings {
+                msg_type: "quality_settings".to_owned(),
+                video_selection: VideoSelectionIntent::ColorFidelity,
+                codec: "h265".to_owned(),
+                chroma: "yuv444".to_owned(),
+                bit_depth: "10".to_owned(),
+                ..Default::default()
+            },
+            capabilities: ClientVideoCapabilitiesMsg {
+                h265: true,
+                main10: true,
+                ..Default::default()
+            },
+            pipeline: None,
+        });
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let mut sink = RecordingSink(Arc::clone(&sent));
+        let (emitter, _recorded) = LifecycleEmitter::recording();
+        let outcome = authenticate_pam_response(
+            &mut sink,
+            &Config::default(),
+            Arc::new(Semaphore::new(1)),
+            "203.0.113.7:40000",
+            &emitter,
+            response,
+            CorrelationId::from_uuid_v4_bytes([7; 16]),
+        )
+        .await;
+        assert!(outcome.is_err());
+        let sent = sent.lock().unwrap();
+        let [Message::Text(answer)] = sent.as_slice() else {
+            panic!("one auth_result: {sent:?}");
+        };
+        let answer: AuthResult = serde_json::from_str(answer).unwrap();
+        // The unservable request was not looked at: the Deck learns only
+        // that the sign-in was refused.
+        assert_eq!(answer.message, THROTTLED_MESSAGE);
+        assert!(!answer.success);
+        assert!(!answer.session_setup_failed);
+    }
+
+    #[tokio::test]
+    async fn a_session_setup_refusal_names_its_reason_and_is_not_a_failed_sign_in() {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let mut sink = RecordingSink(Arc::clone(&sent));
+        assert!(
+            send_session_setup_refusal(
+                &mut sink,
+                &SetupRefusal::video_request("initial video request selects yuv444"),
+            )
+            .await
+        );
+        let sent = sent.lock().unwrap();
+        let [Message::Text(answer)] = sent.as_slice() else {
+            panic!("one auth_result: {sent:?}");
+        };
+        let answer: AuthResult = serde_json::from_str(answer).unwrap();
+        assert!(!answer.success);
+        assert!(answer.session_setup_failed);
+        assert_eq!(
+            answer.message,
+            "video_request_refused: initial video request selects yuv444"
+        );
+    }
+
     fn closed_clipboard_queue() -> Arc<ClipboardWriterQueue> {
         let queue = ClipboardWriterQueue::new();
         queue.close();
@@ -14136,7 +14489,7 @@ mod tests {
         assert_eq!(config.max_message_size, Some(MAX_INBOUND_WS_MESSAGE));
         assert_eq!(config.max_frame_size, Some(MAX_INBOUND_WS_MESSAGE));
         assert_eq!(
-            PREAUTH_CAPACITY * config.max_message_size.unwrap(),
+            arcen_session::session_admission::PREAUTH_CAPACITY * config.max_message_size.unwrap(),
             16 * (arcen_protocol::CHUNK_BYTES + arcen_protocol::CLIPBOARD_HEADER_SIZE)
         );
     }
@@ -14770,7 +15123,7 @@ mod tests {
             arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let json = serde_json::to_string(&RequestFullFrameMsg::default()).unwrap();
-        let session_health = Mutex::new(crate::observability::SessionHealth::new(
+        let session_health = Mutex::new(arcen_observability::session_health::SessionHealth::new(
             arcen_telemetry::QosTargets::default(),
         ));
 
@@ -14834,7 +15187,7 @@ mod tests {
             arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let json = serde_json::to_string(&RequestFullFrameMsg::default()).unwrap();
-        let session_health = Mutex::new(crate::observability::SessionHealth::new(
+        let session_health = Mutex::new(arcen_observability::session_health::SessionHealth::new(
             arcen_telemetry::QosTargets::default(),
         ));
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
@@ -14887,7 +15240,7 @@ mod tests {
         };
         let json = serde_json::to_string(&ping).unwrap();
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
-        let session_health = Mutex::new(crate::observability::SessionHealth::new(
+        let session_health = Mutex::new(arcen_observability::session_health::SessionHealth::new(
             arcen_telemetry::QosTargets::default(),
         ));
 
@@ -14947,7 +15300,7 @@ mod tests {
         };
         let json = serde_json::to_string(&ping).unwrap();
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
-        let session_health = Mutex::new(crate::observability::SessionHealth::new(
+        let session_health = Mutex::new(arcen_observability::session_health::SessionHealth::new(
             arcen_telemetry::QosTargets::default(),
         ));
         let session_started_at = Instant::now();
@@ -15144,7 +15497,7 @@ mod tests {
             arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
-        let session_health = Mutex::new(crate::observability::SessionHealth::new(
+        let session_health = Mutex::new(arcen_observability::session_health::SessionHealth::new(
             arcen_telemetry::QosTargets::default(),
         ));
         let pen = PenEventMsg {
@@ -15181,7 +15534,7 @@ mod tests {
             arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
-        let session_health = Mutex::new(crate::observability::SessionHealth::new(
+        let session_health = Mutex::new(arcen_observability::session_health::SessionHealth::new(
             arcen_telemetry::QosTargets::default(),
         ));
 
@@ -15220,7 +15573,7 @@ mod tests {
             arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
         let mut input_sequence = InputSequenceTracker::default();
         let session_log_id = CorrelationId::from_uuid_v4_bytes([0; 16]);
-        let session_health = Mutex::new(crate::observability::SessionHealth::new(
+        let session_health = Mutex::new(arcen_observability::session_health::SessionHealth::new(
             arcen_telemetry::QosTargets::default(),
         ));
 

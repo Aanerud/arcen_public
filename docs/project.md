@@ -27,11 +27,12 @@ is promised or dated; each item ships when it is proven on real hardware.
   tablet at any distance (design in a separate ADR).
 - **A real pen on headless Wayland desktops**, when GNOME's input emulation
   offers a stylus (see [Where help is wanted](#where-help-is-wanted)).
-- **Not planned: Wintab, and Native tablet on Windows hosts.** Windows hosts
-  deliver pens through Windows Ink only; set drawing applications to Windows
-  Ink ([settings per application](operations/pen-tablet-input.md#4a-windows-applications-choose-windows-ink)).
-  Native tablet on Windows would need a signed kernel driver the project does
-  not fund ([ADR 0017](adr/0017-forward-only-pen-input.md)).
+- **Not planned: Wintab on Windows hosts.** Windows hosts deliver pens
+  through Windows Ink only; set drawing applications to Windows Ink
+  ([settings per application](operations/pen-tablet-input.md#4a-windows-applications-choose-windows-ink)).
+  Native tablet on a Windows host arrives that way too: the Pier reads the
+  bridged pen itself, with no driver
+  ([ADR 0023 amendment](adr/0023-one-native-tablet-pen-position-path.md)).
 
 **Keyboard and cursor**
 
@@ -60,7 +61,7 @@ is promised or dated; each item ships when it is proven on real hardware.
 
 Ordered by how much they matter.
 
-**A Linux or Windows Deck.** See above. The largest gap and the clearest path.
+**A Linux Deck.** See above. The largest gap and the clearest path: the Windows Deck (0.20.0) showed that a second Deck is mostly a decoder, a presenter and a window around the shared Deck core.
 
 **Signed Windows drivers — microphone and USB.** Two features are missing on
 Windows for exactly the same reason, and solving one solves most of the other.
@@ -74,9 +75,12 @@ Windows for exactly the same reason, and solving one solves most of the other.
   driver exists in the tree and is excluded from released installers because it
   is unsigned.
 - **USB passthrough.** A Linux Pier can attach a Deck's physical pen tablet
-  to a session (Native tablet, administrator opt-in). Windows hosts do not offer it, for the same reason: the
-  project does not fund the signing pipeline
-  ([ADR 0017](adr/0017-forward-only-pen-input.md)). The route is recorded
+  to a session (Native tablet, administrator opt-in). A Windows host takes
+  Native tablet without attaching the device: it reads the pen itself and
+  injects Windows Ink, so the whole device (touch, the tablet's keys, the
+  maker's driver) is not attached there; attaching it would need the
+  signing pipeline the project does not fund
+  ([ADR 0017](adr/0017-forward-only-pen-input.md)). That route is recorded
   in [`docs/adr/0012-hard-usb-on-windows-hosts.md`](adr/0012-hard-usb-on-windows-hosts.md)
   and is revisited only if that pipeline is funded.
 

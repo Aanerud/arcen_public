@@ -19,10 +19,7 @@ use arcen_usb_bridge::{
 };
 
 /// Result of admitting one host URB.
-pub enum SubmitResult {
-    Immediate(Vec<u8>),
-    Pending,
-}
+pub use arcen_deck_core::runtime::usb::UsbSubmitResult as SubmitResult;
 
 /// One negotiated Hard USB responder.
 pub struct UsbHardResponder {
@@ -70,7 +67,7 @@ impl UsbHardResponder {
         // every session after that.
         ensure_helper_installed(&socket)?;
 
-        let client = crate::usb_helper_client::HelperClient::connect(&socket).await?;
+        let client = crate::usb_helper_client::connect(&socket).await?;
         tracing::info!(
             target: crate::logging::target::USB,
             socket = %socket,
@@ -211,7 +208,7 @@ fn ensure_helper_installed(socket: &str) -> Result<(), String> {
     if matches!(state, HelperInstallState::RequiresApproval) {
         crate::usb_helper_install::open_login_items_settings();
     }
-    Err(state.guidance().to_owned())
+    Err(state.guidance())
 }
 
 fn cancelled_completion(
@@ -350,4 +347,44 @@ mod tests {
 
     // The physical-capture tests moved with the code they cover, to
     // `clients/macos/usb-helper/src/capture.rs`. Deck no longer captures.
+}
+
+impl arcen_deck_core::runtime::usb::UsbTabletResponder for UsbHardResponder {
+    fn device(&self) -> UsbHardDeviceMsg {
+        Self::device(self)
+    }
+
+    fn update_pen(&mut self, event: PenEvent) {
+        Self::update_pen(self, event);
+    }
+
+    fn submit<'a>(
+        &'a mut self,
+        header: UsbUrbSubmitHeader,
+        payload: &'a [u8],
+    ) -> arcen_deck_core::runtime::usb::BoxFuture<'a, Result<SubmitResult, String>> {
+        Box::pin(Self::submit(self, header, payload))
+    }
+
+    fn cancel(
+        &mut self,
+        generation: arcen_usb_bridge::AttachmentGeneration,
+        urb_id: UrbId,
+    ) -> arcen_deck_core::runtime::usb::BoxFuture<'_, Result<Option<Vec<u8>>, String>> {
+        Box::pin(Self::cancel(self, generation, urb_id))
+    }
+
+    fn has_async_completions(&self) -> bool {
+        Self::has_async_completions(self)
+    }
+
+    fn next_completion(
+        &mut self,
+    ) -> arcen_deck_core::runtime::usb::BoxFuture<'_, Result<Vec<u8>, String>> {
+        Box::pin(Self::next_completion(self))
+    }
+
+    fn shutdown(self: Box<Self>) -> arcen_deck_core::runtime::usb::BoxFuture<'static, ()> {
+        Box::pin(Self::shutdown(*self))
+    }
 }

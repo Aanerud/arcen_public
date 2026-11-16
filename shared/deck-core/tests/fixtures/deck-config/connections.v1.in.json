@@ -1,0 +1,1 @@
+{"connections":[{"name":"pier-linux.example.internal","host":"pier-linux.example.internal","port":18443},{"name":"Studio","host":"203.0.113.10","port":18444,"transport":"quic","security_mode":"high"}]}

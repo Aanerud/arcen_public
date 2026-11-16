@@ -14,6 +14,7 @@ repository.workspace = true
 [dependencies]
 arcen-media.workspace = true
 arcen-protocol.workspace = true
+arcen-usb-bridge.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

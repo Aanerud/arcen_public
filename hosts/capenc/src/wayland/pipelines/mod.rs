@@ -114,6 +114,9 @@ pub struct EpochRequest {
     /// What the host's qualification proved about wide composition, for the
     /// Grading and HDR compositions (ignored by Auto and Speed).
     pub fidelity: FidelityArgs,
+    /// Exact still image (`refine=on`, ADR 0016): only the wide composition
+    /// refines; every other one states why it does not.
+    pub refine: Option<arcen_media::refine::CapencRefineArgs>,
 }
 
 /// The wide-composition facts the parent passes from the host's
@@ -358,6 +361,7 @@ impl EpochRequest {
                 .any(|argument| argument == arcen_media::capenc_stream::CURSOR_POSITION_ARG),
             probe: args.iter().any(|argument| argument == "probe-v1"),
             fidelity: FidelityArgs::from_args(args)?,
+            refine: arcen_media::refine::capenc_refine_args(args)?,
         })
     }
 }

@@ -16,6 +16,8 @@
 //! gives for it, so the parser follows the real layout rather than guessing
 //! offsets.
 
+use crate::bitstream::{BitReader, BitstreamError, unescape_rbsp};
+
 /// The subset of an HEVC SPS that decides what a stream carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HevcStreamTruth {
@@ -189,7 +191,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<HevcStreamTruth, HevcSpsError> {
     if nal.len() < 3 || (nal[0] >> 1) & 0x3F != SPS_NAL_TYPE {
         return Err(HevcSpsError::NotSps);
     }
-    let rbsp = unescape(&nal[2..]);
+    let rbsp = unescape_rbsp(&nal[2..]);
     let mut bits = Bits::new(&rbsp);
 
     bits.skip(4)?; // sps_video_parameter_set_id
@@ -454,81 +456,42 @@ fn vui_colour(bits: &mut Bits<'_>) -> Result<Option<HevcColourDescription>, Hevc
     }))
 }
 
-/// Removes emulation-prevention bytes (`00 00 03` becomes `00 00`).
-fn unescape(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(payload.len());
-    let mut zeros = 0;
-    for &byte in payload {
-        if zeros >= 2 && byte == 3 {
-            zeros = 0;
-            continue;
+impl From<BitstreamError> for HevcSpsError {
+    fn from(error: BitstreamError) -> Self {
+        match error {
+            BitstreamError::Truncated => Self::Truncated,
+            BitstreamError::Invalid(field) => Self::Invalid(field),
+            _ => Self::Invalid("unsupported syntax"),
         }
-        zeros = if byte == 0 { zeros + 1 } else { 0 };
-        out.push(byte);
     }
-    out
 }
 
-struct Bits<'a> {
-    data: &'a [u8],
-    position: usize,
-}
+/// The shared RBSP reader with this module's error type.
+struct Bits<'a>(BitReader<'a>);
 
 impl<'a> Bits<'a> {
     const fn new(data: &'a [u8]) -> Self {
-        Self { data, position: 0 }
-    }
-
-    fn bit(&mut self) -> Result<u32, HevcSpsError> {
-        let byte = *self
-            .data
-            .get(self.position / 8)
-            .ok_or(HevcSpsError::Truncated)?;
-        let bit = (byte >> (7 - self.position % 8)) & 1;
-        self.position += 1;
-        Ok(u32::from(bit))
+        Self(BitReader::new(data))
     }
 
     fn flag(&mut self) -> Result<bool, HevcSpsError> {
-        Ok(self.bit()? == 1)
+        Ok(self.0.flag()?)
     }
 
     fn read(&mut self, count: u32) -> Result<u32, HevcSpsError> {
-        let mut value = 0;
-        for _ in 0..count {
-            value = (value << 1) | self.bit()?;
-        }
-        Ok(value)
+        Ok(self.0.u(count)?)
     }
 
     fn skip(&mut self, count: u32) -> Result<(), HevcSpsError> {
-        let end = self.position + count as usize;
-        if end > self.data.len() * 8 {
-            return Err(HevcSpsError::Truncated);
-        }
-        self.position = end;
-        Ok(())
+        Ok(self.0.skip(count as usize)?)
     }
 
     fn ue(&mut self) -> Result<u32, HevcSpsError> {
-        let mut leading = 0;
-        while self.bit()? == 0 {
-            leading += 1;
-            if leading > 31 {
-                return Err(HevcSpsError::Invalid("exp-golomb"));
-            }
-        }
-        Ok((1 << leading) - 1 + self.read(leading)?)
+        Ok(self.0.ue()?)
     }
 
     fn se(&mut self) -> Result<i32, HevcSpsError> {
-        let value = self.ue()?;
-        let magnitude = i32::try_from(value.div_ceil(2)).unwrap_or(i32::MAX);
-        Ok(if value % 2 == 1 {
-            magnitude
-        } else {
-            -magnitude
-        })
+        Ok(self.0.se()?)
     }
 }
 

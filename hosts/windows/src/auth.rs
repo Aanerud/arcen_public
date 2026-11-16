@@ -8,16 +8,49 @@
 
 use std::sync::Arc;
 
-use tokio::sync::OwnedSemaphorePermit;
+use arcen_session::auth_throttle::{AttemptOutcome, AuthAttempt};
+use arcen_session::session_admission::PreauthPlace;
 use zeroize::Zeroizing;
 
+/// Why a credential check did not produce an account.
+#[derive(Debug)]
+enum LogonFailure {
+    /// The request had no user name or password; nothing was checked.
+    Incomplete,
+    /// `LogonUserW` refused the account or its password.
+    Refused,
+    /// Windows could not check the credential (no logon server), or could
+    /// not resolve the account it proved.
+    Unavailable(String),
+}
+
+impl LogonFailure {
+    /// What the sign-in throttle learns: only Windows refusing the account
+    /// or its password counts as a failed guess.
+    const fn throttle_outcome(&self) -> AttemptOutcome {
+        match self {
+            Self::Refused => AttemptOutcome::Refused,
+            Self::Incomplete | Self::Unavailable(_) => AttemptOutcome::Undecided,
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Incomplete | Self::Refused => "Invalid credentials".to_string(),
+            Self::Unavailable(message) => message,
+        }
+    }
+}
+
+/// A connection's pre-sign-in place, held by the session and, while a
+/// credential check runs, by its blocking worker.
 pub struct PreauthGuard {
-    _permit: OwnedSemaphorePermit,
+    _place: PreauthPlace,
 }
 
 impl PreauthGuard {
-    pub fn new(permit: OwnedSemaphorePermit) -> Arc<Self> {
-        Arc::new(Self { _permit: permit })
+    pub fn new(place: PreauthPlace) -> Arc<Self> {
+        Arc::new(Self { _place: place })
     }
 }
 
@@ -101,17 +134,30 @@ fn sid_string(sid: windows::Win32::Security::PSID) -> Result<String, String> {
     result
 }
 
+/// Checks a credential with `LogonUserW` on a blocking worker.
+///
+/// The throttle `attempt` travels with the worker and is finished there, so
+/// the outcome is recorded even when the caller stops waiting (its deadline,
+/// or a dropped connection) while Windows is still checking.
 pub async fn authenticate_windows(
     username: String,
     credential: Zeroizing<String>,
     preauth_guard: Arc<PreauthGuard>,
+    attempt: AuthAttempt<'static>,
 ) -> Result<(AuthenticatedAccount, Zeroizing<String>), String> {
     run_blocking_auth(preauth_guard, move || {
         // Validate with a borrow, then hand the still-zeroizing credential back
         // so the broker can reuse it for a first-login push without ever making
         // a second copy of the secret. On failure the credential is scrubbed as
         // this closure's `credential` owner is dropped.
-        authenticate_windows_blocking(&username, &credential).map(|account| (account, credential))
+        let checked = authenticate_windows_blocking(&username, &credential);
+        attempt.finish(match &checked {
+            Ok(_) => AttemptOutcome::Accepted,
+            Err(failure) => failure.throttle_outcome(),
+        });
+        checked
+            .map(|account| (account, credential))
+            .map_err(LogonFailure::into_message)
     })
     .await
 }
@@ -140,15 +186,18 @@ where
 fn authenticate_windows_blocking(
     username: &str,
     password: &str,
-) -> Result<AuthenticatedAccount, String> {
-    use windows::core::PCWSTR;
+) -> Result<AuthenticatedAccount, LogonFailure> {
+    use windows::core::{HRESULT, PCWSTR};
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
         LogonUserW, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT,
     };
+    /// `ERROR_NO_LOGON_SERVERS`: no domain controller answered, so nothing
+    /// was learned about the credential.
+    const NO_LOGON_SERVERS: HRESULT = HRESULT::from_win32(1311);
 
     if username.is_empty() || password.is_empty() {
-        return Err("Invalid credentials".to_string());
+        return Err(LogonFailure::Incomplete);
     }
 
     let (user, domain): (String, Option<String>) =
@@ -185,7 +234,12 @@ fn authenticate_windows_blocking(
             code = error.code().0,
             "LogonUser failed"
         );
-        return Err("Invalid credentials".to_string());
+        if error.code() == NO_LOGON_SERVERS {
+            return Err(LogonFailure::Unavailable(
+                "Windows could not reach a logon server".to_string(),
+            ));
+        }
+        return Err(LogonFailure::Refused);
     }
 
     let sid_storage = token_user_buffer(token);
@@ -200,7 +254,7 @@ fn authenticate_windows_blocking(
             %error,
             "cannot read authenticated Windows account SID"
         );
-        "Windows account identity could not be verified".to_string()
+        LogonFailure::Unavailable("Windows account identity could not be verified".to_string())
     })?;
     let canonical_name = lookup_account_name(token_user_sid(&sid_storage)).map_err(|error| {
         tracing::error!(
@@ -209,7 +263,7 @@ fn authenticate_windows_blocking(
             %error,
             "cannot resolve authenticated Windows account name"
         );
-        "Windows account identity could not be resolved".to_string()
+        LogonFailure::Unavailable("Windows account identity could not be resolved".to_string())
     })?;
     tracing::info!(target: crate::logging::AUTH, user = %username, "LogonUser OK");
     Ok(AuthenticatedAccount {
@@ -335,17 +389,22 @@ fn to_wide(value: &str) -> Vec<u16> {
 fn authenticate_windows_blocking(
     username: &str,
     _password: &str,
-) -> Result<AuthenticatedAccount, String> {
+) -> Result<AuthenticatedAccount, LogonFailure> {
     tracing::warn!(
         target: crate::logging::AUTH,
         user = %username,
         "authenticate_windows stub on non-Windows build - denying"
     );
-    Err("Windows authentication is unavailable on this platform".to_string())
+    Err(LogonFailure::Unavailable(
+        "Windows authentication is unavailable on this platform".to_string(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use arcen_session::session_admission::PreauthAdmission;
+
+    const PEER: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 9));
     #[test]
     fn canonical_account_name_requires_domain_and_user() {
         assert_eq!(
@@ -366,23 +425,31 @@ mod tests {
         #[cfg(not(windows))]
         {
             use zeroize::Zeroizing;
-            let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-            let guard = super::PreauthGuard::new(slots.clone().try_acquire_owned().expect("slot"));
-            assert!(super::authenticate_windows(
-                "user".into(),
-                Zeroizing::new("password".to_string()),
-                guard
-            )
-            .await
-            .is_err());
-            assert!(slots.try_acquire_owned().is_ok());
+            static THROTTLE: std::sync::LazyLock<arcen_session::auth_throttle::HostAuthThrottle> =
+                std::sync::LazyLock::new(Default::default);
+            let slots = std::sync::Arc::new(PreauthAdmission::new(1, 1));
+            // An unavailable verifier records nothing against the account, so
+            // repeating it never reaches the back-off.
+            for _ in 0..6 {
+                let guard = super::PreauthGuard::new(slots.try_enter(PEER).expect("slot"));
+                let attempt = THROTTLE.begin(None, "user").expect("not throttled");
+                assert!(super::authenticate_windows(
+                    "user".into(),
+                    Zeroizing::new("password".to_string()),
+                    guard,
+                    attempt
+                )
+                .await
+                .is_err());
+            }
+            assert!(slots.try_enter(PEER).is_ok());
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_auth_keeps_slot_until_blocking_worker_finishes() {
-        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let guard = super::PreauthGuard::new(slots.clone().try_acquire_owned().expect("slot"));
+        let slots = std::sync::Arc::new(PreauthAdmission::new(1, 1));
+        let guard = super::PreauthGuard::new(slots.try_enter(PEER).expect("slot"));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let auth = tokio::spawn(super::run_blocking_auth::<(), _>(guard, move || {
@@ -394,12 +461,12 @@ mod tests {
         started_rx.await.expect("worker started");
         auth.abort();
         let _ = auth.await;
-        assert!(slots.clone().try_acquire_owned().is_err());
+        assert!(slots.try_enter(PEER).is_err());
 
         release_tx.send(()).expect("release worker");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                if slots.clone().try_acquire_owned().is_ok() {
+                if slots.try_enter(PEER).is_ok() {
                     break;
                 }
                 tokio::task::yield_now().await;

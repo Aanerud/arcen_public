@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+# Cross-product clones: production lines (comments, tests and trivial lines
+# removed) inside contiguous runs of at least `window` identical normalised
+# lines shared by two products (the larger side of each pair). Checked by
+# scripts/check_shared_contracts.py; a pair may shrink, never grow.
+# Regenerate after a reviewed reduction with
+# scripts/check_shared_contracts.py --write-clone-baseline.
+
+window = 12
+
+[pairs]
+"clients/macos | hosts/capenc" = 24
+"hosts/linux | hosts/macos" = 12
+"hosts/linux | hosts/windows" = 1353
+"hosts/linux | packaging" = 45
+"hosts/windows | clients/windows" = 14
+"hosts/windows | hosts/macos" = 103

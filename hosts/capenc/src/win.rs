@@ -42,7 +42,7 @@ use windows::Win32::System::Power::{
 
 /// Explicit adapter/output/device selector for resolving one specific DXGI
 /// output, threaded from the pier's freshly re-resolved stable capture
-/// binding (see `hosts/windows/src/multi_monitor_topology.rs`'s
+/// binding (see `arcen_outputs::windows_topology`'s
 /// `CaptureSelector` and `hosts/windows/src/capenc.rs`'s `CapencConfig`).
 ///
 /// `capenc`'s argv cannot select an output by stable adapter LUID directly
@@ -1485,6 +1485,14 @@ unsafe fn sdr_white_level(monitor: HMONITOR) -> Result<u32, String> {
     Err(format!("no active display path for {device}"))
 }
 
+/// How the live NVENC loop writes its output, and whether it refines.
+#[cfg(feature = "nvenc")]
+struct OutputFraming {
+    framed: bool,
+    framed_v2: bool,
+    refine: Option<arcen_media::refine::CapencRefineArgs>,
+}
+
 #[cfg(feature = "nvenc")]
 unsafe fn run_encode(
     mut cap: Source,
@@ -1492,9 +1500,14 @@ unsafe fn run_encode(
     codec: &str,
     fps: u32,
     color: crate::ColorSpec,
-    framed: bool,
+    output: OutputFraming,
     cursor_mode: crate::CursorCaptureMode,
 ) -> i32 {
+    let OutputFraming {
+        framed,
+        framed_v2,
+        refine: refine_args,
+    } = output;
     log(&format!(
         "NVENC ready: {}x{} codec={} chroma={:?} depth={:?} range={:?} matrix={:?} \
          primaries={:?} transfer={:?} capture_format={}",
@@ -1518,7 +1531,64 @@ unsafe fn run_encode(
     let announced_capture = cap.capture_backend();
     let announced_conversion = encoder.conversion_backend();
     let qp_damage_source = cap.qp_damage_source();
+    // Exact still image (ADR 0016), only with `refine=on` on an FP16 capture.
+    let mut refine = match refine_args {
+        None => None,
+        Some(args) if !cap.is_wide() => {
+            log(&format!(
+                "lossless refinement off: the capture is not FP16 (scope {:?})",
+                args.scope
+            ));
+            None
+        }
+        Some(args) => {
+            let dirty_regions = qp_damage_source == crate::nvenc::QpDamageSource::WgcDirtyRegions;
+            let (width, height) = (cap.width(), cap.height());
+            match crate::win_refine::WinRefine::start(
+                &args,
+                color,
+                &mut encoder,
+                width,
+                height,
+                dirty_regions,
+            ) {
+                Ok(mut refine) => {
+                    // The floor until the Pier's link budget sets the rate.
+                    refine.runtime.cap_rate(encoder.average_bitrate_bps());
+                    log(&format!(
+                        "lossless refinement on: scope={:?} still_ms={} max_mbps={}",
+                        args.scope, args.still_ms, args.max_mbps
+                    ));
+                    Some(refine)
+                }
+                Err(error) => {
+                    log(&format!("lossless refinement off: {error}"));
+                    None
+                }
+            }
+        }
+    };
+    let refine_uses_regions = refine
+        .as_ref()
+        .is_some_and(crate::win_refine::WinRefine::needs_dirty_regions);
+    let refine_blocks = (cap.width() as usize).div_ceil(arcen_media::refine::BLOCK)
+        * (cap.height() as usize).div_ceil(arcen_media::refine::BLOCK);
+    let qp_uses_damage = matches!(
+        qp_damage_source,
+        crate::nvenc::QpDamageSource::DxgiRects | crate::nvenc::QpDamageSource::WgcDirtyRegions
+    );
     let mut qp_external_damage = match qp_damage_source {
+        _ if refine_uses_regions => {
+            match arcen_keel::ExternalDamage::new(cap.width() as usize, cap.height() as usize) {
+                Ok(damage) => Some(damage),
+                Err(error) => {
+                    log(&format!(
+                        "lossless refinement dirty regions unavailable: {error}"
+                    ));
+                    None
+                }
+            }
+        }
         crate::nvenc::QpDamageSource::DxgiRects | crate::nvenc::QpDamageSource::WgcDirtyRegions => {
             match arcen_keel::ExternalDamage::new(cap.width() as usize, cap.height() as usize) {
                 Ok(damage) => Some(damage),
@@ -1625,6 +1695,23 @@ unsafe fn run_encode(
     let mut last_emit = Instant::now();
 
     while !control.stop_requested() {
+        if let Some(refine) = refine.as_mut() {
+            // The GPU path's bounded readback, then finished tiles and
+            // digests. Neither waits; at the top of the loop so an idle
+            // iteration that skips its submission still drains them.
+            match refine.poll(&mut encoder) {
+                // Invalidations no capture will carry: submit now.
+                Ok(true) => submission_gate.note_frame(),
+                Ok(false) => {}
+                Err(error) => {
+                    log(&format!("lossless refinement readback failed: {error}"));
+                    return 3;
+                }
+            }
+            if refine.runtime.pump(&mut stdout).is_err() {
+                return 0;
+            }
+        }
         // Drain toward the newest frame (short timeout keeps the pace tight and
         // capture latency low). Only the GPU CopyResource runs while the DXGI
         // frame is held; the CPU Map, colour conversion, NVENC write and
@@ -1654,7 +1741,7 @@ unsafe fn run_encode(
             log(&format!("stage failed: {e}"));
             return 3;
         }
-        if new_frame {
+        if new_frame && qp_uses_damage {
             if let Some(damage) = qp_external_damage.as_ref() {
                 if let Err(error) = encoder.observe_external_damage(damage.damage_map()) {
                     crate::debug_log(&error);
@@ -1664,8 +1751,31 @@ unsafe fn run_encode(
         }
         // The DXGI frame is released by this point.
         if new_frame {
+            if let Some(refine) = refine.as_mut() {
+                // The GPU path's damage for this frame, before it is encoded.
+                let regions: Vec<usize> = if refine_uses_regions {
+                    match qp_external_damage.as_ref() {
+                        Some(damage) => damage.damage_map().dirty_blocks().collect(),
+                        // No accumulator: every block is suspect.
+                        None => (0..refine_blocks).collect(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                if let Err(error) = refine.new_gpu_frame(&mut encoder, regions.into_iter()) {
+                    log(&format!("lossless refinement readback failed: {error}"));
+                    return 3;
+                }
+            }
             let publish_started = Instant::now();
-            let published = encoder.convert_and_publish_staging();
+            let published = match refine.as_mut() {
+                Some(refine) => {
+                    encoder.convert_and_publish_staging_observed(&mut |bytes, pitch| {
+                        refine.observe_mapped(bytes, pitch);
+                    })
+                }
+                None => encoder.convert_and_publish_staging(),
+            };
             let stage_ms = copy_ms + publish_started.elapsed().as_secs_f64() * 1000.0;
             stage_count += 1;
             stage_ms_sum += stage_ms;
@@ -1784,6 +1894,11 @@ unsafe fn run_encode(
             let force = first || requested_idr;
             if requested_idr && !first {
                 log("consuming IDR request");
+                // A requested keyframe is a recovery: refinement starts a
+                // new generation behind its barrier (ADR 0016 R3).
+                if let Some(refine) = refine.as_mut() {
+                    refine.runtime.recovery();
+                }
             }
             if let Some(fps) = control.take_framerate_fps() {
                 target_dt = crate::frame_interval_from_fps(fps);
@@ -1794,6 +1909,28 @@ unsafe fn run_encode(
             if let Some(bps) = control.take_bitrate_bps() {
                 if let Err(error) = encoder.reconfigure_bitrate(bps) {
                     crate::log(&format!("live bitrate reconfigure failed: {error}"));
+                }
+                // The refinement floor until the link budget's first rate.
+                if let Some(refine) = refine.as_mut() {
+                    refine.runtime.cap_rate(bps);
+                }
+            }
+            if let Some((bps, hold)) = control.take_refine_rate() {
+                // The Pier's link budget (ADR 0016 R6).
+                if let Some(refine) = refine.as_mut() {
+                    refine.runtime.set_link_rate(bps, hold);
+                }
+            }
+            if let Some(refine) = refine.as_mut() {
+                if control.take_refine_reset() {
+                    log("lossless refinement: the Deck asked to start over");
+                    refine.runtime.reset_request();
+                }
+                if let Some(enabled) = control.take_refine_enabled() {
+                    log(&format!(
+                        "lossless refinement: the Deck set enabled={enabled}"
+                    ));
+                    refine.runtime.set_enabled(enabled);
                 }
             }
             let t0 = Instant::now();
@@ -1850,7 +1987,28 @@ unsafe fn run_encode(
                             ready_announced = true;
                         }
                         // Parent gone / pipe closed -> exit cleanly.
-                        if crate::write_access_unit(&mut stdout, &au, framed).is_err() {
+                        let written = match refine.as_mut() {
+                            Some(refine) => refine
+                                .runtime
+                                .before_access_unit(&mut stdout)
+                                .and_then(|()| {
+                                    crate::validate_access_unit(&au, true)?;
+                                    arcen_media::capenc_stream::write_record(
+                                        &mut stdout,
+                                        arcen_media::capenc_stream::CapencRecordKind::AccessUnit,
+                                        &au,
+                                    )
+                                }),
+                            // framed-v2 was asked for: every access unit is
+                            // a tagged record, refined or not.
+                            None => crate::write_access_unit_as_requested(
+                                &mut stdout,
+                                &au,
+                                framed,
+                                framed_v2,
+                            ),
+                        };
+                        if written.is_err() {
                             return 0;
                         }
                         enc_count += 1;
@@ -1959,6 +2117,14 @@ unsafe fn run_encode(
                 cap.take_pointer_updates(),
                 control.idr_pending()
             ));
+            // A line of its own: the Pier parses the stats line above into
+            // fixed fields, and refinement's would be lost in it.
+            if let Some(refine) = refine.as_mut() {
+                log(&format!(
+                    "lossless refinement stats:{}",
+                    refine.log_fields()
+                ));
+            }
             crate::debug_log(&format!(
                 "QP map stats: biased_maps={} neutral_maps={} mean_dirty_blocks={:.4}",
                 qp_stats.biased_maps,
@@ -3364,6 +3530,29 @@ pub fn run_with_args(args: Vec<String>) -> ! {
     // easy to introduce and invisible in every other log line.
     log(&format!("capenc: argv={args:?}"));
 
+    // framed-v2 and exact still image (ADR 0016) are written only by the
+    // live FP16 NVENC path; every other path refuses them before capture.
+    let framed_v2 = args
+        .iter()
+        .any(|arg| arg == arcen_media::capenc_stream::FRAMED_OUTPUT_V2);
+    let refine_args = match arcen_media::refine::capenc_refine_args(&args) {
+        Ok(refine) => refine,
+        Err(error) => {
+            log(&format!("ERROR: {error}"));
+            std::process::exit(2);
+        }
+    };
+    #[cfg(feature = "nvenc")]
+    let wide_live = color.bit_depth != arcen_media::BitDepth::Eight
+        && !selftest
+        && admission_probe.is_none()
+        && (encoder_choice == "auto" || encoder_choice == "nvenc");
+    #[cfg(not(feature = "nvenc"))]
+    let wide_live = false;
+    if !wide_live {
+        crate::refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::Windows);
+    }
+
     // Portable OpenH264 is both the explicit software backend and the product
     // auto fallback.
     #[cfg(feature = "software-h264")]
@@ -3576,8 +3765,19 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                                 reason
                             ));
                         }
-                        let code =
-                            run_encode(source, encoder, &codec, fps, color, framed, cursor_mode);
+                        let code = run_encode(
+                            source,
+                            encoder,
+                            &codec,
+                            fps,
+                            color,
+                            OutputFraming {
+                                framed,
+                                framed_v2,
+                                refine: refine_args,
+                            },
+                            cursor_mode,
+                        );
                         std::process::exit(code);
                     },
                     Err(error) => {

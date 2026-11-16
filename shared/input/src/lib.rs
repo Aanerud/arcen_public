@@ -9,7 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+pub mod bridged_pen;
+pub mod compositor_pressure;
 pub mod cursor;
+pub mod deck_events;
+pub mod deck_pen;
+pub mod deck_wheel;
 mod gestures;
 pub mod hid_digitizer;
 pub mod hid_reports;
@@ -30,6 +35,7 @@ mod region_wire;
 pub mod seat_pen;
 pub mod tablet_pointer;
 pub mod text;
+pub mod touchpad;
 pub mod virtual_device;
 
 pub use lane_outbox::{InputLaneOutbox, InputRecordClass, PEN_CONTACT_BACKLOG_CAP};
@@ -937,5 +943,6 @@ mod tests {
     }
 }
 pub use gestures::{
-    GestureEvent, GestureState, GestureStateError, GestureWireRef, coalesce_gestures,
+    GestureEvent, GestureSample, GestureState, GestureStateError, GestureWire, GestureWireRef,
+    coalesce_gestures,
 };

@@ -747,9 +747,9 @@ impl InputController {
         display: &str,
         xauthority: Option<&std::path::Path>,
     ) -> Result<(), String> {
-        let text = super::x11_text::X11Text::connect(display, xauthority)?;
-        self.x11_text = Some(Box::new(text));
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        let text = super::x11_text::X11Text::connect(display, xauthority, sender.clone())?;
+        self.x11_text = Some(Box::new(text));
         self.text_notices = Some((sender, Some(receiver)));
         Ok(())
     }

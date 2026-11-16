@@ -4,9 +4,11 @@
 
 use arcen_protocol::AudioCodec;
 
+pub mod capture_normalizer;
 mod microphone;
 #[cfg(feature = "audio-opus")]
 mod opus;
+pub mod playback_queue;
 pub mod playout;
 use arcen_protocol::messages::{
     AUDIO_PROTOCOL_VERSION, AudioBitrateTierMsg, AudioOutputCapabilitiesMsg, AudioStreamConfigMsg,

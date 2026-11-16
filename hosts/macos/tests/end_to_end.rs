@@ -78,6 +78,14 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServer {
     }
 }
 
+/// The real clock: the Pier checks a certificate's validity period against
+/// it when it loads the material.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 fn temp_dir(name: &str) -> std::path::PathBuf {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let Some(hosts) = manifest.parent() else {
@@ -221,7 +229,7 @@ async fn a_second_client_is_refused_while_a_session_is_active() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -359,7 +367,7 @@ async fn a_client_connects_over_quic_and_completes_the_handshake() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision certificate");
     let paths = MaterialPaths::in_directory(&dir);
@@ -448,7 +456,7 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -487,6 +495,10 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -596,7 +608,7 @@ async fn a_grading_stream_for_an_srgb_deck_says_srgb_in_its_sps() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -637,6 +649,10 @@ async fn a_grading_stream_for_an_srgb_deck_says_srgb_in_its_sps() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -706,7 +722,7 @@ async fn idle_desktop_full_frame_request_reencodes_the_last_frame_as_a_keyframe(
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -739,6 +755,10 @@ async fn idle_desktop_full_frame_request_reencodes_the_last_frame_as_a_keyframe(
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
                 input_bounds: arcen_pier_macos::input::DesktopBounds::new(
                     0.0,
                     0.0,
@@ -843,7 +863,7 @@ async fn input_sent_during_a_stream_moves_the_real_pointer() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -893,6 +913,10 @@ async fn input_sent_during_a_stream_moves_the_real_pointer() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -995,7 +1019,7 @@ async fn the_pier_asks_for_credentials_before_it_greets() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -1047,7 +1071,7 @@ async fn an_unauthenticated_client_gets_no_desktop() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -1101,7 +1125,7 @@ async fn a_client_clipboard_reaches_the_real_pasteboard() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -1144,6 +1168,10 @@ async fn a_client_clipboard_reaches_the_real_pasteboard() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -1240,7 +1268,7 @@ async fn a_client_without_the_right_alpn_is_refused() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -1290,7 +1318,7 @@ async fn a_streamed_session_records_what_it_measured() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -1341,6 +1369,10 @@ async fn a_streamed_session_records_what_it_measured() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -1429,7 +1461,7 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -1473,6 +1505,10 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -1616,7 +1652,7 @@ async fn committed_text_is_typed_and_health_stats_carry_the_path() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -1662,6 +1698,10 @@ async fn committed_text_is_typed_and_health_stats_carry_the_path() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -1805,7 +1845,7 @@ async fn host_audio_reaches_the_client_when_capture_is_available() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -1849,6 +1889,10 @@ async fn host_audio_reaches_the_client_when_capture_is_available() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -2012,7 +2056,7 @@ async fn a_thirty_fps_session_delivers_near_thirty_fps() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -2057,6 +2101,10 @@ async fn a_thirty_fps_session_delivers_near_thirty_fps() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -2200,7 +2248,7 @@ async fn a_still_desktop_sends_almost_nothing() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -2245,6 +2293,10 @@ async fn a_still_desktop_sends_almost_nothing() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -2351,7 +2403,7 @@ async fn a_still_screen_stays_healthy_for_a_minute() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -2425,6 +2477,10 @@ async fn a_still_screen_stays_healthy_for_a_minute() {
                 served_pipeline: None,
                 input_mode_results: Default::default(),
                 path_signal_connection,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await
@@ -2580,7 +2636,7 @@ async fn a_bridged_tablet_is_published_as_hid_devices_fed_and_torn_down() {
         &dir,
         ProvisioningRequest::Ensure,
         &["localhost".to_owned()],
-        1_800_000_000,
+        now_epoch_secs(),
     )
     .expect("provision");
     let paths = MaterialPaths::in_directory(&dir);
@@ -2660,6 +2716,10 @@ async fn a_bridged_tablet_is_published_as_hid_devices_fed_and_torn_down() {
                 served_pipeline: None,
                 input_mode_results: results,
                 path_signal_connection: None,
+                refine: arcen_media::refine::RefinePlan::Off(
+                    arcen_media::refine::RefineOffReason::DeckUnsupported,
+                ),
+                host_keymap: false,
             },
         )
         .await

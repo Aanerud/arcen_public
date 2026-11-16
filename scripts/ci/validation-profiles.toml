@@ -37,6 +37,15 @@ argv = ["cargo", "build", "--locked", "{target}", "-p", "{package}", "{features}
 [template.cargo-clippy-strict]
 argv = ["cargo", "clippy", "--locked", "{target}", "-p", "{package}", "{features}", "--", "-D", "warnings"]
 
+# Type-checks a Windows target from a developer Mac. cargo-xwin downloads
+# Microsoft's SDK and CRT under Microsoft's licence on first use; it is not
+# run in CI (a Release/Security decision).
+[template.cargo-xwin-check]
+argv = ["cargo", "xwin", "check", "--locked", "{target}", "-p", "{package}", "{features}", "--all-targets"]
+
+[template.cargo-xwin-check-lib]
+argv = ["cargo", "xwin", "check", "--locked", "{target}", "-p", "{package}", "{features}", "--lib"]
+
 [template.python-unittest]
 argv = ["python3", "-m", "unittest", "{module}"]
 
@@ -50,6 +59,24 @@ argv = ["bash", "{script}"]
 argv = []
 
 # --- Build profiles: shared crates ------------------------------------------------
+
+[build_profile.shared-deck-core]
+description = "arcen-deck-core, default features (pure: no tokio, quinn, egui or wgpu)"
+target_os = "any"
+package = "arcen-deck-core"
+
+[build_profile.shared-deck-core-all]
+description = "arcen-deck-core with runtime, egui and wgpu-presenter"
+target_os = "any"
+package = "arcen-deck-core"
+features = ["runtime", "egui", "wgpu-presenter"]
+
+[build_profile.shared-deck-core-windows]
+description = "arcen-deck-core, every feature, for the Windows Deck target"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-deck-core"
+features = ["runtime", "egui", "wgpu-presenter"]
 
 [build_profile.shared-identity]
 description = "arcen-identity, default features"
@@ -178,6 +205,11 @@ target_os = "windows"
 rust_target = "x86_64-pc-windows-msvc"
 package = "arcen-pier-windows"
 
+[build_profile.windows-iddcx-provider]
+description = "The IddCx provider's pure contracts and planning (no OS calls; tests run anywhere)"
+target_os = "any"
+package = "arcen-iddcx-provider"
+
 [build_profile.windows-capenc]
 description = "capenc as the Windows Pier links it: WGC/DDA capture, NVENC and OpenH264"
 target_os = "windows"
@@ -197,6 +229,32 @@ description = "Windows installer embedding arcen-pier.exe and the credential pro
 target_os = "windows"
 rust_target = "x86_64-pc-windows-msvc"
 package = "arcen-pier-windows-installer"
+
+# --- Build profiles: Windows Deck ------------------------------------------------------
+
+[build_profile.windows-deck]
+description = "Windows Deck (ADR 0024), x64"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-deck-windows"
+
+[build_profile.windows-usb-component]
+description = "Windows Deck's optional Arcen USB component service (LocalSystem, WinUSB), x64"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-usb-service"
+
+[build_profile.windows-usb-client]
+description = "Windows Deck's side of the Arcen USB component (component state, actions, verified pipe client), x64"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-usb-client"
+
+[build_profile.macos-deck-windows-typecheck]
+description = "The macOS Deck library type-checked for Windows: proves its portable code compiles off macOS (ADR 0024 step 0)"
+target_os = "windows"
+rust_target = "x86_64-pc-windows-msvc"
+package = "arcen-deck-macos"
 
 # --- Build profiles: macOS Pier and Deck -------------------------------------------------
 
@@ -490,6 +548,49 @@ build_profile = "shared-usb-bridge"
 template = "cargo-clippy-strict"
 owner = "Shared/Architecture"
 
+[validation.shared-deck-core-test]
+description = "arcen-deck-core tests, default features"
+kind = "unit"
+build_profile = "shared-deck-core"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-deck-core-clippy]
+description = "arcen-deck-core strict Clippy, default features"
+kind = "lint"
+build_profile = "shared-deck-core"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-deck-core-all-test]
+description = "arcen-deck-core tests with runtime, egui and wgpu-presenter"
+kind = "unit"
+build_profile = "shared-deck-core-all"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-deck-core-all-clippy]
+description = "arcen-deck-core strict Clippy with runtime, egui and wgpu-presenter"
+kind = "lint"
+build_profile = "shared-deck-core-all"
+template = "cargo-clippy-strict"
+owner = "Shared/Architecture"
+
+[validation.shared-deck-core-windows-typecheck]
+description = "arcen-deck-core, every feature, type-checks for x86_64-pc-windows-msvc (cargo xwin on a developer Mac)"
+kind = "build"
+build_profile = "shared-deck-core-windows"
+target_os = "macos"
+template = "cargo-xwin-check"
+owner = "Shared/Architecture"
+
+[validation.shared-deck-core-tree-purity]
+description = "CI proof that default arcen-deck-core pulls in no tokio, quinn, egui, wgpu or product package"
+kind = "evidence"
+build_profile = "shared-deck-core"
+template = "recorded"
+owner = "Shared/Architecture"
+
 [validation.region-patch-benchmark-test]
 description = "Internal region-patch benchmark builds and its tests pass"
 kind = "unit"
@@ -704,6 +805,13 @@ build_profile = "windows-pier"
 template = "cargo-test"
 owner = "Windows Host"
 
+[validation.windows-iddcx-provider-test]
+description = "IddCx provider contract, planning and EDID golden tests"
+kind = "unit"
+build_profile = "windows-iddcx-provider"
+template = "cargo-test"
+owner = "Windows Host"
+
 [validation.windows-capenc-test]
 description = "capenc tests on Windows with NVENC and OpenH264 compiled in"
 kind = "unit"
@@ -716,6 +824,13 @@ description = "capenc builds with the Media Foundation encoder variant"
 kind = "build"
 build_profile = "windows-capenc-mf"
 template = "cargo-build"
+owner = "Windows Host"
+
+[validation.windows-pier-native-tablet-lab]
+description = "Native tablet on the Windows Pier: Deck CLI --usb-emulate wacom-intuos5|generic-pen --usb-emulate-stroke ladder, pressure/tilt/buttons/proximity read by Chrome and Firefox on the Pier's desktop (Windows Ink)"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
 owner = "Windows Host"
 
 [validation.windows-pier-installer-build]
@@ -780,6 +895,67 @@ kind = "hardware"
 build_profile = "windows-pier"
 template = "recorded"
 owner = "Windows Host"
+
+# --- Validations: Windows Deck ----------------------------------------------------------------
+
+[validation.windows-deck-typecheck]
+description = "Windows Deck type-checks for x86_64-pc-windows-msvc (cargo xwin on a developer Mac)"
+kind = "build"
+build_profile = "windows-deck"
+target_os = "macos"
+template = "cargo-xwin-check"
+owner = "Windows Client"
+
+[validation.windows-deck-test]
+description = "Windows Deck builds and its tests pass on Windows/MSVC"
+kind = "unit"
+build_profile = "windows-deck"
+template = "cargo-test"
+owner = "Windows Client"
+
+[validation.windows-deck-session-lab]
+description = "Windows Deck connects, authenticates, streams and reconnects against real Linux and macOS Piers (lab Windows PC to Linux X11, Linux Wayland and macOS Piers)"
+kind = "hardware"
+build_profile = "windows-deck"
+template = "recorded"
+owner = "Windows Client"
+
+[validation.windows-usb-component-typecheck]
+description = "Arcen USB component service type-checks and passes strict Clippy for x86_64-pc-windows-msvc (cargo xwin on a developer Mac)"
+kind = "build"
+build_profile = "windows-usb-component"
+target_os = "macos"
+template = "cargo-xwin-check"
+owner = "Windows Client"
+
+[validation.windows-usb-component-test]
+description = "Arcen USB component service builds and its tests pass on Windows/MSVC"
+kind = "unit"
+build_profile = "windows-usb-component"
+template = "cargo-test"
+owner = "Windows Client"
+
+[validation.windows-usb-component-lab]
+description = "Arcen USB component on Windows 11 x64 with Secure Boot: prepare, per-session claim and release (stand-in device on the lab VM; a real tablet on a physical PC), bridged to Linux and macOS Piers"
+kind = "hardware"
+build_profile = "windows-usb-component"
+template = "recorded"
+owner = "Windows Client"
+
+[validation.windows-usb-client-typecheck]
+description = "Arcen USB component client type-checks and passes strict Clippy for x86_64-pc-windows-msvc, with and without the lab feature (cargo xwin on a developer Mac)"
+kind = "build"
+build_profile = "windows-usb-client"
+target_os = "macos"
+template = "cargo-xwin-check"
+owner = "Windows Client"
+
+[validation.windows-usb-client-test]
+description = "Arcen USB component client builds and its tests pass on Windows/MSVC"
+kind = "unit"
+build_profile = "windows-usb-client"
+template = "cargo-test"
+owner = "Windows Client"
 
 # --- Validations: macOS Pier ------------------------------------------------------------------
 
@@ -867,6 +1043,14 @@ description = "macOS Deck builds for Intel Macs"
 kind = "build"
 build_profile = "macos-deck-intel"
 template = "cargo-build"
+owner = "macOS Client"
+
+[validation.macos-deck-windows-typecheck]
+description = "macOS Deck library type-checks for x86_64-pc-windows-msvc (cargo xwin on a developer Mac; ADR 0024 step 0)"
+kind = "build"
+build_profile = "macos-deck-windows-typecheck"
+target_os = "macos"
+template = "cargo-xwin-check-lib"
 owner = "macOS Client"
 
 [validation.macos-deck-native-tablet-test]

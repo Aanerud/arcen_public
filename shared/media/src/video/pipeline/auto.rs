@@ -25,6 +25,7 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     keel: KEEL_IDLE_QP_OFF,
     queue: DEFAULT_QUEUE_POLICY,
     decode_latency: super::DecodeLatencyPolicy::DEFAULT,
+    present_timing: super::PresentTiming::Newest,
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
     favours: "a sharp picture, up to 30 fps",
     gives_up: "frame rate when the link is tight",

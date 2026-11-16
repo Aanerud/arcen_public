@@ -1,0 +1,19 @@
+{
+  "pins": {
+    "203.0.113.20:18444": {
+      "digest": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+      "kind": "certificate_sha256"
+    },
+    "pier-a.example.internal:18444": {
+      "digest": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+      "kind": "spki_sha256",
+      "label": "Studio A",
+      "pinned_at": "2026-11-14T08:00:00Z"
+    },
+    "pier-c.example.internal:18444": {
+      "digest": "not-a-digest",
+      "kind": "unknown_kind"
+    }
+  },
+  "version": 1
+}

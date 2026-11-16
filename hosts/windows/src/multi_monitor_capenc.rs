@@ -39,14 +39,15 @@ use arcen_protocol::messages::CursorMode;
 use arcen_protocol::{ChromaSubsampling, VideoCodec};
 use arcen_telemetry::CorrelationId;
 
-use crate::capenc::{Capenc, CapencConfig, CapencStartError, EncoderSelection, IdrRequester};
-use crate::multi_monitor_topology::{
+use crate::capenc::{Capenc, CapencConfig, CapencStartError, IdrRequester};
+use crate::nvapi::AdapterLuid;
+use arcen_media::video::EncoderRequest;
+use arcen_media::video::ResolvedMediaPlan;
+use arcen_media::{BitDepth, ColorMatrix, ColorRange, EncodeIntent};
+use arcen_outputs::windows_topology::{
     CaptureSelector, CaptureSelectorError, PhysicalOutputInventory, WindowsMonitorPlan,
     WindowsTopologyPlan,
 };
-use crate::nvapi::AdapterLuid;
-use arcen_media::video::ResolvedMediaPlan;
-use arcen_media::{BitDepth, ColorMatrix, ColorRange, EncodeIntent};
 
 /// Carrier A and the production Deck consumer are wired.
 pub const MULTI_MONITOR_CARRIER_READY: bool = true;
@@ -77,7 +78,7 @@ pub struct MonitorPipelineTemplate {
     /// Optional native encoder ceiling from the served pipeline contract.
     pub encoder_max_bitrate_bps: Option<u32>,
     pub fps: u32,
-    pub encoder: Option<EncoderSelection>,
+    pub encoder: Option<EncoderRequest>,
     pub video_selection: arcen_protocol::messages::VideoSelectionIntent,
     pub cursor_mode: CursorMode,
     pub session_log_id: CorrelationId,
@@ -85,7 +86,7 @@ pub struct MonitorPipelineTemplate {
 
 impl MonitorPipelineTemplate {
     fn qp_map_for_config(&self, config: &CapencConfig) -> arcen_media::video::QpMapPolicy {
-        if config.encoder == Some(EncoderSelection::SoftwareH264) {
+        if config.encoder == Some(EncoderRequest::SoftwareH264) {
             return arcen_media::video::QpMapPolicy::Off;
         }
         let video = arcen_media::VideoConfiguration {
@@ -145,7 +146,7 @@ impl std::error::Error for MultiCapencConfigError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorPipelineSpec {
     pub session_monitor_id: SessionMonitorId,
-    /// Stable identity: see `multi_monitor_topology`'s module documentation.
+    /// Stable identity: see `arcen_outputs::windows_topology`'s module documentation.
     pub adapter_luid: AdapterLuid,
     pub target_id: u32,
     /// Rotation-aware applied on-desktop footprint (`WindowsMonitorPlan::width`/
@@ -155,7 +156,7 @@ pub struct MonitorPipelineSpec {
     /// is never copied here.
     pub width: u32,
     pub height: u32,
-    pub encoder: Option<EncoderSelection>,
+    pub encoder: Option<EncoderRequest>,
     pub codec: Option<VideoCodec>,
     pub chroma: Option<ChromaSubsampling>,
 }
@@ -163,7 +164,7 @@ pub struct MonitorPipelineSpec {
 impl MonitorPipelineSpec {
     pub fn set_media_policy(
         &mut self,
-        encoder: EncoderSelection,
+        encoder: EncoderRequest,
         codec: VideoCodec,
         chroma: ChromaSubsampling,
     ) {
@@ -199,7 +200,7 @@ pub fn build_pipeline_specs(
             // (already swapped from the native mode at 90/270 degrees), not
             // the pre-rotation `mode_width`/`mode_height` — those remain
             // display-set/recovery-journal only. See `WindowsMonitorPlan`'s
-            // field docs in `multi_monitor_topology`.
+            // field docs in `arcen_outputs::windows_topology`.
             width: monitor.width,
             height: monitor.height,
             encoder: None,
@@ -310,13 +311,13 @@ pub fn resolve_pipeline_specs(
                 device_name: Some(selector.device_name.clone()),
                 codec: spec.codec.unwrap_or(template.codec),
                 chroma: spec.chroma.unwrap_or(template.chroma),
-                bit_depth: if spec.encoder == Some(EncoderSelection::SoftwareH264) {
+                bit_depth: if spec.encoder == Some(EncoderRequest::SoftwareH264) {
                     BitDepth::Eight
                 } else {
                     template.bit_depth
                 },
                 color_range: template.color_range,
-                color_matrix: if spec.encoder == Some(EncoderSelection::SoftwareH264)
+                color_matrix: if spec.encoder == Some(EncoderRequest::SoftwareH264)
                     && template.color_matrix.is_identity()
                 {
                     ColorMatrix::Bt709
@@ -327,14 +328,14 @@ pub fn resolve_pipeline_specs(
                 color_primaries: template.color_primaries,
                 intent: template.intent,
                 motion_priority: template.motion_priority,
-                qp_map: if spec.encoder == Some(EncoderSelection::SoftwareH264) {
+                qp_map: if spec.encoder == Some(EncoderRequest::SoftwareH264) {
                     arcen_media::video::QpMapPolicy::Off
                 } else {
                     template.qp_map
                 },
                 debug_diagnostics: template.debug_diagnostics,
                 encoder_max_bitrate_bps: template.encoder_max_bitrate_bps,
-                fps: if spec.encoder == Some(EncoderSelection::SoftwareH264) {
+                fps: if spec.encoder == Some(EncoderRequest::SoftwareH264) {
                     template.fps.min(
                         arcen_media::video::EncoderBackend::OpenH264
                             .contract()
@@ -348,6 +349,7 @@ pub fn resolve_pipeline_specs(
                 encoder: spec.encoder.or(template.encoder),
                 cursor_mode: template.cursor_mode,
                 session_log_id: template.session_log_id.clone(),
+                refine: None,
             };
             config.qp_map = template.qp_map_for_config(&config);
             Ok(ResolvedMonitorPipeline {
@@ -735,9 +737,9 @@ pub fn decide_restart(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi_monitor_topology::AvailableOutput;
     use crate::nvapi::AdapterLuid;
     use arcen_media::Rotation;
+    use arcen_outputs::windows_topology::AvailableOutput;
     use std::sync::{Arc, Mutex};
 
     fn sid(value: u16) -> SessionMonitorId {
@@ -822,7 +824,7 @@ mod tests {
                     global_index,
                     device_name: format!(r"\\.\DISPLAY{}", global_index + 1),
                     mode_capability:
-                        crate::multi_monitor_topology::OutputModeCapability::CustomTimingCapable {
+                        arcen_outputs::windows_topology::OutputModeCapability::CustomTimingCapable {
                             min_width: 320,
                             max_width: 7_680,
                             min_height: 240,
@@ -867,7 +869,7 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
-            encoder: Some(EncoderSelection::Auto),
+            encoder: Some(EncoderRequest::Auto),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
@@ -1037,7 +1039,7 @@ mod tests {
         let plan = plan(1);
         let mut specs = build_pipeline_specs(&plan).expect("specs");
         specs[0].set_media_policy(
-            EncoderSelection::SoftwareH264,
+            EncoderRequest::SoftwareH264,
             VideoCodec::H264,
             ChromaSubsampling::Yuv420,
         );
@@ -1109,7 +1111,7 @@ mod tests {
                 global_index: 0,
                 device_name: r"\\.\DISPLAY1".to_owned(),
                 mode_capability:
-                    crate::multi_monitor_topology::OutputModeCapability::CustomTimingCapable {
+                    arcen_outputs::windows_topology::OutputModeCapability::CustomTimingCapable {
                         min_width: 320,
                         max_width: 7_680,
                         min_height: 240,
@@ -1134,7 +1136,7 @@ mod tests {
                 global_index: 1,
                 device_name: r"\\.\DISPLAY2".to_owned(),
                 mode_capability:
-                    crate::multi_monitor_topology::OutputModeCapability::CustomTimingCapable {
+                    arcen_outputs::windows_topology::OutputModeCapability::CustomTimingCapable {
                         min_width: 320,
                         max_width: 7_680,
                         min_height: 240,
@@ -1172,7 +1174,7 @@ mod tests {
             global_index: 0,
             device_name: r"\\.\DISPLAY1".to_owned(),
             mode_capability:
-                crate::multi_monitor_topology::OutputModeCapability::CustomTimingCapable {
+                arcen_outputs::windows_topology::OutputModeCapability::CustomTimingCapable {
                     min_width: 320,
                     max_width: 7_680,
                     min_height: 240,
@@ -1247,9 +1249,10 @@ mod tests {
             fps: 60,
             width: 1_920,
             height: 1_080,
-            encoder: Some(EncoderSelection::Auto),
+            encoder: Some(EncoderRequest::Auto),
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
+            refine: None,
         };
         ResolvedMonitorPipeline {
             session_monitor_id: sid(session_monitor_id),
@@ -1538,7 +1541,7 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
-            encoder: Some(EncoderSelection::Nvenc),
+            encoder: Some(EncoderRequest::NativeNvenc),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([7; 16]),

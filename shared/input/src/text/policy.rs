@@ -510,8 +510,18 @@ impl TextInputPolicy {
         let mut actions = Vec::with_capacity(events.len());
         if !self.active() {
             for (index, event) in events.iter().enumerate() {
-                if matches!(event, DeckTextEvent::Key(_)) {
+                if let DeckTextEvent::Key(stroke) = event {
+                    // The host sees this press, so its release must reach
+                    // it too, whatever an earlier mode left marked as text.
+                    if let (KeyPhase::Press, Some(position)) = (stroke.phase, stroke.position) {
+                        self.text_keys.remove(&position);
+                    }
                     actions.push(DeckTextAction::ForwardKey(index));
+                } else if self.preedit {
+                    // Committed text went out of use mid-composition (Typing
+                    // = Keys): the composition is over, so hide it.
+                    self.preedit = false;
+                    actions.push(DeckTextAction::Preedit(None));
                 }
             }
             return actions;
@@ -796,6 +806,44 @@ mod tests {
             ]),
             [DeckTextAction::ForwardKey(0)]
         );
+    }
+
+    #[test]
+    fn a_press_the_host_saw_in_keys_mode_gets_its_release_after_a_mode_change() {
+        let mut policy = active_policy(TypingMode::Characters);
+        // Sent as text; its release is lost (an input method swallowed it).
+        policy.plan_frame(&[
+            DeckTextEvent::Key(stroke(KEY_A, true)),
+            DeckTextEvent::Text("a".to_owned()),
+        ]);
+        policy.configure(TypingMode::Keys, OptionKeyMode::default());
+        assert_eq!(
+            policy.plan_frame(&[DeckTextEvent::Key(stroke(KEY_A, true))]),
+            [DeckTextAction::ForwardKey(0)]
+        );
+        // Still held when the mode changes back: the host must see the release.
+        policy.configure(TypingMode::Characters, OptionKeyMode::default());
+        assert_eq!(
+            policy.plan_frame(&[DeckTextEvent::Key(stroke(KEY_A, false))]),
+            [DeckTextAction::ForwardKey(0)]
+        );
+    }
+
+    #[test]
+    fn a_composition_cut_short_by_keys_mode_is_hidden() {
+        let mut policy = active_policy(TypingMode::Auto);
+        assert_eq!(
+            policy.plan_frame(&[DeckTextEvent::Preedit("にほ".to_owned())]),
+            [DeckTextAction::Preedit(Some("にほ".to_owned()))]
+        );
+        policy.configure(TypingMode::Keys, OptionKeyMode::default());
+        assert!(policy.composing());
+        assert_eq!(
+            policy.plan_frame(&[DeckTextEvent::Preedit(String::new())]),
+            [DeckTextAction::Preedit(None)]
+        );
+        assert!(!policy.composing());
+        assert!(policy.plan_frame(&[DeckTextEvent::FocusLost]).is_empty());
     }
 
     #[test]

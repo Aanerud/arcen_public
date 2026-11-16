@@ -18,7 +18,7 @@ use arcen_media::refine::tile::{
 };
 use arcen_media::video::{PackedRgb10Layout, Rgb10Signal};
 use arcen_media::{
-    BitDepth, ChromaSubsampling, ColorPrimaries, ColorRange, TransferCharacteristics,
+    BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, TransferCharacteristics,
 };
 use arcen_protocol::refine::{
     BarrierReason, CODEC_DELTA_ZSTD1, RefineControlMsg, RefineDomain, RefineTileHeader,
@@ -39,6 +39,7 @@ fn contract() -> RefineContract {
         primaries: ColorPrimaries::Bt709,
         range: ColorRange::Full,
         chroma: ChromaSubsampling::Yuv444,
+        matrix: ColorMatrix::Identity,
     }
 }
 
@@ -65,8 +66,12 @@ struct Link {
 
 impl Link {
     fn new() -> Self {
+        Self::with_contract(contract())
+    }
+
+    fn with_contract(contract: RefineContract) -> Self {
         Self {
-            pier: PierMonitorRefine::new(1, 1, 1, contract(), GRID, 300),
+            pier: PierMonitorRefine::new(1, 1, 1, contract, GRID, 300),
             deck: DeckRefineSession::new(),
             now: Duration::ZERO,
             source: frame(0),
@@ -184,10 +189,7 @@ fn a_still_test_pattern_reaches_level_one_then_two_and_three() {
     let verdict = status.verdict.clone().expect("verified");
     assert_eq!(verdict.level, VerificationLevel::SourceCodes);
     assert_eq!(verdict.coverage_permille(), 1000);
-    assert_eq!(
-        status.text,
-        "Source codes verified (pre-display transforms); 100.0% coverage; level 1"
-    );
+    assert_eq!(status.text, "Exact: 100% of picture verified (level 1)");
     assert_eq!(link.deck.stats().digest_matches, 1);
 
     // The presenter uploads the overlay; reading the GPU texture back and
@@ -217,7 +219,7 @@ fn a_still_test_pattern_reaches_level_one_then_two_and_three() {
         link.deck
             .on_readback(1, VerificationLevel::RenderedRgb, fence, &readback)
     );
-    assert!(link.deck.status(1).text.ends_with("level 3"));
+    assert!(link.deck.status(1).text.ends_with("(level 3)"));
     let mut wrong = readback.clone();
     wrong[0].1 ^= 1;
     assert!(
@@ -225,6 +227,41 @@ fn a_still_test_pattern_reaches_level_one_then_two_and_three() {
             .deck
             .on_readback(1, VerificationLevel::GpuOverlay, fence, &wrong)
     );
+}
+
+#[test]
+fn hdr_pq_codes_are_verified_digest_exact_in_their_own_contract() {
+    // The Wayland HDR composition: PQ / BT.2020 codes, tiles straight from
+    // the read-back (no conversion before the encoder's matrix).
+    let pq = RefineContract {
+        transfer: TransferCharacteristics::Pq,
+        primaries: ColorPrimaries::Bt2020,
+        ..contract()
+    };
+    let mut link = Link::with_contract(pq);
+    link.pier
+        .on_capture(0..GRID.block_count() as usize, link.now);
+    link.access_unit();
+    let bytes = link.deck.contract(1).expect("barrier");
+    assert_eq!((bytes.transfer, bytes.primaries), (16, 9));
+    assert!(RefineContract::describes_stream(
+        bytes,
+        BitDepth::Ten,
+        TransferCharacteristics::Pq,
+        ColorPrimaries::Bt2020
+    ));
+    assert!(!RefineContract::describes_stream(
+        bytes,
+        BitDepth::Ten,
+        TransferCharacteristics::Bt709,
+        ColorPrimaries::Bt709
+    ));
+    link.refine_everything();
+    let verdict = link.deck.status(1).verdict.expect("verified");
+    assert_eq!(verdict.level, VerificationLevel::SourceCodes);
+    assert_eq!(verdict.coverage_permille(), 1000);
+    assert_eq!(link.deck.stats().digest_matches, 1);
+    assert_eq!(link.deck.stats().digest_mismatches, 0);
 }
 
 #[test]
@@ -412,7 +449,7 @@ fn a_tile_flood_is_bounded_and_malformed_records_disable_refinement_visibly() {
     assert_eq!(link.deck.disabled(), Some(RefineDisabled::MalformedRecords));
     assert_eq!(
         link.deck.status(1).text,
-        "Refinement disabled (malformed records)"
+        "Exact: stopped (the host sent malformed data)"
     );
     assert_eq!(
         link.deck.on_refine_record(&record, link.now),
@@ -465,7 +502,7 @@ fn an_eight_bit_fallback_disables_the_monitor_and_re_enable_needs_a_new_generati
     link.access_unit();
     link.refine_everything();
     link.deck.set_monitor_enabled(1, false);
-    assert_eq!(link.deck.status(1).text, "Refinement off for this display");
+    assert_eq!(link.deck.status(1).text, "Exact: off for this display");
     assert_eq!(
         link.deck.take_control_messages(),
         vec![RefineControlMsg::RefineControl {
@@ -474,10 +511,13 @@ fn an_eight_bit_fallback_disables_the_monitor_and_re_enable_needs_a_new_generati
         }]
     );
     link.deck.set_monitor_enabled(1, true);
-    assert_eq!(link.deck.status(1).text, "Refinement off");
+    assert_eq!(
+        link.deck.status(1).text,
+        "Exact: waiting for a still picture"
+    );
     link.pier.reset(BarrierReason::Reenable);
     link.access_unit();
-    assert!(link.deck.status(1).text.starts_with("Refining"));
+    assert!(link.deck.status(1).text.starts_with("Exact: arriving"));
 }
 
 const HD: RefineGrid = RefineGrid {
@@ -513,9 +553,11 @@ fn an_idle_screen_with_a_blinking_caret_costs_the_capture_thread_under_a_millise
     let mut producer = RefineProducer::new(
         (1, 1, 1),
         contract(),
-        HD,
-        PackedRgb10Layout::XRGB2101010,
-        Rgb10Signal::Direct,
+        arcen_media::refine::source::PackedRgb10Source::new(
+            HD,
+            PackedRgb10Layout::XRGB2101010,
+            Rgb10Signal::Direct,
+        ),
         300,
         1_000_000_000,
         Duration::ZERO,
@@ -752,4 +794,154 @@ fn generation_reuse_with_another_size_and_monitor_floods_are_refused() {
         deck.block_map(1).is_some(),
         "the first monitor is untouched"
     );
+}
+
+mod review_2026_11_13 {
+    use super::*;
+    use arcen_protocol::refine::{
+        BlockRuns, RefineBarrier, RefineContractBytes, RefineFence, RefineScope,
+    };
+    use std::num::NonZeroU32;
+
+    fn scope() -> RefineScope {
+        RefineScope {
+            monitor_id: 1,
+            topology_generation: 1,
+            stream_epoch: 1,
+            generation: NonZeroU32::new(2).unwrap(),
+        }
+    }
+
+    fn barrier(width: u32, height: u32) -> Vec<u8> {
+        RefineBarrier {
+            scope: scope(),
+            reason: BarrierReason::Start,
+            contract: RefineContractBytes {
+                domain: 1,
+                depth: 10,
+                transfer: 1,
+                primaries: 1,
+                matrix: 0,
+                range: 1,
+                chroma: 2,
+            },
+            source_width: width,
+            source_height: height,
+        }
+        .encode()
+    }
+
+    fn fence(number: u64, block_count: u32) -> Vec<u8> {
+        RefineFence {
+            scope: scope(),
+            fence: number,
+            block_count,
+            invalidated: BlockRuns::from_sorted_indices([]),
+        }
+        .encode()
+    }
+
+    fn tile(x: u16, valid_from_fence: u64, seed: u16) -> (Vec<u8>, TileCodes) {
+        let codes = TileCodes::new(16, 16, vec![seed; 768]).unwrap();
+        let payload = encode_residuals(&codes, 10).unwrap();
+        let header = RefineTileHeader {
+            scope: scope(),
+            valid_from_fence,
+            domain: RefineDomain::Rgb,
+            depth: 10,
+            codec: CODEC_DELTA_ZSTD1,
+            x,
+            y: 0,
+            width: 16,
+            height: 16,
+            payload_len: u32::try_from(payload.len()).unwrap(),
+        };
+        (header.encode_with(&payload), codes)
+    }
+
+    /// A newer tile that overtook its fences replaces a block already on
+    /// the GPU: the old texels are cleared until the new tile is valid.
+    #[test]
+    fn a_replaced_gpu_block_is_cleared_until_its_new_tile_is_valid() {
+        let mut deck = DeckRefineSession::new();
+        let now = MS;
+        deck.on_video_record(&barrier(32, 16), now).unwrap();
+        deck.on_video_record(&fence(1, 2), now).unwrap();
+        deck.on_presented(1, 1, now);
+        let (record, codes) = tile(0, 1, 100);
+        let RefineAdmission::Tile(ticket) = deck.on_refine_record(&record, now) else {
+            panic!("admitted");
+        };
+        deck.commit(&ticket, &codes, now).unwrap();
+        assert_eq!(deck.take_overlay_delta(1, 1).set.len(), 1);
+        let (record, codes) = tile(0, 12, 200);
+        let RefineAdmission::Tile(ticket) = deck.on_refine_record(&record, now) else {
+            panic!("admitted");
+        };
+        deck.commit(&ticket, &codes, now).unwrap();
+        assert!(deck.overlay_dirty(1));
+        let delta = deck.take_overlay_delta(1, 1);
+        assert_eq!(delta.clear.len(), 1, "the stale block leaves the GPU");
+        assert!(delta.set.is_empty(), "the new tile is not valid at fence 1");
+    }
+
+    /// A tile admitted under one grid is never committed under another
+    /// grid that reuses the identity (and never panics the decode worker).
+    #[test]
+    fn a_tile_from_a_previous_grid_is_refused_at_commit() {
+        let mut deck = DeckRefineSession::new();
+        let now = MS;
+        deck.on_video_record(&barrier(1024, 64), now).unwrap();
+        deck.on_video_record(&fence(5, 256), now).unwrap();
+        let (record, codes) = tile(512, 5, 7);
+        let RefineAdmission::Tile(ticket) = deck.on_refine_record(&record, now) else {
+            panic!("admitted");
+        };
+        // An out-of-order fence clears the monitor; the same identity then
+        // returns with another grid.
+        let _ = deck.on_video_record(&fence(5, 256), now);
+        deck.on_video_record(&barrier(256, 256), now).unwrap();
+        assert_eq!(
+            deck.commit(&ticket, &codes, now),
+            Err(RefineDrop::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn a_barrier_storm_disables_refinement_visibly() {
+        let mut deck = DeckRefineSession::new();
+        for step in 0..=arcen_media::refine::deck::MAX_BARRIERS_PER_WINDOW as u32 {
+            let _ = deck.on_video_record(&barrier(32, 16), MS * step);
+        }
+        assert_eq!(deck.disabled(), Some(RefineDisabled::TooManyBarriers));
+        assert!(deck.status(1).text.contains("too often"));
+    }
+
+    /// One presenter refines one monitor: a barrier for a second is refused.
+    #[test]
+    fn a_single_monitor_deck_refuses_a_second_monitor() {
+        let mut deck = DeckRefineSession::new().with_max_monitors(1);
+        deck.on_video_record(&barrier(32, 16), MS).unwrap();
+        let other = RefineBarrier {
+            scope: RefineScope {
+                monitor_id: 2,
+                ..scope()
+            },
+            reason: BarrierReason::Start,
+            contract: RefineContractBytes {
+                domain: 1,
+                depth: 10,
+                transfer: 1,
+                primaries: 1,
+                matrix: 0,
+                range: 1,
+                chroma: 2,
+            },
+            source_width: 4096,
+            source_height: 4096,
+        }
+        .encode();
+        assert!(deck.on_video_record(&other, MS).is_err());
+        assert!(deck.grid(2).is_none());
+    }
 }

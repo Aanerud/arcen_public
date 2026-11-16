@@ -114,7 +114,5 @@ hosts/windows/src/latest.rs 208
 hosts/windows/src/multi_monitor_capenc.rs 458
 hosts/windows/src/multi_monitor_gate.rs 426
 hosts/windows/src/multi_monitor_input.rs 398
-hosts/windows/src/multi_monitor_recovery.rs 265
-hosts/windows/src/multi_monitor_topology.rs 680
 hosts/windows/src/observability.rs 430
 hosts/windows/src/resume.rs 956

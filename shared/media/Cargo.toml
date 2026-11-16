@@ -46,6 +46,10 @@ zstd = { workspace = true, optional = true }
 serde_json.workspace = true
 
 [[example]]
+name = "software_h264_vector"
+required-features = ["software-h264-source"]
+
+[[example]]
 name = "refine_verify"
 required-features = ["refine-zstd-decode"]
 

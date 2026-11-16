@@ -14,7 +14,8 @@ entitlement is the gate, the Pier does not read `usb.native_tablet`.
 Pressure: since 0.19.0 (§14.1) the Pier reads the pen itself for a model
 whose packets Arcen knows (the Intuos5 touch L) and posts CoreGraphics
 tablet events with pressure, which reverses this record's "never interpret"
-for the macOS Pier; any other model is refused (§14.2), because macOS
+for the macOS Pier; any other model was refused (§14.2; since 2026-11-15 read
+by its own report descriptor, ADR 0023 amendment), because macOS
 publishes bridged devices as virtual and the tablet maker's driver does not
 bind them (§10). A DriverKit HID driver was researched and set aside (§14).
 `probe-bridged-hid` writes the Wacom mode switch and is built only with the
@@ -560,6 +561,10 @@ Native tablet itself (no separate build feature):
 | Console | a console change ends the attachment with no pen event, not even a release (§6); any other end lifts a pen left in proximity |
 
 #### 14.2 One Native tablet way; unknown models are refused (2026-11-12)
+
+> **Superseded 2026-11-15** by the [ADR 0023 amendment](0023-one-native-tablet-pen-position-path.md#amendment-2026-11-15-any-tablet-by-default-tablet-support-and-native-tablet-are-different-contracts):
+> an unknown model is read by its own HID report descriptor; only a
+> pen in a vendor format no reader knows is refused. Kept as the record.
 
 One Native tablet way means the pen reader. A tablet whose
 model the shared reader does not know (`host_decoded_intuos_model`) is no

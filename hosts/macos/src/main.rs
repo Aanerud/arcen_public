@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Usage: arcen-pier-macos [--config PATH] [daemon|agent|serve|install-service|uninstall-service|validate-config|inventory|permissions|diagnostics|probe-media|probe-input|probe-keyboard|probe-clipboard|probe-cursor|probe-modes|probe-scroll|probe-audio|register-audio-consent|request-permissions|new-host-cert|support-bundle]"
+            "Usage: arcen-pier-macos [--config PATH] [daemon|agent|serve|install-service|uninstall-service|validate-config|inventory|permissions|diagnostics|probe-media|probe-input|probe-keyboard|probe-keymap|probe-clipboard|probe-cursor|probe-modes|probe-scroll|probe-audio|register-audio-consent|request-permissions|new-host-cert|support-bundle]"
         );
         return ExitCode::SUCCESS;
     }
@@ -108,6 +108,26 @@ fn main() -> ExitCode {
     #[cfg(feature = "lab-bridged-hid-probe")]
     if command == "probe-bridged-hid" {
         return arcen_pier_macos::bridged_hid_probe::run(&support_args);
+    }
+    // The session's keyboard-layout watcher (`host_keymap`): Text Input
+    // Sources want a main thread, and the agent's belongs to its runtime.
+    if command == "keymap-watch" {
+        return arcen_pier_macos::input::layout::run_keymap_watch();
+    }
+    // This Mac's current layout as a Deck would be told it.
+    if command == "probe-keymap" {
+        return match arcen_pier_macos::input::layout::read_layout()
+            .and_then(|notice| serde_json::to_string_pretty(&notice).ok())
+        {
+            Some(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("probe-keymap: no keyboard layout could be read");
+                ExitCode::FAILURE
+            }
+        };
     }
     if command == "virtual-display-child" {
         return match arcen_pier_macos::virtual_display::run_child_stdio() {
@@ -942,6 +962,8 @@ async fn serve_desktop(
             microphone,
             audio,
             path_signal_connection: socket.get_ref().path_signal_connection(),
+            refine: handshake.refine,
+            host_keymap: handshake.host_keymap,
         },
     )
     .await?;
@@ -1027,6 +1049,7 @@ async fn serve_multi_desktop(
             session_id,
             audio,
             path_signal_connection: socket.get_ref().path_signal_connection(),
+            host_keymap: handshake.host_keymap,
         },
     )
     .await?;
@@ -1396,12 +1419,19 @@ fn run_daemon(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         .auth
         .reconnect_window_secs
         .unwrap_or(arcen_session::direct_reconnect::DEFAULT_RECONNECT_WINDOW_SECONDS);
+    // Exact still image: the grant offers the refine lane only when this
+    // host may refine at all.
+    let refine_allowed = arcen_pier_macos::refine::COMPILED
+        && arcen_session::pier_config::LosslessRefinementSetting::resolve(
+            host_setup.file_config.video.lossless_refinement,
+        );
     runtime.block_on(daemon_loop(
         config,
         host,
         port,
         host_setup.telemetry,
         reconnect_window_secs,
+        refine_allowed,
     ))
 }
 
@@ -1411,6 +1441,7 @@ async fn daemon_loop(
     port: u16,
     telemetry: arcen_pier_macos::observability::HostTelemetry,
     reconnect_window_secs: u32,
+    refine_allowed: bool,
 ) -> ExitCode {
     let address = match resolve_bind_addr(&host, port).await {
         Ok(address) => address,
@@ -1489,92 +1520,102 @@ async fn daemon_loop(
         }
     }
 
-    let relays = std::sync::Arc::new(RelayCount::default());
+    serve_decks(&listener, &registry, refine_allowed).await
+}
+
+/// Admits Decks side by side and relays each to its desktop agent; returns
+/// only when the endpoint closes.
+async fn serve_decks(
+    listener: &arcen_pier_macos::net::Listener,
+    registry: &std::sync::Arc<arcen_pier_macos::relay::AgentRegistry>,
+    refine_allowed: bool,
+) -> ExitCode {
+    // Handshakes run side by side, each holding one of the shared
+    // pre-sign-in places from its first packet until its control lane is
+    // open, so a peer that never finishes delays nobody else.
+    let handshakes =
+        std::sync::Arc::new(arcen_session::session_admission::PreauthAdmission::default());
+    let relays = std::sync::Arc::new(arcen_session::session_admission::PreauthAdmission::new(
+        RELAY_LIMIT,
+        arcen_session::session_admission::PREAUTH_PER_SOURCE,
+    ));
     loop {
-        let (mut deck, peer) = match listener.accept_raw().await {
-            Ok(accepted) => accepted,
+        let incoming = match listener.next_incoming().await {
+            Ok(incoming) => incoming,
             Err(error) => {
                 eprintln!("daemon: {error}");
                 return ExitCode::FAILURE;
             }
         };
-        // The one-session rule is the agent's, applied after the password. The
-        // service only bounds how many Decks it relays at once, overall and per
-        // address, so a silent peer holds one sign-in slot rather than the
-        // whole host.
-        match RelayCount::enter(&relays, peer.ip()) {
-            Some(held) => {
-                let registry = std::sync::Arc::clone(&registry);
-                tokio::spawn(async move {
-                    relay_one(deck, peer, &registry).await;
+        let peer = incoming.remote_address();
+        let handshake =
+            match handshakes.try_enter_unproved(peer.ip(), incoming.remote_address_validated()) {
+                Ok(place) => place,
+                Err(arcen_session::session_admission::PreauthRefusal::AddressUnproved) => {
+                    // A stateless Retry: a forged source cannot answer it, so
+                    // it cannot hold another machine's places.
+                    if let Err(error) = incoming.retry() {
+                        error.into_incoming().refuse();
+                    }
+                    continue;
+                }
+                Err(refusal) => {
+                    tracing::info!(
+                        target: "arcen::net",
+                        %peer,
+                        reason = refusal.as_str(),
+                        "QUIC connection refused before TLS: {refusal}"
+                    );
+                    incoming.refuse();
+                    continue;
+                }
+            };
+        let relays = std::sync::Arc::clone(&relays);
+        let registry = std::sync::Arc::clone(registry);
+        tokio::spawn(async move {
+            let admitted = arcen_pier_macos::net::Listener::admit(
+                incoming,
+                arcen_pier_macos::net::admission_deadline(),
+            )
+            .await;
+            drop(handshake);
+            let Some((mut deck, peer)) = admitted else {
+                return;
+            };
+            // The one-session rule is the agent's, applied after the password.
+            // The service only bounds how many Decks it relays at once, overall
+            // and per address, so a silent peer holds one sign-in slot rather
+            // than the whole host.
+            match relays.try_enter(peer.ip()) {
+                Ok(held) => {
+                    relay_one(deck, peer, &registry, refine_allowed).await;
                     drop(held);
-                });
-            }
-            None => {
-                eprintln!("refused {peer}: too many connections");
-                tokio::spawn(async move {
+                }
+                Err(refusal) => {
+                    eprintln!("refused {peer}: {refusal}");
                     let _ = arcen_pier_macos::net::refuse_lanes(
                         &mut deck,
                         "too many connections to this Mac right now; try again shortly",
                     )
                     .await;
-                });
-            }
-        }
-    }
-}
-
-/// Decks the service is relaying, overall and per source address.
-#[derive(Debug, Default)]
-struct RelayCount {
-    by_source: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>,
-}
-
-/// Relays at once: one per agent sign-in slot.
-const RELAY_LIMIT: usize = AGENT_SIGN_IN_SLOTS;
-/// Relays at once from one address, so one machine cannot take every slot.
-const RELAY_LIMIT_PER_SOURCE: usize = 2;
-
-/// One relay's place in the count, given back when dropped.
-struct RelayHeld {
-    count: std::sync::Arc<RelayCount>,
-    source: std::net::IpAddr,
-}
-
-impl Drop for RelayHeld {
-    fn drop(&mut self) {
-        if let Ok(mut by_source) = self.count.by_source.lock() {
-            if let Some(held) = by_source.get_mut(&self.source) {
-                *held = held.saturating_sub(1);
-                if *held == 0 {
-                    by_source.remove(&self.source);
                 }
             }
-        }
+        });
     }
 }
 
-impl RelayCount {
-    fn enter(count: &std::sync::Arc<Self>, source: std::net::IpAddr) -> Option<RelayHeld> {
-        let mut by_source = count.by_source.lock().ok()?;
-        let total: usize = by_source.values().sum();
-        let from_source = by_source.get(&source).copied().unwrap_or(0);
-        if total >= RELAY_LIMIT || from_source >= RELAY_LIMIT_PER_SOURCE {
-            return None;
-        }
-        *by_source.entry(source).or_insert(0) += 1;
-        Some(RelayHeld {
-            count: std::sync::Arc::clone(count),
-            source,
-        })
-    }
-}
+/// Relays at once: one per agent sign-in slot. The service holds a Deck's
+/// place for its whole relay, at most
+/// [`arcen_session::session_admission::PREAUTH_PER_SOURCE`] from one source,
+/// because the sign-in and the session both run in the console user's agent.
+const RELAY_LIMIT: usize = AGENT_SIGN_IN_SLOTS;
 
 /// Hands one admitted Deck to the console session's agent and relays it.
 async fn relay_one(
     mut deck: arcen_transport::quic::SessionLaneSocket,
     peer: std::net::SocketAddr,
     registry: &arcen_pier_macos::relay::AgentRegistry,
+    refine_allowed: bool,
 ) {
     let attached = registry
         .attach(
@@ -1607,6 +1648,7 @@ async fn relay_one(
                 session,
                 Some(audio_channel),
                 true,
+                refine_allowed,
             )
             .await;
             registry.end_session(session);
@@ -2466,26 +2508,35 @@ const AUDIO_START_BUDGET: std::time::Duration = std::time::Duration::from_millis
 /// password in the username box.
 fn report_handshake_failure(
     telemetry: &arcen_pier_macos::observability::HostTelemetry,
-    error: &str,
+    error: &arcen_pier_macos::session::HandshakeError,
     session_id: &arcen_telemetry::CorrelationId,
     peer: std::net::SocketAddr,
 ) {
     eprintln!("handshake failed: {error}");
-    let stage = if error.contains("authentication") {
-        "authenticate"
-    } else if error.contains("application handshake") {
-        "application_handshake_timeout"
-    } else {
-        "handshake"
-    };
+    let (stage, reason_class) = handshake_failure_class(error);
     emit_session_event(
         telemetry,
         arcen_telemetry::LifecycleEventKind::SessionAuthFail,
         &scope_with_user(session_id, None, peer),
-        arcen_telemetry::lifecycle_fields::session_auth_fail("pam", stage, "rejected"),
+        arcen_telemetry::lifecycle_fields::session_auth_fail("pam", stage, reason_class),
         arcen_telemetry::names::target::AUTH,
         "session auth fail",
     );
+}
+
+/// The `stage` and `reason_class` of a failed handshake's `SESSION_AUTH_FAIL`.
+fn handshake_failure_class(
+    error: &arcen_pier_macos::session::HandshakeError,
+) -> (&'static str, &'static str) {
+    use arcen_pier_macos::session::HandshakeError;
+    match error {
+        HandshakeError::SetupRefused(refusal) => (refusal.log_stage(), refusal.log_reason_class()),
+        HandshakeError::Rejected(_) => ("authenticate", "rejected"),
+        HandshakeError::ApplicationHandshakeTimeout => {
+            ("application_handshake_timeout", "rejected")
+        }
+        _ => ("handshake", "rejected"),
+    }
 }
 
 /// Returns the machine's sound, reporting whether it came back.
@@ -2949,7 +3000,7 @@ async fn serve_one(
             }
         }
         Err(error) => {
-            report_handshake_failure(telemetry, &error.to_string(), &session_id, peer);
+            report_handshake_failure(telemetry, &error, &session_id, peer);
             SessionOutcome::Refused
         }
     }
@@ -3425,6 +3476,8 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
             #[cfg(feature = "lab-bridged-hid-probe")]
             "probe-bridged-hid" => command = "probe-bridged-hid",
             "virtual-display-child" => command = "virtual-display-child",
+            "keymap-watch" => command = "keymap-watch",
+            "probe-keymap" => command = "probe-keymap",
             "install-service" => command = "install-service",
             "activate" => command = "activate",
             "uninstall-service" => command = "uninstall-service",
@@ -3457,25 +3510,30 @@ mod tests {
 
     #[test]
     fn relays_are_bounded_overall_and_per_source() {
-        let count = std::sync::Arc::new(super::RelayCount::default());
+        use arcen_session::session_admission::{
+            PREAUTH_PER_SOURCE, PreauthAdmission, PreauthRefusal,
+        };
+        let count = std::sync::Arc::new(PreauthAdmission::new(
+            super::RELAY_LIMIT,
+            PREAUTH_PER_SOURCE,
+        ));
         let one: std::net::IpAddr = "203.0.113.1".parse().expect("address");
         let two: std::net::IpAddr = "203.0.113.2".parse().expect("address");
-        let first = super::RelayCount::enter(&count, one).expect("first");
-        let second = super::RelayCount::enter(&count, one).expect("second");
-        assert!(
-            super::RelayCount::enter(&count, one).is_none(),
+        let first = count.try_enter(one).expect("first");
+        let second = count.try_enter(one).expect("second");
+        assert_eq!(
+            count.try_enter(one).err(),
+            Some(PreauthRefusal::SourceBusy),
             "one address may not take every slot"
         );
-        let third = super::RelayCount::enter(&count, two).expect("another address");
-        assert!(
-            super::RelayCount::enter(&count, two).is_none(),
+        let third = count.try_enter(two).expect("another address");
+        assert_eq!(
+            count.try_enter(two).err(),
+            Some(PreauthRefusal::Full),
             "overall bound"
         );
         drop(first);
-        assert!(
-            super::RelayCount::enter(&count, one).is_some(),
-            "a slot comes back"
-        );
+        assert!(count.try_enter(one).is_ok(), "a slot comes back");
         drop((second, third));
     }
 

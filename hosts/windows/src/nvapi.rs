@@ -66,11 +66,44 @@ pub const ID_SYS_GET_GPU_AND_OUTPUT_ID: u32 = 0x112b_a1a5;
 
 type NvPhysicalGpuHandle = *mut c_void;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub struct AdapterLuid {
-    pub low_part: u32,
-    pub high_part: i32,
+pub use arcen_outputs::windows_topology::AdapterLuid;
+
+/// The serde form of the shared, serde-free [`AdapterLuid`]:
+/// `{"low_part": u32, "high_part": i32}`, unchanged since the type lived in
+/// this module (recovery journals and inventory reports on disk use it).
+#[derive(Deserialize, Serialize)]
+#[serde(remote = "AdapterLuid", rename = "AdapterLuid")]
+pub(crate) struct AdapterLuidSerde {
+    low_part: u32,
+    high_part: i32,
+}
+
+/// [`AdapterLuidSerde`] for an optional LUID: `null` or the object. Fields
+/// using it also need `#[serde(default)]` so a missing key stays `None`.
+pub(crate) mod optional_adapter_luid {
+    use super::{AdapterLuid, AdapterLuidSerde};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize, Serialize)]
+    #[serde(transparent)]
+    struct Luid(#[serde(with = "AdapterLuidSerde")] AdapterLuid);
+
+    #[allow(
+        clippy::ref_option,
+        reason = "serde `with` passes the field by reference"
+    )]
+    pub(crate) fn serialize<S: Serializer>(
+        value: &Option<AdapterLuid>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(Luid).serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<AdapterLuid>, D::Error> {
+        Ok(Option::<Luid>::deserialize(deserializer)?.map(|Luid(luid)| luid))
+    }
 }
 
 #[repr(C)]
@@ -435,7 +468,7 @@ pub struct DisplayConfigPath {
     pub non_nvidia_adapter: bool,
     #[serde(default)]
     pub reserved_path_flags: u32,
-    #[serde(default)]
+    #[serde(default, with = "optional_adapter_luid")]
     pub os_adapter_luid: Option<AdapterLuid>,
 }
 
@@ -865,6 +898,7 @@ impl std::fmt::Display for ApplyExactError {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecoveryData {
     pub device_name: String,
+    #[serde(with = "AdapterLuidSerde")]
     pub adapter_luid: AdapterLuid,
     pub original_edid: Option<Vec<u8>>,
     pub original_config: DisplayConfig,
@@ -892,6 +926,7 @@ pub struct RecoveryData {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TimingRecoveryData {
     pub device_name: String,
+    #[serde(with = "AdapterLuidSerde")]
     pub adapter_luid: AdapterLuid,
     pub display_id: u32,
     pub width: u32,
@@ -2610,6 +2645,49 @@ impl Nvapi {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    struct LuidFields {
+        #[serde(with = "AdapterLuidSerde")]
+        luid: AdapterLuid,
+        #[serde(default, with = "optional_adapter_luid")]
+        maybe: Option<AdapterLuid>,
+    }
+
+    #[test]
+    fn the_shared_adapter_luid_keeps_its_journal_json() {
+        let luid = AdapterLuid {
+            low_part: 0x0001_2345,
+            high_part: -2,
+        };
+        let fields = LuidFields {
+            luid,
+            maybe: Some(luid),
+        };
+        let json = serde_json::to_value(&fields).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "luid": {"low_part": 74_565, "high_part": -2},
+                "maybe": {"low_part": 74_565, "high_part": -2},
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<LuidFields>(json).expect("parse"),
+            fields
+        );
+        let none: LuidFields =
+            serde_json::from_str(r#"{"luid":{"low_part":1,"high_part":0},"maybe":null}"#)
+                .expect("null optional");
+        assert_eq!(none.maybe, None);
+        let missing: LuidFields = serde_json::from_str(r#"{"luid":{"low_part":1,"high_part":0}}"#)
+            .expect("missing optional");
+        assert_eq!(missing.maybe, None);
+        assert_eq!(
+            serde_json::to_value(&missing).expect("serialize none")["maybe"],
+            serde_json::Value::Null
+        );
+    }
 
     #[test]
     fn a_display_nvapi_does_not_know_is_not_an_nvidia_fault() {

@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-pier-windows"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 description = "Arcen Pier (Windows) — native Rust QUIC host with LogonUser auth, WTS session attachment, SendInput injection, and DXGI/WGC->NVENC capture."
 publish.workspace = true
@@ -15,7 +15,12 @@ name = "arcen-pier"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["lossless-refine"]
+# Exact still image (lossless refinement, ADR 0016): capenc's producer for
+# the FP16 Grading/HDR captures (native libzstd). Compiled into release
+# builds; it runs only when `video.lossless_refinement` is on, the Deck asks
+# for it and the shared plan grants the session.
+lossless-refine = ["arcen-capenc/lossless-refine"]
 # Dormant source compatibility only. Release/package builds must not enable
 # this feature; shipped Pier binaries expose QUIC exclusively.
 wss-compat = [
@@ -30,7 +35,6 @@ wss-compat = [
 [dependencies]
 futures-util = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2.workspace = true
@@ -38,11 +42,12 @@ zip.workspace = true
 arcen-protocol = { path = "../../shared/protocol", default-features = false }
 arcen-media = { workspace = true, features = ["audio-opus"] }
 arcen-input.workspace = true
+arcen-usb-bridge.workspace = true
 arcen-iddcx-provider.workspace = true
 arcen-session.workspace = true
 arcen-identity.workspace = true
 arcen-telemetry.workspace = true
-arcen-observability.workspace = true
+arcen-observability = { workspace = true, features = ["support-bundle"] }
 arcen-outputs.workspace = true
 arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
 arcen-cp-ipc = { path = "cp-ipc" }
@@ -96,6 +101,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",                       # Known ProgramData folder resolution
     "Win32_UI_HiDpi",                       # SetProcessDpiAwarenessContext
     "Win32_Graphics_Gdi",                   # monitor metrics (Stage 4)
+    "Win32_Graphics_Dwm",                   # cloaked windows are left alone when windows move back
     "Win32_Graphics_Direct3D",              # host GPU capability probing
     "Win32_Graphics_Direct3D11",            # D3D11 feature/video-device probing
     "Win32_Globalization",                  # ordinal Unicode adapter-name matching

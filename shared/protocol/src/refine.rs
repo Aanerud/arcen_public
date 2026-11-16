@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Lossless refinement records (ADR 0016) — DRAFT, not negotiated by any
-//! product yet.
+//! Lossless refinement records (ADR 0016): "exact still image".
+//!
+//! Negotiated per session: the Deck sends [`LosslessRefineCapability`] in its
+//! `AuthResponse` only while its user switch is on, the Pier answers with
+//! [`LosslessRefineStatusMsg`] in its `ServerHelloMsg` and grants the
+//! `refine` lane only when the shared plan is on. Nothing below reaches a
+//! peer that did not take part in that exchange.
 //!
 //! Four binary records: [`RefineFence`] and [`RefineBarrier`] travel on the
 //! video lane (ordered with the access units they describe), [`RefineTile`]
@@ -11,6 +16,8 @@
 //!
 //! The records are codec-free: a tile's payload is opaque bytes whose
 //! expanded size the header fixes; the codec adapters live elsewhere.
+
+pub mod carry;
 
 use crate::wire::FrameType;
 use serde::{Deserialize, Serialize};
@@ -259,6 +266,13 @@ impl BlockRuns {
                 _ => runs.push((index, 1)),
             }
         }
+        Self(runs)
+    }
+
+    /// Runs already known to be ascending, non-overlapping and non-empty
+    /// (the union of validated runs of one grid).
+    #[must_use]
+    pub(crate) fn from_runs_unchecked(runs: Vec<(u32, u32)>) -> Self {
         Self(runs)
     }
 
@@ -707,8 +721,8 @@ impl RefineDigest {
     }
 }
 
-/// Deck capability (draft; carried in `ClientHelloMsg` when products adopt
-/// it): the domains and codecs the Deck can apply.
+/// Deck capability (`AuthResponse.lossless_refine_v1`): the domains and
+/// codecs the Deck can apply. Sent only while the Deck's switch is on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LosslessRefineCapability {
     /// Domain tokens ([`RefineDomain::token`]).
@@ -732,7 +746,54 @@ impl LosslessRefineCapability {
     }
 }
 
-/// Deck → Pier control requests (draft).
+/// Whether a session refines, as the Pier's hello states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefineStateMsg {
+    /// Refinement runs; the `refine` lane is granted.
+    On,
+    /// Refinement does not run; `reason` says why.
+    Off,
+    /// A state this peer does not know (a newer Pier): treated as off.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Pier → Deck: the session's refinement plan (`ServerHelloMsg.lossless_refine`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LosslessRefineStatusMsg {
+    /// On or off.
+    pub state: RefineStateMsg,
+    /// Stable reason token when off (`operator_off`, `eight_bit`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Domain token when on (`rgb`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Code depth when on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+    /// Codec token when on ([`CODEC_DELTA_ZSTD1_TOKEN`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// Per-block stillness before refinement, when on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub still_ms: Option<u32>,
+    /// Refinement ceiling in Mbit/s, when on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mbps: Option<u32>,
+}
+
+impl LosslessRefineStatusMsg {
+    /// Whether refinement runs.
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        self.state == RefineStateMsg::On
+    }
+}
+
+/// Deck → Pier control requests on the control lane, sent only after the
+/// Pier granted the `refine` lane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RefineControlMsg {
@@ -780,6 +841,28 @@ mod tests {
             height,
             payload_len: 3,
         }
+    }
+
+    #[test]
+    fn the_status_message_is_additive_and_tolerates_newer_states() {
+        let on = LosslessRefineStatusMsg {
+            state: RefineStateMsg::On,
+            reason: None,
+            domain: Some("rgb".into()),
+            bit_depth: Some(10),
+            codec: Some(CODEC_DELTA_ZSTD1_TOKEN.into()),
+            still_ms: Some(300),
+            max_mbps: Some(25),
+        };
+        let json = serde_json::to_string(&on).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LosslessRefineStatusMsg>(&json).unwrap(),
+            on
+        );
+        let newer: LosslessRefineStatusMsg =
+            serde_json::from_str(r#"{"state":"paused","reason":"x"}"#).unwrap();
+        assert_eq!(newer.state, RefineStateMsg::Unknown);
+        assert!(!newer.is_on());
     }
 
     #[test]

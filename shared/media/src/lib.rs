@@ -17,6 +17,7 @@ pub use arcen_keel::{
 pub mod annexb;
 mod applied_topology;
 pub mod audio;
+pub mod bitstream;
 pub mod capenc_control;
 pub mod capenc_stream;
 pub mod clipboard;
@@ -27,6 +28,7 @@ pub mod display_color;
 mod encoder_admission;
 pub mod hevc_sps;
 mod multi_monitor;
+pub mod obu;
 pub mod presentation;
 pub mod rate_control;
 pub mod refine;

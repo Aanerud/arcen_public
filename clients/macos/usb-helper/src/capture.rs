@@ -127,16 +127,6 @@ impl DeviceIdentity {
     }
 }
 
-/// Numeric encoding of [`UsbSpeed`] for the handshake frame.
-#[must_use]
-pub const fn speed_code(speed: UsbSpeed) -> u8 {
-    match speed {
-        UsbSpeed::Low => 0,
-        UsbSpeed::Full => 1,
-        UsbSpeed::High => 2,
-    }
-}
-
 /// The libusb handle of a captured device, and the obligation to give it back.
 struct CapturedPhysicalUsb {
     handle: rusb::DeviceHandle<rusb::Context>,
@@ -956,6 +946,7 @@ fn read_report_descriptors(
 mod tests {
     use super::*;
     use arcen_protocol::decode_usb_urb_complete;
+    use arcen_usb_bridge::component_ipc::speed_code;
     use arcen_usb_bridge::{
         SetupPacket, SyntheticDevice, SyntheticHandle, SyntheticOp, SyntheticTabletDevice,
     };

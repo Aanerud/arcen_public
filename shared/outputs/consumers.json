@@ -211,13 +211,15 @@
         "admission",
         "applied",
         "atomic_start",
+        "display_lease",
         "edid",
         "fairness",
         "provider",
         "provider::capability",
         "provider::error",
         "provider::transaction",
-        "windows_multi_monitor"
+        "windows_multi_monitor",
+        "windows_topology"
       ],
       "production_uses": [
         {
@@ -259,7 +261,7 @@
         {
           "id": "windows-multi-monitor",
           "entry_points": [
-            "hosts/windows/src/multi_monitor_topology.rs",
+            "hosts/windows/src/display.rs",
             "hosts/windows/src/multi_monitor_capenc.rs",
             "hosts/windows/src/iddcx.rs",
             "hosts/windows/src/multi_monitor_gate.rs",
@@ -267,6 +269,23 @@
           ],
           "build_profiles": ["windows-pier"],
           "validation": ["windows-pier-test", "windows-multi-monitor-lab"],
+          "owner": "Windows Host"
+        }
+      ]
+    },
+    {
+      "package": "arcen-iddcx-provider",
+      "dependency_kind": "normal",
+      "contracts": ["edid"],
+      "paths": [
+        {
+          "id": "windows-iddcx-provider",
+          "entry_points": [
+            "hosts/windows/iddcx-provider/src/edid.rs",
+            "hosts/windows/iddcx-provider/src/abi.rs"
+          ],
+          "build_profiles": ["windows-iddcx-provider"],
+          "validation": ["windows-iddcx-provider-test", "windows-pier-test"],
           "owner": "Windows Host"
         }
       ]

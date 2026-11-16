@@ -19,15 +19,24 @@
 mod backend;
 pub mod bridge_seat;
 mod bridged_device_guard;
+pub mod captured_facts;
+pub mod component_ipc;
+pub mod component_lease;
+pub mod component_session;
 mod descriptor;
 pub mod descriptor_fixtures;
 mod exporter;
+mod generic_pen;
+mod generic_pen_tablet;
 pub mod hid_device_ipc;
 mod hid_digitizer;
 mod hid_host;
 mod hid_publish;
+mod host_pen;
+mod host_pen_bridge;
 mod kernel_package;
 mod ledger;
+mod native_component;
 mod policy;
 mod raw_hid;
 mod session_seat;
@@ -40,6 +49,7 @@ mod types;
 mod usbip;
 mod wacom_intuos5;
 mod wacom_intuos_pen;
+pub mod winusb_package;
 
 pub use backend::{
     BackendRefusal, BackendStatus, CapturedDeviceFacts, CapturedUsbDevice, CompletionSink,
@@ -62,6 +72,17 @@ pub use exporter::{
     USB_CLASS_HID, UrbSubmission, UsbExporter, admissible_tablet, control_dispatch,
     tablet_profile_for, verify_captured_tablet,
 };
+pub use generic_pen::{
+    GENERIC_QUIET_EXIT, GENERIC_TOUCH_THRESHOLD, GenericPenLayout, GenericPenReader,
+    GenericPenRefusal, MAX_PEN_FIELD_BITS, MAX_PEN_REPORT_BITS, MAX_PEN_REPORTS, PenField,
+    PenReportLayout, UNITLESS_TILT_DEGREES, generic_pen_layout,
+};
+pub use generic_pen_tablet::{
+    GENERIC_PEN_IN, GENERIC_PEN_MAX_PRESSURE, GENERIC_PEN_MAX_X, GENERIC_PEN_MAX_Y,
+    GENERIC_PEN_PRODUCT_ID, GENERIC_PEN_REPORT_ID, GENERIC_PEN_VENDOR_ID, GENERIC_SCRIPTED_CORNER,
+    GENERIC_SCRIPTED_END, GENERIC_SCRIPTED_PRESSURE, GENERIC_SCRIPTED_START, GenericPenState,
+    GenericPenTablet, GenericScriptedReport, generic_pen_scripted_stroke,
+};
 pub use hid_digitizer::{
     AxisRange, CollectionClass, DESCRIPTOR_HID, DESCRIPTOR_HID_REPORT, HidClassDescriptorError,
     HidDescriptorError, MAX_COLLECTION_DEPTH, MAX_GLOBAL_STACK_DEPTH,
@@ -71,8 +92,8 @@ pub use hid_digitizer::{
     USAGE_PAGE_GENERIC_DESKTOP, USAGE_PAGE_VENDOR_DEFINED_MIN, USAGE_PAGE_VENDOR_DIGITIZER,
     classify_pen_tablet, declares_any_digitizer, declares_pen_or_vendor_digitizer,
     disqualifying_collection, hid_report_descriptor_length, hid_report_descriptor_request,
-    is_boot_keyboard_interface, parse_hid_class_descriptor, parse_report_descriptor,
-    requested_report_descriptor_interface,
+    is_boot_keyboard_interface, names_pen_digitizer, parse_hid_class_descriptor,
+    parse_report_descriptor, requested_report_descriptor_interface,
 };
 pub use hid_host::{
     BridgedHidDevice, DEFAULT_PRODUCT_NAME, HID_HOST_CONTROL_DEADLINE, HID_HOST_CONTROL_TIMEOUT_MS,
@@ -82,12 +103,21 @@ pub use hid_host::{
     hid_country_codes, is_bridged_location_id, location_id, string_descriptor,
 };
 pub use hid_publish::{APPLE_EVENT_PAGES, HidPublishPolicy, PublishRefusal, publishable};
+pub use host_pen::{HostPenReader, HostPenRoute, NoHostPenRoute, host_pen_route};
+pub use host_pen_bridge::{
+    HOST_PEN_BACKLOG, HOST_PEN_TOKENS, HostPenBridge, HostPenBridgeOutput, HostPenMode,
+    HostPenNote, NoPenInterface, read_pen_mode,
+};
 pub use kernel_package::{
     VhciHcdFacts, el_point_release, kernel_arch, kernel_modules_internal_command,
     kernel_modules_internal_package, missing_vhci_hcd_reason, os_release_is_rhel_family,
     rocky_package_urls, valid_kernel_release,
 };
 pub use ledger::{InFlightLedger, LedgerError, UrbRecord};
+pub use native_component::{
+    ComponentReason, DeckPlatform, MAX_COMPONENT_REASON_CHARS, NativeComponentAction,
+    NativeComponentFacts, NativeUsbComponentState,
+};
 pub use policy::{
     DeviceProfile, DeviceSnapshot, InterfaceRule, PolicyDecision, PolicyDenial, evaluate_profile,
     is_permanently_prohibited_class,

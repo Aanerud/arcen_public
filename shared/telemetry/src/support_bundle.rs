@@ -317,6 +317,14 @@ pub enum NoticeCode {
     CanonicalLogRecordTooLarge,
     /// A canonical log fragment lacked a complete line boundary.
     CanonicalLogRecordIncomplete,
+    /// Crash reports were left out because the bundle was not asked to
+    /// include them (they can hold stack fragments such as a password).
+    CrashReportsNotRequested,
+    /// Crash reports were included because the bundle was asked to.
+    CrashReportsRequested,
+    /// The bundle was asked for crash reports, but this product does not
+    /// collect them yet.
+    CrashReportsNotCollected,
 }
 
 /// One typed omission/degradation notice.
@@ -365,6 +373,11 @@ pub struct SupportBundleManifest {
     pub component: BundleComponent,
     /// Host-supplied UNIX timestamp.
     pub generated_at_unix_seconds: u64,
+    /// The bundle's random public identifier (`ARC-XXXX-XXXX`,
+    /// [`BundlePseudonymizer::bundle_id`]): what a public report and the
+    /// privately sent bundle share. Absent in bundles made before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
     /// Sorted hashed payload entries, excluding `manifest.json`.
     pub entries: Vec<BundleEntry>,
     /// Sorted typed source outcomes.
@@ -378,6 +391,7 @@ pub struct SupportBundleManifest {
 pub struct SupportBundleManifestBuilder {
     component: BundleComponent,
     generated_at_unix_seconds: u64,
+    bundle_id: Option<String>,
     entries: Vec<BundleEntry>,
     notices: Vec<BundleNotice>,
     redactions: Vec<RedactionRecord>,
@@ -390,10 +404,18 @@ impl SupportBundleManifestBuilder {
         Self {
             component,
             generated_at_unix_seconds,
+            bundle_id: None,
             entries: Vec::new(),
             notices: Vec::new(),
             redactions: Vec::new(),
         }
+    }
+
+    /// Records the bundle's public identifier.
+    #[must_use]
+    pub fn with_bundle_id(mut self, bundle_id: String) -> Self {
+        self.bundle_id = Some(bundle_id);
+        self
     }
 
     /// Adds one unique payload entry.
@@ -472,6 +494,7 @@ impl SupportBundleManifestBuilder {
             schema_version: SUPPORT_BUNDLE_SCHEMA_VERSION,
             component: self.component,
             generated_at_unix_seconds: self.generated_at_unix_seconds,
+            bundle_id: self.bundle_id,
             entries: self.entries,
             notices: self.notices,
             redactions: self.redactions,
@@ -607,6 +630,63 @@ fn escape_json_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
+/// Keys of a canonical record's `fields` that carry an identity, and the
+/// class each is pseudonymized as (host and peer-address values by
+/// [`BundlePseudonymizer::pseudonymize_address`]). The top-level `user`, `host` and
+/// `peer_addr` are reserved field keys; these are the names products log the
+/// same identities under inside `fields`: a sign-in name, a host's own name
+/// or address (its bind or local address, a TLS server name), a peer's
+/// address, and a Wi-Fi name.
+pub const BUNDLE_IDENTITY_FIELDS: &[(&str, BundleIdentityKind)] = &[
+    ("addr", BundleIdentityKind::Host),
+    ("endpoint", BundleIdentityKind::PeerAddress),
+    ("hostname", BundleIdentityKind::Host),
+    ("local_addr", BundleIdentityKind::Host),
+    ("peer", BundleIdentityKind::PeerAddress),
+    ("remote_addr", BundleIdentityKind::PeerAddress),
+    ("resolved", BundleIdentityKind::Host),
+    ("server", BundleIdentityKind::Host),
+    ("server_name", BundleIdentityKind::Host),
+    ("ssid", BundleIdentityKind::NetworkIdentity),
+    ("username", BundleIdentityKind::User),
+];
+
+/// The identity class of a canonical record's `fields` key, when its name
+/// says it holds one: an exact name in [`BUNDLE_IDENTITY_FIELDS`], or a name
+/// shaped like one — `…_user`, `…_username`, `…_account` (a person);
+/// `…_addr`, `…_address`, `…_addresses`, `…_host`, `…hostname`, `…_domain`,
+/// `uri`, `url`, `…_uri`, `…_url`, `…_endpoint` (a machine). Only string
+/// values are replaced, so a count or flag with such a name stays.
+#[must_use]
+pub fn bundle_identity_field(key: &str) -> Option<BundleIdentityKind> {
+    if let Some((_, kind)) = BUNDLE_IDENTITY_FIELDS
+        .iter()
+        .find(|(field, _)| *field == key)
+    {
+        return Some(*kind);
+    }
+    let ends = |suffixes: &[&str]| suffixes.iter().any(|suffix| key.ends_with(suffix));
+    if key == "account" || ends(&["_user", "_username", "_account"]) {
+        Some(BundleIdentityKind::User)
+    } else if matches!(key, "uri" | "url")
+        || ends(&[
+            "_addr",
+            "_address",
+            "_addresses",
+            "_host",
+            "hostname",
+            "_domain",
+            "_uri",
+            "_url",
+            "_endpoint",
+        ])
+    {
+        Some(BundleIdentityKind::Host)
+    } else {
+        None
+    }
+}
+
 /// Domain-separated identity classes supported by bundle pseudonymization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BundleIdentityKind {
@@ -695,8 +775,140 @@ impl BundlePseudonymizer {
     /// Returns a stable, domain-separated pseudonym for this bundle.
     #[must_use]
     pub fn pseudonymize(&self, kind: BundleIdentityKind, value: &str) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = self.mac(kind.domain(), value.as_bytes());
+        let mut pseudonym = String::with_capacity(69);
+        pseudonym.push_str("anon:");
+        push_hex(&mut pseudonym, &digest);
+        pseudonym
+    }
 
+    /// The one rule for a machine's name or address, wherever a bundle
+    /// carries one (a Pier's or a Deck's, in a log record, a saved
+    /// connection, a trusted pin or a network probe): the host part becomes
+    /// its [`BundleIdentityKind::Host`] pseudonym, so the same machine reads
+    /// the same in every file of one bundle; an IP literal keeps only its
+    /// family and scope, and a port stays.
+    ///
+    /// `203.0.113.82:18444` → `anon:<hex>[ipv4-public]:18444`;
+    /// `[fd00::1]:18444` → `anon:<hex>[ipv6-ula]:18444`;
+    /// `render07.example.internal` → `anon:<hex>[name]`.
+    #[must_use]
+    pub fn pseudonymize_address(&self, value: &str) -> String {
+        let (host, port) = split_host_port(value);
+        let scope = host
+            .parse::<std::net::IpAddr>()
+            .map_or("name", |address| address_scope(address.to_canonical()));
+        let mut pseudonym = self.pseudonymize(BundleIdentityKind::Host, host);
+        pseudonym.push('[');
+        pseudonym.push_str(scope);
+        pseudonym.push(']');
+        if let Some(port) = port {
+            pseudonym.push(':');
+            pseudonym.push_str(port);
+        }
+        pseudonym
+    }
+
+    /// The pseudonym for an identity of `kind`: an address for
+    /// [`BundleIdentityKind::Host`] and [`BundleIdentityKind::PeerAddress`],
+    /// a plain pseudonym otherwise.
+    #[must_use]
+    pub fn pseudonymize_identity(&self, kind: BundleIdentityKind, value: &str) -> String {
+        match kind {
+            BundleIdentityKind::Host | BundleIdentityKind::PeerAddress => {
+                self.pseudonymize_address(value)
+            }
+            BundleIdentityKind::User | BundleIdentityKind::NetworkIdentity => {
+                self.pseudonymize(kind, value)
+            }
+        }
+    }
+
+    /// `text` with every IPv4 or IPv6 literal (with or without a port) in it
+    /// replaced by its [`Self::pseudonymize_address`] pseudonym; `None` when
+    /// it holds none. For free text a product does not control — a
+    /// dependency's error message naming a destination — where no field name
+    /// says an address is there.
+    #[must_use]
+    pub fn pseudonymize_ip_literals(&self, text: &str) -> Option<String> {
+        let is_part = |c: char| c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '[' | ']');
+        let mut output = String::with_capacity(text.len());
+        let mut replaced = false;
+        let mut rest = text;
+        while let Some(start) = rest.find(is_part) {
+            let (before, from) = rest.split_at(start);
+            output.push_str(before);
+            let end = from.find(|c: char| !is_part(c)).unwrap_or(from.len());
+            let run = &from[..end];
+            let (lead, candidate, trail) = ip_candidate(run);
+            let preceded_by_word = lead.is_empty()
+                && before
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !preceded_by_word && is_ip_literal(candidate) {
+                output.push_str(lead);
+                output.push_str(&self.pseudonymize_address(candidate));
+                output.push_str(trail);
+                replaced = true;
+            } else {
+                output.push_str(run);
+            }
+            rest = &from[end..];
+        }
+        output.push_str(rest);
+        replaced.then_some(output)
+    }
+
+    /// `text` with the account name of every home folder in it replaced by
+    /// its [`BundleIdentityKind::User`] pseudonym (the one a record's `user`
+    /// gets), so a path keeps its shape but not the person:
+    /// `C:\Users\alice\AppData\Local\Arcen` →
+    /// `C:\Users\anon:<hex>\AppData\Local\Arcen`. Windows homes in any
+    /// case, with backslashes, forward slashes or JSON-escaped ones, and under
+    /// `Documents and Settings`; macOS `/Users/<name>`; Linux `/home/<name>`.
+    /// System folders (`Public`, `Default`, `All Users`, `Shared`) stay.
+    /// `None` when `text` holds none.
+    #[must_use]
+    pub fn pseudonymize_home_paths(&self, text: &str) -> Option<String> {
+        let mut output = String::with_capacity(text.len());
+        let mut copied = 0;
+        let mut search = 0;
+        while let Some((root_end, name_end)) = next_home_account(text, search) {
+            output.push_str(&text[copied..root_end]);
+            output
+                .push_str(&self.pseudonymize(BundleIdentityKind::User, &text[root_end..name_end]));
+            copied = name_end;
+            search = name_end;
+        }
+        (copied != 0).then(|| {
+            output.push_str(&text[copied..]);
+            output
+        })
+    }
+
+    /// This bundle's public identifier, `ARC-XXXX-XXXX` (40 bits, Crockford
+    /// base 32): derived from the bundle's random key, so it is random per
+    /// bundle and says nothing about the key or the machine.
+    #[must_use]
+    pub fn bundle_id(&self) -> String {
+        const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let digest = self.mac(b"bundle_id", b"");
+        let bits = digest[..5]
+            .iter()
+            .fold(0_u64, |bits, byte| (bits << 8) | u64::from(*byte));
+        let mut id = String::from("ARC-");
+        for index in 0..8 {
+            if index == 4 {
+                id.push('-');
+            }
+            let symbol = usize::try_from((bits >> (35 - 5 * index)) & 0x1f).unwrap_or(0);
+            id.push(char::from(CROCKFORD[symbol]));
+        }
+        id
+    }
+
+    fn mac(&self, domain: &[u8], value: &[u8]) -> [u8; 32] {
         let mut inner_pad = [0x36_u8; 64];
         let mut outer_pad = [0x5c_u8; 64];
         for (index, byte) in self.key.0.iter().copied().enumerate() {
@@ -707,9 +919,9 @@ impl BundlePseudonymizer {
         let mut inner = Sha256::new();
         inner.update(inner_pad.as_slice());
         inner.update(b"arcen-support-bundle-pseudonym-v1\0");
-        inner.update(kind.domain());
+        inner.update(domain);
         inner.update(b"\0");
-        inner.update(value.as_bytes());
+        inner.update(value);
         let inner_digest = inner.finalize();
         inner_pad.fill(0);
 
@@ -718,14 +930,209 @@ impl BundlePseudonymizer {
         outer.update(inner_digest);
         let digest = outer.finalize();
         outer_pad.fill(0);
+        digest.into()
+    }
+}
 
-        let mut pseudonym = String::with_capacity(69);
-        pseudonym.push_str("anon:");
-        for byte in digest {
-            pseudonym.push(char::from(HEX[usize::from(byte >> 4)]));
-            pseudonym.push(char::from(HEX[usize::from(byte & 0x0f)]));
+fn push_hex(text: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        text.push(char::from(HEX[usize::from(byte >> 4)]));
+        text.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+}
+
+/// Folders under a home root that belong to no person.
+const HOME_SYSTEM_FOLDERS: &[&str] = &["public", "default", "default user", "all users", "shared"];
+
+/// The next home folder's account name at or after `from`, as the byte
+/// range `(start, end)` of the name: it follows `/Users/`, `/home/` or a
+/// Windows `X:\Users\` (any case, `\`, `\\` or `/`, or `Documents and
+/// Settings`) and runs to the next separator; a name with spaces counts
+/// only up to a path separator (`C:\Users\alice smith\…`), otherwise
+/// its first word. Placeholders (`<user>`, `%USERNAME%`, `$USER`, `~`), an
+/// existing pseudonym and system folders are skipped.
+fn next_home_account(text: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = from;
+    while index < bytes.len() {
+        let Some(start) = home_root_end(bytes, index) else {
+            index += 1;
+            continue;
+        };
+        index = start;
+        let stop =
+            |byte: u8| byte.is_ascii_whitespace() || b"\\/\"'`<>%{}$*:|?,;()[]".contains(&byte);
+        let mut end = start;
+        while end < bytes.len() && !stop(bytes[end]) {
+            end += 1;
         }
-        pseudonym
+        if end == start || text[start..].starts_with("anon:") {
+            continue;
+        }
+        let first_word = end;
+        // A name with single spaces in it, ended by a path separator.
+        let mut extended = end;
+        while bytes.get(extended) == Some(&b' ')
+            && bytes.get(extended + 1).is_some_and(|byte| !stop(*byte))
+        {
+            extended += 1;
+            while extended < bytes.len() && !stop(bytes[extended]) {
+                extended += 1;
+            }
+        }
+        if extended != end && matches!(bytes.get(extended), Some(b'\\' | b'/')) {
+            end = extended;
+        }
+        let name = &text[start..end];
+        let first = &text[start..first_word];
+        if name.bytes().all(|byte| byte == b'.')
+            || HOME_SYSTEM_FOLDERS.iter().any(|folder| {
+                folder.eq_ignore_ascii_case(name) || folder.eq_ignore_ascii_case(first)
+            })
+        {
+            index = end;
+            continue;
+        }
+        return Some((start, end));
+    }
+    None
+}
+
+/// Where a home root that starts at `index` ends (the account name's first
+/// byte), if one does.
+fn home_root_end(bytes: &[u8], index: usize) -> Option<usize> {
+    let rest = &bytes[index..];
+    for root in [b"/Users/".as_slice(), b"/home/".as_slice()] {
+        if rest.starts_with(root) {
+            return Some(index + root.len());
+        }
+    }
+    let separators = |at: usize| {
+        let mut end = at;
+        while matches!(bytes.get(end), Some(b'\\' | b'/')) {
+            end += 1;
+        }
+        (end > at).then_some(end)
+    };
+    if !rest.first()?.is_ascii_alphabetic()
+        || rest.get(1) != Some(&b':')
+        || index
+            .checked_sub(1)
+            .is_some_and(|before| bytes[before].is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let folder = separators(index + 2)?;
+    ["users", "documents and settings"]
+        .into_iter()
+        .find_map(|name| {
+            let candidate = bytes.get(folder..folder + name.len())?;
+            candidate
+                .eq_ignore_ascii_case(name.as_bytes())
+                .then(|| separators(folder + name.len()))
+                .flatten()
+        })
+}
+
+/// Splits a run of address characters into the text before an address,
+/// the address and the text after it: a leading `:` (`peer:203.0.113.5`), a
+/// `[` or `]` without its partner (`[a:p, b:p]` from a list), trailing `.`
+/// or `:`, and brackets around a whole `host:port` (`[203.0.113.5:443]`).
+fn ip_candidate(run: &str) -> (&str, &str, &str) {
+    let mut start = 0;
+    let mut end = run.len();
+    loop {
+        let core = &run[start..end];
+        if core.starts_with(':') || (core.starts_with('[') && !core.contains(']')) {
+            start += 1;
+        } else if core.ends_with(['.', ':']) || (core.ends_with(']') && !core.contains('[')) {
+            end -= 1;
+        } else {
+            break;
+        }
+        if start >= end {
+            return (run, "", "");
+        }
+    }
+    let core = &run[start..end];
+    if core.len() > 2
+        && core.starts_with('[')
+        && core.ends_with(']')
+        && core[1..core.len() - 1].contains(':')
+        && split_host_port(core).1.is_none()
+        && is_ip_literal(&core[1..core.len() - 1])
+    {
+        start += 1;
+        end -= 1;
+    }
+    (&run[..start], &run[start..end], &run[end..])
+}
+
+/// An IPv4 or IPv6 literal, alone or with a port, that holds a digit (so a
+/// Rust path's `::` is not one).
+fn is_ip_literal(candidate: &str) -> bool {
+    if !candidate.bytes().any(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let (host, _) = split_host_port(candidate);
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// `host:port`, `[v6]:port`, a bare IPv6 literal or a bare host.
+fn split_host_port(value: &str) -> (&str, Option<&str>) {
+    let is_port = |port: &str| !port.is_empty() && port.parse::<u16>().is_ok();
+    if let Some(rest) = value.strip_prefix('[')
+        && let Some((host, after)) = rest.split_once(']')
+    {
+        return match after.strip_prefix(':') {
+            Some(port) if is_port(port) => (host, Some(port)),
+            _ => (host, None),
+        };
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && is_port(port) => (host, Some(port)),
+        _ => (value, None),
+    }
+}
+
+/// The scope an IP literal keeps in a bundle.
+fn address_scope(address: std::net::IpAddr) -> &'static str {
+    match address {
+        std::net::IpAddr::V4(v4) => {
+            let [first, second, ..] = v4.octets();
+            if v4.is_unspecified() {
+                "ipv4-unspecified"
+            } else if v4.is_loopback() {
+                "ipv4-loopback"
+            } else if v4.is_private() {
+                "ipv4-private"
+            } else if v4.is_link_local() {
+                "ipv4-link-local"
+            } else if first == 100 && (64..128).contains(&second) {
+                "ipv4-shared"
+            } else if v4.is_multicast() || v4.is_broadcast() {
+                "ipv4-multicast"
+            } else {
+                "ipv4-public"
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            if v6.is_unspecified() {
+                "ipv6-unspecified"
+            } else if v6.is_loopback() {
+                "ipv6-loopback"
+            } else if first & 0xfe00 == 0xfc00 {
+                "ipv6-ula"
+            } else if first & 0xffc0 == 0xfe80 {
+                "ipv6-link-local"
+            } else if v6.is_multicast() {
+                "ipv6-multicast"
+            } else {
+                "ipv6-public"
+            }
+        }
     }
 }
 
@@ -765,6 +1172,9 @@ pub struct CanonicalJsonlTransformReport {
     pub output_limit_reached: bool,
     /// Identity kinds replaced at least once.
     pub redacted_kinds: Vec<BundleIdentityKind>,
+    /// JSON pointers replaced at least once (`/user`, `/fields/username`,
+    /// …), sorted: the redaction records a bundle lists for the log.
+    pub redacted_key_paths: Vec<String>,
 }
 
 impl CanonicalJsonlTransformReport {
@@ -778,13 +1188,20 @@ impl CanonicalJsonlTransformReport {
             incomplete_lines: 0,
             output_limit_reached: false,
             redacted_kinds: Vec::new(),
+            redacted_key_paths: Vec::new(),
         }
     }
 
-    fn record_kind(&mut self, kind: BundleIdentityKind) {
+    fn record(&mut self, kind: BundleIdentityKind, key_path: &str) {
         if !self.redacted_kinds.contains(&kind) {
             self.redacted_kinds.push(kind);
             self.redacted_kinds.sort_unstable();
+        }
+        if let Err(index) = self
+            .redacted_key_paths
+            .binary_search_by(|known| known.as_str().cmp(key_path))
+        {
+            self.redacted_key_paths.insert(index, key_path.to_owned());
         }
     }
 }
@@ -917,15 +1334,15 @@ fn emit_canonical_line(
         return Ok(());
     }
 
-    let mut redacted_kinds = Vec::with_capacity(4);
+    let mut redacted = Vec::with_capacity(4);
     for (field, kind) in [
         ("user", BundleIdentityKind::User),
         ("host", BundleIdentityKind::Host),
         ("peer_addr", BundleIdentityKind::PeerAddress),
     ] {
         if let Some(serde_json::Value::String(identity)) = object.get_mut(field) {
-            *identity = pseudonymizer.pseudonymize(kind, identity);
-            redacted_kinds.push(kind);
+            *identity = pseudonymizer.pseudonymize_identity(kind, identity);
+            redacted.push((kind, format!("/{field}")));
         }
     }
     let Some(fields) = object
@@ -935,9 +1352,33 @@ fn emit_canonical_line(
         report.invalid_lines += 1;
         return Ok(());
     };
-    if let Some(serde_json::Value::String(identity)) = fields.get_mut("ssid") {
-        *identity = pseudonymizer.pseudonymize(BundleIdentityKind::NetworkIdentity, identity);
-        redacted_kinds.push(BundleIdentityKind::NetworkIdentity);
+    for (field, value) in fields.iter_mut() {
+        let serde_json::Value::String(text) = value else {
+            continue;
+        };
+        if let Some(kind) = bundle_identity_field(field) {
+            *text = pseudonymizer.pseudonymize_identity(kind, text);
+            redacted.push((kind, format!("/fields/{field}")));
+            continue;
+        }
+        if let Some(scrubbed) = pseudonymizer.pseudonymize_ip_literals(text) {
+            *text = scrubbed;
+            redacted.push((BundleIdentityKind::Host, format!("/fields/{field}")));
+        }
+        if let Some(scrubbed) = pseudonymizer.pseudonymize_home_paths(text) {
+            *text = scrubbed;
+            redacted.push((BundleIdentityKind::User, format!("/fields/{field}")));
+        }
+    }
+    if let Some(serde_json::Value::String(message)) = object.get_mut("message") {
+        if let Some(scrubbed) = pseudonymizer.pseudonymize_ip_literals(message) {
+            *message = scrubbed;
+            redacted.push((BundleIdentityKind::Host, "/message".to_owned()));
+        }
+        if let Some(scrubbed) = pseudonymizer.pseudonymize_home_paths(message) {
+            *message = scrubbed;
+            redacted.push((BundleIdentityKind::User, "/message".to_owned()));
+        }
     }
 
     let mut rendered =
@@ -952,8 +1393,8 @@ fn emit_canonical_line(
         .map_err(CanonicalJsonlTransformError::Write)?;
     report.output_bytes += rendered.len() as u64;
     report.accepted_lines += 1;
-    for kind in redacted_kinds {
-        report.record_kind(kind);
+    for (kind, key_path) in redacted {
+        report.record(kind, &key_path);
     }
     Ok(())
 }

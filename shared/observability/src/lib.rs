@@ -7,7 +7,10 @@
 
 mod runtime;
 mod sampler;
+pub mod session_health;
 mod sink;
+#[cfg(feature = "support-bundle")]
+pub mod support_bundle;
 
 pub use runtime::{
     BuildError, EffectiveDiagnosticPolicy, EmissionReport, FlushError, GlobalInstallError,
@@ -16,6 +19,9 @@ pub use runtime::{
 };
 pub use sampler::{
     CallerQosSnapshot, HeartbeatCounters, HeartbeatSnapshot, QosCounters, QosSampler,
+};
+pub use session_health::{
+    ContentEvidence, HealthObservation, HostCounters, SessionHealth, health_state_message,
 };
 pub use sink::{
     BoundedSink, DeliveryOutcome, Sink, SinkBuildError, SinkError, SinkLossClass, SinkLossDelta,

@@ -41,6 +41,7 @@ mod loss_guard;
 mod monitor;
 mod monitor_registry;
 mod peer;
+mod pier;
 mod priority;
 mod session_lanes;
 
@@ -79,8 +80,9 @@ pub use identity::{
 pub use lane_relay::{
     LaneRelayEvent, LaneRelayStats, PierLaneRelay, RELAY_AUDIO_BACKLOG, RELAY_BULK_BACKLOG,
     RELAY_BULK_INBOUND_BACKLOG, RELAY_BULK_WRITE_TIMEOUT, RELAY_INPUT_BACKLOG,
-    RELAY_INPUT_RELEASE_REASON, RELAY_MICROPHONE_BACKLOG, RELAY_USB_BACKLOG, RELAY_VIDEO_BACKLOG,
-    RelayRoute,
+    RELAY_INPUT_RELEASE_REASON, RELAY_MICROPHONE_BACKLOG, RELAY_REFINE_BACKLOG,
+    RELAY_REFINE_RESET_REASON, RELAY_USB_BACKLOG, RELAY_VIDEO_BACKLOG, RelayRoute,
+    wait_for_refine_turn,
 };
 pub use lane_runtime::{
     DEFAULT_LANE_PREFACE_TIMEOUT, INTERACTIVE_LANE_BURST_BYTES, INTERACTIVE_LANE_BURST_WINDOW,
@@ -107,6 +109,7 @@ pub use monitor::{
 };
 pub use monitor_registry::{ExpectedMonitorStream, MonitorRosterError, MonitorStreamRoster};
 pub use peer::{AsyncTransportPeer, BoxFuture, QuicPeer, QuicPeerCounters, QuicRuntimeConfig};
+pub use pier::{pier_server_config, resolve_pier_bind_address};
 pub use priority::{
     AUDIO_PRIORITY_STREAM_PRIORITY, PriorityAudio, PriorityAudioSend, PriorityStreamError,
     accept_audio_priority_stream, open_audio_priority_stream, read_priority_frame,

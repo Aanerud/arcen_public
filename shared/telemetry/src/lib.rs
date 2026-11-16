@@ -55,15 +55,15 @@ pub use stream_stats::{
     stage_averages,
 };
 pub use support_bundle::{
-    BundleComponent, BundleEntry, BundleIdentityKind, BundleNotice, BundlePath, BundlePseudonymKey,
-    BundlePseudonymizer, BundleSource, BundleTruncation, CanonicalJsonlTransformError,
-    CanonicalJsonlTransformLimits, CanonicalJsonlTransformReport, MAX_BUNDLE_ENTRIES,
-    MAX_BUNDLE_NOTICES, MAX_BUNDLE_PATH_BYTES, MAX_CANONICAL_JSON_LINE_BYTES,
+    BUNDLE_IDENTITY_FIELDS, BundleComponent, BundleEntry, BundleIdentityKind, BundleNotice,
+    BundlePath, BundlePseudonymKey, BundlePseudonymizer, BundleSource, BundleTruncation,
+    CanonicalJsonlTransformError, CanonicalJsonlTransformLimits, CanonicalJsonlTransformReport,
+    MAX_BUNDLE_ENTRIES, MAX_BUNDLE_NOTICES, MAX_BUNDLE_PATH_BYTES, MAX_CANONICAL_JSON_LINE_BYTES,
     MAX_REDACTION_KEY_PATH_BYTES, MAX_REDACTION_RECORDS, NoticeCode, NoticeKind, REDACTED_VALUE,
     RedactionDecision, RedactionReason, RedactionRecord, SUPPORT_BUNDLE_SCHEMA_VERSION,
     Sha256Digest, SupportBundleContractError, SupportBundleManifest, SupportBundleManifestBuilder,
-    SupportBundleRedactionPolicy, TruncationReason, redact_json_document, redact_json_document_at,
-    transform_canonical_jsonl,
+    SupportBundleRedactionPolicy, TruncationReason, bundle_identity_field, redact_json_document,
+    redact_json_document_at, transform_canonical_jsonl,
 };
 
 /// Maximum correlation identifier length.

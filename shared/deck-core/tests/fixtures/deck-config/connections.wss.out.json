@@ -1,0 +1,73 @@
+{
+  "connections": [
+    {
+      "future_entry_field": {
+        "kept": true
+      },
+      "host": "pier-a.example.internal",
+      "id": "studio-wss",
+      "kind": "direct",
+      "name": "Studio over WSS",
+      "port": 18444,
+      "security_mode": "high",
+      "settings": {
+        "displays_mode": "single_primary",
+        "future_setting": "kept",
+        "keyboard_shortcuts": "swap_command_control",
+        "left_option_altgr": true,
+        "remembered_username": "AD\\artist.user",
+        "tablet_mode_requested": "wacom_usb_bridge",
+        "version": 1
+      },
+      "transport": "quic"
+    },
+    {
+      "host": "203.0.113.30",
+      "id": "connection-62f683cd6635ef0f6f198eb24cd77056",
+      "kind": "direct",
+      "name": "WSS without an id or a port",
+      "port": 18444,
+      "settings": {
+        "remembered_username": null,
+        "tablet_mode_requested": "local_termination",
+        "version": 1
+      },
+      "transport": "quic"
+    },
+    {
+      "host": "pier-b.example.internal",
+      "id": "proxied-wss",
+      "kind": "direct",
+      "name": "WSS on its own port",
+      "port": 443,
+      "settings": {
+        "remembered_username": null,
+        "tablet_mode_requested": "local_termination",
+        "version": 1
+      },
+      "transport": "quic"
+    },
+    {
+      "host": "203.0.113.40",
+      "id": "already-quic",
+      "kind": "direct",
+      "name": "Already QUIC",
+      "port": 18443,
+      "settings": {
+        "remembered_username": null,
+        "tablet_mode_requested": "local_termination",
+        "version": 1
+      },
+      "transport": "quic"
+    },
+    {
+      "host": "pier-c.example.internal",
+      "id": "cleartext-ws",
+      "name": "Cleartext WebSocket",
+      "port": 18443,
+      "transport": "ws"
+    }
+  ],
+  "last_selected_connection_id": "studio-wss",
+  "version": 2
+}

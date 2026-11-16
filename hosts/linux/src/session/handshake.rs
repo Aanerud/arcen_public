@@ -221,6 +221,7 @@ pub fn build_server_hello(
         clipboard: Some(crate::clipboard::advertised_policy(cfg, session)),
         device_capabilities: Default::default(),
         negotiated_transport: None, // set from the active socket before transmission
+        lossless_refine: None,
         // This host emits REL_WHEEL_HI_RES/REL_HWHEEL_HI_RES (120 units per
         // detent) plus compatible legacy detents, so trackpad point travel can
         // stay precise when the Deck advertises it.

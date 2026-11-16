@@ -34,6 +34,14 @@ and ``scripts/ci/shared-contracts.toml`` and checks:
   new one fails the check until it moves to ``shared/`` or is added to the
   baseline with a reason in review. The baseline may shrink, never grow.
 
+* The earned-differences ledger (``scripts/ci/platform-differences.toml``,
+  see ``platform_differences.py``): every OS-conditional ``cfg`` in shared/,
+  every ``platform`` config key and every capability difference between
+  products is an earned difference (an OS API forces it) or a recorded gap;
+  citations must still hold, local copies of shared items and cross-product
+  clones may not grow, and ``docs/architecture/platform-differences.md`` is
+  up to date.
+
 * ``[default_configs]``: the packaged ``pier.json`` templates of every Pier
   carry identical common sections. Only the listed ``ignore`` paths (file
   locations and platform-specific keys) and ``platform`` may differ, so an
@@ -50,7 +58,7 @@ results; ``--gate`` fails while a mandatory validation lacks a ``passed``
 result for the head revision.
 
 Usage: ``scripts/check_shared_contracts.py [--root DIR] [--write-baseline]
-[--write-report] [--impact --base REV [--head REV] [--evidence FILE]... [--gate]]``
+[--write-report] [--write-clone-baseline] [--impact --base REV [--head REV] [--evidence FILE]... [--gate]]``
 """
 
 from __future__ import annotations
@@ -68,6 +76,8 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import platform_differences
 
 # Anything that means "this file talks to the operating system". A file with
 # none of these is portable Rust living in a platform directory.
@@ -331,6 +341,7 @@ OWNERS = frozenset(
         "Windows Host",
         "macOS Host",
         "macOS Client",
+        "Windows Client",
     }
 )
 TARGET_OSES = ("any", "linux", "macos", "windows")
@@ -2181,6 +2192,12 @@ def render_report(
         "own tests: run `python3 scripts/check_shared_contracts.py --impact --base",
         "<rev>` to list it.",
         "",
+        "The other side of the same rule is the",
+        "[earned-differences ledger](platform-differences.md): every difference",
+        "between products must be forced by an operating-system API, or be a",
+        "recorded gap with an owner. `scripts/shared_adoption_index.py` reports the",
+        "Shared Adoption Index over time ([history](shared-adoption-history.md)).",
+        "",
     ]
     if statuses is None:
         lines += [
@@ -2341,6 +2358,7 @@ def run(
     write_baseline: bool = False,
     workspace: Workspace | None = None,
     write_report: bool = False,
+    write_clone_baseline: bool = False,
 ) -> Report:
     contracts = tomllib.loads((root / "scripts/ci/shared-contracts.toml").read_text())
     report = Report()
@@ -2364,6 +2382,7 @@ def run(
     check_ratchet(root, contracts, report, write_baseline)
     check_default_configs(root, contracts, report)
     check_operations_references(root, report)
+    platform_differences.check(root, report, write_report, write_clone_baseline)
     return report
 
 
@@ -2484,7 +2503,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--write-baseline", action="store_true")
-    parser.add_argument("--write-report", action="store_true", help=f"regenerate {REPORT_PATH}")
+    parser.add_argument(
+        "--write-report",
+        action="store_true",
+        help=f"regenerate {REPORT_PATH} and {platform_differences.DOC_PATH}",
+    )
+    parser.add_argument(
+        "--write-clone-baseline",
+        action="store_true",
+        help=f"record today's cross-product clones in {platform_differences.CLONE_BASELINE_PATH}",
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--impact", action="store_true", help="list validation a change requires")
     parser.add_argument("--base", help="comparison revision for --impact")
@@ -2516,7 +2544,12 @@ def main() -> int:
         return run_impact(args)
     if args.report:
         return write_status_report(args)
-    report = run(args.root, args.write_baseline, write_report=args.write_report)
+    report = run(
+        args.root,
+        args.write_baseline,
+        write_report=args.write_report,
+        write_clone_baseline=args.write_clone_baseline,
+    )
     if args.verbose:
         for note in report.notes:
             print(f"  {note}")

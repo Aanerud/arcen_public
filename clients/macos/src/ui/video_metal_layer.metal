@@ -75,7 +75,7 @@
 // test run: those tests build the production pipeline state from this
 // source, render 8-bit and 10-bit 4:2:0, 4:2:2 and 4:4:4 planes through
 // `fs_convert` on the real Metal device, and compare the read-back pixels
-// with the CPU reference in `video_render.rs`.
+// with the shared CPU reference in `arcen_media::video::present`.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -83,7 +83,7 @@ using namespace metal;
 // Keep numerically in sync with `MetalVideoUniform` in `video_metal_layer.rs`
 // (which builds this buffer's bytes by hand -- see that struct's own doc)
 // and, for every field except `code_unnormalize_scale`, with `VideoUniform`
-// in `video_render.wgsl`/`video_render.rs`.
+// in `video_render.wgsl` and `arcen_media::video::present`.
 struct VideoUniform {
     float luma_offset;
     float luma_span_inv;
@@ -102,9 +102,9 @@ struct VideoUniform {
     float code_unnormalize_scale;
 };
 
-// Keep in sync with `ShaderMode` in `video_render.rs` (reused directly by
-// `MetalVideoUniform::from_contract` -- see that function's own doc) and
-// the `MODE_*` constants in `video_render.wgsl`. `MODE_PACKED_RGBA` (2) is
+// Keep in sync with `arcen_media::video::present::MODE_*` (the shared
+// uniform `MetalVideoUniform::from_contract` wraps) and the `MODE_*`
+// constants in `video_render.wgsl`. `MODE_PACKED_RGBA` (2) is
 // deliberately absent here: this shader's only source is a real decoded
 // `CVPixelBuffer` (see `video_metal_layer.rs`'s `DedicatedLayerFrame`),
 // which is never the already-converted-RGB payload that mode exists for.
@@ -159,7 +159,7 @@ vertex VsOut vs_main(uint vertex_id [[vertex_id]]) {
 // takes the early return -- bit-identical to before.
 //
 // `video_render.wgsl`'s `chroma_codes` is the WGSL twin of this function and
-// `video_render::VideoUniform::chroma_reference_codes` the CPU reference
+// `arcen_media::video::present::VideoUniform::chroma_reference_codes` the CPU reference
 // both are tested against; change all three together.
 constant float CHROMA_FIT_EPSILON = 3.0e-4; // ~16 code^2 at 8-bit limited range
 
@@ -263,6 +263,8 @@ static float2 chroma_codes(
 // `plane0` is bound with sample access only so `chroma_codes` can take a
 // block mean in one filtered sample. Chroma is reconstructed explicitly by
 // `chroma_codes`, identically to the WGSL twin.
+static float4 codes_to_rgb(float luma_code, float cb_code, float cr_code, constant VideoUniform& u);
+
 static float4 convert_codes(
     VsOut in,
     texture2d<float, access::sample> plane0,
@@ -280,9 +282,13 @@ static float4 convert_codes(
     // formula.
     float luma_code = luma_raw * u.code_unnormalize_scale;
     float2 chroma_code = chroma_codes(plane0, plane1, in.uv, luma_code, u) * u.code_unnormalize_scale;
-    float cb_code = chroma_code.x;
-    float cr_code = chroma_code.y;
+    return codes_to_rgb(luma_code, chroma_code.x, chroma_code.y, u);
+}
 
+// The range and matrix step of `convert_codes`, from the three codes of one
+// pixel. Shared by the video and by Y'CbCr refinement tiles, so a refined
+// pixel passes exactly the presenter's own range and matrix.
+static float4 codes_to_rgb(float luma_code, float cb_code, float cr_code, constant VideoUniform& u) {
     if (u.mode == MODE_IDENTITY_GBR) {
         // Identity/GBR passthrough (ITU-T H.273): plane0 -> G, the chroma
         // plane's Cb slot -> B, its Cr slot -> R, all three scaled by the
@@ -339,6 +345,30 @@ fragment float4 fs_convert_refined(
         uint4 code = overlay.read(luma_coord);
         if (code.a != 0) {
             return float4(float3(code.rgb) / 1023.0, 1.0);
+        }
+    }
+    return convert_codes(in, plane0, plane1, u);
+}
+
+// Lossless refinement (ADR 0016 R1), Y'CbCr domain: `overlay` holds the
+// source's Y', Cb, Cr codes (in the R, G, B slots) and a nonzero alpha
+// where a refined, currently valid block lies. They replace the decoded
+// codes before the range and matrix step -- no chroma reconstruction for a
+// refined pixel -- and then take exactly the video's own uniforms, so the
+// presenter's input codes are the source's. Composited at the source
+// coordinate, before any scaling or display transform (PQ/EDR included).
+fragment float4 fs_convert_refined_ycbcr(
+    VsOut in [[stage_in]],
+    texture2d<float, access::sample> plane0 [[texture(0)]],
+    texture2d<float, access::read> plane1 [[texture(1)]],
+    texture2d<uint, access::read> overlay [[texture(2)]],
+    constant VideoUniform& u [[buffer(0)]]
+) {
+    uint2 luma_coord = uint2(in.uv * float2(u.luma_width, u.luma_height));
+    if (luma_coord.x < overlay.get_width() && luma_coord.y < overlay.get_height()) {
+        uint4 code = overlay.read(luma_coord);
+        if (code.a != 0) {
+            return codes_to_rgb(float(code.r), float(code.g), float(code.b), u);
         }
     }
     return convert_codes(in, plane0, plane1, u);

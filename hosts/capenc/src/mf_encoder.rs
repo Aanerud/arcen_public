@@ -54,8 +54,11 @@ use arcen_media::{
     BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, TransferCharacteristics,
 };
 
-use crate::annexb::{avcc_to_annexb, parse_avc_decoder_config, prepend_parameter_sets};
 use crate::{log, ColorSpec};
+use arcen_media::annexb::{
+    annex_b_parameter_sets, length_prefixed_to_annex_b, parse_avc_decoder_config,
+    prepend_annex_b_units, starts_with_start_code, NalCodec,
+};
 
 pub(crate) struct Config {
     pub width: u32,
@@ -355,10 +358,10 @@ impl Encoder {
         // — the MS SW MFT on Win11 26200 defaults to Annex-B. Detect which and
         // convert as needed so downstream always sees Annex-B.
         let mut au = Vec::with_capacity(out_bytes.len() + 128);
-        if starts_with_annexb_start_code(&out_bytes) {
+        if starts_with_start_code(&out_bytes) {
             au.extend_from_slice(&out_bytes);
         } else {
-            let converted = avcc_to_annexb(&out_bytes, &mut au)
+            let converted = length_prefixed_to_annex_b(&out_bytes, &mut au)
                 .map_err(|e| windows::core::Error::new(E_FAIL, format!("AVCC->Annex-B: {e}")));
             if let Err(error) = converted {
                 self.out_scratch = out_bytes;
@@ -373,7 +376,7 @@ impl Encoder {
                 // for the next IDR when the MFT didn't populate the attribute.
                 self.parameter_sets = scan_parameter_sets(&au);
             }
-            prepend_parameter_sets(&self.parameter_sets, &mut au);
+            prepend_annex_b_units(&self.parameter_sets, &mut au);
         }
 
         Ok(Some(au))
@@ -754,13 +757,6 @@ unsafe fn build_output_type(cfg: &Config) -> windows::core::Result<IMFMediaType>
     Ok(mt)
 }
 
-/// True if the buffer begins with an Annex-B start code
-/// (`00 00 00 01` or `00 00 01`).
-fn starts_with_annexb_start_code(bytes: &[u8]) -> bool {
-    (bytes.len() >= 4 && bytes[..4] == [0, 0, 0, 1])
-        || (bytes.len() >= 3 && bytes[..3] == [0, 0, 1])
-}
-
 /// eAVEncH264VLevel values from codecapi.h. Return the smallest level that
 /// fits the source. Falls back to 5.2 (highest supported by the SW MFT).
 fn pick_h264_level(width: u32, height: u32, fps: u32) -> u32 {
@@ -1089,48 +1085,19 @@ unsafe fn extract_parameter_sets(mt: &IMFMediaType) -> Vec<Vec<u8>> {
     {
         return Vec::new();
     }
-    let ps = parse_avc_decoder_config(&buf);
-    if !ps.is_empty() {
-        return ps;
+    if let Some(units) = parse_avc_decoder_config(&buf) {
+        return units.into_iter().map(<[u8]>::to_vec).collect();
     }
     // Some encoders write raw Annex-B into the attribute; scan for start codes.
     scan_parameter_sets(&buf)
 }
 
-/// Scan an Annex-B byte stream for NAL type 7 (SPS) and 8 (PPS), returning
-/// each NAL unit stripped of its start code.
+/// The SPS and PPS units of an Annex-B byte stream, without start codes.
 fn scan_parameter_sets(bytes: &[u8]) -> Vec<Vec<u8>> {
-    let mut params = Vec::new();
-    let mut i = 0usize;
-    let mut last_start: Option<usize> = None;
-    while i + 3 < bytes.len() {
-        let is_start3 = bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1;
-        let is_start4 =
-            bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 0 && bytes[i + 3] == 1;
-        if is_start3 || is_start4 {
-            let payload_start = i + if is_start4 { 4 } else { 3 };
-            if let Some(prev) = last_start {
-                let end = i;
-                if end > prev {
-                    let nal_type = bytes[prev] & 0x1f;
-                    if nal_type == 7 || nal_type == 8 {
-                        params.push(bytes[prev..end].to_vec());
-                    }
-                }
-            }
-            last_start = Some(payload_start);
-            i = payload_start;
-        } else {
-            i += 1;
-        }
-    }
-    if let Some(prev) = last_start {
-        let nal_type = bytes[prev] & 0x1f;
-        if nal_type == 7 || nal_type == 8 {
-            params.push(bytes[prev..].to_vec());
-        }
-    }
-    params
+    annex_b_parameter_sets(bytes, NalCodec::H264)
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect()
 }
 
 unsafe fn copy_sample_bytes(sample: &IMFSample, out: &mut Vec<u8>) -> windows::core::Result<()> {

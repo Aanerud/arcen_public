@@ -38,6 +38,7 @@
 
 use core::fmt;
 
+use arcen_media::video::EncoderRequest;
 use arcen_media::{RequestedMonitorTopology, TopologyGeneration};
 
 /// The host-independent gates that must all be open before a request can be
@@ -533,6 +534,127 @@ fn degraded<P, C, E>(stage: AdmissionStage, source: E) -> AdmissionOutcome<P, C,
     )))
 }
 
+/// The encoder a Pier's multi-monitor sessions will be admitted with, as
+/// far as the Pier knows it before authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferEncoder {
+    /// The Pier has one native encoder that carries every output (the macOS
+    /// Pier's `VideoToolbox`).
+    Native,
+    /// The request admission will use, resolved before the offer (the Linux
+    /// Pier resolves `auto` from its configuration and qualification record).
+    Resolved(EncoderRequest),
+    /// The configured request; the Pier resolves `auto` for each session
+    /// before admission (the Windows Pier: the adapter that owns a session's
+    /// outputs is known only in the signed-in user's session, never in
+    /// session 0 where the offer is built).
+    PerSession(EncoderRequest),
+}
+
+impl OfferEncoder {
+    /// Whether a multi-monitor plan can be served with this encoder.
+    ///
+    /// Multi-monitor admission plans only direct NVENC and `OpenH264`
+    /// (the Linux Pier's `validate_uniform_exact_encoder_policy`, the
+    /// Windows Pier's `encoder_admission`); Media Foundation and AV1 are
+    /// refused there, so offering them would promise what admission
+    /// refuses. An unresolved `auto` is servable only when the Pier
+    /// resolves it per session.
+    #[must_use]
+    pub const fn serves_multi_monitor(self) -> bool {
+        match self {
+            Self::Native => true,
+            Self::Resolved(request) => matches!(
+                request,
+                EncoderRequest::NativeNvenc | EncoderRequest::SoftwareH264
+            ),
+            Self::PerSession(request) => matches!(
+                request,
+                EncoderRequest::Auto | EncoderRequest::NativeNvenc | EncoderRequest::SoftwareH264
+            ),
+        }
+    }
+}
+
+/// What decides a Pier's pre-authentication `multi_monitor_v1` offer.
+///
+/// Rotations and carriers stay the Pier's own: they are capabilities of its
+/// outputs and its media path, not policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfferPolicy {
+    /// Carrier, operator switch and outputs. `offer_advertised` is ignored:
+    /// it records this decision.
+    pub gates: AdmissionGates,
+    pub encoder: OfferEncoder,
+    /// Most outputs this Pier can serve at once, when it can know that
+    /// before authentication (configured heads, proven virtual outputs,
+    /// concurrent captures). `None` for the Windows Pier, which cannot see
+    /// the interactive desktop's outputs from session 0.
+    pub host_capacity: Option<usize>,
+    /// The operator's `platform.multi_monitor.max_monitors`, where the Pier
+    /// has one.
+    pub operator_ceiling: Option<u8>,
+}
+
+/// Why a Pier withholds its multi-monitor offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OfferWithheld {
+    /// A gate is closed (carrier, operator switch or outputs, in that order).
+    Gate(GateClosed),
+    /// The encoder multi-monitor sessions would use cannot serve them.
+    Encoder(OfferEncoder),
+    /// The ceilings leave no monitor to offer.
+    NoMonitors,
+}
+
+impl fmt::Display for OfferWithheld {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gate(gate) => gate.fmt(formatter),
+            Self::Encoder(encoder) => write!(
+                formatter,
+                "the encoder multi-monitor sessions would use cannot serve them ({encoder:?})"
+            ),
+            Self::NoMonitors => formatter.write_str("the monitor ceiling is zero"),
+        }
+    }
+}
+
+impl std::error::Error for OfferWithheld {}
+
+/// The `max_monitors` a Pier advertises, or why it advertises nothing.
+///
+/// The gates are checked in [`AdmissionGates::evaluate`]'s order, then the
+/// encoder; the count is the least of the Pier's capacity, the operator's
+/// ceiling and [`arcen_media::MAX_MULTI_MONITOR_COUNT`].
+///
+/// # Errors
+///
+/// Returns the first reason the offer is withheld.
+pub fn offer_max_monitors(policy: &OfferPolicy) -> Result<u8, OfferWithheld> {
+    AdmissionGates {
+        offer_advertised: true,
+        ..policy.gates
+    }
+    .evaluate()
+    .map_err(OfferWithheld::Gate)?;
+    if !policy.encoder.serves_multi_monitor() {
+        return Err(OfferWithheld::Encoder(policy.encoder));
+    }
+    let protocol = u8::try_from(arcen_media::MAX_MULTI_MONITOR_COUNT).unwrap_or(u8::MAX);
+    let capacity = policy.host_capacity.map_or(protocol, |capacity| {
+        u8::try_from(capacity).unwrap_or(u8::MAX)
+    });
+    let max = protocol
+        .min(capacity)
+        .min(policy.operator_ceiling.unwrap_or(protocol));
+    if max == 0 {
+        return Err(OfferWithheld::NoMonitors);
+    }
+    Ok(max)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -800,6 +922,101 @@ mod tests {
             AdmissionRejection::new(AdmissionStage::Planning, "no head").into();
         assert_eq!(rejection.stage(), Some(AdmissionStage::Planning));
         assert!(rejection.to_string().contains("planning"));
+    }
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use arcen_media::video::EncoderRequest;
+
+    use super::{
+        AdmissionGates, GateClosed, OfferEncoder, OfferPolicy, OfferWithheld, offer_max_monitors,
+    };
+
+    const ALL: [EncoderRequest; 5] = [
+        EncoderRequest::Auto,
+        EncoderRequest::NativeNvenc,
+        EncoderRequest::WindowsMediaFoundation,
+        EncoderRequest::SoftwareH264,
+        EncoderRequest::SoftwareAv1,
+    ];
+
+    fn policy(encoder: OfferEncoder) -> OfferPolicy {
+        OfferPolicy {
+            gates: AdmissionGates::OPEN,
+            encoder,
+            host_capacity: None,
+            operator_ceiling: None,
+        }
+    }
+
+    #[test]
+    fn gates_close_the_offer_in_admission_order() {
+        let mut closed = policy(OfferEncoder::Native);
+        closed.gates = AdmissionGates::CLOSED;
+        assert_eq!(
+            offer_max_monitors(&closed),
+            Err(OfferWithheld::Gate(GateClosed::CarrierNotReady))
+        );
+        closed.gates.carrier_ready = true;
+        assert_eq!(
+            offer_max_monitors(&closed),
+            Err(OfferWithheld::Gate(GateClosed::OperatorDisabled))
+        );
+        closed.gates.operator_enabled = true;
+        assert_eq!(
+            offer_max_monitors(&closed),
+            Err(OfferWithheld::Gate(GateClosed::NoInventoryAvailable))
+        );
+        closed.gates.inventory_available = true;
+        assert_eq!(offer_max_monitors(&closed), Ok(4));
+    }
+
+    #[test]
+    fn only_encoders_admission_plans_are_offered() {
+        for request in ALL {
+            let resolved = offer_max_monitors(&policy(OfferEncoder::Resolved(request)));
+            let per_session = offer_max_monitors(&policy(OfferEncoder::PerSession(request)));
+            match request {
+                EncoderRequest::NativeNvenc | EncoderRequest::SoftwareH264 => {
+                    assert_eq!(resolved, Ok(4));
+                    assert_eq!(per_session, Ok(4));
+                }
+                EncoderRequest::Auto => {
+                    assert_eq!(
+                        resolved,
+                        Err(OfferWithheld::Encoder(OfferEncoder::Resolved(request)))
+                    );
+                    assert_eq!(per_session, Ok(4));
+                }
+                EncoderRequest::WindowsMediaFoundation | EncoderRequest::SoftwareAv1 => {
+                    assert!(resolved.is_err() && per_session.is_err(), "{request:?}");
+                }
+            }
+        }
+        assert_eq!(offer_max_monitors(&policy(OfferEncoder::Native)), Ok(4));
+    }
+
+    #[test]
+    fn the_least_ceiling_wins_and_zero_withholds() {
+        let mut ceilings = policy(OfferEncoder::Native);
+        for (capacity, operator, expected) in [
+            (None, None, Ok(4)),
+            (Some(1), None, Ok(1)),
+            (Some(3), Some(2), Ok(2)),
+            (Some(9), None, Ok(4)),
+            (None, Some(9), Ok(4)),
+            (None, Some(0), Err(OfferWithheld::NoMonitors)),
+            (Some(0), None, Err(OfferWithheld::NoMonitors)),
+        ] {
+            ceilings.host_capacity = capacity;
+            ceilings.operator_ceiling = operator;
+            assert_eq!(
+                offer_max_monitors(&ceilings),
+                expected,
+                "{capacity:?} {operator:?}"
+            );
+        }
     }
 }
 

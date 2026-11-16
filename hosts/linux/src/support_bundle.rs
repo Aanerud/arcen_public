@@ -1,66 +1,42 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
+//! `arcen-pier support-bundle`: the Linux Pier's sources for the shared
+//! support-bundle collector (`arcen_observability::support_bundle`), which
+//! owns the archive, its limits, the manifest and redaction.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arcen_observability::support_bundle::{
+    self as bundle, BundleLimits, LogCandidate, OutputOption, SupportBundleError,
+};
 use arcen_telemetry::{
-    redact_json_document_at, transform_canonical_jsonl, BundleComponent, BundleEntry,
-    BundleIdentityKind, BundleNotice, BundlePath, BundlePseudonymKey, BundlePseudonymizer,
-    BundleSource, BundleTruncation, CanonicalJsonlTransformLimits, CanonicalJsonlTransformReport,
-    NoticeCode, NoticeKind, RedactionDecision, RedactionReason, RedactionRecord, Sha256Digest,
-    SupportBundleManifestBuilder, SupportBundleRedactionPolicy, TruncationReason, REDACTED_VALUE,
+    redact_json_document_at, BundleComponent, BundleIdentityKind, BundlePath, BundlePseudonymKey,
+    BundlePseudonymizer, BundleSource, NoticeCode, NoticeKind, RedactionDecision, RedactionReason,
+    RedactionRecord, SupportBundleManifest, SupportBundleRedactionPolicy, REDACTED_VALUE,
 };
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
-const MAX_LOG_BYTES: u64 = 200 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_DOCUMENT_BYTES: u64 = 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 2 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 /// The live Wayland probe runs `gnome-shell --help` and similar, each
 /// bounded on its own; this bounds the whole selection.
 const DESKTOP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_COMMANDS: usize = 8;
-const COLLISION_LIMIT: u16 = 100;
 const DEFAULT_OUTPUT_DIRECTORY: &str = "/var/lib/arcen/support";
+const USAGE: &str = "USAGE:\n  arcen-pier support-bundle [--out <DIR>] [--include-crash-dumps]";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SupportBundleOptions {
-    pub output_directory: Option<PathBuf>,
-}
+pub use bundle::WriteOptions as SupportBundleOptions;
 
 pub fn parse_options(arguments: &[String]) -> Result<SupportBundleOptions, String> {
-    let mut output_directory = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--out" => {
-                if output_directory.is_some() {
-                    return Err("--out may be supplied only once".to_string());
-                }
-                index += 1;
-                output_directory = Some(PathBuf::from(
-                    arguments
-                        .get(index)
-                        .ok_or_else(|| "--out requires a directory".to_string())?,
-                ));
-            }
-            "-h" | "--help" => {
-                return Err("USAGE:\n  arcen-pier support-bundle [--out <DIR>]".to_string());
-            }
-            other => return Err(format!("unknown support-bundle argument: {other}")),
-        }
-        index += 1;
+    match bundle::parse_output_option(arguments)? {
+        OutputOption::Help => Err(USAGE.to_string()),
+        OutputOption::Write(options) => Ok(options),
     }
-    Ok(SupportBundleOptions { output_directory })
 }
 
 #[derive(Debug)]
@@ -86,34 +62,25 @@ pub fn run(options: &SupportBundleOptions) -> Result<SupportBundleResult, String
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "system clock precedes the Unix epoch".to_string())?
         .as_secs();
-    let (final_path, partial_path, file) =
-        create_output_file(&output_directory, generated_at, std::process::id())?;
-    let result = build_archive(file, generated_at);
-    match result {
-        Ok((file, omission_count)) => {
-            if let Err(error) = file.sync_all() {
-                drop(file);
-                let _ = std::fs::remove_file(&partial_path);
-                return Err(format!("sync support-bundle partial archive: {error}"));
-            }
-            drop(file);
-            if let Err(error) = std::fs::rename(&partial_path, &final_path) {
-                let _ = std::fs::remove_file(&partial_path);
-                return Err(format!(
-                    "publish support bundle {}: {error}",
-                    final_path.display()
-                ));
-            }
-            Ok(SupportBundleResult {
-                path: final_path,
-                omission_count,
-            })
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(&partial_path);
-            Err(error)
-        }
-    }
+    let mut pseudonym_key = BundlePseudonymKey::zeroed();
+    getrandom::getrandom(pseudonym_key.entropy_buffer())
+        .map_err(|_| "generate support-bundle pseudonymization key".to_string())?;
+    let process_id = std::process::id();
+    let sources = BundleSources::host(options.include_crash_dumps);
+    let (path, omission_count) = bundle::write_archive(
+        &output_directory,
+        |suffix| format!("arcen-support-{generated_at}-{process_id}{suffix}.zip"),
+        |file| {
+            let (file, _, omissions) = build_archive(file, generated_at, pseudonym_key, &sources)
+                .map_err(SupportBundleError::Archive)?;
+            Ok((file, omissions))
+        },
+    )
+    .map_err(bundle::command_error)?;
+    Ok(SupportBundleResult {
+        path,
+        omission_count,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -132,65 +99,62 @@ fn set_default_directory_permissions(_path: &Path, _using_default: bool) -> Resu
     Ok(())
 }
 
-fn create_output_file(
-    directory: &Path,
-    unix_seconds: u64,
-    process_id: u32,
-) -> Result<(PathBuf, PathBuf, File), String> {
-    for suffix in 0..COLLISION_LIMIT {
-        let suffix = if suffix == 0 {
-            String::new()
-        } else {
-            format!("-{suffix}")
-        };
-        let name = format!("arcen-support-{unix_seconds}-{process_id}{suffix}.zip");
-        let final_path = directory.join(&name);
-        if final_path.exists() {
-            continue;
-        }
-        let partial_path = directory.join(format!(".{name}.partial"));
-        let mut options = OpenOptions::new();
-        options.write(true).read(true).create_new(true);
-        set_private_file_mode(&mut options);
-        match options.open(&partial_path) {
-            Ok(file) => return Ok((final_path, partial_path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "create support-bundle partial archive {}: {error}; use --out <DIR> to select a writable directory",
-                    partial_path.display()
-                ));
-            }
+/// Lists the managed logs for a bundle (`crate::logging::support_bundle_logs`).
+type LogListing = fn() -> Result<
+    (Vec<crate::logging::SupportBundleLog>, bool, bool),
+    crate::logging::SupportBundleLogError,
+>;
+
+/// Where this Pier's bundle sources are. The host's own in production; a
+/// golden test points them at fixtures and leaves out the live probes.
+struct BundleSources {
+    logs: LogListing,
+    pier_config: PathBuf,
+    xorg_config: PathBuf,
+    /// The live host probes: system, service, effective configuration,
+    /// runtime, desktop provider and the journal.
+    host_probes: bool,
+    /// Crash reports were asked for (`--include-crash-dumps`).
+    include_crash_dumps: bool,
+}
+
+impl BundleSources {
+    fn host(include_crash_dumps: bool) -> Self {
+        Self {
+            logs: crate::logging::support_bundle_logs,
+            pier_config: PathBuf::from("/etc/arcen/pier.json"),
+            xorg_config: PathBuf::from("/etc/arcen/xorg.conf"),
+            host_probes: true,
+            include_crash_dumps,
         }
     }
-    Err("support-bundle output collision limit reached".to_string())
 }
 
-#[cfg(target_os = "linux")]
-fn set_private_file_mode(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-}
-
-#[cfg(not(target_os = "linux"))]
-fn set_private_file_mode(_options: &mut OpenOptions) {}
-
-fn build_archive(file: File, generated_at: u64) -> Result<(File, usize), String> {
-    let mut pseudonym_key = BundlePseudonymKey::zeroed();
-    getrandom::getrandom(pseudonym_key.entropy_buffer())
-        .map_err(|_| "generate support-bundle pseudonymization key".to_string())?;
-    let component = BundleComponent {
+fn component() -> BundleComponent {
+    BundleComponent {
         name: "arcen-pier-linux".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         os: "linux".to_string(),
         arch: std::env::consts::ARCH.to_string(),
+    }
+}
+
+fn build_archive<W: Write + Seek>(
+    writer: W,
+    generated_at: u64,
+    pseudonym_key: BundlePseudonymKey,
+    sources: &BundleSources,
+) -> Result<(W, SupportBundleManifest, usize), String> {
+    let mut collector = Collector {
+        inner: bundle::Collector::new(
+            writer,
+            component(),
+            generated_at,
+            BundlePseudonymizer::new(pseudonym_key),
+            BundleLimits::PIER,
+        ),
+        command_count: 0,
     };
-    let mut collector = Collector::new(
-        file,
-        component,
-        generated_at,
-        BundlePseudonymizer::new(pseudonym_key),
-    );
     collector.notice(
         "config/tls/key",
         NoticeKind::Omitted,
@@ -206,6 +170,10 @@ fn build_archive(file: File, generated_at: u64) -> Result<(File, usize), String>
         NoticeKind::Omitted,
         NoticeCode::SensitiveRuntimeExcluded,
     )?;
+    // No crash-report source on this Pier yet (GAP-040).
+    collector
+        .inner
+        .crash_report_choice(sources.include_crash_dumps, false)?;
     collector.notice(
         "logs/Xorg.log",
         NoticeKind::Omitted,
@@ -217,385 +185,46 @@ fn build_archive(file: File, generated_at: u64) -> Result<(File, usize), String>
         NoticeCode::DiagnosticUnavailable,
     )?;
 
-    collect_logs(&mut collector)?;
-    collect_json_config(
-        &mut collector,
-        Path::new("/etc/arcen/pier.json"),
-        "config/pier.json",
-    )?;
+    collect_logs(&mut collector, sources.logs)?;
+    collect_json_config(&mut collector, &sources.pier_config, "config/pier.json")?;
     collect_regular_file(
         &mut collector,
-        Path::new("/etc/arcen/xorg.conf"),
+        &sources.xorg_config,
         "config/xorg.conf",
         BundleSource::Configuration,
     )?;
-    collect_system_diagnostics(&mut collector)?;
-    collect_service_diagnostics(&mut collector)?;
-    collect_effective_config(&mut collector)?;
-    collect_runtime_diagnostics(&mut collector)?;
-    collect_desktop_provider(&mut collector)?;
-    collect_lifecycle_events(&mut collector)?;
-    collector.finish()
+    if sources.host_probes {
+        collect_system_diagnostics(&mut collector)?;
+        collect_service_diagnostics(&mut collector)?;
+        collect_effective_config(&mut collector)?;
+        collect_runtime_diagnostics(&mut collector)?;
+        collect_desktop_provider(&mut collector)?;
+        collect_lifecycle_events(&mut collector)?;
+    }
+    Ok(collector.inner.finish()?)
 }
 
-struct Collector {
-    zip: ZipWriter<File>,
-    manifest: SupportBundleManifestBuilder,
-    pseudonymizer: BundlePseudonymizer,
-    total_bytes: u64,
-    omission_count: usize,
+/// The shared collector plus this Pier's bound on diagnostic commands.
+struct Collector<W: Write + Seek> {
+    inner: bundle::Collector<W>,
     command_count: usize,
 }
 
-impl Collector {
-    fn new(
-        file: File,
-        component: BundleComponent,
-        generated_at: u64,
-        pseudonymizer: BundlePseudonymizer,
-    ) -> Self {
-        Self {
-            zip: ZipWriter::new(file),
-            manifest: SupportBundleManifestBuilder::new(component, generated_at),
-            pseudonymizer,
-            total_bytes: 0,
-            omission_count: 0,
-            command_count: 0,
-        }
+impl<W: Write + Seek> std::ops::Deref for Collector<W> {
+    type Target = bundle::Collector<W>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
+}
 
-    fn notice(&mut self, source: &str, kind: NoticeKind, code: NoticeCode) -> Result<(), String> {
-        if !matches!(kind, NoticeKind::Advisory | NoticeKind::Truncated) {
-            self.omission_count += 1;
-        }
-        self.manifest
-            .add_notice(BundleNotice {
-                source: BundlePath::new(source).map_err(contract_error)?,
-                kind,
-                code,
-            })
-            .map_err(contract_error)
+impl<W: Write + Seek> std::ops::DerefMut for Collector<W> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
+}
 
-    fn redaction(&mut self, record: RedactionRecord) -> Result<(), String> {
-        self.manifest.add_redaction(record).map_err(contract_error)
-    }
-
-    fn add_bytes(
-        &mut self,
-        archive_path: &str,
-        source: BundleSource,
-        bytes: &[u8],
-    ) -> Result<bool, String> {
-        let path = BundlePath::new(archive_path).map_err(contract_error)?;
-        if bytes.len() as u64 > MAX_TOTAL_BYTES.saturating_sub(self.total_bytes) {
-            self.notice(
-                path.as_str(),
-                NoticeKind::Omitted,
-                NoticeCode::TotalPayloadLimit,
-            )?;
-            return Ok(false);
-        }
-        self.zip
-            .start_file(path.as_str(), zip_options())
-            .map_err(zip_error)?;
-        let mut digest = Sha256::new();
-        for chunk in bytes.chunks(COPY_BUFFER_BYTES) {
-            self.zip.write_all(chunk).map_err(io_error)?;
-            digest.update(chunk);
-        }
-        let size = bytes.len() as u64;
-        self.total_bytes += size;
-        self.manifest
-            .add_entry(BundleEntry {
-                path,
-                source,
-                original_size_bytes: size,
-                included_size_bytes: size,
-                sha256: Sha256Digest::from_bytes(digest.finalize().into()),
-                truncation: None,
-            })
-            .map_err(contract_error)?;
-        Ok(true)
-    }
-
-    fn add_file(
-        &mut self,
-        file_path: &Path,
-        archive_path: &str,
-        source: BundleSource,
-        original_size: u64,
-        included_size: u64,
-        reason: Option<TruncationReason>,
-    ) -> Result<bool, String> {
-        if included_size == 0 {
-            return Ok(false);
-        }
-        let path = BundlePath::new(archive_path).map_err(contract_error)?;
-        let metadata = match std::fs::symlink_metadata(file_path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                self.file_notice(path.as_str(), &error)?;
-                return Ok(false);
-            }
-        };
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            self.notice(
-                path.as_str(),
-                NoticeKind::Invalid,
-                NoticeCode::UnsafeFileType,
-            )?;
-            return Ok(false);
-        }
-        let mut file = match File::open(file_path) {
-            Ok(file) => file,
-            Err(error) => {
-                self.file_notice(path.as_str(), &error)?;
-                return Ok(false);
-            }
-        };
-        let opened = file.metadata().map_err(io_error)?;
-        if !opened.is_file() {
-            self.notice(
-                path.as_str(),
-                NoticeKind::Invalid,
-                NoticeCode::UnsafeFileType,
-            )?;
-            return Ok(false);
-        }
-        let offset = original_size.saturating_sub(included_size);
-        file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-        self.zip
-            .start_file(path.as_str(), zip_options())
-            .map_err(zip_error)?;
-        let mut digest = Sha256::new();
-        let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-        let mut remaining = included_size;
-        let mut written = 0_u64;
-        while remaining != 0 {
-            let count =
-                match file.read(&mut buffer[..remaining.min(COPY_BUFFER_BYTES as u64) as usize]) {
-                    Ok(0) => break,
-                    Ok(count) => count,
-                    Err(error) => {
-                        self.zip.abort_file().map_err(zip_error)?;
-                        self.file_notice(path.as_str(), &error)?;
-                        return Ok(false);
-                    }
-                };
-            self.zip.write_all(&buffer[..count]).map_err(io_error)?;
-            digest.update(&buffer[..count]);
-            written += count as u64;
-            remaining -= count as u64;
-        }
-        let after = file.metadata().map_err(io_error)?;
-        let changed = after.len() != opened.len()
-            || after.modified().ok() != opened.modified().ok()
-            || written != included_size;
-        let truncation = if changed {
-            self.notice(
-                path.as_str(),
-                NoticeKind::Truncated,
-                NoticeCode::SourceChangedDuringRead,
-            )?;
-            Some(BundleTruncation {
-                original_offset: offset,
-                reason: TruncationReason::ChangedDuringRead,
-            })
-        } else {
-            reason.map(|reason| BundleTruncation {
-                original_offset: offset,
-                reason,
-            })
-        };
-        self.total_bytes += written;
-        self.manifest
-            .add_entry(BundleEntry {
-                path,
-                source,
-                original_size_bytes: original_size,
-                included_size_bytes: written,
-                sha256: Sha256Digest::from_bytes(digest.finalize().into()),
-                truncation,
-            })
-            .map_err(contract_error)?;
-        Ok(true)
-    }
-
-    fn add_canonical_log_file(
-        &mut self,
-        file_path: &Path,
-        archive_path: &str,
-        original_size: u64,
-        input_limit: u64,
-        output_limit: u64,
-        budget_reason: TruncationReason,
-    ) -> Result<u64, String> {
-        if input_limit == 0 || output_limit == 0 {
-            return Ok(0);
-        }
-        let path = BundlePath::new(archive_path).map_err(contract_error)?;
-        let metadata = match std::fs::symlink_metadata(file_path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                self.file_notice(path.as_str(), &error)?;
-                return Ok(0);
-            }
-        };
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            self.notice(
-                path.as_str(),
-                NoticeKind::Invalid,
-                NoticeCode::UnsafeFileType,
-            )?;
-            return Ok(0);
-        }
-        let mut file = match File::open(file_path) {
-            Ok(file) => file,
-            Err(error) => {
-                self.file_notice(path.as_str(), &error)?;
-                return Ok(0);
-            }
-        };
-        let opened = file.metadata().map_err(io_error)?;
-        if !opened.is_file() {
-            self.notice(
-                path.as_str(),
-                NoticeKind::Invalid,
-                NoticeCode::UnsafeFileType,
-            )?;
-            return Ok(0);
-        }
-        let effective_input_limit = input_limit.min(opened.len());
-        let offset = opened.len().saturating_sub(effective_input_limit);
-        let discard_initial_fragment = starts_mid_line(&mut file, offset)?;
-        file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-        self.zip
-            .start_file(path.as_str(), zip_options())
-            .map_err(zip_error)?;
-        let mut writer = DigestingZipWriter::new(&mut self.zip);
-        let report = transform_canonical_jsonl(
-            Read::by_ref(&mut file),
-            &mut writer,
-            &self.pseudonymizer,
-            CanonicalJsonlTransformLimits {
-                max_input_bytes: effective_input_limit,
-                max_output_bytes: output_limit,
-                discard_initial_fragment,
-            },
-        )
-        .map_err(|error| format!("transform canonical support-bundle log: {error}"))?;
-        let (written, digest) = writer.finish();
-        if written == 0 {
-            self.zip.abort_file().map_err(zip_error)?;
-        }
-
-        let after = file.metadata().map_err(io_error)?;
-        let changed = opened.len() != original_size
-            || after.len() != opened.len()
-            || after.modified().ok() != opened.modified().ok();
-        self.record_log_transform(path.as_str(), &report)?;
-        if report.output_limit_reached {
-            self.notice(
-                path.as_str(),
-                NoticeKind::Truncated,
-                match budget_reason {
-                    TruncationReason::GlobalLimit => NoticeCode::TotalPayloadLimit,
-                    TruncationReason::PerSourceLimit | TruncationReason::ChangedDuringRead => {
-                        NoticeCode::LogPayloadLimit
-                    }
-                },
-            )?;
-        }
-        let truncation = if changed {
-            self.notice(
-                path.as_str(),
-                NoticeKind::Truncated,
-                NoticeCode::SourceChangedDuringRead,
-            )?;
-            Some(BundleTruncation {
-                original_offset: offset,
-                reason: TruncationReason::ChangedDuringRead,
-            })
-        } else if offset != 0 || report.output_limit_reached {
-            Some(BundleTruncation {
-                original_offset: offset,
-                reason: budget_reason,
-            })
-        } else {
-            None
-        };
-        if written == 0 {
-            return Ok(0);
-        }
-        self.total_bytes += written;
-        self.manifest
-            .add_entry(BundleEntry {
-                path: path.clone(),
-                source: BundleSource::Log,
-                original_size_bytes: original_size,
-                included_size_bytes: written,
-                sha256: Sha256Digest::from_bytes(digest),
-                truncation,
-            })
-            .map_err(contract_error)?;
-        for kind in report.redacted_kinds {
-            self.redaction(RedactionRecord {
-                entry_path: path.clone(),
-                key_path: kind.canonical_key_path().to_string(),
-                reason: RedactionReason::IdentityPseudonymized,
-            })?;
-        }
-        Ok(written)
-    }
-
-    fn record_log_transform(
-        &mut self,
-        source: &str,
-        report: &CanonicalJsonlTransformReport,
-    ) -> Result<(), String> {
-        if report.invalid_lines != 0 {
-            self.notice(
-                source,
-                NoticeKind::Invalid,
-                NoticeCode::CanonicalLogRecordInvalid,
-            )?;
-        }
-        if report.oversized_lines != 0 {
-            self.notice(
-                source,
-                NoticeKind::Invalid,
-                NoticeCode::CanonicalLogRecordTooLarge,
-            )?;
-        }
-        if report.incomplete_lines != 0 {
-            self.notice(
-                source,
-                NoticeKind::Invalid,
-                NoticeCode::CanonicalLogRecordIncomplete,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn file_notice(&mut self, source: &str, error: &std::io::Error) -> Result<(), String> {
-        if error.kind() == std::io::ErrorKind::PermissionDenied {
-            self.notice(
-                source,
-                NoticeKind::PermissionDenied,
-                NoticeCode::SourcePermissionDenied,
-            )
-        } else if error.kind() == std::io::ErrorKind::NotFound {
-            self.notice(source, NoticeKind::Unavailable, NoticeCode::SourceNotFound)
-        } else {
-            self.notice(
-                source,
-                NoticeKind::Unavailable,
-                NoticeCode::SourceUnavailable,
-            )
-        }
-    }
-
+impl<W: Write + Seek> Collector<W> {
     fn command(&mut self, program: &str, arguments: &[&str]) -> CommandOutcome {
         if self.command_count >= MAX_COMMANDS {
             return CommandOutcome::unavailable();
@@ -603,27 +232,12 @@ impl Collector {
         self.command_count += 1;
         run_bounded_command(program, arguments)
     }
-
-    fn finish(mut self) -> Result<(File, usize), String> {
-        let manifest = self.manifest.finish();
-        let bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|error| format!("serialize support-bundle manifest: {error}"))?;
-        self.zip
-            .start_file("manifest.json", zip_options())
-            .map_err(zip_error)?;
-        for chunk in bytes.chunks(COPY_BUFFER_BYTES) {
-            self.zip.write_all(chunk).map_err(io_error)?;
-        }
-        let file = self.zip.finish().map_err(zip_error)?;
-        if file.metadata().map_err(io_error)?.len() > MAX_TOTAL_BYTES {
-            return Err("support-bundle archive exceeded the 256 MiB limit".to_string());
-        }
-        Ok((file, self.omission_count))
-    }
 }
-
-fn collect_logs(collector: &mut Collector) -> Result<(), String> {
-    let (logs, candidates_truncated, legacy) = match crate::logging::support_bundle_logs() {
+fn collect_logs<W: Write + Seek>(
+    collector: &mut Collector<W>,
+    logs: LogListing,
+) -> Result<(), String> {
+    let (logs, candidates_truncated, legacy) = match logs() {
         Ok(result) => result,
         Err(crate::logging::SupportBundleLogError::PermissionDenied) => {
             collector.notice(
@@ -648,61 +262,43 @@ fn collect_logs(collector: &mut Collector) -> Result<(), String> {
     if candidates_truncated {
         collector.notice("logs", NoticeKind::Truncated, NoticeCode::LogCandidateLimit)?;
     }
-    let mut remaining_logs = MAX_LOG_BYTES;
-    for log in logs {
-        if remaining_logs == 0 {
-            collector.notice("logs", NoticeKind::Truncated, NoticeCode::LogPayloadLimit)?;
-            break;
-        }
-        let total_remaining = MAX_TOTAL_BYTES.saturating_sub(collector.total_bytes);
-        if total_remaining == 0 {
-            collector.notice("logs", NoticeKind::Truncated, NoticeCode::TotalPayloadLimit)?;
-            break;
-        }
-        let output_limit = remaining_logs.min(total_remaining);
-        let input_limit = log.size_bytes.min(output_limit);
-        let budget_reason = if output_limit == total_remaining {
-            TruncationReason::GlobalLimit
-        } else {
-            TruncationReason::PerSourceLimit
-        };
-        let written = collector.add_canonical_log_file(
-            &log.path,
-            &log.archive_path,
-            log.size_bytes,
-            input_limit,
-            output_limit,
-            budget_reason,
-        )?;
-        remaining_logs = remaining_logs.saturating_sub(written);
-    }
+    let logs: Vec<LogCandidate> = logs
+        .into_iter()
+        .map(|log| LogCandidate {
+            path: log.path,
+            archive_path: log.archive_path,
+            size_bytes: log.size_bytes,
+        })
+        .collect();
+    bundle::collect_canonical_logs(collector, &logs)?;
     Ok(())
 }
 
-fn collect_json_config(
-    collector: &mut Collector,
+fn collect_json_config<W: Write + Seek>(
+    collector: &mut Collector<W>,
     source_path: &Path,
     archive_path: &str,
 ) -> Result<(), String> {
-    let archive = BundlePath::new(archive_path).map_err(contract_error)?;
-    let Some(mut document) =
-        read_json_document(source_path, MAX_DOCUMENT_BYTES, collector, &archive)?
+    let archive = BundlePath::new(archive_path).map_err(SupportBundleError::from)?;
+    let Some(mut document) = bundle::read_json_document(collector, source_path, archive_path)?
     else {
         return Ok(());
     };
-    let redactions = redact_json_document_at(&archive, &mut document).map_err(contract_error)?;
+    let redactions = bundle::redact_pier_config(&archive, &mut document)?;
     let bytes = serde_json::to_vec_pretty(&document)
         .map_err(|error| format!("serialize redacted Linux config: {error}"))?;
-    if collector.add_bytes(archive.as_str(), BundleSource::Configuration, &bytes)? {
-        for redaction in redactions {
-            collector.redaction(redaction)?;
-        }
-    }
+    collector.add_document(
+        archive.as_str(),
+        BundleSource::Configuration,
+        None,
+        &bytes,
+        redactions,
+    )?;
     Ok(())
 }
 
-fn collect_regular_file(
-    collector: &mut Collector,
+fn collect_regular_file<W: Write + Seek>(
+    collector: &mut Collector<W>,
     source_path: &Path,
     archive_path: &str,
     source: BundleSource,
@@ -714,7 +310,7 @@ fn collect_regular_file(
             return Ok(());
         }
     };
-    if metadata.len() > MAX_DOCUMENT_BYTES {
+    if metadata.len() > collector.limits().max_document_bytes {
         collector.notice(
             archive_path,
             NoticeKind::Invalid,
@@ -733,7 +329,7 @@ fn collect_regular_file(
     Ok(())
 }
 
-fn collect_system_diagnostics(collector: &mut Collector) -> Result<(), String> {
+fn collect_system_diagnostics<W: Write + Seek>(collector: &mut Collector<W>) -> Result<(), String> {
     let report = SystemReport {
         os: "linux",
         arch: std::env::consts::ARCH,
@@ -747,7 +343,9 @@ fn collect_system_diagnostics(collector: &mut Collector) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_service_diagnostics(collector: &mut Collector) -> Result<(), String> {
+fn collect_service_diagnostics<W: Write + Seek>(
+    collector: &mut Collector<W>,
+) -> Result<(), String> {
     let outcome = collector.command(
         "systemctl",
         &[
@@ -789,7 +387,7 @@ fn collect_service_diagnostics(collector: &mut Collector) -> Result<(), String> 
     Ok(())
 }
 
-fn collect_effective_config(collector: &mut Collector) -> Result<(), String> {
+fn collect_effective_config<W: Write + Seek>(collector: &mut Collector<W>) -> Result<(), String> {
     let outcome = collector.command(
         "systemctl",
         &[
@@ -819,8 +417,8 @@ fn collect_effective_config(collector: &mut Collector) -> Result<(), String> {
         BundleSource::Diagnostics,
         &bytes,
     )? {
-        let entry_path =
-            BundlePath::new("diagnostics/effective-config.json").map_err(contract_error)?;
+        let entry_path = BundlePath::new("diagnostics/effective-config.json")
+            .map_err(SupportBundleError::from)?;
         for (key_path, reason) in redactions {
             collector.redaction(RedactionRecord {
                 entry_path: entry_path.clone(),
@@ -856,7 +454,9 @@ fn pier_multicall_present() -> bool {
     .any(|path| Path::new(path).is_file())
 }
 
-fn collect_runtime_diagnostics(collector: &mut Collector) -> Result<(), String> {
+fn collect_runtime_diagnostics<W: Write + Seek>(
+    collector: &mut Collector<W>,
+) -> Result<(), String> {
     let runtime_root = Path::new("/run/arcen/sessions");
     let metadata = std::fs::symlink_metadata(runtime_root).ok();
     let pier_multicall_present = pier_multicall_present();
@@ -887,7 +487,7 @@ fn collect_runtime_diagnostics(collector: &mut Collector) -> Result<(), String> 
 /// record is the configured one (`capture.wayland_qualification_record`,
 /// default production), included as diagnostics; it holds versions, the
 /// Pier executable's hash and measured rates, and no secrets.
-fn collect_desktop_provider(collector: &mut Collector) -> Result<(), String> {
+fn collect_desktop_provider<W: Write + Seek>(collector: &mut Collector<W>) -> Result<(), String> {
     const REPORT: &str = "diagnostics/desktop-provider.json";
     const RECORD: &str = "diagnostics/wayland-qualification.json";
     let config = match crate::cli::parse(&[]) {
@@ -968,20 +568,21 @@ fn collect_desktop_provider(collector: &mut Collector) -> Result<(), String> {
             .map_err(|error| format!("serialize desktop provider diagnostics: {error}"))?;
         collector.add_bytes(REPORT, BundleSource::Diagnostics, &bytes)?;
     }
-    let archive = BundlePath::new(RECORD).map_err(contract_error)?;
-    let Some(mut record) =
-        read_json_document(&record_path, MAX_DOCUMENT_BYTES, collector, &archive)?
-    else {
+    let archive = BundlePath::new(RECORD).map_err(SupportBundleError::from)?;
+    let Some(mut record) = bundle::read_json_document(collector, &record_path, RECORD)? else {
         return Ok(());
     };
-    let redactions = redact_json_document_at(&archive, &mut record).map_err(contract_error)?;
+    let redactions =
+        redact_json_document_at(&archive, &mut record).map_err(SupportBundleError::from)?;
     let bytes = serde_json::to_vec_pretty(&record)
         .map_err(|error| format!("serialize Wayland qualification record: {error}"))?;
-    if collector.add_bytes(archive.as_str(), BundleSource::Diagnostics, &bytes)? {
-        for redaction in redactions {
-            collector.redaction(redaction)?;
-        }
-    }
+    collector.add_document(
+        archive.as_str(),
+        BundleSource::Diagnostics,
+        None,
+        &bytes,
+        redactions,
+    )?;
     Ok(())
 }
 
@@ -1044,13 +645,13 @@ fn desktop_provider_report(
     report
 }
 
-fn collect_lifecycle_events(collector: &mut Collector) -> Result<(), String> {
+fn collect_lifecycle_events<W: Write + Seek>(collector: &mut Collector<W>) -> Result<(), String> {
     match crate::eventlog::query_recent_events(crate::eventlog::EventExcerptLimits::default()) {
         Ok(excerpt) => {
             let _ = (excerpt.record_count, excerpt.media_type);
             let (bytes, identity_redacted, invalid_omitted) = match excerpt.source {
                 crate::eventlog::NativeEventQuerySource::Journal => {
-                    pseudonymize_native_journal(&excerpt.bytes, &collector.pseudonymizer)
+                    pseudonymize_native_journal(&excerpt.bytes, collector.pseudonymizer())
                 }
                 crate::eventlog::NativeEventQuerySource::Syslog => (excerpt.bytes, false, false),
             };
@@ -1068,7 +669,8 @@ fn collect_lifecycle_events(collector: &mut Collector) -> Result<(), String> {
             }
             if added && identity_redacted {
                 collector.redaction(RedactionRecord {
-                    entry_path: BundlePath::new(excerpt.suggested_name).map_err(contract_error)?,
+                    entry_path: BundlePath::new(excerpt.suggested_name)
+                        .map_err(SupportBundleError::from)?,
                     key_path: "/ARCEN_FIELD_SSID".to_string(),
                     reason: RedactionReason::IdentityPseudonymized,
                 })?;
@@ -1135,72 +737,6 @@ fn pseudonymize_native_journal(
         output.push(b'\n');
     }
     (output, identity_redacted, invalid_omitted)
-}
-
-fn read_json_document(
-    path: &Path,
-    limit: u64,
-    collector: &mut Collector,
-    logical_path: &BundlePath,
-) -> Result<Option<serde_json::Value>, String> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            collector.file_notice(logical_path.as_str(), &error)?;
-            return Ok(None);
-        }
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        collector.notice(
-            logical_path.as_str(),
-            NoticeKind::Invalid,
-            NoticeCode::UnsafeFileType,
-        )?;
-        return Ok(None);
-    }
-    if metadata.len() > limit {
-        collector.notice(
-            logical_path.as_str(),
-            NoticeKind::Invalid,
-            NoticeCode::SourceTooLarge,
-        )?;
-        return Ok(None);
-    }
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) => {
-            collector.file_notice(logical_path.as_str(), &error)?;
-            return Ok(None);
-        }
-    };
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let count = file.read(&mut buffer).map_err(io_error)?;
-        if count == 0 {
-            break;
-        }
-        if bytes.len() + count > limit as usize {
-            collector.notice(
-                logical_path.as_str(),
-                NoticeKind::Invalid,
-                NoticeCode::SourceTooLarge,
-            )?;
-            return Ok(None);
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-    match serde_json::from_slice(&bytes) {
-        Ok(document) => Ok(Some(document)),
-        Err(_) => {
-            collector.notice(
-                logical_path.as_str(),
-                NoticeKind::Invalid,
-                NoticeCode::SourceInvalid,
-            )?;
-            Ok(None)
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1455,67 +991,6 @@ fn read_bounded_multiline(path: &Path, limit: usize) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn zip_options() -> SimpleFileOptions {
-    SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o600)
-}
-
-fn starts_mid_line(file: &mut File, offset: u64) -> Result<bool, String> {
-    if offset == 0 {
-        return Ok(false);
-    }
-    file.seek(SeekFrom::Start(offset - 1)).map_err(io_error)?;
-    let mut previous = [0_u8; 1];
-    file.read_exact(&mut previous).map_err(io_error)?;
-    Ok(previous[0] != b'\n')
-}
-
-struct DigestingZipWriter<'a> {
-    zip: &'a mut ZipWriter<File>,
-    digest: Sha256,
-    written: u64,
-}
-
-impl<'a> DigestingZipWriter<'a> {
-    fn new(zip: &'a mut ZipWriter<File>) -> Self {
-        Self {
-            zip,
-            digest: Sha256::new(),
-            written: 0,
-        }
-    }
-
-    fn finish(self) -> (u64, [u8; 32]) {
-        (self.written, self.digest.finalize().into())
-    }
-}
-
-impl Write for DigestingZipWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let count = self.zip.write(bytes)?;
-        self.digest.update(&bytes[..count]);
-        self.written += count as u64;
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.zip.flush()
-    }
-}
-
-fn contract_error(error: impl std::fmt::Display) -> String {
-    format!("support-bundle contract: {error}")
-}
-
-fn zip_error(error: zip::result::ZipError) -> String {
-    format!("write support-bundle ZIP: {error}")
-}
-
-fn io_error(error: std::io::Error) -> String {
-    format!("write support-bundle payload: {error}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,9 +1047,7 @@ mod tests {
     fn parser_is_strict_and_service_independent() {
         assert_eq!(
             parse_options(&[]).expect("defaults"),
-            SupportBundleOptions {
-                output_directory: None
-            }
+            SupportBundleOptions::default()
         );
         assert!(parse_options(&["--out".to_string()]).is_err());
         assert!(parse_options(&["--unknown".to_string()]).is_err());
@@ -1617,191 +1090,85 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fixture_zip_hashes_payload_and_excludes_manifest_from_index() {
-        let root =
-            std::env::temp_dir().join(format!("arcen-linux-bundle-test-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("test root");
-        let path = root.join("fixture.zip");
-        let file = File::create(&path).expect("fixture archive");
-        let component = BundleComponent {
-            name: "arcen-pier-linux".to_string(),
-            version: "test".to_string(),
-            os: "linux".to_string(),
-            arch: "test".to_string(),
-        };
-        let mut collector = Collector::new(
-            file,
-            component,
-            42,
-            BundlePseudonymizer::new(BundlePseudonymKey::from_bytes([0x11; 32])),
-        );
-        collector
-            .add_bytes(
-                "diagnostics/fixture.txt",
-                BundleSource::Diagnostics,
-                b"fixture",
-            )
-            .expect("payload");
-        let (file, _) = collector.finish().expect("archive");
-        drop(file);
-        let mut archive = zip::ZipArchive::new(File::open(&path).expect("open")).expect("ZIP");
-        assert!(archive.by_name("diagnostics/fixture.txt").is_ok());
-        let manifest: serde_json::Value =
-            serde_json::from_reader(archive.by_name("manifest.json").expect("manifest"))
-                .expect("manifest JSON");
-        assert_eq!(manifest["entries"].as_array().expect("entries").len(), 1);
-        assert_eq!(manifest["entries"][0]["path"], "diagnostics/fixture.txt");
-        let _ = std::fs::remove_dir_all(root);
+    const GOLDEN: &str = "tests/data/support-bundle/manifest.golden.json";
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/support-bundle")
+            .join(name)
     }
 
-    #[test]
-    fn fixture_zip_is_byte_for_byte_deterministic() {
-        let root =
-            std::env::temp_dir().join(format!("arcen-linux-bundle-stable-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("test root");
-        let component = BundleComponent {
-            name: "arcen-pier-linux".to_string(),
-            version: "test".to_string(),
-            os: "linux".to_string(),
-            arch: "test".to_string(),
-        };
-        let mut outputs = Vec::new();
-        for index in 0..2 {
-            let path = root.join(format!("fixture-{index}.zip"));
-            let file = File::create(&path).expect("fixture archive");
-            let mut collector = Collector::new(
-                file,
-                component.clone(),
-                1_700_000_000,
-                BundlePseudonymizer::new(BundlePseudonymKey::from_bytes([0x11; 32])),
-            );
-            collector
-                .add_bytes("diagnostics/a.txt", BundleSource::Diagnostics, b"alpha")
-                .expect("payload");
-            let (file, _) = collector.finish().expect("archive");
-            drop(file);
-            outputs.push(std::fs::read(path).expect("archive bytes"));
-        }
-        assert_eq!(outputs[0], outputs[1]);
-        std::fs::remove_dir_all(root).ok();
+    fn fixture_logs() -> Result<
+        (Vec<crate::logging::SupportBundleLog>, bool, bool),
+        crate::logging::SupportBundleLogError,
+    > {
+        let path = fixture("arcen-pier.jsonl");
+        let size_bytes = std::fs::metadata(&path).expect("fixture log").len();
+        Ok((
+            vec![crate::logging::SupportBundleLog {
+                path,
+                archive_path: "logs/arcen-pier.log".to_string(),
+                size_bytes,
+                modified: UNIX_EPOCH,
+            }],
+            false,
+            false,
+        ))
     }
 
+    /// The Linux Pier's bundle with the live host probes left out (they
+    /// depend on the machine): its fixed notices, a canonical log and its
+    /// configuration, at a fixed time and key. Re-bless after an intended
+    /// change with `ARCEN_BLESS_SUPPORT_GOLDEN=1`.
     #[test]
-    fn log_exports_hide_identity_and_correlate_across_archive_entries() {
-        let root = std::env::current_dir()
-            .expect("current directory")
-            .join("target/arcen-linux-bundle-redaction-test");
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::create_dir_all(&root).expect("test root");
-        let raw = serde_json::json!({
-            "schema_version": 1,
-            "timestamp": "2026-07-24T16:00:00.000000Z",
-            "sequence": 1,
-            "profile_level": 0,
-            "profile_name": "critical",
-            "severity": "info",
-            "role": "host",
-            "component": "pier",
-            "platform": "linux",
-            "target": "arcen::session",
-            "sid": null,
-            "user": "raw-artist",
-            "host": "raw-pier",
-            "peer_addr": "192.0.2.77:4444",
-            "health_state": null,
-            "message": "fixture",
-            "fields": {"ssid": "raw-network"}
-        });
-        let mut line = serde_json::to_vec(&raw).expect("fixture");
-        line.push(b'\n');
-        let first = root.join("first.jsonl");
-        let second = root.join("second.jsonl");
-        std::fs::write(&first, &line).expect("first log");
-        std::fs::write(&second, &line).expect("second log");
-        let archive_path = root.join("bundle.zip");
-        let component = BundleComponent {
-            name: "arcen-pier-linux".to_string(),
-            version: "test".to_string(),
-            os: "linux".to_string(),
-            arch: "test".to_string(),
+    fn the_manifest_matches_the_golden_one_and_leaks_nothing() {
+        let sources = BundleSources {
+            logs: fixture_logs,
+            pier_config: fixture("pier.json"),
+            xorg_config: fixture("xorg.conf"),
+            host_probes: false,
+            include_crash_dumps: false,
         };
-        let mut collector = Collector::new(
-            File::create(&archive_path).expect("archive"),
-            component,
-            42,
-            BundlePseudonymizer::new(BundlePseudonymKey::from_bytes([0x55; 32])),
-        );
-        for (source, destination) in [(&first, "logs/first.jsonl"), (&second, "logs/second.jsonl")]
-        {
-            assert_ne!(
-                collector
-                    .add_canonical_log_file(
-                        source,
-                        destination,
-                        line.len() as u64,
-                        line.len() as u64,
-                        1024 * 1024,
-                        TruncationReason::PerSourceLimit,
-                    )
-                    .expect("pseudonymized log"),
-                0
-            );
+        let (writer, manifest, _) = build_archive(
+            std::io::Cursor::new(Vec::new()),
+            1_794_726_245,
+            BundlePseudonymKey::from_bytes([0x11; 32]),
+            &sources,
+        )
+        .expect("bundle");
+        let mut value = serde_json::to_value(&manifest).expect("manifest JSON");
+        value["component"]["version"] = "<version>".into();
+        value["component"]["arch"] = "<arch>".into();
+        let mut rendered = serde_json::to_string_pretty(&value).expect("render");
+        rendered.push('\n');
+        let golden_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(GOLDEN);
+        if std::env::var_os("ARCEN_BLESS_SUPPORT_GOLDEN").is_some() {
+            std::fs::write(&golden_path, &rendered).expect("bless golden");
         }
-        let (file, _) = collector.finish().expect("finish archive");
-        drop(file);
+        let golden = std::fs::read_to_string(&golden_path)
+            .expect("golden")
+            .replace("\r\n", "\n");
+        assert_eq!(rendered, golden, "manifest differs from {GOLDEN}");
 
-        let mut archive =
-            zip::ZipArchive::new(File::open(&archive_path).expect("open archive")).expect("ZIP");
-        let mut first_export = String::new();
-        archive
-            .by_name("logs/first.jsonl")
-            .expect("first export")
-            .read_to_string(&mut first_export)
-            .expect("read first");
-        let mut second_export = String::new();
-        archive
-            .by_name("logs/second.jsonl")
-            .expect("second export")
-            .read_to_string(&mut second_export)
-            .expect("read second");
-        let mut manifest = String::new();
-        archive
-            .by_name("manifest.json")
-            .expect("manifest")
-            .read_to_string(&mut manifest)
-            .expect("read manifest");
-        let combined = format!("{first_export}{second_export}{manifest}");
-        for identity in ["raw-artist", "raw-pier", "192.0.2.77:4444", "raw-network"] {
-            assert!(!combined.contains(identity));
+        let mut archive = zip::ZipArchive::new(writer).expect("ZIP");
+        let mut text = String::new();
+        for index in 0..archive.len() {
+            archive
+                .by_index(index)
+                .expect("entry")
+                .read_to_string(&mut text)
+                .expect("UTF-8 entry");
         }
-        let first_value: serde_json::Value =
-            serde_json::from_str(&first_export).expect("first JSON");
-        let second_value: serde_json::Value =
-            serde_json::from_str(&second_export).expect("second JSON");
-        assert_eq!(first_value["user"], second_value["user"]);
-        assert_eq!(
-            first_value["fields"]["ssid"],
-            second_value["fields"]["ssid"]
-        );
-        assert!(manifest.contains("identity_pseudonymized"));
-        let manifest_value: serde_json::Value =
-            serde_json::from_str(&manifest).expect("manifest JSON");
-        let first_entry = manifest_value["entries"]
-            .as_array()
-            .expect("entries")
-            .iter()
-            .find(|entry| entry["path"] == "logs/first.jsonl")
-            .expect("first manifest entry");
-        assert_eq!(
-            first_entry["included_size_bytes"],
-            first_export.len() as u64
-        );
-        assert_eq!(
-            first_entry["sha256"],
-            format!("{:x}", Sha256::digest(first_export.as_bytes()))
-        );
-        std::fs::remove_dir_all(root).ok();
+        for secret in [
+            "raw-artist",
+            "raw-pier",
+            "192.0.2.77",
+            "raw-network",
+            "raw-customer",
+            "raw-secret",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked into the bundle");
+        }
     }
 
     #[test]

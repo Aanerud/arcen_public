@@ -19,10 +19,14 @@
 //!   keymap's own names and the desktop's input-source settings.
 //! - [`policy`]: the client-side choice, per keystroke, between sending the
 //!   key position and sending the characters.
+//! - [`host_layout`]: the host's `host_keymap` notice — which characters
+//!   its layout types at each printable position, validated, numbered and
+//!   re-sent on change, for every Pier.
 //! - [`paste`]: the clipboard typed as keystrokes — bounded, paced and
 //!   cancellable on the client, by key or text route per character on the
 //!   host.
 
+pub mod host_layout;
 pub mod keymap;
 pub mod layout;
 pub mod paste;

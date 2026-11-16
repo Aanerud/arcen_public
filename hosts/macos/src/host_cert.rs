@@ -4,8 +4,10 @@
 //!
 //! The decision of what to do — create, keep, renew, rekey or adopt — is not
 //! made here. It comes from [`arcen_transport::cert_provisioning`], so all
-//! three platforms answer it identically. This module only reports what is on
-//! disk and carries out the plan with the filesystem semantics macOS needs.
+//! three platforms answer it identically, and what is on disk is read by
+//! [`arcen_transport::cert_store`], with the file names and pin files every
+//! Pier shares. This module carries out the plan with the filesystem
+//! semantics macOS needs.
 //!
 //! Ownership is recorded in a marker file holding the digest of the
 //! certificate this host issued. If the certificate changes without the marker
@@ -23,38 +25,23 @@ use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use arcen_transport::cert_marker::{self, OwnershipMarker};
+use arcen_transport::cert_marker;
 use arcen_transport::cert_provisioning::{
-    MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningPlan, ProvisioningRefusal,
-    ProvisioningRequest, plan,
+    MaterialState, ProvisioningAction, ProvisioningPlan, ProvisioningRefusal, ProvisioningRequest,
+    plan,
 };
+pub use arcen_transport::cert_store::MaterialPaths;
+use arcen_transport::cert_store::{self, InspectContext, PinFiles};
 use arcen_transport::cert_transaction::{
     FileBefore, FileRecovery, MANAGED_FILES, TransactionJournal, TransactionPhase,
 };
 
-/// Where managed certificate material lives.
+/// Where managed certificate material lives: the system Application Support
+/// folder, where a root daemon keeps its state on macOS.
 pub const DEFAULT_DIRECTORY: &str = "/Library/Application Support/Arcen";
-/// Certificate file name.
-const CERTIFICATE_FILE: &str = "host.crt";
-/// Private key file name.
-const KEY_FILE: &str = "host.key";
-/// Ownership marker file name.
-/// Ownership marker file name. Matches the Linux helper so the two
-/// implementations read each other's material rather than each treating the
-/// other's as foreign.
-const MARKER_FILE: &str = "host.generated-by-arcen";
-/// Whole-certificate pin, for operators to compare against `openssl`.
-const CERT_PIN_FILE: &str = "host.cert-sha256";
-/// Subject public key pin, the value a pinning client compares.
-const SPKI_PIN_FILE: &str = "host.spki-sha256";
 /// Journal recording an in-flight publication so an interrupted run can be
 /// undone or completed rather than left half-applied.
 const JOURNAL_FILE: &str = ".arcen-cert.transaction";
-/// Certificate lifetime. Short enough that a stale host is noticed, long
-/// enough that renewal is not a constant chore.
-const VALIDITY_DAYS: i64 = 825;
-/// How close to expiry counts as needing renewal.
-const RENEW_WITHIN_DAYS: i64 = 30;
 
 /// Why certificate work failed.
 #[derive(Debug)]
@@ -94,65 +81,21 @@ impl From<ProvisioningRefusal> for CertError {
     }
 }
 
-/// Paths to the managed material in one directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MaterialPaths {
-    /// Certificate path.
-    pub certificate: PathBuf,
-    /// Private key path.
-    pub key: PathBuf,
-    /// Ownership marker path.
-    pub marker: PathBuf,
-    /// Whole-certificate pin path.
-    pub certificate_pin: PathBuf,
-    /// Subject public key pin path.
-    pub spki_pin: PathBuf,
-    /// The directory holding all of it.
-    pub directory: PathBuf,
+/// Returns the staging path used to publish `target` atomically.
+fn staging_for(target: &Path) -> PathBuf {
+    let name = target.file_name().map_or_else(
+        || "material".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    target.with_file_name(format!(".{name}.staging"))
 }
 
-impl MaterialPaths {
-    /// Returns the managed paths inside `directory`.
-    #[must_use]
-    pub fn in_directory(directory: &Path) -> Self {
-        Self {
-            certificate: directory.join(CERTIFICATE_FILE),
-            key: directory.join(KEY_FILE),
-            marker: directory.join(MARKER_FILE),
-            certificate_pin: directory.join(CERT_PIN_FILE),
-            spki_pin: directory.join(SPKI_PIN_FILE),
-            directory: directory.to_path_buf(),
-        }
-    }
-
-    /// Returns every file the transaction manages, in the shared order.
-    fn managed(&self) -> [&PathBuf; 5] {
-        [
-            &self.key,
-            &self.certificate,
-            &self.certificate_pin,
-            &self.spki_pin,
-            &self.marker,
-        ]
-    }
-
-    /// Returns the staging path used to publish `target` atomically.
-    #[must_use]
-    fn staging_for(target: &Path) -> PathBuf {
-        let name = target.file_name().map_or_else(
-            || "material".to_owned(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        target.with_file_name(format!(".{name}.staging"))
-    }
-
-    /// Returns whether any staging debris is present.
-    #[must_use]
-    fn has_stale_staging(&self) -> bool {
-        self.managed()
-            .into_iter()
-            .any(|path| Self::staging_for(path).exists())
-    }
+/// Returns whether any staging debris is present.
+fn has_stale_staging(paths: &MaterialPaths) -> bool {
+    paths
+        .managed()
+        .into_iter()
+        .any(|path| staging_for(path).exists())
 }
 
 /// Refuses a managed path that is itself a symbolic link.
@@ -180,7 +123,7 @@ fn reject_symlink(path: &Path) -> Result<(), CertError> {
 fn reject_unsafe_paths(paths: &MaterialPaths) -> Result<(), CertError> {
     for path in paths.managed() {
         reject_symlink(path)?;
-        reject_symlink(&MaterialPaths::staging_for(path))?;
+        reject_symlink(&staging_for(path))?;
     }
     Ok(())
 }
@@ -195,116 +138,12 @@ fn reject_unsafe_paths(paths: &MaterialPaths) -> Result<(), CertError> {
 /// Returns [`CertError::Io`] when the directory cannot be inspected.
 pub fn inspect(paths: &MaterialPaths, now_epoch_secs: u64) -> Result<MaterialState, CertError> {
     reject_unsafe_paths(paths)?;
-    let certificate_present = paths.certificate.is_file();
-    let key_present = paths.key.is_file();
-    if !certificate_present && !key_present {
-        return Ok(MaterialState {
-            stale_staging_present: paths.has_stale_staging(),
-            ..MaterialState::absent()
-        });
-    }
-
-    let certificate_bytes = if certificate_present {
-        Some(
-            fs::read(&paths.certificate)
-                .map_err(|error| CertError::Io(format!("read certificate: {error}")))?,
-        )
-    } else {
-        None
+    let context = InspectContext {
+        stale_staging_present: has_stale_staging(paths),
+        machine_sans: None,
     };
-
-    let ownership = certificate_bytes.as_ref().map(|bytes| {
-        if !paths.marker.exists() {
-            MaterialOwnership::Foreign
-        } else if marker_matches(paths, bytes) {
-            MaterialOwnership::Owned
-        } else {
-            MaterialOwnership::Ambiguous
-        }
-    });
-
-    let (certificate_valid, expiring_or_expired) =
-        certificate_bytes.as_ref().map_or((false, false), |bytes| {
-            inspect_validity(bytes, now_epoch_secs)
-        });
-
-    Ok(MaterialState {
-        certificate_present,
-        key_present,
-        ownership,
-        certificate_valid,
-        expiring_or_expired,
-        stale_staging_present: paths.has_stale_staging(),
-        legacy_arcen_self_signed: certificate_bytes.as_ref().is_some_and(|bytes| {
-            arcen_transport::cert_marker::is_legacy_arcen_self_signed_pem(
-                bytes,
-                legacy_arcen_evidence(paths, bytes),
-            )
-        }),
-    })
-}
-
-/// Returns whether the ownership marker describes the certificate on disk.
-///
-/// Both the certificate and subject-public-key pins must match. A marker left
-/// in place while the certificate underneath it changed does not count as
-/// ownership.
-fn marker_matches(paths: &MaterialPaths, certificate_bytes: &[u8]) -> bool {
-    let Ok(recorded) = fs::read_to_string(&paths.marker) else {
-        return false;
-    };
-    let Ok(marker) = OwnershipMarker::parse(&recorded) else {
-        return false;
-    };
-    let Some(pins) = cert_marker::pins_from_pem(certificate_bytes) else {
-        return false;
-    };
-    marker.matches(&pins.certificate, &pins.spki)
-}
-
-fn legacy_arcen_evidence(
-    paths: &MaterialPaths,
-    certificate_bytes: &[u8],
-) -> arcen_transport::cert_marker::LegacyArcenEvidence {
-    let companion_pins_match = fs::read_to_string(&paths.certificate_pin)
-        .ok()
-        .zip(fs::read_to_string(&paths.spki_pin).ok())
-        .is_some_and(|(certificate_pin, spki_pin)| {
-            arcen_transport::cert_marker::companion_pins_match_pem(
-                certificate_bytes,
-                &certificate_pin,
-                &spki_pin,
-            )
-        });
-    arcen_transport::cert_marker::LegacyArcenEvidence {
-        arcen_tls_directory: true,
-        companion_pins_match,
-        machine_sans_match: false,
-    }
-}
-
-/// Reads a certificate's validity through the shared contract.
-///
-/// Returns `(usable_now, renewal_due)`.
-///
-/// This delegates rather than parsing again. The version that lived here had
-/// drifted: it compared only against the renewal threshold, so a certificate
-/// that expired last year reported as valid. Linux and Windows already asked
-/// `ValidityWindow::is_current`, which is the kind of divergence that makes
-/// the same directory produce different provisioning decisions on different
-/// hosts.
-fn inspect_validity(pem_bytes: &[u8], now_epoch_secs: u64) -> (bool, bool) {
-    let Some(window) = cert_marker::validity_from_pem(pem_bytes) else {
-        // Material this host cannot inspect is not material it will keep
-        // serving.
-        return (false, false);
-    };
-    let now = i64::try_from(now_epoch_secs).unwrap_or(i64::MAX);
-    let renew_threshold = RENEW_WITHIN_DAYS * 24 * 60 * 60;
-    (
-        window.is_current(now),
-        window.is_due_for_renewal(now, renew_threshold),
-    )
+    cert_store::inspect(paths, now_epoch_secs, context)
+        .map_err(|error| CertError::Io(format!("read certificate: {error}")))
 }
 
 /// Returns the certificate's SHA-256 as `openssl` reports it.
@@ -351,7 +190,7 @@ pub fn provision(
 
     if decided.clear_stale_staging {
         for target in paths.managed() {
-            let staging = MaterialPaths::staging_for(target);
+            let staging = staging_for(target);
             if staging.exists() {
                 fs::remove_file(&staging)
                     .map_err(|error| CertError::Io(format!("clear staging: {error}")))?;
@@ -439,7 +278,7 @@ fn generate(
     let not_before = time::OffsetDateTime::from_unix_timestamp(issued_at)
         .map_err(|error| CertError::Generation(format!("issue time: {error}")))?;
     let not_after = not_before
-        .checked_add(time::Duration::days(VALIDITY_DAYS))
+        .checked_add(time::Duration::days(cert_store::VALIDITY_DAYS))
         .ok_or_else(|| CertError::Generation("validity window overflows".to_owned()))?;
     params.not_before = not_before;
     params.not_after = not_after;
@@ -589,7 +428,7 @@ fn recover_interrupted(paths: &MaterialPaths) -> Result<Option<String>, CertErro
     }
 
     for path in paths.managed() {
-        let _ = fs::remove_file(MaterialPaths::staging_for(path));
+        let _ = fs::remove_file(staging_for(path));
     }
     let transaction = journal.transaction_id().to_owned();
     fs::remove_file(&journal_path)
@@ -628,49 +467,26 @@ fn publish(
         write_private(&paths.key, key_pem.as_bytes(), 0o600)?;
     }
     write_private(&paths.certificate, certificate_pem.as_bytes(), 0o644)?;
-    write_pins(paths, certificate_pem.as_bytes())?;
-    write_marker(paths, certificate_pem.as_bytes())
+    write_pins_and_marker(paths, certificate_pem.as_bytes())
 }
 
-/// Writes the operator-facing pin files.
+/// Writes the operator-facing pin files and the ownership marker.
 ///
-/// The shapes match what `packaging/linux/README.md` documents, so the two
-/// platforms produce files an operator can compare side by side: the
-/// whole-certificate fingerprint as `openssl` prints it, and one
-/// `sha256/<base64>` subject public key line.
-fn write_pins(paths: &MaterialPaths, certificate_bytes: &[u8]) -> Result<(), CertError> {
-    let pins = cert_marker::pins_from_pem(certificate_bytes)
-        .ok_or_else(|| CertError::Generation("cannot pin the generated certificate".to_owned()))?;
-    write_private(
-        &paths.certificate_pin,
-        format!(
-            "sha256 Fingerprint={}\n",
-            cert_marker::colon_hex(&pins.certificate)
-        )
-        .as_bytes(),
-        0o644,
-    )?;
-    write_private(
-        &paths.spki_pin,
-        format!("{}\n", pins.spki).as_bytes(),
-        0o644,
-    )
-}
-
-fn write_marker(paths: &MaterialPaths, certificate_bytes: &[u8]) -> Result<(), CertError> {
-    let pins = cert_marker::pins_from_pem(certificate_bytes)
-        .ok_or_else(|| CertError::Generation("cannot pin the generated certificate".to_owned()))?;
-    let marker = OwnershipMarker::new(&pins.certificate, &pins.spki)
-        .map_err(|error| CertError::Generation(format!("ownership marker: {error}")))?;
-    // The marker is not secret and operators read it, so it matches the
-    // certificate's mode rather than the key's.
-    write_private(&paths.marker, marker.render().as_bytes(), 0o644)
+/// Their text is the shared [`PinFiles`] contract, so every Pier produces
+/// files an operator can compare side by side. None is secret, so all take
+/// the certificate's mode rather than the key's.
+fn write_pins_and_marker(paths: &MaterialPaths, certificate_bytes: &[u8]) -> Result<(), CertError> {
+    let pins = PinFiles::for_certificate(certificate_bytes).map_err(CertError::Generation)?;
+    for (path, contents) in pins.files(paths) {
+        write_private(path, contents.as_bytes(), 0o644)?;
+    }
+    Ok(())
 }
 
 /// Writes `bytes` to `target` through a staging file with `mode` set before
 /// the file becomes visible under its real name.
 fn write_private(target: &Path, bytes: &[u8], mode: u32) -> Result<(), CertError> {
-    let staging = MaterialPaths::staging_for(target);
+    let staging = staging_for(target);
     {
         let mut file = fs::File::create(&staging)
             .map_err(|error| CertError::Io(format!("create {}: {error}", staging.display())))?;
@@ -692,7 +508,16 @@ fn write_private(target: &Path, bytes: &[u8], mode: u32) -> Result<(), CertError
 
 #[cfg(test)]
 mod tests {
+    use arcen_transport::cert_provisioning::MaterialOwnership;
+
     use super::*;
+
+    fn inspected(paths: &MaterialPaths, now: u64) -> MaterialState {
+        match inspect(paths, now) {
+            Ok(state) => state,
+            Err(error) => panic!("inspect: {error:?}"),
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -736,7 +561,7 @@ mod tests {
         );
 
         // The material is now recognised as ours.
-        let state = inspect(&paths, NOW).expect("inspect");
+        let state = inspected(&paths, NOW);
         assert_eq!(state.ownership, Some(MaterialOwnership::Owned));
         assert!(state.certificate_valid);
         assert!(!state.expiring_or_expired);
@@ -864,7 +689,7 @@ mod tests {
         // longer matches what is on disk.
         fs::remove_file(&paths.marker).expect("remove marker");
 
-        let state = inspect(&paths, NOW).expect("inspect");
+        let state = inspected(&paths, NOW);
         assert_eq!(state.ownership, Some(MaterialOwnership::Foreign));
 
         assert!(state.legacy_arcen_self_signed);
@@ -940,8 +765,9 @@ mod tests {
         let key_before = fs::read(&paths.key).expect("key");
 
         // Jump to within the renewal window of the certificate's expiry.
-        let near_expiry = NOW + (VALIDITY_DAYS as u64 * 24 * 60 * 60) - (5 * 24 * 60 * 60);
-        let state = inspect(&paths, near_expiry).expect("inspect");
+        let near_expiry =
+            NOW + (cert_store::VALIDITY_DAYS as u64 * 24 * 60 * 60) - (5 * 24 * 60 * 60);
+        let state = inspected(&paths, near_expiry);
         assert!(state.expiring_or_expired);
 
         let outcome = provision(
@@ -961,10 +787,10 @@ mod tests {
     fn interrupted_staging_does_not_block_a_fresh_creation() {
         let dir = temp_dir("staging");
         let paths = MaterialPaths::in_directory(&dir);
-        let staging = MaterialPaths::staging_for(&paths.key);
+        let staging = staging_for(&paths.key);
         fs::write(&staging, b"half written").expect("debris");
 
-        let state = inspect(&paths, NOW).expect("inspect");
+        let state = inspected(&paths, NOW);
         assert!(state.stale_staging_present);
 
         provision(
@@ -1246,10 +1072,16 @@ mod tests {
 
     #[test]
     fn unparseable_certificates_are_reported_invalid_not_assumed_good() {
-        let (valid, expiring) = inspect_validity(b"not a certificate", NOW);
-        assert!(!valid);
-        assert!(!expiring);
+        let dir = temp_dir("unparseable");
+        let paths = MaterialPaths::in_directory(&dir);
+        fs::write(&paths.certificate, b"not a certificate").expect("certificate");
+        fs::write(&paths.key, b"not a key").expect("key");
+        let state = inspected(&paths, NOW);
+        assert!(!state.certificate_valid);
+        assert!(!state.expiring_or_expired);
+        fs::remove_dir_all(&dir).ok();
     }
+
     #[test]
     fn an_expired_certificate_is_not_reported_as_valid() {
         // The version this replaced compared only against the renewal
@@ -1257,14 +1089,7 @@ mod tests {
         // merely due for renewal. Linux and Windows already asked
         // `is_current`, so the same directory produced different provisioning
         // decisions depending on which host inspected it.
-        let directory = std::env::temp_dir().join(format!(
-            "arcen-validity-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        std::fs::create_dir_all(&directory).expect("temp dir");
+        let directory = temp_dir("validity");
         let paths = MaterialPaths::in_directory(&directory);
 
         let issued_at = 1_700_000_000_u64;
@@ -1275,23 +1100,27 @@ mod tests {
             issued_at,
         )
         .expect("create material");
-        let pem = std::fs::read(&paths.certificate).expect("read certificate");
 
-        let (valid_now, _) = inspect_validity(&pem, issued_at + 60);
-        assert!(valid_now, "fresh material must be usable");
+        let now = inspected(&paths, issued_at + 60);
+        assert!(now.certificate_valid, "fresh material must be usable");
 
         // Far past any plausible validity window.
-        let (valid_later, renew_later) =
-            inspect_validity(&pem, issued_at + 100 * 365 * 24 * 60 * 60);
+        let later = inspected(&paths, issued_at + 100 * 365 * 24 * 60 * 60);
         assert!(
-            !valid_later,
+            !later.certificate_valid,
             "an expired certificate must not report as usable"
         );
-        assert!(renew_later, "and it is certainly due for renewal");
+        assert!(
+            later.expiring_or_expired,
+            "and it is certainly due for renewal"
+        );
 
         // Before it was issued is also not usable.
-        let (valid_before, _) = inspect_validity(&pem, issued_at.saturating_sub(86_400));
-        assert!(!valid_before, "a not-yet-valid certificate is not usable");
+        let before = inspected(&paths, issued_at.saturating_sub(86_400));
+        assert!(
+            !before.certificate_valid,
+            "a not-yet-valid certificate is not usable"
+        );
 
         std::fs::remove_dir_all(&directory).ok();
     }

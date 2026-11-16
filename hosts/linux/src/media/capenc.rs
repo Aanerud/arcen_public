@@ -46,7 +46,8 @@ use tracing::Instrument;
 use crate::logging::target;
 use crate::session::identity::UserExecution;
 
-use super::annexb::{access_unit_is_keyframe, AccessUnit, NalCodec};
+use super::annexb::AccessUnit;
+use arcen_media::annexb::video_unit_is_keyframe;
 
 const FRAMED_OUTPUT_V1: &str = "framed-v1";
 const FRAME_LENGTH_SIZE: usize = 4;
@@ -142,6 +143,33 @@ pub enum CapencStartError {
 }
 
 /// Everything needed to launch one `capenc` child.
+/// Whether this Pier contains capenc's refinement producer.
+pub const REFINE_COMPILED: bool = cfg!(feature = "lossless-refine");
+
+/// capenc's refinement scope. Each capenc process starts from its own
+/// generation, so the scope need not change between epochs.
+pub(crate) const REFINE_SCOPE: (u16, u64, u64) = (arcen_media::refine::PRIMARY_MONITOR, 1, 1);
+
+/// Refine-lane records waiting for the attachment's refine lane writer, at
+/// most (records are at most 128 KiB; most are a few KiB). capenc paces
+/// records at no more than the video bitrate, and starts before the lane is
+/// granted, so this holds a still desktop's first refinement; beyond it a
+/// slower link drops records and capenc starts over.
+pub(crate) const REFINE_LANE_RECORDS: usize = 256;
+
+/// What a single-monitor attachment knows about exact still image (ADR
+/// 0016): the operator's switch, the Deck's capability, and where capenc's
+/// refine-lane records go. The decision is the shared plan's.
+#[derive(Debug, Clone)]
+pub struct RefineForward {
+    /// `video.lossless_refinement`.
+    pub operator_enabled: bool,
+    /// What the Deck asked for (`AuthResponse.lossless_refine_v1`).
+    pub deck: Option<arcen_protocol::refine::LosslessRefineCapability>,
+    /// The attachment's refine-lane queue.
+    pub lane: mpsc::Sender<Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CapencConfig {
     pub binary: PathBuf,
@@ -222,6 +250,12 @@ pub struct CapencConfig {
     /// qualification record: sent only to a ten-bit Wayland capture, whose
     /// Grading or HDR composition admits nothing those facts do not prove.
     pub wayland_fidelity_args: Vec<String>,
+    /// Exact still image (lossless refinement, ADR 0016) for a
+    /// single-monitor attachment: the operator's switch, the Deck's
+    /// capability and the refine-lane queue. `None` for probes and
+    /// multi-monitor pipelines. Whether this capture refines is
+    /// [`Self::refine_plan`], decided per spawn by the shared plan.
+    pub refine: Option<RefineForward>,
     /// `DISPLAY` for the child (e.g. `":0"`). None ⇒ inherit.
     pub display: Option<String>,
     /// `XAUTHORITY` for the child. None ⇒ inherit.
@@ -300,6 +334,34 @@ impl CapencConfig {
                 .is_some_and(|handoff| handoff.cursor_mode() == ScreenCastCursorMode::Metadata)
     }
 
+    /// The shared refinement plan for this capture (ADR 0016).
+    pub(crate) fn refine_plan(&self) -> arcen_media::refine::RefinePlan {
+        let Some(forward) = self.refine.as_ref() else {
+            return arcen_media::refine::RefinePlan::Off(
+                arcen_media::refine::RefineOffReason::MultiMonitor,
+            );
+        };
+        arcen_media::refine::plan_for_capture(
+            REFINE_COMPILED,
+            forward.operator_enabled,
+            forward.deck.as_ref(),
+            arcen_media::refine::CaptureRefineFacts {
+                depth: self.bit_depth,
+                chroma: if self.yuv444 {
+                    ChromaSubsampling::Yuv444
+                } else {
+                    ChromaSubsampling::Yuv420
+                },
+                transfer: self.transfer,
+                primaries: self.color_primaries,
+                // Ten-bit captures (Xorg depth-30 XShm, the Wayland wide
+                // read-back) reach host memory; eight-bit ones stay on the GPU.
+                source: arcen_media::refine::RefineSourceKind::for_linux_capture(self.bit_depth),
+                single_monitor: true,
+            },
+        )
+    }
+
     /// Build the argv exactly as `capenc_backend.start()` does.
     ///
     /// A `variant=<id>` token is appended whenever this config's full colour
@@ -321,11 +383,15 @@ impl CapencConfig {
         if self.yuv444 {
             v.push("yuv444".to_string());
         }
-        v.push(if self.cursor_events() {
+        let refine = self.refine_plan();
+        v.push(if self.cursor_events() || refine.is_on() {
             arcen_media::capenc_stream::FRAMED_OUTPUT_V2.to_string()
         } else {
             FRAMED_OUTPUT_V1.to_string()
         });
+        // Exact still image: only on a plan the shared rule grants, which
+        // is never the eight-bit NvFBC path (ADR 0016).
+        v.extend(refine.capenc_args(REFINE_SCOPE));
         // The desktop's cursor hub reports host-caused pointer motion to a
         // Deck that asks for it; positions are cheap (one small record per
         // Mutter cursor update, bounded by the stream rate).
@@ -729,6 +795,8 @@ pub(crate) enum StdinCmd {
     Bitrate(u64),
     /// Apply a live frame-rate target.
     Framerate(u32),
+    /// A lossless-refinement control (`REFINE-RESET`/`-PAUSE`/`-RESUME`).
+    Refine(arcen_media::capenc_control::CapencControlCommand),
     /// Request graceful encoder teardown, then close stdin.
     Stop,
 }
@@ -786,6 +854,19 @@ impl IdrRequester {
                 false
             }
         }
+    }
+
+    /// A lossless-refinement control (`REFINE-RESET`/`-PAUSE`/`-RESUME`)
+    /// for whichever capenc currently serves this slot. Non-blocking.
+    pub fn request_refine(
+        &self,
+        command: arcen_media::capenc_control::CapencControlCommand,
+    ) -> bool {
+        let tx = self
+            .control_tx
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tx.try_send(StdinCmd::Refine(command)).is_ok()
     }
 
     /// Point this requester — and every clone sharing its slot — at a newly
@@ -1173,6 +1254,7 @@ pub async fn preflight(config: CapencConfig) -> Result<(), CapencStartError> {
 fn native_probe_attempt(config: &CapencConfig) -> CapencConfig {
     let (mut attempt, _) = apply_capture_cursor_constraint(config.clone());
     attempt.encoder = EncoderRequest::NativeNvenc;
+    attempt.refine = None;
     attempt
 }
 
@@ -1603,9 +1685,7 @@ async fn spawn_one(
         sid = %config.session_log_id
     );
     let nal_codec = match plan.video.codec {
-        VideoCodec::H264 => NalCodec::H264,
-        VideoCodec::H265 => NalCodec::H265,
-        VideoCodec::Av1 => NalCodec::Av1,
+        codec @ (VideoCodec::H264 | VideoCodec::H265 | VideoCodec::Av1) => codec,
         _ => {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -1622,15 +1702,23 @@ async fn spawn_one(
             stream_size: (plan.width, plan.height),
         })
     });
-    match cursor.flatten() {
-        Some(cursor) => {
+    let refine = config
+        .refine
+        .as_ref()
+        .filter(|_| config.refine_plan().is_on())
+        .map(|forward| RefineTarget {
+            lane: forward.lane.clone(),
+            control: stdin_tx.clone(),
+        });
+    match (cursor.flatten(), refine) {
+        (None, None) => {
+            tokio::spawn(read_stdout(stdout, nal_codec, frames_tx).instrument(helper_span.clone()));
+        }
+        (cursor, refine) => {
             tokio::spawn(
-                read_framed_v2(stdout, nal_codec, frames_tx, cursor)
+                read_framed_v2(stdout, nal_codec, frames_tx, cursor, refine)
                     .instrument(helper_span.clone()),
             );
-        }
-        None => {
-            tokio::spawn(read_stdout(stdout, nal_codec, frames_tx).instrument(helper_span.clone()));
         }
     }
     tokio::spawn(write_stdin(stdin, idr_rx, stdin_rx).instrument(helper_span.clone()));
@@ -1793,7 +1881,7 @@ pub(crate) fn admission_probe_command(
 /// treated as child-write boundaries.
 async fn read_stdout(
     mut stdout: tokio::process::ChildStdout,
-    codec: NalCodec,
+    codec: VideoCodec,
     frames_tx: mpsc::Sender<AccessUnit>,
 ) {
     loop {
@@ -1817,7 +1905,7 @@ async fn read_stdout(
 
 async fn read_framed_access_unit<R>(
     reader: &mut R,
-    codec: NalCodec,
+    codec: VideoCodec,
 ) -> std::io::Result<Option<AccessUnit>>
 where
     R: AsyncRead + Unpin,
@@ -1851,7 +1939,7 @@ where
             format!("truncated framed-v1 access unit: expected {payload_len} bytes: {error}"),
         )
     })?;
-    let is_keyframe = access_unit_is_keyframe(&data, codec);
+    let is_keyframe = video_unit_is_keyframe(&data, codec);
     Ok(Some(AccessUnit::new(data, is_keyframe)))
 }
 
@@ -1868,35 +1956,78 @@ struct CursorTarget {
 /// framed-v2 stdout → access units and cursor events. The child runs as
 /// the desktop's user, so every record is bounded before it is read; a
 /// malformed record ends the stream like a malformed framed-v1 one.
+/// Where a refining capenc's records go: refine-lane records into the
+/// attachment's queue; a full queue asks capenc to start over.
+struct RefineTarget {
+    lane: mpsc::Sender<Vec<u8>>,
+    control: mpsc::Sender<StdinCmd>,
+}
+
 async fn read_framed_v2(
     mut stdout: tokio::process::ChildStdout,
-    codec: NalCodec,
+    codec: VideoCodec,
     frames_tx: mpsc::Sender<AccessUnit>,
-    cursor: CursorTarget,
+    cursor: Option<CursorTarget>,
+    refine: Option<RefineTarget>,
 ) {
-    cursor.hub.note_stream_size(cursor.stream_size);
+    if let Some(cursor) = cursor.as_ref() {
+        cursor.hub.note_stream_size(cursor.stream_size);
+    }
+    // Video-lane refinement records ride with the next access unit.
+    let mut refine_prefix: Vec<Vec<u8>> = Vec::new();
+    let mut last_overflow_reset: Option<std::time::Instant> = None;
     loop {
         match read_framed_v2_record(&mut stdout, codec).await {
             Ok(None) => {
                 tracing::info!(target: target::CAPENC, "capenc stdout closed (EOF)");
                 break;
             }
-            Ok(Some(FramedV2Record::AccessUnit(au))) => {
+            Ok(Some(FramedV2Record::AccessUnit(mut au))) => {
+                au.refine = std::mem::take(&mut refine_prefix);
                 if frames_tx.send(au).await.is_err() {
                     return;
                 }
             }
             Ok(Some(FramedV2Record::Cursor(event))) => {
-                cursor
-                    .hub
-                    .apply(&cursor.connector, cursor.generation, &event);
+                if let Some(cursor) = cursor.as_ref() {
+                    cursor
+                        .hub
+                        .apply(&cursor.connector, cursor.generation, &event);
+                }
             }
             Ok(Some(FramedV2Record::Position(position))) => {
-                cursor
-                    .hub
-                    .apply_position(&cursor.connector, cursor.stream_size, &position);
+                if let Some(cursor) = cursor.as_ref() {
+                    cursor
+                        .hub
+                        .apply_position(&cursor.connector, cursor.stream_size, &position);
+                }
             }
-            Ok(Some(FramedV2Record::Refine)) => {}
+            Ok(Some(FramedV2Record::RefineVideo(record))) => {
+                if refine.is_some() && refine_prefix.len() < MAX_REFINE_PREFIX_RECORDS {
+                    refine_prefix.push(record);
+                }
+            }
+            Ok(Some(FramedV2Record::RefineLane(record))) => {
+                let Some(refine) = refine.as_ref() else {
+                    continue;
+                };
+                if refine.lane.try_send(record).is_err() {
+                    // A dropped tile leaves the Deck's digest incomplete:
+                    // start a new generation instead, at most once a second.
+                    let due =
+                        last_overflow_reset.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+                    if due {
+                        last_overflow_reset = Some(std::time::Instant::now());
+                        let _ = refine.control.try_send(StdinCmd::Refine(
+                            arcen_media::capenc_control::CapencControlCommand::RefineReset,
+                        ));
+                        tracing::info!(
+                            target: target::CAPENC,
+                            "refine lane queue full — refinement starts over"
+                        );
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(target: target::CAPENC, error = %e, "invalid framed-v2 capenc stdout");
                 break;
@@ -1905,16 +2036,21 @@ async fn read_framed_v2(
     }
 }
 
+/// Video-lane refinement records kept for one access unit at most (a
+/// barrier and a fence per access unit; anything more is a broken producer).
+const MAX_REFINE_PREFIX_RECORDS: usize = 8;
+
 enum FramedV2Record {
     AccessUnit(AccessUnit),
     Cursor(arcen_media::capenc_stream::CapencCursorEvent),
     Position(arcen_media::capenc_stream::CapencCursorPosition),
-    Refine,
+    RefineVideo(Vec<u8>),
+    RefineLane(Vec<u8>),
 }
 
 async fn read_framed_v2_record<R>(
     reader: &mut R,
-    codec: NalCodec,
+    codec: VideoCodec,
 ) -> std::io::Result<Option<FramedV2Record>>
 where
     R: AsyncRead + Unpin,
@@ -1946,7 +2082,7 @@ where
                     "framed-v2 access unit too long",
                 ));
             }
-            let is_keyframe = access_unit_is_keyframe(&body, codec);
+            let is_keyframe = video_unit_is_keyframe(&body, codec);
             FramedV2Record::AccessUnit(AccessUnit::new(body, is_keyframe))
         }
         CapencRecordKind::Cursor => {
@@ -1955,9 +2091,10 @@ where
         CapencRecordKind::CursorPosition => {
             FramedV2Record::Position(decode_cursor_position(&body).map_err(invalid)?)
         }
-        // Lossless refinement (ADR 0016) is produced only with `refine=on`,
-        // which this Pier never passes yet; such records are not forwarded.
-        CapencRecordKind::RefineVideo | CapencRecordKind::RefineLane => FramedV2Record::Refine,
+        // Lossless refinement (ADR 0016), produced only with `refine=on`.
+        // The Deck validates every record; the Pier only routes them.
+        CapencRecordKind::RefineVideo => FramedV2Record::RefineVideo(body),
+        CapencRecordKind::RefineLane => FramedV2Record::RefineLane(body),
     }))
 }
 
@@ -2011,6 +2148,16 @@ async fn write_stdin(
                     .and(stdin.flush().await)
                 {
                     tracing::warn!(target: target::CAPENC, error = %e, "capenc framerate write failed");
+                    break;
+                }
+            }
+            StdinCmd::Refine(command) => {
+                if let Err(e) = stdin
+                    .write_all(command.as_wire_line().as_bytes())
+                    .await
+                    .and(stdin.flush().await)
+                {
+                    tracing::warn!(target: target::CAPENC, error = %e, "capenc refine control write failed");
                     break;
                 }
             }
@@ -2256,11 +2403,94 @@ mod tests {
             speed_runtime_shortfall: false,
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
+            refine: None,
             display: None,
             xauthority: None,
             execution: None,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
         }
+    }
+
+    /// Exact still image: only a ten-bit 4:4:4 capture (Xorg or Wayland)
+    /// with the operator's switch on and a Deck that asked gets the refinement
+    /// arguments (and framed-v2); the eight-bit NvFBC path never does.
+    #[test]
+    fn capenc_gets_refinement_arguments_only_on_a_granted_plan() {
+        let (lane, _records) = mpsc::channel(1);
+        let forward = |operator: bool| RefineForward {
+            operator_enabled: operator,
+            deck: Some(arcen_protocol::refine::LosslessRefineCapability {
+                domains: vec!["rgb".into()],
+                codecs: vec!["delta-zstd1".into()],
+            }),
+            lane: lane.clone(),
+        };
+        let grading = CapencConfig {
+            bit_depth: BitDepth::Ten,
+            color_range: ColorRange::Full,
+            cursor_mode: CursorMode::Local,
+            refine: Some(forward(true)),
+            ..native_config()
+        };
+        // HDR (PQ / BT.2020, the Wayland wide composition's contract) is
+        // refined in its own codes, like Grading; the capture provider does
+        // not decide it, the depth does.
+        let hdr = CapencConfig {
+            transfer: arcen_media::TransferCharacteristics::Pq,
+            color_primaries: arcen_media::ColorPrimaries::Bt2020,
+            color_matrix: ColorMatrix::Bt2020Ncl,
+            ..grading.clone()
+        };
+        for config in [&grading, &hdr] {
+            let argv = config.argv();
+            if REFINE_COMPILED {
+                assert!(argv.contains(&"framed-v2".to_owned()), "{argv:?}");
+                assert!(argv.contains(&"refine=on".to_owned()), "{argv:?}");
+                assert!(argv.contains(&"refine-scope=1:1:1".to_owned()), "{argv:?}");
+            }
+        }
+        for off in [
+            CapencConfig {
+                refine: Some(forward(false)),
+                ..grading.clone()
+            },
+            CapencConfig {
+                bit_depth: BitDepth::Eight,
+                ..grading.clone()
+            },
+            CapencConfig {
+                yuv444: false,
+                ..grading.clone()
+            },
+            CapencConfig {
+                refine: None,
+                ..grading.clone()
+            },
+        ] {
+            let argv = off.argv();
+            assert!(
+                !argv.iter().any(|arg| arg.starts_with("refine")),
+                "{argv:?}"
+            );
+            assert!(!argv.contains(&"framed-v2".to_owned()), "{argv:?}");
+        }
+        assert!(native_probe_attempt(&grading).refine.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_framed_v2_reader_keeps_refinement_records_for_the_pier() {
+        use arcen_media::capenc_stream::{encode_record, CapencRecordKind};
+        let mut stdout = encode_record(CapencRecordKind::RefineVideo, &[0x0A, 1, 2]).unwrap();
+        stdout.extend(encode_record(CapencRecordKind::RefineLane, &[0x0B, 1, 2, 3]).unwrap());
+        let mut reader = stdout.as_slice();
+        assert!(matches!(
+            read_framed_v2_record(&mut reader, VideoCodec::H264).await.unwrap(),
+            Some(FramedV2Record::RefineVideo(ref body)) if body == &[0x0A, 1, 2]
+        ));
+        assert!(matches!(
+            read_framed_v2_record(&mut reader, VideoCodec::H264).await.unwrap(),
+            Some(FramedV2Record::RefineLane(ref body)) if body == &[0x0B, 1, 2, 3]
+        ));
     }
 
     #[test]
@@ -2307,6 +2537,7 @@ mod tests {
             speed_runtime_shortfall: false,
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
+            refine: None,
             display: None,
             xauthority: None,
             execution: None,
@@ -2733,18 +2964,18 @@ mod tests {
         );
         let mut reader = stdout.as_slice();
         assert!(matches!(
-            read_framed_v2_record(&mut reader, NalCodec::H264).await.unwrap(),
+            read_framed_v2_record(&mut reader, VideoCodec::H264).await.unwrap(),
             Some(FramedV2Record::AccessUnit(AccessUnit { ref data, is_keyframe: true, .. })) if data == &access_unit
         ));
         assert!(matches!(
-            read_framed_v2_record(&mut reader, NalCodec::H264).await.unwrap(),
+            read_framed_v2_record(&mut reader, VideoCodec::H264).await.unwrap(),
             Some(FramedV2Record::Cursor(ref read)) if *read == event
         ));
         assert!(matches!(
-            read_framed_v2_record(&mut reader, NalCodec::H264).await.unwrap(),
+            read_framed_v2_record(&mut reader, VideoCodec::H264).await.unwrap(),
             Some(FramedV2Record::Position(read)) if read == position
         ));
-        assert!(read_framed_v2_record(&mut reader, NalCodec::H264)
+        assert!(read_framed_v2_record(&mut reader, VideoCodec::H264)
             .await
             .unwrap()
             .is_none());
@@ -2753,7 +2984,7 @@ mod tests {
         let mut framed_v1 = 7u32.to_be_bytes().to_vec();
         framed_v1.extend_from_slice(&access_unit);
         let mut reader = framed_v1.as_slice();
-        assert!(read_framed_v2_record(&mut reader, NalCodec::H264)
+        assert!(read_framed_v2_record(&mut reader, VideoCodec::H264)
             .await
             .is_err());
     }
@@ -2951,6 +3182,7 @@ mod tests {
             speed_runtime_shortfall: false,
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
+            refine: None,
             display: Some(":0".into()),
             xauthority: Some("/home/artist/.Xauthority".into()),
             execution: Some(UserExecution::new(identity, environment)),
@@ -3001,6 +3233,7 @@ mod tests {
             speed_runtime_shortfall: false,
             gpu_import_verified: true,
             wayland_fidelity_args: Vec::new(),
+            refine: None,
             ..wayland_config(60, true, ScreenCastCursorMode::Embedded)
         };
         assert!(rated.argv().contains(&"capture-rate=58".to_owned()));
@@ -3016,6 +3249,7 @@ mod tests {
             speed_runtime_shortfall: false,
             gpu_import_verified: true,
             wayland_fidelity_args: Vec::new(),
+            refine: None,
             ..native_config()
         };
         assert!(!xorg
@@ -3069,17 +3303,20 @@ mod tests {
         let ten_bit = CapencConfig {
             bit_depth: BitDepth::Ten,
             wayland_fidelity_args: fidelity.clone(),
+            refine: None,
             ..wayland_config(60, false, ScreenCastCursorMode::Embedded)
         };
         let argv = ten_bit.argv();
         assert!(fidelity.iter().all(|argument| argv.contains(argument)));
         let eight_bit = CapencConfig {
             wayland_fidelity_args: fidelity.clone(),
+            refine: None,
             ..wayland_config(60, false, ScreenCastCursorMode::Embedded)
         };
         let xorg = CapencConfig {
             bit_depth: BitDepth::Ten,
             wayland_fidelity_args: fidelity,
+            refine: None,
             ..native_config()
         };
         for config in [eight_bit, xorg] {
@@ -3597,13 +3834,13 @@ mod tests {
     async fn framed_reader_reassembles_arbitrarily_fragmented_prefix_and_payload() {
         let payload = b"\0\0\0\x01\x67sps\0\0\0\x01\x65idr".to_vec();
         let mut reader = fragmented_reader(framed(&payload), &[1, 2, 1, 3]).await;
-        let au = read_framed_access_unit(&mut reader, NalCodec::H264)
+        let au = read_framed_access_unit(&mut reader, VideoCodec::H264)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(au.data, payload);
         assert!(au.is_keyframe);
-        assert!(read_framed_access_unit(&mut reader, NalCodec::H264)
+        assert!(read_framed_access_unit(&mut reader, VideoCodec::H264)
             .await
             .unwrap()
             .is_none());
@@ -3614,7 +3851,7 @@ mod tests {
         let mut payload = vec![0xAB; 4 * 1024 * 1024];
         payload[..5].copy_from_slice(b"\0\0\0\x01\x41");
         let mut reader = fragmented_reader(framed(&payload), &[1, 7, 31, 1024, 4093]).await;
-        let au = read_framed_access_unit(&mut reader, NalCodec::H264)
+        let au = read_framed_access_unit(&mut reader, VideoCodec::H264)
             .await
             .unwrap()
             .unwrap();
@@ -3625,7 +3862,7 @@ mod tests {
     #[tokio::test]
     async fn framed_reader_rejects_truncated_prefix() {
         let mut reader = fragmented_reader(vec![0, 0, 1], &[1]).await;
-        let error = read_framed_access_unit(&mut reader, NalCodec::H264)
+        let error = read_framed_access_unit(&mut reader, VideoCodec::H264)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -3636,7 +3873,7 @@ mod tests {
         let mut bytes = 10u32.to_be_bytes().to_vec();
         bytes.extend_from_slice(b"short");
         let mut reader = fragmented_reader(bytes, &[1, 2]).await;
-        let error = read_framed_access_unit(&mut reader, NalCodec::H264)
+        let error = read_framed_access_unit(&mut reader, VideoCodec::H264)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -3646,7 +3883,7 @@ mod tests {
     async fn framed_reader_rejects_oversized_payload_before_allocating() {
         let bytes = ((MAX_ACCESS_UNIT_SIZE + 1) as u32).to_be_bytes().to_vec();
         let mut reader = fragmented_reader(bytes, &[1]).await;
-        let error = read_framed_access_unit(&mut reader, NalCodec::H264)
+        let error = read_framed_access_unit(&mut reader, VideoCodec::H264)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

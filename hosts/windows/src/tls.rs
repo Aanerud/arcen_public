@@ -1,322 +1,53 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Windows Pier TLS material loading, validation, reload, and lifecycle events.
+//! Windows Pier TLS material: the Windows file-system checks behind the
+//! shared `arcen_transport::host_material` loader, and the broker's lifecycle
+//! events.
+//!
+//! Reading, validation, pinning, reload and expiry are shared with every Pier.
+//! What is Windows' own is how a file is opened and judged: every ancestor is
+//! opened without following reparse points and held open without
+//! `FILE_SHARE_DELETE` until the leaf is open, only local disk paths are
+//! accepted, and the private key's DACL must be protected and grant full
+//! control to SYSTEM and Administrators only.
 
-use std::fmt::{Display, Formatter};
-use std::io::{BufReader, Cursor, Read};
+use std::path::Path;
 #[cfg(windows)]
-use std::path::Prefix;
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Component, PathBuf, Prefix};
 use std::sync::Arc;
 
-use arcen_transport::tls::{
-    CertificateKeyPolicy, CertificateMetadata, CertificateTimePolicy, ReloadingCertifiedKey,
-    SystemUnixClock, TlsPosture, UnixClock, ValidatedCertificate,
+use arcen_transport::host_material::{
+    CertificateEvent, HostTlsError, HostTlsMaterial, HostTlsSource, MaterialKind, SecureFileSystem,
+    WindowsFileFacts,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use arcen_transport::tls::SystemUnixClock;
 #[cfg(feature = "wss-compat")]
 use tokio_rustls::TlsAcceptor;
-use zeroize::Zeroizing;
 
-pub(crate) const MAX_CERTIFICATE_PEM_BYTES: u64 = 1024 * 1024;
-pub(crate) const MAX_PRIVATE_KEY_PEM_BYTES: u64 = 128 * 1024;
+/// The process named in certificate lifecycle events.
 const COMPONENT: &str = "pier_broker";
-const SOURCE: &str = "pem";
 
-#[derive(Debug, Clone)]
-pub(crate) struct TlsFileSource {
-    pub(crate) certificate_path: PathBuf,
-    pub(crate) private_key_path: PathBuf,
-    pub(crate) expected_sans: Vec<String>,
-    pub(crate) posture: TlsPosture,
-    pub(crate) key_policy: CertificateKeyPolicy,
-    pub(crate) time_policy: CertificateTimePolicy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MaterialKind {
-    Certificate,
-    PrivateKey,
-}
-
-impl MaterialKind {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Certificate => "certificate",
-            Self::PrivateKey => "private key",
-        }
-    }
-
-    const fn maximum(self) -> u64 {
-        match self {
-            Self::Certificate => MAX_CERTIFICATE_PEM_BYTES,
-            Self::PrivateKey => MAX_PRIVATE_KEY_PEM_BYTES,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TlsLoadError {
-    Missing(&'static str),
-    Open(&'static str),
-    NotRegular(&'static str),
-    ReparsePoint(&'static str),
-    NonDiskDevice(&'static str),
-    Oversized(&'static str, u64),
-    Read(&'static str),
-    ChangedDuringRead(&'static str),
-    BroadPrivateKeyAcl,
-    AclQueryFailed,
-    MalformedCertificatePem,
-    EmptyCertificateChain,
-    MalformedPrivateKeyPem,
-    MissingPrivateKey,
-    MultiplePrivateKeys,
-    CertificateRejected,
-    ResolverRejected,
-    PostureRejected,
-}
-
-impl TlsLoadError {
-    pub(crate) const fn reason_class(&self) -> &'static str {
-        match self {
-            Self::Missing(_) => "material_missing",
-            Self::Open(_) | Self::Read(_) => "material_unavailable",
-            Self::NotRegular(_) | Self::NonDiskDevice(_) => "unsafe_file_type",
-            Self::ReparsePoint(_) => "reparse_point",
-            Self::Oversized(_, _) => "material_oversized",
-            Self::ChangedDuringRead(_) => "material_changed",
-            Self::BroadPrivateKeyAcl => "private_key_acl",
-            Self::AclQueryFailed => "acl_query_failed",
-            Self::MalformedCertificatePem
-            | Self::EmptyCertificateChain
-            | Self::MalformedPrivateKeyPem
-            | Self::MissingPrivateKey
-            | Self::MultiplePrivateKeys => "pem_invalid",
-            Self::CertificateRejected | Self::ResolverRejected => "certificate_rejected",
-            Self::PostureRejected => "posture_rejected",
-        }
-    }
-}
-
-impl Display for TlsLoadError {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing(kind) => write!(formatter, "TLS {kind} file does not exist"),
-            Self::Open(kind) => write!(formatter, "TLS {kind} file could not be opened securely"),
-            Self::NotRegular(kind) => write!(formatter, "TLS {kind} is not a regular file"),
-            Self::ReparsePoint(kind) => {
-                write!(formatter, "TLS {kind} path contains a reparse point")
-            }
-            Self::NonDiskDevice(kind) => write!(formatter, "TLS {kind} is not a disk file"),
-            Self::Oversized(kind, maximum) => {
-                write!(formatter, "TLS {kind} exceeds the {maximum}-byte limit")
-            }
-            Self::Read(kind) => write!(formatter, "TLS {kind} could not be read"),
-            Self::ChangedDuringRead(kind) => {
-                write!(formatter, "TLS {kind} changed while it was read")
-            }
-            Self::BroadPrivateKeyAcl => formatter.write_str(
-                "TLS private key DACL must be protected and contain only SYSTEM and Administrators full-control entries",
-            ),
-            Self::AclQueryFailed => {
-                formatter.write_str("TLS private key DACL could not be validated")
-            }
-            Self::MalformedCertificatePem => {
-                formatter.write_str("TLS certificate PEM contains an invalid or unsupported block")
-            }
-            Self::EmptyCertificateChain => {
-                formatter.write_str("TLS certificate PEM contains no certificates")
-            }
-            Self::MalformedPrivateKeyPem => {
-                formatter.write_str("TLS private-key PEM contains an invalid or unsupported block")
-            }
-            Self::MissingPrivateKey => {
-                formatter.write_str("TLS private-key PEM contains no usable private key")
-            }
-            Self::MultiplePrivateKeys => {
-                formatter.write_str("TLS private-key PEM must contain exactly one private key")
-            }
-            Self::CertificateRejected => formatter.write_str(
-                "TLS certificate/key failed validity, SAN, key-policy, or key-match validation",
-            ),
-            Self::ResolverRejected => {
-                formatter.write_str("TLS certificate resolver rejected the active certificate")
-            }
-            Self::PostureRejected => {
-                formatter.write_str("TLS version/cipher posture could not build a server config")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TlsLoadError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileSnapshot {
-    identity: u128,
-    length: u64,
-    modified: u64,
-    regular: bool,
-    reparse: bool,
-    disk: bool,
-}
-
-trait SecureFileSystem {
-    type Handle: Read;
-
-    fn open(&self, path: &Path, kind: MaterialKind) -> Result<Self::Handle, TlsLoadError>;
-    fn snapshot(
-        &self,
-        handle: &Self::Handle,
-        kind: MaterialKind,
-    ) -> Result<FileSnapshot, TlsLoadError>;
-    fn private_key_acl_restricted(&self, handle: &Self::Handle) -> Result<bool, TlsLoadError>;
-}
-
-fn read_bounded<F: SecureFileSystem>(
-    file_system: &F,
-    path: &Path,
-    kind: MaterialKind,
-) -> Result<Vec<u8>, TlsLoadError> {
-    let mut handle = file_system.open(path, kind)?;
-    let before = file_system.snapshot(&handle, kind)?;
-    if !before.regular {
-        return Err(TlsLoadError::NotRegular(kind.label()));
-    }
-    if before.reparse {
-        return Err(TlsLoadError::ReparsePoint(kind.label()));
-    }
-    if !before.disk {
-        return Err(TlsLoadError::NonDiskDevice(kind.label()));
-    }
-    if before.length > kind.maximum() {
-        return Err(TlsLoadError::Oversized(kind.label(), kind.maximum()));
-    }
-    if kind == MaterialKind::PrivateKey && !file_system.private_key_acl_restricted(&handle)? {
-        return Err(TlsLoadError::BroadPrivateKeyAcl);
-    }
-
-    let mut bytes = Vec::with_capacity(before.length as usize);
-    (&mut handle)
-        .take(kind.maximum() + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| TlsLoadError::Read(kind.label()))?;
-    if bytes.len() as u64 > kind.maximum() {
-        return Err(TlsLoadError::Oversized(kind.label(), kind.maximum()));
-    }
-    let after = file_system.snapshot(&handle, kind)?;
-    if before != after || bytes.len() as u64 != before.length {
-        return Err(TlsLoadError::ChangedDuringRead(kind.label()));
-    }
-    Ok(bytes)
-}
-
-fn parse_material(
-    certificate_pem: &[u8],
-    private_key_pem: &[u8],
-) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsLoadError> {
-    let mut certificates = Vec::new();
-    for item in rustls_pemfile::read_all(&mut BufReader::new(Cursor::new(certificate_pem))) {
-        match item.map_err(|_| TlsLoadError::MalformedCertificatePem)? {
-            rustls_pemfile::Item::X509Certificate(certificate) => certificates.push(certificate),
-            _ => return Err(TlsLoadError::MalformedCertificatePem),
-        }
-    }
-    if certificates.is_empty() {
-        return Err(TlsLoadError::EmptyCertificateChain);
-    }
-
-    let mut private_key = None;
-    for item in rustls_pemfile::read_all(&mut BufReader::new(Cursor::new(private_key_pem))) {
-        let key = match item.map_err(|_| TlsLoadError::MalformedPrivateKeyPem)? {
-            rustls_pemfile::Item::Pkcs1Key(key) => PrivateKeyDer::Pkcs1(key),
-            rustls_pemfile::Item::Pkcs8Key(key) => PrivateKeyDer::Pkcs8(key),
-            rustls_pemfile::Item::Sec1Key(key) => PrivateKeyDer::Sec1(key),
-            _ => return Err(TlsLoadError::MalformedPrivateKeyPem),
-        };
-        if private_key.replace(key).is_some() {
-            return Err(TlsLoadError::MultiplePrivateKeys);
-        }
-    }
-    Ok((
-        certificates,
-        private_key.ok_or(TlsLoadError::MissingPrivateKey)?,
-    ))
-}
-
-fn load_validated<F: SecureFileSystem>(
-    file_system: &F,
-    source: &TlsFileSource,
-    clock: &dyn UnixClock,
-) -> Result<ValidatedCertificate, TlsLoadError> {
-    let certificate_pem = read_bounded(
-        file_system,
-        &source.certificate_path,
-        MaterialKind::Certificate,
-    )?;
-    let private_key_pem = Zeroizing::new(read_bounded(
-        file_system,
-        &source.private_key_path,
-        MaterialKind::PrivateKey,
-    )?);
-    let (certificate_chain, private_key) = parse_material(&certificate_pem, &private_key_pem)?;
-    let expected = source
-        .expected_sans
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    ValidatedCertificate::new_for_server_names(
-        certificate_chain,
-        private_key,
-        &expected,
-        clock,
-        source.key_policy,
-    )
-    .map_err(|_| TlsLoadError::CertificateRejected)
-}
-
+/// The material this Pier serves, and the WSS acceptor over it when built.
 pub(crate) struct TlsLifecycle {
-    resolver: Arc<ReloadingCertifiedKey>,
+    material: HostTlsMaterial,
     #[cfg(feature = "wss-compat")]
     acceptor: TlsAcceptor,
-    source: TlsFileSource,
-    clock: Arc<dyn UnixClock>,
-    expiring_emitted: AtomicBool,
-    expired_emitted: AtomicBool,
 }
 
 impl TlsLifecycle {
-    pub(crate) fn load(source: TlsFileSource) -> Result<Self, TlsLoadError> {
-        Self::load_with(&SystemSecureFileSystem, source, Arc::new(SystemUnixClock))
-    }
-
-    fn load_with<F: SecureFileSystem>(
-        file_system: &F,
-        source: TlsFileSource,
-        clock: Arc<dyn UnixClock>,
-    ) -> Result<Self, TlsLoadError> {
-        let validated = load_validated(file_system, &source, clock.as_ref())?;
-        let resolver = Arc::new(
-            ReloadingCertifiedKey::new(validated, Arc::clone(&clock))
-                .map_err(|_| TlsLoadError::ResolverRejected)?,
-        );
+    pub(crate) fn load(source: HostTlsSource) -> Result<Self, HostTlsError> {
+        let material = HostTlsMaterial::load(
+            &SystemSecureFileSystem,
+            source,
+            Arc::new(SystemUnixClock),
+            COMPONENT,
+        )?;
         #[cfg(feature = "wss-compat")]
-        let acceptor = TlsAcceptor::from(Arc::new(
-            source
-                .posture
-                .server_config(resolver.clone())
-                .map_err(|_| TlsLoadError::PostureRejected)?,
-        ));
+        let acceptor = TlsAcceptor::from(Arc::new(material.server_config()?));
         Ok(Self {
-            resolver,
+            material,
             #[cfg(feature = "wss-compat")]
             acceptor,
-            source,
-            clock,
-            expiring_emitted: AtomicBool::new(false),
-            expired_emitted: AtomicBool::new(false),
         })
     }
 
@@ -325,174 +56,38 @@ impl TlsLifecycle {
         self.acceptor.clone()
     }
 
-    /// Builds a `rustls::ServerConfig` for use with a Quinn QUIC endpoint,
-    /// using the same cert resolver and cipher-suite posture as the direct
-    /// `TlsAcceptor`. The caller must set `alpn_protocols` before converting.
+    /// The rustls server configuration for the QUIC endpoint; the caller
+    /// sets ALPN.
     pub(crate) fn rustls_server_config_for_quic(
         &self,
-    ) -> Result<rustls::ServerConfig, TlsLoadError> {
-        self.source
-            .posture
-            .server_config(self.resolver.clone())
-            .map_err(|_| TlsLoadError::PostureRejected)
-    }
-
-    pub(crate) fn metadata(&self) -> Result<CertificateMetadata, TlsLoadError> {
-        self.resolver
-            .metadata()
-            .map_err(|_| TlsLoadError::ResolverRejected)
+    ) -> Result<rustls::ServerConfig, HostTlsError> {
+        self.material.server_config()
     }
 
     /// Stable direct-session Host identity derived only from the validated TLS SPKI.
-    pub(crate) fn host_identity(&self) -> Result<arcen_identity::HostIdentity, TlsLoadError> {
-        let metadata = self.metadata()?;
-        arcen_identity::HostIdentity::new(format!(
-            "spki-sha256:{}",
-            hex_digest(&metadata.spki_sha256)
-        ))
-        .map_err(|_| TlsLoadError::ResolverRejected)
+    pub(crate) fn host_identity(&self) -> Result<arcen_identity::HostIdentity, HostTlsError> {
+        self.material.host_identity()
     }
 
     pub(crate) fn emit_startup(&self, emitter: &crate::LifecycleEmitter) {
-        let Ok(metadata) = self.metadata() else {
-            return;
-        };
-        let expiring = self
-            .source
-            .time_policy
-            .is_expiring(&metadata, self.clock.as_ref())
-            .unwrap_or(false);
-        self.expiring_emitted.store(expiring, Ordering::Release);
-        emit_certificate(
-            emitter,
-            if expiring {
-                arcen_telemetry::LifecycleEventKind::TlsCertificateExpiring
-            } else {
-                arcen_telemetry::LifecycleEventKind::TlsCertificateActive
-            },
-            &metadata,
-            expiring.then(|| {
-                self.source
-                    .time_policy
-                    .days_remaining(&metadata, self.clock.as_ref())
-                    .unwrap_or(0)
-            }),
-        );
+        emit(emitter, self.material.startup_event());
     }
 
-    pub(crate) fn reload(&self, emitter: &crate::LifecycleEmitter) -> Result<(), TlsLoadError> {
-        let replacement =
-            load_validated(&SystemSecureFileSystem, &self.source, self.clock.as_ref());
-        match replacement.and_then(|replacement| {
-            self.resolver
-                .reload_validated(replacement)
-                .map_err(|_| TlsLoadError::ResolverRejected)
-        }) {
-            Ok(metadata) => {
-                self.expiring_emitted.store(false, Ordering::Release);
-                self.expired_emitted.store(false, Ordering::Release);
-                emit_certificate(
-                    emitter,
-                    arcen_telemetry::LifecycleEventKind::TlsCertificateReloaded,
-                    &metadata,
-                    None,
-                );
-                self.check_and_emit_status(emitter);
-                Ok(())
-            }
-            Err(error) => {
-                emit_reload_failed(emitter, error.reason_class());
-                Err(error)
-            }
-        }
+    pub(crate) fn reload(&self, emitter: &crate::LifecycleEmitter) -> Result<(), HostTlsError> {
+        let outcome = self.material.reload(&SystemSecureFileSystem);
+        emit(emitter, outcome.events);
+        outcome.result
     }
 
     pub(crate) fn check_and_emit_status(&self, emitter: &crate::LifecycleEmitter) {
-        let Ok(metadata) = self.metadata() else {
-            return;
-        };
-        let Ok(now) = self.clock.now_epoch_secs() else {
-            return;
-        };
-        let expired = now > metadata.not_after_epoch_secs;
-        let expiring = !expired
-            && metadata.not_after_epoch_secs.saturating_sub(now)
-                <= self.source.time_policy.warning_window_secs;
-        if expiring && !self.expiring_emitted.swap(true, Ordering::AcqRel) {
-            emit_certificate(
-                emitter,
-                arcen_telemetry::LifecycleEventKind::TlsCertificateExpiring,
-                &metadata,
-                Some(
-                    self.source
-                        .time_policy
-                        .days_remaining(&metadata, self.clock.as_ref())
-                        .unwrap_or(0),
-                ),
-            );
-        }
-        if expired && !self.expired_emitted.swap(true, Ordering::AcqRel) {
-            emit_certificate(
-                emitter,
-                arcen_telemetry::LifecycleEventKind::TlsCertificateExpired,
-                &metadata,
-                None,
-            );
-        }
+        emit(emitter, self.material.status_events());
     }
 }
 
-fn hex_digest(digest: &[u8; 32]) -> String {
-    let mut value = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(value, "{byte:02x}");
+fn emit(emitter: &crate::LifecycleEmitter, events: impl IntoIterator<Item = CertificateEvent>) {
+    for event in events {
+        crate::emit_lifecycle_event(emitter, event.kind, random_correlation_id(), event.fields);
     }
-    value
-}
-
-fn certificate_fields(
-    metadata: &CertificateMetadata,
-    days_remaining: Option<u64>,
-) -> arcen_telemetry::StructuredFields {
-    let mut fields = arcen_telemetry::StructuredFields::default();
-    let _ = fields.insert(
-        "component",
-        arcen_telemetry::FieldValue::String(COMPONENT.to_string()),
-    );
-    let _ = fields.insert(
-        "source",
-        arcen_telemetry::FieldValue::String(SOURCE.to_string()),
-    );
-    let _ = fields.insert(
-        "cert_sha256",
-        arcen_telemetry::FieldValue::String(hex_digest(&metadata.cert_sha256)),
-    );
-    let _ = fields.insert(
-        "spki_sha256",
-        arcen_telemetry::FieldValue::String(hex_digest(&metadata.spki_sha256)),
-    );
-    let _ = fields.insert(
-        "key_algorithm",
-        arcen_telemetry::FieldValue::String(metadata.key_algorithm.as_str().to_string()),
-    );
-    let _ = fields.insert(
-        "key_bits",
-        arcen_telemetry::FieldValue::Integer(i64::from(metadata.key_bits)),
-    );
-    let _ = fields.insert(
-        "not_after_epoch_secs",
-        arcen_telemetry::FieldValue::Integer(
-            i64::try_from(metadata.not_after_epoch_secs).unwrap_or(i64::MAX),
-        ),
-    );
-    if let Some(days) = days_remaining {
-        let _ = fields.insert(
-            "days_remaining",
-            arcen_telemetry::FieldValue::Integer(i64::try_from(days).unwrap_or(i64::MAX)),
-        );
-    }
-    fields
 }
 
 /// Produces a fresh non-secret correlation id for a standalone lifecycle event.
@@ -510,50 +105,15 @@ fn random_correlation_id() -> arcen_telemetry::CorrelationId {
     }
 }
 
-fn emit_certificate(
-    emitter: &crate::LifecycleEmitter,
-    kind: arcen_telemetry::LifecycleEventKind,
-    metadata: &CertificateMetadata,
-    days_remaining: Option<u64>,
-) {
-    crate::emit_lifecycle_event(
-        emitter,
-        kind,
-        random_correlation_id(),
-        certificate_fields(metadata, days_remaining),
-    );
-}
-
-fn emit_reload_failed(emitter: &crate::LifecycleEmitter, reason_class: &'static str) {
-    let mut fields = arcen_telemetry::StructuredFields::default();
-    let _ = fields.insert(
-        "component",
-        arcen_telemetry::FieldValue::String(COMPONENT.to_string()),
-    );
-    let _ = fields.insert(
-        "source",
-        arcen_telemetry::FieldValue::String(SOURCE.to_string()),
-    );
-    let _ = fields.insert(
-        "reason_class",
-        arcen_telemetry::FieldValue::String(reason_class.to_string()),
-    );
-    crate::emit_lifecycle_event(
-        emitter,
-        arcen_telemetry::LifecycleEventKind::TlsCertificateReloadFailed,
-        random_correlation_id(),
-        fields,
-    );
-}
-
 #[cfg(windows)]
 struct SystemSecureFileSystem;
 
 #[cfg(windows)]
 impl SecureFileSystem for SystemSecureFileSystem {
     type Handle = std::fs::File;
+    type Snapshot = WindowsFileFacts;
 
-    fn open(&self, path: &Path, kind: MaterialKind) -> Result<Self::Handle, TlsLoadError> {
+    fn open(&self, path: &Path, kind: MaterialKind) -> Result<Self::Handle, HostTlsError> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
@@ -576,10 +136,10 @@ impl SecureFileSystem for SystemSecureFileSystem {
                 .map_err(|error| map_open_error(error, kind))?;
             let snapshot = windows_snapshot(&directory, kind)?;
             if snapshot.reparse {
-                return Err(TlsLoadError::ReparsePoint(kind.label()));
+                return Err(HostTlsError::ReparsePoint(kind.label()));
             }
             if snapshot.regular || !snapshot.disk {
-                return Err(TlsLoadError::NotRegular(kind.label()));
+                return Err(HostTlsError::NotRegular(kind.label()));
             }
             // Keeping every checked directory open without FILE_SHARE_DELETE
             // prevents an attacker from replacing an ancestor before the leaf opens.
@@ -599,12 +159,21 @@ impl SecureFileSystem for SystemSecureFileSystem {
         &self,
         handle: &Self::Handle,
         kind: MaterialKind,
-    ) -> Result<FileSnapshot, TlsLoadError> {
+    ) -> Result<WindowsFileFacts, HostTlsError> {
         windows_snapshot(handle, kind)
     }
 
-    fn private_key_acl_restricted(&self, handle: &Self::Handle) -> Result<bool, TlsLoadError> {
-        validate_restricted_key_acl(handle)
+    fn admit(
+        &self,
+        handle: &Self::Handle,
+        snapshot: &WindowsFileFacts,
+        kind: MaterialKind,
+    ) -> Result<(), HostTlsError> {
+        snapshot.admit(kind)?;
+        if kind == MaterialKind::PrivateKey && !validate_restricted_key_acl(handle)? {
+            return Err(HostTlsError::BroadPrivateKeyAcl);
+        }
+        Ok(())
     }
 }
 
@@ -614,8 +183,9 @@ struct SystemSecureFileSystem;
 #[cfg(not(windows))]
 impl SecureFileSystem for SystemSecureFileSystem {
     type Handle = std::fs::File;
+    type Snapshot = WindowsFileFacts;
 
-    fn open(&self, path: &Path, kind: MaterialKind) -> Result<Self::Handle, TlsLoadError> {
+    fn open(&self, path: &Path, kind: MaterialKind) -> Result<Self::Handle, HostTlsError> {
         std::fs::File::open(path).map_err(|error| map_open_error(error, kind))
     }
 
@@ -623,16 +193,16 @@ impl SecureFileSystem for SystemSecureFileSystem {
         &self,
         handle: &Self::Handle,
         kind: MaterialKind,
-    ) -> Result<FileSnapshot, TlsLoadError> {
+    ) -> Result<WindowsFileFacts, HostTlsError> {
         let metadata = handle
             .metadata()
-            .map_err(|_| TlsLoadError::Read(kind.label()))?;
+            .map_err(|_| HostTlsError::Read(kind.label()))?;
         let modified = metadata
             .modified()
             .ok()
             .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |value| value.as_nanos() as u64);
-        Ok(FileSnapshot {
+        Ok(WindowsFileFacts {
             identity: 0,
             length: metadata.len(),
             modified,
@@ -642,26 +212,35 @@ impl SecureFileSystem for SystemSecureFileSystem {
         })
     }
 
-    fn private_key_acl_restricted(&self, _handle: &Self::Handle) -> Result<bool, TlsLoadError> {
-        Err(TlsLoadError::AclQueryFailed)
+    fn admit(
+        &self,
+        _handle: &Self::Handle,
+        snapshot: &WindowsFileFacts,
+        kind: MaterialKind,
+    ) -> Result<(), HostTlsError> {
+        snapshot.admit(kind)?;
+        if kind == MaterialKind::PrivateKey {
+            return Err(HostTlsError::AclQueryFailed);
+        }
+        Ok(())
     }
 }
 
-fn map_open_error(error: std::io::Error, kind: MaterialKind) -> TlsLoadError {
+fn map_open_error(error: std::io::Error, kind: MaterialKind) -> HostTlsError {
     if error.kind() == std::io::ErrorKind::NotFound {
-        TlsLoadError::Missing(kind.label())
+        HostTlsError::Missing(kind.label())
     } else {
-        TlsLoadError::Open(kind.label())
+        HostTlsError::Open(kind.label())
     }
 }
 
 #[cfg(windows)]
-fn absolute_without_traversal(path: &Path, kind: MaterialKind) -> Result<PathBuf, TlsLoadError> {
+fn absolute_without_traversal(path: &Path, kind: MaterialKind) -> Result<PathBuf, HostTlsError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|_| TlsLoadError::Open(kind.label()))?
+            .map_err(|_| HostTlsError::Open(kind.label()))?
             .join(path)
     };
     let mut normalized = PathBuf::new();
@@ -671,7 +250,7 @@ fn absolute_without_traversal(path: &Path, kind: MaterialKind) -> Result<PathBuf
                 normalized.push(component.as_os_str());
             }
             Component::Prefix(_) => {
-                return Err(TlsLoadError::NonDiskDevice(kind.label()));
+                return Err(HostTlsError::NonDiskDevice(kind.label()));
             }
             Component::RootDir | Component::Normal(_) => {
                 normalized.push(component.as_os_str());
@@ -679,7 +258,7 @@ fn absolute_without_traversal(path: &Path, kind: MaterialKind) -> Result<PathBuf
             Component::CurDir => {}
             Component::ParentDir => {
                 if !normalized.pop() {
-                    return Err(TlsLoadError::ReparsePoint(kind.label()));
+                    return Err(HostTlsError::ReparsePoint(kind.label()));
                 }
             }
         }
@@ -691,7 +270,7 @@ fn absolute_without_traversal(path: &Path, kind: MaterialKind) -> Result<PathBuf
 fn windows_snapshot(
     file: &std::fs::File,
     kind: MaterialKind,
-) -> Result<FileSnapshot, TlsLoadError> {
+) -> Result<WindowsFileFacts, HostTlsError> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
@@ -704,7 +283,7 @@ fn windows_snapshot(
     // SAFETY: `handle` is borrowed from a live `File`; `information` is valid
     // writable storage of the exact structure expected by the API.
     unsafe { GetFileInformationByHandle(handle, &raw mut information) }
-        .map_err(|_| TlsLoadError::Read(kind.label()))?;
+        .map_err(|_| HostTlsError::Read(kind.label()))?;
     // SAFETY: `handle` remains live and GetFileType does not take ownership.
     let disk = unsafe { GetFileType(handle) } == FILE_TYPE_DISK;
     let identity = (u128::from(information.dwVolumeSerialNumber) << 64)
@@ -713,7 +292,7 @@ fn windows_snapshot(
     let length = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
     let modified = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
         | u64::from(information.ftLastWriteTime.dwLowDateTime);
-    Ok(FileSnapshot {
+    Ok(WindowsFileFacts {
         identity,
         length,
         modified,
@@ -724,7 +303,7 @@ fn windows_snapshot(
 }
 
 #[cfg(windows)]
-fn validate_restricted_key_acl(file: &std::fs::File) -> Result<bool, TlsLoadError> {
+fn validate_restricted_key_acl(file: &std::fs::File) -> Result<bool, HostTlsError> {
     use std::mem::{offset_of, size_of};
     use std::os::windows::io::AsRawHandle;
     use std::ptr::{addr_of, null_mut};
@@ -767,14 +346,14 @@ fn validate_restricted_key_acl(file: &std::fs::File) -> Result<bool, TlsLoadErro
         )
     };
     if status.0 != 0 || descriptor.0.is_null() {
-        return Err(TlsLoadError::AclQueryFailed);
+        return Err(HostTlsError::AclQueryFailed);
     }
     let descriptor = Descriptor(descriptor);
     let mut control = 0_u16;
     let mut revision = 0_u32;
     // SAFETY: the descriptor remains live and both output pointers are valid.
     unsafe { GetSecurityDescriptorControl(descriptor.0, &raw mut control, &raw mut revision) }
-        .map_err(|_| TlsLoadError::AclQueryFailed)?;
+        .map_err(|_| HostTlsError::AclQueryFailed)?;
     if control & SE_DACL_PROTECTED.0 == 0 || dacl.is_null() {
         return Ok(false);
     }
@@ -786,13 +365,13 @@ fn validate_restricted_key_acl(file: &std::fs::File) -> Result<bool, TlsLoadErro
 
     fn known_sid(
         kind: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
-    ) -> Result<Vec<u8>, TlsLoadError> {
+    ) -> Result<Vec<u8>, HostTlsError> {
         let mut bytes = vec![0_u8; SECURITY_MAX_SID_SIZE as usize];
         let mut length = bytes.len() as u32;
         // SAFETY: the buffer and size pointer are valid and large enough for a
         // well-known SID; no domain SID is needed for these two identities.
         unsafe { CreateWellKnownSid(kind, None, PSID(bytes.as_mut_ptr().cast()), &raw mut length) }
-            .map_err(|_| TlsLoadError::AclQueryFailed)?;
+            .map_err(|_| HostTlsError::AclQueryFailed)?;
         bytes.truncate(length as usize);
         Ok(bytes)
     }
@@ -818,7 +397,7 @@ fn validate_restricted_key_acl(file: &std::fs::File) -> Result<bool, TlsLoadErro
         let mut raw_ace = null_mut();
         // SAFETY: AceCount proves both queried indexes are in range.
         unsafe { GetAce(dacl, index, &raw mut raw_ace) }
-            .map_err(|_| TlsLoadError::AclQueryFailed)?;
+            .map_err(|_| HostTlsError::AclQueryFailed)?;
         if raw_ace.is_null() {
             return Ok(false);
         }
@@ -858,259 +437,7 @@ fn validate_restricted_key_acl(file: &std::fs::File) -> Result<bool, TlsLoadErro
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::collections::HashMap;
-    use std::sync::atomic::AtomicU64;
-
-    use arcen_transport::tls::{ClockError, RingCipherSuite, TlsVersionFloor};
-    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
-
     use super::*;
-
-    const NOW: u64 = 1_800_000_000;
-
-    #[derive(Clone)]
-    struct FakeSpec {
-        bytes: Vec<u8>,
-        snapshot: FileSnapshot,
-        changed: bool,
-        restricted_acl: bool,
-    }
-
-    struct FakeHandle {
-        cursor: Cursor<Vec<u8>>,
-        before: FileSnapshot,
-        after: FileSnapshot,
-        snapshots: Cell<u8>,
-        restricted_acl: bool,
-    }
-
-    impl Read for FakeHandle {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            self.cursor.read(buffer)
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeFileSystem {
-        files: HashMap<PathBuf, FakeSpec>,
-    }
-
-    impl FakeFileSystem {
-        fn add(&mut self, path: &str, bytes: Vec<u8>, restricted_acl: bool) {
-            self.files.insert(
-                PathBuf::from(path),
-                FakeSpec {
-                    snapshot: FileSnapshot {
-                        identity: self.files.len() as u128 + 1,
-                        length: bytes.len() as u64,
-                        modified: 1,
-                        regular: true,
-                        reparse: false,
-                        disk: true,
-                    },
-                    bytes,
-                    changed: false,
-                    restricted_acl,
-                },
-            );
-        }
-    }
-
-    impl SecureFileSystem for FakeFileSystem {
-        type Handle = FakeHandle;
-
-        fn open(&self, path: &Path, kind: MaterialKind) -> Result<Self::Handle, TlsLoadError> {
-            let spec = self
-                .files
-                .get(path)
-                .ok_or(TlsLoadError::Missing(kind.label()))?;
-            let mut after = spec.snapshot.clone();
-            if spec.changed {
-                after.modified += 1;
-            }
-            Ok(FakeHandle {
-                cursor: Cursor::new(spec.bytes.clone()),
-                before: spec.snapshot.clone(),
-                after,
-                snapshots: Cell::new(0),
-                restricted_acl: spec.restricted_acl,
-            })
-        }
-
-        fn snapshot(
-            &self,
-            handle: &Self::Handle,
-            _kind: MaterialKind,
-        ) -> Result<FileSnapshot, TlsLoadError> {
-            let count = handle.snapshots.get();
-            handle.snapshots.set(count + 1);
-            Ok(if count == 0 {
-                handle.before.clone()
-            } else {
-                handle.after.clone()
-            })
-        }
-
-        fn private_key_acl_restricted(&self, handle: &Self::Handle) -> Result<bool, TlsLoadError> {
-            Ok(handle.restricted_acl)
-        }
-    }
-
-    #[derive(Debug)]
-    struct TestClock(AtomicU64);
-
-    impl TestClock {
-        fn new(now: u64) -> Self {
-            Self(AtomicU64::new(now))
-        }
-    }
-
-    impl UnixClock for TestClock {
-        fn now_epoch_secs(&self) -> Result<u64, ClockError> {
-            Ok(self.0.load(Ordering::SeqCst))
-        }
-    }
-
-    fn material(name: &str) -> (Vec<u8>, Vec<u8>) {
-        let mut params = CertificateParams::new(vec![name.to_string()]).expect("params");
-        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2040, 1, 1);
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let key = KeyPair::generate().expect("key");
-        let certificate = params.self_signed(&key).expect("certificate");
-        (
-            certificate.pem().into_bytes(),
-            key.serialize_pem().into_bytes(),
-        )
-    }
-
-    fn source(expected_sans: Vec<String>) -> TlsFileSource {
-        TlsFileSource {
-            certificate_path: PathBuf::from("host.crt"),
-            private_key_path: PathBuf::from("host.key"),
-            expected_sans,
-            posture: TlsPosture::new(
-                TlsVersionFloor::default(),
-                std::iter::empty::<RingCipherSuite>(),
-            )
-            .expect("posture"),
-            key_policy: CertificateKeyPolicy::default(),
-            time_policy: CertificateTimePolicy::default(),
-        }
-    }
-
-    fn good_file_system() -> FakeFileSystem {
-        let (certificate, key) = material("host.example");
-        let mut fs = FakeFileSystem::default();
-        fs.add("host.crt", certificate, true);
-        fs.add("host.key", key, true);
-        fs
-    }
-
-    #[test]
-    fn fake_secure_reader_rejects_missing_partial_and_oversized_material() {
-        let fs = FakeFileSystem::default();
-        assert_eq!(
-            read_bounded(&fs, Path::new("missing.crt"), MaterialKind::Certificate),
-            Err(TlsLoadError::Missing("certificate"))
-        );
-
-        let mut partial = FakeFileSystem::default();
-        partial.add("host.crt", b"certificate".to_vec(), true);
-        assert_eq!(
-            read_bounded(&partial, Path::new("host.key"), MaterialKind::PrivateKey),
-            Err(TlsLoadError::Missing("private key"))
-        );
-
-        let mut oversized = FakeFileSystem::default();
-        oversized.add(
-            "host.key",
-            vec![0; MAX_PRIVATE_KEY_PEM_BYTES as usize + 1],
-            true,
-        );
-        assert_eq!(
-            read_bounded(&oversized, Path::new("host.key"), MaterialKind::PrivateKey),
-            Err(TlsLoadError::Oversized(
-                "private key",
-                MAX_PRIVATE_KEY_PEM_BYTES
-            ))
-        );
-    }
-
-    #[test]
-    fn fake_secure_reader_rejects_directory_reparse_device_acl_and_change() {
-        for (mut snapshot, expected) in [
-            (
-                FileSnapshot {
-                    identity: 1,
-                    length: 0,
-                    modified: 1,
-                    regular: false,
-                    reparse: false,
-                    disk: true,
-                },
-                TlsLoadError::NotRegular("private key"),
-            ),
-            (
-                FileSnapshot {
-                    identity: 1,
-                    length: 0,
-                    modified: 1,
-                    regular: true,
-                    reparse: true,
-                    disk: true,
-                },
-                TlsLoadError::ReparsePoint("private key"),
-            ),
-            (
-                FileSnapshot {
-                    identity: 1,
-                    length: 0,
-                    modified: 1,
-                    regular: true,
-                    reparse: false,
-                    disk: false,
-                },
-                TlsLoadError::NonDiskDevice("private key"),
-            ),
-        ] {
-            snapshot.length = 1;
-            let mut fs = FakeFileSystem::default();
-            fs.files.insert(
-                PathBuf::from("host.key"),
-                FakeSpec {
-                    bytes: vec![1],
-                    snapshot,
-                    changed: false,
-                    restricted_acl: true,
-                },
-            );
-            assert_eq!(
-                read_bounded(&fs, Path::new("host.key"), MaterialKind::PrivateKey),
-                Err(expected)
-            );
-        }
-
-        let mut broad = FakeFileSystem::default();
-        broad.add("host.key", vec![1], false);
-        assert_eq!(
-            read_bounded(&broad, Path::new("host.key"), MaterialKind::PrivateKey),
-            Err(TlsLoadError::BroadPrivateKeyAcl)
-        );
-
-        let mut changed = FakeFileSystem::default();
-        changed.add("host.key", vec![1], true);
-        changed
-            .files
-            .get_mut(Path::new("host.key"))
-            .expect("file")
-            .changed = true;
-        assert_eq!(
-            read_bounded(&changed, Path::new("host.key"), MaterialKind::PrivateKey),
-            Err(TlsLoadError::ChangedDuringRead("private key"))
-        );
-    }
 
     #[cfg(windows)]
     #[test]
@@ -1135,107 +462,32 @@ mod tests {
         ] {
             assert_eq!(
                 absolute_without_traversal(path, MaterialKind::Certificate),
-                Err(TlsLoadError::NonDiskDevice("certificate"))
+                Err(HostTlsError::NonDiskDevice("certificate"))
             );
         }
     }
 
+    /// Off Windows the key's DACL cannot be checked, so a build there refuses
+    /// the key rather than serving one nobody inspected.
+    #[cfg(not(windows))]
     #[test]
-    fn exact_one_key_and_matching_pair_are_required() {
-        let (certificate, first_key) = material("host.example");
-        let (_, second_key) = material("host.example");
+    fn a_key_whose_dacl_cannot_be_read_is_refused() {
+        let facts = WindowsFileFacts {
+            identity: 0,
+            length: 1,
+            modified: 0,
+            regular: true,
+            reparse: false,
+            disk: true,
+        };
+        let file = std::fs::File::open(std::env::current_exe().expect("exe")).expect("file");
         assert_eq!(
-            parse_material(&certificate, &[first_key.clone(), second_key].concat()).map(|_| ()),
-            Err(TlsLoadError::MultiplePrivateKeys)
+            SystemSecureFileSystem.admit(&file, &facts, MaterialKind::PrivateKey),
+            Err(HostTlsError::AclQueryFailed)
         );
         assert_eq!(
-            parse_material(&certificate, b"").map(|_| ()),
-            Err(TlsLoadError::MissingPrivateKey)
+            SystemSecureFileSystem.admit(&file, &facts, MaterialKind::Certificate),
+            Ok(())
         );
-
-        let mut fs = FakeFileSystem::default();
-        fs.add("host.crt", certificate, true);
-        fs.add("host.key", material("other.example").1, true);
-        assert_eq!(
-            load_validated(
-                &fs,
-                &source(vec!["host.example".to_string()]),
-                &TestClock::new(NOW)
-            )
-            .map(|_| ()),
-            Err(TlsLoadError::CertificateRejected)
-        );
-    }
-
-    #[test]
-    fn every_expected_san_is_required_and_lifecycle_metadata_is_private() {
-        let fs = good_file_system();
-        let validated = load_validated(
-            &fs,
-            &source(vec!["host.example".to_string()]),
-            &TestClock::new(NOW),
-        )
-        .expect("validated");
-        let fields = certificate_fields(validated.metadata(), None);
-        let rendered = format!("{fields:?}");
-        assert!(rendered.contains("cert_sha256"));
-        assert!(rendered.contains("spki_sha256"));
-        assert!(!rendered.contains("host.example"));
-        assert!(!rendered.contains("host.crt"));
-
-        assert_eq!(
-            load_validated(
-                &fs,
-                &source(vec![
-                    "host.example".to_string(),
-                    "missing.example".to_string()
-                ]),
-                &TestClock::new(NOW)
-            )
-            .map(|_| ()),
-            Err(TlsLoadError::CertificateRejected)
-        );
-    }
-
-    #[test]
-    fn reload_success_failure_and_expiry_keep_fail_closed_state() {
-        let fs = good_file_system();
-        let clock = Arc::new(TestClock::new(NOW));
-        let lifecycle =
-            TlsLifecycle::load_with(&fs, source(vec!["host.example".to_string()]), clock.clone())
-                .expect("lifecycle");
-        assert!(lifecycle.resolver.resolve_current().is_some());
-
-        let replacement = load_validated(
-            &fs,
-            &source(vec!["host.example".to_string()]),
-            clock.as_ref(),
-        )
-        .expect("replacement");
-        lifecycle
-            .resolver
-            .reload_validated(replacement)
-            .expect("reload");
-        let last_good = lifecycle.metadata().expect("metadata").cert_sha256;
-
-        let (_, wrong_key) = material("other.example");
-        let mut mismatch = good_file_system();
-        mismatch
-            .files
-            .get_mut(Path::new("host.key"))
-            .expect("key")
-            .bytes = wrong_key;
-        assert!(load_validated(
-            &mismatch,
-            &source(vec!["host.example".to_string()]),
-            clock.as_ref()
-        )
-        .is_err());
-        assert_eq!(
-            lifecycle.metadata().expect("metadata").cert_sha256,
-            last_good
-        );
-        clock.0.store(3_000_000_000, Ordering::SeqCst);
-        assert!(lifecycle.resolver.resolve_current().is_none());
     }
 }

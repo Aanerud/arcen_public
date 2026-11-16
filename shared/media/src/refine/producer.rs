@@ -1,131 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! The Pier-side refinement producer for a CPU-resident packed-RGB10
-//! source (Linux Xorg depth-30 `XShm`): an exact source mirror that yields
-//! damage by comparison, the scheduler, tile extraction into immutable
-//! snapshots for a compression worker, and the token bucket that paces
-//! finished records. Codec-free: the caller compresses.
+//! The Pier-side refinement producer, generic over a [`RefineSource`]: the
+//! scheduler, tile extraction into immutable snapshots for a compression
+//! worker, and the token bucket that paces finished records. Codec-free:
+//! the caller compresses. The only product-specific part is the source
+//! (`super::source`): for the Linux Xorg depth-30 `XShm` capture it is
+//! [`super::source::PackedRgb10Source`].
 
+use super::RefineContract;
 use super::budget::{MAX_BURST_BYTES, RefineBudget};
 use super::digest::tile_block_fingerprints;
 use super::pier::{PierMonitorRefine, TileJob};
-use super::tile::{RefineGrid, TileCodes, TileRect, extract_packed_rgb10};
-use super::{BLOCK, RefineContract};
-use crate::video::{PackedRgb10Layout, Rgb10Signal};
+use super::source::RefineSource;
+use super::tile::{TileCodes, TileRect};
 use arcen_protocol::refine::{BarrierReason, CODEC_DELTA_ZSTD1, RefineTileHeader};
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub use super::source::SourceMirror;
+
 /// Tiles handed to the worker and not yet finished, plus finished records
 /// not yet written, at most.
 pub const MAX_OUTSTANDING_TILES: usize = 16;
-
-/// An exact CPU copy of the source, updated by compare-and-copy so the
-/// damage it reports is exact per 16×16 block.
-#[derive(Debug, Clone)]
-pub struct SourceMirror {
-    grid: RefineGrid,
-    bytes: Vec<u8>,
-    valid: bool,
-}
-
-impl SourceMirror {
-    /// An empty mirror for `grid`.
-    #[must_use]
-    pub fn new(grid: RefineGrid) -> Self {
-        Self {
-            grid,
-            bytes: vec![0; grid.width as usize * grid.height as usize * 4],
-            valid: false,
-        }
-    }
-
-    /// Bytes per mirror row.
-    #[must_use]
-    pub fn stride(&self) -> usize {
-        self.grid.width as usize * 4
-    }
-
-    /// The mirror.
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Copies a rectangle whose top-left pixel is `src[0]` (rows `stride`
-    /// bytes apart) and returns the blocks whose bytes changed, ascending.
-    /// The first observation marks every block it covers. A rectangle
-    /// outside the source, or a source too short for it, observes nothing.
-    pub fn observe_rect(&mut self, src: &[u8], stride: usize, rect: TileRect) -> Vec<usize> {
-        let (x, y, width, height) = (
-            rect.x as usize,
-            rect.y as usize,
-            rect.width as usize,
-            rect.height as usize,
-        );
-        if width == 0
-            || height == 0
-            || x + width > self.grid.width as usize
-            || y + height > self.grid.height as usize
-            || stride < width * 4
-            || src.len() < stride * (height - 1) + width * 4
-        {
-            return Vec::new();
-        }
-        let first = !self.valid;
-        let cols = self.grid.cols() as usize;
-        let mut dirty = vec![false; self.grid.block_count() as usize];
-        let mirror_stride = self.stride();
-        for row in 0..height {
-            let source_row = &src[row * stride..row * stride + width * 4];
-            let mirror_start = (y + row) * mirror_stride + x * 4;
-            let block_row = (y + row) / BLOCK;
-            let mut column = x;
-            while column < x + width {
-                let block_end = ((column / BLOCK) + 1) * BLOCK;
-                let end = block_end.min(x + width);
-                let from = (column - x) * 4;
-                let to = (end - x) * 4;
-                let mirror = &mut self.bytes[mirror_start + from..mirror_start + to];
-                if first || mirror != &source_row[from..to] {
-                    mirror.copy_from_slice(&source_row[from..to]);
-                    dirty[block_row * cols + column / BLOCK] = true;
-                }
-                column = end;
-            }
-        }
-        if first {
-            self.valid = x == 0
-                && y == 0
-                && width == self.grid.width as usize
-                && height == self.grid.height as usize;
-        }
-        dirty
-            .iter()
-            .enumerate()
-            .filter_map(|(index, dirty)| dirty.then_some(index))
-            .collect()
-    }
-
-    /// Observes a whole frame.
-    pub fn observe_whole(&mut self, src: &[u8], stride: usize) -> Vec<usize> {
-        let rect = TileRect {
-            x: 0,
-            y: 0,
-            width: self.grid.width,
-            height: self.grid.height,
-        };
-        self.observe_rect(src, stride, rect)
-    }
-
-    /// Whether a whole frame has been observed.
-    #[must_use]
-    pub const fn is_valid(&self) -> bool {
-        self.valid
-    }
-}
 
 /// A first refinement generation unique to this process (and to each
 /// producer in it), so a restarted producer that reuses the same
@@ -157,19 +55,26 @@ pub fn process_unique_generation() -> NonZeroU32 {
 pub struct TileWork {
     /// The job.
     pub job: TileJob,
-    /// Its codes, copied out of the mirror.
+    /// Its codes, copied out of the source.
     pub codes: TileCodes,
 }
 
 /// The refinement producer of one monitor.
 #[derive(Debug)]
-pub struct RefineProducer {
+pub struct RefineProducer<S: RefineSource> {
     scheduler: PierMonitorRefine,
-    mirror: SourceMirror,
-    layout: PackedRgb10Layout,
-    signal: Rgb10Signal,
+    source: S,
     depth: u8,
     budget: RefineBudget,
+    /// Ceiling the operator configured; no rate ever exceeds it.
+    max_rate_bps: u64,
+    /// The Pier's link budget set the rate ([`Self::set_link_rate`]); the
+    /// video-target floor no longer applies.
+    link_rate: bool,
+    /// Holds the link budget asked for.
+    pub holds: u64,
+    /// The Deck asked for no tiles (`refine_control`): fences continue.
+    paused: bool,
     in_worker: usize,
     ready: VecDeque<(TileJob, Vec<u8>)>,
     /// Finished records cancelled by motion (their blocks are rescheduled).
@@ -180,21 +85,20 @@ pub struct RefineProducer {
     pub written_bytes: u64,
 }
 
-impl RefineProducer {
-    /// A producer at `rate_bps` (the session's refinement ceiling).
+impl<S: RefineSource> RefineProducer<S> {
+    /// A producer over `source` at `rate_bps` (the session's refinement
+    /// ceiling). `contract` must describe the source's domain and depth.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         scope: (u16, u64, u64),
         contract: RefineContract,
-        grid: RefineGrid,
-        layout: PackedRgb10Layout,
-        signal: Rgb10Signal,
+        source: S,
         still_ms: u32,
         rate_bps: u64,
         now: Duration,
     ) -> Self {
         let (monitor_id, topology_generation, stream_epoch) = scope;
+        let grid = source.grid();
         Self {
             scheduler: PierMonitorRefine::new(
                 monitor_id,
@@ -205,11 +109,13 @@ impl RefineProducer {
                 still_ms,
             )
             .with_first_generation(process_unique_generation()),
-            mirror: SourceMirror::new(grid),
-            layout,
-            signal,
-            depth: contract.bits(),
+            depth: source.depth(),
+            source,
             budget: RefineBudget::new(rate_bps, MAX_BURST_BYTES, now),
+            max_rate_bps: rate_bps,
+            link_rate: false,
+            holds: 0,
+            paused: false,
             in_worker: 0,
             ready: VecDeque::new(),
             dropped: 0,
@@ -224,16 +130,118 @@ impl RefineProducer {
         &self.scheduler
     }
 
-    /// A whole captured frame.
-    pub fn observe_whole(&mut self, src: &[u8], stride: usize, now: Duration) {
-        let dirty = self.mirror.observe_whole(src, stride);
-        self.scheduler.on_capture(dirty, now);
+    /// A whole captured frame; returns the blocks it changed.
+    pub fn observe_whole(&mut self, src: &[u8], stride: usize, now: Duration) -> Vec<usize> {
+        let grid = self.source.grid();
+        let rect = TileRect {
+            x: 0,
+            y: 0,
+            width: grid.width,
+            height: grid.height,
+        };
+        self.observe_rect(src, stride, rect, now)
     }
 
-    /// A captured rectangle (`src[0]` is its top-left pixel).
-    pub fn observe_rect(&mut self, src: &[u8], stride: usize, rect: TileRect, now: Duration) {
-        let dirty = self.mirror.observe_rect(src, stride, rect);
-        self.scheduler.on_capture(dirty, now);
+    /// A captured rectangle (`src[0]` is its top-left pixel); returns the
+    /// blocks it changed.
+    pub fn observe_rect(
+        &mut self,
+        src: &[u8],
+        stride: usize,
+        rect: TileRect,
+        now: Duration,
+    ) -> Vec<usize> {
+        let dirty = self.source.observe(src, stride, rect);
+        self.scheduler.on_capture(dirty.clone(), now);
+        dirty
+    }
+
+    /// Damage known without the pixels (a capture API's dirty regions, for
+    /// a capture whose pixels reach the source later): the blocks are
+    /// invalidated with the next access unit like observed damage. Indices
+    /// outside the grid are ignored; the list need not be sorted.
+    pub fn observe_blocks(&mut self, mut blocks: Vec<usize>, now: Duration) {
+        let count = self.source.grid().block_count() as usize;
+        blocks.retain(|block| *block < count);
+        blocks.sort_unstable();
+        blocks.dedup();
+        self.scheduler.on_capture(blocks, now);
+    }
+
+    /// The source, for a capture loop that updates it itself (a lagging
+    /// readback marks it stale, then observes the frame it read back).
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// The floor before the Pier's link budget has a path sample: the
+    /// session's current video bitrate target, never above the configured
+    /// ceiling. Ignored once [`Self::set_link_rate`] has set the rate
+    /// (ADR 0016, refinement-budget amendment).
+    pub fn cap_rate(&mut self, bps: u64, now: Duration) {
+        if !self.link_rate {
+            self.budget.set_rate(bps.min(self.max_rate_bps), now);
+        }
+    }
+
+    /// The rate the Pier's link budget allows from the link's residual
+    /// (ADR 0016 R6), never above the configured ceiling. `hold` freezes
+    /// the bucket and cancels finished records (their blocks are refined
+    /// again later) until the next call without it.
+    pub fn set_link_rate(&mut self, bps: u64, hold: bool, now: Duration) {
+        self.link_rate = true;
+        self.budget.set_rate(bps.min(self.max_rate_bps), now);
+        if hold {
+            if !self.budget.is_suspended(now) {
+                self.holds += 1;
+            }
+            // Until the next budget window at the latest; a later call
+            // without `hold` releases it at once.
+            self.budget
+                .hold_until(now, now.saturating_add(super::budget::RESUME_AFTER * 3));
+            for (job, _) in std::mem::take(&mut self.ready) {
+                self.scheduler.tile_dropped(&job);
+                self.dropped += 1;
+            }
+        } else {
+            self.budget.release(now);
+        }
+    }
+
+    /// Whether the link budget set the rate (`false`: the video-target
+    /// floor).
+    #[must_use]
+    pub const fn rate_from_link(&self) -> bool {
+        self.link_rate
+    }
+
+    /// Current refinement rate.
+    #[must_use]
+    pub const fn rate_bps(&self) -> u64 {
+        self.budget.rate_bps()
+    }
+
+    /// The Deck turned refinement off for this monitor (`false`) or on
+    /// again (`true`). Pausing drops queued records; resuming starts a new
+    /// generation, so nothing refined before the pause inherits validity.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled != self.paused {
+            return;
+        }
+        self.paused = !enabled;
+        if enabled {
+            self.reset(BarrierReason::Reenable);
+        } else {
+            for (job, _) in std::mem::take(&mut self.ready) {
+                self.scheduler.tile_dropped(&job);
+            }
+        }
+    }
+
+    /// Whether the Deck paused refinement.
+    #[must_use]
+    pub const fn is_paused(&self) -> bool {
+        self.paused
     }
 
     /// Records to write on the video lane immediately before the next
@@ -253,21 +261,13 @@ impl RefineProducer {
     /// [`MAX_OUTSTANDING_TILES`] outstanding.
     pub fn take_work(&mut self, now: Duration) -> Vec<TileWork> {
         let room = MAX_OUTSTANDING_TILES.saturating_sub(self.in_worker + self.ready.len());
-        if !self.mirror.is_valid() || room == 0 || self.budget.is_suspended(now) {
+        if self.paused || !self.source.ready() || room == 0 || self.budget.is_suspended(now) {
             return Vec::new();
         }
         let grid = self.scheduler.grid();
-        let stride = self.mirror.stride();
         let mut work = Vec::new();
         for job in self.scheduler.due_tiles(now, room) {
-            match extract_packed_rgb10(
-                self.mirror.bytes(),
-                stride,
-                grid,
-                job.rect,
-                self.layout,
-                self.signal,
-            ) {
+            match self.source.extract(job.rect) {
                 Ok(codes) => {
                     self.scheduler
                         .tile_fingerprints(&job, &tile_block_fingerprints(grid, job.rect, &codes));
@@ -295,7 +295,7 @@ impl RefineProducer {
         let header = RefineTileHeader {
             scope: job.scope,
             valid_from_fence: job.valid_from_fence,
-            domain: arcen_protocol::refine::RefineDomain::Rgb,
+            domain: self.source.domain(),
             depth: self.depth,
             codec: CODEC_DELTA_ZSTD1,
             x: narrow(job.rect.x),
@@ -338,48 +338,16 @@ impl RefineProducer {
 
     /// A digest record, once the monitor has settled and the covered set
     /// changed since the last digest. Built from the fingerprints taken at
-    /// extraction: the mirror's compare-and-copy damage is exact, so
+    /// extraction: a [`RefineSource`] reports exact damage, so
     /// re-reading the source could only return the same bytes, and the
     /// capture thread never re-fingerprints the screen (a keepalive or an
     /// idle caret costs nothing here).
     pub fn digest(&mut self, now: Duration) -> Option<Vec<u8>> {
-        if !self.ready.is_empty() || self.in_worker > 0 {
+        if self.paused || !self.ready.is_empty() || self.in_worker > 0 {
             return None;
         }
         self.scheduler
             .digest_from_stored(now)
             .map(|digest| digest.encode())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_mirror_reports_exact_block_damage() {
-        let grid = RefineGrid {
-            width: 40,
-            height: 20,
-        };
-        let mut mirror = SourceMirror::new(grid);
-        let mut frame = vec![7_u8; 40 * 20 * 4];
-        assert_eq!(mirror.observe_whole(&frame, 160).len(), 6);
-        assert!(mirror.observe_whole(&frame, 160).is_empty());
-        // One pixel in block (2, 1).
-        frame[(17 * 40 + 33) * 4] = 9;
-        assert_eq!(mirror.observe_whole(&frame, 160), vec![5]);
-        // A region read: only its blocks are compared, and a block the
-        // region touches but did not change is not damaged.
-        frame[(18 * 40 + 31) * 4] = 1;
-        let rect = TileRect {
-            x: 30,
-            y: 16,
-            width: 4,
-            height: 4,
-        };
-        let src = frame[(16 * 40 + 30) * 4..].to_vec();
-        assert_eq!(mirror.observe_rect(&src, 160, rect), vec![4]);
-        assert_eq!(&mirror.bytes()[(18 * 40 + 31) * 4], &1);
     }
 }

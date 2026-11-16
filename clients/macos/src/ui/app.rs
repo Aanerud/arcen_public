@@ -4,15 +4,13 @@
 use crate::observability::ClientTelemetry;
 use crate::pipeline::frame_queue::IncomingMediaTelemetry;
 use crate::pipeline::video_decoder::DecodedVideoFrame;
-#[cfg(test)]
-use crate::protocol::messages::TabletModeReason;
 use crate::protocol::messages::{
-    AuthRequest, ClientMonitor, CursorMode, CursorModeResultMsg, GestureMagnifyMsg,
-    GestureRotateMsg, GestureSmartZoomMsg, GestureSwipeMsg, HealthPongMsg, HealthStatsMsg,
+    AuthRequest, ClientMonitor, CursorMode, CursorModeResultMsg, HealthPongMsg, HealthStatsMsg,
     InputCapabilityAvailability, KeyEventMsg, KeyResetModifiersMsg, MouseButtonMsg,
-    MouseMoveRelativeMsg, PointerMotionMode, ScrollPhaseMsg, ServerHelloMsg, SwipeDirectionMsg,
-    TabletModeMsg, TabletModeResultMsg,
+    MouseMoveRelativeMsg, PointerMotionMode, ServerHelloMsg, TabletModeMsg, TabletModeResultMsg,
 };
+#[cfg(test)]
+use crate::protocol::messages::{ScrollPhaseMsg, TabletModeReason};
 use crate::reconnect::{
     fresh_holder_nonce, ConnectionIdentity, MonotonicClock, ReconnectController, ReconnectPhase,
     SystemClock, SystemJitter,
@@ -26,44 +24,80 @@ use crate::transport::websocket::{
 };
 use crate::ui::display_fit::DisplayFitTracker;
 use crate::ui::home::{
-    render_home, ConnectionDraft, ConnectionKind, HomeAction, HomeViewState,
-    SavedConnectionSettings, SavedConnectionSummary, SavedTransport,
+    apply_home_action, render_home, ConnectionDraft, HomeAction, HomeEffect, HomeViewState,
 };
 use crate::ui::keyboard::{KeyboardAction, KeyboardInput, NativeKeyMetadata};
 use crate::ui::macos_menu;
-use crate::ui::media_worker::{
-    spawn_media_worker, MonitorPresentationTarget, NativePresentationMetadata, SharedMediaState,
-};
+use crate::ui::media_worker::{spawn_media_worker, NativePresentationMetadata, SharedMediaState};
 use crate::ui::multi_window_activation::{
     self, MultiWindowSessionState, MULTI_WINDOW_ENTER_TIMEOUT,
 };
 use crate::ui::multi_window_runtime::{
-    live_active_displays, monitor_index_in, viewport_builder_for, window_display_id,
-    window_number_for_title, window_title_for, ActiveDisplayInfo, MonitorWindowAssignment,
-    MultiWindowEnterAttempt, MultiWindowEnterPoll, MultiWindowPlan, ViewportBindObservation,
+    build_plan, live_active_displays, monitor_index_in, viewport_builder_for, viewport_id_for,
+    window_display_id, window_number_for_title, window_title_for, ActiveDisplayInfo,
+    MultiWindowEnterAttempt, MultiWindowEnterPoll, ViewportBindObservation,
 };
 use crate::ui::multi_window_session::ValidatedAppliedTopology;
 use crate::ui::pen_input::{PenInput, PenLink, PenRoute, SharedInputSequence, SharedRegionRuntime};
 use crate::ui::region_runtime::{DeckRegionRuntime, LegacyRegionWireMessage, RegionViewport};
-use crate::ui::session_truth::{self, ActiveContract, ExactnessReadout, NegotiatedTruth};
+#[cfg(any(test, feature = "dev-tools"))]
+use crate::ui::session_truth;
+use crate::ui::session_truth::{ActiveContract, ExactnessReadout, NegotiatedTruth};
 use crate::ui::theme;
 use crate::ui::video_metal_layer::{
     DedicatedEightBitPresentationStatus, DedicatedEightBitVideoPresenter, DedicatedLayerFrame,
     DedicatedPresentationStatus, DedicatedVideoPresenter,
 };
 use crate::ui::video_render::RemoteVideoFrame;
-use arcen_input::{FractionalMotionAccumulator, PenTool, RegionInputWireMessage};
+#[cfg(test)]
+use arcen_deck_core::connect_plan::{
+    advertised_physical_size_mm, apply_remote_ui_scale, effective_monitor_stream_scale,
+    effective_remote_ui_percent, negotiated_live_display_state,
+};
+pub use arcen_deck_core::connect_plan::{
+    apply_automatic_remote_ui_scale_to_monitors, apply_automatic_remote_ui_scale_to_topology,
+    monitors_for_displays_mode,
+};
+use arcen_deck_core::connect_plan::{
+    apply_remote_ui_scale_to_requested_topology, approved_multi_monitor_selection,
+    client_monitors_from_topology, display_fit_gate, full_color_display_ids,
+    legacy_roster_for_connect_options, monitors_for_policy, primary_monitor, StreamSizingPolicy,
+};
+use arcen_deck_core::reconnect_flow::ResumeLaunch;
+use arcen_deck_core::screens::certificate::{
+    render_certificate_changed, render_certificate_warning, CertificateAction,
+    CertificateChangedAction, CertificateFacts, RememberedIdentity,
+};
+use arcen_deck_core::screens::connecting::{
+    render_connecting, render_displays_unsupported, render_topology_conflict, ConnectingAction,
+    DisplaysUnsupportedAction, TopologyConflictAction,
+};
+use arcen_deck_core::screens::reconnect::{
+    render_reconnecting, render_signing_in, HeldFrame, HeldFrameAction,
+};
+use arcen_deck_core::screens::sign_in::{
+    render_credentials, render_disclaimer, CredentialAction, CredentialsView, DisclaimerAction,
+};
+#[cfg(test)]
+use arcen_deck_core::screens::statistics::{client_video_health_rows, host_path_row};
+use arcen_deck_core::screens::statistics::{
+    exact_status_line, health_overlay_text, paint_health_overlay, paint_lossless_tiles,
+    paint_negotiated_truth_panel, paint_presentation_warning, paint_stream_stats,
+    paint_truth_badge, stream_pipeline_label, DecodeTruth, HealthOverlayFacts,
+};
+use arcen_deck_core::screens::widgets::{back_button, labelled_line_edit};
+#[cfg(test)]
+use arcen_input::PenTool;
+use arcen_input::{FractionalMotionAccumulator, RegionInputWireMessage};
 use arcen_telemetry::{rate_per_second, rounded_percentiles_ms};
 use arcen_transport::tls::TlsPin;
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::CGColor;
 #[cfg(target_os = "macos")]
 use objc2_quartz_core::CATransaction;
-use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -76,7 +110,6 @@ const UI_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 /// local input each wake the UI themselves; this poll only bounds what is
 /// drained per pass without a wake (telemetry, inbound clipboard).
 const UI_IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
-const CONNECTING_PROGRESS_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 /// How long after local input the session keeps the 16 ms poll.
 const UI_ACTIVE_WINDOW: Duration = Duration::from_secs(1);
 const TELEMETRY_WINDOW: Duration = Duration::from_secs(2);
@@ -134,6 +167,7 @@ impl UiLoadMeter {
 }
 
 /// User plus system CPU time this process has used.
+#[cfg(unix)]
 fn process_cpu_time() -> Duration {
     // SAFETY: `getrusage` only writes the zeroed `rusage` it is given.
     let usage = unsafe {
@@ -152,6 +186,12 @@ fn process_cpu_time() -> Duration {
         )
     };
     time(usage.ru_utime) + time(usage.ru_stime)
+}
+
+/// Not measured off Unix yet: the Windows Deck reads `GetProcessTimes`.
+#[cfg(not(unix))]
+fn process_cpu_time() -> Duration {
+    Duration::ZERO
 }
 
 /// The session background must not cover a dedicated video layer that is still
@@ -369,39 +409,6 @@ fn should_schedule_session_poll(
     transitioning || (has_session_commands && matches!(screen, AppScreen::InSession))
 }
 
-/// Start angle of the connecting arc, quantised to the repaint cadence so the
-/// animation never asks for more passes than `CONNECTING_PROGRESS_REPAINT_INTERVAL`.
-fn connecting_progress_angle(time_seconds: f64) -> f64 {
-    let step = CONNECTING_PROGRESS_REPAINT_INTERVAL.as_secs_f64();
-    (time_seconds / step).floor() * step * std::f64::consts::TAU
-}
-
-/// Paints the same arc as `egui::Spinner` without its per-frame
-/// `request_repaint`, which otherwise drives the UI at display refresh while
-/// a session is only connecting.
-fn paint_connecting_progress(ui: &mut egui::Ui, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    ui.ctx()
-        .request_repaint_after(CONNECTING_PROGRESS_REPAINT_INTERVAL);
-    let radius = rect.height().min(rect.width()) / 2.0 - 2.0;
-    let start = connecting_progress_angle(ui.input(|input| input.time));
-    let end = start + 240f64.to_radians();
-    let points = (0..32)
-        .map(|i| {
-            let angle = start + (end - start) * f64::from(i) / 32.0;
-            let (sin, cos) = angle.sin_cos();
-            rect.center() + radius * egui::vec2(cos as f32, sin as f32)
-        })
-        .collect();
-    ui.painter().add(egui::Shape::line(
-        points,
-        egui::Stroke::new(3.0, egui::Color32::from_rgb(0x66, 0x66, 0x66)),
-    ));
-}
-
 /// The one authoritative egui pointer button -> wire mouse button mapping,
 /// shared verbatim by the root viewport's pointer dispatch and every
 /// secondary viewport's (`dispatch_secondary_pointer`) so both can never
@@ -505,57 +512,6 @@ fn apply_secondary_host_cursor(
 /// `image` prepared for the native cursor at the scale `image_rect` shows a
 /// stream `stream_width` pixels wide at, reusing `presented` when the image
 /// and scale are unchanged.
-/// The viewer point for a position at `fraction` of the stream, or `None`
-/// outside it.
-fn host_pointer_point(image_rect: egui::Rect, fraction: (f64, f64)) -> Option<egui::Pos2> {
-    let (x, y) = fraction;
-    if !(0.0..1.0).contains(&x) || !(0.0..1.0).contains(&y) {
-        return None;
-    }
-    Some(egui::pos2(
-        image_rect.left() + (x as f32) * image_rect.width(),
-        image_rect.top() + (y as f32) * image_rect.height(),
-    ))
-}
-
-/// A plain arrow with its tip at `at`, for a host cursor the Deck has no
-/// image of.
-fn paint_pointer_arrow(painter: &egui::Painter, at: egui::Pos2) {
-    const ARROW: [[f32; 2]; 7] = [
-        [0.0, 0.0],
-        [0.0, 17.0],
-        [4.0, 13.0],
-        [7.0, 20.0],
-        [9.5, 19.0],
-        [6.5, 12.0],
-        [12.0, 12.0],
-    ];
-    let points = ARROW
-        .iter()
-        .map(|[x, y]| at + egui::vec2(*x, *y))
-        .collect::<Vec<_>>();
-    painter.add(egui::Shape::convex_polygon(
-        points.clone(),
-        egui::Color32::WHITE,
-        egui::Stroke::NONE,
-    ));
-    painter.add(egui::Shape::closed_line(
-        points,
-        egui::Stroke::new(1.0, egui::Color32::BLACK),
-    ));
-}
-
-/// A small pen mark centred on `at`: a white dot ringed in black, visible
-/// on any background, for a host that hides its pointer while a bridged pen
-/// drives it (`arcen_input::host_pointer::LedPointerMark::PenMark`).
-fn paint_pen_mark(painter: &egui::Painter, at: egui::Pos2) {
-    painter.circle(
-        at,
-        3.5,
-        egui::Color32::WHITE,
-        egui::Stroke::new(1.5, egui::Color32::BLACK),
-    );
-}
 
 /// One host-led cursor decision, logged when it changes (booleans only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -969,20 +925,12 @@ pub enum AppScreen {
     Settings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReconnectOverlay {
-    pub attempt: u32,
-    pub next_retry: Option<Duration>,
-    pub deadline: Duration,
-    pub last_error: String,
-}
-
-/// How long Cmd+Q must be held in a session to quit the Deck.
-const QUIT_HOLD: Duration = Duration::from_secs(3);
+pub use arcen_deck_core::reconnect_flow::ReconnectOverlay;
 
 /// Why HDR cannot be chosen.
-const NO_HDR_SCREEN: &str =
-    "No HDR-capable screen found. Connect an HDR display to use this preset.";
+const NO_HDR_SCREEN: &str = arcen_deck_core::screens::settings::no_hdr_screen(
+    arcen_deck_core::screens::wording::DeckPlatform::Mac,
+);
 
 /// How long a reading of whether any screen can show HDR is trusted.
 const HDR_SCREEN_REFRESH: Duration = Duration::from_secs(2);
@@ -1002,27 +950,6 @@ fn without_unavailable_hdr(
     Some((performance, color))
 }
 
-/// What a held Cmd+Q does next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuitHoldStep {
-    /// Still held, not long enough yet.
-    Holding,
-    /// Held for [`QUIT_HOLD`]: the Deck quits.
-    Quit,
-    /// Let go sooner: the tap was for the host.
-    SendToHost,
-}
-
-const fn quit_hold_step(held: bool, elapsed: Duration) -> QuitHoldStep {
-    if !held {
-        QuitHoldStep::SendToHost
-    } else if elapsed.as_millis() >= QUIT_HOLD.as_millis() {
-        QuitHoldStep::Quit
-    } else {
-        QuitHoldStep::Holding
-    }
-}
-
 /// A sign-in screen the Deck will follow into the desktop that replaces it.
 ///
 /// The schedule is shared (`arcen_session::login_window_handover`); what
@@ -1033,563 +960,8 @@ struct LoginWindowHandover {
     auth: crate::transport::websocket::AuthSubmission,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CredentialAction {
-    None,
-    Back,
-    Connect,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisclaimerAction {
-    None,
-    Accept,
-    Decline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CertificateAction {
-    None,
-    Cancel,
-    TrustForSession,
-    TrustAndRemember,
-}
-
-/// What the user chose when a remembered identity turned out not to match.
-///
-/// There is deliberately no "trust the new one" here. Accepting a replacement
-/// in a single click would show the user a fingerprint at the moment they are
-/// most motivated to dismiss it. Forgetting instead drops the stale pin and
-/// nothing more; the next connection raises the ordinary first-use prompt,
-/// where the new fingerprint is displayed for comparison before it is trusted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CertificateChangedAction {
-    None,
-    Cancel,
-    ForgetAndReconnect,
-}
-
-/// Which settings panel is showing. Mirrors the reference client's left nav.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsTab {
-    Language,
-    Streaming,
-    Displays,
-    Microphone,
-    Clipboard,
-    Input,
-    Logs,
-    Advanced,
-}
-
-impl SettingsTab {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            SettingsTab::Language => "Language",
-            SettingsTab::Streaming => "Streaming",
-            SettingsTab::Displays => "Displays",
-            SettingsTab::Microphone => "Microphone",
-            SettingsTab::Clipboard => "Clipboard",
-            SettingsTab::Input => "Input",
-            SettingsTab::Logs => "Logs",
-            SettingsTab::Advanced => "Advanced",
-        }
-    }
-}
-
-/// Log verbosity, matching the reference client's Level 0..3 scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel {
-    Critical,
-    Error,
-    Info,
-    Debug,
-}
-
-impl LogLevel {
-    const ALL: [LogLevel; 4] = [
-        LogLevel::Critical,
-        LogLevel::Error,
-        LogLevel::Info,
-        LogLevel::Debug,
-    ];
-
-    fn index(self) -> u8 {
-        match self {
-            LogLevel::Critical => 0,
-            LogLevel::Error => 1,
-            LogLevel::Info => 2,
-            LogLevel::Debug => 3,
-        }
-    }
-
-    fn from_index(value: u8) -> Self {
-        match value {
-            0 => LogLevel::Critical,
-            1 => LogLevel::Error,
-            3 => LogLevel::Debug,
-            _ => LogLevel::Info,
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            LogLevel::Critical => "Level 0 Critical",
-            LogLevel::Error => "Level 1 Error",
-            LogLevel::Info => "Level 2 Info",
-            LogLevel::Debug => "Level 3 Debug",
-        }
-    }
-
-    fn profile(self) -> arcen_telemetry::OperationalProfile {
-        match self {
-            LogLevel::Critical => arcen_telemetry::OperationalProfile::Critical,
-            LogLevel::Error => arcen_telemetry::OperationalProfile::Error,
-            LogLevel::Info => arcen_telemetry::OperationalProfile::Info,
-            LogLevel::Debug => arcen_telemetry::OperationalProfile::Debug,
-        }
-    }
-}
-
-/// Certificate verification strictness for outgoing connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SecurityMode {
-    High,
-    Medium,
-    Low,
-}
-
-impl SecurityMode {
-    fn key(self) -> &'static str {
-        match self {
-            SecurityMode::High => "high",
-            SecurityMode::Medium => "medium",
-            SecurityMode::Low => "low",
-        }
-    }
-
-    fn from_key(value: &str) -> Self {
-        match value {
-            "high" => SecurityMode::High,
-            "low" => SecurityMode::Low,
-            _ => SecurityMode::Medium,
-        }
-    }
-}
-
-/// Preferred frame-rate/latency profile for the video stream.
-///
-/// This used to also pick the codec and chroma subsampling (High = HEVC
-/// 4:4:4, the other two modes = H.264 4:2:0), back when there was only one
-/// axis of "how much colour fidelity". Now that [`ColorFidelity`] owns the
-/// full codec/chroma/bit-depth/range/matrix contract as its own independent
-/// setting, `PerformanceMode` keeps exactly the one thing that is genuinely
-/// about performance rather than colour: the frame-rate ceiling. See
-/// `connect_options_with_stream_sizing_policy`, which is the one place these
-/// two settings still meet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PerformanceMode {
-    Standard,
-    High,
-    HighLegacy,
-}
-
-impl PerformanceMode {
-    fn key(self) -> &'static str {
-        match self {
-            PerformanceMode::Standard => "standard",
-            PerformanceMode::High => "high",
-            PerformanceMode::HighLegacy => "high_legacy",
-        }
-    }
-
-    fn from_key(value: &str) -> Self {
-        match value {
-            "high" => PerformanceMode::High,
-            "standard" => PerformanceMode::Standard,
-            "high_legacy" => PerformanceMode::HighLegacy,
-            _ => PerformanceMode::Standard,
-        }
-    }
-
-    /// Frame-rate ceiling for GUI-initiated sessions. Standard trades peak
-    /// smoothness for steadier cadence; High/Legacy run the full 60 fps path.
-    ///
-    /// This is the only thing `PerformanceMode` still controls: `High` and
-    /// `HighLegacy` are now behaviourally identical (both 60 fps, with colour
-    /// fully decoupled into `ColorFidelity`). `HighLegacy` is kept only so a
-    /// `settings.json` persisted before this change keeps loading to the same
-    /// frame-rate ceiling it always had; there is no reason for a new choice
-    /// to prefer it over `High`.
-    fn max_fps(self) -> u32 {
-        match self {
-            PerformanceMode::Standard => 30,
-            PerformanceMode::High | PerformanceMode::HighLegacy => 60,
-        }
-    }
-}
-
-const fn streaming_contract(
-    preset: arcen_media::video::StreamingPreset,
-) -> arcen_media::video::PresetContract {
-    arcen_media::video::contract(preset)
-}
-
-/// Colour-fidelity preset for the video stream. Standard fixes the ordinary
-/// 4:2:0/8-bit colour axes while authorizing host-ranked AV1/HEVC/H.264;
-/// higher presets request concrete HEVC 4:4:4 contracts.
-///
-/// `Standard` reproduces Arcen's historical contract exactly (H.264 4:2:0
-/// 8-bit limited range), so it is both the default for a new install and
-/// what every settings.json written before this setting existed resolves to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorFidelity {
-    /// Adaptive hardware codec, 4:2:0 8-bit limited range. The H.264 value in
-    /// `preset_configuration` is the legacy compatibility preference; the
-    /// auth-time selection intent authorizes the Pier to choose AV1/HEVC/H.264.
-    Standard,
-    /// HEVC 4:4:4 8-bit full range -- no chroma subsampling and the full
-    /// code range, at the original 8-bit depth.
-    FullColour,
-    /// HEVC 4:4:4 10-bit full range BT.709 -- the grader/VFX-grade target
-    /// contract (`arcen_media::VideoConfiguration::grading_reference`).
-    GradingReference,
-    /// HEVC 4:4:4 10-bit full range, **PQ over BT.2020** -- the HDR10 ask.
-    ///
-    /// The only preset whose transfer is not an SDR curve, and therefore the
-    /// only one that asks a host to compose, capture and encode the desktop
-    /// wide. `GradingReference` is already 10-bit; depth is not what makes
-    /// this HDR, the transfer is.
-    Hdr10,
-}
-
-impl ColorFidelity {
-    fn key(self) -> &'static str {
-        match self {
-            ColorFidelity::Standard => "standard",
-            ColorFidelity::FullColour => "full_colour",
-            ColorFidelity::GradingReference => "grading_reference",
-            ColorFidelity::Hdr10 => "hdr10",
-        }
-    }
-
-    fn from_key(value: &str) -> Self {
-        match value {
-            "full_colour" => ColorFidelity::FullColour,
-            "grading_reference" => ColorFidelity::GradingReference,
-            "hdr10" => ColorFidelity::Hdr10,
-            _ => ColorFidelity::Standard,
-        }
-    }
-
-    /// One-line description of this preset's contract, suitable for the
-    /// Advanced settings UI (see `settings_radio`).
-    fn describe(self) -> &'static str {
-        match self {
-            ColorFidelity::Standard => "Automatic performance codec, 4:2:0 8-bit limited range",
-            ColorFidelity::FullColour => "4:4:4 8-bit full range -- no chroma subsampling",
-            ColorFidelity::GradingReference => {
-                "4:4:4 10-bit full range, BT.709 -- highest-fidelity SDR. The extra depth \
-                 absorbs rounding, not brightness; added latency"
-            }
-            ColorFidelity::Hdr10 => {
-                "4:4:4 10-bit, PQ over BT.2020 -- asks the host to compose, capture and \
-                 stream in HDR. Hosts without a proven HDR desktop provider visibly degrade \
-                 to Grading Reference SDR"
-            }
-        }
-    }
-
-    /// Short display name for this preset, used as the settings-radio title
-    /// in the Colour fidelity section (`describe` is that radio's longer
-    /// body text).
-    fn title(self) -> &'static str {
-        match self {
-            ColorFidelity::Standard => "Standard (Adaptive)",
-            ColorFidelity::FullColour => "Full Colour (SDR)",
-            ColorFidelity::GradingReference => "Grading Reference (SDR)",
-            ColorFidelity::Hdr10 => "HDR10 (wide)",
-        }
-    }
-
-    /// Encoder effort follows the user-facing fidelity choice. Grading is the
-    /// only preset that intentionally trades interaction latency for image
-    /// quality; ordinary and full-colour work remain latency-first.
-    const fn encode_intent(self) -> arcen_media::EncodeIntent {
-        match self {
-            Self::GradingReference | Self::Hdr10 => arcen_media::EncodeIntent::Quality,
-            Self::Standard | Self::FullColour => arcen_media::EncodeIntent::Interactive,
-        }
-    }
-
-    /// The compatibility codec preference plus complete colour axes this
-    /// preset asks for, before any Advanced axis override in
-    /// [`ColorFidelityOverrides`] is applied.
-    fn preset_configuration(self) -> arcen_media::VideoConfiguration {
-        match self {
-            ColorFidelity::Standard => arcen_media::VideoConfiguration::legacy_h264(),
-            ColorFidelity::FullColour => arcen_media::VideoConfiguration {
-                codec: arcen_media::VideoCodec::H265,
-                chroma: arcen_media::ChromaSubsampling::Yuv444,
-                bit_depth: arcen_media::BitDepth::Eight,
-                range: arcen_media::ColorRange::Full,
-                matrix: arcen_media::ColorMatrix::Bt709,
-                primaries: arcen_media::ColorPrimaries::Bt709,
-                transfer: arcen_media::TransferCharacteristics::Bt709,
-            },
-            ColorFidelity::GradingReference => arcen_media::VideoConfiguration::grading_reference(),
-            ColorFidelity::Hdr10 => arcen_media::VideoConfiguration {
-                codec: arcen_media::VideoCodec::H265,
-                chroma: arcen_media::ChromaSubsampling::Yuv444,
-                bit_depth: arcen_media::BitDepth::Ten,
-                range: arcen_media::ColorRange::Full,
-                matrix: arcen_media::ColorMatrix::Bt2020Ncl,
-                primaries: arcen_media::ColorPrimaries::Bt2020,
-                transfer: arcen_media::TransferCharacteristics::Pq,
-            },
-        }
-    }
-}
-
-/// Advanced per-axis overrides on top of a [`ColorFidelity`] preset.
-///
-/// Every axis defaults to `None`, meaning "follow the preset". Setting an
-/// axis to `Some` marks it as the user's explicit choice, distinct from
-/// whatever the preset itself asks for on that axis, so a later preset
-/// change -- which only ever replaces an axis this struct leaves `None` --
-/// can never silently discard it. See
-/// [`ColorFidelitySettings::resolved_variant`] for the full precedence rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct ColorFidelityOverrides {
-    codec: Option<arcen_media::VideoCodec>,
-    chroma: Option<arcen_media::ChromaSubsampling>,
-    bit_depth: Option<arcen_media::BitDepth>,
-    range: Option<arcen_media::ColorRange>,
-    matrix: Option<arcen_media::ColorMatrix>,
-}
-
-impl ColorFidelityOverrides {
-    /// Applies whichever axes this struct sets on top of `base`, leaving
-    /// `base`'s own value for every axis left `None`. Colour primaries and
-    /// transfer characteristics are not an overridable axis here and always
-    /// come from `base`.
-    fn apply_to(self, base: arcen_media::VideoConfiguration) -> arcen_media::VideoConfiguration {
-        arcen_media::VideoConfiguration {
-            codec: self.codec.unwrap_or(base.codec),
-            chroma: self.chroma.unwrap_or(base.chroma),
-            bit_depth: self.bit_depth.unwrap_or(base.bit_depth),
-            range: self.range.unwrap_or(base.range),
-            matrix: self.matrix.unwrap_or(base.matrix),
-            ..base
-        }
-    }
-}
-
-/// A client's full colour-fidelity choice: a [`ColorFidelity`] preset, any
-/// Advanced per-axis [`ColorFidelityOverrides`] on top of it, and an optional
-/// explicit probe-matrix variant that bypasses both.
-///
-/// Persisted as part of [`ClientSettings`]; see `load_client_settings` and
-/// `save_client_settings`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColorFidelitySettings {
-    preset: ColorFidelity,
-    overrides: ColorFidelityOverrides,
-    /// Explicit variant to stream, identified by its stable
-    /// `arcen_media::video::VideoVariant` id (e.g. `hevc-444-10-full-bt709`).
-    /// Typically one of the 11 `arcen_media::video::PROBE_MATRIX` rows, so
-    /// the w0 testing machine can drive any of them directly from
-    /// settings.json, bypassing `overrides` and `preset` entirely -- though
-    /// any coherent id is accepted, not only those 11. `None` for ordinary
-    /// use.
-    variant_override: Option<arcen_media::video::VideoVariant>,
-}
-
-impl Default for ColorFidelitySettings {
-    fn default() -> Self {
-        Self {
-            preset: ColorFidelity::Standard,
-            overrides: ColorFidelityOverrides::default(),
-            variant_override: None,
-        }
-    }
-}
-
-impl ColorFidelitySettings {
-    fn video_selection(self) -> arcen_protocol::messages::VideoSelectionIntent {
-        if cfg!(feature = "dev-tools")
-            && (self.variant_override.is_some()
-                || self.overrides.codec.is_some()
-                || self
-                    .overrides
-                    .chroma
-                    .is_some_and(|chroma| chroma != arcen_media::ChromaSubsampling::Yuv420))
-        {
-            return arcen_protocol::messages::VideoSelectionIntent::Exact;
-        }
-        match self.preset {
-            ColorFidelity::Standard => {
-                arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance
-            }
-            ColorFidelity::FullColour | ColorFidelity::GradingReference | ColorFidelity::Hdr10 => {
-                arcen_protocol::messages::VideoSelectionIntent::ColorFidelity
-            }
-        }
-    }
-
-    /// Resolves the effective video contract, applying precedence:
-    /// `variant_override` (an explicit probe-matrix row) beats any
-    /// individual `overrides` axis, which in turn beats `preset`. An axis
-    /// `overrides` leaves `None` falls through to the preset's own value for
-    /// that axis.
-    ///
-    /// `variant_override` is always coherent -- it can only ever have been
-    /// populated by a successful `VideoVariant::from_id`, which checks this
-    /// itself. Individual `overrides` axes are *not* cross-checked against
-    /// each other here, though: each axis is applied independently, so a
-    /// combination the caller picks one axis at a time (e.g. the Standard
-    /// preset's 4:2:0 chroma plus an identity-matrix override, with no
-    /// accompanying chroma override) can still resolve to a
-    /// [`arcen_media::video::VideoVariant`] that is not offered. Call
-    /// `.is_coherent()` on the result before relying on it for anything that
-    /// must actually stream.
-    fn resolved_variant(self) -> arcen_media::video::VideoVariant {
-        if let Some(variant) = self.variant_override {
-            return variant;
-        }
-        let configuration = self.overrides.apply_to(self.preset.preset_configuration());
-        arcen_media::video::VideoVariant::new(configuration)
-    }
-}
-
-/// The four ordinary streaming choices shown by the Deck.
-///
-/// The persisted performance and colour settings remain separate for
-/// backwards compatibility and for developer-only axis overrides. This type
-/// is the simple product surface that maps each user choice to one complete,
-/// coherent pair of settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamingPreset {
-    Auto,
-    Speed,
-    Grading,
-    Hdr,
-    Custom,
-}
-
-impl StreamingPreset {
-    const PRIMARY: [Self; 4] = [Self::Auto, Self::Speed, Self::Grading, Self::Hdr];
-
-    fn from_settings(
-        performance: PerformanceMode,
-        color: ColorFidelitySettings,
-    ) -> StreamingPreset {
-        if color.overrides != ColorFidelityOverrides::default() || color.variant_override.is_some()
-        {
-            return Self::Custom;
-        }
-        match (performance, color.preset) {
-            (PerformanceMode::Standard, ColorFidelity::Standard) => Self::Auto,
-            (PerformanceMode::High | PerformanceMode::HighLegacy, ColorFidelity::Standard) => {
-                Self::Speed
-            }
-            (PerformanceMode::Standard, ColorFidelity::GradingReference) => Self::Grading,
-            (PerformanceMode::Standard, ColorFidelity::Hdr10) => Self::Hdr,
-            _ => Self::Custom,
-        }
-    }
-
-    fn apply_to(self, performance: &mut PerformanceMode, color: &mut ColorFidelitySettings) {
-        let (next_performance, next_color) = match self {
-            Self::Auto => (PerformanceMode::Standard, ColorFidelity::Standard),
-            Self::Speed => (PerformanceMode::High, ColorFidelity::Standard),
-            Self::Grading => (PerformanceMode::Standard, ColorFidelity::GradingReference),
-            Self::Hdr => (PerformanceMode::Standard, ColorFidelity::Hdr10),
-            Self::Custom => return,
-        };
-        *performance = next_performance;
-        *color = ColorFidelitySettings {
-            preset: next_color,
-            overrides: ColorFidelityOverrides::default(),
-            variant_override: None,
-        };
-    }
-
-    const fn title(self) -> &'static str {
-        match self {
-            Self::Auto => "Auto",
-            Self::Speed => "Speed",
-            Self::Grading => "Grading",
-            Self::Hdr => "HDR",
-            Self::Custom => "Custom",
-        }
-    }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Auto => streaming_contract(arcen_media::video::StreamingPreset::Auto).summary,
-            Self::Speed => streaming_contract(arcen_media::video::StreamingPreset::Speed).summary,
-            Self::Grading => {
-                streaming_contract(arcen_media::video::StreamingPreset::Grading).summary
-            }
-            Self::Hdr => streaming_contract(arcen_media::video::StreamingPreset::Hdr).summary,
-            Self::Custom => "Developer-defined streaming configuration.",
-        }
-    }
-
-    const fn contract(self) -> Option<arcen_media::video::PresetContract> {
-        match self {
-            Self::Auto => Some(streaming_contract(
-                arcen_media::video::StreamingPreset::Auto,
-            )),
-            Self::Speed => Some(streaming_contract(
-                arcen_media::video::StreamingPreset::Speed,
-            )),
-            Self::Grading => Some(streaming_contract(
-                arcen_media::video::StreamingPreset::Grading,
-            )),
-            Self::Hdr => Some(streaming_contract(arcen_media::video::StreamingPreset::Hdr)),
-            Self::Custom => None,
-        }
-    }
-
-    const fn wire_pipeline(self) -> Option<arcen_protocol::messages::StreamPipeline> {
-        match self {
-            Self::Auto => Some(arcen_protocol::messages::StreamPipeline::Auto),
-            Self::Speed => Some(arcen_protocol::messages::StreamPipeline::Speed),
-            Self::Grading => Some(arcen_protocol::messages::StreamPipeline::Grading),
-            Self::Hdr => Some(arcen_protocol::messages::StreamPipeline::Hdr),
-            Self::Custom => None,
-        }
-    }
-}
-
-/// The exact contract a connection will request on the wire: `settings`'s own
-/// `resolved_variant()` when that is a combination Arcen actually offers, or
-/// -- when it is not, per `resolved_variant`'s documented gap where
-/// individual `overrides` axes are not cross-validated against each other --
-/// `settings.preset`'s own contract instead, which
-/// `color_fidelity_preset_maps_to_documented_contract` pins as always
-/// coherent standing alone.
-///
-/// Shared by the Advanced settings screen's live "Resolving to" read-out
-/// (`settings_screen`) and `connect_options_with_stream_sizing_policy`, so
-/// neither can ever disagree with the other about what a connection is about
-/// to request, and so an incoherent Advanced axis combination can never
-/// reach the host.
-fn effective_color_fidelity_variant(
-    settings: ColorFidelitySettings,
-) -> arcen_media::video::VideoVariant {
-    if !cfg!(feature = "dev-tools") {
-        return arcen_media::video::VideoVariant::new(settings.preset.preset_configuration());
-    }
-    let resolved = settings.resolved_variant();
-    if resolved.is_coherent() {
-        resolved
-    } else {
-        arcen_media::video::VideoVariant::new(settings.preset.preset_configuration())
-    }
-}
+use arcen_deck_core::screens::settings::{tablet_mode_description, tablet_mode_label, SettingsTab};
+use arcen_deck_core::screens::wording::deck_platform;
 
 fn stream_profile_video_variant(
     profile: &StreamProfile,
@@ -1604,224 +976,6 @@ fn stream_profile_video_variant(
         transfer: arcen_media::TransferCharacteristics::from_token(&profile.transfer)?,
     };
     Some(arcen_media::video::VideoVariant::new(configuration))
-}
-
-/// Human-readable label for a codec axis choice in the Colour fidelity
-/// Advanced selectors (see `settings_screen`).
-fn color_fidelity_codec_label(codec: arcen_media::VideoCodec) -> &'static str {
-    match codec {
-        arcen_media::VideoCodec::Jpeg => "JPEG",
-        arcen_media::VideoCodec::H264 => "H.264",
-        arcen_media::VideoCodec::H265 => "HEVC (H.265)",
-        arcen_media::VideoCodec::Vp9 => "VP9",
-        arcen_media::VideoCodec::Av1 => "AV1",
-    }
-}
-
-/// Human-readable label for a chroma axis choice.
-fn color_fidelity_chroma_label(chroma: arcen_media::ChromaSubsampling) -> &'static str {
-    match chroma {
-        arcen_media::ChromaSubsampling::Yuv420 => "4:2:0",
-        arcen_media::ChromaSubsampling::Yuv422 => "4:2:2",
-        arcen_media::ChromaSubsampling::Yuv444 => "4:4:4",
-    }
-}
-
-/// Human-readable label for a bit-depth axis choice.
-fn color_fidelity_bit_depth_label(bit_depth: arcen_media::BitDepth) -> String {
-    format!("{}-bit", bit_depth.bits())
-}
-
-/// Human-readable label for a colour-range axis choice.
-fn color_fidelity_range_label(range: arcen_media::ColorRange) -> &'static str {
-    match range {
-        arcen_media::ColorRange::Limited => "Limited range",
-        arcen_media::ColorRange::Full => "Full range",
-    }
-}
-
-/// Human-readable label for a matrix axis choice.
-fn color_fidelity_matrix_label(matrix: arcen_media::ColorMatrix) -> &'static str {
-    match matrix {
-        arcen_media::ColorMatrix::Identity => "Identity (GBR)",
-        arcen_media::ColorMatrix::Bt709 => "BT.709",
-        arcen_media::ColorMatrix::Bt601 => "BT.601",
-        arcen_media::ColorMatrix::Bt2020Ncl => "BT.2020 NCL",
-    }
-}
-
-/// How the client wants the host to size the streamed desktop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisplaysMode {
-    /// Match every active local display to one host output, up to four.
-    MatchLayout,
-    /// Stream only the client's primary display, at its native resolution.
-    SinglePrimary,
-    /// Single stream shown in a resizable window (fit-to-window on the client).
-    Windowed,
-}
-
-impl DisplaysMode {
-    pub const WIRE_VALUES: [&'static str; 3] = ["match_layout", "single_primary", "windowed"];
-
-    pub(crate) const ALL: [DisplaysMode; 3] = [
-        DisplaysMode::MatchLayout,
-        DisplaysMode::SinglePrimary,
-        DisplaysMode::Windowed,
-    ];
-
-    /// Wire token sent to the host in the auth response.
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            DisplaysMode::MatchLayout => "match_layout",
-            DisplaysMode::SinglePrimary => "single_primary",
-            DisplaysMode::Windowed => "windowed",
-        }
-    }
-
-    pub fn from_wire(value: &str) -> Option<Self> {
-        match value {
-            "match_layout" => Some(DisplaysMode::MatchLayout),
-            "single_primary" => Some(DisplaysMode::SinglePrimary),
-            "windowed" => Some(DisplaysMode::Windowed),
-            _ => None,
-        }
-    }
-
-    fn key(self) -> &'static str {
-        self.as_wire()
-    }
-
-    fn from_key(value: &str) -> Self {
-        match value {
-            "single_primary" => DisplaysMode::SinglePrimary,
-            "windowed" => DisplaysMode::Windowed,
-            _ => DisplaysMode::MatchLayout,
-        }
-    }
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            DisplaysMode::MatchLayout => "Match my layout",
-            DisplaysMode::SinglePrimary => "Primary display only",
-            DisplaysMode::Windowed => "Windowed",
-        }
-    }
-
-    /// One-line explanation shown under the selector in the Displays panel.
-    pub(crate) fn description(self) -> &'static str {
-        match self {
-            DisplaysMode::MatchLayout => {
-                "Match up to 4 of your displays with real native fullscreen windows on a \
-                 host that supports it, each pixel-exact. Requires Separate Spaces on and \
-                 standard fullscreen (Notch area off) locally, and requires the host to \
-                 support and accept it. If the host doesn't support multi-monitor, or the \
-                 local layout can't be applied, the connection fails, with an error that \
-                 clearly explains why, instead of silently falling back to the primary \
-                 display — switch to Primary Display Only and reconnect to use this host."
-            }
-            DisplaysMode::SinglePrimary => {
-                "Stream only your primary display, sized to what the Deck can show in \
-                 fullscreen so the image is pixel-exact. The stream does not resize \
-                 with the app window."
-            }
-            DisplaysMode::Windowed => {
-                "Stream your primary display into a resizable window. The image \
-                 scales to fit the window instead of taking over a whole monitor."
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamSizingPolicy {
-    FollowWindow,
-    PinPrimary {
-        primary_size: Option<[u32; 2]>,
-        local_display_count: usize,
-        match_layout_fallback: bool,
-    },
-}
-
-impl StreamSizingPolicy {
-    /// `presentation_size` is the size the Deck can actually present in
-    /// fullscreen on the primary display (see
-    /// [`crate::display::presentation_size_for_display`]). Pinned modes use it
-    /// verbatim; `None` falls back to the monitor's own reported size, which is
-    /// the pre-DISPLAY-380 behaviour and what unit tests exercise.
-    ///
-    /// `multi_monitor_topology_attached` mirrors
-    /// `options.multi_monitor_topology.is_some()` for this exact connection
-    /// attempt: whether a real multi-monitor-v1 request is actually going to
-    /// be sent to the host, already decided by the caller (`start_connection`'s
-    /// `match_layout_preflight` plus `approved_multi_monitor_selection`) before
-    /// this is called. It is what `match_layout_fallback` below is actually
-    /// keyed on now that the multi-window runtime is live -- `monitors.len() >
-    /// 1` alone used to be a reliable proxy for "will fall back to primary
-    /// only" back when the runtime gate made that outcome unconditional, but
-    /// today it would otherwise misreport a genuine, successfully negotiated
-    /// multi-monitor session as a fallback.
-    fn resolve(
-        mode: DisplaysMode,
-        monitors: &[ClientMonitor],
-        presentation_size: Option<[u32; 2]>,
-        multi_monitor_topology_attached: bool,
-    ) -> Self {
-        let primary_size = primary_monitor(monitors)
-            .map(|monitor| presentation_size.unwrap_or([monitor.width_px, monitor.height_px]));
-        match mode {
-            DisplaysMode::Windowed => StreamSizingPolicy::FollowWindow,
-            DisplaysMode::SinglePrimary => StreamSizingPolicy::PinPrimary {
-                primary_size,
-                local_display_count: monitors.len(),
-                match_layout_fallback: false,
-            },
-            DisplaysMode::MatchLayout => StreamSizingPolicy::PinPrimary {
-                primary_size,
-                local_display_count: monitors.len(),
-                match_layout_fallback: monitors.len() > 1 && !multi_monitor_topology_attached,
-            },
-        }
-    }
-
-    fn follows_window(self) -> bool {
-        matches!(self, StreamSizingPolicy::FollowWindow)
-    }
-
-    fn is_pinned(self) -> bool {
-        !self.follows_window()
-    }
-
-    fn primary_size(self) -> Option<[u32; 2]> {
-        match self {
-            StreamSizingPolicy::FollowWindow => None,
-            StreamSizingPolicy::PinPrimary { primary_size, .. } => primary_size,
-        }
-    }
-
-    fn match_layout_fallback(self) -> bool {
-        matches!(
-            self,
-            StreamSizingPolicy::PinPrimary {
-                match_layout_fallback: true,
-                ..
-            }
-        )
-    }
-
-    fn status_note(self) -> Option<&'static str> {
-        self.match_layout_fallback().then_some(
-            "Multi-monitor layout matching isn't available for this connection; using the \
-             primary display.",
-        )
-    }
-}
-
-fn primary_monitor(monitors: &[ClientMonitor]) -> Option<&ClientMonitor> {
-    monitors
-        .iter()
-        .find(|monitor| monitor.is_primary)
-        .or_else(|| monitors.first())
 }
 
 /// Report what the host actually did with the requested display size.
@@ -1914,252 +1068,6 @@ fn display_scale_mismatch_notes(display: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// Remote desktop UI scale, expressed as a Windows display-scaling percentage.
-///
-/// The client reports a coherent stream scale and synthetic physical size.
-/// Windows Pier uses both as the requested display-scale contract, applying the
-/// matching Windows scale step on NVIDIA GRID and retaining EDID DPI as
-/// verifiable metadata. Reporting the Mac panel's true size would tie a
-/// point-sized stream to the panel's backing DPI and make the remote UI far too
-/// large.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteUiScale {
-    /// Use the stream's own logical-to-physical scale and a synthetic 96-DPI
-    /// point-sized panel instead of leaking the Mac panel's backing DPI.
-    Automatic,
-    Percent(u32),
-}
-
-impl RemoteUiScale {
-    const ALL: [RemoteUiScale; 7] = [
-        RemoteUiScale::Automatic,
-        RemoteUiScale::Percent(100),
-        RemoteUiScale::Percent(125),
-        RemoteUiScale::Percent(150),
-        RemoteUiScale::Percent(175),
-        RemoteUiScale::Percent(200),
-        RemoteUiScale::Percent(250),
-    ];
-
-    fn from_percent(percent: u32) -> Self {
-        if percent == 0 {
-            RemoteUiScale::Automatic
-        } else {
-            RemoteUiScale::Percent(percent.clamp(100, 400))
-        }
-    }
-
-    fn as_percent(self) -> u32 {
-        match self {
-            RemoteUiScale::Automatic => 0,
-            RemoteUiScale::Percent(percent) => percent,
-        }
-    }
-
-    /// One-line explanation shown next to the selector in the Displays panel.
-    fn label(self) -> String {
-        match self {
-            RemoteUiScale::Automatic => "Automatic (match this display)".to_string(),
-            RemoteUiScale::Percent(percent) => format!("{percent}%"),
-        }
-    }
-}
-
-/// The physical size to advertise so the host's synthesized EDID lands on
-/// `percent` Windows display scaling.
-///
-/// Windows picks its recommended scaling from the display's DPI, and DPI is
-/// pixels over physical size. `100%` is 96 DPI by definition, so the size that
-/// produces a given percentage is `pixels * 25.4 / (96 * percent / 100)`.
-fn advertised_physical_size_mm(width_px: u32, height_px: u32, percent: u32) -> (f32, f32) {
-    let dpi = 96.0 * percent.max(1) as f32 / 100.0;
-    (width_px as f32 * 25.4 / dpi, height_px as f32 * 25.4 / dpi)
-}
-
-/// This *specific* monitor's own effective HiDPI stream-scale multiplier for
-/// [`advertised_physical_size_mm`]'s "apparent size" doubling: its own real
-/// backing scale (2 for a Retina panel, 1.5 for a scaled Retina mode, 1
-/// otherwise) when the session streams at HiDPI resolution
-/// (`hidpi_streaming`), or unconditionally `1` when it does not -- every
-/// stream is point-sized then, regardless of any monitor's own backing
-/// scale.
-///
-/// The *exact* advertised ratio, never an integer rounding of it: a monitor's
-/// `scale` and its `width_px`/`height_px` come from one shared
-/// [`crate::display::metrics::DisplayMetrics`] reading, so a HiDPI stream
-/// carries exactly `scale` times the presentable points. Rounding 1.5 up to 2
-/// here would advertise a physical size 33% off the size actually streamed
-/// and put a scaled Retina session back at the wrong apparent size.
-///
-/// Always derived from *this* monitor's own `scale`/`monitor().scale`,
-/// never a blanket value borrowed from the primary or any other monitor in
-/// the same roster: a mixed Retina-primary/non-Retina-secondary roster must
-/// scale each entry from its own backing scale, never from whichever
-/// monitor happened to be used to compute a single shared multiplier for
-/// everyone -- see [`apply_remote_ui_scale`] and
-/// [`apply_remote_ui_scale_to_requested_topology`]'s own per-monitor
-/// mixed-Retina requirement.
-///
-/// A non-finite or sub-1 scale (never produced by `DisplayMetrics`, which
-/// refuses both) falls back to 1: an unreadable display must not silently
-/// shrink the advertised panel.
-#[must_use]
-fn effective_monitor_stream_scale(monitor_scale: f32, hidpi_streaming: bool) -> f32 {
-    if hidpi_streaming && monitor_scale.is_finite() {
-        monitor_scale.max(1.0)
-    } else {
-        1.0
-    }
-}
-
-/// The percentage [`advertised_physical_size_mm`] must actually target for
-/// one monitor: the user's chosen percentage multiplied by that monitor's own
-/// effective stream scale ([`effective_monitor_stream_scale`]).
-///
-/// Rounded to the whole percent the EDID's millimetre fields can express, and
-/// never zero.
-#[must_use]
-fn effective_remote_ui_percent(percent: u32, monitor_scale: f32, hidpi_streaming: bool) -> u32 {
-    let scale = effective_monitor_stream_scale(monitor_scale, hidpi_streaming);
-    let effective = (percent as f32 * scale).round();
-    effective.clamp(1.0, u32::MAX as f32) as u32
-}
-
-/// Resolve one monitor's coherent stream-scale and synthesized EDID size.
-///
-/// `Automatic` means 100% for a point-sized stream. A HiDPI stream multiplies
-/// that percentage by its exact backing ratio so both stream modes describe
-/// the same apparent desktop size. The returned scale is likewise the stream's
-/// actual logical-to-physical ratio, never the local panel's raw backing scale
-/// when only logical points are being streamed.
-fn remote_ui_monitor_contract(
-    width_px: u32,
-    height_px: u32,
-    monitor_scale: f32,
-    hidpi_streaming: bool,
-    scale: RemoteUiScale,
-) -> (f32, f32, f32) {
-    let stream_scale = effective_monitor_stream_scale(monitor_scale, hidpi_streaming);
-    let percent = match scale {
-        RemoteUiScale::Automatic => 100,
-        RemoteUiScale::Percent(percent) => percent,
-    };
-    let effective = effective_remote_ui_percent(percent, monitor_scale, hidpi_streaming);
-    let (width_mm, height_mm) = advertised_physical_size_mm(width_px, height_px, effective);
-    (stream_scale, width_mm, height_mm)
-}
-
-/// Rewrite the reported physical size of each monitor so the remote desktop
-/// comes up at the user's chosen UI scale.
-///
-/// The chosen percentage is *apparent* size, so each monitor's own effective
-/// stream scale (see [`effective_monitor_stream_scale`]: 2 for a HiDPI
-/// Retina monitor while `hidpi_streaming` is on, 1.5 for a scaled Retina
-/// mode, 1 otherwise) has to multiply it — without this, "150%" on a HiDPI
-/// stream renders every element at half the physical size it has on a
-/// point-size stream, which is why a Retina session looked microscopic.
-/// Computed independently per monitor (never a single shared multiplier for
-/// the whole roster), so a mixed Retina-primary/non-Retina-secondary layout
-/// scales each display from its own backing scale.
-fn apply_remote_ui_scale(
-    monitors: &mut [ClientMonitor],
-    scale: RemoteUiScale,
-    hidpi_display_mask: u8,
-) {
-    for (index, monitor) in monitors.iter_mut().enumerate() {
-        let hidpi_streaming = index < 4 && hidpi_display_mask & (1u8 << index) != 0;
-        let (stream_scale, width_mm, height_mm) = remote_ui_monitor_contract(
-            monitor.width_px,
-            monitor.height_px,
-            monitor.scale,
-            hidpi_streaming,
-            scale,
-        );
-        monitor.scale = stream_scale;
-        monitor.width_mm = width_mm;
-        monitor.height_mm = height_mm;
-    }
-}
-
-/// Applies Deck's default Automatic UI-scale contract to a legacy monitor
-/// roster used by CLI quick-connect and smoke diagnostics.
-pub fn apply_automatic_remote_ui_scale_to_monitors(
-    monitors: &mut [ClientMonitor],
-    hidpi_display_mask: u8,
-) {
-    apply_remote_ui_scale(monitors, RemoteUiScale::Automatic, hidpi_display_mask);
-}
-
-/// Rewrites the reported physical size of every monitor in an approved
-/// multi-monitor-v1 requested topology to the user's chosen Remote UI Scale,
-/// applying the exact same `advertised_physical_size_mm` formula and
-/// per-monitor HiDPI multiplier ([`effective_remote_ui_percent`]) as
-/// [`apply_remote_ui_scale`] uses for the legacy `options.monitors` roster
-/// -- each monitor's own `monitor().scale`, never one shared multiplier
-/// borrowed from the primary or any other entry in the same roster, so a
-/// mixed Retina-primary/non-Retina-secondary topology scales each display
-/// independently from its own backing scale.
-///
-/// Without this, `options.monitors` (scaled) and the multi-monitor-v1
-/// sidecar (`options.multi_monitor_topology`, built straight from
-/// `crate::display::topology::build_requested_topology`'s real, unscaled
-/// hardware measurements) would disagree on the exact same primary
-/// monitor's physical size -- a host computing DPI from the sidecar's own
-/// per-monitor descriptors (`crate::transport::multi_monitor::to_wire_topology`)
-/// would see the user's real panel size and ignore their chosen scale
-/// entirely, while a host still falling back to the legacy roster would
-/// honour it. Called once, in `connect_options_with_stream_sizing_policy`,
-/// on the already-preflighted/approved topology snapshot before it is
-/// threaded into [`approved_multi_monitor_selection`] and stored/attached as
-/// the sidecar -- never re-derived later at auth time.
-fn apply_remote_ui_scale_to_requested_topology(
-    topology: &arcen_media::RequestedMonitorTopology,
-    scale: RemoteUiScale,
-    hidpi_display_mask: u8,
-) -> arcen_media::RequestedMonitorTopology {
-    let monitors: Vec<arcen_media::RequestedMonitor> = topology
-        .monitors()
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, mut requested)| {
-            let hidpi_streaming = index < 4 && hidpi_display_mask & (1u8 << index) != 0;
-            let (stream_scale, width_mm, height_mm) = remote_ui_monitor_contract(
-                requested.monitor().width_px,
-                requested.monitor().height_px,
-                requested.monitor().scale,
-                hidpi_streaming,
-                scale,
-            );
-            requested.monitor.scale = stream_scale;
-            requested.monitor.width_mm = width_mm;
-            requested.monitor.height_mm = height_mm;
-            requested
-        })
-        .collect();
-    // Only `scale`/`width_mm`/`height_mm` changed above; every invariant
-    // `RequestedMonitorTopology::new` re-checks (client display identity,
-    // exactly one primary, logical arrangement rect, duplicate monitor id,
-    // zero dimensions) depends solely on fields left untouched here, while
-    // `remote_ui_monitor_contract` always returns a finite positive scale.
-    arcen_media::RequestedMonitorTopology::new(monitors)
-        .expect("rewriting the validated stream scale and EDID size cannot invalidate topology")
-}
-
-/// Applies Deck's default Automatic UI-scale contract to a requested topology
-/// used by multi-monitor smoke diagnostics.
-#[must_use]
-pub fn apply_automatic_remote_ui_scale_to_topology(
-    topology: &arcen_media::RequestedMonitorTopology,
-    hidpi_display_mask: u8,
-) -> arcen_media::RequestedMonitorTopology {
-    apply_remote_ui_scale_to_requested_topology(
-        topology,
-        RemoteUiScale::Automatic,
-        hidpi_display_mask,
-    )
-}
-
 /// The fullscreen presentation size of the primary display, for pinned modes.
 ///
 /// Probes the real hardware, so callers that need deterministic behaviour (unit
@@ -2185,128 +1093,6 @@ pub fn primary_presentation_size(
         use_notch_area,
         hidpi,
     )
-}
-
-fn primary_only_monitors(
-    monitors: &[ClientMonitor],
-    pinned_size: Option<[u32; 2]>,
-) -> Vec<ClientMonitor> {
-    primary_monitor(monitors)
-        .map(|monitor| {
-            let mut monitor = monitor.clone();
-            monitor.x = 0;
-            monitor.y = 0;
-            monitor.is_primary = true;
-            // The host builds the remote desktop from this size, so it must be
-            // what the Deck will present, not the raw panel size.
-            if let Some([width, height]) = pinned_size {
-                monitor.width_px = width;
-                monitor.height_px = height;
-            }
-            // Never ask for a virtual display faster than the session can
-            // stream; the spare pixel-clock budget is what keeps a HiDPI mode
-            // inside EDID 1.4 limits.
-            monitor.refresh_hz = crate::display::pinned_refresh_hz(monitor.refresh_hz);
-            monitor
-        })
-        .into_iter()
-        .collect()
-}
-
-fn monitors_for_policy(
-    policy: StreamSizingPolicy,
-    monitors: &[ClientMonitor],
-) -> Vec<ClientMonitor> {
-    match policy {
-        StreamSizingPolicy::FollowWindow => monitors.to_vec(),
-        StreamSizingPolicy::PinPrimary { primary_size, .. } => {
-            primary_only_monitors(monitors, primary_size)
-        }
-    }
-}
-
-/// The legacy `ConnectOptions.monitors` roster to send alongside
-/// `multi_monitor_topology`.
-///
-/// One frozen post-fallback, post-scale snapshot: whenever multi-monitor is
-/// actually going to be negotiated (`multi_monitor_topology` is
-/// `Some`), the legacy roster is derived directly from that exact same
-/// already-approved, already-scaled sidecar topology via
-/// [`client_monitors_from_topology`] -- `monitors`/`policy` are entirely
-/// ignored in that branch, never re-read or re-scaled independently. A
-/// fresh, independent re-enumeration here could disagree with the
-/// already-approved topology if a display was hot-plugged/unplugged in the
-/// interval between `match_layout_preflight` capturing it and this call, or
-/// if the two rosters were scaled independently -- either way, a host must
-/// never be able to observe a `multi_monitor_topology` and a legacy
-/// `monitors` roster describing two different snapshots of the local
-/// hardware. A genuine post-snapshot hotplug is instead caught later, once
-/// connected, by the existing committed-topology/roster-loss failure path
-/// (`drive_multi_window`'s hard-failure checks), which disconnects and
-/// requires a fresh reconnect rather than silently sending a mismatched
-/// hello.
-///
-/// When no multi-monitor topology will be attached (`None` -- reached for
-/// every legacy/single-display/windowed/primary-only session, and also for
-/// Match My Layout with multiple displays whenever preflight itself never
-/// requests one in the first place, e.g. a diagnostic-only caller that
-/// never runs preflight at all), this reproduces exactly today's existing
-/// behaviour: `monitors_for_policy` followed by one `apply_remote_ui_scale`
-/// pass over the freshly enumerated local `monitors`. A host that lacks or
-/// declines multi-monitor-v1 is *not* one of these cases: preflight has
-/// already approved and attached a local topology by the time this function
-/// runs, so that failure surfaces later, during auth, as a hard connection
-/// failure (`crate::transport::multi_monitor::MultiMonitorAuthError::UnsupportedHost`),
-/// never a silent reduction back to this legacy roster.
-fn legacy_roster_for_connect_options(
-    multi_monitor_topology: Option<
-        &crate::transport::multi_monitor::RequestedMultiMonitorSelection,
-    >,
-    policy: StreamSizingPolicy,
-    monitors: &[ClientMonitor],
-    remote_ui_scale: RemoteUiScale,
-    hidpi_display_mask: u8,
-) -> Vec<ClientMonitor> {
-    match multi_monitor_topology {
-        Some(selection) => client_monitors_from_topology(&selection.topology),
-        None => {
-            let mut legacy_monitors = monitors_for_policy(policy, monitors);
-            apply_remote_ui_scale(&mut legacy_monitors, remote_ui_scale, hidpi_display_mask);
-            legacy_monitors
-        }
-    }
-}
-
-pub fn monitors_for_displays_mode(
-    mode: DisplaysMode,
-    monitors: &[ClientMonitor],
-    presentation_size: Option<[u32; 2]>,
-) -> Vec<ClientMonitor> {
-    // The `media-smoke` CLI diagnostic never negotiates a real
-    // multi-monitor-v1 topology (see `main.rs`, which always leaves
-    // `ConnectOptions.multi_monitor_topology` at `None`), so this is always a
-    // legacy roster derived purely from local display count/policy.
-    monitors_for_policy(
-        StreamSizingPolicy::resolve(mode, monitors, presentation_size, false),
-        monitors,
-    )
-}
-
-/// Whether the Deck may retarget the remote desktop to the viewer surface.
-///
-/// DISPLAY-380 fixed this deliberately: only Windowed follows the
-/// app window. The pinned modes lock the stream to the target monitor and
-/// suppress this tracker entirely, and hosts do not advertise
-/// `supports_display_update` in a pinned mode. Asking anyway produces a host
-/// rejection (`display_backend_cannot_retarget` on a host without the NVAPI
-/// custom-timing path) and cannot change the stream size.
-fn display_fit_gate(
-    policy: StreamSizingPolicy,
-    host_supports_display_update: bool,
-    in_session: bool,
-    frame_fresh: bool,
-) -> bool {
-    policy.follows_window() && host_supports_display_update && in_session && frame_fresh
 }
 
 const VIDEO_STALL_OVERLAY_AFTER: Duration = Duration::from_secs(4);
@@ -2470,59 +1256,6 @@ fn pinned_image_offset(surface: [f32; 2], stream: [f32; 2]) -> Option<[f32; 2]> 
     Some([(leftover_x / 2.0).max(0.0), y])
 }
 
-/// Whether this session negotiates typed pen input: local setting on, host
-/// speaks input protocol v3+, and the host's `InputCapabilitiesMsg.pen` is
-/// `Available`. Fails closed (`false`) on any missing piece — an older host,
-/// a host with no pen capability, or the local setting off all fall back to
-/// the mouse-emulation duplicates the tablet driver already produces, with
-/// pressure honestly reported unavailable rather than guessed at.
-fn pen_negotiation_result(
-    requested_mode: TabletModeMsg,
-    input_protocol_version: u32,
-    pen_capability: InputCapabilityAvailability,
-) -> bool {
-    matches!(requested_mode, TabletModeMsg::LocalTermination)
-        && input_protocol_version >= crate::protocol::messages::PEN_INPUT_PROTOCOL_VERSION
-        && pen_capability == InputCapabilityAvailability::Available
-}
-
-const fn tablet_mode_allows_typed_pen(mode: TabletModeMsg) -> bool {
-    matches!(mode, TabletModeMsg::LocalTermination)
-}
-
-fn provisional_tablet_mode_active(
-    requested: TabletModeMsg,
-    input_protocol_version: u32,
-    local_pen_capability: InputCapabilityAvailability,
-    host_pen_capability: InputCapabilityAvailability,
-) -> TabletModeMsg {
-    match requested {
-        TabletModeMsg::LocalTermination
-            if input_protocol_version >= crate::protocol::messages::PEN_INPUT_PROTOCOL_VERSION
-                && local_pen_capability == InputCapabilityAvailability::Available
-                && host_pen_capability == InputCapabilityAvailability::Available =>
-        {
-            TabletModeMsg::LocalTermination
-        }
-        TabletModeMsg::DisabledMouseCompat => TabletModeMsg::DisabledMouseCompat,
-        TabletModeMsg::LocalTermination | TabletModeMsg::UsbTabletBridge => {
-            TabletModeMsg::DisabledMouseCompat
-        }
-    }
-}
-
-const fn protocol_capability(
-    availability: arcen_input::CapabilityAvailability,
-) -> InputCapabilityAvailability {
-    match availability {
-        arcen_input::CapabilityAvailability::Available => InputCapabilityAvailability::Available,
-        arcen_input::CapabilityAvailability::Unavailable => {
-            InputCapabilityAvailability::Unavailable
-        }
-        arcen_input::CapabilityAvailability::Unknown => InputCapabilityAvailability::Unknown,
-    }
-}
-
 fn tablet_mode_change_requires_reconnect(
     previous: TabletModeMsg,
     requested: TabletModeMsg,
@@ -2573,439 +1306,12 @@ const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
     TabletModeMsg::DisabledMouseCompat,
 ];
 
-const fn tablet_mode_label(mode: TabletModeMsg) -> &'static str {
-    match mode {
-        TabletModeMsg::LocalTermination => "Tablet support",
-        TabletModeMsg::UsbTabletBridge => "Native tablet (USB bridged)",
-        TabletModeMsg::DisabledMouseCompat => "Mouse compatibility only",
-    }
-}
-
-const fn tablet_mode_description(mode: TabletModeMsg) -> &'static str {
-    match mode {
-        // Both descriptions lead with the network, because that is the choice
-        // the operator is actually making. Everything else about these two
-        // modes follows from where the pen is interpreted, and where the pen is
-        // interpreted is decided by how far away the host is.
-        TabletModeMsg::LocalTermination => {
-            "For Wi-Fi, 5G, and working away from the office — good enough for most remote \
-             work. This Mac's tablet driver reads the pen and Arcen sends finished pen events \
-             to the host, so no tablet driver is needed there and no pen sample has to wait for \
-             a reply. Distance costs you responsiveness, not correctness.\n\n\
-             Pressure, tilt, rotation, eraser, proximity, and barrel buttons all work; finger \
-             touch and the tablet's own buttons stay on this Mac. The tablet also stays usable \
-             in Mac applications while you are connected."
-        }
-        TabletModeMsg::UsbTabletBridge => {
-            "For a LAN — the office nearby, not the other side of the country. As close to \
-             plugging the tablet straight into the host as a network allows: a privileged \
-             Arcen helper takes the device away from macOS and forwards its raw USB traffic, \
-             and the host's own driver for that tablet claims it exactly as if it were plugged \
-             in there. Any pen tablet works, whoever made it. \
-             Arcen never interprets the pen, so the whole device works — pressure, tilt, \
-             rotation, eraser, the tablet's own buttons, and finger touch.\n\n\
-             In exchange: every pen sample makes a full round trip to the host, so latency is \
-             felt directly and this is not a WAN mode. Mac applications cannot use the tablet \
-             until you disconnect, and the host needs its own driver for the tablet and USB \
-             virtualization. The host's driver moves the host's pointer; with Local cursor \
-             rendering Arcen Deck draws the cursor where the host reports it, which is the \
-             recommended pairing (host cursor rendering also works, one video round trip \
-             later). The helper is what runs privileged; Arcen Deck itself never does."
-        }
-        TabletModeMsg::DisabledMouseCompat => {
-            "No tablet redirection. The pen behaves as a mouse; no pressure, tilt, eraser, \
-             proximity, or tablet buttons are available. No tablet-specific Arcen dependencies."
-        }
-    }
-}
-
-/// Client preferences. Microphone consent is intentionally runtime-only; all
-/// other fields are persisted to `<config>/settings.json`.
-///
-/// USB policy is deliberate: HID devices (keyboard, mouse, pen tablet stylus)
-/// always ride the low-latency input channel natively — the lesson learned
-/// from Sunshine. Only NON-HID devices (tablet control surfaces, USB
-/// flash drives) use bridged auto-forwarding, which adds WAN latency, so it
-/// stays OFF unless the user explicitly opts in.
-#[derive(Debug, Clone, Copy)]
-struct ClientSettings {
-    log_level: LogLevel,
-    security_mode: SecurityMode,
-    performance_mode: PerformanceMode,
-    displays_mode: DisplaysMode,
-    cursor_preference: CursorMode,
-    clipboard_enabled: bool,
-    microphone_enabled: bool,
-    hidpi_streaming: bool,
-    /// Whether a pinned fullscreen session may cover the notch region on a
-    /// notched Mac.
-    ///
-    /// Off (default): the stream is sized to the safe area, so it fills the
-    /// whole presentable area 1:1 with no bars and no downscale; the notch
-    /// strip stays black because it is a hole in the panel. On: the stream is
-    /// sized to the full panel, leaving no black at all, but the notch
-    /// physically covers a slice of the remote desktop's top edge.
-    fullscreen_uses_notch_area: bool,
-    /// Windows display-scaling percentage to aim the remote desktop at, or 0
-    /// for the panel's real measurements.
-    remote_ui_scale_percent: u32,
-    /// Primary-first/spatial display slots that require full-color 4:4:4.
-    /// Zero preserves the ordinary host-default connection profile.
-    full_color_display_mask: u8,
-    /// Primary-first/spatial display slots that stream at their own backing
-    /// (HiDPI) resolution instead of point size.
-    ///
-    /// A point-sized stream sends the display's *logical* size, so a Retina
-    /// panel showing 1800 points across a large physical screen produces a
-    /// 1800-pixel remote desktop that Windows then renders at 100% -- which
-    /// is why the Philips looked oversized on 2026-08-11. Streaming the
-    /// backing pixels instead lets the remote OS apply its own scaling and
-    /// land at the right apparent size.
-    ///
-    /// Per display rather than one session-wide switch (`hidpi_streaming`,
-    /// which this supersedes for multi-monitor sessions): the cost is
-    /// roughly four times the pixels for a 2x panel, so it must be
-    /// affordable per monitor rather than all-or-nothing. Zero -- the
-    /// default -- keeps every monitor point-sized, exactly as before.
-    hidpi_display_mask: u8,
-    /// Local opt-in for typed AppKit tablet/pen input (`tablet` module local
-    /// termination). Defaults to `true`: users with no pen tablet are
-    /// unaffected (capability probing still reports `Unavailable`), while
-    /// pen tablet owners get typed pen support without an extra opt-in step. A
-    /// user who wants to force the tablet driver's mouse-emulation fallback can
-    /// still turn this off explicitly in Advanced settings.
-    tablet_input_enabled: bool,
-    tablet_mode_requested: TabletModeMsg,
-    /// Colour-fidelity preset plus any Advanced overrides and explicit
-    /// probe-matrix variant. See `ColorFidelitySettings::resolved_variant`
-    /// for how these combine into the effective video contract.
-    color_fidelity: ColorFidelitySettings,
-    /// What the encoder should optimise for. Deliberately kept out of
-    /// [`ColorFidelitySettings`]: colour is a contract the host negotiates
-    /// and reports back, while intent is a one-way knob that never changes
-    /// which pixels are asked for (see [`arcen_media::EncodeIntent`]).
-    encode_intent: arcen_media::EncodeIntent,
-    /// How typed characters reach a host that takes committed text
-    /// (`arcen_input::text::TypingMode`; Auto by default).
-    typing_mode: arcen_input::text::TypingMode,
-    /// What each Option key does: Automatic by default (a Mac host keeps
-    /// both as Option; other hosts get left Alt, right characters).
-    option_key_mode: arcen_input::text::OptionKeyPreference,
-    /// Paste as Keystrokes: confirmation threshold and typing rate.
-    paste: arcen_input::text::PasteSettings,
-}
-
-const SAVED_CONNECTIONS_VERSION: u32 = 2;
-const SAVED_CONNECTION_SETTINGS_VERSION: u32 = 1;
-
-#[derive(Debug, Clone)]
-struct SavedConnectionsStore {
-    version: u32,
-    connections: Vec<SavedConnectionSummary>,
-    unparsed_connections: Vec<serde_json::Value>,
-    last_selected_connection_id: Option<String>,
-    legacy_username_fallback: Option<String>,
-    unknown: serde_json::Map<String, serde_json::Value>,
-    fingerprint: Option<[u8; 32]>,
-}
-
-impl SavedConnectionsStore {
-    fn with_connections(connections: Vec<SavedConnectionSummary>) -> Self {
-        Self {
-            version: SAVED_CONNECTIONS_VERSION,
-            connections,
-            unparsed_connections: Vec::new(),
-            last_selected_connection_id: None,
-            legacy_username_fallback: None,
-            unknown: serde_json::Map::new(),
-            fingerprint: None,
-        }
-    }
-}
-
-impl Default for ClientSettings {
-    fn default() -> Self {
-        Self {
-            log_level: if cfg!(debug_assertions) {
-                LogLevel::Info
-            } else {
-                LogLevel::Critical
-            },
-            security_mode: SecurityMode::Medium,
-            performance_mode: PerformanceMode::Standard,
-            displays_mode: DisplaysMode::MatchLayout,
-            cursor_preference: CursorMode::Local,
-            clipboard_enabled: true,
-            microphone_enabled: false,
-            hidpi_streaming: false,
-            fullscreen_uses_notch_area: false,
-            remote_ui_scale_percent: 0,
-            full_color_display_mask: 0,
-            hidpi_display_mask: 0,
-            tablet_input_enabled: true,
-            tablet_mode_requested: TabletModeMsg::LocalTermination,
-            color_fidelity: ColorFidelitySettings::default(),
-            encode_intent: arcen_media::EncodeIntent::default(),
-            typing_mode: arcen_input::text::TypingMode::default(),
-            option_key_mode: arcen_input::text::OptionKeyPreference::default(),
-            paste: arcen_input::text::PasteSettings::default(),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum ClientConfigError {
-    #[error("client configuration location is unavailable")]
-    ConfigUnavailable,
-    #[error("client configuration I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("client configuration is invalid: {0}")]
-    Parse(#[from] serde_json::Error),
-    #[error("client configuration is invalid: {0}")]
-    Invalid(&'static str),
-    #[error("saved connection no longer exists: {0}")]
-    ConnectionMissing(String),
-    #[error("saved connection id already exists: {0}")]
-    ConnectionConflict(String),
-    #[error("saved connection was changed in another process: {0}")]
-    ConnectionChanged(String),
-    #[error("saved connections changed in another process")]
-    StaleSnapshot,
-    #[error("another Deck instance is updating saved connections; try again")]
-    ConfigBusy,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ClientConfigRepository {
-    root: Option<std::path::PathBuf>,
-}
-
-impl ClientConfigRepository {
-    const CONNECTION_LOCK_TIMEOUT: Duration = Duration::from_millis(100);
-    const CONNECTION_LOCK_RETRY: Duration = Duration::from_millis(5);
-
-    #[cfg(not(test))]
-    fn for_process() -> Self {
-        Self {
-            root: production_config_dir(),
-        }
-    }
-
-    #[cfg(test)]
-    fn for_process() -> Self {
-        Self::default()
-    }
-
-    #[cfg(test)]
-    fn at(root: std::path::PathBuf) -> Self {
-        Self { root: Some(root) }
-    }
-
-    fn settings_file(&self) -> Option<std::path::PathBuf> {
-        Some(self.root.as_ref()?.join("settings.json"))
-    }
-
-    fn connections_file(&self) -> Option<std::path::PathBuf> {
-        Some(self.root.as_ref()?.join("connections.json"))
-    }
-
-    fn connections_lock_file(&self) -> Option<std::path::PathBuf> {
-        Some(self.root.as_ref()?.join("connections.json.lock"))
-    }
-
-    fn remembered_username_file(&self) -> Option<std::path::PathBuf> {
-        Some(self.root.as_ref()?.join("remembered_username"))
-    }
-
-    /// Host identities the user chose to remember.
-    ///
-    /// Separate from `connections.json` because a pin belongs to an endpoint,
-    /// not to a bookmark: someone who types a host into quick-connect faces the
-    /// same substitution risk as someone who clicks a saved entry.
-    fn trusted_pins_file(&self) -> Option<std::path::PathBuf> {
-        Some(self.root.as_ref()?.join("trusted_pins.json"))
-    }
-
-    fn lock_connections(&self) -> Result<std::fs::File, ClientConfigError> {
-        let path = self
-            .connections_lock_file()
-            .ok_or(ClientConfigError::ConfigUnavailable)?;
-        let parent = path.parent().ok_or(ClientConfigError::ConfigUnavailable)?;
-        std::fs::create_dir_all(parent)?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        let deadline = Instant::now() + Self::CONNECTION_LOCK_TIMEOUT;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(ClientConfigError::ConfigBusy);
-                    }
-                    std::thread::sleep(Self::CONNECTION_LOCK_RETRY.min(remaining));
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-            }
-        }
-        Ok(file)
-    }
-
-    fn mutate_connections(
-        &self,
-        mutation: impl FnOnce(&mut SavedConnectionsStore) -> Result<(), ClientConfigError>,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        let _lock = self.lock_connections()?;
-        let mut store = load_saved_connections(self)?
-            .unwrap_or_else(|| SavedConnectionsStore::with_connections(Vec::new()));
-        mutation(&mut store)?;
-        store.version = store.version.max(SAVED_CONNECTIONS_VERSION);
-        write_saved_connections(self, &mut store)?;
-        Ok(store)
-    }
-
-    fn set_last_selected(&self, id: &str) -> Result<SavedConnectionsStore, ClientConfigError> {
-        self.mutate_connections(|store| {
-            if !store.connections.iter().any(|saved| saved.id == id) {
-                return Err(ClientConfigError::ConnectionMissing(id.to_string()));
-            }
-            store.last_selected_connection_id = Some(id.to_string());
-            Ok(())
-        })
-    }
-
-    fn set_remembered_username(
-        &self,
-        id: &str,
-        username: Option<String>,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        self.mutate_connections(|store| {
-            let saved = store
-                .connections
-                .iter_mut()
-                .find(|saved| saved.id == id)
-                .ok_or_else(|| ClientConfigError::ConnectionMissing(id.to_string()))?;
-            saved.settings.remembered_username = username;
-            saved.settings.unknown.remove("remembered_username");
-            Ok(())
-        })
-    }
-
-    fn set_tablet_mode_requested(
-        &self,
-        id: &str,
-        mode: TabletModeMsg,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        self.mutate_connections(|store| {
-            let saved = store
-                .connections
-                .iter_mut()
-                .find(|saved| saved.id == id)
-                .ok_or_else(|| ClientConfigError::ConnectionMissing(id.to_string()))?;
-            saved.settings.tablet_mode_requested = mode;
-            Ok(())
-        })
-    }
-
-    fn set_displays_mode(
-        &self,
-        id: &str,
-        mode: Option<DisplaysMode>,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        self.mutate_connections(|store| {
-            let saved = store
-                .connections
-                .iter_mut()
-                .find(|saved| saved.id == id)
-                .ok_or_else(|| ClientConfigError::ConnectionMissing(id.to_string()))?;
-            saved.settings.displays_mode = mode;
-            Ok(())
-        })
-    }
-
-    fn add_connection(
-        &self,
-        connection: SavedConnectionSummary,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        self.mutate_connections(|store| {
-            if store
-                .connections
-                .iter()
-                .any(|saved| saved.id == connection.id)
-            {
-                return Err(ClientConfigError::ConnectionConflict(connection.id.clone()));
-            }
-            store.last_selected_connection_id = Some(connection.id.clone());
-            store.connections.push(connection);
-            Ok(())
-        })
-    }
-
-    fn update_connection(
-        &self,
-        id: &str,
-        expected: &SavedConnectionSummary,
-        connection: SavedConnectionSummary,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        if connection.id != id {
-            return Err(ClientConfigError::ConnectionConflict(connection.id.clone()));
-        }
-        self.mutate_connections(|store| {
-            let saved = store
-                .connections
-                .iter_mut()
-                .find(|saved| saved.id == id)
-                .ok_or_else(|| ClientConfigError::ConnectionMissing(id.to_string()))?;
-            if saved != expected {
-                return Err(ClientConfigError::ConnectionChanged(id.to_string()));
-            }
-            *saved = connection;
-            Ok(())
-        })
-    }
-
-    fn delete_connection(
-        &self,
-        id: &str,
-        expected: &SavedConnectionSummary,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        self.mutate_connections(|store| {
-            let index = store
-                .connections
-                .iter()
-                .position(|saved| saved.id == id)
-                .ok_or_else(|| ClientConfigError::ConnectionMissing(id.to_string()))?;
-            if &store.connections[index] != expected {
-                return Err(ClientConfigError::ConnectionChanged(id.to_string()));
-            }
-            store.connections.remove(index);
-            if store.last_selected_connection_id.as_deref() == Some(id) {
-                store.last_selected_connection_id = None;
-            }
-            Ok(())
-        })
-    }
-
-    fn save_connections_snapshot(
-        &self,
-        snapshot: &SavedConnectionsStore,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        let _lock = self.lock_connections()?;
-        let current = load_saved_connections(self)?;
-        let current_fingerprint = current.as_ref().and_then(|store| store.fingerprint);
-        if current_fingerprint != snapshot.fingerprint {
-            return Err(ClientConfigError::StaleSnapshot);
-        }
-        let mut refreshed = snapshot.clone();
-        refreshed.version = refreshed.version.max(SAVED_CONNECTIONS_VERSION);
-        write_saved_connections(self, &mut refreshed)?;
-        Ok(refreshed)
-    }
-}
+pub use arcen_deck_core::config::*;
+use arcen_deck_core::screens::host_pointer::host_pointer_point;
+#[cfg(test)]
+use arcen_deck_core::screens::menu::QUIT_HOLD;
+use arcen_deck_core::screens::menu::{quit_hold_step, QuitHoldStep};
+pub use arcen_deck_core::settings::*;
 
 pub struct ArcenApp {
     config_repository: ClientConfigRepository,
@@ -3407,11 +1713,21 @@ pub struct ArcenApp {
     /// The pipeline the Pier says it serves (`active_pipeline`, then
     /// `served_pipeline` updates).
     served_pipeline_token: Option<String>,
-    /// Lossless refinement state owner (ADR 0016). Nothing is refined until
-    /// a Pier grants the refine lane; this build does not advertise it yet.
-    refine: arcen_media::refine::deck::DeckRefineSession,
+    /// Exact still image (lossless refinement, ADR 0016): this connection's
+    /// hub, shared with the lane readers, decode worker and presenter.
+    /// Nothing is refined until a Pier grants the refine lane.
+    refine: arcen_media::refine::hub::DeckRefineHub,
+    /// What the Pier's hello said about exact still image; `None` from a
+    /// Pier that predates it or when this Deck did not ask.
+    refine_offer: Option<arcen_protocol::refine::LosslessRefineStatusMsg>,
+    /// Whether this connection asked for exact still image.
+    exact_requested: bool,
+    /// The last exact-still-image status logged, so a change is logged once.
+    refine_logged: Option<(Option<u32>, Option<u8>)>,
+    /// When the last exact-still-image window summary was logged.
+    refine_window_at: Option<Instant>,
     fullscreen: bool,
-    session_fullscreen_restore: Option<bool>,
+    session_fullscreen_restore: arcen_deck_core::display::SessionFullscreen,
     last_wire_video_summary: String,
     last_decoder_summary: String,
     last_audio_summary: String,
@@ -3434,7 +1750,6 @@ pub struct ArcenApp {
     add_connection_host: String,
     add_connection_name: String,
     add_connection_port: String,
-    add_connection_transport: SavedTransport,
     add_connection_username: String,
     add_connection_tablet_mode_requested: TabletModeMsg,
     /// Working value for the connection form's Displays selector; `None`
@@ -3468,15 +1783,12 @@ pub struct ArcenApp {
     last_audio_queued_ms: usize,
     remember_username: bool,
     settings_tab: SettingsTab,
-    /// Cached privileged-helper registration state. Refreshed on demand rather
-    /// than per frame: reading it is an XPC round trip to `smd`.
-    #[cfg(feature = "native-tablet")]
-    usb_helper_state: Option<crate::usb_helper_install::HelperInstallState>,
-    /// Last privileged-helper installation failure, shown beside the control
-    /// that caused it. Without this a refused or cancelled install only
-    /// reached the log, and the button looked inert.
-    #[cfg(feature = "native-tablet")]
-    usb_helper_error: Option<String>,
+    /// The privileged helper's control in Settings › Input: its state, read
+    /// on demand rather than per frame (an XPC round trip to `smd`), the last
+    /// failure shown beside it, and the action running off the UI thread.
+    native_tablet: arcen_deck_core::screens::settings::NativeTabletComponent,
+    /// Settings › Logs › "Create support bundle…" (shared panel).
+    support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel,
     log_level: LogLevel,
     security_mode: SecurityMode,
     performance_mode: PerformanceMode,
@@ -3627,6 +1939,8 @@ pub struct ArcenApp {
     /// Local opt-in for typed tablet/pen input; mirrors
     /// `ClientSettings::tablet_input_enabled`.
     tablet_input_enabled: bool,
+    /// `ClientSettings::exact_still_image`: asked for on the next connection.
+    exact_still_image: bool,
     tablet_mode_requested: TabletModeMsg,
     tablet_mode_active: TabletModeMsg,
     tablet_mode_reason: String,
@@ -3683,14 +1997,6 @@ pub struct ArcenApp {
     tablet_producer_drops_seen: u64,
     /// View > Tablet Monitor panel visibility toggle.
     tablet_monitor_panel_open: bool,
-    /// Mirror the tablet X axis and negate tilt-X for left-handed use.
-    /// Toggled by View > Tablet Orientation Left-handed.
-    tablet_left_handed: bool,
-    /// Maintain the physical aspect ratio of the tablet active area.
-    /// State is persisted across a session but the full proportional-mapping
-    /// implementation requires tablet device-info (aspect ratio) from AppKit;
-    /// toggling stores the intent and shows it in Tablet Monitor.
-    tablet_force_proportions: bool,
     /// Test-only seam letting `sync_media_state`'s own tests force
     /// `begin_multi_window_if_applicable`'s return value for exactly the
     /// next call, so `sync_media_state`'s bail-out-on-`SessionTornDown`
@@ -3770,6 +2076,7 @@ impl ArcenApp {
         );
         options.clipboard_enabled = app.clipboard_enabled;
         options.microphone_enabled = app.microphone_enabled;
+        options.exact_still_image = app.exact_still_image;
         let mut draft = ConnectionDraft {
             saved_connection_id: None,
             kind: ConnectionKind::DirectMachine,
@@ -3778,7 +2085,6 @@ impl ArcenApp {
             username: options.username.clone(),
             password: String::new(),
             use_tls: options.use_tls,
-            use_quic: options.quic_enabled,
             tls_trust: Some(options.tls.clone()),
             auto_reconnect: true,
         };
@@ -4084,12 +2390,20 @@ impl ArcenApp {
             session_backstop: SessionBackstopState::default(),
             presenter_telemetry: PresenterTelemetryWindow::default(),
             show_health_overlay: false,
-            show_stream_stats: false,
-            show_lossless_tiles: false,
+            // Lab runs (dev-tools builds only) open with the views on, so a
+            // proof needs no input on the Mac running it.
+            show_stream_stats: cfg!(feature = "dev-tools")
+                && std::env::var_os("ARCEN_SHOW_STREAM_STATS").is_some_and(|value| value == "1"),
+            show_lossless_tiles: cfg!(feature = "dev-tools")
+                && std::env::var_os("ARCEN_SHOW_LOSSLESS_TILES").is_some_and(|value| value == "1"),
             served_pipeline_token: None,
-            refine: arcen_media::refine::deck::DeckRefineSession::new(),
+            refine: arcen_media::refine::hub::DeckRefineHub::new(),
+            refine_offer: None,
+            exact_requested: false,
+            refine_logged: None,
+            refine_window_at: None,
             fullscreen: false,
-            session_fullscreen_restore: None,
+            session_fullscreen_restore: arcen_deck_core::display::SessionFullscreen::default(),
             last_wire_video_summary: "No wire frames yet".to_string(),
             last_decoder_summary: "No decoded frames yet".to_string(),
             last_audio_summary: "No audio yet".to_string(),
@@ -4118,7 +2432,6 @@ impl ArcenApp {
             add_connection_host: String::new(),
             add_connection_name: String::new(),
             add_connection_port: String::new(),
-            add_connection_transport: SavedTransport::Quic,
             add_connection_username: String::new(),
             add_connection_tablet_mode_requested: tablet_mode_requested,
             add_connection_displays_mode: None,
@@ -4133,10 +2446,8 @@ impl ArcenApp {
             last_audio_queued_ms: 0,
             remember_username: true,
             settings_tab: SettingsTab::Streaming,
-            #[cfg(feature = "native-tablet")]
-            usb_helper_state: None,
-            #[cfg(feature = "native-tablet")]
-            usb_helper_error: None,
+            native_tablet: Default::default(),
+            support_bundle: Default::default(),
             log_level: settings.log_level,
             security_mode: settings.security_mode,
             performance_mode: settings.performance_mode,
@@ -4200,6 +2511,7 @@ impl ArcenApp {
             stream_sizing_policy: StreamSizingPolicy::FollowWindow,
             display_fit: DisplayFitTracker::new(),
             tablet_input_enabled: tablet_mode_allows_typed_pen(tablet_mode_requested),
+            exact_still_image: settings.exact_still_image,
             tablet_mode_requested,
             tablet_mode_active: tablet_mode_requested,
             tablet_mode_reason: String::new(),
@@ -4216,8 +2528,6 @@ impl ArcenApp {
             hello_local_pen_capability: InputCapabilityAvailability::Unknown,
             tablet_producer_drops_seen: 0,
             tablet_monitor_panel_open: false,
-            tablet_left_handed: false,
-            tablet_force_proportions: false,
             home_add_mode: false,
             #[cfg(test)]
             force_multi_window_begin_outcome: std::cell::Cell::new(None),
@@ -4231,7 +2541,7 @@ impl Default for ArcenApp {
         if let Err(error) = migrate_legacy_config_dir() {
             tracing::error!(%error, "legacy client configuration directory migration failed");
         }
-        Self::from_config_repository(ClientConfigRepository::for_process())
+        Self::from_config_repository(config_repository_for_process())
     }
 }
 
@@ -4346,6 +2656,7 @@ impl eframe::App for ArcenApp {
         self.sync_mouse_coalescing(ctx);
         self.keep_root_display_sync();
         self.keep_session_backstop();
+        self.drive_exact_still_image();
         if !self.native_menu_refreshed {
             macos_menu::set_waker(ctx);
             macos_menu::install();
@@ -4422,7 +2733,10 @@ impl eframe::App for ArcenApp {
         self.poll_microphone_teardown();
         self.sync_media_state(ctx);
         self.sync_session_fullscreen(ctx);
-        self.clipboard_controller.sync(Instant::now());
+        self.clipboard_controller.sync(
+            Instant::now(),
+            crate::platform_services::services().as_ref(),
+        );
         self.drive_reconnect(ctx);
         self.drive_login_window_handover(ctx);
         self.drive_quit_hold(ctx);
@@ -4500,8 +2814,8 @@ impl eframe::App for ArcenApp {
                             saved_connections: &self.saved_connections,
                             search: &mut self.connection_search,
                             operator_notice,
-                            show_add_form: self.home_add_mode,
-                            editing_index: self.editing_index,
+                            show_add_form: &mut self.home_add_mode,
+                            editing_index: &mut self.editing_index,
                             form_name: &mut self.add_connection_name,
                             form_host: &mut self.add_connection_host,
                             form_port: &mut self.add_connection_port,
@@ -4513,22 +2827,35 @@ impl eframe::App for ArcenApp {
                             connection_test: self.connection_test.as_ref(),
                         };
                         if let Some(action) = render_home(ui, &mut state) {
-                            if !matches!(
+                            let keeps_test = matches!(
                                 action,
                                 HomeAction::TestConnection { .. } | HomeAction::ConnectionTest(_)
-                            ) {
+                            );
+                            let outcome = apply_home_action(
+                                &mut state,
+                                action,
+                                &self.config_repository,
+                                self.security_mode,
+                            );
+                            if !keeps_test {
                                 self.connection_test = None;
                             }
-                            match action {
-                                HomeAction::TestConnection { host, port } => {
-                                    self.connection_test =
-                                        Some(crate::ui::connection_test::ConnectionTest::start(
-                                            &host,
-                                            &port,
-                                            ui.ctx(),
-                                        ));
+                            if let Some(store) = outcome.store {
+                                self.reconcile_saved_connections(store);
+                            }
+                            if let Some(status) = outcome.status {
+                                self.status = status;
+                            }
+                            match outcome.effect {
+                                HomeEffect::None => {}
+                                HomeEffect::TestConnection { host, port } => {
+                                    self.connection_test = Some(crate::ui::connection_test::start(
+                                        &host,
+                                        &port,
+                                        ui.ctx(),
+                                    ));
                                 }
-                                HomeAction::ConnectionTest(panel) => {
+                                HomeEffect::ConnectionTest(panel) => {
                                     use crate::ui::connection_test::ConnectionTestAction;
                                     match panel {
                                         ConnectionTestAction::Close => self.connection_test = None,
@@ -4542,56 +2869,17 @@ impl eframe::App for ArcenApp {
                                         }
                                         ConnectionTestAction::RunAgain => {
                                             if let Some(previous) = self.connection_test.take() {
-                                                self.connection_test = Some(
-                                                    crate::ui::connection_test::ConnectionTest::start(
+                                                self.connection_test =
+                                                    Some(crate::ui::connection_test::start(
                                                         &previous.target_label,
                                                         "",
                                                         ui.ctx(),
-                                                    ),
-                                                );
+                                                    ));
                                             }
                                         }
                                     }
                                 }
-                                HomeAction::BeginAdd => {
-                                    self.editing_index = None;
-                                    self.add_connection_host.clear();
-                                    self.add_connection_name.clear();
-                                    self.add_connection_username.clear();
-                                    // A brand-new connection starts on the
-                                    // application default rather than
-                                    // inheriting whichever connection was
-                                    // edited last.
-                                    self.add_connection_displays_mode = None;
-                                    self.add_connection_keyboard =
-                                        arcen_input::keyboard::KeyboardSettings::default();
-                                    self.add_connection_port =
-                                        ConnectionKind::DirectMachine.default_port().to_string();
-                                    self.add_connection_transport = SavedTransport::Quic;
-                                    self.home_add_mode = true;
-                                }
-                                HomeAction::SelectConnection(index) => {
-                                    if let Some(saved) = self.saved_connections.get(index) {
-                                        self.direct.saved_connection_id = Some(saved.id.clone());
-                                        self.direct.kind = saved.kind;
-                                        self.direct.host = saved.host.clone();
-                                        self.direct.port = if saved.port != 0 {
-                                            saved.port
-                                        } else {
-                                            saved.kind.default_port()
-                                        };
-                                        self.direct.use_tls = saved.use_tls;
-                                        self.direct.username = saved
-                                            .settings
-                                            .remembered_username
-                                            .clone()
-                                            .unwrap_or_default();
-                                        self.direct.password.clear();
-                                        self.home_add_mode = false;
-                                        self.editing_index = None;
-                                    }
-                                }
-                                HomeAction::Connect(mut draft) => {
+                                HomeEffect::Connect(mut draft) => {
                                     // If the detail panel provided a password, pre-load
                                     // an explicit auth submission so the Credentials
                                     // screen is skipped. Threaded through as an explicit
@@ -4615,180 +2903,21 @@ impl eframe::App for ArcenApp {
                                     };
                                     self.begin_connection_flow(draft, submission, ui.ctx());
                                 }
-                                HomeAction::Edit(index) => {
-                                    if let Some(saved) = self.saved_connections.get(index) {
-                                        self.add_connection_host = saved.host.clone();
-                                        self.add_connection_name = saved.name.clone();
-                                        self.add_connection_transport = saved.transport;
-                                        let port = if saved.port != 0 {
-                                            saved.port
-                                        } else {
-                                            saved.kind.default_port()
-                                        };
-                                        self.add_connection_port = port.to_string();
-                                        self.add_connection_username = saved
-                                            .settings
-                                            .remembered_username
-                                            .clone()
-                                            .unwrap_or_default();
-                                        self.add_connection_displays_mode =
-                                            saved.settings.displays_mode;
-                                        self.add_connection_keyboard = saved.settings.keyboard;
-                                        self.editing_index = Some(index);
-                                        self.home_add_mode = false;
-                                    }
-                                }
-                                HomeAction::Delete(index) => {
-                                    if let Some(removed) =
-                                        self.saved_connections.get(index).cloned()
-                                    {
-                                        match self
-                                            .config_repository
-                                            .delete_connection(&removed.id, &removed)
-                                        {
-                                            Ok(store) => {
-                                                self.reconcile_saved_connections(store);
-                                                self.status = format!("Removed {}", removed.name);
-                                                // Clear selection if we deleted the selected one
-                                                if self.direct.saved_connection_id.as_deref()
-                                                    == Some(removed.id.as_str())
-                                                {
-                                                    self.direct.saved_connection_id = None;
-                                                }
-                                            }
-                                            Err(error) => {
-                                                self.status =
-                                                    format!("Connection was not removed: {error}");
-                                            }
-                                        }
-                                    }
-                                }
-                                HomeAction::SaveNew {
-                                    name,
-                                    host,
-                                    port,
-                                    username,
-                                    displays_mode,
-                                    keyboard,
-                                } => {
-                                    let port_num = port
-                                        .trim()
-                                        .parse::<u16>()
-                                        .ok()
-                                        .filter(|v| *v != 0)
-                                        .unwrap_or_else(|| {
-                                            ConnectionKind::DirectMachine.default_port()
-                                        });
-                                    let id = new_saved_connection_id(
-                                        ConnectionKind::DirectMachine,
-                                        &host,
-                                        port_num,
-                                        true,
-                                        self.security_mode,
-                                        &name,
-                                        self.saved_connections.len(),
-                                    );
-                                    let connection = SavedConnectionSummary {
-                                        id: id.clone(),
-                                        kind: ConnectionKind::DirectMachine,
-                                        name: name.clone(),
-                                        host: host.clone(),
-                                        port: port_num,
-                                        use_tls: true,
-                                        transport: SavedTransport::Quic,
-                                        identity_security_mode: Some(
-                                            self.security_mode.key().to_string(),
-                                        ),
-                                        settings: SavedConnectionSettings {
-                                            remembered_username: validated_remembered_username(
-                                                &username,
-                                            ),
-                                            displays_mode,
-                                            keyboard,
-                                            ..SavedConnectionSettings::default()
-                                        },
-                                        unknown: serde_json::Map::new(),
-                                    };
-                                    match self.config_repository.add_connection(connection) {
-                                        Ok(store) => {
-                                            self.reconcile_saved_connections(store);
-                                            // Auto-select the newly added connection
-                                            self.direct.saved_connection_id = Some(id.clone());
-                                            self.direct.host = host;
-                                            self.direct.port = port_num;
-                                            self.direct.username =
-                                                validated_remembered_username(&username)
-                                                    .unwrap_or_default();
-                                            self.direct.password.clear();
-                                            self.status = format!("Added {name}");
-                                            self.home_add_mode = false;
-                                            self.editing_index = None;
-                                        }
-                                        Err(error) => {
-                                            self.status =
-                                                format!("Connection was not saved: {error}");
-                                        }
-                                    }
-                                }
-                                HomeAction::SaveEdit {
-                                    index,
-                                    name,
-                                    host,
-                                    port,
-                                    username,
-                                    displays_mode,
-                                    keyboard,
-                                } => {
-                                    if let Some(original) =
-                                        self.saved_connections.get(index).cloned()
-                                    {
-                                        let port_num = port
-                                            .trim()
-                                            .parse::<u16>()
-                                            .ok()
-                                            .filter(|v| *v != 0)
-                                            .unwrap_or(original.port);
-                                        let mut updated = original.clone();
-                                        updated.name = name.clone();
-                                        updated.host = host;
-                                        updated.port = port_num;
-                                        updated.settings.remembered_username =
-                                            validated_remembered_username(&username);
-                                        updated.settings.unknown.remove("remembered_username");
-                                        updated.settings.displays_mode = displays_mode;
-                                        updated.settings.keyboard = keyboard;
-                                        match self.config_repository.update_connection(
-                                            &original.id,
-                                            &original,
-                                            updated,
-                                        ) {
-                                            Ok(store) => {
-                                                self.reconcile_saved_connections(store);
-                                                self.status = format!("Updated {name}");
-                                                self.editing_index = None;
-                                                self.home_add_mode = false;
-                                            }
-                                            Err(error) => {
-                                                self.status =
-                                                    format!("Connection was not saved: {error}");
-                                            }
-                                        }
-                                    }
-                                }
-                                HomeAction::CancelForm => {
-                                    self.home_add_mode = false;
-                                    self.editing_index = None;
-                                    self.add_connection_host.clear();
-                                    self.add_connection_name.clear();
-                                    self.add_connection_username.clear();
-                                    self.add_connection_port.clear();
-                                }
                             }
                         }
                     }
                     AppScreen::AddConnection => self.add_connection_screen(ui),
                     AppScreen::CertificateWarning(draft, info) => {
-                        let cert_action = self.certificate_warning_modal(ui, &info);
+                        let facts = CertificateFacts {
+                            endpoint: info.endpoint.clone(),
+                            server_name: info.server_name.clone(),
+                            peer_address: info.peer_address.clone(),
+                            spki_display: info.spki_sha256_display.clone(),
+                            certificate_display: info.certificate_sha256_display.clone(),
+                            not_before_epoch_secs: info.not_before_epoch_secs,
+                            not_after_epoch_secs: info.not_after_epoch_secs,
+                        };
+                        let cert_action = render_certificate_warning(ui, &facts);
                         match cert_action {
                             CertificateAction::None => {
                                 self.screen = AppScreen::CertificateWarning(draft, info);
@@ -4822,7 +2951,20 @@ impl eframe::App for ArcenApp {
                     }
                     AppScreen::CertificateChanged(draft, remembered) => {
                         let endpoint = connection_endpoint(&draft);
-                        match self.certificate_changed_modal(ui, &endpoint, &remembered) {
+                        let identity = RememberedIdentity {
+                            label: remembered.label.clone(),
+                            pinned_at: remembered.pinned_at.clone(),
+                            spki_display: remembered
+                                .to_pin()
+                                .map(|pin| crate::transport::tls::format_fingerprint(&pin.digest))
+                                .unwrap_or_else(|| remembered.digest.clone()),
+                        };
+                        match render_certificate_changed(
+                            ui,
+                            &endpoint,
+                            &identity,
+                            &mut self.certificate_change_acknowledged,
+                        ) {
                             CertificateChangedAction::None => {
                                 self.screen = AppScreen::CertificateChanged(draft, remembered);
                             }
@@ -4847,7 +2989,7 @@ impl eframe::App for ArcenApp {
                         }
                     }
                     AppScreen::Disclaimer(mut draft, text) => {
-                        match self.disclaimer_screen(ui, &draft, &text) {
+                        match render_disclaimer(ui, &draft, &text) {
                             DisclaimerAction::None => {
                                 self.screen = AppScreen::Disclaimer(draft, text);
                             }
@@ -4868,7 +3010,15 @@ impl eframe::App for ArcenApp {
                         }
                     }
                     AppScreen::Credentials(mut draft) => {
-                        match self.credentials_screen(ui, &mut draft) {
+                        let credentials_note = self.credentials_note.clone();
+                        let mut view = CredentialsView {
+                            draft: &mut draft,
+                            note: credentials_note.as_deref(),
+                            error: self.status.strip_prefix("Connection error: "),
+                            remember_username: &mut self.remember_username,
+                        };
+                        let action = render_credentials(ui, &mut view);
+                        match action {
                             CredentialAction::None => self.screen = AppScreen::Credentials(draft),
                             // Back must actually leave: re-running the
                             // connection flow lands right back on this screen
@@ -5279,8 +3429,29 @@ impl ArcenApp {
                 .active_pipeline
                 .as_ref()
                 .map(|pipeline| pipeline.token().to_string());
-            // A new hello is a new session: nothing refined survives it.
-            self.refine = arcen_media::refine::deck::DeckRefineSession::new();
+            // The hub is this connection's own; the video lane may already
+            // have started a generation, so it is not reset here. A Pier
+            // that did not offer refinement gets every record ignored.
+            self.refine_offer = hello.lossless_refine.clone();
+            if !self
+                .refine_offer
+                .as_ref()
+                .is_some_and(|offer| offer.is_on())
+            {
+                self.refine.set_accepting(false);
+            }
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                asked = self.exact_requested,
+                offered = self.refine_offer.as_ref().is_some_and(|offer| offer.is_on()),
+                reason = self
+                    .refine_offer
+                    .as_ref()
+                    .and_then(|offer| offer.reason.as_deref())
+                    .unwrap_or(""),
+                "{}",
+                arcen_telemetry::names::refine::PLAN
+            );
             let path_note = if negotiated_truth.encoder_hardware == Some(true) {
                 format!(
                     "Native optimized media path: {}",
@@ -5641,7 +3812,7 @@ impl ArcenApp {
             crate::logging::diagnostics::SessionContext {
                 host: options.host.clone(),
                 port: options.port,
-                scheme: direct_transport_scheme(&options),
+                scheme: "quic",
                 tls: options.use_tls,
                 security_mode: self.security_mode.key().to_string(),
                 codec: options.profile.codec.clone(),
@@ -5705,9 +3876,13 @@ impl ArcenApp {
 
         let pinned_session =
             matches!(self.screen, AppScreen::InSession) && self.stream_sizing_policy.is_pinned();
-        if pinned_session {
-            if self.session_fullscreen_restore.is_none() {
-                self.session_fullscreen_restore = Some(self.fullscreen);
+        // The shared rule (`arcen_deck_core::display::SessionFullscreen`);
+        // the notch-covering fullscreen is the Mac's own way in and out.
+        match self
+            .session_fullscreen_restore
+            .step(pinned_session, self.fullscreen)
+        {
+            Some(arcen_deck_core::display::SessionFullscreenStep::Enter) => {
                 if self.fullscreen_uses_notch_area && self.enter_notch_fullscreen(ctx) {
                     self.notch_fullscreen_active = true;
                     self.fullscreen = true;
@@ -5716,18 +3891,21 @@ impl ArcenApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                 }
             }
-            return;
-        }
-
-        if let Some(restore) = self.session_fullscreen_restore.take() {
-            if self.notch_fullscreen_active {
-                self.leave_notch_fullscreen(ctx);
-                self.notch_fullscreen_active = false;
-                self.fullscreen = restore;
-            } else if self.fullscreen != restore {
-                self.fullscreen = restore;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(restore));
+            Some(arcen_deck_core::display::SessionFullscreenStep::Leave { restore }) => {
+                self.leave_session_fullscreen(ctx, restore);
             }
+            None => {}
+        }
+    }
+
+    fn leave_session_fullscreen(&mut self, ctx: &egui::Context, restore: bool) {
+        if self.notch_fullscreen_active {
+            self.leave_notch_fullscreen(ctx);
+            self.notch_fullscreen_active = false;
+            self.fullscreen = restore;
+        } else if self.fullscreen != restore {
+            self.fullscreen = restore;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(restore));
         }
     }
 
@@ -5828,6 +4006,18 @@ impl ArcenApp {
                 DedicatedPresentationStatus::Inactive
             };
             state.layer_present_ms_samples.clear();
+        }
+        // Exact still image: this connection's hub. A committed tile or a
+        // raised verdict repaints, which re-presents a still frame.
+        self.refine = handle.media.refine().clone();
+        self.refine_offer = None;
+        self.exact_requested = self.exact_still_image;
+        self.refine_logged = None;
+        {
+            let repaint = ctx.clone();
+            self.refine
+                .set_waker(Arc::new(move || repaint.request_repaint()));
+            shared.lock().expect("media state poisoned").refine_hub = Some(self.refine.clone());
         }
         spawn_media_worker(
             handle.events,
@@ -5947,7 +4137,7 @@ impl ArcenApp {
     fn close_multi_window_session(&mut self) {
         if let MultiWindowSessionState::Active { attempt, .. } = &self.multi_window {
             self.pending_viewport_closes
-                .extend(attempt.plan().viewport_ids());
+                .extend(attempt.plan().windows());
             #[cfg(feature = "dev-tools")]
             if self.windowed_monitor_test.is_some() {
                 self.pending_root_title_restore = true;
@@ -6049,7 +4239,7 @@ impl ArcenApp {
         };
         let active_display_ids: Vec<u32> = live_active_displays()
             .into_iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         let (monitor_index, restore_fullscreen) = snapshot.restore_commands(&active_display_ids);
         if let Some(index) = monitor_index {
@@ -6137,10 +4327,7 @@ impl ArcenApp {
                 let validated = root_monitor_id.map_or(validated.clone(), |root_monitor_id| {
                     Self::reorder_validated_for_root_monitor(validated, root_monitor_id)
                 });
-                let plan = match MultiWindowPlan::build(
-                    &validated.monitor_ids(),
-                    &validated.cg_display_ids(),
-                ) {
+                let plan = match build_plan(&validated.monitor_ids(), &validated.display_ids()) {
                     Ok(plan) => plan,
                     Err(error) => {
                         tracing::error!(
@@ -6183,7 +4370,7 @@ impl ArcenApp {
                     generation = validated.generation.get(),
                     monitors = validated.monitors.len(),
                     root_monitor_id = root_monitor_id.map(|id| id.get()),
-                    root_display_id = plan.primary_cg_display_id(),
+                    root_display_id = plan.primary_display_id(),
                     "beginning production multi-window entry",
                 );
                 #[cfg(feature = "dev-tools")]
@@ -6201,7 +4388,7 @@ impl ArcenApp {
                                 monitors = mode.monitor_count,
                                 monitor_width_px = mode.monitor_size_px[0],
                                 monitor_height_px = mode.monitor_size_px[1],
-                                backing_display_id = tile_display.cg_display_id,
+                                backing_display_id = tile_display.display_id,
                                 tiles = ?tiles.iter().map(|tile| {
                                     (
                                         tile.session_monitor_id.get(),
@@ -6257,65 +4444,16 @@ impl ArcenApp {
         validated: &ValidatedAppliedTopology,
         refresh_by_display: &BTreeMap<u32, u32>,
     ) -> Option<arcen_media::SessionMonitorId> {
-        validated
-            .monitors
-            .iter()
-            .enumerate()
-            .max_by_key(|(index, monitor)| {
-                (
-                    refresh_by_display
-                        .get(&monitor.cg_display_id)
-                        .copied()
-                        .unwrap_or_default(),
-                    std::cmp::Reverse(*index),
-                )
-            })
-            .map(|(_, monitor)| monitor.session_monitor_id)
+        arcen_deck_core::multi_window::session::choose_root_monitor(validated, refresh_by_display)
     }
 
     fn reorder_validated_for_root_monitor(
-        mut validated: ValidatedAppliedTopology,
+        validated: ValidatedAppliedTopology,
         root_monitor_id: arcen_media::SessionMonitorId,
     ) -> ValidatedAppliedTopology {
-        let Some(root_index) = validated
-            .monitors
-            .iter()
-            .position(|monitor| monitor.session_monitor_id == root_monitor_id)
-        else {
-            return validated;
-        };
-        if root_index == 0 {
-            return validated;
-        }
-        let root = validated.monitors.remove(root_index);
-        validated.monitors.insert(0, root);
-        let mut media_plans = validated.media_roster.plans().to_vec();
-        if let Some(plan_index) = media_plans
-            .iter()
-            .position(|plan| plan.session_monitor_id == root_monitor_id)
-        {
-            let plan = media_plans.remove(plan_index);
-            media_plans.insert(0, plan);
-            match arcen_media::RegionMediaRoster::new(media_plans) {
-                Ok(roster) => {
-                    validated.media_roster = Box::new(roster);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        target: "arcen::display",
-                        %error,
-                        "could not reorder media roster for root monitor; keeping negotiated order",
-                    );
-                }
-            }
-        }
-        validated
+        arcen_deck_core::multi_window::session::reorder_for_root_monitor(validated, root_monitor_id)
     }
 
-    /// Drains `self.pending_viewport_closes`, sending an explicit
-    /// `egui::ViewportCommand::Close` to each queued viewport. See that
-    /// field's own doc for why this is a separate `logic()`-driven step
-    /// rather than sent directly from wherever the close was queued.
     fn drain_pending_viewport_closes(&mut self, ctx: &egui::Context) {
         for viewport_id in self.pending_viewport_closes.drain(..) {
             ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
@@ -6332,42 +4470,17 @@ impl ArcenApp {
     /// (idempotent, mirroring the worker's own already-built short-circuit)
     /// or if the session has no media handle.
     fn arm_multi_window_decode_isolation(&mut self, validated: &ValidatedAppliedTopology) {
-        // Media stream epochs are supplied by the negotiated roster and each
-        // frame's carrier header. The region input/window aggregate does not
-        // retain or derive them.
-        let roster = validated.media_roster();
         let Some(media) = &self.media else {
             return;
         };
-        let display_targets: BTreeMap<u32, (String, u32)> = crate::display::enumerate()
-            .into_iter()
-            .map(|display| (display.id, (display.name, display.refresh_hz)))
-            .collect();
-        let mut state = media.lock().expect("media state poisoned");
-        if state.multi_monitor_decode_roster.is_none() {
-            state.multi_monitor_decode_roster = Some((validated.generation, roster));
-            state.multi_monitor_root_monitor_id = self.multi_window_root_monitor_id;
-            state.monitor_presentation_targets = validated
-                .monitors
-                .iter()
-                .map(|monitor| {
-                    (
-                        monitor.session_monitor_id,
-                        MonitorPresentationTarget {
-                            deck_display_id: monitor.cg_display_id,
-                            deck_display_name: display_targets
-                                .get(&monitor.cg_display_id)
-                                .map(|(name, _)| name)
-                                .cloned()
-                                .unwrap_or_else(|| format!("Display {}", monitor.cg_display_id)),
-                            display_refresh_hz: display_targets
-                                .get(&monitor.cg_display_id)
-                                .map_or(0, |(_, refresh_hz)| *refresh_hz),
-                        },
-                    )
-                })
-                .collect();
-        }
+        media
+            .lock()
+            .expect("media state poisoned")
+            .arm_multi_monitor_decode(
+                validated,
+                self.multi_window_root_monitor_id,
+                &crate::display::enumerate(),
+            );
     }
 
     fn ensure_region_runtime_for_validated(
@@ -6566,73 +4679,14 @@ impl ArcenApp {
         }
     }
 
-    fn send_gesture_magnify(&mut self, scale_delta: f64, phase: ScrollPhaseMsg, coalescable: bool) {
-        let message = GestureMagnifyMsg {
-            scale_delta,
-            phase,
-            sequence: self.next_input_sequence(),
-            timestamp_ns: Self::now_epoch_ns(),
-            coalescable,
-            ..GestureMagnifyMsg::default()
+    /// One trackpad gesture step, as the shared model sends it (the
+    /// Windows Deck sends the same messages for a touchpad pinch).
+    fn send_gesture_sample(&mut self, sample: arcen_input::GestureSample) {
+        let wire = sample.wire(self.next_input_sequence(), Self::now_epoch_ns());
+        let Ok(value) = wire.to_value() else {
+            return;
         };
-        self.send_gesture_value(
-            serde_json::to_value(message).expect("GestureMagnifyMsg serializes"),
-            arcen_protocol::messages::GESTURE_MAGNIFY,
-        );
-    }
-
-    fn send_gesture_rotate(
-        &mut self,
-        degrees_delta: f64,
-        phase: ScrollPhaseMsg,
-        coalescable: bool,
-    ) {
-        let message = GestureRotateMsg {
-            degrees_delta,
-            phase,
-            sequence: self.next_input_sequence(),
-            timestamp_ns: Self::now_epoch_ns(),
-            coalescable,
-            ..GestureRotateMsg::default()
-        };
-        self.send_gesture_value(
-            serde_json::to_value(message).expect("GestureRotateMsg serializes"),
-            arcen_protocol::messages::GESTURE_ROTATE,
-        );
-    }
-
-    fn send_gesture_smart_zoom(&mut self) {
-        let message = GestureSmartZoomMsg {
-            sequence: self.next_input_sequence(),
-            timestamp_ns: Self::now_epoch_ns(),
-            ..GestureSmartZoomMsg::default()
-        };
-        self.send_gesture_value(
-            serde_json::to_value(message).expect("GestureSmartZoomMsg serializes"),
-            arcen_protocol::messages::GESTURE_SMART_ZOOM,
-        );
-    }
-
-    fn send_gesture_swipe(
-        &mut self,
-        direction: SwipeDirectionMsg,
-        fingers: u8,
-        phase: ScrollPhaseMsg,
-        coalescable: bool,
-    ) {
-        let message = GestureSwipeMsg {
-            direction,
-            fingers,
-            phase,
-            sequence: self.next_input_sequence(),
-            timestamp_ns: Self::now_epoch_ns(),
-            coalescable,
-            ..GestureSwipeMsg::default()
-        };
-        self.send_gesture_value(
-            serde_json::to_value(message).expect("GestureSwipeMsg serializes"),
-            arcen_protocol::messages::GESTURE_SWIPE,
-        );
+        self.send_gesture_value(value, wire.input_type());
     }
 
     fn process_gesture_samples(&mut self, focused: bool) {
@@ -6652,25 +4706,7 @@ impl ArcenApp {
         }
         #[cfg(target_os = "macos")]
         for sample in samples {
-            match sample {
-                crate::gestures::GestureSample::Magnify { scale_delta, phase } => {
-                    self.send_gesture_magnify(scale_delta, phase, true);
-                }
-                crate::gestures::GestureSample::Rotate {
-                    degrees_delta,
-                    phase,
-                } => {
-                    self.send_gesture_rotate(degrees_delta, phase, true);
-                }
-                crate::gestures::GestureSample::SmartZoom => self.send_gesture_smart_zoom(),
-                crate::gestures::GestureSample::Swipe {
-                    direction,
-                    fingers,
-                    phase,
-                } => {
-                    self.send_gesture_swipe(direction, fingers, phase, true);
-                }
-            }
+            self.send_gesture_sample(sample);
         }
     }
 
@@ -7034,7 +5070,7 @@ impl ArcenApp {
     /// `disconnect`/`close_multi_window_session`, never presenting or
     /// leaving open a partial subset of monitors.
     fn drive_multi_window(&mut self, ctx: &egui::Context) {
-        let (validated, primary_cg_display_id, assignments, already_committed) =
+        let (validated, primary_display_id, assignments, already_committed) =
             match &self.multi_window {
                 MultiWindowSessionState::Inactive => return,
                 MultiWindowSessionState::Active {
@@ -7043,7 +5079,7 @@ impl ArcenApp {
                     committed,
                 } => (
                     validated.clone(),
-                    attempt.plan().primary_cg_display_id(),
+                    attempt.plan().primary_display_id(),
                     attempt.plan().assignments().to_vec(),
                     *committed,
                 ),
@@ -7082,12 +5118,12 @@ impl ArcenApp {
         #[cfg(feature = "dev-tools")]
         let mut active_display_ids: Vec<u32> = active_displays
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         #[cfg(not(feature = "dev-tools"))]
         let active_display_ids: Vec<u32> = active_displays
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         #[cfg(feature = "dev-tools")]
         let windowed_test_context = if let Some(mode) = self.windowed_monitor_test {
@@ -7104,14 +5140,14 @@ impl ArcenApp {
             };
             active_displays = (0..mode.monitor_count)
                 .map(|index| ActiveDisplayInfo {
-                    cg_display_id: crate::ui::windowed_monitor_test::synthetic_display_id(index),
+                    display_id: crate::ui::windowed_monitor_test::synthetic_display_id(index),
                     width_pts: display.width,
                     height_pts: display.height,
                 })
                 .collect();
             active_display_ids = active_displays
                 .iter()
-                .map(|display| display.cg_display_id)
+                .map(|display| display.display_id)
                 .collect();
             Some((mode, display))
         } else {
@@ -7120,7 +5156,7 @@ impl ArcenApp {
 
         let root_move_command_needed = match &self.multi_window {
             MultiWindowSessionState::Active { attempt, .. } => {
-                attempt.root_move_command_needed(primary_cg_display_id)
+                attempt.root_move_command_needed(primary_display_id)
             }
             MultiWindowSessionState::Inactive => false,
         };
@@ -7148,7 +5184,7 @@ impl ArcenApp {
                     &root_window_title,
                     tile,
                     display,
-                    primary_cg_display_id,
+                    primary_display_id,
                     root_move_command_needed,
                     snapshot_needed,
                 ),
@@ -7169,7 +5205,7 @@ impl ArcenApp {
             drive_root_multi_window_target(
                 ctx,
                 &root_window_title,
-                primary_cg_display_id,
+                primary_display_id,
                 &active_display_ids,
                 root_move_command_needed,
                 snapshot_needed,
@@ -7180,7 +5216,7 @@ impl ArcenApp {
             drive_root_multi_window_target(
                 ctx,
                 &root_window_title,
-                primary_cg_display_id,
+                primary_display_id,
                 &active_display_ids,
                 root_move_command_needed,
                 snapshot_needed,
@@ -7190,7 +5226,7 @@ impl ArcenApp {
         }
         if root_move_command_sent {
             if let MultiWindowSessionState::Active { attempt, .. } = &mut self.multi_window {
-                attempt.record_root_move_command_sent(primary_cg_display_id);
+                attempt.record_root_move_command_sent(primary_display_id);
             }
         }
 
@@ -7235,7 +5271,7 @@ impl ArcenApp {
             .collect();
         for assignment in &assignments {
             let monitor_id = assignment.session_monitor_id;
-            let viewport_id = assignment.viewport_id;
+            let viewport_id = assignment.window;
             // `remove` (never `get(..).cloned()`): consumes this monitor's
             // slot exactly like root's own `latest_frame.take()` does, so an
             // ordinary repaint with no fresh decode in between reads `None`
@@ -7369,7 +5405,7 @@ impl ArcenApp {
                 .or_default()
                 .clone();
             let display_refresh_hz = display_refresh_by_id
-                .get(&assignment.cg_display_id)
+                .get(&assignment.display_id)
                 .copied()
                 .unwrap_or_default();
             let now = Instant::now();
@@ -7435,7 +5471,7 @@ impl ArcenApp {
             let callback_state = Arc::clone(&deferred_state);
             let callback_media = self.media.clone();
             #[cfg(feature = "dev-tools")]
-            let expected_virtual_display_id = assignment.cg_display_id;
+            let expected_virtual_display_id = assignment.display_id;
             ctx.show_viewport_deferred(viewport_id, builder, move |ui, _class| {
                 let show_started_at = Instant::now();
                 let viewport_paint_started_at = Instant::now();
@@ -7572,7 +5608,7 @@ impl ArcenApp {
                     crate::ui::windowed_monitor_test::confirmation_observation(
                         observation,
                         expected_virtual_display_id,
-                        display.cg_display_id,
+                        display.display_id,
                     )
                 } else {
                     observation
@@ -8374,20 +6410,6 @@ impl ArcenApp {
             MenuCommand::ToggleTabletMonitor => {
                 self.tablet_monitor_panel_open = !self.tablet_monitor_panel_open;
             }
-            MenuCommand::ToggleTabletLeftHanded => {
-                self.tablet_left_handed = !self.tablet_left_handed;
-                tracing::debug!(
-                    left_handed = self.tablet_left_handed,
-                    "tablet orientation toggled"
-                );
-            }
-            MenuCommand::ToggleTabletForceProportions => {
-                self.tablet_force_proportions = !self.tablet_force_proportions;
-                tracing::debug!(
-                    force_proportions = self.tablet_force_proportions,
-                    "tablet force proportions toggled (proportional mapping planned; not yet applied)"
-                );
-            }
             MenuCommand::ToggleNegotiatedTruth => {
                 self.negotiated_truth_panel_open = !self.negotiated_truth_panel_open;
             }
@@ -8403,6 +6425,13 @@ impl ArcenApp {
                 // against whichever pattern was selected before it.
                 self.pattern_accuracy = None;
             }
+            // Only a developer build's menu offers it; the PC Deck's own
+            // commands and its About window are not on the Mac's menu bar.
+            #[cfg(not(feature = "dev-tools"))]
+            MenuCommand::CycleTestPattern => {}
+            MenuCommand::About
+            | MenuCommand::SendSecureAttention
+            | MenuCommand::ToggleKeyboardGrab => {}
         }
     }
 
@@ -8637,7 +6666,7 @@ impl ArcenApp {
             .or_default()
             .clear();
         self.secondary_pointer_lock = Some(monitor_id);
-        let viewport_id = MonitorWindowAssignment::viewport_id_for(monitor_id);
+        let viewport_id = viewport_id_for(monitor_id);
         ctx.send_viewport_cmd_to(
             viewport_id,
             egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked),
@@ -8703,7 +6732,7 @@ impl ArcenApp {
         self.secondary_pointer_lock = None;
         self.secondary_relative_motion.remove(&monitor_id);
         if let Some(ctx) = self.viewport_context.clone() {
-            let viewport_id = MonitorWindowAssignment::viewport_id_for(monitor_id);
+            let viewport_id = viewport_id_for(monitor_id);
             ctx.send_viewport_cmd_to(
                 viewport_id,
                 egui::ViewportCommand::CursorGrab(egui::CursorGrab::None),
@@ -8804,19 +6833,11 @@ impl ArcenApp {
     }
 
     fn launcher_top_bar(&mut self, ui: &mut egui::Ui) {
-        let width = ui.available_width();
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(0x20, 0x23, 0x21))
-            .inner_margin(egui::Margin::symmetric(20, 8))
-            .show(ui, |ui| {
-                ui.set_width(width);
-                ui.set_min_height(34.0);
-                ui.horizontal(|ui| {
-                    if toolbar_icon(ui, "⚙").clicked() {
-                        self.screen = AppScreen::Settings;
-                    }
-                });
-            });
+        if arcen_deck_core::screens::launcher::render_launcher_top_bar(ui)
+            == arcen_deck_core::screens::launcher::LauncherAction::OpenSettings
+        {
+            self.screen = AppScreen::Settings;
+        }
     }
 
     fn begin_connection_flow(
@@ -8874,12 +6895,12 @@ impl ArcenApp {
         // applied to a different one, however the user got there. A stale
         // entry for another endpoint is dropped rather than honoured.
         let endpoint = connection_endpoint(draft);
-        if let Some((owner, mode)) = self.pending_displays_override.take() {
-            if owner == endpoint {
-                return Some(mode);
-            }
-        }
-        self.saved_displays_mode_for(draft)
+        let saved = self.saved_displays_mode_for(draft);
+        arcen_deck_core::connect_plan::resolve_attempt_displays_mode(
+            &mut self.pending_displays_override,
+            &endpoint,
+            saved,
+        )
     }
 
     /// This connection's own saved Displays choice, or `None` when it is
@@ -8960,20 +6981,11 @@ impl ArcenApp {
                 height_px = mode.monitor_size_px[1],
                 "requesting synthetic local display layout for windowed multi-monitor test mode",
             );
-            let require_full_color_roster = effective_color_fidelity_variant(self.color_fidelity)
-                .video
-                .chroma
-                == arcen_media::ChromaSubsampling::Yuv444;
-            let full_color_display_ids = topology
-                .monitors()
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| {
-                    require_full_color_roster
-                        || (*index < 4 && self.full_color_display_mask & (1u8 << index) != 0)
-                })
-                .map(|(_, monitor)| monitor.monitor().identity.id.clone())
-                .collect();
+            let full_color_display_ids = full_color_display_ids(
+                &topology,
+                self.color_fidelity,
+                self.full_color_display_mask,
+            );
             return Ok(Some(
                 crate::transport::multi_monitor::RequestedMultiMonitorSelection {
                     topology,
@@ -9005,21 +7017,11 @@ impl ArcenApp {
             crate::ui::multi_window::multi_window_runtime_available(),
         )?;
         if let Some(selection) = approved.as_mut() {
-            let require_full_color_roster = effective_color_fidelity_variant(self.color_fidelity)
-                .video
-                .chroma
-                == arcen_media::ChromaSubsampling::Yuv444;
-            selection.full_color_display_ids = selection
-                .topology
-                .monitors()
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| {
-                    require_full_color_roster
-                        || (*index < 4 && self.full_color_display_mask & (1u8 << index) != 0)
-                })
-                .map(|(_, monitor)| monitor.monitor().identity.id.clone())
-                .collect();
+            selection.full_color_display_ids = full_color_display_ids(
+                &selection.topology,
+                self.color_fidelity,
+                self.full_color_display_mask,
+            );
         }
         Ok(approved)
     }
@@ -9064,28 +7066,10 @@ impl ArcenApp {
         } else {
             self.disconnect();
         }
-        #[cfg(not(feature = "wss-compat"))]
-        {
-            draft.use_quic = true;
-        }
-        if draft.kind == ConnectionKind::DirectMachine
-            && draft.use_quic
-            && (!draft.use_tls || draft.port == 0)
-        {
+        if draft.kind == ConnectionKind::DirectMachine && (!draft.use_tls || draft.port == 0) {
             self.status =
                 "Direct QUIC connections require TLS and a nonzero UDP port; update this connection."
                     .to_string();
-            self.pending_connection = None;
-            self.screen = AppScreen::Home;
-            return;
-        }
-        #[cfg(feature = "wss-compat")]
-        if draft.kind == ConnectionKind::DirectMachine
-            && !draft.use_quic
-            && (!draft.use_tls || draft.port != ConnectionKind::DirectMachine.default_port())
-        {
-            self.status =
-                "Direct connections require WSS on TCP 18443; update this connection.".to_string();
             self.pending_connection = None;
             self.screen = AppScreen::Home;
             return;
@@ -9245,32 +7229,12 @@ impl ArcenApp {
             self.drop_session_handles();
             return false;
         };
-        let grant = authentication.resume_grant.take();
-        let sid = std::mem::take(&mut authentication.session_log_id);
         let kind = authentication.kind;
-        let result = match kind {
-            AuthenticationKind::InitialOptIn => controller
-                .accept_initial(
-                    grant,
-                    authentication.resume_window,
-                    authentication.resumed,
-                    sid,
-                )
-                .map(|_| ()),
-            AuthenticationKind::Resume => controller.accept_resume(
-                grant,
-                authentication.resume_window,
-                authentication.resumed,
-                sid,
-                self.reconnect_clock.now(),
-            ),
-            AuthenticationKind::Refresh => controller.accept_refresh(
-                grant,
-                authentication.resume_window,
-                authentication.resumed,
-                sid,
-            ),
-        };
+        let result = arcen_deck_core::reconnect_flow::accept_authentication(
+            controller,
+            &mut authentication,
+            self.reconnect_clock.now(),
+        );
         if result.is_err() {
             controller.terminal();
             self.status = "Host returned an invalid session-resume response".to_string();
@@ -9372,9 +7336,8 @@ impl ArcenApp {
         // needs the live identity. Building it enumerates every display
         // through WindowServer, which on every pass of a healthy session
         // kept a core and WindowServer busy for the whole session.
-        let reconnecting = self.reconnect.as_ref().is_some_and(|controller| {
-            matches!(controller.phase(), ReconnectPhase::Reconnecting { .. })
-        });
+        let reconnecting =
+            arcen_deck_core::reconnect_flow::is_reconnecting(self.reconnect.as_ref());
         if !reconnecting && self.active_connection.is_some() && self.reconnect_options.is_some() {
             self.refresh_reconnect_screen();
             return;
@@ -9398,79 +7361,43 @@ impl ArcenApp {
             return;
         };
 
-        let attempt = match self.reconnect.as_mut().unwrap().take_due(
-            now,
+        match arcen_deck_core::reconnect_flow::next_resume_launch(
+            self.reconnect.as_mut().unwrap(),
+            &self.reconnect_clock,
             self.connection_generation,
             &identity,
+            self.reconnect_options.as_ref(),
         ) {
-            Ok(attempt) => attempt,
-            Err(_) => {
+            ResumeLaunch::Idle => {}
+            ResumeLaunch::Abandon => {
                 self.return_to_credentials();
                 return;
             }
-        };
-        if let Some(attempt) = attempt {
-            let deadline = match self.reconnect.as_ref().and_then(|controller| {
-                controller.resume_budget(self.reconnect_clock.now()).ok()?;
-                self.reconnect_clock
-                    .instant_at(controller.resume_deadline().ok()?)
-            }) {
-                Some(deadline) => deadline,
-                None => {
-                    self.return_to_credentials();
-                    return;
-                }
-            };
-            let Some(options) = self
-                .reconnect_options
-                .as_ref()
-                .map(ConnectOptions::credential_free_clone)
-            else {
-                self.return_to_credentials();
-                return;
-            };
-            self.pending_connection = self.active_connection.clone();
-            self.launch_resume_attempt(options, attempt, deadline, ctx);
+            ResumeLaunch::Launch {
+                options,
+                attempt,
+                deadline,
+            } => {
+                self.pending_connection = self.active_connection.clone();
+                self.launch_resume_attempt(*options, attempt, deadline, ctx);
+            }
         }
         self.refresh_reconnect_screen();
     }
 
     fn refresh_reconnect_screen(&mut self) {
-        let Some(phase) = self
+        let Some((overlay, resuming)) = self
             .reconnect
             .as_ref()
-            .map(|controller| controller.phase().clone())
+            .and_then(|controller| ReconnectOverlay::from_phase(controller.phase()))
         else {
             return;
         };
-        match phase {
-            ReconnectPhase::Reconnecting {
-                attempt,
-                next_retry,
-                deadline,
-                last_error,
-            } => {
-                self.screen = AppScreen::Reconnecting(ReconnectOverlay {
-                    attempt,
-                    next_retry: Some(next_retry),
-                    deadline,
-                    last_error,
-                });
-            }
-            ReconnectPhase::Resuming {
-                attempt,
-                deadline,
-                last_error,
-            } => {
-                self.screen = AppScreen::Resuming(ReconnectOverlay {
-                    attempt,
-                    next_retry: None,
-                    deadline,
-                    last_error,
-                });
-            }
-            ReconnectPhase::Connected | ReconnectPhase::Cancelled | ReconnectPhase::Terminal => {}
-        }
+        self.screen = if resuming {
+            AppScreen::Resuming(overlay)
+        } else {
+            AppScreen::Reconnecting(overlay)
+        };
     }
 
     fn return_to_credentials(&mut self) {
@@ -9697,9 +7624,9 @@ impl ArcenApp {
         // message. Matching it exactly therefore never fired and the user was
         // shown the raw error text with no way to act on either option it
         // named -- exactly the dead end this screen exists to remove.
-        if end
-            .message
-            .contains(arcen_protocol::messages::MULTI_MONITOR_TOPOLOGY_CONFLICT_REASON)
+        let displays_recovery = arcen_deck_core::connect_plan::displays_recovery_for(&end.message);
+        if displays_recovery
+            == Some(arcen_deck_core::connect_plan::DisplaysRecovery::TopologyConflict)
         {
             if let Some(draft) = self.active_connection.clone() {
                 tracing::info!(
@@ -9721,10 +7648,7 @@ impl ArcenApp {
         // display.
         // Also matched anywhere in the message rather than at the start: the
         // same close reason can arrive wrapped by the transport.
-        if end
-            .message
-            .contains(crate::transport::websocket::MULTI_MONITOR_UNSUPPORTED_PREFIX)
-        {
+        if displays_recovery == Some(arcen_deck_core::connect_plan::DisplaysRecovery::Unsupported) {
             if let Some(draft) = self.active_connection.clone() {
                 tracing::info!(
                     target: crate::logging::target::SESSION,
@@ -9741,25 +7665,16 @@ impl ArcenApp {
         // scheduler below.
         let tofu_pin_mismatch = crate::transport::tls::is_tofu_pin_mismatch_message(&end.message);
 
-        if end.transient() {
-            if let Some(controller) = self
-                .reconnect
-                .as_mut()
-                .filter(|controller| controller.generation() == generation)
-            {
-                if controller
-                    .schedule(
-                        end.message,
-                        self.reconnect_clock.observed_at(end.observed_at),
-                        &mut self.reconnect_jitter,
-                    )
-                    .is_ok()
-                {
-                    self.refresh_reconnect_screen();
-                    ctx.request_repaint();
-                    return;
-                }
-            }
+        if arcen_deck_core::reconnect_flow::schedule_after_end(
+            self.reconnect.as_mut(),
+            generation,
+            &end,
+            &self.reconnect_clock,
+            &mut self.reconnect_jitter,
+        ) {
+            self.refresh_reconnect_screen();
+            ctx.request_repaint();
+            return;
         }
 
         if matches!(
@@ -9855,290 +7770,6 @@ impl ArcenApp {
         }
     }
 
-    /// Certificate warning rendered as a centred modal overlay.
-    /// The caller is responsible for rendering the background screen first.
-    fn certificate_warning_modal(
-        &mut self,
-        ui: &mut egui::Ui,
-        info: &CertInfo,
-    ) -> CertificateAction {
-        let mut action = CertificateAction::None;
-        // Dim background
-        let screen = ui.clip_rect();
-        ui.painter()
-            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
-
-        egui::Window::new("cert_warning_modal")
-            .title_bar(false)
-            .resizable(false)
-            .collapsible(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([520.0, 0.0])
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::WHITE)
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(0xDD, 0xDD, 0xDD),
-                    ))
-                    .corner_radius(12.0)
-                    .inner_margin(egui::Margin::symmetric(36, 30)),
-            )
-            .show(ui.ctx(), |ui| {
-                ui.set_width(448.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("⚠")
-                            .color(egui::Color32::from_rgb(0xE7, 0xB8, 0x1C))
-                            .size(28.0),
-                    );
-                    ui.add_space(10.0);
-                    ui.heading(
-                        egui::RichText::new("Verify this host")
-                            .color(egui::Color32::BLACK)
-                            .size(22.0),
-                    );
-                });
-                ui.add_space(14.0);
-                ui.label(
-                    egui::RichText::new(
-                        "The server certificate is not issued by a trusted authority. \
-                         Compare these values with the host administrator before granting \
-                         session-only trust.",
-                    )
-                    .color(egui::Color32::from_rgb(0x44, 0x44, 0x44))
-                    .size(14.0),
-                );
-                ui.add_space(14.0);
-                let mono_color = egui::Color32::from_rgb(0x55, 0x55, 0x55);
-                for (label, value) in [
-                    ("Endpoint", info.endpoint.to_string()),
-                    ("Server name", info.server_name.clone()),
-                    // Which address actually presented this certificate. A
-                    // hostname can resolve to several, and all of them are
-                    // dialled; without this the dialog could show a fingerprint
-                    // under a name the user trusts while it came from somewhere
-                    // else on that name.
-                    (
-                        "Peer address",
-                        info.peer_address.clone().unwrap_or_else(|| "—".to_string()),
-                    ),
-                    ("SPKI SHA-256", info.spki_sha256_display.clone()),
-                    (
-                        "Certificate SHA-256",
-                        info.certificate_sha256_display.clone(),
-                    ),
-                    (
-                        "Valid (Unix UTC)",
-                        format!(
-                            "{} – {}",
-                            info.not_before_epoch_secs, info.not_after_epoch_secs
-                        ),
-                    ),
-                ] {
-                    ui.label(
-                        egui::RichText::new(format!("{label}   {value}"))
-                            .color(mono_color)
-                            .monospace()
-                            .size(12.5),
-                    );
-                }
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Compare this fingerprint with the Pier before trusting it. \
-                         Remembering it means you will be warned if this host's identity \
-                         ever changes.",
-                    )
-                    .strong()
-                    .color(egui::Color32::from_rgb(0x44, 0x44, 0x44))
-                    .size(13.0),
-                );
-                ui.add_space(22.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Trust and Remember")
-                                    .color(egui::Color32::WHITE)
-                                    .size(14.0),
-                            )
-                            .fill(theme::ACCENT)
-                            .min_size(egui::vec2(184.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        action = CertificateAction::TrustAndRemember;
-                    }
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("Trust Once").size(14.0))
-                                .min_size(egui::vec2(120.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        action = CertificateAction::TrustForSession;
-                    }
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("Cancel").size(14.0))
-                                .min_size(egui::vec2(88.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        action = CertificateAction::Cancel;
-                    }
-                });
-            });
-        action
-    }
-
-    /// Shown when a *remembered* identity no longer matches what answered.
-    ///
-    /// Presents the fingerprint this Deck trusted and when it was trusted, and
-    /// names both explanations without ranking them — the benign one (the host
-    /// was reinstalled or its certificate was regenerated) and the one the
-    /// mechanism exists to catch. The action is gated behind an explicit tick
-    /// so that clearing trust cannot be done by reflex.
-    fn certificate_changed_modal(
-        &mut self,
-        ui: &mut egui::Ui,
-        endpoint: &str,
-        remembered: &crate::ui::trusted_pins::StoredPin,
-    ) -> CertificateChangedAction {
-        let mut action = CertificateChangedAction::None;
-        let screen = ui.clip_rect();
-        ui.painter()
-            .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
-
-        let danger = egui::Color32::from_rgb(0xC0, 0x39, 0x2B);
-        let remembered_display = remembered
-            .to_pin()
-            .map(|pin| crate::transport::tls::format_fingerprint(&pin.digest))
-            .unwrap_or_else(|| remembered.digest.clone());
-
-        egui::Window::new("cert_changed_modal")
-            .title_bar(false)
-            .resizable(false)
-            .collapsible(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size([560.0, 0.0])
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::WHITE)
-                    .stroke(egui::Stroke::new(1.5, danger))
-                    .corner_radius(12.0)
-                    .inner_margin(egui::Margin::symmetric(36, 30)),
-            )
-            .show(ui.ctx(), |ui| {
-                ui.set_width(488.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("⛔").color(danger).size(28.0));
-                    ui.add_space(10.0);
-                    ui.heading(
-                        egui::RichText::new("This host's identity changed")
-                            .color(egui::Color32::BLACK)
-                            .size(22.0),
-                    );
-                });
-                ui.add_space(14.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Arcen remembered this host's certificate, and the server that \
-                         answered presented a different one. Arcen refused to send your \
-                         credentials.",
-                    )
-                    .color(egui::Color32::from_rgb(0x44, 0x44, 0x44))
-                    .size(14.0),
-                );
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new(
-                        "This happens when the Pier is reinstalled or its certificate is \
-                         regenerated — and it is also what interception looks like. Confirm \
-                         with whoever runs the host before continuing.",
-                    )
-                    .color(egui::Color32::from_rgb(0x44, 0x44, 0x44))
-                    .size(14.0),
-                );
-                ui.add_space(16.0);
-
-                let mono_color = egui::Color32::from_rgb(0x55, 0x55, 0x55);
-                for (label, value) in [
-                    ("Endpoint", endpoint.to_string()),
-                    (
-                        "Trusted as",
-                        remembered.label.clone().unwrap_or_else(|| "—".to_string()),
-                    ),
-                    (
-                        "Trusted on",
-                        remembered
-                            .pinned_at
-                            .clone()
-                            .unwrap_or_else(|| "—".to_string()),
-                    ),
-                    ("Remembered SPKI", remembered_display.clone()),
-                ] {
-                    ui.label(
-                        egui::RichText::new(format!("{label}   {value}"))
-                            .color(mono_color)
-                            .monospace()
-                            .size(12.5),
-                    );
-                }
-                ui.add_space(14.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Forgetting does not trust the new certificate. Arcen reconnects \
-                         straight away and shows it to you for comparison first.",
-                    )
-                    .color(egui::Color32::from_rgb(0x44, 0x44, 0x44))
-                    .size(13.0),
-                );
-                ui.add_space(14.0);
-                ui.checkbox(
-                    &mut self.certificate_change_acknowledged,
-                    egui::RichText::new(
-                        "I confirmed with the host administrator that its certificate changed",
-                    )
-                    .color(egui::Color32::BLACK)
-                    .size(13.0),
-                );
-                ui.add_space(20.0);
-                ui.horizontal(|ui| {
-                    let armed = self.certificate_change_acknowledged;
-                    if ui
-                        .add_enabled(
-                            armed,
-                            egui::Button::new(
-                                egui::RichText::new("Forget and Verify")
-                                    .color(egui::Color32::WHITE)
-                                    .size(14.0),
-                            )
-                            .fill(danger)
-                            .min_size(egui::vec2(196.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        action = CertificateChangedAction::ForgetAndReconnect;
-                    }
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("Cancel").size(14.0))
-                                .min_size(egui::vec2(96.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        action = CertificateChangedAction::Cancel;
-                    }
-                });
-            });
-        action
-    }
-
     #[cfg(test)]
     fn prepare_saved_connection_editor(&mut self, index: usize) {
         let Some(saved) = self.saved_connections.get(index).cloned() else {
@@ -10146,7 +7777,6 @@ impl ArcenApp {
         };
         self.add_connection_host = saved.host;
         self.add_connection_name = saved.name;
-        self.add_connection_transport = saved.transport;
         self.add_connection_port = if saved.port != 0 {
             saved.port
         } else {
@@ -10200,46 +7830,6 @@ impl ArcenApp {
                 ui.set_width(420.0);
                 ui.add_space(24.0);
                 labelled_line_edit(ui, "Address", &mut self.add_connection_host, false);
-                #[cfg(feature = "wss-compat")]
-                {
-                    ui.add_space(28.0);
-                    ui.label(
-                        egui::RichText::new("Transport")
-                            .color(egui::Color32::from_rgb(0x5F, 0x5F, 0x5F))
-                            .size(13.0),
-                    );
-                    let previous_transport = self.add_connection_transport;
-                    let transport_response =
-                        egui::ComboBox::from_id_salt("saved_connection_transport")
-                            .selected_text(self.add_connection_transport.label())
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.add_connection_transport,
-                                    SavedTransport::Wss,
-                                    "WSS (TCP)",
-                                );
-                                ui.selectable_value(
-                                    &mut self.add_connection_transport,
-                                    SavedTransport::Quic,
-                                    "QUIC (UDP)",
-                                );
-                            })
-                            .response;
-                    if transport_response.changed() {
-                        let previous_port = previous_transport.default_port();
-                        if self.add_connection_port.trim().is_empty()
-                            || self.add_connection_port.trim() == previous_port.to_string()
-                        {
-                            self.add_connection_port =
-                                self.add_connection_transport.default_port().to_string();
-                        }
-                    }
-                    ui.add_space(28.0);
-                }
-                #[cfg(not(feature = "wss-compat"))]
-                {
-                    self.add_connection_transport = SavedTransport::Quic;
-                }
                 labelled_line_edit(ui, "Port", &mut self.add_connection_port, false);
                 ui.add_space(28.0);
                 labelled_line_edit(ui, "Connection Name", &mut self.add_connection_name, false);
@@ -10262,15 +7852,13 @@ impl ArcenApp {
                     );
                 }
                 let parsed_port = self.add_connection_port.trim().parse::<u16>().ok();
-                let port_valid = parsed_port
-                    .is_some_and(|port| self.add_connection_transport.accepts_port(port));
+                let port_valid =
+                    parsed_port.is_some_and(|port| SavedTransport::Quic.accepts_port(port));
                 if !port_valid {
                     ui.label(
-                        egui::RichText::new(
-                            self.add_connection_transport.port_validation_message(),
-                        )
-                        .color(egui::Color32::from_rgb(0xC0, 0x20, 0x20))
-                        .size(13.0),
+                        egui::RichText::new(SavedTransport::Quic.port_validation_message())
+                            .color(egui::Color32::from_rgb(0xC0, 0x20, 0x20))
+                            .size(13.0),
                     );
                 }
                 ui.add_space(28.0);
@@ -10293,6 +7881,7 @@ impl ArcenApp {
                 ui.label(
                     egui::RichText::new(tablet_mode_description(
                         self.add_connection_tablet_mode_requested,
+                        deck_platform(ui.ctx()),
                     ))
                     .color(egui::Color32::DARK_GRAY)
                     .size(12.0),
@@ -10331,8 +7920,8 @@ impl ArcenApp {
                     let host = self.add_connection_host.trim().to_string();
                     let name = self.add_connection_name.trim().to_string();
                     let port = parsed_port
-                        .filter(|port| self.add_connection_transport.accepts_port(*port))
-                        .unwrap_or_else(|| self.add_connection_transport.default_port());
+                        .filter(|port| SavedTransport::Quic.accepts_port(*port))
+                        .unwrap_or_else(|| SavedTransport::Quic.default_port());
                     let saved_result = match self.editing_index {
                         Some(index) if index < self.saved_connections.len() => {
                             let original = self.saved_connections[index].clone();
@@ -10341,7 +7930,7 @@ impl ArcenApp {
                             updated.host = host.clone();
                             updated.port = port;
                             updated.use_tls = true;
-                            updated.transport = self.add_connection_transport;
+                            updated.transport = SavedTransport::Quic;
                             updated.settings.remembered_username =
                                 validated_remembered_username(&self.add_connection_username);
                             updated.settings.tablet_mode_requested =
@@ -10368,7 +7957,7 @@ impl ArcenApp {
                                 host: host.clone(),
                                 port,
                                 use_tls: true,
-                                transport: self.add_connection_transport,
+                                transport: SavedTransport::Quic,
                                 identity_security_mode: Some(self.security_mode.key().to_string()),
                                 settings: SavedConnectionSettings {
                                     remembered_username: validated_remembered_username(
@@ -10410,161 +7999,6 @@ impl ArcenApp {
         });
     }
 
-    fn credentials_screen(
-        &mut self,
-        ui: &mut egui::Ui,
-        draft: &mut ConnectionDraft,
-    ) -> CredentialAction {
-        let mut action = CredentialAction::None;
-        ui.add_space(80.0);
-        ui.horizontal_top(|ui| {
-            ui.add_space(72.0);
-            ui.vertical(|ui| {
-                ui.set_width(310.0);
-                ui.add_space(28.0);
-                ui.heading(
-                    egui::RichText::new("Connect")
-                        .color(egui::Color32::BLACK)
-                        .size(30.0),
-                );
-                ui.add_space(44.0);
-                ui.horizontal(|ui| {
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(ui.cursor().min, egui::vec2(2.0, 20.0)),
-                        0.0,
-                        theme::ACCENT,
-                    );
-                    ui.add_space(14.0);
-                    ui.label(
-                        egui::RichText::new(display_name_for_draft(draft))
-                            .color(egui::Color32::from_rgb(0x3D, 0x3D, 0x3D))
-                            .size(17.0),
-                    );
-                });
-                ui.add_space(220.0);
-                ui.separator();
-                ui.add_space(12.0);
-                if back_button(ui, "Back").clicked() {
-                    action = CredentialAction::Back;
-                }
-            });
-
-            ui.add_space(86.0);
-            ui.vertical(|ui| {
-                ui.set_width(360.0);
-                labelled_line_edit(ui, "Username", &mut draft.username, false);
-                ui.add_space(22.0);
-                labelled_line_edit(ui, "Password", &mut draft.password, true);
-                ui.add_space(24.0);
-                if ui
-                    .add_sized(
-                        [360.0, 48.0],
-                        egui::Button::new(
-                            egui::RichText::new("Connect")
-                                .color(egui::Color32::WHITE)
-                                .size(17.0),
-                        )
-                        .fill(theme::ACCENT),
-                    )
-                    .clicked()
-                {
-                    action = CredentialAction::Connect;
-                }
-                ui.add_space(16.0);
-                if let Some(note) = self.credentials_note.clone() {
-                    ui.label(
-                        egui::RichText::new(note)
-                            .color(egui::Color32::from_rgb(0x55, 0x55, 0x5A))
-                            .size(13.0),
-                    );
-                    ui.add_space(8.0);
-                }
-                if let Some(err) = self.status.strip_prefix("Connection error: ") {
-                    ui.label(
-                        egui::RichText::new(err)
-                            .color(egui::Color32::from_rgb(0xC0, 0x20, 0x20))
-                            .size(13.0),
-                    );
-                    ui.add_space(8.0);
-                }
-                ui.checkbox(&mut self.remember_username, "Remember username");
-            });
-        });
-        action
-    }
-
-    fn disclaimer_screen(
-        &mut self,
-        ui: &mut egui::Ui,
-        draft: &ConnectionDraft,
-        text: &str,
-    ) -> DisclaimerAction {
-        let mut action = DisclaimerAction::None;
-        ui.add_space(52.0);
-        ui.vertical_centered(|ui| {
-            ui.set_max_width(760.0);
-            ui.heading(
-                egui::RichText::new("Review before connect")
-                    .color(egui::Color32::BLACK)
-                    .size(28.0),
-            );
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(format!("Host: {}", connection_endpoint(draft)))
-                    .color(egui::Color32::DARK_GRAY)
-                    .monospace(),
-            );
-            ui.add_space(18.0);
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(0xF7, 0xF7, 0xF7))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgb(0xD8, 0xD8, 0xD8),
-                ))
-                .inner_margin(egui::Margin::same(18))
-                .show(ui, |ui| {
-                    ui.set_width(720.0);
-                    egui::ScrollArea::vertical()
-                        .max_height(420.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(text)
-                                        .color(egui::Color32::BLACK)
-                                        .size(16.0),
-                                )
-                                .selectable(true)
-                                .wrap(),
-                            );
-                        });
-                });
-            ui.add_space(18.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_sized(
-                        [140.0, 44.0],
-                        egui::Button::new(
-                            egui::RichText::new("Accept")
-                                .color(egui::Color32::WHITE)
-                                .size(16.0),
-                        )
-                        .fill(theme::ACCENT),
-                    )
-                    .clicked()
-                {
-                    action = DisclaimerAction::Accept;
-                }
-                if ui
-                    .add_sized([140.0, 44.0], egui::Button::new("Decline"))
-                    .clicked()
-                {
-                    action = DisclaimerAction::Decline;
-                }
-            });
-        });
-        action
-    }
-
     /// Presents the two real recoveries for a host multi-monitor topology
     /// conflict.
     ///
@@ -10575,104 +8009,27 @@ impl ArcenApp {
     /// the requested layout but closes those applications. Only the user can
     /// weigh that, so both are offered explicitly and neither is preselected.
     fn topology_conflict_screen(&mut self, ui: &mut egui::Ui, draft: &ConnectionDraft) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(150.0);
-            ui.heading(
-                egui::RichText::new("This desktop was started without your layout")
-                    .color(egui::Color32::BLACK)
-                    .size(26.0),
-            );
-            ui.add_space(18.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} already has a session running that was not set up for your \
-                     current display arrangement.",
-                    display_name_for_draft(draft),
-                ))
-                .color(egui::Color32::DARK_GRAY)
-                .size(16.0),
-            );
-            ui.add_space(34.0);
-
-            let mut choice: Option<bool> = None;
-            ui.horizontal(|ui| {
-                // Centre the pair inside the available width.
-                let pair_width = 250.0 + 12.0 + 250.0;
-                let indent = ((ui.available_width() - pair_width) / 2.0).max(0.0);
-                ui.add_space(indent);
-                if ui
-                    .add_sized(
-                        [250.0, 44.0],
-                        egui::Button::new(
-                            egui::RichText::new("Reconnect to your session")
-                                .size(15.0)
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::from_rgb(0xC9, 0x78, 0x50))
-                        .corner_radius(8.0),
-                    )
-                    .clicked()
-                {
-                    choice = Some(false);
-                }
-                ui.add_space(12.0);
-                if ui
-                    .add_sized(
-                        [250.0, 44.0],
-                        egui::Button::new(
-                            egui::RichText::new("Start fresh with my layout")
-                                .size(15.0)
-                                .color(egui::Color32::from_rgb(0x44, 0x44, 0x4A)),
-                        )
-                        .fill(egui::Color32::TRANSPARENT)
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(0xCB, 0xC5, 0xB9),
-                        ))
-                        .corner_radius(8.0),
-                    )
-                    .clicked()
-                {
-                    choice = Some(true);
-                }
-            });
-
-            ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new(
-                    "Reconnecting keeps your open applications and uses your main display \
-                     only. Starting fresh matches your layout and closes them.",
-                )
-                .color(egui::Color32::from_rgb(0x77, 0x77, 0x77))
-                .size(13.0),
-            );
-            ui.add_space(28.0);
-            if ui
-                .add_sized(
-                    [140.0, 36.0],
-                    egui::Button::new(
-                        egui::RichText::new("Cancel")
-                            .size(14.0)
-                            .color(egui::Color32::from_rgb(0x66, 0x66, 0x6A)),
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .stroke(egui::Stroke::NONE),
-                )
-                .clicked()
-            {
-                self.status.clear();
-                // Never keep credentials alive past a cancelled recovery.
-                self.recovery_auth = None;
-                self.credentials_note = None;
-                self.screen = AppScreen::Home;
+        let replace = match render_topology_conflict(ui, draft) {
+            TopologyConflictAction::None => return,
+            TopologyConflictAction::Cancel => {
+                self.cancel_display_recovery();
+                return;
             }
+            TopologyConflictAction::Reconnect => false,
+            TopologyConflictAction::StartFresh => true,
+        };
+        let draft = draft.clone();
+        let ctx = ui.ctx().clone();
+        self.resolve_topology_conflict(draft, replace, &ctx);
+    }
 
-            if let Some(replace) = choice {
-                let draft = draft.clone();
-                let ctx = ui.ctx().clone();
-                self.resolve_topology_conflict(draft, replace, &ctx);
-            }
-        });
+    /// Cancel on either display recovery screen.
+    fn cancel_display_recovery(&mut self) {
+        self.status.clear();
+        // Never keep credentials alive past a cancelled recovery.
+        self.recovery_auth = None;
+        self.credentials_note = None;
+        self.screen = AppScreen::Home;
     }
 
     /// Retries the connection with the user's explicit conflict choice.
@@ -10703,23 +8060,15 @@ impl ArcenApp {
     /// The state half of [`Self::resolve_topology_conflict`], separated from
     /// launching the attempt so the decision itself is directly testable.
     fn apply_topology_conflict_choice(&mut self, endpoint: &str, replace: bool) {
-        self.pending_desktop_replacement = replace;
-        if replace {
-            self.status = "Starting a fresh session with your layout…".to_string();
-            self.credentials_note =
-                Some("Signing in again to start a fresh session with your layout.".to_string());
-        } else {
-            // Retrying with the same Match My Layout request would hit the
-            // identical conflict again, so fall back to the layout the
-            // existing desktop can actually serve. One-shot, and deliberately
-            // not persisted: keeping the user's existing desktop this once
-            // must not permanently downgrade this connection.
-            self.pending_displays_override =
-                Some((endpoint.to_string(), DisplaysMode::SinglePrimary));
-            self.status = "Reconnecting to your existing session…".to_string();
-            self.credentials_note =
-                Some("Signing in again to reconnect to your existing session.".to_string());
+        // Shared rule: replacing starts fresh with this layout; keeping the
+        // desktop retries once on the layout it can serve, never persisted.
+        let retry = arcen_deck_core::connect_plan::topology_conflict_retry(endpoint, replace);
+        self.pending_desktop_replacement = retry.replace_desktop;
+        if retry.displays_override.is_some() {
+            self.pending_displays_override = retry.displays_override;
         }
+        self.status = retry.status.to_string();
+        self.credentials_note = Some(retry.credentials_note.to_string());
     }
 
     /// Offers the non-destructive recovery available when a host cannot serve
@@ -10730,80 +8079,17 @@ impl ArcenApp {
     /// the user connects to. Saved connections keep the choice so the failure
     /// does not recur on the next launch.
     fn displays_unsupported_screen(&mut self, ui: &mut egui::Ui, draft: &ConnectionDraft) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(150.0);
-            ui.heading(
-                egui::RichText::new("This host cannot match all active displays")
-                    .color(egui::Color32::BLACK)
-                    .size(26.0),
-            );
-            ui.add_space(18.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} cannot serve your complete current layout.\n\n{}",
-                    display_name_for_draft(draft),
-                    self.status,
-                ))
-                .color(egui::Color32::DARK_GRAY)
-                .size(16.0),
-            );
-            ui.add_space(34.0);
-
-            let mut use_single = false;
-            if ui
-                .add_sized(
-                    [280.0, 44.0],
-                    egui::Button::new(
-                        egui::RichText::new("Use Primary Display Only")
-                            .size(15.0)
-                            .color(egui::Color32::WHITE),
-                    )
-                    .fill(egui::Color32::from_rgb(0xC9, 0x78, 0x50))
-                    .corner_radius(8.0),
-                )
-                .clicked()
-            {
-                use_single = true;
-            }
-
-            ui.add_space(16.0);
-            ui.label(
-                egui::RichText::new(
-                    "This is remembered for this connection only. Your other \
-                     connections keep matching your layout.",
-                )
-                .color(egui::Color32::from_rgb(0x77, 0x77, 0x77))
-                .size(13.0),
-            );
-            ui.add_space(28.0);
-            if ui
-                .add_sized(
-                    [140.0, 36.0],
-                    egui::Button::new(
-                        egui::RichText::new("Cancel")
-                            .size(14.0)
-                            .color(egui::Color32::from_rgb(0x66, 0x66, 0x6A)),
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .stroke(egui::Stroke::NONE),
-                )
-                .clicked()
-            {
-                self.status.clear();
-                // Never keep credentials alive past a cancelled recovery.
-                self.recovery_auth = None;
-                self.credentials_note = None;
-                self.screen = AppScreen::Home;
-            }
-
-            if use_single {
+        match render_displays_unsupported(ui, draft, &self.status) {
+            DisplaysUnsupportedAction::None => {}
+            DisplaysUnsupportedAction::Cancel => self.cancel_display_recovery(),
+            DisplaysUnsupportedAction::UsePrimaryOnly => {
                 let draft = draft.clone();
                 let ctx = ui.ctx().clone();
                 let preserved = self.recovery_auth.take();
                 self.apply_displays_unsupported_choice(&draft);
                 self.begin_connection_flow(draft, preserved, &ctx);
             }
-        });
+        }
     }
 
     /// The state half of [`Self::displays_unsupported_screen`], separated
@@ -10813,11 +8099,14 @@ impl ArcenApp {
     /// Pins Primary-display-only for this attempt and, when the connection is
     /// saved, persists it so the same dead end is not hit again next time.
     fn apply_displays_unsupported_choice(&mut self, draft: &ConnectionDraft) {
-        self.pending_displays_override =
-            Some((connection_endpoint(draft), DisplaysMode::SinglePrimary));
-        self.remember_displays_mode_for(draft, DisplaysMode::SinglePrimary);
-        self.status = "Connecting with this host's single display…".to_string();
-        self.credentials_note = Some("Signing in again with Primary Display Only.".to_string());
+        let retry =
+            arcen_deck_core::connect_plan::displays_unsupported_retry(&connection_endpoint(draft));
+        self.pending_displays_override = retry.displays_override;
+        if let Some(mode) = retry.remember {
+            self.remember_displays_mode_for(draft, mode);
+        }
+        self.status = retry.status.to_string();
+        self.credentials_note = Some(retry.credentials_note.to_string());
         tracing::info!(
             target: crate::logging::target::SESSION,
             "user accepted Primary Display Only for a host that cannot serve the complete layout",
@@ -10847,1338 +8136,136 @@ impl ArcenApp {
     }
 
     fn launching_screen(&mut self, ui: &mut egui::Ui, draft: &ConnectionDraft) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(180.0);
-            paint_connecting_progress(ui, 24.0);
-            ui.add_space(28.0);
-            ui.heading(
-                egui::RichText::new("Connecting")
-                    .color(egui::Color32::BLACK)
-                    .size(28.0),
-            );
-            ui.add_space(18.0);
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} as {}",
-                    display_name_for_draft(draft),
-                    if draft.username.is_empty() {
-                        "user"
-                    } else {
-                        draft.username.as_str()
-                    }
-                ))
-                .color(egui::Color32::DARK_GRAY)
-                .size(17.0),
-            );
-            ui.add_space(12.0);
-            ui.label(
-                egui::RichText::new(&self.status)
-                    .color(egui::Color32::from_rgb(0x66, 0x66, 0x66))
-                    .size(15.0),
-            );
-            if let Some(hint) = &self.connection_status_hint {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(hint)
-                        .color(egui::Color32::from_rgb(0xA0, 0x62, 0x36))
-                        .size(13.0),
-                );
-            }
-            ui.add_space(36.0);
-            if ui
-                .add_sized([112.0, 40.0], egui::Button::new("Cancel"))
-                .clicked()
-            {
-                self.disconnect();
-                self.status = "Ready".to_string();
-                self.screen = AppScreen::Home;
-            }
-        });
+        let action = render_connecting(
+            ui,
+            draft,
+            &self.status,
+            self.connection_status_hint.as_deref(),
+        );
+        if action == ConnectingAction::Cancel {
+            self.disconnect();
+            self.status = "Ready".to_string();
+            self.screen = AppScreen::Home;
+        }
     }
 
     fn settings_screen(&mut self, ui: &mut egui::Ui) {
-        let accent = theme::ACCENT;
-        // Work on copies so the nested egui closures don't fight the borrow
-        // checker over `self`; write back (and persist) once at the end.
-        let mut tab = self.settings_tab;
-        let mut log_level = self.log_level;
-        let mut security = self.security_mode;
-        let mut performance = self.performance_mode;
-        let mut color_fidelity = self.color_fidelity;
-        let initial_streaming_preset = StreamingPreset::from_settings(performance, color_fidelity);
-        let mut streaming_preset = initial_streaming_preset;
-        let hdr_screen = self.hdr_screen_available();
-        if !hdr_screen && streaming_preset == StreamingPreset::Hdr {
-            streaming_preset = StreamingPreset::Grading;
-        }
-        let mut displays = self.displays_mode;
-        let mut hidpi = self.hidpi_streaming;
-        let mut use_notch_area = self.fullscreen_uses_notch_area;
-        let mut remote_ui_scale_percent = self.remote_ui_scale_percent;
-        let mut full_color_display_mask = self.full_color_display_mask;
-        let mut hidpi_display_mask = self.hidpi_display_mask;
-        let mut cursor_preference = self.cursor_preference;
-        let mut typing_mode = self.typing_mode;
-        let mut option_key_mode = self.option_key_mode;
-        let mut paste_settings = self.paste_keys.settings();
-        let mut clipboard_enabled = self.clipboard_enabled;
-        let mut microphone_enabled = self.microphone_enabled;
-        let mut tablet_mode_requested = self.tablet_mode_requested;
-        let effective_clipboard = self
-            .clipboard_session
-            .as_ref()
-            .and_then(crate::clipboard::ClipboardSession::policy);
-        let mut show_in_folder = false;
-        let mut refresh_displays = false;
-        let mut close = false;
-        let mut open_colour_check = false;
-
+        use arcen_deck_core::screens::settings::{
+            render_settings, SettingsAction, SettingsFacts, SettingsMonitor, SettingsValues,
+        };
         // Populate the Displays read-out the first time Settings is shown. The
         // authoritative layout is always re-enumerated at connect time; this is
-        // only the panel's snapshot, refreshable via the button below.
+        // only the panel's snapshot, refreshable via the panel's button.
         if self.detected_monitors.is_empty() {
             self.detected_monitors = crate::display::enumerate();
         }
-        let monitors_snapshot = self.detected_monitors.clone();
-
-        // No accent header bar — the reference design relies on the native
-        // window frame. We keep only a subtle top-right "Done" ghost button to
-        // return Home, since this is a single-window app rather than a separate
-        // settings window. Settings persist live on change, so there is no Save.
-        let width = ui.available_width();
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.set_width(width);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(28.0);
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Done")
-                                .color(accent)
-                                .size(15.0)
-                                .strong(),
-                        )
-                        // Warm neutrals taken from the Settings nav pills below
-                        // (hover and active), so the ghost button belongs to the
-                        // same palette instead of introducing a second hue.
-                        .fill(egui::Color32::from_rgb(0xF0, 0xEC, 0xE4))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgb(0xE5, 0xDE, 0xD2),
-                        ))
-                        .corner_radius(8.0)
-                        .min_size(egui::vec2(72.0, 32.0)),
-                    )
-                    .clicked()
-                {
-                    close = true;
-                }
-            });
-        });
-        ui.add_space(2.0);
-
-        let heading_col = egui::Color32::from_rgb(0x1A, 0x1A, 0x1A);
-        let body_height = ui.available_height();
-        ui.horizontal_top(|ui| {
-            ui.set_min_height(body_height);
-            // Sidebar — white column, active item highlighted (reference look).
-            // Wrapped in an explicit vertical: a row/Frame inherits the parent's
-            // horizontal layout and would otherwise stack items left-to-right.
-            ui.add_space(22.0);
-            ui.vertical(|ui| {
-                ui.set_width(210.0);
-                ui.add_space(2.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("settings_nav_scroll")
-                    .max_height(body_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        settings_nav_section_label(ui, "GENERAL");
-                        for item in [
-                            SettingsTab::Language,
-                            SettingsTab::Streaming,
-                            SettingsTab::Displays,
-                        ] {
-                            if settings_nav_item(ui, item.label(), item == tab, accent) {
-                                tab = item;
-                            }
-                            ui.add_space(2.0);
-                        }
-
-                        ui.add_space(8.0);
-                        settings_nav_section_label(ui, "INPUT & DEVICES");
-                        for item in [
-                            SettingsTab::Microphone,
-                            SettingsTab::Clipboard,
-                            SettingsTab::Input,
-                        ] {
-                            if settings_nav_item(ui, item.label(), item == tab, accent) {
-                                tab = item;
-                            }
-                            ui.add_space(2.0);
-                        }
-
-                        ui.add_space(8.0);
-                        settings_nav_section_label(ui, "SYSTEM");
-                        for item in [SettingsTab::Logs, SettingsTab::Advanced] {
-                            if settings_nav_item(ui, item.label(), item == tab, accent) {
-                                tab = item;
-                            }
-                            ui.add_space(2.0);
-                        }
-                    });
-            });
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(44.0);
-            ui.vertical(|ui| {
-                ui.set_width((ui.available_width() - 44.0).clamp(360.0, 760.0));
-                egui::ScrollArea::vertical()
-                    .id_salt("settings_content_scroll")
-                    .max_height(body_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                    // Bump the body text size for the whole content column so the
-                    // descriptions read at reference proportions without touching
-                    // every label individually.
-                    ui.style_mut().text_styles.insert(
-                        egui::TextStyle::Body,
-                        egui::FontId::proportional(16.0),
-                    );
-                    ui.add_space(16.0);
-                    match tab {
-                    SettingsTab::Language => {
-                        ui.label(
-                            egui::RichText::new("Language")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Select the preferred language for your Arcen client.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(24.0);
-                        egui::ComboBox::from_id_salt("language")
-                            .selected_text("English (US)")
-                            .show_ui(ui, |ui| {
-                                let _ = ui.selectable_label(true, "English (US)");
-                            });
-                    }
-                    SettingsTab::Streaming => {
-                        ui.label(
-                            egui::RichText::new("Streaming")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Choose the result you need. Each preset fixes frame rate, colour \
-                                 fidelity, and encoder intent together so the request cannot \
-                                 become an accidental combination of unrelated switches.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(16.0);
-                        for preset in StreamingPreset::PRIMARY {
-                            let available = preset != StreamingPreset::Hdr || hdr_screen;
-                            ui.add_enabled_ui(available, |ui| {
-                                settings_radio(
-                                    ui,
-                                    &mut streaming_preset,
-                                    preset,
-                                    (preset == StreamingPreset::Auto).then_some("(Default)"),
-                                    preset.title(),
-                                    if available {
-                                        preset.description()
-                                    } else {
-                                        NO_HDR_SCREEN
-                                    },
-                                );
-                            });
-                        }
-                        if streaming_preset != initial_streaming_preset {
-                            streaming_preset.apply_to(&mut performance, &mut color_fidelity);
-                        }
-                        if initial_streaming_preset == StreamingPreset::Custom
-                            && streaming_preset == StreamingPreset::Custom
-                        {
-                            ui.label(
-                                egui::RichText::new(
-                                    "A developer-defined configuration is active. Choose one of \
-                                     the four presets above to return to the supported product \
-                                     surface.",
-                                )
-                                .color(theme::DANGER),
-                            );
-                        }
-                        ui.add_space(18.0);
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Colour check…").clicked() {
-                                open_colour_check = true;
-                            }
-                            ui.label(
-                                egui::RichText::new(
-                                    "What the host serves, what this Mac shows, and whether the \
-                                     code values arrive exactly.",
-                                )
-                                .color(egui::Color32::DARK_GRAY),
-                            );
-                        });
-                    }
-                    SettingsTab::Displays => {
-                        ui.label(
-                            egui::RichText::new("Displays")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Choose how the remote stream is sized. Windowed follows the app \
-                                 window. The other modes size the stream to what the Deck can \
-                                 actually show in fullscreen and enter fullscreen on connect.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(16.0);
-                        for mode in DisplaysMode::ALL {
-                            settings_radio(
-                                ui,
-                                &mut displays,
-                                mode,
-                                None,
-                                mode.label(),
-                                mode.description(),
-                            );
-                        }
-
-                        ui.add_space(22.0);
-                        ui.label(
-                            egui::RichText::new("Notch area")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(8.0);
-                        let notch_insets = primary_monitor(&monitors_snapshot)
-                            .map(|monitor| crate::display::safe_area_insets(monitor.id))
-                            .unwrap_or_default();
-                        let has_notch = !notch_insets.is_zero();
-                        ui.add_enabled_ui(has_notch, |ui| {
-                            ui.checkbox(
-                                &mut use_notch_area,
-                                "Extend fullscreen under the notch",
-                            );
-                        });
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(if has_notch {
-                                "Off: the remote desktop fills the area below the notch, \
-                                 1:1 and unscaled, and the notch strip stays black. On: \
-                                 Arcen takes the whole panel instead of using macOS \
-                                 fullscreen, so the desktop is still 1:1 but extends \
-                                 beside and behind the notch — the notch itself covers a \
-                                 slice of the remote screen's top edge. Takes effect at \
-                                 the next connection."
-                            } else {
-                                "Not applicable: this display has no notch, so fullscreen \
-                                 already uses the whole panel."
-                            })
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-
-                        ui.add_space(22.0);
-                        ui.label(
-                            egui::RichText::new("Remote UI scale")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(8.0);
-                        let mut remote_ui_scale =
-                            RemoteUiScale::from_percent(remote_ui_scale_percent);
-                        egui::ComboBox::from_id_salt("remote_ui_scale")
-                            .selected_text(remote_ui_scale.label())
-                            .show_ui(ui, |ui| {
-                                for scale in RemoteUiScale::ALL {
-                                    ui.selectable_value(
-                                        &mut remote_ui_scale,
-                                        scale,
-                                        scale.label(),
-                                    );
-                                }
-                            });
-                        remote_ui_scale_percent = remote_ui_scale.as_percent();
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "How large the remote desktop's own interface is, on hosts \
-                                 that take their scaling from the display Arcen advertises \
-                                 — that is Windows. Automatic reports this panel's real \
-                                 size, so Windows picks the scaling matching its physical \
-                                 density, which on a Retina panel is large; a lower \
-                                 percentage trades apparent size for desktop space. This \
-                                 changes the remote desktop's layout, never the stream's \
-                                 1:1 pixel mapping. Takes effect at the next connection.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Linux hosts ignore this. A GNOME session on Xorg offers \
-                                 only 100% and 200%, and chooses for itself. To change \
-                                 apparent size on a Linux host, use HiDPI streaming below: \
-                                 with it off the remote interface is roughly twice the \
-                                 size it is with it on.",
-                            )
-                            .color(egui::Color32::from_rgb(0x8A, 0x6D, 0x3B)),
-                        );
-
-                        ui.add_space(22.0);
-                        ui.label(
-                            egui::RichText::new("HiDPI / Retina streaming")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(8.0);
-                        ui.checkbox(&mut hidpi, "HiDPI streaming (Retina)");
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Request the stream at your screen's backing resolution \
-                                 (e.g. 3024×1890 on a 1512×945 Retina panel) for crisp \
-                                 1:1 pixel rendering. Increases bandwidth roughly 4×. \
-                                 Takes effect at the next connection.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-
-                        ui.add_space(22.0);
-                        ui.label(
-                            egui::RichText::new("Per-display color priority")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Advanced: require full-color 4:4:4 on selected display numbers. \
-                                 When at least one is selected, unselected displays may use \
-                                 host-approved 4:2:0 hardware or software fallback. Pier still \
-                                 decides which configured GPU/encoder resources may be used and \
-                                 rejects the whole layout if it cannot satisfy every requirement.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Detected displays")
-                                    .color(egui::Color32::BLACK)
-                                    .size(19.0),
-                            );
-                            ui.add_space(10.0);
-                            if ui.button("↻  Refresh").clicked() {
-                                refresh_displays = true;
-                            }
-                        });
-                        ui.add_space(8.0);
-                        if monitors_snapshot.is_empty() {
-                            ui.label(
-                                egui::RichText::new(
-                                    "No displays detected on this platform. The host will fall \
-                                     back to its configured default size.",
-                                )
-                                .color(egui::Color32::DARK_GRAY),
-                            );
-                        } else {
-                            for (idx, mon) in monitors_snapshot.iter().enumerate() {
-                                let name = if mon.name.is_empty() {
-                                    format!("Display {}", idx + 1)
-                                } else {
-                                    mon.name.clone()
-                                };
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!("{}", idx + 1))
-                                            .strong()
-                                            .color(egui::Color32::WHITE)
-                                            .background_color(egui::Color32::from_rgb(
-                                                0x00, 0x89, 0x89,
-                                            )),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(&name)
-                                            .color(egui::Color32::BLACK)
-                                            .size(16.0),
-                                    );
-                                    if mon.is_primary {
-                                        ui.label(
-                                            egui::RichText::new("• Primary")
-                                                .color(egui::Color32::from_rgb(
-                                                    0x00, 0x89, 0x89,
-                                                ))
-                                                .size(14.0),
-                                        );
-                                    }
-                                    if idx < 4 {
-                                        let bit = 1u8 << idx;
-                                        let mut full_color =
-                                            full_color_display_mask & bit != 0;
-                                        if ui
-                                            .checkbox(&mut full_color, "Require 4:4:4")
-                                            .changed()
-                                        {
-                                            if full_color {
-                                                full_color_display_mask |= bit;
-                                            } else {
-                                                full_color_display_mask &= !bit;
-                                            }
-                                        }
-                                        // Only a Retina/scaled panel has
-                                        // backing pixels to stream; offering
-                                        // this on a 1x display would promise
-                                        // a sharpness it cannot deliver
-                                        // while quadrupling nothing.
-                                        if mon.scale > 1.0 {
-                                            let mut hidpi = hidpi_display_mask & bit != 0;
-                                            if ui
-                                                .checkbox(&mut hidpi, "Full resolution")
-                                                .on_hover_text(
-                                                    "Streams this display's full backing \
-                                                     resolution so the remote desktop applies \
-                                                     its own scaling. Sharper and correctly \
-                                                     sized, at roughly four times the pixels.",
-                                                )
-                                                .changed()
-                                            {
-                                                if hidpi {
-                                                    hidpi_display_mask |= bit;
-                                                } else {
-                                                    hidpi_display_mask &= !bit;
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                                let scale = if (mon.scale - mon.scale.round()).abs() < 0.05 {
-                                    format!("{}x", mon.scale.round() as i32)
-                                } else {
-                                    format!("{:.2}x", mon.scale)
-                                };
-                                ui.indent(("mon", idx), |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} × {} px   ·   scale {}   ·   {} Hz   ·   at ({}, {})",
-                                            mon.width_px,
-                                            mon.height_px,
-                                            scale,
-                                            mon.refresh_hz,
-                                            mon.x,
-                                            mon.y,
-                                        ))
-                                        .color(egui::Color32::DARK_GRAY),
-                                    );
-                                    // Fullscreen presentation size: what a
-                                    // pinned session actually streams. Shown
-                                    // only when it differs, i.e. on a notched
-                                    // panel, so the number is never a mystery.
-                                    if let Some([pw, ph]) =
-                                        crate::display::presentation_size_for_display(
-                                            mon.id, false, hidpi,
-                                        )
-                                        .filter(|size| {
-                                            *size != [mon.width_px, mon.height_px]
-                                        })
-                                    {
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "streams {pw} × {ph} px in fullscreen \
-                                                 (the notch strip is reserved by macOS)"
-                                            ))
-                                            .color(egui::Color32::DARK_GRAY),
-                                        );
-                                    }
-                                });
-                                ui.add_space(6.0);
-                            }
-                        }
-                    }
-                    SettingsTab::Microphone => {
-                        ui.label(
-                            egui::RichText::new("Microphone")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.checkbox(
-                            &mut microphone_enabled,
-                            "Allow microphone forwarding for this launch",
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Off by default. When enabled, Deck still waits for host policy, \
-                                 negotiated microphone-v1 capabilities, and macOS microphone \
-                                 permission before capture starts. Disabling this setting stops \
-                                 capture and requires reconnecting.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                    }
-                    SettingsTab::Clipboard => {
-                        ui.label(
-                            egui::RichText::new("Clipboard")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.checkbox(&mut clipboard_enabled, "Enable clipboard redirection");
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Clipboard redirection is enabled by default. The host is \
-                                 authoritative and may narrow or disable direction, content, and \
-                                 transfer size. Turning this off advertises no clipboard \
-                                 capability and starts no pasteboard polling.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("Effective host policy")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        let policy_text = if !clipboard_enabled {
-                            "Disabled locally".to_string()
-                        } else if let Some(policy) = effective_clipboard {
-                            format!(
-                                "{:?} · {:?} · {} MiB",
-                                policy.direction,
-                                policy.content,
-                                policy.max_bytes / (1024 * 1024)
-                            )
-                        } else {
-                            "Not negotiated or disabled by host".to_string()
-                        };
-                        ui.label(
-                            egui::RichText::new(policy_text).color(egui::Color32::DARK_GRAY),
-                        );
-                    }
-                    SettingsTab::Input => {
-                        ui.label(
-                            egui::RichText::new("Input")
-                                .color(egui::Color32::BLACK)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Mouse, keyboard, and tablet input are sent to the remote \
-                                 computer. Cursor rendering only chooses where the pointer is \
-                                 drawn; it never turns remote mouse control off.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(24.0);
-                        ui.label(
-                            egui::RichText::new("Pointer and cursor")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        settings_radio(
-                            ui,
-                            &mut cursor_preference,
-                            CursorMode::Local,
-                            Some("(Recommended)"),
-                            "Client-rendered cursor",
-                            "Your mouse controls the remote computer while Arcen Deck draws the pointer \
-                             locally for immediate response. Works with every host.",
-                        );
-                        settings_radio(
-                            ui,
-                            &mut cursor_preference,
-                            CursorMode::Host,
-                            None,
-                            "Cursor in remote video",
-                            "Your mouse still controls the remote computer, but the host draws the pointer \
-                             into the captured video. This can feel less responsive and depends \
-                             on the capture backend including the cursor.",
-                        );
-                        ui.add_space(24.0);
-                        ui.label(
-                            egui::RichText::new("Typing")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        {
-                            use arcen_input::text::{OptionKeyMode, OptionKeyPreference, TypingMode};
-                            settings_radio(
-                                ui,
-                                &mut typing_mode,
-                                TypingMode::Auto,
-                                Some("(Recommended)"),
-                                "Characters as on this Mac",
-                                "Keys go to the remote computer as keys, except where its keyboard \
-                                 layout would type a different character: those, and everything your \
-                                 input method composes (accents, dead keys, Japanese, Chinese, emoji), \
-                                 arrive as the characters you typed. Needs a host that types text.",
-                            );
-                            settings_radio(
-                                ui,
-                                &mut typing_mode,
-                                TypingMode::Keys,
-                                None,
-                                "Keys only",
-                                "Every key goes as a key; the remote keyboard layout decides each \
-                                 character. Best for games. The input method does not compose.",
-                            );
-                            settings_radio(
-                                ui,
-                                &mut typing_mode,
-                                TypingMode::Characters,
-                                None,
-                                "Always characters",
-                                "Every typed character arrives as typed, whatever the remote layout. \
-                                 Shortcuts still go as keys; held letter keys do not.",
-                            );
-                            ui.add_space(10.0);
-                            settings_radio(
-                                ui,
-                                &mut option_key_mode,
-                                OptionKeyPreference::Automatic,
-                                Some("(Recommended)"),
-                                "Automatic",
-                                "On a Mac host both Option keys stay Option, as on this Mac. On \
-                                 other hosts left Option is Alt and right Option types this \
-                                 Mac's special characters.",
-                            );
-                            settings_radio(
-                                ui,
-                                &mut option_key_mode,
-                                OptionKeyPreference::Chosen(OptionKeyMode::LeftAltRightCharacters),
-                                None,
-                                "Left Option is Alt, right Option types characters",
-                                "Left Option sends Alt shortcuts to the remote computer; right Option \
-                                 types the special characters it types on this Mac.",
-                            );
-                            settings_radio(
-                                ui,
-                                &mut option_key_mode,
-                                OptionKeyPreference::Chosen(OptionKeyMode::BothAlt),
-                                None,
-                                "Both Option keys are Alt",
-                                "Both Option keys send Alt shortcuts.",
-                            );
-                            settings_radio(
-                                ui,
-                                &mut option_key_mode,
-                                OptionKeyPreference::Chosen(OptionKeyMode::BothCharacters),
-                                None,
-                                "Both Option keys type characters",
-                                "Both Option keys type this Mac's special characters.",
-                            );
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "The Connection menu's Keyboard: Characters (Control-Command-U) switches a session \
-                                     to characters and Physical Keys (Control-Command-K) back; a saved \
-                                     connection can start in either.",
-                                )
-                                .color(egui::Color32::DARK_GRAY)
-                                .size(12.0),
-                            );
-                        }
-                        ui.add_space(24.0);
-                        ui.label(
-                            egui::RichText::new("Paste as Keystrokes")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "The Connection menu's Paste as Keystrokes (Control-Option-Command-V) types this Mac's \
-                                 clipboard text into the remote computer, for sign-in screens \
-                                 and consoles that clipboard sharing cannot reach. Esc stops it.",
-                            )
-                            .color(egui::Color32::DARK_GRAY)
-                            .size(12.0),
-                        );
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Typing speed");
-                            egui::ComboBox::from_id_salt("paste_chars_per_second")
-                                .selected_text(format!(
-                                    "{} characters a second",
-                                    paste_settings.chars_per_second
-                                ))
-                                .show_ui(ui, |ui| {
-                                    for rate in arcen_input::text::paste::RATE_CHOICES {
-                                        let label = if rate
-                                            == arcen_input::text::paste::DEFAULT_CHARS_PER_SECOND
-                                        {
-                                            format!("{rate} characters a second (default)")
-                                        } else {
-                                            format!("{rate} characters a second")
-                                        };
-                                        ui.selectable_value(
-                                            &mut paste_settings.chars_per_second,
-                                            rate,
-                                            label,
-                                        );
-                                    }
-                                });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Ask first above");
-                            egui::ComboBox::from_id_salt("paste_confirm_above")
-                                .selected_text(format!(
-                                    "{} characters",
-                                    paste_settings.confirm_above
-                                ))
-                                .show_ui(ui, |ui| {
-                                    for chars in arcen_input::text::paste::CONFIRM_CHOICES {
-                                        ui.selectable_value(
-                                            &mut paste_settings.confirm_above,
-                                            chars,
-                                            format!("{chars} characters"),
-                                        );
-                                    }
-                                });
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Slow the speed down for virtual machine consoles and older \
-                                 applications that drop keys.",
-                            )
-                            .color(egui::Color32::GRAY)
-                            .size(11.0),
-                        );
-                        ui.add_space(24.0);
-                        // One surface owns every input decision. Tablet mode
-                        // and non-HID USB forwarding used to live in two
-                        // different tabs, and the tab named for USB was the
-                        // one that did *not* control the tablet bridge.
-                        ui.label(
-                            egui::RichText::new("Tablet")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.label(
-                            egui::RichText::new(self.tablet_mode_scope_note())
-                                .color(egui::Color32::GRAY)
-                                .size(11.0),
-                        );
-                        ui.add_space(10.0);
-                        settings_radio(
-                            ui,
-                            &mut tablet_mode_requested,
-                            TabletModeMsg::LocalTermination,
-                            Some("(Recommended for WAN)"),
-                            tablet_mode_label(TabletModeMsg::LocalTermination),
-                            tablet_mode_description(TabletModeMsg::LocalTermination),
-                        );
-                        // The helper control sits on the option's own row and
-                        // states where the helper stands, because that is the
-                        // one prerequisite the user can act on from here. It
-                        // used to be a parenthetical badge plus a block of
-                        // buttons that appeared only once the helper was
-                        // *already* missing, which put the status and the fix
-                        // in two different places and left an installed helper
-                        // with nothing to click. Read once per settings visit,
-                        // not per frame: each read is an XPC round trip to
-                        // `smd`.
-                        #[cfg(feature = "native-tablet")]
-                        let helper_state = *self
-                            .usb_helper_state
-                            .get_or_insert_with(crate::usb_helper_install::install_state);
-                        #[cfg(feature = "native-tablet")]
-                        let mut helper_click = None;
-                        #[cfg(feature = "native-tablet")]
-                        settings_radio_with_trailing(
-                            ui,
-                            &mut tablet_mode_requested,
-                            TabletModeMsg::UsbTabletBridge,
-                            None,
-                            tablet_mode_label(TabletModeMsg::UsbTabletBridge),
-                            tablet_mode_description(TabletModeMsg::UsbTabletBridge),
-                            |ui| {
-                                use crate::usb_helper_install::HelperInstallState;
-                                let tint = match helper_state {
-                                    HelperInstallState::Enabled => theme::SUCCESS,
-                                    HelperInstallState::RequiresApproval => theme::WARNING,
-                                    _ => theme::ACCENT,
-                                };
-                                let label = egui::RichText::new(helper_state.action_label())
-                                    .color(tint)
-                                    .size(14.0);
-                                if ui
-                                    .button(label)
-                                    .on_hover_text(helper_state.guidance())
-                                    .clicked()
-                                {
-                                    helper_click = Some(helper_state.action());
-                                }
-                            },
-                        );
-                        #[cfg(not(feature = "native-tablet"))]
-                        settings_radio(
-                            ui,
-                            &mut tablet_mode_requested,
-                            TabletModeMsg::UsbTabletBridge,
-                            Some("(not available in this build)"),
-                            tablet_mode_label(TabletModeMsg::UsbTabletBridge),
-                            tablet_mode_description(TabletModeMsg::UsbTabletBridge),
-                        );
-                        #[cfg(feature = "native-tablet")]
-                        if let Some(action) = helper_click {
-                            use crate::usb_helper_install::{self as helper, HelperAction};
-                            self.usb_helper_error = None;
-                            match action {
-                                HelperAction::Install => match helper::register() {
-                                    Ok(state) => {
-                                        // Registration succeeding does not mean
-                                        // the helper is usable: the ordinary
-                                        // result is a daemon waiting in Login
-                                        // Items, so take the user straight
-                                        // there rather than leaving them to
-                                        // discover it.
-                                        if matches!(
-                                            state,
-                                            helper::HelperInstallState::RequiresApproval
-                                        ) {
-                                            helper::open_login_items_settings();
-                                        }
-                                        self.usb_helper_state = Some(state);
-                                    }
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            target: crate::logging::target::UI,
-                                            %error,
-                                            "privileged USB helper installation failed"
-                                        );
-                                        // Shown, not only logged: the click had
-                                        // no visible effect otherwise, which
-                                        // reads as a broken button.
-                                        self.usb_helper_error = Some(error);
-                                        self.usb_helper_state = None;
-                                    }
-                                },
-                                HelperAction::Approve => {
-                                    helper::open_login_items_settings();
-                                    self.usb_helper_state = None;
-                                }
-                                HelperAction::Recheck => self.usb_helper_state = None,
-                            }
-                        }
-                        #[cfg(feature = "native-tablet")]
-                        if !helper_state.is_ready() {
-                            ui.horizontal(|ui| {
-                                ui.add_space(28.0);
-                                ui.label(
-                                    egui::RichText::new(helper_state.guidance())
-                                        .color(egui::Color32::DARK_GRAY),
-                                );
-                            });
-                            ui.add_space(8.0);
-                        }
-                        #[cfg(feature = "native-tablet")]
-                        if let Some(error) = self.usb_helper_error.clone() {
-                            ui.horizontal(|ui| {
-                                ui.add_space(28.0);
-                                ui.label(egui::RichText::new(error).color(theme::DANGER));
-                            });
-                            ui.add_space(8.0);
-                        }
-                        // A bridged tablet moves the *host's* pointer, and a
-                        // captured tablet no longer moves this Mac's. With
-                        // Local cursor rendering the Deck draws the cursor
-                        // where the host reports its pointer
-                        // (`cursor_position_v1`), the recommended pairing; a
-                        // host that cannot report it leaves the pen without a
-                        // visible pointer, so host cursor rendering stays
-                        // offered next to the choice.
-                        if tablet_mode_requested == TabletModeMsg::UsbTabletBridge
-                            && cursor_preference == CursorMode::Local
-                        {
-                            ui.horizontal(|ui| {
-                                ui.add_space(28.0);
-                                ui.label(
-                                    egui::RichText::new(
-                                        "With Local cursor rendering the pen's pointer is drawn \
-                                         where the host reports it. If the host cannot report \
-                                         its pointer, the pen has no visible pointer: use the \
-                                         host cursor instead.",
-                                    )
-                                    .color(theme::TEXT_SECONDARY),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.add_space(28.0);
-                                if ui.button("Use host cursor").clicked() {
-                                    cursor_preference = CursorMode::Host;
-                                }
-                            });
-                            ui.add_space(8.0);
-                        }
-                        settings_radio(
-                            ui,
-                            &mut tablet_mode_requested,
-                            TabletModeMsg::DisabledMouseCompat,
-                            None,
-                            tablet_mode_label(TabletModeMsg::DisabledMouseCompat),
-                            tablet_mode_description(TabletModeMsg::DisabledMouseCompat),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Mode changes take effect on the next connection.\n\n\
-                                 Native tablet needs a host that can present the tablet on a \
-                                 virtual USB controller, so the host's own driver can claim it. \
-                                 Linux lab builds can. Windows hosts do not offer it: it would need a \
-                                 signed kernel driver the project does not fund (ADR 0017). Use \
-                                 Tablet support there — Windows Ink pressure and tilt, with \
-                                 nothing installed on the host.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(24.0);
-                    }
-                    SettingsTab::Logs => {
-                        ui.label(
-                            egui::RichText::new("Logs").color(heading_col).size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Set the level of detail captured by the logs. Level 0 (Critical) \
-                                 provides the least information and Level 3 (Debug) provides the \
-                                 most information.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("Log level")
-                                .color(egui::Color32::DARK_GRAY)
-                                .size(13.0),
-                        );
-                        egui::ComboBox::from_id_salt("log_level")
-                            .selected_text(log_level.label())
-                            .show_ui(ui, |ui| {
-                                for level in LogLevel::ALL {
-                                    ui.selectable_value(&mut log_level, level, level.label());
-                                }
-                            });
-                        ui.add_space(20.0);
-                        if ui.button("📂  Show in folder").clicked() {
-                            show_in_folder = true;
-                        }
-                    }
-                    SettingsTab::Advanced => {
-                        ui.label(
-                            egui::RichText::new("Advanced")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new("Security modes")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "The Arcen client uses certificates to verify that the server \
-                                 connection is secure. Select your desired security mode:",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(12.0);
-                        settings_radio(
-                            ui,
-                            &mut security,
-                            SecurityMode::High,
-                            None,
-                            "Security mode - High",
-                            "Fully verified. You cannot connect unless the certificate is verified.",
-                        );
-                        settings_radio(
-                            ui,
-                            &mut security,
-                            SecurityMode::Medium,
-                            None,
-                            "Security mode - Medium",
-                            "If the certificate cannot be verified, you will get a warning, but can still connect.",
-                        );
-                        settings_radio(
-                            ui,
-                            &mut security,
-                            SecurityMode::Low,
-                            None,
-                            "Security mode - Low",
-                            "No certificate verification required to connect.",
-                        );
-                        if cfg!(feature = "dev-tools") {
-                            ui.add_space(16.0);
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new("Advanced: streaming overrides")
-                                    .color(egui::Color32::BLACK)
-                                    .size(16.0),
-                            )
-                            .id_salt("color_fidelity_advanced")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("Frame-rate ceiling")
-                                        .color(egui::Color32::BLACK),
-                                );
-                                egui::ComboBox::from_id_salt("streaming_performance_override")
-                                    .selected_text(match performance {
-                                        PerformanceMode::Standard => "30 fps",
-                                        PerformanceMode::High | PerformanceMode::HighLegacy => {
-                                            "60 fps"
-                                        }
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut performance,
-                                            PerformanceMode::Standard,
-                                            "30 fps",
-                                        );
-                                        ui.selectable_value(
-                                            &mut performance,
-                                            PerformanceMode::High,
-                                            "60 fps",
-                                        );
-                                    });
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new("Base colour contract")
-                                        .color(egui::Color32::BLACK),
-                                );
-                                egui::ComboBox::from_id_salt("color_fidelity_preset_override")
-                                    .selected_text(color_fidelity.preset.title())
-                                    .show_ui(ui, |ui| {
-                                        for preset in [
-                                            ColorFidelity::Standard,
-                                            ColorFidelity::FullColour,
-                                            ColorFidelity::GradingReference,
-                                            ColorFidelity::Hdr10,
-                                        ] {
-                                            ui.selectable_value(
-                                                &mut color_fidelity.preset,
-                                                preset,
-                                                preset.title(),
-                                            );
-                                        }
-                                    });
-                                ui.label(
-                                    egui::RichText::new(color_fidelity.preset.describe())
-                                        .color(egui::Color32::DARK_GRAY),
-                                );
-                                ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Pin individual axes on top of the preset above. Each \
-                                     defaults to \"Follow preset\", which is exactly the \
-                                     preset's own value, so it stays invisible until you \
-                                     explicitly pin it -- and a later preset change never \
-                                     discards an axis you pinned here.",
-                                )
-                                .color(egui::Color32::DARK_GRAY),
-                            );
-                            ui.add_space(10.0);
-                            ui.label(egui::RichText::new("Codec").color(egui::Color32::BLACK));
-                            egui::ComboBox::from_id_salt("color_fidelity_codec_override")
-                                .selected_text(color_fidelity.overrides.codec.map_or(
-                                    "Follow preset".to_string(),
-                                    |codec| color_fidelity_codec_label(codec).to_string(),
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.codec,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for codec in arcen_media::VideoCodec::ALL.iter().copied() {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.codec,
-                                            Some(codec),
-                                            color_fidelity_codec_label(codec),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new("Chroma").color(egui::Color32::BLACK));
-                            egui::ComboBox::from_id_salt("color_fidelity_chroma_override")
-                                .selected_text(color_fidelity.overrides.chroma.map_or(
-                                    "Follow preset".to_string(),
-                                    |chroma| color_fidelity_chroma_label(chroma).to_string(),
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.chroma,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for chroma in
-                                        arcen_media::ChromaSubsampling::ALL.iter().copied()
-                                    {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.chroma,
-                                            Some(chroma),
-                                            color_fidelity_chroma_label(chroma),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Bit depth").color(egui::Color32::BLACK),
-                            );
-                            egui::ComboBox::from_id_salt("color_fidelity_bit_depth_override")
-                                .selected_text(
-                                    color_fidelity.overrides.bit_depth.map_or(
-                                        "Follow preset".to_string(),
-                                        color_fidelity_bit_depth_label,
-                                    ),
-                                )
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.bit_depth,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for bit_depth in arcen_media::BitDepth::ALL.iter().copied() {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.bit_depth,
-                                            Some(bit_depth),
-                                            color_fidelity_bit_depth_label(bit_depth),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Colour range").color(egui::Color32::BLACK),
-                            );
-                            egui::ComboBox::from_id_salt("color_fidelity_range_override")
-                                .selected_text(color_fidelity.overrides.range.map_or(
-                                    "Follow preset".to_string(),
-                                    |range| color_fidelity_range_label(range).to_string(),
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.range,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for range in arcen_media::ColorRange::ALL.iter().copied() {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.range,
-                                            Some(range),
-                                            color_fidelity_range_label(range),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new("Matrix").color(egui::Color32::BLACK));
-                            egui::ComboBox::from_id_salt("color_fidelity_matrix_override")
-                                .selected_text(color_fidelity.overrides.matrix.map_or(
-                                    "Follow preset".to_string(),
-                                    |matrix| color_fidelity_matrix_label(matrix).to_string(),
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.matrix,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for matrix in arcen_media::ColorMatrix::ALL.iter().copied() {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.matrix,
-                                            Some(matrix),
-                                            color_fidelity_matrix_label(matrix),
-                                        );
-                                    }
-                                });
-                            });
-                            ui.add_space(16.0);
-                            ui.label(
-                            egui::RichText::new("Variant (testing)")
-                                .color(egui::Color32::BLACK)
-                                .size(16.0),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Pin an exact probe-matrix row, bypassing the preset and \
-                                 Advanced overrides above entirely. This is how the w0 testing \
-                                 machine drives the colour-variation matrix directly. Leave at \
-                                 None for ordinary use.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(8.0);
-                        egui::ComboBox::from_id_salt("color_fidelity_variant_override")
-                            .selected_text(
-                                color_fidelity
-                                    .variant_override
-                                    .map_or("None".to_string(), |variant| variant.describe()),
-                            )
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut color_fidelity.variant_override,
-                                    None,
-                                    "None",
-                                );
-                                for variant in arcen_media::video::PROBE_MATRIX.iter().copied() {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.variant_override,
-                                        Some(variant),
-                                        format!("{} ({})", variant.describe(), variant.id()),
-                                    );
-                                }
-                            });
-                        ui.add_space(16.0);
-                        let color_fidelity_resolved = color_fidelity.resolved_variant();
-                        let color_fidelity_effective =
-                            effective_color_fidelity_variant(color_fidelity);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Resolving to: {}",
-                                color_fidelity_effective.describe()
-                            ))
-                            .color(egui::Color32::BLACK)
-                            .strong(),
-                        );
-                            if !color_fidelity_resolved.is_coherent() {
-                                ui.add_space(6.0);
-                                ui.label(
-                                egui::RichText::new(format!(
-                                    "This exact combination ({}) is not offered. Falling back \
-                                     to the {} preset when you connect.",
-                                    color_fidelity_resolved.describe(),
-                                    color_fidelity.preset.title(),
-                                ))
-                                    .color(theme::DANGER),
-                                );
-                            }
-                        }
-                    }
-                    }
+        let monitors: Vec<SettingsMonitor> = self
+            .detected_monitors
+            .iter()
+            .map(|monitor| SettingsMonitor {
+                monitor: monitor.clone(),
+                fullscreen_size: [false, true].map(|hidpi| {
+                    crate::display::presentation_size_for_display(monitor.id, false, hidpi)
+                }),
+            })
+            .collect();
+        let notch_insets = primary_monitor(&self.detected_monitors)
+            .map(|monitor| crate::display::safe_area_insets(monitor.id))
+            .unwrap_or_default();
+        // The helper's state is read once, not per frame: each read is an XPC
+        // round trip to `smd`.
+        let native_tablet = self.native_tablet.control(
+            crate::platform_services::services().as_ref(),
+            arcen_deck_core::screens::wording::DeckPlatform::Mac,
+        );
+        let facts = SettingsFacts {
+            hdr_screen: self.hdr_screen_available(),
+            notch: Some(!notch_insets.is_zero()),
+            monitors: &monitors,
+            clipboard_policy: self
+                .clipboard_session
+                .as_ref()
+                .and_then(crate::clipboard::ClipboardSession::policy),
+            tablet_scope_note: self.tablet_mode_scope_note(),
+            native_tablet,
+            decode: Some(crate::platform_services::services().decode_report()),
+            support_bundle: Some(
+                self.support_bundle
+                    .view(crate::platform_services::services().as_ref()),
+            ),
+        };
+        let mut values = SettingsValues {
+            tab: self.settings_tab,
+            log_level: self.log_level,
+            security: self.security_mode,
+            performance: self.performance_mode,
+            color_fidelity: self.color_fidelity,
+            displays: self.displays_mode,
+            hidpi: self.hidpi_streaming,
+            use_notch_area: self.fullscreen_uses_notch_area,
+            remote_ui_scale_percent: self.remote_ui_scale_percent,
+            full_color_display_mask: self.full_color_display_mask,
+            hidpi_display_mask: self.hidpi_display_mask,
+            cursor_preference: self.cursor_preference,
+            typing_mode: self.typing_mode,
+            option_key_mode: self.option_key_mode,
+            paste_settings: self.paste_keys.settings(),
+            clipboard_enabled: self.clipboard_enabled,
+            microphone_enabled: self.microphone_enabled,
+            tablet_mode_requested: self.tablet_mode_requested,
+            exact_still_image: self.exact_still_image,
+        };
+        let actions = render_settings(ui, &mut values, &facts);
+        let SettingsValues {
+            tab,
+            log_level,
+            security,
+            performance,
+            color_fidelity,
+            displays,
+            hidpi,
+            use_notch_area,
+            remote_ui_scale_percent,
+            full_color_display_mask,
+            hidpi_display_mask,
+            cursor_preference,
+            typing_mode,
+            option_key_mode,
+            paste_settings,
+            clipboard_enabled,
+            microphone_enabled,
+            mut tablet_mode_requested,
+            exact_still_image,
+        } = values;
+        let mut close = actions.contains(&SettingsAction::Close);
+        let show_in_folder = actions.contains(&SettingsAction::ShowLogFolder);
+        let refresh_displays = actions.contains(&SettingsAction::RefreshDisplays);
+        let open_colour_check = actions.contains(&SettingsAction::OpenColourCheck);
+        for action in &actions {
+            if let SettingsAction::SupportBundle(action) = action {
+                let ctx = ui.ctx().clone();
+                let wake_ctx = ctx.clone();
+                let displays = crate::display::enumerate;
+                self.support_bundle.apply(
+                    *action,
+                    &arcen_deck_core::screens::support_bundle::SupportBundleContext {
+                        services: crate::platform_services::services(),
+                        component: crate::platform_services::support_bundle_component(),
+                        log_level: self.log_level,
+                        displays: &displays,
+                        wake: Arc::new(move || wake_ctx.request_repaint()),
+                        ctx: &ctx,
+                    },
+                );
+            }
+        }
+        if actions.contains(&SettingsAction::NativeTabletComponent) {
+            let ctx = ui.ctx().clone();
+            self.native_tablet
+                .clicked(crate::platform_services::services(), move || {
+                    ctx.request_repaint();
                 });
-            });
-        });
-
+        }
         let old_mode = self.tablet_mode_requested;
         let tablet_mode_persistence_error = if tablet_mode_requested != old_mode {
             self.persist_tablet_mode_for_selected_connection(tablet_mode_requested)
@@ -12207,6 +8294,7 @@ impl ArcenApp {
             || paste_settings != self.paste_keys.settings()
             || clipboard_enabled != self.clipboard_enabled
             || microphone_enabled != self.microphone_enabled
+            || exact_still_image != self.exact_still_image
             || tablet_mode_requested != self.tablet_mode_requested;
         self.settings_tab = tab;
         self.log_level = log_level;
@@ -12234,6 +8322,7 @@ impl ArcenApp {
         let tablet_input_disabled_now = old_tablet_input_enabled && !new_tablet_input_enabled;
         self.clipboard_enabled = clipboard_enabled;
         self.microphone_enabled = microphone_enabled;
+        self.exact_still_image = exact_still_image;
         self.tablet_mode_requested = tablet_mode_requested;
         self.tablet_input_enabled = new_tablet_input_enabled;
         let persistence_failed = if changed {
@@ -12359,17 +8448,15 @@ impl ArcenApp {
             &options.host,
             options.port,
             options.use_tls,
-            saved_transport_for_options(options),
+            SavedTransport::Quic,
             self.security_mode,
         ) else {
             return;
         };
         let saved = &self.saved_connections[index];
         let saved_id = saved.id.clone();
-        draft.use_quic = saved.transport == SavedTransport::Quic;
         draft.use_tls = saved.use_tls;
         draft.port = saved.port;
-        options.quic_enabled = draft.use_quic;
         // This connection's own Displays choice, or `None` to keep
         // following the application default. Never written back into
         // `self.displays_mode`, which stays the app-wide default.
@@ -12485,14 +8572,7 @@ impl ArcenApp {
                 .find(|saved| saved.id == id)
                 .map(|saved| saved.name.clone())
         });
-        match name {
-            Some(name) => format!(
-                "Remembered for \u{201c}{name}\u{201d} only. Each saved connection keeps its \
-                 own tablet mode; choose it again for your other hosts."
-            ),
-            None => "Applies to this session only: select a saved connection to remember it."
-                .to_string(),
-        }
+        arcen_deck_core::screens::settings::tablet_scope_note(name.as_deref())
     }
 
     fn persist_tablet_mode_for_selected_connection(
@@ -12546,6 +8626,7 @@ impl ArcenApp {
                 hidpi_display_mask: self.hidpi_display_mask,
                 tablet_input_enabled: self.tablet_input_enabled,
                 tablet_mode_requested: self.tablet_mode_requested,
+                exact_still_image: self.exact_still_image,
                 color_fidelity: self.color_fidelity,
                 encode_intent: self.encode_intent,
                 typing_mode: self.typing_mode,
@@ -12585,91 +8666,24 @@ impl ArcenApp {
         if let Some(tls) = &draft.tls_trust {
             options.tls = tls.clone();
         } else {
-            match self.security_mode {
-                SecurityMode::High => {}
-                SecurityMode::Medium => {
-                    let endpoint = connection_endpoint(draft);
-                    let pin = self.effective_tls_pin(&endpoint);
-                    options.tls = if let Some(pin) = pin {
-                        match pin.kind {
-                            arcen_transport::tls::PinKind::CertificateSha256 => {
-                                TlsTrustConfig::pinned_certificate(pin.digest)
-                            }
-                            arcen_transport::tls::PinKind::SubjectPublicKeyInfoSha256 => {
-                                TlsTrustConfig::pinned_spki(pin.digest)
-                            }
-                        }
-                    } else {
-                        TlsTrustConfig::tofu_probe(endpoint)
-                    };
-                }
-                SecurityMode::Low => {
-                    // Low is the first half of the explicit insecure double gate. The
-                    // TLS layer still requires ARCEN_ACCEPT_INSECURE=1.
-                    options.tls = TlsTrustConfig::insecure_dev_escape_hatch(true);
-                }
+            let endpoint = connection_endpoint(draft);
+            let pin = self.effective_tls_pin(&endpoint);
+            if let Some(tls) =
+                arcen_deck_core::connect_plan::tls_trust_for(self.security_mode, endpoint, pin)
+            {
+                options.tls = tls;
             }
         }
-        let resolved_color_fidelity = self.color_fidelity.resolved_variant();
-        if !resolved_color_fidelity.is_coherent() {
-            // Only the explicit `variant_override` seam is guaranteed
-            // coherent; individual Advanced axis overrides are not
-            // cross-validated against each other (see
-            // `ColorFidelitySettings::resolved_variant`'s doc comment), so
-            // this is reachable from ordinary Advanced settings use, not
-            // just a programming error. Falling back to the preset keeps an
-            // incoherent combination from ever reaching the host.
-            tracing::warn!(
-                target: "arcen::display",
-                requested = %resolved_color_fidelity.id(),
-                preset = self.color_fidelity.preset.key(),
-                "colour fidelity resolved to a combination Arcen does not offer; falling back \
-                 to the preset's own contract for this connection",
-            );
-        }
-        let effective_color_fidelity = effective_color_fidelity_variant(self.color_fidelity);
-        options.profile.codec = effective_color_fidelity.video.codec.token().to_string();
-        options.profile.chroma = effective_color_fidelity.video.chroma.token().to_string();
-        options.profile.bit_depth = effective_color_fidelity.video.bit_depth.token().to_string();
-        options.profile.color_range = effective_color_fidelity.video.range.token().to_string();
-        options.profile.color_matrix = effective_color_fidelity.video.matrix.token().to_string();
-        // The two axes that carry an HDR ask. They come from the same resolved
-        // variant as the others, so a preset cannot advertise HDR primaries
-        // while streaming an SDR transfer.
-        options.profile.transfer = effective_color_fidelity.video.transfer.token().to_string();
-        options.profile.color_primaries =
-            effective_color_fidelity.video.primaries.token().to_string();
-        options.profile.video_selection = self.color_fidelity.video_selection();
-        let preset_contract =
-            StreamingPreset::from_settings(self.performance_mode, self.color_fidelity).contract();
-        options.profile.pipeline =
-            StreamingPreset::from_settings(self.performance_mode, self.color_fidelity)
-                .wire_pipeline();
-        options.profile.max_fps = preset_contract.map_or_else(
-            || self.performance_mode.max_fps(),
-            |contract| contract.max_fps,
+        arcen_deck_core::connect_plan::apply_streaming_settings(
+            &mut options.profile,
+            self.performance_mode,
+            self.color_fidelity,
         );
-        options.profile.encode_intent = preset_contract
-            .map_or_else(
-                || self.color_fidelity.preset.encode_intent(),
-                |contract| contract.intent,
-            )
-            .token()
-            .to_string();
-        // A custom combination still says what it favours: the high frame-rate
-        // mode is Speed's, so it keeps motion; anything else keeps detail.
-        options.profile.motion_priority = preset_contract
-            .map_or_else(
-                || match self.performance_mode {
-                    PerformanceMode::High | PerformanceMode::HighLegacy => {
-                        arcen_media::video::MotionPriority::Motion
-                    }
-                    PerformanceMode::Standard => arcen_media::video::MotionPriority::Detail,
-                },
-                |contract| contract.priority,
-            )
-            .token()
-            .to_string();
+        // Grading or HDR this Mac cannot decode is never asked for.
+        let _ = arcen_deck_core::connect_plan::keep_profile_decodable(
+            &mut options.profile,
+            &options.services.decode_capabilities(),
+        );
         let monitors = crate::display::enumerate();
         let presentation = primary_presentation_size(
             &monitors,
@@ -12756,6 +8770,7 @@ impl ArcenApp {
         options.microphone_enabled = self.microphone_enabled;
         options.tablet_input_enabled = self.tablet_input_enabled;
         options.tablet_mode_requested = self.tablet_mode_requested;
+        options.exact_still_image = self.exact_still_image;
         options.telemetry = Arc::new(ClientTelemetry::default());
         (options, policy)
     }
@@ -12952,41 +8967,23 @@ impl ArcenApp {
     /// Holds the last frame while the host's sign-in screen gives way to the
     /// signed-in desktop.
     fn signing_in_screen(&mut self, ui: &mut egui::Ui) {
-        let available = egui::vec2(ui.available_width(), ui.available_height().max(240.0));
-        let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
-        if self.dedicated_native_hold_active() {
-            // The last native frame is still held by the dedicated layer under
-            // this translucent overlay.
-        } else if let Some(texture) = &self.remote_texture {
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-            texture.paint(ui.painter(), rect);
-        } else {
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-        }
-        ui.painter()
-            .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
-        ui.painter().text(
-            rect.center() - egui::vec2(0.0, 20.0),
-            egui::Align2::CENTER_CENTER,
-            "Signing in…",
-            egui::FontId::proportional(22.0),
-            egui::Color32::WHITE,
-        );
-        ui.painter().text(
-            rect.center() + egui::vec2(0.0, 16.0),
-            egui::Align2::CENTER_CENTER,
-            "Connecting to your desktop",
-            egui::FontId::proportional(14.0),
-            egui::Color32::from_gray(200),
-        );
-        let btn_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.center().x, rect.bottom() - 44.0),
-            egui::vec2(120.0, 34.0),
-        );
-        if ui.put(btn_rect, egui::Button::new("Disconnect")).clicked() {
+        let held = self.held_frame();
+        if render_signing_in(ui, held) == HeldFrameAction::Disconnect {
             self.disconnect();
             self.status = "Disconnected".to_string();
             self.screen = AppScreen::Home;
+        }
+    }
+
+    /// What stays under the reconnect and signing-in overlays: the frame the
+    /// dedicated layer still holds, the last egui texture, or black.
+    fn held_frame(&self) -> HeldFrame<impl FnOnce(&egui::Painter, egui::Rect) + '_> {
+        if self.dedicated_native_hold_active() {
+            HeldFrame::UnderOverlay
+        } else if let Some(texture) = &self.remote_texture {
+            HeldFrame::Picture(move |painter: &egui::Painter, rect| texture.paint(painter, rect))
+        } else {
+            HeldFrame::Nothing
         }
     }
 
@@ -13102,61 +9099,9 @@ impl ArcenApp {
     }
 
     fn reconnect_screen(&mut self, ui: &mut egui::Ui, overlay: &ReconnectOverlay, resuming: bool) {
-        let available = egui::vec2(ui.available_width(), ui.available_height().max(240.0));
-        let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
-        if self.dedicated_native_hold_active() {
-            // The last native frame is still held by the dedicated layer under
-            // this translucent reconnect/resume overlay.
-        } else if let Some(texture) = &self.remote_texture {
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-            texture.paint(ui.painter(), rect);
-        } else {
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-        }
-
-        // 60% gray overlay
-        ui.painter()
-            .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(153));
-
-        // Primary message
-        ui.painter().text(
-            rect.center() - egui::vec2(0.0, 20.0),
-            egui::Align2::CENTER_CENTER,
-            "Lost connection, attempting to reconnect",
-            egui::FontId::proportional(22.0),
-            egui::Color32::WHITE,
-        );
-
-        // Retry countdown (small, muted)
-        let now = self.reconnect_clock.now();
-        let retry_left = overlay
-            .next_retry
-            .map(|retry| retry.saturating_sub(now).as_secs_f32());
-        let detail = if resuming {
-            retry_left.map_or_else(
-                || "Authenticating…".to_string(),
-                |s| format!("Retry in {s:.0}s"),
-            )
-        } else {
-            retry_left.map_or_else(
-                || "Connecting…".to_string(),
-                |s| format!("Retry in {s:.0}s"),
-            )
-        };
-        ui.painter().text(
-            rect.center() + egui::vec2(0.0, 16.0),
-            egui::Align2::CENTER_CENTER,
-            detail,
-            egui::FontId::proportional(14.0),
-            egui::Color32::from_gray(200),
-        );
-
-        // Disconnect button — bottom-center
-        let btn_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.center().x, rect.bottom() - 44.0),
-            egui::vec2(120.0, 34.0),
-        );
-        if ui.put(btn_rect, egui::Button::new("Disconnect")).clicked() {
+        let retry_left = overlay.retry_left_secs(self.reconnect_clock.now());
+        let held = self.held_frame();
+        if render_reconnecting(ui, held, resuming, retry_left) == HeldFrameAction::Disconnect {
             self.disconnect();
             self.status = "Disconnected".to_string();
             self.screen = AppScreen::Home;
@@ -13391,6 +9336,7 @@ impl ArcenApp {
         if self.show_stream_stats {
             self.paint_stream_stats(ui, image_rect);
         }
+        self.record_support_snapshot();
 
         // When the host could not present the size that was asked for there is
         // spare black around the image; say why in it, so a desktop that is
@@ -13666,7 +9612,7 @@ impl ArcenApp {
             .served_pipeline_token
             .as_deref()
             .map(stream_pipeline_label);
-        let refine = self.refine.status(1).text;
+        let refine = self.exact_status_line();
         arcen_media::stats_overlay::stats_overlay_lines(
             &arcen_media::stats_overlay::StatsOverlayInputs {
                 path: self
@@ -13682,240 +9628,195 @@ impl ArcenApp {
         )
     }
 
+    /// The Stream Statistics line for exact still image: why it is off, or
+    /// how much of the picture is verified exact.
+    fn exact_status_line(&self) -> String {
+        exact_status_line(self.exact_requested, self.refine_offer.as_ref(), || {
+            self.refine
+                .status(arcen_media::refine::PRIMARY_MONITOR)
+                .text
+        })
+    }
+
+    /// Exact still image on a still screen: re-presents the last ten-bit
+    /// frame when the overlay changed, and logs each change of verdict.
+    fn drive_exact_still_image(&mut self) {
+        if !self
+            .refine_offer
+            .as_ref()
+            .is_some_and(|offer| offer.is_on())
+        {
+            return;
+        }
+        let monitor = arcen_media::refine::PRIMARY_MONITOR;
+        if self.refine.overlay_dirty(monitor) {
+            if let Ok(mut presenter) = self.dedicated_video_presenter.lock() {
+                presenter.represent_last();
+            }
+        }
+        let status = self.refine.status(monitor);
+        let key = (
+            status
+                .verdict
+                .as_ref()
+                .map(arcen_media::refine::deck::Verdict::coverage_permille),
+            status.verdict.as_ref().map(|verdict| verdict.level as u8),
+        );
+        let complete = key.0 == Some(1000) && key.1 == Some(3);
+        if !complete && status.active {
+            // Keep passes coming while a still picture builds up, so the
+            // summary and the re-present follow it.
+            if let Some(ctx) = self.viewport_context.as_ref() {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
+        if self
+            .refine_window_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+            && status.active
+        {
+            self.refine_window_at = Some(Instant::now());
+            let stats = self.refine.stats();
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                refined_permille = status.refined_permille,
+                verified_permille = key.0.unwrap_or(0),
+                level = key.1.unwrap_or(0),
+                tiles = stats.tiles_admitted,
+                blocks = stats.blocks_committed,
+                stale_at_commit = stats.blocks_stale_at_commit,
+                payload_bytes = stats.payload_bytes,
+                fences = stats.fences,
+                blocks_invalidated = stats.blocks_invalidated,
+                generations = stats.generations,
+                dropped = stats.dropped,
+                malformed = stats.malformed,
+                "{}",
+                arcen_telemetry::names::refine::WINDOW
+            );
+        }
+        if self.refine_logged != Some(key) {
+            self.refine_logged = Some(key);
+            let stats = self.refine.stats();
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                coverage_permille = key.0.unwrap_or(0),
+                level = key.1.unwrap_or(0),
+                refined_permille = status.refined_permille,
+                tiles = stats.tiles_admitted,
+                blocks = stats.blocks_committed,
+                payload_bytes = stats.payload_bytes,
+                digest_matches = stats.digest_matches,
+                digest_mismatches = stats.digest_mismatches,
+                dropped = stats.dropped,
+                text = %status.text,
+                "{}",
+                arcen_telemetry::names::refine::VERIFIED
+            );
+        }
+        for message in self.refine.take_control_messages() {
+            if let Some(commands) = self.session_commands.as_ref() {
+                if let Ok(value) = serde_json::to_value(&message) {
+                    let _ = commands.send(crate::transport::websocket::SessionCommand::Json(value));
+                }
+            }
+        }
+    }
+
     /// The compact statistics box (P2-4), bottom left of the picture.
     fn paint_stream_stats(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect) {
-        let text = self.stream_stats_lines().join("\n");
-        let font = egui::FontId::monospace(12.0);
-        let galley = ui
-            .painter()
-            .layout_no_wrap(text, font, egui::Color32::WHITE);
-        let size = galley.size() + egui::vec2(20.0, 14.0);
-        let origin = egui::pos2(
-            image_rect.left() + 12.0,
-            image_rect.bottom() - 12.0 - size.y,
-        );
-        let panel = egui::Rect::from_min_size(origin, size);
-        ui.painter()
-            .rect_filled(panel, 8.0, egui::Color32::from_black_alpha(170));
-        ui.painter()
-            .galley(origin + egui::vec2(10.0, 7.0), galley, egui::Color32::WHITE);
+        let lines = self.stream_stats_lines();
+        paint_stream_stats(ui, image_rect, &lines);
     }
 
     /// Lossless-tile debug view: green = verified source codes, amber =
     /// refined but not yet verified, untinted = live (lossy video). Block
     /// coordinates are source pixels, scaled to the picture.
     fn paint_lossless_tiles(&self, ui: &mut egui::Ui, image_rect: egui::Rect) {
-        let Some((grid, blocks)) = self.refine.block_map(1) else {
-            return;
-        };
-        if grid.width == 0 || grid.height == 0 {
-            return;
-        }
-        let scale_x = image_rect.width() / grid.width as f32;
-        let scale_y = image_rect.height() / grid.height as f32;
-        for (index, state) in blocks.iter().enumerate() {
-            let Some(verified) = state else { continue };
-            let Some(block) = u32::try_from(index)
-                .ok()
-                .and_then(|index| grid.block_rect(index))
-            else {
-                continue;
-            };
-            let min = image_rect.left_top()
-                + egui::vec2(block.x as f32 * scale_x, block.y as f32 * scale_y);
-            let tile = egui::Rect::from_min_size(
-                min,
-                egui::vec2(block.width as f32 * scale_x, block.height as f32 * scale_y),
-            );
-            let tint = if *verified {
-                egui::Color32::from_rgba_unmultiplied(40, 200, 90, 70)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(230, 170, 30, 70)
-            };
-            ui.painter().rect_filled(tile, 0.0, tint);
+        if let Some((grid, blocks)) = self.refine.block_map(arcen_media::refine::PRIMARY_MONITOR) {
+            paint_lossless_tiles(ui, image_rect, &grid, &blocks);
         }
     }
 
     fn paint_health_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let overlay_width = (rect.width() - 36.0).clamp(320.0, 1040.0);
-        let overlay = egui::Rect::from_min_size(
-            rect.left_top() + egui::vec2(18.0, 18.0),
-            egui::vec2(overlay_width, 380.0),
-        );
-        ui.painter().rect_filled(
-            overlay,
-            10.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 175),
-        );
-        let (host_delivery, host_video) = self
-            .host_health
-            .as_ref()
-            .map(|stats| {
-                (
-                    format!(
-                        "Host delivery: {:.1}/{:.0} fps · {:.2} Mbps · stage {:.1} ms · encode {:.1} ms · drops {}",
-                        stats.fps_actual,
-                        stats.fps_target,
-                        stats.bandwidth_mbps,
-                        stats.capture_time_ms,
-                        stats.encode_time_ms,
-                        stats.frames_dropped,
-                    ),
-                    format!(
-                        "Host video contract: codec={} · chroma={} · frame={}",
-                        stats.codec, stats.chroma, stats.resolution,
-                    ),
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    "Host delivery: waiting for health_stats".to_string(),
-                    "Host video contract: waiting for negotiation".to_string(),
-                )
-            });
-        let host_path = host_path_row(self.host_health.as_ref());
-        let host_input = self
-            .host_health
-            .as_ref()
-            .map(|stats| {
-                format!(
-                    "Host input: events {} · last {} #{} · proc {:.2} ms",
-                    stats.input_events,
-                    if stats.last_input_type.is_empty() {
-                        "-"
-                    } else {
-                        stats.last_input_type.as_str()
-                    },
-                    stats.last_input_sequence,
-                    stats.input_latency_ms,
-                )
-            })
-            .unwrap_or_else(|| "Host input: waiting".to_string());
-        let pointer = self
-            .last_pointer_norm
-            .map(|(x, y, sx, sy)| format!("pointer {:.3},{:.3} => {},{}", x, y, sx, sy))
-            .unwrap_or_else(|| "pointer outside viewer".to_string());
-        let sent_age = self
-            .last_input_sent_at
-            .map(|sent| format!("{:.0} ms ago", sent.elapsed().as_secs_f64() * 1000.0))
-            .unwrap_or_else(|| "never".to_string());
+        let text = self.health_overlay_text_now();
+        paint_health_overlay(ui, rect, text);
+    }
+
+    /// What Stream Statistics, Negotiated Truth and the health overlay show
+    /// now, kept for a support bundle made after the session
+    /// (`support_bundle::snapshot`; built at most every two seconds).
+    fn record_support_snapshot(&mut self) {
+        arcen_deck_core::support_bundle::snapshot::record_session_snapshot(|| {
+            arcen_deck_core::support_bundle::snapshot::SessionSnapshot {
+                captured_unix_seconds: 0,
+                stream_statistics: self.stream_stats_lines().to_vec(),
+                negotiated_truth: self
+                    .negotiated_truth
+                    .as_ref()
+                    .map(|truth| {
+                        vec![
+                            arcen_deck_core::session_truth::negotiated_truth_summary(truth),
+                            arcen_deck_core::session_truth::truth_badge_text(
+                                truth,
+                                self.decoder_hardware_accelerated,
+                            ),
+                        ]
+                    })
+                    .unwrap_or_default(),
+                health: self
+                    .health_overlay_text_now()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+                decoder_refusal: self.last_decode_error.clone(),
+                telemetry: self
+                    .session_telemetry
+                    .as_deref()
+                    .map(arcen_deck_core::support_bundle::snapshot::telemetry_lines)
+                    .unwrap_or_default(),
+            }
+        });
+    }
+
+    fn health_overlay_text_now(&mut self) -> String {
         let local_build = crate::build_identity::current();
-        let host_build = self.host_build_identity.as_ref().map_or_else(
-            || "Pier: build unavailable".to_string(),
-            |identity| {
-                format!(
-                    "Pier: {} · build {} · rev {} · {}",
-                    identity.version,
-                    identity.build_id,
-                    identity.source_revision,
-                    identity.feature_profile
-                )
-            },
-        );
-        let deck_build = format!(
-            "Deck: {} · build {} · rev {}",
-            local_build.version, local_build.build_id, local_build.source_revision,
-        );
-        let deck_runtime = format!(
-            "Deck runtime: {} · signing {}",
-            local_build.feature_profile,
-            local_build.signing_state.as_deref().unwrap_or("unknown")
-        );
-        let (client_wire, client_decoder) =
-            client_video_health_rows(&self.last_wire_video_summary, &self.last_decoder_summary);
         let now = Instant::now();
         self.expire_presentation_histories(now);
-        let presented_fps = Self::instant_rate(&self.presented_frame_times);
-        let presented_fps_estimated = Self::instant_rate(&self.presented_frame_times_estimated);
-        let displayed_presented_fps = if presented_fps > 0.0 {
-            presented_fps
-        } else {
-            presented_fps_estimated
-        };
-        let presented_label = if presented_fps > 0.0 {
-            "presented"
-        } else {
-            "presented estimated"
-        };
-        let presented_fps_text = if self.active_stream_max_fps > 0 {
-            format!(
-                "{displayed_presented_fps:.1} fps (up to {})",
-                self.active_stream_max_fps
-            )
-        } else {
-            format!("{displayed_presented_fps:.1} fps")
-        };
         let monitor_fps_text = self.multi_monitor_fps_overlay_text();
-        let client_delivery = if monitor_fps_text.is_empty() {
-            format!(
-                "Client delivery: rx {:.1} fps · {presented_label} {presented_fps_text} · wire delay {} ms · clock age {} ms",
-                Self::instant_rate(&self.video_packet_times),
-                self.last_wire_delay_ms
-                    .map(|delay| delay.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                self.last_wire_clock_age_ms
-                    .map(|age| age.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            )
-        } else {
-            format!(
-                "Client delivery: rx {:.1} fps · presented {presented_fps_text} · wire delay {} ms · clock age {} ms\nDisplay fps: {monitor_fps_text}",
-                Self::instant_rate(&self.video_packet_times),
-                self.last_wire_delay_ms
-                    .map(|delay| delay.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                self.last_wire_clock_age_ms
-                    .map(|age| age.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            )
+        let facts = HealthOverlayFacts {
+            deck_build: &local_build,
+            host_build: self.host_build_identity.as_ref(),
+            host_health: self.host_health.as_ref(),
+            wire_summary: &self.last_wire_video_summary,
+            decoder_summary: &self.last_decoder_summary,
+            presented_fps: Self::instant_rate(&self.presented_frame_times),
+            presented_fps_estimated: Self::instant_rate(&self.presented_frame_times_estimated),
+            max_fps: self.active_stream_max_fps,
+            monitor_fps_text: &monitor_fps_text,
+            received_fps: Self::instant_rate(&self.video_packet_times),
+            wire_delay_ms: self.last_wire_delay_ms,
+            clock_age_ms: self.last_wire_clock_age_ms,
+            last_decode_ms: self.last_decode_ms,
+            average_decode_ms: Self::avg_ms(&self.decode_ms_samples),
+            last_upload_ms: self.last_upload_ms,
+            average_upload_ms: Self::avg_ms(&self.upload_ms_samples),
+            video_frames_seen: self.video_frames_seen,
+            video_frames_decoded: self.video_frames_decoded,
+            audio_frames_seen: self.audio_frames_seen,
+            audio_bytes_accepted: self.audio_bytes_accepted,
+            inbox: &self.media_inbox,
+            waiting_for_keyframe: self.waiting_for_keyframe,
+            ingress_idr_requests: self.ingress_idr_requests,
+            malformed_media_packets: self.malformed_media_packets,
+            last_decode_error: self.last_decode_error.as_deref(),
+            input_sequence: self.input_sequence.get(),
+            last_input_sent_type: &self.last_input_sent_type,
+            last_input_sent_age: self.last_input_sent_at.map(|sent| sent.elapsed()),
+            pointer: self.last_pointer_norm,
+            audio_summary: &self.last_audio_summary,
         };
-        let text = format!(
-            "{deck_build}\n{deck_runtime}\n{host_build}\n{host_delivery}\n{host_video}\n{host_path}\n{client_delivery}\n{client_wire}\n{client_decoder} · decode {:.1} ms avg {:.1} · upload {:.1} ms avg {:.1}\nVideo packets {} · presented {} · audio packets {} / {} KB\nInbox video: {}/{} B (high {}/{}) · dropped {} / {} B · superseded {} · loss epochs {}\nInbox audio: {}/{} B (high {}/{}) · drop-tail {} / {} B\nRecovery: waiting={} · ingress IDRs {} · malformed {} (video {} / audio {}) · decoder error={}\nInput sent: {} · last {} #{} ({}) · {pointer}\n{host_input}\n{}",
-            self.last_decode_ms,
-            Self::avg_ms(&self.decode_ms_samples),
-            self.last_upload_ms,
-            Self::avg_ms(&self.upload_ms_samples),
-            self.video_frames_seen,
-            self.video_frames_decoded,
-            self.audio_frames_seen,
-            self.audio_bytes_accepted / 1024,
-            self.media_inbox.video_depth,
-            self.media_inbox.video_bytes,
-            self.media_inbox.video_high_water_depth,
-            self.media_inbox.video_high_water_bytes,
-            self.media_inbox.video_dropped_packets,
-            self.media_inbox.video_dropped_bytes,
-            self.media_inbox.video_superseded_packets,
-            self.media_inbox.video_loss_epochs,
-            self.media_inbox.audio_depth,
-            self.media_inbox.audio_bytes,
-            self.media_inbox.audio_high_water_depth,
-            self.media_inbox.audio_high_water_bytes,
-            self.media_inbox.audio_dropped_packets,
-            self.media_inbox.audio_dropped_bytes,
-            self.waiting_for_keyframe,
-            self.ingress_idr_requests,
-            self.malformed_media_packets,
-            self.media_inbox.malformed_video_packets,
-            self.media_inbox.malformed_audio_packets,
-            self.last_decode_error.as_deref().unwrap_or("-"),
-            self.input_sequence.get(),
-            if self.last_input_sent_type.is_empty() {
-                "-"
-            } else {
-                self.last_input_sent_type.as_str()
-            },
-            self.input_sequence.get(),
-            sent_age,
-            self.last_audio_summary,
-        );
-        ui.painter().text(
-            overlay.left_top() + egui::vec2(14.0, 14.0),
-            egui::Align2::LEFT_TOP,
-            text,
-            egui::FontId::monospace(13.0),
-            egui::Color32::WHITE,
-        );
+        health_overlay_text(&facts)
     }
 
     fn multi_monitor_fps_overlay_text(&self) -> String {
@@ -13927,25 +9828,11 @@ impl ArcenApp {
         else {
             return String::new();
         };
-        if validated.monitors.len() <= 1 {
-            return String::new();
-        }
-        validated
-            .monitors
-            .iter()
-            .filter_map(|monitor| {
-                self.monitor_presented_frame_times
-                    .get(&monitor.session_monitor_id)
-                    .map(|samples| {
-                        format!(
-                            "{}:{:.1}",
-                            monitor.session_monitor_id.get(),
-                            Self::instant_rate(samples)
-                        )
-                    })
-            })
-            .collect::<Vec<_>>()
-            .join(" · ")
+        arcen_deck_core::multi_window::session::monitor_fps_text(validated, |monitor| {
+            self.monitor_presented_frame_times
+                .get(&monitor)
+                .map(Self::instant_rate)
+        })
     }
 
     /// Local-only diagnostic panel for human validation of the tablet
@@ -13955,106 +9842,37 @@ impl ArcenApp {
     /// never logs or persists a sample, matching the local-termination
     /// plan's privacy requirement for this panel.
     fn paint_tablet_monitor_panel(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let overlay = egui::Rect::from_min_size(
-            rect.right_top() + egui::vec2(-420.0, 18.0),
-            egui::vec2(400.0, 370.0),
-        );
-        ui.painter().rect_filled(
-            overlay,
-            10.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 175),
-        );
-        let presence = match crate::tablet::tablet_presence() {
-            arcen_input::CapabilityAvailability::Available => "present",
-            arcen_input::CapabilityAvailability::Unavailable => "not detected",
-            arcen_input::CapabilityAvailability::Unknown => "unknown",
-        };
-        let presence_at_connect = match self.hello_local_pen_capability {
-            InputCapabilityAvailability::Available => "yes",
-            InputCapabilityAvailability::Unavailable => "no (setting off)",
-            InputCapabilityAvailability::Unknown => "unknown (no active session)",
-        };
-        let host_pen_cap = match self.hello_pen_capability {
-            InputCapabilityAvailability::Available => "available",
-            InputCapabilityAvailability::Unavailable => "unavailable (uinput may have failed)",
-            InputCapabilityAvailability::Unknown => "unknown (no active session)",
-        };
-        let negotiated = if self.pen_negotiated {
-            "yes (typed pen)"
-        } else if tablet_mode_allows_typed_pen(self.tablet_mode_active) {
-            "no — host did not confirm pen capability\n\
-             (check pier log: uinput tablet creation may have failed;\n\
-              try: modprobe uinput and verify /dev/uinput permissions)"
-        } else {
-            "no (setting disabled)"
-        };
         let pen = self.pen.borrow();
-        let (tool, in_proximity, touching, pressure, tilt_x, tilt_y, rotation) = pen
-            .last_event
-            .as_ref()
-            .map(|event| {
-                (
-                    match event.tool {
-                        PenTool::Tip => "tip",
-                        PenTool::Eraser => "eraser",
-                    },
-                    event.in_proximity,
-                    event.touching,
-                    event.pressure,
-                    event.tilt_x_degrees,
-                    event.tilt_y_degrees,
-                    event.rotation_degrees,
-                )
-            })
-            .unwrap_or(("-", false, false, 0.0, 0.0, 0.0, 0.0));
-        let text = format!(
-            "Tablet Monitor (local-only; never logged/persisted)\n\
-             Pen tablet: {presence}\n\
-             Typed pen offered: {presence_at_connect}  ·  Host pen cap: {host_pen_cap}\n\
-             Runtime installed: {}\n\
-             Mode requested: {:?}\n\
-             Mode active: {:?}\n\
-             Mode reason: {}\n\
-             Left-handed: {}  ·  Force proportions: {} (planned)\n\
-             Negotiated: {negotiated}\n\
-             Tool: {tool}  ·  in proximity: {in_proximity}  ·  touching: {touching}\n\
-             Pressure: {pressure:.3}  ·  tilt {tilt_x:.1}°/{tilt_y:.1}°  ·  rotation {rotation:.1}°\n\
-             Events sent: {}  ·  overflow resets: {}\n\
-             Producer dropped (queue full): {}\n\
-             Dispatcher edges: {}  ·  motion forwarded: {}  ·  overflow: {}\n\
-             Probe — pressure: {:?}  tilt: {:?}  rotation: {:?}  eraser: {:?}  barrel: {:?}\n\
-             Last error: {}",
-            self.tablet_runtime.is_some(),
-            self.tablet_mode_requested,
-            self.tablet_mode_active,
-            if self.tablet_mode_reason.is_empty() {
-                "-"
-            } else {
-                self.tablet_mode_reason.as_str()
+        arcen_deck_core::screens::statistics::paint_tablet_monitor_panel(
+            ui,
+            rect,
+            &arcen_deck_core::screens::statistics::TabletMonitorFacts {
+                tablet_presence: crate::tablet::tablet_presence(),
+                local_pen_offered: self.hello_local_pen_capability,
+                host_pen: self.hello_pen_capability,
+                pen_negotiated: self.pen_negotiated,
+                typed_pen_allowed: tablet_mode_allows_typed_pen(self.tablet_mode_active),
+                runtime_installed: self.tablet_runtime.is_some(),
+                mode_requested: self.tablet_mode_requested,
+                mode_active: self.tablet_mode_active,
+                mode_reason: &self.tablet_mode_reason,
+                last_event: pen.last_event.as_ref(),
+                events_sent: pen.events_sent,
+                overflow_resets: pen.overflow_resets,
+                producer_dropped: self
+                    .tablet_runtime
+                    .as_ref()
+                    .map_or(0, crate::tablet::TabletRuntime::dropped_count),
+                dispatcher_edges: pen.dispatcher.edge_count(),
+                motion_forwarded: pen.dispatcher.motion_forwarded_count(),
+                dispatcher_overflow: pen.dispatcher.overflow_count(),
+                probe_pressure: pen.probe.pressure,
+                probe_tilt: pen.probe.tilt,
+                probe_rotation: pen.probe.rotation,
+                probe_eraser: pen.probe.eraser,
+                probe_barrel_buttons: pen.probe.barrel_buttons,
+                last_error: pen.last_error.as_deref(),
             },
-            self.tablet_left_handed,
-            self.tablet_force_proportions,
-            pen.events_sent,
-            pen.overflow_resets,
-            self.tablet_runtime
-                .as_ref()
-                .map_or(0, crate::tablet::TabletRuntime::dropped_count),
-            pen.dispatcher.edge_count(),
-            pen.dispatcher.motion_forwarded_count(),
-            pen.dispatcher.overflow_count(),
-            pen.probe.pressure,
-            pen.probe.tilt,
-            pen.probe.rotation,
-            pen.probe.eraser,
-            pen.probe.barrel_buttons,
-            pen.last_error.as_deref().unwrap_or("-"),
-        );
-        ui.painter().text(
-            overlay.left_top() + egui::vec2(14.0, 14.0),
-            egui::Align2::LEFT_TOP,
-            text,
-            egui::FontId::monospace(12.0),
-            egui::Color32::WHITE,
         );
     }
 
@@ -14062,31 +9880,9 @@ impl ArcenApp {
     /// sessions remain inspectable through the detail panel, but do not keep
     /// a permanent "healthy" badge over the video.
     fn paint_negotiated_truth_badge(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let Some(truth) = &self.negotiated_truth else {
-            return;
-        };
-        if !session_truth::should_show_truth_badge(truth) {
-            return;
+        if let Some(truth) = &self.negotiated_truth {
+            paint_truth_badge(ui, rect, truth, self.decoder_hardware_accelerated);
         }
-        let color = if truth.degradation.colour_degraded() {
-            theme::DANGER
-        } else {
-            theme::WARNING
-        };
-        let text = session_truth::truth_badge_text(truth, self.decoder_hardware_accelerated);
-        let badge = egui::Rect::from_min_size(
-            egui::pos2(rect.center().x - 280.0, rect.top() + 8.0),
-            egui::vec2(560.0, 24.0),
-        );
-        ui.painter()
-            .rect_filled(badge, 6.0, egui::Color32::from_black_alpha(190));
-        ui.painter().text(
-            badge.center(),
-            egui::Align2::CENTER_CENTER,
-            text,
-            egui::FontId::proportional(13.0),
-            color,
-        );
     }
 
     fn wants_dedicated_ten_bit_layer(&self) -> bool {
@@ -14423,14 +10219,11 @@ impl ArcenApp {
             .saturating_add(eight_bit.0.presented_time_unconfirmed);
         self.dedicated_presented_time_reported |= confirmed > 0;
         if let Some(telemetry) = &self.session_telemetry {
-            let presented = arcen_media::presentation::presented_frames_for_health(
+            telemetry.record_presenter_frames(
                 confirmed,
                 presented_time_unconfirmed,
                 self.dedicated_presented_time_reported,
             );
-            for _ in 0..presented {
-                telemetry.record_presented(Duration::ZERO);
-            }
         }
         let overflow = ten_bit
             .0
@@ -14643,24 +10436,15 @@ impl ArcenApp {
         let Some(reason) = presentation.fallback_reason() else {
             return;
         };
-        let warning = egui::Rect::from_min_size(
-            egui::pos2(rect.center().x - 320.0, rect.top() + 40.0),
-            egui::vec2(640.0, 26.0),
-        );
-        ui.painter().rect_filled(
-            warning,
-            6.0,
-            egui::Color32::from_rgba_unmultiplied(90, 20, 0, 220),
-        );
-        ui.painter().text(
-            warning.center(),
-            egui::Align2::CENTER_CENTER,
+        paint_presentation_warning(
+            ui,
+            rect,
+            40.0,
+            640.0,
             format!(
                 "Wide-colour warning: RGB10A2Unorm unavailable; rendering 8-bit fallback \
                  ({reason:?})"
             ),
-            egui::FontId::proportional(13.0),
-            theme::DANGER,
         );
     }
 
@@ -14676,24 +10460,15 @@ impl ArcenApp {
         let Some(reason) = presentation.fallback_reason() else {
             return;
         };
-        let warning = egui::Rect::from_min_size(
-            egui::pos2(rect.center().x - 330.0, rect.top() + 70.0),
-            egui::vec2(660.0, 26.0),
-        );
-        ui.painter().rect_filled(
-            warning,
-            6.0,
-            egui::Color32::from_rgba_unmultiplied(90, 20, 0, 220),
-        );
-        ui.painter().text(
-            warning.center(),
-            egui::Align2::CENTER_CENTER,
+        paint_presentation_warning(
+            ui,
+            rect,
+            70.0,
+            660.0,
             format!(
                 "8-bit video layer unavailable; rendering through egui upload fallback \
                  ({reason:?})"
             ),
-            egui::FontId::proportional(13.0),
-            theme::DANGER,
         );
     }
 
@@ -14713,93 +10488,20 @@ impl ArcenApp {
     /// is cached (see `NegotiatedTruth`): Settings is unreachable from
     /// `AppScreen::InSession`, so it cannot change under an open session.
     fn paint_negotiated_truth_panel(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let overlay = egui::Rect::from_min_size(
-            rect.left_bottom() + egui::vec2(18.0, -238.0),
-            egui::vec2(560.0, 220.0),
-        );
-        ui.painter().rect_filled(
-            overlay,
-            10.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
-        );
-        let Some(truth) = &self.negotiated_truth else {
-            ui.painter().text(
-                overlay.left_top() + egui::vec2(14.0, 14.0),
-                egui::Align2::LEFT_TOP,
-                "Negotiated Truth\nwaiting for server_hello",
-                egui::FontId::monospace(13.0),
-                egui::Color32::WHITE,
-            );
-            return;
-        };
-        let axis = |label: &str, requested: &str, actual: Option<&str>| {
-            format!(
-                "{label:<10} requested {requested:<9} actual {}",
-                actual.unwrap_or("unknown")
-            )
-        };
-        let text = format!(
-            "Negotiated Truth (server_hello's ServerColorCaps active_* fields)\n\
-             {}\n{}\n{}\n{}\n{}\n\
-             Intent: {} (requested; no host reports it back)\n\
-             Encode: {} ({})\n\
-             Decode: {} ({}) on {}, {}\n\
-             {}",
-            axis(
-                "Codec",
-                if truth.selection
-                    == arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance
-                {
-                    "adaptive"
-                } else {
-                    truth.requested.codec.token()
-                },
-                truth.active.codec.map(arcen_media::VideoCodec::token),
-            ),
-            axis(
-                "Chroma",
-                truth.requested.chroma.token(),
-                truth
-                    .active
-                    .chroma
-                    .map(arcen_media::ChromaSubsampling::token),
-            ),
-            axis(
-                "Bit depth",
-                truth.requested.bit_depth.token(),
-                truth.active.bit_depth.map(arcen_media::BitDepth::token),
-            ),
-            axis(
-                "Range",
-                truth.requested.range.token(),
-                truth.active.range.map(arcen_media::ColorRange::token),
-            ),
-            axis(
-                "Matrix",
-                truth.requested.matrix.token(),
-                truth.active.matrix.map(arcen_media::ColorMatrix::token),
-            ),
+        let platform = crate::platform::current();
+        paint_negotiated_truth_panel(
+            ui,
+            rect,
+            self.negotiated_truth.as_ref(),
             self.color_fidelity.preset.encode_intent().token(),
-            session_truth::hardware_label(truth.encoder_hardware),
-            truth.encoder_backend,
-            session_truth::hardware_label(self.decoder_hardware_accelerated),
-            if self.decoder_backend_name.is_empty() {
-                "no frame decoded yet"
-            } else {
-                self.decoder_backend_name
+            &DecodeTruth {
+                hardware: self.decoder_hardware_accelerated,
+                backend: self.decoder_backend_name,
+                platform: platform.label(),
+                path: platform
+                    .assess_decode_path(self.decoder_hardware_accelerated)
+                    .token(),
             },
-            crate::platform::current().label(),
-            crate::platform::current()
-                .assess_decode_path(self.decoder_hardware_accelerated)
-                .token(),
-            session_truth::selection_summary(truth.selection, truth.degradation),
-        );
-        ui.painter().text(
-            overlay.left_top() + egui::vec2(14.0, 14.0),
-            egui::Align2::LEFT_TOP,
-            text,
-            egui::FontId::monospace(13.0),
-            egui::Color32::WHITE,
         );
     }
 
@@ -14936,7 +10638,10 @@ impl ArcenApp {
     /// frame header carries no codec, so that axis is the host's.
     fn colour_check_presented(
         &self,
-    ) -> Option<(apple_cf::cv::CVPixelBuffer, arcen_media::VideoConfiguration)> {
+    ) -> Option<(
+        crate::pipeline::video_decoder::NativePixelBuffer,
+        arcen_media::VideoConfiguration,
+    )> {
         let codec = self
             .colour_check_host
             .as_ref()
@@ -15158,46 +10863,14 @@ impl ArcenApp {
 
     /// Draws the cursor the host shows at `at`, above the video.
     fn paint_host_pointer(&mut self, ui: &egui::Ui, image_rect: egui::Rect, at: egui::Pos2) {
-        use arcen_input::cursor::DeckCursor;
-        use arcen_input::host_pointer::LedPointerMark;
-        let painter = ui.painter().with_clip_rect(image_rect);
-        match self.led_pointer_mark() {
-            LedPointerMark::Nothing => return,
-            LedPointerMark::PenMark => return paint_pen_mark(&painter, at),
-            LedPointerMark::Arrow => return paint_pointer_arrow(&painter, at),
-            LedPointerMark::Image => {}
-        }
-        let DeckCursor::Image { id, image, .. } = self.shown_host_cursor() else {
-            return;
-        };
-        let Some([stream_width, _]) = self.remote_frame_size else {
-            return;
-        };
-        if stream_width == 0 {
-            return;
-        }
-        let texture = match &self.host_pointer_texture {
-            Some((shown, texture)) if *shown == id => texture.clone(),
-            _ => {
-                let size = [image.width() as usize, image.height() as usize];
-                let texture = ui.ctx().load_texture(
-                    "host-pointer",
-                    egui::ColorImage::from_rgba_unmultiplied(size, image.rgba()),
-                    egui::TextureOptions::LINEAR,
-                );
-                self.host_pointer_texture = Some((id, texture.clone()));
-                texture
-            }
-        };
-        let points_per_pixel = image_rect.width() / stream_width as f32;
-        let (hotspot_x, hotspot_y) = image.hotspot();
-        let min = at - egui::vec2(hotspot_x as f32, hotspot_y as f32) * points_per_pixel;
-        let size = egui::vec2(image.width() as f32, image.height() as f32) * points_per_pixel;
-        painter.image(
-            texture.id(),
-            egui::Rect::from_min_size(min, size),
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
+        arcen_deck_core::screens::host_pointer::paint_host_pointer(
+            ui,
+            image_rect,
+            at,
+            self.led_pointer_mark(),
+            &self.shown_host_cursor(),
+            self.remote_frame_size.map(|[width, _]| width),
+            &mut self.host_pointer_texture,
         );
     }
 
@@ -15853,12 +11526,8 @@ impl ArcenApp {
         if mode == KeyboardMode::Characters && !self.text_input.host().text_commit {
             let connected = self.session_commands.is_some();
             self.text_input.notify(
-                if connected {
-                    "This host cannot type text sent from the Deck, so the keyboard stays on                      physical keys."
-                } else {
-                    "Keyboard: Characters applies once connected to a host that types text."
-                }
-                .to_owned(),
+                arcen_deck_core::screens::text_input::characters_unavailable_notice(connected)
+                    .to_owned(),
             );
             if connected {
                 return;
@@ -15872,17 +11541,11 @@ impl ArcenApp {
             typing = self.text_input.mode().token(),
             "keyboard mode chosen for this session"
         );
-        self.text_input.notify(match mode {
-            KeyboardMode::Characters => {
-                "Keyboard: Characters. Typed characters arrive as on this Mac; shortcuts stay \
-                 keys. Control-Command-K for physical keys."
-                    .to_owned()
-            }
-            KeyboardMode::Physical => {
-                "Keyboard: Physical keys. The remote keyboard layout decides each character."
-                    .to_owned()
-            }
-        });
+        self.text_input
+            .notify(arcen_deck_core::screens::text_input::keyboard_mode_notice(
+                arcen_deck_core::screens::wording::DeckPlatform::Mac,
+                mode,
+            ));
     }
 
     /// Paste as Keystrokes from the menu.
@@ -16155,30 +11818,11 @@ impl ArcenApp {
         let Some(started) = self.quit_hold else {
             return;
         };
-        let remaining = QUIT_HOLD.saturating_sub(started.elapsed()).as_secs_f32();
-        egui::Area::new(egui::Id::new("arcen-quit-hold"))
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 48.0))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(210))
-                    .corner_radius(10.0)
-                    .inner_margin(egui::Margin::symmetric(18, 12))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Hold ⌘Q to quit Arcen Deck  ({remaining:.0}s)"
-                            ))
-                            .size(16.0)
-                            .color(egui::Color32::WHITE),
-                        );
-                        ui.label(
-                            egui::RichText::new("Let go to send ⌘Q to the remote Mac")
-                                .size(12.0)
-                                .color(egui::Color32::from_gray(200)),
-                        );
-                    });
-            });
+        arcen_deck_core::screens::menu::paint_quit_hold_notice(
+            ctx,
+            arcen_deck_core::screens::wording::DeckPlatform::Mac,
+            started.elapsed(),
+        );
     }
 
     /// One frame's keyboard events: key positions as before, except those
@@ -17019,7 +12663,6 @@ impl ArcenApp {
             secondary_targets: self.secondary_tablet_targets.clone(),
             primary_viewport: self.primary_region_viewport(),
             monitor_viewports,
-            left_handed: self.tablet_left_handed,
         }
     }
 
@@ -17247,10 +12890,12 @@ impl ArcenApp {
             .as_ref()
             .filter(|native| native.video.bit_depth >= arcen_media::BitDepth::Ten)
             .map(|native| DedicatedLayerFrame {
-                pixel_buffer: native.pixel_buffer.clone(),
+                pixel_buffer: native.picture.clone(),
                 contract: native.video.into(),
                 arrival_host_time: crate::ui::video_metal_layer::current_host_time(),
                 source_fps: (self.active_stream_max_fps > 0).then_some(self.active_stream_max_fps),
+                // A frame without a fence never shows exact tiles.
+                refine: None,
             });
         if self.dedicated_video_frame.is_none() {
             self.dedicated_video_presenter
@@ -17723,7 +13368,7 @@ impl RootPreEntrySnapshot {
 }
 
 /// Observes root's own current viewport state each `drive_multi_window`
-/// frame and, if it is not yet resident on `expected_cg_display_id`, or is
+/// frame and, if it is not yet resident on `expected_display_id`, or is
 /// resident there but not yet genuinely fullscreen -- *and*
 /// `move_command_needed` says the caller has not already sent a command for
 /// this exact target -- sends `egui::ViewportCommand::SetMonitor` to move +
@@ -17788,7 +13433,7 @@ impl RootPreEntrySnapshot {
 fn drive_root_multi_window_target(
     ctx: &egui::Context,
     root_window_title: &str,
-    expected_cg_display_id: u32,
+    expected_display_id: u32,
     active_display_ids: &[u32],
     move_command_needed: bool,
     snapshot_needed: bool,
@@ -17807,12 +13452,12 @@ fn drive_root_multi_window_target(
         observed_display_id,
     };
     let needs_command = move_command_needed
-        && (observed_display_id != Some(expected_cg_display_id)
+        && (observed_display_id != Some(expected_display_id)
             || !matches!(observation.fullscreen, Some(true)));
     let mut command_sent = false;
     let mut snapshot = None;
     if needs_command {
-        if let Some(index) = monitor_index_in(active_display_ids, expected_cg_display_id) {
+        if let Some(index) = monitor_index_in(active_display_ids, expected_display_id) {
             if snapshot_needed {
                 snapshot = Some(RootPreEntrySnapshot {
                     display_id: observed_display_id,
@@ -17879,7 +13524,7 @@ fn drive_root_windowed_monitor_test_target(
         crate::ui::windowed_monitor_test::confirmation_observation(
             observation,
             expected_virtual_display_id,
-            display.cg_display_id,
+            display.display_id,
         ),
         command_sent,
         snapshot,
@@ -17888,6 +13533,7 @@ fn drive_root_windowed_monitor_test_target(
 
 fn connect_options_from_draft(draft: &ConnectionDraft) -> ConnectOptions {
     ConnectOptions {
+        services: crate::platform_services::services(),
         host: draft.host.clone(),
         port: draft.port,
         use_tls: draft.use_tls,
@@ -17918,7 +13564,7 @@ fn connect_options_from_draft(draft: &ConnectionDraft) -> ConnectOptions {
         tablet_input_enabled: true,
         tablet_mode_requested: TabletModeMsg::LocalTermination,
         telemetry: Arc::new(ClientTelemetry::default()),
-        quic_enabled: draft.use_quic,
+        exact_still_image: false,
     }
 }
 
@@ -17979,7 +13625,20 @@ fn initial_stream_profile() -> crate::transport::websocket::StreamProfile {
 
 /// Where this Deck remembers host identities (`trusted_pins.json`).
 pub fn trusted_pins_path() -> Option<std::path::PathBuf> {
-    ClientConfigRepository::for_process().trusted_pins_file()
+    config_repository_for_process().trusted_pins_file()
+}
+
+/// The process's config repository: `ARCEN_CONFIG_DIR`, else the native
+/// folder (shared resolution, `arcen_deck_core::directories`). Tests never
+/// touch the real folder.
+#[cfg(not(test))]
+fn config_repository_for_process() -> ClientConfigRepository {
+    ClientConfigRepository::new(production_config_dir())
+}
+
+#[cfg(test)]
+fn config_repository_for_process() -> ClientConfigRepository {
+    ClientConfigRepository::default()
 }
 
 /// Resolve the production base config directory. Honors `$ARCEN_CONFIG_DIR`
@@ -17988,11 +13647,14 @@ pub fn trusted_pins_path() -> Option<std::path::PathBuf> {
 /// elsewhere. All persisted client state lives here.
 #[cfg(not(test))]
 fn production_config_dir() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("ARCEN_CONFIG_DIR") {
-        return Some(std::path::PathBuf::from(dir));
-    }
-    let home = std::env::var_os("HOME")?;
-    let home = std::path::PathBuf::from(home);
+    arcen_deck_core::directories::DeckDirectories::from_process_env(native_config_dir(), None)
+        .config
+}
+
+/// The platform's own config folder, before overrides.
+#[cfg(not(test))]
+fn native_config_dir() -> Option<std::path::PathBuf> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
     #[cfg(target_os = "macos")]
     {
         Some(
@@ -18065,1108 +13727,8 @@ fn migrate_legacy_config_dir() -> Result<(), ClientConfigError> {
     Ok(())
 }
 
-const MAX_REMEMBERED_USERNAME_BYTES: usize = 255;
-
-fn validated_remembered_username(username: &str) -> Option<String> {
-    let username = username.trim();
-    (!username.is_empty()
-        && username.len() <= MAX_REMEMBERED_USERNAME_BYTES
-        && !username.chars().any(char::is_control))
-    .then(|| username.to_string())
-}
-
-fn normalized_connection_host(host: &str) -> String {
-    let host = host.trim();
-    let unbracketed = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    unbracketed.parse::<std::net::IpAddr>().map_or_else(
-        |_| unbracketed.trim_end_matches('.').to_ascii_lowercase(),
-        |address| address.to_string(),
-    )
-}
-
-fn migrated_saved_connection_id(
-    kind: ConnectionKind,
-    host: &str,
-    port: u16,
-    use_tls: bool,
-    security_mode: Option<&str>,
-    name: &str,
-    ordinal: usize,
-) -> String {
-    #[cfg(feature = "wss-compat")]
-    let transport_key = if use_tls { "wss" } else { "ws" };
-    #[cfg(not(feature = "wss-compat"))]
-    let _ = use_tls;
-    #[cfg(not(feature = "wss-compat"))]
-    let transport_key = "quic";
-    let material = format!(
-        "v1|{}|{}|{}|{}|{}|{}|{}",
-        kind.as_key(),
-        transport_key,
-        normalized_connection_host(host),
-        port,
-        security_mode.unwrap_or("*"),
-        name.trim(),
-        ordinal,
-    );
-    let digest = format!("{:x}", Sha256::digest(material.as_bytes()));
-    format!("connection-{}", &digest[..32])
-}
-
-fn new_saved_connection_id(
-    kind: ConnectionKind,
-    host: &str,
-    port: u16,
-    use_tls: bool,
-    security_mode: SecurityMode,
-    name: &str,
-    ordinal: usize,
-) -> String {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    migrated_saved_connection_id(
-        kind,
-        host,
-        port,
-        use_tls,
-        Some(security_mode.key()),
-        &format!("{name}|{}|{nonce}", std::process::id()),
-        ordinal,
-    )
-}
-
-fn saved_transport_for_options(options: &ConnectOptions) -> SavedTransport {
-    #[cfg(feature = "wss-compat")]
-    if !options.quic_enabled {
-        return SavedTransport::Wss;
-    }
-    #[cfg(not(feature = "wss-compat"))]
-    let _ = options;
-    SavedTransport::Quic
-}
-
-fn find_saved_connection_index(
-    connections: &[SavedConnectionSummary],
-    kind: ConnectionKind,
-    host: &str,
-    port: u16,
-    use_tls: bool,
-    transport: SavedTransport,
-    security_mode: SecurityMode,
-) -> Option<usize> {
-    let host = normalized_connection_host(host);
-    let endpoint_matches = |connection: &SavedConnectionSummary| {
-        connection.kind == kind
-            && normalized_connection_host(&connection.host) == host
-            && connection.port == port
-            && connection.use_tls == use_tls
-            && connection.transport == transport
-    };
-    let exact: Vec<_> = connections
-        .iter()
-        .enumerate()
-        .filter(|(_, connection)| {
-            endpoint_matches(connection)
-                && connection.identity_security_mode.as_deref() == Some(security_mode.key())
-        })
-        .map(|(index, _)| index)
-        .collect();
-    if exact.len() == 1 {
-        return exact.first().copied();
-    }
-    if !exact.is_empty() {
-        return None;
-    }
-    let legacy: Vec<_> = connections
-        .iter()
-        .enumerate()
-        .filter(|(_, connection)| {
-            endpoint_matches(connection) && connection.identity_security_mode.is_none()
-        })
-        .map(|(index, _)| index)
-        .collect();
-    (legacy.len() == 1).then(|| legacy[0])
-}
-
-/// A distributable Deck starts with no environment-specific host knowledge.
-fn default_saved_connections() -> Vec<SavedConnectionSummary> {
-    Vec::new()
-}
-
-/// Load the persisted saved-connections list. Absence is normal; an existing
-/// malformed or unreadable document is an explicit error and is never replaced
-/// with starter data.
-fn load_saved_connections(
-    repository: &ClientConfigRepository,
-) -> Result<Option<SavedConnectionsStore>, ClientConfigError> {
-    let path = repository
-        .connections_file()
-        .ok_or(ClientConfigError::ConfigUnavailable)?;
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    parse_saved_connections(&bytes).map(Some)
-}
-
-fn parse_saved_connections(bytes: &[u8]) -> Result<SavedConnectionsStore, ClientConfigError> {
-    let value = serde_json::from_slice::<serde_json::Value>(bytes)?;
-    let mut unknown = value
-        .as_object()
-        .cloned()
-        .ok_or(ClientConfigError::Invalid(
-            "saved connections top-level value must be an object",
-        ))?;
-    let array = unknown
-        .remove("connections")
-        .and_then(|value| value.as_array().cloned())
-        .ok_or(ClientConfigError::Invalid(
-            "saved connections must contain a connections array",
-        ))?;
-    let version = unknown
-        .remove("version")
-        .and_then(|value| value.as_u64())
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(1);
-    let last_selected_connection_id = unknown
-        .remove("last_selected_connection_id")
-        .and_then(|value| value.as_str().map(str::to_string));
-    let legacy_username_fallback = unknown
-        .remove("legacy_username_fallback")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .and_then(|value| validated_remembered_username(&value));
-    let mut connections = Vec::new();
-    let mut unparsed_connections = Vec::new();
-    for (ordinal, raw) in array.into_iter().enumerate() {
-        let parsed = (|| {
-            let mut entry = raw.as_object()?.clone();
-            let name = entry.remove("name")?.as_str()?.to_string();
-            let host = entry.remove("host")?.as_str()?.to_string();
-            let kind = entry
-                .remove("kind")
-                .and_then(|value| value.as_str().map(str::to_string))
-                .as_deref()
-                .map(ConnectionKind::from_key)
-                .unwrap_or(ConnectionKind::DirectMachine);
-            let transport = entry
-                .remove("transport")
-                .and_then(|value| value.as_str().map(str::to_string));
-            #[cfg(not(feature = "wss-compat"))]
-            let legacy_wss = transport.as_deref().is_none_or(|value| value == "wss");
-            let transport = transport.unwrap_or_else(|| "quic".to_string());
-            let saved_transport = match transport.as_str() {
-                "quic" => SavedTransport::Quic,
-                #[cfg(feature = "wss-compat")]
-                "wss" => SavedTransport::Wss,
-                #[cfg(not(feature = "wss-compat"))]
-                "wss" => SavedTransport::Quic,
-                _ => return None,
-            };
-            let parsed_port = entry
-                .remove("port")
-                .and_then(|value| value.as_u64())
-                .and_then(|value| u16::try_from(value).ok())
-                .filter(|value| *value != 0)
-                .unwrap_or_else(|| saved_transport.default_port());
-            #[cfg(not(feature = "wss-compat"))]
-            let port = if legacy_wss && parsed_port == 18_443 {
-                SavedTransport::Quic.default_port()
-            } else {
-                parsed_port
-            };
-            #[cfg(feature = "wss-compat")]
-            let port = parsed_port;
-            let use_tls = true;
-            let identity_security_mode = entry
-                .remove("security_mode")
-                .and_then(|value| value.as_str().map(str::to_string));
-            let settings = parse_saved_connection_settings(entry.remove("settings"));
-            let id = entry
-                .remove("id")
-                .and_then(|value| value.as_str().map(str::to_string))
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| {
-                    migrated_saved_connection_id(
-                        kind,
-                        &host,
-                        port,
-                        use_tls,
-                        identity_security_mode.as_deref(),
-                        &name,
-                        ordinal,
-                    )
-                });
-            Some(SavedConnectionSummary {
-                id,
-                kind,
-                name,
-                host,
-                port,
-                use_tls,
-                transport: saved_transport,
-                identity_security_mode,
-                settings,
-                unknown: entry,
-            })
-        })();
-        if let Some(connection) = parsed {
-            connections.push(connection);
-        } else {
-            unparsed_connections.push(raw);
-        }
-    }
-    Ok(SavedConnectionsStore {
-        version,
-        connections,
-        unparsed_connections,
-        last_selected_connection_id,
-        legacy_username_fallback,
-        unknown,
-        fingerprint: Some(Sha256::digest(bytes).into()),
-    })
-}
-
-fn parse_saved_connection_settings(value: Option<serde_json::Value>) -> SavedConnectionSettings {
-    let Some(mut unknown) = value.and_then(|value| value.as_object().cloned()) else {
-        return SavedConnectionSettings::default();
-    };
-    let version = unknown
-        .remove("version")
-        .and_then(|value| value.as_u64())
-        .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(SAVED_CONNECTION_SETTINGS_VERSION);
-    let remembered_username = match unknown.get("remembered_username") {
-        Some(serde_json::Value::String(value)) => {
-            let value = validated_remembered_username(value);
-            unknown.remove("remembered_username");
-            value
-        }
-        Some(serde_json::Value::Null) => {
-            unknown.remove("remembered_username");
-            None
-        }
-        _ => None,
-    };
-    let tablet_mode_requested = match unknown
-        .remove("tablet_mode_requested")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-    {
-        // `wacom_usb_bridge` is the 0.15 spelling, still written so an older
-        // Deck reads this file; the neutral spelling is accepted too.
-        Some("wacom_usb_bridge" | "usb_tablet_bridge") => TabletModeMsg::UsbTabletBridge,
-        Some("disabled_mouse_compat") => TabletModeMsg::DisabledMouseCompat,
-        _ => TabletModeMsg::LocalTermination,
-    };
-    // An unrecognised or absent value resolves to `None` -- follow the
-    // application default -- and is removed from `unknown` either way so a
-    // stale key can never shadow the parsed field on the next write.
-    let displays_mode = unknown
-        .remove("displays_mode")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-        .and_then(DisplaysMode::from_wire);
-    // Absent or unrecognised: the host platform's own mapping. Saved
-    // connections from before these settings existed read as that.
-    let shortcuts = unknown
-        .remove("keyboard_shortcuts")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-        .and_then(arcen_input::keyboard::ShortcutPreference::from_token)
-        .unwrap_or_default();
-    let left_option_altgr = unknown
-        .remove("left_option_altgr")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    // Absent or unrecognised: the application-wide typing setting.
-    let typing = unknown
-        .remove("keyboard_mode")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-        .and_then(arcen_input::text::KeyboardMode::from_token);
-    SavedConnectionSettings {
-        version,
-        remembered_username,
-        tablet_mode_requested,
-        displays_mode,
-        keyboard: arcen_input::keyboard::KeyboardSettings {
-            shortcuts,
-            left_option_altgr,
-            typing,
-        },
-        unknown,
-    }
-}
-
-fn serialize_saved_connections(
-    store: &SavedConnectionsStore,
-) -> Result<Vec<u8>, ClientConfigError> {
-    let mut items: Vec<serde_json::Value> = store
-        .connections
-        .iter()
-        .map(|c| {
-            let mut settings = c.settings.unknown.clone();
-            settings.insert("version".to_string(), c.settings.version.into());
-            if let Some(username) = &c.settings.remembered_username {
-                settings.insert(
-                    "remembered_username".to_string(),
-                    serde_json::Value::String(username.clone()),
-                );
-            } else {
-                settings
-                    .entry("remembered_username".to_string())
-                    .or_insert(serde_json::Value::Null);
-            }
-            settings.insert(
-                "tablet_mode_requested".to_string(),
-                match c.settings.tablet_mode_requested {
-                    TabletModeMsg::LocalTermination => "local_termination",
-                    TabletModeMsg::UsbTabletBridge => "wacom_usb_bridge",
-                    TabletModeMsg::DisabledMouseCompat => "disabled_mouse_compat",
-                }
-                .into(),
-            );
-            // Absent rather than null when this connection follows the
-            // application default, so an untouched connection's stored
-            // shape is unchanged from before this setting existed.
-            match c.settings.displays_mode {
-                Some(mode) => {
-                    settings.insert("displays_mode".to_string(), mode.as_wire().into());
-                }
-                None => {
-                    settings.remove("displays_mode");
-                }
-            }
-            // Absent while they are the defaults, so an untouched connection
-            // is stored exactly as before.
-            let keyboard = c.settings.keyboard;
-            if keyboard.shortcuts == arcen_input::keyboard::ShortcutPreference::Automatic {
-                settings.remove("keyboard_shortcuts");
-            } else {
-                settings.insert(
-                    "keyboard_shortcuts".to_string(),
-                    keyboard.shortcuts.token().into(),
-                );
-            }
-            if keyboard.left_option_altgr {
-                settings.insert("left_option_altgr".to_string(), true.into());
-            } else {
-                settings.remove("left_option_altgr");
-            }
-            match keyboard.typing {
-                Some(mode) => {
-                    settings.insert("keyboard_mode".to_string(), mode.token().into());
-                }
-                None => {
-                    settings.remove("keyboard_mode");
-                }
-            }
-            let mut entry = c.unknown.clone();
-            entry.insert("id".to_string(), c.id.clone().into());
-            entry.insert("kind".to_string(), c.kind.as_key().into());
-            entry.insert("name".to_string(), c.name.clone().into());
-            entry.insert("host".to_string(), c.host.clone().into());
-            entry.insert("port".to_string(), c.port.into());
-            entry.insert("transport".to_string(), c.transport.as_key().into());
-            if let Some(mode) = &c.identity_security_mode {
-                entry.insert("security_mode".to_string(), mode.clone().into());
-            } else {
-                entry.remove("security_mode");
-            }
-            entry.insert("settings".to_string(), settings.into());
-            entry.into()
-        })
-        .collect();
-    items.extend(store.unparsed_connections.iter().cloned());
-    let mut value = store.unknown.clone();
-    value.insert(
-        "version".to_string(),
-        store.version.max(SAVED_CONNECTIONS_VERSION).into(),
-    );
-    value.insert("connections".to_string(), items.into());
-    if let Some(id) = &store.last_selected_connection_id {
-        value.insert("last_selected_connection_id".to_string(), id.clone().into());
-    } else {
-        value.remove("last_selected_connection_id");
-    }
-    if let Some(username) = &store.legacy_username_fallback {
-        value.insert(
-            "legacy_username_fallback".to_string(),
-            username.clone().into(),
-        );
-    } else {
-        value.remove("legacy_username_fallback");
-    }
-    Ok(serde_json::to_vec_pretty(&serde_json::Value::Object(
-        value,
-    ))?)
-}
-
-fn write_saved_connections(
-    repository: &ClientConfigRepository,
-    store: &mut SavedConnectionsStore,
-) -> Result<(), ClientConfigError> {
-    let path = repository
-        .connections_file()
-        .ok_or(ClientConfigError::ConfigUnavailable)?;
-    let bytes = serialize_saved_connections(store)?;
-    atomic_write_json(&path, &bytes)?;
-    store.fingerprint = Some(Sha256::digest(&bytes).into());
-    Ok(())
-}
-
-#[cfg(test)]
-fn save_saved_connections(repository: &ClientConfigRepository, store: &SavedConnectionsStore) {
-    repository
-        .save_connections_snapshot(store)
-        .expect("test saved-connections snapshot should persist");
-}
-
-static ATOMIC_FILE_NONCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy)]
-enum AtomicWriteStep {
-    Created,
-    Synced,
-}
-
-struct PendingAtomicFile {
-    path: std::path::PathBuf,
-    file: std::fs::File,
-    renamed: bool,
-}
-
-impl Drop for PendingAtomicFile {
-    fn drop(&mut self) {
-        if !self.renamed {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn atomic_write_json(path: &std::path::Path, bytes: &[u8]) -> Result<(), ClientConfigError> {
-    atomic_write_json_with_hook(path, bytes, |_| Ok(()))
-}
-
-fn atomic_write_json_with_hook(
-    path: &std::path::Path,
-    bytes: &[u8],
-    mut hook: impl FnMut(AtomicWriteStep) -> std::io::Result<()>,
-) -> Result<(), ClientConfigError> {
-    use std::io::Write;
-
-    let parent = path.parent().ok_or(ClientConfigError::ConfigUnavailable)?;
-    std::fs::create_dir_all(parent)?;
-    let file_name = path
-        .file_name()
-        .ok_or(ClientConfigError::ConfigUnavailable)?
-        .to_string_lossy();
-    let mut pending = None;
-    for _ in 0..64 {
-        let nonce = ATOMIC_FILE_NONCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => {
-                pending = Some(PendingAtomicFile {
-                    path: temporary,
-                    file,
-                    renamed: false,
-                });
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let mut pending = pending.ok_or_else(|| {
-        ClientConfigError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not reserve a unique atomic-write file",
-        ))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(ClientConfigError::Invalid(
-                    "refusing to replace a symbolic-link configuration file",
-                ));
-            }
-            Ok(metadata) => metadata.permissions().mode(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0o600,
-            Err(error) => return Err(error.into()),
-        };
-        pending
-            .file
-            .set_permissions(std::fs::Permissions::from_mode(mode))?;
-    }
-
-    hook(AtomicWriteStep::Created)?;
-    pending.file.write_all(bytes)?;
-    pending.file.sync_all()?;
-    hook(AtomicWriteStep::Synced)?;
-    std::fs::rename(&pending.path, path)?;
-    pending.renamed = true;
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
-}
-
-fn migrate_legacy_username(
-    store: &mut SavedConnectionsStore,
-    repository: &ClientConfigRepository,
-) -> Result<(), ClientConfigError> {
-    let username = store
-        .legacy_username_fallback
-        .take()
-        .or_else(|| load_legacy_remembered_username(repository));
-    let Some(username) = username else {
-        return Ok(());
-    };
-    let identified = store
-        .last_selected_connection_id
-        .as_ref()
-        .and_then(|id| store.connections.iter_mut().find(|saved| saved.id == *id));
-    if let Some(saved) = identified {
-        if saved.settings.remembered_username.is_none() {
-            saved.settings.remembered_username = Some(username);
-            saved.settings.unknown.remove("remembered_username");
-        }
-    }
-    store.version = store.version.max(SAVED_CONNECTIONS_VERSION);
-    if store.fingerprint.is_some() {
-        *store = repository.save_connections_snapshot(store)?;
-    }
-    clear_legacy_remembered_username(repository)?;
-    Ok(())
-}
-
-fn load_client_settings(
-    repository: &ClientConfigRepository,
-) -> Result<ClientSettings, ClientConfigError> {
-    let mut settings = ClientSettings::default();
-    let path = repository
-        .settings_file()
-        .ok_or(ClientConfigError::ConfigUnavailable)?;
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(settings),
-        Err(error) => return Err(error.into()),
-    };
-    let value = serde_json::from_str::<serde_json::Value>(&text)?;
-    if !value.is_object() {
-        return Err(ClientConfigError::Invalid(
-            "top-level value must be an object",
-        ));
-    }
-    if let Some(level) = value.get("log_level").and_then(serde_json::Value::as_u64) {
-        settings.log_level = LogLevel::from_index(level as u8);
-    }
-    if let Some(mode) = value
-        .get("security_mode")
-        .and_then(serde_json::Value::as_str)
-    {
-        settings.security_mode = SecurityMode::from_key(mode);
-    }
-    if let Some(mode) = value
-        .get("performance_mode")
-        .and_then(serde_json::Value::as_str)
-    {
-        settings.performance_mode = PerformanceMode::from_key(mode);
-    }
-    if let Some(mode) = value
-        .get("displays_mode")
-        .and_then(serde_json::Value::as_str)
-    {
-        settings.displays_mode = DisplaysMode::from_key(mode);
-    }
-    if let Some(mode) = value
-        .get("cursor_preference")
-        .and_then(serde_json::Value::as_str)
-    {
-        settings.cursor_preference = match mode {
-            "host" => CursorMode::Host,
-            _ => CursorMode::Local,
-        };
-    }
-    if let Some(enabled) = value
-        .get("clipboard_enabled")
-        .and_then(serde_json::Value::as_bool)
-    {
-        settings.clipboard_enabled = enabled;
-    }
-    // Microphone consent never survives process launch. Ignore legacy values,
-    // including malformed ones, rather than treating them as current consent.
-    settings.microphone_enabled = false;
-    if let Some(flag) = value
-        .get("hidpi_streaming")
-        .and_then(serde_json::Value::as_bool)
-    {
-        settings.hidpi_streaming = flag;
-    }
-    if let Some(flag) = value
-        .get("fullscreen_uses_notch_area")
-        .and_then(serde_json::Value::as_bool)
-    {
-        settings.fullscreen_uses_notch_area = flag;
-    }
-    if let Some(percent) = value
-        .get("remote_ui_scale_percent")
-        .and_then(serde_json::Value::as_u64)
-    {
-        settings.remote_ui_scale_percent = RemoteUiScale::from_percent(percent as u32).as_percent();
-    }
-    if let Some(mask) = value
-        .get("full_color_display_mask")
-        .and_then(serde_json::Value::as_u64)
-    {
-        settings.full_color_display_mask = u8::try_from(mask).unwrap_or(u8::MAX) & 0x0f;
-    }
-    if let Some(mask) = value
-        .get("hidpi_display_mask")
-        .and_then(serde_json::Value::as_u64)
-    {
-        settings.hidpi_display_mask = u8::try_from(mask).unwrap_or(u8::MAX) & 0x0f;
-    }
-    if let Some(enabled) = value
-        .get("tablet_input_enabled")
-        .and_then(serde_json::Value::as_bool)
-    {
-        settings.tablet_input_enabled = enabled;
-    }
-    settings.tablet_mode_requested = if settings.tablet_input_enabled {
-        TabletModeMsg::LocalTermination
-    } else {
-        TabletModeMsg::DisabledMouseCompat
-    };
-    if let Some(mode) = value
-        .get("tablet_mode_requested")
-        .and_then(serde_json::Value::as_str)
-    {
-        settings.tablet_mode_requested = match mode {
-            // Legacy 0.15 token (still written) or the neutral spelling.
-            "wacom_usb_bridge" | "usb_tablet_bridge" => TabletModeMsg::UsbTabletBridge,
-            "disabled_mouse_compat" => TabletModeMsg::DisabledMouseCompat,
-            _ => TabletModeMsg::LocalTermination,
-        };
-        settings.tablet_input_enabled =
-            tablet_mode_allows_typed_pen(settings.tablet_mode_requested);
-    }
-    let mut color_fidelity = ColorFidelitySettings::default();
-    if let Some(key) = value
-        .get("color_fidelity")
-        .and_then(serde_json::Value::as_str)
-    {
-        color_fidelity.preset = ColorFidelity::from_key(key);
-    }
-    if let Some(token) = value
-        .get("color_fidelity_codec_override")
-        .and_then(serde_json::Value::as_str)
-    {
-        color_fidelity.overrides.codec = arcen_media::VideoCodec::from_token(token);
-    }
-    if let Some(token) = value
-        .get("color_fidelity_chroma_override")
-        .and_then(serde_json::Value::as_str)
-    {
-        color_fidelity.overrides.chroma = arcen_media::ChromaSubsampling::from_token(token);
-    }
-    if let Some(token) = value
-        .get("color_fidelity_bit_depth_override")
-        .and_then(serde_json::Value::as_str)
-    {
-        color_fidelity.overrides.bit_depth = arcen_media::BitDepth::from_token(token);
-    }
-    if let Some(token) = value
-        .get("color_fidelity_range_override")
-        .and_then(serde_json::Value::as_str)
-    {
-        color_fidelity.overrides.range = arcen_media::ColorRange::from_token(token);
-    }
-    if let Some(token) = value
-        .get("color_fidelity_matrix_override")
-        .and_then(serde_json::Value::as_str)
-    {
-        color_fidelity.overrides.matrix = arcen_media::ColorMatrix::from_token(token);
-    }
-    if let Some(id) = value
-        .get("color_fidelity_variant_override")
-        .and_then(serde_json::Value::as_str)
-    {
-        color_fidelity.variant_override = arcen_media::video::VideoVariant::from_id(id).ok();
-    }
-    settings.color_fidelity = color_fidelity;
-    // Unlike the colour axes -- whose overrides are `Option`, so an
-    // unreadable token legitimately means "no override" -- intent has no
-    // absent state. An unknown or non-string value therefore leaves the
-    // default in place rather than clearing anything, so a settings.json
-    // written by a newer build (or hand-edited) can only ever fail back to
-    // Legacy builds persisted this independently. It is intentionally ignored
-    // now: the user-facing Colour Fidelity preset is the sole authority.
-    settings.encode_intent = settings.color_fidelity.preset.encode_intent();
-    if let Some(mode) = value
-        .get("typing_mode")
-        .and_then(serde_json::Value::as_str)
-        .and_then(arcen_input::text::TypingMode::from_token)
-    {
-        settings.typing_mode = mode;
-    }
-    // `option_keys` knows Automatic; older builds wrote only
-    // `option_key_mode`, their default included (see `from_settings`).
-    settings.option_key_mode = arcen_input::text::OptionKeyPreference::from_settings(
-        value.get("option_keys").and_then(serde_json::Value::as_str),
-        value
-            .get("option_key_mode")
-            .and_then(serde_json::Value::as_str),
-    );
-    if let Some(chars) = value
-        .get("paste_confirm_above")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|chars| usize::try_from(chars).ok())
-    {
-        settings.paste.confirm_above = chars;
-    }
-    if let Some(rate) = value
-        .get("paste_chars_per_second")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|rate| u32::try_from(rate).ok())
-    {
-        settings.paste.chars_per_second = rate;
-    }
-    settings.paste = settings.paste.clamped();
-    Ok(settings)
-}
-
-fn save_client_settings(
-    repository: &ClientConfigRepository,
-    settings: &ClientSettings,
-) -> Result<(), ClientConfigError> {
-    let path = repository
-        .settings_file()
-        .ok_or(ClientConfigError::ConfigUnavailable)?;
-    let mut value = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)?
-            .as_object()
-            .cloned()
-            .ok_or(ClientConfigError::Invalid(
-                "client settings top-level value must be an object",
-            ))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
-        Err(error) => return Err(error.into()),
-    };
-    value.insert("log_level".to_string(), settings.log_level.index().into());
-    value.insert(
-        "security_mode".to_string(),
-        settings.security_mode.key().into(),
-    );
-    value.insert(
-        "performance_mode".to_string(),
-        settings.performance_mode.key().into(),
-    );
-    value.insert(
-        "displays_mode".to_string(),
-        settings.displays_mode.key().into(),
-    );
-    value.insert(
-        "cursor_preference".to_string(),
-        match settings.cursor_preference {
-            CursorMode::Local => "local",
-            CursorMode::Host => "host",
-        }
-        .into(),
-    );
-    value.insert(
-        "clipboard_enabled".to_string(),
-        settings.clipboard_enabled.into(),
-    );
-    value.insert(
-        "hidpi_streaming".to_string(),
-        settings.hidpi_streaming.into(),
-    );
-    value.insert(
-        "typing_mode".to_string(),
-        settings.typing_mode.token().into(),
-    );
-    value.insert(
-        "option_keys".to_string(),
-        settings.option_key_mode.token().into(),
-    );
-    // For older builds, which read only this key.
-    value.insert(
-        "option_key_mode".to_string(),
-        settings
-            .option_key_mode
-            .resolve(arcen_protocol::messages::HostPlatform::Unknown)
-            .token()
-            .into(),
-    );
-    value.insert(
-        "paste_confirm_above".to_string(),
-        settings.paste.confirm_above.into(),
-    );
-    value.insert(
-        "paste_chars_per_second".to_string(),
-        settings.paste.chars_per_second.into(),
-    );
-    value.insert(
-        "fullscreen_uses_notch_area".to_string(),
-        settings.fullscreen_uses_notch_area.into(),
-    );
-    value.insert(
-        "remote_ui_scale_percent".to_string(),
-        settings.remote_ui_scale_percent.into(),
-    );
-    value.insert(
-        "full_color_display_mask".to_string(),
-        settings.full_color_display_mask.into(),
-    );
-    value.insert(
-        "hidpi_display_mask".to_string(),
-        settings.hidpi_display_mask.into(),
-    );
-    value.insert(
-        "tablet_input_enabled".to_string(),
-        settings.tablet_input_enabled.into(),
-    );
-    value.insert(
-        "tablet_mode_requested".to_string(),
-        match settings.tablet_mode_requested {
-            TabletModeMsg::LocalTermination => "local_termination",
-            TabletModeMsg::UsbTabletBridge => "wacom_usb_bridge",
-            TabletModeMsg::DisabledMouseCompat => "disabled_mouse_compat",
-        }
-        .into(),
-    );
-    value.insert(
-        "color_fidelity".to_string(),
-        settings.color_fidelity.preset.key().into(),
-    );
-    match settings.color_fidelity.overrides.codec {
-        Some(codec) => {
-            value.insert(
-                "color_fidelity_codec_override".to_string(),
-                codec.token().into(),
-            );
-        }
-        None => {
-            value.remove("color_fidelity_codec_override");
-        }
-    }
-    match settings.color_fidelity.overrides.chroma {
-        Some(chroma) => {
-            value.insert(
-                "color_fidelity_chroma_override".to_string(),
-                chroma.token().into(),
-            );
-        }
-        None => {
-            value.remove("color_fidelity_chroma_override");
-        }
-    }
-    match settings.color_fidelity.overrides.bit_depth {
-        Some(bit_depth) => {
-            value.insert(
-                "color_fidelity_bit_depth_override".to_string(),
-                bit_depth.token().into(),
-            );
-        }
-        None => {
-            value.remove("color_fidelity_bit_depth_override");
-        }
-    }
-    match settings.color_fidelity.overrides.range {
-        Some(range) => {
-            value.insert(
-                "color_fidelity_range_override".to_string(),
-                range.token().into(),
-            );
-        }
-        None => {
-            value.remove("color_fidelity_range_override");
-        }
-    }
-    match settings.color_fidelity.overrides.matrix {
-        Some(matrix) => {
-            value.insert(
-                "color_fidelity_matrix_override".to_string(),
-                matrix.token().into(),
-            );
-        }
-        None => {
-            value.remove("color_fidelity_matrix_override");
-        }
-    }
-    match settings.color_fidelity.variant_override {
-        Some(variant) => {
-            value.insert(
-                "color_fidelity_variant_override".to_string(),
-                variant.id().into(),
-            );
-        }
-        None => {
-            value.remove("color_fidelity_variant_override");
-        }
-    }
-    value.insert(
-        "encode_intent".to_string(),
-        settings
-            .color_fidelity
-            .preset
-            .encode_intent()
-            .token()
-            .into(),
-    );
-    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(value))?;
-    atomic_write_json(&path, &bytes)
-}
-
-/// A radio option with a title (plus optional accent badge) and a wrapped,
-/// indented description — the row layout used across the Advanced panel.
-fn settings_radio<T: PartialEq>(
-    ui: &mut egui::Ui,
-    current: &mut T,
-    value: T,
-    badge: Option<&str>,
-    title: &str,
-    description: &str,
-) {
-    settings_radio_with_trailing(ui, current, value, badge, title, description, |_| {});
-}
-
-/// `settings_radio` with a right-aligned control on the option's own row.
-///
-/// Used where an option depends on something the user may still have to set
-/// up: the status belongs beside the choice it gates, not in a block below it
-/// that only appears once the option is already broken.
-fn settings_radio_with_trailing<T: PartialEq>(
-    ui: &mut egui::Ui,
-    current: &mut T,
-    value: T,
-    badge: Option<&str>,
-    title: &str,
-    description: &str,
-    trailing: impl FnOnce(&mut egui::Ui),
-) {
-    ui.horizontal(|ui| {
-        ui.radio_value(
-            current,
-            value,
-            egui::RichText::new(title)
-                .color(egui::Color32::BLACK)
-                .size(16.0),
-        );
-        if let Some(badge) = badge {
-            ui.label(
-                // Muted copper: secondary to the option label, but in the same
-                // family as the rest of the palette.
-                egui::RichText::new(badge)
-                    .color(egui::Color32::from_rgb(0xB0, 0x8A, 0x6E))
-                    .size(15.0),
-            );
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
-    });
-    ui.indent(title, |ui| {
-        ui.label(egui::RichText::new(description).color(egui::Color32::DARK_GRAY));
-    });
-    ui.add_space(12.0);
-}
-
-fn load_legacy_remembered_username(repository: &ClientConfigRepository) -> Option<String> {
-    if let Some(username) = repository
-        .remembered_username_file()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|username| validated_remembered_username(&username))
-    {
-        return Some(username);
-    }
-    let value = repository
-        .settings_file()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())?;
-    value
-        .get("remembered_username")
-        .and_then(serde_json::Value::as_str)
-        .and_then(validated_remembered_username)
-}
-
-fn clear_legacy_remembered_username(
-    repository: &ClientConfigRepository,
-) -> Result<(), ClientConfigError> {
-    if let Some(path) = repository.remembered_username_file() {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let Some(path) = repository.settings_file() else {
-        return Ok(());
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut value = serde_json::from_str::<serde_json::Value>(&text)?;
-    let object = value.as_object_mut().ok_or(ClientConfigError::Invalid(
-        "client settings top-level value must be an object",
-    ))?;
-    if object.remove("remembered_username").is_some() {
-        atomic_write_json(&path, &serde_json::to_vec_pretty(&value)?)?;
-    }
-    Ok(())
-}
-
 fn connection_endpoint(draft: &ConnectionDraft) -> String {
-    format!("{}:{}", draft.host, draft.port)
-}
-
-/// Whether an already-approved multi-monitor topology snapshot
-/// (`match_layout_preflight`'s result) should actually be attached to
-/// `ConnectOptions.multi_monitor_topology`, as opposed to leaving it at
-/// `None` and falling back to exactly today's legacy primary-only auth.
-///
-/// This is evaluated over the *already-captured* snapshot rather than
-/// re-deriving the decision from a fresh display enumeration, so option
-/// construction cannot drift from what the preflight actually validated.
-/// Building a validated topology and asking a host to apply per-display
-/// encode/routing for more than one monitor is only safe once Deck's UI
-/// runtime can actually present more than one monitor
-/// (see [`crate::ui::multi_window::multi_window_runtime_available`], which
-/// now returns `true`): once real, this passes `approved` through
-/// unchanged for Match My Layout, and still returns `None` for every other
-/// mode (Primary Display Only, Windowed) regardless of what was approved.
-///
-/// `multi_window_runtime_available` mirrors
-/// [`crate::ui::multi_window::multi_window_runtime_available`] (passed in
-/// explicitly so both production's actual current behavior and a
-/// hypothetical runtime-disabled behavior are directly testable without
-/// touching that `const fn`) -- callers must always pass the real `const
-/// fn`'s value in production.
-#[must_use]
-fn approved_multi_monitor_selection(
-    displays_mode: DisplaysMode,
-    approved: Option<crate::transport::multi_monitor::RequestedMultiMonitorSelection>,
-    multi_window_runtime_available: bool,
-) -> Option<crate::transport::multi_monitor::RequestedMultiMonitorSelection> {
-    if displays_mode == DisplaysMode::MatchLayout && multi_window_runtime_available {
-        approved
-    } else {
-        None
-    }
+    draft.endpoint()
 }
 
 /// Pure decision logic behind `start_connection`'s Match My Layout preflight
@@ -19237,150 +13799,29 @@ fn match_layout_preflight(
     notch_fullscreen_active: bool,
     multi_window_runtime_available: bool,
 ) -> Result<Option<crate::transport::multi_monitor::RequestedMultiMonitorSelection>, String> {
-    if displays_mode != DisplaysMode::MatchLayout {
-        return Ok(None);
-    }
-    if !multi_window_runtime_available {
-        return Ok(None);
-    }
-    crate::display::topology::evaluate_match_layout_preflight(local_display_count, separate_spaces)
-        .map_err(|error| error.to_string())?;
-    if local_display_count <= 1 {
-        return Ok(None);
-    }
-    // Multi-monitor Match My Layout requires `StandardFullscreen` on every
-    // display. `RootPreEntrySnapshot`'s restore (and the whole root/secondary
-    // multi-window entry/commit machinery) only ever sends plain
-    // `egui::ViewportCommand::Fullscreen`/`SetMonitor` -- never the custom
-    // AppKit menu-bar-hidden/borderless geometry `enter_notch_fullscreen`/
-    // `leave_notch_fullscreen` apply for the notch-covering policy -- so a
-    // notch-covering root (or the *setting* that would ask
-    // `sync_session_fullscreen` for one on the very next pinned-session
-    // entry) must never be allowed to reach real multi-window entry at all,
-    // rather than teaching that entry/restore path a second notch-aware mode
-    // it cannot safely reproduce per-secondary anyway. This also means the
-    // topology sidecar this preflight approves must never carry
-    // `SafeAreaPolicyMsg::FullFrame` for multi-monitor -- checking
-    // `safe_area_policy` here and hard-coding `StandardFullscreen` into the
-    // approved selection below (rather than passing `safe_area_policy`
-    // through) makes that a structural invariant, not just a side effect of
-    // this gate.
-    //
-    // `notch_fullscreen_active` is root's *live* state, not the setting:
-    // `disconnect()` (called immediately before this preflight, in
-    // `start_connection`) does not synchronously restore a still-active
-    // notch-covering window left over from whatever session just ended --
-    // that only happens on this same frame's *next* `sync_session_fullscreen`
-    // call, later in `logic()` -- so this can still read `true` here even
-    // with the setting itself off, and must independently fail closed rather
-    // than let that race slip through.
-    if matches!(
+    // The decision is shared (`arcen_deck_core::connect_plan`); the Mac adds
+    // its two earned gates: Separate Spaces, and the notch-covering policy,
+    // which multi-monitor Match My Layout cannot reproduce per secondary
+    // (see `NOTCH_AREA_MULTI_MONITOR_GUIDANCE`). `notch_fullscreen_active` is
+    // root's *live* state, not the setting: `disconnect()` does not restore a
+    // still-active notch-covering window synchronously, so it must fail
+    // closed independently of the setting.
+    let full_frame_refusal = (matches!(
         safe_area_policy,
         crate::protocol::messages::SafeAreaPolicyMsg::FullFrame
-    ) || notch_fullscreen_active
-    {
-        return Err(NOTCH_AREA_MULTI_MONITOR_GUIDANCE.to_string());
-    }
-    let topology =
-        build_topology().map_err(|error| format!("Match My Layout cannot start: {error}"))?;
-    Ok(Some(
-        crate::transport::multi_monitor::RequestedMultiMonitorSelection {
-            topology,
-            safe_area_policy: crate::protocol::messages::SafeAreaPolicyMsg::StandardFullscreen,
-            full_color_display_ids: Vec::new(),
+    ) || notch_fullscreen_active)
+        .then(|| NOTCH_AREA_MULTI_MONITOR_GUIDANCE.to_string());
+    arcen_deck_core::connect_plan::match_layout_preflight(
+        displays_mode,
+        local_display_count,
+        |count| {
+            crate::display::topology::evaluate_match_layout_preflight(count, separate_spaces)
+                .map_err(|error| error.to_string())
         },
-    ))
-}
-
-/// Reduces a full validated topology down to just its primary monitor,
-/// discarding every other monitor's facts.
-///
-/// Used to build reconnect identity's live topology snapshot when this
-/// session did not negotiate real multi-monitor-v1
-/// (`options.multi_monitor_topology.is_none()`: Primary Display Only or
-/// Windowed mode, Match My Layout with a single local display, or local
-/// preflight never having produced one): the negotiated session is
-/// primary-only, so identity must depend only on the primary's own facts --
-/// including rotation, which `ClientMonitor` alone cannot express -- never a
-/// secondary's. Note this field's presence/absence is decided entirely
-/// locally before auth; a host that later lacks/declines a genuine
-/// multi-monitor-v1 request instead fails the connection outright and never
-/// reaches reconnect-identity construction for that attempt.
-fn primary_only_topology(
-    topology: &arcen_media::RequestedMonitorTopology,
-) -> Option<arcen_media::RequestedMonitorTopology> {
-    arcen_media::RequestedMonitorTopology::new(vec![topology.primary().clone()]).ok()
-}
-
-/// Converts an already-validated requested topology's monitors back into the
-/// legacy `ClientMonitor` wire roster, in the topology's own order.
-///
-/// Used only to build the reconnect *baseline* identity from a frozen,
-/// already-approved [`crate::transport::multi_monitor::RequestedMultiMonitorSelection`]
-/// snapshot (`connection_identity_baseline`) -- never from a fresh
-/// enumeration -- so the stored baseline's legacy-roster component and its
-/// validated-topology component always describe the exact same negotiated
-/// facts, not two independently re-read sources that could disagree.
-fn client_monitors_from_topology(
-    topology: &arcen_media::RequestedMonitorTopology,
-) -> Vec<ClientMonitor> {
-    topology
-        .monitors()
-        .iter()
-        .map(|requested| {
-            let monitor = requested.monitor();
-            ClientMonitor {
-                id: monitor.identity.id.parse().unwrap_or_default(),
-                x: monitor.x,
-                y: monitor.y,
-                width_px: monitor.width_px,
-                height_px: monitor.height_px,
-                scale: monitor.scale,
-                refresh_hz: monitor.refresh_hz,
-                is_primary: monitor.primary,
-                name: monitor.identity.name.clone(),
-                width_mm: monitor.width_mm,
-                height_mm: monitor.height_mm,
-                vendor: monitor.identity.vendor,
-                model: monitor.identity.model,
-                serial: monitor.identity.serial,
-                edid: String::new(),
-                color: monitor.color,
-            }
-        })
-        .collect()
-}
-
-/// Reduces the freshly re-enumerated live display state down to exactly what
-/// this session negotiated, so reconnect identity never depends on a
-/// secondary display's own changes when only the primary was ever
-/// negotiated.
-///
-/// `multi_monitor_topology_negotiated` mirrors
-/// `options.multi_monitor_topology.is_some()` -- whether real
-/// multi-monitor-v1 was actually approved and requested for *this* session
-/// at connect time. When it was, every negotiated monitor's facts (including
-/// rotation/safe-area) are identity-relevant, so the full live roster/
-/// topology passes through unchanged. When it was not (an old/unsupported
-/// host, Match My Layout not requested, or a single local display), the
-/// negotiated session is exactly today's legacy primary-only fallback: a
-/// secondary display being added, removed, resized, or rotated must never
-/// force a spurious reconnect of that unrelated session, so both the roster
-/// and the topology are reduced to the primary monitor alone before hashing.
-fn negotiated_live_display_state(
-    multi_monitor_topology_negotiated: bool,
-    full_roster: Vec<ClientMonitor>,
-    full_topology: Option<arcen_media::RequestedMonitorTopology>,
-) -> (
-    Vec<ClientMonitor>,
-    Option<arcen_media::RequestedMonitorTopology>,
-) {
-    if multi_monitor_topology_negotiated {
-        return (full_roster, full_topology);
-    }
-    let primary_only_monitors = primary_monitor(&full_roster).cloned().into_iter().collect();
-    let primary_only_live_topology = full_topology.as_ref().and_then(primary_only_topology);
-    (primary_only_monitors, primary_only_live_topology)
+        full_frame_refusal,
+        build_topology,
+        multi_window_runtime_available,
+    )
 }
 
 fn connection_identity(
@@ -19391,46 +13832,20 @@ fn connection_identity(
     hidpi_display_mask: u8,
     remote_ui_scale_percent: u32,
 ) -> ConnectionIdentity {
-    let mut full_roster = crate::display::enumerate();
-    let mut full_topology = crate::display::topology::build_requested_topology(
-        fullscreen_uses_notch_area,
-        hidpi_display_mask,
-    )
-    .ok();
     // The stored reconnect baseline for a negotiated multi-monitor session
-    // hashes `options.multi_monitor_topology`/`options.monitors` *after*
-    // `connect_options_with_stream_sizing_policy` already ran
-    // `apply_remote_ui_scale`/`apply_remote_ui_scale_to_requested_topology`
-    // on them (see `connection_identity_baseline`'s `Some(selection)`
-    // branch). A fresh live re-enumeration here starts from the panel's
-    // real, unscaled physical size, so this candidate must apply the exact
-    // same per-monitor transform -- using the caller's current Remote UI
-    // Scale preference and HiDPI streaming flag, precisely mirroring what
-    // was used to build that stored snapshot -- before folding it into the
-    // hash. Otherwise any non-`Automatic` fixed percentage would make every
-    // `drive_reconnect` tick see a spurious `width_mm`/`height_mm` mismatch
-    // against the baseline even when nothing about the real display layout
-    // ever changed. `Automatic` is a no-op in both transforms, so this
-    // changes nothing when no fixed scale is in effect.
-    apply_remote_ui_scale(
-        &mut full_roster,
-        RemoteUiScale::from_percent(remote_ui_scale_percent),
-        hidpi_display_mask,
-    );
-    full_topology = full_topology.map(|topology| {
-        apply_remote_ui_scale_to_requested_topology(
-            &topology,
-            RemoteUiScale::from_percent(remote_ui_scale_percent),
+    // hashes the already-scaled options; this fresh live re-enumeration goes
+    // through the same Remote UI Scale transform and is reduced to what this
+    // session negotiated (task item 7), by the shared rule.
+    let (live_monitors, live_topology) = arcen_deck_core::connect_plan::identity_display_state(
+        crate::display::enumerate(),
+        crate::display::topology::build_requested_topology(
+            fullscreen_uses_notch_area,
             hidpi_display_mask,
         )
-    });
-    // Reconnect identity must hash exactly the display state actually
-    // negotiated for this session (task item 7), not every locally attached
-    // display -- see `negotiated_live_display_state`.
-    let (live_monitors, live_topology) = negotiated_live_display_state(
+        .ok(),
+        remote_ui_scale_percent,
+        hidpi_display_mask,
         options.multi_monitor_topology.is_some(),
-        full_roster,
-        full_topology,
     );
     let safe_area_policy = if fullscreen_uses_notch_area {
         crate::protocol::messages::SafeAreaPolicyMsg::FullFrame
@@ -19541,192 +13956,18 @@ fn connection_identity_with_live_monitors(
     live_topology: Option<&arcen_media::RequestedMonitorTopology>,
     safe_area_policy: crate::protocol::messages::SafeAreaPolicyMsg,
 ) -> ConnectionIdentity {
-    let security_material = format!(
-        "{}:{}:{:?}",
-        security_mode.key(),
-        options.use_tls,
-        options.tls
-    );
-    let topology_material = format!(
-        "{:?}:{}:{}:{:?}:{:?}:{}:{:?}:{:?}",
-        draft.kind,
-        options.displays_mode,
-        serde_json::to_string(&options.monitors).unwrap_or_default(),
-        options.cursor_preference,
-        options.tablet_mode_requested,
-        serde_json::to_string(live_monitors).unwrap_or_default(),
+    arcen_deck_core::reconnect_flow::connection_identity_with_live_monitors(
+        draft,
+        options,
+        security_mode,
+        live_monitors,
         live_topology,
         safe_area_policy,
-    );
-    ConnectionIdentity {
-        endpoint: format!(
-            "{}://{}:{}",
-            direct_transport_scheme(options),
-            options.host.trim(),
-            options.port
-        ),
-        security: format!("{:x}", Sha256::digest(security_material.as_bytes())),
-        topology: format!("{:x}", Sha256::digest(topology_material.as_bytes())),
-    }
-}
-
-fn direct_transport_scheme(options: &ConnectOptions) -> &'static str {
-    #[cfg(feature = "wss-compat")]
-    if !options.quic_enabled {
-        return if options.use_tls { "wss" } else { "ws" };
-    }
-    #[cfg(not(feature = "wss-compat"))]
-    let _ = options;
-    "quic"
-}
-
-fn display_name_for_draft(draft: &ConnectionDraft) -> &str {
-    if draft.host.is_empty() {
-        "Pier"
-    } else {
-        draft.host.as_str()
-    }
-}
-
-fn toolbar_icon(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(label)
-                .color(egui::Color32::WHITE)
-                .size(18.0),
-        )
-        .fill(egui::Color32::from_white_alpha(16))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(22)))
-        .corner_radius(8.0)
-        .min_size(egui::vec2(34.0, 30.0)),
     )
 }
 
-/// A "back" control whose left chevron is hand-painted, because egui's bundled
-/// fonts render the "←" glyph as a tofu box. Draws `‹ label` in the accent colour and reports
-/// clicks like a normal button.
-fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let color_normal = crate::ui::theme::TEXT_SECONDARY;
-    let color_hover = crate::ui::theme::TEXT_PRIMARY;
-    let font = egui::FontId::proportional(17.0);
-    let chevron_w = 9.0;
-    let gap = 9.0;
-    let pad = egui::vec2(2.0, 6.0);
-
-    let text_size = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font.clone(), color_normal)
-        .size();
-    let size = egui::vec2(
-        pad.x * 2.0 + chevron_w + gap + text_size.x,
-        pad.y * 2.0 + text_size.y.max(18.0),
-    );
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let color = if response.hovered() {
-        color_hover
-    } else {
-        color_normal
-    };
-
-    // Left-pointing chevron.
-    let cx = rect.left() + pad.x + chevron_w;
-    let cy = rect.center().y;
-    let half = 5.0;
-    let stroke = egui::Stroke::new(2.0, color);
-    ui.painter().line_segment(
-        [
-            egui::pos2(cx, cy - half),
-            egui::pos2(rect.left() + pad.x, cy),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.left() + pad.x, cy),
-            egui::pos2(cx, cy + half),
-        ],
-        stroke,
-    );
-
-    let text_pos = egui::pos2(
-        rect.left() + pad.x + chevron_w + gap,
-        rect.center().y - text_size.y * 0.5,
-    );
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, color);
-    ui.painter().galley(text_pos, galley, color);
-
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
-}
-
-/// One left-nav item in the Settings sidebar. Active items get a light accent
-/// highlight pill and accent text (matching the reference design); the label is
-/// painted directly so we control the vertical padding precisely. Returns true
-/// when clicked.
-fn settings_nav_section_label(ui: &mut egui::Ui, label: &str) {
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.add_space(12.0);
-        ui.label(
-            egui::RichText::new(label)
-                .size(10.0)
-                .strong()
-                .color(egui::Color32::from_rgb(0x8B, 0x8B, 0x9A)),
-        );
-    });
-    ui.add_space(4.0);
-}
-
-fn settings_nav_item(ui: &mut egui::Ui, label: &str, active: bool, accent: egui::Color32) -> bool {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(202.0, 42.0), egui::Sense::click());
-    let bg = if active {
-        egui::Color32::from_rgb(0xE5, 0xDE, 0xD2)
-    } else if response.hovered() {
-        egui::Color32::from_rgb(0xF0, 0xEC, 0xE4)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    if bg != egui::Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, 6.0, bg);
-    }
-    let color = if active {
-        accent
-    } else {
-        egui::Color32::from_rgb(0x1A, 0x1A, 0x1A)
-    };
-    let galley =
-        ui.painter()
-            .layout_no_wrap(label.to_string(), egui::FontId::proportional(16.0), color);
-    let pos = egui::pos2(rect.left() + 16.0, rect.center().y - galley.size().y * 0.5);
-    ui.painter().galley(pos, galley, color);
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response.clicked()
-}
-
-fn labelled_line_edit(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool) {
-    let width = ui.available_width();
-    ui.label(
-        egui::RichText::new(label)
-            .color(egui::Color32::from_rgb(0x4A, 0x4A, 0x4A))
-            .strong(),
-    );
-    let edit = egui::TextEdit::singleline(value)
-        .desired_width(width)
-        .vertical_align(egui::Align::Center)
-        .font(egui::TextStyle::Heading)
-        .password(password)
-        .frame(egui::Frame::NONE);
-    ui.scope(|ui| {
-        ui.style_mut().spacing.interact_size.y = 34.0;
-        ui.add_sized([width, 34.0], edit);
-    });
-    let y = ui.cursor().min.y;
-    let rect = egui::Rect::from_min_size(egui::pos2(ui.cursor().min.x, y), egui::vec2(width, 1.0));
-    ui.painter().rect_filled(rect, 0.0, theme::ACCENT);
+fn display_name_for_draft(draft: &ConnectionDraft) -> &str {
+    draft.display_name()
 }
 
 /// Decodes the embedded brand icon for the window manager.
@@ -19836,35 +14077,6 @@ pub fn run_native_app(mut initial_connect: Option<ConnectOptions>) -> eframe::Re
 
 /// The statistics row for the host's measured QUIC path.
 /// User-facing name of a served pipeline token.
-fn stream_pipeline_label(token: &str) -> &str {
-    match token {
-        "auto" => "Auto",
-        "speed" => "Speed",
-        "grading" => "Grading",
-        "hdr" => "HDR",
-        "software" => "Software",
-        "custom" => "Custom",
-        other => other,
-    }
-}
-
-fn host_path_row(stats: Option<&HealthStatsMsg>) -> String {
-    match stats {
-        None => "Path: waiting for health_stats".to_string(),
-        Some(stats) => stats.path.as_ref().map_or_else(
-            || "Path: not reported by this Pier".to_string(),
-            |path| format!("Path: {}", arcen_transport::path_quality_summary(path)),
-        ),
-    }
-}
-
-fn client_video_health_rows(wire: &str, decoder: &str) -> (String, String) {
-    (
-        format!("Client wire: {wire}"),
-        format!("Client decoder: {decoder}"),
-    )
-}
-
 #[cfg(target_os = "macos")]
 fn configure_native_menu(options: &mut eframe::NativeOptions) {
     options.event_loop_builder = Some(Box::new(|builder| {
@@ -20132,17 +14344,6 @@ mod tests {
             false
         ));
         assert!(should_schedule_session_poll(&connecting, false, true));
-    }
-
-    #[test]
-    fn connecting_progress_animation_is_capped_at_ten_hz() {
-        assert!(CONNECTING_PROGRESS_REPAINT_INTERVAL >= Duration::from_millis(100));
-        let step = CONNECTING_PROGRESS_REPAINT_INTERVAL.as_secs_f64();
-        assert_eq!(
-            connecting_progress_angle(0.0),
-            connecting_progress_angle(step * 0.99)
-        );
-        assert!(connecting_progress_angle(step) > connecting_progress_angle(0.0));
     }
 
     use crate::protocol::messages::ResumeErrorCode;
@@ -21169,7 +15370,7 @@ mod tests {
         let lines = app.stream_stats_lines();
         assert_eq!(lines[0], "RTT - · loss - · path not reported");
         assert!(lines[1].contains("pipeline ?"), "{}", lines[1]);
-        assert_eq!(lines[2], "Lossless: Refinement off");
+        assert_eq!(lines[2], "Exact: off (Deck setting)");
         app.served_pipeline_token = Some("grading".to_string());
         assert!(app.stream_stats_lines()[1].contains("Grading"));
     }
@@ -23041,7 +17242,10 @@ mod tests {
             .expect("hello"),
         );
         app.process_keyboard_event(&key_event(egui::Key::SuperLeft, true, CMD));
-        app.send_gesture_magnify(0.1, ScrollPhaseMsg::Began, false);
+        app.send_gesture_sample(arcen_input::GestureSample::Magnify {
+            scale_delta: 0.1,
+            phase: ScrollPhaseMsg::Began,
+        });
         let windows_key = receive_json(&mut receiver);
         assert_eq!(windows_key["scan_code"], 0x0100_0022_u32);
         assert_eq!(receive_json(&mut receiver)["type"], "gesture_magnify");
@@ -27062,7 +21266,6 @@ mod tests {
     async fn sign_in_handover_keeps_native_layer_frame_when_that_was_the_last_picture() {
         let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
         draft.host = "pier.example.internal".to_string();
-        draft.use_quic = false;
         let mut app = ArcenApp {
             active_connection: Some(draft),
             displays_mode: DisplaysMode::SinglePrimary,
@@ -29276,6 +23479,7 @@ mod tests {
                 hidpi_display_mask: 0b0010,
                 tablet_input_enabled: false,
                 tablet_mode_requested: TabletModeMsg::DisabledMouseCompat,
+                exact_still_image: false,
                 color_fidelity: ColorFidelitySettings {
                     preset: ColorFidelity::GradingReference,
                     overrides: ColorFidelityOverrides {
@@ -29747,7 +23951,7 @@ mod tests {
                 .as_deref(),
             Some("test-only")
         );
-        assert!(ClientConfigRepository::for_process().root.is_none());
+        assert!(config_repository_for_process().root.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -29792,84 +23996,36 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "wss-compat")]
-    fn endpoint_lookup_isolates_port_transport_and_security_mode() {
-        let mut port = saved_connection("other-port", "Other port", "HOST.", 19443, Some("port"));
-        let mut high = saved_connection("high", "High", "host", 18443, Some("high"));
+    fn endpoint_lookup_isolates_port_tls_and_security_mode() {
+        let port = saved_connection("other-port", "Other port", "HOST.", 19444, Some("port"));
+        let mut high = saved_connection("high", "High", "host", 18444, Some("high"));
         high.identity_security_mode = Some(SecurityMode::High.key().to_string());
-        let mut cleartext = saved_connection("clear", "Clear", "host", 18443, Some("clear"));
+        let mut cleartext = saved_connection("clear", "Clear", "host", 18444, Some("clear"));
         cleartext.use_tls = false;
-        let mut quic = saved_connection("quic", "QUIC", "host", 18443, Some("quic"));
-        quic.transport = SavedTransport::Quic;
-        port.transport = SavedTransport::Wss;
-        high.transport = SavedTransport::Wss;
-        cleartext.transport = SavedTransport::Wss;
-        let mut medium = saved_connection("medium", "Medium", "Host", 18443, Some("medium"));
-        medium.transport = SavedTransport::Wss;
-        let connections = vec![medium, port.clone(), high, cleartext, quic];
+        let medium = saved_connection("medium", "Medium", "Host", 18444, Some("medium"));
+        let connections = vec![medium, port.clone(), high, cleartext];
 
-        assert_eq!(
-            find_saved_connection_index(
-                &connections,
-                ConnectionKind::DirectMachine,
-                "host.",
-                18443,
-                true,
-                SavedTransport::Wss,
-                SecurityMode::Medium,
-            ),
-            Some(0)
-        );
-        assert_eq!(
-            find_saved_connection_index(
-                &connections,
-                ConnectionKind::DirectMachine,
-                "HOST",
-                19443,
-                true,
-                SavedTransport::Wss,
-                SecurityMode::Medium,
-            ),
-            Some(1)
-        );
-        assert_eq!(
-            find_saved_connection_index(
-                &connections,
-                ConnectionKind::DirectMachine,
-                "host",
-                18443,
-                true,
-                SavedTransport::Wss,
-                SecurityMode::High,
-            ),
-            Some(2)
-        );
-        assert_eq!(
-            find_saved_connection_index(
-                &connections,
-                ConnectionKind::DirectMachine,
-                "host",
-                18443,
-                false,
-                SavedTransport::Wss,
-                SecurityMode::Medium,
-            ),
-            Some(3)
-        );
-        assert_eq!(
-            find_saved_connection_index(
-                &connections,
-                ConnectionKind::DirectMachine,
-                "host",
-                18443,
-                true,
-                SavedTransport::Quic,
-                SecurityMode::Medium,
-            ),
-            Some(4)
-        );
-        port.host = "other".to_string();
-        assert_ne!(connections[0].id, port.id);
+        for (host, port_number, use_tls, security, expected) in [
+            ("host.", 18444, true, SecurityMode::Medium, Some(0)),
+            ("HOST", 19444, true, SecurityMode::Medium, Some(1)),
+            ("host", 18444, true, SecurityMode::High, Some(2)),
+            ("host", 18444, false, SecurityMode::Medium, Some(3)),
+            ("host", 18443, true, SecurityMode::Medium, None),
+        ] {
+            assert_eq!(
+                find_saved_connection_index(
+                    &connections,
+                    ConnectionKind::DirectMachine,
+                    host,
+                    port_number,
+                    use_tls,
+                    SavedTransport::Quic,
+                    security,
+                ),
+                expected,
+                "{host}:{port_number} tls={use_tls} {security:?}"
+            );
+        }
     }
 
     #[test]
@@ -30253,7 +24409,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(not(feature = "wss-compat"))]
     #[test]
     fn legacy_connection_without_transport_migrates_to_quic_port() {
         let _guard = CONFIG_ENV_LOCK
@@ -30284,9 +24439,8 @@ mod tests {
     }
 
     #[test]
-    fn quic_saved_connection_editor_preserves_transport_and_port() {
-        let mut saved = saved_connection("quic", "QUIC host", "pier.example", 19_444, None);
-        saved.transport = SavedTransport::Quic;
+    fn quic_saved_connection_editor_preserves_port() {
+        let saved = saved_connection("quic", "QUIC host", "pier.example", 19_444, None);
         let mut app = ArcenApp {
             saved_connections: vec![saved],
             ..ArcenApp::default()
@@ -30294,7 +24448,6 @@ mod tests {
 
         app.prepare_saved_connection_editor(0);
 
-        assert_eq!(app.add_connection_transport, SavedTransport::Quic);
         assert_eq!(app.add_connection_port, "19444");
     }
 
@@ -30344,6 +24497,9 @@ mod tests {
         assert_eq!(round_trip["version"], 9);
         assert_eq!(round_trip["future_document"]["enabled"], true);
         assert_eq!(round_trip["connections"][0]["future_connection"], 42);
+        // A WSS entry from an older Deck is rewritten as QUIC on the QUIC port.
+        assert_eq!(round_trip["connections"][0]["transport"], "quic");
+        assert_eq!(round_trip["connections"][0]["port"], 18_444);
         assert_eq!(
             round_trip["connections"][0]["settings"]["cursor_mode"],
             "remote"
@@ -31590,7 +25746,7 @@ mod tests {
         }
 
         let identity = ConnectionIdentity {
-            endpoint: "wss://pier:18443".to_string(),
+            endpoint: "quic://pier:18444".to_string(),
             security: "medium:pin".to_string(),
             topology: "direct:display".to_string(),
         };
@@ -31698,7 +25854,7 @@ mod tests {
     /// genuinely preserved/scheduled rather than cancelled.
     fn schedule_capable_reconnect_controller(generation: u64) -> ReconnectController {
         let identity = ConnectionIdentity {
-            endpoint: "wss://pier:18443".to_string(),
+            endpoint: "quic://pier:18444".to_string(),
             security: "medium:pin".to_string(),
             topology: "direct:display".to_string(),
         };
@@ -31905,7 +26061,7 @@ mod tests {
     // end: a valid applied topology begins a live entry, and a legacy/
     // no-capability hello never does.
     //
-    // Every fake `cg_display_id` used below is a sentinel far outside any
+    // Every fake `display_id` used below is a sentinel far outside any
     // real `CGDirectDisplayID` range, so `viewport_builder_for`/
     // `crate::ui::multi_window_runtime::live_active_displays` can never
     // accidentally resolve it on real hardware -- these tests are
@@ -31959,7 +26115,7 @@ mod tests {
             monitors: vec![ResolvedAppliedMonitor {
                 session_monitor_id: arcen_media::SessionMonitorId::new(1)
                     .expect("valid session monitor id"),
-                cg_display_id: FAKE_CG_DISPLAY_ID_PRIMARY,
+                display_id: FAKE_CG_DISPLAY_ID_PRIMARY,
                 rect: MonitorDesktopRect {
                     x: 0,
                     y: 0,
@@ -31989,7 +26145,7 @@ mod tests {
                 ResolvedAppliedMonitor {
                     session_monitor_id: arcen_media::SessionMonitorId::new(1)
                         .expect("valid session monitor id"),
-                    cg_display_id: FAKE_CG_DISPLAY_ID_PRIMARY,
+                    display_id: FAKE_CG_DISPLAY_ID_PRIMARY,
                     rect: MonitorDesktopRect {
                         x: 0,
                         y: 0,
@@ -32000,7 +26156,7 @@ mod tests {
                 ResolvedAppliedMonitor {
                     session_monitor_id: arcen_media::SessionMonitorId::new(2)
                         .expect("valid session monitor id"),
-                    cg_display_id: FAKE_CG_DISPLAY_ID_SECONDARY,
+                    display_id: FAKE_CG_DISPLAY_ID_SECONDARY,
                     rect: MonitorDesktopRect {
                         x: 1920,
                         y: 0,
@@ -32052,7 +26208,7 @@ mod tests {
         let reordered = ArcenApp::reorder_validated_for_root_monitor(validated, root);
 
         assert_eq!(reordered.monitor_ids()[0], root);
-        assert_eq!(reordered.cg_display_ids()[0], FAKE_CG_DISPLAY_ID_SECONDARY);
+        assert_eq!(reordered.display_ids()[0], FAKE_CG_DISPLAY_ID_SECONDARY);
         assert_eq!(reordered.media_roster.plans()[0].session_monitor_id, root);
         assert_eq!(
             reordered
@@ -32085,7 +26241,7 @@ mod tests {
                 ResolvedAppliedMonitor {
                     session_monitor_id: arcen_media::SessionMonitorId::new(1)
                         .expect("valid session monitor id"),
-                    cg_display_id: FAKE_CG_DISPLAY_ID_PRIMARY,
+                    display_id: FAKE_CG_DISPLAY_ID_PRIMARY,
                     rect: MonitorDesktopRect {
                         x: 0,
                         y: 0,
@@ -32096,7 +26252,7 @@ mod tests {
                 ResolvedAppliedMonitor {
                     session_monitor_id: arcen_media::SessionMonitorId::new(2)
                         .expect("valid session monitor id"),
-                    cg_display_id: FAKE_CG_DISPLAY_ID_SECONDARY,
+                    display_id: FAKE_CG_DISPLAY_ID_SECONDARY,
                     rect: MonitorDesktopRect {
                         x: 1920,
                         y: 0,
@@ -32116,7 +26272,7 @@ mod tests {
     }
 
     fn multi_window_test_monitor(
-        cg_display_id: u32,
+        display_id: u32,
         session_monitor_id: u16,
         x: i32,
         width_px: u32,
@@ -32128,7 +26284,7 @@ mod tests {
             RotationMsg,
         };
         AppliedMonitorDescriptorMsg {
-            client_display_id: ClientDisplayId::new(cg_display_id.to_string()).expect("valid id"),
+            client_display_id: ClientDisplayId::new(display_id.to_string()).expect("valid id"),
             session_monitor_id,
             x,
             y: 0,
@@ -32494,9 +26650,9 @@ mod tests {
             ..ArcenApp::default()
         };
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -32555,9 +26711,9 @@ mod tests {
             ..ArcenApp::default()
         };
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -32629,9 +26785,9 @@ mod tests {
             ..ArcenApp::default()
         };
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -32846,12 +27002,12 @@ mod tests {
     fn close_multi_window_session_queues_every_viewport_close_and_resets_state() {
         let mut app = ArcenApp::default();
         let validated = two_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
-        let expected_viewport_ids = plan.viewport_ids();
+        let expected_viewport_ids = plan.windows();
         app.multi_window = MultiWindowSessionState::Active {
             validated,
             attempt: MultiWindowEnterAttempt::new(plan, Duration::ZERO),
@@ -32956,9 +27112,9 @@ mod tests {
         // depending on live hardware displays.
         let validated = two_monitor_validated_topology();
         let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         let mut app = ArcenApp::default();
@@ -33012,7 +27168,7 @@ mod tests {
         // commit is already reflected), not lag another frame behind.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 2 {
             eprintln!(
@@ -33036,7 +27192,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -33046,7 +27202,7 @@ mod tests {
                     },
                     ResolvedAppliedMonitor {
                         session_monitor_id: monitor_id,
-                        cg_display_id: secondary_display_id,
+                        display_id: secondary_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -33064,9 +27220,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         let mut app = ArcenApp::default();
@@ -33164,7 +27320,7 @@ mod tests {
         // texture that does not exist.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 2 {
             eprintln!(
@@ -33188,7 +27344,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -33198,7 +27354,7 @@ mod tests {
                     },
                     ResolvedAppliedMonitor {
                         session_monitor_id: monitor_id,
-                        cg_display_id: secondary_display_id,
+                        display_id: secondary_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -33216,9 +27372,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         let mut app = ArcenApp::default();
@@ -33698,7 +27854,7 @@ mod tests {
             monitors: vec![
                 ResolvedAppliedMonitor {
                     session_monitor_id: arcen_media::SessionMonitorId::new(1).expect("valid id"),
-                    cg_display_id: FAKE_CG_DISPLAY_ID_PRIMARY,
+                    display_id: FAKE_CG_DISPLAY_ID_PRIMARY,
                     rect: MonitorDesktopRect {
                         x: 0,
                         y: 0,
@@ -33708,7 +27864,7 @@ mod tests {
                 },
                 ResolvedAppliedMonitor {
                     session_monitor_id: monitor_a,
-                    cg_display_id: FAKE_CG_DISPLAY_ID_SECONDARY,
+                    display_id: FAKE_CG_DISPLAY_ID_SECONDARY,
                     rect: MonitorDesktopRect {
                         x: 1920,
                         y: 0,
@@ -33718,7 +27874,7 @@ mod tests {
                 },
                 ResolvedAppliedMonitor {
                     session_monitor_id: monitor_b,
-                    cg_display_id: 0xFFFF_FFF3,
+                    display_id: 0xFFFF_FFF3,
                     rect: MonitorDesktopRect {
                         x: 3840,
                         y: 0,
@@ -33862,7 +28018,7 @@ mod tests {
         // doc for the same requirement.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 2 {
             eprintln!(
@@ -33885,7 +28041,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -33896,7 +28052,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(2)
                             .expect("valid id"),
-                        cg_display_id: secondary_display_id,
+                        display_id: secondary_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -33915,9 +28071,9 @@ mod tests {
             }
         };
         let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -34005,7 +28161,7 @@ mod tests {
         // ahead of root's held-key release.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 2 {
             eprintln!(
@@ -34036,7 +28192,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -34046,7 +28202,7 @@ mod tests {
                     },
                     ResolvedAppliedMonitor {
                         session_monitor_id: monitor_id,
-                        cg_display_id: secondary_display_id,
+                        display_id: secondary_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -34064,9 +28220,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -34121,7 +28277,7 @@ mod tests {
         // before the new viewport's key event is dispatched.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 2 {
             eprintln!(
@@ -34153,7 +28309,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -34163,7 +28319,7 @@ mod tests {
                     },
                     ResolvedAppliedMonitor {
                         session_monitor_id: monitor_id,
-                        cg_display_id: secondary_display_id,
+                        display_id: secondary_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -34181,9 +28337,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -34235,7 +28391,7 @@ mod tests {
         // dispatched a second time.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 3 {
             eprintln!(
@@ -34264,7 +28420,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -34274,7 +28430,7 @@ mod tests {
                     },
                     ResolvedAppliedMonitor {
                         session_monitor_id: monitor_a,
-                        cg_display_id: secondary_a_display_id,
+                        display_id: secondary_a_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -34284,7 +28440,7 @@ mod tests {
                     },
                     ResolvedAppliedMonitor {
                         session_monitor_id: monitor_b,
-                        cg_display_id: secondary_b_display_id,
+                        display_id: secondary_b_display_id,
                         rect: MonitorDesktopRect {
                             x: 3840,
                             y: 0,
@@ -34302,9 +28458,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -35141,7 +29297,7 @@ mod tests {
             multi_window: MultiWindowSessionState::Active {
                 validated: two_monitor_validated_topology(),
                 attempt: MultiWindowEnterAttempt::new(
-                    MultiWindowPlan::build(
+                    build_plan(
                         &[
                             arcen_media::SessionMonitorId::new(1).unwrap(),
                             arcen_media::SessionMonitorId::new(2).unwrap(),
@@ -35346,9 +29502,9 @@ mod tests {
     #[test]
     fn commit_multi_window_entry_flips_committed_and_clears_the_snapshot() {
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         let mut app = ArcenApp::default();
@@ -35476,9 +29632,9 @@ mod tests {
         // failure) must not queue any restore either.
         let mut app = ArcenApp::default();
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -35518,7 +29674,7 @@ mod tests {
         // aborted move left it.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.is_empty() {
             eprintln!(
@@ -35541,7 +29697,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -35552,7 +29708,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(2)
                             .expect("valid id"),
-                        cg_display_id: FAKE_SECONDARY_DISPLAY_ID,
+                        display_id: FAKE_SECONDARY_DISPLAY_ID,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -35570,9 +29726,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         let mut app = ArcenApp::default();
@@ -35631,9 +29787,9 @@ mod tests {
         // window command of any kind ever sent this frame, root's own move
         // included.
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         let mut app = ArcenApp::default();
@@ -35694,9 +29850,9 @@ mod tests {
         // on a real display list, rather than vacuously committing.
         let mut app = ArcenApp::default();
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         assert!(
@@ -35723,9 +29879,9 @@ mod tests {
     fn drive_multi_window_disconnects_when_the_committed_primary_display_disappears() {
         let mut app = ArcenApp::default();
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -35748,9 +29904,9 @@ mod tests {
     fn drive_multi_window_aborts_and_disconnects_when_a_secondary_display_target_is_not_live() {
         let mut app = ArcenApp::default();
         let validated = two_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         assert_eq!(plan.assignments().len(), 1);
@@ -35782,9 +29938,9 @@ mod tests {
         // does either.
         let generation = 4;
         let validated = single_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         let mut app = ArcenApp {
@@ -35819,9 +29975,9 @@ mod tests {
     fn drive_multi_window_abort_requires_a_fresh_topology_connection() {
         let generation = 5;
         let validated = two_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         assert_eq!(plan.assignments().len(), 1);
@@ -35862,7 +30018,7 @@ mod tests {
         // has at least 2 live displays.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 2 {
             eprintln!(
@@ -35889,7 +30045,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -35900,7 +30056,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(2)
                             .expect("valid id"),
-                        cg_display_id: secondary_display_id,
+                        display_id: secondary_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -35918,9 +30074,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         assert_eq!(plan.assignments().len(), 1);
@@ -35965,7 +30121,7 @@ mod tests {
         // the other tests above exercise.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 2 {
             eprintln!(
@@ -35988,7 +30144,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -35999,7 +30155,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(2)
                             .expect("valid id"),
-                        cg_display_id: secondary_display_id,
+                        display_id: secondary_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -36017,9 +30173,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -36071,7 +30227,7 @@ mod tests {
         // clock-independent hard failure -- may end a committed session.
         let live_display_ids: Vec<u32> = crate::ui::multi_window_runtime::live_active_displays()
             .iter()
-            .map(|display| display.cg_display_id)
+            .map(|display| display.display_id)
             .collect();
         if live_display_ids.len() < 2 {
             eprintln!(
@@ -36098,7 +30254,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(1)
                             .expect("valid id"),
-                        cg_display_id: root_display_id,
+                        display_id: root_display_id,
                         rect: MonitorDesktopRect {
                             x: 0,
                             y: 0,
@@ -36109,7 +30265,7 @@ mod tests {
                     ResolvedAppliedMonitor {
                         session_monitor_id: arcen_media::SessionMonitorId::new(2)
                             .expect("valid id"),
-                        cg_display_id: secondary_display_id,
+                        display_id: secondary_display_id,
                         rect: MonitorDesktopRect {
                             x: 1920,
                             y: 0,
@@ -36127,9 +30283,9 @@ mod tests {
                 },
             }
         };
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         app.multi_window = MultiWindowSessionState::Active {
@@ -36171,9 +30327,9 @@ mod tests {
         // deadline/timeout mechanism at all.
         let generation = 8;
         let validated = two_monitor_validated_topology();
-        let plan = crate::ui::multi_window_runtime::MultiWindowPlan::build(
+        let plan = crate::ui::multi_window_runtime::build_plan(
             &validated.monitor_ids(),
-            &validated.cg_display_ids(),
+            &validated.display_ids(),
         )
         .expect("valid plan");
         let mut app = ArcenApp {

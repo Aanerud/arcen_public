@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zeroize::Zeroize;
 
-pub const MAX_PASSWORD_FILE_SIZE: usize = 8 * 1024;
+pub use arcen_deck_core::password_text::MAX_PASSWORD_FILE_SIZE;
+use arcen_deck_core::password_text::{
+    read_password_text, strip_one_line_ending, PasswordTextError,
+};
 const MAX_CREDENTIALS_STDIN_SIZE: usize = (MAX_PASSWORD_FILE_SIZE * 2) + 4;
 
 #[derive(Debug, Error)]
@@ -217,34 +220,12 @@ fn read_credentials(reader: impl Read) -> Result<(String, String), PasswordSourc
 
 fn read_password_file(path: &Path) -> Result<String, PasswordSourceError> {
     let file = open_password_file(path)?;
-    let mut bytes = Vec::with_capacity(MAX_PASSWORD_FILE_SIZE + 1);
-    if let Err(source) = file
-        .take((MAX_PASSWORD_FILE_SIZE + 1) as u64)
-        .read_to_end(&mut bytes)
-    {
-        bytes.zeroize();
-        return Err(PasswordSourceError::Read(source));
-    }
-    if bytes.len() > MAX_PASSWORD_FILE_SIZE {
-        bytes.zeroize();
-        return Err(PasswordSourceError::TooLarge {
-            limit: MAX_PASSWORD_FILE_SIZE,
-        });
-    }
-
-    strip_one_line_ending(&mut bytes);
-    if bytes.is_empty() {
-        return Err(PasswordSourceError::Empty);
-    }
-    if bytes.contains(&0) {
-        bytes.zeroize();
-        return Err(PasswordSourceError::ContainsNul);
-    }
-
-    String::from_utf8(bytes).map_err(|error| {
-        let mut bytes = error.into_bytes();
-        bytes.zeroize();
-        PasswordSourceError::InvalidUtf8
+    read_password_text(file).map_err(|error| match error {
+        PasswordTextError::Read(source) => PasswordSourceError::Read(source),
+        PasswordTextError::TooLarge { limit } => PasswordSourceError::TooLarge { limit },
+        PasswordTextError::Empty => PasswordSourceError::Empty,
+        PasswordTextError::ContainsNul => PasswordSourceError::ContainsNul,
+        PasswordTextError::InvalidUtf8 => PasswordSourceError::InvalidUtf8,
     })
 }
 
@@ -304,17 +285,6 @@ fn open_password_file(path: &Path) -> Result<File, PasswordSourceError> {
         return Err(PasswordSourceError::NotRegular);
     }
     Ok(file)
-}
-
-fn strip_one_line_ending(bytes: &mut Vec<u8>) {
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
-    } else if bytes.last() == Some(&b'\r') {
-        bytes.pop();
-    }
 }
 
 #[cfg(test)]

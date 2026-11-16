@@ -104,8 +104,10 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
 - `eventlog.rs` — journald/syslog lifecycle sink (see "Native lifecycle events" below).
 - `support_bundle.rs` — service-independent, bounded ZIP collection over strict
   log, systemd, runtime, command, and sanitized lifecycle-event allowlists.
-- `net/` — `server.rs` (mandatory QUIC accept loop and reasoned closes), `quic.rs`,
-  `tls.rs`, `mod.rs`.
+- `net/` — `server.rs` (mandatory QUIC accept loop and reasoned closes; the
+  endpoint comes from `arcen_transport::quic::pier_server_config`), `tls.rs`
+  (the Linux `openat(O_NOFOLLOW)` file checks behind the shared
+  `arcen_transport::host_material` loader, and SIGHUP reload), `mod.rs`.
 - `session_admission.rs` — capacity-one physical session admission and the
   bounded direct-reconnect hold for the desktop/input/encoder plane.
 - `session/` — `launcher.rs`, `agent.rs`, `lifecycle.rs`, `resume.rs`, `identity.rs` (uid/gid

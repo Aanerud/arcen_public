@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-capenc"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
 publish.workspace = true
@@ -104,7 +104,8 @@ mf = []
 # codec from source; capenc never links a runtime-downloaded binary.
 software-h264 = ["arcen-media/software-h264-source"]
 # Lossless refinement producer on the Xorg depth-30 path (ADR 0016): native
-# libzstd for tile compression. Off by default; also needs `refine=on`.
+# libzstd for tile compression. The Linux Pier enables it by default; it runs
+# only when the Pier passes `refine=on`.
 lossless-refine = ["arcen-media/refine-zstd-encode"]
 # Probe-only rav1e source used to measure the software AV1 ceiling. The
 # product runtime does not select it until an interactive 4:2:0 path and

@@ -67,9 +67,10 @@ mod win;
 /// `docs/architecture/color-fidelity.md`.
 #[cfg(windows)]
 mod win_color_probe;
+/// Exact still image on the Windows FP16 NVENC path (ADR 0016).
+#[cfg(all(feature = "nvenc", windows))]
+mod win_refine;
 
-#[cfg(all(feature = "mf", windows))]
-mod annexb;
 #[cfg(all(feature = "mf", windows))]
 mod mf_encoder;
 #[cfg(all(any(feature = "mf", feature = "software-h264"), windows))]
@@ -229,6 +230,28 @@ pub(crate) struct ControlState {
     bitrate_bps: AtomicU64,
     framerate_fps: AtomicU32,
     stop: AtomicBool,
+    /// `REFINE-RESET` arrived (lossless refinement, ADR 0016).
+    refine_reset: AtomicBool,
+    /// `REFINE-PAUSE` (1) or `REFINE-RESUME` (2), the latest one wins.
+    refine_enable: AtomicU32,
+    /// The latest `REFINE-RATE`, packed by [`pack_refine_rate`]; 0 = none.
+    refine_rate: AtomicU64,
+}
+
+/// Packs a `REFINE-RATE` into one non-zero word: the hold flag in bit 0,
+/// the rate above it (saturated far beyond any link).
+#[cfg(any(
+    test,
+    windows,
+    all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
+))]
+const fn pack_refine_rate(bps: u64, hold: bool) -> u64 {
+    let bps = if bps > (u64::MAX >> 2) {
+        u64::MAX >> 2
+    } else {
+        bps
+    };
+    ((bps << 1) | hold as u64) + 1
 }
 
 #[cfg(any(
@@ -244,6 +267,56 @@ impl ControlState {
             bitrate_bps: AtomicU64::new(0),
             framerate_fps: AtomicU32::new(0),
             stop: AtomicBool::new(false),
+            refine_reset: AtomicBool::new(false),
+            refine_enable: AtomicU32::new(0),
+            refine_rate: AtomicU64::new(0),
+        }
+    }
+
+    /// Consumes a pending `REFINE-RATE`: `(bps, hold)`.
+    #[cfg_attr(
+        not(all(any(target_os = "linux", windows), feature = "nvenc")),
+        allow(
+            dead_code,
+            reason = "only the NVENC wide producers (Linux Xorg depth-30 and Wayland, Windows FP16) refine"
+        )
+    )]
+    pub(crate) fn take_refine_rate(&self) -> Option<(u64, bool)> {
+        match self.refine_rate.swap(0, Ordering::AcqRel) {
+            0 => None,
+            packed => {
+                let value = packed - 1;
+                Some((value >> 1, value & 1 == 1))
+            }
+        }
+    }
+
+    /// Consumes a pending `REFINE-RESET`.
+    #[cfg_attr(
+        not(all(any(target_os = "linux", windows), feature = "nvenc")),
+        allow(
+            dead_code,
+            reason = "only the NVENC wide producers (Linux Xorg depth-30 and Wayland, Windows FP16) refine"
+        )
+    )]
+    pub(crate) fn take_refine_reset(&self) -> bool {
+        self.refine_reset.swap(false, Ordering::AcqRel)
+    }
+
+    /// Consumes a pending `REFINE-PAUSE` (`Some(false)`) or
+    /// `REFINE-RESUME` (`Some(true)`).
+    #[cfg_attr(
+        not(all(any(target_os = "linux", windows), feature = "nvenc")),
+        allow(
+            dead_code,
+            reason = "only the NVENC wide producers (Linux Xorg depth-30 and Wayland, Windows FP16) refine"
+        )
+    )]
+    pub(crate) fn take_refine_enabled(&self) -> Option<bool> {
+        match self.refine_enable.swap(0, Ordering::AcqRel) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
         }
     }
 
@@ -314,6 +387,23 @@ fn read_control<R: BufRead>(reader: R, state: &ControlState, label: &str) {
                     }
                     Ok(arcen_media::capenc_control::CapencControlCommand::Framerate { fps }) => {
                         state.framerate_fps.store(fps, Ordering::Release);
+                    }
+                    Ok(arcen_media::capenc_control::CapencControlCommand::RefineReset) => {
+                        state.refine_reset.store(true, Ordering::Release);
+                    }
+                    Ok(arcen_media::capenc_control::CapencControlCommand::RefinePause) => {
+                        state.refine_enable.store(1, Ordering::Release);
+                    }
+                    Ok(arcen_media::capenc_control::CapencControlCommand::RefineResume) => {
+                        state.refine_enable.store(2, Ordering::Release);
+                    }
+                    Ok(arcen_media::capenc_control::CapencControlCommand::RefineRate {
+                        bps,
+                        hold,
+                    }) => {
+                        state
+                            .refine_rate
+                            .store(pack_refine_rate(bps, hold), Ordering::Release);
                     }
                     Ok(arcen_media::capenc_control::CapencControlCommand::Stop) => break,
                     Err(error) => log(&format!(
@@ -1051,7 +1141,7 @@ pub(crate) fn write_access_unit(
 /// Writes one access unit in the framing the parent asked for: a framed-v2
 /// `AccessUnit` record whenever `framed-v2` was requested — also when lossless
 /// refinement was refused — otherwise framed-v1 or raw Annex-B.
-#[cfg(any(test, all(target_os = "linux", feature = "nvenc")))]
+#[cfg(any(test, all(any(target_os = "linux", windows), feature = "nvenc")))]
 pub(crate) fn write_access_unit_as_requested(
     writer: &mut impl Write,
     access_unit: &[u8],
@@ -1103,7 +1193,9 @@ pub fn run_with_args(args: Vec<String>) {
 
     #[cfg(windows)]
     {
-        refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::Windows);
+        // framed-v2 and refinement are honoured only by the FP16 NVENC
+        // path; `win` refuses them on every other path it dispatches to.
+        refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::WindowsWide);
         win::run_with_args(args);
     }
 
@@ -1336,6 +1428,23 @@ mod tests {
         );
         assert!(state.take_idr());
         assert!(state.stop_requested());
+    }
+
+    #[test]
+    fn the_latest_refine_rate_wins_with_its_hold() {
+        let state = ControlState::new();
+        assert_eq!(state.take_refine_rate(), None);
+        read_control(
+            std::io::Cursor::new(b"REFINE-RATE 9000000\nREFINE-RATE 0 HOLD\nSTOP\n"),
+            &state,
+            "test",
+        );
+        assert_eq!(state.take_refine_rate(), Some((0, true)));
+        assert_eq!(state.take_refine_rate(), None);
+        state
+            .refine_rate
+            .store(pack_refine_rate(12_500_000, false), Ordering::Release);
+        assert_eq!(state.take_refine_rate(), Some((12_500_000, false)));
     }
 
     #[test]

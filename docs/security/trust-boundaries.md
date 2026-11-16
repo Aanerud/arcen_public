@@ -518,9 +518,12 @@ while unavailable or denied sources remain visible as typed notices. Only
 already-sanitized bounded TLS lifecycle metadata may enter through approved
 logs/events.
 
-Host adapters bound source counts and sizes, stream files with fixed buffers,
-reject symlinks/reparse points, cap included logs at 200 MiB and total payload
-at 256 MiB, and atomically publish from a same-directory partial file. Custom
+The shared collector (`arcen_observability::support_bundle`, used by every
+Pier and Deck) bounds source counts and sizes, streams files with fixed
+buffers, rejects symlinks and (Windows) every reparse point, checks on Unix
+that the file opened is the one inspected, caps included logs at 200 MiB and
+total payload at 256 MiB on a Pier, and atomically publishes from a private
+same-directory partial file. Custom
 `--out` paths are operator-selected trust boundaries and retain their existing
 directory permissions.
 

@@ -57,6 +57,7 @@ use arcen_session::direct_reconnect::{
     ReconnectState,
 };
 use arcen_session::restore_lease::{LeaseOwnerId, StateFingerprint};
+use arcen_session::session_setup::SetupRefusal;
 use arcen_telemetry::{CorrelationId, FieldValue, LifecycleEventKind, StructuredFields};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::de::DeserializeOwned;
@@ -85,13 +86,18 @@ use crate::windows_session::{
     AgentControl, AgentReady, AgentStart, AgentStreamingReady, WindowsSessionIdentity,
 };
 use crate::{HostConfig, LifecycleEmitter};
+use arcen_session::session_admission::{
+    AUTH_RESPONSE_TIMEOUT, CREDENTIAL_CHECK_TIMEOUT, HANDSHAKE_MESSAGE_TIMEOUT,
+    INTERACTIVE_AUTH_RESPONSE_TIMEOUT,
+};
+
+/// Failed sign-ins, per source address and per account, shared by every
+/// connection this Pier serves (the policy is `arcen_session::auth_throttle`,
+/// the same on every Pier).
+static AUTH_THROTTLE: std::sync::LazyLock<arcen_session::auth_throttle::HostAuthThrottle> =
+    std::sync::LazyLock::new(arcen_session::auth_throttle::HostAuthThrottle::default);
 
 const SERVER_NAME: &str = "Arcen Windows Host (Rust)";
-const AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-const INTERACTIVE_AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const AUTH_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
-const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
-const QUALITY_SETTINGS_TIMEOUT: Duration = Duration::from_secs(15);
 const DISPLAY_UPDATE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
@@ -668,7 +674,7 @@ async fn run_broker(
     log_state(peer, ServerState::Authenticating);
     let resume_supported = cfg.reconnect_window_secs > 0;
     let mut multi_monitor_gate =
-        crate::multi_monitor_gate::MultiMonitorGate::from_config(&cfg.multi_monitor);
+        crate::multi_monitor_gate::MultiMonitorGate::from_config(&cfg.multi_monitor, cfg.encoder);
     if cfg.iddcx.enabled {
         if let Err(error) = crate::iddcx::probe_strict_readiness(&cfg.iddcx) {
             tracing::warn!(
@@ -847,32 +853,6 @@ async fn run_correlated_broker(
         tracing::warn!(target: SESSION, %peer, %error, "client display plan rejected");
         return Ok(());
     }
-    if let Some(request) = response.initial_video.as_ref() {
-        tracing::debug!(
-            target: SESSION,
-            %peer,
-            requested_transfer = request.quality.transfer.as_str(),
-            requested_primaries = request.quality.color_primaries.as_str(),
-            "auth-time video request received"
-        );
-        if let Err(error) = cfg.apply_initial_video_request(request) {
-            send_auth_result(&mut ws, false, &format!("Video request rejected: {error}")).await?;
-            tracing::warn!(
-                target: SESSION,
-                %peer,
-                %error,
-                "auth-time video request rejected before display or encoder creation"
-            );
-            return Ok(());
-        }
-        tracing::debug!(
-            target: SESSION,
-            %peer,
-            resolved_transfer = cfg.transfer.token(),
-            resolved_primaries = cfg.color_primaries.token(),
-            "auth-time video request resolved"
-        );
-    }
     let resume_disclaimer_binding = crate::resume::disclaimer_binding(
         acknowledged_disclaimer
             .as_ref()
@@ -890,9 +870,44 @@ async fn run_correlated_broker(
     };
     clear_resume_material(&mut response);
     let credential = zeroize::Zeroizing::new(std::mem::take(&mut response.credential));
+    let attempt = match AUTH_THROTTLE.begin(
+        arcen_session::auth_throttle::peer_address(peer),
+        &response.username,
+    ) {
+        Ok(attempt) => attempt,
+        Err(refusal) => {
+            drop(credential);
+            send_auth_result(
+                &mut ws,
+                false,
+                arcen_session::auth_throttle::THROTTLED_MESSAGE,
+            )
+            .await?;
+            tracing::warn!(
+                target: SESSION,
+                %peer,
+                retry_after_secs = refusal.retry_after.as_secs(),
+                "sign-in refused without checking the password: too many recent failures"
+            );
+            emit_session_auth_fail(
+                emitter,
+                session_log_id.clone(),
+                Some(&response.username),
+                peer,
+                "throttle",
+                "too_many_attempts",
+            );
+            return Ok(());
+        }
+    };
     let (account, credential) = match authenticate_with_deadline(
-        AUTH_VERIFY_TIMEOUT,
-        crate::auth::authenticate_windows(response.username.clone(), credential, preauth_guard),
+        CREDENTIAL_CHECK_TIMEOUT,
+        crate::auth::authenticate_windows(
+            response.username.clone(),
+            credential,
+            preauth_guard,
+            attempt,
+        ),
     )
     .await
     {
@@ -911,6 +926,47 @@ async fn run_correlated_broker(
             return Ok(());
         }
     };
+    // The video request, only now that the password is proved and before the
+    // Deck is answered or a session is touched (`arcen_session::session_setup`):
+    // a request this host cannot serve is refused with its reason and is not a
+    // failed sign-in.
+    if let Some(request) = response.initial_video.as_ref() {
+        tracing::debug!(
+            target: SESSION,
+            %peer,
+            requested_transfer = request.quality.transfer.as_str(),
+            requested_primaries = request.quality.color_primaries.as_str(),
+            "auth-time video request received"
+        );
+        if let Err(error) = cfg.apply_initial_video_request(request) {
+            drop(credential);
+            let refusal = SetupRefusal::video_request(&error);
+            send_session_setup_failure(&mut ws, &refusal.message()).await?;
+            tracing::warn!(
+                target: SESSION,
+                %peer,
+                %error,
+                "auth-time video request rejected before display or encoder creation"
+            );
+            emit_session_auth_fail(
+                emitter,
+                session_log_id.clone(),
+                Some(&response.username),
+                peer,
+                refusal.log_stage(),
+                refusal.log_reason_class(),
+            );
+            return Ok(());
+        }
+        tracing::debug!(
+            target: SESSION,
+            %peer,
+            resolved_transfer = cfg.transfer.token(),
+            resolved_primaries = cfg.color_primaries.token(),
+            "auth-time video request resolved"
+        );
+    }
+    let refine_grant = refine_lane_grant(&cfg, &response);
 
     // Existing active-session attach is unchanged. Only when no SID-matching
     // session exists (or a matching one is locked) do we hand the credential to
@@ -1248,6 +1304,7 @@ async fn run_correlated_broker(
     let (agent_log_path, agent_log_user_sid) =
         crate::windows_session::agent_log_registration(&selected, &session_log_id)?;
     let mut active_log = agent_lease.register_active_log(agent_log_path, agent_log_user_sid)?;
+    crate::console_recovery::wait_until_idle().await;
     let mut launched = match crate::windows_session::spawn(
         selected,
         &session_log_id,
@@ -1391,6 +1448,7 @@ async fn run_correlated_broker(
                 cfg.reconnect_window_secs,
                 &mut session_shutdown,
                 incumbent.as_ref(),
+                refine_grant,
             )
             .await
         } else {
@@ -1405,6 +1463,7 @@ async fn run_correlated_broker(
                 &mut session_shutdown,
                 lanes,
                 path_signal_connection,
+                refine_grant,
             )
             .await
         };
@@ -1882,11 +1941,11 @@ where
     // output. On an NVIDIA output the first child keeps `Auto`, but typed
     // pre-READY NVENC unavailability is handled here so the display can be
     // retargeted before an explicit OpenH264 child becomes authoritative.
-    let display_encoder = if config.encoder == crate::capenc::EncoderSelection::Auto {
+    let display_encoder = if config.encoder == arcen_media::video::EncoderRequest::Auto {
         let resolved = config
             .encoder
             .resolve_auto(resolved_output.vendor_id == 0x10de, nvenc_runtime_present());
-        if resolved == crate::capenc::EncoderSelection::SoftwareH264 {
+        if resolved == arcen_media::video::EncoderRequest::SoftwareH264 {
             if config.codec != VideoCodec::H264 || config.chroma != ChromaSubsampling::Yuv420 {
                 tracing::warn!(
                     target: SESSION,
@@ -1901,7 +1960,7 @@ where
             target: SESSION,
             adapter = %resolved_output.adapter_name,
             vendor_id = format_args!("0x{:04x}", resolved_output.vendor_id),
-            resolved = resolved.name(),
+            resolved = resolved.as_arg(),
             "auto encoder selection resolved for the configured adapter"
         );
         resolved
@@ -2067,7 +2126,7 @@ fn hdr10_display_refresh_hz(
 }
 
 fn physical_topology_settled(
-    inventory: &crate::multi_monitor_topology::PhysicalOutputInventory,
+    inventory: &arcen_outputs::windows_topology::PhysicalOutputInventory,
     expected_outputs: usize,
 ) -> Result<(), String> {
     let actual_outputs = inventory.len();
@@ -2105,7 +2164,7 @@ fn physical_topology_settled(
 async fn wait_for_previous_physical_topology_settle(
     allowed_adapters: Vec<String>,
     expected_outputs: usize,
-) -> Result<crate::multi_monitor_topology::PhysicalOutputInventory, String> {
+) -> Result<arcen_outputs::windows_topology::PhysicalOutputInventory, String> {
     let deadline = Instant::now() + PREVIOUS_TOPOLOGY_SETTLE_TIMEOUT;
     let mut attempts = 0_u32;
     loop {
@@ -2146,7 +2205,7 @@ async fn wait_for_previous_physical_topology_settle(
 async fn run_authenticated_agent<S>(
     mut ws: WebSocketStream<S>,
     mut cfg: HostConfig,
-    mut display_encoder: crate::capenc::EncoderSelection,
+    mut display_encoder: arcen_media::video::EncoderRequest,
     peer: String,
     response: AuthResponse,
     windows_session: WindowsSessionIdentity,
@@ -2177,8 +2236,8 @@ where
     if let Some(request) = response.initial_video.as_ref() {
         // An Auto host that resolved to OpenH264 before any NVENC child ran
         // did so for a hardware reason a fidelity refusal names.
-        let auto_software_cause = (cfg.encoder == crate::capenc::EncoderSelection::Auto
-            && display_encoder == crate::capenc::EncoderSelection::SoftwareH264)
+        let auto_software_cause = (cfg.encoder == arcen_media::video::EncoderRequest::Auto
+            && display_encoder == arcen_media::video::EncoderRequest::SoftwareH264)
             .then(auto_software_cause);
         if let Err(error) = cfg.apply_initial_video_request_for_encoder_after(
             request,
@@ -2197,6 +2256,9 @@ where
             "agent resolved the auth-time colour request"
         );
     }
+    // Exact still image (ADR 0016): the Deck asks at authentication, only
+    // while its setting is on; the shared plan decides per capture.
+    cfg.deck_refine = response.lossless_refine_v1.clone();
     let authoritative_timezone = response.timezone.clone();
     let authoritative_cursor = response.cursor_preference;
     let authoritative_cursor_images = response.cursor_image_v1;
@@ -2218,7 +2280,7 @@ where
         })
         .unwrap_or_default();
     let multi_monitor_gate =
-        crate::multi_monitor_gate::MultiMonitorGate::from_config(&cfg.multi_monitor);
+        crate::multi_monitor_gate::MultiMonitorGate::from_config(&cfg.multi_monitor, cfg.encoder);
     let multi_monitor_offer = crate::multi_monitor_gate::build_offer(&multi_monitor_gate);
     let mut nvidia_headless_planning = None;
     let mut multi_monitor_committed = if response.multi_monitor_v1.is_some() {
@@ -2436,7 +2498,7 @@ where
         };
         cfg.output_index = primary.global_index;
     }
-    if display_encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+    if display_encoder == arcen_media::video::EncoderRequest::SoftwareH264 {
         let fitted = match openh264_fitted_display_size(request.size) {
             Ok(fitted) => fitted,
             Err(error) => {
@@ -2479,11 +2541,17 @@ where
         crate::display::DisplayPolicy::Negotiated
     } else {
         match display_encoder {
-            crate::capenc::EncoderSelection::Nvenc => crate::display::DisplayPolicy::ExactIsolated,
-            crate::capenc::EncoderSelection::SoftwareH264 => {
+            arcen_media::video::EncoderRequest::NativeNvenc => {
+                crate::display::DisplayPolicy::ExactIsolated
+            }
+            // `parse_encoder` admits no MF or AV1 request on this Pier; were
+            // one to arrive it is not direct NVENC, so it negotiates too.
+            arcen_media::video::EncoderRequest::SoftwareH264
+            | arcen_media::video::EncoderRequest::WindowsMediaFoundation
+            | arcen_media::video::EncoderRequest::SoftwareAv1 => {
                 crate::display::DisplayPolicy::Negotiated
             }
-            crate::capenc::EncoderSelection::Auto => {
+            arcen_media::video::EncoderRequest::Auto => {
                 // run_agent resolves Auto before this point; if a future entry
                 // path skips that, fail open to negotiation rather than refusing
                 // sessions on hosts that could stream.
@@ -2496,7 +2564,7 @@ where
         }
     };
     if multi_monitor_committed.is_none()
-        && display_encoder == crate::capenc::EncoderSelection::Nvenc
+        && display_encoder == arcen_media::video::EncoderRequest::NativeNvenc
     {
         let adapter = match &cfg.output_selector {
             crate::display::OutputSelector::Adapter { name, .. } => name.clone(),
@@ -2892,7 +2960,7 @@ where
     }
     // The negotiation may have settled on a fallback mode; never promise a
     // stream outside the OpenH264 contract.
-    if display_encoder == crate::capenc::EncoderSelection::SoftwareH264 && !display.is_multi() {
+    if display_encoder == arcen_media::video::EncoderRequest::SoftwareH264 && !display.is_multi() {
         if let Err(error) = ensure_openh264_applied_size(display.report().applied) {
             send_agent_failure(&mut ws, &error).await;
             return Err(error);
@@ -3022,6 +3090,22 @@ where
         let pen_available = prepared_media.pen.is_some();
         let region_input_available = prepared_media.region_input.is_some();
         let multi_monitor_capability = prepared_media.video.multi_capability().cloned();
+        let refine_plan = prepared_media.video.refine_plan(&cfg);
+        tracing::info!(
+            target: SESSION,
+            state = if refine_plan.is_on() { "on" } else { "off" },
+            reason = match refine_plan {
+                arcen_media::refine::RefinePlan::Off(reason) => reason.token(),
+                arcen_media::refine::RefinePlan::On { .. } => "",
+            },
+            deck_asked = cfg.deck_refine.is_some(),
+            "{}",
+            arcen_telemetry::names::refine::PLAN
+        );
+        let refine_status = cfg
+            .deck_refine
+            .is_some()
+            .then(|| refine_plan.hello_status());
         let preferences = run_attachment_handshake(
             &mut ws,
             &cfg,
@@ -3040,6 +3124,7 @@ where
             region_input_available,
             active_transport,
             multi_monitor_capability.as_ref(),
+            refine_status,
         )
         .await;
         let preferences = match preferences {
@@ -3072,7 +3157,13 @@ where
             // The Deck draws host cursor images only when it declared so at
             // sign-in and again in this attachment's hello.
             authoritative_cursor_images && preferences.deck_cursor_images,
+            preferences.deck_text_commit,
             preferences.clipboard,
+            NativeTabletPlan {
+                tablet: preferences.native_tablet,
+                result: preferences.tablet_mode_result.clone(),
+                deck_cursor_positions: preferences.deck_cursor_positions,
+            },
             &mut display,
             prepared_media,
             &attachment_session_log_id,
@@ -3229,7 +3320,15 @@ struct AttachmentPreferences {
     cursor_mode: CursorMode,
     /// The Deck's `ClientHello` echo of `cursor_image_v1`.
     deck_cursor_images: bool,
+    /// The Deck types committed text, so it is told this session's layout
+    /// (`host_keymap`).
+    deck_text_commit: bool,
     tablet_mode_result: TabletModeResultMsg,
+    /// The bridged tablet this attachment reads, when Native tablet is
+    /// active.
+    native_tablet: Option<arcen_input::bridged_pen::AuthorizedTablet>,
+    /// The Deck draws its cursor at host positions (`cursor_position_v1`).
+    deck_cursor_positions: bool,
     clipboard: Option<ClipboardNegotiation>,
 }
 
@@ -3271,6 +3370,7 @@ async fn run_attachment_handshake<S>(
     region_input_available: bool,
     active_transport: &'static str,
     multi_monitor_capability: Option<&ServerMultiMonitorMsg>,
+    refine_status: Option<arcen_protocol::refine::LosslessRefineStatusMsg>,
 ) -> Result<AttachmentPreferences, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -3312,13 +3412,16 @@ where
         region_input_available,
     );
     hello.negotiated_transport = Some(active_transport.to_string());
+    // Exact still image: the shared plan's truth, for a Deck that asked.
+    hello.lossless_refine = refine_status;
     if let Some(capability) = multi_monitor_capability {
         hello = hello
             .with_multi_monitor_v1(capability)
             .map_err(|error| format!("attach multi-monitor ServerHello capability: {error}"))?;
     }
     send_json(ws, &hello, "server_hello").await?;
-    let client_hello: ClientHelloMsg = recv_typed(ws, CLIENT_HELLO, CLIENT_HELLO_TIMEOUT).await?;
+    let client_hello: ClientHelloMsg =
+        recv_typed(ws, CLIENT_HELLO, HANDSHAKE_MESSAGE_TIMEOUT).await?;
     if !multi_monitor_region_input_negotiated(
         multi_monitor_capability.is_some(),
         region_input_available,
@@ -3366,13 +3469,24 @@ where
         } else {
             InputCapabilityAvailability::Unavailable
         },
-        usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
+        // Native tablet needs the same Windows Ink pen device: the Pier
+        // reads the bridged pen itself and injects it there (no driver).
+        usb_tablet_bridge: if pen_available {
+            InputCapabilityAvailability::Available
+        } else {
+            InputCapabilityAvailability::Unavailable
+        },
         disabled_mouse_compat: InputCapabilityAvailability::Available,
     };
-    let tablet_mode_result = resolve_windows_tablet_mode_result(
+    let mut tablet_mode_result = resolve_windows_tablet_mode_result(
         client_hello.tablet_mode_requested,
         client_tablet_capabilities,
         host_tablet_capabilities,
+    );
+    let native_tablet = negotiate_native_tablet(
+        &client_hello,
+        &native_tablet_availability(pen_available),
+        &mut tablet_mode_result,
     );
     let client_hello_size = validate_client_hello(&client_hello, requested)?;
     let clipboard = ClipboardNegotiation::from_client(cfg.clipboard_policy, &client_hello);
@@ -3395,7 +3509,7 @@ where
         }
     }
     let quality: QualitySettings =
-        recv_typed(ws, "quality_settings", QUALITY_SETTINGS_TIMEOUT).await?;
+        recv_typed(ws, "quality_settings", HANDSHAKE_MESSAGE_TIMEOUT).await?;
     if let Some(initial) = cfg.auth_video_request.as_ref() {
         if quality != initial.quality {
             return Err("quality_settings differ from the authenticated setup request".to_string());
@@ -3780,7 +3894,12 @@ where
         microphone,
         cursor_mode: authoritative_cursor,
         deck_cursor_images: client_hello.cursor_image_v1,
+        deck_text_commit: arcen_protocol::messages::supports_text_commit_v1(
+            client_hello.input_capabilities,
+        ),
         tablet_mode_result,
+        native_tablet,
+        deck_cursor_positions: client_hello.cursor_position_v1,
         clipboard,
     })
 }
@@ -3793,7 +3912,7 @@ struct NextAttachment {
 async fn await_attachment_command<S>(
     ws: &mut WebSocketStream<S>,
     cfg: &HostConfig,
-    display_encoder: crate::capenc::EncoderSelection,
+    display_encoder: arcen_media::video::EncoderRequest,
     display_report: &DisplayReport,
     log_controller: &crate::logging::LogController,
     deskside_hook_proof: Option<crate::deskside::HookProof>,
@@ -4033,6 +4152,11 @@ fn validate_auth_response(response: &AuthResponse) -> Result<SessionDisplayPlan,
     if response.username.len() > 256 || response.credential.len() > 4096 {
         return Err("Windows username or credential exceeds safety limit".to_string());
     }
+    // `LogonUserW` reads C strings: an interior NUL would make it check a
+    // different account or password than the one the sign-in throttle keys.
+    if response.username.contains('\0') || response.credential.contains('\0') {
+        return Err("Windows username or credential contains a NUL character".to_string());
+    }
     session_display_plan(response)
 }
 
@@ -4206,13 +4330,13 @@ fn openh264_fallback_retarget_size(
 }
 
 fn capenc_encoder_for_attempt(
-    configured: crate::capenc::EncoderSelection,
-    active: crate::capenc::EncoderSelection,
-) -> crate::capenc::EncoderSelection {
-    if configured == crate::capenc::EncoderSelection::Auto
-        && active == crate::capenc::EncoderSelection::SoftwareH264
+    configured: arcen_media::video::EncoderRequest,
+    active: arcen_media::video::EncoderRequest,
+) -> arcen_media::video::EncoderRequest {
+    if configured == arcen_media::video::EncoderRequest::Auto
+        && active == arcen_media::video::EncoderRequest::SoftwareH264
     {
-        crate::capenc::EncoderSelection::SoftwareH264
+        arcen_media::video::EncoderRequest::SoftwareH264
     } else {
         configured
     }
@@ -4228,7 +4352,7 @@ fn nvenc_runtime_present() -> bool {
     false
 }
 
-/// Why `EncoderSelection::resolve_auto` chose OpenH264: no NVENC runtime, or
+/// Why `EncoderRequest::resolve_auto` chose OpenH264: no NVENC runtime, or
 /// no NVIDIA adapter owning the session output.
 fn auto_software_cause() -> arcen_media::video::BackendUnavailableReason {
     if nvenc_runtime_present() {
@@ -4350,10 +4474,12 @@ fn validate_display_update(
     Ok(size)
 }
 
-fn resize_encoder_for(media_plan: &ResolvedMediaPlan) -> Option<crate::capenc::EncoderSelection> {
+fn resize_encoder_for(
+    media_plan: &ResolvedMediaPlan,
+) -> Option<arcen_media::video::EncoderRequest> {
     match media_plan.backend {
-        EncoderBackend::NativeNvenc => Some(crate::capenc::EncoderSelection::Nvenc),
-        EncoderBackend::OpenH264 => Some(crate::capenc::EncoderSelection::SoftwareH264),
+        EncoderBackend::NativeNvenc => Some(arcen_media::video::EncoderRequest::NativeNvenc),
+        EncoderBackend::OpenH264 => Some(arcen_media::video::EncoderRequest::SoftwareH264),
         // VideoToolbox is macOS and cannot be opened here; it is in the shared
         // vocabulary because another Pier reports it.
         EncoderBackend::WindowsMediaFoundation
@@ -4403,6 +4529,169 @@ fn validate_client_cursor(
     }
 }
 
+/// Native tablet on this Pier (ADR 0023 amendment, 2026-11-15): the
+/// driverless route. Windows has no virtual USB host controller or virtual
+/// HID device without a kernel driver (ADR 0017), so this Pier publishes no
+/// device ([`arcen_usb_bridge::HidPublishPolicy::Nothing`]): the shared
+/// attachment (`arcen_input::bridged_pen`) enumerates the Deck's tablet over
+/// the URB bridge and reads its pen interface with the shared readers, and
+/// every sample is injected through the session's synthetic Windows Ink pen
+/// (`PenInjector`, the device Tablet support uses), in the agent's own
+/// session. `InjectSyntheticPointerInput` delivers to that session's input
+/// desktop only: a locked or disconnected session takes nothing from it, and
+/// the broker ends the attachment (and Native tablet with it) when the
+/// session stops being the bound, unlocked one. Nothing system-wide exists,
+/// so no other account's desktop can receive the pen.
+const NATIVE_TABLET_POLICY: arcen_usb_bridge::HidPublishPolicy =
+    arcen_usb_bridge::HidPublishPolicy::Nothing;
+
+/// Why a session without a Windows Ink pen device refuses Native tablet.
+const NATIVE_TABLET_NO_PEN_DEVICE: &str = "this Windows desktop has no Windows Ink pen device \
+     (CreateSyntheticPointerDevice failed; Windows 10 version 1809 or later is needed)";
+
+/// Told to a Deck whose tablet was accepted.
+const NATIVE_TABLET_NOTICES: arcen_input::bridged_pen::HostPenNotices =
+    arcen_input::bridged_pen::HostPenNotices {
+        dedicated: "Native tablet is active. This Windows Pier reads the pen itself and \
+             injects it as a Windows Ink pen with pressure, tilt, barrel buttons and eraser; \
+             the tablet maker's driver settings, ExpressKeys and touch are not used.",
+        generic: "Native tablet is active. This Windows Pier reads the pen from its standard \
+             HID reports and injects it as a Windows Ink pen with what the tablet reports \
+             (pressure, tilt, buttons, eraser); driver settings, ExpressKeys and touch are \
+             not used.",
+    };
+
+/// Whether this attachment may offer Native tablet: it needs the session's
+/// Windows Ink pen device, nothing else.
+fn native_tablet_availability(pen_available: bool) -> Result<(), String> {
+    if pen_available {
+        Ok(())
+    } else {
+        Err(NATIVE_TABLET_NO_PEN_DEVICE.to_owned())
+    }
+}
+
+/// Settles Native tablet for this attachment: the Deck's device is
+/// authorized with the shared checks before anything is read, and the
+/// tablet-mode result says exactly why not, or what the Deck will get.
+/// Returns the device to read when Native tablet is active.
+fn negotiate_native_tablet(
+    client_hello: &ClientHelloMsg,
+    offer: &Result<(), String>,
+    tablet: &mut TabletModeResultMsg,
+) -> Option<arcen_input::bridged_pen::AuthorizedTablet> {
+    let requested = tablet.requested == TabletModeMsg::UsbTabletBridge;
+    let device = client_hello.usb_hard_device.as_ref();
+    let synthetic = std::env::var("ARCEN_USB_HARD_SYNTHETIC").ok().as_deref() == Some("1");
+    let authorization = (requested && offer.is_ok())
+        .then(|| arcen_input::bridged_pen::authorize(device, NATIVE_TABLET_POLICY, synthetic));
+    tracing::info!(
+        target: INPUT,
+        requested = ?tablet.requested,
+        client_usb_hard_v1 = client_hello.usb_hard_v1,
+        client_usb_hard_vendor_id = device.map(|device| device.vendor_id),
+        client_usb_hard_product_id = device.map(|device| device.product_id),
+        client_usb_hard_descriptors = device.map_or(0, |device| device.hid_report_descriptors.len()),
+        usb_hard_available = offer.is_ok(),
+        unavailable_reason = offer.as_ref().err().map(String::as_str),
+        tablet_refusal = authorization.as_ref().and_then(|result| result.as_ref().err()).map(String::as_str),
+        pen_reader = authorization
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(|tablet| tablet.host_pen.kind()),
+        tablet_pressure_levels = authorization
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|tablet| tablet.profile.capabilities.pressure_levels()),
+        "Hard USB negotiation inputs"
+    );
+    *tablet = arcen_input::bridged_pen::tablet_result(
+        tablet.clone(),
+        offer,
+        authorization.as_ref(),
+        NATIVE_TABLET_NOTICES,
+    );
+    if tablet.accepted && tablet.active == TabletModeMsg::UsbTabletBridge {
+        authorization.and_then(Result::ok)
+    } else {
+        None
+    }
+}
+
+/// Starts Native tablet for an attachment whose handshake accepted it.
+fn start_native_tablet(
+    tablet: Option<&arcen_input::bridged_pen::AuthorizedTablet>,
+    result: &TabletModeResultMsg,
+) -> (
+    arcen_input::bridged_pen::NativeTabletAttachment,
+    arcen_input::bridged_pen::NativeTabletOutput,
+) {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let generation = arcen_input::bridged_pen::fresh_generation(
+        since_epoch,
+        arcen_transport::quic::next_attachment_generation().get(),
+    );
+    if let Some(tablet) = tablet {
+        tracing::info!(
+            target: INPUT,
+            generation = generation.get(),
+            vendor_id = tablet.identity.vendor_id,
+            product_id = tablet.identity.product_id,
+            pen_reader = tablet.host_pen.kind(),
+            pen_interface = tablet.pen_interface,
+            interfaces = tablet.report_descriptors.len(),
+            "Native tablet: enumerating the bridged device; this Pier reads the pen and \
+             injects it as a Windows Ink pen"
+        );
+    }
+    arcen_input::bridged_pen::NativeTabletAttachment::start(
+        tablet,
+        result,
+        NATIVE_TABLET_POLICY,
+        generation,
+        std::time::Instant::now(),
+    )
+}
+
+/// Logs what a Native tablet step says about the pen and the attachment.
+fn log_native_tablet(
+    notes: &[arcen_usb_bridge::HostPenNote],
+    ended: Option<&(String, arcen_input::bridged_pen::NativeTabletCounts)>,
+) {
+    for note in notes {
+        match note {
+            arcen_usb_bridge::HostPenNote::ModeRead { original, failure } => tracing::info!(
+                target: INPUT,
+                original = ?original,
+                failure = ?failure,
+                "Native tablet: the pen's mode before this Pier switches it"
+            ),
+            arcen_usb_bridge::HostPenNote::ModeSwitched { accepted, failure } => tracing::info!(
+                target: INPUT,
+                accepted,
+                failure = ?failure,
+                "Native tablet: this Pier switched the pen to tablet mode"
+            ),
+        }
+    }
+    if let Some((reason, counts)) = ended {
+        tracing::warn!(
+            target: INPUT,
+            event = "usb_hard_device_refused",
+            %reason,
+            pen_packets = counts.pen_packets,
+            pen_ignored = counts.pen_ignored,
+            pen_dropped = counts.pen_dropped,
+            reports = counts.stats.reports,
+            interrupt_errors = counts.stats.interrupt_errors,
+            seconds = counts.elapsed.as_secs(),
+            "Native tablet ended for this attachment; the session goes on"
+        );
+    }
+}
+
 fn resolve_windows_tablet_mode_result(
     requested: TabletModeMsg,
     client_capabilities: TabletModeCapabilitiesMsg,
@@ -4432,11 +4721,17 @@ fn resolve_windows_tablet_mode_result(
             TabletModeMsg::LocalTermination => {
                 "local termination unavailable: Windows Ink synthetic pen backend did not initialize"
             }
+            // Reaches the operator verbatim: the Deck shows this reason
+            // rather than inventing its own, so it has to say what is
+            // missing and what to do instead. A host-side reason is
+            // replaced by the precise one (`bridged_tablet::negotiate`).
+            TabletModeMsg::UsbTabletBridge
+                if host_capabilities.usb_tablet_bridge != InputCapabilityAvailability::Available =>
+            {
+                "Native tablet (USB bridged) unavailable: this Windows desktop has no Windows Ink pen device. Use Tablet support instead."
+            }
             TabletModeMsg::UsbTabletBridge => {
-                // Reaches the operator verbatim: the Deck shows this reason
-                // rather than inventing its own, so it has to say what is
-                // missing and what to do instead.
-                "Native tablet (USB bridged) is not offered on Windows hosts: it needs a signed kernel USB driver that Arcen does not fund (ADR 0017). Use Tablet support instead: it needs no host driver and works over any network."
+                "Native tablet (USB bridged) unavailable: the Deck did not offer a captured USB tablet. Use Tablet support instead."
             }
             TabletModeMsg::DisabledMouseCompat => {
                 "mouse compatibility mode negotiation failed unexpectedly"
@@ -4547,7 +4842,7 @@ fn qp_map_policy_for_capenc(
     capenc: &CapencConfig,
 ) -> arcen_media::video::QpMapPolicy {
     let encoder = capenc.encoder.unwrap_or(cfg.encoder);
-    if encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+    if encoder == arcen_media::video::EncoderRequest::SoftwareH264 {
         return arcen_media::video::QpMapPolicy::Off;
     }
     let video = arcen_media::VideoConfiguration {
@@ -4687,7 +4982,11 @@ fn build_server_hello_with_aggregate(
         // Windows has no raw-HID backend; this is the unrelated, unimplemented
         // experimental raw-HID surface, not the typed pen backend below.
         experimental_raw_hid: false,
-        usb_hard_v1: false,
+        // Native tablet: the Pier reads a bridged pen itself and injects it
+        // through the Windows Ink pen device (`bridged_tablet`), so it is
+        // offered exactly when that device exists. A Deck captures its
+        // tablet only for a host that says so.
+        usb_hard_v1: pen_available,
         supports_display_update: windows_display_update_supported(display),
         requires_auth: true,
         encoder_backend: served_encoder_backend_label(media_plan, aggregate_backend),
@@ -4752,7 +5051,7 @@ fn build_server_hello_with_aggregate(
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: pen_capability,
-            usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
+            usb_tablet_bridge: pen_capability,
             disabled_mouse_compat: InputCapabilityAvailability::Available,
         },
         clipboard: Some(crate::clipboard::policy_message(cfg.clipboard_policy)),
@@ -4783,6 +5082,7 @@ fn build_server_hello_with_aggregate(
             ),
         ]),
         negotiated_transport: None, // set from the active socket before transmission
+        lossless_refine: None,
         // This host takes wheel notches only, and always serves a signed-in
         // desktop: never a login window that sign-in replaces.
         precise_scroll_v1: true,
@@ -5367,6 +5667,56 @@ impl PreparedVideo {
         }
     }
 
+    /// The exact-still-image plan of this attachment (ADR 0016): what the
+    /// capture was started with, checked against the stream it serves.
+    /// Several displays are never refined (first slice).
+    fn refine_plan(&self, cfg: &HostConfig) -> arcen_media::refine::RefinePlan {
+        let Self::Single(pipeline) = self else {
+            return arcen_media::refine::RefinePlan::Off(
+                arcen_media::refine::RefineOffReason::MultiMonitor,
+            );
+        };
+        let started = pipeline.capenc.refine_plan();
+        if !started.is_on() {
+            return started;
+        }
+        let video = pipeline.plan.video;
+        arcen_media::refine::plan_for_capture(
+            crate::capenc::REFINE_COMPILED,
+            cfg.lossless_refinement,
+            cfg.deck_refine.as_ref(),
+            arcen_media::refine::CaptureRefineFacts {
+                depth: video.bit_depth,
+                chroma: video.chroma,
+                transfer: video.transfer,
+                primaries: video.primaries,
+                source: match video.bit_depth {
+                    BitDepth::Eight => arcen_media::refine::RefineSourceKind::GpuOnly,
+                    BitDepth::Ten | BitDepth::Twelve => {
+                        arcen_media::refine::RefineSourceKind::CpuRgb
+                    }
+                },
+                single_monitor: true,
+            },
+        )
+    }
+
+    /// The refine-lane records of a refining single-display capture, for
+    /// the attachment's writer.
+    fn take_refine_lane(&mut self) -> Option<mpsc::Receiver<Vec<u8>>> {
+        match self {
+            Self::Single(pipeline) => pipeline.capenc.take_refine_lane(),
+            Self::Multi { .. } => None,
+        }
+    }
+
+    /// A Deck refinement control for the refining capture.
+    fn request_refine(&self, command: arcen_media::capenc_control::CapencControlCommand) {
+        for pipeline in self.pipelines() {
+            pipeline.capenc.request_refine(command);
+        }
+    }
+
     fn request_keyframe(&self, monitor_id: u16, reason: &'static str) -> bool {
         self.pipelines()
             .iter()
@@ -5551,13 +5901,13 @@ fn next_adaptive_nvenc_codec(config: &HostConfig) -> Option<VideoCodec> {
 
 async fn prepare_attachment_media(
     cfg: &HostConfig,
-    mut display_encoder: crate::capenc::EncoderSelection,
+    mut display_encoder: arcen_media::video::EncoderRequest,
     display: &mut DisplayLease,
     cursor_mode: CursorMode,
     session_log_id: &CorrelationId,
     deskside_capture_binding: Option<StateFingerprint>,
     allow_geometry_retarget: bool,
-) -> Result<(PreparedAttachmentMedia, crate::capenc::EncoderSelection), String> {
+) -> Result<(PreparedAttachmentMedia, arcen_media::video::EncoderRequest), String> {
     let mut attempt_cfg = cfg.clone();
     loop {
         let display_report = display.report();
@@ -5607,8 +5957,8 @@ async fn prepare_attachment_media(
                 ));
             }
             Err(CapencStartError::Unavailable(notice))
-                if cfg.encoder == crate::capenc::EncoderSelection::Auto
-                    && display_encoder == crate::capenc::EncoderSelection::Nvenc
+                if cfg.encoder == arcen_media::video::EncoderRequest::Auto
+                    && display_encoder == arcen_media::video::EncoderRequest::NativeNvenc
                     && notice.backend == EncoderBackend::NativeNvenc =>
             {
                 drop(injector);
@@ -5655,7 +6005,7 @@ async fn prepare_attachment_media(
                 }
                 attempt_cfg
                     .apply_software_h264_backend_after(
-                        crate::capenc::EncoderSelection::SoftwareH264,
+                        arcen_media::video::EncoderRequest::SoftwareH264,
                         Some(notice.reason),
                     )
                     .map_err(|error| {
@@ -5675,7 +6025,7 @@ async fn prepare_attachment_media(
                     display.retarget_exact(fitted)?;
                     ensure_openh264_applied_size(display.report().applied)?;
                 }
-                display_encoder = crate::capenc::EncoderSelection::SoftwareH264;
+                display_encoder = arcen_media::video::EncoderRequest::SoftwareH264;
             }
             Err(CapencStartError::Unavailable(notice)) => {
                 // A pinned NVENC (or a codec ladder that ran out) reported a
@@ -5706,8 +6056,8 @@ async fn prepare_attachment_media(
 
 async fn prepare_multi_monitor_media(
     cfg: &HostConfig,
-    display_encoder: crate::capenc::EncoderSelection,
-    plan: &crate::multi_monitor_topology::WindowsTopologyPlan,
+    display_encoder: arcen_media::video::EncoderRequest,
+    plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
     carrier: MultiMonitorCarrierMsg,
     cursor_mode: CursorMode,
     session_log_id: &CorrelationId,
@@ -5724,23 +6074,30 @@ async fn prepare_multi_monitor_media(
     // configured codec/chroma that a late NVENC fallback may have outlived.
     // Any 4:4:4 client intent is still refused by `plan_encoder_sets`.
     let (codec, chroma) = match display_encoder {
-        crate::capenc::EncoderSelection::Nvenc => (cfg.codec, cfg.chroma),
-        crate::capenc::EncoderSelection::SoftwareH264 => {
+        arcen_media::video::EncoderRequest::NativeNvenc => (cfg.codec, cfg.chroma),
+        arcen_media::video::EncoderRequest::SoftwareH264 => {
             (VideoCodec::H264, ChromaSubsampling::Yuv420)
         }
-        crate::capenc::EncoderSelection::Auto => {
+        arcen_media::video::EncoderRequest::Auto => {
             return Err(
                 "multi-monitor requires a resolved encoder backend before media preparation"
                     .to_string(),
             );
         }
+        unsupported @ (arcen_media::video::EncoderRequest::WindowsMediaFoundation
+        | arcen_media::video::EncoderRequest::SoftwareAv1) => {
+            return Err(format!(
+                "multi-monitor cannot use the {} encoder on this Pier",
+                unsupported.as_arg()
+            ));
+        }
     };
-    let template_fps = if display_encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+    let template_fps = if display_encoder == arcen_media::video::EncoderRequest::SoftwareH264 {
         cfg.fps.min(EncoderBackend::OpenH264.contract().max_fps)
     } else {
         cfg.fps
     };
-    let template_qp_map = if display_encoder == crate::capenc::EncoderSelection::SoftwareH264 {
+    let template_qp_map = if display_encoder == arcen_media::video::EncoderRequest::SoftwareH264 {
         arcen_media::video::QpMapPolicy::Off
     } else {
         let video = arcen_media::VideoConfiguration {
@@ -6052,7 +6409,7 @@ async fn recover_previous_attachment_media(
 
 fn validate_held_output(
     cfg: &HostConfig,
-    display_encoder: crate::capenc::EncoderSelection,
+    display_encoder: arcen_media::video::EncoderRequest,
     display_report: &DisplayReport,
 ) -> Result<crate::display::ResolvedOutput, String> {
     let resolved_output = crate::display::resolve_output_selector(&cfg.output_selector)?;
@@ -6074,7 +6431,7 @@ fn validate_held_output(
         );
         return Err("held display output identity changed".to_string());
     }
-    if display_encoder == crate::capenc::EncoderSelection::Nvenc
+    if display_encoder == arcen_media::video::EncoderRequest::NativeNvenc
         && (resolved_output.vendor_id == 0x1414
             || resolved_output.adapter_name.contains("Microsoft Basic"))
     {
@@ -6182,6 +6539,80 @@ impl Drop for RateTask {
     }
 }
 
+/// Native tablet as the handshake settled it, for one attachment.
+struct NativeTabletPlan {
+    /// The bridged tablet to read, when Native tablet is active.
+    tablet: Option<arcen_input::bridged_pen::AuthorizedTablet>,
+    /// The tablet-mode result the Deck was sent.
+    result: TabletModeResultMsg,
+    /// The Deck draws its cursor at host positions (`cursor_position_v1`).
+    deck_cursor_positions: bool,
+}
+
+/// The host pointer a bridged pen moves on a single captured display, for a
+/// Deck that draws its cursor there.
+fn host_pen_pointer_for(
+    display: &DisplayReport,
+) -> Option<arcen_input::bridged_pen::HostPenPointer> {
+    arcen_input::bridged_pen::HostPenPointer::new(
+        usize::try_from(display.desktop_rect.width).ok()?,
+        usize::try_from(display.desktop_rect.height).ok()?,
+    )
+}
+
+/// Injects what a Native tablet step read through the session's Windows Ink
+/// pen, reports the pointer it moved, and sends the USB frames and any
+/// ending notice to the Deck, in order.
+async fn send_native_tablet_output(
+    control: &mpsc::Sender<WriterControl>,
+    output: arcen_input::bridged_pen::NativeTabletOutput,
+    pen: &mut Option<PenInjector>,
+    pointer: Option<&mut arcen_input::bridged_pen::HostPenPointer>,
+    pending_pointer: &mut Option<Message>,
+) -> Result<(), String> {
+    log_native_tablet(&output.notes, output.ended.as_ref());
+    match pen.as_mut() {
+        Some(pen) => {
+            for event in &output.pens {
+                pen.dispatch(event);
+            }
+        }
+        None if !output.pens.is_empty() => tracing::debug!(
+            target: INPUT,
+            "Native tablet pen events dropped: no synthetic pen device is active"
+        ),
+        None => {}
+    }
+    if let Some(pointer) = pointer {
+        pointer.observe(&output.positions);
+        if let Some(record) = pointer.take_record(std::time::Instant::now()) {
+            *pending_pointer = Some(Message::Binary(record.to_vec()));
+            flush_cursor_message(control, pending_pointer);
+        }
+    }
+    for frame in output.frames {
+        control
+            .send(WriterControl::Message(Message::Binary(frame)))
+            .await
+            .map_err(|_| "outbound writer closed".to_string())?;
+    }
+    if let Some(notice) = output.notice {
+        control
+            .send(WriterControl::Message(Message::Text(notice)))
+            .await
+            .map_err(|_| "outbound writer closed".to_string())?;
+    }
+    Ok(())
+}
+
+/// Resolves at `due` (never when `None`; the arm is disabled then).
+async fn sleep_until_due(due: Option<std::time::Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn stream_session<S>(
     ws: WebSocketStream<S>,
     path_signal_connection: Option<quinn::Connection>,
@@ -6194,7 +6625,9 @@ async fn stream_session<S>(
     >,
     cursor_mode: CursorMode,
     deck_cursor_images: bool,
+    deck_text_commit: bool,
     clipboard_negotiation: Option<ClipboardNegotiation>,
+    native_tablet_plan: NativeTabletPlan,
     display: &mut ActiveDisplayLease,
     prepared_media: PreparedAttachmentMedia,
     session_log_id: &CorrelationId,
@@ -6257,6 +6690,9 @@ where
             )));
         }
     };
+    // Exact still image: the refining capture's tiles go out through the
+    // writer, after everything else.
+    video.set_refine_lane(video_pipelines.take_refine_lane());
     let mut frame_ingress = RoutedFrameIngress::start(&video_pipelines, &video);
     let audio = Arc::new(LatestQueue::new(crate::audio::QUEUE_CAPACITY));
     let clipboard = ClipboardWriterQueue::new();
@@ -6333,6 +6769,22 @@ where
             .map(|pipeline| pipeline.capenc.bitrate())
             .collect::<Vec<_>>();
         let latest_path_signal = Arc::clone(&latest_path_signal);
+        // The refinement budget from the link (ADR 0016 R6), only for a
+        // capture that refines.
+        let refine_meter = video.refine_meter();
+        let mut refine_budget = video_pipelines.pipelines().iter().find_map(|pipeline| {
+            match pipeline.capenc.refine_plan() {
+                arcen_media::refine::RefinePlan::On { max_mbps, .. } => {
+                    pipeline.capenc.refine_requester().map(|capenc| {
+                        (
+                            arcen_media::refine::budget::RefineBudgetSampler::new(max_mbps),
+                            capenc,
+                        )
+                    })
+                }
+                arcen_media::refine::RefinePlan::Off(_) => None,
+            }
+        });
         RateTask(Some(tokio::spawn(async move {
             let policy = arcen_media::video::operational_rate_control_policy(
                 Some(&served_pipeline),
@@ -6410,8 +6862,33 @@ where
                 last_frames = frames;
                 last_bytes = bytes;
                 last_monitor_stats = monitor_stats;
+                let refine_tick = refine_budget.as_mut().map(|(sampler, capenc)| {
+                    let tick = sampler.window(arcen_media::refine::budget::RefineBudgetInputs {
+                        elapsed: Duration::from_secs(1),
+                        path: sample.path,
+                        interactive_bytes: sample.delivered_bytes,
+                        refine_bytes_total: refine_meter.written_bytes(),
+                        video_backlog: false,
+                        video_frame_wait: sample.mean_frame_wait,
+                        video_target_bps: controller.target_bps(),
+                    });
+                    refine_meter.set_held(tick.decision.hold.is_some());
+                    if let Some(command) = tick.decision.capenc_command() {
+                        let _ = capenc.send(command);
+                    }
+                    tick
+                });
                 if rate_control_enabled {
-                    let change = controller.observe(sample);
+                    let hints = arcen_media::rate_control::RateHints {
+                        refine_active: refine_tick.is_some_and(|tick| tick.decision.refine_active),
+                        ..arcen_media::rate_control::RateHints::default()
+                    };
+                    let change = controller.observe_with(sample, hints);
+                    if controller.last_refine_deferral().is_some() {
+                        if let Some((sampler, _)) = refine_budget.as_mut() {
+                            sampler.note_video_deferral();
+                        }
+                    }
                     let want_bps = controller.target_bps();
                     let detail = (motion_priority == arcen_media::video::MotionPriority::Detail)
                         .then(|| controller.detail_framerate(plan.fps));
@@ -6442,6 +6919,8 @@ where
                                 .map(|loss| (loss.rate * 1000.0).round() as u64),
                             loss_sample_packets =
                                 controller.last_loss_evidence().map(|loss| loss.sent_packets),
+                            refine_deferred =
+                                controller.last_refine_deferral().map(|reason| reason.token()),
                             "encoder bitrate follows QUIC path"
                         );
                     }
@@ -6464,6 +6943,14 @@ where
                         last_detail_framerate = detail;
                     }
                 }
+                if let (Some(tick), Some((sampler, _))) = (refine_tick, refine_budget.as_ref()) {
+                    let summary = sampler.summary(&tick);
+                    if tick.changed {
+                        tracing::info!(target: CAPENC, "{} {summary}", arcen_telemetry::names::refine::BUDGET);
+                    } else {
+                        tracing::debug!(target: CAPENC, "{} {summary}", arcen_telemetry::names::refine::BUDGET);
+                    }
+                }
             }
         })))
     };
@@ -6474,7 +6961,10 @@ where
     let mut last_input_type = "";
     let mut input_sequence = InputSequenceTracker::default();
     let mut session_health =
-        crate::observability::SessionHealth::new_with_fps_warmup(initial_qos_targets);
+        arcen_observability::SessionHealth::new_with_fps_warmup(initial_qos_targets);
+    // The health tracker needs a monotonic clock: a wall-clock step (NTP,
+    // leap second) would move a window backwards and reject the tick.
+    let health_started_at = std::time::Instant::now();
     // Cursor streaming: poll GetCursorInfo at ~40 Hz in a dedicated OS
     // thread; only active when cursor mode is Local. A Deck that draws
     // host cursor images gets them (through the broker's lane relay), any
@@ -6486,6 +6976,15 @@ where
     };
     let cursor_images_active = cursor_messages.is_some() && deck_cursor_images;
     let mut pending_cursor_message: Option<Message> = None;
+    // The session's keyboard layout, for a Deck that types committed text:
+    // at attach and on every change (shared `host_layout` contract). Only
+    // the newest notice waits for room.
+    let mut keymap_notices = if deck_text_commit {
+        crate::keymap_watcher::spawn()
+    } else {
+        None
+    };
+    let mut pending_keymap_message: Option<Message> = None;
     let mut health_sequence = 0u64;
     let mut path_quality = arcen_transport::PathQualityTracker::default();
     let path_quality_started = std::time::Instant::now();
@@ -6577,8 +7076,37 @@ where
         );
     }
 
+    // Native tablet (ADR 0023 amendment): inactive unless the handshake
+    // accepted it. The pen is read here and injected through `pen`.
+    let (mut native_tablet, native_tablet_first) = start_native_tablet(
+        native_tablet_plan.tablet.as_ref(),
+        &native_tablet_plan.result,
+    );
+    let mut native_tablet_tick = tokio::time::interval(arcen_input::bridged_pen::BRIDGED_PEN_POLL);
+    native_tablet_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Where the bridged pen puts the pointer, for a Deck that draws its
+    // cursor at host positions; one captured display only.
+    let mut host_pen_pointer = if native_tablet.is_active()
+        && native_tablet_plan.deck_cursor_positions
+        && cursor_mode == CursorMode::Local
+        && region_input.is_none()
+    {
+        host_pen_pointer_for(&display_report)
+    } else {
+        None
+    };
+    let cursor_positions_active = host_pen_pointer.is_some();
+    let mut pending_pointer_message: Option<Message> = None;
     let mut fatal_cleanup = None;
     let stream_result: Result<(), String> = async {
+        send_native_tablet_output(
+            &control_tx,
+            native_tablet_first,
+            &mut pen,
+            host_pen_pointer.as_mut(),
+            &mut pending_pointer_message,
+        )
+        .await?;
         if audio_capture.audio.resolve().is_enabled() && !audio_capture.send_state.is_enabled() {
             writer_audio_result_barrier(
                 &control_tx,
@@ -6589,7 +7117,30 @@ where
             .await?;
         }
         loop {
+        let host_pen_pointer_due = host_pen_pointer
+            .as_ref()
+            .and_then(arcen_input::bridged_pen::HostPenPointer::due_at);
         tokio::select! {
+            _ = native_tablet_tick.tick(), if native_tablet.is_active() => {
+                let output = native_tablet.poll(std::time::Instant::now());
+                send_native_tablet_output(
+                    &control_tx,
+                    output,
+                    &mut pen,
+                    host_pen_pointer.as_mut(),
+                    &mut pending_pointer_message,
+                )
+                .await?;
+            }
+            () = sleep_until_due(host_pen_pointer_due), if host_pen_pointer_due.is_some() => {
+                if let Some(record) = host_pen_pointer
+                    .as_mut()
+                    .and_then(|pointer| pointer.take_record(std::time::Instant::now()))
+                {
+                    pending_pointer_message = Some(Message::Binary(record.to_vec()));
+                    flush_cursor_message(&control_tx, &mut pending_pointer_message);
+                }
+            }
             changed = async { cursor_messages.as_mut()?.changed().await.ok() },
                 if cursor_messages.is_some() =>
             {
@@ -6611,6 +7162,22 @@ where
                         }
                     }
                     None => cursor_messages = None,
+                }
+            }
+            changed = async { keymap_notices.as_mut()?.changed().await.ok() },
+                if keymap_notices.is_some() =>
+            {
+                match changed {
+                    Some(()) => {
+                        let notice = keymap_notices
+                            .as_mut()
+                            .and_then(|notices| notices.borrow_and_update().clone());
+                        if let Some(json) = notice {
+                            pending_keymap_message = Some(Message::Text(json));
+                            flush_cursor_message(&control_tx, &mut pending_keymap_message);
+                        }
+                    }
+                    None => keymap_notices = None,
                 }
             }
             _ = microphone_tick.tick(), if microphone.is_some() => {
@@ -6647,6 +7214,8 @@ where
             }
             _ = idr_retry_tick.tick() => {
                 flush_cursor_message(&control_tx, &mut pending_cursor_message);
+                flush_cursor_message(&control_tx, &mut pending_keymap_message);
+                flush_cursor_message(&control_tx, &mut pending_pointer_message);
                 video.retry_pending_keyframes(|monitor_id| {
                     video_pipelines.request_keyframe(
                         monitor_id,
@@ -6682,6 +7251,7 @@ where
                         accepted: true,
                         reason: CursorModeReason::default(),
                         cursor_images: cursor_images_active,
+                        cursor_positions: cursor_positions_active,
                         ..CursorModeResultMsg::default()
                     };
                     let text = serde_json::to_string(&result)
@@ -6712,6 +7282,7 @@ where
                     OutboundVideo {
                         monitor_id,
                         message: Message::Binary(message.into()),
+                        refine: frame.refine.clone(),
                     },
                     frame.keyframe,
                 ) {
@@ -6997,6 +7568,7 @@ where
                                         pen = new_pen;
                                         media_plan = pipeline.plan;
                                         video_pipelines = PreparedVideo::Single(pipeline);
+                                        video.set_refine_lane(video_pipelines.take_refine_lane());
                                         let next_backend =
                                             video_pipelines.aggregate_accelerator_class();
                                         if next_backend != aggregate_backend {
@@ -7096,6 +7668,7 @@ where
                                             pen = new_pen;
                                             media_plan = pipeline.plan;
                                             video_pipelines = PreparedVideo::Single(pipeline);
+                                            video.set_refine_lane(video_pipelines.take_refine_lane());
                                             let next_backend =
                                                 video_pipelines.aggregate_accelerator_class();
                                             if next_backend != aggregate_backend {
@@ -7159,8 +7732,12 @@ where
                                 .expect("display_update replacement is single-monitor");
                             injector = new_injector;
                             pen = new_pen;
+                            if host_pen_pointer.is_some() {
+                                host_pen_pointer = host_pen_pointer_for(display.report());
+                            }
                             media_plan = pipeline.plan;
                             video_pipelines = PreparedVideo::Single(pipeline);
+                            video.set_refine_lane(video_pipelines.take_refine_lane());
                             let next_backend = video_pipelines.aggregate_accelerator_class();
                             if next_backend != aggregate_backend {
                                 aggregate_backend = next_backend;
@@ -7201,7 +7778,10 @@ where
                             &mut input_sequence,
                         ).await;
                         if let Some(telemetry) = inbound.client_telemetry {
-                            session_health.record_client_at(now_ms_u64(), Some(telemetry));
+                            session_health.record_client_at(
+                                monotonic_ms_since(health_started_at),
+                                Some(telemetry),
+                            );
                         }
                         if let Some(input_type) = inbound.input_type {
                             input_events = input_events.saturating_add(1);
@@ -7256,7 +7836,17 @@ where
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
-                        if bytes.first().copied() == Some(FrameType::AudioUpstream as u8) {
+                        if native_tablet.takes(&bytes) {
+                            let output = native_tablet.on_deck_frame(&bytes, std::time::Instant::now());
+                            send_native_tablet_output(
+                                &control_tx,
+                                output,
+                                &mut pen,
+                                host_pen_pointer.as_mut(),
+                                &mut pending_pointer_message,
+                            )
+                            .await?;
+                        } else if bytes.first().copied() == Some(FrameType::AudioUpstream as u8) {
                             if let Some(ingress) = microphone.as_mut() {
                                 match ingress.ingest(&bytes) {
                                     Ok(arcen_media::audio::MicrophoneIngestOutcome::DroppedWrongGeneration) => {
@@ -7418,20 +8008,30 @@ where
                     server_timestamp_ms: now_ms_u64(),
                     server_state: ServerState::Streaming.as_str().to_string(),
                 };
-                let timestamp_ms = now_ms_u64();
+                let timestamp_ms = monotonic_ms_since(health_started_at);
                 let (sent_frames, bytes_sent) = video_stats.snapshot();
                 let pipeline = video_pipelines.primary_pipeline_telemetry();
-                let counters = crate::observability::HostCounters {
+                let counters = arcen_observability::HostCounters {
                     frames_sent: sent_frames,
                     frames_dropped: dropped_frames,
                     bytes_sent,
                     input_events,
                     last_input_sequence: input_sequence.last_nonzero(),
                     last_input_type,
-                    content_fps: video_pipelines.take_content_fps(),
+                    content: arcen_observability::ContentEvidence::Rate(
+                        video_pipelines.take_content_fps(),
+                    ),
                 };
                 let observation = session_health.observe(timestamp_ms, cfg.fps, counters);
-                let mut stats = crate::observability::SessionHealth::health_stats(
+                if let Some(error) = &observation.clock_error {
+                    tracing::warn!(
+                        target: crate::logging::HEALTH,
+                        sid = %session_log_id,
+                        %error,
+                        "health tracker rejected a non-monotonic tick; assessment skipped"
+                    );
+                }
+                let mut stats = arcen_observability::SessionHealth::health_stats(
                     &observation,
                     counters,
                     cfg.fps,
@@ -7457,9 +8057,12 @@ where
                     );
                 }
                 if observation.snapshot_due {
-                    let snapshot_fields = crate::observability::snapshot_fields(
+                    let snapshot_fields = arcen_observability::session_health::snapshot_fields(
                         &observation.sample,
                         &observation.assessment,
+                        session_health
+                            .client()
+                            .and_then(|telemetry| telemetry.network.as_ref()),
                     );
                     crate::emit_lifecycle_event_with_context(
                         emitter,
@@ -7651,6 +8254,18 @@ where
         result = Err(AttachmentError::FatalCleanup(error));
     }
     log_state(peer, ServerState::Draining);
+    if let Some(counts) = native_tablet.shutdown() {
+        tracing::info!(
+            target: INPUT,
+            pen_packets = counts.pen_packets,
+            pen_ignored = counts.pen_ignored,
+            pen_dropped = counts.pen_dropped,
+            reports = counts.stats.reports,
+            interrupt_errors = counts.stats.interrupt_errors,
+            seconds = counts.elapsed.as_secs(),
+            "Native tablet: attachment ended with the session"
+        );
+    }
     release_all_held_input(&mut injector, &mut pen, &mut region_input);
     video_pipelines.close_frames();
     // A detached attachment must stop its writer immediately so the broker
@@ -8214,6 +8829,12 @@ fn start_capture_after_display<I, C, F>(
         encoder: Some(cfg.encoder),
         cursor_mode,
         session_log_id: session_log_id.clone(),
+        // Exact still image is decided per capture by the shared plan; the
+        // single-display path is the only one that may refine.
+        refine: Some(crate::capenc::RefineForward {
+            operator_enabled: cfg.lossless_refinement,
+            deck: cfg.deck_refine.clone(),
+        }),
     };
     capenc_config.qp_map = qp_map_policy_for_capenc(cfg, &capenc_config);
     let (capture, frames) = spawn_capture(capenc_config)
@@ -8225,6 +8846,9 @@ fn start_capture_after_display<I, C, F>(
 struct OutboundVideo {
     monitor_id: u16,
     message: Message,
+    /// Exact still image: where the refinement records that precede this
+    /// frame wait (ADR 0016 R2); `None` unless the capture refines.
+    refine: Option<crate::capenc::RefineTag>,
 }
 
 /// Typed rejection constructing an [`OutboundVideoMux`] — the exact same
@@ -8247,6 +8871,13 @@ struct OutboundVideoMux {
     /// `RELAYED_VIDEO_FRAMES_IN_FLIGHT`, [`Self::pop`] leaves frames in the
     /// per-monitor queues, where the shared backlog budget sees them age.
     relayed: std::sync::Mutex<arcen_media::video::RelayedVideoWindow>,
+    /// Exact still image: the refining capture's tiles and digests, written
+    /// after everything else (ADR 0016). Replaced when a resize replaces the
+    /// capture.
+    refine_lane: std::sync::Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// The refine records' budget (ADR 0016 R6): bytes handed to the
+    /// broker, and the link budget's hold.
+    refine_meter: Arc<arcen_transport::RefineLaneMeter>,
 }
 
 impl std::fmt::Debug for OutboundVideoMux {
@@ -8274,7 +8905,45 @@ impl OutboundVideoMux {
             roster,
             notify: Notify::new(),
             relayed: std::sync::Mutex::new(arcen_media::video::RelayedVideoWindow::default()),
+            refine_lane: std::sync::Mutex::new(None),
+            refine_meter: Arc::default(),
         })
+    }
+
+    /// The refine records' budget meter (ADR 0016 R6).
+    fn refine_meter(&self) -> Arc<arcen_transport::RefineLaneMeter> {
+        Arc::clone(&self.refine_meter)
+    }
+
+    /// The refining capture's refine-lane records (`None`: none refines).
+    fn set_refine_lane(&self, lane: Option<mpsc::Receiver<Vec<u8>>>) {
+        *self
+            .refine_lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = lane;
+    }
+
+    /// The next refine-lane record; pending while no capture refines. A
+    /// lane set later is seen at the writer's next pass.
+    async fn next_refine_record(&self) -> Vec<u8> {
+        std::future::poll_fn(|cx| {
+            let mut lane = self
+                .refine_lane
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(receiver) = lane.as_mut() else {
+                return std::task::Poll::Pending;
+            };
+            match receiver.poll_recv(cx) {
+                std::task::Poll::Ready(Some(record)) => std::task::Poll::Ready(record),
+                std::task::Poll::Ready(None) => {
+                    *lane = None;
+                    std::task::Poll::Pending
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        })
+        .await
     }
 
     /// Applies the shared backlog budget of `contract_fps` to one monitor's
@@ -8592,9 +9261,17 @@ where
                 Some(frame) => WriterItem::Video {
                     monitor_id: frame.monitor_id,
                     message: frame.message,
+                    refine: frame.refine,
                 },
                 None => WriterItem::Closed(WriterStream::Video),
             },
+            // Exact still image: tiles and digests only when nothing else
+            // is waiting and the link budget does not hold them; the broker
+            // puts them on the refine lane.
+            record = async {
+                arcen_transport::quic::wait_for_refine_turn(&video.refine_meter, || false).await;
+                video.next_refine_record().await
+            }, if video_open => WriterItem::Refine(record),
             () = clipboard_cooldown(), if clipboard_open && !clipboard_allowed => {
                 WriterItem::ClipboardCooldown
             },
@@ -8604,11 +9281,30 @@ where
                 clipboard_allowed = true;
                 (message, None, None)
             }
+            WriterItem::Refine(record) => {
+                video
+                    .refine_meter
+                    .note_written(u64::try_from(record.len()).unwrap_or(u64::MAX));
+                (Message::Binary(record.into()), None, None)
+            }
             WriterItem::Video {
                 monitor_id,
                 message,
+                refine,
             } => {
                 clipboard_allowed = true;
+                // Fences and barriers immediately precede their frame
+                // (ADR 0016 R2); a dropped frame's records go with this one.
+                if let Some(tag) = refine {
+                    for record in tag.take() {
+                        send_ws_with_timeout(
+                            sink,
+                            Message::Binary(record.into()),
+                            WS_WRITE_TIMEOUT,
+                        )
+                        .await?;
+                    }
+                }
                 let bytes = match &message {
                     Message::Binary(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                     _ => 0,
@@ -8686,7 +9382,12 @@ where
 
 enum WriterItem {
     Message(Message),
-    Video { monitor_id: u16, message: Message },
+    Video {
+        monitor_id: u16,
+        message: Message,
+        refine: Option<crate::capenc::RefineTag>,
+    },
+    Refine(Vec<u8>),
     Clipboard(Message),
     ClipboardCooldown,
     AudioBarrier(oneshot::Sender<()>),
@@ -9122,6 +9823,31 @@ async fn handle_inbound(
                 video.request_keyframe_all("client_request_full_frame");
             }
         }
+        // Exact still image (ADR 0016): the Deck asks to start a new
+        // generation, or turns refinement off/on for its (only) monitor.
+        // The broker's lane relay sends the same messages when the refine
+        // lane overflows or ends.
+        "refine_reset" | "refine_control" => {
+            use arcen_media::capenc_control::CapencControlCommand;
+            use arcen_protocol::refine::RefineControlMsg;
+            match serde_json::from_str::<RefineControlMsg>(text) {
+                Ok(RefineControlMsg::RefineReset { reason, .. }) => {
+                    tracing::debug!(target: CAPENC, reason = %reason, "exact still image starts over");
+                    video.request_refine(CapencControlCommand::RefineReset);
+                }
+                Ok(RefineControlMsg::RefineControl { enabled, .. }) => {
+                    tracing::debug!(target: CAPENC, enabled, "exact still image switched by the Deck");
+                    video.request_refine(if enabled {
+                        CapencControlCommand::RefineResume
+                    } else {
+                        CapencControlCommand::RefinePause
+                    });
+                }
+                Err(error) => {
+                    tracing::debug!(target: CAPENC, %error, "invalid refine control message");
+                }
+            }
+        }
         KEY_RESET_MODIFIERS => {
             if let Ok(message) = serde_json::from_str::<KeyResetModifiersMsg>(text) {
                 if releases_all_held_input(&message) {
@@ -9205,6 +9931,10 @@ fn health_ping_action(text: &str) -> InboundAction {
 #[cfg(test)]
 fn health_pong_reply(text: &str) -> Option<String> {
     health_ping_action(text).reply
+}
+
+fn monotonic_ms_since(anchor: std::time::Instant) -> u64 {
+    u64::try_from(anchor.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn now_ms_u64() -> u64 {
@@ -9604,6 +10334,7 @@ async fn relay_client_and_agent<C, CE, A>(
     session_shutdown: &mut watch::Receiver<bool>,
     lanes: Option<arcen_transport::quic::LaneConnection>,
     path_signal_connection: Option<quinn::Connection>,
+    refine_grant: bool,
 ) -> Result<(), String>
 where
     C: Sink<Message> + Stream<Item = Result<Message, CE>> + Unpin,
@@ -9621,6 +10352,7 @@ where
         session_shutdown,
         lanes,
         path_signal_connection,
+        refine_grant,
     )
     .await
     {
@@ -9632,6 +10364,18 @@ where
         }
     }
 }
+/// Whether an attachment's lanes include the refine role (ADR 0016 R7): a
+/// Deck that asked for exact still image, an operator switch that is on, a
+/// build that refines, and a ten-bit session (the only contracts the shared
+/// plan may refine). The agent's hello states the plan for the capture it
+/// actually started; a granted lane the plan leaves unused is never opened.
+fn refine_lane_grant(cfg: &HostConfig, response: &AuthResponse) -> bool {
+    crate::capenc::REFINE_COMPILED
+        && cfg.lossless_refinement
+        && response.lossless_refine_v1.is_some()
+        && cfg.bit_depth != BitDepth::Eight
+}
+
 /// Authorizes the attachment's lanes and sends `lane_attachment` on the
 /// control lane, before anything the agent sends for this attachment
 /// (ADR 0014). Each attachment, including a resumed one, is a new connection
@@ -9640,6 +10384,7 @@ async fn grant_lanes<C>(
     client: &mut C,
     lanes: &arcen_transport::quic::LaneConnection,
     write_timeout: Duration,
+    refine: bool,
 ) -> Result<(), String>
 where
     C: Sink<Message> + Unpin,
@@ -9648,7 +10393,7 @@ where
     let grant = arcen_transport::quic::grant_attachment(
         lanes,
         arcen_transport::quic::next_attachment_generation(),
-        arcen_protocol::lanes::LaneRoleSet::BASE,
+        arcen_protocol::lanes::LaneRoleSet::for_grant(refine),
     )
     .map_err(|error| format!("lane attachment: {error}"))?;
     let text =
@@ -9702,6 +10447,7 @@ async fn relay_resumable_client_and_agent<A>(
     reconnect_window_secs: u32,
     session_shutdown: &mut watch::Receiver<bool>,
     incumbent: Option<&arcen_transport::quic::IncumbentRegistration>,
+    refine_grant: bool,
 ) -> Result<(), String>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -9731,6 +10477,7 @@ where
             session_shutdown,
             lanes,
             path_signal_connection,
+            refine_grant,
         )
         .await
         {
@@ -10093,6 +10840,9 @@ async fn relay_one_attachment<C, CE, A>(
     // lanes.
     lanes: Option<arcen_transport::quic::LaneConnection>,
     path_signal_connection: Option<quinn::Connection>,
+    // Exact still image (ADR 0016 R7): the refine role is granted, and the
+    // relay carries refinement, only for `refine_lane_grant`.
+    refine_grant: bool,
 ) -> RelayOutcome
 where
     C: Sink<Message> + Stream<Item = Result<Message, CE>> + Unpin,
@@ -10114,9 +10864,9 @@ where
         .map(|resumable| resumable_write_timeout(resumable.refresh.window_secs))
         .unwrap_or(WS_WRITE_TIMEOUT);
     let mut lane_relay = match lanes.as_ref() {
-        Some(lanes) => match grant_lanes(client, lanes, write_timeout).await {
+        Some(lanes) => match grant_lanes(client, lanes, write_timeout, refine_grant).await {
             Ok(()) => Some(LoggedLaneRelay(
-                arcen_transport::quic::PierLaneRelay::start(lanes),
+                arcen_transport::quic::PierLaneRelay::start_with(lanes, refine_grant),
             )),
             Err(error) => {
                 tracing::warn!(target: SESSION, %error, "lane attachment not granted");
@@ -10422,6 +11172,8 @@ impl Drop for LoggedLaneRelay {
             clipboard_failed = stats.clipboard_failed,
             input_records = stats.input_records,
             microphone_dropped = stats.microphone_dropped,
+            refine_records = stats.refine_records,
+            refine_dropped = stats.refine_dropped,
             "lane relay ended"
         );
     }
@@ -10625,10 +11377,10 @@ mod tests {
             SingleDisplayReconciliation::Reconciled(7)
         ));
     }
-    use crate::multi_monitor_topology::{
+    use crate::ColorPolicy;
+    use arcen_outputs::windows_topology::{
         AvailableOutput, OutputMode, OutputModeCapability, PhysicalOutputInventory,
     };
-    use crate::ColorPolicy;
     use arcen_protocol::messages::ClientMonitor;
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
@@ -10688,6 +11440,7 @@ mod tests {
         OutboundVideo {
             monitor_id: 0,
             message: Message::Binary(vec![tag].into()),
+            refine: None,
         }
     }
 
@@ -10933,6 +11686,121 @@ mod tests {
         );
     }
 
+    fn native_hello(device: Option<arcen_protocol::messages::UsbHardDeviceMsg>) -> ClientHelloMsg {
+        ClientHelloMsg {
+            usb_hard_v1: device.is_some(),
+            usb_hard_device: device,
+            ..ClientHelloMsg::default()
+        }
+    }
+
+    fn native_intuos5() -> arcen_protocol::messages::UsbHardDeviceMsg {
+        arcen_protocol::messages::UsbHardDeviceMsg {
+            vendor_id: 0x056a,
+            product_id: 0x0317,
+            bcd_device: 0x0100,
+            device_class: 0,
+            speed: arcen_usb_bridge::UsbSpeed::Full,
+            hid_report_descriptors: (0..3)
+                .map(|interface| {
+                    arcen_protocol::messages::UsbHidReportDescriptorMsg::new(
+                        interface,
+                        arcen_usb_bridge::WacomIntuos5::report_descriptor(interface).unwrap(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn native_requested() -> TabletModeResultMsg {
+        TabletModeResultMsg {
+            requested: TabletModeMsg::UsbTabletBridge,
+            active: TabletModeMsg::UsbTabletBridge,
+            accepted: true,
+            ..TabletModeResultMsg::default()
+        }
+    }
+
+    #[test]
+    fn native_tablet_needs_only_the_sessions_windows_ink_pen() {
+        assert_eq!(native_tablet_availability(true), Ok(()));
+        assert_eq!(
+            native_tablet_availability(false),
+            Err(NATIVE_TABLET_NO_PEN_DEVICE.to_owned())
+        );
+        for notice in [
+            NATIVE_TABLET_NOTICES.dedicated,
+            NATIVE_TABLET_NOTICES.generic,
+        ] {
+            assert!(
+                notice.len() <= arcen_protocol::messages::MAX_TABLET_MODE_REASON_BYTES,
+                "{notice}"
+            );
+        }
+        assert!(
+            NATIVE_TABLET_NO_PEN_DEVICE.len() + "Native tablet (USB bridged) unavailable: ".len()
+                <= arcen_protocol::messages::MAX_TABLET_MODE_REASON_BYTES
+        );
+    }
+
+    #[test]
+    fn native_tablet_accepts_an_intuos_or_any_standard_pen_and_publishes_nothing() {
+        let mut result = native_requested();
+        let tablet =
+            negotiate_native_tablet(&native_hello(Some(native_intuos5())), &Ok(()), &mut result)
+                .unwrap();
+        assert!(result.accepted);
+        assert_eq!(result.reason.as_str(), NATIVE_TABLET_NOTICES.dedicated);
+        assert!(tablet.published.is_empty(), "this Pier publishes no device");
+        assert_eq!(tablet.pen_interface, 0);
+        let (mut attachment, first) = start_native_tablet(Some(&tablet), &result);
+        assert!(attachment.is_active());
+        assert_eq!(first.frames.len(), 1, "GET_DESCRIPTOR(Device)");
+        assert!(attachment.shutdown().is_some());
+
+        let mut result = native_requested();
+        let generic = arcen_protocol::messages::UsbHardDeviceMsg {
+            vendor_id: arcen_usb_bridge::GENERIC_PEN_VENDOR_ID,
+            product_id: arcen_usb_bridge::GENERIC_PEN_PRODUCT_ID,
+            hid_report_descriptors: vec![arcen_protocol::messages::UsbHidReportDescriptorMsg::new(
+                0,
+                arcen_usb_bridge::descriptor_fixtures::HUION_STYLE_PEN,
+            )],
+            ..native_intuos5()
+        };
+        assert!(
+            negotiate_native_tablet(&native_hello(Some(generic)), &Ok(()), &mut result).is_some()
+        );
+        assert_eq!(String::from(result.reason), NATIVE_TABLET_NOTICES.generic);
+    }
+
+    #[test]
+    fn native_tablet_refusals_say_why_and_keep_the_deck_on_its_own_tablet() {
+        let mut result = native_requested();
+        let unknown = arcen_protocol::messages::UsbHardDeviceMsg {
+            product_id: 0x0001,
+            ..native_intuos5()
+        };
+        assert!(
+            negotiate_native_tablet(&native_hello(Some(unknown)), &Ok(()), &mut result).is_none()
+        );
+        assert!(!result.accepted && result.reconnect_required);
+        assert!(String::from(result.reason).contains("056a:0001"));
+
+        let mut result = TabletModeResultMsg {
+            accepted: false,
+            active: TabletModeMsg::DisabledMouseCompat,
+            ..native_requested()
+        };
+        assert!(negotiate_native_tablet(
+            &native_hello(Some(native_intuos5())),
+            &native_tablet_availability(false),
+            &mut result
+        )
+        .is_none());
+        assert!(String::from(result.reason).contains("Windows Ink pen device"));
+    }
+
     #[test]
     fn windows_tablet_mode_resolution_keeps_native_bridge_explicit() {
         let client = TabletModeCapabilitiesMsg {
@@ -10974,6 +11842,32 @@ mod tests {
         assert!(!rejected_local.accepted);
         assert_eq!(rejected_local.active, TabletModeMsg::DisabledMouseCompat);
         assert!(rejected_local.reason.as_str().contains("client did not"));
+
+        // With the Windows Ink pen device, Native tablet is accepted (the
+        // Pier reads the bridged pen itself, ADR 0023 amendment).
+        let pen_host = TabletModeCapabilitiesMsg {
+            usb_tablet_bridge: InputCapabilityAvailability::Available,
+            ..host
+        };
+        let native =
+            resolve_windows_tablet_mode_result(TabletModeMsg::UsbTabletBridge, client, pen_host);
+        assert!(native.accepted && !native.reconnect_required);
+        assert_eq!(native.active, TabletModeMsg::UsbTabletBridge);
+        let no_device = resolve_windows_tablet_mode_result(
+            TabletModeMsg::UsbTabletBridge,
+            TabletModeCapabilitiesMsg {
+                usb_tablet_bridge: InputCapabilityAvailability::Unavailable,
+                ..client
+            },
+            pen_host,
+        );
+        assert!(!no_device.accepted);
+        assert_reason_reaches_the_operator(no_device.reason.as_str());
+        assert!(no_device.reason.as_str().contains("did not offer"));
+        assert!(
+            !bridge.reason.as_str().contains("kernel"),
+            "no driver is needed"
+        );
     }
 
     #[test]
@@ -11209,7 +12103,7 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
-            encoder: crate::capenc::EncoderSelection::Auto,
+            encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
@@ -11222,6 +12116,8 @@ mod tests {
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+            lossless_refinement: true,
+            deck_refine: None,
         };
         let start = AgentStart::new(
             "peer".to_string(),
@@ -11749,6 +12645,7 @@ mod tests {
             data: vec![0xAA, 0xBB],
             keyframe: true,
             timestamp_ms: 0x0102_0304,
+            refine: None,
         };
         let media_plan = test_media_plan(
             arcen_media::video::EncoderBackend::NativeNvenc,
@@ -11769,6 +12666,7 @@ mod tests {
             data: vec![0xAA, 0xBB],
             keyframe: true,
             timestamp_ms: 0x0102_0304,
+            refine: None,
         };
         let media_plan = test_media_plan(
             arcen_media::video::EncoderBackend::NativeNvenc,
@@ -11792,6 +12690,7 @@ mod tests {
             data: vec![0xAA, 0xBB],
             keyframe: false,
             timestamp_ms: 0x0102_0304,
+            refine: None,
         };
         let mut media_plan = test_media_plan(
             arcen_media::video::EncoderBackend::NativeNvenc,
@@ -11839,6 +12738,17 @@ mod tests {
         let mut response = AuthResponse::pam("user", "password");
         response.credential = "x".repeat(4097);
         assert!(validate_auth_response(&response).is_err());
+
+        // LogonUserW stops at a NUL, so `victim\0<random>` would be checked
+        // as `victim` while the throttle counted a throwaway account.
+        for (username, credential) in [("victim\0x", "password"), ("victim", "\0x")] {
+            let mut response = AuthResponse::pam(username, credential);
+            response.screen_width = 3600;
+            response.screen_height = 2338;
+            assert!(validate_auth_response(&response)
+                .expect_err("NUL refused")
+                .contains("NUL"));
+        }
     }
 
     fn client_monitor(width_px: u32, height_px: u32, is_primary: bool) -> ClientMonitor {
@@ -12131,17 +13041,17 @@ mod tests {
         );
         assert_eq!(
             capenc_encoder_for_attempt(
-                crate::capenc::EncoderSelection::Auto,
-                crate::capenc::EncoderSelection::Nvenc,
+                arcen_media::video::EncoderRequest::Auto,
+                arcen_media::video::EncoderRequest::NativeNvenc,
             ),
-            crate::capenc::EncoderSelection::Auto
+            arcen_media::video::EncoderRequest::Auto
         );
         assert_eq!(
             capenc_encoder_for_attempt(
-                crate::capenc::EncoderSelection::Auto,
-                crate::capenc::EncoderSelection::SoftwareH264,
+                arcen_media::video::EncoderRequest::Auto,
+                arcen_media::video::EncoderRequest::SoftwareH264,
             ),
-            crate::capenc::EncoderSelection::SoftwareH264
+            arcen_media::video::EncoderRequest::SoftwareH264
         );
         assert!(
             openh264_fallback_retarget_size(requested, requested, false).is_err(),
@@ -12172,7 +13082,7 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 60,
-            encoder: crate::capenc::EncoderSelection::Auto,
+            encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
@@ -12185,6 +13095,8 @@ mod tests {
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+            lossless_refinement: true,
+            deck_refine: None,
         };
         assert_eq!(next_adaptive_nvenc_codec(&config), Some(VideoCodec::H265));
         config.codec = VideoCodec::H265;
@@ -12256,7 +13168,7 @@ mod tests {
             requested_pipeline: Some(arcen_media::video::PipelineId::Hdr),
             active_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
             fps: 30,
-            encoder: crate::capenc::EncoderSelection::Nvenc,
+            encoder: arcen_media::video::EncoderRequest::NativeNvenc,
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
@@ -12269,6 +13181,8 @@ mod tests {
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+            lossless_refinement: true,
+            deck_refine: None,
         };
 
         assert!(
@@ -12321,7 +13235,7 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
-            encoder: crate::capenc::EncoderSelection::Auto,
+            encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
@@ -12334,6 +13248,8 @@ mod tests {
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+            lossless_refinement: true,
+            deck_refine: None,
         };
         let report = DisplayReport {
             requested: DisplaySize {
@@ -12617,6 +13533,11 @@ mod tests {
             hello.device_capabilities["input"]["pen_backend"],
             "unavailable"
         );
+        assert!(!hello.usb_hard_v1);
+        assert_eq!(
+            hello.tablet_mode_capabilities.usb_tablet_bridge,
+            InputCapabilityAvailability::Unavailable
+        );
         assert_eq!(
             hello.audio_output.as_ref().unwrap().codecs,
             vec![AudioCodec::Pcm]
@@ -12643,7 +13564,7 @@ mod tests {
         let mf_cfg = HostConfig {
             codec: VideoCodec::H264,
             chroma: ChromaSubsampling::Yuv420,
-            encoder: crate::capenc::EncoderSelection::SoftwareH264,
+            encoder: arcen_media::video::EncoderRequest::SoftwareH264,
             ..cfg
         };
         let mf_media = test_media_plan(
@@ -12744,6 +13665,13 @@ mod tests {
         assert_eq!(
             pen_hello.device_capabilities["input"]["pen_backend"],
             "synthetic_pointer"
+        );
+        // Native tablet is read here and injected through the same pen
+        // device: offered exactly when it exists.
+        assert!(pen_hello.usb_hard_v1);
+        assert_eq!(
+            pen_hello.tablet_mode_capabilities.usb_tablet_bridge,
+            InputCapabilityAvailability::Available
         );
     }
 
@@ -13109,7 +14037,7 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 60,
-            encoder: crate::capenc::EncoderSelection::Auto,
+            encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
             microphone_input_enabled: false,
@@ -13122,6 +14050,8 @@ mod tests {
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+            lossless_refinement: true,
+            deck_refine: None,
         };
         let report = DisplayReport {
             requested: DisplaySize {
@@ -13275,6 +14205,7 @@ mod tests {
                 encoder: None,
                 cursor_mode: CursorMode::Local,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
+                refine: None,
             })
             .await
             .unwrap();
@@ -13343,7 +14274,7 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
-            encoder: crate::capenc::EncoderSelection::Auto,
+            encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: false,
             audio_compressed: false,
             microphone_input_enabled: false,
@@ -13356,6 +14287,8 @@ mod tests {
             deskside: crate::deskside::DesksideConfig::default(),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+            lossless_refinement: true,
+            deck_refine: None,
         };
         let report = DisplayReport {
             requested: DisplaySize {
@@ -13699,6 +14632,77 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Exact still image (ADR 0016 R2): a frame's fences and barriers are
+    /// written immediately before it, and tiles after everything else.
+    #[tokio::test]
+    async fn the_writer_puts_refinement_records_right_before_their_frame() {
+        let video =
+            Arc::new(OutboundVideoMux::new_with_capacity([0], 2).expect("valid single-route mux"));
+        let carry: crate::capenc::RefineCarry = Arc::new(StdMutex::new(
+            arcen_protocol::refine::carry::RefineVideoCarry::new(),
+        ));
+        carry
+            .lock()
+            .unwrap()
+            .push(0, [vec![FrameType::RefineBarrier as u8, 1]]);
+        let (lane_tx, lane_rx) = mpsc::channel(2);
+        lane_tx
+            .send(vec![FrameType::RefineTiles as u8, 9])
+            .await
+            .unwrap();
+        video.set_refine_lane(Some(lane_rx));
+        assert!(matches!(
+            video.push(
+                0,
+                OutboundVideo {
+                    monitor_id: 0,
+                    message: Message::Binary(vec![FrameType::VideoH264 as u8, 1].into()),
+                    refine: Some(crate::capenc::RefineTag {
+                        carry: Arc::clone(&carry),
+                        seq: 0,
+                    }),
+                },
+                true,
+            ),
+            VideoPushResult::Enqueued { cleared: 0 }
+        ));
+        let audio = Arc::new(LatestQueue::new(1));
+        audio.close();
+        let (_control_tx, control_rx) = mpsc::channel(1);
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let writer = writer_loop(
+            RecordingSink(Arc::clone(&sent)),
+            video,
+            audio,
+            closed_clipboard_queue(),
+            control_rx,
+            Arc::new(AudioSendState::default()),
+            Arc::new(WriterVideoStats::default()),
+            Arc::new(AtomicU64::new(0)),
+        );
+        // The writer keeps waiting for more; what it wrote so far is what
+        // matters.
+        let _ = tokio::time::timeout(Duration::from_millis(200), writer).await;
+        let kinds: Vec<u8> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|message| match message {
+                Message::Binary(bytes) => bytes.first().copied(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                FrameType::RefineBarrier as u8,
+                FrameType::VideoH264 as u8,
+                FrameType::RefineTiles as u8,
+            ]
+        );
+        assert!(carry.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn writer_video_stats_count_only_successful_writes() {
         let video = Arc::new(
@@ -13711,6 +14715,7 @@ mod tests {
                 OutboundVideo {
                     monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8, 1, 2, 3].into()),
+                    refine: None,
                 },
                 true,
             ),
@@ -13747,6 +14752,7 @@ mod tests {
                 OutboundVideo {
                     monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8, 1, 2, 3].into()),
+                    refine: None,
                 },
                 true,
             ),
@@ -13792,6 +14798,7 @@ mod tests {
                 OutboundVideo {
                     monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8, 1].into()),
+                    refine: None,
                 },
                 false,
             ),
@@ -13803,6 +14810,7 @@ mod tests {
                 OutboundVideo {
                     monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8, 2].into()),
+                    refine: None,
                 },
                 false,
             ),
@@ -14218,6 +15226,7 @@ mod tests {
                 OutboundVideo {
                     monitor_id: 0,
                     message: Message::Binary(vec![7].into()),
+                    refine: None,
                 },
                 false,
             ),
@@ -14255,6 +15264,7 @@ mod tests {
                 OutboundVideo {
                     monitor_id: 0,
                     message: Message::Binary(vec![FrameType::VideoH264 as u8].into()),
+                    refine: None,
                 },
                 true,
             ),
@@ -15093,6 +16103,7 @@ mod lane_relay_tests {
                 &mut shutdown,
                 lanes,
                 None,
+                false,
             )
             .await;
             matches!(outcome, RelayOutcome::ExplicitClose)

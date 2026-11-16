@@ -548,6 +548,11 @@ pub struct MediaRelayStats {
 /// With it, the agent's `health_stats` also leave here carrying this
 /// connection's measured path, which the agent cannot see.
 ///
+/// `refine_allowed` is whether this host may refine at all (the build
+/// contains the producer and `video.lossless_refinement` is on): the grant
+/// then includes the `refine` lane for a Deck whose `auth_response` asked
+/// for Y′CbCr tiles (ADR 0016 R7), and the relay carries refinement.
+///
 /// # Errors
 ///
 /// Returns the first transport error when it was not a clean close.
@@ -557,6 +562,7 @@ pub async fn relay_lanes<A>(
     session: u64,
     audio_channel: Option<tokio::sync::oneshot::Receiver<UnixStream>>,
     path_signal: bool,
+    refine_allowed: bool,
 ) -> Result<MediaRelayStats, String>
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -597,6 +603,9 @@ where
     // truth waits for the Deck's `client_hello`, which only follows a
     // successful authentication.
     let mut session_started = false;
+    // Whether the grant carries the refine lane, from the Deck's own
+    // `auth_response` (it travels through here to the agent).
+    let mut refine_grant = false;
 
     let result = loop {
         tokio::select! {
@@ -635,6 +644,9 @@ where
                         break Err("Deck sent a service-only message".to_string());
                     }
                     session_started |= is_client_hello(text);
+                    if relay.is_none() {
+                        refine_grant |= refine_allowed && asks_for_ycbcr_refinement(text);
+                    }
                 }
                 let closing = matches!(record, SessionRecord::Close(_));
                 if let Err(error) = agent_tx.send(record_message(record)).await {
@@ -682,8 +694,8 @@ where
                 let grant_before = relay.is_none() && is_text_type(&control, SERVER_HELLO);
                 let grant_after = relay.is_none() && is_successful_auth_result(&control);
                 if grant_before {
-                    match grant_lanes(&mut deck).await {
-                        Ok(()) => relay = Some(PierLaneRelay::start(&lanes)),
+                    match grant_lanes(&mut deck, refine_grant).await {
+                        Ok(()) => relay = Some(PierLaneRelay::start_with(&lanes, refine_grant)),
                         Err(error) => break Err(error),
                     }
                 }
@@ -695,8 +707,8 @@ where
                     break Ok(());
                 }
                 if grant_after {
-                    match grant_lanes(&mut deck).await {
-                        Ok(()) => relay = Some(PierLaneRelay::start(&lanes)),
+                    match grant_lanes(&mut deck, refine_grant).await {
+                        Ok(()) => relay = Some(PierLaneRelay::start_with(&lanes, refine_grant)),
                         Err(error) => break Err(error),
                     }
                 }
@@ -747,13 +759,16 @@ where
 
 /// Authorizes the attachment's lanes and tells the Deck, on the control
 /// lane, before anything the agent sends after authentication.
-async fn grant_lanes(deck: &mut arcen_transport::quic::SessionLaneSocket) -> Result<(), String> {
+async fn grant_lanes(
+    deck: &mut arcen_transport::quic::SessionLaneSocket,
+    refine: bool,
+) -> Result<(), String> {
     use futures_util::SinkExt as _;
 
     let grant = arcen_transport::quic::grant_attachment(
         deck.lanes(),
         arcen_transport::quic::next_attachment_generation(),
-        arcen_protocol::lanes::LaneRoleSet::BASE,
+        arcen_protocol::lanes::LaneRoleSet::for_grant(refine),
     )
     .map_err(|error| format!("lane attachment: {error}"))?;
     let record = arcen_protocol::lanes::session_text_record(&grant)
@@ -763,6 +778,28 @@ async fn grant_lanes(deck: &mut arcen_transport::quic::SessionLaneSocket) -> Res
         .map_err(|error| format!("to Deck: {error}"))?;
     tracing::info!(target: "arcen::relay", "session runs on isolated lanes");
     Ok(())
+}
+
+/// Whether a Deck's `auth_response` asked for exact still image in the
+/// Y′CbCr domain this host refines in (`lossless_refine_v1`).
+/// Only the two fields are read: the credentials beside them are skipped
+/// unparsed, never copied here.
+fn asks_for_ycbcr_refinement(text: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct RefineAsk {
+        #[serde(rename = "type")]
+        msg_type: String,
+        #[serde(default)]
+        lossless_refine_v1: Option<arcen_protocol::refine::LosslessRefineCapability>,
+    }
+    if !text.contains("lossless_refine_v1") {
+        return false;
+    }
+    serde_json::from_str::<RefineAsk>(text)
+        .ok()
+        .filter(|ask| ask.msg_type == arcen_protocol::messages::AUTH_RESPONSE)
+        .and_then(|ask| ask.lossless_refine_v1)
+        .is_some_and(|capability| capability.accepts(arcen_protocol::refine::RefineDomain::YCbCr))
 }
 
 /// Before the grant only the control lane exists: authentication, its
@@ -1083,6 +1120,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_refine_lane_is_granted_only_to_a_deck_asking_for_ycbcr_tiles() {
+        let ask = |domains: &str| {
+            format!(
+                r#"{{"type":"auth_response","username":"u","password":"p","lossless_refine_v1":{{"domains":{domains},"codecs":["delta-zstd1"]}}}}"#
+            )
+        };
+        assert!(asks_for_ycbcr_refinement(&ask(r#"["rgb","ycbcr"]"#)));
+        assert!(!asks_for_ycbcr_refinement(&ask(r#"["rgb"]"#)));
+        assert!(!asks_for_ycbcr_refinement(
+            r#"{"type":"auth_response","username":"u","password":"p"}"#
+        ));
+        assert!(!asks_for_ycbcr_refinement(
+            &ask(r#"["ycbcr"]"#).replace("auth_response", "client_hello")
+        ));
+    }
+
+    #[test]
     fn the_service_fills_the_path_into_an_agent_s_health_stats_only() {
         let path = || arcen_protocol::messages::PathQualityMsg {
             congestion_control: "bbr".to_owned(),
@@ -1150,6 +1204,11 @@ mod tests {
             .expect("cert");
         std::fs::write(dir.join("host.crt"), certificate.pem()).expect("write cert");
         std::fs::write(dir.join("host.key"), key_pair.serialize_pem()).expect("write key");
+        std::fs::set_permissions(
+            dir.join("host.key"),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("key mode");
         let listener = crate::net::Listener::bind(
             "127.0.0.1:0".parse().expect("addr"),
             crate::net::server_config(&dir.join("host.crt"), &dir.join("host.key"))
@@ -1188,7 +1247,7 @@ mod tests {
         let (pier, _peer) = accepted.expect("accept");
         let (deck, deck_control) = connected.expect("connect");
         let (agent_end, relay_end) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(relay_lanes(pier, relay_end, 1, None, path_signal));
+        tokio::spawn(relay_lanes(pier, relay_end, 1, None, path_signal, false));
         let agent = tokio_tungstenite::WebSocketStream::from_raw_socket(
             agent_end,
             tokio_tungstenite::tungstenite::protocol::Role::Server,

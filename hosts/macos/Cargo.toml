@@ -33,7 +33,11 @@ lab-pen-probe = [
     "objc2-foundation/NSRunLoop",
 ]
 
-default = ["native-tablet"]
+default = ["native-tablet", "lossless-refine"]
+# Exact still image (ADR 0016): the Grading and HDR `xf44` captures are
+# refined in the Y′CbCr domain; the tile encoder is the shared native
+# Zstandard adapter. Switched at run time by `video.lossless_refinement`.
+lossless-refine = ["arcen-media/refine-zstd-encode"]
 # Native tablet (ADR 0022): the session enumerates a Deck's bridged tablet
 # over the USB bridge and the entitled `hid-injector` child publishes one
 # IOHIDUserDevice per HID interface; a known model's pen is read by the Pier
@@ -49,7 +53,7 @@ native-tablet = []
 lab-bridged-hid-probe = ["native-tablet"]
 
 [dependencies]
-arcen-observability.workspace = true
+arcen-observability = { workspace = true, features = ["support-bundle"] }
 arcen-input.workspace = true
 arcen-keel = { workspace = true }
 arcen-media = { workspace = true, features = ["audio-opus"] }
@@ -66,7 +70,6 @@ libc = "0.2"
 quinn.workspace = true
 rcgen = "=0.14.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 rustls-pki-types = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
 tokio-tungstenite = { version = "0.24", default-features = false }
@@ -103,6 +106,7 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
 videotoolbox = { version = "0.18.1", features = ["async"] }
 
 [dev-dependencies]
+rustls-pemfile = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
