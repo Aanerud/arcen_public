@@ -1230,7 +1230,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `zbus` | 5.13.2 | Linux | https://github.com/z-galaxy/zbus/ |
 | `zbus_macros` | 5.13.2 | Linux | https://github.com/z-galaxy/zbus/ |
 | `zbus_names` | 4.3.1 | Linux | https://github.com/z-galaxy/zbus/ |
-| `zip` | 7.2.0 | macOS, Windows, Linux | https://github.com/zip-rs/zip2.git |
+| `zip` | 7.3.0 | macOS, Windows, Linux | https://github.com/zip-rs/zip2.git |
 | `zmij` | 1.0.23 | macOS, Windows, Linux | https://github.com/dtolnay/zmij |
 | `zvariant` | 5.9.2 | Linux | https://github.com/z-galaxy/zbus/ |
 | `zvariant_derive` | 5.9.2 | Linux | https://github.com/z-galaxy/zbus/ |
@@ -14288,7 +14288,7 @@ DEALINGS IN THE SOFTWARE.
 
 #### Notice 209 — applies to 1 package(s)
 
-`zip 7.2.0`
+`zip 7.3.0`
 
 ```text
 The MIT License (MIT)

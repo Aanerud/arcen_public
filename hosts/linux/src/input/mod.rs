@@ -441,6 +441,7 @@ mod backend_choice_tests {
             requested_outputs: None,
             x11_desktop_depth: None,
             native_seat: None,
+            console: false,
             wayland: wayland.then(|| WaylandAgentReady {
                 compositor: "gnome-shell".into(),
                 input_socket: runtime_dir.join(INPUT_SOCKET_NAME),

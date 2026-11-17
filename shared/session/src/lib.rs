@@ -9,6 +9,7 @@ pub mod agent_relay;
 pub mod auth_throttle;
 pub mod compositor_prefix;
 pub mod connection_diagnostics;
+pub mod console_session;
 pub mod deskside;
 pub mod desktop_provider;
 pub mod desktop_session;

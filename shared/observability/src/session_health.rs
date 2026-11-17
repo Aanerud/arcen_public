@@ -32,6 +32,42 @@ use arcen_telemetry::{
     StructuredFields, assess_health,
 };
 
+/// Logs a change of the rate a Pier holds a session at (the shared
+/// `arcen_media::video::HostRateGovernor`): `reason` is its token
+/// (`host_shortfall` with the encoded and delivered counts that showed it,
+/// or `probe`). A rate below the session's is never silent.
+pub fn log_governed_frame_rate(
+    fps: u32,
+    previous_fps: u32,
+    session_fps: u32,
+    reason: &str,
+    counts: Option<(u32, u32)>,
+) {
+    let (encoded_fps, source_fps) = counts.unzip();
+    if counts.is_some() {
+        tracing::warn!(
+            target: arcen_telemetry::names::target::MEDIA,
+            fps,
+            previous_fps,
+            session_fps,
+            encoded_fps,
+            source_fps,
+            fps_basis = reason,
+            "the host encoded below the session's frame rate while its capture delivered it; \
+             lowering the rate until it holds"
+        );
+    } else {
+        tracing::info!(
+            target: arcen_telemetry::names::target::MEDIA,
+            fps,
+            previous_fps,
+            session_fps,
+            reason,
+            "probing a higher frame rate after the host held the lower one"
+        );
+    }
+}
+
 /// Cadence of one host counter sample: every Pier sends `health_stats`
 /// every two seconds.
 pub const HOST_SAMPLE_WINDOW_SECS: u32 = 2;

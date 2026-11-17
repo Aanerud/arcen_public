@@ -22,6 +22,8 @@ mod menu_bar;
 mod overlay;
 mod secondary;
 mod session;
+#[cfg(feature = "dev-tools")]
+mod windowed_test;
 
 use std::process::ExitCode;
 use std::sync::Arc;

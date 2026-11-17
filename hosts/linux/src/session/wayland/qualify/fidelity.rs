@@ -142,6 +142,8 @@ async fn open_session(
         // The temporary qualification account never sees a first-login
         // assistant over the desktop being measured.
         first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup::Skip,
+        // Qualification creates headless desktops of its own.
+        desktop_mode: arcen_session::console_session::DesktopMode::Dedicated,
         // X11 applications are proven by the first output's own session.
         x11_apps: false,
     };

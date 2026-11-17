@@ -22,6 +22,7 @@ pub use sampler::{
 };
 pub use session_health::{
     ContentEvidence, HealthObservation, HostCounters, SessionHealth, health_state_message,
+    log_governed_frame_rate,
 };
 pub use sink::{
     BoundedSink, DeliveryOutcome, Sink, SinkBuildError, SinkError, SinkLossClass, SinkLossDelta,

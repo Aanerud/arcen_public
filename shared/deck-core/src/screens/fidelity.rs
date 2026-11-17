@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! Why a streaming preset or codec is unavailable, in words a user can act
-//! on (PARITY Q-13, sign-off item 14): the GPU, the exact profile it lacks,
+//! on (PARITY Q-13): the GPU, the exact profile it lacks,
 //! what still works, and what to do about it. One table for both Decks;
 //! only the machine's name and the Windows "Use HDR" hint differ. The
 //! sentences about the decoder come from

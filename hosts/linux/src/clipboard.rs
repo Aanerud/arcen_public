@@ -1151,6 +1151,7 @@ mod tests {
             requested_outputs: None,
             x11_desktop_depth: None,
             native_seat: None,
+            console: false,
         }
     }
 

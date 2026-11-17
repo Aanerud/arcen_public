@@ -812,17 +812,13 @@ mod macos {
             // attributes above. Reserved for platforms that provide a blob.
             edid: String::new(),
             color,
+            rotation_degrees: arcen_deck_core::connect_plan::rotation_degrees(metrics.rotation()),
         })
     }
 
     /// The logged clockwise rotation of a display, in degrees.
     fn rotation_degrees(rotation: arcen_media::Rotation) -> u32 {
-        match rotation {
-            arcen_media::Rotation::Degrees0 => 0,
-            arcen_media::Rotation::Degrees90 => 90,
-            arcen_media::Rotation::Degrees180 => 180,
-            arcen_media::Rotation::Degrees270 => 270,
-        }
+        u32::from(arcen_deck_core::connect_plan::rotation_degrees(rotation))
     }
 
     #[cfg(test)]

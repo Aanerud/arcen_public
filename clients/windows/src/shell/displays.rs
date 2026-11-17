@@ -58,6 +58,16 @@ pub(super) fn approve_match_layout(
     mode: DisplaysMode,
     settings: &ClientSettings,
 ) -> Result<Option<RequestedMultiMonitorSelection>, String> {
+    #[cfg(feature = "dev-tools")]
+    if let Some(layout) = super::windowed_test::layout() {
+        let mut selection = super::windowed_test::selection(layout)?;
+        selection.full_color_display_ids = full_color_display_ids(
+            &selection.topology,
+            settings.color_fidelity,
+            settings.full_color_display_mask,
+        );
+        return Ok(Some(selection));
+    }
     approve_match_layout_with(mode, settings, &displays())
 }
 
@@ -94,6 +104,22 @@ pub(super) fn apply_display_plan(
     mode: DisplaysMode,
     approved: Option<RequestedMultiMonitorSelection>,
 ) -> DisplayPlan {
+    // A simulated layout (developer builds) asks for its own monitors, never
+    // this PC's, and its windows are never fullscreen.
+    #[cfg(feature = "dev-tools")]
+    let approved = match (super::windowed_test::layout(), approved) {
+        (Some(_), Some(selection)) => {
+            let monitors = client_monitors_from_topology(&selection.topology);
+            options.monitors.clone_from(&monitors);
+            options.multi_monitor_topology = Some(selection);
+            mode.as_wire().clone_into(&mut options.displays_mode);
+            return DisplayPlan {
+                policy: StreamSizingPolicy::resolve(mode, &monitors, None, true),
+                pinned_display: None,
+            };
+        }
+        (_, approved) => approved,
+    };
     apply_display_plan_with(options, settings, mode, approved, &displays())
 }
 
@@ -253,7 +279,7 @@ mod tests {
         }
     }
 
-    /// The owner's kind of desk: a 4K panel at 150 % with a 1440p panel at
+    /// A common two-monitor desk: a 4K panel at 150 % with a 1440p panel at
     /// 100 % to its right.
     fn two_monitors() -> Vec<(ClientMonitor, DisplayMetrics)> {
         roster_with_metrics(&[

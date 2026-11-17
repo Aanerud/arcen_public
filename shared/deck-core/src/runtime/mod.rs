@@ -17,6 +17,7 @@ pub mod clipboard_controller;
 pub mod clipboard_session;
 pub mod connector;
 pub mod frame_queue;
+pub mod frame_sync;
 pub mod lanes;
 pub mod media_worker;
 pub mod monitor_router;

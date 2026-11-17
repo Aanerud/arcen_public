@@ -2339,6 +2339,9 @@ fn stream_start_fields(
         width: handshake.capture_width,
         height: handshake.capture_height,
         fps: Some(handshake.fps),
+        display_refresh_hz: handshake.frame_rate.display_refresh_hz,
+        fps_basis: Some(handshake.frame_rate.basis.token()),
+        display_backend: None,
         pipeline: handshake
             .active_pipeline
             .as_ref()

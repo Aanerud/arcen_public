@@ -355,7 +355,16 @@ impl X11Capture {
             .get(screen_index)
             .ok_or_else(|| "X11 selected screen is absent".to_string())?;
         let root = screen.root;
-        let mut rect = selected_output_rect(&connection, root, output_index)?;
+        let mut rect = if output_index == arcen_media::capenc_stream::WHOLE_SCREEN_OUTPUT_INDEX {
+            CaptureRect {
+                x: 0,
+                y: 0,
+                width: screen.width_in_pixels,
+                height: screen.height_in_pixels,
+            }
+        } else {
+            selected_output_rect(&connection, root, output_index)?
+        };
         if purpose == CapturePurpose::WideProbe {
             rect = probe_rect(rect);
         }

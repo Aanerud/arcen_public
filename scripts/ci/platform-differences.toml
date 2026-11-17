@@ -51,14 +51,17 @@ config = ["hosts/linux:platform.auth.*"]
 id = "PD-002"
 area = "session model"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
-difference = "The Linux Pier creates and owns a desktop session; the Windows Pier attaches to the console session; the macOS Pier serves the logged-in Aqua session."
-earned_by = "Linux: PAM and logind session creation, Xorg or Wayland compositor spawn. Windows: one interactive console session (WTSConnectSessionW). macOS: one Aqua session per GUI user, owned by loginwindow."
+difference = "Every Pier joins the user's session (ADR 0025): the Linux Pier the user's GDM X11 session (remote-first through GDM's login screen), the Windows Pier the console session, the macOS Pier the logged-in Aqua session. On a Linux host without a display manager the Pier starts the account's real login session itself (PAM `arcen-login`, an X server on a seat0 virtual terminal, the user's X session entry) and joins it; only the Linux Pier can also create a per-connection desktop (`platform.session.mode` `dedicated`, an opt-in, or the headless Wayland provider)."
+earned_by = "Linux: logind sessions, GDM's pre-authenticated greeter hook and PAM, and for a host without a display manager (no login screen exists) PAM and logind session creation with an Xorg or Wayland compositor spawn; Windows and macOS always have the OS's own sign-in screen. Windows: one interactive console session (WTSConnectSessionW). macOS: one Aqua session per GUI user, owned by loginwindow."
 code = [
+  { path = "hosts/linux/src/session/console.rs", symbol = "sign_in_through_greeter" },
+  { path = "hosts/linux/src/session/login_session.rs", symbol = "login_session_main" },
   { path = "hosts/linux/src/session/launcher.rs", symbol = "DedicatedXorg" },
   { path = "hosts/windows/src/windows_session.rs", symbol = "WTSConnectSessionW" },
   { path = "hosts/macos/src/session.rs" },
 ]
 config = [
+  "hosts/linux:platform.session.mode",
   "hosts/linux:platform.session.desktop",
   "hosts/linux:platform.session.display",
   "hosts/linux:platform.session.gpu_head",
@@ -483,15 +486,6 @@ config = [
 ]
 
 [[gap]]
-id = "GAP-010"
-area = "multi-monitor"
-products = ["hosts/macos"]
-difference = "The macOS Pier offers 0° rotation only."
-why_open = "Undetermined: whether CGVirtualDisplay can present rotated modes has not been researched."
-owner = "macOS Host"
-code = [{ path = "hosts/macos/src/multi_monitor.rs", symbol = "SUPPORTED_ROTATIONS" }]
-
-[[gap]]
 id = "GAP-012"
 area = "audio"
 products = ["hosts/windows"]
@@ -707,6 +701,33 @@ difference = "A Deck's support bundle can include its crash reports when asked (
 why_open = "Each OS keeps a Pier's crash reports where the Pier can read them (systemd-coredump, WER LocalDumps, DiagnosticReports); only that source adapter is OS-specific. The opt-in, the manifest record and the scrubbing are shared."
 owner = "Shared/Architecture"
 code = [{ path = "shared/observability/src/support_bundle.rs", symbol = "CrashReportsNotCollected" }]
+
+[[gap]]
+id = "GAP-041"
+area = "session lifetime"
+products = ["hosts/windows", "hosts/macos"]
+difference = "Only the Linux Pier locks the session when a Deck leaves and hands the console back in the shared order (`console_session::DETACH_STEPS`); the Windows and macOS Piers never end the session but leave it unlocked (ADR 0025 audit)."
+why_open = "Not implemented yet: the Windows agent needs LockWorkStation in the user's session at detach, the macOS agent the equivalent screen lock, each followed by the shared hand-back order."
+owner = "Shared/Architecture"
+code = [{ path = "shared/session/src/console_session/mod.rs", symbol = "DETACH_STEPS" }]
+
+[[gap]]
+id = "GAP-042"
+area = "session model"
+products = ["hosts/linux"]
+difference = "The Linux Pier joins X11 console sessions only; a GNOME Wayland console session or login screen is refused `console_wayland_session` (ADR 0025 section 9)."
+why_open = "Not implemented yet. Upstream has the route (Mutter ScreenCast and RemoteDesktop on the user's session bus, as GNOME Remote Desktop's desktop sharing uses; the greeter hook exists in GNOME Shell 40 and 49); Arcen's side (session-bus discovery, RecordMonitor capture of physical monitors, input through the session's RemoteDesktop session, the lock screen) is work package console-wayland."
+owner = "Linux Host"
+code = [{ path = "shared/session/src/console_session/mod.rs", symbol = "WaylandSession" }]
+
+[[gap]]
+id = "GAP-043"
+area = "session model"
+products = ["hosts/windows", "hosts/macos"]
+difference = "Only the Linux Pier names, in the refusal a Deck shows, the other remote-desktop service that holds the workstation, as the host reports it at run time (`console_session::ForeignService`, `ConsoleNotice`); the Windows Pier refuses another account at the console without naming what drives it, the macOS Pier names the console owner only."
+why_open = "Not implemented yet. Windows can read the console or remote session's WinStation name and protocol (`WTSQuerySessionInformationW`, already called in windows_session.rs) and the service owning the session's processes; macOS has no other-product console session model yet. Both would build the same shared ConsoleNotice."
+owner = "Shared/Architecture"
+code = [{ path = "shared/session/src/console_session/foreign_service.rs", symbol = "ConsoleNotice" }]
 
 # --- Capability matrix ----------------------------------------------------------
 
@@ -966,3 +987,15 @@ description = "A support bundle can include the product's own crash reports"
 proof = 'CrashReportSource'
 status = { "hosts/linux" = "GAP-040", "hosts/windows" = "GAP-040", "hosts/macos" = "GAP-040", "clients/macos" = "present", "clients/windows" = "present" }
 paths = { "clients/macos" = ["shared/deck-core/src/support_bundle"], "clients/windows" = ["shared/deck-core/src/support_bundle"] }
+
+[[capability]]
+id = "lock_on_detach"
+description = "Locks the user's session when a Deck leaves, then gives the desk its monitors and input back"
+proof = 'DETACH_STEPS'
+status = { "hosts/linux" = "present", "hosts/windows" = "GAP-041", "hosts/macos" = "GAP-041" }
+
+[[capability]]
+id = "names_conflicting_service"
+description = "A refusal because another remote-desktop service holds the workstation names that service as the host reports it"
+proof = 'ConsoleNotice'
+status = { "hosts/linux" = "present", "hosts/windows" = "GAP-043", "hosts/macos" = "GAP-043" }

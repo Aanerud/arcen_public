@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    AcceleratorClass, MotionPriority, average_bitrate_bps, encoder_buffer_frames,
+    AcceleratorClass, FrameRatePolicy, MotionPriority, average_bitrate_bps, encoder_buffer_frames,
     link_capped_average_bitrate_bps,
 };
 
@@ -561,7 +561,14 @@ impl PresentTiming {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PipelineContract {
     pub id: PipelineId,
+    /// The rate a Deck asks for on the wire (`QualitySettings.max_fps`) for
+    /// this preset: what a Pier that predates display-following serves. A
+    /// current Pier resolves the served rate from [`Self::frame_rate`]
+    /// (`resolve_session_frame_rate`); read this only to build a request or
+    /// to recognise one.
     pub max_fps: u32,
+    /// How the served frame rate is chosen.
+    pub frame_rate: FrameRatePolicy,
     pub priority: MotionPriority,
     pub intent: EncodeIntent,
     pub encoder_buffer_frames: f64,
@@ -582,6 +589,12 @@ pub struct PipelineContract {
 }
 
 impl PipelineContract {
+    /// The highest frame rate this contract serves.
+    #[must_use]
+    pub const fn fps_ceiling(self) -> u32 {
+        self.frame_rate.ceiling_fps()
+    }
+
     #[must_use]
     pub fn bitrate_bounds(
         self,
@@ -744,7 +757,9 @@ pub const fn pipeline_contract(id: PipelineId) -> PipelineContract {
     }
 }
 
-/// Infer the four named pipelines for legacy requests that lack `pipeline`.
+/// Infer the four named pipelines for legacy requests that lack `pipeline`:
+/// a Deck that predates named pipelines asked for Speed with a rate above
+/// 30. A host's own plan uses [`pipeline_for_epoch`] instead.
 ///
 /// Exact requests are developer/custom axes and intentionally stay outside the
 /// named product pipelines.
@@ -774,6 +789,27 @@ pub fn pipeline_for_request(
             }
         }
         VideoSelectionIntent::Exact => None,
+    }
+}
+
+/// The named pipeline of a host's own resolved plan (a capture child's
+/// arguments), where the motion priority is always stated: Speed keeps
+/// motion, Auto keeps detail. Unlike [`pipeline_for_request`], the frame rate
+/// says nothing, because Auto and Speed both follow the Deck display.
+#[must_use]
+pub fn pipeline_for_epoch(
+    selection: VideoSelectionIntent,
+    video: VideoConfiguration,
+    priority: MotionPriority,
+) -> Option<PipelineId> {
+    match selection {
+        VideoSelectionIntent::AdaptivePerformance => Some(match priority {
+            MotionPriority::Motion => PipelineId::Speed,
+            MotionPriority::Detail => PipelineId::Auto,
+        }),
+        VideoSelectionIntent::ColorFidelity | VideoSelectionIntent::Exact => {
+            pipeline_for_request(selection, video, 0, priority)
+        }
     }
 }
 
@@ -809,9 +845,21 @@ pub fn served_pipeline(
     if backend == AcceleratorClass::Software {
         return ServedStreamPipeline::Software;
     }
+    // A named Auto request is Auto at any rate. A named Speed request is
+    // Speed unless it was served detail-first at no more than the rate a
+    // copying route gets without a measurement (Speed served as Auto).
+    let requested_priority = match requested {
+        Some(PipelineId::Auto) => MotionPriority::Detail,
+        Some(PipelineId::Speed)
+            if priority == MotionPriority::Motion || max_fps > super::UNQUALIFIED_COPY_FPS =>
+        {
+            MotionPriority::Motion
+        }
+        _ => priority,
+    };
     if let Some(requested) = requested
         && !context.exact_or_admin_override
-        && product_contract_matches(requested, final_video, max_fps, priority)
+        && product_contract_matches(requested, final_video, max_fps, requested_priority)
     {
         return requested.served_wire();
     }
@@ -1028,11 +1076,11 @@ fn product_contract_matches(
     priority: MotionPriority,
 ) -> bool {
     let contract = pipeline_contract(pipeline);
+    // Auto and Speed both follow the Deck display, so frame rate no longer
+    // tells them apart: what each preserves first does.
     let fps_matches = match pipeline {
-        PipelineId::Speed => max_fps > 30 || priority == MotionPriority::Motion,
-        PipelineId::Auto => max_fps <= 30 && priority == MotionPriority::Detail,
-        PipelineId::Grading | PipelineId::Hdr => {
-            max_fps <= contract.max_fps && priority == contract.priority
+        PipelineId::Speed | PipelineId::Auto | PipelineId::Grading | PipelineId::Hdr => {
+            max_fps <= contract.fps_ceiling() && priority == contract.priority
         }
         PipelineId::Software => false,
     };
@@ -1143,6 +1191,39 @@ mod tests {
                 MotionPriority::Motion
             ),
             None
+        );
+    }
+
+    #[test]
+    fn a_hosts_own_plan_names_auto_and_speed_by_priority_not_rate() {
+        let auto = sdr_420(VideoCodec::H265);
+        let adaptive = VideoSelectionIntent::AdaptivePerformance;
+        assert_eq!(
+            pipeline_for_epoch(adaptive, auto, MotionPriority::Detail),
+            Some(PipelineId::Auto)
+        );
+        assert_eq!(
+            pipeline_for_epoch(adaptive, auto, MotionPriority::Motion),
+            Some(PipelineId::Speed)
+        );
+        assert_eq!(
+            pipeline_for_epoch(
+                VideoSelectionIntent::ColorFidelity,
+                hdr10(),
+                MotionPriority::Detail
+            ),
+            Some(PipelineId::Hdr)
+        );
+        // Auto at a 120 Hz display's rate is still Auto.
+        assert_eq!(
+            served_pipeline(
+                Some(PipelineId::Auto),
+                auto,
+                120,
+                MotionPriority::Detail,
+                hardware_context()
+            ),
+            ServedStreamPipeline::Auto
         );
     }
 

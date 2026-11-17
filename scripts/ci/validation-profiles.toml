@@ -192,8 +192,13 @@ description = "Linux system-audio capture helper"
 target_os = "linux"
 package = "arcen-audiocap"
 
+[build_profile.linux-pam-greeter]
+description = "pam_arcen_greeter.so: the login screen's PAM module for a remote-first console sign-in (ADR 0025; needs libpam headers)"
+target_os = "linux"
+package = "arcen-pam-greeter"
+
 [build_profile.linux-pier-installer]
-description = "Linux installer embedding a release arcen-pier (ARCEN_PIER_BINARY)"
+description = "Linux installer embedding a release arcen-pier (ARCEN_PIER_BINARY) and pam_arcen_greeter.so (ARCEN_PAM_GREETER)"
 target_os = "linux"
 package = "arcen-pier-linux-installer"
 
@@ -642,8 +647,29 @@ build_profile = "linux-audiocap"
 template = "cargo-test"
 owner = "Linux Host"
 
+[validation.linux-pam-greeter-test]
+description = "pam_arcen_greeter record tests (spent once, refused records spent, root-only directory and file, account changes)"
+kind = "unit"
+build_profile = "linux-pam-greeter"
+template = "cargo-test"
+owner = "Linux Host"
+
+[validation.linux-pam-greeter-clippy]
+description = "pam_arcen_greeter strict Clippy on Linux (the module runs inside the display manager's session worker)"
+kind = "lint"
+build_profile = "linux-pam-greeter"
+template = "cargo-clippy-strict"
+owner = "Linux Host"
+
+[validation.linux-console-session-lab]
+description = "Console session (ADR 0025) on a GDM X11 host: a desk sign-in joined with its applications running; a remote-first sign-in completed by the login screen (Service=gdm-ovirtcred) and resumed by a later desk sign-in with the same processes; lock on detach and monitors/input given back; another account refused with its code"
+kind = "hardware"
+build_profile = "linux-pier"
+template = "recorded"
+owner = "Linux Host"
+
 [validation.linux-pier-installer-build]
-description = "Linux installer built around a freshly built release Pier (needs ARCEN_PIER_BINARY)"
+description = "Linux installer built around a freshly built release Pier and PAM module (needs ARCEN_PIER_BINARY and ARCEN_PAM_GREETER)"
 kind = "build"
 build_profile = "linux-pier-installer"
 template = "recorded"

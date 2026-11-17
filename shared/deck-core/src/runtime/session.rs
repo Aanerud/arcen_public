@@ -1512,7 +1512,7 @@ pub struct SessionHandle {
 /// keeps the UI's recovery offer from silently disappearing if the wording is
 /// ever edited.
 pub const MULTI_MONITOR_UNSUPPORTED_PREFIX: &str =
-    "Match My Layout could not be negotiated with this host";
+    arcen_protocol::messages::MULTI_MONITOR_UNSUPPORTED_PREFIX;
 
 #[derive(Debug, Error)]
 pub enum ConnectSmokeError {
@@ -2039,9 +2039,14 @@ async fn run_session_correlated(
     // the `HidSession::start` call site.
     #[cfg(feature = "experimental-raw-hid")]
     let mut host_experimental_raw_hid = false;
+    // The rate the host serves (a current Pier follows this Deck's display
+    // for Auto and Speed), else the requested one, for the health judge.
+    let mut served_target_fps = options.profile.max_fps;
     match msg_type(&hello).unwrap_or("<missing>") {
         SERVER_HELLO => {
             let server_hello: ServerHelloMsg = serde_json::from_value(hello)?;
+            served_target_fps =
+                crate::session_truth::served_max_fps(Some(&server_hello), options.profile.max_fps);
             media.set_limits(IncomingMediaLimits::for_pipeline(
                 server_hello.active_pipeline.as_ref(),
             ));
@@ -2304,7 +2309,7 @@ async fn run_session_correlated(
                     &mut telemetry_window,
                     network,
                     timestamp_ms,
-                    options.profile.max_fps,
+                    served_target_fps,
                     missed_health,
                 );
                 emit_health_transition(
@@ -2451,6 +2456,11 @@ async fn run_session_correlated(
                                     .find(|(sequence, _)| *sequence == pong.sequence)
                                 {
                                     options.telemetry.record_rtt(sent.elapsed());
+                                    options.telemetry.record_clock_sample(
+                                        pong.ping_timestamp_ms,
+                                        pong.server_timestamp_ms,
+                                        sent.elapsed(),
+                                    );
                                     last_pong_sequence = last_pong_sequence.max(pong.sequence);
                                 }
                         if msg_type(&value) == Some(AUTH_RESULT) {

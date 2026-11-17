@@ -28,9 +28,9 @@ Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
 ### Steps
 
 1. **Download** from [Releases](https://github.com/Aanerud/arcen_public/releases):
-   the Deck — `Arcen-Deck-0.20.0-macOS.zip` on an Apple silicon Mac,
-   `Arcen-Deck-Intel-0.20.0-macOS.zip` on an Intel Mac (Apple menu → About
-   This Mac shows which), `Arcen-Deck-0.20.0-windows-x64.msi` on Windows 11 —
+   the Deck — `Arcen-Deck-0.20.1-macOS.zip` on an Apple silicon Mac,
+   `Arcen-Deck-Intel-0.20.1-macOS.zip` on an Intel Mac (Apple menu → About
+   This Mac shows which), `Arcen-Deck-0.20.1-windows-x64.msi` on Windows 11 —
    and the Pier installer for your host. Check them
    against the release's `SHA256SUMS.txt`:
    `shasum -a 256 -c SHA256SUMS.txt --ignore-missing`.
@@ -38,16 +38,16 @@ Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
    TLS identity and the firewall opening, and starts the Pier):
    - Linux, as root:
      ```sh
-     chmod +x install-arcen-pier-0.20.0-linux-x86_64
-     sudo ./install-arcen-pier-0.20.0-linux-x86_64
+     chmod +x install-arcen-pier-0.20.1-linux-x86_64
+     sudo ./install-arcen-pier-0.20.1-linux-x86_64
      ```
      `--check` first shows what it found and would do, and changes nothing.
    - Windows, in **PowerShell as Administrator**, then **reboot** (Windows
      loads Arcen's sign-in provider only at boot):
      ```powershell
-     .\install-arcen-pier-0.20.0-windows-x64.exe
+     .\install-arcen-pier-0.20.1-windows-x64.exe
      ```
-   - macOS: open `ArcenPier-0.20.0.pkg` in **Installer.app** on that Mac
+   - macOS: open `ArcenPier-0.20.1.pkg` in **Installer.app** on that Mac
      (not the `installer` command), then, signed in as the account that will
      be served, approve **Screen & System Audio Recording** and
      **Accessibility** for **Arcen Agent Helper**, and **System Audio
@@ -91,11 +91,11 @@ password and says what to fix. Then see
   plugged into the host, with the host's own tablet driver. A Mac Deck needs
   **macOS 13 or later** (on Intel Macs it has not been tested with a real
   tablet); a Windows Deck needs the optional
-  `Arcen-USB-Component-0.20.0-windows-x64.msi`. Linux, macOS and Windows
+  `Arcen-USB-Component-0.20.1-windows-x64.msi`. Linux, macOS and Windows
   hosts offer it. On a Linux host it is off until you enable it, which restarts the
   running Pier:
   ```sh
-  sudo ./install-arcen-pier-0.20.0-linux-x86_64 --native-tablet --restart
+  sudo ./install-arcen-pier-0.20.1-linux-x86_64 --native-tablet --restart
   ```
   On an X11 host, also restart the display manager once while nobody is
   signed in at the console (`sudo systemctl restart gdm`), or reboot.
@@ -103,7 +103,7 @@ password and says what to fix. Then see
 - **Tablet support** (default pen mode): pressure, tilt and eraser over any
   network where the host supports pen input, with no host driver.
   [User guide: pen](docs/user-guide.md).
-- **Presets:** Auto, Speed (60 fps), Grading (10-bit) and HDR, each its own
+- **Presets:** Auto (your display's refresh), Speed (lowest latency, at least 60 fps), Grading (10-bit) and HDR, each its own
   pipeline. [Presets and pipelines](docs/features.md#streaming-presets-and-independent-pipelines).
 - **Several displays:** with **Match my layout** the host gives each of your
   Deck's displays (up to four) its own, on a Mac or a Windows PC.
@@ -111,16 +111,16 @@ password and says what to fix. Then see
 - **Audio and microphone**, **clipboard** both ways, and your Mac keyboard
   mapped the way the host expects. [User guide](docs/user-guide.md).
 
-## Status (0.20.0)
+## Status (0.20.1)
 
 | Platform | State |
 | --- | --- |
-| Linux Pier, X11 | Works: Auto, Speed, Grading; HDR served as Grading unless the desktop is declared PQ; Native tablet |
+| Linux Pier, X11 | Works: joins your own desktop session at the workstation (disconnect locks it); Auto, Speed, Grading; several displays, one stream each; HDR served as Grading unless the desktop is declared PQ; Native tablet |
 | Linux Pier, GNOME Wayland | Works where the installer's qualification proves it: Auto, Speed, Grading and HDR on GNOME 50+; Native tablet on native-seat desktops |
 | Windows Pier | Works: Auto, Speed, Grading, HDR, several displays; Tablet support (Windows Ink); Native tablet with no driver (the Pier reads the pen and injects it as Windows Ink) |
 | macOS Pier | Preview: Auto, Speed, Grading, HDR with headroom; Native tablet with pressure for the Wacom Intuos5 touch L |
 | macOS Deck | Works: Apple silicon and Intel apps (macOS 12+), signed and notarised; Native tablet on macOS 13+ (Intel untested with a real tablet) |
-| Windows Deck | New: Windows 11 x64, unsigned MSI; Auto, Speed, and Grading/HDR where the GPU decodes HEVC 4:4:4 ten-bit; several displays (Match my layout); Tablet support (Windows Ink); Native tablet with the optional USB component |
+| Windows Deck | Works: Windows 11 x64, unsigned MSI; Auto, Speed, and Grading/HDR where the GPU decodes HEVC 4:4:4 ten-bit; several displays (Match my layout); Tablet support (Windows Ink); Native tablet with the optional USB component |
 | Linux Deck | Does not exist yet: [help wanted](docs/project.md#where-help-is-wanted) |
 
 What each host does in detail, and what was tested on real hardware, is in

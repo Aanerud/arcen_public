@@ -324,8 +324,10 @@ contract surface (`PipelineId`, `PipelineContract`, `CodecPolicy`,
 `BitratePolicy`, `KeelPolicy`) and the legacy inference helper for Decks that
 do not send a wire pipeline. Each named file owns one contract:
 
-- `auto.rs`: adaptive 8-bit 4:2:0, 30 fps, detail-first.
-- `speed.rs`: adaptive 8-bit 4:2:0, 60 fps, motion-first, one-frame buffer,
+- `auto.rs`: adaptive 8-bit 4:2:0 at the Deck display's refresh
+  (`FrameRatePolicy::FollowDisplay`), detail-first, newest-frame present.
+- `speed.rs`: adaptive 8-bit 4:2:0 at the display's refresh but never below
+  60 fps, motion-first, one-frame buffer, tearing present,
   a safe link-capped start with a true 60 fps shape ceiling, and
   Speed-specific low-latency decode policy for clients that consume the
   served pipeline.
@@ -337,6 +339,22 @@ do not send a wire pipeline. Each named file owns one contract:
 
 To change one pipeline, edit only its file and update the pinned tests in
 `pipeline/mod.rs`; platform code should keep reading `pipeline_contract`.
+
+`video/frame_rate.rs` resolves the served frame rate for every Pier:
+`resolve_session_frame_rate` turns a contract's `FrameRatePolicy`, the Deck
+display's refresh (`AuthResponse::display_refresh_hz`), the Deck's request
+(a follow-display preset honours only a request below its legacy wire rate,
+`PipelineContract::max_fps`, which Decks keep sending so older Piers serve
+what they did) and the administrator's `video.fps` into a `SessionFrameRate`
+with its `FrameRateBasis`; hosts narrow it to what their encoder and capture
+prove (`SessionFrameRate::narrow`, `served_stream_rate`) and state it in the
+hello (`stream_rate`) and `SESSION_STREAM_START` (`display_refresh_hz`,
+`fps_basis`). A copying capture route without a rate measurement serves a
+follow-display contract at most at `UNQUALIFIED_COPY_FPS` (capture admission).
+`HostRateGovernor` judges a running Auto or Speed session on the host's own
+encoded/delivered counts and steps it to an even divisor of the session rate
+when the encoder falls behind, probing back up with backoff; the link's
+Detail shedding (`RateController::detail_framerate`) runs under it.
 Grading is the first fidelity contract with a fixed shared ceiling: it starts
 at the previous link-capped value and may climb to 250 Mbit/s. Platform
 encoders consume the paired `encoder_bitrate_bounds` so their native

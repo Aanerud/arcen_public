@@ -21,7 +21,8 @@ use tokio::task::JoinHandle;
 
 use super::identity::UserExecution;
 use super::launcher::{
-    validate_active_logind_session, AuthenticatedLauncher, LauncherError, SessionLauncher,
+    validate_active_logind_session, AuthenticatedLauncher, ConsoleCommand, LauncherError,
+    SessionLauncher,
 };
 use super::resume::{ResumeRegistry, ResumeRegistryError};
 
@@ -72,6 +73,9 @@ pub struct SessionMetadata {
     /// compositor runs natively on it (ADR 0015); `None` for headless Wayland
     /// and dedicated Xorg.
     pub native_seat: Option<String>,
+    /// A joined console session (ADR 0025): the user's own, which the Pier
+    /// never starts or ends.
+    pub console: bool,
 }
 
 #[derive(Debug, Error)]
@@ -281,6 +285,7 @@ impl DesktopSession {
             requested_outputs: self.requested_outputs.clone(),
             x11_desktop_depth: self.launcher.x11_desktop_depth,
             native_seat: self.native_seat(),
+            console: self.launcher.is_console(),
         }
     }
 
@@ -377,6 +382,29 @@ impl SessionRegistry {
         // (Reconnect/Busy/Dead), and the only source of truth this
         // connection has for what to persist on an actual `Create`.
         pending.set_multi_monitor_plan(multi_monitor.as_ref().map(|(plan, _carrier)| plan));
+        // The console is decided afresh for every sign-in, a reattachment
+        // too: while the Deck was away another account may have taken the
+        // workstation (ADR 0025).
+        if pending.joins_console() {
+            let sessions = super::console::read_sessions().await;
+            if let arcen_session::console_session::ConsoleDecision::Refuse(refusal) =
+                arcen_session::console_session::decide_on(
+                    &sessions,
+                    pending.identity.uid,
+                    super::login_session::console_host(),
+                )
+            {
+                tracing::warn!(
+                    target: crate::logging::target::SESSION,
+                    username = %pending.identity.username,
+                    reason_class = refusal.token(),
+                    "the console sign-in is refused before any desktop is joined"
+                );
+                return Err(LifecycleError::Launcher(LauncherError::Console(
+                    super::console::notice_for(refusal, &sessions, pending.identity.uid),
+                )));
+            }
+        }
         let mut pending = Some(pending);
         loop {
             let decision = {
@@ -506,6 +534,11 @@ impl SessionRegistry {
                                         }
                                         existing.connected = true;
                                         existing.disconnected_since = None;
+                                        // A joined console was handed back
+                                        // locked when the Deck left: make it
+                                        // private again before it is shown,
+                                        // and hear whether it could be.
+                                        let attach = existing.launcher.console_attach();
                                         let replacement = pending
                                             .as_ref()
                                             .expect("pending launcher")
@@ -518,10 +551,13 @@ impl SessionRegistry {
                                             existing.execution(),
                                             replacement,
                                             previous,
+                                            attach,
                                         )))
                                     }
                                 }
-                                Arbitration::Busy => ExistingDecision::Busy,
+                                Arbitration::Busy => ExistingDecision::Busy(
+                                    existing.launcher.console_refusal_for_another_user(),
+                                ),
                             },
                             None => ExistingDecision::Create,
                         }
@@ -569,8 +605,29 @@ impl SessionRegistry {
                     self.wait_for_cleanup().await;
                 }
                 ExistingDecision::Reconnect(reconnect) => {
-                    let (metadata, execution, session_log_id, previous_session_log_id) = *reconnect;
+                    let (metadata, execution, session_log_id, previous_session_log_id, attach) =
+                        *reconnect;
                     pending.take().expect("pending launcher").discard().await;
+                    if let Some(answer) = attach {
+                        let outcome = answer.await.unwrap_or_else(|_| {
+                            Err(
+                                arcen_session::console_session::ConsoleRefusal::SessionUnreachable
+                                    .into(),
+                            )
+                        });
+                        if let Err(notice) = outcome {
+                            tracing::warn!(
+                                target: crate::logging::target::SESSION,
+                                username = %metadata.username,
+                                session_id = %metadata.session_id,
+                                reason_class = notice.token(),
+                                "the returning Deck is not attached to the console session; it is released"
+                            );
+                            self.release_refused_console(metadata.generation, &metadata.username)
+                                .await;
+                            return Err(LifecycleError::Launcher(LauncherError::Console(notice)));
+                        }
+                    }
                     tracing::info!(
                         target: crate::logging::target::SESSION,
                         sid = %session_log_id,
@@ -583,16 +640,25 @@ impl SessionRegistry {
                     );
                     return Ok(SessionLease::new(Arc::downgrade(self), metadata, execution));
                 }
-                ExistingDecision::Busy => {
+                ExistingDecision::Busy(console) => {
                     pending.take().expect("pending launcher").discard().await;
-                    return Err(LifecycleError::Busy);
+                    // Another account's joined console session: the same
+                    // typed refusal the launcher gives when it finds it.
+                    return Err(console.map_or(LifecycleError::Busy, |refusal| {
+                        LifecycleError::Launcher(LauncherError::Console(refusal))
+                    }));
                 }
                 ExistingDecision::Create => break,
             }
         }
 
         let mut pending = pending.take().expect("pending launcher");
-        let mut timezone = pending.timezone().cloned();
+        // A joined console session keeps the user's own time zone.
+        let mut timezone = if pending.joins_console() {
+            None
+        } else {
+            pending.timezone().cloned()
+        };
         let original_timezone = std::env::var("TZ").ok();
         let mut timezone_lease = prepare_timezone_for_open(
             &pending.identity,
@@ -621,6 +687,9 @@ impl SessionRegistry {
             return Err(LifecycleError::TimezoneLease);
         }
         let launcher_is_wayland = launcher.wayland.is_some();
+        // A joined console that could not take the plan's layout commits no
+        // plan; the Pier then ends the sign-in with the reason (ADR 0025 §6).
+        let multi_monitor = multi_monitor.filter(|_| launcher.serves_committed_monitors());
         let desktop = DesktopSession {
             launcher,
             connected: true,
@@ -835,6 +904,47 @@ impl SessionRegistry {
             .map_err(|_| LifecycleError::NativeSessionChanged)
     }
 
+    /// The Deck of a joined console session left with its transport (held
+    /// for its resume) or came back: hand the console back locked, or make
+    /// it private again and unlock it. A no-op for a created desktop.
+    pub(crate) fn console_command(&self, metadata: &SessionMetadata, command: ConsoleCommand) {
+        let guard = self.inner.lock().unwrap();
+        if let Some(session) = guard.session.as_ref().filter(|session| {
+            session.generation == metadata.generation
+                && session.launcher.identity.username == metadata.username
+        }) {
+            session.launcher.console_command(command);
+        }
+    }
+
+    /// A returning Deck of a joined console session: the launcher makes the
+    /// console private again and unlocks it; the receiver answers whether
+    /// it could, with the typed reason if not. `None` for a created
+    /// desktop (or another generation).
+    pub(crate) fn console_attach(
+        &self,
+        metadata: &SessionMetadata,
+    ) -> Option<tokio::sync::oneshot::Receiver<super::launcher::ConsoleAttachOutcome>> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .session
+            .as_ref()
+            .filter(|session| {
+                session.generation == metadata.generation
+                    && session.launcher.identity.username == metadata.username
+            })
+            .and_then(|session| session.launcher.console_attach())
+    }
+
+    /// Ends Arcen's hold on a joined console session whose returning Deck
+    /// was refused (the launcher handed the console back and is leaving);
+    /// the user's session itself goes on.
+    pub(crate) async fn release_refused_console(self: &Arc<Self>, generation: u64, username: &str) {
+        if let Some(completed) = self.start_termination(generation, username) {
+            wait_for_cleanup_completion(completed).await;
+        }
+    }
+
     pub fn replace_session_log_id(
         &self,
         metadata: &SessionMetadata,
@@ -912,10 +1022,12 @@ impl SessionRegistry {
             session.connected = false;
             session.disconnected_since = Some(SystemTime::now());
         }
+        session.launcher.console_command(ConsoleCommand::Detach);
         tracing::info!(
             target: crate::logging::target::SESSION,
             username,
             generation,
+            console = session.launcher.is_console(),
             "client detached; graphical session persists for reconnect"
         );
     }
@@ -1120,6 +1232,17 @@ impl HeldDisplayResources {
     }
 }
 
+/// A reattachment: the desktop's metadata and execution, the new and the
+/// previous log ids, and (for a joined console) the launcher's answer to
+/// whether the returning Deck is attached.
+type Reconnection = (
+    SessionMetadata,
+    UserExecution,
+    CorrelationId,
+    CorrelationId,
+    Option<tokio::sync::oneshot::Receiver<super::launcher::ConsoleAttachOutcome>>,
+);
+
 enum ExistingDecision {
     Dead(Box<DesktopSession>),
     /// The existing desktop is healthy but cannot serve this connection's
@@ -1130,9 +1253,11 @@ enum ExistingDecision {
     /// than the configured idle lifetime. Torn down through the same cleanup
     /// path as [`Self::Dead`] and [`Self::Replace`], then retried as Create.
     IdleExpired(Box<DesktopSession>, Duration, Duration),
-    Reconnect(Box<(SessionMetadata, UserExecution, CorrelationId, CorrelationId)>),
+    Reconnect(Box<Reconnection>),
     Draining,
-    Busy,
+    /// Another user's desktop; for a joined console session, the console
+    /// refusal that names it.
+    Busy(Option<arcen_session::console_session::ConsoleNotice>),
     Create,
 }
 

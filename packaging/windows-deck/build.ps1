@@ -418,6 +418,12 @@ foreach ($exe in $Executables) {
     }
 }
 $deckExe = Join-Path $Release "arcen-deck.exe"
+# A developer build (cargo feature dev-tools) must never ship, even when a
+# stale one sits in the target directory.
+$deckText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($deckExe))
+if ($deckText.Contains("ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP")) {
+    throw "arcen-deck.exe was built with the dev-tools feature; a release package refuses it"
+}
 # arcen-deck.exe is a windows-subsystem program: PowerShell neither waits for
 # it nor captures its output when called with `&`, so read it through pipes.
 $psi = New-Object Diagnostics.ProcessStartInfo $deckExe, "--version"

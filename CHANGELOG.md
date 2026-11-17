@@ -6,6 +6,180 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.1] — 2026-11-17
+
+**Arcen is an extension of your machine.** A Linux Pier now joins the
+desktop session you already have at the workstation, with your
+applications open, instead of starting a new desktop for every connection
+([ADR 0025](docs/adr/0025-arcen-joins-the-users-session.md)). Signing in
+from a Deck while nobody is at the desk goes through the workstation's own
+login screen, so the session you later unlock at the desk is the same one.
+Disconnecting locks the session; it never ends it.
+
+Also new: a joined Linux desktop takes your Deck's monitor layout, one
+stream per monitor, and every Deck keeps the monitors of a session in step
+on one shared timeline
+([ADR 0026](docs/adr/0026-one-timeline-for-every-monitor.md)); and Auto now
+follows your display's refresh instead of a fixed 30 fps.
+
+0.20.1 speaks protocol v5, like 0.17.0 to 0.20.0, and every addition is
+negotiated: 0.20.0 Decks and Piers keep working with 0.20.1, without the new
+features.
+
+### Upgrade notes
+
+- **An upgraded Linux Pier with an Xorg server joins the console.**
+  `platform.session.mode` is new and defaults to `console`, also on an
+  upgraded host whose `pier.json` does not set it. To keep a private desktop
+  per sign-in as before, set `"mode": "dedicated"` under
+  `platform.session` and restart the Pier
+  ([administration guide](docs/operations/pier-administration.md#joining-the-users-session-console-mode)).
+- **GNOME on Wayland at the desk** cannot be joined yet: the sign-in is
+  refused (`console_wayland_session`). Set `WaylandEnable=false` in
+  `/etc/gdm/custom.conf` and restart GDM while nobody is signed in.
+- **A host without monitors** (a virtual GPU, a rack workstation) needs
+  `install-arcen-pier --console-outputs 4` to serve several displays; the X
+  server reads the setting at its next start, so restart the display manager
+  while nobody is signed in, or reboot, then restart the Pier.
+- **Domain accounts** (Active Directory through SSSD with Group Policy access
+  control): the installer adds Arcen's sign-in services to the domain's
+  interactive logon map in `/etc/sssd/conf.d/90-arcen-interactive-logon.conf`.
+- Hosts installed from an older template keep `"fps": 60` under `video`,
+  which caps Auto at 60; remove the key to let Auto follow the Deck alone.
+
+### Enhanced
+
+- **A Linux Pier joins your own session.** With an Xorg server
+  (`platform.session.mode` `console`, the new default) a Deck sign-in joins
+  the session the account holds at the workstation, with its applications
+  running; with nobody signed in, GDM's login screen signs the account in,
+  so a later sign-in at the desk resumes the same session. While a Deck is
+  attached the workstation's monitors are blanked and its keyboard and
+  mouse disabled; on disconnect the session is locked, never ended.
+  Another account at the workstation, or its session in another
+  remote-desktop product, is refused with a code (`console_other_user`,
+  `console_other_user_other_product`), and a refusal because another
+  remote-desktop service holds the workstation names that service as the
+  host reports it (its PAM service and the system service that started it),
+  on both Decks and in the Pier log; no product names are built in. A
+  Wayland console is refused (`console_wayland_session`) until Arcen joins
+  Wayland sessions. The installer adds `pam_arcen_greeter.so`,
+  `/etc/pam.d/gdm-ovirtcred` and a system-bus policy for the login screen,
+  and never replaces another product's.
+- **Hosts without a display manager** get a real, persistent login session
+  per account (`gnome-session` on `seat0`, PAM service `arcen-login`, its
+  own systemd unit). A disconnect leaves it private (GNOME has no lock
+  screen without GDM: its monitors stay blank and the desk's input
+  disabled), a Pier restart leaves it running, and the next sign-in of that
+  account joins it; another account is refused while it exists.
+- **Domain accounts sign in remotely.** On a workstation joined to Active
+  Directory through SSSD with Group Policy access control, a sign-in while
+  nobody is at the desk was refused by SSSD, which did not know the login
+  screen's PAM service. The installer now adds Arcen's sign-in services to the
+  domain's interactive logon map ("Allow log on locally", nothing broader;
+  removed on uninstall). An account the policy refuses is logged as
+  `console_account_denied`, and the Deck says the sign-in may be refused by
+  the workstation's policy, without confirming the password.
+- `dedicated` (a private desktop per sign-in, its heads made to the Deck's
+  displays) remains as an explicit opt-in.
+- **Several monitors on a joined Linux desktop.** A Deck that matches its
+  layout (Match my layout) gets one stream and one window per monitor.
+  While it is attached the workstation takes the Deck's layout: sizes,
+  positions (left of or below the primary included), rotation and primary,
+  on the console's own outputs. When it leaves, the session is locked and
+  the workstation's exact layout comes back; a Pier or launcher that is
+  killed has the layout restored by the service. A console that cannot take
+  the layout is put back as it was and the Deck offers Primary Display Only;
+  a subset is never served silently. A single-display Deck is served the
+  whole screen as one picture, scaled to fit when H.264 cannot carry its
+  width (more than 4096 pixels). New installer option `--console-outputs N`
+  (or a head list; `--no-console-outputs` and `--uninstall` remove it) gives
+  a headless host N virtual outputs at boot
+  (`/etc/X11/xorg.conf.d/10-arcen-console-outputs.conf`); it is never
+  written without the flag.
+- **Monitors in step.** Every Deck now presents the streams of a
+  multi-monitor session on one timeline shared with the Pier: a monitor
+  whose frames arrive early waits for the slowest (at most 50 ms), so all
+  monitors show the same moment of the desktop. The Deck
+  logs the skew (`multi-monitor timeline`). This needs no Pier change and
+  works with every Pier.
+- **Rotated monitors.** Both Decks report each monitor's rotation, and the
+  macOS Pier now accepts a Deck monitor turned a quarter, as an upright
+  portrait display.
+- **Auto follows your display.** Auto was a fixed 30 fps contract; it is now
+  served at the refresh the Deck reports for its display on every Pier
+  (today at most 60 Hz: Decks still ask for remote displays no faster than
+  60), lowered only for what the host proves: an administrator's
+  `video.fps`, the encoder's limit, the capture (a Windows desktop's applied
+  refresh, the macOS Pier's 60, a Wayland output without a qualified rate at
+  30). A frame-rate governor steps a session down to an even divisor of its
+  rate when the host encodes below it while the capture delivers it, and
+  probes back up; the link still sheds Auto's frames before its sharpness.
+  Speed stays the latency preset: never below 60 fps, a one-frame encoder
+  buffer, sharpness given up first, and it may tear. The hello states the
+  rate and its reason (`stream_rate`), `SESSION_STREAM_START` records
+  `display_refresh_hz` and `fps_basis`, and Stream Statistics shows "up to
+  60 · your 60 Hz display" or what limits it. Decks keep asking for the old
+  rates, so older Piers serve exactly what they did. The packaged
+  `pier.json` templates no longer set `video.fps`.
+- For developers: `dev-tools` builds of both Decks can simulate a
+  multi-monitor layout as windows on one screen (never in release builds).
+
+### Fixed
+
+- A refused return to a Linux session now shows its real reason. A Deck
+  returning to a held console session (a resume, or a new sign-in) waits for
+  the console to be made private again and is shown the typed reason when it
+  cannot be (`console_session_changed`, another account, privacy), instead
+  of a capture error or a timeout.
+- The desk is never left unlocked and usable when a Linux session cannot be
+  secured. A refusal after the login screen or logind started the session
+  hands it back locked. A console session that will neither lock nor go
+  behind a login screen stays unusable at the desk even after the Pier's
+  launcher is stopped or killed: its desk devices are disabled in the
+  session's own X server and its monitors stay blank, and the Pier retries
+  every 10 s and gives them back only once the session is secured.
+- A sign-in while nobody is at a Linux workstation could end on GDM's login
+  screen with the new session behind it: GDM may put a new login screen in
+  front when the one that took the sign-in ends. The Pier now waits for
+  that, with the desk already private, and brings the session forward again
+  (at most three times while it waits for the session, and three more while
+  it settles).
+- A dedicated Linux desktop no longer starts beside another console session
+  on any virtual terminal (another product's desktop on VT 7 made the second
+  X server hang until a 30-second timeout); it is refused `seat_occupied` or
+  `seat_occupied_other_product`.
+- A Linux sign-in that got no desktop now leaves `SESSION_AUTH_FAIL` (stage
+  `desktop`) and an error line with its reason at every log profile,
+  `critical` included; the launcher's errors keep their severity, and a
+  dedicated X server that fails or hangs records its log tail and keeps its
+  logs in `<runtime_root>/last-failed/`.
+
+### Known limits
+
+- **macOS Pier** remains a preview. Its 0.20.1 changes (rotated Deck
+  monitors, Auto at the Deck's refresh) pass their tests but have not yet
+  been proven on a real macOS host. Restart the Mac after installing or
+  upgrading the macOS Pier.
+- **Linux, GNOME on Wayland:** a console session on Wayland is refused with
+  a reason (Arcen joins X11 GDM sessions only), and the headless Wayland
+  provider still starts a desktop per connection.
+- **Refresh:** Decks ask for remote displays no faster than 60 Hz, so a 120
+  or 144 Hz display is served at 60.
+- **Four 4K monitors** can run below 60 fps per monitor on some GPUs (the
+  host's capture and encoder limit); Stream Statistics shows the rate per
+  monitor, with no degradation notice yet.
+- **Console monitors are found when the Pier starts.** After restarting the
+  display manager, or changing `--console-outputs`, restart the Pier.
+- **Keyring:** after a sign-in from a Deck while nobody was at the desk, the
+  login keyring is not unlocked; GNOME asks for its password on first use.
+- **A colour-management prompt after a sign-in from a Deck:** when nobody was
+  at the desk, GNOME can ask for an administrator password to "create a color
+  managed device" as the new session starts. Choose Cancel; the session
+  works without it.
+- **A host without a display manager** has no lock screen: its session is
+  resumed only through Arcen while it is kept private.
+
 ## [0.20.0] — 2026-11-16
 
 **The Windows Deck.** Arcen Deck now runs on **Windows 11 x64** as well as
@@ -2798,7 +2972,8 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/Aanerud/arcen_public/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/Aanerud/arcen_public/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Aanerud/arcen_public/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/Aanerud/arcen_public/compare/v0.17.0...v0.18.0

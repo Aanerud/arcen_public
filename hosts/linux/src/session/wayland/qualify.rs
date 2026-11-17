@@ -1856,6 +1856,8 @@ fn qualification_launcher_config(
         // The temporary qualification account never sees a first-login
         // assistant over the desktop being measured.
         first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup::Skip,
+        // Qualification creates headless desktops of its own.
+        desktop_mode: arcen_session::console_session::DesktopMode::Dedicated,
         // Only the X11 qualification session asks for Xwayland.
         x11_apps: false,
     })

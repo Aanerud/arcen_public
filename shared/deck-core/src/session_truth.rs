@@ -419,6 +419,19 @@ pub fn format_accuracy(label: &str, accuracy: Option<ColorAccuracy>) -> String {
     }
 }
 
+/// The rate a session is served "up to": the host's stated stream rate (a
+/// current Pier follows the Deck display's refresh for Auto and Speed),
+/// else the rate this Deck asked for (an older Pier serves the request).
+#[must_use]
+pub fn served_max_fps(
+    hello: Option<&arcen_protocol::messages::ServerHelloMsg>,
+    requested_max_fps: u32,
+) -> u32 {
+    hello
+        .and_then(|hello| hello.stream_rate.as_ref())
+        .map_or(requested_max_fps, |rate| rate.fps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

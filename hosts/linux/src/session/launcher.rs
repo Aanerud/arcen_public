@@ -53,6 +53,18 @@ const fn open_timeout(provider: arcen_session::desktop_provider::DesktopProvider
     }
 }
 const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long a dedicated X server may take to answer, well inside the
+/// broker's open timeout.
+#[cfg(target_os = "linux")]
+const XORG_READY_BUDGET: Duration = Duration::from_secs(12);
+/// How long the broker waits for a console launcher's ready response: a
+/// remote-first sign-in through the login screen (bounded at 30 s) and the
+/// new session's display (bounded at 15 s) come first; the wait for GDM to
+/// settle after the sign-in gets what is left, less [`CONSOLE_READY_MARGIN`].
+const CONSOLE_OPEN_TIMEOUT: Duration = Duration::from_secs(55);
+/// What a console launcher keeps of [`CONSOLE_OPEN_TIMEOUT`] for unlocking
+/// the session and starting its agent.
+const CONSOLE_READY_MARGIN: Duration = Duration::from_secs(5);
 const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(12);
 #[cfg(target_os = "linux")]
 const AGENT_EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -99,6 +111,10 @@ pub enum LauncherError {
     LogindActivation,
     #[error("another remote desktop is active on this host (one X11 desktop per host)")]
     SeatOccupied,
+    #[error("another remote-desktop product holds this host's display (one X11 desktop per host)")]
+    SeatOccupiedOtherProduct(Option<arcen_session::console_session::ForeignService>),
+    #[error("the console sign-in was refused: {}", .0.token())]
+    Console(arcen_session::console_session::ConsoleNotice),
     #[error("authenticated logind session could not be unlocked")]
     LogindUnlock,
     #[error("deskside protection failed")]
@@ -143,6 +159,9 @@ pub struct LauncherConfig {
     pub audio: AgentAudioArguments,
     /// `wayland.first_login_setup` for a headless Wayland desktop.
     pub first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup,
+    /// `platform.session.mode`: join the user's console session (the
+    /// default, ADR 0025) or create a dedicated desktop.
+    pub desktop_mode: arcen_session::console_session::DesktopMode,
 }
 
 #[derive(Serialize)]
@@ -222,6 +241,10 @@ struct OpenRequest {
     /// template's own depth, as every desktop had before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     x11_desktop_depth: Option<u8>,
+    /// Join the user's console session instead of creating a desktop
+    /// (`platform.session.mode = console`, ADR 0025).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    console: bool,
 }
 
 /// A served Deck display's facts, carried to the privileged launcher.
@@ -525,6 +548,7 @@ impl OpenRequest {
             wayland_lab_input_seat: None,
             wayland_native_seat: false,
             x11_desktop_depth: None,
+            console: false,
         }
     }
 
@@ -627,6 +651,23 @@ struct LauncherResponse {
     /// Wayland session and from an older launcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     x11_root_depth: Option<u8>,
+    /// Who started the console session this launcher joined (ADR 0025);
+    /// absent for a desktop the launcher created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    console_origin: Option<String>,
+    /// The joined session was started through the login screen for this
+    /// sign-in (remote-first).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    console_signed_in: bool,
+    /// The other remote-desktop service that started the joined session, or
+    /// that a refusal names, as the host reports it (checked again here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    console_service: Option<arcen_session::console_session::ForeignService>,
+    /// The Deck's layout on the joined console (ADR 0025 §6): `applied`,
+    /// or the token of why not (the console is then served as one
+    /// picture). Absent when no layout was asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    console_layout: Option<String>,
 }
 
 /// The helper environment that pins capture to the dedicated X server's GPU.
@@ -683,7 +724,25 @@ impl LauncherResponse {
             wayland: None,
             audio: None,
             x11_root_depth: None,
+            console_origin: None,
+            console_signed_in: false,
+            console_service: None,
+            console_layout: None,
         }
+    }
+
+    /// A refusal that names the service holding the workstation.
+    fn error_naming(
+        status: &str,
+        service: Option<&arcen_session::console_session::ForeignService>,
+    ) -> Self {
+        let mut response = Self::error(status);
+        response.console_service = service.cloned();
+        response
+    }
+
+    fn console_refusal(notice: &arcen_session::console_session::ConsoleNotice) -> Self {
+        Self::error_naming(notice.token(), notice.service())
     }
 
     fn authenticated(identity: &UserIdentity) -> Self {
@@ -729,6 +788,10 @@ impl LauncherResponse {
             wayland: agent.wayland.clone(),
             audio: agent.audio.clone(),
             x11_root_depth,
+            console_origin: None,
+            console_signed_in: false,
+            console_service: None,
+            console_layout: None,
         }
     }
 
@@ -766,6 +829,12 @@ pub struct AuthenticatedLauncher {
     /// Lab (`wayland.lab_seat_pen`): a desktop this sign-in creates gets its
     /// own pen on its own seat.
     lab_seat_pen: bool,
+    /// This launcher was asked to join the console: if it fails, it may
+    /// have been stopped before handing the console back.
+    console_open_sent: bool,
+    /// The Pier-wide console gate while this launcher joins a console.
+    #[cfg(target_os = "linux")]
+    console_gate: Option<super::console::ConsoleGate>,
     /// How a desktop this sign-in creates gets its seat
     /// (`wayland.session_mode`).
     desktop_seat_plan: arcen_session::native_seat::DesktopSeatPlan,
@@ -775,6 +844,7 @@ pub struct AuthenticatedLauncher {
     x11_desktop_depth: Option<arcen_media::video::DesktopDepth>,
     provider: arcen_session::desktop_provider::DesktopProvider,
     audio: AgentAudioArguments,
+    desktop_mode: arcen_session::console_session::DesktopMode,
 }
 
 impl AuthenticatedLauncher {
@@ -1001,6 +1071,9 @@ impl AuthenticatedLauncher {
                 stream_cursor: None,
                 wayland_fidelity_route: None,
                 lab_seat_pen: false,
+                console_open_sent: false,
+                #[cfg(target_os = "linux")]
+                console_gate: None,
                 desktop_seat_plan: arcen_session::native_seat::DesktopSeatPlan::Headless {
                     fallback: None,
                 },
@@ -1008,9 +1081,13 @@ impl AuthenticatedLauncher {
                 x11_desktop_depth: None,
                 provider: config.provider,
                 audio: config.audio.clone(),
+                desktop_mode: config.desktop_mode,
             }),
             "rejected" => Err(LauncherError::Rejected),
-            _ => Err(LauncherError::Protocol),
+            status => arcen_session::console_session::ConsoleNotice::from_status(status, None)
+                .map_or(Err(LauncherError::Protocol), |notice| {
+                    Err(LauncherError::Console(notice))
+                }),
         }
     }
 
@@ -1103,7 +1180,130 @@ impl AuthenticatedLauncher {
         result
     }
 
+    /// Whether this sign-in joins the user's console session (ADR 0025):
+    /// `platform.session.mode = console` on an Xorg host. A headless Wayland
+    /// provider keeps creating its own desktops.
+    pub(crate) fn joins_console(&self) -> bool {
+        self.desktop_mode == arcen_session::console_session::DesktopMode::Console
+            && self.provider == arcen_session::desktop_provider::DesktopProvider::Xorg
+    }
+
+    /// Joins the user's console session through the privileged launcher:
+    /// no PAM session, no X server and no desktop of Arcen's own.
+    async fn open_console(&mut self) -> Result<SessionLauncher, LauncherError> {
+        // Held until this launcher is cleaned up: the Pier's retries of an
+        // unsecured console never run beside a console launcher. A deferred
+        // layout restore stands aside from here on (after the gate, so a
+        // recovery in progress cannot arm one under this attachment).
+        #[cfg(target_os = "linux")]
+        {
+            let gate = super::console::console_gate().await;
+            gate.held_by(self.child.as_ref().and_then(Child::id));
+            self.console_gate = Some(gate);
+            super::console_layout::attachment_starting();
+        }
+        let stdin = self.stdin.as_mut().ok_or(LauncherError::Protocol)?;
+        // The committed plan travels too: the console lays it on its own
+        // outputs while the Deck is attached (ADR 0025 §6).
+        let mut request = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            self.multi_monitor_plan.clone(),
+            self.session_display.clone(),
+            &self.audio,
+            None,
+        );
+        request.console = true;
+        self.console_open_sent = true;
+        let mut request_json = serde_json::to_vec(&request).map_err(|_| LauncherError::Protocol)?;
+        request_json.push(b'\n');
+        stdin.write_all(&request_json).await?;
+        stdin.flush().await?;
+        let response = read_response(
+            self.stdout.as_mut().ok_or(LauncherError::Protocol)?,
+            CONSOLE_OPEN_TIMEOUT,
+        )
+        .await?;
+        if response.status != "ready"
+            || response.username != self.identity.username
+            || response.uid != self.identity.uid
+            || response.wayland.is_some()
+        {
+            return Err(open_response_error(
+                response.status.as_str(),
+                response.console_service.clone(),
+            ));
+        }
+        let environment = SessionEnvironment::build(
+            &self.identity,
+            &response.display,
+            (!response.xauthority.is_empty()).then_some(response.xauthority.as_str()),
+            &response.desktop,
+            None,
+            vec![
+                ("XDG_SESSION_ID".into(), response.session_id.clone()),
+                (
+                    "XDG_SEAT".into(),
+                    arcen_session::console_session::CONSOLE_SEAT.into(),
+                ),
+                (
+                    "ARCEN_SESSION_LOG_ID".into(),
+                    self.session_log_id
+                        .lock()
+                        .expect("session log id lock")
+                        .to_string(),
+                ),
+            ],
+        )
+        .with_session_audio(response.audio.as_ref());
+        let depth = response
+            .x11_root_depth
+            .and_then(arcen_media::video::DesktopDepth::from_x11_depth)
+            .unwrap_or(arcen_media::video::DesktopDepth::Eight);
+        tracing::info!(
+            target: target::SESSION,
+            session_id = %response.session_id,
+            display = %response.display,
+            origin = response.console_origin.as_deref().unwrap_or("unknown"),
+            signed_in_through_login_screen = response.console_signed_in,
+            layout = response.console_layout.as_deref().unwrap_or("not_requested"),
+            root_depth = ?response.x11_root_depth,
+            "joined the user's console session"
+        );
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let writer = tokio::spawn(write_console_commands(
+            self.stdin.take().ok_or(LauncherError::Protocol)?,
+            self.stdout.take().ok_or(LauncherError::Protocol)?,
+            receiver,
+        ));
+        Ok(SessionLauncher {
+            identity: self.identity.clone(),
+            environment,
+            x11_desktop_depth: Some(depth),
+            wayland: None,
+            audio: response.audio,
+            agent_pid: response.agent_pid,
+            child: self.child.take().ok_or(LauncherError::Protocol)?,
+            stdin: None,
+            stderr_task: self.stderr_task.take().ok_or(LauncherError::Protocol)?,
+            _pam_permit: self.pam_permit.take().ok_or(LauncherError::Protocol)?,
+            session_log_id: Arc::clone(&self.session_log_id),
+            #[cfg(target_os = "linux")]
+            seat_pen: None,
+            console: Some(ConsoleLink { commands, writer }),
+            console_origin: response.console_origin.clone(),
+            console_service: response.console_service.clone(),
+            #[cfg(target_os = "linux")]
+            _console_gate: self.console_gate.take(),
+            console_layout_applied: response.console_layout.as_deref()
+                == Some(CONSOLE_LAYOUT_APPLIED),
+        })
+    }
+
     async fn open_inner(&mut self) -> Result<SessionLauncher, LauncherError> {
+        if self.joins_console() {
+            return self.open_console().await;
+        }
         // polkit's state is read before anything is built: it decides
         // whether this desktop may have a seat at all (below), and whether
         // a native desktop may have its Arcen seat.
@@ -1207,7 +1407,10 @@ impl AuthenticatedLauncher {
             || response.username != self.identity.username
             || response.uid != self.identity.uid
         {
-            return Err(open_response_error(response.status.as_str()));
+            return Err(open_response_error(
+                response.status.as_str(),
+                response.console_service.clone(),
+            ));
         }
         let mut extra_environment = vec![
             ("XDG_SESSION_ID".into(), response.session_id.clone()),
@@ -1339,6 +1542,12 @@ impl AuthenticatedLauncher {
             session_log_id: Arc::clone(&self.session_log_id),
             #[cfg(target_os = "linux")]
             seat_pen,
+            console: None,
+            console_origin: None,
+            console_service: None,
+            #[cfg(target_os = "linux")]
+            _console_gate: None,
+            console_layout_applied: false,
         })
     }
 
@@ -1356,6 +1565,14 @@ impl AuthenticatedLauncher {
             finish_stderr(&mut task).await;
         }
         self.pam_permit.take();
+        // A console open that failed may have been stopped before it
+        // handed the console back: lock and restore from its journal. Only
+        // a launcher that was asked to join (a discarded sign-in that
+        // reattached a held console must not touch that console's journal).
+        #[cfg(target_os = "linux")]
+        if self.console_open_sent {
+            super::console::recover_console().await;
+        }
         #[cfg(target_os = "linux")]
         if let Some(pen) = self.native_pen.take() {
             release_native_seat(pen).await;
@@ -1396,9 +1613,227 @@ pub struct SessionLauncher {
     /// revoked, device destroyed, rule removed) with the desktop.
     #[cfg(target_os = "linux")]
     pub seat_pen: Option<Arc<crate::input::seat_pen::SeatPen>>,
+    /// A joined console session's command line to its launcher; `None`
+    /// for a desktop the launcher created.
+    console: Option<ConsoleLink>,
+    /// Who started the joined console session (`ConsoleOrigin::token`).
+    console_origin: Option<String>,
+    /// The other remote-desktop service that started it, as the host
+    /// reported it.
+    console_service: Option<arcen_session::console_session::ForeignService>,
+    /// The Pier-wide console gate, held until this launcher is cleaned up
+    /// (`console::console_gate`).
+    #[cfg(target_os = "linux")]
+    _console_gate: Option<super::console::ConsoleGate>,
+    /// The joined console took the committed multi-monitor plan's layout.
+    console_layout_applied: bool,
+}
+
+/// [`LauncherResponse::console_layout`] when the console took the layout.
+const CONSOLE_LAYOUT_APPLIED: &str = "applied";
+
+/// The layout a joined console takes while the Deck is attached (ADR 0025
+/// §6): a committed multi-monitor plan's monitors; on a host whose console
+/// runs the installer's forced virtual outputs, a single Deck display as
+/// one head too. `None`: the console keeps its own layout.
+#[cfg(target_os = "linux")]
+fn console_layout_requests(
+    open: &OpenRequest,
+) -> Option<Vec<arcen_outputs::console_layout::ConsoleHeadRequest>> {
+    use super::console_layout;
+    if let Some(plan) = open.multi_monitor.clone() {
+        let plan = plan.into_plan().ok()?;
+        if plan.backend == crate::display::topology::LinuxTopologyBackend::ConsoleOutputs {
+            return console_layout::requests_from_plan(&plan);
+        }
+        return None;
+    }
+    let display = open.display.as_ref()?;
+    console_layout::virtual_outputs_installed().then(|| {
+        vec![console_layout::request_for_display(
+            display.width,
+            display.height,
+            display.refresh_hz,
+        )]
+    })
+}
+
+/// What the broker tells a console launcher while the session is joined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsoleCommand {
+    /// The Deck left (transport lost, held for its resume): hand the
+    /// console back locked.
+    Detach,
+    /// The Deck is back: make the console private again and unlock it.
+    Attach,
+}
+
+impl ConsoleCommand {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Detach => "detach",
+            Self::Attach => "attach",
+        }
+    }
+}
+
+/// How long the broker waits for a console launcher to say whether a
+/// returning Deck is attached: bringing a session forward (5 s), blanking,
+/// and a hand-back that has to secure the session (lock 4 s, a login
+/// screen 4 s) come first.
+const CONSOLE_ATTACH_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// What a returning Deck's console attachment came to: attached, or the
+/// typed refusal the Deck is shown.
+pub(crate) type ConsoleAttachOutcome = Result<(), arcen_session::console_session::ConsoleNotice>;
+
+struct ConsoleRequest {
+    command: ConsoleCommand,
+    reply: Option<tokio::sync::oneshot::Sender<ConsoleAttachOutcome>>,
+}
+
+struct ConsoleLink {
+    commands: tokio::sync::mpsc::UnboundedSender<ConsoleRequest>,
+    writer: JoinHandle<()>,
+}
+
+/// The answer a console launcher gives to `attach`: `attached`, or a
+/// console refusal (naming the service when another one holds the
+/// workstation). Anything else, silence or a closed pipe is a session
+/// that could not be reached.
+fn console_attach_outcome(line: Option<&str>) -> ConsoleAttachOutcome {
+    use arcen_session::console_session::{ConsoleNotice, ConsoleRefusal};
+    let response = line.and_then(|line| serde_json::from_str::<LauncherResponse>(line).ok());
+    match response {
+        Some(response) if response.status == "attached" => Ok(()),
+        Some(response) => Err(ConsoleNotice::from_status(
+            &response.status,
+            response.console_service,
+        )
+        .unwrap_or_else(|| ConsoleRefusal::SessionUnreachable.into())),
+        None => Err(ConsoleRefusal::SessionUnreachable.into()),
+    }
+}
+
+/// Writes console commands to the launcher and reads its answer to each
+/// `attach`; when the broker lets go of the link it says `close`, which
+/// hands the console back and ends the launcher (never the session).
+async fn write_console_commands(
+    mut stdin: ChildStdin,
+    mut stdout: Lines<BufReader<ChildStdout>>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<ConsoleRequest>,
+) {
+    // After an answer that never came, a late one must not be taken for
+    // the next attachment's: every later attachment is refused.
+    let mut answers_lost = false;
+    while let Some(ConsoleRequest { command, reply }) = commands.recv().await {
+        let line = format!("{{\"command\":\"{}\"}}\n", command.token());
+        if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+            if let Some(reply) = reply {
+                let _ = reply.send(console_attach_outcome(None));
+            }
+            return;
+        }
+        let Some(reply) = reply else {
+            continue;
+        };
+        let outcome = if answers_lost {
+            console_attach_outcome(None)
+        } else {
+            match tokio::time::timeout(CONSOLE_ATTACH_TIMEOUT, stdout.next_line()).await {
+                Ok(Ok(line)) => console_attach_outcome(line.as_deref()),
+                Ok(Err(_)) | Err(_) => {
+                    answers_lost = true;
+                    console_attach_outcome(None)
+                }
+            }
+        };
+        let _ = reply.send(outcome);
+    }
+    let _ = stdin.write_all(b"{\"command\":\"close\"}\n").await;
+    let _ = stdin.shutdown().await;
 }
 
 impl SessionLauncher {
+    /// Whether this is a joined console session (ADR 0025).
+    pub fn is_console(&self) -> bool {
+        self.console.is_some()
+    }
+
+    /// Whether a committed multi-monitor plan is served as planned: always
+    /// for a desktop the launcher created; for a joined console only when
+    /// the console took the plan's layout (otherwise it is one picture).
+    pub(crate) fn serves_committed_monitors(&self) -> bool {
+        self.console.is_none() || self.console_layout_applied
+    }
+
+    /// What another account is told while this joined console session is
+    /// held for its Deck: the console belongs to this session's user
+    /// (through another product when the display manager did not start
+    /// it). `None` for a desktop the launcher created.
+    pub(crate) fn console_refusal_for_another_user(
+        &self,
+    ) -> Option<arcen_session::console_session::ConsoleNotice> {
+        use arcen_session::console_session::{ConsoleNotice, ConsoleOrigin, ConsoleRefusal};
+        self.console.as_ref()?;
+        let origin = if self.console_origin.as_deref() == Some(ConsoleOrigin::OtherProduct.token())
+        {
+            ConsoleOrigin::OtherProduct
+        } else {
+            ConsoleOrigin::DisplayManager
+        };
+        Some(ConsoleNotice::naming(
+            ConsoleRefusal::other_user(origin),
+            self.console_service.clone(),
+        ))
+    }
+
+    /// Tells a console launcher that the Deck came back; the receiver
+    /// answers once the launcher made the console private again and
+    /// unlocked it, or with the typed reason it did not. `None` for a
+    /// desktop the launcher created.
+    pub(crate) fn console_attach(
+        &self,
+    ) -> Option<tokio::sync::oneshot::Receiver<ConsoleAttachOutcome>> {
+        let link = self.console.as_ref()?;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        if link
+            .commands
+            .send(ConsoleRequest {
+                command: ConsoleCommand::Attach,
+                reply: Some(reply),
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                target: target::SESSION,
+                "the console launcher is gone; the returning Deck is not attached"
+            );
+        }
+        Some(answer)
+    }
+
+    /// Tells a console launcher that the Deck left; a no-op for a desktop
+    /// the launcher created.
+    pub(crate) fn console_command(&self, command: ConsoleCommand) {
+        if let Some(link) = self.console.as_ref() {
+            if link
+                .commands
+                .send(ConsoleRequest {
+                    command,
+                    reply: None,
+                })
+                .is_err()
+            {
+                tracing::warn!(
+                    target: target::SESSION,
+                    command = command.token(),
+                    "the console launcher is gone; the console is recovered when it is cleaned up"
+                );
+            }
+        }
+    }
+
     pub fn execution(&self) -> UserExecution {
         UserExecution::new(self.identity.clone(), self.environment.clone())
     }
@@ -1427,6 +1862,12 @@ impl SessionLauncher {
     }
 
     pub fn agent_is_running(&self) -> bool {
+        if self.console.is_some() {
+            // A joined console opens no PAM session (ADR 0025 §2): its
+            // agent runs as the user beside the launcher, never in the
+            // session's own scope.
+            return agent_pid_is_users(self.agent_pid, self.identity.uid);
+        }
         agent_pid_matches(
             self.agent_pid,
             self.identity.uid,
@@ -1435,6 +1876,28 @@ impl SessionLauncher {
     }
 
     pub async fn shutdown(mut self) -> bool {
+        let console = self.console.take();
+        if let Some(ConsoleLink {
+            commands,
+            mut writer,
+        }) = console
+        {
+            drop(commands);
+            if tokio::time::timeout(Duration::from_secs(2), &mut writer)
+                .await
+                .is_err()
+            {
+                writer.abort();
+            }
+            close_and_stop_launcher(&mut self.stdin, &mut self.child).await;
+            finish_stderr(&mut self.stderr_task).await;
+            let exited = ensure_agent_exited(self.agent_pid).await;
+            // A launcher that died, or was killed before it handed the
+            // console back, left its journal: lock and restore from it.
+            #[cfg(target_os = "linux")]
+            super::console::recover_console().await;
+            return exited;
+        }
         close_and_stop_launcher(&mut self.stdin, &mut self.child).await;
         finish_stderr(&mut self.stderr_task).await;
         let exited = ensure_agent_exited(self.agent_pid).await;
@@ -1448,6 +1911,9 @@ impl SessionLauncher {
 
 impl Drop for SessionLauncher {
     fn drop(&mut self) {
+        if let Some(link) = self.console.take() {
+            link.writer.abort();
+        }
         self.stdin.take();
         let _ = self.child.start_kill();
         self.stderr_task.abort();
@@ -1512,7 +1978,30 @@ where
             );
         }
         let text = crate::eventlog::bounded_diagnostic_line(&line.text);
-        tracing::info!(target: target::AUTH, launcher = true, %sid, "{text}");
+        // The launcher's own errors and warnings keep their severity, so a
+        // host at the `critical` profile still records why a desktop failed.
+        match launcher_line_severity(&text) {
+            tracing::Level::ERROR => {
+                tracing::error!(target: target::AUTH, launcher = true, %sid, "{text}");
+            }
+            tracing::Level::WARN => {
+                tracing::warn!(target: target::AUTH, launcher = true, %sid, "{text}");
+            }
+            _ => tracing::info!(target: target::AUTH, launcher = true, %sid, "{text}"),
+        }
+    }
+}
+
+/// The severity a launcher stderr line carries (its canonical JSON
+/// `severity`, or a plain-text `ERROR`/`WARN` prefix); `INFO` otherwise.
+fn launcher_line_severity(line: &str) -> tracing::Level {
+    let lower = line.trim_start().to_ascii_lowercase();
+    if lower.contains("\"severity\":\"error\"") || lower.starts_with("error") {
+        tracing::Level::ERROR
+    } else if lower.contains("\"severity\":\"warn\"") || lower.starts_with("warn") {
+        tracing::Level::WARN
+    } else {
+        tracing::Level::INFO
     }
 }
 
@@ -1623,23 +2112,37 @@ fn pid_is_live(pid: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn agent_pid_matches(pid: u32, expected_uid: u32, expected_session_id: &str) -> bool {
-    if !pid_is_live(pid) || !safe_session_id(expected_session_id) {
+    if !safe_session_id(expected_session_id) {
+        return false;
+    }
+    let uid_matches = agent_pid_is_users(pid, expected_uid);
+    let cgroup_matches = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .is_ok_and(|cgroup| cgroup.contains(&format!("session-{expected_session_id}.scope")));
+    uid_matches && cgroup_matches
+}
+
+/// Whether `pid` is alive and runs entirely as `expected_uid`.
+#[cfg(target_os = "linux")]
+fn agent_pid_is_users(pid: u32, expected_uid: u32) -> bool {
+    if !pid_is_live(pid) {
         return false;
     }
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
         return false;
     };
     let expected_uid = expected_uid.to_string();
-    let uid_matches = status.lines().find_map(|line| {
+    status.lines().find_map(|line| {
         let fields = line
             .strip_prefix("Uid:")?
             .split_whitespace()
             .collect::<Vec<_>>();
         Some(fields.len() == 4 && fields.iter().all(|uid| *uid == expected_uid))
-    }) == Some(true);
-    let cgroup_matches = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .is_ok_and(|cgroup| cgroup.contains(&format!("session-{expected_session_id}.scope")));
-    uid_matches && cgroup_matches
+    }) == Some(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn agent_pid_is_users(_pid: u32, _expected_uid: u32) -> bool {
+    true
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1657,7 +2160,7 @@ fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) {
 /// at once when the policy would not let the session user's first process
 /// enter that context (see [`super::selinux`]).
 #[cfg(target_os = "linux")]
-fn take_session_exec_context(
+pub(super) fn take_session_exec_context(
 ) -> Result<Option<super::selinux::SessionSecurityContext>, LauncherError> {
     use super::selinux::{
         current_context, take_pam_exec_context, transition_decision, AccessDecision,
@@ -1794,6 +2297,25 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     struct SecretConversation {
         username: String,
         password: Zeroizing<String>,
+        /// What the PAM modules said (an access-control module's reason),
+        /// bounded, for the log only.
+        messages: Vec<String>,
+    }
+    impl SecretConversation {
+        fn note(&mut self, message: &CStr) {
+            if self.messages.len() < 8 {
+                let text: String = message
+                    .to_string_lossy()
+                    .chars()
+                    .filter(|c| {
+                        !c.is_control()
+                            && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+                    })
+                    .take(200)
+                    .collect();
+                self.messages.push(text);
+            }
+        }
     }
     impl ConversationHandler for SecretConversation {
         fn init(&mut self, default_user: Option<&str>) {
@@ -1809,8 +2331,12 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
         fn prompt_echo_off(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
             CString::new(self.password.as_str()).map_err(|_| ErrorCode::CONV_ERR)
         }
-        fn text_info(&mut self, _message: &CStr) {}
-        fn error_msg(&mut self, _message: &CStr) {}
+        fn text_info(&mut self, message: &CStr) {
+            self.note(message);
+        }
+        fn error_msg(&mut self, message: &CStr) {
+            self.note(message);
+        }
     }
 
     // A headless Wayland desktop hands the login password to its own
@@ -1819,6 +2345,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     let conversation = SecretConversation {
         username: auth.username.clone(),
         password: Zeroizing::new(std::mem::take(&mut auth.password)),
+        messages: Vec::new(),
     };
     let mut context = Context::new(&pam_service, Some(&auth.username), conversation)
         .map_err(|_| LauncherError::PamInitialization)?;
@@ -1844,7 +2371,28 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
             .and_then(|()| context.putenv("XDG_VTNR=1"))
             .map_err(|_| LauncherError::PamInitialization)?;
     }
-    if context.authenticate(Flag::NONE).is_err() || context.acct_mgmt(Flag::NONE).is_err() {
+    if context.authenticate(Flag::NONE).is_err() {
+        write_response(&LauncherResponse::error("rejected"))?;
+        return Err(LauncherError::Rejected);
+    }
+    if let Err(error) = context.acct_mgmt(Flag::NONE) {
+        // The password was right; the account check refused. Access
+        // control (a domain's Group Policy logon right through SSSD,
+        // pam_access, an HBAC rule) answers "permission denied": the Deck
+        // is told so in words, the log keeps the module's own reason.
+        if error.code() == ErrorCode::PERM_DENIED {
+            let refusal = arcen_session::console_session::ConsoleRefusal::AccountDenied;
+            tracing::warn!(
+                target: target::SESSION,
+                pam_service = %pam_service,
+                pam_error = %error,
+                module_messages = %context.conversation().messages.join(" | "),
+                reason_class = refusal.token(),
+                "the account check refused this sign-in (access policy)"
+            );
+            write_response(&LauncherResponse::error(refusal.token()))?;
+            return Err(LauncherError::Console(refusal.into()));
+        }
         write_response(&LauncherResponse::error("rejected"))?;
         return Err(LauncherError::Rejected);
     }
@@ -1861,6 +2409,30 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     let open = parse_open_request(&command)?;
     let x11_desktop_depth = open.x11_desktop_depth()?;
     let mut commands = commands.lines();
+    if open.console && !wayland {
+        // No PAM session: the session already exists (or the login screen
+        // creates it). PAM proved the password and the account above.
+        drop(context);
+        let launch = super::login_session::LoginLaunch {
+            xorg_binary: xorg_binary.clone(),
+            xorg_config_template: xorg_config_template.clone(),
+            runtime_root: runtime_root.clone(),
+            gpu_head: gpu_head.clone(),
+            reserved_display: display.clone(),
+            desktop: desktop.clone(),
+            depth: x11_desktop_depth.map(arcen_media::video::DesktopDepth::x11_depth),
+        };
+        return run_console(
+            &identity,
+            &open,
+            &agent_binary,
+            &desktop,
+            &session_log_id,
+            &mut commands,
+            &launch,
+        )
+        .await;
+    }
 
     context
         .putenv(format!("XDG_SESSION_DESKTOP={desktop}"))
@@ -1891,6 +2463,46 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
             }
         })
         .map_err(|_| LauncherError::PamSession)?;
+    // A dedicated desktop never starts beside a console session that holds
+    // the GPU's display on any VT (another remote-desktop product's desktop
+    // runs its own Xorg on VT 7): the second X server hangs, or takes the
+    // console away.
+    if !wayland {
+        if let Some((holder, origin)) =
+            arcen_session::x11_seat::x11_seat_holder(&super::console::read_sessions().await)
+        {
+            tracing::warn!(
+                target: target::SESSION,
+                holder_session = %holder.id,
+                holder_service = %holder.service,
+                holder_vt = holder.vtnr,
+                origin = origin.token(),
+                "a console session holds this host's display; a dedicated desktop is not started beside it"
+            );
+            let error = if origin == arcen_session::console_session::ConsoleOrigin::OtherProduct {
+                let service = super::console::foreign_service(holder);
+                tracing::warn!(
+                    target: target::SESSION,
+                    pam_service = service.pam_service().unwrap_or("unknown"),
+                    unit = service.unit().unwrap_or("unknown"),
+                    process = service.process().unwrap_or("unknown"),
+                    "another remote-desktop service holds this host's display"
+                );
+                LauncherError::SeatOccupiedOtherProduct(Some(service))
+            } else {
+                LauncherError::SeatOccupied
+            };
+            let service = match &error {
+                LauncherError::SeatOccupiedOtherProduct(service) => service.as_ref(),
+                _ => None,
+            };
+            write_response(&LauncherResponse::error_naming(
+                logind_error_status(&error),
+                service,
+            ))?;
+            return Err(error);
+        }
+    }
     let pam_session = match context.open_session(Flag::NONE) {
         Ok(session) => session,
         Err(_) => {
@@ -2003,6 +2615,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
                 .as_ref()
                 .map(|served| (served.width, served.height)),
         },
+        XorgSeat::Dedicated,
     );
     let transaction = arcen_outputs::OutputTransaction::acquire(
         provider,
@@ -2170,6 +2783,502 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     .await;
     drop(pam_session);
     deskside_restore.map_err(|_| LauncherError::Deskside)
+}
+
+/// Joins the user's console session (ADR 0025) and keeps it private until
+/// the broker lets go; then hands the console back locked. Never starts or
+/// ends a session of its own: a remote-first sign-in is completed by GDM's
+/// login screen, and the session lives on after the Deck leaves.
+#[cfg(target_os = "linux")]
+async fn run_console(
+    identity: &UserIdentity,
+    open: &OpenRequest,
+    agent_binary: &Path,
+    desktop: &str,
+    session_log_id: &CorrelationId,
+    commands: &mut Lines<LauncherCommands>,
+    launch: &super::login_session::LoginLaunch,
+) -> Result<(), LauncherError> {
+    use super::console;
+    use arcen_session::console_session::{self as model, ConsoleDecision, ConsoleRefusal};
+
+    let refuse = |notice: model::ConsoleNotice| -> LauncherError {
+        tracing::warn!(
+            target: target::SESSION,
+            reason_class = notice.token(),
+            service = notice
+                .service()
+                .and_then(model::ForeignService::label)
+                .as_deref()
+                .unwrap_or(""),
+            "the console sign-in is refused"
+        );
+        let _ = write_response(&LauncherResponse::console_refusal(&notice));
+        LauncherError::Console(notice)
+    };
+    let ready_by = tokio::time::Instant::now() + CONSOLE_OPEN_TIMEOUT - CONSOLE_READY_MARGIN;
+    let sessions = console::read_sessions().await;
+    let host = super::login_session::console_host();
+    let decision = model::decide_on(&sessions, identity.uid, host);
+    tracing::info!(
+        target: target::SESSION,
+        decision = ?decision,
+        sessions = sessions.len(),
+        "console session decision"
+    );
+    let mut privacy = console::ConsolePrivacy::default();
+    let mut signed_in_through: Option<String> = None;
+    // A login session this launcher started that cannot be made private is
+    // ended: nobody has seen it, and nothing could cover it at the desk.
+    let mut started_login_session = false;
+    let (session_id, origin, signed_in) = match decision {
+        ConsoleDecision::Attach {
+            session,
+            activate,
+            origin,
+        } => {
+            if activate {
+                // As for a returning Deck: the desk's input is disabled and
+                // its monitors blanked (best effort, behind the login
+                // screen) before the session is shown.
+                if let Err(refusal) = privacy.disable_input() {
+                    return Err(refuse(refusal.into()));
+                }
+                if let Some(display) =
+                    console::find_session_display(&session, identity.uid, &identity.home)
+                {
+                    let _ = privacy.blank(&display, &session);
+                }
+                privacy.mark_brought_forward();
+                if !console::activate_session(&session).await {
+                    secure_before_leaving(&mut privacy, None, &session).await;
+                    return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
+                }
+            }
+            (session, origin, false)
+        }
+        ConsoleDecision::SignInThroughGreeter { greeter } => {
+            // The desk's input goes first: nobody at the desk may use the
+            // session the login screen is about to start.
+            if let Err(refusal) = privacy.disable_input() {
+                return Err(refuse(refusal.into()));
+            }
+            match console::sign_in_through_greeter(&greeter, &identity.username, identity.uid).await
+            {
+                Ok(session) => {
+                    privacy.mark_brought_forward();
+                    signed_in_through = Some(greeter);
+                    let origin = console::session_fact(&session)
+                        .await
+                        .map_or(model::ConsoleOrigin::DisplayManager, |fact| fact.origin());
+                    (session, origin, true)
+                }
+                Err(refusal) => return Err(refuse(refusal.into())),
+            }
+        }
+        ConsoleDecision::StartLoginSession { vt } => {
+            // As for a login screen: nobody at the desk may use the session
+            // about to start on its monitors.
+            if let Err(refusal) = privacy.disable_input() {
+                return Err(refuse(refusal.into()));
+            }
+            match super::login_session::start(identity, vt, launch).await {
+                Ok(session) => {
+                    privacy.mark_brought_forward();
+                    started_login_session = true;
+                    (session, model::ConsoleOrigin::Arcen, true)
+                }
+                // A session that did not start was stopped: nothing of it
+                // is left on the desk's monitors.
+                Err(refusal) => {
+                    privacy.release_input();
+                    return Err(refuse(refusal.into()));
+                }
+            }
+        }
+        ConsoleDecision::Refuse(refusal) => {
+            return Err(refuse(console::notice_for(
+                refusal,
+                &sessions,
+                identity.uid,
+            )))
+        }
+    };
+    // A session this sign-in brought to the desk's monitors (started by
+    // the login screen, or brought forward) is secured before any refusal
+    // gives the desk back; one the desk was already using is left as it
+    // was (nothing of it was shown or unlocked).
+    let Some((session_display, depth)) =
+        console::wait_for_session_display(&session_id, identity.uid, &identity.home).await
+    else {
+        if started_login_session {
+            end_unseen_login_session(&mut privacy, None, &session_id).await;
+        } else if privacy.is_brought_forward() {
+            secure_before_leaving(&mut privacy, None, &session_id).await;
+        }
+        return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
+    };
+    if let Err(refusal) = privacy.arm(&session_display, &session_id) {
+        if started_login_session {
+            end_unseen_login_session(&mut privacy, Some(&session_display), &session_id).await;
+        } else if privacy.is_brought_forward() {
+            secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
+        }
+        return Err(refuse(refusal.into()));
+    }
+    // GDM finishes the login screen that took the sign-in only now, and may
+    // put a new one in front of the session; with the desk private, the
+    // session is brought forward again before anything is streamed.
+    if let Some(greeter) = signed_in_through.as_deref() {
+        if !console::settle_signed_in_session(
+            greeter,
+            identity.uid,
+            &session_id,
+            &mut privacy,
+            ready_by,
+        )
+        .await
+        {
+            secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
+            return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
+        }
+    }
+    // The Deck's layout, while the monitors are blank and the session not
+    // yet open (ADR 0025 §6). A console that cannot take it is left as it
+    // is, and the Pier is told why (it ends the sign-in with the reason).
+    let layout_requests = console_layout_requests(open);
+    let console_layout = match layout_requests.as_deref() {
+        Some(requests) => Some(
+            match privacy
+                .apply_layout(&session_display, &session_id, identity.uid, requests)
+                .await
+            {
+                Ok(()) => CONSOLE_LAYOUT_APPLIED.to_owned(),
+                Err(failure) => {
+                    tracing::warn!(
+                        target: target::SESSION,
+                        reason_class = failure.token,
+                        detail = %failure.detail,
+                        monitors = requests.len(),
+                        "the console cannot take the Deck's layout; it is left as it is"
+                    );
+                    failure.token.to_owned()
+                }
+            },
+        ),
+        None => None,
+    };
+    // Only now, with the desk private, may a locked session open.
+    if let Err(error) = unlock_logind_session_id(&session_id).await {
+        tracing::warn!(target: target::SESSION, %error, "the joined console session could not be unlocked; the Deck sees its lock screen");
+    }
+    let vtnr = console::session_fact(&session_id)
+        .await
+        .map_or(0, |fact| fact.vtnr);
+    let environment = SessionEnvironment::build(
+        identity,
+        &session_display.display,
+        Some(&session_display.xauthority.to_string_lossy()),
+        desktop,
+        None,
+        [
+            ("XDG_SESSION_ID".to_owned(), session_id.clone()),
+            ("XDG_SEAT".to_owned(), model::CONSOLE_SEAT.to_owned()),
+            ("XDG_VTNR".to_owned(), vtnr.to_string()),
+        ],
+    )
+    .with_locale(&super::locale::session_locale(&identity.username));
+    if environment.validate_runtime(identity).is_err() {
+        secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
+        return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
+    }
+    let audio = open.audio();
+    let mut agent = match SessionAgent::spawn_console(
+        agent_binary,
+        identity,
+        &environment,
+        desktop,
+        session_log_id,
+        &audio,
+    )
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) => {
+            secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
+            if matches!(error, AgentError::LocalPlaybackRefused(_)) {
+                write_response(&LauncherResponse::error("local_playback_refused"))?;
+                return Err(LauncherError::LocalPlaybackRefused);
+            }
+            // Every failure after authentication answers with a status.
+            write_response(&LauncherResponse::error("agent_error"))?;
+            return Err(error.into());
+        }
+    };
+    let mut ready =
+        LauncherResponse::ready(identity, &environment, &agent.ready, None, Some(depth));
+    ready.console_origin = Some(origin.token().to_owned());
+    ready.console_signed_in = signed_in;
+    if origin == model::ConsoleOrigin::OtherProduct {
+        // Named to another account the Deck's absence would otherwise
+        // leave guessing (`console_refusal_for_another_user`).
+        ready.console_service = console::session_fact(&session_id)
+            .await
+            .map(|fact| console::foreign_service(&fact));
+    }
+    ready.console_layout = console_layout.clone();
+    if let Err(error) = write_response(&ready) {
+        agent.shutdown().await;
+        secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
+        return Err(error);
+    }
+    tracing::info!(
+        target: target::SESSION,
+        session_id = %session_id,
+        display = %session_display.display,
+        origin = origin.token(),
+        signed_in,
+        "the console session is joined and private"
+    );
+
+    // Installed once: a stop that arrives while a command or a hand-back is
+    // being handled is kept for the next wait, never lost.
+    let mut stop = StopSignals::install()?;
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks: u32 = 0;
+    let mut attached = true;
+    loop {
+        tokio::select! {
+            line = commands.next_line() => {
+                let command = match line {
+                    Ok(Some(line)) => serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|value| value.get("command").and_then(|c| c.as_str()).map(str::to_owned)),
+                    _ => None,
+                };
+                match command.as_deref() {
+                    Some("detach") => {
+                        attached = false;
+                        // Held for its resume: the console is locked and
+                        // given back, but keeps the Deck's layout until the
+                        // hold ends (the resumed capture finds its outputs).
+                        privacy.hold_layout();
+                        if privacy.is_armed() {
+                            console::hand_back(&mut privacy, &session_id).await;
+                        }
+                    }
+                    Some("attach") => {
+                        attached = true;
+                        let mut desk = console::LiveDesk {
+                            privacy: &mut privacy,
+                            display: &session_display,
+                            session_id: &session_id,
+                            layout: layout_requests
+                                .as_deref()
+                                .filter(|_| console_layout.as_deref() == Some(CONSOLE_LAYOUT_APPLIED))
+                                .map(|requests| (requests, identity.uid)),
+                            layout_failed: false,
+                        };
+                        // The broker waits for this answer before it
+                        // streams, so the returning Deck is told why.
+                        match console::reattach(
+                            &mut desk,
+                            &session_id,
+                            identity.uid,
+                            super::login_session::console_host(),
+                        )
+                        .await
+                        {
+                            // The returning Deck's layout could not be laid
+                            // again: the console is handed back (unlock) and
+                            // the Deck is not attached.
+                            Ok(()) if desk.layout_failed => {
+                                let _ = write_response(&LauncherResponse::error(
+                                    "console_layout_unproven",
+                                ));
+                                break;
+                            }
+                            Ok(()) => {
+                                let _ = write_response(&LauncherResponse::error("attached"));
+                            }
+                            Err(refusal) => {
+                                let notice = console::notice_for(
+                                    refusal,
+                                    &console::read_sessions().await,
+                                    identity.uid,
+                                );
+                                let _ = write_response(&LauncherResponse::console_refusal(&notice));
+                                break;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            () = stop.recv() => break,
+            _ = agent.wait_for_exit() => {
+                tracing::warn!(target: target::SESSION, "the console session agent exited");
+                break;
+            }
+            _ = tick.tick() => {
+                ticks = ticks.wrapping_add(1);
+                if privacy.is_armed() {
+                    privacy.enforce();
+                    // A hand-back whose lock failed keeps the desk private
+                    // and tries again.
+                    if !attached && ticks.is_multiple_of(5) {
+                        console::hand_back(&mut privacy, &session_id).await;
+                    }
+                }
+                if ticks & 1 == 0 {
+                    let alive = console::session_fact(&session_id)
+                        .await
+                        .is_some_and(|fact| fact.uid == identity.uid && fact.is_console_desktop());
+                    if !alive {
+                        tracing::info!(
+                            target: target::SESSION,
+                            session_id = %session_id,
+                            "the console session ended (the user logged out)"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Leaving: the console's own layout comes back. After a resume hold the
+    // desk already has the session (locked when the Deck left, perhaps
+    // unlocked at the desk since): only its layout is restored, the session
+    // is not locked again.
+    privacy.release_layout_hold();
+    if !privacy.is_armed() && !privacy.holds_input() && !privacy.is_brought_forward() {
+        privacy.restore_layout().await;
+    }
+    // Armed, or with the desk's input still held: the session is handed
+    // back locked before the desk gets anything back. A session that will
+    // neither lock nor go behind a login screen keeps the desk private
+    // (the Deck's stream ends first) until it does, or ends.
+    if privacy.needs_hand_back() && !console::hand_back(&mut privacy, &session_id).await {
+        agent.shutdown().await;
+        keep_private_until_secured(&mut privacy, Some(&session_display), &session_id, &mut stop)
+            .await;
+        return Ok(());
+    }
+    agent.shutdown().await;
+    Ok(())
+}
+
+/// Hands the console back before the launcher leaves, when it must
+/// ([`console::ConsolePrivacy::needs_hand_back`]; callers secure first
+/// and answer the broker after, so its teardown timer cannot cut the
+/// hand-back short); a session that will not
+/// be secured keeps the desk private until it is.
+async fn secure_before_leaving(
+    privacy: &mut super::console::ConsolePrivacy,
+    display: Option<&super::console::SessionDisplay>,
+    session_id: &str,
+) {
+    if privacy.needs_hand_back() && !super::console::hand_back(privacy, session_id).await {
+        // Arcen's own login session is kept private by design: once the
+        // desk is journalled private (the Pier holds it from here), the
+        // refusal goes out now instead of after the broker's timeout.
+        if privacy.is_armed() && super::console::kept_private_by_design(session_id).await {
+            privacy.keep_desk_disabled_beyond_launcher();
+            return;
+        }
+        match StopSignals::install() {
+            Ok(mut stop) => {
+                keep_private_until_secured(privacy, display, session_id, &mut stop).await
+            }
+            Err(error) => tracing::error!(
+                target: target::SESSION,
+                %error,
+                "stop signals could not be watched; the console stays as the failed hand-back left it"
+            ),
+        }
+    }
+}
+
+/// Ends Arcen's own login session that this launcher started and could
+/// not make private (its display did not answer, or the desk could not be
+/// blanked): nobody has seen it, and without a lock screen nothing could
+/// cover it once the desk's input is given back. Kept private meanwhile.
+async fn end_unseen_login_session(
+    privacy: &mut super::console::ConsolePrivacy,
+    display: Option<&super::console::SessionDisplay>,
+    session_id: &str,
+) {
+    let ended = super::console::terminate_session(session_id).await;
+    if ended {
+        tracing::warn!(
+            target: target::SESSION,
+            session_id,
+            "the new login session could not be made private; it was ended before anyone saw it"
+        );
+        privacy.release_input();
+    } else {
+        tracing::error!(
+            target: target::SESSION,
+            session_id,
+            "the new login session could not be made private or ended; the desk stays private"
+        );
+        secure_before_leaving(privacy, display, session_id).await;
+    }
+}
+
+/// Keeps the desk private (monitors blank where the display is known,
+/// input disabled) and retries the hand-back every 5 s until the session
+/// is locked, behind a login screen, or gone, or the launcher is stopped.
+/// From the first failed hand-back on, the session's X server also ignores
+/// the desk's devices (journalled): a grab ends with this process, so a
+/// stop, or a kill, still leaves the desk unusable and its monitors blank;
+/// the Pier keeps retrying (`console::guard_unsecured_console`) and gives
+/// the desk back only once the session is secure.
+async fn keep_private_until_secured(
+    privacy: &mut super::console::ConsolePrivacy,
+    display: Option<&super::console::SessionDisplay>,
+    session_id: &str,
+    stop: &mut StopSignals,
+) {
+    let mut disabled_beyond = false;
+    loop {
+        match display {
+            Some(_) if privacy.is_armed() => privacy.enforce(),
+            Some(display) => {
+                let _ = privacy.arm(display, session_id);
+            }
+            None => {
+                let _ = privacy.disable_input();
+            }
+        }
+        if !disabled_beyond && privacy.is_armed() {
+            privacy.keep_desk_disabled_beyond_launcher();
+            disabled_beyond = true;
+        }
+        tokio::select! {
+            () = stop.recv() => {
+                if disabled_beyond {
+                    tracing::error!(
+                        target: target::SESSION,
+                        session_id,
+                        "stopped before the console session could be locked; its monitors stay blank and the desk's input disabled in its X server until the Pier secures it"
+                    );
+                } else {
+                    tracing::error!(
+                        target: target::SESSION,
+                        session_id,
+                        "stopped before the console session could be locked, and its display is unknown; the desk's input is released"
+                    );
+                }
+                return;
+            }
+            () = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+        if super::console::hand_back(privacy, session_id).await {
+            return;
+        }
+    }
 }
 
 /// The virtual output a headless Wayland session stands for: the served
@@ -2371,7 +3480,7 @@ async fn run_wayland_desktop(
             recover_local_playback(agent_binary, identity, &environment, session_log_id, &audio)
                 .await;
             write_response(&LauncherResponse::error(status))?;
-            return Err(open_response_error(status));
+            return Err(open_response_error(status, None));
         }
         None => {
             let _ = release_wayland_session(session_id, identity, &environment, &runtime_dir, None)
@@ -2669,9 +3778,56 @@ async fn wait_for_deskside_failure(deskside: &mut Option<crate::deskside::LinuxD
     }
 }
 
+/// Which seat position an Xorg the launcher starts takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum XorgSeat {
+    /// An Arcen desktop on VT 1, confined to its own session's devices.
+    Dedicated,
+    /// A real login session on `seat0` at `vt` (ADR 0025 §10): the
+    /// console's devices are its own, as with any display manager's X
+    /// server, and the desk is made private while a Deck is attached.
+    Console { vt: u32 },
+}
+
+impl XorgSeat {
+    fn vt(self) -> u32 {
+        match self {
+            Self::Dedicated => 1,
+            Self::Console { vt } => vt,
+        }
+    }
+}
+
+/// The template's configuration for a console seat's X server: devices are
+/// added and enabled as on any console X server (the template turns that
+/// off for a confined desktop).
+#[cfg(any(target_os = "linux", test))]
+fn with_console_input(config: &str) -> String {
+    let mut out: Vec<&str> = Vec::with_capacity(config.lines().count());
+    for line in config.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let off = words.first() == Some(&"Option")
+            && matches!(
+                words.get(1),
+                Some(&"\"AutoAddDevices\"" | &"\"AutoEnableDevices\"")
+            )
+            && words.get(2) == Some(&"\"false\"");
+        if !off {
+            out.push(line);
+        }
+    }
+    let mut rendered = out.join("\n");
+    if config.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered
+}
+
 #[cfg(target_os = "linux")]
-struct PreparedDedicatedXorg {
+pub(super) struct PreparedDedicatedXorg {
     display_number: u16,
+    /// The virtual terminal the server runs on.
+    vt: u32,
     config_text: String,
     /// The NVIDIA GPU `config_text` names, when the host has it.
     gpu_pci: Option<arcen_outputs::PciAddress>,
@@ -2690,7 +3846,7 @@ struct PreparedDedicatedXorg {
 /// separate `committed` flag. Both are gone: the shared transaction tracks the
 /// state machine, and the binding is what `rollback` needs and nothing else.
 #[cfg(target_os = "linux")]
-struct DedicatedXorgBinding {
+pub(super) struct DedicatedXorgBinding {
     output: DedicatedXorg,
     plan: super::output_provider::DedicatedXorgPlan,
     session_log_id: CorrelationId,
@@ -2704,13 +3860,13 @@ struct DedicatedXorgBinding {
 
 #[cfg(target_os = "linux")]
 impl DedicatedXorgBinding {
-    fn into_output(self) -> DedicatedXorg {
+    pub(super) fn into_output(self) -> DedicatedXorg {
         self.output
     }
 }
 
 #[cfg(target_os = "linux")]
-struct DedicatedXorgProvider<'a> {
+pub(super) struct DedicatedXorgProvider<'a> {
     binary: &'a Path,
     template: &'a Path,
     runtime_root: &'a Path,
@@ -2722,12 +3878,13 @@ struct DedicatedXorgProvider<'a> {
     edid: Option<&'a [u8; 128]>,
     /// The desktop's depth and the single-head screen size.
     screen: arcen_outputs::SessionScreen,
+    seat: XorgSeat,
 }
 
 #[cfg(target_os = "linux")]
 impl<'a> DedicatedXorgProvider<'a> {
     #[allow(clippy::too_many_arguments)] // Dedicated Xorg's existing launch context.
-    fn new(
+    pub(super) fn new(
         binary: &'a Path,
         template: &'a Path,
         runtime_root: &'a Path,
@@ -2737,6 +3894,7 @@ impl<'a> DedicatedXorgProvider<'a> {
         identity: &'a UserIdentity,
         edid: Option<&'a [u8; 128]>,
         screen: arcen_outputs::SessionScreen,
+        seat: XorgSeat,
     ) -> Self {
         Self {
             binary,
@@ -2748,6 +3906,7 @@ impl<'a> DedicatedXorgProvider<'a> {
             identity,
             edid,
             screen,
+            seat,
         }
     }
 }
@@ -2817,7 +3976,10 @@ impl arcen_outputs::OutputProvider for DedicatedXorgProvider<'_> {
             }
             _ => (config_text, None),
         };
-        let config_text = with_session_input_isolation(&config_text, self.x_display)?;
+        let config_text = match self.seat {
+            XorgSeat::Dedicated => with_session_input_isolation(&config_text, self.x_display)?,
+            XorgSeat::Console { .. } => with_console_input(&config_text),
+        };
         // A multi-head plan already sized its own `Virtual`.
         // A single head's `Virtual` is raised to the served display if the
         // template's is smaller, never lowered: later resizes and larger
@@ -2844,6 +4006,7 @@ impl arcen_outputs::OutputProvider for DedicatedXorgProvider<'_> {
         let config_text = rendered.config;
         Ok(PreparedDedicatedXorg {
             display_number,
+            vt: self.seat.vt(),
             config_text,
             gpu_pci,
             edid,
@@ -2895,12 +4058,18 @@ impl arcen_outputs::OutputProvider for DedicatedXorgProvider<'_> {
     }
 
     async fn verify(&mut self, binding: &mut Self::Binding) -> Result<(), Self::Error> {
-        binding.output.wait_ready(self.x_display).await?;
-        if let Some(plan) = binding.plan.as_ref() {
-            binding
-                .output
-                .verify_applied_topology(self.x_display, plan)
-                .await?;
+        let mut result = binding.output.wait_ready(self.x_display).await;
+        if result.is_ok() {
+            if let Some(plan) = binding.plan.as_ref() {
+                result = binding
+                    .output
+                    .verify_applied_topology(self.x_display, plan)
+                    .await;
+            }
+        }
+        if let Err(error) = result {
+            binding.output.keep_failed_logs(&error);
+            return Err(error);
         }
         binding.evidence.set_applied_topology(binding.plan.clone());
         Ok(())
@@ -3080,7 +4249,7 @@ fn prepare_libinput_quirks(
 }
 
 #[cfg(target_os = "linux")]
-struct DedicatedXorg {
+pub(super) struct DedicatedXorg {
     child: Child,
     display_number: u16,
     session_dir: PathBuf,
@@ -3141,7 +4310,7 @@ impl DedicatedXorg {
             .arg(&log_path)
             .arg("-noreset")
             .arg("-novtswitch")
-            .arg("vt1")
+            .arg(format!("vt{}", prepared.vt))
             .arg("-nolisten")
             .arg("tcp")
             .stdin(Stdio::null())
@@ -3169,34 +4338,99 @@ impl DedicatedXorg {
         })
     }
 
+    /// Keeps a failed desktop's Xorg log and configuration beside the
+    /// session runtime root (`last-failed/`, replaced by the next failure)
+    /// and records the log's tail at error level, so a host at the
+    /// `critical` profile can say why its desktop did not start.
+    fn keep_failed_logs(&self, error: &LauncherError) {
+        use std::io::{Read as _, Seek as _};
+        const TAIL_BYTES: u64 = 2048;
+        let log = self.session_dir.join("Xorg.log");
+        let mut tail = String::new();
+        if let Ok(mut file) = std::fs::File::open(&log) {
+            let length = file.metadata().map_or(0, |metadata| metadata.len());
+            let _ = file.seek(std::io::SeekFrom::Start(length.saturating_sub(TAIL_BYTES)));
+            let mut bytes = Vec::new();
+            let _ = file.take(TAIL_BYTES).read_to_end(&mut bytes);
+            tail = crate::eventlog::bounded_diagnostic_line(
+                &String::from_utf8_lossy(&bytes).replace('\n', " | "),
+            )
+            .into_owned();
+        }
+        let kept = self
+            .session_dir
+            .parent()
+            .map(|root| root.join("last-failed"));
+        if let Some(kept) = kept.as_ref() {
+            let _ = std::fs::remove_dir_all(kept);
+            if std::fs::create_dir(kept).is_ok() {
+                let _ = std::fs::set_permissions(kept, std::fs::Permissions::from_mode(0o700));
+                for name in ["Xorg.log", "xorg.conf"] {
+                    let _ = std::fs::copy(self.session_dir.join(name), kept.join(name));
+                }
+            }
+        }
+        tracing::error!(
+            target: target::SESSION,
+            %error,
+            kept = ?kept,
+            xorg_log_tail = %tail,
+            "the dedicated desktop's X server failed; its log is kept"
+        );
+    }
+
     /// The NVIDIA GPU this server drives, for capture to open CUDA on.
     fn gpu_pci(&self) -> Option<arcen_outputs::PciAddress> {
         self.gpu_pci
     }
 
-    fn root_depth(&self) -> Option<u8> {
+    pub(super) fn root_depth(&self) -> Option<u8> {
         self.root_depth
     }
 
-    fn xauthority(&self) -> &str {
+    pub(super) fn xauthority(&self) -> &str {
         self.xauthority
             .to_str()
             .expect("session runtime paths must be UTF-8")
     }
 
     async fn wait_ready(&mut self, display: &str) -> Result<(), LauncherError> {
-        for _ in 0..50 {
+        // Bounded as a whole, and every probe on its own: an X server that
+        // hangs (the field case beside another product's Xorg on the same
+        // GPU) must fail here, with its log kept, before the broker's open
+        // timeout kills the launcher and every trace of why.
+        let deadline = tokio::time::Instant::now() + XORG_READY_BUDGET;
+        while tokio::time::Instant::now() < deadline {
             if self.child.try_wait()?.is_some() {
                 return Err(LauncherError::XorgStart);
             }
-            let probe = Command::new("/usr/bin/xdpyinfo")
+            let mut probe = Command::new("/usr/bin/xdpyinfo");
+            probe
                 .args(["-display", display])
                 .env("XAUTHORITY", &self.xauthority)
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
-                .output()
-                .await;
-            if let Some(output) = probe.ok().filter(|output| output.status.success()) {
+                .kill_on_drop(true);
+            let probe = tokio::time::timeout(Duration::from_secs(2), probe.output())
+                .await
+                .ok()
+                .and_then(Result::ok);
+            if let Some(output) = probe.filter(|output| output.status.success()) {
+                // The answer must be this server's: alive, and holding
+                // every socket of its display (a local user's server could
+                // hold the display's abstract name, which clients try
+                // first, without a file in /tmp).
+                let display_number = parse_dedicated_display(display)?;
+                if self.child.try_wait()?.is_some()
+                    || !x_sockets_belong_to(display_number, self.child.id())
+                {
+                    tracing::error!(
+                        target: target::SESSION,
+                        display_number,
+                        "the display answered, but not from this X server; it is not used"
+                    );
+                    return Err(LauncherError::XorgStart);
+                }
                 self.root_depth = parse_root_depth(&String::from_utf8_lossy(&output.stdout));
                 // tracing's field macros shadow a local named `display`.
                 let x_display = display;
@@ -3235,7 +4469,7 @@ impl DedicatedXorg {
             .output()
             .await?;
         if !output.status.success() {
-            tracing::warn!(
+            tracing::error!(
                 target: target::SESSION,
                 x_display,
                 status = ?output.status.code(),
@@ -3245,7 +4479,7 @@ impl DedicatedXorg {
         }
         let stdout = String::from_utf8(output.stdout).map_err(|_| LauncherError::XorgVerify)?;
         if let Err(error) = super::randr_verify::verify_applied_topology(&stdout, plan) {
-            tracing::warn!(
+            tracing::error!(
                 target: target::SESSION,
                 x_display,
                 %error,
@@ -3259,7 +4493,7 @@ impl DedicatedXorg {
         Ok(())
     }
 
-    async fn wait_for_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    pub(super) async fn wait_for_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
 
@@ -3293,7 +4527,7 @@ impl DedicatedXorg {
 
     /// Best-effort teardown for the session-end path, which tears the whole
     /// session down regardless and has nowhere to return a failure to.
-    async fn shutdown(&mut self) {
+    pub(super) async fn shutdown(&mut self) {
         if let Err(error) = self.release().await {
             tracing::warn!(
                 target: target::SESSION,
@@ -3309,6 +4543,60 @@ impl DedicatedXorg {
         let _ = std::fs::remove_file(display_socket_path(self.display_number));
         let _ = std::fs::remove_dir_all(&self.session_dir);
     }
+}
+
+/// Whether every listening socket of X display `display` (the abstract
+/// `@/tmp/.X11-unix/X<n>` and the file `/tmp/.X11-unix/X<n>`) is held by
+/// process `pid`, and there is at least one. Accepted connections carry the
+/// listener's name too and are left out (`__SO_ACCEPTCON` marks a
+/// listener in `/proc/net/unix`).
+#[cfg(target_os = "linux")]
+fn x_sockets_belong_to(display: u16, pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
+        return false;
+    };
+    let names = [
+        format!("@/tmp/.X11-unix/X{display}"),
+        format!("/tmp/.X11-unix/X{display}"),
+    ];
+    let inodes: Vec<String> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.get(3).copied() != Some("00010000") {
+                return None;
+            }
+            let path = fields.get(7)?;
+            names
+                .iter()
+                .any(|name| name == path)
+                .then(|| fields.get(6).map(|inode| (*inode).to_owned()))
+                .flatten()
+        })
+        .collect();
+    if inodes.is_empty() {
+        return false;
+    }
+    let owned: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .filter_map(|target| {
+                    target
+                        .to_str()?
+                        .strip_prefix("socket:[")?
+                        .strip_suffix(']')
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    inodes.iter().all(|inode| owned.contains(inode))
 }
 
 /// Whether every artifact one dedicated-Xorg attempt created is gone.
@@ -3774,7 +5062,9 @@ async fn command_status_with_timeout(
 }
 
 #[cfg(target_os = "linux")]
-async fn activate_logind_session(environment: &SessionEnvironment) -> Result<(), LauncherError> {
+pub(super) async fn activate_logind_session(
+    environment: &SessionEnvironment,
+) -> Result<(), LauncherError> {
     let session_id = environment
         .session_id()
         .filter(|session_id| safe_session_id(session_id))
@@ -3933,6 +5223,8 @@ async fn validate_logind_ownership(
 fn logind_error_status(error: &LauncherError) -> &'static str {
     match error {
         LauncherError::SeatOccupied => "seat_occupied",
+        LauncherError::SeatOccupiedOtherProduct(_) => "seat_occupied_other_product",
+        LauncherError::Console(notice) => notice.token(),
         LauncherError::LogindActivation => "logind_activation_error",
         _ => "logind_error",
     }
@@ -4004,11 +5296,15 @@ fn write_response(response: &LauncherResponse) -> Result<(), LauncherError> {
     Ok(())
 }
 
-fn open_response_error(status: &str) -> LauncherError {
+fn open_response_error(
+    status: &str,
+    service: Option<arcen_session::console_session::ForeignService>,
+) -> LauncherError {
     match status {
         "logind_error" => LauncherError::LogindSession,
         "logind_activation_error" => LauncherError::LogindActivation,
         "seat_occupied" => LauncherError::SeatOccupied,
+        "seat_occupied_other_product" => LauncherError::SeatOccupiedOtherProduct(service),
         "pam_error" => LauncherError::PamSession,
         "xorg_config_error" => LauncherError::XorgConfig,
         "xorg_start_error" => LauncherError::XorgStart,
@@ -4017,7 +5313,9 @@ fn open_response_error(status: &str) -> LauncherError {
         "wayland_start_error" => LauncherError::WaylandStart,
         "selinux_error" => LauncherError::SelinuxContext,
         "local_playback_refused" => LauncherError::LocalPlaybackRefused,
-        _ => LauncherError::Protocol,
+        "agent_error" => LauncherError::Agent(AgentError::ExitedBeforeReady),
+        status => arcen_session::console_session::ConsoleNotice::from_status(status, service)
+            .map_or(LauncherError::Protocol, LauncherError::Console),
     }
 }
 
@@ -4158,7 +5456,7 @@ fn required_argument(args: &[String], flag: &str) -> Result<String, LauncherErro
 /// plus SIGHUP to every process in its scope; SIGHUP's default action would
 /// kill the launcher before it released the desktop.
 #[cfg(target_os = "linux")]
-struct StopSignals {
+pub(super) struct StopSignals {
     term: tokio::signal::unix::Signal,
     interrupt: tokio::signal::unix::Signal,
     hangup: tokio::signal::unix::Signal,
@@ -4166,7 +5464,7 @@ struct StopSignals {
 
 #[cfg(target_os = "linux")]
 impl StopSignals {
-    fn install() -> Result<Self, LauncherError> {
+    pub(super) fn install() -> Result<Self, LauncherError> {
         use tokio::signal::unix::{signal, SignalKind};
         Ok(Self {
             term: signal(SignalKind::terminate())?,
@@ -4175,7 +5473,7 @@ impl StopSignals {
         })
     }
 
-    async fn recv(&mut self) {
+    pub(super) async fn recv(&mut self) {
         tokio::select! {
             _ = self.term.recv() => {}
             _ = self.interrupt.recv() => {}
@@ -4295,6 +5593,29 @@ mod tests {
             arcen_input::virtual_device::libinput_quirks()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn launcher_errors_keep_their_severity_in_the_broker_log() {
+        use super::launcher_line_severity;
+        assert_eq!(
+            launcher_line_severity(
+                r#"{"severity":"error","message":"dedicated Xorg failed to start"}"#
+            ),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            launcher_line_severity(r#"{"severity":"warn","message":"x"}"#),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            launcher_line_severity("ERROR session-launcher failed"),
+            tracing::Level::ERROR
+        );
+        assert_eq!(
+            launcher_line_severity(r#"{"severity":"info","message":"error in name only"}"#),
+            tracing::Level::INFO
+        );
     }
 
     #[test]
@@ -4658,7 +5979,7 @@ mod tests {
         for (error, status) in cases {
             assert_eq!(output_error_status(&error), status);
             assert_eq!(
-                std::mem::discriminant(&open_response_error(status)),
+                std::mem::discriminant(&open_response_error(status, None)),
                 std::mem::discriminant(&error)
             );
         }
@@ -4677,13 +5998,52 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                std::mem::discriminant(&open_response_error(&response.status)),
+                std::mem::discriminant(&open_response_error(&response.status, None)),
                 std::mem::discriminant(&error)
             );
         }
         assert!(LauncherError::SeatOccupied
             .to_string()
             .contains("one X11 desktop per host"));
+    }
+
+    #[test]
+    fn a_named_service_and_a_reattach_answer_survive_the_launcher_protocol_boundary() {
+        use arcen_session::console_session::{ConsoleNotice, ConsoleRefusal, ForeignService};
+        let service = ForeignService::new("labrdp-session", Some("labrdp.service"), None);
+        let notice = ConsoleNotice::naming(ConsoleRefusal::OtherUserOtherProduct, Some(service));
+        let line = serde_json::to_string(&LauncherResponse::console_refusal(&notice)).unwrap();
+        let response: LauncherResponse = serde_json::from_str(&line).unwrap();
+        let LauncherError::Console(received) =
+            open_response_error(&response.status, response.console_service)
+        else {
+            panic!("a console refusal");
+        };
+        assert_eq!(received, notice);
+        assert!(received.deck_reason().contains("labrdp-session"));
+        // The broker's reading of a returning Deck's attachment.
+        assert_eq!(
+            console_attach_outcome(Some(r#"{"status":"attached"}"#)),
+            Ok(())
+        );
+        assert_eq!(console_attach_outcome(Some(&line)), Err(notice));
+        for silent in [None, Some("garbage"), Some(r#"{"status":"agent_error"}"#)] {
+            assert_eq!(
+                console_attach_outcome(silent),
+                Err(ConsoleRefusal::SessionUnreachable.into()),
+                "{silent:?}"
+            );
+        }
+        let seat = LauncherResponse::error_naming(
+            "seat_occupied_other_product",
+            Some(&ForeignService::new("labrdp-session", None, None)),
+        );
+        let seat: LauncherResponse =
+            serde_json::from_str(&serde_json::to_string(&seat).unwrap()).unwrap();
+        assert!(matches!(
+            open_response_error(&seat.status, seat.console_service),
+            LauncherError::SeatOccupiedOtherProduct(Some(service)) if service.pam_service() == Some("labrdp-session")
+        ));
     }
 
     #[test]
@@ -4700,7 +6060,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                std::mem::discriminant(&open_response_error(status)),
+                std::mem::discriminant(&open_response_error(status, None)),
                 std::mem::discriminant(&error)
             );
         }

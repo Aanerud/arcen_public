@@ -269,6 +269,12 @@ POLKIT = Source(
     "PolkitUnprotected",
 )
 
+CONSOLE = Source(
+    "## Linux sign-in refusals",
+    "shared/session/src/console_session/mod.rs",
+    "ConsoleRefusal",
+)
+
 SOURCES = [
     Source(
         "## Connection test",
@@ -294,7 +300,7 @@ SOURCES = [
         "LauncherError",
         "launcher_error_reason_class",
         enum_path="hosts/linux/src/session/launcher.rs",
-        delegates=(("PolkitUnprotected", POLKIT),),
+        delegates=(("PolkitUnprotected", POLKIT), ("Console", CONSOLE)),
     ),
     Source(
         "## Taking over a disconnected desktop",

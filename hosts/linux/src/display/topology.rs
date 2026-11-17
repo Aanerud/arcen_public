@@ -267,6 +267,11 @@ pub enum LinuxTopologyBackend {
     /// monitor, created at the requested size (`head` is a placeholder
     /// identity, never an NVIDIA head).
     VirtualOutputs,
+    /// The joined console's own outputs (ADR 0025 §6): the launcher puts
+    /// the i-th monitor on the console's i-th connected output, in RandR
+    /// order, while the Deck is attached (`head` is the planner's slot
+    /// token, not the output's name).
+    ConsoleOutputs,
 }
 
 impl LinuxTopologyBackend {
@@ -276,6 +281,7 @@ impl LinuxTopologyBackend {
         match self {
             Self::DedicatedXorg => "dedicated_xorg",
             Self::VirtualOutputs => "virtual_outputs",
+            Self::ConsoleOutputs => "console_outputs",
         }
     }
 }
@@ -308,7 +314,8 @@ impl LinuxTopologyPlan {
     #[must_use]
     pub fn same_desktop(&self, other: &Self) -> bool {
         match (self.backend, other.backend) {
-            (LinuxTopologyBackend::DedicatedXorg, LinuxTopologyBackend::DedicatedXorg) => {
+            (LinuxTopologyBackend::DedicatedXorg, LinuxTopologyBackend::DedicatedXorg)
+            | (LinuxTopologyBackend::ConsoleOutputs, LinuxTopologyBackend::ConsoleOutputs) => {
                 self.without_client_display_facts() == other.without_client_display_facts()
             }
             _ => self == other,
@@ -350,7 +357,9 @@ impl LinuxTopologyPlan {
             .map(LinuxMonitorPlan::region_placement)
             .collect::<Result<Vec<_>, _>>()?;
         let convention = match self.backend {
-            LinuxTopologyBackend::DedicatedXorg => TRANSFORM_CONVENTION,
+            LinuxTopologyBackend::DedicatedXorg | LinuxTopologyBackend::ConsoleOutputs => {
+                TRANSFORM_CONVENTION
+            }
             LinuxTopologyBackend::VirtualOutputs => {
                 arcen_outputs::virtual_topology::VIRTUAL_TRANSFORM_CONVENTION
             }

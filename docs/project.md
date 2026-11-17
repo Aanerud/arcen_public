@@ -228,7 +228,9 @@ packaging/macos/build-pier-pkg.sh               # dist/macos/ArcenPier-<version>
 # wayland-provider, which also needs the PipeWire development headers and
 # libclang (without it the Pier serves X11 only)
 cargo build --locked --release -p arcen-pier-linux --features wayland-provider
+cargo build --locked --release -p arcen-pam-greeter
 ARCEN_PIER_BINARY=target/release/arcen-pier \
+ARCEN_PAM_GREETER=target/release/libpam_arcen_greeter.so \
   cargo build --locked --release -p arcen-pier-linux-installer
 
 # Windows, MSVC

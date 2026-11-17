@@ -114,6 +114,8 @@ EVENT_DEFINITIONS = {
         ),
         (
             ("fps", INTEGER),
+            ("display_refresh_hz", INTEGER),
+            ("fps_basis", STRING),
             ("pipeline", STRING),
             ("display_backend", STRING),
             ("bit_depth", STRING),

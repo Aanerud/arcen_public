@@ -2086,6 +2086,13 @@ pub async fn stream(
     );
     let mut rate_controller = arcen_media::rate_control::RateController::new(policy);
     let mut last_detail_framerate = None;
+    // Holds a follow-display session at the rate this host proves it
+    // encodes, on the session's own offered/encoded counts.
+    let mut governor = served_pipeline
+        .as_ref()
+        .and_then(arcen_media::video::PipelineId::from_served_wire)
+        .and_then(|pipeline| arcen_media::video::HostRateGovernor::for_pipeline(pipeline, fps));
+    let mut governor_mark = (0_u64, 0_u64);
     let mut current_served_pipeline = served_pipeline.clone();
     let mut path_state = arcen_telemetry::PathSignalState::default();
     let mut latest_path_signal: Option<arcen_media::rate_control::PathSignal> = None;
@@ -2429,6 +2436,31 @@ pub async fn stream(
                 _ = rate_tick.tick() => {
                     let (bytes, frames, queued) = rate_mark;
                     let frames_now = stats.frames_sent.saturating_sub(frames);
+                    let offered = frames_offered(&stats);
+                    let encoded = stats.frames_encoded;
+                    if let Some(governor) = governor.as_mut() {
+                        let second = |now: u64, then: u64| {
+                            u32::try_from(now.saturating_sub(then)).unwrap_or(u32::MAX)
+                        };
+                        // What the encode loop was asked for: the published
+                        // Detail rate, zero while it keeps the session's.
+                        let asked = match detail_fps.load(std::sync::atomic::Ordering::Relaxed) {
+                            0 => governor.fps(),
+                            published => published,
+                        };
+                        if let Some(step) = governor.observe(
+                            second(encoded, governor_mark.1),
+                            Some(second(offered, governor_mark.0)),
+                            asked,
+                        ) {
+                            log_governor_step(step, fps);
+                            last_detail_framerate = None;
+                        }
+                    }
+                    governor_mark = (offered, encoded);
+                    let host_fps = governor
+                        .as_ref()
+                        .map_or(fps, arcen_media::video::HostRateGovernor::fps);
                     let path = path_signal_connection
                         .as_ref()
                         .map(|connection| {
@@ -2526,7 +2558,7 @@ pub async fn stream(
                         publish_detail_framerate(
                             &rate_controller,
                             operational_motion_priority,
-                            fps,
+                            host_fps,
                             &detail_fps,
                             &mut last_detail_framerate,
                         );
@@ -4146,6 +4178,18 @@ fn observe_damage(
             cadence.note_frame();
         }
     }
+}
+
+/// Logs a frame-rate governor step: a rate below the session's is never
+/// silent.
+fn log_governor_step(step: arcen_media::video::GovernorStep, session_fps: u32) {
+    arcen_observability::log_governed_frame_rate(
+        step.fps,
+        step.previous_fps,
+        session_fps,
+        step.reason.token(),
+        step.reason.counts(),
+    );
 }
 
 /// Publishes the shared controller's Detail frame rate to the encode loop and

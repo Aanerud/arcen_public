@@ -48,7 +48,7 @@ Read this before you invest time.
 
 | | State |
 |---|---|
-| **Linux Pier** (host) | Works, on **X11** and — new in 0.17.0 — **Wayland** (GNOME Shell/Mutter). The Pier chooses from what the host has, never from the distribution's name: an installed Xorg server keeps the dedicated X11 desktop, and an existing installation never moves; without Xorg, each sign-in gets its own GNOME desktop, which the installer qualifies on the host before the service starts and the service re-qualifies after updates. **X11:** Auto and Speed on the NvFBC GPU path (Speed at 60 fps on a head paced at 120 Hz), Grading on a separate depth-30 XShm path for genuine 10-bit SDR, HDR visibly served as Grading unless the operator declares a Rec.2100 PQ desktop; one X11 desktop per host. **Wayland:** verified end to end on Rocky Linux 10.2 / GNOME 49 with an NVIDIA GRID vGPU (GNOME 40 on Rocky Linux 9 is a tested baseline); other GNOME hosts are admitted only by the same qualification. Auto everywhere, Speed where qualification proves it, Grading and HDR on GNOME/Mutter 50 or newer, and a real pen with pressure and tilt on stock GNOME when the desktop runs natively on its own seat (one per host). Everything Wayland cannot do yet is served visibly lower, with the reason — see [X11 and Wayland compared](#linux-pier-x11-and-wayland-compared) and [How Wayland support works](platforms/linux-wayland.md#how-wayland-support-works). On both, the Pier keeps the host from sleeping while it serves a desktop, and a remote desktop gets polkit's remote answers, never the console's, so its user cannot power off, reboot or suspend the host, change its networking or mount disks without an administrator (fixed in 0.17.0; polkit older than 0.106 cannot be given Arcen's rule, and the Pier logs a `SECURITY:` error there — see [CHANGELOG](../CHANGELOG.md)). |
+| **Linux Pier** (host) | Works, on **X11** and — new in 0.17.0 — **Wayland** (GNOME Shell/Mutter). The Pier chooses from what the host has, never from the distribution's name: an installed Xorg server serves X11, and an existing installation never moves to Wayland. Since 0.20.1 an X11 Pier joins the session the account already holds at the workstation, with its applications open (or signs the account in through GDM's login screen, so the desk later resumes the same session); a disconnect locks the session and never ends it ([ADR 0025](adr/0025-arcen-joins-the-users-session.md)). A private desktop per sign-in (`platform.session.mode` `dedicated`) is an explicit opt-in; without Xorg, each sign-in gets its own GNOME desktop, which the installer qualifies on the host before the service starts and the service re-qualifies after updates. **X11:** Auto and Speed on the NvFBC GPU path (Speed at 60 fps on a head paced at 120 Hz), Grading on a separate depth-30 XShm path for genuine 10-bit SDR, HDR visibly served as Grading unless the operator declares a Rec.2100 PQ desktop; Match my layout gets one stream per monitor on the console's own outputs, in step on one timeline; one X11 desktop per host. **Wayland:** verified end to end on Rocky Linux 10.2 / GNOME 49 with an NVIDIA GRID vGPU (GNOME 40 on Rocky Linux 9 is a tested baseline); other GNOME hosts are admitted only by the same qualification. Auto everywhere, Speed where qualification proves it, Grading and HDR on GNOME/Mutter 50 or newer, and a real pen with pressure and tilt on stock GNOME when the desktop runs natively on its own seat (one per host). Everything Wayland cannot do yet is served visibly lower, with the reason — see [X11 and Wayland compared](#linux-pier-x11-and-wayland-compared) and [How Wayland support works](platforms/linux-wayland.md#how-wayland-support-works). On both, the Pier keeps the host from sleeping while it serves a desktop, and a remote desktop gets polkit's remote answers, never the console's, so its user cannot power off, reboot or suspend the host, change its networking or mount disks without an administrator (fixed in 0.17.0; polkit older than 0.106 cannot be given Arcen's rule, and the Pier logs a `SECURITY:` error there — see [CHANGELOG](../CHANGELOG.md)). |
 | **Windows Pier** (host) | Works. Multi-display is automatic: the service picks an eligible NVIDIA adapter at start, and an administrator can reserve a GPU for other work. Auto/Speed use the 8-bit capture path; Grading uses WGC FP16 scRGB re-encoded with the sRGB curve Windows linearised with, so a 0.18.0 Deck gets the desktop's own code values (older Decks get the BT.709 curve); HDR provisions and verifies an HDR head before a separate FP16-to-PQ/BT.2020 encode path. |
 | **macOS Deck** (client) | Works. Signed and notarised. On Apple silicon VideoToolbox hardware-decodes H.264 and HEVC, including 4:4:4 10-bit. A dedicated 10-bit Metal layer presents Grading in SDR and enables PQ/EDR only for a host-confirmed HDR stream. Two apps from one source, both for macOS 12 or later: **Arcen Deck** for Apple silicon and **Arcen Deck Intel** for Intel Macs. AV1 decode needs Apple silicon M3 or later (macOS 14); the Intel app never offers AV1, and on Intel VideoToolbox may decode in software. Native tablet needs macOS 13, and on an Intel Deck it is untested on hardware. |
 | **Windows Deck** (client) | Works, since 0.20.0. Windows 11 x64, two unsigned MSIs: the Deck, and an optional USB component for Native tablet. Built on the same shared Deck core as the macOS Deck (same screens, presets, sign-in, reconnect and support bundle). A D3D11 hardware decoder handles H.264 and HEVC 4:2:0 eight-bit for Auto and Speed; Grading and HDR (HEVC 4:4:4 ten-bit) need the GPU driving the window's monitor to decode a probe keyframe; on a GPU without it Settings greys them out with the GPU and the profile it lacks, and the Deck never asks for them (a saved Grading or HDR connects as Auto). Auto and Speed offer the host only the codecs the GPU decodes (no AV1 yet). Tablet support through Windows Ink; Native tablet with the USB component. Qualified against Linux X11, GNOME Wayland and macOS Piers; a Windows Pier as its host is not yet part of the lab qualification. |
@@ -136,12 +136,12 @@ at start (`capture.provider`, see [How Wayland support works](platforms/linux-wa
 
 | | X11 (an Xorg server is installed) | Wayland (GNOME Shell/Mutter, no Xorg) |
 |---|---|---|
-| **Desktop** | A dedicated Xorg server on the console seat; one per host | Headless: a seatless GNOME session per sign-in. Native: the same stock compositor on its own logind seat, one per host |
+| **Desktop** | The user's own session at the workstation (GDM, X11), joined and locked on disconnect; or, opt-in, a dedicated Xorg server on the console seat; one per host | Headless: a seatless GNOME session per sign-in. Native: the same stock compositor on its own logind seat, one per host |
 | **Auto / Speed** | NvFBC → CUDA → NVENC, frame stays on the GPU; Speed at 60 fps on a head paced at 120 Hz | Mutter ScreenCast → PipeWire DMA-BUF → EGL → CUDA → NVENC with explicit sync, where qualification verified the import (otherwise a host copy). Speed only where qualification measured the rate at that display size, on one output; otherwise visibly Auto |
 | **Grading** | Depth-30 Xorg → XShm RGB10 → shared conversion → NVENC 4:4:4 10-bit, BT.709. The desktop must be created at depth 30 (`video.x11_desktop_depth`) | GNOME/Mutter 50 or newer after a per-host precision proof, one output, HEVC 4:4:4 10-bit BT.709. GNOME 49 (Rocky Linux 10) only through the optional [side-by-side GNOME prefix](operations/pier-administration.md#upgrading-the-gnome-session-on-el10); otherwise visibly Auto |
 | **HDR** | Served as Grading, unless the operator declares a Rec.2100 PQ desktop (`video.desktop_encoding`) | Real BT.2020/PQ from the compositor on GNOME/Mutter 50 or newer, same proof and limits as Grading |
 | **No NVENC** | OpenH264, H.264 4:2:0 | OpenH264, H.264 4:2:0, up to 30 fps, outputs fitted to 1920×1200 |
-| **Monitors** | One to four; NVIDIA heads discovered at start | One to four Mutter virtual outputs, Remote UI scale, Windowed resize; Speed, Grading and HDR on one output only |
+| **Monitors** | One to four, one stream each; NVIDIA heads discovered at start. A joined console takes the Deck's layout while it is attached and gets its own back afterwards; a headless host needs `install-arcen-pier --console-outputs N` | One to four Mutter virtual outputs, Remote UI scale, Windowed resize; Speed, Grading and HDR on one output only |
 | **Cursor** | The Mac's own cursor drawing the host's cursor images (XFixes) | The Mac's own cursor drawing the host's cursor images, where qualification proves Mutter's cursor metadata; never a second cursor in the video |
 | **Pen (Tablet support)** | Virtual tablet: pressure, tilt, eraser, barrel buttons | Native desktop: a real pen with pressure and tilt in Wayland and Xwayland applications. Headless desktop: acts as a mouse until GNOME's EIS offers a stylus |
 | **Native tablet (USB bridged)** | Administrator opt-in (`usb.native_tablet = "enabled"`, or `install-arcen-pier --native-tablet`), on a LAN, through the distribution's in-tree USB/IP `vhci-hcd` (Rocky/RHEL: `kernel-modules-internal`, installed by the installer only when Native tablet is enabled). The tablet reaches only your desktop, never the login screen, and joins an X11 desktop on the first connection ([ADR 0021](adr/0021-bridged-usb-devices-on-their-own-seat.md)). Proven with a real Wacom Intuos5: first-connection hot-plug, drawing with pressure, the Deck's pen dot and hand-back. The dot follows the pen's own evdev reports (a tablet remapped in X falls back to the X pointer); application ink follows xf86-input-wacom's smoothed X pointer | Native-seat desktops only (same opt-in and controller): the tablet joins the desktop's own seat and the Deck's pen dot follows the pen's own evdev reports; proven with a real Wacom Intuos5 drawing with pressure. GNOME squares stylus pressure (raise the curve in Settings); a tablet remapped in GNOME Settings offsets the Deck's cursor; no cursor positions with several outputs. Headless desktops refuse it |
@@ -178,8 +178,8 @@ that can actually supply that contract.
 
 | Preset | Requested stream | Windows Pier | Linux Pier (Xorg) | macOS Pier (preview) | Deck presentation |
 |---|---|---|---|---|---|
-| **Auto** | 30 fps, adaptive 4:2:0 8-bit | DDA when it proves real frames, otherwise WGC BGRA8 | NvFBC → CUDA → NVENC; device-to-device fast path | ScreenCaptureKit → VideoToolbox; hand-qualified as `420v`/`Yuv420` on one lab Mac | Ordinary SDR VideoToolbox path |
-| **Speed** | 60 fps, adaptive 4:2:0 8-bit | Same 8-bit capture path at the higher cadence | Same NvFBC fast path at the higher cadence | Same macOS 8-bit path at the higher cadence; not a release qualification | Ordinary SDR VideoToolbox path |
+| **Auto** | The Deck display's refresh (today at most 60, see below), adaptive codec (AV1, HEVC, H.264 — the best both sides decode and encode), 4:2:0 8-bit; frame rate gives way first | DDA when it proves real frames, otherwise WGC BGRA8; at most the applied desktop refresh | NvFBC → CUDA → NVENC; device-to-device fast path, head paced at twice the rate | ScreenCaptureKit → VideoToolbox; hand-qualified as `420v`/`Yuv420` on one lab Mac; up to 60 fps (the arranged display runs at twice the rate, at most 120 Hz) | Ordinary SDR path, newest frame at the next refresh, never torn |
+| **Speed** | At least 60 fps (the display's refresh when faster), adaptive 4:2:0 8-bit, 1-frame encoder buffer; sharpness gives way first | Same 8-bit capture path | Same NvFBC fast path | Same macOS 8-bit path; not a release qualification | Ordinary SDR path, frames may replace one mid-refresh (may tear) |
 | **Grading** | 30 fps, HEVC 4:4:4 10-bit full-range BT.709 | WGC FP16 scRGB → sRGB re-encode (desktop codes, tagged `srgb`; BT.709 curve for older Decks) → matrix → NVENC P16 | Depth-30 Xorg → XShm RGB10 (desktop codes, tagged `srgb` for 0.18.0+ Decks) → shared conversion → CUDA upload → NVENC P16 | ScreenCaptureKit 10-bit 4:4:4 in sRGB (desktop codes, tagged `srgb` for 0.18.0+ Decks) → VideoToolbox; hand-qualified as `x444`/`Yuv444` on one lab Mac | Native `xf44` → dedicated `RGB10A2Unorm` Metal layer, SDR |
 | **HDR** | 30 fps, HEVC 4:4:4 10-bit full-range BT.2020/PQ | HDR EDID/topology → exact-target Windows HDR state → WGC FP16 scRGB → absolute PQ/BT.2020 → NVENC P16 | Declared `rec2100-pq` desktop: depth-30 XShm → BT.2020 NCL → NVENC PQ. Otherwise resolves to the Grading pipeline and reports matrix/primaries/transfer degradation | Served when the display being captured reports headroom above SDR white; the virtual display made for an HDR Deck display does. Otherwise the session is served as Grading and says so. | Same 10-bit Metal layer, with PQ colour space and EDR only when the host returns PQ |
 
@@ -429,11 +429,35 @@ anything that fails. It sends no user name or password. The same test is
 **Test connection** in the Deck's connection editor. Its codes are explained
 in [Error codes](operations/error-codes.md).
 
-### If it feels slow, ask for sixty
+### Auto follows your display
 
-The Deck's **Standard** performance mode requests 30 fps. **High** requests 60,
-and on a macOS Pier that is worth far more than the name suggests — measured
-against the same host over the same link, changing only the requested rate:
+**Auto** is served at your display's refresh: 60 fps on a 60 Hz display, 30 on
+a 30 Hz one. Every Pier resolves it the same way, from the refresh the Deck
+reports for the display it sizes the session for (up to 240), and lowers it only for what
+the host proves: an administrator's `video.fps`, the encoder's limit (OpenH264
+stops at 30), the capture (a Windows desktop applied at a lower refresh, the
+macOS Pier's 60, a Wayland output without a qualified rate at 30). Session ›
+Stream Statistics shows the rate and why ("up to 60 · your 60 Hz display",
+"limited by the host's encoder"), and the Pier records it in
+`SESSION_STREAM_START` (`fps`, `display_refresh_hz`, `fps_basis`). While the
+session runs, Auto gives up frame rate before sharpness when the link is tight
+and climbs back when it clears; when the host itself cannot encode the rate
+while its capture delivers it, the Pier steps to an even divisor of the
+display's refresh (60 → 30) and probes back up later.
+
+Today's Decks report at most 60 Hz: they ask the host for a remote display no
+faster than 60 Hz, which keeps high-resolution modes inside EDID pixel-clock
+limits, so a 120 or 144 Hz panel is served 60 for now. Reporting the panel's
+own refresh separately, and sizing each host's head for it, is the next step.
+
+**Speed** is the latency preset: never below 60 fps, even on a slower display
+(a change waits half as long to be captured), the lowest-latency encoder
+settings (a one-frame buffer), sharpness rather than frame rate given up first,
+and frames shown even mid-refresh, so it may tear. **Auto** shows the newest
+frame at the next refresh, never torn, and keeps detail.
+
+Before this release Auto asked for 30 fps. Measured on a macOS Pier against
+the same host over the same link, changing only the requested rate:
 
 | | 30 fps | 60 fps |
 | --- | --- | --- |
@@ -445,6 +469,7 @@ About 59 ms of pipeline becomes 27 ms. Roughly two thirds of that is not the
 encoder at all: at 60 fps the host photographs the screen twice as often, so a
 change waits half as long to be seen in the first place.
 
-It costs bandwidth — about 7.4 Mbps against 4.6 — and on anything faster than a
-domestic uplink that is a trade worth making. From the terminal, add
-`--max-fps 60`.
+It costs bandwidth — about 7.4 Mbps against 4.6 — and the shared rate controller
+pays it only where the link carries it. To keep a session at 30 on a metered
+link, ask for less from the terminal (`--max-fps 30`); a request below the
+preset's own rate is honoured.

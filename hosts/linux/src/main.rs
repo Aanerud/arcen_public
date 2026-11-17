@@ -57,6 +57,11 @@ fn main() -> ExitCode {
                 let args = args.iter().skip(2).cloned().collect::<Vec<_>>();
                 Some(arcen_pier_linux::session::launcher::launcher_main(&args))
             }
+            #[cfg(target_os = "linux")]
+            "login-session" => {
+                let args = args.iter().skip(2).cloned().collect::<Vec<_>>();
+                Some(arcen_pier_linux::session::login_session::login_session_main(&args))
+            }
             "usb-bridge-helper" => {
                 let args = args.iter().skip(2).cloned().collect::<Vec<_>>();
                 Some(arcen_pier_linux::usb_bridge::helper_main(&args))

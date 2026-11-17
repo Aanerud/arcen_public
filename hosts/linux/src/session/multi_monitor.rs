@@ -99,6 +99,11 @@ pub struct MultiMonitorGate {
     /// served by compositor virtual outputs instead of NVIDIA heads, and
     /// [`Self::inventory`] is unused.
     pub virtual_outputs: Option<VirtualOutputGate>,
+    /// Set on a Pier that joins the console (ADR 0025 §6): the plan is laid
+    /// on the console's own outputs while the Deck is attached
+    /// ([`LinuxTopologyBackend::ConsoleOutputs`]); [`Self::inventory`] (the
+    /// GPU's heads) bounds the offer.
+    pub console: bool,
 }
 
 /// What a Wayland Pier can serve as virtual outputs.
@@ -145,7 +150,25 @@ impl MultiMonitorGate {
             inventory: None,
             encoder: EncoderSelection::Auto,
             virtual_outputs: None,
+            console: false,
         }
+    }
+
+    /// The gate of a Pier joining the console: the configured or
+    /// discovered heads bound the offer, and an admitted plan is laid on
+    /// the console's own outputs.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_config`].
+    pub fn console(
+        config: &LinuxMultiMonitorConfig,
+        encoder: EncoderSelection,
+    ) -> Result<Self, LinuxTopologyError> {
+        Self::from_config(config, encoder).map(|gate| Self {
+            console: gate.advertise_enabled,
+            ..gate
+        })
     }
 
     /// The gate of a Pier serving headless Wayland sessions: the operator's
@@ -163,6 +186,7 @@ impl MultiMonitorGate {
             inventory: None,
             encoder,
             virtual_outputs,
+            console: false,
         }
     }
 
@@ -227,6 +251,7 @@ impl MultiMonitorGate {
                 inventory: None,
                 encoder,
                 virtual_outputs: None,
+                console: false,
             });
         }
         let heads = config
@@ -241,6 +266,7 @@ impl MultiMonitorGate {
             inventory: Some(inventory),
             encoder,
             virtual_outputs: None,
+            console: false,
         })
     }
 
@@ -439,6 +465,32 @@ pub fn admit_requested_topology(
     admit_regions(policy.gates(), &policy, requested).into()
 }
 
+/// A Deck states each monitor as seen on its desk (a quarter-turned monitor
+/// in its portrait size, `AlreadyCompositorOriented`). The Xorg planner
+/// drives a head's native panel mode and rotates it, so a joined console's
+/// heads are planned from the native (unrotated) size: swapped for 90 and
+/// 270 degrees, the logical arrangement unchanged.
+fn native_oriented(
+    topology: &RequestedMonitorTopology,
+) -> Result<RequestedMonitorTopology, MediaContractError> {
+    let monitors = topology
+        .monitors()
+        .iter()
+        .map(|requested| {
+            let rect = requested.logical_arrangement_rect()?;
+            let mut monitor = requested.monitor().clone();
+            if matches!(
+                monitor.rotation,
+                arcen_media::Rotation::Degrees90 | arcen_media::Rotation::Degrees270
+            ) {
+                std::mem::swap(&mut monitor.width_px, &mut monitor.height_px);
+            }
+            arcen_media::RequestedMonitor::new(monitor, rect.width, rect.height)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RequestedMonitorTopology::new(monitors)
+}
+
 /// This host's implementation of the shared multi-region admission steps.
 ///
 /// Borrows this connection's offer; the offer and carrier steps both take
@@ -531,10 +583,19 @@ impl RegionAdmissionPolicy for LinuxRegionAdmission<'_> {
                 let Some(inventory) = self.inventory else {
                     return Err(MultiMonitorDegradeReason::NoInventoryConfigured);
                 };
-                topology::plan_topology(topology, generation, inventory)
+                if self.gate.console {
+                    let native = native_oriented(topology)
+                        .map_err(MultiMonitorDegradeReason::InvalidRequestedTopology)?;
+                    topology::plan_topology(&native, generation, inventory)
+                } else {
+                    topology::plan_topology(topology, generation, inventory)
+                }
             }
         }
         .map_err(MultiMonitorDegradeReason::PlanningFailed)?;
+        if self.gate.console {
+            plan.backend = topology::LinuxTopologyBackend::ConsoleOutputs;
+        }
         for (planned, requested) in plan
             .monitors
             .iter_mut()
@@ -672,6 +733,7 @@ pub fn build_applied_capability(
         match plan.backend {
             LinuxTopologyBackend::DedicatedXorg => TopologyBackendKindMsg::DedicatedXorg,
             LinuxTopologyBackend::VirtualOutputs => TopologyBackendKindMsg::VirtualOutputs,
+            LinuxTopologyBackend::ConsoleOutputs => TopologyBackendKindMsg::PhysicalOutputs,
         },
         OFFERED_CARRIERS.to_vec(),
         Some(applied_topology),
@@ -735,7 +797,9 @@ impl AppliedRegionAssembler for LinuxAppliedRegions {
             // only — no invariant depends on this value.
             refresh_hz: match self.backend {
                 LinuxTopologyBackend::DedicatedXorg => 60,
-                LinuxTopologyBackend::VirtualOutputs => monitor.refresh_hz,
+                LinuxTopologyBackend::VirtualOutputs | LinuxTopologyBackend::ConsoleOutputs => {
+                    monitor.refresh_hz
+                }
             },
             rotation: monitor.rotation.into(),
             is_primary: monitor.primary,
@@ -828,6 +892,7 @@ mod tests {
             ),
             encoder,
             virtual_outputs: None,
+            console: false,
         }
     }
 
@@ -851,6 +916,7 @@ mod tests {
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
             virtual_outputs: None,
+            console: false,
         };
         assert!(build_offer(&gate).is_none());
     }
@@ -1039,6 +1105,40 @@ mod tests {
         .expect("offer")
     }
 
+    #[test]
+    fn a_console_plans_a_quarter_turned_monitor_from_its_native_panel() {
+        // The Deck states a portrait monitor in its portrait size; the
+        // console head drives the panel's native landscape mode, rotated.
+        let gate = MultiMonitorGate {
+            console: true,
+            ..enabled_gate(2)
+        };
+        let requested = sample_request(vec![
+            descriptor(
+                "primary",
+                1,
+                (0, 0),
+                (2560, 1600),
+                true,
+                RotationMsg::Degrees0,
+            ),
+            descriptor(
+                "portrait",
+                2,
+                (2560, 0),
+                (1200, 1920),
+                false,
+                RotationMsg::Degrees90,
+            ),
+        ]);
+        let (plan, _) = admit_request(&gate, Some(&sample_offer(2)), &requested).expect("planned");
+        assert_eq!(plan.backend, LinuxTopologyBackend::ConsoleOutputs);
+        let portrait = &plan.monitors[1];
+        assert_eq!(portrait.mode_token, "1920x1200");
+        assert_eq!((portrait.width, portrait.height), (1200, 1920));
+        assert_eq!((portrait.x, portrait.y), (2560, 0));
+    }
+
     fn sample_request(monitors: Vec<RequestedMonitorDescriptorMsg>) -> AuthMultiMonitorRequestMsg {
         AuthMultiMonitorRequestMsg::new(
             RequestedMonitorTopologyMsg::new(monitors).expect("requested topology"),
@@ -1130,6 +1230,7 @@ mod tests {
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
             virtual_outputs: None,
+            console: false,
         };
         let outcomes = [
             baseline_outcome_name(admit_requested_topology(
@@ -1236,6 +1337,7 @@ mod tests {
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
             virtual_outputs: None,
+            console: false,
         };
         let offer = sample_offer(2);
         let request = sample_request(vec![descriptor(
@@ -1812,6 +1914,7 @@ mod tests {
             inventory: None,
             encoder: EncoderSelection::NativeNvenc,
             virtual_outputs: None,
+            console: false,
         };
         let error =
             build_applied_capability(&empty_gate, &plan, carrier, &media, &negotiated, None)

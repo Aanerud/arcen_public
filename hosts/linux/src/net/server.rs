@@ -12,7 +12,7 @@
 //! WS ping) are dispatched; resolution ingest + PAM land in later stages.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -367,7 +367,9 @@ const fn throttle_outcome<T>(
 ) -> AttemptOutcome {
     match result {
         Ok(Ok(_)) => AttemptOutcome::Accepted,
-        Ok(Err(LauncherError::Rejected)) => AttemptOutcome::Refused,
+        // A right password the account policy refuses still counts against
+        // the source, so the refusal is no cheaper oracle than a wrong one.
+        Ok(Err(LauncherError::Rejected | LauncherError::Console(_))) => AttemptOutcome::Refused,
         Ok(Err(_)) | Err(_) => AttemptOutcome::Undecided,
     }
 }
@@ -1444,6 +1446,34 @@ fn multi_monitor_gate(cfg: &Config) -> multi_monitor::MultiMonitorGate {
         );
         return gate;
     }
+    if cfg.joins_console() {
+        // While a Deck that matches its layout is attached, the console's
+        // own outputs take its monitors, one stream each (ADR 0025 §6). The
+        // GPU's heads bound the offer; the launcher lays the plan on the
+        // console's connected outputs, and a console with too few ends the
+        // sign-in with the reason the Deck offers Primary Display Only for.
+        let gate = multi_monitor::MultiMonitorGate::console(
+            &cfg.multi_monitor,
+            cfg.resolved_multi_monitor_encoder(),
+        )
+        .unwrap_or_else(|error| {
+            warn!(
+                target: SESSION,
+                %error,
+                "multi_monitor_v1 head configuration is invalid; the console's monitors are served as one picture"
+            );
+            multi_monitor::MultiMonitorGate::disabled()
+        });
+        info!(
+            target: SESSION,
+            backend = "console_outputs",
+            advertise_enabled = gate.advertise_enabled,
+            heads = ?gate.inventory.as_ref().map(|inventory| inventory.len()),
+            multi_monitor_encoder = ?cfg.resolved_multi_monitor_encoder(),
+            "effective Linux multi-monitor admission policy: a Deck's layout is laid on the console's outputs"
+        );
+        return gate;
+    }
     let gate = multi_monitor::MultiMonitorGate::from_config(
         &cfg.multi_monitor,
         cfg.resolved_multi_monitor_encoder(),
@@ -1490,6 +1520,7 @@ fn config_with_initial_video_request(
     response: &AuthResponse,
 ) -> Result<Config, String> {
     let mut resolved = config.clone();
+    resolved.deck_display_refresh_hz = response.display_refresh_hz();
     if let Some(request) = response.initial_video.as_ref() {
         resolved.apply_initial_video_request(request)?;
     }
@@ -1670,6 +1701,51 @@ fn peer_deck_build(hello: &ClientHelloMsg) -> String {
 /// Safe, closed reason-class mapping for [`LauncherError`]. Never carries
 /// its `Display` text (which may include raw PAM/child diagnostics) into a
 /// native lifecycle event.
+/// Says at start when SSSD's Active Directory Group Policy access control
+/// would not weigh one of Arcen's sign-in services as an interactive logon
+/// (domain accounts are then refused), and when Arcen's SSSD snippet is
+/// missing or shadows a later change to a domain's own list.
+#[cfg(target_os = "linux")]
+fn warn_unweighed_domain_logons(pam_service: &str) {
+    use arcen_session::console_session::domain_logon::{
+        domain_logons, drop_in_is_current, DomainLogon,
+    };
+    let files = crate::session::console::sssd_files();
+    let arcen_services = [
+        arcen_session::console_session::greeter_token::PAM_SERVICE,
+        arcen_session::console_session::login_session::PAM_SERVICE,
+    ];
+    if !drop_in_is_current(&files, &arcen_services) {
+        warn!(
+            target: SESSION,
+            "Arcen's SSSD snippet (/etc/sssd/conf.d/90-arcen-interactive-logon.conf) is missing or no longer matches the domains' own ad_gpo_map_interactive lists; rerun the installer"
+        );
+    }
+    for service in std::iter::once(pam_service).chain(arcen_services) {
+        for (domain, logon) in domain_logons(&files, service) {
+            let refused = match &logon {
+                DomainLogon::Unmapped { .. } | DomainLogon::RemovedByAdministrator => true,
+                DomainLogon::MappedByAdministrator { map } => map == "ad_gpo_map_deny",
+                DomainLogon::NotGpo | DomainLogon::Interactive => false,
+            };
+            if refused {
+                warn!(
+                    target: SESSION,
+                    %domain,
+                    pam_service = service,
+                    decision = ?logon,
+                    "SSSD's Active Directory Group Policy access control does not weigh this sign-in service as an interactive logon; domain accounts are refused (rerun the installer, or map it in ad_gpo_map_interactive)"
+                );
+            }
+        }
+    }
+}
+
+/// What a Deck is told when a sign-in is refused at authentication: the
+/// same words for a wrong password and for an account the host's policy
+/// does not let sign in here, so the answer never confirms a password.
+const AUTH_FAILED_REASON: &str = "Authentication failed: wrong user name or password, or this account may not sign in at this workstation.";
+
 fn launcher_error_reason_class(error: &LauncherError) -> &'static str {
     match error {
         LauncherError::BinaryUnavailable => "binary_unavailable",
@@ -1689,6 +1765,8 @@ fn launcher_error_reason_class(error: &LauncherError) -> &'static str {
         LauncherError::XorgRelease => "xorg_release_failed",
         LauncherError::LogindActivation => "logind_activation_failed",
         LauncherError::SeatOccupied => "seat_occupied",
+        LauncherError::SeatOccupiedOtherProduct(_) => "seat_occupied_other_product",
+        LauncherError::Console(reason) => reason.token(),
         LauncherError::LogindUnlock => "logind_unlock_failed",
         LauncherError::Deskside => "deskside_refused",
         LauncherError::WaylandUnavailable => "wayland_unavailable",
@@ -1699,6 +1777,52 @@ fn launcher_error_reason_class(error: &LauncherError) -> &'static str {
         LauncherError::PolkitUnprotected(reason) => reason.token(),
         LauncherError::NativeSeatUnavailable(_) => "native_seat_unavailable",
     }
+}
+
+/// Records why an authenticated sign-in got no desktop, at every logging
+/// profile: `SESSION_AUTH_FAIL` (stage `desktop`) with the closed reason
+/// class, and an error line with the same class. A failure that left no
+/// line in a `critical` log (field, 2026-11-16) cannot be diagnosed.
+fn record_desktop_failure(
+    emitter: &LifecycleEmitter,
+    session_log_id: CorrelationId,
+    remote_host: &str,
+    username: &str,
+    error: &LifecycleError,
+) {
+    let reason_class = match error {
+        LifecycleError::Busy => "desktop_busy",
+        LifecycleError::Launcher(error) => launcher_error_reason_class(error),
+        LifecycleError::TimezoneLease => "timezone_lease_failed",
+        LifecycleError::ResumeAuthority => "resume_authority_failed",
+        LifecycleError::NativeSessionChanged => "native_session_changed",
+        LifecycleError::DisplayOwnership => "display_ownership_failed",
+    };
+    // The other remote-desktop service a refusal names, as the host
+    // reported it: recorded at every log profile with the refusal.
+    let service = match error {
+        LifecycleError::Launcher(LauncherError::Console(notice)) => notice.service(),
+        LifecycleError::Launcher(LauncherError::SeatOccupiedOtherProduct(service)) => {
+            service.as_ref()
+        }
+        _ => None,
+    };
+    error!(
+        target: SESSION,
+        %username,
+        reason_class,
+        pam_service = service.and_then(|s| s.pam_service()).unwrap_or(""),
+        unit = service.and_then(|s| s.unit()).unwrap_or(""),
+        process = service.and_then(|s| s.process()).unwrap_or(""),
+        "authenticated sign-in got no desktop"
+    );
+    emit_session_auth_fail(
+        emitter,
+        session_log_id,
+        Some(remote_host),
+        "desktop",
+        reason_class,
+    );
 }
 
 async fn receive_auth_response<S>(
@@ -1999,6 +2123,7 @@ where
             pactl: cfg.pactl_bin.clone(),
         },
         first_login_setup: cfg.first_login_setup,
+        desktop_mode: cfg.desktop_mode,
     };
     let launcher_result = tokio::time::timeout(
         CREDENTIAL_CHECK_TIMEOUT,
@@ -2158,9 +2283,30 @@ where
             })
         }
 
+        Ok(Err(LauncherError::Console(notice))) => {
+            warn!(
+                target: AUTH,
+                %username,
+                service = %cfg.pam_service,
+                reason_class = notice.token(),
+                "PAM account check refused the sign-in"
+            );
+            // The Deck is not told the password was right: the account
+            // policy's refusal reads like any failed sign-in, and only this
+            // log says which it was.
+            send_auth_result(sink, false, AUTH_FAILED_REASON).await;
+            emit_session_auth_fail(
+                emitter,
+                session_log_id,
+                Some(remote_host),
+                "pam_acct_mgmt",
+                notice.token(),
+            );
+            Err(())
+        }
         Ok(Err(LauncherError::Rejected)) => {
             warn!(target: AUTH, %username, service = %cfg.pam_service, "PAM authentication rejected");
-            send_auth_result(sink, false, "Authentication failed").await;
+            send_auth_result(sink, false, AUTH_FAILED_REASON).await;
             emit_session_auth_fail(
                 emitter,
                 session_log_id,
@@ -2422,6 +2568,45 @@ fn follow_content_stats(cell: &ContentStatsCell, handle: Option<&CapencHandle>) 
     *lock_recover(cell) = stats;
 }
 
+/// The live capture's once-a-second encoded/delivered counts, followed
+/// across capture restarts, for the frame-rate governor of the rate loop.
+type PipelineStatsCell =
+    Arc<Mutex<Option<tokio::sync::watch::Receiver<Option<capenc::PipelineStatsSample>>>>>;
+
+/// Points the rate loop's governor at `handle`'s counts. A multi-monitor
+/// supervisor's children report only their own output, so it is not
+/// governed.
+fn follow_pipeline_stats(cell: &PipelineStatsCell, handle: Option<&CapencHandle>) {
+    let stats = match handle {
+        Some(CapencHandle::Single(session)) => Some(session.pipeline_stats()),
+        Some(CapencHandle::Multi(_)) | None => None,
+    };
+    *lock_recover(cell) = stats;
+}
+
+/// Logs a frame-rate governor step: a rate below the session's is never
+/// silent.
+fn log_governor_step(step: arcen_media::video::GovernorStep, session_fps: u32) {
+    arcen_observability::log_governed_frame_rate(
+        step.fps,
+        step.previous_fps,
+        session_fps,
+        step.reason.token(),
+        step.reason.counts(),
+    );
+}
+
+/// The latest second the followed capture reported, once per new line.
+fn take_pipeline_second(cell: &PipelineStatsCell) -> Option<capenc::PipelineStatsSample> {
+    let mut guard = lock_recover(cell);
+    let receiver = guard.as_mut()?;
+    if !receiver.has_changed().unwrap_or(false) {
+        return None;
+    }
+    let second = *receiver.borrow_and_update();
+    second
+}
+
 /// The changed-content rate the live capture proved over the health window
 /// since the last tick — only when every stats second in it did
 /// (`arcen_telemetry::ContentWindow`) — for `QosSample::fps_content`.
@@ -2458,6 +2643,8 @@ struct ServedStreamLabels {
     /// `nvctrl` for the dedicated Xorg display, `wayland` for a headless
     /// Wayland session's compositor-owned output.
     display_backend: &'static str,
+    /// The served frame rate and what decided it.
+    frame_rate: Option<arcen_media::video::SessionFrameRate>,
 }
 
 fn emit_session_stream_start(
@@ -2472,34 +2659,17 @@ fn emit_session_stream_start(
     let ServedStreamLabels {
         pipeline,
         display_backend,
+        frame_rate,
     } = labels;
-    let mut fields = StructuredFields::default();
-    let _ = fields.insert(
-        "encoder",
-        FieldValue::String(aggregate_encoder_backend_label(
-            media_plan,
-            aggregate_backend,
-        )),
-    );
-    let _ = fields.insert(
-        "codec",
-        FieldValue::String(media_plan.codec_token().to_string()),
-    );
-    let _ = fields.insert(
-        "chroma",
-        FieldValue::String(media_plan.chroma_token().to_string()),
-    );
-    let _ = fields.insert("width", FieldValue::Integer(i64::from(media_plan.width)));
-    let _ = fields.insert("height", FieldValue::Integer(i64::from(media_plan.height)));
-    let _ = fields.insert("fps", FieldValue::Integer(i64::from(media_plan.fps)));
-    if let Some(pipeline) = pipeline {
-        let _ = fields.insert("pipeline", FieldValue::String(pipeline.token().to_string()));
-    }
-    let _ = fields.insert(
-        "display_backend",
-        FieldValue::String(display_backend.to_string()),
-    );
-    insert_color_identity(&mut fields, media_plan);
+    let encoder = aggregate_encoder_backend_label(media_plan, aggregate_backend);
+    let Some(fields) = media_plan.stream_start_fields(
+        &encoder,
+        pipeline.as_ref().map(|pipeline| pipeline.token()),
+        display_backend,
+        frame_rate,
+    ) else {
+        return;
+    };
     let context = emitter.session_context(
         session_log_id,
         user.map(str::to_string),
@@ -2628,39 +2798,6 @@ fn emit_color_plan_resolved(
         LifecycleEventKind::ColorPlanResolved,
         context,
         fields,
-    );
-}
-
-/// Records the colour identity of the stream the host actually configured.
-///
-/// `codec` and `chroma` alone describe a stream that could be 8- or 10-bit,
-/// full or limited range, BT.709 or PQ. Without these, a host log cannot be
-/// used to check any claim about what depth or colour a session ran at — the
-/// answer lived only in the client's log, which is how an 8-bit session went
-/// unnoticed while both ends believed the pipeline was 10-bit capable.
-///
-/// Every value is read from the resolved plan, so this records what was
-/// configured rather than what was requested.
-fn insert_color_identity(fields: &mut StructuredFields, media_plan: &ResolvedMediaPlan) {
-    let _ = fields.insert(
-        "bit_depth",
-        FieldValue::String(media_plan.bit_depth_token().to_string()),
-    );
-    let _ = fields.insert(
-        "color_range",
-        FieldValue::String(media_plan.range_token().to_string()),
-    );
-    let _ = fields.insert(
-        "color_matrix",
-        FieldValue::String(media_plan.matrix_token().to_string()),
-    );
-    let _ = fields.insert(
-        "color_primaries",
-        FieldValue::String(media_plan.primaries_token().to_string()),
-    );
-    let _ = fields.insert(
-        "transfer",
-        FieldValue::String(media_plan.transfer_token().to_string()),
     );
 }
 
@@ -3124,6 +3261,16 @@ pub async fn serve(
             target: CAPENC,
             "current arcen-pier executable could not be resolved for capenc dispatch"
         ),
+    }
+
+    // A console a previous Pier left private (killed before its launcher
+    // handed it back) is locked and given its monitors back now.
+    // One that cannot be locked yet is kept unusable and tried again.
+    #[cfg(target_os = "linux")]
+    {
+        crate::session::console::recover_console().await;
+        tokio::spawn(crate::session::console::guard_unsecured_console());
+        warn_unweighed_domain_logons(&cfg.pam_service);
     }
 
     let shutdown = signals.stopped();
@@ -4038,6 +4185,7 @@ async fn run_ws(
                 // work, so every other desktop's applications keep the GPU.
                 if authenticated_config.desktop_provider
                     != arcen_session::desktop_provider::DesktopProvider::Wayland
+                    && !launcher.joins_console()
                 {
                     let decision = authenticated_config.new_x11_desktop_depth();
                     info!(
@@ -4130,15 +4278,46 @@ async fn run_ws(
                     multi_monitor::MultiMonitorOutcome::NotRequested
                     | multi_monitor::MultiMonitorOutcome::Degraded(_) => None,
                 };
-                let lease = match session_registry
+                let acquired = session_registry
                     .acquire(
                         launcher,
                         multi_monitor_outcome.into_planned(),
                         response.replace_incompatible_desktop,
                     )
-                    .await
-                {
+                    .await;
+                if let Err(error) = &acquired {
+                    record_desktop_failure(
+                        &emitter,
+                        session_log_id.clone(),
+                        &remote_host,
+                        &response.username,
+                        error,
+                    );
+                }
+                let lease = match acquired {
                     Ok(lease) => lease,
+                    Err(LifecycleError::Launcher(LauncherError::Console(notice))) => {
+                        send_critical_control(
+                            &mut ws,
+                            close_with_reason(&notice.deck_reason()),
+                            "console_refused_close",
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(LifecycleError::Launcher(LauncherError::SeatOccupiedOtherProduct(
+                        service,
+                    ))) => {
+                        send_critical_control(
+                            &mut ws,
+                            close_with_reason(&arcen_session::x11_seat::deck_reason_other_product(
+                                service.as_ref(),
+                            )),
+                            "seat_occupied_close",
+                        )
+                        .await;
+                        return;
+                    }
                     Err(LifecycleError::Busy) => {
                         warn!(
                             target: SESSION,
@@ -4217,7 +4396,33 @@ async fn run_ws(
                         return;
                     }
                 };
-                if admitted_multi_monitor_topology_was_discarded(
+                if lease.metadata.console
+                    && admitted_monitor_count.is_some()
+                    && lease.metadata.multi_monitor_plan.is_none()
+                {
+                    // A joined console that could not take the Deck's layout
+                    // (the launcher logged why): a Deck that matches its
+                    // layout never takes a subset, so the sign-in ends with
+                    // the reason it recognises and offers Primary Display
+                    // Only for (ADR 0025 §6). The lease hands the console
+                    // back.
+                    warn!(
+                        target: SESSION,
+                        username = %response.username,
+                        session_id = %lease.metadata.session_id,
+                        admitted_monitors = admitted_monitor_count.unwrap_or(0),
+                        "the console could not take the Deck's layout; the sign-in ends with the reason, and Primary Display Only is offered"
+                    );
+                    send_critical_control(
+                        &mut ws,
+                        close_with_reason(
+                            arcen_protocol::messages::CONSOLE_LAYOUT_UNSUPPORTED_REASON,
+                        ),
+                        "console_layout_unsupported_close",
+                    )
+                    .await;
+                    return;
+                } else if admitted_multi_monitor_topology_was_discarded(
                     admitted_monitor_count,
                     lease.metadata.multi_monitor_plan.as_ref(),
                 ) {
@@ -4248,7 +4453,8 @@ async fn run_ws(
                         session_id = %lease.metadata.session_id,
                         reconnected = lease.metadata.reconnected,
                         desktop_depth = depth.x11_depth(),
-                        "attached to a dedicated Xorg desktop"
+                        console = lease.metadata.console,
+                        "attached to an Xorg desktop (console: the user's own session)"
                     );
                     if authenticated_config.exceeds_desktop_depth(depth) {
                         match config_on_attached_desktop(&cfg, &response, depth) {
@@ -4269,7 +4475,14 @@ async fn run_ws(
                         }
                     }
                 }
-                if let Err(error) = unlock_logind_session_id(&lease.metadata.session_id).await {
+                // A joined console is unlocked by its launcher, only once the
+                // desk is private again (ADR 0025): never before.
+                let unlocked = if lease.metadata.console {
+                    Ok(())
+                } else {
+                    unlock_logind_session_id(&lease.metadata.session_id).await
+                };
+                if let Err(error) = unlocked {
                     warn!(
                         target: SESSION,
                         username = %response.username,
@@ -4363,6 +4576,20 @@ async fn run_ws(
         session_config.width = width;
         session_config.height = height;
         session_config.wayland_output_refresh_hz = Some(refresh_hz);
+    } else if session_lease
+        .as_ref()
+        .is_some_and(|lease| lease.metadata.console)
+    {
+        // The user's own console keeps its monitors' modes (ADR 0025): a
+        // resize would move the windows the person at the desk left, and
+        // outlive the attachment. Capture serves the screen at its size;
+        // the Deck scales it.
+        info!(
+            target: DISPLAY,
+            "console session: served at its monitors' own size; the console's resolution is never changed"
+        );
+        session_config.width = 0;
+        session_config.height = 0;
     } else if let Some(display_plan) = negotiated_display_plan {
         match nvctrl::requested_resolution(display_plan.width, display_plan.height) {
             Ok(Some(mut resolution)) => {
@@ -4506,23 +4733,30 @@ async fn run_ws(
                 lease,
                 current_host_identity,
                 cfg.disclaimer.as_deref(),
-            )?;
+            )
+            .map_err(|()| "bindings".to_owned())?;
             session_registry
                 .validate_native_session(&lease.metadata)
                 .await
-                .map_err(|_| ())?;
-            let policy = ReconnectPolicy::new(cfg.reconnect_window_secs).map_err(|_| ())?;
+                .map_err(|error| format!("native session: {error}"))?;
+            let policy =
+                ReconnectPolicy::new(cfg.reconnect_window_secs).map_err(|_| "policy".to_owned())?;
             let (owner, commands) = mpsc::unbounded_channel();
             let grant = session_registry
                 .resume()
                 .issue_initial(bindings, policy, owner, &session_log_id)
-                .map_err(|_| ())?;
-            Ok::<_, ()>((grant, commands))
+                .map_err(|error| format!("grant: {error:?}"))?;
+            Ok::<_, String>((grant, commands))
         }
         .await;
         match setup {
             Ok(value) => Some(value),
-            Err(()) => {
+            Err(stage) => {
+                warn!(
+                    target: SESSION,
+                    stage = %stage,
+                    "resume initialization failed; the sign-in is refused"
+                );
                 send_resume_rejection(
                     &mut ws,
                     "resume initialization failed",
@@ -5026,6 +5260,11 @@ async fn run_resumable_session(
             break;
         }
         display_is_held = true;
+        // A joined console is handed back locked while the Deck may resume.
+        session_registry.console_command(
+            &lease.metadata,
+            crate::session::launcher::ConsoleCommand::Detach,
+        );
         if let Err(error) = session_registry.resume().mark_detached(&active_session_id) {
             tracing::error!(
                 target: SESSION,
@@ -5180,6 +5419,37 @@ async fn run_resumable_session(
                             (incumbent, ws.path_signal_connection())
                         {
                             incumbent.replace_connection(connection);
+                        }
+                        // A joined console is made private again and
+                        // unlocked before anything is streamed; a refusal
+                        // reaches the Deck as its typed reason.
+                        if let Some(answer) = session_registry.console_attach(&lease.metadata) {
+                            let outcome = answer.await.unwrap_or_else(|_| {
+                                Err(arcen_session::console_session::ConsoleRefusal::SessionUnreachable
+                                    .into())
+                            });
+                            if let Err(notice) = outcome {
+                                let service = notice.service();
+                                tracing::error!(
+                                    target: SESSION,
+                                    reason_class = notice.token(),
+                                    pam_service = service.and_then(|s| s.pam_service()).unwrap_or(""),
+                                    unit = service.and_then(|s| s.unit()).unwrap_or(""),
+                                    process = service.and_then(|s| s.process()).unwrap_or(""),
+                                    "the resumed Deck is not attached to the console session"
+                                );
+                                send_critical_control(
+                                    &mut ws,
+                                    close_with_reason(&notice.deck_reason()),
+                                    "console_reattach_refused_close",
+                                )
+                                .await;
+                                let _ = reconnect.apply(
+                                    ReconnectEvent::NativeSessionEnded,
+                                    session_registry.resume().monotonic_now(),
+                                );
+                                break 'session;
+                            }
                         }
                         if let Err(error) =
                             session_registry.resume().mark_attached(&active_session_id)
@@ -7603,6 +7873,7 @@ async fn run_attachment(
             } else {
                 "nvctrl"
             },
+            frame_rate: Some(cfg.served_frame_rate(media_plan.fps)),
         },
         session_user.as_deref(),
         Some(remote_host),
@@ -8571,8 +8842,14 @@ async fn run_attachment(
 
     let rate_control_enabled = std::env::var("ARCEN_RATE_CONTROL").as_deref() != Ok("0");
     let health_path_connection = path_signal_connection.clone();
+    let pipeline_stats = PipelineStatsCell::default();
+    follow_pipeline_stats(&pipeline_stats, Some(&capenc));
+    // The rate the governor holds the session at, for health's target.
+    let governed_fps = Arc::new(AtomicU32::new(media_plan.fps));
     let mut rate_task = path_signal_connection.map(|connection| {
         let bitrate_senders = all_monitor_bitrates.clone();
+        let pipeline_stats = Arc::clone(&pipeline_stats);
+        let governed_fps = Arc::clone(&governed_fps);
         let rate_queues = rate_queues.clone();
         let video_write_wait_micros = Arc::clone(&video_write_wait_micros);
         // The refinement budget from the link (ADR 0016 R6), only for an
@@ -8635,6 +8912,15 @@ async fn run_attachment(
             let mut last_keyframe_bytes = session_keyframe_bytes(&rate_queues);
             let mut last_pipeline_bytes = pipeline_bytes(&rate_queues);
             let mut last_detail_framerate = None;
+            // Holds a follow-display session at the rate this host proves it
+            // encodes (Auto and Speed), on capenc's own counts.
+            let mut governor = arcen_media::video::PipelineId::from_served_wire(&served_pipeline)
+                .and_then(|pipeline| {
+                    arcen_media::video::HostRateGovernor::for_pipeline(pipeline, plan.fps)
+                });
+            // The rate the encoder was last asked for (the link's Detail
+            // shedding or the governor), which the governor judges against.
+            let mut asked_fps = plan.fps;
             loop {
                 ticker.tick().await;
                 if connection.close_reason().is_some() {
@@ -8705,9 +8991,26 @@ async fn run_attachment(
                         }
                     }
                     let want_bps = controller.target_bps();
+                    if let (Some(governor), Some(second)) =
+                        (governor.as_mut(), take_pipeline_second(&pipeline_stats))
+                    {
+                        if let Some(step) =
+                            governor.observe(second.encoded, second.delivered(), asked_fps)
+                        {
+                            log_governor_step(step, plan.fps);
+                            governed_fps.store(step.fps, Ordering::Relaxed);
+                        }
+                    }
+                    let host_fps = governor
+                        .as_ref()
+                        .map_or(plan.fps, arcen_media::video::HostRateGovernor::fps);
                     let detail = (motion_priority == arcen_media::video::MotionPriority::Detail)
-                        .then(|| controller.detail_framerate(plan.fps));
-                    let want_fps = detail.map(|detail| detail.fps);
+                        .then(|| controller.detail_framerate(host_fps));
+                    // A Motion stream keeps its rate unless the host cannot.
+                    let want_fps = detail
+                        .map(|detail| detail.fps)
+                        .or_else(|| governor.as_ref().map(|_| host_fps));
+                    asked_fps = want_fps.unwrap_or(plan.fps);
                     let loss = controller.last_loss_evidence();
                     // Every tick, not only on a change: a pipeline whose
                     // mailbox was full catches up with the latest target.
@@ -8746,7 +9049,8 @@ async fn run_attachment(
                             tracing::info!(
                                 target: CAPENC,
                                 fps = detail.fps,
-                                contract_fps = plan.fps,
+                                contract_fps = host_fps,
+                                session_fps = plan.fps,
                                 fps_reason = detail.reason.token(),
                                 target_bps = want_bps,
                                 start_bps,
@@ -8781,6 +9085,7 @@ async fn run_attachment(
     let health_emitter = emitter.clone();
     let health_session_log_id = session_log_id.clone();
     let health_media_plan = media_plan;
+    let health_governed_fps = Arc::clone(&governed_fps);
     let health_service_health = service_health;
     let health_qos_targets = Arc::clone(&qos_targets);
     let health_started_at = session_started_at;
@@ -8875,9 +9180,13 @@ async fn run_attachment(
                 // timestamp (`eventlog::canonical_now`), set independently.
                 let monotonic_now_ms =
                     u64::try_from(health_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                // The rate the host holds the session at now (the governor's,
+                // below the session's when the host cannot keep up), so the
+                // Deck sees the lowered rate and health judges against it.
+                let target_fps = health_governed_fps.load(Ordering::Relaxed).max(1);
                 let observation = lock_recover(&health_session_health).observe(
                     monotonic_now_ms,
-                    health_media_plan.fps,
+                    target_fps,
                     counters,
                 );
                 if let Some(error) = &observation.clock_error {
@@ -8892,7 +9201,7 @@ async fn run_attachment(
                 let mut stats = arcen_observability::session_health::SessionHealth::health_stats(
                     &observation,
                     counters,
-                    health_media_plan.fps,
+                    target_fps,
                     health_media_plan.codec_token(),
                     health_media_plan.chroma_token(),
                     format!("{}x{}", health_media_plan.width, health_media_plan.height),
@@ -9221,6 +9530,7 @@ async fn run_attachment(
                 pump = replacement_pump;
                 capenc = Some(CapencHandle::Single(session));
                 follow_content_stats(&content_stats, capenc.as_ref());
+                follow_pipeline_stats(&pipeline_stats, capenc.as_ref());
                 speed_guard = speed_guard_for(capenc.as_ref(), &epoch_config);
                 if let (Some(ready), Some(previous), Some(lease), Some(retarget)) = (
                     epoch_ready.as_ref(),
@@ -9328,6 +9638,7 @@ async fn run_attachment(
                 });
                 capenc = Some(CapencHandle::Single(session));
                 follow_content_stats(&content_stats, capenc.as_ref());
+                follow_pipeline_stats(&pipeline_stats, capenc.as_ref());
                 current_plan = plan;
                 active_capenc_config = epoch_config;
                 if !queue.activate_generation() {
@@ -9659,6 +9970,7 @@ async fn run_attachment(
                     }
                     capenc = Some(CapencHandle::Single(session));
                     follow_content_stats(&content_stats, capenc.as_ref());
+                follow_pipeline_stats(&pipeline_stats, capenc.as_ref());
                     speed_guard = speed_guard_for(capenc.as_ref(), &resize_config);
                     if served_before != served_after {
                         // Speed at a size this host has no evidence for:
@@ -9900,6 +10212,7 @@ async fn run_attachment(
                 }
                 capenc = Some(CapencHandle::Single(session));
                 follow_content_stats(&content_stats, capenc.as_ref());
+                follow_pipeline_stats(&pipeline_stats, capenc.as_ref());
                 speed_guard = speed_guard_for(capenc.as_ref(), &resize_config);
 
                 // Keep the replacement IDR paused until the accepted result is
@@ -13065,9 +13378,37 @@ mod tests {
     fn multi_monitor_gate_offers_nothing_before_heads_are_discovered() {
         // Multi-display is on by default, but a default config has no heads
         // until startup discovery finds them, so nothing is offered yet.
-        let gate = multi_monitor_gate(&Config::default());
+        let gate = multi_monitor_gate(&Config {
+            desktop_mode: arcen_session::console_session::DesktopMode::Dedicated,
+            ..Config::default()
+        });
         assert!(gate.advertise_enabled);
         assert!(gate.inventory.is_none());
+    }
+
+    #[test]
+    fn a_joined_console_offers_its_heads_and_plans_console_outputs() {
+        // A Deck that matches its layout gets one stream per monitor on the
+        // console's own outputs (ADR 0025 §6); a single-display Deck still
+        // gets the whole screen.
+        let config = Config {
+            multi_monitor: crate::config::LinuxMultiMonitorConfig {
+                advertise_enabled: true,
+                heads: vec!["DFP-0".to_owned(), "DFP-1".to_owned()],
+                ..crate::config::LinuxMultiMonitorConfig::default()
+            },
+            encoder: EncoderRequest::NativeNvenc,
+            ..Config::default()
+        };
+        assert!(config.joins_console());
+        let gate = multi_monitor_gate(&config);
+        assert!(gate.console);
+        let offer = multi_monitor::build_offer(&gate).expect("the console offers its heads");
+        assert_eq!(offer.max_monitors(), 2);
+        assert_eq!(
+            config.output_index(),
+            arcen_media::capenc_stream::WHOLE_SCREEN_OUTPUT_INDEX
+        );
     }
 
     #[test]
@@ -13104,6 +13445,7 @@ mod tests {
                 ..crate::config::LinuxMultiMonitorConfig::default()
             },
             encoder: EncoderRequest::NativeNvenc,
+            desktop_mode: arcen_session::console_session::DesktopMode::Dedicated,
             ..Config::default()
         };
         let gate = multi_monitor_gate(&config);
@@ -15758,6 +16100,11 @@ mod tests {
             ServedStreamLabels {
                 pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Auto),
                 display_backend: "nvctrl",
+                frame_rate: Some(arcen_media::video::SessionFrameRate {
+                    fps: plan.fps,
+                    display_refresh_hz: Some(plan.fps),
+                    basis: arcen_media::video::FrameRateBasis::Display,
+                }),
             },
             Some("alice"),
             Some("198.51.100.7"),
@@ -15767,6 +16114,14 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].kind(), LifecycleEventKind::SessionStreamStart);
         let fields = recorded[0].fields().as_map();
+        assert_eq!(
+            fields.get("display_refresh_hz"),
+            Some(&FieldValue::Integer(i64::from(plan.fps)))
+        );
+        assert_eq!(
+            fields.get("fps_basis"),
+            Some(&FieldValue::String("display".to_string()))
+        );
         assert_eq!(
             fields.get("width"),
             Some(&FieldValue::Integer(i64::from(plan.width)))
@@ -15798,6 +16153,7 @@ mod tests {
             ServedStreamLabels {
                 pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
                 display_backend: "nvctrl",
+                frame_rate: None,
             },
             Some("alice"),
             Some("198.51.100.7"),
@@ -16008,6 +16364,7 @@ mod tests {
             ServedStreamLabels {
                 pipeline: None,
                 display_backend: "nvctrl",
+                frame_rate: None,
             },
             Some("alice"),
             Some("198.51.100.7"),

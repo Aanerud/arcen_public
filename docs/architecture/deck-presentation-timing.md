@@ -115,3 +115,27 @@ median per run, three to four runs per cell (each run is one phase sample).
 | Speed | fullscreen | 12.8 ms | **4.3 ms** | 0 |
 | Speed | windowed | 24.2 ms | **17.2 ms** | 0 (17 % with one drawable in flight, hence two) |
 | Grading | fullscreen | — | 13.0 ms, ten-bit layer, EDR off (unchanged path) | 0 |
+
+## Several monitors: one timeline
+
+In a multi-monitor session each monitor is its own stream, decoded on its
+own. Before a decoded frame reaches its presenter, the shared media worker
+passes it through the session's timeline
+([ADR 0026](../adr/0026-one-timeline-for-every-monitor.md),
+`arcen_media::timeline`, `arcen_deck_core::runtime::frame_sync`): a frame
+of a faster stream waits until the slowest active stream's frames
+captured at the same time are ready too, at most 50 ms, and a lone active
+stream never waits. The worker logs the measured skew every five seconds
+(`multi-monitor timeline`); `ARCEN_DECK_TIMELINE=off` measures without
+holding. The presenter's own refresh phase (above) comes after it.
+
+Every Pier stamps all of its monitors on one clock, the wire clock, so the
+timeline works the same whichever Pier serves the session. Where the stamp
+is taken differs, and only shifts the absolute latency, never the skew
+between streams of the same Pier:
+
+| Pier | Stamp taken |
+| --- | --- |
+| Linux | When the access unit is read from the capture-encode helper (`arcen-capenc`), one helper per monitor |
+| Windows | When the access unit is read from the capture-encode helper, one helper per monitor |
+| macOS | When VideoToolbox returns the access unit, before it is framed and sent |

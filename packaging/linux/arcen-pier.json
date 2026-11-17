@@ -18,7 +18,6 @@
     "color_range": "full",
     "color_matrix": "bt709",
     "color_policy": "default-off",
-    "fps": 60,
     "encoder": "auto",
     "lossless_refinement": "enabled",
     "qp_map": {
@@ -80,6 +79,7 @@
       "height": 0
     },
     "session": {
+      "mode": "console",
       "desktop": "gnome",
       "display": ":11",
       "gpu_head": "DFP-2",

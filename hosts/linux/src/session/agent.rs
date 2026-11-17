@@ -31,6 +31,10 @@ const DESKTOP_START_GRACE: Duration = Duration::from_millis(1500);
 const ACTIVATION_ENVIRONMENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The desktop agent's launcher, which it must not outlive.
 const PARENT_PID_FLAG: &str = "--parent-pid";
+/// The agent of a joined console session (ADR 0025): the session and its
+/// shell are the user's own, so the agent only holds the session's audio
+/// lease while a Deck is attached.
+const CONSOLE_SESSION_FLAG: &str = "--console-session";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const GRACEFUL_AGENT_STOP: Duration = Duration::from_secs(9);
 /// The X11 agent's login-shell bound: its whole start before READY
@@ -258,6 +262,36 @@ impl SessionAgent {
             desktop,
             session_log_id,
             &audio.to_arguments(),
+            READY_TIMEOUT,
+            None,
+        )
+        .await?;
+        if agent.ready.wayland.is_some() {
+            return Err(AgentError::InvalidReady);
+        }
+        Ok(agent)
+    }
+
+    /// Spawns the agent of a joined console session: no desktop shell, no
+    /// login environment import (the session has its own), only the
+    /// session's audio for the attached Deck.
+    pub async fn spawn_console(
+        binary: &Path,
+        identity: &UserIdentity,
+        environment: &SessionEnvironment,
+        desktop: &str,
+        session_log_id: &CorrelationId,
+        audio: &AgentAudioArguments,
+    ) -> Result<Self, AgentError> {
+        let mut arguments = vec![CONSOLE_SESSION_FLAG.to_owned()];
+        arguments.extend(audio.to_arguments());
+        let agent = Self::spawn_with(
+            binary,
+            identity,
+            environment,
+            desktop,
+            session_log_id,
+            &arguments,
             READY_TIMEOUT,
             None,
         )
@@ -661,6 +695,24 @@ pub async fn run_user_agent(args: &[String]) -> Result<(), AgentError> {
         let advertised_desktop = required_environment("XDG_SESSION_DESKTOP")?;
         let audio_arguments = AgentAudioArguments::from_arguments(args)?;
         let session_log_id = argument_value(args, "--session-log-id").unwrap_or_default();
+        if args.iter().any(|argument| argument == CONSOLE_SESSION_FLAG) {
+            return run_console_agent(
+                AgentReady {
+                    pid: std::process::id(),
+                    uid: uid.as_raw(),
+                    username,
+                    display,
+                    session_id,
+                    session_type,
+                    desktop: advertised_desktop,
+                    wayland: None,
+                    audio: None,
+                },
+                &audio_arguments,
+                &session_log_id,
+            )
+            .await;
+        }
 
         // The lease, before the desktop exists, so nothing it plays reaches
         // the host's speakers; beside the login-shell import and the
@@ -756,6 +808,37 @@ pub async fn run_user_agent(args: &[String]) -> Result<(), AgentError> {
             None => Ok(()),
         }
     }
+}
+
+/// The agent of a joined console session: the session's audio lease
+/// (the desk's speakers silent while a Deck is attached, the session's
+/// sound captured for it), released when the launcher hands the console
+/// back. The user's own shell and services keep running untouched.
+#[cfg(target_os = "linux")]
+async fn run_console_agent(
+    mut ready: AgentReady,
+    audio_arguments: &AgentAudioArguments,
+    session_log_id: &str,
+) -> Result<(), AgentError> {
+    use std::io::Write;
+    let mut audio = X11SessionAudio::establish(audio_arguments, session_log_id).await;
+    if let Err(report) = audio.admission(audio_arguments) {
+        audio.release().await;
+        emit_local_playback_refusal(report);
+        return Err(refusal_error(report));
+    }
+    ready.audio = Some(audio.ready());
+    println!(
+        "{}",
+        serde_json::to_string(&ready).map_err(|_| AgentError::InvalidReady)?
+    );
+    std::io::stdout().flush()?;
+    tokio::select! {
+        () = shutdown_signal() => {}
+        () = audio.watch() => {}
+    }
+    audio.release().await;
+    Ok(())
 }
 
 /// The local-playback lease of a dedicated-Xorg desktop, on the user's own

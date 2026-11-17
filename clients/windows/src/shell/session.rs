@@ -866,7 +866,10 @@ impl Connection {
                     .as_ref()
                     .and_then(|stats| stats.path.as_ref()),
                 presented_fps,
-                max_fps: self.max_fps,
+                max_fps: arcen_deck_core::screens::statistics::served_max_fps(
+                    state.server_hello.as_ref(),
+                    self.max_fps,
+                ),
                 axes: axes.as_ref(),
                 // As on the Mac: the served-pipeline update, else the
                 // hello's active pipeline.

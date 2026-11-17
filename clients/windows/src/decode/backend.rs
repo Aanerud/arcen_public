@@ -24,8 +24,9 @@ use super::dxva::{
 use super::session::{D3d11Picture, DecoderSession, PictureBuffers};
 
 /// Pictures the presenter may hold beyond the stream's own buffer: the
-/// frame queue's latest picture, the one on glass and one in flight.
-pub const PRESENTER_SLOTS: u8 = 4;
+/// frame queue's latest picture, the one on glass and one in flight, plus
+/// the frames a multi-monitor session's timeline holds back (ADR 0026).
+pub const PRESENTER_SLOTS: u8 = 4 + arcen_deck_core::runtime::frame_sync::MAX_HELD_PER_MONITOR;
 
 enum Parser {
     H264(H264Parser),

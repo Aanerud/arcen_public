@@ -25,6 +25,13 @@
 //! on a Mac; Windows code is type-checked there with
 //! `cargo xwin check --target x86_64-pc-windows-msvc -p arcen-deck-windows`.
 
+/// Release packaging scans `arcen-deck.exe` for this marker and refuses to
+/// ship it, so a developer build can never become a release.
+#[cfg(feature = "dev-tools")]
+#[used]
+pub static ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER: &[u8] =
+    b"ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP";
+
 #[cfg(windows)]
 pub mod audio;
 #[cfg(windows)]

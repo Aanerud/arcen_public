@@ -45,6 +45,24 @@ pub const fn paced_output_refresh_hz(display_refresh_hz: u32, served_fps: u32) -
     }
 }
 
+/// The rate to ask a refresh-paced capture of a copying route for when a
+/// follow-display contract (Auto) serves `served_fps`: up to
+/// [`super::UNQUALIFIED_COPY_FPS`] the rate itself, so the source skips
+/// frames nobody will encode; above it, only on a route the host's
+/// qualification rated (`qualified_rate`), [`paced_source_offer_fps`] of
+/// the rate it holds; an unrated route is asked for no more than it is
+/// admitted at.
+#[must_use]
+pub fn follow_display_offer_fps(served_fps: u32, qualified_rate: Option<u32>) -> u32 {
+    let served_fps = served_fps.max(1);
+    match qualified_rate {
+        Some(rate) if served_fps > super::UNQUALIFIED_COPY_FPS => {
+            paced_source_offer_fps(served_fps.min(rate.max(1)))
+        }
+        _ => served_fps.min(super::UNQUALIFIED_COPY_FPS),
+    }
+}
+
 /// What a qualified capture rate (`capture-rate=`) rests on: a
 /// qualification measured this exact output, or a larger output of the same
 /// refresh, codec and route (`inferred`, reported as such wherever the rate
@@ -402,5 +420,14 @@ mod tests {
         meter.tick(at(15.0));
         assert_eq!(meter.best_sustained(), Some(58));
         assert_eq!(meter.last_window(), Some(59));
+    }
+
+    #[test]
+    fn auto_offers_its_rate_and_headroom_only_on_a_rated_route() {
+        assert_eq!(follow_display_offer_fps(24, None), 24);
+        assert_eq!(follow_display_offer_fps(60, None), 30);
+        assert_eq!(follow_display_offer_fps(30, Some(60)), 30);
+        assert_eq!(follow_display_offer_fps(60, Some(60)), 120);
+        assert_eq!(follow_display_offer_fps(120, Some(90)), 180);
     }
 }

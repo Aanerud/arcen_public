@@ -194,6 +194,7 @@ mod lab {
             serial: 0,
             edid: String::new(),
             color: None,
+            rotation_degrees: 0,
         }
     }
 

@@ -258,6 +258,7 @@ impl WindowsDisplayFacts {
             serial: 0,
             edid: String::new(),
             color: self.color(),
+            rotation_degrees: arcen_deck_core::connect_plan::rotation_degrees(self.rotation),
         }
     }
 }

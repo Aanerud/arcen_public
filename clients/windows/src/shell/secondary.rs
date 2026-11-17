@@ -61,6 +61,9 @@ impl Drop for SecondaryWindow {
 #[derive(Default)]
 pub(super) struct Secondaries {
     windows: Vec<SecondaryWindow>,
+    /// A simulated layout's root window is on its tile (developer builds).
+    #[cfg(feature = "dev-tools")]
+    root_placed: bool,
 }
 
 impl std::fmt::Debug for Secondaries {
@@ -68,7 +71,7 @@ impl std::fmt::Debug for Secondaries {
         formatter
             .debug_struct("Secondaries")
             .field("windows", &self.windows.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -115,6 +118,57 @@ fn live_displays(event_loop: &ActiveEventLoop) -> Vec<ActiveDisplayInfo> {
             })
         })
         .collect()
+}
+
+/// A simulated layout's windows (developer builds): each is bound on its
+/// synthetic display when it is shown on the display carrying the layout.
+#[cfg(feature = "dev-tools")]
+fn simulated_observations(
+    event_loop: &ActiveEventLoop,
+    observations: &mut [WindowObservation],
+    root_display: u32,
+    planned: &[(SessionMonitorId, u32)],
+) {
+    for observation in observations {
+        let expected = if observation.key == ROOT_WINDOW {
+            root_display
+        } else {
+            planned
+                .iter()
+                .find(|(monitor, _)| monitor.get() == observation.key)
+                .map_or(root_display, |(_, display)| *display)
+        };
+        observation.observation =
+            super::windowed_test::observation(event_loop, observation.observation, expected);
+    }
+}
+
+/// How `monitor`'s window opens: borderless fullscreen on its display, or
+/// (a simulated layout, developer builds) an ordinary window at its tile.
+/// `None` when its display is not attached.
+fn attributes_for(
+    event_loop: &ActiveEventLoop,
+    monitor: SessionMonitorId,
+    screen: u32,
+) -> Option<(winit::window::WindowAttributes, bool)> {
+    #[cfg(feature = "dev-tools")]
+    if let Some(layout) = super::windowed_test::layout() {
+        return super::windowed_test::window_attributes(
+            event_loop,
+            layout,
+            monitor,
+            window_title_for(monitor),
+        )
+        .map(|attributes| (attributes, false));
+    }
+    let target = monitor_for(event_loop, screen)?;
+    Some((
+        Window::default_attributes()
+            .with_title(window_title_for(monitor))
+            .with_decorations(false)
+            .with_fullscreen(Some(Fullscreen::Borderless(Some(target)))),
+        true,
+    ))
 }
 
 fn monitor_for(event_loop: &ActiveEventLoop, display: u32) -> Option<MonitorHandle> {
@@ -166,6 +220,10 @@ impl Secondaries {
             );
         }
         self.windows.clear();
+        #[cfg(feature = "dev-tools")]
+        {
+            self.root_placed = false;
+        }
     }
 
     /// One pass of a multi-window session: open the plan's windows, report
@@ -179,10 +237,17 @@ impl Secondaries {
         launcher: &mut Launcher,
         ctx: &egui::Context,
     ) {
-        let Some((_root_display, planned)) = launcher.multi_window_plan() else {
+        let Some((root_display, planned)) = launcher.multi_window_plan() else {
             self.close_all();
             return;
         };
+        #[cfg(feature = "dev-tools")]
+        if let Some(layout) = super::windowed_test::layout()
+            && !self.root_placed
+        {
+            super::windowed_test::place_root(event_loop, layout, root);
+            self.root_placed = true;
+        }
         self.windows.retain(|window| {
             planned
                 .iter()
@@ -195,10 +260,11 @@ impl Secondaries {
             // A display that is not attached gets no window: the engine
             // sees it missing and ends the layout, never a window on the
             // wrong display.
-            let Some(target) = monitor_for(event_loop, *screen) else {
+            let Some((attributes, fullscreen)) = attributes_for(event_loop, *monitor, *screen)
+            else {
                 continue;
             };
-            match Self::open(event_loop, gpu, *monitor, *screen, target) {
+            match Self::open(event_loop, gpu, *monitor, *screen, attributes, fullscreen) {
                 Ok(window) => self.windows.push(window),
                 Err(error) => tracing::error!(
                     target: "arcen::display",
@@ -210,16 +276,8 @@ impl Secondaries {
             }
         }
 
-        let mut observations = vec![WindowObservation {
-            key: ROOT_WINDOW,
-            observation: observe(root, false),
-        }];
-        observations.extend(self.windows.iter().map(|window| WindowObservation {
-            key: window.monitor.get(),
-            observation: observe(&window.window, window.close_requested),
-        }));
+        let (observations, live) = self.engine_view(event_loop, root, root_display, &planned);
         let any_close = self.windows.iter().any(|window| window.close_requested);
-        let live = live_displays(event_loop);
         launcher.observe_multi_window(&observations, &live, any_close, ctx);
 
         let Some(connection) = launcher.connection() else {
@@ -262,17 +320,44 @@ impl Secondaries {
         }
     }
 
+    /// What the shared engine sees this pass: every window and the
+    /// displays attached now (a simulated layout's own, in developer
+    /// builds).
+    fn engine_view(
+        &self,
+        event_loop: &ActiveEventLoop,
+        root: &Window,
+        root_display: u32,
+        planned: &[(SessionMonitorId, u32)],
+    ) -> (Vec<WindowObservation>, Vec<ActiveDisplayInfo>) {
+        let mut observations = vec![WindowObservation {
+            key: ROOT_WINDOW,
+            observation: observe(root, false),
+        }];
+        observations.extend(self.windows.iter().map(|window| WindowObservation {
+            key: window.monitor.get(),
+            observation: observe(&window.window, window.close_requested),
+        }));
+        #[cfg(feature = "dev-tools")]
+        if let Some(layout) = super::windowed_test::layout() {
+            simulated_observations(event_loop, &mut observations, root_display, planned);
+            return (
+                observations,
+                super::windowed_test::live_displays(event_loop, layout),
+            );
+        }
+        let _ = (root_display, planned);
+        (observations, live_displays(event_loop))
+    }
+
     fn open(
         event_loop: &ActiveEventLoop,
         gpu: &Gpu,
         monitor: SessionMonitorId,
         screen: u32,
-        target: MonitorHandle,
+        attributes: winit::window::WindowAttributes,
+        fullscreen: bool,
     ) -> Result<SecondaryWindow, String> {
-        let attributes = Window::default_attributes()
-            .with_title(window_title_for(monitor))
-            .with_decorations(false)
-            .with_fullscreen(Some(Fullscreen::Borderless(Some(target))));
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -283,7 +368,7 @@ impl Secondaries {
         let mut tree = CompositionTree::new(gpu, hwnd)?;
         let size = window.inner_size();
         let _ = tree.set_client_size((size.width, size.height));
-        tree.set_fullscreen(true);
+        tree.set_fullscreen(fullscreen);
         tree.commit()?;
         let tree: SharedTree = Arc::new(std::sync::Mutex::new(tree));
         tracing::info!(

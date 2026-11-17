@@ -67,6 +67,7 @@
 pub mod admission;
 pub mod applied;
 pub mod atomic_start;
+pub mod console_layout;
 pub mod display_lease;
 pub mod edid;
 pub mod fairness;

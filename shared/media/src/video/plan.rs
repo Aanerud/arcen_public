@@ -667,6 +667,41 @@ impl ResolvedMediaPlan {
             ChromaSubsampling::Yuv444 => "yuv444",
         }
     }
+
+    /// The `SESSION_STREAM_START` fields for this plan, as every Pier with a
+    /// resolved plan states them: what was encoded (encoder label, codec,
+    /// chroma, size, rate and colour identity), the served pipeline, the
+    /// display backend, and why the rate is what it is (`frame_rate`).
+    #[must_use]
+    pub fn stream_start_fields(
+        self,
+        encoder: &str,
+        pipeline: Option<&str>,
+        display_backend: &str,
+        frame_rate: Option<super::SessionFrameRate>,
+    ) -> Option<arcen_telemetry::StructuredFields> {
+        arcen_telemetry::lifecycle_fields::session_stream_start(
+            arcen_telemetry::lifecycle_fields::StreamStart {
+                encoder,
+                codec: self.codec_token(),
+                chroma: self.chroma_token(),
+                width: self.width,
+                height: self.height,
+                fps: Some(self.fps),
+                display_refresh_hz: frame_rate.and_then(|rate| rate.display_refresh_hz),
+                fps_basis: frame_rate.map(|rate| rate.basis.token()),
+                pipeline,
+                display_backend: Some(display_backend),
+                color: Some(arcen_telemetry::lifecycle_fields::ColorIdentity {
+                    bit_depth: self.bit_depth_token(),
+                    color_range: self.range_token(),
+                    color_matrix: self.matrix_token(),
+                    color_primaries: self.primaries_token(),
+                    transfer: self.transfer_token(),
+                }),
+            },
+        )
+    }
 }
 
 /// Pure plan-resolution failure.

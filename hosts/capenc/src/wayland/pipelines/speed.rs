@@ -97,7 +97,7 @@ impl SpeedPipeline {
     pub fn offer(self, requested_fps: u32) -> FormatOffer {
         if self.runtime_shortfall {
             // Served as Auto: ask for no more than Auto needs.
-            return super::auto::AutoPipeline.offer(requested_fps);
+            return super::auto::AutoPipeline::default().offer(requested_fps);
         }
         FormatOffer::sdr8_host(paced_source_offer_fps(
             self.contract().max_fps.min(requested_fps.max(1)),
@@ -173,7 +173,9 @@ mod tests {
         assert_eq!(served.pipeline, PipelineId::Auto);
         assert_eq!(
             pipeline.offer(60).max_fps,
-            super::super::auto::AutoPipeline.offer(60).max_fps
+            super::super::auto::AutoPipeline::default()
+                .offer(60)
+                .max_fps
         );
         let inferred =
             SpeedPipeline::new(Some(60)).with_rate_evidence(CaptureRateEvidence::Inferred {
