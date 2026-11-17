@@ -869,31 +869,41 @@ struct GrabbedInput {
     devices: Vec<(PathBuf, u64, evdev::Device)>,
 }
 
+/// udev's classes of a keyboard or a pointer, as opposed to a device with
+/// a few keys, buttons or switches (`ID_INPUT_KEY`, `ID_INPUT_SWITCH`).
+const KEYBOARD_OR_POINTER_CLASSES: [&str; 7] = [
+    "ID_INPUT_KEYBOARD",
+    "ID_INPUT_MOUSE",
+    "ID_INPUT_TOUCHPAD",
+    "ID_INPUT_TABLET",
+    "ID_INPUT_TOUCHSCREEN",
+    "ID_INPUT_POINTINGSTICK",
+    "ID_INPUT_TRACKBALL",
+];
+
 fn input_device_fact(event: &str) -> Option<InputDeviceFact> {
     let class = Path::new("/sys/class/input").join(event);
     let device = std::fs::canonicalize(class.join("device")).ok()?;
     let dev = std::fs::read_to_string(class.join("dev")).ok()?;
     let udev =
         std::fs::read_to_string(format!("/run/udev/data/c{}", dev.trim())).unwrap_or_default();
+    let bustype = std::fs::read_to_string(class.join("device/id/bustype")).unwrap_or_default();
+    Some(device_fact_from(&device, &udev, &bustype))
+}
+
+/// One device's facts from its sysfs path (`/sys/class/input/eventN/device`
+/// resolved), its udev database record (`/run/udev/data/c<major>:<minor>`)
+/// and its `id/bustype` (hexadecimal).
+fn device_fact_from(device: &Path, udev: &str, bustype: &str) -> InputDeviceFact {
     let property = |key: &str| {
         udev.lines()
             .filter_map(|line| line.strip_prefix("E:"))
             .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
             .map(str::to_owned)
     };
-    let drives_desktop = [
-        "ID_INPUT_KEY",
-        "ID_INPUT_KEYBOARD",
-        "ID_INPUT_MOUSE",
-        "ID_INPUT_TOUCHPAD",
-        "ID_INPUT_TABLET",
-        "ID_INPUT_TOUCHSCREEN",
-        "ID_INPUT_POINTINGSTICK",
-        "ID_INPUT_TRACKBALL",
-    ]
-    .iter()
-    .any(|key| property(key).as_deref() == Some("1"));
-    Some(InputDeviceFact {
+    let set = |key: &&str| property(key).as_deref() == Some("1");
+    let keyboard_or_pointer = KEYBOARD_OR_POINTER_CLASSES.iter().any(set);
+    InputDeviceFact {
         virtual_device: device.starts_with("/sys/devices/virtual"),
         console_seat: property("ID_SEAT").is_none_or(|seat| seat == model::CONSOLE_SEAT),
         // Only Arcen's own udev rule marks a bridged device (a tag and
@@ -903,8 +913,12 @@ fn input_device_fact(event: &str) -> Option<InputDeviceFact> {
             tags.split(',')
                 .any(|tag| tag == arcen_usb_bridge::bridge_seat::XORG_BRIDGE_TAG)
         }) && property("LIBINPUT_IGNORE_DEVICE").as_deref() == Some("1"),
-        drives_desktop,
-    })
+        drives_desktop: keyboard_or_pointer || set(&"ID_INPUT_KEY"),
+        keyboard_or_pointer,
+        // Unreadable reads as bus 0: never the platform bus, so it cannot
+        // excuse a device.
+        bus: u16::from_str_radix(bustype.trim(), 16).unwrap_or(0),
+    }
 }
 
 /// Whether `event`'s device carries Arcen's virtual input vendor (Arcen's
@@ -920,12 +934,167 @@ fn arcen_input_device(event: &str) -> bool {
         == Some(arcen_input::virtual_device::VIRTUAL_INPUT_VENDOR_ID)
 }
 
-/// The name of a software keyboard or pointer of another remote-desktop
-/// product's connected client, if one exists (shared
-/// `another_products_client_input`). Only asked about a desktop another
-/// product owns: there, that product's client is using it now.
-pub(crate) fn another_products_client() -> Option<String> {
+/// The kernel's interfaces for input devices made in user space, by their
+/// node names and fixed misc-device numbers (`UINPUT_MINOR`, `UHID_MINOR`).
+const USER_SPACE_INPUT_NODES: [(&str, u32, u32); 2] = [("uinput", 10, 223), ("uhid", 10, 239)];
+
+/// A process holding a user-space input interface open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputCreator {
+    pid: u32,
+    comm: String,
+    /// `/proc/<pid>/exe` as the link reads (`… (deleted)` after an update
+    /// replaced the file); `None` when unreadable.
+    exe: Option<String>,
+}
+
+/// An executable path without the kernel's ` (deleted)` suffix.
+fn executable_path(link: &str) -> &str {
+    link.strip_suffix(" (deleted)").unwrap_or(link)
+}
+
+/// Whether `creator` is one of Arcen's own processes: the Pier and every
+/// helper it starts run this one executable (also after an update replaced
+/// the file under a running session). Read from the links' text only, so a
+/// holder's executable on a hung network mount cannot stall the check.
+fn arcen_creator(creator: &InputCreator, own_exe: Option<&str>) -> bool {
+    matches!(
+        (creator.exe.as_deref(), own_exe),
+        (Some(theirs), Some(ours)) if executable_path(theirs) == executable_path(ours)
+    )
+}
+
+/// Who holds the user-space input interfaces open, from the processes
+/// found holding one (`None`: they could not all be read).
+fn creators_from(
+    holders: Option<&[InputCreator]>,
+    own_exe: Option<&str>,
+) -> model::UserSpaceInputCreators {
+    match holders {
+        None => model::UserSpaceInputCreators::Unknown,
+        Some(holders) if holders.iter().all(|holder| arcen_creator(holder, own_exe)) => {
+            model::UserSpaceInputCreators::ArcenOnly
+        }
+        Some(_) => model::UserSpaceInputCreators::Other,
+    }
+}
+
+/// A device number's major and minor (glibc's `gnu_dev_major`/`minor`).
+const fn device_major_minor(rdev: u64) -> (u32, u32) {
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "glibc's encoding keeps both numbers within 32 bits"
+    )]
+    let major = (((rdev >> 32) & 0xffff_f000) | ((rdev >> 8) & 0x0000_0fff)) as u32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "glibc's encoding keeps both numbers within 32 bits"
+    )]
+    let minor = (((rdev >> 12) & 0xffff_ff00) | (rdev & 0x0000_00ff)) as u32;
+    (major, minor)
+}
+
+/// Whether descriptor `fd` (a `/proc/<pid>/fd/<n>` link reading `target`)
+/// is open on uinput or uhid: by the node's name, then proved by its device
+/// number (`rdev`, of the opened file), so a node elsewhere (a chroot) still
+/// counts and nothing else is ever stat'ed.
+fn holds_user_space_input(
+    fd: &Path,
+    target: &Path,
+    rdev: &dyn Fn(&Path) -> std::io::Result<u64>,
+) -> std::io::Result<bool> {
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    let Some(&(_, major, minor)) = USER_SPACE_INPUT_NODES
+        .iter()
+        .find(|(node, _, _)| *node == name)
+    else {
+        return Ok(false);
+    };
+    Ok(device_major_minor(rdev(fd)?) == (major, minor))
+}
+
+/// Every process under `proc_root` holding `/dev/uinput` or `/dev/uhid`
+/// open; `None` when a process's descriptors could not be read (a process
+/// or descriptor that ended meanwhile is skipped).
+fn user_space_input_holders(
+    proc_root: &Path,
+    rdev: &dyn Fn(&Path) -> std::io::Result<u64>,
+) -> Option<Vec<InputCreator>> {
+    let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+    let mut holders = Vec::new();
+    for entry in std::fs::read_dir(proc_root).ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let base = entry.path();
+        let descriptors = match std::fs::read_dir(base.join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if gone(&error) => continue,
+            Err(_) => return None,
+        };
+        let mut holds = false;
+        for descriptor in descriptors {
+            let fd = match descriptor {
+                Ok(descriptor) => descriptor.path(),
+                Err(error) if gone(&error) => continue,
+                Err(_) => return None,
+            };
+            match std::fs::read_link(&fd)
+                .and_then(|target| holds_user_space_input(&fd, &target, rdev))
+            {
+                Ok(true) => {
+                    holds = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) if gone(&error) => {}
+                Err(_) => return None,
+            }
+        }
+        if !holds {
+            continue;
+        }
+        let exe = std::fs::read_link(base.join("exe"))
+            .ok()
+            .map(|link| link.to_string_lossy().into_owned());
+        let comm = std::fs::read_to_string(base.join("comm"))
+            .map(|comm| comm.trim().to_owned())
+            .unwrap_or_default();
+        holders.push(InputCreator { pid, comm, exe });
+    }
+    holders.sort_by_key(|holder| holder.pid);
+    Some(holders)
+}
+
+/// A short account of the user-space input creators outside Arcen, for
+/// the log (`pcomm[pid]`, or that they could not be read).
+fn outside_creators(holders: Option<&[InputCreator]>, own_exe: Option<&str>) -> String {
+    let Some(holders) = holders else {
+        return "user-space input creators unreadable".to_owned();
+    };
+    let names: Vec<String> = holders
+        .iter()
+        .filter(|holder| !arcen_creator(holder, own_exe))
+        .map(|holder| format!("{}[{}]", holder.comm, holder.pid))
+        .collect();
+    format!("created through uinput/uhid by {}", names.join(", "))
+}
+
+/// The name of a keyboard or pointer of another remote-desktop product's
+/// connected client, if one exists (shared `another_products_client_input`):
+/// a parentless keyboard or pointer that is not Arcen's, not a firmware
+/// device, while a process outside Arcen holds `/dev/uinput` or `/dev/uhid`.
+/// Only asked about a desktop another product owns: there, that product's
+/// client is using it now.
+fn another_products_client_now() -> Option<String> {
     let entries = std::fs::read_dir("/sys/class/input").ok()?;
+    let mut creators: Option<(Option<Vec<InputCreator>>, Option<String>)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(event) = name.to_str().filter(|name| name.starts_with("event")) else {
@@ -934,14 +1103,49 @@ pub(crate) fn another_products_client() -> Option<String> {
         let Some(fact) = input_device_fact(event) else {
             continue;
         };
-        if model::another_products_client_input(fact, arcen_input_device(event)) {
+        let arcen = arcen_input_device(event);
+        // Who creates input in user space is read only once a device could
+        // be another product's at all (a host with none never scans /proc).
+        if !model::remote_client_input_candidate(fact, arcen) {
+            continue;
+        }
+        let (holders, own_exe) = creators.get_or_insert_with(|| {
+            (
+                user_space_input_holders(Path::new("/proc"), &|fd| {
+                    std::fs::metadata(fd).map(|metadata| metadata.rdev())
+                }),
+                std::fs::read_link("/proc/self/exe")
+                    .ok()
+                    .map(|link| link.to_string_lossy().into_owned()),
+            )
+        });
+        let who = creators_from(holders.as_deref(), own_exe.as_deref());
+        if model::another_products_client_input(fact, arcen, who) {
             let device_name = std::fs::read_to_string(entry.path().join("device/name"))
                 .map(|name| name.trim().to_owned())
                 .unwrap_or_default();
-            return Some(format!("{event} ({device_name})"));
+            return Some(format!(
+                "{event} ({device_name}; bus {:#06x}; {})",
+                fact.bus,
+                outside_creators(holders.as_deref(), own_exe.as_deref())
+            ));
         }
     }
     None
+}
+
+/// [`another_products_client_now`] off the async runtime (it reads sysfs,
+/// udev and, once a device could be another product's, every process's
+/// descriptors). A check that could not run counts as a client: one remote
+/// product at a time is kept when in doubt.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "plain file reads that finish; nothing is left running when the caller stops waiting"
+)]
+pub(crate) async fn another_products_client() -> Option<String> {
+    tokio::task::spawn_blocking(another_products_client_now)
+        .await
+        .unwrap_or_else(|error| Some(format!("the check could not run: {error}")))
 }
 
 impl GrabbedInput {
@@ -2664,5 +2868,222 @@ mod tests {
         ] {
             assert!(requested.contains(&property), "{property} is not requested");
         }
+    }
+
+    /// The field workstation's `HP WMI hotkeys` (`event3`), as udev and
+    /// sysfs show it: the hp-wmi driver registers it without a parent, on
+    /// `BUS_HOST`, with a few keys and switches.
+    const HP_WMI_HOTKEYS_UDEV: &str = "I:15847733\nE:ID_INPUT=1\nE:ID_INPUT_KEY=1\n\
+        E:ID_INPUT_SWITCH=1\nE:NVME_HOST_IFACE=none\nE:LIBINPUT_DEVICE_GROUP=19/0/0:wmi\n\
+        G:power-switch\nQ:power-switch\nV:1\n";
+
+    /// A remote product's client keyboard made through uinput while its
+    /// client is connected (no parent, libevdev's default bus 0 and vendor 0).
+    const PRODUCT_KEYBOARD_UDEV: &str = "I:4011223344\nE:ID_INPUT=1\nE:ID_INPUT_KEY=1\n\
+        E:ID_INPUT_KEYBOARD=1\nE:XKBMODEL=pc105\nE:XKBLAYOUT=no\nG:seat\nG:uaccess\n\
+        Q:seat\nQ:uaccess\nV:1\n";
+
+    #[test]
+    fn a_firmware_hotkey_device_reads_as_a_platform_device_with_a_few_keys() {
+        let fact = device_fact_from(
+            Path::new("/sys/devices/virtual/input/input6"),
+            HP_WMI_HOTKEYS_UDEV,
+            "0019\n",
+        );
+        assert!(fact.virtual_device && fact.console_seat && fact.drives_desktop);
+        assert!(!fact.keyboard_or_pointer);
+        assert_eq!(fact.bus, model::BUS_HOST);
+        assert!(!model::remote_client_input_candidate(fact, false));
+        assert!(!model::another_products_client_input(
+            fact,
+            false,
+            model::UserSpaceInputCreators::Unknown
+        ));
+    }
+
+    #[test]
+    fn a_uinput_keyboard_and_pointer_of_another_product_are_candidates() {
+        let keyboard = device_fact_from(
+            Path::new("/sys/devices/virtual/input/input213"),
+            PRODUCT_KEYBOARD_UDEV,
+            "0000\n",
+        );
+        assert!(keyboard.keyboard_or_pointer && keyboard.virtual_device);
+        assert_eq!(keyboard.bus, 0);
+        assert!(model::remote_client_input_candidate(keyboard, false));
+        // Arcen's own (its vendor) never is.
+        assert!(!model::remote_client_input_candidate(keyboard, true));
+        let mouse = device_fact_from(
+            Path::new("/sys/devices/virtual/input/input214"),
+            "E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_INPUT_TOUCHSCREEN=1\n",
+            "0006",
+        );
+        assert!(model::remote_client_input_candidate(mouse, false));
+        // An unreadable bus never excuses a device.
+        let unread = device_fact_from(
+            Path::new("/sys/devices/virtual/input/input215"),
+            PRODUCT_KEYBOARD_UDEV,
+            "",
+        );
+        assert!(model::remote_client_input_candidate(unread, false));
+    }
+
+    #[test]
+    fn a_bridged_tablet_and_the_desks_own_keyboard_are_not_candidates() {
+        let bridged = device_fact_from(
+            Path::new("/sys/devices/virtual/misc/uhid/0003:056A:0317.0009/input/input30"),
+            "E:ID_INPUT=1\nE:ID_INPUT_TABLET=1\nE:ID_INPUT.tags=arcen_bridge,arcen_bridge_1\n\
+             E:LIBINPUT_IGNORE_DEVICE=1\n",
+            "0003",
+        );
+        assert!(bridged.bridged);
+        assert!(!model::remote_client_input_candidate(bridged, false));
+        let desk = device_fact_from(
+            Path::new("/sys/devices/platform/i8042/serio0/input/input1"),
+            "E:ID_INPUT=1\nE:ID_INPUT_KEY=1\nE:ID_INPUT_KEYBOARD=1\n",
+            "0011",
+        );
+        assert!(!desk.virtual_device);
+        assert!(!model::remote_client_input_candidate(desk, false));
+        assert!(model::disables_while_attached(desk));
+    }
+
+    #[test]
+    fn a_bluetooth_keyboard_at_the_desk_is_not_a_candidate() {
+        // BlueZ makes a Bluetooth LE keyboard through uhid (bluetoothd holds
+        // /dev/uhid), so it has no parent device either.
+        let keyboard = device_fact_from(
+            Path::new("/sys/devices/virtual/misc/uhid/0005:046D:B35B.0004/input/input21"),
+            "E:ID_INPUT=1\nE:ID_INPUT_KEY=1\nE:ID_INPUT_KEYBOARD=1\nE:ID_BUS=bluetooth\n",
+            "0005\n",
+        );
+        assert!(keyboard.virtual_device && keyboard.keyboard_or_pointer);
+        assert_eq!(keyboard.bus, model::BUS_BLUETOOTH);
+        assert!(!model::remote_client_input_candidate(keyboard, false));
+    }
+
+    fn creator(pid: u32, exe: Option<&str>) -> InputCreator {
+        InputCreator {
+            pid,
+            comm: format!("p{pid}"),
+            exe: exe.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn only_arcen_holding_uinput_rules_out_another_products_devices() {
+        use model::UserSpaceInputCreators::{ArcenOnly, Other, Unknown};
+        const OURS: &str = "/opt/arcen/bin/arcen-pier";
+        assert_eq!(creators_from(Some(&[]), Some(OURS)), ArcenOnly);
+        let arcen = [
+            creator(10, Some(OURS)),
+            // A helper of a session that outlived an update of the file.
+            creator(11, Some("/opt/arcen/bin/arcen-pier (deleted)")),
+        ];
+        assert_eq!(creators_from(Some(&arcen), Some(OURS)), ArcenOnly);
+        assert_eq!(
+            creators_from(Some(&arcen), Some("/opt/arcen/bin/arcen-pier (deleted)")),
+            ArcenOnly
+        );
+        let mut both = arcen.to_vec();
+        both.push(creator(20, Some("/usr/lib/remote-product/server")));
+        assert_eq!(creators_from(Some(&both), Some(OURS)), Other);
+        assert_eq!(
+            outside_creators(Some(&both), Some(OURS)),
+            "created through uinput/uhid by p20[20]"
+        );
+        // An unreadable executable is not Arcen's, nor is anyone when this
+        // Pier's own could not be read.
+        assert_eq!(creators_from(Some(&[creator(21, None)]), Some(OURS)), Other);
+        assert_eq!(creators_from(Some(&arcen), None), Other);
+        assert_eq!(creators_from(None, Some(OURS)), Unknown);
+    }
+
+    #[test]
+    fn device_numbers_decode_like_glibc() {
+        // makedev(10, 223) and makedev(10, 239): uinput and uhid.
+        assert_eq!(device_major_minor(0x0adf), (10, 223));
+        assert_eq!(device_major_minor(0x0aef), (10, 239));
+        // A large major and minor use the high bits (glibc's makedev).
+        let (major, minor) = (0x0001_2345_u64, 0x0006_789a_u64);
+        let rdev = ((major & 0x0fff) << 8)
+            | ((major & !0x0fff) << 32)
+            | (minor & 0xff)
+            | ((minor & !0xff) << 12);
+        assert_eq!(device_major_minor(rdev), (0x0001_2345, 0x0006_789a));
+        // The host's own node, where there is one.
+        if let Ok(node) = std::fs::metadata("/dev/uinput") {
+            assert_eq!(device_major_minor(node.rdev()), (10, 223));
+        }
+    }
+
+    #[test]
+    fn uinput_and_uhid_holders_are_read_from_proc() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "arcen-console-input-creators-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let process = |pid: u32, exe: &str, fds: &[&str]| {
+            let base = root.join(pid.to_string());
+            std::fs::create_dir_all(base.join("fd")).unwrap();
+            symlink(exe, base.join("exe")).unwrap();
+            std::fs::write(base.join("comm"), format!("p{pid}\n")).unwrap();
+            for (fd, target) in fds.iter().enumerate() {
+                symlink(target, base.join("fd").join(fd.to_string())).unwrap();
+            }
+        };
+        process(
+            100,
+            "/usr/lib/remote-product/server",
+            &["/dev/null", "/dev/uinput"],
+        );
+        process(
+            200,
+            "/opt/arcen/bin/arcen-pier",
+            &["/dev/uinput", "/dev/uhid"],
+        );
+        process(300, "/usr/bin/bash", &["/dev/null", "socket:[1]"]);
+        // Through a chroot, and a node named uinput that is something else.
+        process(400, "/usr/lib/remote-product/hid", &["/srv/jail/dev/uhid"]);
+        process(500, "/usr/bin/impostor", &["/home/u/uinput"]);
+        // A process that ended between listing and reading.
+        std::fs::create_dir_all(root.join("600")).unwrap();
+        // The fixture's descriptors stand in for device nodes: their device
+        // numbers come from the link text.
+        let rdev = |fd: &Path| -> std::io::Result<u64> {
+            let target = std::fs::read_link(fd)?;
+            Ok(match target.to_str() {
+                Some("/dev/uinput") => 0x0adf,
+                Some("/dev/uhid" | "/srv/jail/dev/uhid") => 0x0aef,
+                _ => 0x0103,
+            })
+        };
+
+        let holders = user_space_input_holders(&root, &rdev).unwrap();
+        assert_eq!(
+            holders.iter().map(|holder| holder.pid).collect::<Vec<_>>(),
+            [100, 200, 400]
+        );
+        assert_eq!(
+            holders[0].exe.as_deref(),
+            Some("/usr/lib/remote-product/server")
+        );
+        const OURS: Option<&str> = Some("/opt/arcen/bin/arcen-pier");
+        assert_eq!(
+            creators_from(Some(&holders), OURS),
+            model::UserSpaceInputCreators::Other
+        );
+        assert_eq!(
+            creators_from(Some(&holders[1..2]), OURS),
+            model::UserSpaceInputCreators::ArcenOnly
+        );
+        // A descriptor that cannot be read makes the answer unknown.
+        let unreadable = |_: &Path| -> std::io::Result<u64> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+        assert!(user_space_input_holders(&root, &unreadable).is_none());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

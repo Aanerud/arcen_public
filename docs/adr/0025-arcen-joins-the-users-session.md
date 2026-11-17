@@ -443,10 +443,21 @@ product owned):*
   `console_layout_differs` and Primary Display Only. Outputs forced
   connected without a mode never take a monitor (shared `takes_a_monitor`).
 - **One remote product at a time.** While that product's client is connected
-  (a software keyboard or pointer that is not Arcen's exists, shared
-  `another_products_client_input`) the sign-in is refused
-  `console_in_use_other_product`; when it connects during an attachment the
-  attachment ends with that code. When another product starts a desktop of
+  the sign-in is refused `console_in_use_other_product`; when it connects
+  during an attachment the attachment ends with that code. A connected
+  client shows as a keyboard or pointer made in user space (shared
+  `another_products_client_input`): a udev keyboard or pointer without a
+  parent device, neither on the host-platform bus (`BUS_HOST`) nor a
+  Bluetooth device at the desk (`BUS_BLUETOOTH`: BlueZ makes Bluetooth LE
+  keyboards and mice through uhid), not Arcen's (its vendor) nor a Deck's
+  bridged device, while a process outside Arcen holds `/dev/uinput` or
+  `/dev/uhid` open (a device made through them lives only while its
+  creator holds one; unreadable counts as such a process).
+  *Amended in the 0.20.2 re-issue:* "any parentless device that is not
+  Arcen's" also took a firmware driver's device; a field workstation's
+  `HP WMI hotkeys` (hp-wmi registers it without a parent, on `BUS_HOST`,
+  with a few keys and switches) refused every join with no client
+  connected. When another product starts a desktop of
   its own while a Deck is attached to any other console session, the
   attachment ends with `console_other_product_started`.
 - **Input devices on any console display.** A joined console's display may

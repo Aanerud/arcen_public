@@ -9558,7 +9558,7 @@ async fn run_attachment(
             _ = guest_check.tick(), if console_joined.is_some() => {
                 use arcen_session::console_session::{other_product_started, ConsoleRefusal};
                 let refusal = if console_guest {
-                    let Some(device) = crate::session::console::another_products_client() else {
+                    let Some(device) = crate::session::console::another_products_client().await else {
                         continue;
                     };
                     error!(

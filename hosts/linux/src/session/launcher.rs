@@ -3013,7 +3013,7 @@ async fn run_console(
     // client is not using it: one remote product at a time (ADR 0025 §8).
     let guest = origin == model::ConsoleOrigin::OtherProduct;
     if guest {
-        if let Some(device) = console::another_products_client() {
+        if let Some(device) = console::another_products_client().await {
             tracing::warn!(
                 target: target::SESSION,
                 session_id = %session_id,
@@ -3244,7 +3244,7 @@ async fn run_console(
                     }
                     Some("attach") => {
                         if guest {
-                            if let Some(device) = console::another_products_client() {
+                            if let Some(device) = console::another_products_client().await {
                                 tracing::warn!(
                                     target: target::SESSION,
                                     device = %device,

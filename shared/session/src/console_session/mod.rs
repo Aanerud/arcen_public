@@ -575,24 +575,65 @@ impl ConsoleRefusal {
     }
 }
 
+/// The kernel's bus type for host-platform devices (`BUS_HOST` in
+/// `linux/input.h`): firmware hotkeys, ACPI buttons and the like.
+pub const BUS_HOST: u16 = 0x19;
+
+/// The kernel's bus type for Bluetooth devices (`BUS_BLUETOOTH`). The desk's
+/// Bluetooth LE keyboards and mice are made through uhid by the Bluetooth
+/// daemon, so they have no parent device either.
+pub const BUS_BLUETOOTH: u16 = 0x05;
+
 /// One evdev input device, as the Pier sees it before deciding whether a
 /// person at the desk could use it while a Deck is attached.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "four independent facts about one device, each read from udev"
+    reason = "independent facts about one device, each read from sysfs or udev"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct InputDeviceFact {
-    /// Created in software (`/sys/devices/virtual`: uinput, Arcen's own
-    /// virtual devices, another remote product's).
+    /// Without a parent device (`/sys/devices/virtual`): created through
+    /// uinput or uhid (Arcen's own virtual devices, another remote
+    /// product's), or registered by a firmware driver without one (HP's WMI
+    /// hotkeys).
     pub virtual_device: bool,
     /// On the console seat (no `ID_SEAT`, or `seat0`).
     pub console_seat: bool,
     /// A Deck's bridged USB device (Native tablet, ADR 0021).
     pub bridged: bool,
-    /// Keyboard, pointer, touch or tablet: something a person can drive
-    /// the desktop with.
+    /// Keyboard, pointer, touch, tablet or keys: something a person can
+    /// drive the desktop with.
     pub drives_desktop: bool,
+    /// A keyboard or a pointer (mouse, touchpad, tablet, touchscreen,
+    /// pointing stick, trackball) as udev classifies it, not a device with
+    /// only a few keys, buttons or switches (hotkeys, a power button).
+    pub keyboard_or_pointer: bool,
+    /// The device's bus type (`id/bustype`).
+    pub bus: u16,
+}
+
+/// Who holds the kernel's interfaces for input devices made in user space
+/// (`/dev/uinput`, `/dev/uhid`) open. A device made through them exists
+/// only while its creator holds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserSpaceInputCreators {
+    /// Nobody, or only Arcen's own processes.
+    ArcenOnly,
+    /// A process that is not Arcen's.
+    Other,
+    /// Could not be read.
+    Unknown,
+}
+
+impl UserSpaceInputCreators {
+    /// Whether a device made in user space may be another product's: a
+    /// creator outside Arcen exists, or none could be ruled out (unknown
+    /// counts as one, so a failed read never lets Arcen join a desktop
+    /// another product's client is using).
+    #[must_use]
+    pub const fn include_another_product(self) -> bool {
+        !matches!(self, Self::ArcenOnly)
+    }
 }
 
 /// Whether the device is the desk's own input, disabled while a Deck is
@@ -603,19 +644,37 @@ pub const fn disables_while_attached(device: InputDeviceFact) -> bool {
     device.drives_desktop && device.console_seat && !device.virtual_device && !device.bridged
 }
 
-/// Whether the device is a remote client's input of another product: a
-/// software keyboard or pointer on the console seat that is not Arcen's own
-/// (`arcen_device`: Arcen's virtual input vendor) nor a Deck's bridged
-/// device. Remote-desktop products create these while their client is
-/// connected; on a desktop another product owns, one present means that
-/// product's client is using the desktop now.
+/// Whether the device, by its own facts, could be a remote client's input
+/// of another product: a keyboard or pointer on the console seat without a
+/// parent device, neither on the host-platform bus nor a Bluetooth device
+/// at the desk, that is not Arcen's own (`arcen_device`: Arcen's virtual
+/// input vendor) nor a Deck's bridged device. A firmware driver's
+/// parentless device (HP's WMI hotkeys: `BUS_HOST`, a few keys and
+/// switches) never is.
 #[must_use]
-pub const fn another_products_client_input(device: InputDeviceFact, arcen_device: bool) -> bool {
-    device.drives_desktop
+pub const fn remote_client_input_candidate(device: InputDeviceFact, arcen_device: bool) -> bool {
+    device.keyboard_or_pointer
         && device.console_seat
         && device.virtual_device
+        && device.bus != BUS_HOST
+        && device.bus != BUS_BLUETOOTH
         && !device.bridged
         && !arcen_device
+}
+
+/// Whether the device is a remote client's input of another product
+/// ([`remote_client_input_candidate`]) while a process outside Arcen holds
+/// the user-space input interfaces (`creators`): remote-desktop products
+/// create their client's keyboard and pointer through them while that
+/// client is connected, so on a desktop another product owns, such a
+/// device means that product's client is using the desktop now.
+#[must_use]
+pub const fn another_products_client_input(
+    device: InputDeviceFact,
+    arcen_device: bool,
+    creators: UserSpaceInputCreators,
+) -> bool {
+    remote_client_input_candidate(device, arcen_device) && creators.include_another_product()
 }
 
 /// The console desktops another remote-desktop product started (the
@@ -1274,36 +1333,122 @@ mod tests {
         assert!(!x_server_peer_trustworthy(OTHER, OTHER, TIM));
     }
 
+    /// A uinput keyboard of another product's connected client, shaped like
+    /// the field's (no parent, bus 0, vendor 0, udev keyboard).
+    const PRODUCT_KEYBOARD: InputDeviceFact = InputDeviceFact {
+        virtual_device: true,
+        console_seat: true,
+        bridged: false,
+        drives_desktop: true,
+        keyboard_or_pointer: true,
+        bus: 0,
+    };
+
     #[test]
     fn another_products_client_shows_as_its_software_input() {
-        let client = InputDeviceFact {
+        use UserSpaceInputCreators::{ArcenOnly, Other, Unknown};
+        assert!(another_products_client_input(
+            PRODUCT_KEYBOARD,
+            false,
+            Other
+        ));
+        // One made over the virtual bus or as a USB device is the same.
+        for bus in [0x03, 0x06] {
+            let device = InputDeviceFact {
+                bus,
+                ..PRODUCT_KEYBOARD
+            };
+            assert!(another_products_client_input(device, false, Other));
+        }
+        // A creator that could not be ruled out still counts.
+        assert!(another_products_client_input(
+            PRODUCT_KEYBOARD,
+            false,
+            Unknown
+        ));
+        // With nothing outside Arcen holding uinput or uhid, no device made
+        // in user space can be another product's.
+        assert!(!another_products_client_input(
+            PRODUCT_KEYBOARD,
+            false,
+            ArcenOnly
+        ));
+        // Arcen's own virtual devices never count.
+        assert!(!another_products_client_input(
+            PRODUCT_KEYBOARD,
+            true,
+            Other
+        ));
+        for device in [
+            InputDeviceFact {
+                virtual_device: false,
+                ..PRODUCT_KEYBOARD
+            },
+            InputDeviceFact {
+                bridged: true,
+                ..PRODUCT_KEYBOARD
+            },
+            InputDeviceFact {
+                drives_desktop: false,
+                keyboard_or_pointer: false,
+                ..PRODUCT_KEYBOARD
+            },
+            InputDeviceFact {
+                console_seat: false,
+                ..PRODUCT_KEYBOARD
+            },
+        ] {
+            assert!(
+                !another_products_client_input(device, false, Other),
+                "{device:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_firmware_hotkey_device_is_never_another_products_client() {
+        use UserSpaceInputCreators::{Other, Unknown};
+        // The field workstation's `HP WMI hotkeys`: registered by the hp-wmi
+        // driver without a parent (so under /sys/devices/virtual), on
+        // BUS_HOST, udev ID_INPUT_KEY and ID_INPUT_SWITCH only. Present on
+        // every boot, with no remote client anywhere.
+        let hotkeys = InputDeviceFact {
             virtual_device: true,
             console_seat: true,
             bridged: false,
             drives_desktop: true,
+            keyboard_or_pointer: false,
+            bus: BUS_HOST,
         };
-        assert!(another_products_client_input(client, false));
-        assert!(!another_products_client_input(client, true));
-        for device in [
-            InputDeviceFact {
-                virtual_device: false,
-                ..client
-            },
-            InputDeviceFact {
-                bridged: true,
-                ..client
-            },
-            InputDeviceFact {
-                drives_desktop: false,
-                ..client
-            },
-            InputDeviceFact {
-                console_seat: false,
-                ..client
-            },
-        ] {
-            assert!(!another_products_client_input(device, false));
+        for creators in [Other, Unknown] {
+            assert!(!another_products_client_input(hotkeys, false, creators));
         }
+        // Either fact alone rules it out: a platform device with a full
+        // keyboard's keys, or a few hotkeys on any other bus.
+        let platform_keyboard = InputDeviceFact {
+            keyboard_or_pointer: true,
+            ..hotkeys
+        };
+        assert!(!remote_client_input_candidate(platform_keyboard, false));
+        let few_keys = InputDeviceFact { bus: 0, ..hotkeys };
+        assert!(!remote_client_input_candidate(few_keys, false));
+        // Without a parent it is left alone while attached, as before.
+        assert!(!disables_while_attached(hotkeys));
+    }
+
+    #[test]
+    fn a_bluetooth_keyboard_at_the_desk_is_never_another_products_client() {
+        // BlueZ makes a Bluetooth LE keyboard through uhid: no parent, and
+        // bluetoothd (not Arcen) holds /dev/uhid.
+        let keyboard = InputDeviceFact {
+            bus: BUS_BLUETOOTH,
+            ..PRODUCT_KEYBOARD
+        };
+        assert!(!another_products_client_input(
+            keyboard,
+            false,
+            UserSpaceInputCreators::Other
+        ));
     }
 
     #[test]
@@ -1313,6 +1458,8 @@ mod tests {
             console_seat: true,
             bridged: false,
             drives_desktop: true,
+            keyboard_or_pointer: true,
+            bus: 0x03,
         };
         assert!(disables_while_attached(physical));
         for other in [
