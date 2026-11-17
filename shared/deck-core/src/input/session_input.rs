@@ -12,20 +12,28 @@
 //! Events the Deck keeps (the input method's composition, Deck shortcuts,
 //! the end of a pointer lock) and the host-led cursor go to the shell's own
 //! sink, never to the host.
+//!
+//! A multi-window session's pointer follows a held-button drag from window
+//! to window ([`PointerDragCapture`]): a window reports its positions as
+//! fractions of its own picture, outside `0.0..=1.0` while it holds a drag
+//! that left it, and the shell publishes where each window is on the Deck's
+//! desktop ([`SessionInput::set_picture_surface`]).
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arcen_input::deck_events::{DeckInputEvent, DeckInputSink, LedCursor};
+use arcen_input::deck_pen::ImageRect;
 use arcen_input::deck_wheel::WheelScroll;
 use arcen_input::keyboard::HostKeyEdge;
 use arcen_input::{GestureSample, PenEvent, RegionInputWireMessage, ScrollPhase, ScrollUnit};
-use arcen_media::{RequestedMonitorTopology, SessionMonitorId};
+use arcen_media::{MonitorDesktopRect, RequestedMonitorTopology, SessionMonitorId};
 use arcen_protocol::messages::{
     KeyEventMsg, KeyResetModifiersMsg, MouseMoveRelativeMsg, PointerMotionMode, ScrollUnitMsg,
     TextCommitMsg,
 };
 
+use super::pointer_drag::{DragGeometry, DragRoute, PictureSurface, PointerDragCapture};
 use super::region_runtime::{
     AppliedTopologyView, DeckRegionRuntime, DeckRegionRuntimeError, RegionViewport,
 };
@@ -71,6 +79,19 @@ struct State {
     last_pointer: Option<(f64, f64, i32, i32)>,
     relative: bool,
     pen_touching: bool,
+    /// The held-button drag across the session's windows.
+    drag: PointerDragCapture,
+    /// Where each window shows its monitor on the Deck's desktop.
+    surfaces: Vec<PictureSurface>,
+    /// The host's applied layout, the drag's fallback geometry.
+    host_layout: Vec<(SessionMonitorId, MonitorDesktopRect)>,
+}
+
+/// What a pointer message does to the drag.
+#[derive(Debug, Clone, Copy)]
+enum PointerEdge {
+    Motion,
+    Button(u8, bool),
 }
 
 impl SessionInput {
@@ -107,6 +128,13 @@ impl SessionInput {
         state.runtime = Some(runtime);
         state.legacy_size = None;
         state.region_input_confirmed = region_input_confirmed;
+        state.host_layout = validated
+            .applied_monitors()
+            .into_iter()
+            .map(|(monitor, _, rect)| (monitor, rect))
+            .collect();
+        state.surfaces.clear();
+        state.drag.reset();
         Ok(())
     }
 
@@ -122,6 +150,9 @@ impl SessionInput {
             state.runtime = Some(DeckRegionRuntime::legacy_primary(width, height)?);
             state.legacy_size = Some((width, height));
             state.region_input_confirmed = false;
+            state.host_layout.clear();
+            state.surfaces.clear();
+            state.drag.reset();
         }
         Ok(())
     }
@@ -136,6 +167,26 @@ impl SessionInput {
     /// otherwise a pinch sends nothing, as on the macOS Deck.
     pub fn set_gestures(&self, gestures: bool) {
         self.lock().gestures = gestures;
+    }
+
+    /// Where the window showing `monitor` is on the Deck's desktop: its
+    /// content area and its picture, in one space for every window
+    /// (`None`: it cannot be placed now). A drag that leaves a window lands
+    /// on the window under the cursor.
+    pub fn set_picture_surface(
+        &self,
+        monitor: SessionMonitorId,
+        placed: Option<(ImageRect, ImageRect)>,
+    ) {
+        let mut state = self.lock();
+        state.surfaces.retain(|surface| surface.monitor != monitor);
+        if let Some((window, picture)) = placed {
+            state.surfaces.push(PictureSurface {
+                monitor,
+                window,
+                picture,
+            });
+        }
     }
 
     /// The input sink of the window showing `monitor` (`None`: the primary,
@@ -162,9 +213,12 @@ impl SessionInput {
             DeckInputEvent::Text(text) => self.text(text),
             DeckInputEvent::PointerMove { x, y } => {
                 self.lock().relative = false;
+                let Some((monitor, at)) = self.place(monitor, (x, y), PointerEdge::Motion) else {
+                    return;
+                };
                 self.pointer(
                     monitor,
-                    (x, y),
+                    at,
                     PointerMotionMode::Absolute,
                     |runtime, viewport, at, sequence, now| {
                         runtime.pointer_motion(viewport, at, sequence, now)
@@ -261,6 +315,10 @@ impl SessionInput {
             }
             return;
         }
+        let Some((monitor, at)) = self.place(monitor, at, PointerEdge::Button(button, pressed))
+        else {
+            return;
+        };
         self.pointer(
             monitor,
             at,
@@ -271,12 +329,52 @@ impl SessionInput {
         );
     }
 
+    /// Which window's monitor a pointer message at `at` (a fraction of the
+    /// picture of the window showing `monitor`) goes to, and where on it:
+    /// the drag's rule in a multi-window session, the window's own picture
+    /// otherwise. `None`: nowhere (another window holds the drag).
+    fn place(
+        &self,
+        monitor: Option<SessionMonitorId>,
+        at: (f64, f64),
+        edge: PointerEdge,
+    ) -> Option<(Option<SessionMonitorId>, (f64, f64))> {
+        let Some(source) = monitor else {
+            return (at.0.is_finite() && at.1.is_finite())
+                .then(|| (None, (at.0.clamp(0.0, 1.0), at.1.clamp(0.0, 1.0))));
+        };
+        let mut state = self.lock();
+        let State {
+            drag,
+            surfaces,
+            host_layout,
+            ..
+        } = &mut *state;
+        let geometry = DragGeometry {
+            surfaces,
+            host: host_layout,
+        };
+        let route = match edge {
+            PointerEdge::Motion => drag.motion(&geometry, source, at),
+            PointerEdge::Button(button, pressed) => {
+                drag.button(&geometry, source, at, button, pressed)
+            }
+        };
+        match route {
+            DragRoute::To { monitor, fraction } => Some((Some(monitor), fraction)),
+            DragRoute::Ignore => None,
+        }
+    }
+
     fn scroll(&self, monitor: Option<SessionMonitorId>, scroll: WheelScroll, at: (f64, f64)) {
         // While locked the host scrolls where its pointer is (the macOS rule).
         let mode = if self.lock().relative {
             PointerMotionMode::Relative
         } else {
             PointerMotionMode::Absolute
+        };
+        let Some((monitor, at)) = self.place(monitor, at, PointerEdge::Motion) else {
+            return;
         };
         match scroll.unit {
             ScrollUnitMsg::Line => {
@@ -343,6 +441,8 @@ impl SessionInput {
         let region = {
             let mut state = self.lock();
             state.relative = true;
+            // A locked pointer has no window to follow.
+            state.drag.reset();
             state
                 .runtime
                 .as_ref()
@@ -766,6 +866,83 @@ mod tests {
         // The region wire has no relative motion: the Deck ends the lock.
         second.input(DeckInputEvent::PointerRelative { dx: 3, dy: 4 });
         assert!(sent(&mut receiver).is_empty());
+    }
+
+    /// The host lays monitor 2 to the right of monitor 1, the Deck shows
+    /// it on a display to the left: the drag follows the Deck's displays.
+    #[test]
+    fn a_held_drag_crosses_into_the_window_under_the_cursor_and_is_released_there() {
+        let (input, mut receiver, _) = session();
+        input
+            .set_region_topology(&two_monitors(), None, true)
+            .unwrap();
+        let (one, two) = (
+            SessionMonitorId::new(1).unwrap(),
+            SessionMonitorId::new(2).unwrap(),
+        );
+        let area = |left: f64| ImageRect {
+            left,
+            top: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        input.set_picture_surface(one, Some((area(0.0), area(0.0))));
+        input.set_picture_surface(two, Some((area(-1920.0), area(-1920.0))));
+        let (first, second) = (input.sink(Some(one)), input.sink(Some(two)));
+        let regions = |values: &[Value], kind_of: &str| -> Vec<u64> {
+            values
+                .iter()
+                .filter(|value| kind(value) == kind_of)
+                .filter_map(|value| value["region_id"].as_u64())
+                .collect()
+        };
+
+        first.input(DeckInputEvent::Button {
+            button: 1,
+            pressed: true,
+            x: 0.1,
+            y: 0.5,
+        });
+        let pressed = sent(&mut receiver);
+        assert_eq!(
+            regions(&pressed, "region_pointer_button"),
+            vec![1],
+            "{pressed:?}"
+        );
+
+        // Window 1 holds the drag and reports a position left of itself.
+        first.input(DeckInputEvent::PointerMove { x: -0.5, y: 0.5 });
+        let crossed = sent(&mut receiver);
+        assert_eq!(
+            regions(&crossed, "region_pointer_leave"),
+            vec![1],
+            "{crossed:?}"
+        );
+        assert_eq!(
+            regions(&crossed, "region_pointer_enter"),
+            vec![2],
+            "{crossed:?}"
+        );
+        // Window 2 sees the pointer too: it sends nothing during the drag.
+        second.input(DeckInputEvent::PointerMove { x: 0.5, y: 0.5 });
+        assert!(sent(&mut receiver).is_empty());
+
+        first.input(DeckInputEvent::Button {
+            button: 1,
+            pressed: false,
+            x: -0.5,
+            y: 0.5,
+        });
+        let released = sent(&mut receiver);
+        assert_eq!(
+            regions(&released, "region_pointer_button"),
+            vec![2],
+            "{released:?}"
+        );
+
+        // Free again: window 2 points into its own monitor.
+        second.input(DeckInputEvent::PointerMove { x: 0.25, y: 0.5 });
+        assert!(!sent(&mut receiver).is_empty());
     }
 
     #[test]

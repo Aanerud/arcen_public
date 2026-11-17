@@ -56,7 +56,12 @@ what the monitor had to queue. Keep it that way:
   (`tablet::MouseCoalescing`); restore it on deactivate and quit.
 - The UI never asks for passes faster than the root display refreshes
   (`paced_ui_poll_interval`): a faster request blocks the main thread in
-  `nextDrawable`, and a blocked main thread cannot dispatch input.
+  `nextDrawable`, and a blocked main thread cannot dispatch input. Hand
+  every delayed repaint to egui through
+  `arcen_deck_core::ui_pacing::egui_repaint_delay`: egui subtracts its
+  predicted frame time (1/60 s), so a bare `request_repaint_after(16 ms)` is
+  an immediate repaint, and with display sync off (multi-window) nothing
+  caps it (786 passes/s measured).
 - Pointer moves and buttons are forwarded in event order, at their own
   positions (`ordered_pointer_events`), not once per pass.
 - Key, modifier, scroll and mouse-button events raise the pen ordering

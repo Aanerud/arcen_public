@@ -81,6 +81,8 @@ pub mod session_truth;
 pub mod settings;
 pub mod support_bundle;
 pub mod trusted_pins;
+pub mod ui_pacing;
+pub mod video_stall;
 
 #[cfg(feature = "runtime")]
 pub mod runtime;

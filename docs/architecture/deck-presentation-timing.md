@@ -129,6 +129,17 @@ stream never waits. The worker logs the measured skew every five seconds
 (`multi-monitor timeline`); `ARCEN_DECK_TIMELINE=off` measures without
 holding. The presenter's own refresh phase (above) comes after it.
 
+After the timeline, each further window of the macOS Deck shows at most
+one new picture per refresh of its own display
+(`arcen_media::RefreshPacedSlot`): a frame that arrives early waits for
+the refresh and a newer one replaces it, but none is thrown away. Capture
+is change-driven, so a monitor whose desktop is still sends nothing for
+seconds; the last frame of a burst must reach the screen, and a picture
+that has not changed is not a stalled stream
+(`arcen_deck_core::video_stall`: a stall is a keyframe wait, a monitor
+whose packets keep arriving without reaching the screen, or a host that
+stopped answering).
+
 Every Pier stamps all of its monitors on one clock, the wire clock, so the
 timeline works the same whichever Pier serves the session. Where the stamp
 is taken differs, and only shifts the absolute latency, never the skew

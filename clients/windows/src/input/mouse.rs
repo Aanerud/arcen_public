@@ -93,7 +93,7 @@ impl Mouse {
                     return handled;
                 }
                 self.last_point = Some(point);
-                if let Some((x, y)) = image.normalize(client_x(lparam), client_y(lparam)) {
+                if let Some((x, y)) = self.locate(image, client_x(lparam), client_y(lparam)) {
                     self.last = (x, y);
                     emit(InputEvent::PointerMove { x, y });
                 }
@@ -114,7 +114,7 @@ impl Mouse {
                     _ => (3, false),
                 };
                 if !self.locked
-                    && let Some(position) = image.normalize(client_x(lparam), client_y(lparam))
+                    && let Some(position) = self.locate(image, client_x(lparam), client_y(lparam))
                 {
                     self.last = position;
                 }
@@ -142,7 +142,8 @@ impl Mouse {
                     };
                     // SAFETY: converts a point of this window's screen.
                     let _ = unsafe { ScreenToClient(hwnd, &raw mut point) };
-                    if let Some(position) = image.normalize(f64::from(point.x), f64::from(point.y))
+                    if let Some(position) =
+                        self.locate(image, f64::from(point.x), f64::from(point.y))
                     {
                         self.last = position;
                     }
@@ -173,6 +174,23 @@ impl Mouse {
             }
             _ => None,
         }
+    }
+
+    /// Where a client point is on the picture: clamped to it, except while
+    /// a button is held. Then this window has the capture and reports where
+    /// the cursor really is, past its own edges, so the session can follow
+    /// the drag into the window under the cursor
+    /// (`arcen_deck_core::input::pointer_drag`).
+    fn locate(&self, image: ImageRect, x: f64, y: f64) -> Option<(f64, f64)> {
+        if self.buttons == 0 {
+            return image.normalize(x, y);
+        }
+        // `normalize` refuses a degenerate rectangle or a non-finite point.
+        image.normalize(x, y)?;
+        Some((
+            (x - image.left) / image.width,
+            (y - image.top) / image.height,
+        ))
     }
 
     /// A touchpad's scroll of `dx`/`dy` host pixels (signed as a wheel) at
@@ -374,6 +392,35 @@ fn client_x(lparam: LPARAM) -> f64 {
 
 fn client_y(lparam: LPARAM) -> f64 {
     f64::from(screen_y(lparam))
+}
+
+/// The window's client area and `image` in it, in screen pixels: where
+/// this window is on the Deck's desktop, for a drag that leaves it.
+pub(super) fn screen_placement(hwnd: HWND, image: ImageRect) -> Option<(ImageRect, ImageRect)> {
+    let mut client = RECT::default();
+    let mut origin = POINT::default();
+    // SAFETY: reads this window's client rectangle and maps its origin to
+    // the screen.
+    let placed = unsafe {
+        GetClientRect(hwnd, &raw mut client).is_ok()
+            && ClientToScreen(hwnd, &raw mut origin).as_bool()
+    };
+    if !placed || client.right <= client.left || client.bottom <= client.top {
+        return None;
+    }
+    let (left, top) = (f64::from(origin.x), f64::from(origin.y));
+    let window = ImageRect {
+        left,
+        top,
+        width: f64::from(client.right - client.left),
+        height: f64::from(client.bottom - client.top),
+    };
+    let picture = ImageRect {
+        left: left + image.left,
+        top: top + image.top,
+        ..image
+    };
+    Some((window, picture))
 }
 
 fn clip_to_client(hwnd: HWND) {

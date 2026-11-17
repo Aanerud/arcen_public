@@ -296,6 +296,12 @@ impl MediaSession {
         })
     }
 
+    /// Frames a further window of a multi-window session presented: they
+    /// count for session health as the root window's do.
+    pub fn record_secondary_presented(&self, frames: u64) {
+        self.telemetry.record_frames_presented(frames);
+    }
+
     /// What the worker publishes (read under the lock, briefly).
     #[must_use]
     pub const fn shared(&self) -> &Arc<Mutex<SharedMediaState>> {

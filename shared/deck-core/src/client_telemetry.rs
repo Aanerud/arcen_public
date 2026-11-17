@@ -108,6 +108,17 @@ impl ClientTelemetry {
         self.presentation_observed.store(true, Ordering::Release);
     }
 
+    /// Frames a multi-window session's further windows put on screen. The
+    /// decoded count covers every monitor's stream, so these count as
+    /// presented too, or every multi-window session reads as unpresented.
+    pub fn record_frames_presented(&self, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        self.frames_presented.fetch_add(frames, Ordering::Relaxed);
+        self.presentation_observed.store(true, Ordering::Release);
+    }
+
     /// What one pass of the dedicated presenters put on glass, counted the
     /// same way on both Decks
     /// ([`arcen_media::presentation::presented_frames_for_health`]):
@@ -474,6 +485,23 @@ mod tests {
         assert_eq!(qos.input_send_time_ms, None);
         assert_eq!(qos.client_health, None);
         assert_eq!(health.overall, None);
+    }
+
+    #[test]
+    fn further_windows_count_as_presented_in_a_multi_window_session() {
+        // Seen live: two monitors decoded, only the root window counted,
+        // every session critical with 40-89 % "unpresented".
+        let telemetry = warmed_telemetry();
+        let mut window = telemetry.window(0);
+        telemetry.record_media(40, 40, 0, Duration::from_millis(2));
+        for _ in 0..20 {
+            telemetry.record_presented(Duration::from_millis(1));
+        }
+        telemetry.record_frames_presented(20);
+        telemetry.record_frames_presented(0);
+        let (_, _, sample) = telemetry.snapshot(&mut window, None, 5_000, 30, 0);
+        assert_eq!(sample.frames_presented, Some(40));
+        assert_eq!(arcen_telemetry::unpresented_basis_points(&sample), Some(0));
     }
 
     #[test]

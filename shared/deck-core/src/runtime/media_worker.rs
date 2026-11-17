@@ -404,6 +404,9 @@ pub struct SharedMediaState<M: MediaPlatform> {
     pub display_update_result: Option<DisplayUpdateResultMsg>,
     pub host_health: Option<HealthStatsMsg>,
     pub last_health_pong: Option<HealthPongMsg>,
+    /// When the host last answered a health ping: the session is alive
+    /// even while every host monitor is still and sends no frames.
+    pub last_health_pong_at: Option<Instant>,
     pub video_frames_seen: u64,
     pub video_frames_decoded: u64,
     pub presentation_superseded_frames: u64,
@@ -592,6 +595,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             display_update_result: Default::default(),
             host_health: Default::default(),
             last_health_pong: Default::default(),
+            last_health_pong_at: None,
             video_frames_seen: Default::default(),
             video_frames_decoded: Default::default(),
             presentation_superseded_frames: Default::default(),
@@ -984,6 +988,7 @@ pub fn spawn_media_worker<M, F>(
                             Some(HEALTH_PONG) => {
                                 if let Ok(pong) = serde_json::from_value::<HealthPongMsg>(value) {
                                     state.last_health_pong = Some(pong);
+                                    state.last_health_pong_at = Some(Instant::now());
                                 }
                                 wake = false;
                             }

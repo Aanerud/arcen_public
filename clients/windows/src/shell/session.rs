@@ -693,6 +693,7 @@ impl Connection {
             .monitor_presented_frames
             .entry(monitor)
             .or_default() += frames;
+        self.media.record_secondary_presented(frames);
         self.note_monitor_presents(monitor, frames);
     }
 
@@ -779,8 +780,14 @@ impl Connection {
     }
 
     /// Keeps a secondary window's input on its picture (the shown fit of
-    /// its own composition tree).
-    pub(super) fn sync_secondary_input(hwnd: HWND, tree: &SharedTree) {
+    /// its own composition tree), and tells the session where the window
+    /// is, for a drag that crosses into it.
+    pub(super) fn sync_secondary_input(
+        &self,
+        hwnd: HWND,
+        monitor: SessionMonitorId,
+        tree: &SharedTree,
+    ) {
         let Some((fit, source)) = tree.lock().ok().and_then(|tree| tree.shown_fit()) else {
             return;
         };
@@ -790,10 +797,13 @@ impl Connection {
             width: f64::from(fit.scale) * f64::from(source.0),
             height: f64::from(fit.scale) * f64::from(source.1),
         };
-        crate::input::with_input(hwnd, |input| {
+        if let Some(placed) = crate::input::with_input(hwnd, |input| {
             input.set_cursor_scale(fit.scale);
             input.set_image_rect(Some(rect));
-        });
+            input.screen_placement()
+        }) {
+            self.input.set_picture_surface(monitor, placed);
+        }
     }
 
     /// Sends credentials (or a disclaimer's acceptance with them).
@@ -1055,12 +1065,18 @@ impl Connection {
         };
         let changed = *current != Some(rect);
         *current = Some(rect);
-        crate::input::with_input(hwnd, |input| {
+        let placed = crate::input::with_input(hwnd, |input| {
             input.set_cursor_scale(fit.scale);
             if changed {
                 input.set_image_rect(Some(rect));
             }
+            input.screen_placement()
         });
+        // A multi-window session's drag follows the pointer into whichever
+        // window it is over: the session knows where the root one is.
+        if let (Some(root), Some(placed)) = (self.multi_window_root_monitor(), placed) {
+            self.input.set_picture_surface(root, placed);
+        }
     }
 
     /// The host-led cursor to draw now: its mark, where on the picture (in

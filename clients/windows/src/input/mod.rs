@@ -619,6 +619,14 @@ impl WindowInput {
         Some((route, over_ui(self.overlay, x, y)))
     }
 
+    /// Where this window and its picture are on the Deck's desktop, in
+    /// screen pixels (`None` until the picture is placed): what a held
+    /// drag that leaves another window is resolved against.
+    #[must_use]
+    pub fn screen_placement(&self) -> Option<(ImageRect, ImageRect)> {
+        mouse::screen_placement(self.hwnd, self.image?)
+    }
+
     fn pointer_over_image(&self) -> bool {
         self.active
             && self
