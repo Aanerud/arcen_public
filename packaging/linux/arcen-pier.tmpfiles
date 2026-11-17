@@ -12,3 +12,7 @@
 # boot entries still create and empty them.
 x /tmp/.X11-unix
 x /tmp/.ICE-unix
+# The console-privacy journal (ADR 0025) lives in /run/arcen: a Pier that
+# lost its launcher reads it to lock the session and give the desk's
+# monitors back.
+d /run/arcen 0755 root root -

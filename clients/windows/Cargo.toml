@@ -22,6 +22,15 @@ path = "src/lib.rs"
 name = "arcen-deck"
 path = "src/main.rs"
 
+[features]
+default = []
+# Developer-only tooling, never in a release package: the env-gated
+# simulated multi-monitor layout (`shell::windowed_test`), which shows each
+# monitor of a synthetic layout in its own window on one display.
+# `packaging/windows-deck/build.ps1` refuses any arcen-deck.exe that carries
+# the ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP string.
+dev-tools = ["arcen-deck-core/dev-tools"]
+
 [dependencies]
 # ui: the shared screens and the session engine (platform: the log runtime).
 arcen-deck-core = { workspace = true, features = ["egui", "runtime"] }

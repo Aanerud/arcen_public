@@ -1087,6 +1087,7 @@ mod nvfbc {
             output_index: u32,
             yuv444: bool,
             cursor_mode: crate::CursorCaptureMode,
+            max_dimension: u32,
         ) -> Result<Self, NativeStartupError> {
             if std::env::var_os("DISPLAY").is_none() {
                 return Err(NativeStartupError::unavailable(
@@ -1181,7 +1182,19 @@ mod nvfbc {
                         (TRACKING_SCREEN, 0, gs.screenSize)
                     }
                 } else {
-                    (TRACKING_SCREEN, 0, gs.screenSize)
+                    // NvFBC scales to `frameSize`: a screen wider than the
+                    // encoder takes (two monitors side by side, H.264) is
+                    // captured fitted to it.
+                    let (w, h) = arcen_media::capenc_stream::fit_whole_screen(
+                        gs.screenSize.w,
+                        gs.screenSize.h,
+                        max_dimension,
+                    );
+                    log(&format!(
+                        "tracking the whole X screen {}x{} ({} outputs), captured at {w}x{h}",
+                        gs.screenSize.w, gs.screenSize.h, output_count
+                    ));
+                    (TRACKING_SCREEN, 0, Size { w, h })
                 };
 
             cap.width = frame_size.w;
@@ -3010,7 +3023,12 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
         if let Some(options) = admission_probe.as_ref() {
             let code = match capture_backend {
                 LinuxCaptureBackend::NvFbc => {
-                    let capture = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
+                    let capture = match nvfbc::Capture::new(
+                        output_index,
+                        yuv444,
+                        cursor_mode,
+                        arcen_media::capenc_stream::whole_screen_max_dimension(&*codec),
+                    ) {
                         Ok(capture) => capture,
                         Err(error) => {
                             drop(cuda_ctx);
@@ -3098,7 +3116,12 @@ pub fn run_with_args(args: Vec<String>, requested_encoder: RequestedEncoder) -> 
         };
         let code = match capture_backend {
             LinuxCaptureBackend::NvFbc => {
-                let capture = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
+                let capture = match nvfbc::Capture::new(
+                    output_index,
+                    yuv444,
+                    cursor_mode,
+                    arcen_media::capenc_stream::whole_screen_max_dimension(&*codec),
+                ) {
                     Ok(capture) => capture,
                     Err(error) => {
                         drop(cuda_ctx);
@@ -3306,7 +3329,12 @@ pub(crate) fn probe_with_args(args: Vec<String>) -> ! {
         };
         match capture_backend {
             LinuxCaptureBackend::NvFbc => {
-                let capture = match nvfbc::Capture::new(output_index, yuv444, cursor_mode) {
+                let capture = match nvfbc::Capture::new(
+                    output_index,
+                    yuv444,
+                    cursor_mode,
+                    arcen_media::capenc_stream::whole_screen_max_dimension(&*codec),
+                ) {
                     Ok(capture) => capture,
                     Err(error) => {
                         drop(cuda_context);

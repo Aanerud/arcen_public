@@ -262,7 +262,8 @@ pub enum AdmissionReason {
     GpuIdentityUnproven,
     /// A same-GPU path across two devices.
     GpuMismatch,
-    /// A copying Speed path has no rate measurement.
+    /// A copying path has no rate measurement: Speed is served as Auto,
+    /// and Auto at no more than [`super::UNQUALIFIED_COPY_FPS`].
     CopyPathNotRateQualified,
     /// The measured capture/copy rate is below the contract ceiling.
     CaptureRateBelowContract,
@@ -426,7 +427,7 @@ impl PresetAdmission {
             matrix_changed: wanted.colour.matrix != got.colour.matrix,
             primaries_changed: wanted.colour.primaries != got.colour.primaries,
             transfer_changed: wanted.colour.transfer != got.colour.transfer,
-            fps_clamped: served.fps_ceiling < wanted.max_fps.min(requested_fps.max(1)),
+            fps_clamped: served.fps_ceiling < wanted.fps_ceiling().min(requested_fps.max(1)),
             geometry_clamped: false,
             cursor_moved_to_local: false,
         })
@@ -456,7 +457,7 @@ fn unavailable(request: AdmissionRequest, reason: AdmissionReason) -> PresetAdmi
     }
 }
 
-/// Auto: eight-bit SDR, up to 30 fps, detail first.
+/// Auto: eight-bit SDR at the session's rate (the Deck display's), detail first.
 #[must_use]
 pub fn admit_auto(
     request: AdmissionRequest,
@@ -510,8 +511,11 @@ pub fn admit_speed_after_runtime_shortfall(
     source: &CaptureSourceEvidence,
     encoder: &EncoderCapability,
 ) -> PresetAdmission {
+    // The host just proved it cannot encode this rate: Auto runs at the
+    // rate a copying route is served at without a measurement.
     let auto = AdmissionRequest {
         preset: StreamingPreset::Auto,
+        max_fps: request.max_fps.min(super::UNQUALIFIED_COPY_FPS),
         ..request
     };
     match sdr8_plan(auto, PipelineId::Auto, source, encoder) {
@@ -859,11 +863,22 @@ fn complete_plan(
     if request.width > encoder.limits.max_width || request.height > encoder.limits.max_height {
         return Err(AdmissionReason::EncoderGeometryExceeded);
     }
-    let mut fps_ceiling = contract.max_fps.min(request.max_fps.max(1));
+    let mut fps_ceiling = contract.fps_ceiling().min(request.max_fps.max(1));
     let mut fps_limited_by = None;
     if encoder.limits.max_fps < fps_ceiling {
         fps_ceiling = encoder.limits.max_fps;
         fps_limited_by = Some(AdmissionReason::EncoderRateBelowContract);
+    }
+    // A copying route above the rate Auto has always been served at needs a
+    // measurement of this host's stack, never an assumption.
+    if contract.frame_rate.follows_display()
+        && encoder.backend.accelerator_class() != AcceleratorClass::Software
+        && !source.copy_path.zero_copy()
+        && source.sustained_fps.authoritative().is_none()
+        && fps_ceiling > super::UNQUALIFIED_COPY_FPS
+    {
+        fps_ceiling = super::UNQUALIFIED_COPY_FPS;
+        fps_limited_by = Some(AdmissionReason::CopyPathNotRateQualified);
     }
     if let Some(measured) = source
         .sustained_fps
@@ -1871,5 +1886,43 @@ mod tests {
                 .unwrap()
                 .fps_clamped
         );
+    }
+
+    #[test]
+    fn auto_at_the_display_rate_needs_a_measured_route_when_it_copies() {
+        let at_sixty = AdmissionRequest {
+            max_fps: 60,
+            ..request(StreamingPreset::Auto)
+        };
+        // Zero copy: the display's rate, nothing clamped.
+        let zero_copy = admit_auto(at_sixty, &sdr8(), &nvenc());
+        let served = zero_copy.served().unwrap();
+        assert_eq!((served.fps_ceiling, served.fps_limited_by), (60, None));
+        // A copying route without a measurement: Auto's long-standing 30,
+        // and the reason is named.
+        let copy = CaptureSourceEvidence {
+            copy_path: CopyPath::HostCopy,
+            ..sdr8()
+        };
+        let unmeasured = admit_auto(at_sixty, &copy, &nvenc());
+        let served = unmeasured.served().unwrap();
+        assert_eq!(
+            (served.fps_ceiling, served.fps_limited_by),
+            (30, Some(AdmissionReason::CopyPathNotRateQualified))
+        );
+        assert!(
+            unmeasured
+                .degradation(StreamingPreset::Auto, 60)
+                .unwrap()
+                .fps_clamped
+        );
+        // The host's qualification measured the route at 60: served at 60.
+        let measured = CaptureSourceEvidence {
+            sustained_fps: SourceFact::Authoritative(60),
+            ..copy
+        };
+        let served = admit_auto(at_sixty, &measured, &nvenc());
+        assert_eq!(served.served().unwrap().fps_ceiling, 60);
+        assert_eq!(served.served().unwrap().pipeline, PipelineId::Auto);
     }
 }

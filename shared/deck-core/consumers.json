@@ -213,6 +213,11 @@
         "egui",
         "runtime"
       ],
+      "forwarded_features": {
+        "dev-tools": [
+          "dev-tools"
+        ]
+      },
       "production_uses": [
         {
           "id": "fullscreen-bar-on-demand",
@@ -269,7 +274,8 @@
             "clients/windows/src/shell/mod.rs",
             "clients/windows/src/shell/launcher.rs",
             "clients/windows/src/shell/displays.rs",
-            "clients/windows/src/shell/secondary.rs"
+            "clients/windows/src/shell/secondary.rs",
+            "clients/windows/src/shell/windowed_test.rs"
           ],
           "build_profiles": [
             "windows-deck"

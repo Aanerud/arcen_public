@@ -39,6 +39,29 @@ port would replace. A second client is mostly a decoder and a window.
 
 ---
 
+## The product principle
+
+> **"Arcen is an extension of your machine — not a locked-in new desktop
+> every time."**
+
+Every Pier, on every operating system:
+
+- **joins the session the user already holds** — it never builds a private
+  desktop for a user who has one;
+- keeps **one session per user, entered from either side** — the desk,
+  Arcen, or another remote-access product;
+- completes a **remote-first sign-in through the operating system's own
+  login**, so a later sign-in at the desk resumes that same session;
+- **locks the session on disconnect and never ends it**; the desk gets its
+  monitors and input back on the lock screen.
+
+The decisions are shared (`arcen_session::console_session`); the record and
+the per-Pier audit are [ADR 0025](docs/adr/0025-arcen-joins-the-users-session.md).
+A change that would create a desktop for a user who has one, or end a
+session on disconnect, needs that ADR changed first.
+
+---
+
 ## The map
 
 [`STRUCTURE.md`](STRUCTURE.md) describes every top-level file and folder,

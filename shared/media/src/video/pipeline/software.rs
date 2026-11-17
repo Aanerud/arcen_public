@@ -20,6 +20,7 @@ use crate::video::MotionPriority;
 pub(super) const CONTRACT: PipelineContract = PipelineContract {
     id: PipelineId::Software,
     max_fps: 30,
+    frame_rate: super::FrameRatePolicy::Fixed { fps: 30 },
     priority: MotionPriority::Detail,
     intent: EncodeIntent::Interactive,
     encoder_buffer_frames: buffer(MotionPriority::Detail, EncodeIntent::Interactive),

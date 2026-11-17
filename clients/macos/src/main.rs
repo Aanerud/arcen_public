@@ -1038,6 +1038,7 @@ fn smoke_monitor_fixture(
                     serial: monitor.serial,
                     edid: String::new(),
                     color: None,
+                    rotation_degrees: monitor.rotation_degrees,
                 },
                 metrics,
             ))
@@ -4097,6 +4098,7 @@ mod tests {
             serial: id,
             edid: String::new(),
             color: None,
+            rotation_degrees: 0,
         }
     }
 

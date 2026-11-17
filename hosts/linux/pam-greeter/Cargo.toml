@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+# Copyright (C) 2026 TUTTIFRUTTI AS
+
+[package]
+name = "arcen-pam-greeter"
+version = "0.20.1"
+edition = "2021"
+description = "Arcen's PAM module for the GNOME login screen's pre-authenticated sign-in: turns a one-time token the Pier issued into the user (ADR 0025)."
+publish.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# cdylib -> /usr/lib64/security/pam_arcen_greeter.so, loaded by the display
+#           manager's session worker for the `gdm-ovirtcred` stack only.
+# rlib   -> the unit tests of the module's file and conversation logic.
+[lib]
+name = "pam_arcen_greeter"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# The token format, its lifetime and every admission rule.
+arcen-session.workspace = true
+libc = "0.2.189"
+
+[lints]
+workspace = true

@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-pier-linux"
-version = "0.20.0"
+version = "0.20.1"
 edition = "2021"
 description = "Arcen Pier (Linux) — native Rust QUIC control plane, PAM auth, session/display management, and capenc supervision."
 publish.workspace = true
@@ -61,7 +61,7 @@ native-tablet = []
 # It also builds the fused capenc's Wayland capture (`arcen-capenc/wayland`),
 # which links libpipewire-0.3, so the Pier can capture the sessions it
 # starts.
-wayland-provider = ["dep:zbus", "dep:reis", "dep:xkbcommon-dl", "dep:xkeysym", "arcen-capenc/wayland"]
+wayland-provider = ["dep:reis", "dep:xkbcommon-dl", "dep:xkeysym", "arcen-capenc/wayland"]
 # Exact still image (lossless refinement, ADR 0016): the producer in the
 # fused capenc (native libzstd). On by default and in release builds; at
 # run time it is offered unless the administrator sets
@@ -128,11 +128,13 @@ ring = "0.17"
 pam-client2 = { version = "0.5.5", default-features = false }
 evdev = "0.13.2"
 nix = { version = "0.29", features = ["fs", "ioctl", "poll", "process", "signal", "socket", "time", "uio", "user"] }
-x11rb = { version = "=0.13.2", default-features = false, features = ["xfixes", "xinput"] }
-# Pure-Rust D-Bus client (MIT) for the Mutter ScreenCast, RemoteDesktop and
-# DisplayConfig interfaces on a headless session's private bus. Only the
-# `wayland-provider` feature links it; it runs on the existing tokio runtime.
-zbus = { version = "5.13.2", default-features = false, features = ["tokio"], optional = true }
+x11rb = { version = "=0.13.2", default-features = false, features = ["randr", "xfixes", "xinput"] }
+# Pure-Rust D-Bus client (MIT): the Mutter ScreenCast, RemoteDesktop and
+# DisplayConfig interfaces on a headless session's private bus
+# (`wayland-provider`), and the system-bus credential signal that completes a
+# remote-first sign-in through GDM's login screen (ADR 0025, every build). It
+# runs on the existing tokio runtime and was already in every release build.
+zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
 # Pure-Rust libei/libeis protocol implementation (MIT). Only the
 # `wayland-provider` feature links it: the session agent speaks to its
 # compositor's EIS server (`RemoteDesktop.ConnectToEIS`) for committed text

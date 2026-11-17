@@ -525,6 +525,10 @@ pub struct SharedMediaState<M: MediaPlatform> {
     /// eight-bit presenter, as a single-monitor session's frames do, rather
     /// than to `latest_frame` (set by a Deck with no egui video path).
     pub routed_primary_dedicated_eight_bit: bool,
+    /// The shared multi-stream timeline (ADR 0026): decoded frames of a
+    /// committed multi-monitor session wait here until frames captured with
+    /// them on the other monitors are ready too, within a bound.
+    pub frame_sync: crate::runtime::frame_sync::FrameSync<M::NativeFrame>,
 }
 
 impl<M: MediaPlatform> std::fmt::Debug for SharedMediaState<M> {
@@ -635,6 +639,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             monitor_presented_frames: Default::default(),
             monitor_presentation_targets: Default::default(),
             routed_primary_dedicated_eight_bit: false,
+            frame_sync: Default::default(),
         }
     }
 }
@@ -808,21 +813,68 @@ pub fn spawn_media_worker<M, F>(
 
             loop {
                 let mut event = None;
-                match service_worker_loop_step(
+                release_held_frames(
                     &shared,
+                    secondary_router.as_ref(),
                     &commands,
                     &mut full_frame_requests,
-                    pending_ingress_idr,
-                    |blocking| {
-                        if blocking {
-                            Ok(events.blocking_recv())
-                        } else {
-                            events.try_recv().map(Some)
+                    &mut pending_ingress_idr,
+                    &telemetry,
+                    repaint,
+                );
+                let hold_wait = crate::runtime::frame_sync::wait_until_due(
+                    shared
+                        .lock()
+                        .expect("media state poisoned")
+                        .frame_sync
+                        .next_due(),
+                    Instant::now(),
+                    HELD_FRAME_POLL,
+                );
+                let step = if let Some(wait) = hold_wait {
+                    // A frame waits for its instant: read events without
+                    // blocking so it is released on time.
+                    if full_frame_requests.is_pending() {
+                        let _ = send_due_full_frame_request(
+                            &shared,
+                            &commands,
+                            &mut full_frame_requests,
+                            pending_ingress_idr,
+                        );
+                    }
+                    match events.try_recv() {
+                        Ok(next) => {
+                            event = Some(next);
+                            WorkerLoopStep::Event
                         }
-                    },
-                    std::thread::sleep,
-                    &mut event,
-                ) {
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            if !wait.is_zero() {
+                                std::thread::sleep(wait);
+                            }
+                            WorkerLoopStep::PendingPolled
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            WorkerLoopStep::Disconnected
+                        }
+                    }
+                } else {
+                    service_worker_loop_step(
+                        &shared,
+                        &commands,
+                        &mut full_frame_requests,
+                        pending_ingress_idr,
+                        |blocking| {
+                            if blocking {
+                                Ok(events.blocking_recv())
+                            } else {
+                                events.try_recv().map(Some)
+                            }
+                        },
+                        std::thread::sleep,
+                        &mut event,
+                    )
+                };
+                match step {
                     WorkerLoopStep::PendingPolled => continue,
                     WorkerLoopStep::Disconnected => break,
                     WorkerLoopStep::Event => {}
@@ -1061,6 +1113,7 @@ pub fn spawn_media_worker<M, F>(
                             repaint,
                         );
                         maybe_heartbeat(&shared, &mut last_heartbeat, &mut monitor_rate_snapshots);
+                        maybe_report_timeline(&shared, &telemetry);
                         // No wake here: a decoded frame wakes the UI where it
                         // is published, and waking for every batch woke it
                         // ~50 times a second for audio alone.
@@ -1988,25 +2041,49 @@ where
                     continue;
                 };
                 decoded_any = true;
-                let superseded = if root_route {
-                    publish_routed_primary_frame(
+                // Every negotiated monitor's frame passes the shared
+                // timeline (ADR 0026); one that must wait for the other
+                // monitors is published later by `release_held_frames`.
+                let (frame, early) = match route {
+                    MonitorRoute::Negotiated(id) => shared
+                        .lock()
+                        .expect("media state poisoned")
+                        .frame_sync
+                        .admit(
+                            id,
+                            frame,
+                            Instant::now(),
+                            crate::runtime::frame_sync::now_wire_ms(),
+                        ),
+                    MonitorRoute::LegacyPrimary => (Some(frame), None),
+                };
+                if let Some(early) = early {
+                    let early_root = Some(early.monitor) == root_monitor_id;
+                    publish_released_frame(
                         shared,
+                        early.monitor,
+                        early_root,
+                        early.frame,
+                        telemetry,
+                        repaint,
+                        commands,
+                        full_frame_requests,
+                        pending_ingress_idr,
+                    );
+                }
+                let superseded = match frame {
+                    Some(frame) => publish_routed_frame(
+                        shared,
+                        route,
+                        root_route,
                         frame,
                         telemetry,
                         repaint,
                         commands,
                         full_frame_requests,
                         pending_ingress_idr,
-                    )
-                    .0
-                } else {
-                    let mut state = shared.lock().expect("media state poisoned");
-                    match route {
-                        MonitorRoute::Negotiated(id) => {
-                            state.secondary_frames.insert(id, frame).is_some()
-                        }
-                        MonitorRoute::LegacyPrimary => false,
-                    }
+                    ),
+                    None => false,
                 };
                 let mut state = shared.lock().expect("media state poisoned");
                 // The routed path publishes into `latest_frame`/
@@ -2145,6 +2222,136 @@ fn monitor_counters<M: MediaPlatform>(
 /// Records one fresh routed decode into both this monitor's own counters and
 /// the session-wide aggregates `publish_decoded_frame` maintains for the
 /// legacy path, so the two paths report the same shape of truth.
+/// How long the worker sleeps at most between event polls while a frame
+/// waits for its presentation instant.
+const HELD_FRAME_POLL: Duration = Duration::from_millis(2);
+
+/// Publishes one decoded frame of a routed (multi-monitor) session: the
+/// root monitor's through the root presentation path, every other monitor's
+/// into `secondary_frames`. Returns whether it replaced an unpresented frame.
+#[allow(clippy::too_many_arguments)]
+fn publish_routed_frame<M: MediaPlatform>(
+    shared: &Arc<Mutex<SharedMediaState<M>>>,
+    route: MonitorRoute,
+    root_route: bool,
+    frame: DecodedVideoFrame<M::NativeFrame>,
+    telemetry: &ClientTelemetry,
+    repaint: &dyn RepaintRequester,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: &mut bool,
+) -> bool {
+    if root_route {
+        publish_routed_primary_frame(
+            shared,
+            frame,
+            telemetry,
+            repaint,
+            commands,
+            full_frame_requests,
+            pending_ingress_idr,
+        )
+        .0
+    } else {
+        let mut state = shared.lock().expect("media state poisoned");
+        match route {
+            MonitorRoute::Negotiated(id) => state.secondary_frames.insert(id, frame).is_some(),
+            MonitorRoute::LegacyPrimary => false,
+        }
+    }
+}
+
+/// Publishes a frame the timeline held, counting a frame it replaced as
+/// superseded (its decode was counted when it decoded).
+#[allow(clippy::too_many_arguments)]
+fn publish_released_frame<M: MediaPlatform>(
+    shared: &Arc<Mutex<SharedMediaState<M>>>,
+    monitor: arcen_media::SessionMonitorId,
+    root_route: bool,
+    frame: DecodedVideoFrame<M::NativeFrame>,
+    telemetry: &ClientTelemetry,
+    repaint: &dyn RepaintRequester,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: &mut bool,
+) {
+    let superseded = publish_routed_frame(
+        shared,
+        MonitorRoute::Negotiated(monitor),
+        root_route,
+        frame,
+        telemetry,
+        repaint,
+        commands,
+        full_frame_requests,
+        pending_ingress_idr,
+    );
+    if superseded {
+        let mut state = shared.lock().expect("media state poisoned");
+        state.presentation_superseded_frames =
+            state.presentation_superseded_frames.saturating_add(1);
+        monitor_counters(&mut state, Some(monitor), |counters| {
+            counters.presentation_superseded = counters.presentation_superseded.saturating_add(1);
+        });
+    }
+    repaint.request_repaint();
+}
+
+/// Publishes every held frame whose presentation instant has come.
+fn release_held_frames<M, RouteDecoder>(
+    shared: &Arc<Mutex<SharedMediaState<M>>>,
+    router: Option<&MonitorFrameRouter<RouteDecoder>>,
+    commands: &SessionCommandSender,
+    full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: &mut bool,
+    telemetry: &ClientTelemetry,
+    repaint: &dyn RepaintRequester,
+) where
+    M: MediaPlatform,
+    RouteDecoder: VideoDecoderBackend<NativeFrame = M::NativeFrame>,
+{
+    let (due, root) = {
+        let mut state = shared.lock().expect("media state poisoned");
+        if state.frame_sync.next_due().is_none() {
+            return;
+        }
+        let due = state
+            .frame_sync
+            .take_due(Instant::now(), crate::runtime::frame_sync::now_wire_ms());
+        (due, state.multi_monitor_root_monitor_id)
+    };
+    let root = root.or_else(|| router.and_then(MonitorFrameRouter::primary_monitor_id));
+    for held in due {
+        publish_released_frame(
+            shared,
+            held.monitor,
+            Some(held.monitor) == root,
+            held.frame,
+            telemetry,
+            repaint,
+            commands,
+            full_frame_requests,
+            pending_ingress_idr,
+        );
+    }
+}
+
+/// Logs the timeline's skew report when one is due.
+fn maybe_report_timeline<M: MediaPlatform>(
+    shared: &Arc<Mutex<SharedMediaState<M>>>,
+    telemetry: &ClientTelemetry,
+) {
+    let clock = telemetry.pier_clock();
+    let report = shared
+        .lock()
+        .expect("media state poisoned")
+        .frame_sync
+        .take_report(crate::runtime::frame_sync::now_wire_ms(), clock);
+    if let Some(report) = report {
+        crate::runtime::frame_sync::log_report(&report);
+    }
+}
+
 fn record_monitor_decode<M: MediaPlatform>(
     state: &mut SharedMediaState<M>,
     monitor_id: Option<arcen_media::SessionMonitorId>,

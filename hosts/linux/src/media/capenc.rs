@@ -25,7 +25,7 @@ use std::time::Duration;
 use arcen_media::video::capture_handoff::{PipeWireCaptureHandoff, ScreenCastCursorMode};
 pub use arcen_media::video::ResolvedMediaPlan;
 use arcen_media::video::{
-    adaptive_codec_ladder, parse_ready_v1, parse_unavailable_v1, pipeline_for_request,
+    adaptive_codec_ladder, parse_ready_v1, parse_unavailable_v1, pipeline_for_epoch,
     resolve_media_plan_degrading, BackendAvailability, BackendCandidate, BackendLimits,
     CaptureAdmissionNotice, EncoderBackend, EncoderRequest, MediaRequest, PipelineId,
     PlanDegradation, PresetAdmission, ReadyExpectation, StreamingPreset, VideoVariant,
@@ -547,10 +547,9 @@ fn admitted_fps(
 ) -> Result<u32, CapencStartError> {
     let protocol = |detail: String| CapencStartError::ReadyProtocol(detail);
     let codec = config.codec_enum()?;
-    let expected = pipeline_for_request(
+    let expected = pipeline_for_epoch(
         config.video_selection,
         config.video_configuration(codec),
-        config.fps,
         config.motion_priority,
     )
     .and_then(streaming_preset);
@@ -1446,10 +1445,9 @@ fn fidelity_refusal_after_native(
         return Ok(None);
     };
     let codec = config.codec_enum()?;
-    let requested = arcen_media::video::pipeline_for_request(
+    let requested = arcen_media::video::pipeline_for_epoch(
         config.video_selection,
         config.video_configuration(codec),
-        config.fps,
         config.motion_priority,
     );
     let decision = arcen_media::video::software_fallback_decision_after_hardware(
@@ -1487,10 +1485,9 @@ fn software_fallback_config(
     let mut config = apply_wayland_cursor_truth(config);
     let source_cursor = wayland_source_cursor(&config);
     let requested_codec = config.codec_enum()?;
-    let requested_pipeline = arcen_media::video::pipeline_for_request(
+    let requested_pipeline = arcen_media::video::pipeline_for_epoch(
         config.video_selection,
         config.video_configuration(requested_codec),
-        config.fps,
         config.motion_priority,
     );
     let software_decision =
@@ -2223,6 +2220,14 @@ impl PipelineStatsSample {
             capture_new: field("capture_new"),
             capture_old: field("capture_old"),
         })
+    }
+
+    /// Frames the capture source delivered that second: `source_fps` where
+    /// the loop reports it (Wayland), else the NvFBC grabs that returned a
+    /// new frame (`capture_new`). `None` when the loop reports neither.
+    #[must_use]
+    pub fn delivered(&self) -> Option<u32> {
+        self.source.or(self.capture_new)
     }
 
     /// Changed-content frames this second proves, for health

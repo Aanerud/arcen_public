@@ -30,6 +30,7 @@ members = [
     "clients/windows/usb/prepare",
     "clients/windows/usb/service",
     "hosts/linux",
+    "hosts/linux/pam-greeter",
     "hosts/capenc",
     "hosts/audiocap",
     "hosts/input-helper",
@@ -63,7 +64,7 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.20.0"
+version = "0.20.1"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -72,19 +73,19 @@ authors = ["TUTTIFRUTTI AS"]
 repository = "https://github.com/Aanerud/arcen_public"
 
 [workspace.dependencies]
-arcen-deck-core = { path = "shared/deck-core", version = "=0.20.0" }
-arcen-identity = { path = "shared/identity", version = "=0.20.0" }
-arcen-input = { path = "shared/input", version = "=0.20.0" }
-arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.20.0" }
-arcen-keel = { path = "shared/keel", version = "=0.20.0" }
-arcen-media = { path = "shared/media", version = "=0.20.0" }
-arcen-observability = { path = "shared/observability", version = "=0.20.0" }
-arcen-outputs = { path = "shared/outputs", version = "=0.20.0" }
-arcen-protocol = { path = "shared/protocol", version = "=0.20.0", default-features = false }
-arcen-session = { path = "shared/session", version = "=0.20.0" }
-arcen-telemetry = { path = "shared/telemetry", version = "=0.20.0" }
-arcen-transport = { path = "shared/transport", version = "=0.20.0", default-features = false }
-arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.20.0" }
+arcen-deck-core = { path = "shared/deck-core", version = "=0.20.1" }
+arcen-identity = { path = "shared/identity", version = "=0.20.1" }
+arcen-input = { path = "shared/input", version = "=0.20.1" }
+arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.20.1" }
+arcen-keel = { path = "shared/keel", version = "=0.20.1" }
+arcen-media = { path = "shared/media", version = "=0.20.1" }
+arcen-observability = { path = "shared/observability", version = "=0.20.1" }
+arcen-outputs = { path = "shared/outputs", version = "=0.20.1" }
+arcen-protocol = { path = "shared/protocol", version = "=0.20.1", default-features = false }
+arcen-session = { path = "shared/session", version = "=0.20.1" }
+arcen-telemetry = { path = "shared/telemetry", version = "=0.20.1" }
+arcen-transport = { path = "shared/transport", version = "=0.20.1", default-features = false }
+arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.20.1" }
 bytes = "1.10.1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["pkcs8", "rand_core", "std"] }
 ed25519 = { version = "=2.2.3", default-features = false, features = ["pkcs8", "std"] }
@@ -113,7 +114,7 @@ tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt-multi-
 tokio-util = { version = "0.7.16", features = ["rt"] }
 x509-parser = { version = "=0.18.1", features = ["verify"] }
 zeroize = "1.8.2"
-zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "=7.3.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [patch.crates-io]
 apple-cf = { path = "third_party/apple-cf-0.9.3-arcen1" }

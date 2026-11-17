@@ -60,6 +60,9 @@ pub struct AdvertisedCapabilities {
     /// Signing in ends it, and the Deck is told so it reconnects rather than
     /// reports a lost connection.
     pub login_window: bool,
+    /// The administrator's frame-rate ceiling (`video.fps`), when one is
+    /// configured; without one, Auto and Speed follow the Deck display.
+    pub fps_ceiling: Option<u32>,
     /// Primary display width in pixels.
     pub width: u32,
     /// Primary display height in pixels.
@@ -149,6 +152,8 @@ pub struct SessionPolicy {
     /// `video.lossless_refinement`: the administrator's exact-still-image
     /// switch (on unless turned off).
     pub lossless_refinement: bool,
+    /// `video.fps`: the administrator's frame-rate ceiling, when configured.
+    pub fps_ceiling: Option<u32>,
 }
 
 impl SessionPolicy {
@@ -172,6 +177,7 @@ impl SessionPolicy {
             lossless_refinement: arcen_session::pier_config::LosslessRefinementSetting::resolve(
                 config.video.lossless_refinement,
             ),
+            fps_ceiling: config.video.fps,
         })
     }
 }
@@ -189,6 +195,7 @@ impl Default for SessionPolicy {
             serving_uid: None,
             login_window: false,
             lossless_refinement: true,
+            fps_ceiling: None,
         }
     }
 }
@@ -226,6 +233,8 @@ pub struct Handshake {
     /// The frame rate this session will serve, resolved from the client's
     /// request against this host's ceiling.
     pub fps: u32,
+    /// `fps` with what decided it (the hello's `stream_rate`).
+    pub frame_rate: arcen_media::video::SessionFrameRate,
     /// Shared detail/motion preference for later encoder/rate-control choices.
     pub motion_priority: arcen_media::video::MotionPriority,
     pub requested_pipeline: Option<arcen_media::video::PipelineId>,
@@ -384,9 +393,15 @@ fn panel_identity(
 /// known to accept.
 fn arranged_refresh_hz(fps: u32) -> f64 {
     const MIN_HZ: u32 = 60;
-    const MAX_HZ: u32 = 120;
-    f64::from(fps.max(1).saturating_mul(2).clamp(MIN_HZ, MAX_HZ))
+    f64::from(
+        fps.max(1)
+            .saturating_mul(2)
+            .clamp(MIN_HZ, MAX_ARRANGED_REFRESH_HZ),
+    )
 }
+
+/// The highest refresh an arranged virtual display is asked for.
+const MAX_ARRANGED_REFRESH_HZ: u32 = 120;
 
 impl RequestedDesktop {
     /// Reads the request out of an auth response.
@@ -522,15 +537,6 @@ impl RequestedDesktop {
     }
 }
 
-/// The frame rate to give an arranged display, before the plan is resolved.
-///
-/// The resolver runs after the display is arranged, so this reads the client's
-/// request directly and falls back to sixty, which is what a display mode
-/// wants when nobody has said otherwise.
-fn fps_hint(initial: Option<&arcen_protocol::messages::InitialVideoRequestMsg>) -> u32 {
-    initial.map_or(60, |request| request.quality.max_fps.max(1))
-}
-
 /// The largest edge a Deck may ask for.
 ///
 /// Well past 8K, and short of anything that would make an encoder session
@@ -656,6 +662,7 @@ pub fn advertise_with_config(
     Ok(AdvertisedCapabilities {
         display_id: primary.display_id,
         login_window: policy.login_window,
+        fps_ceiling: policy.fps_ceiling,
         width: u32::try_from(primary.pixel_width).unwrap_or(1920),
         height: u32::try_from(primary.pixel_height).unwrap_or(1080),
         displays,
@@ -876,6 +883,7 @@ pub fn server_hello_json_for(
         None,
         (capabilities.width, capabilities.height),
         None,
+        None,
     )
 }
 
@@ -940,6 +948,7 @@ pub fn server_hello_json_for_multi(
     multi_monitor: Option<&crate::multi_monitor::MacOsMultiMonitorPlan>,
     picture: (u32, u32),
     lossless_refine: Option<arcen_protocol::refine::LosslessRefineStatusMsg>,
+    stream_rate: Option<arcen_protocol::messages::StreamRateMsg>,
 ) -> String {
     use arcen_protocol::messages::{
         InputCapabilitiesMsg, InputCapabilityAvailability, SERVER_HELLO, ServerColorCaps,
@@ -1052,6 +1061,7 @@ pub fn server_hello_json_for_multi(
             .to_owned(),
         },
         active_pipeline,
+        stream_rate,
         input_protocol_version: arcen_protocol::messages::INPUT_PROTOCOL_VERSION,
         input_capabilities: InputCapabilitiesMsg {
             absolute_pointer: available,
@@ -1392,7 +1402,7 @@ async fn perform_application_handshake(
     let arranged = if single_monitor_session {
         requested_desktop.arrange(
             advertised.display_id,
-            fps_hint(initial_video.as_ref()),
+            admitted_video.session_fps(),
             panel,
             client_display.as_ref(),
         )
@@ -1440,6 +1450,11 @@ async fn perform_application_handshake(
     // wire carried H264 and the hello had promised H265.
     let codec = resolved_video.codec;
     let fps = resolved_video.fps;
+    let stream_rate = arcen_media::video::served_stream_rate(
+        resolved_video.frame_rate,
+        fps,
+        arcen_media::video::FrameRateBasis::Encoder,
+    );
     let motion_priority = resolved_video.motion_priority;
     let requested_pipeline = resolved_video.requested_pipeline;
     let active_pipeline = resolved_video.active_pipeline;
@@ -1496,6 +1511,7 @@ async fn perform_application_handshake(
             multi_monitor.as_ref(),
             (capture_width, capture_height),
             lossless_refine_status(deck_refine.as_ref(), &refine),
+            Some(stream_rate.wire()),
         ),
     )
     .await
@@ -1578,6 +1594,7 @@ async fn perform_application_handshake(
 
     Ok(Handshake {
         fps,
+        frame_rate: stream_rate,
         motion_priority,
         requested_pipeline,
         active_pipeline,
@@ -1904,6 +1921,8 @@ struct ResolvedInitialVideo {
     plan: arcen_media::session_plan::ResolvedVideoPlan,
     codec: crate::encode::EncoderCodec,
     fps: u32,
+    /// `fps` with what decided it; `None` without a Deck request.
+    frame_rate: Option<arcen_media::video::SessionFrameRate>,
     motion_priority: arcen_media::video::MotionPriority,
     requested_pipeline: Option<arcen_media::video::PipelineId>,
     active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
@@ -1984,6 +2003,16 @@ struct AdmittedInitialVideo {
     codec: crate::encode::EncoderCodec,
 }
 
+impl AdmittedInitialVideo {
+    /// The rate the session's display is arranged for: the resolved one,
+    /// or sixty, what a display mode wants when nobody has said otherwise.
+    fn session_fps(&self) -> u32 {
+        self.request
+            .as_ref()
+            .map_or(60, |(_, resolved)| resolved.max_fps.max(1))
+    }
+}
+
 /// Checks the auth-time video request through the shared media policy.
 ///
 /// Every refusal of a request happens here, and nothing here depends on the
@@ -1991,6 +2020,7 @@ struct AdmittedInitialVideo {
 /// `auth_result` with the reason before it arranges anything.
 fn admit_initial_video(
     video: Option<&arcen_protocol::messages::InitialVideoRequestMsg>,
+    display_refresh_hz: Option<u32>,
     capabilities: &AdvertisedCapabilities,
 ) -> Result<AdmittedInitialVideo, HandshakeError> {
     use arcen_media::video::{
@@ -2043,7 +2073,8 @@ fn admit_initial_video(
             color_policy: arcen_media::video::ColorPolicy::DefaultOff,
             codec_pinned: false,
             variant_pinned: false,
-            max_fps: 60,
+            administrator_max_fps: capabilities.fps_ceiling,
+            display_refresh_hz,
         },
         {
             let mut set = arcen_media::CodecSet::empty();
@@ -2057,6 +2088,21 @@ fn admit_initial_video(
         },
     )
     .map_err(|error| HandshakeError::VideoRequest(error.to_string()))?;
+    // VideoToolbox's rate limit, then the capture's: ScreenCaptureKit lands
+    // on every other vsync of a display refreshing at exactly the captured
+    // rate, so the arranged display runs at twice the rate
+    // (`arranged_refresh_hz`) and virtual displays accept up to 120 Hz.
+    let host_resolved = host_resolved
+        .narrow_fps(
+            arcen_media::video::EncoderBackend::VideoToolbox
+                .contract()
+                .max_fps,
+            arcen_media::video::FrameRateBasis::Encoder,
+        )
+        .narrow_fps(
+            MAX_ARRANGED_REFRESH_HZ / 2,
+            arcen_media::video::FrameRateBasis::CaptureSource,
+        );
     let codec = match host_resolved.video.codec {
         VideoCodec::H264 => crate::encode::EncoderCodec::H264,
         VideoCodec::H265 => crate::encode::EncoderCodec::Hevc,
@@ -2091,6 +2137,7 @@ fn plan_initial_video(
             plan: arcen_media::session_plan::ResolvedVideoPlan::standard(None),
             codec: admitted.codec,
             fps: 60,
+            frame_rate: None,
             motion_priority: arcen_media::video::MotionPriority::Detail,
             requested_pipeline: Some(arcen_media::video::PipelineId::Speed),
             active_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Speed),
@@ -2159,6 +2206,7 @@ fn plan_initial_video(
         plan,
         codec: admitted.codec,
         fps: host_resolved.max_fps,
+        frame_rate: Some(host_resolved.frame_rate),
         motion_priority,
         requested_pipeline: host_resolved.pipeline,
         active_pipeline: Some(served_pipeline),
@@ -2173,7 +2221,7 @@ fn resolve_initial_video(
     hdr_output: bool,
 ) -> Result<ResolvedInitialVideo, HandshakeError> {
     Ok(plan_initial_video(
-        admit_initial_video(video, capabilities)?,
+        admit_initial_video(video, None, capabilities)?,
         capabilities,
         hdr_output,
     ))
@@ -2310,7 +2358,11 @@ async fn authenticate(
     // session slot.
     let outcome = match outcome {
         Ok(authenticated) => {
-            match admit_initial_video(response.initial_video.as_ref(), capabilities) {
+            match admit_initial_video(
+                response.initial_video.as_ref(),
+                response.display_refresh_hz(),
+                capabilities,
+            ) {
                 Ok(video) => Ok((authenticated, video)),
                 Err(error) => {
                     let refusal =
@@ -2497,6 +2549,7 @@ mod tests {
         AdvertisedCapabilities {
             display_id: 1,
             login_window: false,
+            fps_ceiling: None,
             displays: vec![crate::displays::DisplaySnapshot {
                 display_id: 1,
                 pixel_width: 1920,
@@ -2609,6 +2662,7 @@ mod tests {
             None,
             (1280, 720),
             None,
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("hello parses");
         assert_eq!(parsed["screen_width"], 1280);
@@ -2681,6 +2735,7 @@ mod tests {
             None,
             (1280, 720),
             lossless_refine_status(Some(&deck), &off),
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("hello parses");
         assert_eq!(parsed["lossless_refine"]["state"], "off");
@@ -2740,6 +2795,7 @@ mod tests {
             serial: 0,
             edid: String::new(),
             color: None,
+            rotation_degrees: 0,
         };
         let reported = panel_identity(&monitor(302.0, 196.0), 1800, 1130);
         assert_eq!(reported.size_mm, (302, 196));
@@ -2790,6 +2846,7 @@ mod tests {
             serial: 0,
             edid: String::new(),
             color,
+            rotation_degrees: 0,
         };
         let hdr = monitor_with_color(Some(arcen_protocol::messages::DisplayColorMsg {
             gamut: arcen_protocol::messages::DisplayGamutMsg::DisplayP3,
@@ -3138,6 +3195,7 @@ mod tests {
                 None,
                 (1920, 1080),
                 None,
+                None,
             ))
             .expect("hello");
         assert_eq!(
@@ -3209,6 +3267,7 @@ mod tests {
                     resolved.active_pipeline,
                     None,
                     (1920, 1080),
+                    None,
                     None,
                 ))
                 .expect("hello");

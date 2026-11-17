@@ -483,9 +483,21 @@ pub fn client_monitors_from_topology(
                 serial: monitor.identity.serial,
                 edid: String::new(),
                 color: monitor.color,
+                rotation_degrees: rotation_degrees(monitor.rotation),
             }
         })
         .collect()
+}
+
+/// Clockwise degrees of a display rotation, as the legacy roster carries it.
+#[must_use]
+pub const fn rotation_degrees(rotation: arcen_media::Rotation) -> u16 {
+    match rotation {
+        arcen_media::Rotation::Degrees0 => 0,
+        arcen_media::Rotation::Degrees90 => 90,
+        arcen_media::Rotation::Degrees180 => 180,
+        arcen_media::Rotation::Degrees270 => 270,
+    }
 }
 
 /// Whether an already-approved multi-monitor topology snapshot
@@ -1008,5 +1020,15 @@ mod tests {
             assert_eq!(live_roster, baseline_roster, "mask {mask:#b} {percent} %");
             assert_eq!(live_topology, Some(baseline_topology));
         }
+    }
+
+    #[test]
+    fn a_console_that_cannot_take_the_layout_offers_primary_display_only() {
+        let reason = arcen_protocol::messages::CONSOLE_LAYOUT_UNSUPPORTED_REASON;
+        assert!(reason.len() <= 120, "the control-frame budget");
+        assert_eq!(
+            displays_recovery_for(&format!("session closed: {reason}")),
+            Some(DisplaysRecovery::Unsupported)
+        );
     }
 }

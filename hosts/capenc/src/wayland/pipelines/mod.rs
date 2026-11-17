@@ -56,7 +56,7 @@ mod wide;
 
 use arcen_media::video::compositor_fidelity::FidelityRoute;
 use arcen_media::video::{
-    pipeline_contract, pipeline_for_request, AdmissionRequest, CaptureMemory, CapturePixelFormat,
+    pipeline_contract, pipeline_for_epoch, AdmissionRequest, CaptureMemory, CapturePixelFormat,
     CaptureRateEvidence, CaptureSourceEvidence, EncoderCapability, MotionPriority, PipelineId,
     PresetAdmission, StreamingPreset,
 };
@@ -434,18 +434,20 @@ impl WaylandPipeline {
         } else {
             VideoSelectionIntent::ColorFidelity
         };
-        let pipeline =
-            match pipeline_for_request(selection, request.video, request.fps, request.priority) {
-                Some(PipelineId::Auto) => Self::Auto(auto::AutoPipeline),
-                Some(PipelineId::Speed) => Self::Speed(
-                    speed::SpeedPipeline::new(request.qualified_rate)
-                        .with_rate_evidence(request.rate_evidence)
-                        .after_runtime_shortfall(request.speed_runtime_shortfall),
-                ),
-                Some(PipelineId::Grading) => Self::Grading(grading::GradingPipeline),
-                Some(PipelineId::Hdr) => Self::Hdr(hdr::HdrPipeline),
-                other => return Err(SelectionRefusal::NoComposition(other)),
-            };
+        let pipeline = match pipeline_for_epoch(selection, request.video, request.priority) {
+            Some(PipelineId::Auto) => Self::Auto(
+                auto::AutoPipeline::new(request.qualified_rate)
+                    .with_rate_evidence(request.rate_evidence),
+            ),
+            Some(PipelineId::Speed) => Self::Speed(
+                speed::SpeedPipeline::new(request.qualified_rate)
+                    .with_rate_evidence(request.rate_evidence)
+                    .after_runtime_shortfall(request.speed_runtime_shortfall),
+            ),
+            Some(PipelineId::Grading) => Self::Grading(grading::GradingPipeline),
+            Some(PipelineId::Hdr) => Self::Hdr(hdr::HdrPipeline),
+            other => return Err(SelectionRefusal::NoComposition(other)),
+        };
         if request.intent != pipeline_contract(pipeline.id()).intent {
             return Err(SelectionRefusal::IntentMismatch);
         }
@@ -508,7 +510,8 @@ impl WaylandPipeline {
         match self {
             // Grading and HDR are admitted at their contract rate, never on
             // an inferred one.
-            Self::Auto(_) | Self::Grading(_) | Self::Hdr(_) => CaptureRateEvidence::Measured,
+            Self::Grading(_) | Self::Hdr(_) => CaptureRateEvidence::Measured,
+            Self::Auto(pipeline) => pipeline.rate_source(),
             Self::Speed(pipeline) => pipeline.rate_source(),
         }
     }
@@ -619,11 +622,12 @@ mod tests {
             WaylandPipeline::select(&speed).unwrap().id(),
             PipelineId::Speed
         );
-        // The shared rule: more than 30 fps is Speed even without motion.
+        // The shared rule: Auto follows the display, so 60 fps detail-first
+        // is still Auto; only motion priority selects Speed.
         let fast = EpochRequest::from_args(&pier_argv("60", None)).unwrap();
         assert_eq!(
             WaylandPipeline::select(&fast).unwrap().id(),
-            PipelineId::Speed
+            PipelineId::Auto
         );
     }
 

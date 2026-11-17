@@ -121,6 +121,29 @@ impl RotationMsg {
             Self::Degrees270 => "degrees270",
         }
     }
+
+    /// Clockwise degrees, as [`ClientMonitor::rotation_degrees`] carries them.
+    #[must_use]
+    pub const fn degrees(self) -> u16 {
+        match self {
+            Self::Degrees0 => 0,
+            Self::Degrees90 => 90,
+            Self::Degrees180 => 180,
+            Self::Degrees270 => 270,
+        }
+    }
+
+    /// The rotation for clockwise `degrees`, or `None` for any other value.
+    #[must_use]
+    pub const fn from_degrees(degrees: u16) -> Option<Self> {
+        match degrees {
+            0 => Some(Self::Degrees0),
+            90 => Some(Self::Degrees90),
+            180 => Some(Self::Degrees180),
+            270 => Some(Self::Degrees270),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for RotationMsg {
@@ -232,6 +255,7 @@ impl RequestedMonitorDescriptorMsg {
             serial: self.serial,
             edid: self.edid.clone(),
             color: self.color,
+            rotation_degrees: self.rotation.degrees(),
         }
     }
 }

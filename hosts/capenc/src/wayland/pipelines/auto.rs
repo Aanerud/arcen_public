@@ -3,27 +3,58 @@
 //! `linux-wayland-auto`: the Wayland Auto composition.
 //!
 //! Auto is the shared detail-first contract (`arcen_media::video::pipeline`
-//! `auto`): up to its frame-rate ceiling, 4:2:0 eight-bit limited BT.709,
+//! `auto`): the Deck display's refresh, 4:2:0 eight-bit limited BT.709,
 //! interactive encoder, detail priority and its VBV. This composition asks
-//! the compositor for the eight-bit SDR family at that ceiling and admits
-//! the source through the shared `admit_auto`. Auto needs no source-rate
-//! qualification: a copying route is labelled with its copy path, not
-//! refused. A software encoder follows the shared software rule.
+//! the compositor for the eight-bit SDR family and admits the source through
+//! the shared `admit_auto`. Every Wayland route copies, so Auto above
+//! `UNQUALIFIED_COPY_FPS` rests on the host's qualified rate for this output
+//! (`capture-rate=`, the same evidence Speed uses); without one it is served
+//! at that rate, labelled `copy_path_not_rate_qualified`, never refused. A
+//! software encoder follows the shared software rule.
 
 use arcen_media::video::{
-    admit_auto, pipeline_contract, AdmissionRequest, CaptureSourceEvidence, EncoderCapability,
-    PipelineContract, PipelineId, PresetAdmission,
+    admit_auto, follow_display_offer_fps, pipeline_contract, AdmissionRequest, CaptureRateEvidence,
+    CaptureSourceEvidence, EncoderCapability, PipelineContract, PipelineId, PresetAdmission,
 };
 
 use crate::wayland::format::FormatOffer;
 
-/// The Auto composition. It has no path-specific state.
+/// The Auto composition and the host's qualified rate for its output.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AutoPipeline;
+pub struct AutoPipeline {
+    qualified_rate: Option<u32>,
+    rate_source: CaptureRateEvidence,
+}
 
 impl AutoPipeline {
     /// The contract this composition requests.
     pub const ID: PipelineId = PipelineId::Auto;
+
+    /// An Auto composition with the host's qualified sustained source rate
+    /// for this output, when one was measured.
+    #[must_use]
+    pub const fn new(qualified_rate: Option<u32>) -> Self {
+        Self {
+            qualified_rate,
+            rate_source: CaptureRateEvidence::Measured,
+        }
+    }
+
+    /// The same composition, its rate measured or inferred
+    /// (`capture-rate-evidence=`).
+    #[must_use]
+    pub const fn with_rate_evidence(self, rate_source: CaptureRateEvidence) -> Self {
+        Self {
+            rate_source,
+            ..self
+        }
+    }
+
+    /// What the rate evidence rests on.
+    #[must_use]
+    pub const fn rate_source(self) -> CaptureRateEvidence {
+        self.rate_source
+    }
 
     /// The shared contract.
     #[must_use]
@@ -31,18 +62,20 @@ impl AutoPipeline {
         pipeline_contract(Self::ID)
     }
 
-    /// The eight-bit SDR family at the contract's ceiling, or the
-    /// request's when lower. Asking for no more than will be encoded lets
-    /// the compositor skip frames nobody will encode.
+    /// The eight-bit SDR family at the shared
+    /// `follow_display_offer_fps` for the rate Auto will encode.
     #[must_use]
     pub fn offer(self, requested_fps: u32) -> FormatOffer {
-        FormatOffer::sdr8_host(self.contract().max_fps.min(requested_fps.max(1)))
+        FormatOffer::sdr8_host(follow_display_offer_fps(
+            self.contract().fps_ceiling().min(requested_fps.max(1)),
+            self.qualified_rate,
+        ))
     }
 
-    /// Auto takes no rate qualification.
+    /// The qualified sustained source rate, as admission evidence.
     #[must_use]
     pub const fn rate_evidence(self) -> Option<u32> {
-        None
+        self.qualified_rate
     }
 
     /// The shared Auto admission.
@@ -107,14 +140,14 @@ pub(crate) mod tests {
 
     #[test]
     fn auto_reads_its_numbers_from_the_shared_contract() {
-        let contract = AutoPipeline.contract();
+        let contract = AutoPipeline::default().contract();
         assert_eq!(contract.max_fps, 30);
         assert_eq!(contract.priority, MotionPriority::Detail);
         assert_eq!(contract.intent, EncodeIntent::Interactive);
         assert!((contract.encoder_buffer_frames - 2.0).abs() < f64::EPSILON);
         assert_eq!(contract.keyframe, KeyframePolicy::ON_DEMAND_ONLY);
         assert!(contract.keel.idle_cadence_required);
-        let offer = AutoPipeline.offer(60);
+        let offer = AutoPipeline::default().offer(60);
         assert_eq!(offer.max_fps, contract.max_fps);
         assert_eq!(
             offer.formats,
@@ -126,7 +159,7 @@ pub(crate) mod tests {
     #[test]
     fn gnome40_host_copy_is_admitted_as_labelled_auto() {
         for codec in [VideoCodec::H264, VideoCodec::H265] {
-            let admission = AutoPipeline.admit(
+            let admission = AutoPipeline::default().admit(
                 request(codec),
                 &gnome40_host_copy(),
                 &encoder(EncoderBackend::NativeNvenc),
@@ -160,7 +193,7 @@ pub(crate) mod tests {
             max_fps: 24,
             ..request(VideoCodec::H264)
         };
-        let admission = AutoPipeline.admit(
+        let admission = AutoPipeline::default().admit(
             request,
             &gnome40_host_copy(),
             &encoder(EncoderBackend::NativeNvenc),
@@ -174,8 +207,40 @@ pub(crate) mod tests {
             .degradation(StreamingPreset::Auto, 24)
             .unwrap()
             .is_exact());
-        assert_eq!(AutoPipeline.offer(24).max_fps, 24);
-        assert_eq!(AutoPipeline.offer(60).max_fps, 30);
+        assert_eq!(AutoPipeline::default().offer(24).max_fps, 24);
+        assert_eq!(AutoPipeline::default().offer(60).max_fps, 30);
+    }
+
+    #[test]
+    fn auto_at_a_qualified_display_rate_is_served_and_offered_with_headroom() {
+        let qualified = AutoPipeline::new(Some(60));
+        assert_eq!(qualified.offer(60).max_fps, 120);
+        assert_eq!(qualified.offer(30).max_fps, 30);
+        let at_sixty = AdmissionRequest {
+            max_fps: 60,
+            ..request(VideoCodec::H265)
+        };
+        let measured = CaptureSourceEvidence {
+            sustained_fps: SourceFact::Authoritative(60),
+            ..gnome40_host_copy()
+        };
+        let served = qualified.admit(at_sixty, &measured, &encoder(EncoderBackend::NativeNvenc));
+        let served = served.served().unwrap();
+        assert_eq!(
+            (served.pipeline, served.fps_ceiling),
+            (PipelineId::Auto, 60)
+        );
+        // Without the host's measurement: Auto's long-standing 30, labelled.
+        let unmeasured = AutoPipeline::default().admit(
+            at_sixty,
+            &gnome40_host_copy(),
+            &encoder(EncoderBackend::NativeNvenc),
+        );
+        let served = unmeasured.served().unwrap();
+        assert_eq!(
+            (served.fps_ceiling, served.fps_limited_by),
+            (30, Some(AdmissionReason::CopyPathNotRateQualified))
+        );
     }
 
     #[test]
@@ -185,7 +250,7 @@ pub(crate) mod tests {
             ..gnome40_host_copy()
         };
         assert!(matches!(
-            AutoPipeline.admit(
+            AutoPipeline::default().admit(
                 request(VideoCodec::H264),
                 &wide,
                 &encoder(EncoderBackend::NativeNvenc)
@@ -203,7 +268,7 @@ pub(crate) mod tests {
             ..gnome40_host_copy()
         };
         assert!(matches!(
-            AutoPipeline.admit(
+            AutoPipeline::default().admit(
                 request(VideoCodec::H264),
                 &pq,
                 &encoder(EncoderBackend::NativeNvenc)
@@ -222,7 +287,7 @@ pub(crate) mod tests {
             ..gnome40_host_copy()
         };
         assert!(matches!(
-            AutoPipeline.admit(
+            AutoPipeline::default().admit(
                 request(VideoCodec::H264),
                 &gpu_convert,
                 &encoder(EncoderBackend::NativeNvenc)
@@ -236,7 +301,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_software_rule_serves_auto_unchanged() {
-        let admission = AutoPipeline.admit(
+        let admission = AutoPipeline::default().admit(
             request(VideoCodec::H264),
             &gnome40_host_copy(),
             &encoder(EncoderBackend::OpenH264),

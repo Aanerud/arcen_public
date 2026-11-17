@@ -213,7 +213,12 @@ pub struct HostInitialVideoPolicy {
     pub color_policy: ColorPolicy,
     pub codec_pinned: bool,
     pub variant_pinned: bool,
-    pub max_fps: u32,
+    /// The administrator's frame-rate ceiling (`video.fps`); `None` when
+    /// none is configured, so Auto and Speed follow the Deck display.
+    pub administrator_max_fps: Option<u32>,
+    /// The served Deck display's refresh
+    /// (`AuthResponse::display_refresh_hz`).
+    pub display_refresh_hz: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +227,49 @@ pub struct ResolvedHostInitialVideo {
     pub selection: VideoSelectionIntent,
     pub pipeline: Option<crate::video::PipelineId>,
     pub encode_intent: EncodeIntent,
+    /// `frame_rate.fps`, the rate the session starts at.
     pub max_fps: u32,
+    /// The rate with its reason, before the host narrows it to its encoder
+    /// and capture ([`crate::video::SessionFrameRate::narrow`]).
+    pub frame_rate: crate::video::SessionFrameRate,
+}
+
+impl ResolvedHostInitialVideo {
+    /// The same plan at most `cap` frames a second, for `basis`.
+    #[must_use]
+    pub fn narrow_fps(self, cap: u32, basis: crate::video::FrameRateBasis) -> Self {
+        let frame_rate = self.frame_rate.narrow(cap, basis);
+        Self {
+            max_fps: frame_rate.fps,
+            frame_rate,
+            ..self
+        }
+    }
+}
+
+/// The resolved plan for `video`, at the rate `rate_pipeline`'s contract
+/// gives the request on this host.
+fn resolved_video(
+    video: VideoConfiguration,
+    selection: VideoSelectionIntent,
+    request: &ResolvedClientVideoRequest,
+    rate_pipeline: Option<crate::video::PipelineId>,
+    policy: HostInitialVideoPolicy,
+) -> ResolvedHostInitialVideo {
+    let frame_rate = crate::video::resolve_session_frame_rate(crate::video::FrameRateRequest {
+        pipeline: rate_pipeline,
+        requested_fps: request.max_fps,
+        display_refresh_hz: policy.display_refresh_hz,
+        administrator_max_fps: policy.administrator_max_fps,
+    });
+    ResolvedHostInitialVideo {
+        video,
+        selection,
+        pipeline: request.pipeline,
+        encode_intent: request.encode_intent,
+        max_fps: frame_rate.fps,
+        frame_rate,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,13 +404,15 @@ pub fn resolve_host_initial_video_with_supported_codecs(
                 VideoVariant::new(policy.current).id()
             )));
         }
-        return Ok(ResolvedHostInitialVideo {
-            video: policy.current,
-            selection: VideoSelectionIntent::Exact,
-            pipeline: request.pipeline,
-            encode_intent: request.encode_intent,
-            max_fps: policy.max_fps.min(request.max_fps),
-        });
+        // An exact administrator variant is served as Custom: the Deck's
+        // own rate, under the administrator's ceiling.
+        return Ok(resolved_video(
+            policy.current,
+            VideoSelectionIntent::Exact,
+            &request,
+            None,
+            policy,
+        ));
     }
 
     let (bit_depth, range, matrix) = resolve_client_color_request_with_matrix_caps(
@@ -436,17 +485,21 @@ pub fn resolve_host_initial_video_with_supported_codecs(
             variant.id()
         )));
     }
-    Ok(ResolvedHostInitialVideo {
+    // A codec pin makes the stream exact (served as Custom), and an exact
+    // stream keeps the Deck's own rate: a capture child admits an exact
+    // request only at exactly that rate.
+    let (selection, rate_pipeline) = if policy.codec_pinned {
+        (VideoSelectionIntent::Exact, None)
+    } else {
+        (request.selection, request.pipeline)
+    };
+    Ok(resolved_video(
         video,
-        selection: if policy.codec_pinned {
-            VideoSelectionIntent::Exact
-        } else {
-            request.selection
-        },
-        pipeline: request.pipeline,
-        encode_intent: request.encode_intent,
-        max_fps: policy.max_fps.min(request.max_fps),
-    })
+        selection,
+        &request,
+        rate_pipeline,
+        policy,
+    ))
 }
 
 #[cfg(test)]
@@ -530,7 +583,8 @@ mod tests {
                 color_policy: ColorPolicy::DefaultOff,
                 codec_pinned: false,
                 variant_pinned: false,
-                max_fps: 60,
+                administrator_max_fps: None,
+                display_refresh_hz: Some(60),
             },
             CodecSet::from_slice(&[VideoCodec::H264]),
         )
@@ -570,7 +624,8 @@ mod tests {
                 color_policy: ColorPolicy::AlwaysOn,
                 codec_pinned: false,
                 variant_pinned: false,
-                max_fps: 30,
+                administrator_max_fps: None,
+                display_refresh_hz: Some(60),
             },
             CodecSet::from_slice(&[VideoCodec::Av1, VideoCodec::H265, VideoCodec::H264]),
         )
@@ -613,7 +668,8 @@ mod tests {
             color_policy: ColorPolicy::AlwaysOn,
             codec_pinned: false,
             variant_pinned: false,
-            max_fps: 60,
+            administrator_max_fps: None,
+            display_refresh_hz: Some(60),
         };
         let resolved = resolve_host_initial_video(request, policy).expect("follows the client");
         assert_eq!(
@@ -659,11 +715,70 @@ mod tests {
                 color_policy: ColorPolicy::DefaultOff,
                 codec_pinned: false,
                 variant_pinned: false,
-                max_fps: 60,
+                administrator_max_fps: None,
+                display_refresh_hz: Some(60),
             },
             CodecSet::from_slice(&[VideoCodec::H264]),
         )
         .expect("H.264 is measured and client-supported");
         assert_eq!(resolved.video.codec, VideoCodec::H264);
+    }
+
+    #[test]
+    fn auto_follows_the_deck_display_and_an_administrator_ceiling_holds() {
+        let request = ResolvedClientVideoRequest {
+            selection: VideoSelectionIntent::AdaptivePerformance,
+            video: video(VideoCodec::H265),
+            encode_intent: EncodeIntent::Interactive,
+            motion_priority: crate::video::MotionPriority::Detail,
+            pipeline: Some(crate::video::PipelineId::Auto),
+            max_fps: 30,
+            capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
+                h264: true,
+                h265: true,
+                ..Default::default()
+            },
+        };
+        let policy = HostInitialVideoPolicy {
+            current: video(VideoCodec::H264),
+            color_policy: ColorPolicy::DefaultOff,
+            codec_pinned: false,
+            variant_pinned: false,
+            administrator_max_fps: None,
+            display_refresh_hz: Some(120),
+        };
+        let resolved = resolve_host_initial_video(request, policy).expect("resolves");
+        assert_eq!(resolved.max_fps, 120);
+        assert_eq!(
+            resolved.frame_rate.basis,
+            crate::video::FrameRateBasis::Display
+        );
+        let capped = resolve_host_initial_video(
+            request,
+            HostInitialVideoPolicy {
+                administrator_max_fps: Some(60),
+                ..policy
+            },
+        )
+        .expect("resolves");
+        assert_eq!(capped.max_fps, 60);
+        let narrowed = capped.narrow_fps(30, crate::video::FrameRateBasis::Encoder);
+        assert_eq!(
+            (narrowed.max_fps, narrowed.frame_rate.basis),
+            (30, crate::video::FrameRateBasis::Encoder)
+        );
+        // A codec pin makes the stream exact: the Deck's own rate.
+        let pinned = resolve_host_initial_video(
+            request,
+            HostInitialVideoPolicy {
+                codec_pinned: true,
+                ..policy
+            },
+        )
+        .expect("resolves");
+        assert_eq!(
+            (pinned.max_fps, pinned.frame_rate.basis),
+            (30, crate::video::FrameRateBasis::Request)
+        );
     }
 }

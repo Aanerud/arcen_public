@@ -60,6 +60,10 @@ pub struct LinuxSessionConfig {
     pub launcher_bin: Option<String>,
     pub zoneinfo_root: Option<String>,
     pub disconnected_idle_timeout_secs: Option<u64>,
+    /// `console` (default): join the user's console session (ADR 0025);
+    /// `dedicated`: a private desktop per sign-in, for a host without a
+    /// display manager.
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

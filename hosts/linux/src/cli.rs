@@ -187,6 +187,16 @@ pub struct Config {
     pub desktop_depth_downgraded: bool,
     pub active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     pub fps: u32,
+    /// The administrator's frame-rate ceiling (`video.fps`, `--fps`), when
+    /// one is configured. Without one, Auto and Speed follow the Deck
+    /// display (`arcen_media::video::resolve_session_frame_rate`).
+    pub fps_ceiling: Option<u32>,
+    /// The refresh of the Deck display this sign-in is sized for
+    /// (`AuthResponse::display_refresh_hz`).
+    pub deck_display_refresh_hz: Option<u32>,
+    /// The session's frame rate and what decided it, once the initial video
+    /// request is resolved (READY, the hello and `SESSION_STREAM_START`).
+    pub frame_rate: Option<arcen_media::video::SessionFrameRate>,
     /// 1-based monitor index (runtime convention); `output_index` subtracts 1.
     pub monitor: u32,
     /// `DISPLAY` the host captures (the host owns `:0`).
@@ -229,6 +239,9 @@ pub struct Config {
     /// `wayland.first_login_setup`: whether GNOME's first-login assistant
     /// and welcome tour run in a headless Wayland desktop.
     pub first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup,
+    /// `platform.session.mode`: join the user's console session (default,
+    /// ADR 0025) or create a dedicated desktop per sign-in.
+    pub desktop_mode: arcen_session::console_session::DesktopMode,
     /// `wayland.lab_seat_pen` (lab, default off): a virtual tablet on a
     /// private udev seat for a headless compositor with the lab input patch.
     pub wayland_lab_seat_pen: bool,
@@ -366,8 +379,20 @@ impl Config {
         self.quic_port.unwrap_or(self.port)
     }
 
-    /// 0-based NvFBC desktop-output index (`monitor_index - 1`).
+    /// Whether a sign-in joins the workstation's own X11 session (ADR 0025)
+    /// rather than creating a desktop.
+    pub fn joins_console(&self) -> bool {
+        self.desktop_mode == arcen_session::console_session::DesktopMode::Console
+            && self.desktop_provider != arcen_session::desktop_provider::DesktopProvider::Wayland
+    }
+
+    /// 0-based NvFBC desktop-output index (`monitor_index - 1`); the whole
+    /// X screen for a joined console, whose monitors are served as one
+    /// picture.
     pub fn output_index(&self) -> u32 {
+        if self.joins_console() {
+            return arcen_media::capenc_stream::WHOLE_SCREEN_OUTPUT_INDEX;
+        }
         self.monitor.saturating_sub(1)
     }
 
@@ -487,6 +512,24 @@ impl Config {
             execution,
             session_log_id,
         }
+    }
+
+    /// The session's frame rate as served once capture and encode admitted
+    /// `served_fps` (READY): the resolved rate, lowered to it with the
+    /// reason (a Wayland capture's admission, otherwise the encoder).
+    #[must_use]
+    pub fn served_frame_rate(&self, served_fps: u32) -> arcen_media::video::SessionFrameRate {
+        use arcen_media::video::FrameRateBasis;
+        use arcen_session::desktop_provider::DesktopProvider;
+        arcen_media::video::served_stream_rate(
+            self.frame_rate,
+            served_fps,
+            if self.desktop_provider == DesktopProvider::Wayland {
+                FrameRateBasis::CaptureSource
+            } else {
+                FrameRateBasis::Encoder
+            },
+        )
     }
 
     /// Whether this Pier's Wayland sessions run the compositor's Xwayland:
@@ -669,25 +712,22 @@ impl Config {
     /// frames into one encoder interval (measured: a 60 Hz head serving Speed
     /// encoded 40 of its 60 frames a second), so the head gets the same
     /// interval of headroom a headless Wayland output gets, from the shared
-    /// `paced_output_refresh_hz` for the requested preset's rate: 120 Hz for
-    /// Speed on a 60 Hz display, 60 Hz for a 30 fps preset on a 30 Hz one.
+    /// `paced_output_refresh_hz` for the session's resolved rate: 120 Hz for
+    /// Auto or Speed at 60 fps on a 60 Hz display, 60 Hz for a 30 fps preset
+    /// on a 30 Hz one.
     /// The display's own rate is kept when it is already high enough, when
     /// an EDID cannot describe the paced timing at this size, for a request
     /// that names no preset, and for Wayland sessions (see
     /// [`Self::wayland_session_refresh_hz`]). A desktop keeps the refresh it
     /// was created at across reattachments.
     pub fn xorg_session_refresh_hz(&self, width: u32, height: u32, display_refresh_hz: u32) -> u32 {
-        use arcen_media::video::{paced_output_refresh_hz, pipeline_contract};
+        use arcen_media::video::paced_output_refresh_hz;
         use arcen_session::desktop_provider::DesktopProvider;
-        if self.desktop_provider != DesktopProvider::Xorg {
+        if self.desktop_provider != DesktopProvider::Xorg || self.requested_pipeline.is_none() {
             return display_refresh_hz;
         }
-        let Some(pipeline) = self.requested_pipeline else {
-            return display_refresh_hz;
-        };
         let paced =
-            paced_output_refresh_hz(display_refresh_hz, pipeline_contract(pipeline).max_fps)
-                .min(MAX_XORG_HEAD_REFRESH_HZ);
+            paced_output_refresh_hz(display_refresh_hz, self.fps).min(MAX_XORG_HEAD_REFRESH_HZ);
         if paced > display_refresh_hz
             && arcen_outputs::edid::cvt_reduced_blanking(width, height, paced).is_ok()
         {
@@ -1011,7 +1051,8 @@ impl Config {
             selection: contract.selection,
             pipeline: Some(served_pipeline),
             encode_intent: contract.intent,
-            max_fps: resolved.max_fps.min(contract.max_fps),
+            max_fps: resolved.max_fps.min(contract.fps_ceiling()),
+            frame_rate: resolved.frame_rate,
         };
         tracing::warn!(
             target: crate::logging::target::MEDIA,
@@ -1115,10 +1156,23 @@ impl Config {
                 color_policy: self.color_policy,
                 codec_pinned: self.codec_pinned,
                 variant_pinned: self.variant_pinned,
-                max_fps: self.fps,
+                administrator_max_fps: self.fps_ceiling,
+                display_refresh_hz: self.deck_display_refresh_hz,
             },
         )
         .map_err(|error| error.to_string())?;
+        // What the host's encoder can sustain: the software encoder's rate
+        // limit is known before any capture starts.
+        let resolved = if self.session_encoder() == EncoderSelection::SoftwareH264 {
+            resolved.narrow_fps(
+                arcen_media::video::EncoderBackend::OpenH264
+                    .contract()
+                    .max_fps,
+                arcen_media::video::FrameRateBasis::Encoder,
+            )
+        } else {
+            resolved
+        };
         let resolved = self.wayland_fidelity_fallback(resolved);
         let (resolved, desktop_depth_downgraded) = self.fixed_desktop_depth_fallback(resolved);
         self.desktop_depth_downgraded = desktop_depth_downgraded;
@@ -1170,6 +1224,7 @@ impl Config {
         self.desktop_encoding = plan.source;
         let video = plan.video;
         self.fps = resolved.max_fps;
+        self.frame_rate = Some(resolved.frame_rate);
         self.codec = video.codec.token().to_string();
         self.chroma = video.chroma.token().to_string();
         self.bit_depth = video.bit_depth;
@@ -1289,6 +1344,9 @@ impl Default for Config {
             desktop_depth_downgraded: false,
             active_pipeline: None,
             fps: 60,
+            fps_ceiling: None,
+            deck_display_refresh_hz: None,
+            frame_rate: None,
             monitor: 1,
             display: ":0".to_string(),
             xauthority: None,
@@ -1311,6 +1369,7 @@ impl Default for Config {
             wayland_qualification_target:
                 arcen_session::wayland_qualification::QualificationTarget::production(),
             first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup::Run,
+            desktop_mode: arcen_session::console_session::DesktopMode::Console,
             wayland_lab_seat_pen: false,
             wayland_session_mode: arcen_session::native_seat::SessionMode::Auto,
             wayland_auto_requalify: true,
@@ -1459,6 +1518,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     }
     if let Some(v) = flag_value(args, "--fps") {
         cfg.fps = v.parse().map_err(|_| format!("invalid --fps: {v}"))?;
+        cfg.fps_ceiling = Some(cfg.fps);
     }
     if let Some(v) = flag_value(args, "--monitor") {
         cfg.monitor = v.parse().map_err(|_| format!("invalid --monitor: {v}"))?;
@@ -2076,6 +2136,7 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     }
     if let Some(value) = file.video.fps {
         cfg.fps = value;
+        cfg.fps_ceiling = Some(value);
     }
     cfg.audio_enabled = file.audio.enabled;
     cfg.audio_compressed = file.audio.compressed;
@@ -2180,6 +2241,14 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     }
     if let Some(value) = platform.session.disconnected_idle_timeout_secs {
         cfg.disconnected_idle_lifetime = Some(validate_disconnected_idle_timeout(value)?);
+    }
+    if let Some(value) = platform.session.mode {
+        cfg.desktop_mode = arcen_session::console_session::DesktopMode::from_token(&value)
+            .ok_or_else(|| {
+                format!(
+                    "Pier config platform.session.mode must be \"console\" or \"dedicated\", not {value:?}"
+                )
+            })?;
     }
     if let Some(value) = platform.input.mode {
         cfg.input_mode = parse_input_mode(&value)?;
@@ -2742,31 +2811,36 @@ mod tests {
     fn a_new_xorg_head_runs_at_the_paced_refresh_for_the_requested_preset() {
         use arcen_media::video::PipelineId;
         use arcen_session::desktop_provider::DesktopProvider;
-        let session = |provider, pipeline| Config {
+        let session = |provider, pipeline, fps| Config {
             desktop_provider: provider,
             requested_pipeline: pipeline,
+            fps,
             ..Config::default()
         };
-        let speed = session(DesktopProvider::Xorg, Some(PipelineId::Speed));
+        let speed = session(DesktopProvider::Xorg, Some(PipelineId::Speed), 60);
         assert_eq!(speed.xorg_session_refresh_hz(1800, 1168, 60), 120);
         assert_eq!(speed.xorg_session_refresh_hz(2560, 1440, 30), 120);
         // Already fast enough: the display's own.
         assert_eq!(speed.xorg_session_refresh_hz(1920, 1080, 144), 144);
         // An EDID cannot describe 4K at 120 Hz: the display's rate.
         assert_eq!(speed.xorg_session_refresh_hz(3840, 2160, 60), 60);
-        // A 30 fps preset on a 30 Hz display gets 60 Hz; on 60 Hz, 60.
+        // Auto follows the display: 60 fps on a 60 Hz display gets the same
+        // headroom as Speed.
+        let auto = session(DesktopProvider::Xorg, Some(PipelineId::Auto), 60);
+        assert_eq!(auto.xorg_session_refresh_hz(1800, 1168, 60), 120);
+        // A 30 fps session on a 30 Hz display gets 60 Hz; on 60 Hz, 60.
         for pipeline in [PipelineId::Auto, PipelineId::Grading] {
-            let session = session(DesktopProvider::Xorg, Some(pipeline));
+            let session = session(DesktopProvider::Xorg, Some(pipeline), 30);
             assert_eq!(session.xorg_session_refresh_hz(2560, 1440, 30), 60);
             assert_eq!(session.xorg_session_refresh_hz(1800, 1168, 60), 60);
         }
         // No preset named, or a Wayland session: the display's rate.
         assert_eq!(
-            session(DesktopProvider::Xorg, None).xorg_session_refresh_hz(1800, 1168, 60),
+            session(DesktopProvider::Xorg, None, 60).xorg_session_refresh_hz(1800, 1168, 60),
             60
         );
         assert_eq!(
-            session(DesktopProvider::Wayland, Some(PipelineId::Speed))
+            session(DesktopProvider::Wayland, Some(PipelineId::Speed), 60)
                 .xorg_session_refresh_hz(1800, 1168, 60),
             60
         );
@@ -2781,6 +2855,11 @@ mod tests {
             pipeline: Some(pipeline),
             encode_intent: pipeline_contract(pipeline).intent,
             max_fps: pipeline_contract(pipeline).max_fps,
+            frame_rate: arcen_media::video::SessionFrameRate {
+                fps: pipeline_contract(pipeline).max_fps,
+                display_refresh_hz: None,
+                basis: arcen_media::video::FrameRateBasis::Contract,
+            },
         };
         let xorg = Config::default();
         let wayland = Config {
@@ -2795,7 +2874,7 @@ mod tests {
             assert_eq!(served.video.transfer, auto.colour.transfer);
             assert_eq!(served.video.chroma, auto.colour.chroma);
             assert_eq!(served.video.codec, requested(pipeline).video.codec);
-            assert!(served.max_fps <= auto.max_fps);
+            assert!(served.max_fps <= auto.fps_ceiling());
             // Xorg keeps its own Grading and HDR paths.
             assert_eq!(
                 xorg.wayland_fidelity_fallback(requested(pipeline)),
@@ -2905,6 +2984,11 @@ mod tests {
             pipeline: Some(pipeline),
             encode_intent: pipeline_contract(pipeline).intent,
             max_fps: pipeline_contract(pipeline).max_fps,
+            frame_rate: arcen_media::video::SessionFrameRate {
+                fps: pipeline_contract(pipeline).max_fps,
+                display_refresh_hz: None,
+                basis: arcen_media::video::FrameRateBasis::Contract,
+            },
         };
         let proven = record(
             CapabilityFact::Available,
@@ -3879,7 +3963,16 @@ mod tests {
         assert_eq!(c.tls_posture.enabled_suites(), RingCipherSuite::ALL);
         assert_eq!(c.tls_time_policy.warning_window_secs, 30 * 24 * 60 * 60);
         assert!(c.tls_expected_sans.is_empty());
-        assert_eq!(c.output_index(), 0, "monitor 1 → output 0");
+        assert_eq!(
+            c.output_index(),
+            arcen_media::capenc_stream::WHOLE_SCREEN_OUTPUT_INDEX,
+            "a joined console is captured whole"
+        );
+        let dedicated = Config {
+            desktop_mode: arcen_session::console_session::DesktopMode::Dedicated,
+            ..c.clone()
+        };
+        assert_eq!(dedicated.output_index(), 0, "monitor 1 → output 0");
         assert!(!c.timezone_redirection);
         assert_eq!(c.zoneinfo_root, PathBuf::from("/usr/share/zoneinfo"));
         assert_eq!(c.reconnect_window_secs, 180);

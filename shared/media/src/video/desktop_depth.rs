@@ -229,7 +229,8 @@ pub fn serve_on_fixed_depth(
         selection: contract.selection,
         pipeline: Some(PipelineId::Auto),
         encode_intent: contract.intent,
-        max_fps: resolved.max_fps.min(contract.max_fps),
+        max_fps: resolved.max_fps.min(contract.fps_ceiling()),
+        frame_rate: resolved.frame_rate,
     };
     FixedDepthOutcome::Downgraded {
         served,
@@ -254,6 +255,11 @@ mod tests {
             pipeline: Some(pipeline),
             encode_intent: contract.intent,
             max_fps: contract.max_fps,
+            frame_rate: crate::video::SessionFrameRate {
+                fps: contract.max_fps,
+                display_refresh_hz: None,
+                basis: crate::video::FrameRateBasis::Contract,
+            },
         }
     }
 
@@ -382,7 +388,7 @@ mod tests {
                 served.encode_intent,
                 pipeline_contract(PipelineId::Auto).intent
             );
-            assert!(served.max_fps <= pipeline_contract(PipelineId::Auto).max_fps);
+            assert!(served.max_fps <= pipeline_contract(PipelineId::Auto).fps_ceiling());
         }
     }
 

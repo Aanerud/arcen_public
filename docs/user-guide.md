@@ -144,8 +144,8 @@ host, not a label on the same picture.
 
 | Preset | What it promises | Use it for |
 | --- | --- | --- |
-| **Auto** (default) | A sharp picture, up to 30 frames a second, 8-bit 4:2:0. When the network is tight it gives up frame rate, not sharpness. | Everyday work: email, browsing, most editing. |
-| **Speed** | Smooth motion, up to 60 frames a second, 8-bit 4:2:0, with the lowest-latency encoder settings. When the network is tight it gives up sharpness. | Playback, scrubbing, animation, anything where motion matters more than fine detail. |
+| **Auto** (default) | A sharp picture at your display's refresh (60 frames a second on a 60 Hz display; today's Decks ask for at most 60), 8-bit 4:2:0, shown without tearing. When the network or the host cannot keep up it gives up frame rate, not sharpness, and climbs back when it can. | Everyday work: email, browsing, most editing. |
+| **Speed** | The lowest latency: at least 60 frames a second (your display's refresh when faster), 8-bit 4:2:0, the lowest-latency encoder settings, frames shown even mid-refresh (it may tear). When the network is tight it gives up sharpness. | Playback, scrubbing, animation, anything where motion matters more than fine detail. |
 | **Grading** | 10-bit 4:4:4 BT.709 **SDR**, up to 30 frames a second. It trades some interaction latency for detail. | Colour-critical SDR work. Also the cure for coloured fringes on fine text. |
 | **HDR** | HDR10: PQ transfer, BT.2020 primaries, 10-bit 4:4:4, up to 30 frames a second. It falls back visibly when the host cannot prove HDR. | HDR grading on a Mac display that can show HDR. |
 
@@ -160,8 +160,10 @@ Things worth knowing:
 - A preset change applies to the next connection. If your session is
   running, the [Colour check](#4-check-your-colour) can switch preset and
   reconnect in one click.
-- If it feels slow, try **Speed**. Asking for 60 frames a second makes the
-  picture feel much faster, at a cost in bandwidth.
+- Auto already runs at your display's refresh; Stream Statistics shows the
+  rate and, when it is lower, why. If it still feels slow, try **Speed**: it
+  never drops below 60 frames a second and trades sharpness, not frames,
+  when the network is tight.
 
 ### When the host serves less than you asked for
 

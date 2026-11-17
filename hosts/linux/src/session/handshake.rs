@@ -138,6 +138,7 @@ pub fn build_server_hello(
                     || cfg.requested_pipeline.is_none(),
             },
         )),
+        stream_rate: Some(cfg.served_frame_rate(plan.fps).wire()),
         color_caps: ServerColorCaps {
             // Backend capability -- what this resolved backend *could*
             // serve -- not what is currently active; `active_*` below
@@ -723,6 +724,7 @@ mod tests {
             requested_outputs: None,
             x11_desktop_depth: None,
             native_seat: None,
+            console: false,
         };
         let plan = native_plan(VideoCodec::H264, false);
         let hello = build_server_hello(

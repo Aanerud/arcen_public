@@ -49,7 +49,7 @@ use arcen_media::{
 
 use crate::pipeline::monitor_router::{MonitorFrameRouter, RouterAdmissionError, RouterBuildError};
 use crate::pipeline::synthetic_multi_monitor::synthetic_frame;
-use crate::ui::multi_window_runtime::MonitorWindowAssignment;
+use crate::ui::multi_window_runtime::{viewport_id_for, MonitorWindowAssignment};
 
 /// Runtime opt-in the lab additionally requires on top of the default-off
 /// `dev-tools` build feature. Only the exact value `1` enables it.
@@ -1127,7 +1127,7 @@ mod macos {
     use crate::pipeline::video_decoder::DecodedVideoFrame;
     use crate::ui::multi_window_diagnostic::{verify_paint_isolation, ViewportPaintAck};
     use crate::ui::multi_window_runtime::{
-        live_active_displays, window_display_id, MonitorWindowAssignment,
+        live_active_displays, viewport_id_for, window_display_id, MonitorWindowAssignment,
     };
 
     use super::{

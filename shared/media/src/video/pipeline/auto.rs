@@ -14,6 +14,10 @@ use crate::video::MotionPriority;
 pub(super) const CONTRACT: PipelineContract = PipelineContract {
     id: PipelineId::Auto,
     max_fps: 30,
+    frame_rate: super::FrameRatePolicy::FollowDisplay {
+        floor_fps: 1,
+        ceiling_fps: crate::video::MAX_SESSION_FPS,
+    },
     priority: MotionPriority::Detail,
     intent: EncodeIntent::Interactive,
     encoder_buffer_frames: buffer(MotionPriority::Detail, EncodeIntent::Interactive),
@@ -27,7 +31,7 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     decode_latency: super::DecodeLatencyPolicy::DEFAULT,
     present_timing: super::PresentTiming::Newest,
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
-    favours: "a sharp picture, up to 30 fps",
-    gives_up: "frame rate when the link is tight",
-    summary: "Favours a sharp picture, up to 30 fps; gives up frame rate when the link is tight.",
+    favours: "a sharp picture at your display's refresh rate, shown the moment it is decoded without tearing",
+    gives_up: "frame rate first when the link or the host cannot keep up, and climbs back when they can",
+    summary: "Favours a sharp picture at your display's refresh rate, shown without tearing; gives up frame rate first when the link or the host cannot keep up, and climbs back when they can.",
 };

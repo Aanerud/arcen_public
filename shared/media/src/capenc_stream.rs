@@ -19,6 +19,33 @@
 
 use crate::cursor::{CursorImage, MAX_SOURCE_CURSOR_SIDE};
 
+/// capenc output index that captures the whole X screen (every monitor, as
+/// the desktop arranges them) instead of one output: a Linux Pier joining
+/// the workstation's own session serves its monitors as one picture.
+pub const WHOLE_SCREEN_OUTPUT_INDEX: u32 = u32::MAX;
+/// The largest side NVENC encodes for `codec` (a capenc codec token):
+/// 4096 for H.264, 8192 for H.265 and AV1.
+#[must_use]
+pub fn whole_screen_max_dimension(codec: &str) -> u32 {
+    if codec == "h264" { 4096 } else { 8192 }
+}
+
+/// The frame a whole X screen of `width`x`height` is captured at so the
+/// encoder takes it: unchanged when it fits `max` on both sides, otherwise
+/// scaled down with its aspect ratio kept, to even sides.
+#[must_use]
+pub fn fit_whole_screen(width: u32, height: u32, max: u32) -> (u32, u32) {
+    if width <= max && height <= max {
+        return (width, height);
+    }
+    let longest = u64::from(width.max(height));
+    let scale = |side: u32| -> u32 {
+        let scaled = u64::from(side) * u64::from(max) / longest;
+        u32::try_from(scaled).unwrap_or(max).max(2) & !1
+    };
+    (scale(width), scale(height))
+}
+
 /// capenc argument selecting framed-v2 output.
 pub const FRAMED_OUTPUT_V2: &str = "framed-v2";
 /// capenc argument asking a framed-v2 cursor stream for pointer positions.
@@ -424,6 +451,17 @@ pub fn check_output_request(args: &[String], route: CapencRoute) -> Result<(), S
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    #[test]
+    fn a_whole_screen_wider_than_the_codec_is_scaled_to_fit() {
+        // Two monitors side by side, 2560x1600 and 1920x1200: too wide for
+        // H.264, not for H.265.
+        assert_eq!(whole_screen_max_dimension("h264"), 4096);
+        assert_eq!(whole_screen_max_dimension("h265"), 8192);
+        assert_eq!(fit_whole_screen(4480, 1600, 4096), (4096, 1462));
+        assert_eq!(fit_whole_screen(4480, 1600, 8192), (4480, 1600));
+        assert_eq!(fit_whole_screen(1600, 5120, 4096), (1280, 4096));
+    }
 
     #[test]
     fn output_arguments_a_path_cannot_honour_are_refused() {

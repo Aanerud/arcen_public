@@ -392,6 +392,16 @@ pub struct HostConfig {
     pub requested_pipeline: Option<arcen_media::video::PipelineId>,
     pub active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     pub fps: u32,
+    /// The administrator's frame-rate ceiling (`video.fps`, `--fps`), when
+    /// one is configured. Without one, Auto and Speed follow the Deck
+    /// display (`arcen_media::video::resolve_session_frame_rate`).
+    pub fps_ceiling: Option<u32>,
+    /// The refresh of the Deck display this sign-in is sized for
+    /// (`AuthResponse::display_refresh_hz`).
+    pub deck_display_refresh_hz: Option<u32>,
+    /// The session's frame rate and what decided it, once the initial video
+    /// request is resolved (the hello and `SESSION_STREAM_START`).
+    pub frame_rate: Option<arcen_media::video::SessionFrameRate>,
     pub encoder: arcen_media::video::EncoderRequest,
     pub audio_enabled: bool,
     pub audio_compressed: bool,
@@ -516,11 +526,13 @@ impl HostConfig {
         if requested_bt709 && self.transfer == arcen_media::TransferCharacteristics::Srgb {
             self.transfer = arcen_media::TransferCharacteristics::Bt709;
         }
-        self.fps = self.fps.min(
-            arcen_media::video::EncoderBackend::OpenH264
-                .contract()
-                .max_fps,
-        );
+        let openh264_fps = arcen_media::video::EncoderBackend::OpenH264
+            .contract()
+            .max_fps;
+        self.fps = self.fps.min(openh264_fps);
+        self.frame_rate = self
+            .frame_rate
+            .map(|rate| rate.narrow(openh264_fps, arcen_media::video::FrameRateBasis::Encoder));
         Ok(())
     }
 
@@ -588,7 +600,8 @@ impl HostConfig {
                 color_policy: self.color_policy,
                 codec_pinned: self.codec_pinned,
                 variant_pinned: self.variant_pinned,
-                max_fps: self.fps,
+                administrator_max_fps: self.fps_ceiling,
+                display_refresh_hz: self.deck_display_refresh_hz,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -623,6 +636,7 @@ impl HostConfig {
             },
         ));
         self.fps = resolved.max_fps;
+        self.frame_rate = Some(resolved.frame_rate);
         self.codec = crate::capenc::protocol_codec(resolved.video.codec);
         self.chroma = crate::capenc::protocol_chroma(resolved.video.chroma);
         self.bit_depth = resolved.video.bit_depth;
@@ -1498,7 +1512,9 @@ where
     let mut video_selection = VideoSelectionIntent::Exact;
     let mut codec_pinned = false;
     let mut variant_pinned = false;
-    let mut fps = 30u32;
+    // The legacy rate for a Deck that states no request, as on Linux.
+    let mut fps = 60u32;
+    let mut fps_ceiling = None;
     let mut encoder = arcen_media::video::EncoderRequest::Auto;
     let mut audio_enabled = true;
     let mut audio_compressed = false;
@@ -1648,6 +1664,7 @@ where
         }
         if let Some(value) = file.video.fps {
             fps = value;
+            fps_ceiling = Some(value);
         }
         if let Some(value) = file.video.encoder {
             encoder = parse_encoder(&value)
@@ -1784,7 +1801,10 @@ where
                 video_selection = VideoSelectionIntent::Exact;
                 variant_pinned = true;
             }
-            "--fps" => fps = next("--fps")?.parse().map_err(|_| "bad --fps")?,
+            "--fps" => {
+                fps = next("--fps")?.parse().map_err(|_| "bad --fps")?;
+                fps_ceiling = Some(fps);
+            }
             "--encoder" => encoder = parse_encoder(&next("--encoder")?)?,
             "--audio" => audio_enabled = true,
             "--no-audio" => audio_enabled = false,
@@ -2013,6 +2033,9 @@ where
         requested_pipeline: None,
         active_pipeline: None,
         fps,
+        fps_ceiling,
+        deck_display_refresh_hz: None,
+        frame_rate: None,
         encoder,
         audio_enabled,
         audio_compressed,

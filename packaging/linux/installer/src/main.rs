@@ -38,6 +38,9 @@ const SOURCE_OFFER: &str = "Arcen is free software under the GNU AGPL-3.0. It co
 #[path = "../../../quic_config_migration.rs"]
 mod quic_config_migration;
 
+/// Forced virtual outputs for a headless console (`--console-outputs`,
+/// ADR 0025 §6).
+mod console_outputs;
 /// Desktop-provider facts, the embedded Pier's runtime check, the Wayland
 /// qualification run and the install log.
 mod desktop;
@@ -59,6 +62,16 @@ mod native_tablet;
 mod xorg_template_trust;
 
 const PIER: &[u8] = include_bytes!(env!("ARCEN_PIER_BINARY_ABS"));
+/// The login screen's half of a remote-first sign-in (ADR 0025): the PAM
+/// module GNOME's login screen loads for Arcen's one-time token.
+const PAM_GREETER: &[u8] = include_bytes!(env!("ARCEN_PAM_GREETER_ABS"));
+/// Where distributions keep PAM modules, first match wins (the directory
+/// that holds `pam_unix.so`).
+const PAM_MODULE_DIRS: [&str; 3] = [
+    "/usr/lib64/security",
+    "/usr/lib/x86_64-linux-gnu/security",
+    "/usr/lib/security",
+];
 
 /// Where the Pier binary lives.
 ///
@@ -222,6 +235,9 @@ struct Options {
     /// `--native-tablet` / `--no-native-tablet`: the administrator's
     /// `usb.native_tablet` choice; `None` keeps the configuration's.
     native_tablet: Option<native_tablet::Choice>,
+    /// `--console-outputs` / `--no-console-outputs`: force virtual outputs
+    /// on a headless console, or remove Arcen's; `None` keeps what is there.
+    console_outputs: Option<console_outputs::Choice>,
     /// Extra names or addresses to place in the generated TLS certificate.
     ///
     /// The certificate is otherwise built from what the machine can see of
@@ -279,6 +295,7 @@ fn parse_args() -> Result<Options, String> {
         restore_gdm: false,
         no_native_tablet_modules: false,
         native_tablet: None,
+        console_outputs: None,
         extra_sans: Vec::new(),
     };
     let mut args = env::args().skip(1);
@@ -312,6 +329,30 @@ fn parse_args() -> Result<Options, String> {
                     );
                 }
                 options.native_tablet = Some(choice);
+            }
+            "--console-outputs" => {
+                let value = args.next().ok_or_else(|| {
+                    "--console-outputs requires a count (2-4) or a list of heads".to_string()
+                })?;
+                if options.console_outputs == Some(console_outputs::Choice::Remove) {
+                    return Err(
+                        "--console-outputs and --no-console-outputs exclude each other".to_string(),
+                    );
+                }
+                options.console_outputs = Some(console_outputs::Choice::Heads(
+                    console_outputs::parse(&value)?,
+                ));
+            }
+            "--no-console-outputs" => {
+                if matches!(
+                    options.console_outputs,
+                    Some(console_outputs::Choice::Heads(_))
+                ) {
+                    return Err(
+                        "--console-outputs and --no-console-outputs exclude each other".to_string(),
+                    );
+                }
+                options.console_outputs = Some(console_outputs::Choice::Remove);
             }
             "--qualify-output" => {
                 let value = args
@@ -350,9 +391,11 @@ fn parse_args() -> Result<Options, String> {
                      \x20                        [--disable-gdm | --restore-gdm]\n\
                      \x20                        [--native-tablet | --no-native-tablet]\n\
                      \x20                        [--no-native-tablet-modules]\n\
+                     \x20                        [--console-outputs N|HEADS | --no-console-outputs]\n\
                      \n\
                      The installer chooses the desktop from what this host has: an\n\
-                     installed Xorg server keeps the dedicated X11 desktop; without one,\n\
+                     installed Xorg server serves X11 (joining the session a user holds\n\
+                     at the workstation, platform.session.mode); without one,\n\
                      a headless GNOME stack with a DRM render node is qualified for\n\
                      Wayland (`arcen-pier wayland qualify --write`) and the service\n\
                      starts only if that passes. It prints what it found and why.\n\
@@ -387,6 +430,16 @@ fn parse_args() -> Result<Options, String> {
                      \x20            Native tablet enabled (you provide vhci-hcd yourself).\n\
                      \x20            --uninstall removes the package only if the installer\n\
                      \x20            installed it.\n\
+                     \n\
+                     --console-outputs  Headless console (no monitors, or a virtual GPU):\n\
+                     \x20            make its X server see N (2-4) NVIDIA outputs as connected\n\
+                     \x20            monitors (DFP-0 ..., or a list such as DFP-0,DFP-1), the first\n\
+                     \x20            lit, so a Deck that matches its layout gets one output and one\n\
+                     \x20            stream per monitor; the console's own layout comes back when\n\
+                     \x20            the Deck leaves. Writes /etc/X11/xorg.conf.d/\n\
+                     \x20            10-arcen-console-outputs.conf; read at the next X server start\n\
+                     \x20            (reboot, or restart the display manager with nobody signed in).\n\
+                     --no-console-outputs  Remove that file (--uninstall does too).\n\
                      \n\
                      --extra-san  Add a DNS name or IP address to the generated TLS\n\
                      \x20            certificate. Repeatable, or comma-separated. Use this when\n\
@@ -604,9 +657,11 @@ fn check(options: &Options) -> Result<(), String> {
     println!();
     match plan {
         Some(InstallPlan::Xorg { .. }) => println!(
-            "The installer would install the Pier for the dedicated X11 desktop: write \
-             {XORG_CONFIG_PATH} if absent and name this machine's NVIDIA GPU in it, then enable \
-             and start arcen-pier.service."
+            "The installer would install the Pier for X11 (joining the session a user holds at \
+             the workstation; GDM's login screen completes a remote-first sign-in): write \
+             {XORG_CONFIG_PATH} if absent and name this machine's NVIDIA GPU in it, install the \
+             login screen's PAM module, stack and bus policy, then enable and start \
+             arcen-pier.service."
         ),
         Some(InstallPlan::Wayland { .. }) => println!(
             "The installer would install the Pier, run `{PIER_PATH} wayland qualify --write` (a \
@@ -1154,7 +1209,11 @@ fn install_logged(options: &Options, log: &mut desktop::InstallLog) -> Result<()
     ensure_cert(options)?;
     install_selinux_module(options)?;
     install_polkit_rule(options);
+    install_greeter_sign_in(options, log)?;
+    install_login_session(options, log)?;
+    install_domain_logon(options, log)?;
     install_xorg_bridge_ignore(options, log)?;
+    console_outputs::apply(options, options.console_outputs.as_ref(), log)?;
     if native_tablet::apply_choice(options, options.native_tablet, log)? {
         native_tablet::ensure(options, options.no_native_tablet_modules, log);
     }
@@ -1625,6 +1684,304 @@ fn install_polkit_rule(options: &Options) {
              the rule at start"
         ),
     }
+}
+
+/// The PAM module directory of this host.
+fn pam_module_dir(options: &Options) -> &'static str {
+    PAM_MODULE_DIRS
+        .iter()
+        .copied()
+        .find(|dir| map_path(&options.prefix, &format!("{dir}/pam_unix.so")).exists())
+        .unwrap_or(PAM_MODULE_DIRS[0])
+}
+
+/// Installs what lets GNOME's login screen complete a remote-first sign-in
+/// (ADR 0025): Arcen's PAM module, the `gdm-ovirtcred` stack built from the
+/// host's own `gdm-password` stack, and the system-bus policy that lets
+/// root own the login screen's credential name. Nothing of another
+/// product's is replaced: a stack or policy that is not Arcen's is kept and
+/// the remote-first sign-in stays unavailable (the Pier says so).
+fn install_greeter_sign_in(options: &Options, log: &mut desktop::InstallLog) -> Result<(), String> {
+    use arcen_session::console_session::greeter_token::{
+        BUS_POLICY_PATH, PAM_MODULE, PAM_SERVICE, bus_policy, bus_policy_is_arcen, pam_stack,
+        pam_stack_is_arcen,
+    };
+    let module = format!("{}/{PAM_MODULE}", pam_module_dir(options));
+    write_atomic(options, &module, PAM_GREETER, 0o644, true)?;
+    let stack_path = format!("/etc/pam.d/{PAM_SERVICE}");
+    let existing = fs::read_to_string(map_path(&options.prefix, &stack_path)).ok();
+    match existing.as_deref() {
+        Some(text) if !pam_stack_is_arcen(text) => log.note(format!(
+            "warning: {stack_path} exists and is not Arcen's; kept. A sign-in through Arcen while \
+             nobody is signed in at the console is refused (console_sign_in_unavailable)"
+        )),
+        _ => match fs::read_to_string(map_path(&options.prefix, "/etc/pam.d/gdm-password"))
+            .ok()
+            .as_deref()
+            .and_then(pam_stack)
+        {
+            Some(stack) => {
+                write_atomic(options, &stack_path, stack.as_bytes(), 0o644, true)?;
+            }
+            None => log.note(
+                "GDM's password stack (/etc/pam.d/gdm-password) is missing: a sign-in through \
+                 Arcen while nobody is signed in at the console is unavailable on this host",
+            ),
+        },
+    }
+    let existing = fs::read_to_string(map_path(&options.prefix, BUS_POLICY_PATH)).ok();
+    if existing
+        .as_deref()
+        .is_some_and(|text| !bus_policy_is_arcen(text))
+    {
+        log.note(format!(
+            "warning: {BUS_POLICY_PATH} exists and is not Arcen's; kept"
+        ));
+        return Ok(());
+    }
+    let changed = existing.as_deref() != Some(bus_policy().as_str());
+    write_atomic(
+        options,
+        BUS_POLICY_PATH,
+        bus_policy().as_bytes(),
+        0o644,
+        true,
+    )?;
+    if changed && is_root_prefix(&options.prefix) && !options.dry_run {
+        // The system bus reads policy at start and on reload.
+        let reloaded = ["dbus-broker.service", "dbus.service"]
+            .iter()
+            .any(|unit| run_systemctl(&["reload", unit]).is_ok());
+        if !reloaded {
+            log.note("warning: the system bus did not reload its policy; reboot before a remote-first sign-in");
+        }
+    }
+    Ok(())
+}
+
+/// Where SSSD's configuration snippets live.
+const SSSD_CONF_DIR: &str = "/etc/sssd/conf.d";
+
+/// The PAM services Arcen signs users in with that SSSD's Active Directory
+/// Group Policy access control must weigh as an interactive logon.
+fn domain_logon_services() -> [&'static str; 2] {
+    [
+        arcen_session::console_session::greeter_token::PAM_SERVICE,
+        arcen_session::console_session::login_session::PAM_SERVICE,
+    ]
+}
+
+/// SSSD's configuration in this prefix, without Arcen's own snippet.
+fn sssd_files(options: &Options) -> Vec<arcen_session::console_session::domain_logon::SssdFile> {
+    use arcen_session::console_session::domain_logon::{DROP_IN_NAME, SssdFile};
+    let mut files = Vec::new();
+    if let Ok(text) = fs::read_to_string(map_path(&options.prefix, "/etc/sssd/sssd.conf")) {
+        files.push(SssdFile {
+            name: "sssd.conf".to_owned(),
+            text,
+        });
+    }
+    if let Ok(entries) = fs::read_dir(map_path(&options.prefix, SSSD_CONF_DIR)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == DROP_IN_NAME || name.starts_with('.') || !name.ends_with(".conf") {
+                continue;
+            }
+            // SSSD reads only snippets owned and protected like
+            // sssd.conf (root, 0600); so does Arcen.
+            let protected = fs::symlink_metadata(entry.path()).is_ok_and(|metadata| {
+                use std::os::unix::fs::MetadataExt as _;
+                arcen_session::console_session::domain_logon::sssd_reads_snippet(
+                    metadata.file_type().is_file(),
+                    metadata.uid(),
+                    metadata.mode(),
+                )
+            });
+            if !protected && is_root_prefix(&options.prefix) {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                files.push(SssdFile { name, text });
+            }
+        }
+    }
+    files
+}
+
+/// Restarts SSSD (when it runs) after its configuration changed, after
+/// checking the configuration when `sssctl` is there; a configuration SSSD
+/// refuses is taken back.
+fn reload_sssd(options: &Options, written: Option<&str>, log: &mut desktop::InstallLog) {
+    if !is_root_prefix(&options.prefix) || options.dry_run {
+        return;
+    }
+    if let Some(path) = written {
+        let _ = Command::new("restorecon").arg(path).status();
+        if Path::new("/usr/sbin/sssctl").exists() {
+            let checked = Command::new("/usr/sbin/sssctl")
+                .arg("config-check")
+                .output()
+                .is_ok_and(|output| output.status.success());
+            if !checked {
+                let _ = fs::remove_file(path);
+                log.note(format!(
+                    "warning: SSSD refused {path} (sssctl config-check); it was removed. A domain \
+                     account's sign-in while nobody is signed in at the console is refused until \
+                     an administrator maps gdm-ovirtcred to ad_gpo_map_interactive"
+                ));
+                return;
+            }
+        }
+    }
+    if run_systemctl(&["try-restart", "sssd.service"]).is_err() {
+        log.note("warning: SSSD did not restart; restart it before a domain account's remote-first sign-in");
+    }
+}
+
+/// Makes Active Directory Group Policy weigh Arcen's remote-first sign-in
+/// as the interactive logon it is ("Allow log on locally", the same right
+/// a sign-in at the desk needs) on a host whose SSSD enforces GPO access
+/// control and would otherwise deny an unknown PAM service (ADR 0025).
+/// Nothing broader, each domain keeps its own list, an administrator's
+/// explicit removal is kept, and a snippet that is not Arcen's is never
+/// touched.
+fn install_domain_logon(options: &Options, log: &mut desktop::InstallLog) -> Result<(), String> {
+    use arcen_session::console_session::domain_logon::{
+        DROP_IN_NAME, DomainLogon, domain_logons, drop_in, is_arcen_drop_in,
+    };
+    let path = format!("{SSSD_CONF_DIR}/{DROP_IN_NAME}");
+    let existing = fs::read_to_string(map_path(&options.prefix, &path)).ok();
+    if existing
+        .as_deref()
+        .is_some_and(|text| !is_arcen_drop_in(text))
+    {
+        log.note(format!("warning: {path} exists and is not Arcen's; kept"));
+        return Ok(());
+    }
+    let files = sssd_files(options);
+    for service in domain_logon_services() {
+        for (domain, logon) in domain_logons(&files, service) {
+            match logon {
+                DomainLogon::RemovedByAdministrator => log.note(format!(
+                    "SSSD domain {domain}: ad_gpo_map_interactive removes {service}; kept. Its \
+                     accounts' remote-first sign-in is refused (console_account_denied)"
+                )),
+                DomainLogon::MappedByAdministrator { map } => log.note(format!(
+                    "SSSD domain {domain}: {service} is mapped by {map}; kept (Arcen adds nothing)"
+                )),
+                _ => {}
+            }
+        }
+    }
+    match drop_in(&files, &domain_logon_services()) {
+        Some(text) if existing.as_deref() != Some(text.as_str()) => {
+            write_atomic(options, &path, text.as_bytes(), 0o600, true)?;
+            log.note(format!(
+                "SSSD: Active Directory Group Policy weighs Arcen's remote-first sign-in \
+                 ({}) as an interactive logon (\"Allow log on locally\") ({path})",
+                domain_logon_services().join(", ")
+            ));
+            reload_sssd(
+                options,
+                Some(&map_path(&options.prefix, &path).to_string_lossy()),
+                log,
+            );
+        }
+        Some(_) => {}
+        None if existing.is_some() => {
+            remove_file(options, &path)?;
+            reload_sssd(options, None, log);
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// Removes Arcen's SSSD snippet (only Arcen's) and restarts SSSD.
+fn remove_domain_logon(options: &Options) -> Result<(), String> {
+    use arcen_session::console_session::domain_logon::{DROP_IN_NAME, is_arcen_drop_in};
+    let path = format!("{SSSD_CONF_DIR}/{DROP_IN_NAME}");
+    if fs::read_to_string(map_path(&options.prefix, &path))
+        .is_ok_and(|text| is_arcen_drop_in(&text))
+    {
+        remove_file(options, &path)?;
+        reload_sssd(options, None, &mut desktop::InstallLog::default());
+    }
+    Ok(())
+}
+
+/// Installs Arcen's login service for a host without a display manager
+/// (ADR 0025 §10): `/etc/pam.d/arcen-login`, built from the host's own
+/// `login` stack (its account and session lines), authenticating nobody.
+/// Another product's file at that path is kept; the sign-in is then refused
+/// `console_sign_in_unavailable` on such a host.
+fn install_login_session(options: &Options, log: &mut desktop::InstallLog) -> Result<(), String> {
+    use arcen_session::console_session::login_session::{
+        PAM_SERVICE, pam_stack, pam_stack_is_arcen,
+    };
+    let stack_path = format!("/etc/pam.d/{PAM_SERVICE}");
+    let existing = fs::read_to_string(map_path(&options.prefix, &stack_path)).ok();
+    if existing
+        .as_deref()
+        .is_some_and(|text| !pam_stack_is_arcen(text))
+    {
+        log.note(format!(
+            "warning: {stack_path} exists and is not Arcen's; kept"
+        ));
+        return Ok(());
+    }
+    match fs::read_to_string(map_path(&options.prefix, "/etc/pam.d/login"))
+        .ok()
+        .as_deref()
+        .and_then(pam_stack)
+    {
+        Some(stack) => write_atomic(options, &stack_path, stack.as_bytes(), 0o644, true),
+        None => {
+            log.note(
+                "The host's login stack (/etc/pam.d/login) is missing: on a host without a \
+                 display manager a sign-in through Arcen is unavailable",
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Removes Arcen's login service (only Arcen's). Sessions it opened keep
+/// running until their users log out.
+fn remove_login_session(options: &Options) -> Result<(), String> {
+    use arcen_session::console_session::login_session::{PAM_SERVICE, pam_stack_is_arcen};
+    let stack_path = format!("/etc/pam.d/{PAM_SERVICE}");
+    if fs::read_to_string(map_path(&options.prefix, &stack_path))
+        .is_ok_and(|text| pam_stack_is_arcen(&text))
+    {
+        remove_file(options, &stack_path)?;
+    }
+    Ok(())
+}
+
+/// Removes the remote-first sign-in pieces, only those that are Arcen's.
+fn remove_greeter_sign_in(options: &Options) -> Result<(), String> {
+    use arcen_session::console_session::greeter_token::{
+        BUS_POLICY_PATH, PAM_MODULE, PAM_SERVICE, bus_policy_is_arcen, pam_stack_is_arcen,
+    };
+    let stack_path = format!("/etc/pam.d/{PAM_SERVICE}");
+    if fs::read_to_string(map_path(&options.prefix, &stack_path))
+        .is_ok_and(|text| pam_stack_is_arcen(&text))
+    {
+        remove_file(options, &stack_path)?;
+    }
+    if fs::read_to_string(map_path(&options.prefix, BUS_POLICY_PATH))
+        .is_ok_and(|text| bus_policy_is_arcen(&text))
+    {
+        remove_file(options, BUS_POLICY_PATH)?;
+    }
+    for dir in PAM_MODULE_DIRS {
+        let module = format!("{dir}/{PAM_MODULE}");
+        if map_path(&options.prefix, &module).exists() {
+            remove_file(options, &module)?;
+        }
+    }
+    Ok(())
 }
 
 /// Removes Arcen's polkit rules (this build's and earlier builds'), never a
@@ -2248,8 +2605,12 @@ fn uninstall(options: &Options) -> Result<(), String> {
     }
     remove_selinux_module(options)?;
     remove_polkit_rules(options)?;
+    remove_greeter_sign_in(options)?;
+    remove_login_session(options)?;
+    remove_domain_logon(options)?;
     remove_bridge_seat_rules(options)?;
     remove_xorg_bridge_ignore(options)?;
+    console_outputs::remove(options)?;
     // Before --purge removes /var/lib/arcen, which holds the record.
     native_tablet::remove(options);
     remove_file(options, PIER_PATH)?;
@@ -3643,6 +4004,64 @@ mod tests {
     }
 
     #[test]
+    fn an_ad_gpo_host_gets_the_interactive_logon_snippet_and_loses_it_on_uninstall() {
+        use arcen_session::console_session::domain_logon::DROP_IN_NAME;
+        let prefix = test_prefix("sssd");
+        let options = Options {
+            prefix: prefix.clone(),
+            dry_run: false,
+            uninstall: false,
+            purge: false,
+            force: false,
+            no_service: true,
+            restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
+            console_outputs: None,
+            extra_sans: Vec::new(),
+        };
+        let dir = prefix.join("etc/sssd/conf.d");
+        fs::create_dir_all(&dir).expect("conf.d");
+        fs::write(
+            prefix.join("etc/sssd/sssd.conf"),
+            "[sssd]\ndomains = corp.example.internal\n[domain/corp.example.internal]\n\
+             id_provider = ad\naccess_provider = ad\nad_gpo_map_interactive = +site-login\n",
+        )
+        .expect("sssd.conf");
+        let mut log = desktop::InstallLog::default();
+        install_domain_logon(&options, &mut log).expect("install");
+        let snippet = dir.join(DROP_IN_NAME);
+        let text = fs::read_to_string(&snippet).expect("snippet");
+        assert!(
+            text.contains("ad_gpo_map_interactive = +site-login, +gdm-ovirtcred, +arcen-login\n"),
+            "{text}"
+        );
+        assert_eq!(
+            fs::metadata(&snippet).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
+        // Idempotent, and nothing to do once SSSD no longer needs it.
+        install_domain_logon(&options, &mut log).expect("again");
+        assert_eq!(fs::read_to_string(&snippet).expect("snippet"), text);
+        // Another's file at that path is never changed or removed.
+        fs::write(&snippet, "[domain/x]\n").expect("foreign");
+        install_domain_logon(&options, &mut log).expect("kept");
+        remove_domain_logon(&options).expect("kept");
+        assert_eq!(
+            fs::read_to_string(&snippet).expect("foreign"),
+            "[domain/x]\n"
+        );
+        fs::write(&snippet, &text).expect("ours again");
+        remove_domain_logon(&options).expect("remove");
+        assert!(!snippet.exists());
+        let _ = fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
     fn staging_install_and_uninstall_of_the_selinux_module_are_symmetric() {
         let prefix = test_prefix("selinux");
         let options = Options {
@@ -3659,6 +4078,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
         install_selinux_module(&options).expect("stage the module");
@@ -3691,6 +4111,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
         };
         let production = QualificationTarget::production();
         let state = [
@@ -3732,6 +4153,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
         };
         let ours = map_path(&prefix, RULE_PATH);
         let legacy = map_path(&prefix, LEGACY_RULE_PATHS[0]);
@@ -3777,6 +4199,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
         };
         let dir = map_path(&prefix, RULE_DIRECTORY);
         fs::create_dir_all(&dir).expect("rules dir");
@@ -3824,6 +4247,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
         };
         let path = map_path(&prefix, XORG_BRIDGE_IGNORE_PATH);
         let mut log = desktop::InstallLog::default();
@@ -3931,6 +4355,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
 
@@ -3974,6 +4399,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
 
@@ -4010,6 +4436,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
 
@@ -4050,6 +4477,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
         let state = inspect_tls(&TlsPaths::from_options(&options)).expect("inspect");
@@ -4088,6 +4516,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
         let state = inspect_tls(&TlsPaths::from_options(&options)).expect("inspect");
@@ -4126,6 +4555,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: vec!["alias.example.internal".to_string()],
         };
 
@@ -4178,6 +4608,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
 
@@ -4216,6 +4647,7 @@ mod tests {
                     restore_gdm: false,
                     no_native_tablet_modules: false,
                     native_tablet: None,
+                    console_outputs: None,
                     extra_sans: Vec::new(),
                 };
                 let paths = TlsPaths::from_options(&options);
@@ -4276,6 +4708,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
 
@@ -4308,6 +4741,7 @@ mod tests {
             restore_gdm: false,
             no_native_tablet_modules: false,
             native_tablet: None,
+            console_outputs: None,
             extra_sans: Vec::new(),
         };
         let paths = TlsPaths::from_options(&options);

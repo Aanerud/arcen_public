@@ -21,7 +21,18 @@ use crate::displays::DisplaySnapshot;
 use crate::{CAN_CAPTURE_MULTIPLE_DISPLAYS, MacOsMultiMonitorConfig, may_advertise_multi_monitor};
 
 const OFFERED_CARRIERS: [MultiMonitorCarrierMsg; 1] = [MultiMonitorCarrierMsg::MuxedReliableStream];
-const SUPPORTED_ROTATIONS: [RotationMsg; 1] = [RotationMsg::Degrees0];
+/// A Deck states each monitor as seen on its desk
+/// (`AlreadyCompositorOriented`), so a quarter-turned Deck monitor asks for a
+/// portrait size and the virtual display is created at exactly that size:
+/// the picture is upright as seen, and the Deck's own compositor turns it onto
+/// the physical panel. `CGVirtualDisplay` has no rotation of its own; it does
+/// not need one.
+const SUPPORTED_ROTATIONS: [RotationMsg; 4] = [
+    RotationMsg::Degrees0,
+    RotationMsg::Degrees90,
+    RotationMsg::Degrees180,
+    RotationMsg::Degrees270,
+];
 const REGION_INPUT_ROUTING_AVAILABLE: bool = true;
 static NEXT_VIRTUAL_DISPLAY_SET: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(1);
@@ -780,7 +791,7 @@ fn applied_descriptor(
         width_px: monitor.width_px,
         height_px: monitor.height_px,
         refresh_hz: monitor.refresh_hz,
-        rotation: RotationMsg::Degrees0,
+        rotation: monitor.requested_monitor.monitor().rotation.into(),
         is_primary: monitor.is_primary,
         media_plan: AppliedMonitorMediaPlanMsg {
             stream_epoch: media.stream_epoch.get(),
@@ -987,6 +998,64 @@ mod tests {
         assert_eq!(plan.desktop_height_px, 1962);
         assert_eq!((plan.monitors[0].x, plan.monitors[0].y), (1800, 0));
         assert_eq!((plan.monitors[1].x, plan.monitors[1].y), (0, 832));
+    }
+
+    #[test]
+    fn a_quarter_turned_deck_monitor_gets_an_upright_portrait_display() {
+        let mut portrait = requested_at("portrait", 2, false, -1200, 0, 1200, 1920);
+        portrait.logical_width = 1200;
+        portrait.logical_height = 1920;
+        portrait.rotation = RotationMsg::Degrees90;
+        let specs = planned_virtual_specs(
+            &request(vec![
+                requested_at("primary", 1, true, 0, 0, 2560, 1600),
+                portrait,
+            ]),
+            60,
+            false,
+            false,
+        )
+        .expect("a rotated Deck monitor is admitted");
+        assert_eq!(
+            (
+                specs[1].requested_wire.width_px,
+                specs[1].requested_wire.height_px
+            ),
+            (1200, 1920),
+            "the virtual display is created at the size seen on the desk"
+        );
+        assert_eq!(
+            (specs[1].layout_rect.x, specs[1].layout_rect.width),
+            (-1200, 1200)
+        );
+        let displays = specs
+            .iter()
+            .map(|spec| DisplaySnapshot {
+                display_id: u32::from(spec.session_monitor_id.get()),
+                pixel_width: spec.requested_wire.width_px as usize,
+                pixel_height: spec.requested_wire.height_px as usize,
+                origin_x: f64::from(spec.raw_x()),
+                origin_y: f64::from(spec.raw_y()),
+            })
+            .collect::<Vec<_>>();
+        let plan = plan_from_virtual_displays(
+            &specs,
+            &displays,
+            &offer(2),
+            MultiMonitorCarrierMsg::MuxedReliableStream,
+            arcen_media::session_plan::ResolvedVideoPlan::standard(None),
+            crate::encode::EncoderCodec::Hevc,
+            60,
+        )
+        .expect("plan");
+        let applied = plan.server_capability.applied_topology().expect("applied");
+        let turned = applied
+            .monitors()
+            .iter()
+            .find(|monitor| monitor.client_display_id.as_str() == "portrait")
+            .expect("portrait applied");
+        assert_eq!((turned.width_px, turned.height_px), (1200, 1920));
+        assert_eq!(turned.rotation, RotationMsg::Degrees90);
     }
 
     #[test]

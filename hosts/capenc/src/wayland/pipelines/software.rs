@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn auto_is_served_as_software_with_the_compositors_cursor() {
-        let software = SoftwarePipeline::new(WaylandPipeline::Auto(AutoPipeline));
+        let software = SoftwarePipeline::new(WaylandPipeline::Auto(AutoPipeline::default()));
         let admission = software.admit(
             request(StreamingPreset::Auto, 1920, 1080, 30),
             &gnome40_host_copy(),
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(served.pipeline, PipelineId::Software);
         assert_eq!(served.fps_ceiling, 30);
         assert!(matches!(reason, AdmissionReason::SoftwareFallback(_)));
-        let auto = SoftwarePipeline::new(WaylandPipeline::Auto(AutoPipeline));
+        let auto = SoftwarePipeline::new(WaylandPipeline::Auto(AutoPipeline::default()));
         assert!(matches!(
             auto.admit(
                 request(StreamingPreset::Auto, 2560, 1600, 30),

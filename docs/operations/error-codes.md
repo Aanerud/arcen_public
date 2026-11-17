@@ -176,9 +176,12 @@ Deck asks for the password again; nothing is lost but the shortcut.
 
 ## Linux sign-in refusals
 
-The Linux Pier's privileged launcher opens the PAM session and starts the
-desktop. When it cannot, the Deck shows the message and the Pier logs the
-reason class below (`SESSION_AUTH_FAIL`, 1101, and the launcher's own lines in
+The Linux Pier's privileged launcher either joins the session the account
+already holds at the workstation (`platform.session.mode` `console`, the
+default; [ADR 0025](../adr/0025-arcen-joins-the-users-session.md)) or, on a
+host set to `dedicated`, opens the PAM session and starts the desktop. When
+it cannot, the Deck shows the message (a `console_*` refusal leads with its
+code) and the Pier logs the reason class below (`SESSION_AUTH_FAIL`, 1101, and the launcher's own lines in
 `/var/log/arcen/arcen-pier.log`). The polkit codes are the launcher refusing a
 desktop it could not keep away from the console's administrator rights.
 
@@ -200,7 +203,8 @@ desktop it could not keep away from the console's administrator rights.
 | `xorg_verify_failed` | The X server started but its outputs were not the ones asked for. | Read the Xorg log and the head-probe log in `/run/arcen/sessions/discovery/`. |
 | `xorg_release_failed` | A previous X server could not be proved gone. | Wait a few seconds and sign in again; if it persists, restart the Pier. |
 | `logind_activation_failed` | logind would not make the session active on its seat. | Check `loginctl list-sessions`; another active session on `seat0` blocks it. |
-| `seat_occupied` | Another X11 desktop holds `seat0` (one X11 desktop per host). | Sign out of the other desktop, or let it reach its idle timeout. |
+| `seat_occupied` | Another X11 desktop holds `seat0` (one X11 desktop per host); on a `dedicated` host, any user's console session on any virtual terminal. | Sign out of the other desktop, or let it reach its idle timeout. A host with a display manager should run `platform.session.mode` `console` (the default), which joins the user's own session instead. |
+| `seat_occupied_other_product` | `dedicated` mode only: another remote-desktop product's desktop (a `seat0` session the display manager did not start) holds the host's display, and a second X server is never started beside it on the same GPU. The Deck names that service as the host reports it (PAM service, and the system service or process that started it). | Sign out of that product's session, or use `platform.session.mode` `console`, which joins your own session in it. |
 | `logind_unlock_failed` | The session could not be unlocked after sign-in. | Read the journal for logind errors; sign in again. |
 | `deskside_refused` | Physical-console privacy (`platform.deskside`) refused this desktop. | See [Deskside privacy refusals](#deskside-privacy-refusals). |
 | `wayland_unavailable` | This Pier was built without the headless Wayland provider. | Install the Wayland-enabled Pier build, or install Xorg. |
@@ -213,6 +217,24 @@ desktop it could not keep away from the console's administrator rights.
 | `polkit_rule_missing` | Arcen's polkit rule is not installed. | `arcen-pier polkit-rule install` (or rerun the installer) and restart the Pier. |
 | `polkit_grants_remote_session` | A rule numbered below `05-` grants an administrator action to the remote session. | Narrow that rule; check with `arcen-pier polkit-rule status`. |
 | `polkit_unverified` | polkit did not answer (`pkaction`/`pkcheck` failed). | Start polkit (`systemctl status polkit`) and sign in again. |
+| `console_other_user` | Another account is signed in at the workstation (active, or waiting for its Deck to resume). Arcen never takes another account's session over. | Ask that person to sign out (or to lock and switch user), or sign in as the account that holds the workstation. |
+| `console_other_user_other_product` | Another account holds the workstation through another remote-desktop product (a `seat0` session the display manager did not start, with its own X server), even while it is not in the foreground. Arcen never stops or reconfigures the other product. The Deck shows the service as the host reports it, for example `another remote-desktop service (<pam service>, <unit>.service) uses this workstation.`; the Pier log carries the session, its PAM service, the system service (`unit`) and process that started it. Names come from the host at run time and only short identifiers are shown. | Ask that person to sign out of the other product. Your own session in it is joined, not refused. |
+| `console_wayland_session` | The session, or the session the login screen would start, is GNOME on Wayland; Arcen joins X11 console sessions. | Set `WaylandEnable=false` in `/etc/gdm/custom.conf` and restart GDM while nobody is signed in, as for other console remote-desktop products. |
+| `console_no_session` | Nobody is signed in, a display manager is configured, and its login screen is not running on the console (it failed), or no virtual terminal 2–12 is free for a session of Arcen's own. A host without any display manager is not refused: Arcen starts the account's login session there. | Start the display manager (`systemctl status gdm`), or disable it (`systemctl disable --now gdm`) if the host should have none. |
+| `console_sign_in_unavailable` | The login screen cannot take a remote sign-in: Arcen's `gdm-ovirtcred` stack or `pam_arcen_greeter.so` is missing, another product owns that stack or the login screen's credential name, or the login screen's shell is not running. | Rerun the installer; read the warning it prints about `/etc/pam.d/gdm-ovirtcred`. Sign in at the workstation once, then connect again. |
+| `console_sign_in_failed` | The login screen did not start the session within 30 seconds, or refused it (account policy, expired password, home directory, a display-manager error). | Read the journal for `gdm-ovirtcred` and `pam_arcen_greeter` at that time; sign in at the workstation to see the display manager's own message. |
+| `console_session_unreachable` | The session's X display could not be found or opened, or logind would not bring the session forward. | Check that the session still runs (`loginctl list-sessions`); sign out and in again at the workstation if its X server is gone. |
+| `console_privacy_unavailable` | The workstation's monitors could not be blanked or its keyboard and mouse could not be disabled, so the session is not shown remotely while the desk could watch it. | Read the Pier log for the device or display that refused; another program holding an exclusive grab on an input device causes this. |
+| `console_account_denied` | The account check refused the sign-in with "permission denied": an access policy does not let this account sign in at this workstation (for a domain account through SSSD, Group Policy's "Allow log on locally"/"Deny log on locally"; also `pam_access`, IdM HBAC). At authentication the Deck is shown only the generic "wrong user name or password, or this account may not sign in at this workstation" (a refusal never confirms a password) and the code is in the Pier log; the Deck shows the code itself when the Pier's own check passed and the domain's map refuses only the remote-first sign-in. Counted like a failed sign-in. | Ask the domain administrator to allow the account to log on locally to this host; the Pier log names the PAM error and the module's message. If only the remote-first sign-in is refused, rerun the installer (it maps `gdm-ovirtcred` in SSSD) and read [Domain accounts](pier-administration.md#joining-the-users-session-console-mode). |
+| `console_session_changed` | A returning Deck (a resume, or a new sign-in while its session was held) found that the account's session at the workstation is no longer the one it had joined: the user signed out, or signed in afresh at the desk. | Sign in again: the new sign-in joins the session the workstation has now. |
+
+A returning Deck is told the same codes as a first sign-in: the Pier waits
+for the console to be made private again before it streams, and when it
+cannot be (another account took the workstation, the session changed, the
+desk could not be made private) the Deck is shown the code and reason
+instead of a capture error or a timeout.
+
+**The Deck's layout on a console.** When a console cannot take a matched layout, the sign-in ends with "Match My Layout could not be negotiated with this host: its console cannot take this layout." The Deck then offers Primary Display Only, which serves one picture. The Pier log (`the console cannot take the Deck's layout; it is left as it is`) names why: `console_outputs_insufficient` (fewer connected outputs than the Deck has monitors: connect monitors, or on a headless host install with `--console-outputs 4` and restart the display manager while nobody is signed in), `console_layout_refused` (the NVIDIA driver refused the MetaMode), `console_layout_unproven` (RandR did not show it afterwards) or `console_layout_unavailable` (the console's own layout could not be read or journalled). The console's own layout is put back in every case; `nvidia-settings -q CurrentMetaMode` on the console display shows the current one.
 
 ## Taking over a disconnected desktop
 

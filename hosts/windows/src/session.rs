@@ -2,7 +2,7 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
@@ -930,6 +930,7 @@ async fn run_correlated_broker(
     // Deck is answered or a session is touched (`arcen_session::session_setup`):
     // a request this host cannot serve is refused with its reason and is not a
     // failed sign-in.
+    cfg.deck_display_refresh_hz = response.display_refresh_hz();
     if let Some(request) = response.initial_video.as_ref() {
         tracing::debug!(
             target: SESSION,
@@ -2233,6 +2234,7 @@ where
     // Resolving here rather than plumbing the broker's copy across keeps one
     // function answering "what did this client ask for", on both sides of the
     // process boundary.
+    cfg.deck_display_refresh_hz = response.display_refresh_hz();
     if let Some(request) = response.initial_video.as_ref() {
         // An Auto host that resolved to OpenH264 before any NVENC child ran
         // did so for a hardware reason a fidelity refusal names.
@@ -4869,6 +4871,30 @@ fn qp_map_policy_for_capenc(
     cfg.qp_map_policy_for_served(&served).unwrap_or(cfg.qp_map)
 }
 
+/// The session's frame rate as served: the resolved rate, lowered to what
+/// the encoder admitted (`media_plan.fps`) and to the refresh the desktop
+/// was applied at (Desktop Duplication and WGC deliver at most one frame per
+/// composition), each with its reason.
+fn served_frame_rate(
+    cfg: &HostConfig,
+    media_plan: &ResolvedMediaPlan,
+    display: &DisplayReport,
+) -> arcen_media::video::SessionFrameRate {
+    let rate = arcen_media::video::served_stream_rate(
+        cfg.frame_rate,
+        media_plan.fps,
+        arcen_media::video::FrameRateBasis::Encoder,
+    );
+    if display.applied_refresh_hz > 0 {
+        rate.narrow(
+            display.applied_refresh_hz,
+            arcen_media::video::FrameRateBasis::CaptureSource,
+        )
+    } else {
+        rate
+    }
+}
+
 fn build_server_hello_with_aggregate(
     cfg: &HostConfig,
     display: &DisplayReport,
@@ -4998,6 +5024,7 @@ fn build_server_hello_with_aggregate(
         available_encoders: BTreeMap::new(),
         codec: media_plan.codec_token().to_string(),
         active_pipeline: Some(served_stream_pipeline(cfg, media_plan, aggregate_backend)),
+        stream_rate: Some(served_frame_rate(cfg, media_plan, display).wire()),
         color_caps: ServerColorCaps {
             // Backend capability -- what this resolved backend *could*
             // serve -- not what is currently active; `active_*` below
@@ -6747,6 +6774,21 @@ where
     ));
     let rate_control_enabled = std::env::var("ARCEN_RATE_CONTROL").as_deref() != Ok("0");
     let latest_path_signal = Arc::new(std::sync::Mutex::new(None));
+    // The rate the frame-rate governor holds a follow-display session at
+    // (Auto, Speed): the health tick judges capenc's counts, the rate task
+    // applies it.
+    let governed_fps = Arc::new(AtomicU32::new(media_plan.fps));
+    // The rate the rate task last asked the encoder for (Detail shedding or
+    // the governor's), which the governor judges against.
+    let asked_fps = Arc::new(AtomicU32::new(media_plan.fps));
+    let mut governor = arcen_media::video::PipelineId::from_served_wire(&served_stream_pipeline(
+        cfg,
+        &media_plan,
+        video_pipelines.aggregate_accelerator_class(),
+    ))
+    .and_then(|pipeline| {
+        arcen_media::video::HostRateGovernor::for_pipeline(pipeline, media_plan.fps)
+    });
     // One controller per set of encoder pipelines: a resize that replaces
     // the pipelines replaces the controller with them, and the guard stops it
     // on every way out of this attachment.
@@ -6769,6 +6811,8 @@ where
             .map(|pipeline| pipeline.capenc.bitrate())
             .collect::<Vec<_>>();
         let latest_path_signal = Arc::clone(&latest_path_signal);
+        let governed_fps = Arc::clone(&governed_fps);
+        let asked_fps = Arc::clone(&asked_fps);
         // The refinement budget from the link (ADR 0016 R6), only for a
         // capture that refines.
         let refine_meter = video.refine_meter();
@@ -6890,14 +6934,21 @@ where
                         }
                     }
                     let want_bps = controller.target_bps();
+                    let host_fps = governed_fps
+                        .load(Ordering::Relaxed)
+                        .clamp(1, plan.fps.max(1));
                     let detail = (motion_priority == arcen_media::video::MotionPriority::Detail)
-                        .then(|| controller.detail_framerate(plan.fps));
-                    let want_fps = detail.map(|detail| detail.fps);
+                        .then(|| controller.detail_framerate(host_fps));
+                    // A Motion stream keeps its rate unless the host cannot.
+                    // A Motion stream keeps the governor's rate, sent every
+                    // tick so a probe back to the session's rate reaches it.
+                    let want_fps = detail.map_or(host_fps, |detail| detail.fps);
+                    asked_fps.store(want_fps, Ordering::Relaxed);
                     // Every tick, not only on a change: a pipeline whose
                     // mailbox was full catches up with the latest target.
                     let outcome = pipeline_sync.sync(
                         want_bps,
-                        want_fps,
+                        Some(want_fps),
                         |index, bps| bitrate_sender[index].request(bps),
                         |index, fps| bitrate_sender[index].request_framerate(fps),
                     );
@@ -6932,7 +6983,8 @@ where
                             tracing::info!(
                                 target: CAPENC,
                                 fps = detail.fps,
-                                contract_fps = plan.fps,
+                                contract_fps = host_fps,
+                                session_fps = plan.fps,
                                 fps_reason = detail.reason.token(),
                                 target_bps = want_bps,
                                 start_bps,
@@ -7042,6 +7094,7 @@ where
         &media_plan,
         Some(served_stream_pipeline(cfg, &media_plan, aggregate_backend)),
         &display_report,
+        Some(served_frame_rate(cfg, &media_plan, &display_report)),
     );
     log_lifecycle(
         lifecycle_key,
@@ -8011,6 +8064,22 @@ where
                 let timestamp_ms = monotonic_ms_since(health_started_at);
                 let (sent_frames, bytes_sent) = video_stats.snapshot();
                 let pipeline = video_pipelines.primary_pipeline_telemetry();
+                // capenc's latest second: what it encoded against what the
+                // capture delivered. A multi-monitor session is not governed.
+                if video_pipelines.pipelines().len() == 1 {
+                    if let Some(step) = governor.as_mut().and_then(|governor| {
+                        governor.observe(
+                            pipeline.encoder_fps.round() as u32,
+                            (pipeline.capture_fps > 0.0)
+                                .then(|| pipeline.capture_fps.round() as u32),
+                            asked_fps.load(Ordering::Relaxed),
+                        )
+                    }) {
+                        log_governor_step(step, media_plan.fps);
+                        governed_fps.store(step.fps, Ordering::Relaxed);
+                    }
+                }
+                let target_fps = governed_fps.load(Ordering::Relaxed).max(1);
                 let counters = arcen_observability::HostCounters {
                     frames_sent: sent_frames,
                     frames_dropped: dropped_frames,
@@ -8022,7 +8091,7 @@ where
                         video_pipelines.take_content_fps(),
                     ),
                 };
-                let observation = session_health.observe(timestamp_ms, cfg.fps, counters);
+                let observation = session_health.observe(timestamp_ms, target_fps, counters);
                 if let Some(error) = &observation.clock_error {
                     tracing::warn!(
                         target: crate::logging::HEALTH,
@@ -8034,7 +8103,7 @@ where
                 let mut stats = arcen_observability::SessionHealth::health_stats(
                     &observation,
                     counters,
-                    cfg.fps,
+                    target_fps,
                     media_plan.codec_token(),
                     media_plan.chroma_token(),
                     display_report.applied.to_string(),
@@ -8513,6 +8582,18 @@ fn clipboard_kind(
     }
 }
 
+/// Logs a frame-rate governor step: a rate below the session's is never
+/// silent.
+fn log_governor_step(step: arcen_media::video::GovernorStep, session_fps: u32) {
+    arcen_observability::log_governed_frame_rate(
+        step.fps,
+        step.previous_fps,
+        session_fps,
+        step.reason.token(),
+        step.reason.counts(),
+    );
+}
+
 /// Emits `SESSION_STREAM_START` (1102) once media/input streaming becomes
 /// active, after display settle and capenc readiness.
 fn emit_session_stream_start(
@@ -8523,31 +8604,16 @@ fn emit_session_stream_start(
     media_plan: &ResolvedMediaPlan,
     pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     display_report: &DisplayReport,
+    frame_rate: Option<arcen_media::video::SessionFrameRate>,
 ) {
-    let mut fields = StructuredFields::default();
-    let _ = fields.insert(
-        "encoder",
-        FieldValue::String(media_plan.backend.ready_token().to_string()),
-    );
-    let _ = fields.insert(
-        "codec",
-        FieldValue::String(media_plan.codec_token().to_string()),
-    );
-    let _ = fields.insert(
-        "chroma",
-        FieldValue::String(media_plan.chroma_token().to_string()),
-    );
-    let _ = fields.insert("width", FieldValue::Integer(i64::from(media_plan.width)));
-    let _ = fields.insert("height", FieldValue::Integer(i64::from(media_plan.height)));
-    let _ = fields.insert("fps", FieldValue::Integer(i64::from(media_plan.fps)));
-    if let Some(pipeline) = pipeline {
-        let _ = fields.insert("pipeline", FieldValue::String(pipeline.token().to_string()));
-    }
-    let _ = fields.insert(
-        "display_backend",
-        FieldValue::String(display_report.backend.to_string()),
-    );
-    insert_color_identity(&mut fields, media_plan);
+    let Some(fields) = media_plan.stream_start_fields(
+        media_plan.backend.ready_token(),
+        pipeline.as_ref().map(|pipeline| pipeline.token()),
+        display_report.backend,
+        frame_rate,
+    ) else {
+        return;
+    };
     crate::emit_lifecycle_event_with_context(
         emitter,
         LifecycleEventKind::SessionStreamStart,
@@ -8557,39 +8623,6 @@ fn emit_session_stream_start(
         local_hostname(),
         Some(peer.to_owned()),
         None,
-    );
-}
-
-/// Records the colour identity of the stream the host actually configured.
-///
-/// `codec` and `chroma` alone describe a stream that could be 8- or 10-bit,
-/// full or limited range, BT.709 or PQ. Without these, a host log cannot be
-/// used to check any claim about what depth or colour a session ran at — the
-/// answer lived only in the client's log, which is how an 8-bit session went
-/// unnoticed while both ends believed the pipeline was 10-bit capable.
-///
-/// Every value is read from the resolved plan, so this records what was
-/// configured rather than what was requested.
-fn insert_color_identity(fields: &mut StructuredFields, media_plan: &ResolvedMediaPlan) {
-    let _ = fields.insert(
-        "bit_depth",
-        FieldValue::String(media_plan.bit_depth_token().to_string()),
-    );
-    let _ = fields.insert(
-        "color_range",
-        FieldValue::String(media_plan.range_token().to_string()),
-    );
-    let _ = fields.insert(
-        "color_matrix",
-        FieldValue::String(media_plan.matrix_token().to_string()),
-    );
-    let _ = fields.insert(
-        "color_primaries",
-        FieldValue::String(media_plan.primaries_token().to_string()),
-    );
-    let _ = fields.insert(
-        "transfer",
-        FieldValue::String(media_plan.transfer_token().to_string()),
     );
 }
 
@@ -8823,7 +8856,13 @@ fn start_capture_after_display<I, C, F>(
             .and_then(|pipeline| {
                 arcen_media::video::pipeline_contract(pipeline).encoder_ceiling_bps()
             }),
-        fps: cfg.fps,
+        // Desktop Duplication and WGC deliver at most one frame per
+        // composition: no faster than the refresh the display was applied
+        // at, as the hello states (`served_frame_rate`).
+        fps: match display.applied_refresh_hz {
+            0 => cfg.fps,
+            refresh => cfg.fps.min(refresh),
+        },
         width: display.applied.width,
         height: display.applied.height,
         encoder: Some(cfg.encoder),
@@ -12103,6 +12142,9 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
+            fps_ceiling: None,
+            deck_display_refresh_hz: None,
+            frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
@@ -13082,6 +13124,9 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 60,
+            fps_ceiling: None,
+            deck_display_refresh_hz: None,
+            frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
@@ -13168,6 +13213,9 @@ mod tests {
             requested_pipeline: Some(arcen_media::video::PipelineId::Hdr),
             active_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
             fps: 30,
+            fps_ceiling: None,
+            deck_display_refresh_hz: None,
+            frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::NativeNvenc,
             audio_enabled: true,
             audio_compressed: false,
@@ -13235,6 +13283,9 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
+            fps_ceiling: None,
+            deck_display_refresh_hz: None,
+            frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
@@ -14037,6 +14088,9 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 60,
+            fps_ceiling: None,
+            deck_display_refresh_hz: None,
+            frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
@@ -14274,6 +14328,9 @@ mod tests {
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
+            fps_ceiling: None,
+            deck_display_refresh_hz: None,
+            frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: false,
             audio_compressed: false,

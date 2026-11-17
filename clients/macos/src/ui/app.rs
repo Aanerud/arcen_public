@@ -1359,6 +1359,8 @@ pub struct ArcenApp {
     /// Requested frame-rate ceiling for the active session, shown beside
     /// measured delivery so it is not mistaken for a promise.
     active_stream_max_fps: u32,
+    /// The host's stated stream rate and its reason (`ServerHelloMsg::stream_rate`).
+    active_stream_rate: Option<arcen_protocol::messages::StreamRateMsg>,
     /// Whether the negotiated-truth detail panel (`paint_negotiated_truth_panel`)
     /// is shown, toggled by `MenuCommand::ToggleNegotiatedTruth`. The
     /// always-on degradation badge (`paint_negotiated_truth_badge`) is
@@ -2261,6 +2263,7 @@ impl ArcenApp {
             requested_video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
             requested_pipeline: None,
             active_stream_max_fps: 0,
+            active_stream_rate: None,
             negotiated_truth_panel_open: false,
             decoder_backend_name: "",
             decoder_hardware_accelerated: None,
@@ -3293,6 +3296,13 @@ impl ArcenApp {
             self.remember_authenticated_username();
             self.note_hello_desktop(hello.login_window);
             self.session_hello_handled = true;
+            // A current Pier serves Auto and Speed at this Deck display's
+            // refresh, not the legacy rate the request carried.
+            self.active_stream_max_fps = arcen_deck_core::screens::statistics::served_max_fps(
+                Some(&hello),
+                self.active_stream_max_fps,
+            );
+            self.active_stream_rate = hello.stream_rate.clone();
             // A fresh hello means a fresh decode session (this session's
             // negotiated contract may differ from the last one this
             // connection had), so any exactness reading measured against
@@ -3793,6 +3803,7 @@ impl ArcenApp {
         self.requested_video_selection = options.profile.video_selection;
         self.requested_pipeline = options.profile.pipeline.clone();
         self.active_stream_max_fps = options.profile.max_fps;
+        self.active_stream_rate = None;
         if self.requested_video_variant.is_none() {
             tracing::warn!(
                 target: crate::logging::target::VIDEO,
@@ -9793,6 +9804,7 @@ impl ArcenApp {
             presented_fps: Self::instant_rate(&self.presented_frame_times),
             presented_fps_estimated: Self::instant_rate(&self.presented_frame_times_estimated),
             max_fps: self.active_stream_max_fps,
+            stream_rate: self.active_stream_rate.as_ref(),
             monitor_fps_text: &monitor_fps_text,
             received_fps: Self::instant_rate(&self.video_packet_times),
             wire_delay_ms: self.last_wire_delay_ms,
@@ -14376,6 +14388,7 @@ mod tests {
             serial: id + 100,
             edid: String::new(),
             color: None,
+            rotation_degrees: 0,
         }
     }
 

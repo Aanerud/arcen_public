@@ -779,6 +779,13 @@ impl Launcher {
             saved_mode,
         )
         .unwrap_or(self.settings.displays_mode);
+        // A simulated layout (developer builds) is always Match My Layout.
+        #[cfg(feature = "dev-tools")]
+        let mode = if super::windowed_test::layout().is_some() {
+            DisplaysMode::MatchLayout
+        } else {
+            mode
+        };
         let approved = match super::displays::approve_match_layout(mode, &self.settings) {
             Ok(approved) => approved,
             Err(message) => {
@@ -1507,6 +1514,11 @@ impl Launcher {
         &mut self,
         fullscreen: bool,
     ) -> Option<(SessionFullscreenStep, Option<u32>)> {
+        // A simulated layout's windows stay windows (developer builds).
+        #[cfg(feature = "dev-tools")]
+        if super::windowed_test::layout().is_some() {
+            return None;
+        }
         let on_screen = matches!(
             self.screen,
             Screen::InSession | Screen::Reconnecting(..) | Screen::SigningIn

@@ -101,6 +101,10 @@ pub struct AgentConfig {
     #[serde(default)]
     auth_video_request: Option<arcen_protocol::messages::InitialVideoRequestMsg>,
     fps: u32,
+    /// The administrator's `video.fps`, when configured: the agent resolves
+    /// the session's rate under the same ceiling as the broker.
+    #[serde(default)]
+    fps_ceiling: Option<u32>,
     #[serde(default)]
     encoder: Option<String>,
     audio_enabled: bool,
@@ -182,6 +186,7 @@ impl AgentConfig {
             variant_pinned: config.variant_pinned,
             auth_video_request: config.auth_video_request.clone(),
             fps: config.fps,
+            fps_ceiling: config.fps_ceiling,
             encoder: Some(config.encoder.as_arg().to_string()),
             audio_enabled: config.audio_enabled,
             audio_compressed: config.audio_compressed,
@@ -294,6 +299,9 @@ impl AgentConfig {
             requested_pipeline: None,
             active_pipeline: None,
             fps: self.fps,
+            fps_ceiling: self.fps_ceiling,
+            deck_display_refresh_hz: None,
+            frame_rate: None,
             encoder,
             audio_enabled: self.audio_enabled,
             audio_compressed: self.audio_compressed,
@@ -2545,6 +2553,7 @@ mod tests {
             variant_pinned: false,
             auth_video_request: None,
             fps: 30,
+            fps_ceiling: None,
             encoder: None,
             audio_enabled: true,
             audio_compressed: false,
@@ -3622,6 +3631,7 @@ mod tests {
             variant_pinned: false,
             auth_video_request: None,
             fps: 60,
+            fps_ceiling: None,
             encoder: None,
             audio_enabled: true,
             audio_compressed: false,
@@ -3659,6 +3669,7 @@ mod tests {
             variant_pinned: false,
             auth_video_request: None,
             fps: 30,
+            fps_ceiling: None,
             encoder: Some("software-h264".to_string()),
             audio_enabled: true,
             audio_compressed: false,
@@ -3696,6 +3707,7 @@ mod tests {
             variant_pinned: false,
             auth_video_request: None,
             fps: 30,
+            fps_ceiling: None,
             encoder: Some("software-h264".to_string()),
             audio_enabled: true,
             audio_compressed: false,

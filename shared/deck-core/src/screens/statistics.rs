@@ -21,6 +21,26 @@ pub fn stream_pipeline_label(token: &str) -> &str {
     }
 }
 
+pub use crate::session_truth::served_max_fps;
+
+/// Why the session runs at its rate, for the statistics: "your 120 Hz
+/// display", or the host limit that holds it below the display.
+#[must_use]
+pub fn stream_rate_note(rate: &arcen_protocol::messages::StreamRateMsg) -> String {
+    let basis = arcen_media::video::FrameRateBasis::from_token(&rate.basis);
+    match (basis, rate.display_refresh_hz) {
+        (Some(arcen_media::video::FrameRateBasis::Display), Some(refresh)) => {
+            format!("your {refresh} Hz display")
+        }
+        (Some(basis), Some(refresh)) if rate.fps < refresh => {
+            format!("limited by {} (display {refresh} Hz)", basis.describe())
+        }
+        (Some(basis), _) => basis.describe().to_owned(),
+        (None, Some(refresh)) => format!("display {refresh} Hz"),
+        (None, None) => rate.basis.clone(),
+    }
+}
+
 /// The Stream Statistics line for exact still image: why it is off, or how
 /// much of the picture is verified exact (`verified`, the refinement hub's
 /// status for the primary monitor).
@@ -137,6 +157,8 @@ pub struct HealthOverlayFacts<'a> {
     pub presented_fps: f64,
     pub presented_fps_estimated: f64,
     pub max_fps: u32,
+    /// The host's stated stream rate and its reason, when it sent one.
+    pub stream_rate: Option<&'a arcen_protocol::messages::StreamRateMsg>,
     /// Per-display rates of a multi-monitor session, or empty.
     pub monitor_fps_text: &'a str,
     pub received_fps: f64,
@@ -251,10 +273,16 @@ pub fn health_overlay_text(facts: &HealthOverlayFacts<'_>) -> String {
     } else {
         "presented estimated"
     };
-    let presented_fps_text = if facts.max_fps > 0 {
-        format!("{displayed_presented_fps:.1} fps (up to {})", facts.max_fps)
-    } else {
-        format!("{displayed_presented_fps:.1} fps")
+    let presented_fps_text = match (facts.stream_rate, facts.max_fps) {
+        (Some(rate), _) => format!(
+            "{displayed_presented_fps:.1} fps (up to {} · {})",
+            rate.fps,
+            stream_rate_note(rate)
+        ),
+        (None, max_fps) if max_fps > 0 => {
+            format!("{displayed_presented_fps:.1} fps (up to {max_fps})")
+        }
+        (None, _) => format!("{displayed_presented_fps:.1} fps"),
     };
     let wire_delay = facts
         .wire_delay_ms
@@ -647,4 +675,40 @@ pub fn paint_tablet_monitor_panel(ui: &egui::Ui, rect: egui::Rect, facts: &Table
         egui::FontId::monospace(12.0),
         egui::Color32::WHITE,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcen_protocol::messages::{ServerHelloMsg, StreamRateMsg};
+
+    fn hello(rate: Option<StreamRateMsg>) -> ServerHelloMsg {
+        let mut hello: ServerHelloMsg =
+            serde_json::from_str(r#"{"type":"server_hello","codec":"h265"}"#).expect("hello");
+        hello.stream_rate = rate;
+        hello
+    }
+
+    #[test]
+    fn the_served_rate_and_its_reason_come_from_the_host() {
+        let older = hello(None);
+        assert_eq!(served_max_fps(Some(&older), 30), 30);
+        assert_eq!(served_max_fps(None, 30), 30);
+        let display = StreamRateMsg {
+            fps: 120,
+            display_refresh_hz: Some(120),
+            basis: "display".to_owned(),
+        };
+        assert_eq!(served_max_fps(Some(&hello(Some(display.clone()))), 30), 120);
+        assert_eq!(stream_rate_note(&display), "your 120 Hz display");
+        let encoder = StreamRateMsg {
+            fps: 60,
+            display_refresh_hz: Some(144),
+            basis: "encoder".to_owned(),
+        };
+        assert_eq!(
+            stream_rate_note(&encoder),
+            "limited by the host's encoder (display 144 Hz)"
+        );
+    }
 }

@@ -1,12 +1,19 @@
 # Arcen Pier Linux single-file installer
 
-Build with the release Pier binary path in `ARCEN_PIER_BINARY`:
+Build with the release Pier binary path in `ARCEN_PIER_BINARY` and the
+login screen's PAM module in `ARCEN_PAM_GREETER`:
 
 ```bash
 cargo build --locked --release -p arcen-pier-linux --features wayland-provider
+cargo build --locked --release -p arcen-pam-greeter
 ARCEN_PIER_BINARY=target/release/arcen-pier \
+ARCEN_PAM_GREETER=target/release/libpam_arcen_greeter.so \
   cargo build --locked --release -p arcen-pier-linux-installer
 ```
+
+The installer writes the module as `pam_arcen_greeter.so` into the host's
+PAM module directory, with `/etc/pam.d/gdm-ovirtcred` and a system-bus
+policy, for remote-first sign-in through GDM's login screen (ADR 0025).
 
 Build on the oldest supported host (glibc): the installer test-runs the
 embedded Pier before writing anything and refuses a host whose loader cannot

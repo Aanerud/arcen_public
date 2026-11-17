@@ -17,3 +17,5 @@
 pub mod activation;
 pub mod runtime;
 pub mod session;
+#[cfg(feature = "dev-tools")]
+pub mod simulated_layout;

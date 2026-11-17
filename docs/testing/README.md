@@ -209,20 +209,38 @@ wayland-provider --lib -- --ignored libei_demo_server`.
 
 ## 6. Windowed multi-monitor live-session test mode
 
-Single-display Deck Macs can exercise the real multi-monitor wire/session path
-against a real Pier by building the Deck with `dev-tools` and setting:
+A Deck with one screen, Mac or Windows PC, can exercise the real multi-monitor
+wire/session path against a real Pier. Build the Deck with `dev-tools`
+(`cargo build --release -p arcen-deck-macos --features dev-tools`, or
+`-p arcen-deck-windows --features dev-tools` on Windows) and set:
 
 ```sh
-ARCEN_DECK_WINDOWED_MONITORS=2   # exact values: 2, 3, or 4
+ARCEN_DECK_WINDOWED_MONITORS=2   # 2, 3 or 4 monitors of one size, two per row
 ARCEN_DECK_WINDOWED_MONITOR_SIZE=1920x1080   # optional WxH, default 1920x1080
+ARCEN_DECK_WINDOWED_MONITORS=field   # 2560x1600 primary at 0,0 + 1920x1200 at -1920,400
+ARCEN_DECK_WINDOWED_MONITORS='2560x1600@0,0*;1200x1920@2560,0:r90'   # any layout
 ```
 
-The Deck sends a synthetic requested local layout with that many monitors to the
+A layout list gives each monitor as `WxH@X,Y[:rDEG][:HZ][*]`, separated by
+`;`: its size as seen on the desk, its place (negative offsets allowed), an
+optional clockwise rotation (90, 180, 270; a quarter-turned monitor is given in
+its portrait size), an optional refresh in Hz, and `*` on the primary (the first
+monitor without one; the primary is requested first). The synthesis is shared by both Decks
+(`arcen_deck_core::multi_window::simulated_layout`, `dev-tools`); the windows
+are arranged on the one display as the layout is on the desk.
+
+`ARCEN_DECK_TIMELINE=off` turns the multi-monitor timeline's holding off for an
+A/B skew measurement ([ADR 0026](../adr/0026-one-timeline-for-every-monitor.md));
+the Deck log's `multi-monitor timeline` lines report the skew either way.
+
+The Deck sends a synthetic requested local layout with those monitors to the
 Pier, so host virtual-display provisioning, per-monitor streams/decoders, region
 input routing, resize/focus, and teardown all use the normal live-session path.
 Only presentation differs: each negotiated monitor opens as a decorated,
-resizable, non-fullscreen macOS window tiled on one local display. Production
-builds do not compile this mode, and an unset or invalid env var leaves normal
+resizable, non-fullscreen window tiled on one local display (on Windows, on the
+primary display). Production builds do not compile this mode; the macOS and
+Windows release packaging both refuse a Deck binary carrying the `dev-tools`
+marker, and an unset or invalid env var leaves normal
 `MultiWindowPlan` invariants unchanged (including rejecting two production
 fullscreen windows on the same local display).
 

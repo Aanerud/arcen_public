@@ -16,6 +16,7 @@ const GRADING_BITRATE_CEILING_BPS: u32 = 250_000_000;
 pub(super) const CONTRACT: PipelineContract = PipelineContract {
     id: PipelineId::Grading,
     max_fps: 30,
+    frame_rate: super::FrameRatePolicy::Fixed { fps: 30 },
     priority: MotionPriority::Detail,
     intent: EncodeIntent::Quality,
     encoder_buffer_frames: buffer(MotionPriority::Detail, EncodeIntent::Quality),

@@ -27,10 +27,13 @@ pub use metrics::{
 
 /// Highest refresh a pinned session asks the host to synthesise.
 ///
-/// The stream is capped at 60 fps by every performance mode, so requesting a
-/// 120 Hz virtual display buys nothing and doubles the pixel-clock budget — on
-/// a `HiDPI` Retina request that is the difference between a working session and
-/// `calculated 1116.72MHz pixel clock exceeds EDID 1.4 limits`.
+/// A 120 Hz virtual display doubles the pixel-clock budget — on a `HiDPI`
+/// Retina request that is the difference between a working session and
+/// `calculated 1116.72MHz pixel clock exceeds EDID 1.4 limits`. Hosts serve
+/// Auto and Speed at the refresh this reports
+/// (`arcen_media::video::resolve_session_frame_rate`), so it is also the
+/// Deck's frame-rate ceiling for both until the panel's own refresh is
+/// reported apart from the virtual display's.
 pub const PINNED_MAX_REFRESH_HZ: u32 = 60;
 
 /// The refresh a pinned session should request for a display running at

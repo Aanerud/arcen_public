@@ -3140,8 +3140,11 @@ without `wayland` refuses such a session with `UNAVAILABLE … not_built`.
 
 **Selection, once per epoch.** capenc reads the Pier's usual argv (codec,
 fps, priority, intent, `variant=`) and resolves it with the shared
-`pipeline_for_request`: the SDR8 format at up to 30 fps with detail
-priority is Auto, above 30 fps or with motion priority is Speed. Grading
+`pipeline_for_epoch`: the SDR8 format with detail priority is Auto, with
+motion priority Speed (both follow the Deck display, so the rate decides
+nothing). Auto above `UNQUALIFIED_COPY_FPS` (30) rests on the same
+`capture-rate=` evidence as Speed; without it Auto is admitted at 30 with
+`copy_path_not_rate_qualified`. Grading
 and HDR are their own compositions (`pipelines/{grading,hdr}.rs`, see
 [Wayland Grading and HDR](#wayland-grading-and-hdr)); exact
 formats have no Wayland composition and are refused with

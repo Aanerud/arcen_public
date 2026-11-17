@@ -106,8 +106,16 @@ pub struct StreamStart<'a> {
     pub height: u32,
     /// Frames per second, when a target exists.
     pub fps: Option<u32>,
+    /// The Deck display refresh an Auto or Speed rate followed, when the
+    /// Deck named one.
+    pub display_refresh_hz: Option<u32>,
+    /// What decided `fps` (an `arcen_media::video::FrameRateBasis` token).
+    pub fps_basis: Option<&'a str>,
     /// Named product pipeline, when known.
     pub pipeline: Option<&'a str>,
+    /// What drives the served display (`nvctrl`, `wayland`, a Windows
+    /// display backend), when the host names one.
+    pub display_backend: Option<&'a str>,
     /// The colour identity of the stream being started.
     ///
     /// Optional only so an emitter that genuinely cannot describe its colour
@@ -131,6 +139,29 @@ pub struct ColorIdentity<'a> {
     pub color_primaries: &'a str,
     /// Transfer characteristics token.
     pub transfer: &'a str,
+}
+
+/// Adds why a stream runs at its rate to `SESSION_STREAM_START` fields: the
+/// Deck display refresh an Auto or Speed rate followed (when the Deck named
+/// one) and what decided the rate (an `arcen_media::video::FrameRateBasis`
+/// token).
+///
+/// # Errors
+///
+/// A [`crate::TelemetryContractError`] if a field were malformed (a
+/// programming error).
+pub fn insert_stream_rate(
+    fields: &mut StructuredFields,
+    display_refresh_hz: Option<u32>,
+    fps_basis: &str,
+) -> Result<(), crate::TelemetryContractError> {
+    if let Some(refresh) = display_refresh_hz {
+        fields.insert(
+            "display_refresh_hz",
+            FieldValue::Integer(i64::from(refresh)),
+        )?;
+    }
+    fields.insert("fps_basis", FieldValue::String(fps_basis.to_owned()))
 }
 
 /// Builds the fields for `SESSION_STREAM_START`.
@@ -157,9 +188,20 @@ pub fn session_stream_start(start: StreamStart<'_>) -> Option<StructuredFields> 
             .insert("fps", FieldValue::Integer(i64::from(fps)))
             .ok()?;
     }
+    if let Some(basis) = start.fps_basis {
+        insert_stream_rate(&mut fields, start.display_refresh_hz, basis).ok()?;
+    }
     if let Some(pipeline) = start.pipeline {
         fields
             .insert("pipeline", FieldValue::String(pipeline.to_owned()))
+            .ok()?;
+    }
+    if let Some(display_backend) = start.display_backend {
+        fields
+            .insert(
+                "display_backend",
+                FieldValue::String(display_backend.to_owned()),
+            )
             .ok()?;
     }
     if let Some(color) = start.color {
@@ -431,8 +473,11 @@ mod tests {
                 chroma: "420",
                 width: 1920,
                 height: 1080,
-                fps: Some(60),
+                fps: Some(120),
+                display_refresh_hz: Some(120),
+                fps_basis: Some("display"),
                 pipeline: Some("speed"),
+                display_backend: Some("nvctrl"),
                 color: None,
             })
         ));
@@ -450,7 +495,10 @@ mod tests {
             width: 1920,
             height: 1080,
             fps: Some(60),
+            display_refresh_hz: None,
+            fps_basis: None,
             pipeline: Some("grading"),
+            display_backend: None,
             color: Some(ColorIdentity {
                 bit_depth: "10",
                 color_range: "limited",

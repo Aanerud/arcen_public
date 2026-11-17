@@ -400,6 +400,16 @@ closes with `DECK_REASON_SEAT_OCCUPIED`. Every launcher failure after
 authentication must write a response status; exiting without one surfaces
 as the misleading "session launcher protocol failed".
 
+A host without a display manager gets the account's real login session,
+not a per-connection desktop (ADR 0025 §10, `session/login_session.rs`,
+shared `console_session::login_session`): systemd runs `arcen-pier
+login-session` as its own unit, which opens PAM `arcen-login` on `seat0` at a
+free VT, starts a console-seat X server (`XorgSeat::Console`) and the user's
+X session entry through `Xsession`, and lives until the user logs out. The
+console path joins it like any console session. Never tie its lifetime to
+a connection or to the Pier's process tree, and never authenticate with
+`arcen-login` (its stack denies `auth`).
+
 A seated desktop is local to polkit (it never reads logind's `Remote`), so
 Arcen's rule `05-arcen-remote-session.rules` (shared
 `arcen_session::polkit_remote`, adapter `session/polkit_remote.rs`) gives

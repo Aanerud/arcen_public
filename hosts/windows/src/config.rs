@@ -399,7 +399,8 @@ mod tests {
         assert_eq!(packaged.video.chroma, None);
         assert_eq!(packaged.video.bit_depth.as_deref(), Some("10"));
         assert_eq!(packaged.video.color_range.as_deref(), Some("full"));
-        assert_eq!(packaged.video.fps, Some(60));
+        // No frame-rate ceiling: Auto and Speed follow the Deck display.
+        assert_eq!(packaged.video.fps, None);
         assert_eq!(packaged.video.encoder.as_deref(), Some("auto"));
     }
 

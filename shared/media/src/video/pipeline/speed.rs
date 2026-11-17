@@ -14,6 +14,10 @@ use crate::video::MotionPriority;
 pub(super) const CONTRACT: PipelineContract = PipelineContract {
     id: PipelineId::Speed,
     max_fps: 60,
+    frame_rate: super::FrameRatePolicy::FollowDisplay {
+        floor_fps: 60,
+        ceiling_fps: crate::video::MAX_SESSION_FPS,
+    },
     priority: MotionPriority::Motion,
     intent: EncodeIntent::Interactive,
     encoder_buffer_frames: buffer(MotionPriority::Motion, EncodeIntent::Interactive),
@@ -27,7 +31,7 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     decode_latency: DecodeLatencyPolicy::SPEED,
     present_timing: super::PresentTiming::Tearing,
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
-    favours: "smooth motion, up to 60 fps",
-    gives_up: "sharpness when the link is tight, and uses the lowest-latency encoder settings (1-frame buffer)",
-    summary: "Favours smooth motion, up to 60 fps; gives up sharpness when the link is tight and uses the lowest-latency encoder settings (1-frame buffer).",
+    favours: "the lowest latency: at least 60 fps (your display's refresh when faster), the lowest-latency encoder settings (1-frame buffer), and frames shown even mid-refresh",
+    gives_up: "sharpness first when the link is tight, and may tear",
+    summary: "Favours the lowest latency: at least 60 fps (your display's refresh when faster) with the lowest-latency encoder settings (1-frame buffer); gives up sharpness first when the link is tight, and may tear.",
 };

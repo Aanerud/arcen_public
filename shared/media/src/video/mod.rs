@@ -18,6 +18,7 @@ mod desktop_encoding;
 mod fps_limiter;
 mod frame;
 mod frame_queue;
+mod frame_rate;
 mod host_converted_capture;
 mod intent;
 mod obu;
@@ -56,8 +57,8 @@ pub use capture_notice::{
 };
 pub use capture_rate::{
     CaptureRateEvidence, PACED_SOURCE_HEADROOM, SPEED_GUARD_SHORT_WINDOWS, SPEED_GUARD_WINDOWS,
-    SpeedGuardVerdict, SpeedRuntimeGuard, SustainedRateMeter, paced_output_refresh_hz,
-    paced_source_offer_fps,
+    SpeedGuardVerdict, SpeedRuntimeGuard, SustainedRateMeter, follow_display_offer_fps,
+    paced_output_refresh_hz, paced_source_offer_fps,
 };
 pub use capture_region::{
     CaptureDamage, CaptureRegion, RegionPolicy, changed_bounds, union_regions,
@@ -106,6 +107,12 @@ pub use frame_queue::{
     VIDEO_ROOM_WAIT, VideoQueuePush, VideoQueueWaitStats, video_backlog_budget,
     video_backlog_budget_from_env, video_backlog_is_legacy_from_env,
 };
+pub use frame_rate::{
+    DISPLAY_REFRESH_FALLBACK_HZ, FrameRateBasis, FrameRatePolicy, FrameRateRequest,
+    GOVERNOR_FIRST_HOLD_SECS, GOVERNOR_MAX_HOLD_SECS, GOVERNOR_MIN_FPS, GOVERNOR_SHORT_WINDOWS,
+    GOVERNOR_WINDOWS, GovernorReason, GovernorStep, HostRateGovernor, MAX_SESSION_FPS,
+    SessionFrameRate, UNQUALIFIED_COPY_FPS, resolve_session_frame_rate, served_stream_rate,
+};
 pub use host_converted_capture::{
     HOST_CONVERTED_CAPTURE_MAX_EDGE, HOST_CONVERTED_CAPTURE_MAX_PIXELS, fit_host_converted_capture,
     host_converted_capture_fits,
@@ -124,9 +131,9 @@ pub use pipeline::{
     coded_fidelity_refusal, operational_bitrate_bounds, operational_encode_intent,
     operational_encoder_bitrate_bounds, operational_keyframe_policy, operational_motion_priority,
     operational_pipeline, operational_present_timing, operational_rate_control_policy,
-    pipeline_codec_ladder, pipeline_contract, pipeline_for_request, proven_path_ceiling_bps,
-    resolve_request_pipeline, served_pipeline, served_pipeline_wants_display_hdr,
-    session_wants_display_hdr, software_fallback_decision,
+    pipeline_codec_ladder, pipeline_contract, pipeline_for_epoch, pipeline_for_request,
+    proven_path_ceiling_bps, resolve_request_pipeline, served_pipeline,
+    served_pipeline_wants_display_hdr, session_wants_display_hdr, software_fallback_decision,
     software_fallback_decision_after_hardware,
 };
 pub use plan::{

@@ -22,8 +22,14 @@ sudo ./install-arcen-pier-<version>-linux-x86_64
 
 The Linux installer chooses the desktop from what the machine has, never from
 the distribution's name, and prints what it found and why (also appended to
-`/var/log/arcen/install.log`). An installed Xorg server keeps the dedicated
-X11 desktop, exactly as before; an existing install never moves. Without
+`/var/log/arcen/install.log`). An installed Xorg server keeps X11 and an
+existing install never moves to Wayland. On X11 a Deck joins the session the
+account holds at the workstation, or signs it in through the login screen
+(`platform.session.mode` `console`, the default since 0.20.1, also on an
+upgrade; `dedicated` keeps a private desktop per sign-in, see the
+[administration guide](operations/pier-administration.md#joining-the-users-session-console-mode)).
+A host without monitors gives each Deck display an output with
+`--console-outputs 4`. Without
 Xorg, a headless GNOME Shell 40+ with PipeWire, WirePlumber, `dbus-daemon`
 and a DRM render node is qualified for Wayland with a short real session
 (`arcen-pier wayland qualify --write`), and the service starts only if that

@@ -32,6 +32,9 @@ pub struct ClientTelemetry {
     rtt_samples: AtomicU64,
     worst_health: AtomicU32,
     reconnects: AtomicU64,
+    /// The Pier's wire clock against this Deck's (ADR 0026), from the
+    /// health ping/pong.
+    pier_clock: Mutex<arcen_media::timeline::PierClockSync>,
 }
 
 impl Default for ClientTelemetry {
@@ -55,6 +58,7 @@ impl Default for ClientTelemetry {
             rtt_samples: AtomicU64::new(0),
             worst_health: AtomicU32::new(0),
             reconnects: AtomicU64::new(0),
+            pier_clock: Mutex::new(arcen_media::timeline::PierClockSync::default()),
         }
     }
 }
@@ -142,6 +146,39 @@ impl ClientTelemetry {
             .fetch_add(u64::from(milliseconds), Ordering::Relaxed);
         self.rtt_samples.fetch_add(1, Ordering::Relaxed);
         self.rtt_observed.store(true, Ordering::Release);
+    }
+
+    /// Records one health ping/pong as a clock sample: the ping left at
+    /// this Deck's `deck_sent_ms` (epoch milliseconds), the Pier stamped
+    /// its pong `pier_ms`, and the pong arrived `round_trip` after the ping.
+    pub fn record_clock_sample(&self, deck_sent_ms: u64, pier_ms: u64, round_trip: Duration) {
+        use arcen_media::timeline::wire_ms;
+        if deck_sent_ms == 0 || pier_ms == 0 {
+            return;
+        }
+        let estimate = self
+            .pier_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(wire_ms(deck_sent_ms), wire_ms(pier_ms), round_trip);
+        if let Some(estimate) = estimate {
+            tracing::debug!(
+                target: crate::log_target::HEALTH,
+                offset_ms = estimate.offset_ms,
+                round_trip_ms = estimate.round_trip_ms,
+                samples = estimate.samples,
+                "pier clock estimate"
+            );
+        }
+    }
+
+    /// The current estimate of the Pier's wire clock, once a ping/pong
+    /// sample exists.
+    pub fn pier_clock(&self) -> Option<arcen_media::timeline::PierClockEstimate> {
+        self.pier_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .estimate()
     }
 
     pub fn record_reconnect(&self) {

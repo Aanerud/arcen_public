@@ -233,6 +233,182 @@ sudo rm -f /opt/arcen/bin/arcen-pier
 
 Leave `/etc/arcen`, `/var/lib/arcen/support`, and `/var/log/arcen` in place unless a decommission procedure explicitly preserves and then deletes operational data.
 
+#### Joining the user's session (console mode)
+
+A Linux Pier with an Xorg server serves the session the account already
+holds at the workstation (`platform.session.mode`, default `console`;
+[ADR 0025](../adr/0025-arcen-joins-the-users-session.md)). It never builds a
+private desktop for a user who has one, and a disconnect never ends the
+session.
+
+| At the workstation | A Deck sign-in of that account |
+| --- | --- |
+| The account is signed in (GDM, X11) | joins that session: the same desktop and applications; unlocks it if it was locked |
+| The account's session waits behind the login screen (switch user) | brings it forward, then joins it |
+| Nobody is signed in, GDM's login screen shows | the login screen signs the account in (a one-time token, below); GDM owns the session, so a later sign-in at the desk resumes it |
+| The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it; the other product is never stopped or reconfigured |
+| Another account is signed in (or holds the console through another product) | refused, `console_other_user` or `console_other_user_other_product` |
+| GNOME on Wayland | refused, `console_wayland_session`: set `WaylandEnable=false` in `/etc/gdm/custom.conf` and restart GDM while nobody is signed in |
+| No display manager on the host, nobody signed in | starts the account's real login session (below), then joins it |
+| The account's session that Arcen started | joins it (same desktop, same applications) |
+| Another account's session that Arcen started | refused, `console_other_user` (one account at a time without a display manager) |
+| A display manager is configured but its login screen is not running | refused, `console_no_session` |
+
+While a Deck is attached the workstation is private: its monitors are
+blanked (zero gamma ramps; the Deck's picture is unaffected), its real
+keyboards, mice and tablets are disabled (Arcen's own virtual devices keep
+working) and its speakers are muted. When the Deck leaves, the Pier locks the
+session first, then gives the monitors and input back: the person at the
+desk sees the lock screen and unlocks it with their password. The session
+keeps running until the user logs out.
+
+**Monitors: the Deck's layout while it is attached.** A Deck that matches its
+layout (Match my layout, two or more displays) gets one stream per monitor
+and one window per monitor, presented in step on one timeline
+([ADR 0026](../adr/0026-one-timeline-for-every-monitor.md)). While it is
+attached the console takes the Deck's monitors: the i-th Deck display on the
+console's i-th connected output, at the Deck display's size, position
+(left of or below the primary included), rotation and primary, applied as
+one NVIDIA MetaMode. An output that lists the Deck's size drives it exactly;
+otherwise it keeps a mode it offers (a desk monitor's own panel timing) and
+scales (`ViewPortIn`), so no monitor is driven with a timing it did not
+offer. Outputs the layout does not use are switched off. Before anything
+changes the Pier journals the console's own layout
+(`/run/arcen/console-layout.json`: MetaMode, primary, hidden outputs); when
+the Deck leaves the session is locked first and then exactly that layout
+comes back, then the monitors and input. A Pier or launcher that is killed
+leaves the journal, and the service restores the layout (after locking the
+session) when it cleans up and at its next start.
+
+| Console | A Deck matching a two-monitor layout |
+| --- | --- |
+| Two or more connected outputs (desk monitors, or `--console-outputs`) | two outputs, two streams, two windows |
+| One connected output (a headless host without `--console-outputs`) | the sign-in ends with "its console cannot take this layout", and the Deck offers Primary Display Only (one picture); the Pier logs `console_outputs_insufficient` |
+| A single-display Deck (or Primary display only) | one picture of the whole screen; the console keeps its layout, except on a `--console-outputs` host, where its first output takes the Deck display's size |
+
+GNOME on X11 has one integer scale for the whole screen and it belongs to
+the user: the console keeps it (a Retina Deck display shows the desktop at
+the console's scale; set GNOME's scale at the desk or from the Deck if you
+want it larger). The refresh follows the output's mode for that size
+(NVIDIA's MetaMode names a size, not a rate).
+
+**A headless console: `--console-outputs`.** A host without monitors (a
+virtual GPU, a rack workstation) has one connected output. Install with
+`--console-outputs 4` (or a head list, `--console-outputs DFP-0,DFP-1`) to
+make the console's X server see those NVIDIA heads as connected monitors,
+the first one lit. The installer writes
+`/etc/X11/xorg.conf.d/10-arcen-console-outputs.conf` (first line
+`# Arcen console virtual outputs …`), an `OutputClass` matched on the NVIDIA
+kernel driver that merges into any existing `/etc/X11/xorg.conf`; the X
+server reads it when it starts, so reboot or restart the display manager
+while nobody is signed in. Unused forced outputs are hidden from the desktop
+(RandR `non-desktop`) while a Deck is attached. `--no-console-outputs` and
+`--uninstall` remove the file (only Arcen's); nothing else in the host's
+display configuration is changed. This changes what the host's X server
+sees, so it is never done without the flag.
+
+**Remote-first sign-in.** GDM resumes only sessions it started, so a Deck
+sign-in while nobody is signed in is completed by GDM's login screen. After
+the Pier has checked the password, it hands the login screen a one-time
+token over the system bus; the login screen's `gdm-ovirtcred` PAM stack runs
+`pam_arcen_greeter.so`, which spends the token (once, within 30 seconds, for
+that one account) and names the user; the rest of the stack is the host's
+own `gdm-password` account and session lines. The installer writes three
+files and removes them on uninstall:
+
+| File | Purpose |
+| --- | --- |
+| `/usr/lib64/security/pam_arcen_greeter.so` | the login screen's token module |
+| `/etc/pam.d/gdm-ovirtcred` | the login screen's pre-authenticated stack, built from `/etc/pam.d/gdm-password` (first line `# arcen-greeter-login v1`) |
+| `/etc/dbus-1/system.d/arcen-greeter-login.conf` | lets root own the login screen's credential name, `org.ovirt.vdsm.Credentials` |
+
+An existing `gdm-ovirtcred` stack or bus policy that is not Arcen's (oVirt's
+guest agent) is kept; the remote-first sign-in is then refused
+`console_sign_in_unavailable`. Every token accepted or refused is in the
+journal (`journalctl | grep pam_arcen_greeter`). The keyring is not unlocked
+by a token: GNOME asks for it on first use. As such a session starts, GNOME's
+colour plugin can ask for an administrator password to "create a color
+managed device" (polkit action `org.freedesktop.color-manager.create-device`);
+Cancel dismisses it and the session works without it.
+
+**Domain accounts (SSSD with Active Directory Group Policy).** On a host
+joined to Active Directory through SSSD with GPO access control
+(`access_provider = ad`, `ad_gpo_access_control` `enforcing` (the default)
+or `permissive`), SSSD decides each PAM service's logon right by name and
+denies a service it does not know (`ad_gpo_default_right`, default `deny`).
+The remote-first sign-in is the same interactive logon as a sign-in at the
+desk, so the installer writes `/etc/sssd/conf.d/90-arcen-interactive-logon.conf`
+(root, `0600`, first line `# arcen-interactive-logon v1`) adding
+`gdm-ovirtcred` to `ad_gpo_map_interactive` in each such domain, keeping the
+domain's own list (`+site-login` stays `+site-login, +gdm-ovirtcred`), then
+checks it with `sssctl config-check` and restarts SSSD. Group Policy then
+weighs the sign-in by "Allow log on locally" and "Deny log on locally",
+exactly as at the desk, and by nothing broader. A domain whose
+administrator removed the service (`-gdm-ovirtcred`) keeps that choice. The
+uninstaller removes the file. The Pier's own service (`platform.auth.pam_service`,
+`login` by default) is in SSSD's default interactive set already.
+
+A sign-in the account check refuses (Group Policy's logon right through
+SSSD, `pam_access`, an IdM HBAC rule) reads on the Deck like any failed
+sign-in ("wrong user name or password, or this account may not sign in at
+this workstation"): the Deck is never told that a password was right. The
+Pier log records it as `console_account_denied` with the PAM error and what
+the modules said. A domain account whose password and account check passed
+but whose remote-first sign-in the domain's map refuses (the administrator
+removed `gdm-ovirtcred`, or put it in `ad_gpo_map_deny`) is shown
+`console_account_denied`; on a host whose SSSD would not weigh
+`gdm-ovirtcred` as an interactive logon at all (installed before the host
+joined the domain: rerun the installer) it is refused
+`console_sign_in_unavailable` at once instead of timing out. The snippet
+holds a copy of each domain's `ad_gpo_map_interactive` list (SSSD keeps one
+value per option): after changing that list in `sssd.conf`, rerun the
+installer; the Pier warns at start while the snippet is stale. A service an
+administrator mapped to another right (`ad_gpo_map_permit`, `…_deny`) is
+left to that map.
+
+**Hosts without a display manager.** When `display-manager.service` is not
+configured (GDM disabled or not installed), a Deck sign-in while nobody is
+signed in starts the account's own login session, as a display manager
+would, and joins it ([ADR 0025 §10](../adr/0025-arcen-joins-the-users-session.md#10-hosts-without-a-display-manager-a-real-login-session)):
+
+- systemd runs `arcen-pier login-session` as `arcen-login-<uid>.service`;
+  it opens a PAM session with `arcen-login`, on `seat0` at the first free
+  virtual terminal from 7, starts the X server there from
+  `/etc/arcen/xorg.conf`, and runs the account's X session
+  (`/usr/share/xsessions/gnome-xorg.desktop`, through
+  `/etc/X11/xinit/Xsession`): `gnome-session`, its settings daemons,
+  autostart, desktop icons, "Log Out".
+- The session belongs to logind, not to the connection or the Pier: a
+  disconnect leaves it private (below), a Pier restart or upgrade leaves
+  it running, and the next sign-in of that account joins it. Only the
+  user's logout, an administrator (`loginctl terminate-session <id>`) or a
+  shutdown ends it. The exception is a session that has just started and
+  cannot be made private: the Pier ends it before anyone sees it.
+- One account at a time: while it exists another account is refused
+  `console_other_user`. To free the workstation, the user logs out, or
+  `loginctl terminate-user <name>`.
+- After a disconnect the session stays private, not locked: GNOME Shell
+  has no lock screen without GDM. Its monitors stay blank and the desk's
+  keyboard and mouse stay disabled in its X server until the owner signs in
+  through Arcen again or logs out. The Pier logs "the login session stays
+  private". Nobody can use the session at the desk. The keyring is not
+  unlocked (no password reaches the session).
+
+The installer writes `/etc/pam.d/arcen-login` from the host's own
+`/etc/pam.d/login` (first line `# arcen-login v1`; `auth pam_deny`, the host's
+`account` and `session` lines) and removes it on uninstall; a file that is
+not Arcen's is kept and the sign-in is refused `console_sign_in_unavailable`.
+Its log: `journalctl -u 'arcen-login-*'` and the Pier log.
+
+**Keeping a private desktop per sign-in.** `platform.session.mode` set to
+`dedicated` is an explicit opt-in, never a default: a dedicated Xorg on VT 1
+per sign-in whose heads are created to the Deck's displays (`match_layout`
+multi-monitor), ended with its connection after the reconnect window. It is
+kept only for that Deck-shaped layout; on a host with a display manager it
+starts a desktop GDM cannot resume, and it refuses while any account's
+console session (or another product's, or Arcen's own login session) holds
+the display.
+
 #### Which desktop a Linux Pier serves
 
 The Pier chooses at start from what the host has, never from the
@@ -240,7 +416,7 @@ distribution's name (`capture.provider`, default `auto`):
 
 | Host | Desktop served |
 | --- | --- |
-| An Xorg server is installed | a dedicated X11 desktop, as before; an existing installation never moves to Wayland |
+| An Xorg server is installed | the user's own console session (`platform.session.mode` `console`, above), or with `dedicated` a dedicated X11 desktop; an existing installation never moves to Wayland |
 | No Xorg server; a GNOME Shell or Mutter with `--headless` and `--virtual-monitor`, systemd-logind, `dbus-daemon`, PipeWire and WirePlumber, a GPU driver with DRM (a `/dev/dri/renderD*` node), and a valid Wayland qualification record | a headless Wayland desktop (Pier built with `wayland-provider`) |
 | No Xorg server and no DRM render node | none: the Pier refuses to start and says to install an Xorg server or a GPU driver with DRM/KMS (for NVIDIA, `nvidia-drm` with `modeset=1`). Arcen never changes driver configuration. |
 | No Xorg server, Wayland not proven | none: the Pier refuses to start naming what is missing and, for the record, the command below |
@@ -249,7 +425,7 @@ distribution's name (`capture.provider`, default `auto`):
 override the host cannot honour stops the Pier with the reason rather than
 serving the other desktop.
 
-**One X11 desktop per host.** A dedicated X11 desktop is a logind session on
+**One X11 desktop per host (`dedicated` mode).** A dedicated X11 desktop is a logind session on
 `seat0` at VT 1, and logind keeps one such session per host. While one X11
 desktop is alive — from this Pier, from a second Pier on another port, or a
 desktop that is still closing — a sign-in that needs a new one is refused:
@@ -393,7 +569,10 @@ logrotate's reload during it only reopen the log. Set
 never re-qualified automatically.
 
 What a qualified Wayland host serves today: **Auto** (eight-bit SDR, the
-compositor's cursor drawn into the video); **Speed** at a Deck display size
+compositor's cursor drawn into the video) at the Deck display's refresh where
+the qualification measured this output size and refresh holding it (the same
+measurement Speed uses), otherwise at 30 fps with
+`copy_path_not_rate_qualified`; **Speed** at a Deck display size
 the qualification measured holding 60 fps (57 fps or more), or no wider and
 no taller than one it did (reported as `inferred`), otherwise a Speed request
 is visibly served as Auto and its size is measured by the next qualification
@@ -960,8 +1139,16 @@ section explains the policies behind the keys.
 Production Deck users choose one complete streaming preset: **Auto**, **Speed**,
 **Grading**, or **HDR**. They never select codecs or combine frame-rate and
 colour switches independently. Auto and Speed authorize the host to rank AV1,
-HEVC, then H.264 on the approved adapter before OpenH264, at 30 and 60 fps
-respectively. Grading requests HEVC 4:4:4 10-bit BT.709 at 30 fps. HDR requests
+HEVC, then H.264 on the approved adapter before OpenH264. Both follow the Deck
+display's refresh (Speed never below 60 fps), under `video.fps` when it is set,
+the encoder's limit and what the capture proves; every Pier resolves the rate
+with the shared `arcen_media::video::resolve_session_frame_rate` and states it
+with its reason (`fps_basis`) in `SESSION_STREAM_START` and the hello's
+`stream_rate`. At run time a frame-rate governor lowers the rate to an even
+divisor of the display's (60 → 30 → 20) when the host encodes below it while
+the capture delivers it, and probes back up; the link's Detail shedding still
+lowers Auto's rate before its sharpness. Grading requests HEVC 4:4:4 10-bit
+BT.709 at 30 fps. HDR requests
 HEVC 4:4:4 10-bit BT.2020/PQ at 30 fps and remains active only when the host
 proves a real HDR desktop source.
 

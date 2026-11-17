@@ -27,6 +27,18 @@ use arcen_usb_bridge::UsbSpeed;
 pub const MULTI_MONITOR_TOPOLOGY_CONFLICT_REASON: &str =
     "This desktop was started without your layout. Reconnect to keep it, or start a fresh session.";
 
+/// How a Deck recognises that a host cannot serve its matched layout: it
+/// then offers Primary Display Only. A host's own close reason starts with
+/// it, as does the Deck's negotiation failure.
+pub const MULTI_MONITOR_UNSUPPORTED_PREFIX: &str =
+    "Match My Layout could not be negotiated with this host";
+
+/// A joined console that cannot take the Deck's layout (ADR 0025 §6): the
+/// sign-in ends with this reason (within the 120-byte control-frame budget)
+/// and the Pier log names why.
+pub const CONSOLE_LAYOUT_UNSUPPORTED_REASON: &str =
+    "Match My Layout could not be negotiated with this host: its console cannot take this layout.";
+
 pub const CLIENT_HELLO: &str = "client_hello";
 pub const SERVER_HELLO: &str = "server_hello";
 pub const AUTH_REQUEST: &str = "auth_request";
@@ -1063,6 +1075,20 @@ pub struct ClientMonitor {
     /// predates it, and then a host falls back to its own defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<DisplayColorMsg>,
+    /// Clockwise rotation of the display in degrees (0, 90, 180 or 270), as
+    /// its operating system applies it (the multi-monitor descriptors'
+    /// `rotation`). It does not change how `width_px`/`height_px` are read.
+    /// Absent (0) from a Deck that predates it.
+    #[serde(default, skip_serializing_if = "is_zero_rotation")]
+    pub rotation_degrees: u16,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if signature"
+)]
+fn is_zero_rotation(degrees: &u16) -> bool {
+    *degrees == 0
 }
 
 /// The widest standard gamut a client display can show.
@@ -1363,6 +1389,27 @@ impl AuthResponse {
     /// Attach the enumerated client display layout. Sets `screen_width/height`
     /// from the primary monitor (falling back to the first monitor) so the host
     /// sizes the session's X server to the client's real primary resolution.
+    /// The refresh rate of the Deck display the session is sized for: the
+    /// multi-monitor request's primary, else the primary (or first) legacy
+    /// monitor. `None` when the Deck named none.
+    #[must_use]
+    pub fn display_refresh_hz(&self) -> Option<u32> {
+        let multi = self
+            .multi_monitor_v1
+            .as_ref()
+            .map(|request| request.requested_topology().primary().refresh_hz);
+        let legacy = || {
+            self.monitors
+                .iter()
+                .find(|monitor| monitor.is_primary)
+                .or_else(|| self.monitors.first())
+                .map(|monitor| monitor.refresh_hz)
+        };
+        multi
+            .filter(|refresh| *refresh > 0)
+            .or_else(|| legacy().filter(|refresh| *refresh > 0))
+    }
+
     pub fn with_displays(
         mut self,
         monitors: Vec<ClientMonitor>,
@@ -2402,6 +2449,26 @@ impl Default for ServerColorCaps {
     }
 }
 
+/// The frame rate a host serves a session at (`ServerHelloMsg::stream_rate`).
+///
+/// Auto and Speed follow the Deck display's refresh; `basis` names what
+/// decided the rate (an `arcen_media::video::FrameRateBasis` token:
+/// `display`, `administrator`, `encoder`, `capture_source`, …), so a Deck can
+/// say why a session runs below its display. The rate may later fall at run
+/// time (the link, the host keeping up); `health_pong`'s `fps_target`
+/// carries that.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamRateMsg {
+    /// Frames per second the session starts at.
+    pub fps: u32,
+    /// The Deck display refresh the rate followed, when the Deck named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_refresh_hz: Option<u32>,
+    /// What decided `fps`.
+    #[serde(default)]
+    pub basis: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServerHelloMsg {
     #[serde(rename = "type")]
@@ -2514,6 +2581,10 @@ pub struct ServerHelloMsg {
     /// Pipeline the host actually served. Omitted by legacy hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_pipeline: Option<ServedStreamPipeline>,
+    /// The frame rate the host serves the session at, and why. Omitted by
+    /// hosts that predate it (they serve the requested `max_fps`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_rate: Option<StreamRateMsg>,
     #[serde(default)]
     pub color_caps: ServerColorCaps,
     #[serde(default)]
@@ -4729,6 +4800,42 @@ mod tests {
     }
 
     #[test]
+    fn server_hello_stream_rate_is_additive() {
+        let old: ServerHelloMsg = serde_json::from_str(r#"{"type":"server_hello","codec":"h264"}"#)
+            .expect("old hello parses");
+        assert_eq!(old.stream_rate, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("stream_rate"));
+        let mut hello = old;
+        hello.stream_rate = Some(StreamRateMsg {
+            fps: 120,
+            display_refresh_hz: Some(120),
+            basis: "display".to_owned(),
+        });
+        let round_trip: ServerHelloMsg =
+            serde_json::from_value(serde_json::to_value(&hello).expect("json")).expect("hello");
+        assert_eq!(round_trip.stream_rate, hello.stream_rate);
+    }
+
+    #[test]
+    fn the_served_display_refresh_comes_from_the_primary_monitor() {
+        let monitor = |refresh_hz, is_primary| ClientMonitor {
+            refresh_hz,
+            is_primary,
+            width_px: 1920,
+            height_px: 1080,
+            ..ClientMonitor::default()
+        };
+        let response = AuthResponse::password("user", "secret");
+        assert_eq!(response.display_refresh_hz(), None);
+        let response = AuthResponse::password("user", "secret")
+            .with_displays(vec![monitor(60, false), monitor(144, true)], "match_layout");
+        assert_eq!(response.display_refresh_hz(), Some(144));
+        let response = AuthResponse::password("user", "secret")
+            .with_displays(vec![monitor(0, true)], "single_primary");
+        assert_eq!(response.display_refresh_hz(), None);
+    }
+
+    #[test]
     fn served_pipeline_message_round_trips_and_preserves_unknown_served_token() {
         let message = ServedPipelineMsg::new(
             ServedStreamPipeline::Software,
@@ -5791,6 +5898,7 @@ mod tests {
                 serial: 0xfd626d62,
                 edid: String::new(),
                 color: None,
+                rotation_degrees: 0,
             },
             ClientMonitor {
                 id: 2,

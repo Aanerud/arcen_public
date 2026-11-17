@@ -47,6 +47,11 @@
 # is a shared call (admit_speed, admit_speed_after_runtime_shortfall,
 # paced_source_offer_fps, CaptureRateEvidence); it passed the ratchet before only
 # because nothing touched it. It moves to shared/ with pipelines/mod.rs.
+# hosts/capenc/src/wayland/pipelines/auto.rs is the Auto composition's
+# glue, Speed's sibling: since Auto follows the Deck display it carries the same argv
+# rate evidence (capture-rate and its measured or inferred kind) to the shared
+# admission. Every decision is a shared call (admit_auto, follow_display_offer_fps,
+# UNQUALIFIED_COPY_FPS via the admission); it moves to shared/ with pipelines/mod.rs.
 # hosts/linux/src/media/wayland_cursor.rs is the Pier's fan-out of
 # a Wayland desktop's cursor: a tokio watch channel per desktop, found by the session's
 # private runtime directory, fed by capenc's framed-v2 reader and followed by each
@@ -64,6 +69,7 @@ hosts/capenc/src/wayland/evidence.rs 190
 hosts/capenc/src/wayland/format.rs 64
 hosts/capenc/src/wayland/layout.rs 287
 hosts/capenc/src/wayland/materialise.rs 57
+hosts/capenc/src/wayland/pipelines/auto.rs 55
 hosts/capenc/src/wayland/pipelines/mod.rs 185
 hosts/capenc/src/wayland/pipelines/output.rs 67
 hosts/capenc/src/wayland/pipelines/software.rs 41

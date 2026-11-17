@@ -25,6 +25,47 @@ pub const X11_DESKTOP_VT: u32 = 1;
 /// 120-byte budget the Pier allows there.
 pub const DECK_REASON_SEAT_OCCUPIED: &str = "Another remote desktop is active on this host (one X11 desktop per host). Sign out of it first.";
 
+/// What the Deck is told when another remote-desktop product's own desktop
+/// holds the host's display: a second X server must not start beside it on
+/// the same GPU.
+pub const DECK_REASON_SEAT_OTHER_PRODUCT: &str = "Another remote-desktop product holds this host's display (one X11 desktop per host). Sign out of it first.";
+
+/// [`DECK_REASON_SEAT_OTHER_PRODUCT`] naming the service the host reports
+/// (when it fits the close-frame budget).
+#[must_use]
+pub fn deck_reason_other_product(
+    service: Option<&crate::console_session::ForeignService>,
+) -> String {
+    let head = "Another remote-desktop service (";
+    let tail = ") holds this host's display. Sign out of it first.";
+    let budget = crate::console_session::foreign_service::DECK_REASON_MAX
+        .saturating_sub(head.len() + tail.len());
+    service
+        .and_then(|service| service.label_within(budget))
+        .map_or_else(
+            || DECK_REASON_SEAT_OTHER_PRODUCT.to_owned(),
+            |label| format!("{head}{label}{tail}"),
+        )
+}
+
+/// Who holds the console before a dedicated desktop would start: any
+/// user's graphical session on `seat0`, on any virtual terminal (another
+/// product's desktop runs its own Xorg on another VT, not VT 1), and
+/// whether the display manager started it.
+#[must_use]
+pub fn x11_seat_holder(
+    sessions: &[crate::console_session::ConsoleSessionFact],
+) -> Option<(
+    &crate::console_session::ConsoleSessionFact,
+    crate::console_session::ConsoleOrigin,
+)> {
+    sessions
+        .iter()
+        .filter(|session| session.is_console_desktop())
+        .map(|session| (session, session.origin()))
+        .max_by_key(|(_, origin)| *origin == crate::console_session::ConsoleOrigin::OtherProduct)
+}
+
 /// The facts logind reports for one session (`loginctl show-session -p Id
 /// -p Seat -p VTNr -p Class -p State -p Type`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +191,56 @@ mod tests {
         assert_eq!(
             SeatSessionFact::from_properties("Id=5\nVTNr=garbage\n").map(|s| s.vtnr),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn any_console_desktop_on_any_vt_holds_the_seat_and_another_product_is_named() {
+        use crate::console_session::{ConsoleOrigin, ConsoleSessionFact};
+        let parse = |text: &str| ConsoleSessionFact::from_properties(text).expect("fact");
+        let greeter = parse(
+            "Id=c1\nUser=42\nSeat=seat0\nVTNr=1\nClass=greeter\nType=x11\nState=active\nActive=yes\nService=gdm-launch-environment\n",
+        );
+        let ssh = parse(
+            "Id=5\nUser=0\nSeat=\nClass=user\nType=tty\nState=active\nRemote=yes\nService=sshd\n",
+        );
+        let arcen = parse(
+            "Id=6\nUser=1003\nSeat=seat0\nVTNr=1\nTTY=arcen\nClass=user\nType=x11\nState=active\nRemote=yes\nService=login\n",
+        );
+        assert!(x11_seat_holder(&[greeter.clone(), ssh.clone(), arcen]).is_none());
+        let product = parse(
+            "Id=81063\nUser=1001\nSeat=seat0\nVTNr=7\nClass=user\nType=x11\nState=active\nActive=yes\nRemote=yes\nService=vendor-session\n",
+        );
+        let gdm = parse(
+            "Id=9\nUser=1002\nSeat=seat0\nVTNr=2\nClass=user\nType=x11\nState=online\nService=gdm-password\n",
+        );
+        let all = [greeter, gdm.clone(), product, ssh];
+        let (holder, origin) = x11_seat_holder(&all).expect("held");
+        assert_eq!(holder.id, "81063");
+        assert_eq!(origin, ConsoleOrigin::OtherProduct);
+        assert_eq!(
+            x11_seat_holder(&[gdm]).map(|(s, o)| (s.id.as_str(), o)),
+            Some(("9", ConsoleOrigin::DisplayManager))
+        );
+        assert!(DECK_REASON_SEAT_OTHER_PRODUCT.len() <= 120);
+    }
+
+    #[test]
+    fn the_other_product_reason_names_the_service_within_budget() {
+        let service = crate::console_session::ForeignService::new(
+            "labrdp-session",
+            Some("labrdp.service"),
+            None,
+        );
+        let reason = deck_reason_other_product(Some(&service));
+        assert!(
+            reason.contains("labrdp-session, labrdp.service"),
+            "{reason}"
+        );
+        assert!(reason.len() <= 120);
+        assert_eq!(
+            deck_reason_other_product(None),
+            DECK_REASON_SEAT_OTHER_PRODUCT
         );
     }
 

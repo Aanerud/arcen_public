@@ -754,6 +754,7 @@ mod harness {
                 .map_or(FirstLoginSetup::Run, |token| {
                     FirstLoginSetup::from_token(&token).expect("--first-login-setup run|skip")
                 }),
+            desktop_mode: arcen_session::console_session::DesktopMode::Dedicated,
         };
         let permit = Arc::new(tokio::sync::Semaphore::new(1))
             .acquire_owned()

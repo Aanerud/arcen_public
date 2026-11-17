@@ -350,6 +350,10 @@ const SESSION_STREAM_START_FIELDS: &[LifecycleFieldSpec] = &[
     required("width", LifecycleFieldType::Integer),
     required("height", LifecycleFieldType::Integer),
     optional("fps", LifecycleFieldType::Integer),
+    // Why the session runs at `fps`: Auto and Speed follow the Deck
+    // display's refresh, capped only by what the host proves.
+    optional("display_refresh_hz", LifecycleFieldType::Integer),
+    optional("fps_basis", LifecycleFieldType::String),
     optional("pipeline", LifecycleFieldType::String),
     optional("display_backend", LifecycleFieldType::String),
     // Colour identity. Optional in the schema so an older emitter's events are

@@ -39,6 +39,7 @@ mod region_schedule;
 pub mod session_plan;
 pub mod stats_overlay;
 pub mod test_pattern;
+pub mod timeline;
 mod topology_placement;
 pub mod video;
 
