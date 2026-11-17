@@ -63,6 +63,9 @@ use arcen_deck_core::connect_plan::{
     client_monitors_from_topology, display_fit_gate, full_color_display_ids,
     legacy_roster_for_connect_options, monitors_for_policy, primary_monitor, StreamSizingPolicy,
 };
+use arcen_deck_core::input::pointer_drag::{
+    DragGeometry, DragRoute, PictureSurface, PointerDragCapture,
+};
 use arcen_deck_core::reconnect_flow::ResumeLaunch;
 use arcen_deck_core::screens::certificate::{
     render_certificate_changed, render_certificate_warning, CertificateAction,
@@ -86,6 +89,7 @@ use arcen_deck_core::screens::statistics::{
     paint_truth_badge, stream_pipeline_label, DecodeTruth, HealthOverlayFacts,
 };
 use arcen_deck_core::screens::widgets::{back_button, labelled_line_edit};
+use arcen_input::deck_pen::ImageRect;
 #[cfg(test)]
 use arcen_input::PenTool;
 use arcen_input::{FractionalMotionAccumulator, RegionInputWireMessage};
@@ -565,6 +569,8 @@ fn present_host_cursor(
 #[derive(Debug, Clone)]
 struct DeferredSecondaryOutput {
     observation: ViewportBindObservation,
+    /// This viewport's window and picture on the Mac's desktop.
+    placement: Option<(ImageRect, ImageRect)>,
     local_fraction: Option<(f64, f64)>,
     buttons: [(u8, bool); 3],
     focused: bool,
@@ -1095,13 +1101,6 @@ pub fn primary_presentation_size(
     )
 }
 
-const VIDEO_STALL_OVERLAY_AFTER: Duration = Duration::from_secs(4);
-
-fn video_stream_stalled(last_presented_at: Option<Instant>, now: Instant) -> bool {
-    last_presented_at
-        .is_some_and(|last| now.saturating_duration_since(last) >= VIDEO_STALL_OVERLAY_AFTER)
-}
-
 fn root_viewport_visible_for_presenter(viewport: &egui::ViewportInfo) -> bool {
     viewport.visible().unwrap_or(true)
 }
@@ -1447,7 +1446,9 @@ pub struct ArcenApp {
     secondary_textures: BTreeMap<arcen_media::SessionMonitorId, egui::TextureHandle>,
     secondary_deferred_viewports:
         BTreeMap<arcen_media::SessionMonitorId, Arc<Mutex<DeferredSecondaryViewportState>>>,
-    secondary_last_present_request: BTreeMap<arcen_media::SessionMonitorId, Instant>,
+    /// Each secondary viewport's next frame, paced to its display's refresh.
+    secondary_paced_frames:
+        BTreeMap<arcen_media::SessionMonitorId, arcen_media::RefreshPacedSlot<DecodedVideoFrame>>,
     secondary_refresh_superseded_pending: BTreeMap<arcen_media::SessionMonitorId, u64>,
     /// Per-frame `(window_number, monitor_id, ViewSize)` for every currently
     /// open secondary viewport, refreshed every `drive_multi_window` call
@@ -1553,15 +1554,16 @@ pub struct ArcenApp {
     /// `release_pointer_lock_if_secondary_focused`) or the session/window
     /// tears down (`close_multi_window_session`).
     secondary_pointer_lock: Option<arcen_media::SessionMonitorId>,
-    /// The monitor a held-button drag started on, or `None` when no button
-    /// is held.
-    ///
-    /// Latched in `send_mouse_button` and read by `send_mouse_move` so a
-    /// drag may follow the cursor across a monitor boundary instead of
-    /// clamping to the origin monitor's edge. Only ever set for a committed
-    /// multi-window topology; every legacy session leaves it `None` and
-    /// keeps the original single-region behaviour untouched.
-    pointer_drag_origin: Option<arcen_media::SessionMonitorId>,
+    /// The committed multi-window session's one held-button drag: which
+    /// viewport (root or secondary) holds it, so a drag follows the cursor
+    /// into the window it is over instead of clamping to its origin's edge
+    /// (the shared `arcen_deck_core::input::pointer_drag` rule). Every legacy
+    /// session leaves it idle.
+    pointer_drag: PointerDragCapture,
+    /// Where each committed viewport shows its monitor on this Mac's
+    /// desktop (global points), refreshed every pass: the geometry a drag
+    /// is resolved against.
+    pointer_surfaces: Vec<PictureSurface>,
     /// Set for exactly one connection attempt after the user explicitly chose
     /// to replace a remote desktop whose committed topology cannot serve the
     /// requested layout. Cleared once consumed, so a later ordinary connect
@@ -1738,6 +1740,21 @@ pub struct ArcenApp {
     ingress_idr_requests: u64,
     malformed_media_packets: u64,
     waiting_for_keyframe: bool,
+    /// The root window's own monitor waits for a keyframe (the session-wide
+    /// flag outside a committed multi-window session).
+    root_waiting_for_keyframe: bool,
+    /// When the host last answered a health ping.
+    last_host_answer_at: Option<Instant>,
+    /// Whether "Video stream stalled" covers the root picture.
+    video_stall_shown: bool,
+    /// Packets the root window's monitor has sent (all video packets
+    /// outside a committed multi-window session).
+    root_packets_received: u64,
+    /// `root_packets_received` and `last_presented_at` when the root
+    /// picture last changed.
+    root_packets_at_present: (u64, Option<Instant>),
+    /// Since the root's monitor first sent a packet not shown yet.
+    root_unshown_packet_since: Option<Instant>,
     audio_playback_underruns: u64,
     audio_buffer_trim_events: u64,
     audio_buffer_trimmed_samples: u64,
@@ -2311,7 +2328,7 @@ impl ArcenApp {
             pending_root_frame: None,
             secondary_textures: BTreeMap::new(),
             secondary_deferred_viewports: BTreeMap::new(),
-            secondary_last_present_request: BTreeMap::new(),
+            secondary_paced_frames: BTreeMap::new(),
             secondary_refresh_superseded_pending: BTreeMap::new(),
             secondary_tablet_targets: Vec::new(),
             pending_viewport_closes: Vec::new(),
@@ -2340,7 +2357,8 @@ impl ArcenApp {
             pointer_lock: false,
             relative_motion: FractionalMotionAccumulator::default(),
             secondary_pointer_lock: None,
-            pointer_drag_origin: None,
+            pointer_drag: PointerDragCapture::default(),
+            pointer_surfaces: Vec::new(),
             pending_desktop_replacement: false,
             credentials_note: None,
             secondary_relative_motion: BTreeMap::new(),
@@ -2415,6 +2433,12 @@ impl ArcenApp {
             ingress_idr_requests: 0,
             malformed_media_packets: 0,
             waiting_for_keyframe: false,
+            root_waiting_for_keyframe: false,
+            last_host_answer_at: None,
+            video_stall_shown: false,
+            root_packets_received: 0,
+            root_packets_at_present: (0, None),
+            root_unshown_packet_since: None,
             audio_playback_underruns: 0,
             audio_buffer_trim_events: 0,
             audio_buffer_trimmed_samples: 0,
@@ -2708,9 +2732,13 @@ impl eframe::App for ArcenApp {
             self.session_commands.is_some(),
             transitioning,
         ) {
-            ctx.request_repaint_after(paced_ui_poll_interval(
+            let interval = paced_ui_poll_interval(
                 ui_poll_interval(transitioning, self.last_local_input.map(|at| at.elapsed())),
                 self.root_refresh_period,
+            );
+            ctx.request_repaint_after(arcen_deck_core::ui_pacing::egui_repaint_delay(
+                interval,
+                ctx.input(|input| input.predicted_dt),
             ));
             if self.multi_window.is_active() {
                 self.multi_window_timing.note_ui_interval_wake();
@@ -3190,6 +3218,15 @@ impl ArcenApp {
             self.ingress_idr_requests = state.ingress_idr_requests;
             self.malformed_media_packets = state.malformed_media_packets;
             self.waiting_for_keyframe = state.waiting_for_keyframe;
+            self.root_waiting_for_keyframe = self
+                .committed_root_monitor_id()
+                .and_then(|root| state.monitor_media.get(&root))
+                .map_or(state.waiting_for_keyframe, |root| root.waiting_for_keyframe);
+            self.last_host_answer_at = state.last_health_pong_at;
+            self.root_packets_received = self
+                .committed_root_monitor_id()
+                .and_then(|root| state.monitor_media.get(&root))
+                .map_or(state.video_frames_seen, |root| root.frames_received);
             if !state.last_wire_video_summary.is_empty() {
                 self.last_wire_video_summary = state.last_wire_video_summary.clone();
             }
@@ -4183,7 +4220,7 @@ impl ArcenApp {
         self.pending_root_frame = None;
         self.secondary_textures.clear();
         self.secondary_deferred_viewports.clear();
-        self.secondary_last_present_request.clear();
+        self.secondary_paced_frames.clear();
         self.secondary_refresh_superseded_pending.clear();
         self.secondary_tablet_targets.clear();
         self.secondary_scroll_accum.clear();
@@ -4194,7 +4231,8 @@ impl ArcenApp {
         // A drag capture belongs to the committed topology it started under;
         // a fresh commit can reuse the same negotiated `SessionMonitorId`
         // for a physically different monitor.
-        self.pointer_drag_origin = None;
+        self.pointer_drag.reset();
+        self.pointer_surfaces.clear();
         self.secondary_relative_motion.clear();
         // Final enablement audit: a stale cached position from a prior
         // committed roster/topology (a fresh commit can reuse the same
@@ -4918,15 +4956,33 @@ impl ArcenApp {
         if !self.ensure_region_runtime_for_validated(validated) {
             return;
         }
-        let Some(viewport) = self.region_viewport_for_monitor(monitor_id) else {
+        let (target, fraction, motion_mode) = if self.secondary_pointer_lock == Some(monitor_id) {
+            (
+                monitor_id,
+                clamp_unit_fraction(local_fraction),
+                PointerMotionMode::Relative,
+            )
+        } else {
+            // The shared drag rule: a held drag that left this viewport goes
+            // to the monitor under the cursor, and only the viewport holding
+            // the drag moves the one remote pointer.
+            let held = buttons
+                .iter()
+                .filter(|(_, pressed)| *pressed)
+                .fold(0, |held, (button, _)| {
+                    held | PointerDragCapture::button_bit(*button)
+                });
+            let Some((target, fraction)) =
+                self.route_pointer_drag_sample(monitor_id, local_fraction, Some(held))
+            else {
+                return;
+            };
+            (target, fraction, PointerMotionMode::Absolute)
+        };
+        let Some(viewport) = self.region_viewport_for_monitor(target) else {
             return;
         };
-        let motion_mode = if self.secondary_pointer_lock == Some(monitor_id) {
-            PointerMotionMode::Relative
-        } else {
-            PointerMotionMode::Absolute
-        };
-        self.dispatch_region_pointer_sample(viewport, local_fraction, &buttons, motion_mode);
+        self.dispatch_region_pointer_sample(viewport, fraction, &buttons, motion_mode);
     }
 
     /// Forwards one secondary viewport's raw per-frame scroll delta through
@@ -4978,15 +5034,24 @@ impl ArcenApp {
         if !self.ensure_region_runtime_for_validated(validated) {
             return;
         }
-        let Some(viewport) = self.region_viewport_for_monitor(monitor_id) else {
+        let (target, fraction, motion_mode) = if self.secondary_pointer_lock == Some(monitor_id) {
+            (
+                monitor_id,
+                clamp_unit_fraction(local_fraction),
+                PointerMotionMode::Relative,
+            )
+        } else {
+            let Some((target, fraction)) =
+                self.route_pointer_drag_sample(monitor_id, local_fraction, None)
+            else {
+                return;
+            };
+            (target, fraction, PointerMotionMode::Absolute)
+        };
+        let Some(viewport) = self.region_viewport_for_monitor(target) else {
             return;
         };
-        let motion_mode = if self.secondary_pointer_lock == Some(monitor_id) {
-            PointerMotionMode::Relative
-        } else {
-            PointerMotionMode::Absolute
-        };
-        self.dispatch_region_pointer_scroll(viewport, local_fraction, dx, dy, motion_mode);
+        self.dispatch_region_pointer_scroll(viewport, fraction, dx, dy, motion_mode);
     }
 
     /// One `drive_multi_window` frame's entire button/scroll dispatch for
@@ -5246,6 +5311,7 @@ impl ArcenApp {
             monitor_id: arcen_media::SessionMonitorId,
             observation: ViewportBindObservation,
             texture: Option<egui::TextureHandle>,
+            placement: Option<(ImageRect, ImageRect)>,
             local_fraction: Option<(f64, f64)>,
             buttons: [(u8, bool); 3],
             focused: bool,
@@ -5371,6 +5437,7 @@ impl ArcenApp {
                                 monitor_id,
                                 observation: ViewportBindObservation::default(),
                                 texture: self.secondary_textures.get(&monitor_id).cloned(),
+                                placement: None,
                                 local_fraction: None,
                                 buttons: POINTER_BUTTON_WIRE_MAPPING
                                     .map(|(_, wire_button)| (wire_button, false)),
@@ -5395,6 +5462,7 @@ impl ArcenApp {
                                 monitor_id,
                                 observation: ViewportBindObservation::default(),
                                 texture: self.secondary_textures.get(&monitor_id).cloned(),
+                                placement: None,
                                 local_fraction: None,
                                 buttons: POINTER_BUTTON_WIRE_MAPPING
                                     .map(|(_, wire_button)| (wire_button, false)),
@@ -5421,32 +5489,43 @@ impl ArcenApp {
                 .unwrap_or_default();
             let now = Instant::now();
             let mut request_viewport_repaint = !already_committed;
-            if let Some(frame) = frame {
-                if arcen_media::refresh_present_due(
-                    self.secondary_last_present_request
-                        .get(&monitor_id)
-                        .map(|last| now.duration_since(*last)),
-                    display_refresh_hz,
-                ) {
-                    deferred_state
-                        .lock()
-                        .expect("secondary viewport state poisoned")
-                        .pending_frame = Some(frame);
-                    self.secondary_last_present_request.insert(monitor_id, now);
-                    self.multi_window_timing.note_secondary_frame_wake();
-                    request_viewport_repaint = true;
-                } else {
-                    *self
-                        .secondary_refresh_superseded_pending
-                        .entry(monitor_id)
-                        .or_default() += 1;
-                    if let Some(media) = &self.media {
-                        let mut state = media.lock().expect("media state poisoned");
-                        let counters = state.monitor_media.entry(monitor_id).or_default();
-                        counters.frames_superseded_by_refresh =
-                            counters.frames_superseded_by_refresh.saturating_add(1);
-                    }
+            // At most one new picture per refresh of this viewport's display;
+            // an early frame waits for the refresh rather than being dropped,
+            // so the last frame of a burst always reaches the screen.
+            let slot = self.secondary_paced_frames.entry(monitor_id).or_default();
+            let (due_frame, superseded) = match frame {
+                Some(frame) => {
+                    let offer = slot.offer(frame, now, display_refresh_hz);
+                    (offer.present, offer.superseded)
                 }
+                None => (slot.take_due(now, display_refresh_hz), false),
+            };
+            let held_wait = slot.wait(now, display_refresh_hz);
+            if superseded {
+                *self
+                    .secondary_refresh_superseded_pending
+                    .entry(monitor_id)
+                    .or_default() += 1;
+                if let Some(media) = &self.media {
+                    let mut state = media.lock().expect("media state poisoned");
+                    let counters = state.monitor_media.entry(monitor_id).or_default();
+                    counters.frames_superseded_by_refresh =
+                        counters.frames_superseded_by_refresh.saturating_add(1);
+                }
+            }
+            if let Some(frame) = due_frame {
+                deferred_state
+                    .lock()
+                    .expect("secondary viewport state poisoned")
+                    .pending_frame = Some(frame);
+                self.multi_window_timing.note_secondary_frame_wake();
+                request_viewport_repaint = true;
+            }
+            if let Some(wait) = held_wait {
+                ctx.request_repaint_after(arcen_deck_core::ui_pacing::egui_repaint_delay(
+                    wait,
+                    ctx.input(|input| input.predicted_dt),
+                ));
             }
             {
                 let mut state = deferred_state
@@ -5481,6 +5560,7 @@ impl ArcenApp {
 
             let callback_state = Arc::clone(&deferred_state);
             let callback_media = self.media.clone();
+            let callback_telemetry = self.session_telemetry.clone();
             #[cfg(feature = "dev-tools")]
             let expected_virtual_display_id = assignment.display_id;
             ctx.show_viewport_deferred(viewport_id, builder, move |ui, _class| {
@@ -5677,6 +5757,11 @@ impl ArcenApp {
                 let fresh_presented = already_committed && had_fresh_frame;
                 if fresh_presented {
                     state.presented_fresh_frames = state.presented_fresh_frames.saturating_add(1);
+                    // Session health weighs presented against decoded frames,
+                    // and decoded counts every monitor's.
+                    if let Some(telemetry) = &callback_telemetry {
+                        telemetry.record_frames_presented(1);
+                    }
                     if let Some(media) = &callback_media {
                         *media
                             .lock()
@@ -5689,6 +5774,9 @@ impl ArcenApp {
                 state.texture = texture.clone();
                 state.output = Some(DeferredSecondaryOutput {
                     observation,
+                    placement: info
+                        .inner_rect
+                        .map(|window| viewport_placement(window, image_rect)),
                     local_fraction,
                     buttons,
                     focused,
@@ -5729,6 +5817,7 @@ impl ArcenApp {
                     monitor_id,
                     observation: ViewportBindObservation::default(),
                     texture,
+                    placement: None,
                     local_fraction: None,
                     buttons: POINTER_BUTTON_WIRE_MAPPING
                         .map(|(_, wire_button)| (wire_button, false)),
@@ -5746,6 +5835,7 @@ impl ArcenApp {
                 monitor_id,
                 observation: output.observation,
                 texture,
+                placement: output.placement,
                 local_fraction: output.local_fraction,
                 buttons: output.buttons,
                 focused: output.focused,
@@ -5990,6 +6080,9 @@ impl ArcenApp {
                 ));
             }
             for result in results {
+                if let Some(placement) = result.placement {
+                    self.set_pointer_surface(result.monitor_id, placement);
+                }
                 if !result.input_fresh {
                     // Nothing new from this viewport since its last paint.
                     continue;
@@ -6841,6 +6934,8 @@ impl ArcenApp {
         if let Some(runtime) = self.region_runtime.borrow_mut().as_mut() {
             runtime.release_all();
         }
+        // Every button is up on the host: no viewport holds a drag.
+        self.pointer_drag.reset();
     }
 
     fn launcher_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -7269,6 +7364,46 @@ impl ArcenApp {
             self.waiting_for_keyframe = true;
         }
         true
+    }
+
+    /// Whether the root picture shows "Video stream stalled": a picture
+    /// that has not changed is a still host monitor, not a stall, while the
+    /// host still answers or another monitor still streams
+    /// (`arcen_deck_core::video_stall`).
+    fn video_stream_stalled_at(&self, now: Instant) -> bool {
+        let since = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
+        arcen_deck_core::video_stall::video_stalled(arcen_deck_core::video_stall::VideoStallFacts {
+            since_presented: since(self.last_presented_at),
+            waiting_for_keyframe: self.root_waiting_for_keyframe,
+            since_unshown_packet: since(self.root_unshown_packet_since),
+            since_video_packet: since(self.video_packet_times.back().copied()),
+            since_host_answer: since(self.last_host_answer_at),
+        })
+    }
+
+    fn video_stream_stalled_now(&self) -> bool {
+        self.video_stream_stalled_at(Instant::now())
+    }
+
+    /// Notes when the root's monitor sent a packet that has not reached the
+    /// screen: a picture whose own stream flows yet never changes is a stall,
+    /// unlike a still host monitor that sends nothing.
+    ///
+    /// The worker counts a routed frame just after publishing it, so the
+    /// count may trail the picture just shown by one; only a second packet
+    /// beyond it counts as unshown.
+    fn note_root_unshown_packets(&mut self, now: Instant) {
+        let (received_at_present, presented_at) = self.root_packets_at_present;
+        if presented_at != self.last_presented_at
+            || self.root_packets_received < received_at_present
+        {
+            self.root_packets_at_present = (self.root_packets_received, self.last_presented_at);
+            self.root_unshown_packet_since = None;
+        } else if self.root_packets_received > received_at_present.saturating_add(1)
+            && self.root_unshown_packet_since.is_none()
+        {
+            self.root_unshown_packet_since = Some(now);
+        }
     }
 
     fn keep_root_display_sync(&mut self) {
@@ -9393,9 +9528,22 @@ impl ArcenApp {
             self.paint_exactness_readout_panel(ui, rect);
         }
 
-        if video_stream_stalled(self.last_presented_at, Instant::now())
-            && self.remote_texture.is_some()
-        {
+        self.note_root_unshown_packets(Instant::now());
+        let stalled = self.video_stream_stalled_now() && self.remote_texture.is_some();
+        if stalled != self.video_stall_shown {
+            self.video_stall_shown = stalled;
+            let since = |at: Option<Instant>| at.map(|at| at.elapsed().as_millis());
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                shown = stalled,
+                since_presented_ms = since(self.last_presented_at),
+                since_video_packet_ms = since(self.video_packet_times.back().copied()),
+                since_host_answer_ms = since(self.last_host_answer_at),
+                waiting_for_keyframe = self.root_waiting_for_keyframe,
+                "video stall overlay changed",
+            );
+        }
+        if stalled {
             ui.painter()
                 .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(153));
             ui.painter().text(
@@ -9510,6 +9658,11 @@ impl ArcenApp {
         // was made rather than where the pointer ended the pass.
         let pointer_pos =
             ui.input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()));
+        if let Some(root_monitor_id) = self.committed_root_monitor_id() {
+            if let Some(window) = ui.ctx().input(|input| input.viewport().inner_rect) {
+                self.set_pointer_surface(root_monitor_id, viewport_placement(window, image_rect));
+            }
+        }
         if !pen_has_authority {
             let fallback_pos = pointer_pos.or(self.last_pointer_view_pos);
             let pointer_events = ui.input(|input| ordered_pointer_events(&input.events));
@@ -12124,15 +12277,20 @@ impl ArcenApp {
         if self.pointer_lock {
             return;
         }
-        // While a button is held, macOS keeps delivering motion to the window
-        // the press started in even after the cursor has physically left it,
-        // and `pos` then falls outside `rect`. Clamping that into this
-        // monitor's own region pins the remote cursor to the boundary, which
-        // is why a window dragged toward a neighbouring screen stopped dead
-        // at desktop x = 0 and dropped there. Resolve the crossing into the
-        // monitor that actually contains the position first, and dispatch
-        // through *that* monitor's region.
-        if let Some((monitor_id, fraction)) = self.resolve_pointer_drag_crossing(rect, pos) {
+        // A committed multi-window session: while a button is held, macOS
+        // keeps delivering motion to the window the press started in even
+        // after the cursor has left it, so `pos` falls outside `rect`. The
+        // shared drag rule follows it into the window it is over instead of
+        // pinning the remote cursor to this monitor's edge.
+        if let Some(root_monitor_id) = self.committed_root_monitor_id() {
+            let Some(unclamped) = unclamped_view_fraction(rect, pos) else {
+                return;
+            };
+            let Some((monitor_id, fraction)) =
+                self.route_pointer_drag(root_monitor_id, unclamped, None)
+            else {
+                return;
+            };
             if let Some(viewport) = self.region_viewport_for_monitor(monitor_id) {
                 self.last_pointer_view_pos = Some(Self::clamp_to_rect(rect, pos));
                 self.dispatch_region_pointer_motion(
@@ -12153,45 +12311,77 @@ impl ArcenApp {
         self.dispatch_region_pointer_motion(viewport, local_fraction, PointerMotionMode::Absolute);
     }
 
-    /// Resolves a root-viewport pointer position that has left `rect` during
-    /// a held-button drag into the monitor that actually contains it.
-    ///
-    /// Returns `None` whenever the crossing machinery must not engage at all:
-    /// no committed multi-window topology, a degenerate rect, a position
-    /// still inside the origin monitor, or a position that lands in no
-    /// admitted monitor. In every one of those cases the caller keeps its
-    /// existing clamped single-region behaviour.
-    fn resolve_pointer_drag_crossing(
-        &self,
-        rect: egui::Rect,
-        pos: egui::Pos2,
+    /// Records where `monitor_id`'s viewport shows its picture on this
+    /// Mac's desktop (global points): its window and the picture in it.
+    fn set_pointer_surface(
+        &mut self,
+        monitor_id: arcen_media::SessionMonitorId,
+        (window, picture): (ImageRect, ImageRect),
+    ) {
+        self.pointer_surfaces
+            .retain(|surface| surface.monitor != monitor_id);
+        self.pointer_surfaces.push(PictureSurface {
+            monitor: monitor_id,
+            window,
+            picture,
+        });
+    }
+
+    /// Where a pointer sample from `source`'s viewport goes in a committed
+    /// multi-window session: the shared drag rule
+    /// (`arcen_deck_core::input::pointer_drag`) over this Mac's display
+    /// arrangement, with the host's applied layout as the fallback.
+    /// `unclamped` is the fraction of `source`'s picture, outside
+    /// `0.0..=1.0` while a drag has left it. `edge` is a button change
+    /// (`(wire_button, pressed)`), `None` a move. `None`: another viewport
+    /// holds the drag.
+    fn route_pointer_drag(
+        &mut self,
+        source: arcen_media::SessionMonitorId,
+        unclamped: (f64, f64),
+        edge: Option<(u8, bool)>,
     ) -> Option<(arcen_media::SessionMonitorId, (f64, f64))> {
-        let MultiWindowSessionState::Active {
-            validated,
-            committed: true,
-            ..
-        } = &self.multi_window
-        else {
-            return None;
+        let held = edge.map(|(button, pressed)| {
+            let bit = PointerDragCapture::button_bit(button);
+            let held = self.pointer_drag.held();
+            if pressed {
+                held | bit
+            } else {
+                held & !bit
+            }
+        });
+        self.route_pointer_drag_sample(source, unclamped, held)
+    }
+
+    /// [`Self::route_pointer_drag`] for a viewport that reports its button
+    /// state: `held` is the mask of wire buttons down after this sample
+    /// (`None`: unchanged).
+    fn route_pointer_drag_sample(
+        &mut self,
+        source: arcen_media::SessionMonitorId,
+        unclamped: (f64, f64),
+        held: Option<u8>,
+    ) -> Option<(arcen_media::SessionMonitorId, (f64, f64))> {
+        let host: Vec<_> = match &self.multi_window {
+            MultiWindowSessionState::Active { validated, .. } => validated
+                .monitors
+                .iter()
+                .map(|monitor| (monitor.session_monitor_id, monitor.rect))
+                .collect(),
+            MultiWindowSessionState::Inactive => Vec::new(),
         };
-        if rect.width() <= 0.0 || rect.height() <= 0.0 {
-            return None;
+        let geometry = DragGeometry {
+            surfaces: &self.pointer_surfaces,
+            host: &host,
+        };
+        let route = match held {
+            Some(held) => self.pointer_drag.sample(&geometry, source, unclamped, held),
+            None => self.pointer_drag.motion(&geometry, source, unclamped),
+        };
+        match route {
+            DragRoute::To { monitor, fraction } => Some((monitor, fraction)),
+            DragRoute::Ignore => None,
         }
-        let origin = self.pointer_drag_origin?;
-        // Deliberately unclamped: a fraction outside `0.0..=1.0` is the
-        // entire signal that the cursor left this monitor.
-        let unclamped = (
-            f64::from((pos.x - rect.left()) / rect.width()),
-            f64::from((pos.y - rect.top()) / rect.height()),
-        );
-        let roster: Vec<_> = validated
-            .monitors
-            .iter()
-            .map(|monitor| (monitor.session_monitor_id, monitor.rect))
-            .collect();
-        let (monitor_id, fraction) =
-            arcen_media::resolve_pointer_crossing(&roster, origin, unclamped)?;
-        (monitor_id != origin).then_some((monitor_id, fraction))
     }
 
     fn send_mouse_relative(&mut self, motion: egui::Vec2) {
@@ -12298,38 +12488,31 @@ impl ArcenApp {
         } else {
             PointerMotionMode::Absolute
         };
-        // Latch the drag origin on press and clear it on release, so
-        // `send_mouse_move` knows a held-button drag is in progress and may
-        // follow the cursor across a monitor boundary. Tracked per session
-        // rather than per button: the host owns one remote cursor, so the
-        // first press starts the capture and the last release ends it.
-        if pressed {
-            self.pointer_drag_origin = self.pointer_drag_origin.or_else(|| {
-                self.committed_root_monitor_id()
-                    .filter(|_| motion_mode == PointerMotionMode::Absolute)
-            });
-        } else if !self.remote_pointer_buttons.iter().any(|held| *held) {
-            self.pointer_drag_origin = None;
-        }
-        // A crossed drag must release on the monitor it actually ended over,
-        // not back on the origin monitor -- otherwise the button-up lands at
-        // the boundary and the dragged window snaps back.
-        if let Some((monitor_id, fraction)) = self.resolve_pointer_drag_crossing(rect, pos) {
-            if let Some(viewport) = self.region_viewport_for_monitor(monitor_id) {
-                if motion_mode == PointerMotionMode::Absolute {
+        // A committed multi-window session: the press latches this viewport
+        // as the drag's origin, and a release lands on the monitor the drag
+        // ended over, not back at the origin's edge (where the dragged
+        // window would drop).
+        if motion_mode == PointerMotionMode::Absolute {
+            if let Some(root_monitor_id) = self.committed_root_monitor_id() {
+                let Some(unclamped) = unclamped_view_fraction(rect, pos) else {
+                    return;
+                };
+                let Some((monitor_id, fraction)) =
+                    self.route_pointer_drag(root_monitor_id, unclamped, Some((button, pressed)))
+                else {
+                    return;
+                };
+                if let Some(viewport) = self.region_viewport_for_monitor(monitor_id) {
                     self.last_pointer_view_pos = Some(Self::clamp_to_rect(rect, pos));
+                    self.dispatch_region_pointer_button(
+                        viewport,
+                        fraction,
+                        button,
+                        pressed,
+                        motion_mode,
+                    );
+                    return;
                 }
-                self.dispatch_region_pointer_button(
-                    viewport,
-                    fraction,
-                    button,
-                    pressed,
-                    motion_mode,
-                );
-                if !pressed && !self.remote_pointer_buttons.iter().any(|held| *held) {
-                    self.pointer_drag_origin = None;
-                }
-                return;
             }
         }
         let Some(local_fraction) = Self::viewport_local_fraction(rect, pos) else {
@@ -13301,9 +13484,12 @@ const fn root_viewer_should_take_keyboard_focus(
 ///
 /// `pointer_buttons_down` preserves drag continuation exactly like root's
 /// own `response.dragged()` arm: while a button is held, the drag keeps
-/// dispatching even after the pointer leaves this viewport's rect, clamped
-/// to the edge (root clamps identically). A degenerate rect, or a pointer
-/// that is neither inside nor dragging, dispatches nothing.
+/// dispatching after the pointer leaves this viewport's rect, *unclamped*:
+/// a fraction outside `0.0..=1.0` is where the cursor really is, and the
+/// shared drag rule (`route_pointer_drag_sample`) follows it into the
+/// window it is over. A free pointer is clamped to the picture. A
+/// degenerate rect, or a pointer that is neither inside nor dragging,
+/// dispatches nothing.
 #[must_use]
 fn secondary_local_fraction(
     rect: egui::Rect,
@@ -13311,16 +13497,56 @@ fn secondary_local_fraction(
     pointer_buttons_down: bool,
 ) -> Option<(f64, f64)> {
     let pos = pointer_pos?;
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return None;
-    }
     if !rect.contains(pos) && !pointer_buttons_down {
         return None;
     }
-    Some((
-        f64::from(((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0)),
-        f64::from(((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0)),
-    ))
+    let (x, y) = unclamped_view_fraction(rect, pos)?;
+    if pointer_buttons_down {
+        Some((x, y))
+    } else {
+        Some((x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)))
+    }
+}
+
+/// Clamps a picture fraction into the picture.
+#[must_use]
+fn clamp_unit_fraction((x, y): (f64, f64)) -> (f64, f64) {
+    (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0))
+}
+
+/// `pos` as a fraction of `rect`, unclamped (`None` for a degenerate rect):
+/// outside `0.0..=1.0` when a held drag has left the viewport.
+#[must_use]
+fn unclamped_view_fraction(rect: egui::Rect, pos: egui::Pos2) -> Option<(f64, f64)> {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+    let fraction = (
+        f64::from((pos.x - rect.left()) / rect.width()),
+        f64::from((pos.y - rect.top()) / rect.height()),
+    );
+    (fraction.0.is_finite() && fraction.1.is_finite()).then_some(fraction)
+}
+
+/// A viewport's window and picture on this Mac's desktop: `window` is its
+/// content area in global points (egui's `ViewportInfo::inner_rect`, the
+/// same space for every display), `picture` its video rect in that window.
+#[must_use]
+fn viewport_placement(window: egui::Rect, picture: egui::Rect) -> (ImageRect, ImageRect) {
+    let rect = |left: f32, top: f32, size: egui::Vec2| ImageRect {
+        left: f64::from(left),
+        top: f64::from(top),
+        width: f64::from(size.x),
+        height: f64::from(size.y),
+    };
+    (
+        rect(window.left(), window.top(), window.size()),
+        rect(
+            window.left() + picture.left(),
+            window.top() + picture.top(),
+            picture.size(),
+        ),
+    )
 }
 
 /// Root's own state, captured once, the instant *before* the very first
@@ -15334,17 +15560,53 @@ mod tests {
     }
 
     #[test]
-    fn video_stall_overlay_uses_local_presentation_time_only() {
+    fn a_still_root_monitor_on_a_live_session_is_not_dimmed_as_stalled() {
         let now = Instant::now();
-        assert!(!video_stream_stalled(None, now));
-        assert!(!video_stream_stalled(
-            Some(now - Duration::from_secs(3)),
-            now
-        ));
-        assert!(video_stream_stalled(
-            Some(now - Duration::from_secs(4)),
-            now
-        ));
+        let mut app = ArcenApp::default();
+        assert!(!app.video_stream_stalled_at(now));
+        app.last_presented_at = Some(now - Duration::from_secs(3));
+        assert!(!app.video_stream_stalled_at(now));
+
+        // Seen live: the root monitor's host desktop was still for 8 s while
+        // the other monitor streamed and the host answered every ping.
+        app.last_presented_at = Some(now - Duration::from_secs(8));
+        app.video_packet_times
+            .push_back(now - Duration::from_millis(40));
+        app.last_host_answer_at = Some(now - Duration::from_secs(2));
+        assert!(!app.video_stream_stalled_at(now));
+
+        // Every monitor still, host still answering.
+        app.video_packet_times.clear();
+        assert!(!app.video_stream_stalled_at(now));
+
+        // The host went silent.
+        app.last_host_answer_at = Some(now - Duration::from_secs(13));
+        assert!(app.video_stream_stalled_at(now));
+
+        // A picture the Deck cannot show while frames arrive.
+        app.last_host_answer_at = Some(now);
+        app.root_waiting_for_keyframe = true;
+        assert!(app.video_stream_stalled_at(now));
+
+        // The root's own stream flows and nothing reaches the screen.
+        app.root_waiting_for_keyframe = false;
+        let start = now - Duration::from_secs(5);
+        app.note_root_unshown_packets(start);
+        // The shown frame's own packet may be counted just after it showed.
+        app.root_packets_received += 1;
+        app.note_root_unshown_packets(start);
+        assert_eq!(app.root_unshown_packet_since, None);
+        app.root_packets_received += 2;
+        app.note_root_unshown_packets(start);
+        app.note_root_unshown_packets(now - Duration::from_secs(1));
+        assert_eq!(app.root_unshown_packet_since, Some(start));
+        assert!(app.video_stream_stalled_at(now));
+
+        // A new root picture clears it.
+        app.last_presented_at = Some(now);
+        app.note_root_unshown_packets(now);
+        assert_eq!(app.root_unshown_packet_since, None);
+        assert!(!app.video_stream_stalled_at(now));
     }
 
     #[test]
@@ -18691,14 +18953,21 @@ mod tests {
 
     #[test]
     fn secondary_local_fraction_keeps_dispatching_a_held_drag_outside_the_viewport() {
-        // Root keeps dispatching through `response.dragged()` while a
-        // button is held, clamped to its rect; the secondary must match
-        // that exactly rather than dropping the drag at the edge.
+        // A held drag keeps dispatching after it leaves the viewport, and
+        // keeps where the cursor really is: clamping it here pinned the
+        // remote pointer to this monitor's edge, so a window dragged from
+        // a secondary display towards another one stopped there. The
+        // shared drag rule resolves the unclamped fraction into the window
+        // under the cursor.
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1800.0, 1130.0));
         let fraction = secondary_local_fraction(rect, Some(egui::pos2(-40.0, 4000.0)), true)
             .expect("a held drag must keep dispatching");
-        assert!((fraction.0 - 0.0).abs() < 1e-9);
-        assert!((fraction.1 - 1.0).abs() < 1e-9);
+        assert!((fraction.0 - (-40.0 / 1800.0)).abs() < 1e-6);
+        assert!((fraction.1 - (4000.0 / 1130.0)).abs() < 1e-6);
+        // A free pointer is still clamped to the picture.
+        let free = secondary_local_fraction(rect, Some(egui::pos2(1800.0, 0.0)), false)
+            .expect("an edge pointer is inside");
+        assert_eq!(free, (1.0, 0.0));
     }
 
     #[test]
@@ -20988,6 +21257,171 @@ mod tests {
         );
     }
 
+    /// The owner's arrangement in Match My Layout: the main display (a
+    /// secondary viewport, monitor 2) is left of the built-in one that
+    /// carries the root viewport (monitor 1) -- the opposite of the host's
+    /// applied layout, where monitor 2 is right of monitor 1. A drag follows
+    /// the Mac's displays.
+    fn drag_test_app() -> (
+        ArcenApp,
+        mpsc::UnboundedReceiver<SessionCommand>,
+        crate::ui::multi_window_session::ValidatedAppliedTopology,
+        egui::Rect,
+        egui::Rect,
+    ) {
+        let (mut app, receiver) = app_with_command_channel();
+        let validated = two_monitor_validated_topology();
+        let plan = crate::ui::multi_window_runtime::build_plan(
+            &validated.monitor_ids(),
+            &validated.display_ids(),
+        )
+        .expect("valid plan");
+        app.multi_window = MultiWindowSessionState::Active {
+            validated: validated.clone(),
+            attempt: MultiWindowEnterAttempt::new(plan, Duration::ZERO),
+            committed: true,
+        };
+        app.multi_window_root_monitor_id = Some(arcen_media::SessionMonitorId::new(1).unwrap());
+        assert!(app.ensure_region_runtime_for_validated(&validated));
+        let main = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2560.0, 1440.0));
+        let builtin = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1728.0, 1117.0));
+        app.set_pointer_surface(
+            arcen_media::SessionMonitorId::new(2).unwrap(),
+            viewport_placement(main, main),
+        );
+        app.set_pointer_surface(
+            arcen_media::SessionMonitorId::new(1).unwrap(),
+            viewport_placement(main.translate(egui::vec2(2560.0, 0.0)), builtin),
+        );
+        (app, receiver, validated, main, builtin)
+    }
+
+    fn drain_region_json(
+        receiver: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    ) -> Vec<serde_json::Value> {
+        let mut values = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            if let SessionCommand::Json(value) = command {
+                if value["type"] != arcen_protocol::messages::REQUEST_FULL_FRAME {
+                    values.push(value);
+                }
+            }
+        }
+        values
+    }
+
+    fn regions_of(values: &[serde_json::Value], kind: &str) -> Vec<u64> {
+        values
+            .iter()
+            .filter(|value| value["type"] == kind)
+            .filter_map(|value| value["region_id"].as_u64())
+            .collect()
+    }
+
+    #[test]
+    fn a_drag_started_on_a_secondary_viewport_crosses_into_the_root_one_and_is_released_there() {
+        let (mut app, mut receiver, validated, main, builtin) = drag_test_app();
+        let secondary = arcen_media::SessionMonitorId::new(2).unwrap();
+        let held = [(1, true), (2, false), (3, false)];
+        let free = [(1, false), (2, false), (3, false)];
+
+        app.dispatch_secondary_pointer_and_scroll_for_frame(
+            &validated,
+            secondary,
+            secondary_local_fraction(main, Some(egui::pos2(1280.0, 720.0)), false),
+            held,
+            egui::Vec2::ZERO,
+        );
+        let pressed = drain_region_json(&mut receiver);
+        assert_eq!(
+            regions_of(&pressed, "region_pointer_button"),
+            vec![2],
+            "{pressed:?}"
+        );
+
+        // macOS keeps delivering the drag to the main display's window, at
+        // a position right of it: the built-in display's middle.
+        let crossing = secondary_local_fraction(main, Some(egui::pos2(3424.0, 558.5)), true);
+        app.dispatch_secondary_pointer_and_scroll_for_frame(
+            &validated,
+            secondary,
+            crossing,
+            held,
+            egui::Vec2::ZERO,
+        );
+        let crossed = drain_region_json(&mut receiver);
+        assert_eq!(
+            regions_of(&crossed, "region_pointer_enter"),
+            vec![1],
+            "{crossed:?}"
+        );
+
+        // The root viewport sees the pointer too: it sends nothing while the
+        // secondary holds the drag.
+        app.send_mouse_move(builtin, egui::pos2(864.0, 558.5));
+        assert!(drain_region_json(&mut receiver).is_empty());
+
+        // The release is delivered to the main display's window as well,
+        // and lands on the built-in display, where the drag ended.
+        app.dispatch_secondary_pointer_and_scroll_for_frame(
+            &validated,
+            secondary,
+            crossing,
+            free,
+            egui::Vec2::ZERO,
+        );
+        let released = drain_region_json(&mut receiver);
+        assert_eq!(
+            regions_of(&released, "region_pointer_button"),
+            vec![1],
+            "{released:?}"
+        );
+        assert_eq!(app.pointer_drag.origin(), None);
+    }
+
+    #[test]
+    fn a_drag_started_on_the_root_viewport_crosses_into_a_secondary_one_and_back() {
+        let (mut app, mut receiver, _validated, _main, builtin) = drag_test_app();
+
+        app.send_mouse_button(builtin, egui::pos2(100.0, 500.0), 1, true);
+        let pressed = drain_region_json(&mut receiver);
+        assert_eq!(
+            regions_of(&pressed, "region_pointer_button"),
+            vec![1],
+            "{pressed:?}"
+        );
+
+        // 1280 points left of the built-in display: the main display's
+        // middle, a place the host's layout (monitor 2 to the right) would
+        // never have reached.
+        app.send_mouse_move(builtin, egui::pos2(-1280.0, 720.0));
+        let crossed = drain_region_json(&mut receiver);
+        assert_eq!(
+            regions_of(&crossed, "region_pointer_enter"),
+            vec![2],
+            "{crossed:?}"
+        );
+
+        app.send_mouse_move(builtin, egui::pos2(200.0, 300.0));
+        let back = drain_region_json(&mut receiver);
+        assert_eq!(
+            regions_of(&back, "region_pointer_enter"),
+            vec![1],
+            "{back:?}"
+        );
+
+        app.send_mouse_move(builtin, egui::pos2(-1280.0, 720.0));
+        let _ = drain_region_json(&mut receiver);
+        app.send_mouse_button(builtin, egui::pos2(-1280.0, 720.0), 1, false);
+        let released = drain_region_json(&mut receiver);
+        assert_eq!(
+            regions_of(&released, "region_pointer_button"),
+            vec![2],
+            "{released:?}"
+        );
+        assert_eq!(app.pointer_drag.origin(), None);
+    }
+
     /// A held-button drag that leaves its origin monitor must resolve into
     /// the monitor that actually contains the cursor, not clamp to the
     /// origin's edge. The 2026-08-11 pier-windows.example.internal drag pressed at
@@ -22061,10 +22495,7 @@ mod tests {
             Some(fallback_presented_at)
         );
         assert!(
-            !video_stream_stalled(
-                app.last_presented_at,
-                fallback_presented_at + Duration::from_secs(1)
-            ),
+            !app.video_stream_stalled_at(fallback_presented_at + Duration::from_secs(1)),
             "fresh RGBA fallback presentation must not be dimmed by stale native history",
         );
     }
@@ -27421,51 +27852,36 @@ mod tests {
     ) {
         let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
         let mut app = ArcenApp::default();
-        app.secondary_last_present_request
-            .insert(monitor_id, Instant::now());
+        let now = Instant::now();
+        let frame = |timestamp_ms| DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: vec![255; 2 * 2 * 4],
+            timestamp_ms,
+            pixel_format: "bgra".to_string(),
+            backend: "test",
+            native: None,
+        };
+        let slot = app.secondary_paced_frames.entry(monitor_id).or_default();
+        assert!(slot.offer(frame(0), now, 30).present.is_some());
         let shared = Arc::new(Mutex::new(SharedMediaState::fresh(1, false)));
         shared
             .lock()
             .expect("media state poisoned")
             .secondary_frames
-            .insert(
-                monitor_id,
-                DecodedVideoFrame {
-                    width: 2,
-                    height: 2,
-                    rgba: vec![255; 2 * 2 * 4],
-                    timestamp_ms: 0,
-                    pixel_format: "bgra".to_string(),
-                    backend: "test",
-                    native: None,
-                },
-            );
+            .insert(monitor_id, frame(1));
         app.media = Some(Arc::clone(&shared));
-        let state = app
-            .secondary_deferred_viewports
-            .entry(monitor_id)
-            .or_default()
-            .clone();
-        let frame = shared
+        let taken = shared
             .lock()
             .expect("media state poisoned")
             .secondary_frames
-            .remove(&monitor_id);
-        if arcen_media::refresh_present_due(
-            app.secondary_last_present_request
-                .get(&monitor_id)
-                .map(|last| Instant::now().duration_since(*last)),
-            30,
-        ) {
-            state
-                .lock()
-                .expect("secondary viewport state poisoned")
-                .pending_frame = frame;
-        } else {
-            *app.secondary_refresh_superseded_pending
-                .entry(monitor_id)
-                .or_default() += 1;
-        }
+            .remove(&monitor_id)
+            .expect("decoded frame");
+        let slot = app
+            .secondary_paced_frames
+            .get_mut(&monitor_id)
+            .expect("slot");
+        let early = slot.offer(taken, now + Duration::from_millis(5), 30);
         assert!(
             shared
                 .lock()
@@ -27476,14 +27892,17 @@ mod tests {
             "the frame must be consumed (taken) once read, not left in the map to be re-cloned \
              on every later repaint",
         );
+        assert!(
+            early.present.is_none(),
+            "a fresh frame arriving before the display is due does not force another drawable \
+             acquire on the slow viewport",
+        );
         assert_eq!(
-            app.secondary_refresh_superseded_pending
-                .get(&monitor_id)
-                .copied()
-                .unwrap_or_default(),
-            1,
-            "a fresh frame arriving before the display is due is counted as refresh-superseded \
-             instead of forcing another drawable acquire on the slow viewport",
+            slot.take_due(now + Duration::from_millis(34), 30)
+                .map(|frame| frame.timestamp_ms),
+            Some(1),
+            "it waits for the refresh instead of being dropped: with change-driven capture it \
+             may be the last frame for seconds",
         );
     }
 
@@ -29105,9 +29524,11 @@ mod tests {
             Some(egui::pos2(500.0, 100.0)),
             release.pointer_in_use,
         )
-        .expect("captured release outside the image clamps to the image edge");
+        .expect("a captured release outside the image still dispatches");
+        // Unclamped: the shared drag rule places it in the window under the
+        // cursor (this one, its top letterbox bar) at the picture's edge.
         assert!((fraction.0 - 0.5).abs() < 0.001);
-        assert_eq!(fraction.1, 0.0);
+        assert!((fraction.1 - (-0.2)).abs() < 1e-6);
     }
 
     #[test]
@@ -29226,9 +29647,9 @@ mod tests {
             Some(egui::pos2(500.0, 100.0)),
             release_both.pointer_in_use,
         )
-        .expect("accepted drag release outside the image clamps to the image edge");
+        .expect("an accepted drag release outside the image still dispatches");
         assert!((fraction.0 - 0.5).abs() < 0.001);
-        assert_eq!(fraction.1, 0.0);
+        assert!((fraction.1 - (-0.2)).abs() < 1e-6);
     }
 
     #[test]

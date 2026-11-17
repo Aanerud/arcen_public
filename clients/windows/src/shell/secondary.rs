@@ -294,7 +294,7 @@ impl Secondaries {
                 attach.push((window.hwnd, window.monitor));
                 window.input_attached = true;
             }
-            super::session::Connection::sync_secondary_input(window.hwnd, &window.tree);
+            connection.sync_secondary_input(window.hwnd, window.monitor, &window.tree);
         }
         for (monitor, pipeline, frame) in &frames {
             let Some(window) = self

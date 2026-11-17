@@ -5,9 +5,11 @@
 //! Platform adapters read their window system through the shared policies
 //! in `arcen-input` and emit [`arcen_input::deck_events::DeckInputEvent`]s;
 //! [`region_runtime`] owns the region-authoritative pointer state and wire
-//! encoding (shared by every Deck).
+//! encoding (shared by every Deck); [`pointer_drag`] follows a held-button
+//! drag across Match My Layout's windows.
 
 pub mod overlay_pointer;
+pub mod pointer_drag;
 pub mod region_runtime;
 #[cfg(feature = "runtime")]
 mod session_input;

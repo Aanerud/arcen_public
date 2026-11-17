@@ -463,6 +463,88 @@ pub fn refresh_present_due(
     elapsed.as_nanos() >= interval_nanos
 }
 
+/// One display's next picture, paced to that display's refresh.
+///
+/// A display shows at most one new picture per refresh, so a frame that
+/// arrives before the refresh is due waits here; a newer one replaces it
+/// (newest wins). It is never thrown away: capture is change-driven, so the
+/// last frame of a burst may be the last frame for seconds, and dropping it
+/// would leave a stale picture on screen until the host next changes.
+#[derive(Debug)]
+pub struct RefreshPacedSlot<F> {
+    held: Option<F>,
+    last_present: Option<std::time::Instant>,
+}
+
+impl<F> Default for RefreshPacedSlot<F> {
+    fn default() -> Self {
+        Self {
+            held: None,
+            last_present: None,
+        }
+    }
+}
+
+/// What [`RefreshPacedSlot::offer`] did with a frame.
+#[derive(Debug)]
+pub struct PacedOffer<F> {
+    /// The frame to present now, when the display is due.
+    pub present: Option<F>,
+    /// A held frame was replaced by a newer one before it could be shown.
+    pub superseded: bool,
+}
+
+impl<F> RefreshPacedSlot<F> {
+    /// Offers a freshly decoded `frame` for a display refreshing at
+    /// `display_refresh_hz` (0 = unknown, never paced).
+    pub fn offer(
+        &mut self,
+        frame: F,
+        now: std::time::Instant,
+        display_refresh_hz: u32,
+    ) -> PacedOffer<F> {
+        let superseded = self.held.replace(frame).is_some();
+        PacedOffer {
+            present: self.take_due(now, display_refresh_hz),
+            superseded,
+        }
+    }
+
+    /// The held frame, once the display is due for a new picture.
+    pub fn take_due(&mut self, now: std::time::Instant, display_refresh_hz: u32) -> Option<F> {
+        self.held.as_ref()?;
+        if !refresh_present_due(
+            self.last_present
+                .map(|last| now.saturating_duration_since(last)),
+            display_refresh_hz,
+        ) {
+            return None;
+        }
+        self.last_present = Some(now);
+        self.held.take()
+    }
+
+    /// How long until the held frame is due; `None` when nothing waits.
+    #[must_use]
+    pub fn wait(&self, now: std::time::Instant, display_refresh_hz: u32) -> Option<Duration> {
+        self.held.as_ref()?;
+        let (Some(last), Some(interval)) = (
+            self.last_present,
+            1_000_000_000_u64
+                .checked_div(u64::from(display_refresh_hz))
+                .map(Duration::from_nanos),
+        ) else {
+            return Some(Duration::ZERO);
+        };
+        Some(interval.saturating_sub(now.saturating_duration_since(last)))
+    }
+
+    /// Forgets the held frame and the pacing (a new session or topology).
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Classifies a telemetry window into display-refresh supersession versus
 /// losses before a frame could be physically shown.
 ///
@@ -1337,6 +1419,58 @@ mod tests {
         assert!(!refresh_present_due(Some(Duration::from_millis(16)), 30));
         assert!(refresh_present_due(Some(Duration::from_millis(34)), 30));
         assert!(refresh_present_due(Some(Duration::from_millis(9)), 120));
+    }
+
+    #[test]
+    fn an_early_frame_waits_for_the_refresh_instead_of_being_dropped() {
+        let start = std::time::Instant::now();
+        let mut slot = RefreshPacedSlot::default();
+        let first = slot.offer(1, start, 30);
+        assert_eq!(first.present, Some(1));
+        assert!(!first.superseded);
+
+        // 10 ms later, before a 30 Hz refresh is due: held, not lost.
+        let early = slot.offer(2, start + Duration::from_millis(10), 30);
+        assert_eq!(early.present, None);
+        let wait = slot
+            .wait(start + Duration::from_millis(10), 30)
+            .expect("a frame waits");
+        assert!(wait > Duration::from_millis(23) && wait <= Duration::from_millis(24));
+        assert_eq!(slot.take_due(start + Duration::from_millis(20), 30), None);
+
+        // The last frame of the burst reaches the screen once due, with no
+        // newer frame ever arriving.
+        assert_eq!(
+            slot.take_due(start + Duration::from_millis(34), 30),
+            Some(2)
+        );
+        assert_eq!(slot.wait(start + Duration::from_millis(34), 30), None);
+    }
+
+    #[test]
+    fn a_newer_frame_replaces_the_held_one() {
+        let start = std::time::Instant::now();
+        let mut slot = RefreshPacedSlot::default();
+        assert_eq!(slot.offer(1, start, 30).present, Some(1));
+        assert_eq!(
+            slot.offer(2, start + Duration::from_millis(5), 30).present,
+            None
+        );
+        let newer = slot.offer(3, start + Duration::from_millis(9), 30);
+        assert!(newer.superseded);
+        assert_eq!(newer.present, None);
+        assert_eq!(
+            slot.take_due(start + Duration::from_millis(40), 30),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn an_unknown_refresh_presents_every_frame() {
+        let start = std::time::Instant::now();
+        let mut slot = RefreshPacedSlot::default();
+        assert_eq!(slot.offer(1, start, 0).present, Some(1));
+        assert_eq!(slot.offer(2, start, 0).present, Some(2));
     }
 
     #[test]

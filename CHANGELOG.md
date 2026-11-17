@@ -86,6 +86,45 @@ protocol v5 and works with every 0.17.0 to 0.20.1 Deck and Pier.
   own desktop choice where it used to start `platform.session.desktop`. The Pier log names the desktop
   every joined session runs.
 
+### Re-issue — Fixed
+
+The 0.20.2 Decks were re-issued with these fixes; Piers are unchanged.
+
+- **A drag stopped at the edge of a display in Match my layout (reported
+  on 0.20.2).** Holding a mouse button and dragging, for example a window
+  from one of your displays to another, stopped the pointer at the edge of
+  the first display, on every host. The macOS Deck followed a drag across
+  displays only from the window on its fastest display, and only where the
+  host had laid its monitors out like your desk; the Windows Deck never
+  did. Both Decks now share one rule: the window you pressed in keeps the
+  drag, the pointer goes to the host monitor shown on the display it is
+  over (by your Deck's own arrangement, so a host that laid its monitors
+  out differently is followed too), a gap between displays lands on the
+  nearest display's edge, and the release lands where the drag ended.
+  Update the macOS and Windows Decks; Piers need no change.
+- **A display of a Match my layout session kept going dark (reported on
+  0.20.2; macOS Deck).** A Pier sends a monitor's picture only when it
+  changes, so a monitor whose desktop is still sends nothing for seconds.
+  The macOS Deck read four seconds without a new picture in its main
+  window as a stalled stream and dimmed that display under "Video stream
+  stalled" until the host's desktop changed again; on a two-display Mac
+  this was the display holding the main window. The Deck now shows a stall
+  only when the host has gone silent, or that display's stream keeps
+  arriving and nothing of it reaches the screen.
+- **The macOS Deck's interface ran hundreds of passes a second in a
+  multi-display session.** While you used the Mac, a 16 ms poll was read
+  as "repaint now" and, with display sync off for several windows, nothing
+  capped it (786 passes a second measured). It now runs at its poll rate.
+- **A further display could keep a stale picture (macOS Deck).** A frame
+  that arrived less than one refresh after the previous one was thrown
+  away instead of shown at the next refresh, so a 30 Hz display lost a
+  third of a 30 fps stream and, when that was the last change, kept the
+  older picture. It now waits for the refresh; a newer frame replaces it.
+- **Multi-display sessions reported their health as critical (both
+  Decks).** The pictures shown on further displays were not counted as
+  presented, so every Match my layout session read as 40 % or more of its
+  frames unpresented.
+
 ## [0.20.1] — 2026-11-17
 
 **Arcen is an extension of your machine.** A Linux Pier now joins the
