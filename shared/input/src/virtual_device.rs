@@ -234,7 +234,7 @@ impl Error for SessionInputIdentityError {}
 /// The identity shared by one session's virtual devices and its X server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionInputIdentity {
-    display: u8,
+    display: u16,
 }
 
 impl SessionInputIdentity {
@@ -254,16 +254,41 @@ impl SessionInputIdentity {
         {
             return Err(invalid());
         }
-        let number = digits.parse::<u8>().map_err(|_| invalid())?;
-        if !(LOWEST_DISPLAY..=HIGHEST_DISPLAY).contains(&number) {
+        let number = digits.parse::<u16>().map_err(|_| invalid())?;
+        if !(u16::from(LOWEST_DISPLAY)..=u16::from(HIGHEST_DISPLAY)).contains(&number) {
             return Err(invalid());
         }
         Ok(Self { display: number })
     }
 
-    /// The dedicated X display number.
+    /// Identity of the devices injected into a joined console session's X
+    /// server (ADR 0025), whatever display number that server has: a display
+    /// manager's (`:0`, `:1`) or another remote-desktop product's (`:100`).
+    /// A console X server admits input devices by itself; the token only
+    /// names the devices, and no dedicated desktop runs beside a joined
+    /// console, so no isolation class admits them anywhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `display` is exactly `:N` (a local display,
+    /// `N` at most 65535, no leading zero, screen suffix or host part).
+    pub fn for_joined_console(display: &str) -> Result<Self, SessionInputIdentityError> {
+        let invalid = || SessionInputIdentityError::InvalidDisplay(display.to_owned());
+        let digits = display.strip_prefix(':').ok_or_else(invalid)?;
+        if digits.is_empty()
+            || digits.len() > 5
+            || (digits.len() > 1 && digits.starts_with('0'))
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid());
+        }
+        let display = digits.parse::<u16>().map_err(|_| invalid())?;
+        Ok(Self { display })
+    }
+
+    /// The X display number.
     #[must_use]
-    pub const fn display_number(self) -> u8 {
+    pub const fn display_number(self) -> u16 {
         self.display
     }
 
@@ -315,6 +340,32 @@ impl SessionInputIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_joined_consoles_devices_are_named_for_any_local_display() {
+        for (display, number) in [(":0", 0), (":1", 1), (":100", 100), (":65535", 65535)] {
+            let identity = SessionInputIdentity::for_joined_console(display).expect(display);
+            assert_eq!(identity.display_number(), number);
+            assert!(
+                identity.device_name(VirtualInputRole::Relative).len() <= MAX_DEVICE_NAME_BYTES
+            );
+        }
+        assert_eq!(
+            SessionInputIdentity::for_joined_console(":100")
+                .expect("product display")
+                .session_token(),
+            "(session :100)"
+        );
+        for display in ["", ":", "100", ":010", ":65536", ":1.0", "host:1", ":-1"] {
+            assert!(
+                SessionInputIdentity::for_joined_console(display).is_err(),
+                "{display}"
+            );
+        }
+        // A dedicated desktop's display stays within its own range.
+        assert!(SessionInputIdentity::for_x_display(":100").is_err());
+        assert!(SessionInputIdentity::for_x_display(":0").is_err());
+    }
 
     #[test]
     fn libinput_quirks_turn_off_smoothing_only_for_the_virtual_pen() {

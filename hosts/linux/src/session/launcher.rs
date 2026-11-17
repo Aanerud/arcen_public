@@ -148,6 +148,8 @@ pub struct LauncherConfig {
     pub runtime_root: PathBuf,
     pub agent_binary: PathBuf,
     pub desktop: String,
+    /// `platform.session.default_desktop` for console sign-ins.
+    pub default_desktop: Option<arcen_session::console_session::account_desktop::DesktopId>,
     pub deskside: crate::deskside::LinuxDesksideConfig,
     /// Desktop provider the privileged launcher creates.
     pub provider: arcen_session::desktop_provider::DesktopProvider,
@@ -668,6 +670,20 @@ struct LauncherResponse {
     /// picture). Absent when no layout was asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     console_layout: Option<String>,
+    /// A console shown as it is (`console_layout` = `shown`): the RandR
+    /// output each committed monitor is captured from, in plan order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    console_outputs: Option<Vec<String>>,
+    /// What `platform.session.default_desktop` did for a sign-in that
+    /// started the account's session (`default_applied`,
+    /// `account_choice`…); absent for a joined session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    console_default_desktop: Option<String>,
+    /// The joined session's desktop as logind recorded it
+    /// (`XDG_SESSION_DESKTOP`: `gnome-classic`, `gnome-xorg`…). The agent
+    /// keeps the configured desktop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    console_desktop: Option<String>,
 }
 
 /// The helper environment that pins capture to the dedicated X server's GPU.
@@ -728,6 +744,9 @@ impl LauncherResponse {
             console_signed_in: false,
             console_service: None,
             console_layout: None,
+            console_outputs: None,
+            console_default_desktop: None,
+            console_desktop: None,
         }
     }
 
@@ -792,6 +811,9 @@ impl LauncherResponse {
             console_signed_in: false,
             console_service: None,
             console_layout: None,
+            console_outputs: None,
+            console_default_desktop: None,
+            console_desktop: None,
         }
     }
 
@@ -1002,6 +1024,14 @@ impl AuthenticatedLauncher {
             .arg(&config.agent_binary)
             .arg("--desktop-session")
             .arg(&config.desktop)
+            .args(
+                config
+                    .default_desktop
+                    .as_ref()
+                    .map(|desktop| ["--default-desktop", desktop.as_str()])
+                    .into_iter()
+                    .flatten(),
+            )
             .arg("--desktop-provider")
             .arg(config.provider.token())
             .args(config.x11_apps.then_some(super::wayland::LAUNCHER_X11_FLAG))
@@ -1266,6 +1296,8 @@ impl AuthenticatedLauncher {
             display = %response.display,
             origin = response.console_origin.as_deref().unwrap_or("unknown"),
             signed_in_through_login_screen = response.console_signed_in,
+            desktop = response.console_desktop.as_deref().unwrap_or("unknown"),
+            default_desktop = response.console_default_desktop.as_deref().unwrap_or("not_applicable"),
             layout = response.console_layout.as_deref().unwrap_or("not_requested"),
             root_depth = ?response.x11_root_depth,
             "joined the user's console session"
@@ -1295,8 +1327,16 @@ impl AuthenticatedLauncher {
             console_service: response.console_service.clone(),
             #[cfg(target_os = "linux")]
             _console_gate: self.console_gate.take(),
-            console_layout_applied: response.console_layout.as_deref()
-                == Some(CONSOLE_LAYOUT_APPLIED),
+            console_layout_applied: matches!(
+                response.console_layout.as_deref(),
+                Some(CONSOLE_LAYOUT_APPLIED | CONSOLE_LAYOUT_SHOWN)
+            ),
+            console_guest: response.console_origin.as_deref()
+                == Some(arcen_session::console_session::ConsoleOrigin::OtherProduct.token()),
+            console_shown_outputs: response
+                .console_outputs
+                .clone()
+                .filter(|_| response.console_layout.as_deref() == Some(CONSOLE_LAYOUT_SHOWN)),
         })
     }
 
@@ -1548,6 +1588,8 @@ impl AuthenticatedLauncher {
             #[cfg(target_os = "linux")]
             _console_gate: None,
             console_layout_applied: false,
+            console_guest: false,
+            console_shown_outputs: None,
         })
     }
 
@@ -1625,12 +1667,22 @@ pub struct SessionLauncher {
     /// (`console::console_gate`).
     #[cfg(target_os = "linux")]
     _console_gate: Option<super::console::ConsoleGate>,
-    /// The joined console took the committed multi-monitor plan's layout.
+    /// The joined console took the committed multi-monitor plan's layout,
+    /// or showed it as it is (a guest console whose layout is the Deck's).
     console_layout_applied: bool,
+    /// The joined console belongs to another remote-desktop product: it is
+    /// shown as it is and never changed (ADR 0025 §8).
+    console_guest: bool,
+    /// Such a console's outputs, one per committed monitor, in plan order.
+    console_shown_outputs: Option<Vec<String>>,
 }
 
 /// [`LauncherResponse::console_layout`] when the console took the layout.
 const CONSOLE_LAYOUT_APPLIED: &str = "applied";
+/// [`LauncherResponse::console_layout`] when a console shown as it is
+/// already has the Deck's layout: nothing is changed, each monitor is
+/// captured from the output that shows it.
+const CONSOLE_LAYOUT_SHOWN: &str = "shown";
 
 /// The layout a joined console takes while the Deck is attached (ADR 0025
 /// §6): a committed multi-monitor plan's monitors; on a host whose console
@@ -1765,6 +1817,17 @@ impl SessionLauncher {
     /// the console took the plan's layout (otherwise it is one picture).
     pub(crate) fn serves_committed_monitors(&self) -> bool {
         self.console.is_none() || self.console_layout_applied
+    }
+
+    /// Whether this joined console belongs to another remote-desktop
+    /// product (shown as it is, never changed).
+    pub(crate) fn is_console_guest(&self) -> bool {
+        self.console.is_some() && self.console_guest
+    }
+
+    /// The outputs a console shown as it is captures, in plan order.
+    pub(crate) fn console_shown_outputs(&self) -> Option<Vec<String>> {
+        self.console_shown_outputs.clone()
     }
 
     /// What another account is told while this joined console session is
@@ -2250,6 +2313,13 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     let runtime_root = PathBuf::from(required_argument(args, "--runtime-root")?);
     let agent_binary = PathBuf::from(required_argument(args, "--agent-bin")?);
     let desktop = required_argument(args, "--desktop-session")?;
+    let default_desktop = match argument_value(args, "--default-desktop") {
+        None => None,
+        Some(id) => Some(
+            arcen_session::console_session::account_desktop::DesktopId::parse(&id)
+                .ok_or(LauncherError::Protocol)?,
+        ),
+    };
     let session_log_id = CorrelationId::parse_uuid(required_argument(args, "--session-log-id")?)
         .map_err(|_| LauncherError::Protocol)?;
     let provider = match argument_value(args, "--desktop-provider") {
@@ -2420,6 +2490,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
             gpu_head: gpu_head.clone(),
             reserved_display: display.clone(),
             desktop: desktop.clone(),
+            default_desktop: default_desktop.clone(),
             depth: x11_desktop_depth.map(arcen_media::video::DesktopDepth::x11_depth),
         };
         return run_console(
@@ -2828,6 +2899,9 @@ async fn run_console(
     );
     let mut privacy = console::ConsolePrivacy::default();
     let mut signed_in_through: Option<String> = None;
+    // What `platform.session.default_desktop` did for a sign-in that
+    // starts the account's session (ADR 0025); none for a joined session.
+    let mut default_desktop: Option<&'static str> = None;
     // A login session this launcher started that cannot be made private is
     // ended: nobody has seen it, and nothing could cover it at the desk.
     let mut started_login_session = false;
@@ -2863,6 +2937,16 @@ async fn run_console(
             if let Err(refusal) = privacy.disable_input() {
                 return Err(refuse(refusal.into()));
             }
+            // Before the login screen reads the account's settings.
+            default_desktop = Some(
+                super::account_desktop::prepare(
+                    &identity.username,
+                    identity.uid,
+                    launch.default_desktop.as_ref(),
+                )
+                .await
+                .token(),
+            );
             match console::sign_in_through_greeter(&greeter, &identity.username, identity.uid).await
             {
                 Ok(session) => {
@@ -2882,7 +2966,28 @@ async fn run_console(
             if let Err(refusal) = privacy.disable_input() {
                 return Err(refuse(refusal.into()));
             }
-            match super::login_session::start(identity, vt, launch).await {
+            let prepared = super::account_desktop::prepare(
+                &identity.username,
+                identity.uid,
+                launch.default_desktop.as_ref(),
+            )
+            .await;
+            default_desktop = Some(prepared.token());
+            let mut launch = launch.clone();
+            let chosen = arcen_session::console_session::account_desktop::login_session_desktop(
+                &prepared.choice,
+                &prepared.decision,
+                launch.default_desktop.as_ref(),
+                &launch.desktop,
+            );
+            if chosen != launch.desktop {
+                if super::login_session::has_x_session(&chosen) {
+                    launch.desktop = chosen;
+                } else {
+                    tracing::warn!(target: target::SESSION, desktop = %chosen, configured = %launch.desktop, "the account's desktop has no X session entry; the configured desktop starts");
+                }
+            }
+            match super::login_session::start(identity, vt, &launch).await {
                 Ok(session) => {
                     privacy.mark_brought_forward();
                     started_login_session = true;
@@ -2904,6 +3009,31 @@ async fn run_console(
             )))
         }
     };
+    // Another product's desktop is joined only while that product's own
+    // client is not using it: one remote product at a time (ADR 0025 §8).
+    let guest = origin == model::ConsoleOrigin::OtherProduct;
+    if guest {
+        if let Some(device) = console::another_products_client() {
+            tracing::warn!(
+                target: target::SESSION,
+                session_id = %session_id,
+                device = %device,
+                "another remote-desktop product's client is using this desktop"
+            );
+            if privacy.is_brought_forward() {
+                secure_before_leaving(&mut privacy, None, &session_id).await;
+            } else {
+                privacy.release_input();
+            }
+            let service = console::session_fact(&session_id)
+                .await
+                .map(|fact| console::foreign_service(&fact));
+            return Err(refuse(model::ConsoleNotice::naming(
+                ConsoleRefusal::InUseOtherProduct,
+                service,
+            )));
+        }
+    }
     // A session this sign-in brought to the desk's monitors (started by
     // the login screen, or brought forward) is secured before any refusal
     // gives the desk back; one the desk was already using is left as it
@@ -2946,8 +3076,40 @@ async fn run_console(
     // The Deck's layout, while the monitors are blank and the session not
     // yet open (ADR 0025 §6). A console that cannot take it is left as it
     // is, and the Pier is told why (it ends the sign-in with the reason).
-    let layout_requests = console_layout_requests(open);
+    let layout_requests = if guest {
+        // Shown as it is: never laid out; a single picture never asks.
+        open.multi_monitor
+            .clone()
+            .and_then(|plan| plan.into_plan().ok())
+            .and_then(|plan| super::console_layout::requests_from_plan(&plan))
+    } else {
+        console_layout_requests(open)
+    };
+    let mut console_outputs = None;
     let console_layout = match layout_requests.as_deref() {
+        Some(requests) if guest => Some(
+            match super::console_layout::bind_shown(&session_display, requests).await {
+                Ok(names) => {
+                    tracing::info!(
+                        target: target::SESSION,
+                        outputs = ?names,
+                        "another product's desktop already has the Deck's layout; each monitor is captured as it is shown"
+                    );
+                    console_outputs = Some(names);
+                    CONSOLE_LAYOUT_SHOWN.to_owned()
+                }
+                Err(failure) => {
+                    tracing::warn!(
+                        target: target::SESSION,
+                        reason_class = failure.token,
+                        detail = %failure.detail,
+                        monitors = requests.len(),
+                        "another product's desktop is not laid out as the Deck's monitors; it is never changed"
+                    );
+                    failure.token.to_owned()
+                }
+            },
+        ),
         Some(requests) => Some(
             match privacy
                 .apply_layout(&session_display, &session_id, identity.uid, requests)
@@ -2975,6 +3137,15 @@ async fn run_console(
     let vtnr = console::session_fact(&session_id)
         .await
         .map_or(0, |fact| fact.vtnr);
+    // The desktop the session runs, as logind recorded it.
+    let started_desktop = super::account_desktop::session_desktop(&session_id, identity.uid);
+    tracing::info!(
+        target: target::SESSION,
+        session_id = %session_id,
+        desktop = started_desktop.as_deref().unwrap_or("unknown"),
+        default_desktop = default_desktop.unwrap_or("not_applicable"),
+        "the console session's desktop"
+    );
     let environment = SessionEnvironment::build(
         identity,
         &session_display.display,
@@ -3019,6 +3190,8 @@ async fn run_console(
         LauncherResponse::ready(identity, &environment, &agent.ready, None, Some(depth));
     ready.console_origin = Some(origin.token().to_owned());
     ready.console_signed_in = signed_in;
+    ready.console_default_desktop = default_desktop.map(str::to_owned);
+    ready.console_desktop = started_desktop;
     if origin == model::ConsoleOrigin::OtherProduct {
         // Named to another account the Deck's absence would otherwise
         // leave guessing (`console_refusal_for_another_user`).
@@ -3027,6 +3200,7 @@ async fn run_console(
             .map(|fact| console::foreign_service(&fact));
     }
     ready.console_layout = console_layout.clone();
+    ready.console_outputs = console_outputs;
     if let Err(error) = write_response(&ready) {
         agent.shutdown().await;
         secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
@@ -3069,6 +3243,24 @@ async fn run_console(
                         }
                     }
                     Some("attach") => {
+                        if guest {
+                            if let Some(device) = console::another_products_client() {
+                                tracing::warn!(
+                                    target: target::SESSION,
+                                    device = %device,
+                                    "another remote-desktop product's client is using this desktop; the returning Deck is refused"
+                                );
+                                let service = console::session_fact(&session_id)
+                                    .await
+                                    .map(|fact| console::foreign_service(&fact));
+                                let notice = model::ConsoleNotice::naming(
+                                    ConsoleRefusal::InUseOtherProduct,
+                                    service,
+                                );
+                                let _ = write_response(&LauncherResponse::console_refusal(&notice));
+                                break;
+                            }
+                        }
                         attached = true;
                         let mut desk = console::LiveDesk {
                             privacy: &mut privacy,

@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-capenc"
-version = "0.20.1"
+version = "0.20.2"
 edition = "2021"
 description = "Arcen capture+encode engine — NvFBC/DXGI/WGC -> NVENC (zero-copy). Emits Annex-B to stdout. Spawned by both Arcen Piers."
 publish.workspace = true

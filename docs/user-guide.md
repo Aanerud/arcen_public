@@ -536,7 +536,9 @@ does not ship. On the Mac host (preview) it is built but not yet qualified.
   needs macOS's "Displays have separate Spaces" turned on, **Extend
   fullscreen under the notch** turned off, and a host that supports it. If
   it cannot be done, the connection fails with a message that says why
-  rather than quietly showing one display.
+  rather than quietly showing one display. A display you turned on its side
+  (portrait) gets a portrait display on the host; a host that cannot rotate
+  a display gives it the same portrait size, upright.
 - **Primary display only**: just your main display, sized to what it shows
   full-screen, pixel for pixel. The stream does not follow the window.
 - **Windowed**: your main display in a window you can resize. The image

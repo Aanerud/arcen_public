@@ -62,6 +62,9 @@
 # feeds capenc's CursorEmitter (over the PipeWire CursorState) into it. The record
 # format and writer are shared (arcen_media::capenc_stream::write_record); it moves to
 # shared/ with pipelines/mod.rs and wayland/cursor.rs.
+# hosts/linux/src/net/setup_watch.rs is the Linux Pier's connection-scoped
+# lifecycle glue (a tokio task-local and the Pier's LifecycleEmitter), as
+# hosts/*/src/observability.rs are; its trace moves to shared/ with the emitter seam.
 hosts/capenc/src/annexb.rs 80
 hosts/capenc/src/region_schedule.rs 225
 hosts/capenc/src/wayland/cursor.rs 126
@@ -86,6 +89,7 @@ hosts/linux/src/input/region_adapter.rs 221
 hosts/linux/src/media/annexb.rs 124
 hosts/linux/src/media/mod.rs 57
 hosts/linux/src/media/wayland_cursor.rs 83
+hosts/linux/src/net/setup_watch.rs 83
 hosts/linux/src/observability.rs 520
 hosts/linux/src/session/audio.rs 209
 hosts/linux/src/session/client.rs 338

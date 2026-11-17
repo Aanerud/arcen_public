@@ -81,6 +81,7 @@
     "session": {
       "mode": "console",
       "desktop": "gnome",
+      "default_desktop": null,
       "display": ":11",
       "gpu_head": "DFP-2",
       "xorg_bin": "/usr/libexec/Xorg",

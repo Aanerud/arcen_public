@@ -67,6 +67,43 @@ distribution rules (`05-`), reads the logind record through `polkit.spawn`
 (polkit's JavaScript sees only `seat`, `session`, `local` and `active`), and
 names no session, so sign-ins never write it.
 
+A process in no logind session (a systemd user service: GNOME 40 and later
+run the shell and the settings daemons that way) reaches the rule with no
+session and no seat, but `local` from its user's display session and
+`active` when any of the user's sessions is active. Up to 0.20.1 the rule
+counted every such subject as remote, so on a host with Arcen installed the
+desk user's own shell asked for an administrator to power off, and GNOME's
+colour plugin asked for a password in every session (reported from the
+field on 0.20.1; reproduced on Rocky 9, polkit 0.117: `gsd-color` in
+`user@.service` got `session=null local=true active=true`). Such a process
+may belong to any of the user's sessions, so from 0.20.2 the rule counts it
+as remote while any of them is an Arcen desktop or a seated remote session:
+it resolves the user name to a uid with `id` (cached per name), reads
+`SESSIONS=` from logind's user record (`/run/systemd/users/<uid>`) and
+classifies each listed session as above (logind 252 on Rocky 9 leaves an
+ended session in that list until the user's next session starts, so a
+listed session missing from a successful `ls` of `/run/systemd/sessions`
+is gone and skipped; a listing that fails skips nothing). Otherwise — only console sessions,
+or ssh logins, which are seatless — polkit's own answer stands. A uid, user
+record or session record it cannot read still counts as remote. The cost:
+while a user has a separate Arcen desktop open (a dedicated or native
+desktop beside their desk session), their desk session's user services get
+the remote answers too; a joined console session (ADR 0025) is the user's
+own session and has no such second session.
+
+The user of an Arcen desktop (`TTY=arcen` or an Arcen seat, not merely
+`REMOTE=1`) is granted, without a password, exactly the colord actions
+GNOME's colour plugin calls for the desktop's monitors and the user's own
+ICC profiles (`org.freedesktop.color-manager.create-device`,
+`create-profile`, `delete-device`, `delete-profile`), and only for a subject
+whose uid is the session's own (logind's `UID=`). colord does not check
+who owns a device or profile it deletes, so, like a user at the desk, such
+a user can delete any colour device or profile (colour settings only; LOW,
+recorded). Every other action,
+including colord's system-wide profile installation, device inhibition and
+sensor locking, keeps its remote answer. A site rule numbered `00`–`04` can
+still deny them.
+
 A seated desktop is refused before any session is opened while the rule is
 not installed (`polkit_rule_missing`). After its session is active and
 before it is handed over, every desktop is proved: the Pier runs `pkcheck`

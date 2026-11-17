@@ -21,9 +21,9 @@ use arcen_session::polkit_remote::{
     admission, console_self_test, console_self_test_candidate, is_arcen_rule,
     later_restrictive_policies, needs_checks, parse_policy_defaults, parse_polkit_version,
     refusal_before_launch, rule_text, supports_js_rules, valid_session_id, ActionDefaults,
-    Admission, CatPath, ConsoleSelfTest, DesktopSeat, PolkitCheck, PolkitState, PolkitUnprotected,
-    SessionRecord, ACTION_DIRS, LEGACY_RULE_PATHS, PROBE_ACTIONS, RULE_PATH, SESSION_RECORD_DIR,
-    SITE_RULE_DIR,
+    Admission, CatPath, ConsoleSelfTest, DesktopSeat, IdPath, PolkitCheck, PolkitState,
+    PolkitUnprotected, SessionRecord, ACTION_DIRS, LEGACY_RULE_PATHS, PROBE_ACTIONS, RULE_PATH,
+    SESSION_RECORD_DIR, SITE_RULE_DIR,
 };
 
 use crate::logging::target;
@@ -94,6 +94,13 @@ fn cat_path() -> CatPath {
         .unwrap_or(CatPath::UsrBin)
 }
 
+fn id_path() -> IdPath {
+    IdPath::CANDIDATES
+        .into_iter()
+        .find(|id| Path::new(id.path()).is_file())
+        .unwrap_or(IdPath::UsrBin)
+}
+
 /// The actions installed now, with their defaults, from the `.policy` files
 /// (no tool is run: a large `pkaction` listing cannot stall anything).
 #[must_use]
@@ -123,7 +130,7 @@ fn rule_for(actions: &[ActionDefaults]) -> String {
         .iter()
         .map(|action| (action.id.clone(), action.any))
         .collect::<Vec<_>>();
-    rule_text(&pairs, cat_path())
+    rule_text(&pairs, cat_path(), id_path())
 }
 
 /// The rule for the actions installed now.
@@ -135,7 +142,10 @@ pub fn current_rule() -> String {
 /// What [`install`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallOutcome {
+    /// There was no Arcen rule; it is written.
     Written,
+    /// An earlier rule (another build's, or for other actions) is replaced.
+    Updated,
     Unchanged,
 }
 
@@ -161,12 +171,14 @@ pub fn install() -> Result<InstallOutcome, String> {
     remove_legacy();
     let path = Path::new(RULE_PATH);
     let text = current_rule();
+    let mut replacing = false;
     match std::fs::read_to_string(path) {
         Ok(existing) if !is_arcen_rule(&existing) => {
             return Err(format!("{RULE_PATH} exists and is not Arcen's"));
         }
         Ok(existing) if existing == text => return Ok(InstallOutcome::Unchanged),
-        _ => {}
+        Ok(_) => replacing = true,
+        Err(_) => {}
     }
     let dir = path.parent().ok_or("rule path has no directory")?;
     if !dir.is_dir() {
@@ -196,7 +208,11 @@ pub fn install() -> Result<InstallOutcome, String> {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("{RULE_PATH}: {error}"));
     }
-    Ok(InstallOutcome::Written)
+    Ok(if replacing {
+        InstallOutcome::Updated
+    } else {
+        InstallOutcome::Written
+    })
 }
 
 /// Removes the rule (and rules earlier Arcen builds wrote) when they are
@@ -386,13 +402,13 @@ pub fn ensure_at_start() {
             tracing::info!(
                 target: target::SESSION,
                 path = RULE_PATH,
-                written = outcome == InstallOutcome::Written,
+                written = outcome != InstallOutcome::Unchanged,
                 elapsed_ms = started.elapsed().as_millis(),
                 "polkit remote-session rule is current for the installed actions"
             );
             // Off the start-up path: a hung polkitd must never delay the
             // Pier's start or its signal handling.
-            let written = outcome == InstallOutcome::Written;
+            let written = outcome != InstallOutcome::Unchanged;
             let spawned = std::thread::Builder::new()
                 .name("arcen-polkit-self-test".into())
                 .spawn(move || {
@@ -429,6 +445,10 @@ pub fn cli_main(args: &[String]) -> std::process::ExitCode {
         Some("install") => match install() {
             Ok(InstallOutcome::Written) => {
                 println!("polkit: wrote {RULE_PATH}");
+                ExitCode::SUCCESS
+            }
+            Ok(InstallOutcome::Updated) => {
+                println!("polkit: updated {RULE_PATH} (the installed rule was an earlier one)");
                 ExitCode::SUCCESS
             }
             Ok(InstallOutcome::Unchanged) => {
@@ -1016,5 +1036,7 @@ mod tests {
     fn the_rule_reads_records_with_a_cat_that_exists() {
         assert!(Path::new(cat_path().path()).is_file());
         assert!(current_rule().contains(cat_path().path()));
+        assert!(Path::new(id_path().path()).is_file());
+        assert!(current_rule().contains(id_path().path()));
     }
 }

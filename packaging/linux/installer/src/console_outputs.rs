@@ -17,8 +17,9 @@
 //! while nobody is signed in.
 
 use arcen_outputs::console_layout::{
-    MAX_VIRTUAL_OUTPUTS, VIRTUAL_OUTPUTS_CONF_PATH, default_forced_heads, is_forced_head_token,
-    is_virtual_outputs_conf, virtual_outputs_conf,
+    MAX_VIRTUAL_OUTPUTS, VIRTUAL_OUTPUTS_CONF_PATH, default_forced_heads,
+    headless_console_outputs_advice, is_forced_head_token, is_virtual_outputs_conf,
+    virtual_outputs_conf,
 };
 
 use crate::desktop::InstallLog;
@@ -87,6 +88,20 @@ pub fn apply(
                 log.note(format!(
                     "Console outputs: {VIRTUAL_OUTPUTS_CONF_PATH} kept (remove with --no-console-outputs)"
                 ));
+            } else if existing.is_none() {
+                let discovered = discovered_heads(options);
+                if let Some(value) =
+                    headless_console_outputs_advice(nvidia_monitor_connected(options), &discovered)
+                {
+                    log.note(format!(
+                        "Console outputs: this host's NVIDIA GPU drives no monitor, so a Deck that                          matches a layout of several displays has one output to use. Rerun with                          --console-outputs {value} ({}), then restart the display manager while                          nobody is signed in.",
+                        if discovered.is_empty() {
+                            "the Pier names the GPU's real heads in                              /run/arcen/sessions/discovery/nvidia-heads.json once it has started                              with the GPU free; use those"
+                        } else {
+                            "the GPU's heads as the Pier found them"
+                        }
+                    ));
+                }
             }
             Ok(())
         }
@@ -139,6 +154,55 @@ pub fn apply(
             Ok(())
         }
     }
+}
+
+/// Whether an NVIDIA GPU of this host drives a monitor, from DRM's connector
+/// status (`nvidia-drm`): `None` when no NVIDIA card exposes connectors.
+fn nvidia_monitor_connected(options: &Options) -> Option<bool> {
+    let root = map_path(&options.prefix, "/sys/class/drm");
+    let entries = std::fs::read_dir(&root).ok()?;
+    let mut seen = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((card, _connector)) = name.split_once('-') else {
+            continue;
+        };
+        let driver = std::fs::read_link(root.join(card).join("device/driver")).ok();
+        if !driver
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|driver| driver == "nvidia")
+        {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        seen = true;
+        if status.trim() == "connected" {
+            return Some(true);
+        }
+    }
+    seen.then_some(false)
+}
+
+/// The heads the Pier's start-time probe found, if it has run.
+fn discovered_heads(options: &Options) -> Vec<String> {
+    std::fs::read_to_string(map_path(
+        &options.prefix,
+        "/run/arcen/sessions/discovery/nvidia-heads.json",
+    ))
+    .ok()
+    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    .and_then(|discovery| {
+        discovery.get("heads")?.as_array().map(|heads| {
+            heads
+                .iter()
+                .filter_map(|head| head.as_str().map(str::to_owned))
+                .collect()
+        })
+    })
+    .unwrap_or_default()
 }
 
 /// `--uninstall`: removes the file if it is Arcen's.

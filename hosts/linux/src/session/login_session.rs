@@ -35,17 +35,60 @@ const DISPLAY_MANAGER_UNIT: &str = "/etc/systemd/system/display-manager.service"
 const START_TIMEOUT: Duration = Duration::from_secs(25);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Whether the host has a display manager (`systemctl enable gdm` and its
-/// kind link `display-manager.service`).
-pub(crate) fn display_manager_configured() -> bool {
-    std::fs::symlink_metadata(DISPLAY_MANAGER_UNIT).is_ok()
+/// The unit `display-manager.service` points at (`systemctl enable gdm`
+/// links it), or `None` without one.
+fn display_manager_target() -> Option<String> {
+    std::fs::symlink_metadata(DISPLAY_MANAGER_UNIT).ok()?;
+    let target = std::fs::canonicalize(DISPLAY_MANAGER_UNIT)
+        .ok()
+        .or_else(|| std::fs::read_link(DISPLAY_MANAGER_UNIT).ok())?;
+    Some(target.file_name()?.to_string_lossy().into_owned())
 }
 
-/// The host facts a console decision needs beside logind's sessions.
-pub(crate) fn console_host() -> model::ConsoleHost {
-    model::ConsoleHost {
-        display_manager: display_manager_configured(),
+/// Whether `display-manager.service` is running, asked of systemd with a
+/// bound (an unanswered systemd counts as running: the cautious answer).
+fn display_manager_active() -> bool {
+    let child = std::process::Command::new("/usr/bin/systemctl")
+        .args(["is-active", "--quiet", "display-manager.service"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return true;
+    };
+    let deadline = std::time::Instant::now() + COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return true;
+            }
+        }
     }
+}
+
+/// The host facts a console decision needs beside logind's sessions: a
+/// display manager counts when one is configured, or when whatever is
+/// aliased as the display manager (another product's unit) is running
+/// (`ConsoleHost::from_display_manager`).
+pub(crate) fn console_host() -> model::ConsoleHost {
+    let unit = display_manager_target();
+    let active = unit.is_some() && display_manager_active();
+    let host = model::ConsoleHost::from_display_manager(unit.as_deref(), active);
+    tracing::debug!(
+        target: target::SESSION,
+        display_manager_unit = unit.as_deref().unwrap_or(""),
+        display_manager_active = active,
+        display_manager = host.display_manager,
+        "console host: display manager"
+    );
+    host
 }
 
 /// What the console launcher passes on to a new login session.
@@ -59,6 +102,9 @@ pub(crate) struct LoginLaunch {
     /// taken by a login session.
     pub(crate) reserved_display: String,
     pub(crate) desktop: String,
+    /// `platform.session.default_desktop` (ADR 0025): for an account
+    /// without a choice of its own.
+    pub(crate) default_desktop: Option<arcen_session::console_session::account_desktop::DesktopId>,
     /// The depth the session's X server is created at
     /// (`video.x11_desktop_depth`, decided for the first sign-in).
     pub(crate) depth: Option<u8>,
@@ -319,19 +365,30 @@ impl pam_client2::ConversationHandler for NoConversation {
     fn error_msg(&mut self, _message: &std::ffi::CStr) {}
 }
 
-/// The session entry's command for `desktop`.
-fn session_command(desktop: &str) -> Result<Vec<String>, LauncherError> {
+/// The session entry's command for `desktop`, and the desktop names it
+/// declares (`XDG_CURRENT_DESKTOP`).
+fn session_command(desktop: &str) -> Result<(Vec<String>, Option<String>), LauncherError> {
     for name in policy::xsession_names(desktop) {
         let path = Path::new(policy::XSESSIONS_DIR).join(name);
         if let Ok(entry) = std::fs::read_to_string(&path) {
             if let Some(words) = policy::xsession_exec(&entry) {
                 tracing::info!(target: target::SESSION, entry = %path.display(), command = %words.join(" "), "the account's X session");
-                return Ok(words);
+                return Ok((words, policy::xsession_desktop_names(&entry)));
             }
         }
     }
     tracing::error!(target: target::SESSION, desktop, "no usable X session entry in /usr/share/xsessions");
     Err(LauncherError::Protocol)
+}
+
+/// Whether `desktop` has an X session entry Arcen's login session can run.
+pub(crate) fn has_x_session(desktop: &str) -> bool {
+    policy::xsession_names(desktop).iter().any(|name| {
+        std::fs::read_to_string(Path::new(policy::XSESSIONS_DIR).join(name))
+            .ok()
+            .and_then(|entry| policy::xsession_exec(&entry))
+            .is_some()
+    })
 }
 
 async fn run(args: &[String]) -> Result<(), LauncherError> {
@@ -369,15 +426,17 @@ async fn run(args: &[String]) -> Result<(), LauncherError> {
     if identity.uid != uid || identity.uid == 0 {
         return Err(LauncherError::Protocol);
     }
-    let command = session_command(&desktop)?;
+    let (command, desktop_names) = session_command(&desktop)?;
 
     let mut context = Context::new(policy::PAM_SERVICE, Some(&username), NoConversation)
         .map_err(|_| LauncherError::PamInitialization)?;
-    let current = if desktop == "gnome-classic" {
-        "GNOME-Classic:GNOME"
-    } else {
-        "GNOME"
-    };
+    let current = desktop_names.unwrap_or_else(|| {
+        if desktop == "gnome-classic" {
+            "GNOME-Classic:GNOME".to_owned()
+        } else {
+            "GNOME".to_owned()
+        }
+    });
     context
         .set_tty(Some(&format!("/dev/tty{vt}")))
         .and_then(|()| context.set_xdisplay(Some(&x_display)))

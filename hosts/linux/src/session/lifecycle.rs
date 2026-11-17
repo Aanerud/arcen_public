@@ -76,6 +76,13 @@ pub struct SessionMetadata {
     /// A joined console session (ADR 0025): the user's own, which the Pier
     /// never starts or ends.
     pub console: bool,
+    /// A joined console another remote-desktop product owns, shown as it is
+    /// (ADR 0025 §8): its outputs are never changed, and its own client
+    /// connecting ends the attachment.
+    pub console_guest: bool,
+    /// The RandR outputs such a console's monitors are captured from, in
+    /// the committed plan's order; `None` when outputs follow the plan.
+    pub console_shown_outputs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Error)]
@@ -286,6 +293,8 @@ impl DesktopSession {
             x11_desktop_depth: self.launcher.x11_desktop_depth,
             native_seat: self.native_seat(),
             console: self.launcher.is_console(),
+            console_guest: self.launcher.is_console_guest(),
+            console_shown_outputs: self.launcher.console_shown_outputs(),
         }
     }
 

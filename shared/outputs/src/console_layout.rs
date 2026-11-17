@@ -83,6 +83,36 @@ pub fn virtual_outputs_conf(heads: &[String]) -> Option<String> {
     ))
 }
 
+/// The `--console-outputs` value an installer recommends on a host whose
+/// NVIDIA GPU drives no monitor (`nvidia_monitor_connected` `Some(false)`;
+/// `None` when the host cannot tell), so a Deck that matches its layout has
+/// outputs to use: the GPU's real heads as the Pier's start-time probe found
+/// them (`discovered`, e.g. `DFP-0,DFP-2,DFP-4,DFP-6` on a board whose
+/// outputs are those heads), else a count. `None`: nothing to recommend.
+#[must_use]
+pub fn headless_console_outputs_advice(
+    nvidia_monitor_connected: Option<bool>,
+    discovered: &[String],
+) -> Option<String> {
+    if nvidia_monitor_connected != Some(false) {
+        return None;
+    }
+    let heads: Vec<&String> = discovered
+        .iter()
+        .filter(|head| is_forced_head_token(head))
+        .take(MAX_VIRTUAL_OUTPUTS)
+        .collect();
+    Some(if heads.len() >= 2 {
+        heads
+            .iter()
+            .map(|head| head.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        MAX_VIRTUAL_OUTPUTS.to_string()
+    })
+}
+
 /// Whether `text` is a file [`virtual_outputs_conf`] wrote.
 #[must_use]
 pub fn is_virtual_outputs_conf(text: &str) -> bool {
@@ -189,6 +219,9 @@ pub enum ConsoleLayoutError {
     NoModes { output: String },
     /// Exactly one requested monitor must be primary.
     PrimaryCount(usize),
+    /// A console shown as it is (another product's desktop) has outputs
+    /// laid out other than the Deck's monitors; Arcen does not change them.
+    ShownLayoutDiffers { requested: usize, shown: usize },
 }
 
 impl ConsoleLayoutError {
@@ -200,6 +233,7 @@ impl ConsoleLayoutError {
             Self::NotEnoughOutputs { .. } => "console_outputs_insufficient",
             Self::NoModes { .. } => "console_output_without_modes",
             Self::PrimaryCount(_) => "console_layout_primary",
+            Self::ShownLayoutDiffers { .. } => "console_layout_differs",
         }
     }
 }
@@ -222,15 +256,106 @@ impl std::fmt::Display for ConsoleLayoutError {
                     "{count} monitors are marked primary (one required)"
                 )
             }
+            Self::ShownLayoutDiffers { requested, shown } => write!(
+                formatter,
+                "the desktop shows {shown} monitors laid out differently from the Deck's {requested}, and is not changed"
+            ),
         }
     }
 }
 
 impl std::error::Error for ConsoleLayoutError {}
 
+/// One output of a console's X server that shows a picture now: its mode's
+/// native size, rotation and place in the X screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownOutput {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+    pub rotation: Rotation,
+    pub primary: bool,
+}
+
+/// Binds a Deck's monitors to a console shown as it is — another
+/// product's desktop, whose outputs Arcen never changes (ADR 0025 §8): the
+/// Deck's layout must be the desktop's own, monitor for monitor (native
+/// size, rotation and place, both normalised to the layout's top-left
+/// corner), and every shown output is used. Returns each request's output
+/// name in request order. A Deck whose layout differs is answered with
+/// [`ConsoleLayoutError::ShownLayoutDiffers`] and offered Primary Display
+/// Only (the whole screen as one picture).
+///
+/// # Errors
+///
+/// [`ConsoleLayoutError`] when the layouts differ.
+pub fn bind_shown_layout(
+    requests: &[ConsoleHeadRequest],
+    shown: &[ShownOutput],
+) -> Result<Vec<String>, ConsoleLayoutError> {
+    if requests.is_empty() {
+        return Err(ConsoleLayoutError::Empty);
+    }
+    let differs = || ConsoleLayoutError::ShownLayoutDiffers {
+        requested: requests.len(),
+        shown: shown.len(),
+    };
+    if requests.len() != shown.len() {
+        return Err(differs());
+    }
+    let request_origin = (
+        requests.iter().map(|request| request.x).min().unwrap_or(0),
+        requests.iter().map(|request| request.y).min().unwrap_or(0),
+    );
+    let shown_origin = (
+        shown.iter().map(|output| output.x).min().unwrap_or(0),
+        shown.iter().map(|output| output.y).min().unwrap_or(0),
+    );
+    let mut taken = vec![false; shown.len()];
+    let mut names = Vec::with_capacity(requests.len());
+    for request in requests {
+        let place = (request.x - request_origin.0, request.y - request_origin.1);
+        let found = shown.iter().enumerate().find(|(index, output)| {
+            !taken[*index]
+                && (output.x - shown_origin.0, output.y - shown_origin.1) == place
+                && (output.width, output.height) == (request.width, request.height)
+                && output.rotation == request.rotation
+        });
+        let Some((index, output)) = found else {
+            return Err(differs());
+        };
+        taken[index] = true;
+        names.push(output.name.clone());
+    }
+    Ok(names)
+}
+
+/// Whether `output` can show a Deck monitor: connected, and listing at
+/// least one mode. A head forced connected with nothing behind it (another
+/// product's `ConnectedMonitor` on a physical board) lists no mode and is
+/// left alone.
+#[must_use]
+pub fn takes_a_monitor(output: &ConsoleOutput) -> bool {
+    output.connected && !output.modes.is_empty()
+}
+
+/// How many Deck monitors the console's `outputs` can show at once: the
+/// joined session's own X server is the authority for a console's
+/// multi-monitor offer (ADR 0025 §6), read at each sign-in.
+#[must_use]
+pub fn console_monitor_capacity(outputs: &[ConsoleOutput]) -> usize {
+    outputs
+        .iter()
+        .filter(|output| takes_a_monitor(output))
+        .count()
+        .min(MAX_VIRTUAL_OUTPUTS)
+}
+
 /// Plans `requests` onto the console's `outputs`: the i-th Deck monitor on
-/// the i-th connected output (`RandR` order), every other connected output
-/// off.
+/// the i-th output that can show one ([`takes_a_monitor`], `RandR` order),
+/// every other such output off; outputs listing no mode are not touched.
 ///
 /// # Errors
 ///
@@ -247,7 +372,10 @@ pub fn plan_console_layout(
     if primaries != 1 {
         return Err(ConsoleLayoutError::PrimaryCount(primaries));
     }
-    let connected: Vec<&ConsoleOutput> = outputs.iter().filter(|output| output.connected).collect();
+    let connected: Vec<&ConsoleOutput> = outputs
+        .iter()
+        .filter(|output| takes_a_monitor(output))
+        .collect();
     if connected.len() < requests.len() {
         return Err(ConsoleLayoutError::NotEnoughOutputs {
             requested: requests.len(),
@@ -469,6 +597,101 @@ mod tests {
         ));
     }
 
+    fn shown(name: &str, (width, height): (u32, u32), (x, y): (i32, i32)) -> ShownOutput {
+        ShownOutput {
+            name: name.to_owned(),
+            width,
+            height,
+            x,
+            y,
+            rotation: Rotation::Degrees0,
+            primary: false,
+        }
+    }
+
+    #[test]
+    fn a_headless_gpu_is_recommended_its_real_heads() {
+        let found: Vec<String> = ["DFP-0", "DFP-2", "DFP-4", "DFP-6", "DFP-7"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(
+            headless_console_outputs_advice(Some(false), &found).as_deref(),
+            Some("DFP-0,DFP-2,DFP-4,DFP-6")
+        );
+        assert_eq!(
+            headless_console_outputs_advice(Some(false), &[]).as_deref(),
+            Some("4")
+        );
+        assert_eq!(headless_console_outputs_advice(Some(true), &found), None);
+        assert_eq!(headless_console_outputs_advice(None, &found), None);
+    }
+
+    #[test]
+    fn a_desktop_shown_as_it_is_takes_a_deck_whose_layout_is_its_own() {
+        // The desktop: DP-2 1920x1200 at 0,400 left of DP-0 2560x1600 at
+        // 1920,0. The Deck: its 2560x1600 primary first, the 1920x1200 to
+        // its left, as planned (non-negative origin).
+        let desktop = [
+            shown("DP-0", (2560, 1600), (1920, 0)),
+            shown("DP-2", (1920, 1200), (0, 400)),
+        ];
+        let deck = [
+            request(2560, 1600, 1920, 0, true),
+            request(1920, 1200, 0, 400, false),
+        ];
+        assert_eq!(
+            bind_shown_layout(&deck, &desktop).expect("the same layout"),
+            ["DP-0", "DP-2"]
+        );
+        // Shifted as a whole still matches (only relative places count).
+        let shifted = [
+            request(2560, 1600, 1920 + 7, 3, true),
+            request(1920, 1200, 7, 403, false),
+        ];
+        assert!(bind_shown_layout(&shifted, &desktop).is_ok());
+        // Another size, another place, a monitor too many or too few.
+        for deck in [
+            vec![
+                request(2560, 1440, 1920, 0, true),
+                request(1920, 1200, 0, 400, false),
+            ],
+            vec![
+                request(2560, 1600, 0, 0, true),
+                request(1920, 1200, 2560, 0, false),
+            ],
+            vec![request(2560, 1600, 0, 0, true)],
+        ] {
+            let error = bind_shown_layout(&deck, &desktop).expect_err("differs");
+            assert_eq!(error.token(), "console_layout_differs");
+        }
+    }
+
+    #[test]
+    fn forced_outputs_without_modes_take_no_monitor_and_are_left_alone() {
+        // Another product's server: two desk monitors, two heads forced
+        // connected with nothing behind them, in RandR order between them.
+        let outputs = [
+            output("DP-0", true, &[(2560, 1600, 59_972)]),
+            output("DP-1", false, &[]),
+            output("DP-4", true, &[]),
+            output("DP-2", true, &[(1920, 1200, 59_950)]),
+            output("DP-6", true, &[]),
+        ];
+        assert_eq!(console_monitor_capacity(&outputs), 2);
+        let plan = plan_console_layout(
+            &[
+                request(2560, 1600, 1920, 0, true),
+                request(1920, 1200, 0, 400, false),
+            ],
+            &outputs,
+        )
+        .expect("two monitors on the two desk outputs");
+        let names: Vec<_> = plan.heads.iter().map(|head| head.output.as_str()).collect();
+        assert_eq!(names, ["DP-0", "DP-2"]);
+        assert!(plan.unused.is_empty());
+        assert!(plan.heads.iter().all(|head| !head.scaled));
+    }
+
     #[test]
     fn disconnected_outputs_are_not_used_and_too_few_refuse() {
         let outputs = [vgx("DVI-D-0"), output("DVI-D-1", false, &[])];
@@ -526,8 +749,9 @@ mod tests {
         );
         assert_eq!(
             plan_console_layout(&[request(10, 10, 0, 0, true)], &[output("A", true, &[])]),
-            Err(ConsoleLayoutError::NoModes {
-                output: "A".to_owned()
+            Err(ConsoleLayoutError::NotEnoughOutputs {
+                requested: 1,
+                available: 0
             })
         );
     }

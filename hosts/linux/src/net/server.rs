@@ -126,6 +126,14 @@ use arcen_telemetry::{
 };
 
 const CAPTURE_ENCODER_INIT_FAILED: &str = "capture/encoder initialization failed";
+/// Closes after authentication that used to carry no reason (the Deck then
+/// said only "host closed the connection during setup").
+const DISPLAY_RESIZE_FAILED_REASON: &str =
+    "display_resize_failed: the host could not set its display to this Deck's size";
+const INVALID_RESOLUTION_REASON: &str =
+    "invalid_resolution: the host cannot serve the display size this Deck asked for";
+const INPUT_SETUP_FAILED_REASON: &str =
+    "input_setup_failed: the host could not prepare keyboard and mouse input for this session";
 use serde::de::DeserializeOwned;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -1110,6 +1118,9 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
+    if matches!(message, Message::Close(_)) {
+        super::setup_watch::note_close(kind);
+    }
     send_ws_with_timeout(sink, message, kind, timeout).await
 }
 
@@ -1507,6 +1518,67 @@ fn multi_monitor_gate(cfg: &Config) -> multi_monitor::MultiMonitorGate {
     gate
 }
 
+/// A joined console's multi-monitor offer and plan come from the
+/// console's live X server, read for each connection (ADR 0025 §6): the
+/// outputs that can take a monitor, or, on a desktop another product owns,
+/// the outputs it shows now. A probe X server cannot run while another
+/// holds the GPU, and outputs change after the Pier started (a GDM restart,
+/// another product's server). Without a console X server the start-time
+/// heads stay (a host whose login session Arcen starts itself).
+async fn with_live_console_heads(cfg: Arc<Config>) -> Arc<Config> {
+    if !cfg.joins_console() || !cfg.multi_monitor.advertise_enabled {
+        return cfg;
+    }
+    match cached_live_console().await {
+        Ok(live) => {
+            info!(
+                target: SESSION,
+                session_id = %live.session_id,
+                origin = live.origin.token(),
+                outputs = ?live.outputs,
+                monitors = live.monitors,
+                "console outputs read from the console's X server for this sign-in"
+            );
+            let mut config = (*cfg).clone();
+            config.multi_monitor.heads =
+                arcen_outputs::console_layout::default_forced_heads(live.monitors);
+            Arc::new(config)
+        }
+        Err(error) => {
+            info!(
+                target: SESSION,
+                %error,
+                start_time_heads = ?cfg.multi_monitor.heads,
+                "no console X server answers; the multi-monitor offer keeps the start-time heads"
+            );
+            cfg
+        }
+    }
+}
+
+/// The console's live outputs, read at most once per
+/// [`LIVE_CONSOLE_REUSE`]: the read happens before a peer authenticates, so
+/// any number of connections costs one read per period.
+async fn cached_live_console() -> Result<crate::session::console_layout::LiveConsole, String> {
+    type Cached = (
+        Instant,
+        Result<crate::session::console_layout::LiveConsole, String>,
+    );
+    static LAST: tokio::sync::Mutex<Option<Cached>> = tokio::sync::Mutex::const_new(None);
+    let mut last = LAST.lock().await;
+    if let Some((at, result)) = last.as_ref() {
+        if at.elapsed() < LIVE_CONSOLE_REUSE {
+            return result.clone();
+        }
+    }
+    let result = crate::session::console_layout::live_console().await;
+    *last = Some((Instant::now(), result.clone()));
+    result
+}
+
+/// How long one reading of the console's live outputs is reused.
+const LIVE_CONSOLE_REUSE: Duration = Duration::from_secs(5);
+
 struct AuthenticatedConnection {
     response: AuthResponse,
     display_plan: auth::SessionDisplayPlan,
@@ -1641,6 +1713,7 @@ fn emit_session_auth_fail(
         context,
         fields,
     );
+    super::setup_watch::settled();
 }
 
 /// Emits `SESSION_AUTH_OK` (1100) once PAM, uid/gid bind, and logind
@@ -2115,6 +2188,7 @@ where
         runtime_root: cfg.session_runtime_root.clone(),
         agent_binary,
         desktop: cfg.desktop_session.clone(),
+        default_desktop: cfg.default_desktop.clone(),
         deskside: cfg.deskside.clone(),
         provider: cfg.desktop_provider,
         x11_apps: cfg.wayland_x11_apps_enabled(),
@@ -2381,6 +2455,9 @@ enum SessionEndReason {
     /// The session-bound input injector was lost for good (superseded, or
     /// its session could not be reached again).
     InputLost,
+    /// The joined desktop belongs to another remote-desktop product whose
+    /// own client connected: one remote product at a time (ADR 0025 §8).
+    ConsoleTakenOver,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2430,6 +2507,7 @@ impl SessionEndReason {
             Self::HostShutdown => "host_shutdown",
             Self::ResumeAuthorityFailure => "resume_authority",
             Self::InputLost => "input",
+            Self::ConsoleTakenOver => "console",
         }
     }
 
@@ -2444,6 +2522,7 @@ impl SessionEndReason {
             Self::HostShutdown => "host_shutdown",
             Self::ResumeAuthorityFailure => "resume_authority_failure",
             Self::InputLost => "input_lost",
+            Self::ConsoleTakenOver => "console_taken_over",
         }
     }
 }
@@ -2656,6 +2735,7 @@ fn emit_session_stream_start(
     user: Option<&str>,
     peer_addr: Option<&str>,
 ) {
+    super::setup_watch::settled();
     let ServedStreamLabels {
         pipeline,
         display_backend,
@@ -2816,6 +2896,7 @@ fn emit_session_end_or_interrupted(
     peer_addr: Option<&str>,
     client_network: Option<&arcen_protocol::messages::ClientNetworkSnapshotMsg>,
 ) {
+    super::setup_watch::settled();
     let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
     let frames_sent = i64::try_from(frames_sent).unwrap_or(i64::MAX);
     let frames_dropped = i64::try_from(frames_dropped).unwrap_or(i64::MAX);
@@ -3704,7 +3785,7 @@ async fn handle_connection(
     info!(target: NET, %peer, "client connected (WS+TLS)");
     let span = tracing::info_span!("linux_connection", sid = tracing::field::Empty);
     let remote_scope_id = peer_scope_id(peer);
-    run_ws(
+    super::setup_watch::scope(run_ws(
         DirectSessionSocket::wss(ws),
         state.cfg.clone(),
         preauth_permit,
@@ -3721,7 +3802,7 @@ async fn handle_connection(
         Arc::clone(&state.admission_runtime),
         Arc::clone(&state.incumbent),
         None,
-    )
+    ))
     .instrument(span)
     .await;
     debug!(target: NET, %peer, "connection closed");
@@ -3833,7 +3914,7 @@ async fn handle_quic_connection(
     info!(target: NET, %peer, "client connected (QUIC+TLS)");
     let span = tracing::info_span!("linux_connection", sid = tracing::field::Empty);
     let remote_scope_id = peer_scope_id(peer);
-    run_ws(
+    super::setup_watch::scope(run_ws(
         DirectSessionSocket::quic(ws),
         state.cfg.clone(),
         preauth_permit,
@@ -3850,7 +3931,7 @@ async fn handle_quic_connection(
         Arc::clone(&state.admission_runtime),
         Arc::clone(&state.incumbent),
         lane_sink,
-    )
+    ))
     .instrument(span)
     .await;
     debug!(target: NET, %peer, "QUIC connection closed");
@@ -3895,6 +3976,11 @@ async fn run_ws(
     incumbent: Arc<arcen_transport::quic::IncumbentAttachment>,
     lane_sink: Option<Arc<arcen_transport::quic::ObservabilityLaneSink>>,
 ) {
+    let cfg = if cfg.auth_mode == AuthMode::None {
+        cfg
+    } else {
+        with_live_console_heads(cfg).await
+    };
     let (authenticated, session_log_id) = if cfg.auth_mode == AuthMode::None {
         let session_log_id = match fallback_session_log_id() {
             Ok(value) => value,
@@ -4149,6 +4235,9 @@ async fn run_ws(
     }
 
     let mut session_config = (*cfg).clone();
+    // Armed once the desktop exists: from then on no exit leaves the
+    // `critical` log without a record (`setup_watch`).
+    let mut _setup_watch: Option<super::setup_watch::SetupWatch> = None;
     let (mut auth_response, session_lease): (Option<AuthResponse>, Option<SessionLease>) =
         match authenticated {
             Some(authenticated) => {
@@ -4396,6 +4485,14 @@ async fn run_ws(
                         return;
                     }
                 };
+                // The desktop exists: from here no exit leaves the `critical`
+                // log without a record (`setup_watch`).
+                _setup_watch = Some(super::setup_watch::SetupWatch::arm(
+                    &emitter,
+                    session_log_id.clone(),
+                    &response.username,
+                    &remote_host,
+                ));
                 if lease.metadata.console
                     && admitted_monitor_count.is_some()
                     && lease.metadata.multi_monitor_plan.is_none()
@@ -4406,12 +4503,24 @@ async fn run_ws(
                     // the reason it recognises and offers Primary Display
                     // Only for (ADR 0025 §6). The lease hands the console
                     // back.
-                    warn!(
+                    error!(
                         target: SESSION,
                         username = %response.username,
                         session_id = %lease.metadata.session_id,
                         admitted_monitors = admitted_monitor_count.unwrap_or(0),
+                        guest = lease.metadata.console_guest,
                         "the console could not take the Deck's layout; the sign-in ends with the reason, and Primary Display Only is offered"
+                    );
+                    emit_session_auth_fail(
+                        &emitter,
+                        session_log_id.clone(),
+                        Some(&remote_host),
+                        "desktop",
+                        if lease.metadata.console_guest {
+                            "console_layout_differs"
+                        } else {
+                            "console_layout_unsupported"
+                        },
                     );
                     send_critical_control(
                         &mut ws,
@@ -4505,6 +4614,7 @@ async fn run_ws(
                     Some(&remote_host),
                     lease.metadata.session_id.parse::<i64>().ok(),
                 );
+
                 log_lifecycle(
                     &lease.metadata.session_id,
                     "authenticated",
@@ -4701,7 +4811,7 @@ async fn run_ws(
                         warn!(target: DISPLAY, %error, "client resolution resize failed");
                         send_critical_control(
                             &mut ws,
-                            Message::Close(None),
+                            close_with_reason(DISPLAY_RESIZE_FAILED_REASON),
                             "display_resize_close",
                         )
                         .await;
@@ -4712,8 +4822,12 @@ async fn run_ws(
             Ok(None) => {}
             Err(error) => {
                 warn!(target: DISPLAY, %error, "invalid authenticated client resolution");
-                send_critical_control(&mut ws, Message::Close(None), "invalid_resolution_close")
-                    .await;
+                send_critical_control(
+                    &mut ws,
+                    close_with_reason(INVALID_RESOLUTION_REASON),
+                    "invalid_resolution_close",
+                )
+                .await;
                 return;
             }
         }
@@ -5770,7 +5884,12 @@ async fn run_attachment(
         Some(binary) => binary,
         None => {
             warn!(target: CAPENC, "no capenc binary — closing connection");
-            send_critical_control(&mut sink, Message::Close(None), "capenc_missing_close").await;
+            send_critical_control(
+                &mut sink,
+                close_with_reason(CAPTURE_ENCODER_INIT_FAILED),
+                "capenc_missing_close",
+            )
+            .await;
             return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
         }
     };
@@ -5892,6 +6011,9 @@ async fn run_attachment(
                 execution: initial_capenc.execution.clone(),
                 session_log_id: initial_capenc.session_log_id.clone(),
                 capture_bindings,
+                output_names: session_lease
+                    .and_then(|lease| lease.metadata.console_shown_outputs.clone())
+                    .unwrap_or_default(),
             };
             let encoder_plan = match encoder_admission::plan_encoder_sets(
                 plan,
@@ -6269,7 +6391,7 @@ async fn run_attachment(
                         warn!(target: INPUT, %error, "shared Linux region input adapter setup failed");
                         send_critical_control(
                             &mut sink,
-                            Message::Close(None),
+                            close_with_reason(INPUT_SETUP_FAILED_REASON),
                             "region_input_setup_close",
                         )
                         .await;
@@ -6284,12 +6406,22 @@ async fn run_attachment(
                     .map_or(cfg.session_display.as_str(), |metadata| {
                         metadata.display.as_str()
                     });
-                let identity = match crate::input::session_input_identity(input_display) {
+                let joined_console = current_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.console);
+                let identity = match crate::input::session_input_identity(
+                    input_display,
+                    joined_console,
+                ) {
                     Ok(identity) => identity,
                     Err(error) => {
-                        warn!(target: INPUT, %error, "native uinput refused: no dedicated X display to bind the devices to");
-                        send_critical_control(&mut sink, Message::Close(None), "input_setup_close")
-                            .await;
+                        error!(target: INPUT, %error, "native uinput refused: no X display to bind the devices to");
+                        send_critical_control(
+                            &mut sink,
+                            close_with_reason(INPUT_SETUP_FAILED_REASON),
+                            "input_setup_close",
+                        )
+                        .await;
                         capenc.shutdown().await;
                         return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
                     }
@@ -6330,8 +6462,12 @@ async fn run_attachment(
                     }
                     Err(error) => {
                         warn!(target: INPUT, %error, "native uinput setup failed");
-                        send_critical_control(&mut sink, Message::Close(None), "input_setup_close")
-                            .await;
+                        send_critical_control(
+                            &mut sink,
+                            close_with_reason(INPUT_SETUP_FAILED_REASON),
+                            "input_setup_close",
+                        )
+                        .await;
                         capenc.shutdown().await;
                         return AttachmentEnd::terminal(SessionEndReason::MediaEnded);
                     }
@@ -9397,8 +9533,64 @@ async fn run_attachment(
     let mut input_status = lock_recover(&input_controller)
         .as_ref()
         .and_then(PierInput::wayland_status);
+    // A desktop another product owns is shared with nobody: its own client
+    // connecting ends this attachment, with the reason (ADR 0025 §8).
+    // Any other joined console steps aside when another product starts a
+    // desktop of its own on the console (it is the display manager again).
+    let console_guest = session_lease.is_some_and(|lease| lease.metadata.console_guest);
+    let console_joined = session_lease
+        .filter(|lease| lease.metadata.console)
+        .map(|lease| lease.metadata.session_id.clone());
+    let foreign_before: Vec<String> = match (&console_joined, console_guest) {
+        (Some(joined), false) => arcen_session::console_session::other_product_desktops(
+            &crate::session::console::read_sessions().await,
+            joined,
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        _ => Vec::new(),
+    };
+    let mut guest_check = tokio::time::interval(Duration::from_secs(2));
+    guest_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let end_reason = loop {
         tokio::select! {
+            _ = guest_check.tick(), if console_joined.is_some() => {
+                use arcen_session::console_session::{other_product_started, ConsoleRefusal};
+                let refusal = if console_guest {
+                    let Some(device) = crate::session::console::another_products_client() else {
+                        continue;
+                    };
+                    error!(
+                        target: SESSION,
+                        %device,
+                        "another remote-desktop product's client connected to this desktop; the attachment ends"
+                    );
+                    ConsoleRefusal::InUseOtherProduct
+                } else {
+                    let sessions = crate::session::console::read_sessions().await;
+                    if !other_product_started(
+                        &sessions,
+                        console_joined.as_deref().unwrap_or(""),
+                        &foreign_before,
+                    ) {
+                        continue;
+                    }
+                    error!(
+                        target: SESSION,
+                        "another remote-desktop product started its own desktop on the console; the attachment ends and the session is kept"
+                    );
+                    ConsoleRefusal::OtherProductStarted
+                };
+                let reason = refusal.deck_reason();
+                if ctrl_tx
+                    .send_required(close_with_reason(reason), "console_taken_over_close")
+                    .await
+                {
+                    let _ = ctrl_tx.barrier().await;
+                }
+                break SessionEndReason::ConsoleTakenOver;
+            }
             loss = wait_for_input_loss(&mut input_status) => {
                 // Input that can no longer reach the session would leave the
                 // Deck typing into nothing; end the attachment and say why.

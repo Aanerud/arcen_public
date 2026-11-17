@@ -17,7 +17,8 @@ use std::path::Path;
 
 use arcen_media::Rotation;
 use arcen_outputs::console_layout::{
-    plan_console_layout, ConsoleHeadRequest, ConsoleLayoutPlan, ConsoleOutput, OutputMode,
+    bind_shown_layout, console_monitor_capacity, plan_console_layout, takes_a_monitor,
+    ConsoleHeadRequest, ConsoleLayoutPlan, ConsoleOutput, OutputMode, ShownOutput,
 };
 use serde::{Deserialize, Serialize};
 use x11rb::connection::Connection as _;
@@ -142,6 +143,208 @@ pub(crate) fn request_for_display(width: u32, height: u32, refresh_hz: u32) -> C
         refresh_hz,
         primary: true,
     }
+}
+
+/// How long reading a live X server's outputs may take.
+const LIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The outputs of a console's X server that show a picture now (a CRTC
+/// with a mode), in RandR order.
+fn read_shown(
+    connection: &RustConnection,
+    root: xproto::Window,
+) -> Result<Vec<ShownOutput>, String> {
+    let resources = connection
+        .randr_get_screen_resources_current(root)
+        .map_err(|error| format!("request RandR resources: {error}"))?
+        .reply()
+        .map_err(|error| format!("RandR resources: {error}"))?;
+    let (_, facts) = read_outputs(connection, root)?;
+    let primary = primary_name(connection, root, &facts);
+    let mut shown = Vec::new();
+    for fact in &facts {
+        if fact.crtc == 0 {
+            continue;
+        }
+        let crtc = connection
+            .randr_get_crtc_info(fact.crtc, resources.config_timestamp)
+            .map_err(|error| format!("request RandR CRTC: {error}"))?
+            .reply()
+            .map_err(|error| format!("RandR CRTC: {error}"))?;
+        let Some(mode) = resources.modes.iter().find(|mode| mode.id == crtc.mode) else {
+            continue;
+        };
+        let rotation = if crtc.rotation.contains(randr::Rotation::ROTATE270) {
+            Rotation::Degrees90
+        } else if crtc.rotation.contains(randr::Rotation::ROTATE180) {
+            Rotation::Degrees180
+        } else if crtc.rotation.contains(randr::Rotation::ROTATE90) {
+            Rotation::Degrees270
+        } else {
+            Rotation::Degrees0
+        };
+        shown.push(ShownOutput {
+            name: fact.name.clone(),
+            width: u32::from(mode.width),
+            height: u32::from(mode.height),
+            x: i32::from(crtc.x),
+            y: i32::from(crtc.y),
+            rotation,
+            primary: primary.as_deref() == Some(fact.name.as_str()),
+        });
+    }
+    Ok(shown)
+}
+
+/// Reads `display`'s outputs off the async runtime, bounded: an X server
+/// that does not answer is no answer.
+async fn read_live<T: Send + 'static>(
+    display: &SessionDisplay,
+    read: fn(&RustConnection, xproto::Window) -> Result<T, String>,
+) -> Result<T, String> {
+    let display = display.clone();
+    let socket = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let reported = std::sync::Arc::clone(&socket);
+    let work = tokio::task::spawn_blocking(move || {
+        let connection = super::console::connect_reporting(&display, |stream| {
+            if let (Ok(clone), Ok(mut slot)) = (stream.try_clone(), reported.lock()) {
+                *slot = Some(clone);
+            }
+        })?;
+        let root = root_of(&connection)?;
+        read(&connection, root)
+    });
+    match tokio::time::timeout(LIVE_READ_TIMEOUT, work).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("read the X server's outputs: {error}")),
+        Err(_) => {
+            // The blocked thread waits on this socket without a bound: shut
+            // it down so the thread wakes and ends.
+            if let Some(stream) = socket.lock().ok().and_then(|mut slot| slot.take()) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            Err("the X server did not answer in time".to_owned())
+        }
+    }
+}
+
+/// Binds the Deck's monitors to a console shown as it is (another
+/// product's desktop): nothing is changed; the Deck's layout must be the
+/// desktop's own (`arcen_outputs::console_layout::bind_shown_layout`).
+pub(crate) async fn bind_shown(
+    display: &SessionDisplay,
+    requests: &[ConsoleHeadRequest],
+) -> Result<Vec<String>, LayoutFailure> {
+    let shown = read_live(display, read_shown)
+        .await
+        .map_err(|error| LayoutFailure::new("console_layout_unproven", error))?;
+    bind_shown_layout(requests, &shown).map_err(|error| {
+        let detail = format!(
+            "{error}; the desktop shows {}",
+            shown
+                .iter()
+                .map(|output| format!(
+                    "{} {}x{}+{}+{}",
+                    output.name, output.width, output.height, output.x, output.y
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        LayoutFailure::new(error.token(), detail)
+    })
+}
+
+/// What a console's live X server can show a Deck, read at each sign-in
+/// (ADR 0025 §6): the multi-monitor offer comes from it, never from a probe
+/// X server started beside a desktop that holds the GPU.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveConsole {
+    pub(crate) session_id: String,
+    pub(crate) origin: arcen_session::console_session::ConsoleOrigin,
+    /// How many Deck monitors it can show: outputs that take a monitor
+    /// for a console Arcen lays out, the outputs showing a picture now for
+    /// one shown as it is (another product's).
+    pub(crate) monitors: usize,
+    /// For the log: the outputs it counted.
+    pub(crate) outputs: Vec<String>,
+}
+
+/// Reads the console's live X server: the `seat0` X11 desktop in front
+/// (any account's, a login screen's too), else any on `seat0`.
+///
+/// # Errors
+///
+/// When no console X server answers (nothing graphical runs, or its
+/// display cannot be opened).
+pub(crate) async fn live_console() -> Result<LiveConsole, String> {
+    use arcen_session::console_session::{ConsoleOrigin, ARCEN_TTY, CONSOLE_SEAT};
+    let mut candidates: Vec<_> = super::console::read_sessions()
+        .await
+        .into_iter()
+        .filter(|fact| {
+            fact.seat == CONSOLE_SEAT
+                && fact.session_type == "x11"
+                && fact.tty != ARCEN_TTY
+                && fact.state != "closing"
+        })
+        .collect();
+    candidates.sort_by_key(|fact| (!fact.active, fact.class != "user"));
+    let mut last_error = "no X11 session on the console seat".to_owned();
+    for fact in candidates {
+        let Some(home) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(fact.uid))
+            .ok()
+            .flatten()
+            .map(|user| user.dir)
+        else {
+            continue;
+        };
+        let Some(display) = super::console::find_session_display(&fact.id, fact.uid, &home) else {
+            last_error = format!("session {} has no display Arcen can open", fact.id);
+            continue;
+        };
+        let origin = if fact.class == "user" {
+            fact.origin()
+        } else {
+            ConsoleOrigin::DisplayManager
+        };
+        let result = if origin == ConsoleOrigin::OtherProduct {
+            read_live(&display, read_shown).await.map(|shown| {
+                (
+                    shown
+                        .len()
+                        .min(arcen_outputs::console_layout::MAX_VIRTUAL_OUTPUTS),
+                    shown.into_iter().map(|output| output.name).collect(),
+                )
+            })
+        } else {
+            read_live(&display, |connection, root| {
+                read_outputs(connection, root).map(|(outputs, _)| outputs)
+            })
+            .await
+            .map(|outputs| {
+                (
+                    console_monitor_capacity(&outputs),
+                    outputs
+                        .into_iter()
+                        .filter(takes_a_monitor)
+                        .map(|output| output.name)
+                        .collect(),
+                )
+            })
+        };
+        match result {
+            Ok((monitors, outputs)) => {
+                return Ok(LiveConsole {
+                    session_id: fact.id,
+                    origin,
+                    monitors,
+                    outputs,
+                })
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 fn root_of(connection: &RustConnection) -> Result<xproto::Window, String> {

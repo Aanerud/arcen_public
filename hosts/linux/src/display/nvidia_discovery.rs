@@ -80,6 +80,20 @@ pub fn apply_startup_discovery(config: &mut Config) {
         );
         return;
     }
+    // A joined console's outputs are read from its live X server at each
+    // sign-in. A probe X server started beside one that holds the GPU (a
+    // login screen, a user's desktop, another product's server) hangs after
+    // loading the driver and may disturb it: never start one then.
+    if config.joins_console() {
+        if let Some(pid) = running_x_server() {
+            tracing::info!(
+                target: crate::logging::target::SESSION,
+                x_server_pid = pid,
+                "console mode: an X server holds the GPU; no NVIDIA head probe is started, outputs are read from the console's X server at each sign-in"
+            );
+            return;
+        }
+    }
     if config.encoder != crate::media::capenc::EncoderSelection::Auto
         && config.encoder != crate::media::capenc::EncoderSelection::NativeNvenc
     {
@@ -369,6 +383,15 @@ fn store_cache(discovery_dir: &Path, heads: &[String], log_path: &Path) {
         return;
     };
     let _ = fs::write(discovery_dir.join(DISCOVERY_CACHE_FILE), bytes);
+}
+
+/// A running X server (`Xorg`/`X`), by its process id.
+fn running_x_server() -> Option<u32> {
+    fs::read_dir("/proc").ok()?.flatten().find_map(|entry| {
+        let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+        let comm = fs::read_to_string(entry.path().join("comm")).ok()?;
+        matches!(comm.trim(), "Xorg" | "X").then_some(pid)
+    })
 }
 
 fn is_executable(path: &Path) -> bool {

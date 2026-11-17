@@ -226,6 +226,9 @@ pub struct Config {
     pub session_launcher_bin: Option<PathBuf>,
     /// GNOME session token passed to `/usr/bin/gnome-session`.
     pub desktop_session: String,
+    /// `platform.session.default_desktop`: the desktop a remote-first
+    /// sign-in starts for an account without a choice of its own.
+    pub default_desktop: Option<arcen_session::console_session::account_desktop::DesktopId>,
     /// `capture.provider`: `auto` (from host facts) unless an operator
     /// override names a provider.
     pub provider_preference: arcen_session::desktop_provider::ProviderPreference,
@@ -456,6 +459,7 @@ impl Config {
         CapencConfig {
             binary,
             output_index: self.output_index(),
+            output_name: None,
             codec: self.codec.clone(),
             encoder: self.session_encoder(),
             fps: self.fps,
@@ -1364,6 +1368,7 @@ impl Default for Config {
             session_agent_bin: None,
             session_launcher_bin: None,
             desktop_session: "gnome".to_string(),
+            default_desktop: None,
             provider_preference: arcen_session::desktop_provider::ProviderPreference::Auto,
             desktop_provider: arcen_session::desktop_provider::DesktopProvider::Xorg,
             wayland_qualification_target:
@@ -2207,6 +2212,17 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     }
     if let Some(value) = platform.session.desktop {
         cfg.desktop_session = parse_desktop_session(&value)?;
+    }
+    if let Some(value) = platform.session.default_desktop {
+        cfg.default_desktop = Some(
+            arcen_session::console_session::account_desktop::DesktopId::parse(&value).ok_or_else(
+                || {
+                    format!(
+                        "invalid platform.session.default_desktop: {value:?} (the name of an X session entry in /usr/share/xsessions without .desktop, for example gnome-classic)"
+                    )
+                },
+            )?,
+        );
     }
     if let Some(value) = platform.session.display {
         validate_session_display(&value)?;

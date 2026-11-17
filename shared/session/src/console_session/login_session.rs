@@ -102,14 +102,46 @@ pub fn choose_vt(used: &[u32]) -> Option<u32> {
     (7..=12).chain(2..=6).find(|vt| !used.contains(vt))
 }
 
-/// The session entries a desktop name may use, preferred first: the X11
-/// entry of the configured GNOME session.
+/// The session entries a desktop id may use, preferred first: its X11
+/// variant (`gnome-xorg` for `gnome`), then the entry of that name. An id
+/// that is not a plain name has none.
 #[must_use]
-pub fn xsession_names(desktop: &str) -> &'static [&'static str] {
-    match desktop {
-        "gnome-classic" => &["gnome-classic-xorg.desktop", "gnome-classic.desktop"],
-        _ => &["gnome-xorg.desktop", "gnome.desktop"],
+pub fn xsession_names(desktop: &str) -> Vec<String> {
+    if super::account_desktop::DesktopId::parse(desktop).is_none() {
+        return Vec::new();
     }
+    vec![
+        format!("{desktop}-xorg.desktop"),
+        format!("{desktop}.desktop"),
+    ]
+}
+
+/// The desktop names an X session entry declares (`DesktopNames=`), as
+/// `XDG_CURRENT_DESKTOP` wants them (`GNOME-Classic:GNOME`); `None` when
+/// it declares none or a name that is not plain.
+#[must_use]
+pub fn xsession_desktop_names(entry: &str) -> Option<String> {
+    let mut in_entry = false;
+    let mut names = None;
+    for line in entry.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if in_entry {
+            if let Some(value) = line.strip_prefix("DesktopNames=") {
+                names = Some(value.trim());
+            }
+        }
+    }
+    let parts: Vec<&str> = names?.split(';').filter(|part| !part.is_empty()).collect();
+    let plain = !parts.is_empty()
+        && parts.iter().all(|part| {
+            part.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        });
+    plain.then(|| parts.join(":"))
 }
 
 /// The command of an X session entry (`[Desktop Entry] Exec=`), as plain
@@ -256,10 +288,41 @@ mod tests {
         ] {
             assert_eq!(xsession_exec(bad), None, "{bad}");
         }
-        assert_eq!(xsession_names("gnome")[0], "gnome-xorg.desktop");
         assert_eq!(
-            xsession_names("gnome-classic")[0],
-            "gnome-classic-xorg.desktop"
+            xsession_names("gnome"),
+            ["gnome-xorg.desktop", "gnome.desktop"]
+        );
+        assert_eq!(
+            xsession_names("gnome-classic"),
+            ["gnome-classic-xorg.desktop", "gnome-classic.desktop"]
+        );
+        assert_eq!(
+            xsession_names("gnome-custom-session"),
+            [
+                "gnome-custom-session-xorg.desktop",
+                "gnome-custom-session.desktop"
+            ]
+        );
+        assert!(xsession_names("../x").is_empty());
+    }
+
+    #[test]
+    fn an_entrys_desktop_names_become_the_current_desktop() {
+        assert_eq!(
+            xsession_desktop_names(
+                "[Desktop Entry]\nName=Classic\nDesktopNames=GNOME-Classic;GNOME;\n"
+            )
+            .as_deref(),
+            Some("GNOME-Classic:GNOME")
+        );
+        assert_eq!(xsession_desktop_names("[Desktop Entry]\nExec=x\n"), None);
+        assert_eq!(
+            xsession_desktop_names("[Desktop Entry]\nDesktopNames=a b;\n"),
+            None
+        );
+        assert_eq!(
+            xsession_desktop_names("[Other]\nDesktopNames=GNOME\n"),
+            None
         );
     }
 }
