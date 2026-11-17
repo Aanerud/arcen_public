@@ -138,6 +138,7 @@ pub(super) async fn qualify_multi_output(
         runtime_root: config.session_runtime_root.clone(),
         agent_binary: config.resolve_session_agent_binary()?,
         desktop: config.desktop_session.clone(),
+        default_desktop: None,
         deskside: crate::deskside::LinuxDesksideConfig::default(),
         provider: DesktopProvider::Wayland,
         audio: crate::session::agent::AgentAudioArguments {

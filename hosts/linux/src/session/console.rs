@@ -283,6 +283,14 @@ fn session_processes(session_id: &str, uid: u32) -> Vec<SessionProcess> {
     processes
 }
 
+/// `XDG_SESSION_DESKTOP` as the user's processes in the session's scope
+/// have it (GDM 40 does not give logind the session's desktop).
+pub(crate) fn session_environ_desktop(session_id: &str, uid: u32) -> Option<String> {
+    session_processes(session_id, uid)
+        .iter()
+        .find_map(|process| environ_value(process.pid, "XDG_SESSION_DESKTOP"))
+}
+
 fn environ_value(pid: u32, key: &str) -> Option<String> {
     use std::io::Read as _;
     let file = std::fs::File::open(format!("/proc/{pid}/environ")).ok()?;
@@ -301,6 +309,12 @@ pub(crate) struct SessionDisplay {
     pub(crate) display: String,
     pub(crate) number: u32,
     pub(crate) xauthority: PathBuf,
+    /// The session's user: the authority file and the X server answering on
+    /// the socket are proved against it when the display is opened.
+    /// `None` only in a journal an older launcher wrote: the file's owner
+    /// stands in for it then.
+    #[serde(default)]
+    pub(crate) uid: Option<u32>,
 }
 
 fn socket_path(number: u32) -> PathBuf {
@@ -344,6 +358,7 @@ pub(crate) fn find_session_display(
                 display: format!(":{number}"),
                 number,
                 xauthority,
+                uid: Some(uid),
             });
         }
     }
@@ -376,15 +391,60 @@ pub(crate) async fn wait_for_session_display(
 }
 
 /// Opens the session's X display as root with the session's own cookie.
+///
+/// The authority file is opened without following a link and proved on the
+/// opened file (a regular file of the user's or root's, writable by nobody
+/// else); the cookie is sent only to an X server the shared
+/// `x_server_peer_trustworthy` admits, proved by the socket's peer
+/// credentials: the session's processes name the file and the display, and
+/// anyone may listen on a display number nobody serves.
 pub(crate) fn connect(display: &SessionDisplay) -> Result<RustConnection, String> {
+    connect_reporting(display, |_| {})
+}
+
+/// [`connect`], handing `on_socket` the X socket before the handshake, so a
+/// caller that gives up waiting can shut it down and wake a thread blocked
+/// on an X server that accepted the connection but never answers.
+pub(crate) fn connect_reporting(
+    display: &SessionDisplay,
+    on_socket: impl FnOnce(&std::os::unix::net::UnixStream),
+) -> Result<RustConnection, String> {
     use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&display.xauthority)
+        .map_err(|error| format!("open X authority: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("X authority: {error}"))?;
+    let session_uid = display.uid.unwrap_or_else(|| metadata.uid());
+    if !model::xauthority_trustworthy(
+        metadata.file_type().is_file(),
+        metadata.uid(),
+        metadata.mode(),
+        session_uid,
+    ) {
+        return Err("the X authority file is not the session's".to_owned());
+    }
     let mut cookie = Vec::new();
-    std::fs::File::open(&display.xauthority)
-        .and_then(|file| file.take(MAX_XAUTHORITY_BYTES).read_to_end(&mut cookie))
+    (&mut file)
+        .take(MAX_XAUTHORITY_BYTES)
+        .read_to_end(&mut cookie)
         .map_err(|error| format!("read X authority: {error}"))?;
     let cookie = model::mit_magic_cookie(&cookie, display.number);
     let stream = std::os::unix::net::UnixStream::connect(socket_path(display.number))
         .map_err(|error| format!("connect X socket: {error}"))?;
+    let peer = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map_err(|error| format!("X socket peer: {error}"))?;
+    if !model::x_server_peer_trustworthy(peer.uid(), metadata.uid(), session_uid) {
+        return Err(format!(
+            "the X socket :{} is not served by the session's X server",
+            display.number
+        ));
+    }
+    on_socket(&stream);
     let (stream, _) =
         DefaultStream::from_unix_stream(stream).map_err(|error| format!("X stream: {error}"))?;
     let (name, data) = match cookie {
@@ -845,6 +905,43 @@ fn input_device_fact(event: &str) -> Option<InputDeviceFact> {
         }) && property("LIBINPUT_IGNORE_DEVICE").as_deref() == Some("1"),
         drives_desktop,
     })
+}
+
+/// Whether `event`'s device carries Arcen's virtual input vendor (Arcen's
+/// own injectors).
+fn arcen_input_device(event: &str) -> bool {
+    std::fs::read_to_string(
+        Path::new("/sys/class/input")
+            .join(event)
+            .join("device/id/vendor"),
+    )
+    .ok()
+    .and_then(|vendor| u16::from_str_radix(vendor.trim(), 16).ok())
+        == Some(arcen_input::virtual_device::VIRTUAL_INPUT_VENDOR_ID)
+}
+
+/// The name of a software keyboard or pointer of another remote-desktop
+/// product's connected client, if one exists (shared
+/// `another_products_client_input`). Only asked about a desktop another
+/// product owns: there, that product's client is using it now.
+pub(crate) fn another_products_client() -> Option<String> {
+    let entries = std::fs::read_dir("/sys/class/input").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(event) = name.to_str().filter(|name| name.starts_with("event")) else {
+            continue;
+        };
+        let Some(fact) = input_device_fact(event) else {
+            continue;
+        };
+        if model::another_products_client_input(fact, arcen_input_device(event)) {
+            let device_name = std::fs::read_to_string(entry.path().join("device/name"))
+                .map(|name| name.trim().to_owned())
+                .unwrap_or_default();
+            return Some(format!("{event} ({device_name})"));
+        }
+    }
+    None
 }
 
 impl GrabbedInput {

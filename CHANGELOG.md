@@ -6,6 +6,86 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.2] — 2026-11-17
+
+A field release for 0.20.1. A Linux Pier now works beside another
+remote-desktop product on the same workstation (it joins that product's
+desktop as a guest and never changes it), finds the monitors of the desktop
+it joins at every connection, and says why whenever a sign-in fails; the
+installer helps on graphics cards without monitors; a sign-in from a Deck
+gets the desktop its users expect, without password prompts. Match my
+layout also works with a Deck monitor turned on its side. 0.20.2 speaks
+protocol v5 and works with every 0.17.0 to 0.20.1 Deck and Pier.
+
+### Fixed
+
+- **Match my layout failed when a Deck monitor is rotated (reported on
+  0.20.1).** With a monitor turned on its side, connecting with Match my
+  layout to a host that cannot rotate a display failed with "requested
+  monitor … uses unsupported rotation". A Linux Pier serving Wayland
+  desktops is such a host. The Deck now asks it for that monitor upright, at
+  the size you see on your desk, which is what the Deck shows anyway, and
+  asks for the rotation only where the host offers it (macOS, Windows and
+  Linux X11 Piers). Earlier Decks had the same limit. Update the macOS and
+  Windows Decks; Piers need no change.
+- **A Linux Pier could not join a desktop that another remote-desktop
+  product runs (reported on 0.20.1).** On a workstation where another
+  product owns the desktop, connecting failed with "host closed the
+  connection during setup", and the Pier's log said nothing after the
+  sign-in. The other product's X server uses display `:100`, and the Pier
+  only made keyboard and mouse devices for displays `:1` to `:99`. The Pier
+  now joins such a desktop as a guest: it streams each screen as that desktop
+  shows it and never changes its layout. Match my layout works when your
+  Deck's monitors are laid out like the desktop's; otherwise the Deck offers
+  Primary Display Only. While the other product's own client is connected,
+  the Pier says so (`console_in_use_other_product`) instead of joining.
+- **No multi-monitor offer while another X server holds the GPU (reported
+  on 0.20.1).** The Pier looked for monitors once, at start, with a test X
+  server that cannot run beside another one. It now reads the monitors from
+  the desktop's own X server at each sign-in, so Match my layout also works
+  after the login screen restarts, without restarting the Pier.
+- **"Nobody is signed in" on a host whose display manager is another
+  product (reported on 0.20.1).** With that product stopped, nothing shows a
+  login screen. The Pier now starts your own desktop session, as on a host
+  without a display manager. If the other product starts again while you are
+  connected, the Deck is told (`console_other_product_started`).
+- **No usable monitors on a GPU without monitors.** On a rack
+  workstation whose NVIDIA GPU drives no monitor, the login screen's X
+  server had no usable outputs. The Linux installer now notices it and
+  recommends rerunning with `--console-outputs` and the GPU's real head
+  names, which the Pier lists once it has started
+  ([administration guide](docs/operations/pier-administration.md#joining-the-users-session-console-mode)).
+- **A failed sign-in always says why.** Every way a sign-in can end before
+  its picture arrives now gives the Deck a reason and writes one line to the
+  Pier's log at every log level.
+- **Password prompts for colour management and Power Off on Linux (reported
+  on 0.20.1).** On a Linux host with Arcen installed, GNOME asked for an
+  administrator password to "create a color managed device" (several times
+  as a session signed in from a Deck started), and the desk user's own
+  Power Off asked for one too. GNOME 40 and later run its shell and
+  settings daemons outside the logind session, and Arcen's polkit rule
+  counted every such program as remote. The rule now counts them as
+  remote only while their user has an Arcen desktop or another remote
+  desktop open, so a session at the desk or joined from a Deck keeps the
+  user's own rights; and the user of an
+  Arcen desktop may create and delete colour devices and profiles without
+  a password, as a user at the desk may. Every other administrator action in a
+  remote desktop still asks for an administrator. The installer and the
+  Pier's start replace the rule (`polkit: updated …`).
+- **A blank desktop after a sign-in from a Deck (reported on 0.20.1).** A
+  sign-in while nobody was at the desk started the desktop the account's
+  settings name, which for an account that never chose one is the
+  distribution's default (standard GNOME on Enterprise Linux), not the GNOME
+  Classic desktop the workstation's users knew: no icons, no Applications
+  menu. The new `platform.session.default_desktop` (for example
+  `gnome-classic`) names the desktop such accounts get. The Linux Pier
+  records it in the account's settings before the login screen takes the
+  sign-in, only when the account has no choice of its own, and never
+  changes an account's own choice; Arcen's own login session on a host
+  without a display manager honours it too, and now starts the account's
+  own desktop choice where it used to start `platform.session.desktop`. The Pier log names the desktop
+  every joined session runs.
+
 ## [0.20.1] — 2026-11-17
 
 **Arcen is an extension of your machine.** A Linux Pier now joins the
@@ -2972,7 +3052,8 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.2...HEAD
+[0.20.2]: https://github.com/Aanerud/arcen_public/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/Aanerud/arcen_public/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/Aanerud/arcen_public/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/Aanerud/arcen_public/compare/v0.18.0...v0.19.0

@@ -17,6 +17,7 @@
 //! session's processes, evdev, `RandR`) and acts on the answers; the Windows
 //! and macOS Piers reach the same model through their own console APIs.
 
+pub mod account_desktop;
 pub mod domain_logon;
 pub mod foreign_service;
 pub mod greeter_token;
@@ -242,6 +243,40 @@ impl Default for ConsoleHost {
     }
 }
 
+/// Display managers whose login screen completes a remote-first sign-in or
+/// comes back by itself: a configured one that is down is a failure
+/// (`console_no_session`), not a host without one.
+pub const DISPLAY_MANAGER_UNITS: &[&str] = &[
+    "gdm.service",
+    "gdm3.service",
+    "lightdm.service",
+    "sddm.service",
+    "lxdm.service",
+    "xdm.service",
+    "slim.service",
+];
+
+impl ConsoleHost {
+    /// The host's display manager from what systemd says about
+    /// `display-manager.service`: the unit the alias points at (`None`
+    /// when there is no alias) and whether it is running.
+    ///
+    /// A display manager's alias counts whether or not it runs. An alias to
+    /// anything else — another remote-desktop product that makes itself the
+    /// display manager and starts a display manager only while it runs —
+    /// counts only while that unit runs: stopped, nothing will show a login
+    /// screen, and the host is served like one without a display manager
+    /// (ADR 0025 §10).
+    #[must_use]
+    pub fn from_display_manager(alias_target: Option<&str>, active: bool) -> Self {
+        let display_manager = match alias_target {
+            None => false,
+            Some(unit) => active || DISPLAY_MANAGER_UNITS.contains(&unit),
+        };
+        Self { display_manager }
+    }
+}
+
 /// Decides what a sign-in of `uid` does on a host with a display manager.
 #[must_use]
 pub fn decide(sessions: &[ConsoleSessionFact], uid: u32) -> ConsoleDecision {
@@ -437,11 +472,21 @@ pub enum ConsoleRefusal {
     /// account, its domain policy: Group Policy's "Allow log on locally")
     /// does not let this account sign in at this workstation.
     AccountDenied,
+    /// The account's own desktop in another remote-desktop product is in
+    /// use through that product right now (its client is connected). One
+    /// remote product at a time: Arcen does not take the desktop over, and
+    /// ends its own attachment when that product's client connects.
+    InUseOtherProduct,
+    /// While a Deck was attached, another remote-desktop product started its
+    /// own desktop on the console (it is the host's display manager again).
+    /// Arcen steps aside rather than fight it for the GPU and the virtual
+    /// terminal; the account's Arcen desktop is not ended.
+    OtherProductStarted,
 }
 
 impl ConsoleRefusal {
     /// Every refusal (the error-code reference checks each has a row).
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::OtherUser,
         Self::OtherUserOtherProduct,
         Self::WaylandSession,
@@ -452,6 +497,8 @@ impl ConsoleRefusal {
         Self::PrivacyUnavailable,
         Self::SessionChanged,
         Self::AccountDenied,
+        Self::InUseOtherProduct,
+        Self::OtherProductStarted,
     ];
 
     /// The refusal for another account's session of `origin`.
@@ -478,6 +525,8 @@ impl ConsoleRefusal {
             Self::PrivacyUnavailable => "console_privacy_unavailable",
             Self::SessionChanged => "console_session_changed",
             Self::AccountDenied => "console_account_denied",
+            Self::InUseOtherProduct => "console_in_use_other_product",
+            Self::OtherProductStarted => "console_other_product_started",
         }
     }
 
@@ -516,6 +565,12 @@ impl ConsoleRefusal {
             Self::AccountDenied => {
                 "console_account_denied: your (domain) account policy does not allow this account to sign in at this workstation."
             }
+            Self::InUseOtherProduct => {
+                "console_in_use_other_product: this desktop is in use through another remote-desktop product."
+            }
+            Self::OtherProductStarted => {
+                "console_other_product_started: another remote-desktop product took over this workstation."
+            }
         }
     }
 }
@@ -546,6 +601,55 @@ pub struct InputDeviceFact {
 #[must_use]
 pub const fn disables_while_attached(device: InputDeviceFact) -> bool {
     device.drives_desktop && device.console_seat && !device.virtual_device && !device.bridged
+}
+
+/// Whether the device is a remote client's input of another product: a
+/// software keyboard or pointer on the console seat that is not Arcen's own
+/// (`arcen_device`: Arcen's virtual input vendor) nor a Deck's bridged
+/// device. Remote-desktop products create these while their client is
+/// connected; on a desktop another product owns, one present means that
+/// product's client is using the desktop now.
+#[must_use]
+pub const fn another_products_client_input(device: InputDeviceFact, arcen_device: bool) -> bool {
+    device.drives_desktop
+        && device.console_seat
+        && device.virtual_device
+        && !device.bridged
+        && !arcen_device
+}
+
+/// The console desktops another remote-desktop product started (the
+/// display manager and Arcen did not), other than the joined session
+/// `joined`.
+#[must_use]
+pub fn other_product_desktops<'a>(
+    sessions: &'a [ConsoleSessionFact],
+    joined: &str,
+) -> Vec<&'a str> {
+    sessions
+        .iter()
+        .filter(|session| {
+            session.id != joined
+                && session.is_console_desktop()
+                && session.origin() == ConsoleOrigin::OtherProduct
+        })
+        .map(|session| session.id.as_str())
+        .collect()
+}
+
+/// Whether another remote-desktop product started a desktop of its own on
+/// the console while the session `joined` was attached: one of
+/// [`other_product_desktops`] that was not there when the attachment began
+/// (`before`). ADR 0025 §8, "the other product is the display manager".
+#[must_use]
+pub fn other_product_started(
+    sessions: &[ConsoleSessionFact],
+    joined: &str,
+    before: &[String],
+) -> bool {
+    other_product_desktops(sessions, joined)
+        .into_iter()
+        .any(|id| !before.iter().any(|known| known == id))
 }
 
 /// How a console session that did not lock may still be given back to the
@@ -665,6 +769,17 @@ pub const fn xauthority_trustworthy(
     session_uid: u32,
 ) -> bool {
     regular && (owner == session_uid || owner == 0) && mode & 0o022 == 0
+}
+
+/// Whether a session's cookie may be sent to the X server answering on its
+/// socket: an X server run by root (the display manager's, another
+/// product's), or the session user's own X server presenting the user's own
+/// cookie. The socket directory is world-writable, so anyone may listen on
+/// a display number nobody serves; a cookie from a root-owned file (or
+/// anyone else's) never goes to such a listener.
+#[must_use]
+pub const fn x_server_peer_trustworthy(peer_uid: u32, cookie_owner: u32, session_uid: u32) -> bool {
+    peer_uid == 0 || (peer_uid == session_uid && cookie_owner == session_uid)
 }
 
 /// The `MIT-MAGIC-COOKIE-1` an X authority file (`Xauthority` format: per
@@ -922,6 +1037,20 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_product_aliased_as_the_display_manager_is_no_display_manager() {
+        let host = |target, active| ConsoleHost::from_display_manager(target, active);
+        assert!(!host(None, false).display_manager);
+        assert!(host(Some("gdm.service"), false).display_manager);
+        assert!(host(Some("gdm.service"), true).display_manager);
+        assert!(host(Some("remote-product.service"), true).display_manager);
+        assert!(!host(Some("remote-product.service"), false).display_manager);
+        assert_eq!(
+            decide_on(&[], TIM, host(Some("remote-product.service"), false)),
+            ConsoleDecision::StartLoginSession { vt: 7 }
+        );
+    }
+
+    #[test]
     fn a_host_without_a_display_manager_gets_a_real_login_session_once_per_account() {
         let no_dm = ConsoleHost {
             display_manager: false,
@@ -1112,6 +1241,69 @@ mod tests {
             ConsoleRefusal::other_user(ConsoleOrigin::OtherProduct),
             ConsoleRefusal::OtherUserOtherProduct
         );
+    }
+
+    #[test]
+    fn another_products_desktop_beside_the_joined_one_is_noticed() {
+        let mine = arcen_login("40", TIM, 7);
+        assert!(!other_product_started(
+            std::slice::from_ref(&mine),
+            "40",
+            &[]
+        ));
+        let mut product = session("81", TIM, "user", "x11", true);
+        product.service = "remote-product-session".into();
+        let both = [mine, product.clone()];
+        assert_eq!(other_product_desktops(&both, "40"), ["81"]);
+        assert!(other_product_started(&both, "40", &[]));
+        // One that was already there when the attachment began is not news.
+        assert!(!other_product_started(&both, "40", &["81".to_owned()]));
+        // The joined session itself is never "another".
+        assert!(!other_product_started(&[product], "81", &[]));
+    }
+
+    #[test]
+    fn a_cookie_goes_only_to_root_x_servers_or_the_users_own_with_its_own_cookie() {
+        assert!(x_server_peer_trustworthy(0, 0, TIM));
+        assert!(x_server_peer_trustworthy(0, TIM, TIM));
+        assert!(x_server_peer_trustworthy(TIM, TIM, TIM));
+        // A listener of the user's on a display nobody serves never gets a
+        // root-owned cookie, nor anyone else's.
+        assert!(!x_server_peer_trustworthy(TIM, 0, TIM));
+        assert!(!x_server_peer_trustworthy(TIM, OTHER, TIM));
+        assert!(!x_server_peer_trustworthy(OTHER, OTHER, TIM));
+    }
+
+    #[test]
+    fn another_products_client_shows_as_its_software_input() {
+        let client = InputDeviceFact {
+            virtual_device: true,
+            console_seat: true,
+            bridged: false,
+            drives_desktop: true,
+        };
+        assert!(another_products_client_input(client, false));
+        assert!(!another_products_client_input(client, true));
+        for device in [
+            InputDeviceFact {
+                virtual_device: false,
+                ..client
+            },
+            InputDeviceFact {
+                bridged: true,
+                ..client
+            },
+            InputDeviceFact {
+                drives_desktop: false,
+                ..client
+            },
+            InputDeviceFact {
+                console_seat: false,
+                ..client
+            },
+        ] {
+            assert!(!another_products_client_input(device, false));
+        }
     }
 
     #[test]

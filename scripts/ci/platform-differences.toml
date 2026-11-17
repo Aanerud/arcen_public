@@ -63,6 +63,7 @@ code = [
 config = [
   "hosts/linux:platform.session.mode",
   "hosts/linux:platform.session.desktop",
+  "hosts/linux:platform.session.default_desktop",
   "hosts/linux:platform.session.display",
   "hosts/linux:platform.session.gpu_head",
   "hosts/linux:platform.session.xorg_bin",

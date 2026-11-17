@@ -625,6 +625,7 @@ mod tests {
     fn template() -> MonitorPipelineTemplate {
         MonitorPipelineTemplate {
             capture_bindings: Vec::new(),
+            output_names: Vec::new(),
             binary: PathBuf::from("/nonexistent/arcen-capenc"),
             codec: "h265".to_owned(),
             encoder: EncoderSelection::NativeNvenc,

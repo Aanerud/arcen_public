@@ -30,6 +30,29 @@
 //! it then caches. The rule is static: it names no session, so nothing is
 //! rewritten per sign-in.
 //!
+//! A process in no logind session — a systemd user service, which is how
+//! GNOME 40 and later run the shell and the settings daemons — reaches the
+//! rule with no session and no seat, yet `local` (from its user's display
+//! session, `sd_uid_get_display`) and `active` (any of the user's sessions)
+//! as polkit judged them. Such a process may belong to any of the user's
+//! sessions, so the rule counts it as remote while any of them is an Arcen
+//! desktop or a seated remote session: it learns the uid with `id` (cached
+//! per name), reads `SESSIONS=` from logind's user record
+//! (`/run/systemd/users/<uid>`) and classifies each. logind (252, Rocky 9)
+//! leaves an ended session in that list until the user's next session
+//! starts; a listed session missing from a successful `ls` of
+//! `/run/systemd/sessions` is gone and skipped. Otherwise (only console
+//! sessions and ssh logins) polkit's own answer stands. Earlier rules counted
+//! every such subject as remote, which took the console's rights from the
+//! desk user's own shell (power off asked for an administrator) and made
+//! GNOME's colour plugin ask for a password in every session. Anything it
+//! cannot read still counts as remote.
+//!
+//! The user of an Arcen desktop (opened by an Arcen launcher, or on an
+//! Arcen seat) is granted [`ARCEN_DESKTOP_GRANTS`] — the colord calls
+//! GNOME's colour plugin makes — for a subject whose uid is the session's
+//! own; every other action keeps its remote answer.
+//!
 //! A desktop is admitted only when polkit, asked about a process in its
 //! session, refuses it a set of actions stock systems grant local users
 //! ([`admission`]). This module is the pure part: the `.policy` reader, the
@@ -93,6 +116,52 @@ pub const PROBE_ACTIONS: &[&str] = &[
     "org.freedesktop.timedate1.set-time",
 ];
 
+/// Actions the rule grants without a password to the user of an Arcen
+/// desktop (a session an Arcen launcher opened or one on an Arcen seat), for
+/// a subject of that same user only: exactly the colord calls GNOME's colour
+/// plugin (`gsd-color`) makes for the desktop's monitors and the user's own
+/// ICC profiles (`cd_client_create_device`/`delete_device` in
+/// `gsd-color-state.c`, `create_profile_for_icc`/`delete_profile` in
+/// `gsd-color-profiles.c`). Their `allow_any` is `auth_admin`, so without
+/// this every Arcen desktop asked for an administrator's password as it
+/// started and whenever its monitors changed. Every other colord action
+/// (system-wide profiles, inhibiting a device, locking a sensor) keeps its
+/// remote answer.
+pub const ARCEN_DESKTOP_GRANTS: &[&str] = &[
+    "org.freedesktop.color-manager.create-device",
+    "org.freedesktop.color-manager.create-profile",
+    "org.freedesktop.color-manager.delete-device",
+    "org.freedesktop.color-manager.delete-profile",
+];
+
+/// logind's per-user records (`DISPLAY=<session id>` names the user's
+/// graphical session, which `sd_uid_get_display` reads; mode 0644).
+pub const USER_RECORD_DIR: &str = "/run/systemd/users";
+
+/// The `id` the rule spawns to learn a user's uid (polkit gives the rule
+/// the user's name only). polkit runs it as its own user, with an absolute
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdPath {
+    /// `/usr/bin/id` (EL, Fedora, Debian, Ubuntu).
+    UsrBin,
+    /// `/bin/id`.
+    Bin,
+}
+
+impl IdPath {
+    /// Candidates in the order a host adapter should look for them.
+    pub const CANDIDATES: [Self; 2] = [Self::UsrBin, Self::Bin];
+
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::UsrBin => "/usr/bin/id",
+            Self::Bin => "/bin/id",
+        }
+    }
+}
+
 /// The `cat` the rule spawns to read a session record. polkit runs it as
 /// its own user, with an absolute path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +181,16 @@ impl CatPath {
         match self {
             Self::UsrBin => "/usr/bin/cat",
             Self::Bin => "/bin/cat",
+        }
+    }
+
+    /// The `ls` beside it (coreutils installs both in the same directory),
+    /// which lists the session records that exist.
+    #[must_use]
+    pub const fn ls_path(self) -> &'static str {
+        match self {
+            Self::UsrBin => "/usr/bin/ls",
+            Self::Bin => "/bin/ls",
         }
     }
 }
@@ -287,7 +366,15 @@ impl SessionRecord {
     /// when an Arcen launcher opened it, or when it sits on an Arcen seat.
     #[must_use]
     pub fn is_remote(&self) -> bool {
-        self.remote || self.tty == SESSION_TTY || self.seat.starts_with(ARCEN_SEAT_PREFIX)
+        self.remote || self.is_arcen_desktop()
+    }
+
+    /// The rule's decision for [`ARCEN_DESKTOP_GRANTS`]: an Arcen launcher
+    /// opened the session, or it sits on an Arcen seat. `REMOTE=1` alone
+    /// (ssh, another product's remote login) is not an Arcen desktop.
+    #[must_use]
+    pub fn is_arcen_desktop(&self) -> bool {
+        self.tty == SESSION_TTY || self.seat.starts_with(ARCEN_SEAT_PREFIX)
     }
 }
 
@@ -378,9 +465,9 @@ pub fn later_restrictive_policies(
 }
 
 /// The rule text for `actions` (each id once; the first wins), reading
-/// session records with `cat`.
+/// logind's records with `cat` and resolving user names with `id`.
 #[must_use]
-pub fn rule_text(actions: &[(String, ImplicitAuth)], cat: CatPath) -> String {
+pub fn rule_text(actions: &[(String, ImplicitAuth)], cat: CatPath, id_path: IdPath) -> String {
     let mut seen = std::collections::BTreeMap::new();
     for (id, allow_any) in actions {
         if valid_action_id(id) {
@@ -396,8 +483,10 @@ pub fn rule_text(actions: &[(String, ImplicitAuth)], cat: CatPath) -> String {
          // own seat) would get the console's allow_active grants. For a subject in a remote\n\
          // seated session this rule answers each action's allow_any default, as polkit does for\n\
          // any seatless remote session, and AUTH_ADMIN for an action it does not know; an action\n\
-         // whose allow_any is YES is left to the later rules. Every other subject is left to the\n\
-         // other rules. Site restrictions for remote desktops must be numbered 00-04: this rule\n\
+         // whose allow_any is YES is left to the later rules. A process in no session (a systemd\n\
+         // user service, such as GNOME's shell and settings daemons) is remote while any of its\n\
+         // user's sessions is. The user of an Arcen desktop gets the colord calls GNOME's colour\n\
+         // plugin makes for that desktop. Every other subject is left to the other rules. Site restrictions for remote desktops must be numbered 00-04: this rule\n\
          // answers before later ones. arcen-pier rewrites this file at start for the actions\n\
          // installed then; install-arcen-pier --uninstall removes it.\n",
     );
@@ -405,43 +494,167 @@ pub fn rule_text(actions: &[(String, ImplicitAuth)], cat: CatPath) -> String {
     for (id, allow_any) in &seen {
         let _ = writeln!(out, "        \"{id}\": {},", allow_any.js());
     }
+    out.push_str("    };\n    var arcenDesktopGrants = {\n");
+    for grant in ARCEN_DESKTOP_GRANTS {
+        let _ = writeln!(out, "        \"{grant}\": true,");
+    }
     out.push_str("    };\n");
-    let cat = cat.path();
+    out.push_str(&rule_body(cat.path(), cat.ls_path(), id_path.path()));
+    out
+}
+
+/// The rule's helpers (failure log, uid and user record lookups).
+fn rule_body(cat: &str, ls: &str, id: &str) -> String {
+    let mut out = String::new();
     let _ = write!(
         out,
         r#"    var has = Object.prototype.hasOwnProperty;
     var remoteSessions = {{}};
+    var uids = {{}};
     var readFailureLogged = false;
-    function remoteSession(session) {{
+    function readFailed(what, error) {{
+        if (!readFailureLogged) {{
+            readFailureLogged = true;
+            polkit.log("arcen: " + what + " unreadable, treated as remote (logged once): " + error);
+        }}
+    }}
+    function uidOf(user) {{
+        if (user === "") {{
+            return "";
+        }}
+        if (has.call(uids, user)) {{
+            return uids[user];
+        }}
+        var uid;
+        try {{
+            uid = String(polkit.spawn(["{id}", "-u", "--", user])).replace(/\s+$/, "");
+        }} catch (error) {{
+            readFailed("the uid of " + user, error);
+            return "";
+        }}
+        if (!/^[0-9]{{1,10}}$/.test(uid)) {{
+            return "";
+        }}
+        uids[user] = uid;
+        return uid;
+    }}
+    function userSessions(user) {{
+        var uid = uidOf(user);
+        if (uid === "") {{
+            return null;
+        }}
+        var record;
+        try {{
+            record = polkit.spawn(["{cat}", "{USER_RECORD_DIR}/" + uid]);
+        }} catch (error) {{
+            readFailed("logind user " + uid, error);
+            return null;
+        }}
+        var listed = /^SESSIONS=(.*)$/m.exec(record);
+        var sessions = listed ? listed[1].split(" ") : [];
+        var valid = [];
+        for (var i = 0; i < sessions.length; i++) {{
+            if (sessions[i] !== "") {{
+                valid.push(sessions[i]);
+            }}
+        }}
+        return valid.length > 0 ? valid : null;
+    }}
+    function liveSessions() {{
+        var listing;
+        try {{
+            listing = String(polkit.spawn(["{ls}", "--", "{SESSION_RECORD_DIR}"]));
+        }} catch (error) {{
+            readFailed("{SESSION_RECORD_DIR} (ls)", error);
+            return null;
+        }}
+        var live = {{}};
+        var names = listing.split("\n");
+        for (var i = 0; i < names.length; i++) {{
+            live[names[i]] = true;
+        }}
+        return live;
+    }}
+"#
+    );
+    out.push_str(&rule_decision(cat));
+    out
+}
+
+/// The session classifier and the rule itself.
+fn rule_decision(cat: &str) -> String {
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        r#"    function sessionFacts(session, seat) {{
+        var facts = {{ remote: false, arcen: seat.indexOf("{ARCEN_SEAT_PREFIX}") === 0, seated: seat !== "", owner: "" }};
         if (!/^[A-Za-z0-9]{{1,{MAX_SESSION_ID_LEN}}}$/.test(session)) {{
-            return true;
+            facts.remote = true;
+            facts.seated = true;
+            return facts;
         }}
         if (has.call(remoteSessions, session)) {{
-            return true;
+            return remoteSessions[session];
         }}
         var record;
         try {{
             record = polkit.spawn(["{cat}", "{SESSION_RECORD_DIR}/" + session]);
         }} catch (error) {{
-            if (!readFailureLogged) {{
-                readFailureLogged = true;
-                polkit.log("arcen: logind session " + session + " unreadable, treated as remote (logged once): " + error);
+            readFailed("logind session " + session, error);
+            facts.remote = true;
+            facts.seated = true;
+            return facts;
+        }}
+        if (/^TTY={SESSION_TTY}$/m.test(record) || /^SEAT={ARCEN_SEAT_PREFIX}/m.test(record)) {{
+            facts.arcen = true;
+        }}
+        if (/^SEAT=./m.test(record)) {{
+            facts.seated = true;
+        }}
+        if (facts.arcen) {{
+            var owner = /^UID=([0-9]{{1,10}})$/m.exec(record);
+            facts.owner = owner ? owner[1] : "";
+        }}
+        facts.remote = facts.arcen || /^REMOTE=1$/m.test(record);
+        if (facts.remote) {{
+            remoteSessions[session] = facts;
+        }}
+        return facts;
+    }}
+    function sessionlessFacts(user) {{
+        var sessions = userSessions(user);
+        var facts = {{ remote: false, arcen: false, seated: false, owner: "" }};
+        if (sessions === null) {{
+            facts.remote = true;
+            return facts;
+        }}
+        var live = liveSessions();
+        for (var i = 0; i < sessions.length; i++) {{
+            if (live !== null && !has.call(live, sessions[i])) {{
+                continue;
             }}
-            return true;
+            var listed = sessionFacts(sessions[i], "");
+            if (listed.arcen || (listed.remote && listed.seated)) {{
+                facts.remote = true;
+            }}
+            if (listed.arcen && listed.owner !== "") {{
+                facts.owner = listed.owner;
+            }}
         }}
-        if (/^REMOTE=1$/m.test(record) || /^TTY={SESSION_TTY}$/m.test(record)) {{
-            remoteSessions[session] = true;
-            return true;
-        }}
-        return false;
+        return facts;
     }}
     polkit.addRule(function (action, subject) {{
         if (!subject.local) {{
             return null;
         }}
-        var seat = String(subject.seat || "");
-        if (seat.indexOf("{ARCEN_SEAT_PREFIX}") !== 0 && !remoteSession(String(subject.session || ""))) {{
+        var user = String(subject.user || "");
+        var session = String(subject.session || "");
+        var facts = session === "" ? sessionlessFacts(user) : sessionFacts(session, String(subject.seat || ""));
+        if (!facts.remote) {{
             return null;
+        }}
+        if (has.call(arcenDesktopGrants, action.id) && facts.owner !== "" && facts.owner === uidOf(user)) {{
+            return polkit.Result.YES;
         }}
         if (!has.call(allowAny, action.id)) {{
             return polkit.Result.AUTH_ADMIN;
@@ -776,7 +989,7 @@ mod tests {
 
     #[test]
     fn the_rule_maps_remote_seated_subjects_to_allow_any_and_unknown_actions_to_admin() {
-        let rule = rule_text(&parse_policy(LOGIN1), CatPath::UsrBin);
+        let rule = rule_text(&parse_policy(LOGIN1), CatPath::UsrBin, IdPath::UsrBin);
         assert!(is_arcen_rule(&rule));
         assert!(rule.starts_with(RULE_HEADER));
         assert!(
@@ -786,11 +999,14 @@ mod tests {
             rule.contains("\"org.freedesktop.login1.inhibit-delay-sleep\": polkit.Result.YES,")
         );
         assert!(rule.contains("if (!subject.local) {"));
-        assert!(rule.contains("seat.indexOf(\"seat-arcen-pen-\") !== 0"));
+        assert!(rule.contains("arcen: seat.indexOf(\"seat-arcen-pen-\") === 0"));
         assert!(
             rule.contains("polkit.spawn([\"/usr/bin/cat\", \"/run/systemd/sessions/\" + session])")
         );
-        assert!(rule.contains("/^REMOTE=1$/m.test(record) || /^TTY=arcen$/m.test(record)"));
+        assert!(
+            rule.contains("/^TTY=arcen$/m.test(record) || /^SEAT=seat-arcen-pen-/m.test(record)")
+        );
+        assert!(rule.contains("facts.remote = facts.arcen || /^REMOTE=1$/m.test(record);"));
         assert!(rule.contains("/^[A-Za-z0-9]{1,64}$/.test(session)"));
         assert!(rule.contains(
             "if (!has.call(allowAny, action.id)) {\n            return polkit.Result.AUTH_ADMIN;"
@@ -808,7 +1024,9 @@ mod tests {
             !rule.contains("evil"),
             "an id that is not a plain dotted name never reaches the rule"
         );
-        assert!(rule_text(&[], CatPath::Bin).contains("polkit.spawn([\"/bin/cat\""));
+        assert!(
+            rule_text(&[], CatPath::Bin, IdPath::UsrBin).contains("polkit.spawn([\"/bin/cat\"")
+        );
         assert_eq!(
             rule_text(
                 &[
@@ -816,7 +1034,8 @@ mod tests {
                     ("a.b".into(), ImplicitAuth::Yes),
                     ("bad\"id".into(), ImplicitAuth::Yes)
                 ],
-                CatPath::UsrBin
+                CatPath::UsrBin,
+                IdPath::UsrBin
             )
             .matches("\"a.b\": polkit.Result.NO")
             .count(),
@@ -825,9 +1044,78 @@ mod tests {
     }
 
     #[test]
+    fn a_subject_in_no_session_is_remote_while_any_of_its_users_desktops_is() {
+        let rule = rule_text(&parse_policy(LOGIN1), CatPath::UsrBin, IdPath::Bin);
+        assert!(rule.contains(
+            "var facts = session === \"\" ? sessionlessFacts(user) : sessionFacts(session, String(subject.seat || \"\"));"
+        ));
+        assert!(rule.contains("polkit.spawn([\"/bin/id\", \"-u\", \"--\", user])"));
+        assert!(rule.contains("if (!/^[0-9]{1,10}$/.test(uid)) {"));
+        assert!(rule.contains("polkit.spawn([\"/usr/bin/cat\", \"/run/systemd/users/\" + uid])"));
+        assert!(rule.contains("var listed = /^SESSIONS=(.*)$/m.exec(record);"));
+        assert!(
+            rule.contains("if (listed.arcen || (listed.remote && listed.seated)) {"),
+            "any Arcen desktop or seated remote session of the user makes its session-less programs remote; an ssh login does not"
+        );
+        assert!(
+            rule.contains("if (sessions === null) {\n            facts.remote = true;"),
+            "no uid, no user record or no sessions fails closed"
+        );
+        assert!(rule.contains("return valid.length > 0 ? valid : null;"));
+        assert!(
+            rule.contains(
+                "if (live !== null && !has.call(live, sessions[i])) {\n                continue;"
+            ),
+            "logind leaves ended sessions in the user record; one missing from a successful listing is gone"
+        );
+        assert!(rule.contains(
+            "listing = String(polkit.spawn([\"/usr/bin/ls\", \"--\", \"/run/systemd/sessions\"]));"
+        ));
+        assert!(
+            rule.contains(
+                "readFailed(\"/run/systemd/sessions (ls)\", error);\n            return null;"
+            ),
+            "a listing that fails treats no session as gone"
+        );
+        assert!(rule_text(&[], CatPath::Bin, IdPath::UsrBin).contains("polkit.spawn([\"/bin/ls\""));
+    }
+
+    #[test]
+    fn an_arcen_desktops_own_user_gets_only_the_colour_plugins_calls() {
+        let rule = rule_text(&parse_policy(LOGIN1), CatPath::UsrBin, IdPath::UsrBin);
+        for grant in ARCEN_DESKTOP_GRANTS {
+            assert!(grant.starts_with("org.freedesktop.color-manager."));
+            assert!(rule.contains(&format!("        \"{grant}\": true,\n")));
+        }
+        for kept in [
+            "install-system-wide",
+            "modify-device",
+            "modify-profile",
+            "device-inhibit",
+            "sensor-lock",
+        ] {
+            assert!(!rule.contains(&format!("color-manager.{kept}\": true")));
+        }
+        assert!(rule.contains(
+            "if (has.call(arcenDesktopGrants, action.id) && facts.owner !== \"\" && facts.owner === uidOf(user)) {\n            return polkit.Result.YES;"
+        ));
+        assert!(
+            rule.contains("var owner = /^UID=([0-9]{1,10})$/m.exec(record);"),
+            "only an Arcen desktop's session has an owner the grant can match"
+        );
+        assert!(rule.contains(
+            "if (facts.arcen) {\n            var owner = /^UID=([0-9]{1,10})$/m.exec(record);"
+        ));
+        assert!(rule.contains(
+            "if (listed.arcen && listed.owner !== \"\") {\n                facts.owner = listed.owner;"
+        ));
+        assert_eq!(rule.matches("facts.owner = ").count(), 2);
+    }
+
+    #[test]
     fn the_rule_text_is_es5_for_every_polkit_javascript_engine() {
         // polkit 0.106–0.120 embed SpiderMonkey; 121+ may embed duktape (ES5).
-        let rule = rule_text(&parse_policy(LOGIN1), CatPath::UsrBin);
+        let rule = rule_text(&parse_policy(LOGIN1), CatPath::UsrBin, IdPath::UsrBin);
         for es6 in ["=>", "let ", "const ", "`", "...", "class "] {
             assert!(!rule.contains(es6), "rule uses {es6:?}");
         }
@@ -837,7 +1125,11 @@ mod tests {
 
     #[test]
     fn arcen_rules_are_recognized_by_header_including_earlier_builds() {
-        assert!(is_arcen_rule(&rule_text(&[], CatPath::UsrBin)));
+        assert!(is_arcen_rule(&rule_text(
+            &[],
+            CatPath::UsrBin,
+            IdPath::UsrBin
+        )));
         assert!(is_arcen_rule(
             "// Arcen native-seat polkit rule (generated by arcen-pier; do not edit).\n(function () {})();"
         ));
@@ -869,6 +1161,11 @@ mod tests {
         );
         let console = SessionRecord::parse("REMOTE=0\nTTY=tty2\nSEAT=seat0\nVTNR=2\n");
         assert!(!console.is_remote(), "a console login keeps its rights");
+        assert!(record.is_arcen_desktop());
+        assert!(
+            !SessionRecord::parse("REMOTE=1\nTTY=pts/0\nSEAT=seat0\n").is_arcen_desktop(),
+            "another product's remote login is remote but not an Arcen desktop"
+        );
         assert!(!SessionRecord::parse("REMOTE=0\nSEAT=seat0\nTTY=arcenx\n").is_remote());
     }
 
@@ -1102,7 +1399,10 @@ mod tests {
                 "00-site-allow.rules".to_owned(),
                 "return polkit.Result.NO;".to_owned(),
             ),
-            (RULE_FILE_NAME.to_owned(), rule_text(&[], CatPath::UsrBin)),
+            (
+                RULE_FILE_NAME.to_owned(),
+                rule_text(&[], CatPath::UsrBin, IdPath::UsrBin),
+            ),
             (
                 "10-lockdown.rules".to_owned(),
                 "return polkit.Result.NO;".to_owned(),

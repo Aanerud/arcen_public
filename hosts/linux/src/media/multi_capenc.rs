@@ -111,6 +111,10 @@ pub struct MonitorPipelineTemplate {
     /// headless Wayland output is its own stream); empty for dedicated Xorg,
     /// whose monitors are NvFBC outputs of one X display.
     pub capture_bindings: Vec<MonitorCaptureBinding>,
+    /// The RandR output each monitor of the plan captures, by plan
+    /// position, on a joined console shown as it is (another product's
+    /// desktop, ADR 0025 §8); empty when outputs are addressed by position.
+    pub output_names: Vec<String>,
 }
 
 /// Where one virtual output's capture comes from: the session-user
@@ -395,6 +399,7 @@ pub fn build_pipeline_specs(
                 config: CapencConfig {
                     binary: template.binary.clone(),
                     output_index,
+                    output_name: template.output_names.get(position).cloned(),
                     codec: template.codec.clone(),
                     encoder: template.encoder,
                     fps: template.fps,
@@ -420,6 +425,7 @@ pub fn build_pipeline_specs(
                     qp_map: template.qp_map_for_config(&CapencConfig {
                         binary: template.binary.clone(),
                         output_index,
+                        output_name: None,
                         codec: template.codec.clone(),
                         encoder: template.encoder,
                         fps: template.fps,
@@ -946,6 +952,7 @@ mod tests {
         CapencConfig {
             binary: PathBuf::from("/nonexistent/arcen-capenc"),
             output_index,
+            output_name: None,
             codec: "h264".to_owned(),
             encoder: EncoderSelection::Auto,
             fps: 60,
@@ -1031,6 +1038,7 @@ mod tests {
     fn template() -> MonitorPipelineTemplate {
         MonitorPipelineTemplate {
             capture_bindings: Vec::new(),
+            output_names: Vec::new(),
             binary: PathBuf::from("/nonexistent/arcen-capenc"),
             codec: "h264".to_owned(),
             // `NativeNvenc`, not `Auto`: these fixtures exercise
@@ -1175,6 +1183,7 @@ mod tests {
     fn template_with_encoder(encoder: EncoderSelection) -> MonitorPipelineTemplate {
         MonitorPipelineTemplate {
             capture_bindings: Vec::new(),
+            output_names: Vec::new(),
             encoder,
             ..template()
         }

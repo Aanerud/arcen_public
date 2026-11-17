@@ -479,6 +479,20 @@ pub(crate) fn cursor_mode_from_args(args: &[String]) -> Result<CursorCaptureMode
 
 static SESSION_LOG_ID: OnceLock<Option<CorrelationId>> = OnceLock::new();
 
+/// The RandR output named by `output=<name>`, read once from the process
+/// arguments: capture binds that output instead of the positional index.
+#[cfg(all(target_os = "linux", any(feature = "nvenc", feature = "software-h264")))]
+pub(crate) fn requested_output_name() -> Option<&'static str> {
+    static OUTPUT_NAME: OnceLock<Option<String>> = OnceLock::new();
+    OUTPUT_NAME
+        .get_or_init(|| {
+            std::env::args()
+                .find_map(|argument| argument.strip_prefix("output=").map(str::to_owned))
+                .filter(|name| !name.is_empty())
+        })
+        .as_deref()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledBackendFeatures {
     pub nvenc: bool,

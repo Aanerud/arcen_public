@@ -288,6 +288,8 @@ fn main() -> ExitCode {
     // have added some, or an upgrade from a build without it).
     #[cfg(target_os = "linux")]
     arcen_pier_linux::session::polkit_remote::ensure_at_start();
+    #[cfg(target_os = "linux")]
+    arcen_pier_linux::session::account_desktop::check_at_start(config.default_desktop.as_ref());
     let mut config = config;
     // Set when start-up re-qualified the host after an update: the X11
     // trigger below then waits for the next start.

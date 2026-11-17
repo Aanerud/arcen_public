@@ -1,6 +1,6 @@
 # ADR 0025: Arcen joins the user's session
 
-**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety). Product-wide; the Linux Pier is its main
+**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop). Product-wide; the Linux Pier is its main
 part. Builds on [ADR 0005](0005-direct-transport-resume-authority.md)
 (resume), [ADR 0008](0008-virtual-display-for-windows-hosts.md) and
 [ADR 0014](0014-quic-lanes-and-capture-contracts.md); changes the Linux
@@ -422,6 +422,45 @@ service is not the display manager's.
   `display-manager.service` counts as having one.)
 - A dedicated desktop (§10) refuses `seat_occupied_other_product` instead
   of starting beside such a desktop on any VT.
+
+*Amended 2026-11-17 (0.20.2, from a field workstation whose desktop another
+product owned):*
+
+- **Outputs come from the live X server.** The console's multi-monitor offer
+  and plan are read from the console's own X server for each connection
+  (`console_layout::live_console`), not from a probe X server started at Pier
+  start: that probe hangs while another X server holds the GPU and so
+  withheld the offer. No probe starts while any X server runs. The pre-auth
+  read is cached for 5 s, and the display is opened only after its
+  authority file (no link followed, proved on the opened file) and the X
+  socket's peer (root, or the user's own server with the user's own cookie,
+  shared `x_server_peer_trustworthy`) are proved.
+- **Guest mode.** Such a desktop is shown as it is: Arcen never lays it out
+  (no MetaMode, RandR or non-desktop change). A Deck that matches its layout
+  is served one stream per output the desktop shows when its monitors have
+  exactly that layout (shared `bind_shown_layout`), each captured from its
+  output by RandR name (capenc `output=<name>`); otherwise
+  `console_layout_differs` and Primary Display Only. Outputs forced
+  connected without a mode never take a monitor (shared `takes_a_monitor`).
+- **One remote product at a time.** While that product's client is connected
+  (a software keyboard or pointer that is not Arcen's exists, shared
+  `another_products_client_input`) the sign-in is refused
+  `console_in_use_other_product`; when it connects during an attachment the
+  attachment ends with that code. When another product starts a desktop of
+  its own while a Deck is attached to any other console session, the
+  attachment ends with `console_other_product_started`.
+- **Input devices on any console display.** A joined console's display may
+  have any number (the field's was `:100`); its devices are named with
+  `SessionInputIdentity::for_joined_console`. Before, uinput was refused for
+  a display outside `:1`..`:99` and setup ended with a bare close.
+- **The other product as display manager.** `display-manager.service`
+  pointing at a unit that is not a display manager counts only while that
+  unit runs (shared `ConsoleHost::from_display_manager`); stopped, the host
+  is served as one without a display manager (§10).
+- **No silent setup end.** From the moment a sign-in has its desktop, any
+  exit before the stream starts records `SESSION_INTERRUPTED` (stage
+  `setup`, the close the Deck was sent as reason class) at every profile
+  (`net/setup_watch.rs`), and every close carries a reason.
 
 ### 9. Wayland GDM sessions
 

@@ -1847,6 +1847,7 @@ fn qualification_launcher_config(
             .resolve_session_agent_binary()
             .ok_or("the session agent cannot be resolved")?,
         desktop: config.desktop_session.clone(),
+        default_desktop: None,
         deskside: crate::deskside::LinuxDesksideConfig::default(),
         provider: DesktopProvider::Wayland,
         audio: crate::session::agent::AgentAudioArguments {

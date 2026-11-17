@@ -79,6 +79,24 @@ actions installed then; uninstall removes it.
   `arcen: … unreadable`, unless polkitd runs with `--log-level=err`, as
   on Rocky/RHEL 10, which drops rule messages; the console self-test below
   still reports it). It names no session: sign-ins never rewrite it.
+- **Programs outside a session.** GNOME 40 and later run the shell and the
+  settings daemons as systemd user services, outside every logind session.
+  The rule counts such a program as remote while any of its user's sessions
+  is an Arcen desktop or a seated remote session (`id -u` for the uid, then
+  `SESSIONS=` in `/run/systemd/users/<uid>`), and otherwise leaves it to
+  polkit, which judges it by the user's display session. Up to 0.20.1 the
+  rule counted every such program as remote, so desk users and sessions
+  signed in from a Deck were asked for an administrator password by GNOME's
+  colour plugin ("create a color managed device") and for Power Off.
+- **Colour management in Arcen desktops.** The user of an Arcen desktop
+  (`TTY=arcen` or an Arcen seat) may create and delete colord devices and
+  profiles (`org.freedesktop.color-manager.create-device`, `create-profile`,
+  `delete-device`, `delete-profile`, the calls GNOME's colour plugin makes)
+  without a password, for their own processes only. As for a user at the
+  desk, colord lets such a user delete any colour device or profile, not
+  only their own. Every other action, including colord's
+  `install-system-wide`, keeps its remote answer. Deny them with a site rule
+  numbered `00`–`04` if needed.
 - **Order, and site restrictions.** `05-` runs before the rules
   distributions ship (`20-gnome-initial-setup`, `49-polkit-pkla-compat`,
   `50-default`, `org.freedesktop.*.rules`), so a distribution rule that
@@ -131,7 +149,9 @@ actions installed then; uninstall removes it.
   restrictions and the console self-test; `check <pid>` shows the admission
   a desktop whose session holds that process would get now (the same checks
   the Pier makes at sign-in); `print` shows the rule the Pier would write;
-  `remove` removes Arcen's rule.
+  `remove` removes Arcen's rule. `install` (which the installer runs) says
+  `wrote` for a new rule, `updated` when it replaced an earlier Arcen rule
+  (an upgrade), and `is current` when nothing changed.
 
 #### The NVIDIA GPU in `/etc/arcen/xorg.conf`
 
@@ -246,13 +266,15 @@ session.
 | The account is signed in (GDM, X11) | joins that session: the same desktop and applications; unlocks it if it was locked |
 | The account's session waits behind the login screen (switch user) | brings it forward, then joins it |
 | Nobody is signed in, GDM's login screen shows | the login screen signs the account in (a one-time token, below); GDM owns the session, so a later sign-in at the desk resumes it |
-| The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it; the other product is never stopped or reconfigured |
+| The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it as a guest: its screens are streamed as they are and never changed (below); the other product is never stopped or reconfigured |
+| The same, while that product's own client is connected | refused, `console_in_use_other_product`: one remote-desktop product at a time |
 | Another account is signed in (or holds the console through another product) | refused, `console_other_user` or `console_other_user_other_product` |
 | GNOME on Wayland | refused, `console_wayland_session`: set `WaylandEnable=false` in `/etc/gdm/custom.conf` and restart GDM while nobody is signed in |
 | No display manager on the host, nobody signed in | starts the account's real login session (below), then joins it |
 | The account's session that Arcen started | joins it (same desktop, same applications) |
 | Another account's session that Arcen started | refused, `console_other_user` (one account at a time without a display manager) |
 | A display manager is configured but its login screen is not running | refused, `console_no_session` |
+| `display-manager.service` points at another remote-desktop product's unit, and that unit is stopped | nothing will show a login screen: served like a host without a display manager (Arcen's real login session) |
 
 While a Deck is attached the workstation is private: its monitors are
 blanked (zero gamma ramps; the Deck's picture is unaffected), its real
@@ -286,6 +308,30 @@ session) when it cleans up and at its next start.
 | One connected output (a headless host without `--console-outputs`) | the sign-in ends with "its console cannot take this layout", and the Deck offers Primary Display Only (one picture); the Pier logs `console_outputs_insufficient` |
 | A single-display Deck (or Primary display only) | one picture of the whole screen; the console keeps its layout, except on a `--console-outputs` host, where its first output takes the Deck display's size |
 
+The Pier reads the console's outputs from the console's own X server each
+time a Deck connects (the login screen's, the user's, or another product's
+server), so outputs that changed after the Pier started, or a display
+manager restarted since, are offered as they are now. It never starts a
+probe X server while another X server holds the GPU; the start-time probe
+runs only on a host where no X server runs yet.
+
+**Another product's desktop is shown as it is.** On a session another
+remote-desktop product started (its own X server, a logind session whose PAM
+service is not the display manager's), Arcen changes nothing on the X
+server: no MetaMode, no RandR change, no hidden outputs. A Deck that matches
+its layout is served one stream per output that desktop shows, when the
+Deck's monitors have exactly that desktop's layout (sizes, rotation and
+relative positions); each monitor is captured from the output that shows it,
+by name. A Deck whose layout differs is answered "its console cannot take
+this layout" (the Pier logs `console_layout_differs`) and offered Primary
+Display Only, the whole screen as one picture. Heads the product forces
+connected without a picture are ignored. The desk's physical monitors are
+blanked and its physical keyboards and mice disabled as on any console; the
+product's own virtual keyboards and mice are never touched. While Arcen is
+attached, that product's client connecting (its virtual keyboard or pointer
+appears) ends Arcen's attachment with `console_in_use_other_product`, and
+the session is locked as on every disconnect.
+
 GNOME on X11 has one integer scale for the whole screen and it belongs to
 the user: the console keeps it (a Retina Deck display shows the desktop at
 the console's scale; set GNOME's scale at the desk or from the Deck if you
@@ -307,6 +353,17 @@ while nobody is signed in. Unused forced outputs are hidden from the desktop
 display configuration is changed. This changes what the host's X server
 sees, so it is never done without the flag.
 
+`--console-outputs` next to another remote-desktop product: the file is an
+`OutputClass`, so every X server on the GPU reads it, the other product's
+too. NVIDIA takes `ConnectedMonitor` and `MetaModes` from a server's own
+`Device` section first: a product that sets its own heads (as such products
+do) keeps them, and the file changes nothing there (lab: the product's
+server logs "Applying OutputClass "arcen-console-outputs"" and still runs its
+own heads and layout). A product that sets no heads of its own would get
+these. Use the GPU's real head names (`--console-outputs DFP-0,DFP-2,DFP-4,DFP-6`
+on a board whose outputs are those heads) so the display manager's server
+and the product's agree.
+
 **Remote-first sign-in.** GDM resumes only sessions it started, so a Deck
 sign-in while nobody is signed in is completed by GDM's login screen. After
 the Pier has checked the password, it hands the login screen a one-time
@@ -326,10 +383,7 @@ An existing `gdm-ovirtcred` stack or bus policy that is not Arcen's (oVirt's
 guest agent) is kept; the remote-first sign-in is then refused
 `console_sign_in_unavailable`. Every token accepted or refused is in the
 journal (`journalctl | grep pam_arcen_greeter`). The keyring is not unlocked
-by a token: GNOME asks for it on first use. As such a session starts, GNOME's
-colour plugin can ask for an administrator password to "create a color
-managed device" (polkit action `org.freedesktop.color-manager.create-device`);
-Cancel dismisses it and the session works without it.
+by a token: GNOME asks for it on first use.
 
 **Domain accounts (SSSD with Active Directory Group Policy).** On a host
 joined to Active Directory through SSSD with GPO access control
@@ -408,6 +462,80 @@ kept only for that Deck-shaped layout; on a host with a display manager it
 starts a desktop GDM cannot resume, and it refuses while any account's
 console session (or another product's, or Arcen's own login session) holds
 the display.
+
+#### Switching between Arcen and another remote-desktop product
+
+Arcen and another remote-desktop product can be installed on one Linux
+workstation; one of them serves the console at a time.
+
+| Situation | What Arcen does |
+| --- | --- |
+| The product runs, and the account's desktop in it exists, nobody connected through the product | joins that desktop as a guest (shown as it is, never changed) |
+| The product's client is connected | refuses `console_in_use_other_product` |
+| The product's client connects while a Deck is attached to that desktop | ends the Deck's attachment with `console_in_use_other_product`; the session is locked as on every disconnect |
+| The product is the host's display manager (`display-manager.service` points at its unit) and is stopped; GDM is not running | starts the account's real login session (a host without a display manager); a reconnect joins the same session |
+| The product starts again while a Deck is attached to Arcen's session | ends the attachment with `console_other_product_started`; Arcen's session is not ended by Arcen |
+
+GNOME runs one graphical session per account: two desktops of the same
+account (Arcen's login session and the product's) share the account's
+systemd user manager and its GNOME services. On the lab host, the account's
+Arcen login session ended when the product's desktop of the same account
+ended. Treat the account's desktop as belonging to one product at a time.
+
+To move a workstation from the other product to Arcen:
+
+1. Ask the user to save their work and sign out of the product's desktop.
+2. Stop the product's service. If it is the display manager and starts GDM
+   itself, either leave GDM stopped (Arcen then starts the account's real
+   login session at the next Deck sign-in) or enable GDM as the display
+   manager (`systemctl enable --force gdm`, then start it while nobody is
+   signed in) so Arcen signs in through GDM's login screen.
+3. On a host without monitors, install with `--console-outputs` and the
+   GPU's real head names before GDM's X server starts.
+
+To move back, sign out of the Arcen desktop from a Deck (or end it with
+`loginctl terminate-session`), then start the product. Restart the Arcen
+Pier only while no Arcen session is attached.
+
+#### Which desktop a sign-in from a Deck starts
+
+GDM starts the desktop an account's settings name (AccountsService
+`Session`). An account that never chose one carries its distribution's
+template value — `gnome` (standard GNOME) on Enterprise Linux — so a sign-in
+from a Deck while nobody is at the desk starts standard GNOME, which can
+look like a blank desktop to users who know GNOME Classic (no desktop icons,
+no Applications menu). Set the desktop such accounts get:
+
+```json
+"platform": { "session": { "default_desktop": "gnome-classic" } }
+```
+
+The value is the name of an entry in `/usr/share/xsessions` without
+`.desktop` (`gnome`, `gnome-xorg`, `gnome-classic`, `gnome-classic-xorg`
+on Rocky 9). Before the login screen takes a remote-first sign-in, the Pier
+records it in the account's settings through AccountsService's own D-Bus
+interface (`SetXSession` and `SetSession`), as choosing it from the login
+screen's gear menu would. It does so only when the account has no choice of
+its own: no AccountsService record, no session in it, or the value of the
+distribution's template (`/etc/accountsservice/user-templates` or
+`/usr/share/accountsservice/user-templates`, `standard` and
+`administrator`). Arcen remembers what it applied in
+`/var/lib/arcen/default-desktop/<uid>` (root only), so an account that later
+chooses another desktop at the login screen, even the template's, keeps its
+choice; an account still on the value Arcen applied gets a changed setting.
+Joining an existing session never changes anything. On a host without a
+display manager, Arcen's own login session starts the account's choice,
+else this setting, else `platform.session.desktop`.
+
+Every joined session's Pier log line `joined the user's console session`
+names the desktop it runs (`desktop=gnome-classic`, from logind or the
+session's own environment) and what the setting did for a sign-in that
+started it (`default_desktop=` `default_applied`, `account_choice`,
+`already_default`, `default_desktop_not_installed`, `no_default_desktop`, or
+`default_not_applied` when AccountsService refused or did not answer within
+5 seconds; `not_applicable` for a session that already existed). A name that is not installed is logged once at start.
+Uninstalling removes the records; a user's AccountsService setting stays, as
+the user's own setting.
 
 #### Which desktop a Linux Pier serves
 

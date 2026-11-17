@@ -47,6 +47,10 @@ pub struct LinuxCaptureConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct LinuxSessionConfig {
     pub desktop: Option<String>,
+    /// The desktop (an `/usr/share/xsessions` id) a remote-first sign-in
+    /// starts for an account that never chose one; absent: the account's
+    /// template value (ADR 0025).
+    pub default_desktop: Option<String>,
     pub display: Option<String>,
     pub gpu_head: Option<String>,
     pub xorg_bin: Option<String>,

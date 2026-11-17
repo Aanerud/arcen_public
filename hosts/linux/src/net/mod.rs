@@ -3,6 +3,7 @@
 //! Network layer: the TLS/WebSocket listener + per-connection relay.
 
 pub mod server;
+pub(crate) mod setup_watch;
 pub mod tls;
 
 pub use server::serve;

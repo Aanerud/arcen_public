@@ -1161,6 +1161,29 @@ mod nvfbc {
             }
 
             let output_count = gs.dwOutputNum.min(OUTPUT_MAX as u32);
+            // `output=<name>`: a console shown as it is binds its outputs by
+            // name; one NvFBC does not offer is refused, never replaced by
+            // the whole screen.
+            let output_index = match crate::requested_output_name() {
+                Some(name) => {
+                    let found = (0..output_count).find(|&index| {
+                        let output = gs.outputs[index as usize];
+                        output_name(&output) == name
+                            && output.trackedBox.w > 0
+                            && output.trackedBox.h > 0
+                    });
+                    match found {
+                        Some(index) => index,
+                        None => {
+                            return Err(NativeStartupError::unavailable(
+                                BackendUnavailableReason::UnsupportedDisplay,
+                                format!("NvFBC offers no active RandR output named {name:?}"),
+                            ));
+                        }
+                    }
+                }
+                None => output_index,
+            };
             let (tracking, output_id, frame_size) =
                 if gs.bXRandRAvailable == TRUE && output_index < output_count {
                     let output = gs.outputs[output_index as usize];

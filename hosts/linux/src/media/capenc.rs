@@ -175,6 +175,10 @@ pub struct CapencConfig {
     pub binary: PathBuf,
     /// 0-based NvFBC desktop-output index (already `monitor_index - 1`).
     pub output_index: u32,
+    /// The RandR output to capture by name (`output=<name>`), which capenc
+    /// prefers over [`Self::output_index`]: a console shown as it is (another
+    /// product's desktop) is not laid out in the plan's order.
+    pub output_name: Option<String>,
     /// `"h264"` or `"h265"` (the only Annex-B codecs).
     pub codec: String,
     pub encoder: EncoderSelection,
@@ -397,6 +401,9 @@ impl CapencConfig {
         // Mutter cursor update, bounded by the stream rate).
         if self.cursor_events() {
             v.push(arcen_media::capenc_stream::CURSOR_POSITION_ARG.to_string());
+        }
+        if let Some(name) = self.output_name.as_deref() {
+            v.push(format!("output={name}"));
         }
         v.push(format!("encoder={}", self.encoder.as_arg()));
         v.push(format!(
@@ -2381,6 +2388,7 @@ mod tests {
         CapencConfig {
             binary: PathBuf::from("arcen-capenc"),
             output_index: 1,
+            output_name: None,
             codec: "h265".to_string(),
             encoder: EncoderRequest::NativeNvenc,
             fps: 60,
@@ -2515,6 +2523,7 @@ mod tests {
         let cfg = CapencConfig {
             binary: PathBuf::from("arcen-capenc"),
             output_index: 0,
+            output_name: None,
             codec: "h264".to_string(),
             encoder: EncoderSelection::Auto,
             fps: 60,

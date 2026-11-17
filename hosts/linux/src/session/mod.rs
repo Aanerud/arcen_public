@@ -2,6 +2,8 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! Per-client session state + the WS handshake.
 
+#[cfg(target_os = "linux")]
+pub mod account_desktop;
 pub mod agent;
 pub mod audio;
 pub mod auth;

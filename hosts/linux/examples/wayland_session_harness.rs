@@ -490,6 +490,7 @@ mod harness {
         let config = CapencConfig {
             binary: PathBuf::from(required(args, "--capenc-run")),
             output_index: 0,
+            output_name: None,
             codec: flag(args, "--codec").unwrap_or_else(|| "h264".into()),
             // `--encoder auto` runs the Pier's own ladder (native, then
             // software); `software-h264` the Wayland software composition.
@@ -746,6 +747,7 @@ mod harness {
             runtime_root: "/nonexistent/runtime".into(),
             agent_binary: pier,
             desktop: "gnome".into(),
+            default_desktop: None,
             deskside: Default::default(),
             provider: DesktopProvider::Wayland,
             x11_apps: x11,

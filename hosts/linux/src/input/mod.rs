@@ -442,6 +442,8 @@ mod backend_choice_tests {
             x11_desktop_depth: None,
             native_seat: None,
             console: false,
+            console_guest: false,
+            console_shown_outputs: None,
             wayland: wayland.then(|| WaylandAgentReady {
                 compositor: "gnome-shell".into(),
                 input_socket: runtime_dir.join(INPUT_SOCKET_NAME),
@@ -538,19 +540,26 @@ mod experimental_raw_hid_tests {
     }
 }
 
-/// The identity the session's virtual devices are named for.
+/// The identity the session's virtual devices are named for: a dedicated
+/// X display (`:1`..`:99`), or a joined console's display, whatever its
+/// number (another product's server is `:100` in the field).
 ///
 /// # Errors
 ///
-/// Returns an error when `display` is not a dedicated X display; uinput is
-/// then refused rather than creating devices every X server would admit.
+/// Returns an error when `display` is not such a display; uinput is then
+/// refused rather than creating devices every X server would admit.
 pub fn session_input_identity(
     display: &str,
+    joined_console: bool,
 ) -> Result<
     arcen_input::virtual_device::SessionInputIdentity,
     arcen_input::virtual_device::SessionInputIdentityError,
 > {
-    arcen_input::virtual_device::SessionInputIdentity::for_x_display(display)
+    if joined_console {
+        arcen_input::virtual_device::SessionInputIdentity::for_joined_console(display)
+    } else {
+        arcen_input::virtual_device::SessionInputIdentity::for_x_display(display)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -13,7 +13,9 @@
 //! `RequestedMonitorTopologyMsg` shape, (b) applying the explicit host-offer
 //! gate: Match My Layout with more than one monitor must fail loudly with
 //! [`MultiMonitorAuthError::UnsupportedHost`] rather than silently degrading
-//! to a primary-only `AuthResponse`, and (c) advertising exactly the ordered
+//! to a primary-only `AuthResponse`, (b2) asking for a monitor upright at its
+//! as-seen size when the host does not rotate it
+//! ([`upright_unsupported_rotations`]), and (c) advertising exactly the ordered
 //! carrier list Deck itself actually implements (see
 //! [`deck_supported_carriers`]).
 
@@ -52,7 +54,8 @@ use arcen_media::RequestedMonitorTopology;
 
 use arcen_protocol::messages::{
     AuthRequest, AuthRequestMultiMonitorOfferError, AuthResponse, MultiMonitorCarrierMsg,
-    MultiMonitorValidationError, RequestedMonitorTopologyMsg, SafeAreaPolicyMsg,
+    MultiMonitorValidationError, RequestedMonitorDescriptorMsg, RequestedMonitorTopologyMsg,
+    RotationMsg, SafeAreaPolicyMsg,
 };
 
 /// Auth-time multi-monitor-v1 carriers Deck can actually use, in Deck's
@@ -103,7 +106,8 @@ pub enum MultiMonitorAuthError {
     UnsupportedHost(AuthRequestMultiMonitorOfferError),
     /// The local topology was rejected against the host's advertised offer
     /// (for example, the offer's `max_monitors` is lower than the local
-    /// display count, or a requested rotation is unsupported).
+    /// display count). A rotation the offer does not list is asked for
+    /// upright instead ([`upright_unsupported_rotations`]).
     RejectedByAdvertisement(MultiMonitorValidationError),
     /// The local topology could not be translated into the wire shape. This
     /// indicates a mismatch between the `arcen_media` and `arcen_protocol`
@@ -160,6 +164,15 @@ pub fn to_wire_topology_with_quality(
     safe_area_policy: SafeAreaPolicyMsg,
     full_color_display_ids: &[String],
 ) -> Result<RequestedMonitorTopologyMsg, MultiMonitorAuthError> {
+    let monitors = wire_descriptors(topology, safe_area_policy, full_color_display_ids)?;
+    RequestedMonitorTopologyMsg::new(monitors).map_err(MultiMonitorAuthError::WireConversionFailed)
+}
+
+fn wire_descriptors(
+    topology: &RequestedMonitorTopology,
+    safe_area_policy: SafeAreaPolicyMsg,
+    full_color_display_ids: &[String],
+) -> Result<Vec<RequestedMonitorDescriptorMsg>, MultiMonitorAuthError> {
     let mut monitors = Vec::with_capacity(topology.monitors().len());
     for requested in topology.monitors() {
         let quality_intent = if full_color_display_ids
@@ -175,7 +188,42 @@ pub fn to_wire_topology_with_quality(
             .map_err(MultiMonitorAuthError::WireConversionFailed)?;
         monitors.push(descriptor);
     }
-    RequestedMonitorTopologyMsg::new(monitors).map_err(MultiMonitorAuthError::WireConversionFailed)
+    Ok(monitors)
+}
+
+/// Asks for every monitor whose rotation the host's offer does not list as
+/// an upright monitor (`Degrees0`), and returns each one changed with the
+/// rotation it had.
+///
+/// A Deck states every monitor as it is seen on the desk
+/// (`TransformConvention::AlreadyCompositorOriented`): a quarter-turned
+/// monitor's `width_px`/`height_px`, logical size and physical millimetres
+/// are already its portrait extent, and `rotation` only tells a host that
+/// can drive a rotated panel to do so. A host that cannot (Wayland virtual
+/// outputs, Windows capture without IDD, a Linux head without rotation)
+/// serves that same as-seen size upright, which the Deck presents
+/// unchanged in that monitor's window. Nothing else in the descriptor
+/// changes, so positions, the primary and input mapping stay exactly as
+/// requested. A rotation is never dropped when the offer does not list
+/// `Degrees0` either; the shared validation then reports it.
+pub fn upright_unsupported_rotations(
+    monitors: &mut [RequestedMonitorDescriptorMsg],
+    supported_rotations: &[RotationMsg],
+) -> Vec<(String, RotationMsg)> {
+    if !supported_rotations.contains(&RotationMsg::Degrees0) {
+        return Vec::new();
+    }
+    let mut changed = Vec::new();
+    for monitor in monitors {
+        if !supported_rotations.contains(&monitor.rotation) {
+            changed.push((
+                monitor.client_display_id.as_str().to_owned(),
+                monitor.rotation,
+            ));
+            monitor.rotation = RotationMsg::Degrees0;
+        }
+    }
+    changed
 }
 
 /// Attaches the validated multi-monitor-v1 sidecar to `response`, requiring
@@ -187,8 +235,10 @@ pub fn to_wire_topology_with_quality(
 /// not advertise a valid multi-monitor-v1 offer,
 /// [`MultiMonitorAuthError::WireConversionFailed`] when the local topology
 /// cannot be encoded, and [`MultiMonitorAuthError::RejectedByAdvertisement`]
-/// when the host's offer rejects the local topology (for example an
-/// unsupported rotation or a monitor count above the offer's `max_monitors`).
+/// when the host's offer rejects the local topology (for example a monitor
+/// count above the offer's `max_monitors`). A monitor whose rotation the
+/// offer does not list is requested upright at its as-seen size
+/// ([`upright_unsupported_rotations`]); rotation alone never fails the layout.
 pub fn attach_multi_monitor_v1(
     response: AuthResponse,
     auth_request: &AuthRequest,
@@ -214,8 +264,19 @@ pub fn attach_multi_monitor_v1_with_quality(
     let offer = auth_request
         .required_multi_monitor_v1_offer()
         .map_err(MultiMonitorAuthError::UnsupportedHost)?;
-    let wire_topology =
-        to_wire_topology_with_quality(local_topology, safe_area_policy, full_color_display_ids)?;
+    let mut monitors = wire_descriptors(local_topology, safe_area_policy, full_color_display_ids)?;
+    for (client_display_id, rotation) in
+        upright_unsupported_rotations(&mut monitors, offer.supported_rotations())
+    {
+        tracing::info!(
+            target: crate::log_target::SESSION,
+            client_display_id,
+            rotation = %rotation,
+            "the host does not rotate this monitor; it is requested upright at the size it is seen on the desk",
+        );
+    }
+    let wire_topology = RequestedMonitorTopologyMsg::new(monitors)
+        .map_err(MultiMonitorAuthError::WireConversionFailed)?;
     response
         .with_multi_monitor_v1(offer, wire_topology, deck_supported_carriers().to_vec())
         .map_err(MultiMonitorAuthError::RejectedByAdvertisement)
@@ -296,6 +357,213 @@ mod tests {
             disclaimer: None,
             multi_monitor_v1: None,
         }
+    }
+
+    /// The owner's desk: a 2560x1440 primary, a 1440x2560 monitor turned
+    /// 270 degrees above-left of it, and a 1080x1920 one turned 90 degrees
+    /// on its right, each stated as seen (portrait size and millimetres).
+    fn turned_desk() -> RequestedMonitorTopology {
+        let at = |id: &str, primary, (x, y), (width, height), (width_mm, height_mm), rotation| {
+            let mut monitor = monitor(id, primary, x);
+            monitor.y = y;
+            monitor.width_px = width;
+            monitor.height_px = height;
+            monitor.scale = 1.0;
+            monitor.width_mm = width_mm;
+            monitor.height_mm = height_mm;
+            monitor.rotation = rotation;
+            RequestedMonitor::new(monitor, width, height).expect("valid requested monitor")
+        };
+        RequestedMonitorTopology::new(vec![
+            at(
+                "2",
+                true,
+                (0, 0),
+                (2560, 1440),
+                (599.0, 340.0),
+                Rotation::Degrees0,
+            ),
+            at(
+                "3",
+                false,
+                (-1440, -1120),
+                (1440, 2560),
+                (340.0, 599.0),
+                Rotation::Degrees270,
+            ),
+            at(
+                "4",
+                false,
+                (2560, 0),
+                (1080, 1920),
+                (300.0, 530.0),
+                Rotation::Degrees90,
+            ),
+        ])
+        .expect("valid topology")
+    }
+
+    fn negotiate_turned_desk(
+        supported_rotations: Vec<RotationMsg>,
+    ) -> Result<AuthResponse, MultiMonitorAuthError> {
+        let offer = AuthMultiMonitorOfferMsg::new(
+            4,
+            supported_rotations,
+            vec![MultiMonitorCarrierMsg::MuxedReliableStream],
+        )
+        .expect("valid offer");
+        let auth_request = bare_auth_request()
+            .with_multi_monitor_v1_offer(offer)
+            .expect("valid offer attaches");
+        attach_multi_monitor_v1(
+            AuthResponse::password("user", "pass"),
+            &auth_request,
+            &turned_desk(),
+            SafeAreaPolicyMsg::StandardFullscreen,
+        )
+    }
+
+    /// `(id, rotation, x, y, width, height, width_mm, height_mm, primary)`
+    /// of each requested monitor, in layout order.
+    fn requested_facts(
+        response: &AuthResponse,
+    ) -> Vec<(String, RotationMsg, i32, i32, u32, u32, f32, f32, bool)> {
+        response
+            .multi_monitor_v1
+            .as_ref()
+            .expect("sidecar attached")
+            .requested_topology()
+            .monitors()
+            .iter()
+            .map(|monitor| {
+                (
+                    monitor.client_display_id.as_str().to_owned(),
+                    monitor.rotation,
+                    monitor.x,
+                    monitor.y,
+                    monitor.width_px,
+                    monitor.height_px,
+                    monitor.width_mm,
+                    monitor.height_mm,
+                    monitor.is_primary,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_host_that_does_not_rotate_gets_turned_monitors_upright_at_their_as_seen_size() {
+        let response = negotiate_turned_desk(vec![RotationMsg::Degrees0])
+            .expect("rotation alone never fails the layout");
+        assert_eq!(
+            requested_facts(&response),
+            vec![
+                (
+                    "2".into(),
+                    RotationMsg::Degrees0,
+                    0,
+                    0,
+                    2560,
+                    1440,
+                    599.0,
+                    340.0,
+                    true
+                ),
+                (
+                    "3".into(),
+                    RotationMsg::Degrees0,
+                    -1440,
+                    -1120,
+                    1440,
+                    2560,
+                    340.0,
+                    599.0,
+                    false
+                ),
+                (
+                    "4".into(),
+                    RotationMsg::Degrees0,
+                    2560,
+                    0,
+                    1080,
+                    1920,
+                    300.0,
+                    530.0,
+                    false
+                ),
+            ],
+            "only the rotation changes: sizes, millimetres, positions and the primary stay as seen"
+        );
+        assert!(
+            response
+                .monitors
+                .iter()
+                .all(|monitor| monitor.rotation_degrees == 0),
+            "the legacy roster agrees with the sidecar"
+        );
+        let offer = AuthMultiMonitorOfferMsg::new(
+            4,
+            vec![RotationMsg::Degrees0],
+            vec![MultiMonitorCarrierMsg::MuxedReliableStream],
+        )
+        .expect("valid offer");
+        arcen_protocol::messages::AdvertisedMultiMonitorOffer::from_offer(&offer)
+            .expect("valid offer")
+            .validate_request(response.multi_monitor_v1.as_ref().expect("sidecar"))
+            .expect("the host's own check accepts the request");
+    }
+
+    #[test]
+    fn a_host_that_rotates_receives_every_rotation() {
+        let response =
+            negotiate_turned_desk(RotationMsg::ALL.to_vec()).expect("negotiation succeeds");
+        let rotations: Vec<_> = requested_facts(&response)
+            .into_iter()
+            .map(|facts| (facts.0, facts.1, facts.4, facts.5))
+            .collect();
+        assert_eq!(
+            rotations,
+            vec![
+                ("2".into(), RotationMsg::Degrees0, 2560, 1440),
+                ("3".into(), RotationMsg::Degrees270, 1440, 2560),
+                ("4".into(), RotationMsg::Degrees90, 1080, 1920),
+            ]
+        );
+        assert_eq!(
+            response
+                .monitors
+                .iter()
+                .map(|monitor| monitor.rotation_degrees)
+                .collect::<Vec<_>>(),
+            vec![0, 270, 90]
+        );
+    }
+
+    #[test]
+    fn only_the_rotations_a_host_lacks_are_requested_upright() {
+        let response = negotiate_turned_desk(vec![RotationMsg::Degrees0, RotationMsg::Degrees90])
+            .expect("negotiation succeeds");
+        let rotations: Vec<_> = requested_facts(&response)
+            .into_iter()
+            .map(|facts| (facts.0, facts.1))
+            .collect();
+        assert_eq!(
+            rotations,
+            vec![
+                ("2".into(), RotationMsg::Degrees0),
+                ("3".into(), RotationMsg::Degrees0),
+                ("4".into(), RotationMsg::Degrees90),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_offer_without_upright_keeps_the_rotation_for_the_shared_check_to_report() {
+        let error = negotiate_turned_desk(vec![RotationMsg::Degrees90]).unwrap_err();
+        assert!(matches!(
+            error,
+            MultiMonitorAuthError::RejectedByAdvertisement(_)
+        ));
     }
 
     #[test]

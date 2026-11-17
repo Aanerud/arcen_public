@@ -878,6 +878,9 @@ fn selected_output_rect(
         .map_err(|error| format!("request XRandR resources: {error}"))?
         .reply()
         .map_err(|error| format!("XRandR resources: {error}"))?;
+    // `output=<name>`: a console shown as it is binds its outputs by name;
+    // one that is not lit is refused, never replaced by another.
+    let wanted_name = crate::requested_output_name();
     let mut connected_index = 0u32;
     for output in resources.outputs {
         let info = connection
@@ -888,7 +891,11 @@ fn selected_output_rect(
         if info.connection != randr::Connection::CONNECTED || info.crtc == 0 {
             continue;
         }
-        if connected_index != output_index {
+        if let Some(name) = wanted_name {
+            if info.name.as_slice() != name.as_bytes() {
+                continue;
+            }
+        } else if connected_index != output_index {
             connected_index = connected_index.saturating_add(1);
             continue;
         }
@@ -904,8 +911,9 @@ fn selected_output_rect(
             height: crtc.height,
         });
     }
-    Err(format!(
-        "XRandR connected output index {output_index} is unavailable"
+    Err(wanted_name.map_or_else(
+        || format!("XRandR connected output index {output_index} is unavailable"),
+        |name| format!("XRandR output {name:?} is not lit"),
     ))
 }
 
