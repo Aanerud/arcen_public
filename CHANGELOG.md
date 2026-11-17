@@ -88,7 +88,21 @@ protocol v5 and works with every 0.17.0 to 0.20.1 Deck and Pier.
 
 ### Re-issue — Fixed
 
-The 0.20.2 Decks were re-issued with these fixes; Piers are unchanged.
+The 0.20.2 Decks and the Linux Pier were re-issued with these fixes; the
+Windows Pier is unchanged.
+
+- **Linux Pier: a firmware hotkey device no longer makes Arcen think
+  another remote product is in use (reported on 0.20.2).** On an HP
+  workstation whose desktop another remote-desktop product owns, every
+  sign-in was refused `console_in_use_other_product` even with that
+  product's client disconnected: the kernel's `HP WMI hotkeys` device has no
+  parent device, and any such keyboard-like device that was not Arcen's was
+  read as the other product's connected client. Arcen now counts only a
+  keyboard or pointer made in user space while a process that is not
+  Arcen's holds `/dev/uinput` or `/dev/uhid`; firmware devices (on the
+  host-platform bus, or with only a few keys or switches) and the desk's
+  Bluetooth keyboards and mice never count. One remote product at a time
+  still holds.
 
 - **A drag stopped at the edge of a display in Match my layout (reported
   on 0.20.2).** Holding a mouse button and dragging, for example a window

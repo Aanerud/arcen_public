@@ -330,7 +330,12 @@ blanked and its physical keyboards and mice disabled as on any console; the
 product's own virtual keyboards and mice are never touched. While Arcen is
 attached, that product's client connecting (its virtual keyboard or pointer
 appears) ends Arcen's attachment with `console_in_use_other_product`, and
-the session is locked as on every disconnect.
+the session is locked as on every disconnect. Arcen recognises that client
+by a keyboard or pointer made in user space (through `/dev/uinput` or
+`/dev/uhid`) while a process that is not Arcen's holds that interface; the
+machine's own firmware devices, such as HP's WMI hotkeys, and Bluetooth
+keyboards and mice never count. The
+Pier log names the device, its bus and the processes holding the interface.
 
 GNOME on X11 has one integer scale for the whole screen and it belongs to
 the user: the console keeps it (a Retina Deck display shows the desktop at
