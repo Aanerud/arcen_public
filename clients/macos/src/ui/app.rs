@@ -466,6 +466,12 @@ struct DeferredSecondaryViewportState {
     frame_size: Option<[usize; 2]>,
     accepted_pointer_buttons: [bool; 3],
     ignored_pointer_buttons: [bool; 3],
+    /// Where this viewport showed its picture on its last paint, in its own
+    /// points: its pointer events are placed against it the moment they
+    /// arrive (`forward_secondary_pointer_events`).
+    image_rect: Option<egui::Rect>,
+    /// This viewport's pointer between its events.
+    pointer: arcen_deck_core::input::viewport_pointer::ViewportPointer,
     logged_first_paint: bool,
     output: Option<DeferredSecondaryOutput>,
     presented_fresh_frames: u64,
@@ -572,17 +578,16 @@ struct DeferredSecondaryOutput {
     /// This viewport's window and picture on the Mac's desktop.
     placement: Option<(ImageRect, ImageRect)>,
     local_fraction: Option<(f64, f64)>,
-    buttons: [(u8, bool); 3],
     focused: bool,
     keyboard_events: Vec<egui::Event>,
     tablet_target: Option<(isize, ViewSize)>,
     scroll: egui::Vec2,
-    motion: egui::Vec2,
-    /// Whether this output's input (pointer sample, keys, scroll, motion)
-    /// has not been dispatched yet. A deferred viewport paints on its own
-    /// schedule while root passes run far more often; its input is one
-    /// sample per paint and must be dispatched exactly once, or root would
-    /// replay a stale pointer position every pass.
+    /// Whether keys or scroll gathered since root last read this output
+    /// are still to be dispatched. A deferred viewport paints on its own
+    /// schedule (egui runs two more passes after every input pass), so keys
+    /// and scroll accumulate here until root dispatches them, exactly once.
+    /// Pointer moves and buttons never wait for root: they leave from
+    /// `raw_input_hook` as the viewport's pass begins.
     input_fresh: bool,
 }
 
@@ -2582,6 +2587,15 @@ impl eframe::App for ArcenApp {
         if !raw_input.events.is_empty() {
             self.last_local_input = Some(Instant::now());
         }
+        // eframe runs this hook for every viewport's pass, not only root's.
+        let root_pass = raw_input.viewport_id == egui::ViewportId::ROOT;
+        if !root_pass {
+            self.forward_secondary_pointer_events(
+                raw_input.viewport_id,
+                raw_input.focused,
+                &raw_input.events,
+            );
+        }
         self.native_key_metadata = crate::ui::keyboard::drain_native_key_metadata().into();
         // Root's own raw OS focus flag is *not*, by itself, authoritative
         // for "pointer/pen ownership must be torn down": macOS has exactly
@@ -2626,10 +2640,17 @@ impl eframe::App for ArcenApp {
         // in the same frame by `sync_keyboard_focus_across_viewports`,
         // whose own `Some -> None` edge releases held keys, pointer lock,
         // and pen authority together.
-        if root_focus_out_is_total_focus_loss(
-            raw_input.focused,
-            self.active_secondary_keyboard_focus,
-        ) && self.keyboard.update_focus(false)
+        //
+        // Only root's own pass carries root's focus: a secondary viewport's
+        // pass reports that viewport's, which is `false` whenever root holds
+        // focus (a drag from root into a secondary repaints it at the
+        // pointer's rate: about 90 resets a second).
+        if root_pass
+            && root_focus_out_is_total_focus_loss(
+                raw_input.focused,
+                self.active_secondary_keyboard_focus,
+            )
+            && self.keyboard.update_focus(false)
         {
             self.release_remote_keys("focus_out");
         }
@@ -5125,6 +5146,113 @@ impl ArcenApp {
         }
     }
 
+    /// Forwards a committed secondary viewport's pointer events the moment
+    /// its pass begins, each at its own position and in order
+    /// (`arcen_deck_core::input::viewport_pointer`).
+    ///
+    /// Root used to read one pointer sample per secondary paint on its own
+    /// next pass. egui runs two more passes after every input pass, and the
+    /// last of them overwrote the sample before root read it: on a still
+    /// host monitor 4-7 of 120 moves reached the host, and a drag's release
+    /// was lost, leaving the button held there.
+    fn forward_secondary_pointer_events(
+        &mut self,
+        viewport_id: egui::ViewportId,
+        focused: bool,
+        events: &[egui::Event],
+    ) {
+        use arcen_deck_core::input::viewport_pointer::{PictureRect, ViewportPointerEvent};
+
+        let MultiWindowSessionState::Active {
+            validated,
+            attempt,
+            committed: true,
+        } = &self.multi_window
+        else {
+            return;
+        };
+        let Some(monitor_id) = attempt
+            .plan()
+            .assignments()
+            .iter()
+            .find(|assignment| assignment.window == viewport_id)
+            .map(|assignment| assignment.session_monitor_id)
+        else {
+            return;
+        };
+        let validated = validated.clone();
+        let Some(state) = self.secondary_deferred_viewports.get(&monitor_id).cloned() else {
+            return;
+        };
+        let mut samples = Vec::new();
+        let mut motion = egui::Vec2::ZERO;
+        {
+            let mut state = state.lock().expect("secondary viewport state poisoned");
+            let picture = state.image_rect.map(|rect| PictureRect {
+                left: rect.left(),
+                top: rect.top(),
+                width: rect.width(),
+                height: rect.height(),
+            });
+            for event in events {
+                let pointer_event = match event {
+                    egui::Event::PointerMoved(pos) => {
+                        ViewportPointerEvent::Moved { x: pos.x, y: pos.y }
+                    }
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        ..
+                    } => {
+                        let Some(index) = POINTER_BUTTON_WIRE_MAPPING
+                            .iter()
+                            .position(|(mapped, _)| mapped == button)
+                        else {
+                            continue;
+                        };
+                        ViewportPointerEvent::Button {
+                            x: pos.x,
+                            y: pos.y,
+                            button: index,
+                            pressed: *pressed,
+                        }
+                    }
+                    egui::Event::PointerGone => ViewportPointerEvent::Left,
+                    egui::Event::MouseMoved(delta) => {
+                        motion += *delta;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if let Some(sample) = state.pointer.apply(picture, pointer_event) {
+                    samples.push(sample);
+                }
+            }
+        }
+        if samples.is_empty() && motion == egui::Vec2::ZERO {
+            return;
+        }
+        // Root's relative lock must not swallow a press into this viewport.
+        self.release_pointer_lock_if_secondary_focused(focused);
+        for sample in samples {
+            let mut buttons = POINTER_BUTTON_WIRE_MAPPING.map(|(_, wire)| (wire, false));
+            for ((_, down), held) in buttons.iter_mut().zip(sample.held) {
+                *down = held;
+            }
+            self.dispatch_secondary_pointer_and_scroll_for_frame(
+                &validated,
+                monitor_id,
+                sample.fraction,
+                buttons,
+                egui::Vec2::ZERO,
+            );
+        }
+        if self.secondary_pointer_lock == Some(monitor_id) && motion != egui::Vec2::ZERO {
+            self.send_secondary_mouse_relative(monitor_id, motion);
+        }
+    }
+
     /// Per-frame driver for a live [`MultiWindowSessionState::Active`] entry:
     /// opens/repaints every additional native fullscreen viewport this
     /// plan needs (root presents the selected fastest local display through
@@ -5313,7 +5441,6 @@ impl ArcenApp {
             texture: Option<egui::TextureHandle>,
             placement: Option<(ImageRect, ImageRect)>,
             local_fraction: Option<(f64, f64)>,
-            buttons: [(u8, bool); 3],
             focused: bool,
             keyboard_events: Vec<egui::Event>,
             /// This viewport's own current `(window_number, ViewSize)`, used
@@ -5329,13 +5456,6 @@ impl ArcenApp {
             /// through the same discrete-wheel-tick bucketing as root's own
             /// scroll handling and forwarded via `dispatch_secondary_scroll`.
             scroll: egui::Vec2,
-            /// This viewport's own raw per-frame relative pointer motion,
-            /// read from its own egui `InputState` exactly like root's own
-            /// `input.pointer.motion()` -- forwarded via
-            /// `send_secondary_mouse_relative` only while this monitor
-            /// itself owns `self.secondary_pointer_lock`; otherwise unused
-            /// (harmless to always capture, mirroring `buttons`/`scroll`).
-            motion: egui::Vec2,
             /// Whether this result carries input not yet dispatched; see
             /// `DeferredSecondaryOutput::input_fresh`.
             input_fresh: bool,
@@ -5439,13 +5559,10 @@ impl ArcenApp {
                                 texture: self.secondary_textures.get(&monitor_id).cloned(),
                                 placement: None,
                                 local_fraction: None,
-                                buttons: POINTER_BUTTON_WIRE_MAPPING
-                                    .map(|(_, wire_button)| (wire_button, false)),
                                 focused: false,
                                 keyboard_events: Vec::new(),
                                 tablet_target: None,
                                 scroll: egui::Vec2::ZERO,
-                                motion: egui::Vec2::ZERO,
                                 input_fresh: false,
                             });
                             continue;
@@ -5464,13 +5581,10 @@ impl ArcenApp {
                                 texture: self.secondary_textures.get(&monitor_id).cloned(),
                                 placement: None,
                                 local_fraction: None,
-                                buttons: POINTER_BUTTON_WIRE_MAPPING
-                                    .map(|(_, wire_button)| (wire_button, false)),
                                 focused: false,
                                 keyboard_events: Vec::new(),
                                 tablet_target: None,
                                 scroll: egui::Vec2::ZERO,
-                                motion: egui::Vec2::ZERO,
                                 input_fresh: false,
                             });
                             continue;
@@ -5598,6 +5712,7 @@ impl ArcenApp {
                 }
                 let image_rect =
                     aspect_fit_rect(rect, state.frame_size, ui.ctx().pixels_per_point());
+                state.image_rect = Some(image_rect);
                 {
                     let DeferredSecondaryViewportState {
                         host_cursor,
@@ -5734,11 +5849,7 @@ impl ArcenApp {
                 });
                 let local_fraction =
                     secondary_local_fraction(image_rect, pointer_pos, capture.pointer_in_use);
-                let buttons = capture.buttons;
                 let scroll = ui.input(|input| input.smooth_scroll_delta());
-                let motion = ui
-                    .input(|input| input.pointer.motion())
-                    .unwrap_or(egui::Vec2::ZERO);
                 let window_height = f64::from(ui.ctx().content_rect().height());
                 let tablet_target = window_number_for_title(&title).map(|window_number| {
                     (
@@ -5772,19 +5883,35 @@ impl ArcenApp {
                     }
                 }
                 state.texture = texture.clone();
+                // Keys and scroll wait for root's pass; keep what root has
+                // not dispatched yet, and wake it.
+                let new_keys: Vec<egui::Event> = keyboard_events
+                    .into_iter()
+                    .filter(|event| !is_pointer_event(event))
+                    .collect();
+                let has_new_input = !new_keys.is_empty() || scroll != egui::Vec2::ZERO;
+                let (mut pending_keys, pending_scroll, pending) = state
+                    .output
+                    .take()
+                    .filter(|output| output.input_fresh)
+                    .map_or((Vec::new(), egui::Vec2::ZERO, false), |output| {
+                        (output.keyboard_events, output.scroll, true)
+                    });
+                pending_keys.extend(new_keys);
+                if has_new_input {
+                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                }
                 state.output = Some(DeferredSecondaryOutput {
                     observation,
                     placement: info
                         .inner_rect
                         .map(|window| viewport_placement(window, image_rect)),
                     local_fraction,
-                    buttons,
                     focused,
-                    keyboard_events,
+                    keyboard_events: pending_keys,
                     tablet_target,
-                    scroll,
-                    motion,
-                    input_fresh: true,
+                    scroll: pending_scroll + scroll,
+                    input_fresh: pending || has_new_input,
                 });
                 state.viewport_paint_ms.push(viewport_paint_ms);
                 state.texture_upload_ms.push(texture_upload_ms);
@@ -5804,7 +5931,6 @@ impl ArcenApp {
                     pending.input_fresh = false;
                     pending.keyboard_events.clear();
                     pending.scroll = egui::Vec2::ZERO;
-                    pending.motion = egui::Vec2::ZERO;
                 }
                 (output, state.texture.clone(), state.drain_timings())
             };
@@ -5819,13 +5945,10 @@ impl ArcenApp {
                     texture,
                     placement: None,
                     local_fraction: None,
-                    buttons: POINTER_BUTTON_WIRE_MAPPING
-                        .map(|(_, wire_button)| (wire_button, false)),
                     focused: false,
                     keyboard_events: Vec::new(),
                     tablet_target: None,
                     scroll: egui::Vec2::ZERO,
-                    motion: egui::Vec2::ZERO,
                     input_fresh: false,
                 });
                 continue;
@@ -5837,12 +5960,10 @@ impl ArcenApp {
                 texture,
                 placement: output.placement,
                 local_fraction: output.local_fraction,
-                buttons: output.buttons,
                 focused: output.focused,
                 keyboard_events: output.keyboard_events,
                 tablet_target: output.tablet_target,
                 scroll: output.scroll,
-                motion: output.motion,
                 input_fresh: output.input_fresh,
             });
         }
@@ -6104,33 +6225,32 @@ impl ArcenApp {
                 ) {
                     self.dispatch_keyboard_events(&result.keyboard_events);
                 }
-                // Only a viewport that actually received pointer input this
-                // paint may move the one remote pointer; one that merely
-                // repainted (a new video frame) must not re-send the position
-                // egui remembers from before the pointer left it.
-                if self.secondary_pointer_lock == Some(result.monitor_id)
-                    || viewport_saw_pointer_input(&result.keyboard_events)
-                {
-                    self.dispatch_secondary_pointer_and_scroll_for_frame(
-                        &validated,
-                        result.monitor_id,
+                // Pointer moves, buttons and relative motion already left
+                // from `raw_input_hook`, event by event; only scroll (egui
+                // smooths it over the viewport's passes) leaves here, at the
+                // pointer's position in this viewport.
+                if result.scroll != egui::Vec2::ZERO {
+                    let lock_owner = self.secondary_pointer_lock == Some(result.monitor_id);
+                    let contained = self
+                        .secondary_pointer_contained
+                        .get(&result.monitor_id)
+                        .copied()
+                        .unwrap_or(false);
+                    let fraction = resolve_secondary_dispatch_local_fraction(
+                        lock_owner || contained,
                         result.local_fraction,
-                        result.buttons,
-                        result.scroll,
+                        self.secondary_last_known_local_fraction
+                            .get(&result.monitor_id)
+                            .copied(),
                     );
-                }
-                // Relative motion is dispatched independently of
-                // `local_fraction`: while this monitor owns
-                // `secondary_pointer_lock`, the OS cursor is hidden/grabbed
-                // and its absolute position sample is expected to go stale
-                // or disappear entirely (mirroring root's own pointer-lock
-                // behavior), so gating this on `local_fraction.is_some()`
-                // would silently drop the very motion the lock exists to
-                // forward.
-                if self.secondary_pointer_lock == Some(result.monitor_id)
-                    && result.motion != egui::Vec2::ZERO
-                {
-                    self.send_secondary_mouse_relative(result.monitor_id, result.motion);
+                    if let Some(fraction) = fraction {
+                        self.dispatch_secondary_scroll(
+                            &validated,
+                            result.monitor_id,
+                            fraction,
+                            result.scroll,
+                        );
+                    }
                 }
             }
         } else {
@@ -13303,15 +13423,16 @@ fn ordered_pointer_events(events: &[egui::Event]) -> Vec<OrderedPointerEvent> {
         .collect()
 }
 
-fn viewport_saw_pointer_input(events: &[egui::Event]) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event,
-            egui::Event::PointerMoved(_)
-                | egui::Event::PointerButton { .. }
-                | egui::Event::MouseWheel { .. }
-        )
-    })
+/// Pointer events of a secondary viewport leave from `raw_input_hook`;
+/// root never sees them again.
+fn is_pointer_event(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::PointerMoved(_)
+            | egui::Event::MouseMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::PointerGone
+    )
 }
 
 /// Where this viewport's pointer is, if it is in this viewport at all.
@@ -18753,19 +18874,22 @@ mod tests {
 
     #[test]
     fn only_pointer_events_count_as_pointer_input() {
-        assert!(!viewport_saw_pointer_input(&[]));
-        assert!(!viewport_saw_pointer_input(&[egui::Event::WindowFocused(
-            true
-        )]));
-        assert!(viewport_saw_pointer_input(&[egui::Event::PointerMoved(
-            egui::pos2(1.0, 2.0)
-        )]));
-        assert!(viewport_saw_pointer_input(&[egui::Event::PointerButton {
+        assert!(!is_pointer_event(&egui::Event::WindowFocused(true)));
+        assert!(!is_pointer_event(&egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        }));
+        assert!(is_pointer_event(&egui::Event::PointerMoved(egui::pos2(
+            1.0, 2.0
+        ))));
+        assert!(is_pointer_event(&egui::Event::PointerButton {
             pos: egui::pos2(1.0, 2.0),
             button: egui::PointerButton::Primary,
             pressed: true,
             modifiers: egui::Modifiers::NONE,
-        }]));
+        }));
     }
 
     /// Live Windows Pier evidence (two displays): half of 49,040
@@ -21377,6 +21501,106 @@ mod tests {
             "{released:?}"
         );
         assert_eq!(app.pointer_drag.origin(), None);
+    }
+
+    fn secondary_pass_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            viewport_id: crate::ui::multi_window_runtime::viewport_id_for(
+                arcen_media::SessionMonitorId::new(2).unwrap(),
+            ),
+            focused: true,
+            events,
+            ..egui::RawInput::default()
+        }
+    }
+
+    /// Live, Match My Layout on a still host monitor: of 120 hover moves over
+    /// the secondary window 4-7 reached the host, and a title-bar drag sent
+    /// its press but never its release (held on the host for 20 s). egui runs
+    /// two more passes after each input pass and the last one overwrote the
+    /// one sample root read. Each event now leaves as the viewport's own pass
+    /// begins, whatever root and the video do.
+    #[test]
+    fn every_secondary_pointer_event_reaches_the_host_without_a_root_pass() {
+        let (mut app, mut receiver, _validated, main, _builtin) = drag_test_app();
+        let secondary = arcen_media::SessionMonitorId::new(2).unwrap();
+        app.secondary_deferred_viewports
+            .entry(secondary)
+            .or_default()
+            .lock()
+            .unwrap()
+            .image_rect = Some(main);
+        let ctx = egui::Context::default();
+
+        for step in 0..120 {
+            let mut raw = secondary_pass_input(vec![egui::Event::PointerMoved(egui::pos2(
+                100.0 + step as f32 * 10.0,
+                700.0,
+            ))]);
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            // egui's two settle passes carry no events.
+            for _ in 0..2 {
+                let mut settle = secondary_pass_input(Vec::new());
+                eframe::App::raw_input_hook(&mut app, &ctx, &mut settle);
+            }
+        }
+        let hover = drain_region_json(&mut receiver);
+        assert_eq!(
+            regions_of(&hover, "region_pointer_enter").len()
+                + regions_of(&hover, "region_pointer_motion").len(),
+            120,
+            "{hover:?}"
+        );
+
+        let press = egui::Event::PointerButton {
+            pos: egui::pos2(500.0, 700.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let release = egui::Event::PointerButton {
+            pos: egui::pos2(900.0, 800.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // Press, drag and release inside one pass: every step still leaves.
+        let mut raw = secondary_pass_input(vec![
+            press,
+            egui::Event::PointerMoved(egui::pos2(700.0, 750.0)),
+            egui::Event::PointerMoved(egui::pos2(900.0, 800.0)),
+            release,
+        ]);
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let drag = drain_region_json(&mut receiver);
+        let buttons: Vec<bool> = drag
+            .iter()
+            .filter(|value| value["type"] == "region_pointer_button")
+            .map(|value| value["pressed"].as_bool().unwrap())
+            .collect();
+        assert_eq!(buttons, vec![true, false], "{drag:?}");
+        assert!(
+            regions_of(&drag, "region_pointer_motion").len() >= 2,
+            "{drag:?}"
+        );
+        assert_eq!(app.pointer_drag.origin(), None);
+    }
+
+    #[test]
+    fn a_secondary_viewports_pass_never_releases_the_keys_root_holds() {
+        // Live: a drag from root into a secondary repainted the secondary at
+        // the pointer's rate, and each of its passes read as root losing
+        // focus: about 90 `key_reset_modifiers` a second.
+        let (mut app, mut receiver) = app_with_command_channel();
+        app.screen = AppScreen::InSession;
+        seed_non_modifier_and_modifier(&mut app, &mut receiver);
+        for _ in 0..30 {
+            let mut raw = secondary_pass_input(Vec::new());
+            raw.focused = false;
+            eframe::App::raw_input_hook(&mut app, &egui::Context::default(), &mut raw);
+        }
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(app.keyboard.held_count(), 2);
     }
 
     #[test]

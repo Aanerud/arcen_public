@@ -64,6 +64,15 @@ what the monitor had to queue. Keep it that way:
   caps it (786 passes/s measured).
 - Pointer moves and buttons are forwarded in event order, at their own
   positions (`ordered_pointer_events`), not once per pass.
+- A secondary Match My Layout viewport's pointer leaves from
+  `raw_input_hook` as that viewport's pass begins
+  (`forward_secondary_pointer_events`, shared
+  `arcen_deck_core::input::viewport_pointer`), never from root's pass:
+  egui runs two settle passes after every input pass, so a per-paint
+  sample read later by root is overwritten (4-7 of 120 moves and lost
+  releases measured). eframe calls `raw_input_hook` for every viewport;
+  anything root-only there must check `raw_input.viewport_id`.
+  Test: `every_secondary_pointer_event_reaches_the_host_without_a_root_pass`.
 - Key, modifier, scroll and mouse-button events raise the pen ordering
   barrier in the tablet monitor. A key release the input method swallowed
   keeps pen samples held until text input's release recovery has sent it
@@ -74,8 +83,11 @@ what the monitor had to queue. Keep it that way:
 - Tests: `pen_samples_at_200_hz_are_forwarded_at_200_hz_while_the_ui_runs_at_30_hz`,
   `samples_after_a_keyboard_edge_wait_for_the_ui_pass_and_keep_their_order`.
 
-Follow-up: keyboard (and secondary-viewport pointer) input still leaves on the
-UI pass; a keyboard fast path is a separate package.
+Follow-up: keyboard (and secondary-viewport keys and scroll, gathered until
+root's next pass, which they wake) still leaves on the UI pass; a keyboard
+fast path is a separate package. Root passes still exceed the root display's
+refresh while the mouse moves over root in multi-window (egui's two settle
+passes per input pass with display sync off: ~165/s measured at 55 events/s).
 
 ## Native tablet: one path
 
