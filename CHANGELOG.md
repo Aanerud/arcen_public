@@ -103,6 +103,19 @@ Windows Pier is unchanged.
   host-platform bus, or with only a few keys or switches) and the desk's
   Bluetooth keyboards and mice never count. One remote product at a time
   still holds.
+- **Linux Pier: after the Deck left a joined desktop, the desk had no
+  sound and Arcen stayed in the session (reported on 0.20.2).** A desktop
+  Arcen joined (the console, or another remote-desktop product's desktop)
+  kept Arcen's session helpers running after the Deck disconnected, with no
+  end, and their audio lease kept the user's default output on Arcen's
+  silent sink and the speakers muted; the other product's client connecting
+  meanwhile did not make Arcen step aside. Now the desk gets its sound back
+  as it is handed back (the default output and mutes it had, or what the
+  user chose since; Arcen's sink is removed), a Deck that closes leaves the
+  desktop at once, and only a lost connection is held for its resume: for
+  at most the reconnect window (`auth.reconnect_window_secs`), and no longer
+  as soon as the other product's client connects, it starts a desktop of
+  its own, or someone unlocks or signs in at the desk.
 
 - **A drag stopped at the edge of a display in Match my layout (reported
   on 0.20.2).** Holding a mouse button and dragging, for example a window

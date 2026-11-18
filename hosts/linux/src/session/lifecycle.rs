@@ -1027,6 +1027,30 @@ impl SessionRegistry {
             });
             return;
         }
+        // A joined console is the desk's again once its Deck left without a
+        // resume hold (ADR 0025 §4): the launcher hands it back (locked,
+        // with its sound) and exits; the session continues. A resume hold
+        // never comes here (it holds the display instead).
+        if !state.draining
+            && arcen_session::console_session::detached_hold::after_deck_left(
+                session.launcher.is_console(),
+                false,
+            ) == arcen_session::console_session::detached_hold::AfterDeckLeft::LeaveConsole
+        {
+            state.draining = true;
+            let session = state.session.take().expect("existing session");
+            drop(guard);
+            tracing::info!(
+                target: crate::logging::target::SESSION,
+                username,
+                generation,
+                "client detached from a joined console; it is handed back and Arcen leaves it (the session continues)"
+            );
+            self.spawn_cleanup(async move {
+                session.shutdown().await;
+            });
+            return;
+        }
         if session.connected {
             session.connected = false;
             session.disconnected_since = Some(SystemTime::now());

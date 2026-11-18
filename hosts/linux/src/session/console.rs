@@ -1226,6 +1226,13 @@ pub(crate) struct ConsolePrivacy {
     /// The layout is kept through a hand-back while a Deck is held for its
     /// resume ([`Self::hold_layout`]).
     layout_held: bool,
+    /// The session agent's audio lease (the desk's speakers silent while a
+    /// Deck is attached), given back with the desk ([`DetachStep::RestoreAudio`]).
+    ///
+    /// [`DetachStep::RestoreAudio`]: arcen_session::console_session::DetachStep::RestoreAudio
+    audio: Option<super::agent::ConsoleAudioControl>,
+    /// The agent holds the lease now.
+    audio_held: bool,
 }
 
 impl ConsolePrivacy {
@@ -1411,6 +1418,49 @@ impl ConsolePrivacy {
 
     pub(crate) fn release_input(&mut self) {
         self.input.release();
+    }
+
+    /// The session agent's audio lease, held from the agent's start.
+    pub(crate) fn hold_audio_with(&mut self, control: Option<super::agent::ConsoleAudioControl>) {
+        self.audio_held = control.is_some();
+        self.audio = control;
+    }
+
+    /// Gives the desk its sound back: the agent ends its lease, so the
+    /// default sink and mutes are the desk's own again.
+    pub(crate) async fn restore_audio(&mut self) {
+        if !self.audio_held {
+            return;
+        }
+        let Some(control) = self.audio.as_mut() else {
+            return;
+        };
+        self.audio_held = false;
+        if control.release().await {
+            tracing::info!(
+                target: target::AUDIO,
+                "the desk's sound is given back: Arcen's audio lease ended"
+            );
+        } else {
+            tracing::error!(
+                target: target::AUDIO,
+                "the session agent did not confirm giving the desk its sound back; it is restored when the agent ends"
+            );
+        }
+    }
+
+    /// Silences the desk again for a returning Deck. Whether the agent
+    /// holds the lease with the evidence the operator's policy requires (a
+    /// console without an audio link has nothing to take).
+    pub(crate) async fn retake_audio(&mut self) -> bool {
+        let Some(control) = self.audio.as_mut() else {
+            return true;
+        };
+        if self.audio_held {
+            return true;
+        }
+        self.audio_held = control.hold().await;
+        self.audio_held
     }
 
     pub(crate) fn is_armed(&self) -> bool {
@@ -1770,6 +1820,7 @@ pub(crate) async fn hand_back(privacy: &mut ConsolePrivacy, session_id: &str) ->
                 privacy.restore_layout().await;
                 privacy.restore_outputs();
             }
+            model::DetachStep::RestoreAudio => privacy.restore_audio().await,
             model::DetachStep::ReleaseInput => privacy.release_input(),
         }
     }
@@ -2650,6 +2701,33 @@ impl ConsoleDesk for LiveDesk<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_desk_gets_its_sound_back_once_and_a_returning_deck_silences_it_again() {
+        let mut privacy = ConsolePrivacy::default();
+        privacy.restore_audio().await;
+        assert!(
+            privacy.retake_audio().await,
+            "no audio link: nothing to take"
+        );
+        // A second release or hold would be answered `unexpected`.
+        let (_agent, control) = super::super::agent::ConsoleAudioControl::stand_in("released held");
+        privacy.hold_audio_with(Some(control));
+        privacy.restore_audio().await;
+        privacy.restore_audio().await;
+        assert!(privacy.retake_audio().await);
+        assert!(privacy.retake_audio().await);
+    }
+
+    #[tokio::test]
+    async fn a_desk_that_cannot_be_silenced_again_refuses_the_returning_deck() {
+        let (_agent, control) =
+            super::super::agent::ConsoleAudioControl::stand_in("released refused");
+        let mut privacy = ConsolePrivacy::default();
+        privacy.hold_audio_with(Some(control));
+        privacy.restore_audio().await;
+        assert!(!privacy.retake_audio().await);
+    }
 
     const TIM: u32 = 1001;
 
