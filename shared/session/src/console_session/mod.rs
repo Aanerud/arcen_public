@@ -18,6 +18,7 @@
 //! and macOS Piers reach the same model through their own console APIs.
 
 pub mod account_desktop;
+pub mod detached_hold;
 pub mod domain_logon;
 pub mod foreign_service;
 pub mod greeter_token;
@@ -557,7 +558,7 @@ impl ConsoleRefusal {
                 "console_session_unreachable: your session's display could not be opened."
             }
             Self::PrivacyUnavailable => {
-                "console_privacy_unavailable: the workstation's screens and input could not be made private."
+                "console_privacy_unavailable: the workstation's screens, speakers and input could not be made private."
             }
             Self::SessionChanged => {
                 "console_session_changed: your session at this workstation changed; sign in again to join it."
@@ -782,18 +783,24 @@ pub enum DetachStep {
     AwaitLockScreen,
     /// Give the local monitors their own picture back.
     RestoreOutputs,
+    /// Give the desk its sound back: the session's audio lease ends, so
+    /// the default sink and every mute are what they were before the Deck
+    /// attached (or what the user chose since), and Arcen's session sink
+    /// goes.
+    RestoreAudio,
     /// Give the local keyboard, mouse and tablets back.
     ReleaseInput,
 }
 
 /// The order a Deck's departure hands the console back in: lock first so
-/// the monitors come back on the lock screen, never on the desktop; input
-/// last so nobody can act before the screen is locked. Nothing ends the
-/// session.
-pub const DETACH_STEPS: [DetachStep; 4] = [
+/// the monitors and the speakers come back on the lock screen, never on the
+/// desktop; input last so nobody can act before the screen is locked.
+/// Nothing ends the session.
+pub const DETACH_STEPS: [DetachStep; 5] = [
     DetachStep::LockSession,
     DetachStep::AwaitLockScreen,
     DetachStep::RestoreOutputs,
+    DetachStep::RestoreAudio,
     DetachStep::ReleaseInput,
 ];
 
@@ -1490,6 +1497,9 @@ mod tests {
         assert!(position(DetachStep::LockSession) < position(DetachStep::AwaitLockScreen));
         assert!(position(DetachStep::AwaitLockScreen) < position(DetachStep::RestoreOutputs));
         assert!(position(DetachStep::RestoreOutputs) < position(DetachStep::ReleaseInput));
+        // The desk's sound comes back with its picture, after the lock.
+        assert!(position(DetachStep::AwaitLockScreen) < position(DetachStep::RestoreAudio));
+        assert!(position(DetachStep::RestoreAudio) < position(DetachStep::ReleaseInput));
     }
 
     #[test]

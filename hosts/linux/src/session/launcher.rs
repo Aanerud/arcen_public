@@ -3186,6 +3186,8 @@ async fn run_console(
             return Err(error.into());
         }
     };
+    // The desk's sound goes back with the desk when the Deck leaves.
+    privacy.hold_audio_with(agent.take_audio_control());
     let mut ready =
         LauncherResponse::ready(identity, &environment, &agent.ready, None, Some(depth));
     ready.console_origin = Some(origin.token().to_owned());
@@ -3235,11 +3237,15 @@ async fn run_console(
                     Some("detach") => {
                         attached = false;
                         // Held for its resume: the console is locked and
-                        // given back, but keeps the Deck's layout until the
-                        // hold ends (the resumed capture finds its outputs).
+                        // given back with its sound (the default sink and
+                        // mutes the desk had), but keeps the Deck's layout
+                        // until the hold ends (the resumed capture finds its
+                        // outputs).
                         privacy.hold_layout();
-                        if privacy.is_armed() {
-                            console::hand_back(&mut privacy, &session_id).await;
+                        let given_back = !privacy.is_armed()
+                            || console::hand_back(&mut privacy, &session_id).await;
+                        if given_back {
+                            privacy.restore_audio().await;
                         }
                     }
                     Some("attach") => {
@@ -3260,6 +3266,21 @@ async fn run_console(
                                 let _ = write_response(&LauncherResponse::console_refusal(&notice));
                                 break;
                             }
+                        }
+                        // The desk's speakers are silent again before
+                        // anything of the session is captured; a desk that
+                        // cannot be proven silent refuses the returning Deck
+                        // without touching the console.
+                        if !privacy.retake_audio().await {
+                            tracing::warn!(
+                                target: target::SESSION,
+                                session_id = %session_id,
+                                "the desk's speakers could not be proven silent; the returning Deck is refused (audio.local_playback)"
+                            );
+                            let _ = write_response(&LauncherResponse::console_refusal(
+                                &ConsoleRefusal::PrivacyUnavailable.into(),
+                            ));
+                            break;
                         }
                         attached = true;
                         let mut desk = console::LiveDesk {
@@ -3351,10 +3372,13 @@ async fn run_console(
     // back locked before the desk gets anything back. A session that will
     // neither lock nor go behind a login screen keeps the desk private
     // (the Deck's stream ends first) until it does, or ends.
+    // The desk's speakers stay silent with its monitors: the agent (and so
+    // its audio lease) ends only after the session is secured, or when this
+    // launcher is stopped.
     if privacy.needs_hand_back() && !console::hand_back(&mut privacy, &session_id).await {
-        agent.shutdown().await;
         keep_private_until_secured(&mut privacy, Some(&session_display), &session_id, &mut stop)
             .await;
+        agent.shutdown().await;
         return Ok(());
     }
     agent.shutdown().await;

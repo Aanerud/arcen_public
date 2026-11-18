@@ -5374,11 +5374,24 @@ async fn run_resumable_session(
             break;
         }
         display_is_held = true;
-        // A joined console is handed back locked while the Deck may resume.
+        // A joined console is handed back locked, with its sound, while the
+        // Deck may resume; the hold ends early when the console is someone
+        // else's again (ADR 0025 §4).
         session_registry.console_command(
             &lease.metadata,
             crate::session::launcher::ConsoleCommand::Detach,
         );
+        let mut console_hold = if lease.metadata.console {
+            Some(
+                arcen_session::console_session::detached_hold::DetachedHold::new(
+                    &lease.metadata.session_id,
+                    lease.metadata.console_guest,
+                    &crate::session::console::read_sessions().await,
+                ),
+            )
+        } else {
+            None
+        };
         if let Err(error) = session_registry.resume().mark_detached(&active_session_id) {
             tracing::error!(
                 target: SESSION,
@@ -5630,6 +5643,27 @@ async fn run_resumable_session(
                             session_registry.resume().monotonic_now(),
                         );
                         break 'session;
+                    }
+                    if let Some(hold) = console_hold.as_mut() {
+                        let client = if hold.watches_client() {
+                            crate::session::console::another_products_client().await
+                        } else {
+                            None
+                        };
+                        let sessions = crate::session::console::read_sessions().await;
+                        if let Some(end) = hold.observe(&sessions, client.is_some()) {
+                            tracing::warn!(
+                                target: SESSION,
+                                reason_class = end.token(),
+                                device = client.as_deref().unwrap_or(""),
+                                "the console is someone else's again; the resume hold ends and Arcen leaves it"
+                            );
+                            let _ = reconnect.apply(
+                                ReconnectEvent::ExplicitDisconnect,
+                                session_registry.resume().monotonic_now(),
+                            );
+                            break 'session;
+                        }
                     }
                 }
             }

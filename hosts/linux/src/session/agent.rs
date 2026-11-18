@@ -10,7 +10,7 @@ use arcen_telemetry::CorrelationId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
@@ -35,6 +35,19 @@ const PARENT_PID_FLAG: &str = "--parent-pid";
 /// shell are the user's own, so the agent only holds the session's audio
 /// lease while a Deck is attached.
 const CONSOLE_SESSION_FLAG: &str = "--console-session";
+/// What the launcher tells a console agent on its standard input, one line
+/// each, and what the agent answers on its standard output.
+const CONSOLE_AUDIO_RELEASE: &str = "release";
+const CONSOLE_AUDIO_RELEASED: &str = "released";
+const CONSOLE_AUDIO_HOLD: &str = "hold";
+const CONSOLE_AUDIO_HELD: &str = "held";
+const CONSOLE_AUDIO_REFUSED: &str = "refused";
+/// How long a console agent may take to give the desk its sound back (each
+/// `pactl` is bounded at 2 s; a bridge stops first).
+const CONSOLE_AUDIO_RELEASE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a console agent may take to silence the desk again for a
+/// returning Deck: the lease's own budget and a margin.
+const CONSOLE_AUDIO_HOLD_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const GRACEFUL_AGENT_STOP: Duration = Duration::from_secs(9);
 /// The X11 agent's login-shell bound: its whole start before READY
@@ -244,6 +257,103 @@ pub struct SessionAgent {
     child: Child,
     stderr_task: JoinHandle<()>,
     pub ready: AgentReady,
+    audio_control: Option<ConsoleAudioControl>,
+}
+
+/// What the agent's standard input carries.
+enum AgentStdin {
+    Closed,
+    /// A secret it reads to end of file before anything else.
+    Secret(Zeroizing<Vec<u8>>),
+    /// A console agent's audio commands ([`ConsoleAudioControl`]).
+    Control,
+}
+
+/// The launcher's hold on a console agent's audio lease (ADR 0025 §4): the
+/// desk's speakers are silent and the session's sound captured only while
+/// a Deck is attached. A command whose answer did not come in time leaves
+/// the link unusable: every later [`Self::hold`] fails, so a returning Deck
+/// is never told the desk is silent on a stale answer.
+pub struct ConsoleAudioControl {
+    stdin: ChildStdin,
+    answers: crate::bounded_io::BoundedLineReader<BufReader<ChildStdout>>,
+    lost: bool,
+    release_timeout: Duration,
+    hold_timeout: Duration,
+}
+
+impl ConsoleAudioControl {
+    async fn ask(&mut self, command: &str, timeout: Duration) -> Option<String> {
+        if self.lost {
+            return None;
+        }
+        let line = format!("{command}\n");
+        let answer = tokio::time::timeout(timeout, async {
+            self.stdin.write_all(line.as_bytes()).await.ok()?;
+            self.stdin.flush().await.ok()?;
+            self.answers
+                .next_bounded_line()
+                .await
+                .ok()
+                .flatten()
+                .map(|line| line.text)
+        })
+        .await
+        .ok()
+        .flatten();
+        if answer.is_none() {
+            self.lost = true;
+        }
+        answer
+    }
+
+    /// Ends the lease: the desk's default sink and mutes are what they were
+    /// (or what the user chose since) and the session sink is gone.
+    /// Whether the agent said so.
+    pub async fn release(&mut self) -> bool {
+        self.ask(CONSOLE_AUDIO_RELEASE, self.release_timeout)
+            .await
+            .is_some_and(|answer| answer.trim() == CONSOLE_AUDIO_RELEASED)
+    }
+
+    /// Takes the lease again for a returning Deck. Whether the agent holds
+    /// it with the evidence the operator's policy requires.
+    pub async fn hold(&mut self) -> bool {
+        self.ask(CONSOLE_AUDIO_HOLD, self.hold_timeout)
+            .await
+            .is_some_and(|answer| answer.trim() == CONSOLE_AUDIO_HELD)
+    }
+
+    /// A link to a stand-in console agent: for each of `answers` it reads
+    /// one command and answers it when the command is the one that answer
+    /// belongs to (`silent` never answers). Keep the child alive.
+    #[cfg(test)]
+    pub(crate) fn stand_in(answers: &str) -> (Child, Self) {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                "for answer in $1; do read -r command || exit 0; case $command:$answer in \
+                 release:released|hold:held|hold:refused) echo $answer;; *:silent) sleep 30;; \
+                 *) echo unexpected;; esac; done; sleep 30",
+            )
+            .arg("stand-in")
+            .arg(answers)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("stand-in agent");
+        let control = Self {
+            stdin: child.stdin.take().expect("piped stdin"),
+            answers: crate::bounded_io::BoundedLineReader::new(BufReader::new(
+                child.stdout.take().expect("piped stdout"),
+            )),
+            lost: false,
+            release_timeout: Duration::from_millis(500),
+            hold_timeout: Duration::from_millis(500),
+        };
+        (child, control)
+    }
 }
 
 impl SessionAgent {
@@ -263,7 +373,7 @@ impl SessionAgent {
             session_log_id,
             &audio.to_arguments(),
             READY_TIMEOUT,
-            None,
+            AgentStdin::Closed,
         )
         .await?;
         if agent.ready.wayland.is_some() {
@@ -293,7 +403,7 @@ impl SessionAgent {
             session_log_id,
             &arguments,
             READY_TIMEOUT,
-            None,
+            AgentStdin::Control,
         )
         .await?;
         if agent.ready.wayland.is_some() {
@@ -372,7 +482,9 @@ impl SessionAgent {
             session_log_id,
             &arguments,
             WAYLAND_READY_TIMEOUT,
-            services.keyring_password,
+            services
+                .keyring_password
+                .map_or(AgentStdin::Closed, AgentStdin::Secret),
         )
         .await?;
         let consistent = agent.ready.wayland.as_ref().is_some_and(|wayland| {
@@ -414,7 +526,7 @@ impl SessionAgent {
         session_log_id: &CorrelationId,
         extra_arguments: &[String],
         ready_timeout: Duration,
-        stdin_secret: Option<Zeroizing<Vec<u8>>>,
+        stdin: AgentStdin,
     ) -> Result<Self, AgentError> {
         if !binary.is_file() {
             return Err(AgentError::BinaryUnavailable);
@@ -430,10 +542,10 @@ impl SessionAgent {
             .arg("--session-log-id")
             .arg(session_log_id.as_str())
             .args(extra_arguments)
-            .stdin(if stdin_secret.is_some() {
-                Stdio::piped()
-            } else {
+            .stdin(if matches!(stdin, AgentStdin::Closed) {
                 Stdio::null()
+            } else {
+                Stdio::piped()
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -445,7 +557,11 @@ impl SessionAgent {
         }
         configure_user_command(&mut command, identity, environment)?;
         let mut child = command.spawn()?;
-        if let Some(secret) = stdin_secret {
+        let control_stdin = match stdin {
+            AgentStdin::Control => Some(child.stdin.take().ok_or(AgentError::InvalidReady)?),
+            AgentStdin::Closed | AgentStdin::Secret(_) => None,
+        };
+        if let AgentStdin::Secret(secret) = stdin {
             // The agent reads it to end of file before anything else; the
             // pipe holds it, and it is never in argv, env or a file.
             if let Some(mut stdin) = child.stdin.take() {
@@ -500,11 +616,25 @@ impl SessionAgent {
             desktop = %ready.desktop,
             "authenticated user session-agent ready"
         );
+        let audio_control = control_stdin.map(|stdin| ConsoleAudioControl {
+            stdin,
+            answers: crate::bounded_io::BoundedLineReader::new(lines.into_inner()),
+            lost: false,
+            release_timeout: CONSOLE_AUDIO_RELEASE_TIMEOUT,
+            hold_timeout: CONSOLE_AUDIO_HOLD_TIMEOUT,
+        });
         Ok(Self {
             child,
             stderr_task,
             ready,
+            audio_control,
         })
+    }
+
+    /// The console agent's audio link, for the launcher's hand-back and
+    /// reattachment; `None` for any other agent (or once taken).
+    pub fn take_audio_control(&mut self) -> Option<ConsoleAudioControl> {
+        self.audio_control.take()
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -812,8 +942,11 @@ pub async fn run_user_agent(args: &[String]) -> Result<(), AgentError> {
 
 /// The agent of a joined console session: the session's audio lease
 /// (the desk's speakers silent while a Deck is attached, the session's
-/// sound captured for it), released when the launcher hands the console
-/// back. The user's own shell and services keep running untouched.
+/// sound captured for it). The launcher ends it when it hands the console
+/// back (`release`) and takes it again for a returning Deck (`hold`), one
+/// line each on standard input, answered on standard output; it ends with
+/// the agent, and when the launcher's end of the pipe closes. The user's own
+/// shell and services keep running untouched.
 #[cfg(target_os = "linux")]
 async fn run_console_agent(
     mut ready: AgentReady,
@@ -833,12 +966,102 @@ async fn run_console_agent(
         serde_json::to_string(&ready).map_err(|_| AgentError::InvalidReady)?
     );
     std::io::stdout().flush()?;
-    tokio::select! {
-        () = shutdown_signal() => {}
-        () = audio.watch() => {}
+    let mut commands = console_commands();
+    let mut held = true;
+    // Installed once: a stop that arrives while a command is handled is
+    // kept for the next wait.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            () = audio.watch(), if held => break,
+            line = next_console_command(commands.as_mut()) => {
+                let Some(line) = line else { break };
+                let answer = match line.trim() {
+                    CONSOLE_AUDIO_RELEASE => {
+                        if held {
+                            audio.release().await;
+                            held = false;
+                            tracing::info!(
+                                target: target::AUDIO,
+                                event = "local_playback_lease",
+                                action = "released_for_desk",
+                                "the Deck left: the desk's sound is its own again"
+                            );
+                        }
+                        CONSOLE_AUDIO_RELEASED
+                    }
+                    CONSOLE_AUDIO_HOLD => {
+                        if !held {
+                            audio = X11SessionAudio::establish(audio_arguments, session_log_id).await;
+                        }
+                        if audio.admission(audio_arguments).is_ok() {
+                            held = true;
+                            CONSOLE_AUDIO_HELD
+                        } else {
+                            audio.release().await;
+                            held = false;
+                            tracing::warn!(
+                                target: target::AUDIO,
+                                event = "local_playback_lease",
+                                action = "refused",
+                                "the desk's speakers could not be proven silent for the returning Deck"
+                            );
+                            CONSOLE_AUDIO_REFUSED
+                        }
+                    }
+                    _ => continue,
+                };
+                println!("{answer}");
+                std::io::stdout().flush()?;
+            }
+        }
     }
     audio.release().await;
     Ok(())
+}
+
+/// The launcher's commands on standard input, read without a blocking
+/// thread (a blocked `stdin` read would hold the runtime, and so the agent's
+/// exit, until the launcher closes the pipe). `None` without a pipe there:
+/// the lease is then held until the agent ends, as before.
+#[cfg(target_os = "linux")]
+fn console_commands(
+) -> Option<crate::bounded_io::BoundedLineReader<BufReader<tokio::net::unix::pipe::Receiver>>> {
+    use std::os::fd::AsFd;
+    let stdin = std::io::stdin().as_fd().try_clone_to_owned().ok()?;
+    match tokio::net::unix::pipe::Receiver::from_owned_fd(stdin) {
+        Ok(pipe) => Some(crate::bounded_io::BoundedLineReader::new(BufReader::new(
+            pipe,
+        ))),
+        Err(error) => {
+            tracing::warn!(
+                target: target::AUDIO,
+                %error,
+                "no command pipe from the launcher; the audio lease is held until the agent ends"
+            );
+            None
+        }
+    }
+}
+
+/// The next command line; `None` once the launcher's end is closed.
+#[cfg(target_os = "linux")]
+async fn next_console_command(
+    commands: Option<
+        &mut crate::bounded_io::BoundedLineReader<BufReader<tokio::net::unix::pipe::Receiver>>,
+    >,
+) -> Option<String> {
+    let Some(commands) = commands else {
+        return std::future::pending().await;
+    };
+    commands
+        .next_bounded_line()
+        .await
+        .ok()
+        .flatten()
+        .map(|line| line.text)
 }
 
 /// The local-playback lease of a dedicated-Xorg desktop, on the user's own
@@ -1422,6 +1645,30 @@ pub fn agent_main(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_console_agent_gives_the_desk_its_sound_back_and_takes_it_again() {
+        let (_agent, mut control) = ConsoleAudioControl::stand_in("released held refused");
+        assert!(control.release().await);
+        assert!(control.hold().await);
+        // A desk that cannot be proven silent again is refused.
+        assert!(!control.hold().await);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_answer_is_never_taken_for_the_desk_being_silent() {
+        let (_agent, mut control) = ConsoleAudioControl::stand_in("released released");
+        assert!(control.release().await);
+        assert!(!control.hold().await);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_console_audio_command_never_lets_a_deck_back_in() {
+        let (_agent, mut control) = ConsoleAudioControl::stand_in("silent held");
+        assert!(!control.release().await, "no answer in time");
+        // Its late answer must not be taken for the next command's.
+        assert!(!control.hold().await);
+    }
 
     /// A shell that writes to stdout (as GLib does for a user's
     /// `G_MESSAGES_DEBUG`) must never reach the agent's READY pipe.

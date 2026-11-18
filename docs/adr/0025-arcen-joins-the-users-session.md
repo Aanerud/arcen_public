@@ -257,8 +257,9 @@ SSSD would not weigh the login screen's service as interactive.
 
 | Event | What happens |
 | --- | --- |
-| Explicit disconnect, or the reconnect window ends | The console is handed back (below) and the launcher exits; the session continues |
-| Transport lost (held for its resume) | The console is handed back at once; a resume makes it private again and unlocks it (below) |
+| Explicit disconnect, a Deck that did not ask for resume, or the reconnect window ends | The console is handed back (below) and the launcher exits; the session continues |
+| Transport lost (held for its resume) | The console is handed back at once, with its sound; a resume makes it private again and unlocks it (below) |
+| While held: another product's client takes the desktop, that product starts a desktop of its own, or someone unlocks or signs in at the desk | The hold ends at once and the launcher exits (`console_session::detached_hold`) |
 | A resume finds the console changed | The console is decided afresh just before anything is touched (`console_session::decide_reattach`, `console::reattach`): only the held session of the same account, still the one the decision attaches, is joined; anything else refuses without touching the desk. The launcher answers the broker's `attach` with `attached` or the typed refusal, and the broker waits for that answer (25 s bound) before it streams: the returning Deck is shown the code (`console_session_changed` when the account's session is no longer the one it joined), never a capture error |
 | Same user signs in again | Joins the same session |
 | The user logs out (at the desk is impossible while attached; from the Deck) | The attachment ends |
@@ -280,7 +281,8 @@ holding the desk's input hands it back too.
 
 **Hand-back order** (`console_session::DETACH_STEPS`): lock the session,
 wait (bounded) for the lock screen, give the monitors their own gamma ramps
-back, release the desk's input. The monitors never show an unlocked desktop
+back, give the desk its sound back (the session agent ends its audio lease),
+release the desk's input. The monitors never show an unlocked desktop
 and nobody can act before the screen is locked (`console::hand_back` stops
 at the first step that cannot be proved).
 
@@ -291,6 +293,19 @@ never unlocks a joined console.
 Polkit's remote-session rule (`05-arcen-remote-session.rules`) does not
 apply: the joined session is the user's own local session, with the rights
 the user has at the desk.
+
+*Amended in the 0.20.2 re-issue (field: a desktop another product owned):*
+a joined console used to stay joined after its Deck left — a Deck that did
+not ask for resume kept the launcher and session agent with no end (the rule
+for Arcen's own dedicated desktops), and the agent's audio lease kept the
+user's default output on Arcen's silent sink with the speakers muted until
+the user logged out. What a held console keeps is now only what a resume
+needs (an idle launcher and agent; no audio lease, devices or layout of a
+guest console), for at most `auth.reconnect_window_secs`, and the hold is
+watched every 2 s (`detached_hold::DetachedHold`): the other product's
+client (a guest console), the other product's own new desktop, a session
+unlocked again after the hand-back locked it, or another desktop in front
+and unlocked, end it at once.
 
 ### 5. Privacy while a Deck is attached
 
@@ -311,7 +326,9 @@ the user has at the desk.
   hot-plugged devices. The kernel releases a grab when its descriptor
   closes, so a crash gives the desk its input back.
 - **Sound:** the session's audio lease mutes the desk's speakers while
-  attached (`audio.local_playback`), as before.
+  attached (`audio.local_playback`), and only then: it ends with the
+  hand-back and is taken again (and proved, or the returning Deck is
+  refused) before a resumed Deck is shown anything.
 
 ### 6. Displays and layout
 
