@@ -349,7 +349,14 @@ what they did) and the administrator's `video.fps` into a `SessionFrameRate`
 with its `FrameRateBasis`; hosts narrow it to what their encoder and capture
 prove (`SessionFrameRate::narrow`, `served_stream_rate`) and state it in the
 hello (`stream_rate`) and `SESSION_STREAM_START` (`display_refresh_hz`,
-`fps_basis`). A copying capture route without a rate measurement serves a
+`fps_basis`). The display refresh is the one the Deck states for its panel
+(`AuthResponse::display_refresh_v1`), apart from the mode it asks the host to
+create; a multi-monitor session resolves for its fastest display and
+`monitor_frame_rate` lowers each monitor to its own, so a slow display never
+caps a fast one. `served_head_refresh_hz` (`capture_rate.rs`) is the refresh
+a host creates a head at for a served rate: twice the rate, else the rate,
+else the Deck's requested mode, within what the host can create, never from
+the Deck panel's refresh. A copying capture route without a rate measurement serves a
 follow-display contract at most at `UNQUALIFIED_COPY_FPS` (capture admission).
 `HostRateGovernor` judges a running Auto or Speed session on the host's own
 encoded/delivered counts and steps it to an even divisor of the session rate

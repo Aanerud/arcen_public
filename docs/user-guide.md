@@ -130,7 +130,11 @@ the first connection.
 **Settings › Advanced › Security modes** decides how strict the Deck is.
 **Medium** is the default: a certificate that no trusted authority issued
 gets the **Verify this host** prompt above. **High** refuses to connect
-unless the certificate is fully verified. **Low** skips the check; avoid it.
+unless a certificate authority this computer trusts issued the host's
+certificate. Every Arcen host makes its own self-signed certificate, so High
+refuses a host, and says why, until its administrator installs a
+certificate from a trusted authority. Medium checks such a host by its
+fingerprint instead. **Low** skips the check; avoid it.
 Open Settings with the gear button (⚙) at the top of the Deck window when
 you are not in a session.
 
@@ -144,7 +148,7 @@ host, not a label on the same picture.
 
 | Preset | What it promises | Use it for |
 | --- | --- | --- |
-| **Auto** (default) | A sharp picture at your display's refresh (60 frames a second on a 60 Hz display; today's Decks ask for at most 60), 8-bit 4:2:0, shown without tearing. When the network or the host cannot keep up it gives up frame rate, not sharpness, and climbs back when it can. | Everyday work: email, browsing, most editing. |
+| **Auto** (default) | A sharp picture at your display's refresh (60 frames a second on a 60 Hz display, 120 on a 120 Hz one where the host can show it; with Match my layout each monitor at its own), 8-bit 4:2:0, shown without tearing. When the network or the host cannot keep up it gives up frame rate, not sharpness, and climbs back when it can. | Everyday work: email, browsing, most editing. |
 | **Speed** | The lowest latency: at least 60 frames a second (your display's refresh when faster), 8-bit 4:2:0, the lowest-latency encoder settings, frames shown even mid-refresh (it may tear). When the network is tight it gives up sharpness. | Playback, scrubbing, animation, anything where motion matters more than fine detail. |
 | **Grading** | 10-bit 4:4:4 BT.709 **SDR**, up to 30 frames a second. It trades some interaction latency for detail. | Colour-critical SDR work. Also the cure for coloured fringes on fine text. |
 | **HDR** | HDR10: PQ transfer, BT.2020 primaries, 10-bit 4:4:4, up to 30 frames a second. It falls back visibly when the host cannot prove HDR. | HDR grading on a Mac display that can show HDR. |
@@ -310,6 +314,10 @@ responsiveness, not correctness.
 - To use the tablet's express keys or touch ring in the remote desktop, map
   them to ordinary keys or scrolling in the tablet maker's control panel on
   your Mac. They then arrive as keys.
+- On the Windows Deck, the tablet's driver must hand the pen to Windows as a
+  pen. When it does not, the Deck says: "Your tablet is sending mouse
+  input, so pressure can't reach the host. In Wacom Tablet Properties ›
+  Mapping, turn on Use Windows Ink for this app (or Other Programs)."
 
 What the host makes of the pen:
 
@@ -501,14 +509,12 @@ content and the size limit, and the Deck cannot override it.
 The host's sound plays on your Mac, in stereo, when the host has sound
 turned on (the installed default).
 
-On a **Linux host the host's own speakers are muted by default** for your
+On every host **the host's own speakers are muted by default** for your
 whole session, so nobody next to the machine hears your work. If the host
 cannot prove its speakers are silent, it refuses the session ("The host
 could not mute its own speakers…") rather than play aloud. Your
-administrator can choose to let them play. A Mac host does the same; it
-needs the System Audio Recording permission on the host for that, and
-refuses the session until it has it. A Windows host does not mute its
-speakers yet.
+administrator can choose to let them play. A Mac host needs the System Audio
+Recording permission for that, and refuses the session until it has it.
 
 ### Your microphone into the host
 
@@ -571,8 +577,10 @@ display.
 How big the remote desktop's own menus and text look is a separate
 question:
 
-- On a **Windows** host, **Remote UI scale** sets it. Automatic reports your
-  panel's real size and lets Windows choose.
+- On a **Windows** host, **Remote UI scale** sets it, for each display.
+  Automatic reports your panel's real size and lets Windows choose. Windows
+  has only fixed steps, so a display may show the nearest one (125% on a
+  1.5× Retina display shows at 175%); the Deck says so.
 - A **Linux** host ignores Remote UI scale. Turning HiDPI streaming off
   makes its interface roughly twice as large.
 
@@ -690,6 +698,7 @@ and says what to do. Then look for what you see below. Anything marked
 | HDR refused on Windows (`hdr_not_activated`, `hdr_link_exceeded`) | Windows could not switch the display to HDR, or the size is too large for HDR. | Use Grading, or turn off Retina streaming, or use one display. |
 | HDR greyed out | None of your Mac's displays can show HDR. | Connect an HDR display, or use Grading. |
 | The pen acts as a mouse | The tablet mode is Mouse compatibility, the host is a Linux Wayland desktop without a pen seat, or the application uses Wintab. | **Settings › Input › Tablet › Tablet support**; on Windows, set the application to Windows Ink. |
+| No pressure from a Windows Deck; the Deck said "Your tablet is sending mouse input…" | The tablet's driver gives the Deck mouse input, not a pen (Wacom: Use Windows Ink is off for the Deck). | In Wacom Tablet Properties › Mapping, turn on **Use Windows Ink** for Arcen Deck (or Other Programs). |
 | A web page on a Mac host says *Pointer type: Mouse*, pressure 0.50 | The page is open in Safari. Safari on macOS reports every pen as a mouse, including one plugged straight into that Mac: WebKit takes no pen data from macOS. | Use Chrome on the host (it reports pen, pressure, tilt and rotation), or a native drawing application. |
 | "Native tablet is not enabled on this host…" | The host's administrator has not turned Native tablet on (`usb.native_tablet`). | Choose **Tablet support**, or ask the administrator to enable it. |
 | "Native tablet (USB bridged) unavailable…" or "…refused…" | The host cannot take a bridged tablet, or reads no pen from this one; the reason says which. | Choose **Tablet support**. |

@@ -89,6 +89,7 @@ mod tests {
 
     fn options() -> ConnectOptions {
         ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "host.example".to_string(),
             port: 18_444,

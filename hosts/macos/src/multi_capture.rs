@@ -54,6 +54,12 @@ impl MonitorCapture {
     pub fn stop(&self) {
         self.session.stop();
     }
+
+    /// Frames this display's stream shed because the encoder was behind.
+    #[must_use]
+    pub fn dropped_frames(&self) -> u64 {
+        self.session.dropped_frames()
+    }
 }
 
 /// Concurrent capture of several displays.

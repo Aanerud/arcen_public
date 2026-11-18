@@ -50,12 +50,19 @@ latency absolute (capture on the Pier to presentation on the Deck).
 multi-monitor session (deck-core's media worker, both Decks):
 
 - *transit* = Deck time when decoded − Pier capture stamp, per frame;
-- each stream's median transit over the last second;
-- the session's playout delay = the slowest *active* stream's median (a
-  stream is active when it decoded a frame in the last 500 ms; an idle
-  monitor sends nothing while nothing changes on it);
+- each stream's median transit over the last second, or over the last
+  half second when that is lower (a stream that has just recovered from a
+  burst stops holding the others at once);
+- the session's playout delay = the slowest *pacing* stream's median. A
+  stream paces when it decoded a frame in the last 500 ms (an idle
+  monitor sends nothing while nothing changes on it) and at least eight
+  in the last second: a monitor that only sends its keepalive, or a few
+  frames while a window crosses its edge, has a median of a handful of
+  samples, and holding a moving monitor to it put them further apart
+  (Windows Pier, uneven motion: skew p90 7–16 ms with the timeline,
+  0–4 ms without; amended 2026-11-18);
 - a frame waits `delay − its own transit`, at most **50 ms**;
-- a lone active stream is never held, so single-monitor sessions and a
+- a lone pacing stream is never held, so single-monitor sessions and a
   Deck where only one monitor is changing pay nothing.
 
 A frame that needed more than the bound is presented late rather than

@@ -7,7 +7,7 @@
 //! its window; this is the one line that says so.
 
 use arcen_media::{RequestedMonitorTopology, Rotation};
-use arcen_protocol::messages::AppliedMonitorTopologyMsg;
+use arcen_protocol::messages::{AppliedMonitorTopologyMsg, ServerHelloMsg};
 
 /// One line naming every Deck display the host shows at another size (the
 /// picture is scaled, letterboxed when the shapes differ) or does not show
@@ -51,6 +51,18 @@ pub fn applied_layout_note(
         ));
     }
     (!parts.is_empty()).then(|| format!("Host layout kept: {}", parts.join("; ")))
+}
+
+/// [`applied_layout_note`] for the layout a hello says the host applied,
+/// against the layout this attempt asked for; `None` without either.
+#[must_use]
+pub fn hello_layout_note(
+    requested: Option<&RequestedMonitorTopology>,
+    hello: &ServerHelloMsg,
+) -> Option<String> {
+    let requested = requested?;
+    let capability = hello.multi_monitor_v1().ok().flatten()?;
+    applied_layout_note(requested, capability.applied_topology()?)
 }
 
 #[cfg(test)]

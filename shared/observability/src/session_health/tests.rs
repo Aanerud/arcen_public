@@ -329,6 +329,82 @@ fn offered_frames_prove_the_content_rate_only_in_a_proven_window() {
     assert_eq!(again.sample.fps_content, Some(3));
 }
 
+/// Two still monitors send a keepalive a second each; the counts are the
+/// session's, so the window is judged against both outputs' target, and the
+/// Deck is told each stream's own rate.
+#[test]
+fn several_still_outputs_are_judged_together_and_reported_per_stream() {
+    let mut health = SessionHealth::new(QosTargets::default());
+    let counters = |frames_sent: u64, content| HostCounters {
+        frames_sent,
+        content: rate(content),
+        outputs: 2,
+        ..HostCounters::default()
+    };
+    let idle = health.observe(
+        2_000,
+        60,
+        counters(
+            4,
+            arcen_telemetry::outputs_content([(60, Some(0)), (60, Some(1))]).fps_content,
+        ),
+    );
+    assert_eq!(idle.sample.fps_target, Some(120));
+    assert_eq!(idle.assessment.host_delivery.state, Some(HealthState::Ok));
+    let stats =
+        SessionHealth::health_stats(&idle, counters(4, None), 60, "h265", "yuv420", "x".into());
+    assert!((stats.fps_target - 60.0).abs() < f64::EPSILON);
+    assert!((stats.fps_actual - 1.0).abs() < f64::EPSILON);
+    assert_eq!(stats.frames_sent, 4);
+    // One output busy and behind: its whole target is still owed.
+    let behind = health.observe(
+        4_000,
+        60,
+        counters(
+            64,
+            arcen_telemetry::outputs_content([(60, None), (60, Some(0))]).fps_content,
+        ),
+    );
+    assert_eq!(
+        behind.assessment.host_delivery.state,
+        Some(HealthState::Critical)
+    );
+}
+
+/// Monitors served at their own rates (30 and 120) are judged against the
+/// sum of their targets, not the primary's rate times the outputs.
+#[test]
+fn outputs_at_their_own_rates_are_judged_against_their_sum() {
+    let mut health = SessionHealth::new(QosTargets::default());
+    let content = arcen_telemetry::outputs_content([(30, None), (120, None)]);
+    let counters = |frames_sent: u64| HostCounters {
+        frames_sent,
+        content: rate(content.fps_content),
+        outputs: 2,
+        outputs_fps_target: content.fps_target,
+        ..HostCounters::default()
+    };
+    // 120 a second in all: the primary's 30 times two would call it
+    // healthy; it is four fifths of what the two monitors owe.
+    let behind = health.observe(2_000, 30, counters(240));
+    assert_eq!(behind.sample.fps_target, Some(150));
+    assert_eq!(
+        behind.assessment.host_delivery.state,
+        Some(HealthState::Degraded)
+    );
+    let stats =
+        SessionHealth::health_stats(&behind, counters(240), 30, "h265", "yuv420", "x".into());
+    assert!(
+        (stats.fps_target - 30.0).abs() < f64::EPSILON,
+        "per stream, as before"
+    );
+    let delivered = health.observe(4_000, 30, counters(240 + 300));
+    assert_eq!(
+        delivered.assessment.host_delivery.state,
+        Some(HealthState::Ok)
+    );
+}
+
 /// The window maths is `arcen_telemetry::HostWindowTracker`'s, exactly: the
 /// Linux and Windows copies computed the same numbers by hand.
 #[test]
@@ -675,4 +751,36 @@ fn the_wire_and_log_names_of_a_state_agree_with_its_serde_form() {
         assert_eq!(wire, serde_json::Value::from(state.as_str()));
     }
     assert_eq!(state_name(None), "unavailable");
+}
+
+/// A relay fills the connection's path into an agent's `health_stats` and
+/// leaves every other message, and stats an agent measured, alone.
+#[test]
+fn a_relay_fills_the_path_into_an_agent_s_health_stats_only() {
+    let path = || arcen_protocol::messages::PathQualityMsg {
+        congestion_control: "bbr".to_owned(),
+        rtt_us: 12_000,
+        sent_packets: 40,
+        window_ms: 2_000,
+        ..Default::default()
+    };
+    let agent = serde_json::to_string(&HealthStatsMsg {
+        frames_sent: 120,
+        ..Default::default()
+    })
+    .unwrap();
+    let filled: HealthStatsMsg =
+        serde_json::from_str(&health_stats_with_path(&agent, path).expect("filled")).unwrap();
+    assert_eq!(filled.path, Some(path()));
+    assert_eq!(filled.frames_sent, 120);
+    let measured = serde_json::to_string(&filled).unwrap();
+    assert!(health_stats_with_path(&measured, || unreachable!()).is_none());
+    assert!(health_stats_with_path(r#"{"type":"cursor_shape"}"#, || unreachable!()).is_none());
+    assert!(
+        health_stats_with_path(
+            r#"{"type":"text_commit_result","note":"health_stats"}"#,
+            || { unreachable!() }
+        )
+        .is_none()
+    );
 }

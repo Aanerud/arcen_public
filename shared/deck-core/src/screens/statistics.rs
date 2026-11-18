@@ -215,6 +215,11 @@ pub fn health_overlay_text(facts: &HealthOverlayFacts<'_>) -> String {
         },
     );
     let host_path = host_path_row(facts.host_health);
+    let host_displays = facts
+        .host_health
+        .and_then(|stats| arcen_media::stats_overlay::host_display_rates_line(&stats.monitors))
+        .map(|line| format!("\n{line}"))
+        .unwrap_or_default();
     let host_input = facts.host_health.map_or_else(
         || "Host input: waiting".to_string(),
         |stats| {
@@ -303,7 +308,7 @@ pub fn health_overlay_text(facts: &HealthOverlayFacts<'_>) -> String {
     };
     let inbox = facts.inbox;
     format!(
-        "{deck_build}\n{deck_runtime}\n{host_build}\n{host_delivery}\n{host_video}\n{host_path}\n{client_delivery}\n{client_wire}\n{client_decoder} · decode {:.1} ms avg {:.1} · upload {:.1} ms avg {:.1}\nVideo packets {} · presented {} · audio packets {} / {} KB\nInbox video: {}/{} B (high {}/{}) · dropped {} / {} B · superseded {} · loss epochs {}\nInbox audio: {}/{} B (high {}/{}) · drop-tail {} / {} B\nRecovery: waiting={} · ingress IDRs {} · malformed {} (video {} / audio {}) · decoder error={}\nInput sent: {} · last {} #{} ({}) · {pointer}\n{host_input}\n{}",
+        "{deck_build}\n{deck_runtime}\n{host_build}\n{host_delivery}{host_displays}\n{host_video}\n{host_path}\n{client_delivery}\n{client_wire}\n{client_decoder} · decode {:.1} ms avg {:.1} · upload {:.1} ms avg {:.1}\nVideo packets {} · presented {} · audio packets {} / {} KB\nInbox video: {}/{} B (high {}/{}) · dropped {} / {} B · superseded {} · loss epochs {}\nInbox audio: {}/{} B (high {}/{}) · drop-tail {} / {} B\nRecovery: waiting={} · ingress IDRs {} · malformed {} (video {} / audio {}) · decoder error={}\nInput sent: {} · last {} #{} ({}) · {pointer}\n{host_input}\n{}",
         facts.last_decode_ms,
         facts.average_decode_ms,
         facts.last_upload_ms,
@@ -698,6 +703,7 @@ mod tests {
             fps: 120,
             display_refresh_hz: Some(120),
             basis: "display".to_owned(),
+            follows_display_moves: false,
         };
         assert_eq!(served_max_fps(Some(&hello(Some(display.clone()))), 30), 120);
         assert_eq!(stream_rate_note(&display), "your 120 Hz display");
@@ -705,6 +711,7 @@ mod tests {
             fps: 60,
             display_refresh_hz: Some(144),
             basis: "encoder".to_owned(),
+            follows_display_moves: false,
         };
         assert_eq!(
             stream_rate_note(&encoder),

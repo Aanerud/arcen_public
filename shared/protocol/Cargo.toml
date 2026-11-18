@@ -18,9 +18,6 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Dormant source compatibility only. Product Deck/Pier builds must not enable
-# this feature; shipped direct sessions are QUIC-only.
-wss-compat = []
 
 [dependencies]
 arcen-usb-bridge.workspace = true

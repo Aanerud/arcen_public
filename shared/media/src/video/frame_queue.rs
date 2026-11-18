@@ -9,6 +9,7 @@
 //! effect.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Classification of one encoded access unit for queue recovery decisions.
@@ -226,6 +227,68 @@ impl VideoQueueWaitStats {
             )
         };
         Self { frames, mean, max }
+    }
+}
+
+/// A host writer's video writes: how long they waited on the transport, and
+/// whether one is waiting now.
+///
+/// A writer that the path holds up for a whole rate interval sends no frame
+/// and leaves its queue empty, so the queue alone cannot say that video
+/// waits. [`Self::unsent`] is what a Pier reports as
+/// [`crate::rate_control::RateHints::video_backlog`]: encoded video still
+/// queued, or a write the transport has not accepted yet.
+#[derive(Debug, Default)]
+pub struct VideoWriteMeter {
+    in_progress: AtomicUsize,
+    waited_micros: AtomicU64,
+}
+
+impl VideoWriteMeter {
+    /// Starts one video write; it is in progress until the guard drops,
+    /// which adds its duration to [`Self::take_wait`].
+    #[must_use = "the write counts as in progress only while the guard lives"]
+    pub fn begin(&self) -> VideoWrite<'_> {
+        self.in_progress.fetch_add(1, Ordering::Relaxed);
+        VideoWrite {
+            meter: self,
+            started: Instant::now(),
+        }
+    }
+
+    /// Whether a video write is waiting on the transport now.
+    #[must_use]
+    pub fn in_progress(&self) -> bool {
+        self.in_progress.load(Ordering::Relaxed) != 0
+    }
+
+    /// Whether encoded video waits to be sent: `queued` (the host's own
+    /// queues hold a frame) or a write in progress.
+    #[must_use]
+    pub fn unsent(&self, queued: bool) -> bool {
+        queued || self.in_progress()
+    }
+
+    /// Time the finished writes spent writing since the previous call.
+    pub fn take_wait(&self) -> Duration {
+        Duration::from_micros(self.waited_micros.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// One video write in progress ([`VideoWriteMeter::begin`]).
+#[derive(Debug)]
+pub struct VideoWrite<'a> {
+    meter: &'a VideoWriteMeter,
+    started: Instant,
+}
+
+impl Drop for VideoWrite<'_> {
+    fn drop(&mut self) {
+        let micros = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.meter
+            .waited_micros
+            .fetch_add(micros, Ordering::Relaxed);
+        self.meter.in_progress.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -913,6 +976,20 @@ impl<T> SharedVideoQueue<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_write_the_transport_holds_is_unsent_video_until_it_ends() {
+        let meter = VideoWriteMeter::default();
+        assert!(!meter.unsent(false));
+        assert!(meter.unsent(true));
+        let write = meter.begin();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(meter.unsent(false), "an empty queue behind a held write");
+        drop(write);
+        assert!(!meter.unsent(false));
+        assert!(meter.take_wait() >= Duration::from_millis(2));
+        assert_eq!(meter.take_wait(), Duration::ZERO);
+    }
+
     #[test]
     fn combined_wait_is_weighted_by_frames() {
         let combined = VideoQueueWaitStats::combine([

@@ -35,9 +35,11 @@ pub mod wording;
 
 use crate::present::RepaintRequester;
 
-/// The UI thread's egui context wakes the UI for the media worker.
+/// The UI thread's egui context wakes the UI for the media worker: the root
+/// viewport's pass, which takes the media worker's output, even when the
+/// wake lands while another viewport is being drawn.
 impl RepaintRequester for egui::Context {
     fn request_repaint(&self) {
-        egui::Context::request_repaint(self);
+        self.request_repaint_of(egui::ViewportId::ROOT);
     }
 }

@@ -1,21 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Reversible NVIDIA NV-CONTROL ViewPortIn resize via `nvidia-settings`.
+//! Reversible NVIDIA ViewPortIn resize of a single-display session, spoken
+//! as NV-CONTROL over a proven X connection.
+//!
+//! The display is opened the way the joined console's layout is
+//! (`session::console::connect`): the authority file without following a
+//! link and proved on the opened file, the cookie sent only to an X server
+//! its socket's peer credentials admit, and every reply parsed, bounded, by
+//! `display::nv_control`. No `nvidia-settings` runs as root against a
+//! session's X server.
 
 use std::path::PathBuf;
-use std::process::Output;
-use std::process::Stdio;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
-use tokio::task::JoinHandle;
-use tokio::time::Instant as TokioInstant;
 
 use crate::logging::target;
+use crate::session::console::SessionDisplay;
+use crate::session::console_layout::{nv_assign, nv_assign_blocking, nv_snapshot};
 use crate::LifecycleEmitter;
 use arcen_telemetry::{CorrelationId, FieldValue, LifecycleEventKind, StructuredFields};
 
@@ -23,77 +25,6 @@ const MIN_WIDTH: u32 = 320;
 const MIN_HEIGHT: u32 = 240;
 const MAX_WIDTH: u32 = 16_384;
 const MAX_HEIGHT: u32 = 8_640;
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
-const REAP_TIMEOUT: Duration = Duration::from_secs(1);
-
-struct ReapRequest {
-    child: std::process::Child,
-    operation: &'static str,
-    poll_error_reported: bool,
-}
-
-static BLOCKING_REAPER: LazyLock<Result<Sender<ReapRequest>, String>> = LazyLock::new(|| {
-    let (sender, receiver) = mpsc::channel::<ReapRequest>();
-    std::thread::Builder::new()
-        .name("arcen-nvctrl-reaper".to_string())
-        .spawn(move || {
-            let mut pending = Vec::<ReapRequest>::new();
-            let mut disconnected = false;
-            loop {
-                if pending.is_empty() {
-                    if disconnected {
-                        return;
-                    }
-                    match receiver.recv() {
-                        Ok(request) => pending.push(request),
-                        Err(_) => return,
-                    }
-                } else if !disconnected {
-                    match receiver.recv_timeout(Duration::from_millis(5)) {
-                        Ok(request) => pending.push(request),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => disconnected = true,
-                    }
-                }
-                pending.extend(receiver.try_iter());
-
-                let mut index = 0;
-                while index < pending.len() {
-                    match pending[index].child.try_wait() {
-                        Ok(Some(status)) => {
-                            let request = pending.swap_remove(index);
-                            tracing::debug!(
-                                target: target::DISPLAY,
-                                operation = request.operation,
-                                %status,
-                                "reaped timed-out NV-CONTROL helper"
-                            );
-                        }
-                        Ok(None) => index += 1,
-                        Err(error) => {
-                            let operation = pending[index].operation;
-                            let should_report = !pending[index].poll_error_reported;
-                            pending[index].poll_error_reported = true;
-                            index += 1;
-                            if should_report {
-                                tracing::warn!(
-                                    target: target::DISPLAY,
-                                    operation,
-                                    %error,
-                                    "NV-CONTROL helper reaper poll failed; retaining child"
-                                );
-                            }
-                        }
-                    }
-                }
-                if !pending.is_empty() {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-        })
-        .map(|_| sender)
-        .map_err(|error| error.to_string())
-});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resolution {
@@ -118,275 +49,112 @@ impl Resolution {
 pub enum DisplayError {
     #[error("invalid client resolution {0}x{1}")]
     InvalidResolution(u32, u32),
-    #[error("nvidia-settings query returned no MetaMode")]
-    MissingMetaMode,
     #[error("cannot parse active output/base mode from MetaMode")]
     InvalidMetaMode,
-    #[error("nvidia-settings failed: {0}")]
+    #[error("the display {0} is not a local X display")]
+    NotLocal(String),
+    #[error("the display {0} has no X authority file to open it with")]
+    NoAuthority(String),
+    #[error("NV-CONTROL failed: {0}")]
     Command(String),
-    #[error("nvidia-settings {operation} timed out after {timeout_ms}ms")]
-    Timeout {
-        operation: &'static str,
-        timeout_ms: u64,
-    },
-    #[error("nvidia-settings {operation} could not be reaped after termination")]
-    ReapTimeout { operation: &'static str },
-    #[error("NV-CONTROL child reaper is unavailable: {0}")]
-    ReaperUnavailable(String),
-    #[error("nvidia-settings I/O failed: {0}")]
-    Io(#[from] std::io::Error),
+}
+
+/// The single-display session's X server, addressed over NV-CONTROL.
+#[derive(Debug, Clone)]
+pub struct NvControl {
+    target: Target,
 }
 
 #[derive(Debug, Clone)]
-pub struct NvControl {
-    display: String,
-    xauthority: Option<String>,
-    binary: PathBuf,
-    command_timeout: Duration,
-    reap_timeout: Duration,
+enum Target {
+    Display(SessionDisplay),
+    /// No usable display: every request fails with this reason.
+    Unusable(Arc<str>),
     #[cfg(test)]
-    pid_observer: Option<Arc<Mutex<Vec<u32>>>>,
+    Fake(Arc<FakeNvControl>),
 }
 
 impl NvControl {
-    pub fn new(display: String, xauthority: Option<String>) -> Self {
-        Self {
-            display,
+    /// The X display `display` (`:N`), opened with the cookie in
+    /// `xauthority`, which must belong to `uid` (the session's user; `None`
+    /// lets the file's owner stand in, for a display Arcen did not start for
+    /// a user) or root.
+    pub fn new(display: String, xauthority: Option<String>, uid: Option<u32>) -> Self {
+        let target = match (
+            arcen_session::console_session::local_display_number(&display),
             xauthority,
-            binary: PathBuf::from("nvidia-settings"),
-            command_timeout: COMMAND_TIMEOUT,
-            reap_timeout: REAP_TIMEOUT,
-            #[cfg(test)]
-            pid_observer: None,
-        }
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.binary);
-        command
-            .env("DISPLAY", &self.display)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(xauthority) = &self.xauthority {
-            command.env("XAUTHORITY", xauthority);
-        }
-        command
-    }
-
-    fn command_blocking(&self) -> std::process::Command {
-        let mut command = std::process::Command::new(&self.binary);
-        command
-            .env("DISPLAY", &self.display)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(xauthority) = &self.xauthority {
-            command.env("XAUTHORITY", xauthority);
-        }
-        command
+        ) {
+            (None, _) => Target::Unusable(DisplayError::NotLocal(display).to_string().into()),
+            (Some(_), None) => {
+                Target::Unusable(DisplayError::NoAuthority(display).to_string().into())
+            }
+            (Some(number), Some(xauthority)) => Target::Display(SessionDisplay {
+                display: format!(":{number}"),
+                number,
+                xauthority: PathBuf::from(xauthority),
+                uid,
+            }),
+        };
+        Self { target }
     }
 
     pub async fn snapshot(&self) -> Result<String, DisplayError> {
-        let output = self
-            .run_async("snapshot", &["--query", "CurrentMetaMode", "--terse"])
-            .await?;
-        if !output.status.success() {
-            return Err(DisplayError::Command(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
+        match &self.target {
+            Target::Display(display) => nv_snapshot(display).await.map_err(DisplayError::Command),
+            Target::Unusable(reason) => Err(DisplayError::Command(reason.to_string())),
+            #[cfg(test)]
+            Target::Fake(fake) => fake.snapshot(),
         }
-        parse_metamode_query(&String::from_utf8_lossy(&output.stdout))
     }
 
     pub async fn assign(&self, metamode: &str) -> Result<(), DisplayError> {
-        let assignment = format!("CurrentMetaMode={metamode}");
-        let output = self.run_async("assign", &["--assign", &assignment]).await?;
-        if !output.status.success() {
-            return Err(DisplayError::Command(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
+        match &self.target {
+            Target::Display(display) => nv_assign(display, metamode)
+                .await
+                .map_err(DisplayError::Command),
+            Target::Unusable(reason) => Err(DisplayError::Command(reason.to_string())),
+            #[cfg(test)]
+            Target::Fake(fake) => fake.assign(metamode),
         }
-        Ok(())
     }
 
     fn assign_blocking(&self, metamode: &str) -> Result<(), DisplayError> {
-        let assignment = format!("CurrentMetaMode={metamode}");
-        let output = self.run_blocking("drop restore", &["--assign", &assignment])?;
-        if !output.status.success() {
-            return Err(DisplayError::Command(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
+        match &self.target {
+            Target::Display(display) => {
+                nv_assign_blocking(display, metamode).map_err(DisplayError::Command)
+            }
+            Target::Unusable(reason) => Err(DisplayError::Command(reason.to_string())),
+            #[cfg(test)]
+            Target::Fake(fake) => fake.assign(metamode),
         }
+    }
+}
+
+/// A scripted NV-CONTROL for the guard's tests.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct FakeNvControl {
+    current: Mutex<String>,
+    fail_assign: bool,
+    assign_delay: std::time::Duration,
+    assigned: Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl FakeNvControl {
+    fn snapshot(&self) -> Result<String, DisplayError> {
+        Ok(self.current.lock().unwrap().clone())
+    }
+
+    fn assign(&self, metamode: &str) -> Result<(), DisplayError> {
+        std::thread::sleep(self.assign_delay);
+        if self.fail_assign {
+            return Err(DisplayError::Command("refused".to_owned()));
+        }
+        metamode.clone_into(&mut self.current.lock().unwrap());
+        self.assigned.lock().unwrap().push(metamode.to_owned());
         Ok(())
     }
-
-    async fn run_async(
-        &self,
-        operation: &'static str,
-        args: &[&str],
-    ) -> Result<Output, DisplayError> {
-        let deadline = TokioInstant::now() + self.command_timeout;
-        let mut command = self.command();
-        command.args(args);
-        let mut child = command.spawn()?;
-        self.observe_pid(child.id());
-        let stdout = child.stdout.take().expect("nvidia-settings stdout piped");
-        let stderr = child.stderr.take().expect("nvidia-settings stderr piped");
-        let mut stdout_task = tokio::spawn(read_pipe(stdout));
-        let mut stderr_task = tokio::spawn(read_pipe(stderr));
-
-        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
-            Ok(Ok(status)) => status,
-            Ok(Err(error)) => {
-                let cleanup = kill_and_reap_async(&mut child, self.reap_timeout, operation).await;
-                abort_pipe_tasks(&mut stdout_task, &mut stderr_task).await;
-                cleanup?;
-                return Err(DisplayError::Io(error));
-            }
-            Err(_) => {
-                let cleanup = kill_and_reap_async(&mut child, self.reap_timeout, operation).await;
-                abort_pipe_tasks(&mut stdout_task, &mut stderr_task).await;
-                cleanup?;
-                return Err(DisplayError::Timeout {
-                    operation,
-                    timeout_ms: duration_ms(self.command_timeout),
-                });
-            }
-        };
-        let stdout = match finish_pipe_task(&mut stdout_task, deadline).await {
-            Ok(stdout) => stdout,
-            Err(PipeTaskError::Deadline) => {
-                abort_pipe_tasks(&mut stdout_task, &mut stderr_task).await;
-                return Err(PipeTaskError::Deadline.with_operation(operation, self.command_timeout));
-            }
-            Err(error) => {
-                stderr_task.abort();
-                let _ = stderr_task.await;
-                return Err(error.with_operation(operation, self.command_timeout));
-            }
-        };
-        let stderr = match finish_pipe_task(&mut stderr_task, deadline).await {
-            Ok(stderr) => stderr,
-            Err(PipeTaskError::Deadline) => {
-                stderr_task.abort();
-                let _ = stderr_task.await;
-                return Err(PipeTaskError::Deadline.with_operation(operation, self.command_timeout));
-            }
-            Err(error) => return Err(error.with_operation(operation, self.command_timeout)),
-        };
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
-    }
-
-    fn run_blocking(&self, operation: &'static str, args: &[&str]) -> Result<Output, DisplayError> {
-        let reaper = blocking_reaper()?.clone();
-        let mut command = self.command_blocking();
-        command.args(args);
-        let mut child = command.spawn()?;
-        self.observe_pid(Some(child.id()));
-        let started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {}
-                Err(error) => {
-                    kill_and_reap_blocking(child, self.reap_timeout, operation, &reaper)?;
-                    return Err(DisplayError::Io(error));
-                }
-            }
-            if started.elapsed() >= self.command_timeout {
-                kill_and_reap_blocking(child, self.reap_timeout, operation, &reaper)?;
-                return Err(DisplayError::Timeout {
-                    operation,
-                    timeout_ms: duration_ms(self.command_timeout),
-                });
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        Ok(Output {
-            status,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        })
-    }
-
-    #[cfg(test)]
-    fn observe_pid(&self, pid: Option<u32>) {
-        if let (Some(observer), Some(pid)) = (&self.pid_observer, pid) {
-            observer.lock().unwrap().push(pid);
-        }
-    }
-
-    #[cfg(not(test))]
-    fn observe_pid(&self, _pid: Option<u32>) {}
-}
-
-async fn kill_and_reap_async(
-    child: &mut tokio::process::Child,
-    timeout: Duration,
-    operation: &'static str,
-) -> Result<(), DisplayError> {
-    let _ = child.start_kill();
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(DisplayError::Io(error)),
-        Err(_) => Err(DisplayError::ReapTimeout { operation }),
-    }
-}
-
-fn kill_and_reap_blocking(
-    mut child: std::process::Child,
-    timeout: Duration,
-    operation: &'static str,
-    reaper: &Sender<ReapRequest>,
-) -> Result<(), DisplayError> {
-    if let Err(error) = child.kill() {
-        handoff_child_to_reaper(child, operation, reaper);
-        return Err(DisplayError::Io(error));
-    }
-    if timeout.is_zero() {
-        handoff_child_to_reaper(child, operation, reaper);
-        return Err(DisplayError::ReapTimeout { operation });
-    }
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
-            Err(error) => {
-                handoff_child_to_reaper(child, operation, reaper);
-                return Err(DisplayError::Io(error));
-            }
-        }
-        if started.elapsed() >= timeout {
-            handoff_child_to_reaper(child, operation, reaper);
-            return Err(DisplayError::ReapTimeout { operation });
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn blocking_reaper() -> Result<&'static Sender<ReapRequest>, DisplayError> {
-    BLOCKING_REAPER
-        .as_ref()
-        .map_err(|error| DisplayError::ReaperUnavailable(error.clone()))
-}
-
-fn handoff_child_to_reaper(
-    child: std::process::Child,
-    operation: &'static str,
-    reaper: &Sender<ReapRequest>,
-) {
-    reaper
-        .send(ReapRequest {
-            child,
-            operation,
-            poll_error_reported: false,
-        })
-        .expect("process-wide NV-CONTROL reaper remains connected");
 }
 
 impl Drop for MetaModeGuard {
@@ -602,7 +370,6 @@ impl MetaModeGuard {
         emitter: LifecycleEmitter,
         correlation_id: CorrelationId,
     ) -> Result<Self, DisplayError> {
-        blocking_reaper()?;
         let prior = controller.snapshot().await?;
         let requested = build_viewport_metamode(&prior, resolution)?;
         let changed = requested != prior;
@@ -705,55 +472,6 @@ impl MetaModeGuard {
     }
 }
 
-async fn read_pipe<R: AsyncRead + Unpin>(mut pipe: R) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-enum PipeTaskError {
-    Io(std::io::Error),
-    Deadline,
-}
-
-impl PipeTaskError {
-    fn with_operation(self, operation: &'static str, timeout: Duration) -> DisplayError {
-        match self {
-            Self::Io(error) => DisplayError::Io(error),
-            Self::Deadline => DisplayError::Timeout {
-                operation,
-                timeout_ms: duration_ms(timeout),
-            },
-        }
-    }
-}
-
-async fn finish_pipe_task(
-    task: &mut JoinHandle<std::io::Result<Vec<u8>>>,
-    deadline: TokioInstant,
-) -> Result<Vec<u8>, PipeTaskError> {
-    match tokio::time::timeout_at(deadline, &mut *task).await {
-        Ok(Ok(Ok(bytes))) => Ok(bytes),
-        Ok(Ok(Err(error))) => Err(PipeTaskError::Io(error)),
-        Ok(Err(error)) => Err(PipeTaskError::Io(std::io::Error::other(error))),
-        Err(_) => Err(PipeTaskError::Deadline),
-    }
-}
-
-async fn abort_pipe_tasks(
-    stdout: &mut JoinHandle<std::io::Result<Vec<u8>>>,
-    stderr: &mut JoinHandle<std::io::Result<Vec<u8>>>,
-) {
-    stdout.abort();
-    stderr.abort();
-    let _ = stdout.await;
-    let _ = stderr.await;
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().min(u64::MAX as u128) as u64
-}
-
 pub fn requested_resolution(width: u32, height: u32) -> Result<Option<Resolution>, DisplayError> {
     match (width, height) {
         (0, 0) => Ok(None),
@@ -763,14 +481,6 @@ pub fn requested_resolution(width: u32, height: u32) -> Result<Option<Resolution
             Ok(Some(resolution))
         }
     }
-}
-
-fn parse_metamode_query(output: &str) -> Result<String, DisplayError> {
-    output
-        .split_once("::")
-        .map(|(_, metamode)| metamode.trim().to_string())
-        .filter(|metamode| !metamode.is_empty())
-        .ok_or(DisplayError::MissingMetaMode)
 }
 
 fn build_viewport_metamode(prior: &str, resolution: Resolution) -> Result<String, DisplayError> {
@@ -824,100 +534,64 @@ fn parse_size_prefix(value: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    #[cfg(unix)]
-    use std::sync::Arc;
-
-    #[cfg(unix)]
-    static ARTIFACT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     fn test_correlation_id() -> CorrelationId {
         CorrelationId::parse_uuid("01234567-89ab-4def-8123-456789abcdef")
             .expect("canonical correlation id")
     }
 
-    const QUERY: &str = "id=50, switchable=no, source=nv-control :: DPY-0: 3840x2160 \
-                         @3840x2160 +0+0 {ViewPortIn=3840x2160, \
-                         ViewPortOut=3840x2160+0+0}\n";
-    const AUTO_QUERY: &str = "id=50, switchable=yes, source=xconfig :: \
-                             DPY-1: nvidia-auto-select @2560x1600 +0+0 \
-                             {ViewPortIn=2560x1600, ViewPortOut=2560x1600+0+0}\n";
+    /// What NV-CONTROL answers (the driver's `token=value … ::` prefix is
+    /// already removed by `display::nv_control`).
+    const QUERY: &str = "DPY-0: 3840x2160 @3840x2160 +0+0 {ViewPortIn=3840x2160, \
+                         ViewPortOut=3840x2160+0+0}";
+    const AUTO_QUERY: &str = "DPY-1: nvidia-auto-select @2560x1600 +0+0 \
+                              {ViewPortIn=2560x1600, ViewPortOut=2560x1600+0+0}";
+    const PRIOR: &str = "DPY-0: 3840x2160 @3840x2160 +0+0";
 
-    #[cfg(unix)]
-    fn process_exists(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+    fn scripted(current: &str) -> FakeNvControl {
+        FakeNvControl {
+            current: Mutex::new(current.to_owned()),
+            ..FakeNvControl::default()
+        }
     }
 
-    #[cfg(unix)]
-    fn wait_for_file(path: &std::path::Path) {
-        let started = Instant::now();
-        while !path.is_file() && started.elapsed() < Duration::from_secs(10) {
+    fn controller(fake: &Arc<FakeNvControl>) -> NvControl {
+        NvControl {
+            target: Target::Fake(Arc::clone(fake)),
+        }
+    }
+
+    fn armed_guard(fake: &Arc<FakeNvControl>, emitter: LifecycleEmitter) -> MetaModeGuard {
+        MetaModeGuard {
+            controller: controller(fake),
+            prior: PRIOR.to_owned(),
+            resolution: Resolution {
+                width: 3840,
+                height: 2160,
+            },
+            changed: true,
+            restore_hold: None,
+            emitter,
+            correlation_id: test_correlation_id(),
+        }
+    }
+
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(path.is_file(), "timed out waiting for {}", path.display());
+        done()
     }
 
-    #[cfg(unix)]
-    fn wait_for_pids(observer: &Arc<Mutex<Vec<u32>>>, minimum: usize) {
-        let started = Instant::now();
-        while observer.lock().unwrap().len() < minimum && started.elapsed() < Duration::from_secs(2)
-        {
-            std::thread::sleep(Duration::from_millis(5));
+    struct RestoreHold(Arc<AtomicBool>);
+
+    impl Drop for RestoreHold {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
         }
-        assert!(observer.lock().unwrap().len() >= minimum);
-    }
-
-    #[cfg(unix)]
-    fn test_directory(name: &str) -> PathBuf {
-        let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/arcen-test-artifacts")
-            .join(format!("metamode-{name}-{}-{sequence}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
-        directory
-    }
-
-    /// Write an executable stub through a child shell.
-    ///
-    /// The whole suite runs in one multi-threaded process. Had this process
-    /// written the stub itself, a child another test forked meanwhile would
-    /// hold a copy of the write descriptor until it execs, and running the
-    /// stub would fail with ETXTBSY (26): `explicit_restore_emits_display_restored_on_success`
-    /// failed under load that way while passing every time in isolation.
-    /// With the shell as the only writer, the stub is complete and closed when
-    /// this returns. Nothing probes it by running it: a probe is a real call,
-    /// and a recording stub's probe left an empty record behind that a test
-    /// then read as the restore's.
-    #[cfg(unix)]
-    fn write_executable_stub(path: &std::path::Path, body: &str) {
-        let written = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("printf '%s' \"$2\" > \"$1\" && chmod 700 \"$1\"")
-            .arg("sh")
-            .arg(path)
-            .arg(body)
-            .status()
-            .unwrap();
-        assert!(written.success(), "stub {}", path.display());
-    }
-
-    /// A stub `nvidia-settings` that records its arguments in `output`. The
-    /// record is renamed into place, so a test polling for it never reads it
-    /// half written.
-    #[cfg(unix)]
-    fn write_recording_stub(path: &std::path::Path, output: &std::path::Path) {
-        let output = output.display();
-        write_executable_stub(
-            path,
-            &format!("#!/bin/sh\nprintf '%s' \"$*\" > '{output}.part' && mv '{output}.part' '{output}'\n"),
-        );
     }
 
     #[test]
@@ -965,28 +639,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_exact_prior_metamode_from_terse_query() {
-        assert_eq!(
-            parse_metamode_query(QUERY).unwrap(),
-            "DPY-0: 3840x2160 @3840x2160 +0+0 {ViewPortIn=3840x2160, \
-             ViewPortOut=3840x2160+0+0}"
-        );
-    }
-
-    #[test]
     fn builds_viewportin_from_active_output_and_base_mode() {
-        let prior = parse_metamode_query(QUERY).unwrap();
+        let prior = QUERY;
         assert_eq!(
-            build_viewport_metamode(&prior, Resolution::new(3600, 2338).unwrap()).unwrap(),
+            build_viewport_metamode(prior, Resolution::new(3600, 2338).unwrap()).unwrap(),
             "DPY-0: 3840x2160 { ViewPortIn=3600x2338, ViewPortOut=3840x2160+0+0 }"
         );
     }
 
     #[test]
     fn fresh_xorg_auto_select_metamode_can_be_resized() {
-        let prior = parse_metamode_query(AUTO_QUERY).unwrap();
+        let prior = AUTO_QUERY;
         assert_eq!(
-            build_viewport_metamode(&prior, Resolution::new(3600, 2338).unwrap()).unwrap(),
+            build_viewport_metamode(prior, Resolution::new(3600, 2338).unwrap()).unwrap(),
             "DPY-1: nvidia-auto-select { ViewPortIn=3600x2338, ViewPortOut=2560x1600+0+0 }"
         );
     }
@@ -1039,118 +704,108 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn armed_drop_guard_restores_prior_metamode() {
-        use std::fs;
-
-        let directory = test_directory("drop");
-        let script = directory.join("nvidia-settings");
-        let output = directory.join("args");
-        write_recording_stub(&script, &output);
-        {
-            let controller = NvControl {
-                display: ":0".to_string(),
-                xauthority: None,
-                binary: script,
-                command_timeout: Duration::from_secs(10),
-                reap_timeout: Duration::from_secs(1),
-                pid_observer: None,
-            };
-            let _guard = MetaModeGuard {
-                controller,
-                prior: "DPY-0: 3840x2160 @3840x2160 +0+0".to_string(),
-                resolution: Resolution {
-                    width: 3840,
-                    height: 2160,
-                },
-                changed: true,
-                restore_hold: None,
-                emitter: LifecycleEmitter::disabled(),
-                correlation_id: test_correlation_id(),
-            };
-        }
-        wait_for_file(&output);
-        let args = fs::read_to_string(output).unwrap();
-        assert!(args.contains("--assign CurrentMetaMode=DPY-0: 3840x2160 @3840x2160 +0+0"));
-        let _ = fs::remove_dir_all(directory);
+    fn a_display_without_an_authority_file_or_not_local_is_refused_before_any_request() {
+        let none = NvControl::new(":0".to_owned(), None, Some(1000));
+        assert!(
+            matches!(none.target, Target::Unusable(ref reason) if reason.contains("X authority"))
+        );
+        let remote = NvControl::new("host:0".to_owned(), Some("/x".to_owned()), None);
+        assert!(
+            matches!(remote.target, Target::Unusable(ref reason) if reason.contains("not a local"))
+        );
+        let local = NvControl::new(
+            ":7.0".to_owned(),
+            Some("/run/a/Xauthority".to_owned()),
+            Some(1000),
+        );
+        let Target::Display(display) = local.target else {
+            panic!("a local display with an authority file is usable");
+        };
+        assert_eq!(
+            display,
+            SessionDisplay {
+                display: ":7".to_owned(),
+                number: 7,
+                xauthority: PathBuf::from("/run/a/Xauthority"),
+                uid: Some(1000),
+            }
+        );
+        let error = none.assign_blocking(PRIOR).unwrap_err().to_string();
+        assert!(error.contains("X authority"), "{error}");
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn armed_drop_guard_restores_prior_metamode() {
+        let fake = Arc::new(scripted(QUERY));
+        drop(armed_guard(&fake, LifecycleEmitter::disabled()));
+        assert!(wait_until(|| !fake.assigned.lock().unwrap().is_empty()));
+        assert_eq!(*fake.assigned.lock().unwrap(), vec![PRIOR.to_owned()]);
+    }
+
     #[tokio::test]
     async fn apply_with_hold_emits_display_armed_only_when_the_metamode_changes() {
-        use std::fs;
-
-        let directory = test_directory("apply-armed");
-        let script = directory.join("nvidia-settings");
-        write_executable_stub(
-            &script,
-            &format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *--query*) printf '%s' \"{}\" ;;\n  *) exit 0 ;;\nesac\n",
-                QUERY
-            ),
-        );
-        let controller = NvControl {
-            display: ":0".to_string(),
-            xauthority: None,
-            binary: script,
-            command_timeout: Duration::from_secs(3),
-            reap_timeout: Duration::from_secs(1),
-            pid_observer: None,
-        };
+        let fake = Arc::new(scripted(QUERY));
         let (emitter, recorded) = LifecycleEmitter::recording();
         let resolution = Resolution::new(3600, 2338).unwrap();
 
-        let guard = MetaModeGuard::apply(controller, resolution, emitter, test_correlation_id())
-            .await
-            .expect("apply succeeds against the fake nvidia-settings script");
+        let mut guard = MetaModeGuard::apply(
+            controller(&fake),
+            resolution,
+            emitter,
+            test_correlation_id(),
+        )
+        .await
+        .expect("apply succeeds");
         assert!(guard.changed);
-
-        let recorded = crate::eventlog::test_support::recorded_events(&recorded);
-        assert_eq!(recorded.len(), 1);
         assert_eq!(
-            recorded[0].kind(),
+            *fake.assigned.lock().unwrap(),
+            vec!["DPY-0: 3840x2160 { ViewPortIn=3600x2338, ViewPortOut=3840x2160+0+0 }".to_owned()]
+        );
+
+        let recorded_events = crate::eventlog::test_support::recorded_events(&recorded);
+        assert_eq!(recorded_events.len(), 1);
+        assert_eq!(
+            recorded_events[0].kind(),
             arcen_telemetry::LifecycleEventKind::DisplayArmed
         );
         assert_eq!(
-            recorded[0].fields().as_map().get("changed"),
+            recorded_events[0].fields().as_map().get("changed"),
             Some(&FieldValue::Boolean(true))
         );
-        let _ = fs::remove_dir_all(directory);
+        guard.changed = false;
+
+        // Already at the requested viewport: nothing assigned, nothing armed.
+        let satisfied = Arc::new(scripted(
+            "DPY-0: 3840x2160 { ViewPortIn=3600x2338, ViewPortOut=3840x2160+0+0 }",
+        ));
+        let (emitter, recorded) = LifecycleEmitter::recording();
+        let guard = MetaModeGuard::apply(
+            controller(&satisfied),
+            resolution,
+            emitter,
+            test_correlation_id(),
+        )
+        .await
+        .expect("apply succeeds");
+        assert!(!guard.changed);
+        assert!(satisfied.assigned.lock().unwrap().is_empty());
+        assert!(crate::eventlog::test_support::recorded_events(&recorded).is_empty());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn reassign_preserves_the_original_restore_target() {
-        use std::fs;
-
-        let directory = test_directory("reassign");
-        let script = directory.join("nvidia-settings");
-        write_executable_stub(
-            &script,
-            &format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *--query*) printf '%s' \"{}\" ;;\n  *) exit 0 ;;\nesac\n",
-                QUERY
-            ),
-        );
-        let controller = NvControl {
-            display: ":0".to_string(),
-            xauthority: None,
-            binary: script,
-            command_timeout: Duration::from_secs(3),
-            reap_timeout: Duration::from_secs(1),
-            pid_observer: None,
-        };
+        let fake = Arc::new(scripted(QUERY));
         let (emitter, _recorded) = LifecycleEmitter::recording();
 
         let mut guard = MetaModeGuard::apply(
-            controller,
+            controller(&fake),
             Resolution::new(1512, 982).unwrap(),
             emitter,
             test_correlation_id(),
         )
         .await
-        .expect("apply succeeds against the fake nvidia-settings script");
+        .expect("apply succeeds");
         let original_prior = guard.prior.clone();
         assert!(guard.changed);
         assert_eq!(guard.resolution(), Resolution::new(1512, 982).unwrap());
@@ -1173,41 +828,18 @@ mod tests {
             .expect("reassign back to prior succeeds");
         assert_eq!(guard.prior, original_prior);
         assert!(guard.changed, "restore obligation stays armed");
-        let _ = fs::remove_dir_all(directory);
+        guard.changed = false;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_restore_emits_display_restored_on_success() {
-        use std::fs;
-
-        let directory = test_directory("restore-success");
-        let script = directory.join("nvidia-settings");
-        write_executable_stub(&script, "#!/bin/sh\nexit 0\n");
-        let controller = NvControl {
-            display: ":0".to_string(),
-            xauthority: None,
-            binary: script,
-            command_timeout: Duration::from_secs(3),
-            reap_timeout: Duration::from_secs(1),
-            pid_observer: None,
-        };
+        let fake = Arc::new(scripted(QUERY));
         let (recording_emitter, recorded) = LifecycleEmitter::recording();
-        let mut guard = MetaModeGuard {
-            controller,
-            prior: "DPY-0: 3840x2160 @3840x2160 +0+0".to_string(),
-            resolution: Resolution {
-                width: 3840,
-                height: 2160,
-            },
-            changed: true,
-            restore_hold: None,
-            emitter: recording_emitter,
-            correlation_id: test_correlation_id(),
-        };
+        let mut guard = armed_guard(&fake, recording_emitter);
 
         guard.restore().await.expect("restore succeeds");
         assert!(!guard.changed);
+        assert_eq!(*fake.assigned.lock().unwrap(), vec![PRIOR.to_owned()]);
 
         let recorded = crate::eventlog::test_support::recorded_events(&recorded);
         assert_eq!(recorded.len(), 1);
@@ -1215,38 +847,16 @@ mod tests {
             recorded[0].kind(),
             arcen_telemetry::LifecycleEventKind::DisplayRestored
         );
-        let _ = fs::remove_dir_all(directory);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_restore_emits_display_restore_failed_and_leaves_the_guard_armed() {
-        use std::fs;
-
-        let directory = test_directory("restore-failure");
-        let script = directory.join("nvidia-settings");
-        write_executable_stub(&script, "#!/bin/sh\nexit 1\n");
-        let controller = NvControl {
-            display: ":0".to_string(),
-            xauthority: None,
-            binary: script,
-            command_timeout: Duration::from_secs(3),
-            reap_timeout: Duration::from_secs(1),
-            pid_observer: None,
-        };
+        let fake = Arc::new(FakeNvControl {
+            fail_assign: true,
+            ..scripted(QUERY)
+        });
         let (recording_emitter, recorded) = LifecycleEmitter::recording();
-        let mut guard = MetaModeGuard {
-            controller,
-            prior: "DPY-0: 3840x2160 @3840x2160 +0+0".to_string(),
-            resolution: Resolution {
-                width: 3840,
-                height: 2160,
-            },
-            changed: true,
-            restore_hold: None,
-            emitter: recording_emitter,
-            correlation_id: test_correlation_id(),
-        };
+        let mut guard = armed_guard(&fake, recording_emitter);
 
         assert!(guard.restore().await.is_err());
         // The guard stays armed so `Drop`'s fallback still retries.
@@ -1262,312 +872,81 @@ mod tests {
             recorded[0].fields().as_map().get("journal_pending"),
             Some(&FieldValue::Boolean(true))
         );
-        guard.changed = false; // avoid a real Drop-triggered background retry in this test
-        let _ = fs::remove_dir_all(directory);
+        guard.changed = false; // avoid a Drop-triggered background retry in this test
     }
 
-    #[cfg(unix)]
     #[test]
     fn drop_fallback_restore_success_emits_watchdog_restore() {
-        use std::fs;
-
-        let directory = test_directory("drop-watchdog");
-        let script = directory.join("nvidia-settings");
-        let output = directory.join("args");
-        write_recording_stub(&script, &output);
+        let fake = Arc::new(scripted(QUERY));
         let (recording_emitter, recorded) = LifecycleEmitter::recording();
-        {
-            let controller = NvControl {
-                display: ":0".to_string(),
-                xauthority: None,
-                binary: script,
-                command_timeout: Duration::from_secs(10),
-                reap_timeout: Duration::from_secs(1),
-                pid_observer: None,
-            };
-            let _guard = MetaModeGuard {
-                controller,
-                prior: "DPY-0: 3840x2160 @3840x2160 +0+0".to_string(),
-                resolution: Resolution {
-                    width: 3840,
-                    height: 2160,
-                },
-                changed: true,
-                restore_hold: None,
-                emitter: recording_emitter,
-                correlation_id: test_correlation_id(),
-            };
-        }
-        wait_for_file(&output);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while crate::eventlog::test_support::recorded_events(&recorded).is_empty()
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        drop(armed_guard(&fake, recording_emitter));
+        assert!(wait_until(|| {
+            !crate::eventlog::test_support::recorded_events(&recorded).is_empty()
+        }));
         let recorded = crate::eventlog::test_support::recorded_events(&recorded);
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             recorded[0].kind(),
             arcen_telemetry::LifecycleEventKind::WatchdogRestore
         );
-        let _ = fs::remove_dir_all(directory);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn snapshot_and_assign_commands_have_hard_deadlines_and_are_reaped() {
-        use std::fs;
-
-        let directory = test_directory("timeout");
-        let script = directory.join("nvidia-settings");
-        write_executable_stub(&script, "#!/bin/sh\nexec sleep 999\n");
-        let observer = Arc::new(Mutex::new(Vec::new()));
-        let controller = NvControl {
-            display: ":0".to_string(),
-            xauthority: None,
-            binary: script,
-            command_timeout: Duration::from_millis(100),
-            reap_timeout: Duration::from_secs(1),
-            pid_observer: Some(observer.clone()),
-        };
-
-        assert!(matches!(
-            controller.snapshot().await,
-            Err(DisplayError::Timeout {
-                operation: "snapshot",
-                ..
-            })
-        ));
-        assert!(matches!(
-            controller.assign("DPY-0: 3840x2160").await,
-            Err(DisplayError::Timeout {
-                operation: "assign",
-                ..
-            })
-        ));
-        let captured_pids = observer.lock().unwrap().clone();
-        assert_eq!(captured_pids.len(), 2);
-        assert!(captured_pids.into_iter().all(|pid| !process_exists(pid)));
-        let _ = fs::remove_dir_all(directory);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn explicit_restore_has_a_hard_deadline_and_reaps() {
-        use std::fs;
-
-        let directory = test_directory("restore-timeout");
-        let script = directory.join("nvidia-settings");
-        write_executable_stub(&script, "#!/bin/sh\nexec sleep 999\n");
-        let observer = Arc::new(Mutex::new(Vec::new()));
-        let controller = NvControl {
-            display: ":0".to_string(),
-            xauthority: None,
-            binary: script,
-            command_timeout: Duration::from_millis(100),
-            reap_timeout: Duration::from_secs(1),
-            pid_observer: Some(observer.clone()),
-        };
-        let mut guard = MetaModeGuard {
-            controller,
-            prior: "DPY-0: 3840x2160 @3840x2160 +0+0".to_string(),
-            resolution: Resolution {
-                width: 3840,
-                height: 2160,
-            },
-            changed: true,
-            restore_hold: None,
-            emitter: LifecycleEmitter::disabled(),
-            correlation_id: test_correlation_id(),
-        };
-
-        assert!(matches!(
-            guard.restore().await,
-            Err(DisplayError::Timeout {
-                operation: "assign",
-                ..
-            })
-        ));
-        guard.changed = false;
-        let pid = observer.lock().unwrap()[0];
-        assert!(!process_exists(pid));
-        let _ = fs::remove_dir_all(directory);
-    }
-
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn drop_restore_worker_is_nonblocking_and_bounded() {
-        use std::fs;
-
-        let directory = test_directory("drop-timeout");
-        let script = directory.join("nvidia-settings");
-        write_executable_stub(&script, "#!/bin/sh\nexec sleep 999\n");
-        let observer = Arc::new(Mutex::new(Vec::new()));
-        let controller = NvControl {
-            display: ":0".to_string(),
-            xauthority: None,
-            binary: script,
-            command_timeout: Duration::from_millis(100),
-            reap_timeout: Duration::from_secs(1),
-            pid_observer: Some(observer.clone()),
-        };
-        struct RestoreHold(Arc<AtomicBool>);
-        impl Drop for RestoreHold {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
+    async fn drop_restore_worker_is_nonblocking_and_releases_the_hold_after_restoring() {
+        let fake = Arc::new(FakeNvControl {
+            assign_delay: Duration::from_millis(200),
+            ..scripted(QUERY)
+        });
         let hold_released = Arc::new(AtomicBool::new(false));
-        let started = Instant::now();
-        let mut guard = MetaModeGuard {
-            controller,
-            prior: "DPY-0: 3840x2160 @3840x2160 +0+0".to_string(),
-            resolution: Resolution {
-                width: 3840,
-                height: 2160,
-            },
-            changed: true,
-            restore_hold: None,
-            emitter: LifecycleEmitter::disabled(),
-            correlation_id: test_correlation_id(),
-        };
+        let mut guard = armed_guard(&fake, LifecycleEmitter::disabled());
         guard.restore_hold = Some(Box::new(RestoreHold(hold_released.clone())));
+        let started = Instant::now();
         drop(guard);
-        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_millis(100));
         assert!(!hold_released.load(Ordering::SeqCst));
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            tokio::time::sleep(Duration::from_millis(1)),
-        )
-        .await
-        .unwrap();
-        wait_for_pids(&observer, 1);
-        let pid = observer.lock().unwrap()[0];
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while process_exists(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!process_exists(pid));
-        let release_deadline = Instant::now() + Duration::from_secs(2);
-        while !hold_released.load(Ordering::SeqCst) && Instant::now() < release_deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(hold_released.load(Ordering::SeqCst));
-        let _ = fs::remove_dir_all(directory);
+        assert!(wait_until(|| hold_released.load(Ordering::SeqCst)));
+        assert_eq!(*fake.assigned.lock().unwrap(), vec![PRIOR.to_owned()]);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn restore_spawn_failure_uses_bounded_synchronous_fallback() {
-        use std::fs;
-
-        let directory = test_directory("drop-spawn-failure");
-        let script = directory.join("nvidia-settings");
-        let output = directory.join("args");
-        write_recording_stub(&script, &output);
-        struct RestoreHold(Arc<AtomicBool>);
-        impl Drop for RestoreHold {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
+    fn restore_spawn_failure_uses_the_synchronous_fallback() {
+        let fake = Arc::new(scripted(QUERY));
         let hold_released = Arc::new(AtomicBool::new(false));
-        let controller = NvControl {
-            display: ":0".to_string(),
-            xauthority: None,
-            binary: script,
-            // Generous timeout: under full-suite parallel load the fake
-            // script can take well over a second to be scheduled, and a
-            // timeout here surfaces as a missing args file, not a clean
-            // assertion failure.
-            command_timeout: Duration::from_secs(10),
-            reap_timeout: Duration::from_secs(1),
-            pid_observer: None,
-        };
-        let mut guard = MetaModeGuard {
-            controller,
-            prior: "DPY-0: 3840x2160 @3840x2160 +0+0".to_string(),
-            resolution: Resolution {
-                width: 3840,
-                height: 2160,
-            },
-            changed: true,
-            restore_hold: Some(Box::new(RestoreHold(hold_released.clone()))),
-            emitter: LifecycleEmitter::disabled(),
-            correlation_id: test_correlation_id(),
-        };
+        let mut guard = armed_guard(&fake, LifecycleEmitter::disabled());
+        guard.restore_hold = Some(Box::new(RestoreHold(hold_released.clone())));
 
         guard.dispatch_restore(|_| Err(std::io::Error::other("forced spawn failure")));
 
         assert!(!guard.changed);
         assert!(hold_released.load(Ordering::SeqCst));
-        let args = fs::read_to_string(output).unwrap();
-        assert!(args.contains("--assign CurrentMetaMode=DPY-0: 3840x2160 @3840x2160 +0+0"));
-        let _ = fs::remove_dir_all(directory);
+        assert_eq!(*fake.assigned.lock().unwrap(), vec![PRIOR.to_owned()]);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn blocking_reap_timeout_transfers_child_to_waiter() {
-        let child = std::process::Command::new("sh")
-            .args(["-c", "exec sleep 999"])
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-
-        assert!(matches!(
-            kill_and_reap_blocking(
-                child,
-                Duration::ZERO,
-                "test reap handoff",
-                blocking_reaper().unwrap()
-            ),
-            Err(DisplayError::ReapTimeout {
-                operation: "test reap handoff"
-            })
-        ));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while process_exists(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!process_exists(pid));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stuck_reap_request_does_not_block_later_children() {
-        let reaper = blocking_reaper().unwrap();
-        let blocker = std::process::Command::new("sh")
-            .args(["-c", "exec sleep 1"])
-            .spawn()
-            .unwrap();
-        let blocker_pid = blocker.id();
-        handoff_child_to_reaper(blocker, "test stuck child", reaper);
-
-        let child = std::process::Command::new("sh")
-            .args(["-c", "exec sleep 999"])
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        assert!(matches!(
-            kill_and_reap_blocking(child, Duration::ZERO, "test later child", reaper),
-            Err(DisplayError::ReapTimeout {
-                operation: "test later child"
-            })
-        ));
-
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while process_exists(pid) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!process_exists(pid));
-        assert!(process_exists(blocker_pid));
-
-        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
-        while process_exists(blocker_pid) && Instant::now() < cleanup_deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(!process_exists(blocker_pid));
+    /// Lab evidence against a real NVIDIA X server, as root like the Pier:
+    /// `ARCEN_NVCTRL_LAB_DISPLAY=:0 ARCEN_NVCTRL_LAB_XAUTHORITY=<file>
+    /// ARCEN_NVCTRL_LAB_UID=<owner> cargo test -p arcen-pier-linux --lib
+    /// nvctrl_lab -- --ignored --nocapture`. Reads the MetaMode, assigns
+    /// that same MetaMode on the async and the Drop (blocking) path, and
+    /// reads it back unchanged.
+    #[tokio::test]
+    #[ignore = "needs an NVIDIA X server"]
+    async fn nvctrl_lab_snapshot_and_reassign_the_current_metamode() {
+        let variable = |name: &str| std::env::var(name).expect(name);
+        let controller = NvControl::new(
+            variable("ARCEN_NVCTRL_LAB_DISPLAY"),
+            Some(variable("ARCEN_NVCTRL_LAB_XAUTHORITY")),
+            variable("ARCEN_NVCTRL_LAB_UID").parse().ok(),
+        );
+        let prior = controller.snapshot().await.expect("snapshot");
+        println!("snapshot {prior}");
+        controller.assign(&prior).await.expect("assign");
+        let blocking = controller.clone();
+        let same = prior.clone();
+        tokio::task::spawn_blocking(move || blocking.assign_blocking(&same))
+            .await
+            .unwrap()
+            .expect("assign on the Drop path");
+        assert_eq!(controller.snapshot().await.expect("read back"), prior);
+        println!("read back unchanged");
     }
 }

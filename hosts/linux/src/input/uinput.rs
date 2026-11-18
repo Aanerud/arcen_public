@@ -42,6 +42,10 @@ pub struct InputController {
     width: u32,
     height: u32,
     region_input: Option<RegionInputAdapter>,
+    /// The one output a single-display Deck is shown of a wider desktop
+    /// (another product's, never changed): its pointer and pen land there
+    /// on the whole screen (`width × height`).
+    picture: Option<arcen_outputs::console_layout::ShownOutput>,
     held_keys: HashSet<u16>,
     held_buttons: HashSet<u16>,
     vertical_scroll_remainder: i64,
@@ -199,6 +203,7 @@ impl InputController {
                 width,
                 height,
                 region_input,
+                picture: None,
                 held_keys: HashSet::new(),
                 held_buttons: HashSet::new(),
                 vertical_scroll_remainder: 0,
@@ -212,6 +217,12 @@ impl InputController {
             },
             stats,
         ))
+    }
+
+    /// Whether the Deck holds either Control key.
+    #[must_use]
+    pub fn control_held(&self) -> bool {
+        super::edges::control_held(&self.held_keys)
     }
 
     pub fn key_event(&mut self, message: &KeyEventMsg) -> Result<(), InputError> {
@@ -497,6 +508,19 @@ impl InputController {
     /// Callers must call `PenEventMsg::validate()` and advance the shared
     /// input sequence tracker before calling this.
     pub fn pen_event(&mut self, message: &PenEventMsg) -> Result<(), InputError> {
+        let placed;
+        let message = match self.picture.as_ref() {
+            Some(output) => {
+                let (x, y) = output.screen_point(message.x, message.y, (self.width, self.height));
+                placed = PenEventMsg {
+                    x,
+                    y,
+                    ..message.clone()
+                };
+                &placed
+            }
+            None => message,
+        };
         let axes = pen::PenAxes::from_event(
             message,
             self.width,
@@ -856,7 +880,16 @@ impl InputController {
         Ok(())
     }
 
+    /// Shows a single-display Deck only `output` of the whole screen (see
+    /// [`Self::picture`]); `None` maps the Deck's picture to the screen.
+    pub fn set_picture(&mut self, output: Option<arcen_outputs::console_layout::ShownOutput>) {
+        self.picture = output;
+    }
+
     fn position_events(&self, x: f64, y: f64) -> [InputEvent; 2] {
+        let (x, y) = self.picture.as_ref().map_or((x, y), |output| {
+            output.screen_point(x, y, (self.width, self.height))
+        });
         [
             InputEvent::new(
                 EventType::ABSOLUTE.0,

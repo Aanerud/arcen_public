@@ -77,6 +77,33 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// which ends the session.
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How often an established session checks that its user still owns the
+/// console: a session of a user who switched away ends within this.
+const CONSOLE_POLL: Duration = Duration::from_millis(500);
+
+/// Who may use the helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientPolicy {
+    /// `--allow-uid`: this uid, whoever is at the console.
+    Fixed(u32),
+    /// Whoever owns the console now. Fast user switching moves the console
+    /// to another user: the helper follows it, so the user who switched
+    /// away keeps no access to the captured device.
+    Console,
+}
+
+impl ClientPolicy {
+    /// Whether `uid` may connect or go on using the device, given the
+    /// console's current owner. Root is never a client.
+    fn permits(self, uid: u32, console_owner: impl FnOnce() -> u32) -> bool {
+        uid != 0
+            && match self {
+                Self::Fixed(allowed) => uid == allowed,
+                Self::Console => uid == console_owner(),
+            }
+    }
+}
+
 fn main() {
     // Nothing this root process creates is for anyone else. Set before any
     // thread exists, so the socket is unconnectable by others even for the
@@ -131,17 +158,18 @@ fn main() {
     #[cfg(feature = "iousbhost")]
     iousbhost::recover_at_start();
 
-    let allowed_uid = allowed_uid.unwrap_or_else(console_owner_uid);
-    if allowed_uid == 0 {
-        fail("refusing to authorize root as the client uid; pass --allow-uid");
-    }
+    let policy = match allowed_uid {
+        Some(0) => fail("refusing to authorize root as the client uid"),
+        Some(uid) => ClientPolicy::Fixed(uid),
+        None => ClientPolicy::Console,
+    };
 
     eprintln!(
         "arcen-usb-helper: capture backend: {} (version {})",
         backend.name(),
         env!("CARGO_PKG_VERSION")
     );
-    if let Err(error) = serve(Path::new(&socket_path), allowed_uid, backend) {
+    if let Err(error) = serve(Path::new(&socket_path), policy, backend) {
         fail(&error);
     }
 }
@@ -214,8 +242,9 @@ fn fail(message: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Best-effort owner of the current console session, used as the default
-/// authorized client uid when one is not supplied explicitly.
+/// Owner of the current console session (`loginwindow` gives `/dev/console`
+/// to the user at the console, and back to root at the login window); root
+/// when it cannot be read, which permits nobody.
 fn console_owner_uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata("/dev/console").map_or(0, |metadata| metadata.uid())
@@ -268,7 +297,7 @@ fn socket_location(socket_path: &Path) -> Result<(PathBuf, String), String> {
     Ok((directory.to_path_buf(), name.to_owned()))
 }
 
-fn serve(socket_path: &Path, allowed_uid: u32, backend: Backend) -> Result<(), String> {
+fn serve(socket_path: &Path, policy: ClientPolicy, backend: Backend) -> Result<(), String> {
     // The directory is verified from `/` down and pinned, and the socket is
     // bound, given its mode and handed to the client uid relative to it: no
     // `chmod` or `chown` follows a path anyone but root could change, and a
@@ -283,16 +312,27 @@ fn serve(socket_path: &Path, allowed_uid: u32, backend: Backend) -> Result<(), S
         SOCKET_DIRECTORY_MODE,
     )
     .map_err(|error| format!("socket directory {}: {error}", directory.display()))?;
-    // The peer-uid check is the real gate; the mode and owner simply avoid
-    // advertising the endpoint to every local process.
-    let listener = directory
-        .bind_socket(&name, allowed_uid)
-        .map_err(|error| format!("bind {}: {error}", socket_path.display()))?;
+    // The peer-uid check is the real gate. A fixed client gets a socket
+    // only it can connect to; for the console's owner, who changes with
+    // fast user switching, the socket stays root's (0666) so no user owns
+    // the inode and can change its mode or ACL to keep the next one out.
+    let listener = match policy {
+        ClientPolicy::Fixed(uid) => directory.bind_socket(&name, uid),
+        ClientPolicy::Console => directory.bind_socket_for_any_peer(&name),
+    }
+    .map_err(|error| format!("bind {}: {error}", socket_path.display()))?;
 
-    eprintln!(
-        "arcen-usb-helper: listening on {} for uid {allowed_uid}",
-        socket_path.display()
-    );
+    match policy {
+        ClientPolicy::Fixed(uid) => eprintln!(
+            "arcen-usb-helper: listening on {} for uid {uid}",
+            socket_path.display()
+        ),
+        ClientPolicy::Console => eprintln!(
+            "arcen-usb-helper: listening on {} for the console user (now uid {})",
+            socket_path.display(),
+            console_owner_uid()
+        ),
+    }
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -302,8 +342,8 @@ fn serve(socket_path: &Path, allowed_uid: u32, backend: Backend) -> Result<(), S
                 continue;
             }
         };
-        match peer_uid(&stream) {
-            Ok(uid) if uid == allowed_uid => {}
+        let uid = match peer_uid(&stream) {
+            Ok(uid) if policy.permits(uid, console_owner_uid) => uid,
             Ok(uid) => {
                 eprintln!("arcen-usb-helper: rejected connection from uid {uid}");
                 continue;
@@ -312,14 +352,43 @@ fn serve(socket_path: &Path, allowed_uid: u32, backend: Backend) -> Result<(), S
                 eprintln!("arcen-usb-helper: could not read peer credentials: {error}");
                 continue;
             }
-        }
-        if let Err(error) = handle_client(&stream, backend) {
+        };
+        let permitted = move || policy.permits(uid, console_owner_uid);
+        if let Err(error) = handle_client(&stream, backend, permitted) {
             eprintln!("arcen-usb-helper: session ended: {error}");
             let _ = write_frame(&mut &stream, TAG_ERROR, &encode_error(&error));
         }
         eprintln!("arcen-usb-helper: device released, awaiting next client");
     }
     Ok(())
+}
+
+/// Ends the session (shuts its socket down) once `permitted` turns false,
+/// checking every [`CONSOLE_POLL`] until `done` is dropped: an idle session
+/// sends no request to check on.
+fn revoke_when_not_permitted(
+    stream: &UnixStream,
+    permitted: impl Fn() -> bool + Send + 'static,
+) -> Result<std::sync::mpsc::Sender<()>, String> {
+    let socket = stream
+        .try_clone()
+        .map_err(|error| format!("clone socket: {error}"))?;
+    let (done, until) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("session-owner".to_owned())
+        .spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                until.recv_timeout(CONSOLE_POLL)
+            {
+                if !permitted() {
+                    eprintln!("arcen-usb-helper: the client no longer owns the console; ending the session");
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            }
+        })
+        .map_err(|error| format!("start the session-owner thread: {error}"))?;
+    Ok(done)
 }
 
 /// Reads the connecting process's effective uid from the socket itself.
@@ -341,7 +410,13 @@ fn peer_uid(stream: &UnixStream) -> Result<u32, String> {
 
 /// Serves one Deck connection: capture, handshake, then pump URBs until the
 /// peer disconnects. The device is released on every exit path.
-fn handle_client(stream: &UnixStream, backend: Backend) -> Result<(), String> {
+fn handle_client(
+    stream: &UnixStream,
+    backend: Backend,
+    permitted: impl Fn() -> bool + Clone + Send + 'static,
+) -> Result<(), String> {
+    // Before the device is captured, so a session is never without it.
+    let _revoke = revoke_when_not_permitted(stream, permitted.clone())?;
     eprintln!(
         "arcen-usb-helper: client connected; capturing device with {}",
         backend.name()
@@ -443,7 +518,7 @@ fn handle_client(stream: &UnixStream, backend: Backend) -> Result<(), String> {
         }
     });
 
-    let outcome = run_requests(&device, &mut reader, &outbound_tx, stream);
+    let outcome = run_requests(&device, &mut reader, &outbound_tx, stream, &permitted);
     drop(outbound_tx);
 
     device.shutdown();
@@ -463,6 +538,7 @@ fn run_requests(
     reader: &mut impl std::io::Read,
     outbound: &std::sync::mpsc::SyncSender<Vec<u8>>,
     socket: &UnixStream,
+    permitted: &impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut deadline_cleared = false;
     loop {
@@ -473,6 +549,11 @@ fn run_requests(
             // not still be armed once a session is genuinely under way.
             Err(_) => return Ok(()),
         };
+        // Every request is the console owner's: a user who switched away
+        // loses the device at once, not at the next poll.
+        if !permitted() {
+            return Err("the client no longer owns the console".to_owned());
+        }
         if !deadline_cleared {
             // A real client has now asked for something, so it is not the
             // silent squatter the deadline exists for. Remove it: an
@@ -581,6 +662,26 @@ mod tests {
                 backend: Backend::COMPILED_DEFAULT,
                 action: Action::Serve,
             })
+        );
+    }
+
+    #[test]
+    fn the_console_policy_follows_the_console_and_never_admits_root() {
+        let console = ClientPolicy::Console;
+        assert!(console.permits(501, || 501));
+        // Fast user switching: uid 502 now owns the console, 501 is out.
+        assert!(!console.permits(501, || 502));
+        assert!(console.permits(502, || 502));
+        // The login window (console owned by root) admits nobody.
+        assert!(!console.permits(0, || 0));
+        assert!(!console.permits(501, || 0));
+        let fixed = ClientPolicy::Fixed(501);
+        assert!(fixed.permits(501, || 502));
+        assert!(!fixed.permits(502, || 502));
+        assert!(!ClientPolicy::Fixed(0).permits(0, || 0));
+        assert_eq!(
+            parse_args(&args(&[])).map(|options| options.allowed_uid),
+            Ok(None)
         );
     }
 

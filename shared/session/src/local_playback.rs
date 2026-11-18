@@ -83,6 +83,9 @@ pub enum MuteBasis {
     NoLocalOutput,
     /// The platform silences output natively (a process tap).
     PlatformTap,
+    /// Every output device is muted at the device ([`EndpointMuteJournal`]),
+    /// while the session still captures what is played.
+    EndpointMute,
 }
 
 impl MuteBasis {
@@ -95,6 +98,7 @@ impl MuteBasis {
             Self::PrivateGraph => "private_graph",
             Self::NoLocalOutput => "no_local_output",
             Self::PlatformTap => "platform_tap",
+            Self::EndpointMute => "endpoint_mute",
         }
     }
 }
@@ -424,6 +428,93 @@ pub fn restore(
         }
     }
     actions
+}
+
+/// Current [`EndpointMuteJournal`] format.
+pub const ENDPOINT_MUTE_JOURNAL_VERSION: u32 = 1;
+
+/// What an endpoint-mute lease changed, persisted before each change.
+///
+/// For a host whose audio system cannot route playback to a session sink but
+/// can mute each output device while the session still captures what is
+/// played (Windows: WASAPI loopback carries the mix while the render
+/// endpoint is muted). The lease mutes every output device that is not
+/// muted, records each in this journal *before* muting it, and at the end
+/// unmutes only those ([`endpoints_to_unmute`]): a device the user had muted
+/// stays muted. A journal left by a lease that never ended is undone the
+/// same way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointMuteJournal {
+    pub version: u32,
+    /// Output devices the lease muted. Only these are unmuted.
+    pub muted: BTreeSet<String>,
+}
+
+impl Default for EndpointMuteJournal {
+    fn default() -> Self {
+        Self {
+            version: ENDPOINT_MUTE_JOURNAL_VERSION,
+            muted: BTreeSet::new(),
+        }
+    }
+}
+
+impl EndpointMuteJournal {
+    /// Whether this journal is one this code can restore.
+    #[must_use]
+    pub const fn is_supported(&self) -> bool {
+        self.version == ENDPOINT_MUTE_JOURNAL_VERSION
+    }
+}
+
+/// The output devices a lease must mute now: every one that is not muted,
+/// in the order given. Record each in the journal before muting it. Run it
+/// again while the lease lasts, so a device that appears, or that someone
+/// unmutes, is silenced too.
+#[must_use]
+pub fn endpoints_to_mute(endpoints: &[Sink]) -> Vec<String> {
+    endpoints
+        .iter()
+        .filter(|endpoint| !endpoint.muted)
+        .map(|endpoint| endpoint.name.clone())
+        .collect()
+}
+
+/// What an endpoint-mute lease proves for a request of `requested`, read
+/// back from the devices (`None`: they could not be read). A host without
+/// any output device is silent by construction.
+#[must_use]
+pub fn endpoint_report(endpoints: Option<&[Sink]>, requested: bool) -> LocalPlaybackReport {
+    if !requested {
+        return LocalPlaybackReport::not_requested();
+    }
+    match endpoints {
+        Some([]) => LocalPlaybackReport::no_local_output(),
+        Some(endpoints) => LocalPlaybackReport {
+            evidence: MuteEvidence::observed(
+                true,
+                Some(endpoints.iter().all(|endpoint| endpoint.muted)),
+            ),
+            basis: MuteBasis::EndpointMute,
+        },
+        None => LocalPlaybackReport {
+            evidence: MuteEvidence::observed(true, None),
+            basis: MuteBasis::EndpointMute,
+        },
+    }
+}
+
+/// The output devices that undo `journal`: those the lease muted that are
+/// still present and still muted. A device someone unmuted since, or one
+/// that is gone, is left as it is.
+#[must_use]
+pub fn endpoints_to_unmute(journal: &EndpointMuteJournal, endpoints: &[Sink]) -> Vec<String> {
+    endpoints
+        .iter()
+        .filter(|endpoint| endpoint.muted && journal.muted.contains(&endpoint.name))
+        .map(|endpoint| endpoint.name.clone())
+        .collect()
 }
 
 /// Maximum length of a session tag in a sink name.
@@ -922,6 +1013,50 @@ mod tests {
         assert_eq!(
             text,
             r#"{"evidence":{"requested":true,"observed_muted":true,"honoured":true},"basis":"private_graph"}"#
+        );
+    }
+
+    #[test]
+    fn an_endpoint_lease_mutes_what_plays_and_gives_back_only_what_it_muted() {
+        let before = [sink("speakers", false), sink("hdmi", true)];
+        assert_eq!(endpoints_to_mute(&before), vec!["speakers".to_owned()]);
+        let mut journal = EndpointMuteJournal::default();
+        journal.muted.extend(endpoints_to_mute(&before));
+        let during = [sink("speakers", true), sink("hdmi", true)];
+        assert!(endpoints_to_mute(&during).is_empty());
+        let report = endpoint_report(Some(&during), true);
+        assert!(report.evidence.honoured);
+        assert_eq!(report.basis, MuteBasis::EndpointMute);
+        assert!(admit(LocalPlayback::Muted, Some(report.evidence)).is_ok());
+        // The device the user had muted stays muted.
+        assert_eq!(
+            endpoints_to_unmute(&journal, &during),
+            vec!["speakers".to_owned()]
+        );
+        // Someone unmuted it since: nothing to give back.
+        assert!(endpoints_to_unmute(&journal, &before).is_empty());
+        let text = serde_json::to_string(&journal).unwrap();
+        assert_eq!(text, r#"{"version":1,"muted":["speakers"]}"#);
+        assert!(
+            serde_json::from_str::<EndpointMuteJournal>(&text)
+                .unwrap()
+                .is_supported()
+        );
+    }
+
+    #[test]
+    fn an_endpoint_lease_without_proof_refuses_and_without_devices_is_silent() {
+        let audible = endpoint_report(Some(&[sink("speakers", false)]), true);
+        assert!(admit(LocalPlayback::Muted, Some(audible.evidence)).is_err());
+        let unreadable = endpoint_report(None, true);
+        assert_eq!(unreadable.evidence.observed_muted, None);
+        assert!(admit(LocalPlayback::Muted, Some(unreadable.evidence)).is_err());
+        let none = endpoint_report(Some(&[]), true);
+        assert_eq!(none.basis, MuteBasis::NoLocalOutput);
+        assert!(admit(LocalPlayback::Muted, Some(none.evidence)).is_ok());
+        assert_eq!(
+            endpoint_report(Some(&[sink("speakers", false)]), false),
+            LocalPlaybackReport::not_requested()
         );
     }
 }

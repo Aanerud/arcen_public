@@ -124,7 +124,7 @@ chown -R root:wheel "$ARCEN_MICROPHONE_DRIVER" 2>/dev/null || true
 chmod 755 "$ARCEN_MICROPHONE_DRIVER" "$ARCEN_MICROPHONE_DRIVER/Contents" "$ARCEN_MICROPHONE_DRIVER/Contents/MacOS" 2>/dev/null || true
 chmod 644 "$ARCEN_MICROPHONE_DRIVER/Contents/Info.plist" 2>/dev/null || true
 chmod 755 "$ARCEN_MICROPHONE_DRIVER/Contents/MacOS/ArcenMicrophone" 2>/dev/null || true
-arcen_restart_coreaudiod
+arcen_restart_coreaudiod --expect-driver
 arcen_log "installed the Arcen Microphone Core Audio driver"
 
 # --- Start and prove it runs -----------------------------------------------

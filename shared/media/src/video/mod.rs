@@ -58,7 +58,7 @@ pub use capture_notice::{
 pub use capture_rate::{
     CaptureRateEvidence, PACED_SOURCE_HEADROOM, SPEED_GUARD_SHORT_WINDOWS, SPEED_GUARD_WINDOWS,
     SpeedGuardVerdict, SpeedRuntimeGuard, SustainedRateMeter, follow_display_offer_fps,
-    paced_output_refresh_hz, paced_source_offer_fps,
+    paced_output_refresh_hz, paced_source_offer_fps, served_head_refresh_hz,
 };
 pub use capture_region::{
     CaptureDamage, CaptureRegion, RegionPolicy, changed_bounds, union_regions,
@@ -104,14 +104,15 @@ pub use frame_queue::{
     FrameClassification, FullFrameRequestCoalescer, FullFrameRequestDecision, KeyframeRequestRetry,
     MIN_VIDEO_BACKLOG_FRAMES, PinGenerationRecovery, RELAYED_VIDEO_FRAMES_IN_FLIGHT,
     RELAYED_VIDEO_RESYNC, RelayedVideoWindow, RoomState, SharedVideoQueue, VIDEO_BACKLOG_ENV,
-    VIDEO_ROOM_WAIT, VideoQueuePush, VideoQueueWaitStats, video_backlog_budget,
-    video_backlog_budget_from_env, video_backlog_is_legacy_from_env,
+    VIDEO_ROOM_WAIT, VideoQueuePush, VideoQueueWaitStats, VideoWrite, VideoWriteMeter,
+    video_backlog_budget, video_backlog_budget_from_env, video_backlog_is_legacy_from_env,
 };
 pub use frame_rate::{
     DISPLAY_REFRESH_FALLBACK_HZ, FrameRateBasis, FrameRatePolicy, FrameRateRequest,
     GOVERNOR_FIRST_HOLD_SECS, GOVERNOR_MAX_HOLD_SECS, GOVERNOR_MIN_FPS, GOVERNOR_SHORT_WINDOWS,
     GOVERNOR_WINDOWS, GovernorReason, GovernorStep, HostRateGovernor, MAX_SESSION_FPS,
-    SessionFrameRate, UNQUALIFIED_COPY_FPS, resolve_session_frame_rate, served_stream_rate,
+    SerialPacing, SessionFrameRate, SourceEvidence, UNQUALIFIED_COPY_FPS, monitor_frame_rate,
+    resolve_session_frame_rate, served_stream_rate,
 };
 pub use host_converted_capture::{
     HOST_CONVERTED_CAPTURE_MAX_EDGE, HOST_CONVERTED_CAPTURE_MAX_PIXELS, fit_host_converted_capture,
@@ -139,18 +140,20 @@ pub use pipeline::{
 pub use plan::{
     AcceleratorClass, BackendAvailability, BackendCandidate, BackendLimits,
     BackendUnavailableNotice, BackendUnavailableReason, CaptureBackend, ConversionBackend,
-    EncoderBackend, EncoderRequest, MediaPlanError, MediaRequest, PlanDegradation,
-    ReadyExpectation, ReadyProtocolError, ResolvedMediaPlan, UnavailableProtocolError,
-    format_ready_v1, format_ready_v1_with_capture, format_ready_v1_with_capture_and_conversion,
+    EncoderBackend, EncoderRequest, MediaPlanError, MediaRequest, NVENC_H264_MAX_DIMENSION,
+    PlanDegradation, ReadyExpectation, ReadyProtocolError, ResolvedMediaPlan,
+    UnavailableProtocolError, codec_dimension_ceiling, codec_fits_dimensions, format_ready_v1,
+    format_ready_v1_with_capture, format_ready_v1_with_capture_and_conversion,
     format_unavailable_v1, parse_ready_capture, parse_ready_conversion, parse_ready_v1,
     parse_unavailable_v1, resolve_media_plan, resolve_media_plan_degrading,
 };
 pub use policy::{
     ClientColorRequest, ColorCeiling, ColorMatrixCapabilities, ColorPolicy, HostInitialVideoError,
     HostInitialVideoPolicy, ResolvedHostInitialVideo, adaptive_codec_ladder,
-    cap_bit_depth_to_client, client_can_decode, color_contract_is_servable,
-    resolve_client_color_request, resolve_client_color_request_with_matrix_caps,
-    resolve_host_initial_video, resolve_host_initial_video_with_supported_codecs,
+    adaptive_codec_ladder_for_size, adaptive_roster_codec_ladder, cap_bit_depth_to_client,
+    client_can_decode, color_contract_is_servable, resolve_client_color_request,
+    resolve_client_color_request_with_matrix_caps, resolve_host_initial_video,
+    resolve_host_initial_video_with_supported_codecs,
 };
 pub use preset::{
     MotionPriority, PresetContract, StreamingPreset, contract, encoder_buffer_frames,

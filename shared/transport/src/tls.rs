@@ -27,17 +27,11 @@ const EC_PUBLIC_KEY_OID: &str = "1.2.840.10045.2.1";
 const P256_OID: &str = "1.2.840.10045.3.1.7";
 const P384_OID: &str = "1.3.132.0.34";
 const ED25519_OID: &str = "1.3.101.112";
-#[cfg(feature = "wss-compat")]
-static TLS12_AND_TLS13: [&rustls::SupportedProtocolVersion; 2] =
-    [&rustls::version::TLS13, &rustls::version::TLS12];
 static TLS13_ONLY: [&rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
 
 /// Lowest TLS protocol version admitted by the shared posture.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TlsVersionFloor {
-    /// TLS 1.2 and TLS 1.3.
-    #[cfg(feature = "wss-compat")]
-    Tls12,
     /// TLS 1.3 only.
     #[default]
     Tls13,
@@ -46,8 +40,6 @@ pub enum TlsVersionFloor {
 impl Display for TlsVersionFloor {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            #[cfg(feature = "wss-compat")]
-            Self::Tls12 => "TLS1.2",
             Self::Tls13 => "TLS1.3",
         })
     }
@@ -58,8 +50,6 @@ impl FromStr for TlsVersionFloor {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            #[cfg(feature = "wss-compat")]
-            "TLS1.2" => Ok(Self::Tls12),
             "TLS1.3" => Ok(Self::Tls13),
             _ => Err(TlsError::UnsupportedVersionFloor),
         }
@@ -75,42 +65,10 @@ pub enum RingCipherSuite {
     Tls13Aes128GcmSha256,
     /// TLS 1.3 ChaCha20-Poly1305 with SHA-256.
     Tls13Chacha20Poly1305Sha256,
-    /// TLS 1.2 ECDHE-ECDSA AES-256-GCM with SHA-384.
-    #[cfg(feature = "wss-compat")]
-    TlsEcdheEcdsaWithAes256GcmSha384,
-    /// TLS 1.2 ECDHE-ECDSA AES-128-GCM with SHA-256.
-    #[cfg(feature = "wss-compat")]
-    TlsEcdheEcdsaWithAes128GcmSha256,
-    /// TLS 1.2 ECDHE-ECDSA ChaCha20-Poly1305 with SHA-256.
-    #[cfg(feature = "wss-compat")]
-    TlsEcdheEcdsaWithChacha20Poly1305Sha256,
-    /// TLS 1.2 ECDHE-RSA AES-256-GCM with SHA-384.
-    #[cfg(feature = "wss-compat")]
-    TlsEcdheRsaWithAes256GcmSha384,
-    /// TLS 1.2 ECDHE-RSA AES-128-GCM with SHA-256.
-    #[cfg(feature = "wss-compat")]
-    TlsEcdheRsaWithAes128GcmSha256,
-    /// TLS 1.2 ECDHE-RSA ChaCha20-Poly1305 with SHA-256.
-    #[cfg(feature = "wss-compat")]
-    TlsEcdheRsaWithChacha20Poly1305Sha256,
 }
 
 impl RingCipherSuite {
-    /// All ring suites in rustls provider preference order.
-    #[cfg(feature = "wss-compat")]
-    pub const ALL: [Self; 9] = [
-        Self::Tls13Aes256GcmSha384,
-        Self::Tls13Aes128GcmSha256,
-        Self::Tls13Chacha20Poly1305Sha256,
-        Self::TlsEcdheEcdsaWithAes256GcmSha384,
-        Self::TlsEcdheEcdsaWithAes128GcmSha256,
-        Self::TlsEcdheEcdsaWithChacha20Poly1305Sha256,
-        Self::TlsEcdheRsaWithAes256GcmSha384,
-        Self::TlsEcdheRsaWithAes128GcmSha256,
-        Self::TlsEcdheRsaWithChacha20Poly1305Sha256,
-    ];
     /// All TLS 1.3 ring suites in provider preference order.
-    #[cfg(not(feature = "wss-compat"))]
     pub const ALL: [Self; 3] = [
         Self::Tls13Aes256GcmSha384,
         Self::Tls13Aes128GcmSha256,
@@ -124,22 +82,6 @@ impl RingCipherSuite {
             Self::Tls13Aes256GcmSha384 => "TLS13_AES_256_GCM_SHA384",
             Self::Tls13Aes128GcmSha256 => "TLS13_AES_128_GCM_SHA256",
             Self::Tls13Chacha20Poly1305Sha256 => "TLS13_CHACHA20_POLY1305_SHA256",
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheEcdsaWithAes256GcmSha384 => "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheEcdsaWithAes128GcmSha256 => "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheEcdsaWithChacha20Poly1305Sha256 => {
-                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
-            }
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheRsaWithAes256GcmSha384 => "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheRsaWithAes128GcmSha256 => "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheRsaWithChacha20Poly1305Sha256 => {
-                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
-            }
         }
     }
 
@@ -148,30 +90,6 @@ impl RingCipherSuite {
             Self::Tls13Aes256GcmSha384 => CipherSuite::TLS13_AES_256_GCM_SHA384,
             Self::Tls13Aes128GcmSha256 => CipherSuite::TLS13_AES_128_GCM_SHA256,
             Self::Tls13Chacha20Poly1305Sha256 => CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheEcdsaWithAes256GcmSha384 => {
-                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
-            }
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheEcdsaWithAes128GcmSha256 => {
-                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-            }
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheEcdsaWithChacha20Poly1305Sha256 => {
-                CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
-            }
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheRsaWithAes256GcmSha384 => {
-                CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-            }
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheRsaWithAes128GcmSha256 => {
-                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-            }
-            #[cfg(feature = "wss-compat")]
-            Self::TlsEcdheRsaWithChacha20Poly1305Sha256 => {
-                CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-            }
         }
     }
 }
@@ -292,8 +210,6 @@ fn protocol_versions(
     floor: TlsVersionFloor,
 ) -> &'static [&'static rustls::SupportedProtocolVersion] {
     match floor {
-        #[cfg(feature = "wss-compat")]
-        TlsVersionFloor::Tls12 => &TLS12_AND_TLS13,
         TlsVersionFloor::Tls13 => &TLS13_ONLY,
     }
 }
@@ -1204,12 +1120,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(contract_names, provider_names);
 
-        #[cfg(feature = "wss-compat")]
-        let disabled = [
-            RingCipherSuite::Tls13Aes128GcmSha256,
-            RingCipherSuite::TlsEcdheRsaWithAes128GcmSha256,
-        ];
-        #[cfg(not(feature = "wss-compat"))]
         let disabled = [RingCipherSuite::Tls13Aes128GcmSha256];
         let posture = TlsPosture::new(TlsVersionFloor::default(), disabled).expect("posture");
         assert_eq!(
@@ -1232,25 +1142,6 @@ mod tests {
             TlsPosture::new(TlsVersionFloor::default(), RingCipherSuite::ALL),
             Err(TlsError::InvalidTlsPosture)
         );
-        #[cfg(feature = "wss-compat")]
-        {
-            assert_eq!(
-                TlsPosture::new(
-                    TlsVersionFloor::Tls13,
-                    RingCipherSuite::ALL[..3].iter().copied()
-                ),
-                Err(TlsError::InvalidTlsPosture)
-            );
-            assert!(
-                TlsPosture::new(
-                    TlsVersionFloor::Tls13,
-                    RingCipherSuite::ALL[3..].iter().copied()
-                )
-                .is_ok()
-            );
-            assert_eq!("TLS1.2".parse(), Ok(TlsVersionFloor::Tls12));
-        }
-        #[cfg(not(feature = "wss-compat"))]
         assert_eq!(
             "TLS1.2".parse::<TlsVersionFloor>(),
             Err(TlsError::UnsupportedVersionFloor)

@@ -21,7 +21,8 @@ The workspace `members` carry the active shared surfaces (`identity`, `input`,
 CP. `arcen-observability` is the OS-free tracing and bounded-I/O runtime for
 this direct Pier/Deck scope, while `arcen-telemetry` remains pure.
 `arcen-transport` is active for the dependency-light TLS lifecycle and direct
-QUIC product carrier. Its `wss-compat` feature is dormant and non-shipping.
+QUIC product carrier. (Its dormant `wss-compat` feature was removed on
+2026-11-18.)
 Linux/Windows clients are out of `members` until their milestone. Shared APIs must avoid
 unnecessary platform assumptions so deferred products slot in later without promising support
 now. Direct connections on a trusted network are the product path.

@@ -3,6 +3,7 @@
 
 use arcen_protocol::messages::{AuthResponse, VideoSelectionIntent};
 use arcen_protocol::{ChromaSubsampling, VideoCodec};
+use arcen_session::console_session::{ConsoleNotice, ConsoleRefusal, ForeignService};
 use arcen_telemetry::CorrelationId;
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
@@ -301,10 +302,13 @@ impl AgentConfig {
             fps: self.fps,
             fps_ceiling: self.fps_ceiling,
             deck_display_refresh_hz: None,
+            deck_monitor_refresh_hz: Vec::new(),
             frame_rate: None,
             encoder,
             audio_enabled: self.audio_enabled,
             audio_compressed: self.audio_compressed,
+            // The broker holds the session's local playback lease, not the agent.
+            local_playback: arcen_session::pier_config::LocalPlayback::Audible,
             microphone_input_enabled: self.microphone_input_enabled,
             clipboard_policy: self.clipboard_policy,
             timezone_redirection: self.timezone_redirection,
@@ -904,6 +908,86 @@ fn classify_cp_bind(
     }
 }
 
+/// The typed refusal for a console bind `classify_cp_bind` rejected, when
+/// the cause is another account or another remote-desktop service: a
+/// session other than the console's that a client is attached to (another
+/// account's: `console_other_user_other_product`; the account's own:
+/// `console_in_use_other_product`), with its id so its service can be
+/// named; else another account active at the console
+/// (`console_other_user`).
+fn console_refusal(
+    candidates: &[(SessionCandidate, AccountMatch)],
+    active_console_id: u32,
+) -> Option<(ConsoleRefusal, Option<u32>)> {
+    let remote = candidates.iter().find(|(candidate, _)| {
+        candidate.id != active_console_id
+            && !candidate.user.is_empty()
+            && matches!(
+                candidate.state,
+                SessionState::Active | SessionState::Connected
+            )
+    });
+    if let Some((candidate, relation)) = remote {
+        let refusal = if *relation == AccountMatch::Match {
+            ConsoleRefusal::InUseOtherProduct
+        } else {
+            ConsoleRefusal::OtherUserOtherProduct
+        };
+        return Some((refusal, Some(candidate.id)));
+    }
+    let (console, relation) = candidates
+        .iter()
+        .find(|(candidate, _)| candidate.id == active_console_id)?;
+    (*relation == AccountMatch::Other && console.state == SessionState::Active)
+        .then_some((ConsoleRefusal::OtherUser, None))
+}
+
+/// How a departing Deck's session was secured (ADR 0025, "disconnect
+/// locks").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockOutcome {
+    /// Locked through `LockWorkStation` in the session.
+    Locked,
+    /// It was locked or disconnected already.
+    AlreadySecured,
+    /// It would not lock; it was disconnected from the console instead, so
+    /// the desk shows the sign-in screen and a sign-in reconnects it.
+    Disconnected,
+    /// It is gone or is not the Deck's account's session: nothing to lock.
+    Elsewhere,
+}
+
+impl LockOutcome {
+    pub(crate) const fn token(self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::AlreadySecured => "already_secured",
+            Self::Disconnected => "disconnected",
+            Self::Elsewhere => "elsewhere",
+        }
+    }
+}
+
+/// Locks the Deck's session `session_id` when it is still the active,
+/// unlocked session of `expected_sid`, and waits until Windows reports it
+/// locked; disconnects it from the console when it will not lock.
+pub(crate) fn lock_session(session_id: u32, expected_sid: &str) -> Result<LockOutcome, String> {
+    platform::lock_session(session_id, expected_sid)
+}
+
+/// Whether `session_id` is still the active, unlocked session of
+/// `expected_sid`, as Windows reports it now (`false` when it cannot tell).
+pub(crate) fn still_unlocked_session_of(session_id: u32, expected_sid: &str) -> bool {
+    platform::still_unlocked_session_of(session_id, expected_sid)
+}
+
+/// `arcen-pier lock-session`, started by the broker in the user's session:
+/// locks the workstation (`LockWorkStation` must run on the session's
+/// interactive desktop).
+pub(crate) fn lock_workstation() -> Result<(), String> {
+    platform::lock_workstation()
+}
+
 pub struct LaunchedAgent {
     stream: Option<PipeStream>,
     pub process_id: u32,
@@ -947,8 +1031,10 @@ pub enum BindStatus {
     /// console at `target` before it can be captured.
     Reconnect { source: u32, target: u32 },
     /// The console is owned by another account, remote/stale, or otherwise
-    /// ambiguous. Credential Provider dispatch is forbidden.
-    Rejected(&'static str),
+    /// ambiguous. Credential Provider dispatch is forbidden. The notice is
+    /// the typed refusal a Deck is shown when the cause is another account
+    /// or another remote-desktop service (named as Windows reports it).
+    Rejected(&'static str, Option<ConsoleNotice>),
     /// A hard error (e.g. the broker lacks the privilege to query user tokens).
     Error(String),
 }
@@ -1064,10 +1150,11 @@ mod platform {
     };
     use windows::Win32::System::Pipes::CreatePipe;
     use windows::Win32::System::RemoteDesktop::{
-        WTSActive, WTSClientProtocolType, WTSConnected, WTSDisconnected, WTSDomainName,
-        WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
-        WTSQuerySessionInformationW, WTSQueryUserToken, WTSSessionInfoEx, WTSUserName, WTSINFOEXW,
-        WTS_CURRENT_SERVER_HANDLE, WTS_SESSIONSTATE_UNLOCK, WTS_SESSION_INFOW,
+        WTSActive, WTSClientProtocolType, WTSConnected, WTSDisconnectSession, WTSDisconnected,
+        WTSDomainName, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+        WTSQuerySessionInformationW, WTSQueryUserToken, WTSSessionInfoEx, WTSUserName,
+        WTSWinStationName, WTSINFOEXW, WTS_CURRENT_SERVER_HANDLE, WTS_SESSIONSTATE_UNLOCK,
+        WTS_SESSION_INFOW,
     };
     use windows::Win32::System::Threading::{
         CreateProcessAsUserW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
@@ -1250,7 +1337,7 @@ mod platform {
             target: u32,
         },
         /// No CP scenario is safe for the observed session topology.
-        Rejected(&'static str),
+        Rejected(&'static str, Option<super::ConsoleNotice>),
         /// No matching token could be queried (accumulated per-session errors).
         TokenErrors(Vec<String>),
     }
@@ -1266,6 +1353,7 @@ mod platform {
         if active_console_id == u32::MAX {
             return Ok(BindOutcome::Rejected(
                 "Windows did not report an active physical console",
+                None,
             ));
         }
         let candidates = ordered_supported_candidates(all_candidates.clone());
@@ -1367,7 +1455,10 @@ mod platform {
             CpBindDecision::Reject(_reason) if !token_errors.is_empty() => {
                 Ok(BindOutcome::TokenErrors(token_errors))
             }
-            CpBindDecision::Reject(reason) => Ok(BindOutcome::Rejected(reason)),
+            CpBindDecision::Reject(reason) => Ok(BindOutcome::Rejected(
+                reason,
+                rejection_notice(&observed, active_console_id),
+            )),
         }
     }
 
@@ -1384,7 +1475,7 @@ mod platform {
             BindOutcome::Reconnect { source, target } => {
                 super::BindStatus::Reconnect { source, target }
             }
-            BindOutcome::Rejected(reason) => super::BindStatus::Rejected(reason),
+            BindOutcome::Rejected(reason, notice) => super::BindStatus::Rejected(reason, notice),
             BindOutcome::TokenErrors(errors) => super::BindStatus::Error(format!(
                 "The broker could not query any matching WTS user token. Run the broker as LocalSystem with SeTcbPrivilege; details: {}",
                 errors.join("; ")
@@ -1481,7 +1572,7 @@ mod platform {
                 "strict WTS reclassification found the account's session on {source} rather than \
                  the console {target}"
             )),
-            BindOutcome::Rejected(reason) => Err(format!(
+            BindOutcome::Rejected(reason, _) => Err(format!(
                 "strict WTS reclassification rejected post-login topology: {reason}"
             )),
             BindOutcome::TokenErrors(errors) => Err(format!(
@@ -1504,6 +1595,26 @@ mod platform {
             .into_iter()
             .find(|candidate| candidate.id == session_id)
             .map(|candidate| candidate.state)
+    }
+
+    /// The typed refusal for a rejected bind (`super::console_refusal`),
+    /// naming the other remote-desktop service by the session's WinStation
+    /// and client protocol as Windows reports them.
+    fn rejection_notice(
+        observed: &[(SessionCandidate, AccountMatch)],
+        active_console_id: u32,
+    ) -> Option<super::ConsoleNotice> {
+        let (refusal, holder) = super::console_refusal(observed, active_console_id)?;
+        let service = holder.and_then(|id| {
+            let protocol = observed
+                .iter()
+                .find(|(candidate, _)| candidate.id == id)
+                .and_then(|(candidate, _)| candidate.protocol);
+            query_session_string(id, WTSWinStationName)
+                .ok()
+                .map(|station| super::ForeignService::windows_station(&station, protocol))
+        });
+        Some(super::ConsoleNotice::naming(refusal, service))
     }
 
     fn enumerate_sessions() -> Result<Vec<SessionCandidate>, String> {
@@ -2257,6 +2368,157 @@ mod platform {
         observe_bound_sid(identity, expected_sid)
     }
 
+    const LOCK_HELPER_TIMEOUT_MS: u32 = 5_000;
+    const LOCK_SCREEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn lock_session(session_id: u32, expected_sid: &str) -> Result<super::LockOutcome, String> {
+        let Some(candidate) = enumerate_sessions()?
+            .into_iter()
+            .find(|candidate| candidate.id == session_id)
+        else {
+            return Ok(super::LockOutcome::Elsewhere);
+        };
+        if candidate.user.is_empty() {
+            return Ok(super::LockOutcome::Elsewhere);
+        }
+        if candidate.state != SessionState::Active || !candidate.unlocked {
+            return Ok(super::LockOutcome::AlreadySecured);
+        }
+        let mut token = HANDLE::default();
+        // SAFETY: token is a valid out-param and the id came from WTS enumeration.
+        unsafe { WTSQueryUserToken(session_id, &mut token) }
+            .map_err(|error| format!("WTSQueryUserToken({session_id}): {error}"))?;
+        let token = own(token);
+        if !crate::auth::token_string_sid(raw(&token))?.eq_ignore_ascii_case(expected_sid) {
+            return Ok(super::LockOutcome::Elsewhere);
+        }
+        if let Err(error) = run_lock_helper(&token) {
+            tracing::warn!(
+                target: crate::logging::SESSION,
+                windows_session_id = session_id,
+                %error,
+                "the session lock helper failed"
+            );
+        }
+        let deadline = std::time::Instant::now() + LOCK_SCREEN_TIMEOUT;
+        loop {
+            if !query_session_unlocked(session_id)? {
+                return Ok(super::LockOutcome::Locked);
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // It would not lock: take it off the console instead. The desk then
+        // shows the sign-in screen, and the account's next sign-in, at the
+        // desk or through Arcen, reconnects the same session.
+        // SAFETY: plain WTS call on a session id from enumeration.
+        unsafe { WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, true) }
+            .map_err(|error| format!("WTSDisconnectSession({session_id}): {error}"))?;
+        Ok(super::LockOutcome::Disconnected)
+    }
+
+    pub fn still_unlocked_session_of(session_id: u32, expected_sid: &str) -> bool {
+        let Ok(sessions) = enumerate_sessions() else {
+            return false;
+        };
+        let active = sessions
+            .into_iter()
+            .find(|candidate| candidate.id == session_id)
+            .is_some_and(|candidate| is_active_resumable_candidate(&candidate));
+        if !active {
+            return false;
+        }
+        let mut token = HANDLE::default();
+        // SAFETY: token is a valid out-param and the id came from WTS enumeration.
+        if unsafe { WTSQueryUserToken(session_id, &mut token) }.is_err() {
+            return false;
+        }
+        let token = own(token);
+        crate::auth::token_string_sid(raw(&token))
+            .is_ok_and(|sid| sid.eq_ignore_ascii_case(expected_sid))
+    }
+
+    /// Starts `arcen-pier lock-session` as the session's user on its
+    /// interactive desktop and waits for it.
+    fn run_lock_helper(user_token: &OwnedHandle) -> Result<(), String> {
+        let mut primary = HANDLE::default();
+        // SAFETY: the user token is live; the output is a valid out-param.
+        unsafe {
+            DuplicateTokenEx(
+                raw(user_token),
+                TOKEN_ALL_ACCESS,
+                None,
+                SecurityIdentification,
+                TokenPrimary,
+                &mut primary,
+            )
+        }
+        .map_err(|error| format!("DuplicateTokenEx(lock helper): {error}"))?;
+        let primary = own(primary);
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("resolve the Pier executable: {error}"))?;
+        let executable = executable
+            .to_str()
+            .ok_or_else(|| "the Pier executable path is not valid UTF-8".to_string())?;
+        let executable_wide = wide(executable);
+        let mut command_wide = wide(&format!(
+            "{} lock-session",
+            quote_windows_argument(executable)
+        ));
+        let mut desktop = wide(r"winsta0\default");
+        let startup = windows::Win32::System::Threading::STARTUPINFOW {
+            cb: std::mem::size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop.as_mut_ptr()),
+            ..Default::default()
+        };
+        let mut process_info = PROCESS_INFORMATION::default();
+        // SAFETY: every buffer is NUL-terminated and outlives the call; no
+        // handle is inherited.
+        unsafe {
+            CreateProcessAsUserW(
+                raw(&primary),
+                PCWSTR(executable_wide.as_ptr()),
+                PWSTR(command_wide.as_mut_ptr()),
+                None,
+                None,
+                false,
+                CREATE_NO_WINDOW,
+                None,
+                PCWSTR::null(),
+                &startup,
+                &mut process_info,
+            )
+        }
+        .map_err(|error| format!("CreateProcessAsUserW(lock helper): {error}"))?;
+        let process = own(process_info.hProcess);
+        drop(own(process_info.hThread));
+        // SAFETY: the process handle is live.
+        if unsafe { WaitForSingleObject(raw(&process), LOCK_HELPER_TIMEOUT_MS) } != WAIT_OBJECT_0 {
+            // SAFETY: the handle is live; a helper that hangs must not linger.
+            unsafe {
+                let _ = TerminateProcess(raw(&process), 1);
+            }
+            return Err("the session lock helper timed out".to_string());
+        }
+        let mut code = 0u32;
+        // SAFETY: the handle is live and the out-parameter is valid.
+        unsafe { windows::Win32::System::Threading::GetExitCodeProcess(raw(&process), &mut code) }
+            .map_err(|error| format!("GetExitCodeProcess(lock helper): {error}"))?;
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(format!("the session lock helper exited with {code}"))
+        }
+    }
+
+    pub fn lock_workstation() -> Result<(), String> {
+        // SAFETY: no arguments; it only asks Windows to lock this session.
+        unsafe { windows::Win32::System::Shutdown::LockWorkStation() }
+            .map_err(|error| format!("LockWorkStation: {error}"))
+    }
+
     pub fn observe_resumable_bound_session(
         identity: &WindowsSessionIdentity,
         expected_sid: &str,
@@ -2493,6 +2755,21 @@ mod platform {
     ) -> Result<(), String> {
         Err("Windows WTS sessions are unavailable on this platform".to_string())
     }
+
+    pub fn lock_session(
+        _session_id: u32,
+        _expected_sid: &str,
+    ) -> Result<super::LockOutcome, String> {
+        Err("Windows WTS sessions are unavailable on this platform".to_string())
+    }
+
+    pub fn lock_workstation() -> Result<(), String> {
+        Err("LockWorkStation is only available on Windows".to_string())
+    }
+
+    pub fn still_unlocked_session_of(_session_id: u32, _expected_sid: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -2714,6 +2991,91 @@ mod tests {
             },
             relation,
         )
+    }
+
+    #[test]
+    fn a_refused_bind_names_who_holds_the_workstation() {
+        let logon_ui = cp_candidate(
+            1,
+            "",
+            SessionState::Active,
+            false,
+            Some(0),
+            AccountMatch::NoUser,
+        );
+        // Another account attached over RDP while the console waits at LogonUI.
+        let candidates = vec![
+            logon_ui.clone(),
+            cp_candidate(
+                3,
+                "editor",
+                SessionState::Active,
+                true,
+                Some(2),
+                AccountMatch::Other,
+            ),
+        ];
+        assert!(matches!(
+            classify_cp_bind(&candidates, 1),
+            CpBindDecision::Reject(_)
+        ));
+        assert_eq!(
+            console_refusal(&candidates, 1),
+            Some((ConsoleRefusal::OtherUserOtherProduct, Some(3)))
+        );
+        // The account's own desktop is in use through another product.
+        let candidates = vec![
+            logon_ui,
+            cp_candidate(
+                3,
+                "artist",
+                SessionState::Active,
+                true,
+                Some(2),
+                AccountMatch::Match,
+            ),
+        ];
+        assert_eq!(
+            console_refusal(&candidates, 1),
+            Some((ConsoleRefusal::InUseOtherProduct, Some(3)))
+        );
+        // Another account at the console itself.
+        let candidates = vec![cp_candidate(
+            1,
+            "editor",
+            SessionState::Active,
+            false,
+            Some(0),
+            AccountMatch::Other,
+        )];
+        assert_eq!(
+            classify_cp_bind(&candidates, 1),
+            CpBindDecision::Reject("another account is actively using the physical console")
+        );
+        assert_eq!(
+            console_refusal(&candidates, 1),
+            Some((ConsoleRefusal::OtherUser, None))
+        );
+        // A parked RDP session holds nothing: no typed refusal.
+        let candidates = vec![
+            cp_candidate(
+                1,
+                "",
+                SessionState::Disconnected,
+                false,
+                Some(0),
+                AccountMatch::NoUser,
+            ),
+            cp_candidate(
+                3,
+                "editor",
+                SessionState::Disconnected,
+                true,
+                Some(0),
+                AccountMatch::Other,
+            ),
+        ];
+        assert_eq!(console_refusal(&candidates, 1), None);
     }
 
     #[test]

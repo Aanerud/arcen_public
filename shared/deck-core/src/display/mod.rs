@@ -29,11 +29,12 @@ pub use metrics::{
 ///
 /// A 120 Hz virtual display doubles the pixel-clock budget — on a `HiDPI`
 /// Retina request that is the difference between a working session and
-/// `calculated 1116.72MHz pixel clock exceeds EDID 1.4 limits`. Hosts serve
-/// Auto and Speed at the refresh this reports
-/// (`arcen_media::video::resolve_session_frame_rate`), so it is also the
-/// Deck's frame-rate ceiling for both until the panel's own refresh is
-/// reported apart from the virtual display's.
+/// `calculated 1116.72MHz pixel clock exceeds EDID 1.4 limits`. It limits
+/// only the mode the host creates: the panel's own refresh is stated apart
+/// (`crate::connect_plan::deck_display_refresh`), and current hosts serve
+/// Auto and Speed at that (`arcen_media::video::resolve_session_frame_rate`),
+/// creating a faster head where they can. A host that predates the
+/// statement serves at most this.
 pub const PINNED_MAX_REFRESH_HZ: u32 = 60;
 
 /// The refresh a pinned session should request for a display running at

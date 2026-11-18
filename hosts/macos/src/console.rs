@@ -67,9 +67,10 @@ impl std::fmt::Display for ConsoleError {
                 waited,
             } => write!(
                 formatter,
-                "{authenticated} authenticated, but {console_owner} is still at the console after \
-                 {}s; switch the console to {authenticated} (log out, or use Fast User Switching) \
-                 and reconnect",
+                "{}: {authenticated} authenticated, but {console_owner} is still at the console \
+                 after {}s; switch the console to {authenticated} (log out, or use Fast User \
+                 Switching) and reconnect",
+                arcen_session::console_session::ConsoleRefusal::OtherUser.token(),
                 waited.as_secs()
             ),
         }
@@ -77,6 +78,26 @@ impl std::fmt::Display for ConsoleError {
 }
 
 impl std::error::Error for ConsoleError {}
+
+/// What a Deck that proved another account is told: the shared
+/// `console_other_user` code, then who holds this Mac's screen, so the
+/// person knows which account to sign in as. Said only after the password
+/// was proved; the login window lists the same accounts to anyone at the
+/// Mac.
+#[must_use]
+pub fn other_user_refusal(console_owner: Option<&str>) -> String {
+    let code = arcen_session::console_session::ConsoleRefusal::OtherUser.token();
+    match console_owner {
+        Some(owner) => format!(
+            "{code}: {owner} is signed in at this Mac; sign in as {owner}, or switch to your \
+             account at the Mac first"
+        ),
+        None => format!(
+            "{code}: another account is signed in at this Mac; sign in as that account, or \
+             switch to yours at the Mac first"
+        ),
+    }
+}
 
 /// Names macOS uses for "nobody is really logged in".
 ///
@@ -366,5 +387,26 @@ mod tests {
             Err(ConsoleError::NoConsoleUser) => {}
             Ok(owner) => panic!("this account should not own the console: {owner}"),
         }
+    }
+
+    #[test]
+    fn another_account_s_refusal_leads_with_the_shared_code_and_names_the_owner() {
+        let named = other_user_refusal(Some("alice"));
+        assert!(
+            named.starts_with("console_other_user: alice is signed in"),
+            "{named}"
+        );
+        let unnamed = other_user_refusal(None);
+        assert!(
+            unnamed.starts_with("console_other_user: another account"),
+            "{unnamed}"
+        );
+        let mismatch = ConsoleError::Mismatch {
+            authenticated: "bob".to_owned(),
+            console_owner: "alice".to_owned(),
+            waited: Duration::ZERO,
+        }
+        .to_string();
+        assert!(mismatch.starts_with("console_other_user: bob authenticated, but alice"));
     }
 }

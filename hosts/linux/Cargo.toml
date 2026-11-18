@@ -68,16 +68,6 @@ wayland-provider = ["dep:reis", "dep:xkbcommon-dl", "dep:xkeysym", "arcen-capenc
 # `video.lossless_refinement = "disabled"`, and engages only when the Deck
 # asks for it on an eligible session.
 lossless-refine = ["arcen-capenc/lossless-refine"]
-# Dormant source compatibility only. Release/package builds must not enable
-# this feature; shipped Pier binaries expose QUIC exclusively.
-wss-compat = [
-    "arcen-protocol/wss-compat",
-    "arcen-transport/wss-compat",
-    "dep:tokio-rustls",
-    "rustls/tls12",
-    "tokio-rustls/tls12",
-    "tokio-tungstenite/handshake",
-]
 
 [dependencies]
 arcen-audiocap = { path = "../audiocap" }
@@ -113,10 +103,9 @@ thiserror = "1"
 zeroize = "1"
 
 # Async runtime, QUIC TLS, transport-neutral message framing, and capenc
-# supervision. Tungstenite remains as an internal framing codec; its network
-# handshake and TLS features are enabled only by `wss-compat`.
+# supervision. Tungstenite remains only as the in-process message type and
+# framing codec of the QUIC session lanes, without its handshake or TLS.
 tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread", "sync", "time", "io-util", "process", "signal"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 tokio-tungstenite = { version = "0.24", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

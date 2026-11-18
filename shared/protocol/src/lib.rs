@@ -56,9 +56,6 @@ pub use wire::{
     USB_URB_SUBMIT_HEADER_SIZE, VIDEO_HEADER_SIZE, VIDEO_KEYFRAME_FLAG,
 };
 
-/// Canonical dormant secure-WebSocket compatibility capability.
-#[cfg(feature = "wss-compat")]
-pub const CAPABILITY_TRANSPORT_WSS: &str = "transport:wss-v1";
 /// Canonical transport capability: QUIC profile.
 pub const CAPABILITY_TRANSPORT_QUIC: &str = "transport:quic-v1";
 /// Preface a host writes first on the audio priority stream, so a client can
@@ -78,17 +75,7 @@ pub const MAX_TRANSPORT_CAPABILITIES: usize = 8;
 pub const MAX_TRANSPORT_CAPABILITY_ID_BYTES: usize = 64;
 
 fn is_known_transport_capability(capability: &str) -> bool {
-    if capability == CAPABILITY_TRANSPORT_QUIC {
-        return true;
-    }
-    #[cfg(feature = "wss-compat")]
-    {
-        capability == CAPABILITY_TRANSPORT_WSS
-    }
-    #[cfg(not(feature = "wss-compat"))]
-    {
-        false
-    }
+    capability == CAPABILITY_TRANSPORT_QUIC
 }
 
 /// Returns a bounded, de-duplicated view of known transport capabilities.
@@ -119,9 +106,8 @@ pub fn sanitize_transport_capabilities(capabilities: &[String]) -> Vec<&str> {
 /// Returns `Some(capability_id)` for the highest-priority common entry, or
 /// `None` when the lists are disjoint.
 ///
-/// Product builds negotiate only `"transport:quic-v1"`. The dormant
-/// `wss-compat` feature adds `"transport:wss-v1"` as a lower-priority option
-/// for explicit compatibility builds.
+/// Arcen negotiates only `"transport:quic-v1"` (ADR 0007); the retired
+/// `"transport:wss-v1"` is an unknown capability.
 ///
 /// # Example
 ///
@@ -143,12 +129,6 @@ pub fn negotiate_transport<'a>(
     {
         return Some(CAPABILITY_TRANSPORT_QUIC);
     }
-    #[cfg(feature = "wss-compat")]
-    if client_capabilities.contains(&CAPABILITY_TRANSPORT_WSS)
-        && host_capabilities.contains(&CAPABILITY_TRANSPORT_WSS)
-    {
-        return Some(CAPABILITY_TRANSPORT_WSS);
-    }
     None
 }
 
@@ -158,15 +138,6 @@ mod negotiate_tests {
 
     #[test]
     fn prefers_quic_when_both_support_it() {
-        #[cfg(feature = "wss-compat")]
-        assert_eq!(
-            negotiate_transport(
-                &[CAPABILITY_TRANSPORT_WSS, CAPABILITY_TRANSPORT_QUIC],
-                &[CAPABILITY_TRANSPORT_QUIC, CAPABILITY_TRANSPORT_WSS],
-            ),
-            Some(CAPABILITY_TRANSPORT_QUIC)
-        );
-        #[cfg(not(feature = "wss-compat"))]
         assert_eq!(
             negotiate_transport(&[CAPABILITY_TRANSPORT_QUIC], &[CAPABILITY_TRANSPORT_QUIC],),
             Some(CAPABILITY_TRANSPORT_QUIC)
@@ -174,59 +145,18 @@ mod negotiate_tests {
     }
 
     #[test]
-    #[cfg(feature = "wss-compat")]
-    fn falls_back_to_wss_when_client_has_no_quic() {
-        assert_eq!(
-            negotiate_transport(
-                &[CAPABILITY_TRANSPORT_WSS],
-                &[CAPABILITY_TRANSPORT_QUIC, CAPABILITY_TRANSPORT_WSS],
-            ),
-            Some(CAPABILITY_TRANSPORT_WSS)
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "wss-compat")]
-    fn returns_none_when_no_common_capability() {
-        assert_eq!(
-            negotiate_transport(&[CAPABILITY_TRANSPORT_QUIC], &[CAPABILITY_TRANSPORT_WSS]),
-            None
-        );
-    }
-
-    #[test]
     fn legacy_client_empty_list_returns_none() {
-        #[cfg(feature = "wss-compat")]
-        assert_eq!(
-            negotiate_transport(&[], &[CAPABILITY_TRANSPORT_WSS, CAPABILITY_TRANSPORT_QUIC]),
-            None
-        );
-        #[cfg(not(feature = "wss-compat"))]
         assert_eq!(negotiate_transport(&[], &[CAPABILITY_TRANSPORT_QUIC]), None);
     }
 
     #[test]
     fn sanitize_transport_capabilities_deduplicates_and_filters_unknown() {
-        #[cfg(feature = "wss-compat")]
-        let offered = vec![
-            CAPABILITY_TRANSPORT_WSS.to_string(),
-            "transport:unknown".to_string(),
-            CAPABILITY_TRANSPORT_WSS.to_string(),
-            CAPABILITY_TRANSPORT_QUIC.to_string(),
-        ];
-        #[cfg(not(feature = "wss-compat"))]
         let offered = vec![
             "transport:wss-v1".to_string(),
             "transport:unknown".to_string(),
             CAPABILITY_TRANSPORT_QUIC.to_string(),
             CAPABILITY_TRANSPORT_QUIC.to_string(),
         ];
-        #[cfg(feature = "wss-compat")]
-        assert_eq!(
-            sanitize_transport_capabilities(&offered),
-            vec![CAPABILITY_TRANSPORT_WSS, CAPABILITY_TRANSPORT_QUIC]
-        );
-        #[cfg(not(feature = "wss-compat"))]
         assert_eq!(
             sanitize_transport_capabilities(&offered),
             vec![CAPABILITY_TRANSPORT_QUIC]

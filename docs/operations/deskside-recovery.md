@@ -12,6 +12,14 @@ maintenance command as LocalSystem when the protected
 follow reparse points, or delete a failed journal before topology ownership is
 adjudicated. Hooks are process-owned and disappear with the authenticated agent.
 
+On macOS (`platform.desktop.deskside.enabled`) there is nothing to
+recover by hand: the desk's input filter and dark displays belong to the
+signed-in user's session helper, and the window server removes the filter and
+restores the displays' colour tables when that process exits. If a desk stays
+dark, end the helper (`launchctl kickstart -k gui/<uid>/pier.arcen.tech.agent`
+or sign out); `arcen-pier-macos probe-desk-privacy` run in that session shows
+whether any display still reads dark.
+
 On Linux, stop Pier and preserve `/run/arcen/deskside-recovery.json` with root
 ownership, mode 0600, and a mode-0700 `/run/arcen` parent. Restarting Pier
 replays the bounded xrandr/DPMS snapshot before listener readiness. Do not run

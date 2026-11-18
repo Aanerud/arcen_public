@@ -399,6 +399,20 @@ pub fn parse_fingerprint(value: &str) -> Result<Sha256Fingerprint, TlsTrustError
     Ok(out)
 }
 
+/// Why Security mode High refused `host`, the same words on every Deck.
+#[must_use]
+pub fn high_security_untrusted_issuer(host: &str) -> String {
+    format!(
+        "Security mode is High, which accepts a host only with a certificate \
+         issued by a certificate authority this computer trusts. {host} presented \
+         a certificate no trusted authority issued, such as the self-signed \
+         certificate every Arcen host makes for itself. Ask the host's \
+         administrator to install a certificate from a trusted authority, or set \
+         Security mode to Medium: Medium shows you the host's fingerprint to \
+         check the first time, then accepts only that certificate."
+    )
+}
+
 #[must_use]
 pub fn is_tofu_eligible_error(error: &RustlsError) -> bool {
     matches!(

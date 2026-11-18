@@ -391,10 +391,47 @@ pub fn is_xorg_bridge_ignore_conf(text: &str) -> bool {
 /// id, which a bridged device's string descriptors could imitate, and a later
 /// class's `Ignore` wins), then exactly this desktop's own bridge is
 /// re-admitted, with the xf86-input-wacom driver (libinput is told to ignore
-/// bridged nodes) and its pressure recalibration off
-/// ([`XORG_BRIDGE_PRESSURE_RECALIBRATION`]).
+/// bridged nodes), its pressure recalibration off
+/// ([`XORG_BRIDGE_PRESSURE_RECALIBRATION`]) and its position averaging off
+/// ([`XORG_BRIDGE_RAW_SAMPLE`]).
 #[must_use]
 pub fn xorg_session_bridge_class(display: u16) -> String {
+    render_session_bridge_class(
+        display,
+        &[
+            ("PressureRecalibration", XORG_BRIDGE_PRESSURE_RECALIBRATION),
+            ("RawSample", XORG_BRIDGE_RAW_SAMPLE),
+        ],
+    )
+}
+
+/// The bridge classes earlier Piers rendered, newest first: a desktop one
+/// of them started keeps confining bridged devices exactly as the current
+/// class does (same identifiers, tags, driver and `Ignore`), only its
+/// driver tuning differs, so another desktop's Native tablet must not be
+/// refused for it.
+fn earlier_session_bridge_classes(display: u16) -> [String; 2] {
+    [
+        // 0.19.x to 0.20.2: pressure recalibration off.
+        render_session_bridge_class(
+            display,
+            &[("PressureRecalibration", XORG_BRIDGE_PRESSURE_RECALIBRATION)],
+        ),
+        // Before 0.19.x: the driver's own tuning.
+        render_session_bridge_class(display, &[]),
+    ]
+}
+
+fn render_session_bridge_class(display: u16, options: &[(&str, &str)]) -> String {
+    let mut lines = String::new();
+    for (name, value) in options {
+        lines.push_str("    Option         \"");
+        lines.push_str(name);
+        lines.push_str("\" \"");
+        lines.push_str(value);
+        lines.push_str("\"\n");
+    }
+    let options = lines;
     format!(
         "Section \"InputClass\"\n    \
              Identifier     \"{XORG_SESSION_BRIDGE_IGNORE_CLASS}\"\n    \
@@ -406,8 +443,8 @@ pub fn xorg_session_bridge_class(display: u16) -> String {
              Identifier     \"{XORG_SESSION_BRIDGE_CLASS}\"\n    \
              MatchTag       \"{}\"\n    \
              Driver         \"wacom\"\n    \
-             Option         \"Ignore\" \"off\"\n    \
-             Option         \"PressureRecalibration\" \"{XORG_BRIDGE_PRESSURE_RECALIBRATION}\"\n\
+             Option         \"Ignore\" \"off\"\n\
+         {options}\
          EndSection\n",
         x11_session_tag(display)
     )
@@ -428,9 +465,25 @@ pub fn xorg_session_bridge_class(display: u16) -> String {
 /// (`wacom(4)`).
 pub const XORG_BRIDGE_PRESSURE_RECALIBRATION: &str = "off";
 
+/// xf86-input-wacom's `RawSample` for a bridged tablet: one sample, no
+/// averaging.
+///
+/// The driver moves the pointer to the average of the last `RawSample` raw
+/// positions (default 4, `wacom(4)`), which smooths a locally sampled
+/// tablet's few-millisecond reports. A bridged tablet's reports arrive one
+/// per network round trip, so the average spans several round trips and
+/// the X pointer and every application's ink trail the pen by about one
+/// and a half reports (ADR 0023: 64 ms behind at a 41.5 ms report interval,
+/// while the pen's own reports are current). With one sample the pointer
+/// is where the pen's latest report puts it. `Suppress` (the driver's
+/// default 2) only drops changes below two tablet units, which a sparse
+/// report stream never needs, and is kept.
+pub const XORG_BRIDGE_RAW_SAMPLE: &str = "1";
+
 /// The display whose bridge a rendered Xorg configuration re-admits: only
 /// when the configuration ends with exactly [`xorg_session_bridge_class`] for
-/// it, so no later class can re-admit a bridged device.
+/// it (or the class an earlier Pier rendered, which confines the same
+/// way), so no later class can re-admit a bridged device.
 #[must_use]
 pub fn admitted_bridge_display(config: &str) -> Option<u16> {
     let once = |identifier: &str| config.matches(&format!("\"{identifier}\"")).count() == 1;
@@ -438,8 +491,11 @@ pub fn admitted_bridge_display(config: &str) -> Option<u16> {
         return None;
     }
     let config = config.trim_end();
-    (1..=MAX_X11_DISPLAY)
-        .find(|display| config.ends_with(xorg_session_bridge_class(*display).trim_end()))
+    (1..=MAX_X11_DISPLAY).find(|display| {
+        std::iter::once(xorg_session_bridge_class(*display))
+            .chain(earlier_session_bridge_classes(*display))
+            .any(|class| config.ends_with(class.trim_end()))
+    })
 }
 
 /// What the adapter found about one running X server.
@@ -1058,8 +1114,17 @@ mod tests {
         // A pen sampled once per round trip often lands already in contact:
         // its contact pressure must not become the zero.
         assert!(class[own..].contains("Option         \"PressureRecalibration\" \"off\"\n"));
+        // Reports arrive one per round trip: averaging them makes ink trail.
+        assert!(class[own..].contains("Option         \"RawSample\" \"1\"\n"));
         let config = format!("Section \"ServerFlags\"\nEndSection\n\n{class}");
         assert_eq!(admitted_bridge_display(&config), Some(58));
+        // A desktop an earlier Pier started confines its bridge the same
+        // way, with older driver tuning: still recognised.
+        let earlier = config.replace("    Option         \"RawSample\" \"1\"\n", "");
+        assert_ne!(earlier, config);
+        assert_eq!(admitted_bridge_display(&earlier), Some(58));
+        let oldest = earlier.replace("    Option         \"PressureRecalibration\" \"off\"\n", "");
+        assert_eq!(admitted_bridge_display(&oldest), Some(58));
         // A class after them could re-admit a bridged device: not admitted.
         let followed = format!("{config}\nSection \"InputClass\"\nEndSection\n");
         assert_eq!(admitted_bridge_display(&followed), None);

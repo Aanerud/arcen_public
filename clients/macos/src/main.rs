@@ -19,10 +19,7 @@ use arcen_deck::transport::websocket::{
     connect_smoke, spawn_session, AuthSubmission, ConnectOptions, FullFrameRequestGate,
     SessionCommand, SessionCommandSender, SessionEvent, SessionHandle, StreamProfile,
 };
-use arcen_deck::ui::app::{
-    apply_automatic_remote_ui_scale_to_monitors, apply_automatic_remote_ui_scale_to_topology,
-    monitors_for_displays_mode, primary_presentation_size, DisplaysMode,
-};
+use arcen_deck::ui::app::{monitors_for_displays_mode, primary_presentation_size, DisplaysMode};
 use arcen_deck::ui::run_native_app;
 
 /// Extra `--help` usage lines contributed by developer-only tooling. Empty
@@ -393,10 +390,10 @@ async fn main() {
                 usage:\n\
                   arcen-client\n\
                   arcen-client --connect <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--codec h264|h265|av1] [--chroma yuv420|yuv444] [--video-selection exact|adaptive-performance|color-fidelity] [--bit-depth 8|10|12] [--color-range limited|full] [--color-matrix bt709|identity|bt601|bt2020ncl] [--transfer bt709|srgb|pq|hlg] [--color-primaries bt709|bt2020|display_p3] [--encode-intent interactive|quality] [--max-fps N] [--microphone]\n\
-                  arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK]\n\
-                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK]\n\
-                  arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--monitor-fixture PATH] [--hidpi-displays MASK] [--full-color-display ID] [--tablet-mode light|hard|off]\n\
-                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off] [--pen | --pen-full [--pen-wait-ms MS] [--pen-end-in-contact] | --pen-file PATH [--pen-go-file PATH]] [--text STRING]... [--keys SCRIPT | --keys-file PATH (quiet: tokens never printed) [--keyboard-shortcuts automatic|windows_app|swap_command_control|command_is_control] [--left-option-altgr]]... [--paste-file PATH [--paste-rate CHARS_PER_SECOND] [--paste-wait-ms MS] [--paste-click] [--paste-return]]\n\
+                  arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT]\n\
+                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT]\n\
+                  arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--monitor-fixture PATH] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT] [--full-color-display ID] [--tablet-mode light|hard|off]\n\
+                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off] [--pen | --pen-full [--pen-wait-ms MS] [--pen-end-in-contact] | --pen-file PATH [--pen-go-file PATH]] [--text STRING]... [--keys SCRIPT | --keys-file PATH (quiet: tokens never printed) [--keyboard-shortcuts automatic|windows_app|swap_command_control|command_is_control] [--left-option-altgr]]... [--paste-file PATH [--paste-rate CHARS_PER_SECOND] [--paste-wait-ms MS] [--paste-click] [--paste-return]] [--magnify SCALE]\n\
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
                   arcen-client multi-monitor-window-diagnostic [1|2|4] [--timeout-secs N]\n\
                   arcen-client platform-report\n\
@@ -530,8 +527,25 @@ async fn main() {
             click: args.iter().any(|arg| arg == "--paste-click"),
             return_after: args.iter().any(|arg| arg == "--paste-return"),
         });
-        if let Err(error) =
-            input_smoke(options, flag_values(&args, "--text"), pen, keys, paste).await
+        let magnify = flag_value(&args, "--magnify").map(|scale| {
+            scale
+                .parse::<f64>()
+                .ok()
+                .filter(|scale| scale.is_finite() && *scale > 0.0)
+                .unwrap_or_else(|| {
+                    eprintln!("--magnify: a positive scale, such as 2 or 0.5");
+                    std::process::exit(2);
+                })
+        });
+        if let Err(error) = input_smoke(
+            options,
+            flag_values(&args, "--text"),
+            pen,
+            keys,
+            paste,
+            magnify,
+        )
+        .await
         {
             eprintln!("input-smoke failed: {error}");
             shutdown_and_exit(1);
@@ -1120,6 +1134,9 @@ fn connect_options_from_parts_with_monitors(
             .map(|(monitor, _)| monitor.clone())
             .collect()
     });
+    // The displays' own refresh (a fixture's as written), before the
+    // requested modes are pinned; the picture is on the primary.
+    let display_refresh = arcen_deck_core::connect_plan::deck_display_refresh(&monitors, None);
     let displays_mode = displays_mode_from_args(args)?;
     // Smoke/quick-connect reproduces the shipped defaults: the notch-area
     // opt-in is a GUI setting, and HiDPI streaming is off unless the
@@ -1134,9 +1151,27 @@ fn connect_options_from_parts_with_monitors(
         })
         .transpose()?
         .unwrap_or(0);
+    // `--remote-ui-scale PCT` (100-400) asks for the GUI's fixed Remote UI
+    // scale instead of Automatic (`auto`, the default).
+    let remote_ui_scale = match flag_value(args, "--remote-ui-scale") {
+        None => arcen_deck_core::settings::RemoteUiScale::Automatic,
+        Some(value) if value.eq_ignore_ascii_case("auto") => {
+            arcen_deck_core::settings::RemoteUiScale::Automatic
+        }
+        Some(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|percent| (100..=400).contains(percent))
+            .map(arcen_deck_core::settings::RemoteUiScale::Percent)
+            .ok_or_else(|| format!("--remote-ui-scale expects auto or 100-400: {value}"))?,
+    };
     let presentation = primary_presentation_size(&monitors, false, hidpi_mask & 1 != 0);
     let mut selected_monitors = monitors_for_displays_mode(displays_mode, &monitors, presentation);
-    apply_automatic_remote_ui_scale_to_monitors(&mut selected_monitors, hidpi_mask);
+    arcen_deck_core::connect_plan::apply_remote_ui_scale(
+        &mut selected_monitors,
+        remote_ui_scale,
+        hidpi_mask,
+    );
     let multi_monitor_topology = (args.get(1).map(String::as_str) == Some("multi-monitor-smoke"))
         .then(|| {
             let mut topology = match fixture_displays.as_ref() {
@@ -1155,7 +1190,11 @@ fn connect_options_from_parts_with_monitors(
             if topology.monitors().len() < 2 {
                 return Err("multi-monitor-smoke requires at least two active displays".to_string());
             }
-            topology = apply_automatic_remote_ui_scale_to_topology(&topology, hidpi_mask);
+            topology = arcen_deck_core::connect_plan::apply_remote_ui_scale_to_requested_topology(
+                &topology,
+                remote_ui_scale,
+                hidpi_mask,
+            );
             let full_color_display_ids = match flag_value(args, "--full-color-display") {
                 Some(value) if value.eq_ignore_ascii_case("all") => topology
                     .monitors()
@@ -1212,6 +1251,7 @@ fn connect_options_from_parts_with_monitors(
         }
     };
     Ok(ConnectOptions {
+        display_refresh,
         services: arcen_deck::platform_services::services(),
         host,
         port,
@@ -1366,6 +1406,7 @@ async fn input_smoke(
     pen: Option<PenSmokeScript>,
     keys: KeysSmoke,
     paste: Option<PasteSmoke>,
+    magnify: Option<f64>,
 ) -> Result<(), String> {
     let hard_mode = options.tablet_mode_requested == TabletModeMsg::UsbTabletBridge;
     let mut text_capabilities = None;
@@ -1523,6 +1564,10 @@ async fn input_smoke(
         let hello = host_hello.ok_or_else(|| "no server hello".to_string())?;
         return keys_smoke(&mut session, &hello, &keys).await;
     }
+    if let Some(scale) = magnify {
+        let hello = host_hello.ok_or_else(|| "no server hello".to_string())?;
+        return magnify_smoke(&mut session, &hello, scale).await;
+    }
 
     let events = [
         serde_json::json!({"type":"mouse_move","x":0.5,"y":0.5,"server_x":-1,"server_y":-1,"sequence":1,"timestamp_ns":0,"coalescable":true}),
@@ -1544,6 +1589,49 @@ async fn input_smoke(
     tokio::time::sleep(Duration::from_millis(500)).await;
     close_smoke_session(&mut session).await;
     println!("input-smoke complete input_events=8 reset_events=1 keyboard=3 mouse=3 scroll=2");
+    Ok(())
+}
+
+/// Lab (`input-smoke --magnify SCALE`): a trackpad pinch to `scale` times
+/// the size, in ten steps (Began, Changed…, Ended), as the Deck window sends
+/// one to a host that advertised gestures.
+async fn magnify_smoke(
+    session: &mut SessionHandle,
+    hello: &ServerHelloMsg,
+    scale: f64,
+) -> Result<(), String> {
+    use arcen_deck::protocol::messages::ScrollPhaseMsg;
+    if !arcen_deck::protocol::messages::supports_gestures_v1(
+        hello.input_protocol_version,
+        hello.input_capabilities,
+    ) {
+        return Err("host did not advertise gestures".to_string());
+    }
+    const STEPS: u64 = 10;
+    let step = scale.powf(1.0 / STEPS as f64) - 1.0;
+    for sequence in 1..=STEPS {
+        let phase = match sequence {
+            1 => ScrollPhaseMsg::Began,
+            STEPS => ScrollPhaseMsg::Ended,
+            _ => ScrollPhaseMsg::Changed,
+        };
+        let sample = arcen_input::GestureSample::Magnify {
+            scale_delta: step,
+            phase,
+        };
+        let arcen_input::GestureWire::Magnify(message) = sample.wire(sequence, sequence) else {
+            return Err("a magnify sample is a magnify message".to_string());
+        };
+        let value = serde_json::to_value(&message).map_err(|error| error.to_string())?;
+        session
+            .commands
+            .send(SessionCommand::Json(value))
+            .map_err(|_| "session closed while sending a pinch".to_string())?;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    close_smoke_session(session).await;
+    println!("input-smoke complete magnify scale={scale} steps={STEPS} step_delta={step:.4}");
     Ok(())
 }
 
@@ -2665,6 +2753,16 @@ async fn media_smoke(
     }
     let result: Result<(), String> = async {
     let mut decoders = BTreeMap::<u16, NativeVideoDecoder>::new();
+    // The colour axes no packet header carries, from the hello, taught to
+    // every decoder as the product's media worker does: without them a PQ
+    // stream is decoded as BT.709 SDR (or refused by a decoder that checks
+    // the contract).
+    let mut session_color = arcen_deck_core::decode::SessionColor::default();
+    let decoder_for = |session_color| {
+        let mut decoder = NativeVideoDecoder::new();
+        decoder.set_session_color(session_color);
+        decoder
+    };
     let mut expected_monitor_ids = BTreeSet::<u16>::new();
     let mut expected_wire_profiles = BTreeMap::<
         u16,
@@ -2971,6 +3069,14 @@ async fn media_smoke(
                 return Err("server certificate requires interactive trust".to_string());
             }
             SessionEvent::ServerHello(hello) => {
+                if let Some(rate) = hello.stream_rate.as_ref() {
+                    println!(
+                        "stream rate fps={} display_refresh_hz={} basis={}",
+                        rate.fps,
+                        rate.display_refresh_hz.unwrap_or(0),
+                        rate.basis
+                    );
+                }
                 if exact_smoke {
                     println!(
                         "exact-offer {}",
@@ -3025,6 +3131,15 @@ async fn media_smoke(
                     Ok(None) => println!("host-build unavailable"),
                     Err(error) => return Err(format!("invalid host build identity: {error}")),
                 }
+                session_color = arcen_deck_core::decode::SessionColor::from_hello(&hello);
+                for decoder in decoders.values_mut() {
+                    decoder.set_session_color(session_color);
+                }
+                println!(
+                    "session-colour primaries={} transfer={}",
+                    session_color.primaries.token(),
+                    session_color.transfer.token()
+                );
                 server_supports_audio = hello.supports_audio;
                 server_supports_h265 = hello.supports_h265;
                 server_supports_av1 = hello.supports_av1;
@@ -3153,7 +3268,7 @@ async fn media_smoke(
                         ));
                     }
                     for monitor_id in &expected_monitor_ids {
-                        decoders.insert(*monitor_id, NativeVideoDecoder::new());
+                        decoders.insert(*monitor_id, decoder_for(session_color));
                     }
                     println!(
                         "multi-monitor applied monitors={} desktop={}x{} carrier={}",
@@ -3162,11 +3277,22 @@ async fn media_smoke(
                         applied.desktop_height_px(),
                         applied.selected_carrier()
                     );
+                    for monitor in applied.monitors() {
+                        println!(
+                            "multi-monitor monitor {} session_monitor={} {}x{} fps={} refresh_hz={}",
+                            monitor.client_display_id.as_str(),
+                            monitor.session_monitor_id,
+                            monitor.media_plan.width_px,
+                            monitor.media_plan.height_px,
+                            monitor.media_plan.fps,
+                            monitor.refresh_hz
+                        );
+                    }
                     if let Some(note) = layout_note {
                         println!("multi-monitor layout note: {note}");
                     }
                 } else {
-                    decoders.insert(0, NativeVideoDecoder::new());
+                    decoders.insert(0, decoder_for(session_color));
                 }
                 full_frame_requests.request();
                 let _ = full_frame_requests.send_due(&session.commands);
@@ -3374,7 +3500,7 @@ async fn media_smoke(
                     }
                     let decoder = decoders
                         .entry(monitor_id)
-                        .or_insert_with(NativeVideoDecoder::new);
+                        .or_insert_with(|| decoder_for(session_color));
                     let decoded = match decoder.decode(&header, &payload) {
                         Ok(decoded) => decoded,
                         Err(error) => {
@@ -4513,7 +4639,7 @@ mod tests {
             let options =
                 parse_with_monitors(&args, monitors.clone()).expect("parse pinned displays mode");
             let mut expected = vec![monitors[0].clone()];
-            apply_automatic_remote_ui_scale_to_monitors(&mut expected, 0);
+            arcen_deck::ui::app::apply_automatic_remote_ui_scale_to_monitors(&mut expected, 0);
 
             assert_eq!(options.displays_mode, mode);
             assert_eq!(options.monitors, expected);
@@ -4524,7 +4650,7 @@ mod tests {
 
         let options = parse_with_monitors(&args, monitors.clone()).expect("parse windowed mode");
         let mut expected = monitors;
-        apply_automatic_remote_ui_scale_to_monitors(&mut expected, 0);
+        arcen_deck::ui::app::apply_automatic_remote_ui_scale_to_monitors(&mut expected, 0);
 
         assert_eq!(options.displays_mode, "windowed");
         assert_eq!(options.monitors, expected);

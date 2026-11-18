@@ -131,6 +131,7 @@ mod input;
 mod ipc;
 mod keymap_watcher;
 mod latest;
+mod local_playback;
 #[cfg(windows)]
 mod log_maintenance;
 mod logging;
@@ -201,13 +202,9 @@ use std::time::Duration;
 use arcen_media::{BitDepth, ColorMatrix, ColorRange};
 use arcen_protocol::messages::{InitialVideoRequestMsg, VideoSelectionIntent};
 use arcen_protocol::{ChromaSubsampling, VideoCodec};
-#[cfg(feature = "wss-compat")]
-use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-#[cfg(feature = "wss-compat")]
-use tokio_tungstenite::accept_async_with_config;
-use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 #[cfg(windows)]
 use tokio_tungstenite::WebSocketStream;
 
@@ -224,21 +221,10 @@ const SOURCE_OFFER: &str =
     "Arcen is free software under the GNU AGPL-3.0. It comes with ABSOLUTELY NO WARRANTY. \
      You may redistribute it under the terms of that licence. If you run a modified version \
      that others connect to over a network, you must offer them its corresponding source.";
-#[cfg(feature = "wss-compat")]
-const TLS_VERSION_REQUIREMENT: &str = "TLS1.2 or TLS1.3";
-#[cfg(not(feature = "wss-compat"))]
 const TLS_VERSION_REQUIREMENT: &str = "TLS1.3";
 const TCP_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBSOCKET_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_INBOUND_CONTROL_MESSAGE: usize = 64 * 1024;
-const MAX_INBOUND_MESSAGE: usize = if MAX_INBOUND_CONTROL_MESSAGE
-    > arcen_protocol::CLIPBOARD_HEADER_SIZE + arcen_protocol::CHUNK_BYTES
-{
-    MAX_INBOUND_CONTROL_MESSAGE
-} else {
-    arcen_protocol::CLIPBOARD_HEADER_SIZE + arcen_protocol::CHUNK_BYTES
-};
 
 /// Process-local Windows Event Log lifecycle emitter.
 ///
@@ -396,15 +382,24 @@ pub struct HostConfig {
     /// one is configured. Without one, Auto and Speed follow the Deck
     /// display (`arcen_media::video::resolve_session_frame_rate`).
     pub fps_ceiling: Option<u32>,
-    /// The refresh of the Deck display this sign-in is sized for
-    /// (`AuthResponse::display_refresh_hz`).
+    /// The refresh of the Deck display the session's rate follows
+    /// (`AuthResponse::display_refresh_hz`: the fastest display of a
+    /// multi-monitor request, else the display that shows the stream).
     pub deck_display_refresh_hz: Option<u32>,
+    /// Each requested monitor's own Deck display refresh, by client display
+    /// id (`AuthResponse::monitor_display_refresh_hz`), the primary first;
+    /// empty without a multi-monitor request. Each monitor is served at its
+    /// own ([`Self::monitor_frame_rate`]).
+    pub deck_monitor_refresh_hz: Vec<(String, u32)>,
     /// The session's frame rate and what decided it, once the initial video
     /// request is resolved (the hello and `SESSION_STREAM_START`).
     pub frame_rate: Option<arcen_media::video::SessionFrameRate>,
     pub encoder: arcen_media::video::EncoderRequest,
     pub audio_enabled: bool,
     pub audio_compressed: bool,
+    /// `audio.local_playback`: whether the host's own speakers stay silent
+    /// for the session (`local_playback::LocalPlaybackLease`).
+    pub local_playback: arcen_session::pier_config::LocalPlayback,
     pub microphone_input_enabled: bool,
     pub clipboard_policy: arcen_media::clipboard::ClipboardPolicy,
     pub timezone_redirection: bool,
@@ -435,6 +430,39 @@ impl HostConfig {
 
     pub fn codec_name(&self) -> &'static str {
         codec_name(self.codec)
+    }
+
+    /// Reads each requested monitor's own Deck display refresh out of
+    /// `response` ([`Self::deck_monitor_refresh_hz`], the primary first).
+    pub(crate) fn set_deck_monitor_refresh(
+        &mut self,
+        response: &arcen_protocol::messages::AuthResponse,
+    ) {
+        self.deck_monitor_refresh_hz = response.monitor_display_refreshes();
+    }
+
+    /// The rate monitor `client_display_id` of a multi-monitor session is
+    /// served at: the session's (`session_fps`, the encoder's) lowered to
+    /// that monitor's own Deck display (`arcen_media::video::monitor_frame_rate`),
+    /// so a slow display never caps a fast one.
+    pub(crate) fn monitor_frame_rate(
+        &self,
+        client_display_id: &str,
+        session_fps: u32,
+    ) -> arcen_media::video::SessionFrameRate {
+        let session = arcen_media::video::served_stream_rate(
+            self.frame_rate,
+            session_fps,
+            arcen_media::video::FrameRateBasis::Encoder,
+        );
+        arcen_media::video::monitor_frame_rate(
+            session,
+            self.requested_pipeline,
+            self.deck_monitor_refresh_hz
+                .iter()
+                .find(|(id, _)| id == client_display_id)
+                .map(|(_, refresh)| *refresh),
+        )
     }
 
     pub fn chroma_name(&self) -> &'static str {
@@ -671,9 +699,6 @@ pub(crate) struct Args {
     config: HostConfig,
     /// Deprecated legacy alias for the QUIC UDP port.
     quic_port: Option<u16>,
-    /// Dormant compatibility listener, absent from product binaries.
-    #[cfg(feature = "wss-compat")]
-    wss_port: Option<u16>,
 }
 
 impl Args {
@@ -684,6 +709,8 @@ impl Args {
 
 enum MaintenanceCommand {
     Capenc,
+    /// Started by the broker in a departing Deck's session: lock it.
+    LockSession,
     RestoreDisplay {
         journal: Option<std::path::PathBuf>,
         console: bool,
@@ -778,6 +805,12 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
     let mut arguments = remaining.into_iter();
     match command.as_str() {
         "capenc" => Ok(Some(MaintenanceCommand::Capenc)),
+        "lock-session" => {
+            if arguments.next().is_some() {
+                return Err("lock-session accepts no arguments".to_string());
+            }
+            Ok(Some(MaintenanceCommand::LockSession))
+        }
         "restore-display" => {
             let mut journal = None;
             let mut console = false;
@@ -1518,6 +1551,7 @@ where
     let mut encoder = arcen_media::video::EncoderRequest::Auto;
     let mut audio_enabled = true;
     let mut audio_compressed = false;
+    let mut local_playback = arcen_session::pier_config::LocalPlayback::default();
     let mut microphone_input_enabled = false;
     let mut lossless_refinement = true;
     let mut clipboard_policy = arcen_media::clipboard::ClipboardPolicy::default();
@@ -1531,8 +1565,6 @@ where
     let mut output_selector = display::OutputSelector::GlobalIndex(0);
     let mut disclaimer_config = config::DisclaimerConfig::default();
     let mut quic_port: Option<u16> = None;
-    #[cfg(feature = "wss-compat")]
-    let mut wss_port: Option<u16> = None;
 
     if let Some(loaded) = loaded {
         config_path = Some(loaded.path);
@@ -1672,6 +1704,7 @@ where
         }
         audio_enabled = file.audio.enabled;
         audio_compressed = file.audio.compressed;
+        local_playback = file.audio.local_playback;
         microphone_input_enabled = file.microphone_input.enabled;
         lossless_refinement = arcen_session::pier_config::LosslessRefinementSetting::resolve(
             file.video.lossless_refinement,
@@ -1747,10 +1780,6 @@ where
                         .parse()
                         .map_err(|_| "bad --quic-port")?,
                 )
-            }
-            #[cfg(feature = "wss-compat")]
-            "--wss-port" => {
-                wss_port = Some(next("--wss-port")?.parse().map_err(|_| "bad --wss-port")?)
             }
             "--tls-cert" => tls_cert = next("--tls-cert")?,
             "--tls-key" => tls_key = next("--tls-key")?,
@@ -1894,10 +1923,6 @@ where
     if direct_quic_port == 0 {
         return Err("direct QUIC requires a nonzero UDP port".to_string());
     }
-    #[cfg(feature = "wss-compat")]
-    if wss_port == Some(direct_quic_port) {
-        return Err("dormant WSS compatibility cannot share the QUIC UDP port".to_string());
-    }
     if fps == 0 || fps > 240 {
         return Err("--fps must be between 1 and 240".to_string());
     }
@@ -2035,10 +2060,12 @@ where
         fps,
         fps_ceiling,
         deck_display_refresh_hz: None,
+        deck_monitor_refresh_hz: Vec::new(),
         frame_rate: None,
         encoder,
         audio_enabled,
         audio_compressed,
+        local_playback,
         microphone_input_enabled,
         clipboard_policy,
         timezone_redirection,
@@ -2082,8 +2109,6 @@ where
         disclaimer,
         config,
         quic_port,
-        #[cfg(feature = "wss-compat")]
-        wss_port,
     })
 }
 
@@ -2420,6 +2445,15 @@ fn main() {
             let args = std::iter::once(program).chain(raw).collect::<Vec<_>>();
             arcen_capenc::run_with_args(args);
             return;
+        }
+        Ok(Some(MaintenanceCommand::LockSession)) => {
+            std::process::exit(match windows_session::lock_workstation() {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            });
         }
         Ok(Some(MaintenanceCommand::SessionAgent {
             read_handle,
@@ -2847,7 +2881,9 @@ fn main() {
                 MaintenanceCommand::NvapiHeadlessProbe { .. } => unreachable!("handled above"),
                 #[cfg(windows)]
                 MaintenanceCommand::SupportBundle(_) => unreachable!("handled above"),
-                MaintenanceCommand::Capenc => unreachable!("handled above"),
+                MaintenanceCommand::Capenc | MaintenanceCommand::LockSession => {
+                    unreachable!("handled above")
+                }
             };
             let exit_code = match result {
                 Ok(()) => 0,
@@ -2921,140 +2957,6 @@ async fn console_shutdown() {
         Ok(()) => tracing::info!(target: NET, "shutdown signal received"),
         Err(error) => tracing::warn!(target: NET, %error, "shutdown signal failed"),
     }
-}
-
-#[cfg(feature = "wss-compat")]
-type CompatibilityListener = Option<TcpListener>;
-#[cfg(not(feature = "wss-compat"))]
-type CompatibilityListener = ();
-
-#[cfg(feature = "wss-compat")]
-async fn accept_compatibility(
-    listener: &CompatibilityListener,
-) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
-    match listener {
-        Some(listener) => listener.accept().await,
-        None => std::future::pending().await,
-    }
-}
-
-#[cfg(not(feature = "wss-compat"))]
-async fn accept_compatibility(
-    _listener: &CompatibilityListener,
-) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
-    std::future::pending().await
-}
-
-#[cfg(feature = "wss-compat")]
-#[allow(clippy::too_many_arguments)]
-fn spawn_compatibility_session(
-    stream: tokio::net::TcpStream,
-    peer: std::net::SocketAddr,
-    args: &Args,
-    tls_lifecycle: &Arc<tls::TlsLifecycle>,
-    agent_lease: &Arc<session::BrokerAgentLease>,
-    cp_coordinator: &Arc<cp_pipe::CpCoordinator>,
-    timezone_controller: &Arc<timezone::TimezoneController>,
-    emitter: &LifecycleEmitter,
-    resume_registry: &Arc<resume::ResumeRegistry>,
-    session_shutdown: &watch::Sender<bool>,
-    preauth_slots: &Arc<PreauthAdmission>,
-    sessions: &mut JoinSet<()>,
-) {
-    let acceptor = tls_lifecycle.acceptor();
-    let connection_tls = Arc::clone(tls_lifecycle);
-    let config = args.config.clone();
-    let disclaimer = args.disclaimer.clone();
-    let profile = agent_lease.current_profile();
-    let agent_lease = Arc::clone(agent_lease);
-    let cp_coordinator = Arc::clone(cp_coordinator);
-    let timezone_controller = Arc::clone(timezone_controller);
-    let emitter = emitter.clone();
-    let resume_registry = Arc::clone(resume_registry);
-    let session_shutdown = session_shutdown.subscribe();
-    let preauth_permit = match preauth_slots.try_enter(peer.ip()) {
-        Ok(place) => place,
-        Err(refusal) => {
-            tracing::warn!(
-                target: NET,
-                %peer,
-                capacity = arcen_session::session_admission::PREAUTH_CAPACITY,
-                reason = refusal.as_str(),
-                "rejecting dormant compatibility connection: {refusal}"
-            );
-            return;
-        }
-    };
-    let preauth_guard = auth::PreauthGuard::new(preauth_permit);
-    sessions.spawn(async move {
-        let _ = stream.set_nodelay(true);
-        tracing::info!(target: NET, %peer, "dormant WSS compatibility TCP accepted");
-        let tls_stream =
-            match tokio::time::timeout(TCP_TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
-            .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => {
-                tracing::warn!(target: NET, %peer, %error, "dormant compatibility TLS handshake failed");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    target: NET,
-                    %peer,
-                    "dormant compatibility TCP/TLS handshake timed out"
-                );
-                return;
-            }
-        };
-        let mut ws_config = WebSocketConfig::default();
-        ws_config.max_message_size = Some(MAX_INBOUND_MESSAGE);
-        ws_config.max_frame_size = Some(MAX_INBOUND_MESSAGE);
-        let websocket = match tokio::time::timeout(
-            WEBSOCKET_UPGRADE_TIMEOUT,
-            accept_async_with_config(tls_stream, Some(ws_config)),
-        )
-        .await
-        {
-            Ok(Ok(websocket)) => websocket,
-            Ok(Err(error)) => {
-                tracing::warn!(target: NET, %peer, %error, "dormant compatibility WebSocket handshake failed");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!(target: NET, %peer, "dormant compatibility WebSocket upgrade timed out");
-                return;
-            }
-        };
-        let host_identity = match connection_tls.host_identity() {
-            Ok(identity) => identity,
-            Err(error) => {
-                tracing::warn!(
-                    target: NET,
-                    %peer,
-                    reason_class = error.reason_class(),
-                    "stable TLS host identity unavailable after dormant compatibility handshake"
-                );
-                return;
-            }
-        };
-        session::run(
-            crate::resume::DirectSessionSocket::wss(websocket),
-            config,
-            disclaimer,
-            peer.to_string(),
-            preauth_guard,
-            agent_lease,
-            cp_coordinator,
-            timezone_controller,
-            profile,
-            emitter,
-            resume_registry,
-            host_identity,
-            session_shutdown,
-        )
-        .await;
-    });
 }
 
 #[derive(Default)]
@@ -3213,28 +3115,12 @@ where
         fps = args.config.fps,
         audio = args.config.audio_enabled,
         audio_compressed = args.config.audio_compressed,
+        local_playback = args.config.local_playback.token(),
         microphone_input = args.config.microphone_input_enabled,
         protocol = arcen_protocol::PROTOCOL_VERSION,
         "QUIC direct-session endpoint listening"
     );
 
-    #[cfg(feature = "wss-compat")]
-    let compatibility_listener = if let Some(wss_port) = args.wss_port {
-        let bind = format!("{}:{wss_port}", args.host);
-        let listener = TcpListener::bind(&bind)
-            .await
-            .map_err(|error| format!("bind dormant WSS compatibility {bind}: {error}"))?;
-        tracing::warn!(
-            target: NET,
-            %bind,
-            "dormant WSS compatibility listener enabled"
-        );
-        Some(listener)
-    } else {
-        None
-    };
-    #[cfg(not(feature = "wss-compat"))]
-    let compatibility_listener = ();
     let preauth_slots = Arc::new(PreauthAdmission::default());
     let agent_lease = Arc::new(session::BrokerAgentLease::new(
         args.profile,
@@ -3256,6 +3142,7 @@ where
     let mut tls_health_interval = tokio::time::interval(Duration::from_secs(60));
     tls_health_interval.tick().await;
     let topology_debug = WtsTopologyDebugWorker::default();
+    let _ = tokio::task::spawn_blocking(local_playback::recover_left_over).await;
     let mut console_display_recovery =
         console_recovery::ConsoleDisplayRecovery::new(recovery::default_path());
     console_display_recovery.request(arcen_outputs::display_lease::DisplayLeaseEvent::PierStarted);
@@ -3585,35 +3472,6 @@ where
                 }
                 continue;
             }
-            accepted = accept_compatibility(&compatibility_listener) => {
-                #[cfg(feature = "wss-compat")]
-                match accepted {
-                    Ok((stream, peer)) => spawn_compatibility_session(
-                        stream,
-                        peer,
-                        &args,
-                        &tls_lifecycle,
-                        &agent_lease,
-                        &cp_coordinator,
-                        &timezone_controller,
-                        &emitter,
-                        &resume_registry,
-                        &session_shutdown,
-                        &preauth_slots,
-                        &mut sessions,
-                    ),
-                    Err(error) => {
-                        tracing::warn!(
-                            target: NET,
-                            %error,
-                            "dormant WSS compatibility accept failed"
-                        );
-                    }
-                }
-                #[cfg(not(feature = "wss-compat"))]
-                let _ = accepted;
-                continue;
-            },
         }
     }
 
@@ -3916,18 +3774,6 @@ mod tests {
             arcen_media::clipboard::HARD_MAX_CLIPBOARD_BYTES + 1
         )
         .is_err());
-    }
-
-    #[test]
-    fn preauth_clipboard_frame_memory_is_bounded_for_sixteen_connections() {
-        assert_eq!(
-            MAX_INBOUND_MESSAGE,
-            arcen_protocol::CLIPBOARD_HEADER_SIZE + arcen_protocol::CHUNK_BYTES
-        );
-        assert_eq!(
-            arcen_session::session_admission::PREAUTH_CAPACITY * MAX_INBOUND_MESSAGE,
-            16 * (arcen_protocol::CHUNK_BYTES + arcen_protocol::CLIPBOARD_HEADER_SIZE)
-        );
     }
 
     #[test]

@@ -20,9 +20,13 @@ pub use runtime::{
 pub use sampler::{
     CallerQosSnapshot, HeartbeatCounters, HeartbeatSnapshot, QosCounters, QosSampler,
 };
+pub use session_health::monitor_rates::{
+    MONITOR_LIMITED_HOST_SHORTFALL, MonitorCounters, MonitorRateChange, MonitorRates,
+    log_monitor_rate_change,
+};
 pub use session_health::{
     ContentEvidence, HealthObservation, HostCounters, SessionHealth, health_state_message,
-    log_governed_frame_rate,
+    health_stats_with_path, log_governed_frame_rate,
 };
 pub use sink::{
     BoundedSink, DeliveryOutcome, Sink, SinkBuildError, SinkError, SinkLossClass, SinkLossDelta,

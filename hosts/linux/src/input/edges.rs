@@ -56,6 +56,13 @@ pub fn plan_key_edges(
     edges
 }
 
+/// Whether `held` contains either Control key (evdev `KEY_LEFTCTRL` 29,
+/// `KEY_RIGHTCTRL` 97).
+#[must_use]
+pub fn control_held(held: &HashSet<u16>) -> bool {
+    held.contains(&29) || held.contains(&97)
+}
+
 /// The Shift, Ctrl, Alt and Meta edges that make `held` agree with a
 /// compact wire modifier mask.
 pub fn plan_modifier_edges(held: &mut HashSet<u16>, modifiers: u32) -> Vec<(u16, bool)> {

@@ -12,6 +12,8 @@ pub mod client;
 pub(crate) mod console;
 #[cfg(target_os = "linux")]
 pub(crate) mod console_layout;
+#[cfg(target_os = "linux")]
+pub(crate) mod console_windows;
 pub mod handshake;
 pub mod identity;
 pub mod launcher;
@@ -19,6 +21,8 @@ pub mod lifecycle;
 pub mod locale;
 #[cfg(target_os = "linux")]
 pub mod login_env;
+#[cfg(target_os = "linux")]
+pub mod login_keyring;
 #[cfg(target_os = "linux")]
 pub mod login_session;
 #[cfg(all(target_os = "linux", feature = "wayland-provider"))]

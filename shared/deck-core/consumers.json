@@ -29,6 +29,7 @@
         "display",
         "display_fit",
         "input",
+        "installed_copies",
         "keymap",
         "logging",
         "microphone",

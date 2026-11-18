@@ -700,15 +700,17 @@ pub fn atomic_write_json_with_hook(
         ))
     })?;
 
+    // A symbolic link in the configuration's place is refused on every OS
+    // (std reads links on Windows too); only the mode bits below are Unix's.
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(ClientConfigError::Invalid(
+            "refusing to replace a symbolic-link configuration file",
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(ClientConfigError::Invalid(
-                    "refusing to replace a symbolic-link configuration file",
-                ));
-            }
             Ok(metadata) => metadata.permissions().mode(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0o600,
             Err(error) => return Err(error.into()),

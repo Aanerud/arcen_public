@@ -848,6 +848,7 @@ mod lab {
         }
         let monitors = services.displays();
         let options = ConnectOptions {
+            display_refresh: None,
             host,
             port,
             use_tls: true,

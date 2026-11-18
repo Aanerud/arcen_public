@@ -154,7 +154,6 @@ in [`docs/architecture/platform-differences.md`](docs/architecture/platform-diff
 
 | Path | Is |
 | --- | --- |
-| `session-probe/` | A Python Deck stand-in that completes a full session handshake and reports whether frames arrive. |
 | `region-patch-benchmark/` | A research-only Rust harness for region patch framing; a workspace member for CI, never in a product. |
 
 ### `support/` — local only

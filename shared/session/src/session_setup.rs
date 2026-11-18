@@ -30,6 +30,12 @@ pub const VIDEO_REQUEST_REFUSED: &str = "video_request_refused";
 /// Code leading a refused multi-monitor request.
 pub const MULTI_MONITOR_REFUSED: &str = "multi_monitor_refused";
 
+/// What the Deck is told, as a close reason, when the host's display capture
+/// or encoder did not start for a session it had already accepted (a Pier
+/// that starts capture only after `auth_result`). Led by its code.
+pub const DECK_REASON_CAPTURE_START_FAILED: &str =
+    "capture_start_failed: the host could not start capturing or encoding its display.";
+
 /// How Piers before this module worded a refused video request (an
 /// unsuccessful `auth_result` without `session_setup_failed`). A Deck still
 /// recognises it, so a newer Deck words an older Pier's refusal correctly.
@@ -125,6 +131,14 @@ impl Display for SetupRefusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_capture_close_reason_fits_a_close_frame() {
+        // A close frame carries 123 bytes of reason; a longer one is a
+        // protocol error at the Deck instead of an explanation.
+        assert!(DECK_REASON_CAPTURE_START_FAILED.len() <= 123);
+        assert!(DECK_REASON_CAPTURE_START_FAILED.starts_with("capture_start_failed: "));
+    }
 
     #[test]
     fn a_refusal_leads_with_its_code_and_reads_back() {

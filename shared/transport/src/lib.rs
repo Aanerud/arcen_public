@@ -5,8 +5,7 @@
 //! This crate defines a product-neutral transport contract (payload caps,
 //! authenticated admission, reliability classes, bounded queues, metadata-first
 //! receive, and lifecycle events). The optional `quic` feature adds the
-//! concrete Quinn adapter. Dormant secure-WebSocket compatibility policy is
-//! available only through the explicit `wss-compat` feature.
+//! concrete Quinn adapter. QUIC is the only transport profile (ADR 0007).
 //!
 //! No adaptive forward error correction is implemented or claimed anywhere in
 //! this crate. See [`FecPolicy`].
@@ -18,8 +17,6 @@ pub mod cert_marker;
 pub mod cert_provisioning;
 pub mod cert_store;
 pub mod cert_transaction;
-#[cfg(feature = "wss-compat")]
-pub mod fallback;
 pub mod host_material;
 pub mod lanes;
 pub mod liveness;
@@ -52,9 +49,6 @@ use std::fmt::{Display, Formatter};
 pub const MAX_NEGOTIATED_CAPABILITIES: usize = 64;
 /// Maximum bytes in one capability or peer identity.
 pub const MAX_TRANSPORT_IDENTITY_BYTES: usize = 512;
-/// Capability identifying the dormant secure-WebSocket compatibility profile.
-#[cfg(feature = "wss-compat")]
-pub const CAPABILITY_TRANSPORT_WSS: &str = "transport:wss-v1";
 /// Capability identifying the concrete QUIC profile.
 pub const CAPABILITY_TRANSPORT_QUIC: &str = "transport:quic-v1";
 /// Capability identifying ordered reliable-stream delivery.
@@ -103,9 +97,6 @@ pub const LOG_FIELD_DATAGRAMS_ACTIVE: &str = "datagrams_active";
 /// Transport profile availability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransportProfile {
-    /// Dormant secure-WebSocket compatibility profile.
-    #[cfg(feature = "wss-compat")]
-    WebSocketSecure,
     /// Standard QUIC reliable streams plus encrypted datagrams.
     Quic,
 }
@@ -137,7 +128,7 @@ pub enum ReliabilityClass {
 /// Delivery mechanism selected by a concrete adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryMechanism {
-    /// Ordered reliable stream, used by WSS and QUIC persistent streams.
+    /// Ordered reliable stream (QUIC persistent streams).
     ReliableStream,
     /// Encrypted QUIC datagram (RFC 9221), available only for `MediaLowLatency`.
     #[cfg(feature = "quic")]
@@ -210,12 +201,12 @@ pub fn reliability_class_for_frame_byte(frame_type_byte: u8) -> ReliabilityClass
 ///
 /// Routing table:
 ///
-/// | Class                | Profile::Quic + datagrams | Profile::Quic no datagrams | WSS |
-/// |----------------------|---------------------------|----------------------------|-----|
-/// | `Control`            | `ReliableStream`          | `ReliableStream`           | `ReliableStream` |
-/// | `MediaReliable`      | `ReliableStream`          | `ReliableStream`           | `ReliableStream` |
-/// | `MediaLowLatency`    | `EncryptedDatagram`       | `ReliableStream`           | `ReliableStream` |
-/// | `InputLowLatency`    | `ReliableStream`          | `ReliableStream`           | `ReliableStream` |
+/// | Class                | Profile::Quic + datagrams | Profile::Quic no datagrams |
+/// |----------------------|---------------------------|----------------------------|
+/// | `Control`            | `ReliableStream`          | `ReliableStream`           |
+/// | `MediaReliable`      | `ReliableStream`          | `ReliableStream`           |
+/// | `MediaLowLatency`    | `EncryptedDatagram`       | `ReliableStream`           |
+/// | `InputLowLatency`    | `ReliableStream`          | `ReliableStream`           |
 #[must_use]
 pub fn delivery_mechanism_for(
     reliability_class: ReliabilityClass,
@@ -373,9 +364,6 @@ impl DirectResumeTransportBinding {
     }
 }
 
-/// Backward-compatible alias for the former WSS-specific binding name.
-pub type DirectWssResumeBinding = DirectResumeTransportBinding;
-
 /// One negotiated capability identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapabilityId(String);
@@ -472,10 +460,6 @@ pub fn select_transport_profile(
     if shared(TransportProfile::Quic) {
         return Ok(TransportProfile::Quic);
     }
-    #[cfg(feature = "wss-compat")]
-    if shared(TransportProfile::WebSocketSecure) {
-        return Ok(TransportProfile::WebSocketSecure);
-    }
     Err(TransportContractError::TransportProfileMismatch)
 }
 
@@ -491,8 +475,6 @@ pub fn validate_negotiated_capabilities(
     required: &NegotiatedCapabilities,
 ) -> Result<(), TransportContractError> {
     let profile_capability = match profile {
-        #[cfg(feature = "wss-compat")]
-        TransportProfile::WebSocketSecure => CAPABILITY_TRANSPORT_WSS,
         TransportProfile::Quic => CAPABILITY_TRANSPORT_QUIC,
     };
     if !negotiated.contains_name(profile_capability)
@@ -1169,17 +1151,6 @@ pub enum TransportEvent {
     /// drops silently, but best-effort datagrams may under pressure.
     #[cfg(feature = "quic")]
     DatagramDropped(quic::DatagramDropReason),
-    /// The transport circuit breaker changed the active fallback mode.
-    ///
-    /// Hosts and clients should log this event with [`LOG_FIELD_TRANSPORT_MODE_PREV`]
-    /// and [`LOG_FIELD_TRANSPORT_MODE`] for operational visibility.
-    #[cfg(feature = "wss-compat")]
-    FallbackModeChanged {
-        /// Mode before the transition.
-        from: fallback::FallbackMode,
-        /// Mode after the transition.
-        to: fallback::FallbackMode,
-    },
 }
 
 /// Synchronous adapter boundary for compatibility transports.
@@ -1277,39 +1248,6 @@ pub fn receive_bounded<P: TransportPeer>(
         metadata: accepted.metadata,
         payload,
     }))
-}
-
-/// Maps a dormant compatibility [`fallback::FallbackMode`] to the string value used for the
-/// [`LOG_FIELD_TRANSPORT_MODE`] structured-logging field.
-///
-/// | Mode                     | Label              |
-/// |--------------------------|--------------------|
-/// | `QuicWithDatagrams`      | `"quic_datagrams"` |
-/// | `QuicStreamsOnly`         | `"quic_streams"`   |
-/// | `WebSocketSecure`        | `"wss"`            |
-#[must_use]
-#[cfg(feature = "wss-compat")]
-pub fn transport_mode_label(mode: fallback::FallbackMode) -> &'static str {
-    match mode {
-        fallback::FallbackMode::QuicWithDatagrams => "quic_datagrams",
-        fallback::FallbackMode::QuicStreamsOnly => "quic_streams",
-        fallback::FallbackMode::WebSocketSecure => "wss",
-    }
-}
-
-/// Maps a [`fallback::FailureKind`] to the string value used for the
-/// [`LOG_FIELD_FAILURE_KIND`] structured-logging field.
-#[must_use]
-#[cfg(feature = "wss-compat")]
-pub fn failure_kind_label(kind: fallback::FailureKind) -> &'static str {
-    match kind {
-        fallback::FailureKind::QuicHandshake => "quic_handshake",
-        fallback::FailureKind::PacketTimeout => "packet_timeout",
-        fallback::FailureKind::SustainedLoss => "sustained_loss",
-        fallback::FailureKind::DatagramDrop => "datagram_drop",
-        fallback::FailureKind::ConnectionClosed => "connection_closed",
-        fallback::FailureKind::PathChange => "path_change",
-    }
 }
 
 /// Maps a [`quic::DatagramDropReason`] to the string value used for the
@@ -1440,31 +1378,6 @@ mod routing_tests {
             reliability_class_for_frame_byte(0xFF),
             ReliabilityClass::Control
         );
-    }
-
-    #[test]
-    #[cfg(feature = "wss-compat")]
-    fn wss_always_delivers_via_stream() {
-        for class in [
-            ReliabilityClass::Control,
-            ReliabilityClass::MediaReliable,
-            ReliabilityClass::MediaLowLatency,
-            ReliabilityClass::InputLowLatency,
-        ] {
-            assert_eq!(
-                delivery_mechanism_for(
-                    class,
-                    TransportProfile::WebSocketSecure,
-                    true,
-                    1,
-                    1024,
-                    Some(1200),
-                    0
-                ),
-                DeliveryMechanism::ReliableStream,
-                "WSS class {class:?} must always use ReliableStream"
-            );
-        }
     }
 
     #[cfg(feature = "quic")]
@@ -1936,22 +1849,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "quic", feature = "wss-compat"))]
-    fn datagrams_are_rejected_outside_quic_profile() {
-        let policy = BoundedTransportPolicy::default();
-        let datagram = envelope_for(
-            ReliabilityClass::MediaLowLatency,
-            DeliveryMechanism::EncryptedDatagram,
-            1,
-        );
-        assert_eq!(
-            policy.validate(TransportProfile::WebSocketSecure, &datagram),
-            Err(TransportContractError::DeliveryNotAvailableForProfile)
-        );
-        assert_eq!(policy.validate(TransportProfile::Quic, &datagram), Ok(()));
-    }
-
-    #[test]
     #[cfg(feature = "quic")]
     fn datagrams_are_rejected_for_non_low_latency_classes() {
         let policy = BoundedTransportPolicy::default();
@@ -1979,11 +1876,6 @@ mod tests {
             ReliabilityClass::InputLowLatency,
         ] {
             let stream_envelope = envelope_for(class, DeliveryMechanism::ReliableStream, 1);
-            #[cfg(feature = "wss-compat")]
-            assert_eq!(
-                policy.validate(TransportProfile::WebSocketSecure, &stream_envelope),
-                Ok(())
-            );
             assert_eq!(
                 policy.validate(TransportProfile::Quic, &stream_envelope),
                 Ok(())

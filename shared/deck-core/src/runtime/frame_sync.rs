@@ -288,16 +288,26 @@ mod tests {
         };
         let mut sync = FrameSync::<()>::new(config);
         let now = Instant::now();
-        for index in 0..5u32 {
+        // Enough frames for stream 1 to pace the playout delay.
+        let pacing = u32::try_from(arcen_media::timeline::DEFAULT_MIN_PACING_FRAMES).expect("few");
+        for index in 0..pacing {
             sync.admit(id(1), frame(index), now, index + 500);
         }
         let mut early = Vec::new();
-        for index in 0..8u32 {
-            let (_, overflow) = sync.admit(id(2), frame(index), now, index + 10);
+        let mut first_held = None;
+        for index in 0..pacing + 8 {
+            let (published, overflow) = sync.admit(id(2), frame(index), now, index + 10);
+            if published.is_none() {
+                first_held.get_or_insert(index);
+            }
             early.extend(overflow.map(|held| held.frame.timestamp_ms));
         }
         assert!(!early.is_empty());
-        assert_eq!(early[0], 0, "the oldest held frame goes first");
+        assert_eq!(
+            Some(early[0]),
+            first_held,
+            "the oldest held frame goes first"
+        );
         assert!(
             sync.held
                 .iter()

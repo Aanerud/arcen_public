@@ -15,6 +15,7 @@
 
 pub mod build;
 pub mod folders;
+pub mod installed_copies;
 pub mod netinfo;
 pub mod password_file;
 pub mod pen;

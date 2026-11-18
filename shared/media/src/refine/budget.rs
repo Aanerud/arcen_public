@@ -929,7 +929,9 @@ mod tests {
             "refinement never probed: {:?}",
             run.holds
         );
-        assert!(run.deferrals > 0);
+        // The still video sends next to nothing, so its controller leaves
+        // the queue to refinement without even deferring.
+        assert_eq!(run.deferrals, 0);
         let mean_mbps = run.refine_bits / 40.0 / 1e6;
         assert!(mean_mbps > 3.0, "refinement averaged {mean_mbps:.1} Mbit/s");
     }

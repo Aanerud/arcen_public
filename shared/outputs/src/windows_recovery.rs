@@ -639,6 +639,10 @@ mod tests {
             )
             .expect("logical rect"),
             scale: arcen_media::Scale120::new(120).expect("scale"),
+            ui_scale: crate::ui_scale::WindowsUiScale::from_percent(
+                100,
+                crate::ui_scale::ScaleBasis::Unknown,
+            ),
             refresh_hz: 60,
             rotation: Rotation::Degrees0,
             primary,

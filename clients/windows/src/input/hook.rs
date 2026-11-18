@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! The low-level keyboard hook (`WH_KEYBOARD_LL`), installed only while a
-//! session window has focus.
+//! session window has focus, and taking a press only while that window is
+//! the foreground window.
 //!
 //! The shared [`HookRouter`] decides each edge: the Deck's own chords are
 //! always taken (Windows would act on Ctrl+Windows chords otherwise); with
-//! the keyboard grab on, the session also takes the system shortcuts
-//! (Windows key, Alt+Tab, Ctrl+Esc, Print Screen). A taken key is posted to
+//! the keyboard grab on (by default whenever a session window has focus,
+//! `KeyboardGrab::Always`), the session also takes the system shortcuts
+//! (Windows key, Alt+Tab, Alt+Esc, Ctrl+Esc, Print Screen). A taken key is posted to
 //! the session window as [`WM_HOOK_KEY`] and never reaches the system; a
 //! release always goes where its press went. Windows+L and Ctrl+Alt+Del
 //! cannot be taken, by design of Windows.
@@ -26,8 +28,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, PostMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP,
+    CallNextHookEx, GetForegroundWindow, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, PostMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP,
 };
 
 /// A key the hook took, posted to the session window: `wParam` is the
@@ -170,6 +172,13 @@ fn take(event: &KBDLLHOOKSTRUCT) -> bool {
         let (scan, extended) =
             super::keyboard::key_position(vk, event.scanCode, flags & LLKHF_EXTENDED != 0);
         let key = state.reader.read(vk, scan, extended, pressed);
+        // The hook is global: a press is the session's only while its window
+        // is in front. Focus may already be elsewhere before the window
+        // hears of it (and removes the hook); such a key is never taken.
+        // SAFETY: no arguments; returns a handle or null.
+        if pressed && unsafe { GetForegroundWindow() } != state.hwnd {
+            return false;
+        }
         let route = state.router.route(key, pressed, state.grabbed);
         if route == HookRoute::System {
             return false;

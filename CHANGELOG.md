@@ -180,6 +180,451 @@ Windows Pier is unchanged.
   window was read as the main window losing focus. Only the main window's
   own focus counts now.
 
+### Re-issued 2026-11-18 evening
+
+Every 0.20.2 download (both Decks, the USB component and every Pier) was
+re-issued on the evening of 18 November 2026 with these changes.
+
+#### Changed
+
+- **Video bitrate no longer collapses on a path whose round trip drifts.**
+  On the lab VPN the RTT climbs 2–3 ms a second for 15–20 s and falls back
+  (15–30 ms above its minimum, with no load), and every Pier's rate
+  controller read that as queueing: on the lab host, with that sawtooth
+  emulated on the Pier's flow, an idle Auto stream was cut from 5.9 to
+  1.2 Mbit/s five times in 90 s. The controller's baseline now follows a
+  slow RTT slope (at most 4 ms/s, never a level, never while lossy, queued
+  or while the stream's own load grows), and a stream that sends under a
+  tenth of its target does not answer a queue it cannot be causing; the
+  first interval that sends into it is cut at once. Real congestion is cut
+  exactly as fast as before. Pier logs state the judged and the path's
+  queue delay (`queue_delay_ms`, `path_queue_delay_ms`, `idle_queue`).
+  Every Pier now tells the controller whether encoded video still waits (a
+  queued frame or a write the path holds up), so a quiet second is judged
+  idle on the Windows and macOS Piers too, and a writer stuck behind the
+  path is never mistaken for an idle stream on any Pier. The Windows Pier's
+  refinement now also waits while video is queued, as on the other Piers.
+  The macOS Pier's relay now reports the video frames it has released to
+  the session, as the Windows broker does, and no longer spins when the
+  session's side audio channel is closed (it starved the relay's path
+  reports).
+- **The frame-rate governor now sees a slow encoder in a serial capture
+  loop.** Software H.264 over XShm, and every loop that grabs between its own
+  encodes, delivered no more frames than it encoded, so the governor held 30
+  fps while about 8 were encoded. Each Pier now counts what the source
+  produced while the loop was away (NvFBC `capture_behind`; Desktop
+  Duplication's accumulated presents and Windows.Graphics.Capture's
+  superseded frames as `capture_behind`), and the Xorg software loop states
+  its pacing (`ticks_due`, `fresh_frames`, `fps_limiter`). The software
+  contract's 30 fps is now governed too (it is OpenH264's ceiling, not a
+  promise); Grading and HDR keep their fixed 30.
+- **An Auto multi-monitor roster past H.264's picture ceiling uses a codec
+  that fits.** NVENC encodes H.264 at most 4096 px a side; the shared plan
+  now knows it, Auto rosters drop H.264 for a larger monitor and climb to
+  HEVC, then AV1, when the Deck decodes them, and an exact H.264 request on
+  a 5120 px monitor is refused by name before any encoder is probed.
+- **A Linux console takes Match My Layout beyond 8192 pixels** (two 5K
+  monitors side by side): each console monitor is its own stream, so only
+  the console X server's own maximum (`xrandr`'s screen maximum, proved
+  before anything changes) bounds the layout; a layout beyond it is refused
+  `console_screen_too_large`. A dedicated Xorg desktop keeps 8192.
+- **The Linux Pier no longer runs `nvidia-settings` as root against a
+  joined console's X server.** It changes the console's MetaMode over
+  NV-CONTROL itself, on the X connection whose authority file and server it
+  has already proved, with every reply parsed and bounded. The single-display
+  resize of a dedicated Xorg desktop now does the same, so no Pier path runs
+  `nvidia-settings` any more; the root Pier's X connections also no longer
+  wait on a display socket that accepts nothing.
+- **Applications on a Linux desktop keep the user's GPU and driver choices**
+  from their login shell (`__NV_PRIME_RENDER_OFFLOAD`, `__GLX_VENDOR_LIBRARY_NAME`,
+  `MESA_*`, `DRI_PRIME`, …): the session bus, the activation environment and
+  autostart programs get them; only the compositor (and its Xwayland) starts
+  without them, as before.
+- **A bridged tablet's pen on an Xorg desktop is no longer averaged**
+  (`RawSample` 1): the X pointer and the ink are at the pen's latest report,
+  not about one and a half reports behind.
+- **A Windows Pier locks the session when the Deck leaves.** Arcen joins
+  the user's session and never ends it; until now a Windows Pier also left
+  it unlocked at the desk when the Deck disconnected. It now restores the
+  displays, then locks the session (as the user, `LockWorkStation`; a
+  session that will not lock is disconnected from the console, so the desk
+  shows the sign-in screen), then gives the desk its sound back. A sign-in
+  of the same account that takes the session over, or a session that
+  changed at the desk, is not locked. While a Deck's session is held for its
+  resume it stays unlocked for now (GAP-044).
+- **A Windows host's own speakers are muted during a session**
+  (`audio.local_playback`, default `muted`, as on Linux and macOS): every
+  output device is muted for the whole session, detached time included,
+  while the Deck still hears everything; only the devices Arcen muted are
+  unmuted afterwards, also after a stopped service. A host that cannot prove
+  its speakers silent refuses the session. Set `"local_playback":
+  "audible"` to keep them playing.
+- **A Windows Pier's console refusals lead with the shared codes**
+  (`console_other_user`, `console_other_user_other_product`,
+  `console_in_use_other_product`), and name another remote-desktop service
+  that holds the workstation by its WinStation listener and protocol (for
+  example `RDP-Tcp, rdp`). A returning Deck whose session changed at the
+  desk is told `console_session_changed`. Another user's sign-in while a
+  session waits for its Deck's resume is told so in the Linux Pier's words.
+- **A macOS Pier locks the session when the Deck leaves** (ADR 0025), as the
+  Linux and Windows Piers do: the system's own Lock Screen, read back before
+  the session's displays and sound are given back. A console another account
+  took over meanwhile is left alone; the login window is never locked. A
+  Deck that comes back signs in at the streamed lock screen.
+- **A macOS Pier keeps the Mac awake while it serves** (an IOKit
+  `PreventUserIdleSystemSleep` assertion for the session) and wakes its
+  displays when a Deck connects, so a Mac whose screen had gone dark is
+  served instead of refused with "inventory is empty".
+- **A macOS Pier counts failed sign-ins once for the whole Mac.** The login
+  window and each signed-in account have their own desktop agent, and each
+  kept its own back-off; the network service now applies the shared
+  throttle to every sign-in it relays.
+- **A macOS Pier's refusals after the password are typed**: another account
+  at the Mac is `console_other_user` and names that account; a Match My
+  Layout request it cannot build is refused with `multi_monitor_refused`
+  before the Deck is told it signed in; a display capture or encoder that
+  does not start closes the session with `capture_start_failed`.
+- **macOS Deck: the main window's mouse leaves before the window is
+  drawn.** Moves and clicks over the picture are sent as the window's
+  update begins, as a further Match my layout window's already were, not
+  from inside the drawing code; a click that comes with a key or a
+  modifier change still leaves in order with it.
+
+#### Fixed
+
+- **Windows Deck: Match my layout presents without holding the decoder
+  up, and logs where the time goes.** A field Deck with two 2560x1600
+  monitors showed about 35 and 29 of 60 frames a second and video drifting
+  behind the sound until it jumped. Each window's presenter waited for the
+  display's next refresh, and presented, while holding the graphics
+  device's shared lock, so the other window and the decoder waited behind
+  it; it now does both holding none of the Deck's locks and shows the
+  newest frame. A further window's frame also waited for the main window's
+  next screen update (one a refresh, in its phase); the media worker now
+  hands it over at once, as the macOS Deck does. The decoder and each
+  presenter log their timing every five seconds. Still open, measured on a
+  virtual GPU: with two windows on two displays the `Present` call itself
+  blocks for 15-16 ms and holds the device, so the two monitors decode
+  about 60 frames a second between them; the skip-ahead below keeps the
+  picture with the sound meanwhile.
+- **Both Decks: Auto and Speed skip ahead when this computer cannot decode
+  every frame.** The video inbox keeps half a second per monitor so a burst
+  after a network stall is decoded, and a decoder slower than the stream
+  filled it too, the picture drifting behind the sound until it overflowed.
+  When two batches in a row waited over 100 ms, and the second no less, the
+  monitor's video now skips to its next keyframe; Stream Statistics says how
+  often (`Decoder: fell behind the stream …`). Grading and HDR still show
+  every frame.
+- **Windows Deck: Alt+Tab, the Windows key, Alt+Esc and Ctrl+Esc go to the
+  host whenever a session window has focus**, windowed too, not only in
+  fullscreen. The Deck's own chords still reach the Deck (Ctrl+Alt+Home,
+  Ctrl+Alt+F12, F9), a click elsewhere or Session › Keyboard Grab gives the
+  shortcuts back, and Windows+L and Ctrl+Alt+Del stay with the PC. The hook
+  takes a key only while the session window is in front.
+- **Both Decks: Security mode High says why it refuses a host.** High
+  accepts only a certificate from an authority the computer trusts; an Arcen
+  host's own self-signed certificate failed with "invalid peer certificate:
+  UnknownIssuer". The Deck now says what High means, why this host fails it,
+  and what to do (a certificate from a trusted authority, or Medium).
+- **Both Decks: Settings › Displays says when a saved connection keeps its
+  own choice.** A connection saved with its own Displays choice connects
+  with it whatever Settings says, so Primary display only still opened every
+  monitor. Settings › Displays now names the selected connection's choice,
+  with a button to make it follow the setting, and the log names the mode of
+  every attempt and where it came from.
+- **Linux Pier: Primary Display Only on another product's desktop shows one
+  monitor.** A desktop another remote product laid out over two monitors
+  was served whole to a Deck that asked for one display, both monitors
+  squeezed into one picture. The Deck is now shown the monitor its primary
+  maps to, by name and at its own size, with its pointer and pen on that
+  monitor; the desktop is never changed.
+- **Linux Pier: Native tablet on the desktop of the machine's own monitors
+  is refused up front, saying why.** Its X server is not one Arcen starts,
+  so a bridged tablet cannot be kept to the session; the bridge used to
+  start and then fail with "not a dedicated Xorg desktop display". Tablet
+  support works there.
+- **A Windows host gives every display the Remote UI scale you chose.** With
+  Match my layout and two or more displays a fixed Remote UI scale was set on
+  the wrong display or refused: Windows renumbers its displays while it
+  applies a layout, and the Pier looked each display up by the old name. It
+  now finds each display by its stable target, so a 2×3840×2160 layout no
+  longer fails with "did not settle at 100%", and a 1.5× Retina display at
+  125, 175 or 250% no longer refuses the session. Windows has only fixed
+  steps (100–500%) and caps each display by its size, so the Pier sets the
+  nearest step that display offers (125% on a 1.5× Retina is 175%; 250% is
+  300%) and both Decks name a display shown at another scale than asked. A
+  single NVIDIA headless display now gets its scale too.
+- **macOS: a Pier agent that dies while a Deck is attached no longer
+  leaves the session unlocked.** When the agent's process ended (a crash, a
+  kill, an installer stopping it), the window server gave the desk its
+  displays and input back with the session unlocked, and the agent launchd
+  started next knew nothing of the Deck. The agent now starts a small lock
+  guard for each Deck attached to a signed-in session, outside its own
+  process group so that launchd's signal to the dead agent's group does not
+  reach it. When the agent's pipe closes without a hand-back, the guard
+  darkens the desk again (with desk privacy on), locks the session, proves
+  the lock and gives the displays back. The agent also records the
+  attachment, and a restarted agent that finds its own login session's
+  record locks the session before it serves anything (GAP-048). The Linux
+  Pier already locked a console left by a launcher that died; that recovery
+  is now covered by regression tests. A Windows broker that dies is still
+  GAP-047.
+- **Linux: a joined console's windows go back where they were.** After a
+  Deck's multi-monitor layout on an X11 console, the console's own layout
+  came back, but nothing put back the windows the layout had moved off a
+  hidden or resized monitor; that was left to the window manager. The Pier
+  now records the session's windows before the layout and once it has
+  settled. On hand-back, or in the Pier's recovery, it moves back each window
+  the layout moved and the Deck's user did not. This happens behind the lock
+  screen, while the monitors are still blank (GAP-046). Measured on the lab
+  host (GNOME Shell 40): the window manager already moves windows back when
+  their monitor returns, so the Pier found nothing to move there. The Pier
+  does the same for any EWMH window manager.
+- **macOS: no restart needed after installing the Pier.** After every
+  package install the login-window agent could refuse every session ("The
+  host could not mute its own speakers") until the Mac was restarted: the
+  installer restarted Core Audio and went on at once, and launchd started the
+  agent while Core Audio was still restarting. The installer now waits for
+  Core Audio to serve again with the Arcen microphone loaded, the agent no
+  longer opens Core Audio before a Deck connects, and an agent whose taps
+  Core Audio does not know restarts itself. A capture start that waits on
+  the System Audio Recording prompt no longer refuses a session whose
+  speakers are already proved muted: it is served without sound, so the
+  prompt can be answered from the Deck.
+- **macOS: a pen leaving the tablet** now reaches browsers as
+  `pointerout`/`pointerleave` (Chrome on macOS reads it only from a mouse
+  event with the tablet-proximity subtype, which the Pier now posts beside
+  the tablet proximity event).
+- **A rotated monitor on a Linux dedicated Xorg desktop** is planned from
+  its native panel size, as on a joined console: a portrait monitor stood
+  in the X screen landscape before.
+- **A Linux desktop ended on the host while a Deck was attached** is
+  reported as "the desktop session on the host ended", not as "video
+  capture keeps failing on the host".
+- **Linux Wayland session helpers retry a socket call a signal
+  interrupted** (keymap reader, tablet proof) instead of failing.
+- **Linux: the login screen did not come back after a session ended.**
+  On GDM 40 hosts (RHEL 9 family), ending a session a remote-first sign-in
+  started could leave the monitor on an empty text console: GDM opened its
+  new login screen but lost the switch to its terminal (a race with logind
+  restoring the ended session's terminal, opened by a login screen left
+  closing), and every later remote sign-in was refused
+  `console_sign_in_unavailable` until GDM was restarted. The Pier now brings
+  that login screen to its terminal itself, between sign-ins and before a
+  remote-first sign-in, gives the sign-in token again to a login screen that
+  had only just started, and ends the processes a finished login screen
+  left behind. Earlier releases had the same fault.
+- **Linux: the keyring stayed locked after a remote-first sign-in.** A
+  sign-in through GDM's login screen, or into Arcen's own login session on
+  a host without a display manager, now unlocks the login keyring with the
+  password the Pier checked (creating it when there is none), as a sign-in
+  at the login screen does.
+- **Linux: an unlocked session hidden behind the login screen.** When a
+  joined GDM session would not lock as the Deck left, the Pier put the login
+  screen in front but left the session usable one key chord away. It now
+  stays blank, with the desk's keyboard and mouse disabled in it, until it
+  locks (at most a minute, for a session whose lock screen is turned off).
+- **Linux: Arcen's login session on a host without a display manager** is
+  created at the size of the first Deck display that signs in, with that
+  display's EDID, instead of the template's head size.
+- **Auto follows the display that shows the picture, each monitor its own.**
+  A Pier used to serve every monitor at the refresh of the Deck's primary
+  display, so a 30 Hz main monitor held a 120 Hz built-in display at 30 fps.
+  Now a single stream follows the display its window is on, and with Match
+  my layout each monitor is served at its own display's refresh (also for
+  an older Deck's Match my layout, at the refresh of the mode it asked for).
+  The Deck's panel refresh is a new, optional field: an older Pier ignores
+  it and serves at most 60, as before. A windowed session now asks for a
+  remote display mode of at most 60 Hz too, like the other Displays modes.
+- **120 and 144 Hz Deck displays are served above 60 fps.** Both Decks now
+  state each panel's own refresh (a ProMotion panel's maximum, 120 Hz) apart
+  from the remote display mode they ask for, which stays at most 60 Hz so
+  Retina modes keep fitting an EDID timing. Every Pier serves that refresh
+  where its head can run it and says "limited by the host's capture" where
+  it cannot.
+- **A Windows Pier creates every display of a multi-monitor session at the
+  rate it is served at.** A 120 Hz Deck monitor's virtual display used to
+  stay at the 60 Hz mode the Deck asks for, which capped its stream at 60;
+  it now runs at 120 Hz where an EDID timing at its size carries it, as a
+  single display already did (HDR keeps the refresh its 10-bit link was
+  admitted at).
+- **Health judges each monitor at its own rate.** A multi-monitor session
+  whose displays run at 30 and 120 Hz owes 150 frames a second, not twice
+  the primary's rate, so a fast monitor that falls behind is no longer
+  invisible.
+- **The timeline that keeps monitors in step holds a moving monitor only for
+  another moving one** (ADR 0026 amended). A monitor sending only its
+  keepalive, or a few frames while a window crossed its edge, used to set
+  the playout delay, which pushed the monitors further apart than no
+  timeline at all on a Windows Pier with uneven motion. A monitor that has
+  just caught up after a burst stops holding the others at once.
+- **Linux X11 heads are paced from the served rate, not the Deck panel.** A
+  joined console's heads and a dedicated desktop's head run at twice the
+  served rate (else the rate) where the output allows: a 30 Hz Deck monitor
+  no longer leaves the host's desktop animating at 30 Hz.
+
+#### Fixed
+
+- **The macOS Deck ran far more screen updates than the display can show
+  while the mouse moved in a Match my layout window.** Every mouse event
+  started three updates of the Deck's window (165 a second at 55 events a
+  second), because the window that shows several displays does not wait for
+  the display. Updates of the main window now begin at most once per refresh
+  of the display it is on, on both Decks; mouse and keyboard input that
+  arrives in between goes out with the next update, no more than one refresh
+  later, as in a single-window session.
+- **macOS Deck: pointer lock in a further Match my layout window sent the
+  mouse's movement after its clicks.** Movement now goes to the host in the
+  order it happened, between the presses and releases it came between.
+- **Windows Deck: Stream Statistics made the video later.** Its text
+  changed on every update, so the panel was redrawn with every video frame
+  and moved the picture's deadline by about 2 ms. Both Decks now refresh
+  the panel's text four times a second.
+
+- **A fresh sign-in of the same account pre-empts its own detached session
+  on a Windows Pier, logged as a pre-emption** (issue #134): the waiting
+  session is handed over at once, unlocked, instead of reading as a failed
+  resume. Another account still waits for the reconnect window, and an
+  attached Deck is never pre-empted.
+- **A Windows Pier no longer discards display modes whose size is not a
+  multiple of 16** (issue #125). The filter served the Media Foundation
+  encoder, which the Pier no longer uses; OpenH264 pads and crops itself.
+  A 1792x1120 request on a host without NVENC now lands on 1680x1050 rather
+  than a smaller aligned mode.
+- **`install-arcen-pier --uninstall --purge` keeps the Windows Deck's USB
+  component state** (`%ProgramData%\Arcen\USB`) on a machine that has both.
+- **An idle desktop no longer reads as critical health.** A still desktop
+  sends only what changes plus a keepalive a second, and health judges frame
+  rate against the content that changed — but a multi-monitor session on a
+  Linux or Windows Pier proved nothing about its content, so two still
+  monitors were judged against the full target (`HEALTH_CRITICAL
+  dominant_cause=fps value 1 < 42` on every run against a two-monitor Linux
+  workstation). Every Pier now judges a multi-monitor session on all its
+  monitors' frames, each owing only what its own capture proved, against the
+  target times the monitors, as the macOS Pier already did; moving content
+  the pipeline falls behind on, dropped frames, latency and unpresented
+  frames still raise `degraded` and `critical`. `health_stats` reports each
+  stream's own rate, which is what a Deck paces each monitor by (a macOS
+  Pier's multi-display sessions used to report the sum).
+- **The Linux NvFBC capture counts the content it fell behind on.** Its
+  encode loop grabs between encodes, so an unchanged grab did not prove the
+  screen was idle; it now also counts the frames the NvFBC server generated
+  while the loop was away encoding (`capture_behind`), and health judges
+  against the changes seen plus those missed.
+- **The Windows Pier's `health_stats` carry the network path** (`path`), as
+  the documentation said: the broker fills it in, as the macOS network
+  service does.
+- **A joined Linux console is never served faster than its outputs
+  refresh.** Auto on a console whose monitor runs at 60 Hz is served 60, with
+  the capture named as the reason, rather than promising a faster Deck
+  display's rate.
+
+- **macOS Deck: Auto showed about a third of its frames on a scaled or
+  windowed display.** On a 60 Hz display that macOS composes (a window, or
+  a scaled mode such as a 4K panel that "looks like 2560x1440"), a picture
+  takes two to three refreshes to reach the screen, and the Deck kept only
+  one in flight, rendering the next only on the following refresh: 20 of
+  40-48 frames a second were shown, and the session read `HEALTH_CRITICAL
+  unpresented`. A frame now goes the moment a drawable is free, and Auto
+  keeps a second picture in flight where it measurably takes longer than a
+  refresh to reach the screen (display sync stays on: nothing tears).
+  Measured on such a display at 60 fps: full screen 48 -> 95 % of frames
+  shown at the same latency; windowed 46 -> 64 %, about one refresh later.
+- **macOS Deck: Grading after signing in through the Deck stayed 8-bit.**
+  When a macOS Pier's sign-in screen handed over to the desktop, the
+  reconnected Grading session fell back to the eight-bit presentation
+  (`NoRootLayer`) for good: its first ten-bit frame reached the presenter
+  before the ten-bit layer was attached. It now waits for its layer.
+
+#### Added
+
+- **The Windows Deck names an older copy that may run instead of it**, as
+  the Mac Deck does: another running `arcen-deck.exe` from another folder,
+  or an installed Arcen Deck of another version or build, is named at start.
+
+- **Both Decks say when a host kept its own layout**: a Match my layout
+  session whose host shows some displays at another size, or not at all
+  (another product's desktop), names them once as a notice and keeps the
+  line in Stream Statistics (the Deck CLI already printed it).
+- The Deck CLI smokes take `--remote-ui-scale auto|PCT`.
+- **A display the host cannot keep up with is named, with the reason.** A
+  Linux or Windows Pier reports each monitor's served and sent rate in
+  `health_stats` (`monitors`), and a monitor that sends below what its
+  content changed at for two windows running is marked `limited_by:
+  host_shortfall` and logged on the Pier. Both Decks show it in Stream
+  Statistics ("Host displays: 1 60/60 · 2 41/60 limited by the host keeping
+  up") and log each change.
+- **A Deck re-reports the display its window moved to.** Both Decks tell
+  the host when a single-stream session's window settles on another display
+  (or that display's refresh changes), with the new additive
+  `display_refresh_update`, sent only to a host whose hello states
+  `stream_rate.follows_display_moves`. No Pier states it yet: following the
+  move on each Pier is tracked work (`fps-window-moves-pier-*`).
+- **The macOS Pier hands the console back in the shared order** (GAP-041
+  closed): lock, lock screen, displays, sound, input, as on Linux.
+- **Desk privacy on a macOS Pier** (`platform.desktop.deskside.enabled`,
+  off by default, as on Windows; GAP-014 closed): while a Deck is attached
+  to a signed-in user's session, every display but the Pier's own virtual
+  ones goes dark (an all-zero colour table, read back and re-asserted every
+  100 ms; a display that stays lit for two seconds ends the session) and an event filter drops every keyboard, pointer, scroll, tablet,
+  gesture and system-key event the Pier did not post. The desk gets them
+  back in the shared hand-back order once the session is locked (a session
+  that will not lock stays private, retried, for at most a minute), at
+  once if the console switches to another account (the Deck's session then
+  ends), and when the helper process ends for any reason (a crash hands the
+  session back unlocked). A session that cannot be made private is
+  refused `console_privacy_unavailable`. `arcen-pier-macos
+  probe-desk-privacy` measures it on a Mac. Not covered: keystrokes into a
+  password field (Secure Event Input bypasses every event filter), Siri,
+  Voice Control and dictation at the desk, and displays fed by screen
+  capture (DisplayLink, Sidecar, AirPlay).
+- **The macOS Pier names a display it cannot keep up with, too**: a
+  multi-display session reports each display's served and sent rate in
+  `health_stats` (`monitors`) like the Linux and Windows Piers, a display's
+  content rate counted only from its own `ScreenCaptureKit` stream's
+  evidence that the screen was still (GAP-045 closed). A still display
+  now sends a keepalive once a second, as on the other Piers, so it is not
+  mistaken for one the host cannot keep up with.
+- **A trackpad pinch zooms on Linux and Windows hosts.** Both Piers now
+  advertise gestures and turn a pinch from either Deck into Control + wheel
+  at the pointer (one notch per 20 % of scale), with nothing left held when
+  the gesture ends or is lost; rotate, smart zoom and swipe are declined and
+  logged. Before, a pinch did nothing there.
+- **`RESUME_HOLD_ENDED` (1108)**, at every log profile: why a Linux or
+  Windows Pier let go of a desktop it held for its Deck's resume without a
+  resume (`resume_window_expired`, `desk_took_over`, `other_product_client`,
+  `native_session_ended`, …) and for how long (`held_ms`).
+- The Deck's five-second `client QoS snapshot` line says why a window was not
+  ok (`dominant_cause`, presented and received rates, unpresented share).
+- **The macOS Deck warns at start when another copy of it may open instead**:
+  a copy elsewhere with the same bundle identifier that is running, or of
+  another version (a download folder, a mounted disk image), is named in the
+  start status and logged.
+
+#### Fixed (hardening)
+
+- **macOS USB helper and fast user switching**: the helper followed the user
+  who owned the console when it started, so after a switch the first user
+  kept the tablet. It now admits only the console's current owner, on every
+  connection and request, and ends a session within half a second when its
+  user switches away; a helper started at the login window no longer exits
+  and restarts until someone signs in.
+- **Linux tablet bridge on a fast reconnect**: the ending bridge's seat rule
+  clean-up could delete the new bridge's rule for the same desktop; it now
+  removes only its own rule.
+- **The Deck CLI `media-smoke` decodes HDR (PQ) sessions as the Deck does**:
+  it now teaches its decoders the session colour from the host's hello
+  (and prints `session-colour`).
+
+#### Removed
+
+- **The Piers' dormant WSS listener** (`--wss-port`, TLS 1.2, the
+  `transport:wss-v1` capability) and the `wss-compat` features of both
+  Piers, `arcen-protocol` and `arcen-transport`: no shipped build enabled it
+  and no Deck can speak it. `tokio-rustls`, `http`, `httparse` and `sha1`
+  leave the build graph. The Python `tools/session-probe`, its only client,
+  is retired; the macOS Deck's `media-smoke` proves a host streams.
+
 ## [0.20.1] — 2026-11-17
 
 **Arcen is an extension of your machine.** A Linux Pier now joins the

@@ -355,7 +355,12 @@ second), and a shortfall of one frame a second is window quantisation, not a
 fault. Client presentation (`unpresented`) allows one decoded frame in flight
 at the window boundary and is judged only on windows of at least ten decoded
 frames. Each Pier and the Deck feed `fps_content` from
-counters they already keep; see `docs/operations/monitoring.md`.
+counters they already keep; a Pier that captures several monitors combines
+them with `outputs_content` (each monitor owes what its own capture
+proved, up to its own served rate) and is judged against the sum of the
+monitors' rates (`HostCounters::outputs_fps_target`); each monitor's own
+line, and whether it keeps up, is `arcen_observability::MonitorRates`
+(`health_stats.monitors`); see `docs/operations/monitoring.md`.
 
 Rationale for defaults (all overridable via `QosTargets` in the standard logging
 config): at 24 fps content, 0.9× (≈21.6) is where artists perceive judder; 60 ms RTT

@@ -1578,6 +1578,33 @@ impl AuthMultiMonitorRequestMsg {
     pub fn carriers(&self) -> &[MultiMonitorCarrierMsg] {
         &self.carriers
     }
+
+    /// The same request with each monitor's `refresh_hz` replaced by
+    /// `refresh(monitor)`: what a host creates its outputs at when it runs
+    /// a monitor faster than the mode the Deck asked for (its served rate).
+    /// Everything else, and the order, is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rewritten roster fails validation.
+    pub fn with_monitor_refresh(
+        &self,
+        refresh: impl Fn(&RequestedMonitorDescriptorMsg) -> u32,
+    ) -> Result<Self, MultiMonitorValidationError> {
+        let monitors = self
+            .requested_topology
+            .monitors()
+            .iter()
+            .map(|monitor| RequestedMonitorDescriptorMsg {
+                refresh_hz: refresh(monitor),
+                ..monitor.clone()
+            })
+            .collect();
+        Self::new(
+            RequestedMonitorTopologyMsg::new(monitors)?,
+            self.carriers.clone(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2379,6 +2406,42 @@ mod tests {
             sample_client_supported_carriers(),
         )
         .expect("auth request sidecar")
+    }
+
+    #[test]
+    fn a_multi_monitor_request_follows_its_fastest_display_and_each_monitor_its_own() {
+        use crate::messages::{DeckDisplayRefreshMsg, DeckPanelRefreshMsg};
+        // Primary: 120 Hz mode (id 7); left: 60 Hz mode (id 11).
+        let mut response = AuthResponse::password("user", "secret");
+        response.multi_monitor_v1 = Some(sample_auth_multi_monitor_request());
+        assert_eq!(response.display_refresh_hz(), Some(120));
+        assert_eq!(response.display_refresh_hz_for("display-left"), Some(60));
+        // The Deck states its panels: a 30 Hz primary never caps the
+        // 144 Hz display, and the session follows the fastest.
+        response.display_refresh_v1 = Some(DeckDisplayRefreshMsg {
+            stream_display_id: None,
+            displays: vec![
+                DeckPanelRefreshMsg {
+                    id: 7,
+                    refresh_hz: 30,
+                },
+                DeckPanelRefreshMsg {
+                    id: 11,
+                    refresh_hz: 144,
+                },
+            ],
+        });
+        assert_eq!(response.display_refresh_hz(), Some(144));
+        assert_eq!(response.display_refresh_hz_for("display-primary"), Some(30));
+        assert_eq!(response.display_refresh_hz_for("display-left"), Some(144));
+        assert_eq!(response.display_refresh_hz_for("display-unknown"), None);
+        assert_eq!(
+            response.monitor_display_refreshes(),
+            vec![
+                ("display-primary".to_owned(), 30),
+                ("display-left".to_owned(), 144)
+            ]
+        );
     }
 
     #[test]

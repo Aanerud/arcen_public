@@ -25,8 +25,8 @@ mod support_bundle;
 pub use health::{
     ContentWindow, HOST_FPS_WARMUP_MS, HealthAssessment, HealthCause, HealthSide, HealthState,
     HealthTracker, HealthTrackerError, HealthTransition, HostCounterTotals, HostWindow,
-    HostWindowTracker, QosSample, QosTargetError, QosTargets, assess_health, fps_expected,
-    fps_threshold, unpresented_basis_points,
+    HostWindowTracker, OutputsContent, QosSample, QosTargetError, QosTargets, assess_health,
+    fps_expected, fps_threshold, outputs_content, unpresented_basis_points,
 };
 pub use lifecycle::{
     LIFECYCLE_EVENT_DEFINITIONS, LifecycleEventDefinition, LifecycleEventKind,

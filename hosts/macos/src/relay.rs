@@ -557,12 +557,190 @@ pub struct MediaRelayStats {
 ///
 /// Returns the first transport error when it was not a clean close.
 pub async fn relay_lanes<A>(
+    deck: arcen_transport::quic::SessionLaneSocket,
+    agent: A,
+    session: u64,
+    audio_channel: Option<tokio::sync::oneshot::Receiver<UnixStream>>,
+    path_signal: bool,
+    refine_allowed: bool,
+) -> Result<MediaRelayStats, String>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    relay_lanes_gated(
+        deck,
+        agent,
+        session,
+        audio_channel,
+        path_signal,
+        refine_allowed,
+        None,
+    )
+    .await
+}
+
+/// The network service's own back-off on failed sign-ins.
+///
+/// The password is checked in the desktop agent, and the login window and
+/// each signed-in account have their own agent process; a throttle in each
+/// let a guesser who failed against one count afresh against the next. The
+/// service relays every sign-in, so it keeps the one throttle for the whole
+/// Mac (the shared policy, keyed by source and account), as the Linux and
+/// Windows Piers do in their one network process. An agent still keeps its
+/// own, for `serve`, where there is no service.
+pub static SERVICE_AUTH_THROTTLE: std::sync::LazyLock<
+    arcen_session::auth_throttle::HostAuthThrottle,
+> = std::sync::LazyLock::new(arcen_session::auth_throttle::HostAuthThrottle::default);
+
+/// One relayed sign-in, as the service's throttle sees it: the account the
+/// Deck named (never its credential) and how the agent answered.
+#[derive(Debug)]
+pub struct SignInGate {
+    throttle: &'static arcen_session::auth_throttle::HostAuthThrottle,
+    source: Option<std::net::IpAddr>,
+    attempt: Option<arcen_session::auth_throttle::AuthAttempt<'static>>,
+    decided: bool,
+}
+
+impl SignInGate {
+    /// A gate for sign-ins from `source` against `throttle`.
+    #[must_use]
+    pub const fn new(
+        throttle: &'static arcen_session::auth_throttle::HostAuthThrottle,
+        source: Option<std::net::IpAddr>,
+    ) -> Self {
+        Self {
+            throttle,
+            source,
+            attempt: None,
+            decided: false,
+        }
+    }
+
+    /// Reads a Deck message before the attachment: whether to forward it,
+    /// answer it with a refusal instead, or end the relay (a second sign-in
+    /// on one connection, which only a client probing the gate sends).
+    fn on_deck_text(&mut self, text: &str) -> DeckVerdict {
+        #[derive(serde::Deserialize)]
+        struct Account {
+            #[serde(rename = "type")]
+            msg_type: String,
+            #[serde(default)]
+            username: String,
+        }
+        // Decided on the parsed type, as the agent parses it: a type written
+        // with JSON escapes is the same message to the agent. Only the
+        // account is read; the credential beside it is skipped unparsed and
+        // never copied here.
+        let Some(account) = serde_json::from_str::<Account>(text)
+            .ok()
+            .filter(|account| account.msg_type == arcen_protocol::messages::AUTH_RESPONSE)
+        else {
+            return DeckVerdict::Forward;
+        };
+        if self.decided {
+            return DeckVerdict::Close;
+        }
+        self.decided = true;
+        // The agent checks no password for an empty name.
+        if account.username.is_empty() {
+            return DeckVerdict::Forward;
+        }
+        match self.throttle.begin(self.source, &account.username) {
+            Ok(attempt) => {
+                self.attempt = Some(attempt);
+                DeckVerdict::Forward
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    target: arcen_telemetry::names::target::AUTH,
+                    peer = ?self.source,
+                    retry_after_secs = refusal.retry_after.as_secs(),
+                    "sign-in refused by the service without asking the agent: too many recent \
+                     failures"
+                );
+                serde_json::to_string(&arcen_protocol::messages::AuthResult {
+                    msg_type: arcen_protocol::messages::AUTH_RESULT.to_owned(),
+                    success: false,
+                    message: crate::auth::AuthFailure::TooManyAttempts.to_string(),
+                    resume_grant: None,
+                    resume_window_secs: None,
+                    resumed: false,
+                    error_code: None,
+                    session_setup_failed: false,
+                })
+                .map_or(DeckVerdict::Close, DeckVerdict::Refuse)
+            }
+        }
+    }
+
+    /// Reads an agent message before the attachment: its `auth_result`
+    /// ends the attempt with what the agent learnt.
+    fn on_agent_text(&mut self, text: &str) {
+        if self.attempt.is_none() || !text.contains(arcen_protocol::messages::AUTH_RESULT) {
+            return;
+        }
+        let Some(result) = serde_json::from_str::<arcen_protocol::messages::AuthResult>(text)
+            .ok()
+            .filter(|result| result.msg_type == arcen_protocol::messages::AUTH_RESULT)
+        else {
+            return;
+        };
+        if let Some(attempt) = self.attempt.take() {
+            attempt.finish(sign_in_outcome(&result));
+        }
+    }
+}
+
+/// What the service does with a Deck message before the attachment.
+#[derive(Debug, PartialEq, Eq)]
+enum DeckVerdict {
+    /// Pass it to the agent.
+    Forward,
+    /// Answer with this `auth_result` and end the relay.
+    Refuse(String),
+    /// End the relay without an answer.
+    Close,
+}
+
+/// What an agent's `auth_result` taught the throttle. The agent words a
+/// refused credential exactly as [`crate::auth::AuthFailure`] does (same
+/// binary); any other refusal said nothing about the credential.
+fn sign_in_outcome(
+    result: &arcen_protocol::messages::AuthResult,
+) -> arcen_session::auth_throttle::AttemptOutcome {
+    use crate::auth::AuthFailure;
+    use arcen_session::auth_throttle::AttemptOutcome;
+    if result.success || result.session_setup_failed {
+        return AttemptOutcome::Accepted;
+    }
+    let refused = [
+        AuthFailure::InvalidCredentials,
+        AuthFailure::AccountNotPermitted,
+    ]
+    .iter()
+    .any(|failure| failure.to_string() == result.message);
+    if refused {
+        AttemptOutcome::Refused
+    } else {
+        AttemptOutcome::Undecided
+    }
+}
+
+/// [`relay_lanes`], with the service's sign-in throttle in front of the
+/// agent (`gate`).
+///
+/// # Errors
+///
+/// Returns the first transport error when it was not a clean close.
+pub async fn relay_lanes_gated<A>(
     mut deck: arcen_transport::quic::SessionLaneSocket,
     agent: A,
     session: u64,
     audio_channel: Option<tokio::sync::oneshot::Receiver<UnixStream>>,
     path_signal: bool,
     refine_allowed: bool,
+    mut gate: Option<SignInGate>,
 ) -> Result<MediaRelayStats, String>
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -585,6 +763,7 @@ where
     // The agent's own audio channel, when it opens one: audio that never
     // shares a socket with video on the way here.
     let (side_tx, mut side_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let mut side_open = true;
     let side_channel = audio_channel.map(|channel| {
         tokio::spawn(async move {
             if let Ok(channel) = channel.await {
@@ -606,6 +785,11 @@ where
     // Whether the grant carries the refine lane, from the Deck's own
     // `auth_response` (it travels through here to the agent).
     let mut refine_grant = false;
+    // The relay's running count of video frames it is done with, reported
+    // to the agent once it streams (`ServiceMessage::VideoReleased`), so the
+    // agent knows when video still waits here (`RateHints::video_backlog`).
+    let mut video_released: Option<tokio::sync::watch::Receiver<u64>> = None;
+    let mut video_released_reported = 0_u64;
 
     let result = loop {
         tokio::select! {
@@ -646,6 +830,14 @@ where
                     session_started |= is_client_hello(text);
                     if relay.is_none() {
                         refine_grant |= refine_allowed && asks_for_ycbcr_refinement(text);
+                        match gate.as_mut().map_or(DeckVerdict::Forward, |gate| gate.on_deck_text(text)) {
+                            DeckVerdict::Forward => {}
+                            DeckVerdict::Refuse(refusal) => {
+                                let _ = deck.send(SessionRecord::Text(refusal)).await;
+                                break Ok(());
+                            }
+                            DeckVerdict::Close => break Ok(()),
+                        }
                     }
                 }
                 let closing = matches!(record, SessionRecord::Close(_));
@@ -668,13 +860,18 @@ where
                 };
                 if path_signal
                     && let SessionRecord::Text(text) = &record
-                    && let Some(filled) = with_service_path(text, || {
+                    && let Some(filled) = arcen_observability::health_stats_with_path(text, || {
                         path_quality.sample(path_started.elapsed(), &connection)
                     })
                 {
                     record = SessionRecord::Text(filled);
                 }
                 stats.to_deck += 1;
+                if relay.is_none()
+                    && let (Some(gate), SessionRecord::Text(text)) = (gate.as_mut(), &record)
+                {
+                    gate.on_agent_text(text);
+                }
                 let control = match relay.as_mut() {
                     Some(relay) => match relay.route_to_deck(record) {
                         RelayRoute::Control(record) => record,
@@ -695,7 +892,11 @@ where
                 let grant_after = relay.is_none() && is_successful_auth_result(&control);
                 if grant_before {
                     match grant_lanes(&mut deck, refine_grant).await {
-                        Ok(()) => relay = Some(PierLaneRelay::start_with(&lanes, refine_grant)),
+                        Ok(()) => {
+                            let started = PierLaneRelay::start_with(&lanes, refine_grant);
+                            video_released = Some(started.video_released());
+                            relay = Some(started);
+                        }
                         Err(error) => break Err(error),
                     }
                 }
@@ -708,17 +909,26 @@ where
                 }
                 if grant_after {
                     match grant_lanes(&mut deck, refine_grant).await {
-                        Ok(()) => relay = Some(PierLaneRelay::start_with(&lanes, refine_grant)),
+                        Ok(()) => {
+                            let started = PierLaneRelay::start_with(&lanes, refine_grant);
+                            video_released = Some(started.video_released());
+                            relay = Some(started);
+                        }
                         Err(error) => break Err(error),
                     }
                 }
             }
-            frame = side_rx.recv() => {
-                if let Some(frame) = frame {
-                    stats.side_channel_audio += 1;
-                    if let Some(relay) = relay.as_mut() {
-                        let _ = relay.route_to_deck(SessionRecord::Binary(frame));
-                    }
+            // A closed channel (none opened, or it ended) is ready at once
+            // forever: polled first it would spin this loop and starve the
+            // arms below it.
+            frame = side_rx.recv(), if side_open => {
+                let Some(frame) = frame else {
+                    side_open = false;
+                    continue;
+                };
+                stats.side_channel_audio += 1;
+                if let Some(relay) = relay.as_mut() {
+                    let _ = relay.route_to_deck(SessionRecord::Binary(frame));
                 }
             }
             _ = path_tick.tick(), if path_signal => {
@@ -743,6 +953,33 @@ where
                     .await
                 {
                     break Err(format!("to agent path signal: {error}"));
+                }
+            }
+            changed = async {
+                match video_released.as_mut() {
+                    Some(released) => released.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if session_started => {
+                let (Ok(()), Some(released)) = (changed, video_released.as_mut()) else {
+                    video_released = None;
+                    continue;
+                };
+                let total = *released.borrow_and_update();
+                if total <= video_released_reported {
+                    continue;
+                }
+                video_released_reported = total;
+                let message = ServiceMessage::VideoReleased { session, released: total };
+                let text = match serde_json::to_string(&message) {
+                    Ok(text) => text,
+                    Err(error) => break Err(format!("video released encode: {error}")),
+                };
+                if let Err(error) = agent_tx
+                    .send(tokio_tungstenite::tungstenite::Message::Text(text))
+                    .await
+                {
+                    break Err(format!("to agent video released: {error}"));
                 }
             }
         }
@@ -840,25 +1077,6 @@ fn is_successful_auth_result(record: &arcen_protocol::lanes::SessionRecord) -> b
     text_json(record, arcen_protocol::messages::AUTH_RESULT).is_some_and(|value| {
         value.get("success").and_then(serde_json::Value::as_bool) == Some(true)
     })
-}
-
-/// An agent's `health_stats` with `path` set from `measure`, or `None` for
-/// any other message and for stats that already carry a path (an agent that
-/// owns its connection measured it).
-fn with_service_path(
-    text: &str,
-    measure: impl FnOnce() -> arcen_protocol::messages::PathQualityMsg,
-) -> Option<String> {
-    use arcen_protocol::messages::{HEALTH_STATS, HealthStatsMsg};
-    if !text.contains(HEALTH_STATS) {
-        return None;
-    }
-    let mut stats = serde_json::from_str::<HealthStatsMsg>(text).ok()?;
-    if stats.msg_type != HEALTH_STATS || stats.path.is_some() {
-        return None;
-    }
-    stats.path = Some(measure());
-    serde_json::to_string(&stats).ok()
 }
 
 fn message_record(
@@ -1120,6 +1338,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_service_throttles_sign_ins_across_every_agent_it_relays_to() {
+        let throttle: &'static arcen_session::auth_throttle::HostAuthThrottle = Box::leak(
+            Box::new(arcen_session::auth_throttle::HostAuthThrottle::default()),
+        );
+        let ask = r#"{"type":"auth_response","method":"pam","username":"guessed","credential":"nope","screen_width":1,"screen_height":1}"#;
+        let refused = serde_json::to_string(&arcen_protocol::messages::AuthResult {
+            msg_type: arcen_protocol::messages::AUTH_RESULT.to_owned(),
+            success: false,
+            message: crate::auth::AuthFailure::InvalidCredentials.to_string(),
+            resume_grant: None,
+            resume_window_secs: None,
+            resumed: false,
+            error_code: None,
+            session_setup_failed: false,
+        })
+        .unwrap();
+        let source: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        // Each sign-in is its own relay, whichever agent (login window or a
+        // signed-in account) answers it; the free failures are spent once.
+        let policy = arcen_session::auth_throttle::AuthThrottlePolicy::default();
+        for _ in 0..policy.free_failures {
+            let mut gate = SignInGate::new(throttle, Some(source));
+            assert_eq!(gate.on_deck_text(ask), DeckVerdict::Forward);
+            gate.on_agent_text(&refused);
+        }
+        let mut gate = SignInGate::new(throttle, Some(source));
+        assert_eq!(gate.on_deck_text(ask), DeckVerdict::Forward);
+        gate.on_agent_text(&refused);
+        // Backing off now: refused by the service, from another address too
+        // (the account is a key of its own), without reaching an agent.
+        let other: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+        // Written with an escape, the type is still the agent's
+        // `auth_response`.
+        let escaped = ask.replace("auth_response", "auth\\u005fresponse");
+        let DeckVerdict::Refuse(refusal) =
+            SignInGate::new(throttle, Some(other)).on_deck_text(&escaped)
+        else {
+            panic!("throttled");
+        };
+        let refusal: arcen_protocol::messages::AuthResult = serde_json::from_str(&refusal).unwrap();
+        assert!(!refusal.success);
+        assert_eq!(
+            refusal.message,
+            arcen_session::auth_throttle::THROTTLED_MESSAGE
+        );
+        // One sign-in per connection: a second ends the relay.
+        let fresh: &'static arcen_session::auth_throttle::HostAuthThrottle = Box::leak(Box::new(
+            arcen_session::auth_throttle::HostAuthThrottle::default(),
+        ));
+        let mut gate = SignInGate::new(fresh, Some(source));
+        assert_eq!(gate.on_deck_text(ask), DeckVerdict::Forward);
+        assert_eq!(gate.on_deck_text(ask), DeckVerdict::Close);
+    }
+
+    #[test]
+    fn only_a_refused_credential_counts_against_a_sign_in() {
+        use arcen_session::auth_throttle::AttemptOutcome;
+        let result = |success, setup, message: String| arcen_protocol::messages::AuthResult {
+            msg_type: arcen_protocol::messages::AUTH_RESULT.to_owned(),
+            success,
+            message,
+            resume_grant: None,
+            resume_window_secs: None,
+            resumed: false,
+            error_code: None,
+            session_setup_failed: setup,
+        };
+        use crate::auth::AuthFailure;
+        assert_eq!(
+            sign_in_outcome(&result(true, false, "Authenticated".into())),
+            AttemptOutcome::Accepted
+        );
+        // A session the host could not start: the password was right.
+        assert_eq!(
+            sign_in_outcome(&result(false, true, "video_request_refused: x".into())),
+            AttemptOutcome::Accepted
+        );
+        for counted in [
+            AuthFailure::InvalidCredentials,
+            AuthFailure::AccountNotPermitted,
+        ] {
+            assert_eq!(
+                sign_in_outcome(&result(false, false, counted.to_string())),
+                AttemptOutcome::Refused
+            );
+        }
+        for not_counted in [
+            AuthFailure::PolicyUnavailable,
+            AuthFailure::NotConsoleOwner,
+            AuthFailure::HostBusy,
+            AuthFailure::TooManyAttempts,
+        ] {
+            assert_eq!(
+                sign_in_outcome(&result(false, false, not_counted.to_string())),
+                AttemptOutcome::Undecided
+            );
+        }
+    }
+
+    #[test]
     fn the_refine_lane_is_granted_only_to_a_deck_asking_for_ycbcr_tiles() {
         let ask = |domains: &str| {
             format!(
@@ -1134,38 +1452,6 @@ mod tests {
         assert!(!asks_for_ycbcr_refinement(
             &ask(r#"["ycbcr"]"#).replace("auth_response", "client_hello")
         ));
-    }
-
-    #[test]
-    fn the_service_fills_the_path_into_an_agent_s_health_stats_only() {
-        let path = || arcen_protocol::messages::PathQualityMsg {
-            congestion_control: "bbr".to_owned(),
-            rtt_us: 12_000,
-            sent_packets: 40,
-            window_ms: 2_000,
-            ..Default::default()
-        };
-        let agent = serde_json::to_string(&arcen_protocol::messages::HealthStatsMsg {
-            frames_sent: 120,
-            ..Default::default()
-        })
-        .unwrap();
-        let filled: arcen_protocol::messages::HealthStatsMsg =
-            serde_json::from_str(&with_service_path(&agent, path).expect("filled")).unwrap();
-        assert_eq!(filled.path, Some(path()));
-        assert_eq!(filled.frames_sent, 120);
-        // Measured by an agent that owns its connection: left alone.
-        let measured = serde_json::to_string(&filled).unwrap();
-        assert!(with_service_path(&measured, || unreachable!()).is_none());
-        // Anything else is never parsed into stats.
-        assert!(with_service_path(r#"{"type":"cursor_shape"}"#, || unreachable!()).is_none());
-        assert!(
-            with_service_path(
-                r#"{"type":"text_commit_result","note":"health_stats"}"#,
-                || { unreachable!() }
-            )
-            .is_none()
-        );
     }
 
     fn scratch_socket(name: &str) -> PathBuf {
@@ -1443,6 +1729,83 @@ mod tests {
         let path = received.path.expect("the service measured the path");
         assert!(path.congestion_control_token().is_some(), "{path:?}");
         assert!(path.rtt_us > 0 && path.sent_packets > 0, "{path:?}");
+        std::fs::remove_dir_all(&rig.dir).ok();
+    }
+
+    #[tokio::test]
+    async fn the_agent_hears_how_many_video_frames_the_relay_is_done_with() {
+        use arcen_protocol::lanes::{LaneRole, SessionRecord};
+        use arcen_transport::quic::{PeerLaneEvent, PeerLaneReader};
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let mut rig = lane_rig("released").await;
+        for text in [
+            r#"{"type":"auth_result","success":true}"#,
+            r#"{"type":"server_hello"}"#,
+        ] {
+            rig.agent
+                .send(Message::Text(text.into()))
+                .await
+                .expect("agent control");
+        }
+        assert!(deck_text(&mut rig).await.contains("auth_result"));
+        let grant = deck_text(&mut rig).await;
+        arcen_transport::quic::accept_attachment(
+            &rig.deck,
+            &serde_json::from_str(&grant).expect("grant"),
+        )
+        .expect("accepted");
+        assert!(deck_text(&mut rig).await.contains("server_hello"));
+        let hello = serde_json::to_string(&arcen_protocol::messages::ClientHelloMsg::default())
+            .expect("hello");
+        rig.deck_control
+            .sender
+            .send(arcen_transport::quic::session_record_bytes(
+                &SessionRecord::Text(hello),
+            ))
+            .await
+            .expect("client_hello");
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), rig.agent.next())
+                .await
+                .expect("in time")
+                .expect("message")
+                .expect("valid");
+            if matches!(&message, Message::Text(text) if is_client_hello(text)) {
+                break;
+            }
+        }
+
+        let mut video_lane = PeerLaneReader::new(&rig.deck, LaneRole::Video);
+        rig.agent
+            .send(Message::Binary(video(true)))
+            .await
+            .expect("video");
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), video_lane.next())
+                .await
+                .expect("video in time")
+                .expect("video lane")
+            {
+                PeerLaneEvent::Frame(_) => break,
+                PeerLaneEvent::Opened { .. } | PeerLaneEvent::Lost { .. } => {}
+            }
+        }
+        let released = loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), rig.agent.next())
+                .await
+                .expect("a release report in time")
+                .expect("message")
+                .expect("valid");
+            if let Message::Text(text) = message
+                && let Ok(ServiceMessage::VideoReleased { released, .. }) =
+                    serde_json::from_str::<ServiceMessage>(&text)
+            {
+                break released;
+            }
+        };
+        assert_eq!(released, 1, "the one frame the relay sent into the lane");
         std::fs::remove_dir_all(&rig.dir).ok();
     }
 

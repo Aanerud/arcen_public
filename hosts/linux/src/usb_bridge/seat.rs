@@ -13,6 +13,7 @@
 use arcen_usb_bridge::bridge_seat::{
     self, BridgeSeat, BridgedInputNode, BridgedNodeRole, RULE_DIRECTORY,
 };
+use nix::fcntl::{Flock, FlockArg};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -28,9 +29,18 @@ const UDEVADM_TIMEOUT: Duration = Duration::from_secs(10);
 const NODES_STABLE_FOR: Duration = Duration::from_millis(600);
 
 /// One installed rule; dropping it removes the rule and reloads udev.
+///
+/// A native seat's rule file is named by the seat alone, so a bridge for the
+/// same desktop that starts while this one is still ending (a fast
+/// reconnect) renames its own rule over this one's. The drop therefore
+/// removes the file only while it still names this helper as its owner, and
+/// install and drop hold the rule directory's lock, so the check and the
+/// removal cannot straddle the other helper's rename.
 #[derive(Debug)]
 pub struct SeatRule {
     path: PathBuf,
+    directory: PathBuf,
+    owner: u32,
     reload: bool,
 }
 
@@ -43,7 +53,14 @@ impl SeatRule {
     /// When `prefix` or `seat` is invalid, the rule cannot be written, or
     /// `udevadm control --reload` fails; nothing is left behind.
     pub fn install(prefix: &str, seat: &BridgeSeat) -> io::Result<Self> {
-        Self::install_in(Path::new(RULE_DIRECTORY), prefix, seat, true, process_alive)
+        Self::install_in(
+            Path::new(RULE_DIRECTORY),
+            prefix,
+            seat,
+            true,
+            std::process::id(),
+            process_alive,
+        )
     }
 
     fn install_in(
@@ -51,11 +68,13 @@ impl SeatRule {
         prefix: &str,
         seat: &BridgeSeat,
         reload: bool,
+        owner: u32,
         alive: impl Fn(u32) -> bool,
     ) -> io::Result<Self> {
         let text = bridge_seat::udev_rule(prefix, seat)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         fs::create_dir_all(directory)?;
+        let lock = lock_rule_directory(directory)?;
         // A helper killed without cleanup left its rule for this port: its
         // seat and links would apply to the new device too. It goes first; a
         // live bridge's rule on this port refuses the install.
@@ -68,7 +87,7 @@ impl SeatRule {
         }
         let name = seat.rule_file_name();
         let path = directory.join(&name);
-        let temporary = directory.join(format!(".{name}.{}", std::process::id()));
+        let temporary = directory.join(format!(".{name}.{owner}"));
         let _ = fs::remove_file(&temporary);
         {
             let mut file = fs::OpenOptions::new()
@@ -77,7 +96,7 @@ impl SeatRule {
                 .mode(0o644)
                 .custom_flags(nix::libc::O_NOFOLLOW)
                 .open(&temporary)?;
-            writeln!(file, "{OWNER_LINE}{}", std::process::id())?;
+            writeln!(file, "{OWNER_LINE}{owner}")?;
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
         }
@@ -85,7 +104,13 @@ impl SeatRule {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
-        let rule = Self { path, reload };
+        drop(lock);
+        let rule = Self {
+            path,
+            directory: directory.to_path_buf(),
+            owner,
+            reload,
+        };
         if reload {
             udevadm(&["control", "--reload"])?;
         }
@@ -101,11 +126,35 @@ impl SeatRule {
 
 impl Drop for SeatRule {
     fn drop(&mut self) {
-        let removed = fs::remove_file(&self.path).is_ok();
+        let removed = remove_owned_rule(&self.directory, &self.path, self.owner);
         if removed && self.reload {
             let _ = udevadm(&["control", "--reload"]);
         }
     }
+}
+
+/// Serializes rule installs and removals between bridge helpers (an
+/// advisory lock on the rule directory itself: no extra file for udev to
+/// see). Held for milliseconds.
+fn lock_rule_directory(directory: &Path) -> io::Result<Flock<fs::File>> {
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(directory)?;
+    Flock::lock(handle, FlockArg::LockExclusive).map_err(|(_, errno)| io::Error::from(errno))
+}
+
+/// Removes the rule at `path` if it still names `owner`; another helper's
+/// rule renamed over it stays. Returns whether a rule was removed.
+fn remove_owned_rule(directory: &Path, path: &Path, owner: u32) -> bool {
+    let Ok(_lock) = lock_rule_directory(directory) else {
+        return false;
+    };
+    let owned = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| rule_owner(&text))
+        == Some(owner);
+    owned && fs::remove_file(path).is_ok()
 }
 
 fn udevadm(arguments: &[&str]) -> io::Result<()> {
@@ -232,6 +281,12 @@ fn clear_port_rules_in(
 }
 
 fn sweep_stale_rules_in(directory: &Path, alive: impl Fn(u32) -> bool) -> Vec<String> {
+    // Under the rule directory's lock, as installs and drops: a live
+    // helper's rule renamed over a dead one's between the read and the
+    // removal would otherwise go.
+    let Ok(_lock) = lock_rule_directory(directory) else {
+        return Vec::new();
+    };
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
     };
@@ -629,6 +684,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     const PREFIX: &str = "/devices/platform/vhci_hcd.0/usb3/3-1";
+    const OWN: u32 = 4_100_000;
 
     fn scratch(name: &str) -> PathBuf {
         let base = std::env::temp_dir();
@@ -650,7 +706,7 @@ mod tests {
     #[test]
     fn a_rule_is_installed_atomically_and_removed_on_drop() {
         let dir = scratch("rule");
-        let rule = SeatRule::install_in(&dir, PREFIX, &seat(), false, |_| false).unwrap();
+        let rule = SeatRule::install_in(&dir, PREFIX, &seat(), false, OWN, |_| false).unwrap();
         let text = fs::read_to_string(rule.path()).unwrap();
         assert!(text.starts_with(OWNER_LINE));
         assert!(text.contains("arcen_bridge,arcen_bridge_58"));
@@ -658,12 +714,15 @@ mod tests {
         let path = rule.path().to_owned();
         drop(rule);
         assert!(!path.exists());
-        assert!(
-            SeatRule::install_in(&dir, "/devices/pci0000:00/usb1/1-1", &seat(), false, |_| {
-                false
-            })
-            .is_err()
-        );
+        assert!(SeatRule::install_in(
+            &dir,
+            "/devices/pci0000:00/usb1/1-1",
+            &seat(),
+            false,
+            OWN,
+            |_| false
+        )
+        .is_err());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     }
 
@@ -689,7 +748,7 @@ mod tests {
             "/devices/platform/vhci_hcd.0/usb3/3-2",
             4_000_002,
         );
-        let rule = SeatRule::install_in(&dir, PREFIX, &seat(), false, |_| false).unwrap();
+        let rule = SeatRule::install_in(&dir, PREFIX, &seat(), false, OWN, |_| false).unwrap();
         assert!(
             !dir.join(old.rule_file_name()).exists(),
             "the dead rule for this port is gone"
@@ -699,16 +758,45 @@ mod tests {
         drop(rule);
         // A live owner's rule on the same port refuses a second bridge.
         write(&old, PREFIX, 4_000_003);
-        let refused = SeatRule::install_in(&dir, PREFIX, &seat(), false, |pid| pid == 4_000_003);
+        let refused =
+            SeatRule::install_in(&dir, PREFIX, &seat(), false, OWN, |pid| pid == 4_000_003);
         assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::AddrInUse);
         assert!(dir.join(old.rule_file_name()).exists());
         assert!(!dir.join(seat().rule_file_name()).exists());
     }
 
+    /// A native seat's rule is named by the seat alone: a bridge for the
+    /// same desktop that starts while the previous one ends renames its rule
+    /// over the old one's, and the old helper's drop must leave it.
+    #[test]
+    fn dropping_a_rule_leaves_a_newer_bridges_rule_of_the_same_name() {
+        let dir = scratch("reconnect");
+        let pen = BridgeSeat::parse("seat-arcen-pen-0123456789abcdef").unwrap();
+        let old = SeatRule::install_in(&dir, PREFIX, &pen, false, OWN, |_| false).unwrap();
+        let path = old.path().to_owned();
+        // The new helper (another port, the old owner still alive while it
+        // detaches) renames its rule over the old one.
+        let new = SeatRule::install_in(
+            &dir,
+            "/devices/platform/vhci_hcd.0/usb3/3-2",
+            &pen,
+            false,
+            OWN + 1,
+            |pid| pid == OWN,
+        )
+        .unwrap();
+        assert_eq!(new.path(), path);
+        drop(old);
+        let text = fs::read_to_string(&path).expect("the newer rule survives");
+        assert_eq!(rule_owner(&text), Some(OWN + 1));
+        drop(new);
+        assert!(!path.exists());
+    }
+
     #[test]
     fn the_sweep_removes_only_rules_of_dead_owners() {
         let dir = scratch("sweep");
-        let live = SeatRule::install_in(&dir, PREFIX, &seat(), false, |_| false).unwrap();
+        let live = SeatRule::install_in(&dir, PREFIX, &seat(), false, OWN, |_| false).unwrap();
         let dead_seat = x11(58, 9);
         fs::write(
             dir.join(dead_seat.rule_file_name()),
@@ -721,7 +809,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("61-other.rules"), "# not ours\n").unwrap();
-        let own = std::process::id();
+        let own = OWN;
         let mut removed = sweep_stale_rules_in(&dir, |pid| pid == own);
         removed.sort();
         assert_eq!(

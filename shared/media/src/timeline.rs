@@ -20,12 +20,15 @@
 //!   Deck time, so the Deck can report true capture-to-present latency.
 //! - [`FrameSetTimeline`] decides how long a decoded frame waits before it
 //!   is presented. Every frame's transit (Deck time when decoded minus Pier
-//!   capture stamp) is measured per stream; the slowest active stream's
+//!   capture stamp) is measured per stream; the slowest pacing stream's
 //!   median transit is the session's playout delay, and a frame of a faster
 //!   stream is held for the difference, so frames captured together are
 //!   presented together. The wait is bounded ([`TimelineConfig::max_hold`]):
 //!   a stream that is later than the bound is shown late rather than
-//!   stalling the others, and a lone active stream is never held.
+//!   stalling the others, and a lone pacing stream is never held. A stream
+//!   paces while it is moving: a frame in the last
+//!   [`TimelineConfig::idle_after`] and at least
+//!   [`TimelineConfig::min_pacing_frames`] in the transit window.
 //!
 //! Synchronisation does not depend on the clock offset: both clocks cancel
 //! out of the difference between two streams' transits. The offset only
@@ -50,6 +53,12 @@ pub const DEFAULT_TRANSIT_WINDOW: Duration = Duration::from_secs(1);
 /// A stream without a frame for this long no longer sets the playout delay
 /// (an idle monitor sends nothing while nothing changes on it).
 pub const DEFAULT_IDLE_AFTER: Duration = Duration::from_millis(500);
+
+/// Frames a stream must have decoded within the transit window before it
+/// sets the playout delay: a monitor that only sends its keepalive, or a few
+/// frames while a window crosses its edge, has a median of a handful of
+/// samples, and holding a moving monitor to it put the two further apart.
+pub const DEFAULT_MIN_PACING_FRAMES: usize = 8;
 
 /// How often [`FrameSetTimeline::take_report`] summarises.
 pub const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -159,6 +168,9 @@ pub struct TimelineConfig {
     pub transit_window: Duration,
     /// A stream idle this long stops setting the playout delay.
     pub idle_after: Duration,
+    /// Frames a stream needs in the transit window to set the playout
+    /// delay (see [`DEFAULT_MIN_PACING_FRAMES`]).
+    pub min_pacing_frames: usize,
     /// How often a report is due.
     pub report_interval: Duration,
 }
@@ -170,6 +182,7 @@ impl Default for TimelineConfig {
             max_hold: DEFAULT_MAX_HOLD,
             transit_window: DEFAULT_TRANSIT_WINDOW,
             idle_after: DEFAULT_IDLE_AFTER,
+            min_pacing_frames: DEFAULT_MIN_PACING_FRAMES,
             report_interval: DEFAULT_REPORT_INTERVAL,
         }
     }
@@ -217,13 +230,18 @@ struct StreamTrack {
 }
 
 impl StreamTrack {
-    fn median_since(&self, since_ms: u32) -> Option<i32> {
+    /// The median transit since `since_ms`, when at least `min_frames`
+    /// frames arrived since then.
+    fn median_since(&self, since_ms: u32, min_frames: usize) -> Option<i32> {
         let mut recent: Vec<i32> = self
             .transits
             .iter()
             .filter(|(at, _)| wire_delta_ms(*at, since_ms) >= 0)
             .map(|(_, transit)| *transit)
             .collect();
+        if recent.len() < min_frames.max(1) {
+            return None;
+        }
         median(&mut recent)
     }
 
@@ -291,13 +309,14 @@ impl FrameSetTimeline {
 
     /// Records a frame of `stream` captured at Pier wire time `captured_ms`
     /// and decoded at Deck wire time `decoded_ms`, and says how long to hold
-    /// it. Holding needs at least two active streams; a frame is never held
+    /// it. Holding needs at least two pacing streams; a frame is never held
     /// longer than [`TimelineConfig::max_hold`].
     pub fn admit(&mut self, stream: u16, captured_ms: u32, decoded_ms: u32) -> HoldDecision {
         let transit_ms = wire_delta_ms(decoded_ms, captured_ms);
         let window_ms = duration_ms_i32(self.config.transit_window);
         let idle_ms = duration_ms_i32(self.config.idle_after);
         let since = decoded_ms.wrapping_sub(window_ms.unsigned_abs());
+        let recent_since = decoded_ms.wrapping_sub(window_ms.unsigned_abs() / 2);
         {
             let track = self.streams.entry(stream).or_default();
             track.transits.push_back((decoded_ms, transit_ms));
@@ -316,7 +335,11 @@ impl FrameSetTimeline {
             .streams
             .values()
             .filter(|track| track.active_at(decoded_ms, idle_ms))
-            .filter_map(|track| track.median_since(since))
+            .filter_map(|track| {
+                let window = track.median_since(since, self.config.min_pacing_frames)?;
+                let recent = track.median_since(recent_since, self.config.min_pacing_frames / 2);
+                Some(recent.map_or(window, |recent| recent.min(window)))
+            })
             .collect();
         let target_ms = active.iter().copied().max().unwrap_or(transit_ms);
         let wanted = if active.len() >= 2 {
@@ -527,6 +550,50 @@ mod tests {
         let later = 10_000;
         assert_eq!(feed(&mut timeline, 2, later, 20).hold, Duration::ZERO);
         assert_eq!(feed(&mut timeline, 2, later + 16, 10).hold, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_monitor_sending_a_few_frames_does_not_hold_a_moving_one() {
+        let mut timeline = FrameSetTimeline::new(TimelineConfig::default());
+        // Stream 1 moves at 60 fps; stream 2 sends a frame every 200 ms (a
+        // window's edge crossing it), each slower than stream 1's.
+        let mut held = 0;
+        for frame in 0..120u32 {
+            let captured = 1_000 + frame * 16;
+            if frame % 12 == 0 {
+                feed(&mut timeline, 2, captured, 35);
+            }
+            if feed(&mut timeline, 1, captured, 20).hold > Duration::ZERO {
+                held += 1;
+            }
+        }
+        assert_eq!(held, 0, "five frames a second never set the playout delay");
+        // Once stream 2 moves too, stream 1 waits for it again.
+        let mut last = Duration::ZERO;
+        for frame in 120..180u32 {
+            let captured = 1_000 + frame * 16;
+            feed(&mut timeline, 2, captured, 35);
+            last = feed(&mut timeline, 1, captured, 20).hold;
+        }
+        assert_eq!(last, Duration::from_millis(15));
+    }
+
+    #[test]
+    fn a_stream_that_recovered_from_a_burst_stops_holding_the_others_at_once() {
+        let mut timeline = FrameSetTimeline::new(TimelineConfig::default());
+        // 600 ms of stream 1 late by 40 ms (a burst queued on its lane),
+        // then 300 ms at its usual transit.
+        for frame in 0..56u32 {
+            let captured = 1_000 + frame * 16;
+            let transit = if frame < 38 { 60 } else { 20 };
+            feed(&mut timeline, 1, captured, transit);
+            feed(&mut timeline, 2, captured, 20);
+        }
+        // Over the last second stream 1's median is still the burst's; over
+        // the last half second it is back to normal.
+        let decision = feed(&mut timeline, 2, 1_000 + 56 * 16, 20);
+        assert_eq!(decision.target_ms, 20);
+        assert_eq!(decision.hold, Duration::ZERO);
     }
 
     #[test]

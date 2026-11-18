@@ -36,7 +36,7 @@ posture identically to both Piers:
 
 | Control | Implemented rule |
 | --- | --- |
-| Versions | QUIC always negotiates TLS 1.3 as required by QUIC. Dormant WSS/TLS 1.2 support is available only in non-shipping Pier `wss-compat` builds; the Decks have none. |
+| Versions | QUIC always negotiates TLS 1.3 as required by QUIC. There is no TLS 1.2 support in any build (the dormant WSS listener and its `wss-compat` feature were removed on 2026-11-18). |
 | Suites | Shipped products expose only the three TLS 1.3 ring suites below, in provider order, minus the optional exact-name blacklist. An empty effective set is rejected. |
 | Leaf key | RSA of at least 2048 bits, P-256, P-384, or Ed25519 only. |
 | Leaf purpose | A CA leaf is rejected. If key usage exists, `digitalSignature` is required. If extended key usage exists, `serverAuth` is required and `anyExtendedKeyUsage` is rejected. |
@@ -49,9 +49,6 @@ The shipped suites, in effective preference order, are:
 1. `TLS13_AES_256_GCM_SHA384`
 2. `TLS13_AES_128_GCM_SHA256`
 3. `TLS13_CHACHA20_POLY1305_SHA256`
-
-Only an explicit non-shipping Pier `wss-compat` build adds the six TLS 1.2
-ECDHE-ECDSA/ECDHE-RSA AES-GCM and ChaCha20-Poly1305 suites.
 
 The lifecycle work does not enable client authentication, key logging, or
 early data. QUIC requires the private ALPN `arcen-quic-v1`. There is no

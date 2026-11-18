@@ -215,6 +215,26 @@ Do not infer audio from a tap that constructed: on a machine with capture
 denied, a tap creates, reports a valid format, honours a mute request and then
 delivers nothing. Read `audio_observed` from `probe-audio`.
 
+Two more, both from package installs on the lab Mac:
+
+* **A Core Audio connection opened while Core Audio restarts can go stale.**
+  The postinstall restarts `coreaudiod` to load the microphone driver. When
+  it went on at once, the login-window agent launchd started next created
+  taps (status 0) whose every property read then failed with `'!obj'`, so
+  the mute could not be proved and every session was refused until the Mac
+  restarted; restarting only the agent got past it. So the postinstall
+  waits for the old `coreaudiod` to exit and for `core-audio-ready` (a
+  fresh process per question) before it starts anything, the agent opens no
+  Core Audio connection before a Deck connects, and an agent that sees
+  `'!obj'` on its own tap (`audio::core_audio_connection_stale`) exits with
+  75 so launchd starts a fresh one.
+* **The prompt blocks after the mute exists.** A capture start blocked on
+  the System Audio Recording prompt (the tap and its mute already proved)
+  serves the session without sound instead of refusing it; the waiting
+  worker keeps the Mac muted until the prompt is answered and then releases
+  its tap. Refusing there left the only person who could answer the prompt
+  (the one connecting) unable to see it.
+
 ## Structured logging is how latency is proven
 
 The Pier emits the same schema-validated lifecycle records the Linux host does,
@@ -666,6 +686,59 @@ consent prompt in the root context. Until someone at the machine answers it,
 ScreenCaptureKit delivers a few frames and then stalls. TCC consent is per user,
 and the login window has none. Consent prompts must therefore be raised and
 answered while somebody is logged in.
+
+## Joining the user's session (ADR 0025)
+
+* **Disconnect locks.** When a signed-in user's Deck session ends, the agent
+  locks the session (`screen_lock`: the system's Lock Screen,
+  `SACLockScreenImmediate` found with `dlsym`, proved from
+  `CGSessionCopyCurrentDictionary`'s `CGSSessionScreenIsLocked`), then drops
+  the virtual displays, then releases the sound (`DETACH_STEPS`). Not the
+  login window, not `serve` (it would lock the developer's own screen), and
+  not a console another account took over (`Departure::SessionChanged`).
+  There is no public unlock after a password check: a returning Deck signs
+  in at the streamed lock screen.
+* **An agent that dies locks too** (`lock_guard`, shared
+  `console_session::owner_death`, GAP-048 closed). For each Deck attached
+  to a signed-in session, the agent starts `lock-guard`: the same binary, in
+  its own process group. launchd sends `SIGTERM` to a dead agent's process
+  group and only that group; this was measured with a `KeepAlive` agent
+  killed by `SIGKILL`. If the guard's pipe closes without a release, it
+  darkens the desk (when the desk was private), locks, proves the lock and
+  gives the displays back. The agent also writes
+  `~/Library/Application Support/Arcen/Pier/deck-attachment`, naming the
+  `kCGSSessionIDKey` session, `kern.bootsessionuuid` and the uid. A
+  restarted agent that finds its own session's record locks before it
+  serves anything. Between the death and the lock screen the desk's input
+  is not filtered, because the tap's Accessibility grant is the agent's.
+* **Awake while serving.** Every connection declares user activity first (a
+  sleeping display is not an active one, and the inventory would be empty),
+  and a session holds a `PreventUserIdleSystemSleep` assertion (`power`).
+* **One sign-in throttle per Mac.** Each agent is its own process, so the
+  network service applies the shared throttle to the `auth_response` it
+  relays and learns the outcome from the agent's `auth_result`
+  (`relay::SignInGate`). The agent keeps its own for `serve`.
+* **Desk privacy** (`desk_privacy.rs`, opt-in
+  `platform.desktop.deskside.enabled`, as Windows): armed after the session
+  is admitted and before anything is shown, for a signed-in user's agent
+  only. Input: an active `CGEventTap` at `kCGHIDEventTap` passes only events
+  the window server attributes to this process
+  (`kCGEventSourceUnixProcessID`; hardware and virtual HID read `0`), so it
+  needs the Accessibility grant keyboard input has and refuses
+  `input_backend: virtual_hid`. Displays: an all-zero
+  `CGSetDisplayTransferByTable` on every display but the Pier's own virtual
+  ones (vendor `0x3456`), read back, re-asserted every 100 ms; a display
+  lit for 2 s ends the session (shared `PrivacyWatch`). Hand-back: lock
+  (retried every 5 s, at most `UNLOCKED_GRACE`), displays, sound, input; a
+  console held by another account for three readings gets the desk back and
+  ends the session; a panic locks first. Both die with the process; the
+  lock guard below locks the session after them. Not covered: Secure Event Input hides keystrokes
+  from taps; Siri, Voice Control and dictation act through accessibility;
+  DisplayLink/Sidecar/AirPlay displays are fed by capture. `probe-desk-privacy [--listen S] [--blank S
+  --capture]` measures it from the Aqua session (measured here: the
+  owner's hardware events read pid 0, the probe's own post its pid);
+  whether `ScreenCaptureKit` reads before the table is the `--capture`
+  proof still to run on the lab Mac.
 
 **Apple publishes no contract that third-party code may capture the login
 window.** Every piece above is documented on its own, but the combination is

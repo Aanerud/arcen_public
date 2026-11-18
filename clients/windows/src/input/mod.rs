@@ -417,6 +417,12 @@ impl WindowInput {
         if !self.active {
             return None;
         }
+        if msg == hook::WM_HOOK_KEY && !self.focused {
+            // Taken by the hook while the window was in front, posted, and
+            // only now handled after focus left (whose release went first):
+            // a press sent now would stay held on the host.
+            return Some(LRESULT(0));
+        }
         if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) {
             // egui may have switched the input method since the last change
             // this input saw (a text field in the connection bar).

@@ -89,6 +89,25 @@ impl ForeignService {
         self.pam_service.is_some() || self.unit.is_some() || self.process.is_some()
     }
 
+    /// What a Windows host reports for a session another remote-desktop
+    /// service attaches: the session's window station, the listener it came in
+    /// through (`RDP-Tcp#3` is a connection of the `RDP-Tcp` listener, so
+    /// the connection number is left off), and its client protocol
+    /// (`WTSClientProtocolType`: 1 is ICA, 2 RDP). The window station takes the
+    /// place of a PAM service, the protocol that of the process.
+    #[must_use]
+    pub fn windows_station(win_station: &str, protocol: Option<u16>) -> Self {
+        let listener = win_station
+            .split_once('#')
+            .map_or(win_station, |(listener, _)| listener);
+        let protocol = match protocol {
+            Some(1) => Some("ica"),
+            Some(2) => Some("rdp"),
+            _ => None,
+        };
+        Self::new(listener, None, protocol)
+    }
+
     #[must_use]
     pub fn pam_service(&self) -> Option<&str> {
         self.pam_service.as_deref()
@@ -272,6 +291,35 @@ mod tests {
                 .label()
                 .as_deref(),
             Some("same")
+        );
+    }
+
+    #[test]
+    fn a_windows_session_is_named_by_its_listener_and_protocol() {
+        let notice = ConsoleNotice::naming(
+            ConsoleRefusal::OtherUserOtherProduct,
+            Some(ForeignService::windows_station("RDP-Tcp#3", Some(2))),
+        );
+        assert_eq!(
+            notice.deck_reason(),
+            "console_other_user_other_product: another remote-desktop service (RDP-Tcp, rdp) uses this workstation."
+        );
+        assert_eq!(
+            ForeignService::windows_station("ICA-CGP#12", Some(1))
+                .label()
+                .as_deref(),
+            Some("ICA-CGP, ica")
+        );
+        // An unknown protocol names the listener alone; a hostile name nothing.
+        assert_eq!(
+            ForeignService::windows_station("Remote Station", Some(9)).label(),
+            None
+        );
+        assert_eq!(
+            ForeignService::windows_station("Vendor-1#0", Some(7))
+                .label()
+                .as_deref(),
+            Some("Vendor-1")
         );
     }
 

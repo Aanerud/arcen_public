@@ -103,6 +103,21 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   (`arcen_protocol::cursor::CursorRecordRelay`). Never send an agent record
   without its image, and never strip images in the agent.
 
+- Disconnect locks (ADR 0025): the broker's `hand_back_session` runs after
+  the agent exits, in `console_session::DETACH_STEPS_OUTPUTS_FIRST` order
+  (the agent restores displays and input first, because a locked session's
+  processes may not change its displays), then `lock_session`
+  (`arcen-pier lock-session` as the user, `LockWorkStation`; disconnect from
+  the console if it will not lock), then the speakers. Whether to lock is the
+  shared `Departure::locks_session`: never on a same-account takeover
+  (`OwnerCommand::TakenOver`, displaced incumbent) or a changed session.
+  Keep every relay exit setting its `Departure`.
+- `audio.local_playback` is the broker's endpoint-mute lease
+  (`local_playback.rs`, shared `local_playback::endpoint_*`): every active
+  render endpoint muted (loopback still carries the mix), journalled in
+  `recovery\local-playback.json` before each mute, re-asserted each second,
+  undone only for what it muted, recovered at service start.
+
 Escalate shared API or protocol changes to Shared/Architecture; authentication,
 privilege, GPU, signing, packaging, and release changes to Release/Security.
 

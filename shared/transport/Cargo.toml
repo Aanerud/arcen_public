@@ -23,9 +23,6 @@ quic = [
     "dep:tokio",
     "dep:tokio-util",
 ]
-# Dormant compatibility policy only. Product Deck/Pier dependencies disable
-# default features and never enable this in shipped binaries.
-wss-compat = ["arcen-protocol/wss-compat", "rustls/tls12"]
 
 [dependencies]
 arcen-identity.workspace = true

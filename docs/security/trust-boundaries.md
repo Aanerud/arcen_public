@@ -165,6 +165,19 @@ what one would. Each step is reviewed as a boundary (Release/Security):
   who is also signed in at the console runs a second keyring daemon on the
   same keyring files, as activation already did before this; gnome-keyring
   re-reads keyring files that change.
+- **Login password to the keyring (console sign-ins that start the
+  session).** GDM's login screen taking a one-time token and Arcen's own
+  login session on a host without a display manager never show the password
+  to `pam_gnome_keyring`. For those two only, the root launcher keeps one
+  zeroizing copy of the password it just proved until the session's agent
+  is up, then writes it to the standard input of a short-lived helper
+  started as the session user (`session-agent --login-keyring-unlock`,
+  environment cleared, privileges dropped, uid 0 refused) and drops it.
+  The helper reads at most 8 KiB, waits at most 30 s for the user's own
+  keyring daemon, refuses a control socket in `/run/user/<uid>/keyring`
+  that is not a socket owned by the user or whose peer is another uid, and
+  sends the one `UNLOCK` request `pam_gnome_keyring` sends there. Only the
+  result is logged. A joined existing session is never touched.
 - **Login-shell environment (both providers).** The agent, as the session
   user and never as root, runs the user's login shell once
   (`$SHELL -l -c 'exec env -0'`). The shell must be listed in `/etc/shells`
@@ -175,9 +188,16 @@ what one would. Each step is reviewed as a boundary (Release/Security):
   locale and time-zone variables Arcen owns never enter. Imported names are
   logged, never their values. A failure is one log line. Nor can it change
   how the compositor composes or which GPU and driver it uses: Mutter,
-  Clutter, Cogl and GNOME Shell switches (such as `MUTTER_DEBUG_FORCE_HDR`),
-  EGL/GLX/Mesa/GBM driver selection and `GSETTINGS_BACKEND` (which would
-  bypass the pinned settings) are denied. The compositor's command removes
+  Clutter, Cogl and GNOME Shell switches (such as `MUTTER_DEBUG_FORCE_HDR`)
+  and `GSETTINGS_BACKEND` (which would bypass the pinned settings) are
+  denied. EGL/GLX/Mesa/GBM driver and PRIME selection (`__EGL_*`, `__GLX_*`,
+  `__NV_*`, `LIBGL_*`, `MESA_*`, `GBM_*`, `DRI_PRIME`, `EGL_PLATFORM`) is the
+  user's choice for their applications: the session bus and the activation
+  environment (D-Bus-activatable applications, user services) and autostart
+  programs get it, but the compositor (and the Xwayland it starts) is
+  started without it (`selects_gpu_or_driver`). A program GNOME Shell
+  spawns directly inherits the shell's environment and so does not see it.
+  The compositor's command removes
   `MUTTER_DEBUG_FORCE_HDR` unless the session is a forced-HDR one. Where the
   user's configuration lives (`XDG_CONFIG_HOME`, `XDG_CONFIG_DIRS`) is
   honoured: autostart, its conditions and the first-login marker are read
@@ -328,6 +348,36 @@ after a failure, and preserves failed recovery state. This ordering limits both
 privacy gaps and local denial of service. SAS/secure desktop, kernel HID,
 pen/tablet, physical hot-plug, sleep/resume, and driver-reset behavior are
 explicit non-claims pending physical lab evidence.
+
+The macOS Pier's desk privacy (`platform.desktop.deskside.enabled`, off by
+default; `hosts/macos/src/desk_privacy.rs`, rules in the shared
+`arcen_session::console_session::desk_privacy`) runs in the signed-in user's
+session helper, never at the login window and never in `serve`. It needs no
+new privilege: the active `CGEventTap` needs the Accessibility grant keyboard
+input already holds, and the transfer tables are the session's own. The
+filter passes only events the window server attributes to the helper's own
+process id (`kCGEventSourceUnixProcessID`); hardware, virtual HID and every
+other process's synthetic events are dropped, so a process that can post
+events as the helper can also pass the filter (the same non-claim as the
+Windows marker). A display counts as dark when its table reads back dark;
+the tables are re-asserted every 100 ms, so a display reconfiguration or
+wake that resets them shows the desk the session for up to 100 ms. A display
+that stays lit for two seconds, or a display list that cannot be read, ends
+the Deck's session, locked first. A console held by another account for
+three consecutive readings (one a second) gets the desk back and ends the
+Deck's session. A panic locks the session before the displays come back; a
+crash does not: the tap's port dies with the process and the window server
+restores a process's tables when it exits, so the desk gets the session
+unlocked. Not covered: Secure Event Input (a focused password field) hides
+keystrokes from every event tap, so the desk can type, unseen, into a
+password field the Deck focused (the pointer stays blocked and the screens
+dark); Siri, Voice Control, Switch Control, head-pointer input and
+dictation act through accessibility and input methods, not HID events; a
+display whose picture is itself a screen capture (DisplayLink, Sidecar,
+AirPlay) may show the session although its table reads back dark (not yet
+measured). Nothing about the events is logged but counts. Between a sign-in typed at the streamed login window
+and the Deck's reconnect to the signed-in user's helper (about two seconds)
+the desk is not yet private: the login window's helper never arms it.
 
 ## Linux X11 virtual input boundary
 

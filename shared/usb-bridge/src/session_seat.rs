@@ -41,6 +41,11 @@ pub enum HardUsbSessionSeat {
     /// A native Wayland desktop on its own Arcen seat, whose compositor takes
     /// the bridged device through logind.
     ArcenSeat,
+    /// The desktop on the machine's own monitors, joined (ADR 0025), Arcen's
+    /// or another remote product's: its X server is not one Arcen starts, so
+    /// it never admits a device tagged for it alone, and an untagged one
+    /// would reach every X server on the seat.
+    JoinedConsole,
 }
 
 /// Why Hard USB was refused for a session.
@@ -67,6 +72,9 @@ pub enum HardUsbSessionDenial {
     /// The tablet presents a keyboard (a keyboard interface, or keyboard
     /// keys on a node), which on `seat0` would reach the machine's console.
     X11KeyboardInterface,
+    /// The session is the desktop on the machine's own monitors; see
+    /// [`HardUsbSessionSeat::JoinedConsole`].
+    JoinedConsole,
 }
 
 impl HardUsbSessionDenial {
@@ -107,6 +115,11 @@ impl HardUsbSessionDenial {
                 "Native tablet stopped: the tablet's devices on this host did not prove they \
                  belong to your desktop alone. Use Tablet support."
             }
+            Self::JoinedConsole => {
+                "Native tablet is not available on the desktop of this machine's own \
+                 monitors: Arcen did not start its display server, so a bridged tablet \
+                 could not be kept to your session. Use Tablet support."
+            }
         }
     }
 }
@@ -130,6 +143,7 @@ pub const fn admit_hard_usb_session(seat: HardUsbSessionSeat) -> Result<(), Hard
         HardUsbSessionSeat::X11Desktop | HardUsbSessionSeat::ArcenSeat => Ok(()),
         HardUsbSessionSeat::Seatless => Err(HardUsbSessionDenial::SeatlessSession),
         HardUsbSessionSeat::ConsoleSeat => Err(HardUsbSessionDenial::ConsoleSeatSession),
+        HardUsbSessionSeat::JoinedConsole => Err(HardUsbSessionDenial::JoinedConsole),
     }
 }
 
@@ -166,6 +180,7 @@ mod tests {
             HardUsbSessionDenial::X11DesktopPredatesBridge,
             HardUsbSessionDenial::X11DeviceNotVerified,
             HardUsbSessionDenial::X11KeyboardInterface,
+            admit_hard_usb_session(HardUsbSessionSeat::JoinedConsole).unwrap_err(),
         ] {
             assert!(denial.reason().contains("Tablet support"));
             // Fits the protocol's tablet-mode reason bound (240 bytes).

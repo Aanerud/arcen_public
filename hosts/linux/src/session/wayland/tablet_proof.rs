@@ -277,14 +277,18 @@ fn send_with_fd(
     let fds = [fd.as_raw_fd()];
     let control = [nix::sys::socket::ControlMessage::ScmRights(&fds)];
     let iov = [std::io::IoSlice::new(message)];
-    let sent = nix::sys::socket::sendmsg::<()>(
-        connection.stream.as_raw_fd(),
-        &iov,
-        &control,
-        nix::sys::socket::MsgFlags::empty(),
-        None,
-    )
-    .map_err(std::io::Error::from)?;
+    let sent = loop {
+        match nix::sys::socket::sendmsg::<()>(
+            connection.stream.as_raw_fd(),
+            &iov,
+            &control,
+            nix::sys::socket::MsgFlags::empty(),
+            None,
+        ) {
+            Err(nix::errno::Errno::EINTR) => {}
+            other => break other.map_err(std::io::Error::from)?,
+        }
+    };
     if sent == message.len() {
         Ok(())
     } else {
@@ -342,6 +346,19 @@ mod tests {
         args
     }
 
+    /// One read from the test client, retried after a signal.
+    fn read_some(client: &mut std::os::unix::net::UnixStream, scratch: &mut [u8]) {
+        loop {
+            match client.read(scratch) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                result => {
+                    result.unwrap();
+                    return;
+                }
+            }
+        }
+    }
+
     fn global(name: u32, interface: &str) -> Vec<u8> {
         let mut args = name.to_le_bytes().to_vec();
         put_string(&mut args, interface);
@@ -360,7 +377,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut client, _) = listener.accept().unwrap();
             let mut scratch = [0_u8; 4096];
-            let _ = client.read(&mut scratch).unwrap();
+            read_some(&mut client, &mut scratch);
             let mut first = Vec::new();
             first.extend(global(7, "wl_seat"));
             first.extend(global(9, "zwp_tablet_manager_v2"));
@@ -369,7 +386,7 @@ mod tests {
             first.extend(global(12, "xdg_wm_base"));
             first.extend(event(SYNC_ID, 0, &0_u32.to_le_bytes()));
             client.write_all(&first).unwrap();
-            let _ = client.read(&mut scratch).unwrap();
+            read_some(&mut client, &mut scratch);
             let tablet = 0xff00_0001_u32;
             let mut tablets = Vec::new();
             tablets.extend(event(

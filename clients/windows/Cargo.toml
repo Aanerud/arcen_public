@@ -119,6 +119,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Controls",
     "Win32_Globalization",
     "Win32_Storage_FileSystem",
+    # platform: other running copies of the Deck (installed_copies).
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 # ui (shell): the window, egui and its wgpu (DX12) renderer on the
 # composition tree's overlay visual. Same versions as the macOS Deck's

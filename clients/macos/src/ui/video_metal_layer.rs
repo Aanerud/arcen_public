@@ -292,7 +292,7 @@ use std::time::Duration;
 pub(crate) use super::video_layer_status::*;
 
 use arcen_media::presentation::{
-    FramePacer, FramePacerCounters, FramePacerDropReason, FramePacerRefresh,
+    FramePacer, FramePacerCounters, FramePacerDropReason, FramePacerRefresh, NewestPresentDepth,
 };
 use arcen_media::video::PresentTiming;
 use block2::RcBlock;
@@ -1578,6 +1578,7 @@ impl DedicatedVideoLayer {
             Arc::clone(&in_flight),
             frame.arrival_host_time,
             target_host_time,
+            PresentedFollowUp::default(),
         );
         let retained_frame = TenBitInFlightFrame {
             _pixel_buffer: pixel_buffer.clone(),
@@ -1668,14 +1669,15 @@ const fn retained_handle_detach_before_install(has_retained_handle: bool) -> boo
     has_retained_handle
 }
 
-/// Small pure in-flight gate for the dedicated layer. Runtime rendering waits
-/// for completion today, so the counter normally returns to zero immediately;
-/// the type exists to keep the pacing invariant testable before a completion
-/// callback/display-link variant grows out of it.
+/// In-flight gate for the dedicated layer: a picture counts from submission
+/// until its drawable's presented handler, which releases the slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LayerInFlightGate {
     max_in_flight: u8,
     in_flight: u8,
+    /// The limit follows the measured submission-to-glass time
+    /// ([`NewestPresentDepth`]); set while the timing is `Newest`.
+    follows_depth: bool,
 }
 
 impl LayerInFlightGate {
@@ -1683,7 +1685,14 @@ impl LayerInFlightGate {
         Self {
             max_in_flight,
             in_flight: 0,
+            follows_depth: false,
         }
+    }
+
+    /// Nothing is in flight: a picture submitted now measures the display
+    /// path alone.
+    pub(crate) const fn is_idle(self) -> bool {
+        self.in_flight == 0
     }
 
     pub(crate) const fn can_submit(self) -> bool {
@@ -1721,6 +1730,11 @@ pub struct DedicatedEightBitVideoLayer {
     in_flight: Arc<Mutex<LayerInFlightGate>>,
     /// The presentation timing applied to the layer ([`Self::apply_timing`]).
     timing: PresentTiming,
+    /// Submission-to-glass time under `Newest`, which decides how many
+    /// pictures may be in flight.
+    newest_depth: Arc<Mutex<NewestPresentDepth>>,
+    /// Wakes the presenter when a slot frees ([`SlotFreed`]).
+    slot_freed: Option<SlotFreed>,
 }
 
 /// How the eight-bit layer presents under a pipeline's timing.
@@ -1728,10 +1742,13 @@ pub struct DedicatedEightBitVideoLayer {
 /// `displaySyncEnabled` is off only where the timing allows tearing
 /// (Speed): Core Animation then shows a drawable as soon as it is ready
 /// instead of at the next refresh, "possibly with brief visual artifacts
-/// (tearing)" (`CAMetalLayer.displaySyncEnabled`). Auto keeps one drawable
-/// in flight, so a newer frame waits as the newest in the pacer instead of
-/// queueing behind an older drawable (Core Animation shows display-synced
-/// drawables in order, each for a refresh). Speed keeps two: without
+/// (tearing)" (`CAMetalLayer.displaySyncEnabled`). Auto starts with one
+/// drawable in flight, so a newer frame waits as the newest in the pacer
+/// instead of queueing behind an older drawable (Core Animation shows
+/// display-synced drawables in order, each for a refresh); where the system
+/// composes the layer and a picture measurably takes longer than a refresh
+/// to reach the glass, it keeps a second one ([`NewestPresentDepth`]), or
+/// it would show only every second or third refresh. Speed keeps two: without
 /// display sync a drawable is shown as soon as it is ready, so a second one
 /// does not wait behind the first, and fewer frames are replaced unseen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1839,6 +1856,8 @@ impl DedicatedEightBitVideoLayer {
             applied_scaling: None,
             in_flight: Arc::new(Mutex::new(LayerInFlightGate::default())),
             timing: PresentTiming::Vsync,
+            newest_depth: Arc::new(Mutex::new(NewestPresentDepth::default())),
+            slot_freed: None,
         })
     }
 
@@ -1850,16 +1869,26 @@ impl DedicatedEightBitVideoLayer {
         }
         let plan = EightBitLayerTiming::for_timing(timing);
         self.layer.setDisplaySyncEnabled(plan.display_sync);
-        self.in_flight
-            .lock()
-            .expect("in-flight gate poisoned")
-            .max_in_flight = plan.max_in_flight;
+        let follows_depth = timing == PresentTiming::Newest;
+        let max_in_flight = if follows_depth {
+            self.newest_depth
+                .lock()
+                .expect("present depth poisoned")
+                .in_flight()
+        } else {
+            plan.max_in_flight
+        };
+        {
+            let mut gate = self.in_flight.lock().expect("in-flight gate poisoned");
+            gate.max_in_flight = max_in_flight;
+            gate.follows_depth = follows_depth;
+        }
         self.timing = timing;
         tracing::info!(
             target: crate::logging::target::VIDEO,
             timing = timing.token(),
             display_sync = self.layer.displaySyncEnabled(),
-            max_in_flight = plan.max_in_flight,
+            max_in_flight,
             "eight-bit video layer presentation timing applied",
         );
     }
@@ -1946,13 +1975,14 @@ impl DedicatedEightBitVideoLayer {
         }
         self.apply_timing(frame.timing);
         let in_flight = Arc::clone(&self.in_flight);
-        if !in_flight
-            .lock()
-            .expect("in-flight gate poisoned")
-            .submitted()
-        {
-            return Err(DedicatedLayerOutcome::NoDrawableAvailable);
-        }
+        let submitted_alone = {
+            let mut gate = in_flight.lock().expect("in-flight gate poisoned");
+            let alone = gate.is_idle();
+            if !gate.submitted() {
+                return Err(DedicatedLayerOutcome::NoDrawableAvailable);
+            }
+            alone
+        };
         let result = autoreleasepool(|_| {
             self.render_inner(
                 frame,
@@ -1960,6 +1990,7 @@ impl DedicatedEightBitVideoLayer {
                 target_host_time,
                 refresh_period,
                 telemetry,
+                submitted_alone,
             )
         });
         if result.is_err() {
@@ -1978,6 +2009,7 @@ impl DedicatedEightBitVideoLayer {
         target_host_time: Duration,
         refresh_period: Duration,
         telemetry: Arc<DedicatedPresenterTelemetry>,
+        submitted_alone: bool,
     ) -> Result<(), DedicatedLayerOutcome> {
         self.ensure_colorspace(frame.contract.primaries, frame.contract.transfer);
         let plan = plane_pixel_formats(frame.contract.depth);
@@ -2084,12 +2116,22 @@ impl DedicatedEightBitVideoLayer {
             );
         }
         telemetry.record_submitted(target_host_time, frame.arrival_host_time, refresh_period);
+        let measure =
+            (submitted_alone && self.timing == PresentTiming::Newest).then(|| DepthMeasure {
+                depth: Arc::clone(&self.newest_depth),
+                submitted_host_time: current_host_time(),
+                refresh_period,
+            });
         install_presented_handler(
             drawable_for_present,
             telemetry,
             Arc::clone(&in_flight),
             frame.arrival_host_time,
             target_host_time,
+            PresentedFollowUp {
+                measure,
+                slot_freed: self.slot_freed.clone(),
+            },
         );
         let retained_frame = EightBitInFlightFrame {
             _pixel_buffer: pixel_buffer.clone(),
@@ -2200,9 +2242,16 @@ trait DedicatedRenderableLayer<F>: Send + 'static {
     fn ready_for_frame(&self) -> bool {
         true
     }
+    /// The layer presents frames on arrival and wants a wake when a slot
+    /// frees ([`Self::set_slot_freed`]).
+    const WAKES_ON_FREED_SLOT: bool = false;
+    /// Hands the layer the presenter's wake for a freed drawable slot.
+    fn set_slot_freed(&mut self, _slot_freed: SlotFreed) {}
 }
 
 impl DedicatedRenderableLayer<DedicatedEightBitLayerFrame> for DedicatedEightBitVideoLayer {
+    const WAKES_ON_FREED_SLOT: bool = true;
+
     fn ready_for_frame(&self) -> bool {
         self.in_flight
             .lock()
@@ -2222,6 +2271,10 @@ impl DedicatedRenderableLayer<DedicatedEightBitLayerFrame> for DedicatedEightBit
 
     fn layer_handle(&self) -> Retained<CAMetalLayer> {
         self.layer.clone()
+    }
+
+    fn set_slot_freed(&mut self, slot_freed: SlotFreed) {
+        self.slot_freed = Some(slot_freed);
     }
 }
 
@@ -2321,6 +2374,10 @@ struct DedicatedPresenterTelemetry {
     last_submitted_host_time_us: AtomicU64,
     last_refresh_period_us: AtomicU64,
     latest_refresh_period_us: AtomicU64,
+    /// Submission to `presentedTime` of pictures submitted alone.
+    submit_to_glass_us: Mutex<Vec<u64>>,
+    /// The in-flight limit after the last presented picture.
+    max_in_flight: AtomicU64,
 }
 
 impl DedicatedPresenterTelemetry {
@@ -2441,6 +2498,13 @@ impl DedicatedPresenterTelemetry {
             .push(duration_micros(late));
     }
 
+    fn record_submit_to_glass(&self, depth: Duration) {
+        self.submit_to_glass_us
+            .lock()
+            .expect("submit-to-glass telemetry poisoned")
+            .push(duration_micros(depth));
+    }
+
     fn record_confirmed(&self) {
         self.frames_confirmed.fetch_add(1, Ordering::Relaxed);
         self.confirmed_presented_at
@@ -2485,6 +2549,14 @@ impl DedicatedPresenterTelemetry {
             .expect("confirmed presentation telemetry poisoned")
             .drain(..)
             .collect();
+        let mut submit_to_glass = self
+            .submit_to_glass_us
+            .lock()
+            .expect("submit-to-glass telemetry poisoned");
+        submit_to_glass.sort_unstable();
+        let submit_to_glass_p50_us = percentile(&submit_to_glass, 50);
+        submit_to_glass.clear();
+        drop(submit_to_glass);
         let refresh_period_us = match self.latest_refresh_period_us.load(Ordering::Relaxed) {
             0 => None,
             value => Some(value),
@@ -2516,6 +2588,11 @@ impl DedicatedPresenterTelemetry {
             submitted_presented_at,
             confirmed_presented_at,
             refresh_period_us,
+            submit_to_glass_p50_us,
+            max_in_flight: match self.max_in_flight.load(Ordering::Relaxed) {
+                0 => None,
+                value => Some(value),
+            },
         }
     }
 }
@@ -2542,12 +2619,41 @@ fn atomic_max(target: &AtomicU64, value: u64) {
     }
 }
 
+/// Wakes the presenter's slot thread when a drawable slot frees, so a frame
+/// that waited in the pacer is submitted at once instead of on the next
+/// display-link tick (which, with one picture in flight on a composed
+/// display, cost a whole refresh per frame).
+#[derive(Clone)]
+struct SlotFreed(std::sync::mpsc::Sender<()>);
+
+impl SlotFreed {
+    fn notify(&self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// A submission-to-glass measurement for [`NewestPresentDepth`]: a picture
+/// submitted while none other was in flight.
+struct DepthMeasure {
+    depth: Arc<Mutex<NewestPresentDepth>>,
+    submitted_host_time: Duration,
+    refresh_period: Duration,
+}
+
+/// What a presented handler does besides telemetry and releasing the slot.
+#[derive(Default)]
+struct PresentedFollowUp {
+    measure: Option<DepthMeasure>,
+    slot_freed: Option<SlotFreed>,
+}
+
 fn install_presented_handler(
     drawable: &ProtocolObject<dyn MTLDrawable>,
     telemetry: Arc<DedicatedPresenterTelemetry>,
     in_flight: Arc<Mutex<LayerInFlightGate>>,
     arrival_host_time: Duration,
     target_host_time: Duration,
+    follow_up: PresentedFollowUp,
 ) {
     let handler = RcBlock::new(move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
         // SAFETY: Metal invokes the block with the drawable being presented.
@@ -2559,10 +2665,42 @@ fn install_presented_handler(
             telemetry.record_confirmed();
             telemetry.record_on_glass(presented, arrival_host_time, target_host_time);
         }
-        in_flight
-            .lock()
-            .expect("in-flight gate poisoned")
-            .completed();
+        let changed_in_flight = follow_up
+            .measure
+            .as_ref()
+            .filter(|_| !presented.is_zero())
+            .and_then(|measure| {
+                let depth = presented.saturating_sub(measure.submitted_host_time);
+                telemetry.record_submit_to_glass(depth);
+                let mut tracker = measure.depth.lock().expect("present depth poisoned");
+                tracker
+                    .record(depth, measure.refresh_period)
+                    .map(|next| (next, tracker.median(), measure.refresh_period))
+            });
+        {
+            let mut gate = in_flight.lock().expect("in-flight gate poisoned");
+            gate.completed();
+            if let Some((next, _, _)) = changed_in_flight {
+                if gate.follows_depth {
+                    gate.max_in_flight = next;
+                }
+            }
+            telemetry
+                .max_in_flight
+                .store(u64::from(gate.max_in_flight), Ordering::Relaxed);
+        }
+        if let Some((next, median, refresh)) = changed_in_flight {
+            tracing::info!(
+                target: crate::logging::target::VIDEO,
+                max_in_flight = next,
+                submit_to_glass_p50_us = ?median.map(duration_micros),
+                refresh_period_us = duration_micros(refresh),
+                "eight-bit video layer pictures in flight follow the display path",
+            );
+        }
+        if let Some(slot_freed) = follow_up.slot_freed.as_ref() {
+            slot_freed.notify();
+        }
         tracing::trace!(
             target: crate::logging::target::VIDEO,
             presented_time_s = presented.as_secs_f64(),
@@ -2585,6 +2723,8 @@ where
     shared: DedicatedThreadShared<L, F, S>,
     telemetry: Arc<DedicatedPresenterTelemetry>,
     display_link: Option<DedicatedDisplayLink<L, F, S>>,
+    /// The slot thread's wake for the current `shared` ([`SlotFreed`]).
+    slot_freed: Option<SlotFreed>,
 }
 
 struct DedicatedPresenterThreadState<L, F, S>
@@ -2674,6 +2814,7 @@ where
             )),
             telemetry: Arc::new(DedicatedPresenterTelemetry::default()),
             display_link: None,
+            slot_freed: None,
         }
     }
 }
@@ -3132,13 +3273,58 @@ where
         }
     }
 
+    /// The wake for this presenter's slot thread, started on first use. The
+    /// thread presents the newest waiting frame each time a drawable slot
+    /// frees (a timing that waits for the refresh is left to the display
+    /// link). It ends with the presenter's state or its last wake.
+    fn slot_freed_sender(&mut self) -> SlotFreed {
+        if let Some(slot_freed) = self.slot_freed.as_ref() {
+            return slot_freed.clone();
+        }
+        let (sender, receiver) = std::sync::mpsc::channel::<()>();
+        let shared = Arc::downgrade(&self.shared);
+        let telemetry = Arc::clone(&self.telemetry);
+        let spawned = std::thread::Builder::new()
+            .name("arcen-video-slot".to_owned())
+            .spawn(move || {
+                // SAFETY: sets the calling thread's own QoS class; no
+                // pointers are passed.
+                unsafe {
+                    libc::pthread_set_qos_class_self_np(
+                        libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+                        0,
+                    );
+                }
+                while receiver.recv().is_ok() {
+                    while receiver.try_recv().is_ok() {}
+                    let Some(shared) = shared.upgrade() else {
+                        break;
+                    };
+                    present_on_arrival(&shared, Arc::clone(&telemetry));
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(
+                target: crate::logging::target::VIDEO,
+                %error,
+                "video slot thread did not start; a waiting frame is presented on the next refresh",
+            );
+        }
+        let slot_freed = SlotFreed(sender);
+        self.slot_freed = Some(slot_freed.clone());
+        slot_freed
+    }
+
     fn install_layer(
         &mut self,
-        layer: L,
+        mut layer: L,
         visible: bool,
         geometry: DedicatedLayerGeometry,
         display_id: Option<CGDirectDisplayID>,
     ) {
+        if L::WAKES_ON_FREED_SLOT {
+            layer.set_slot_freed(self.slot_freed_sender());
+        }
         if visible {
             self.ensure_display_link(display_id);
         } else {
@@ -3391,6 +3577,7 @@ where
             Condvar::new(),
         ));
         self.telemetry = Arc::new(DedicatedPresenterTelemetry::default());
+        self.slot_freed = None;
     }
 
     fn take_async_status(&self) -> Option<S> {
@@ -4463,6 +4650,31 @@ mod tests {
             assert_eq!(probe.rendered(), vec![1, 3], "{timing:?}");
             assert_eq!(thread.pacer_counters_for_test().dropped_overflow, 1);
         }
+    }
+
+    #[test]
+    fn a_frame_waiting_for_a_slot_is_presented_when_the_slot_frees_not_on_the_next_refresh() {
+        let layer = FakeGeometryLayer::default();
+        let probe = layer.clone();
+        let mut thread = timed_thread(layer);
+        let frame = |id| TimedFrame {
+            id,
+            timing: PresentTiming::Newest,
+        };
+        assert!(thread.submit(frame(1), current_host_time()));
+        probe.set_slots_busy(true);
+        assert!(thread.submit(frame(2), current_host_time()));
+        assert_eq!(probe.rendered(), vec![1]);
+        // The drawable of frame 1 reached the glass: its presented handler
+        // frees the slot and wakes the slot thread. No display-link tick.
+        probe.set_slots_busy(false);
+        thread.slot_freed_sender().notify();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while probe.rendered().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(probe.rendered(), vec![1, 2]);
+        assert_eq!(thread.queue_depth_for_test(), 0);
     }
 
     #[test]

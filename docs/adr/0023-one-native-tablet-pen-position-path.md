@@ -132,6 +132,15 @@ averaging. Sent-to-received is the same for both paths (about 16 ms, half
 the round trip). The application's ink on X11 still follows the averaged X
 pointer; the Deck's dot now shows where the pen is.
 
+Amendment (2026-11): the desktop's bridge class now sets the driver's
+`RawSample` to 1 (`arcen_usb_bridge::bridge_seat::XORG_BRIDGE_RAW_SAMPLE`),
+so the X pointer, and the ink that follows it, is at the pen's latest
+report rather than the average of its last four. `Suppress` keeps the
+driver's default (2 tablet units). A desktop an earlier Pier started ends
+with that Pier's class, which confines bridged devices the same way; it is
+still recognised (`admitted_bridge_display`), so it never blocks another
+desktop's Native tablet.
+
 A remap was proven to hand the pointer back: setting the stylus's
 "Coordinate Transformation Matrix" to `0.5 0 0 0 1 0 0 0 1` mid-run gave
 `Remapped(Transform)` 0.86 s later, and "Wacom Rotation" 3 gave

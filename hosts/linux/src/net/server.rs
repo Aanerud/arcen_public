@@ -18,15 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arcen_session::session_setup::SetupRefusal;
 use futures_util::{SinkExt, StreamExt};
-#[cfg(feature = "wss-compat")]
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
-#[cfg(feature = "wss-compat")]
-use tokio_tungstenite::accept_hdr_async_with_config;
-#[cfg(feature = "wss-compat")]
-use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, trace, warn, Instrument};
@@ -40,8 +34,6 @@ use crate::display::topology::LinuxTopologyPlan;
 use crate::eventlog;
 use crate::input::region_adapter::RegionInputAdapter;
 use crate::input::{InputBackendChoice, InputController, InputError, InputStats, PierInput};
-#[cfg(feature = "wss-compat")]
-use crate::logging::target::TLS;
 use crate::logging::target::{AUDIO, AUTH, CAPENC, DISPLAY, HEALTH, INPUT, MEDIA, NET, SESSION};
 use crate::logging::LogController;
 use crate::media::audio::{self as audiocap, AudioConfig};
@@ -97,23 +89,26 @@ use arcen_media::{
 use arcen_protocol::messages::{
     msg_type, supports_region_input_v1, supports_text_commit_v1, AuthRequest, AuthResponse,
     AuthResult, ClientHelloMsg, ClipboardDataMsg, CursorMode, CursorModeReason,
-    CursorModeResultMsg, DisplayUpdateMsg, DisplayUpdateResultMsg, HealthPingMsg, HealthPongMsg,
-    InputCapabilityAvailability, KeyEventMsg, KeyResetModifiersMsg, MicrophoneStreamStopMsg,
-    MouseButtonMsg, MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg,
-    QualitySettings, RegionInputValidationError, RegionPenEventMsg, RegionPointerButtonMsg,
-    RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg,
-    RequestFullFrameMsg, ResumeErrorCode, ServerMultiMonitorMsg, TabletModeCapabilitiesMsg,
-    TabletModeMsg, TabletModeReason, TabletModeResultMsg, TextCommitMsg, AUTH_METHOD_RESUME,
-    AUTH_REQUEST, AUTH_RESULT, CLIENT_HELLO, CLIPBOARD_DATA, DISPLAY_UPDATE, HEALTH_PING,
-    HEALTH_PONG, KEY_RESET_MODIFIERS, MICROPHONE_STREAM_STOP, MOUSE_MOVE_RELATIVE, MOUSE_SCROLL,
-    PEN_EVENT, REGION_INPUT_PROTOCOL_VERSION, REGION_PEN_EVENT, REGION_POINTER_BUTTON,
-    REGION_POINTER_ENTER, REGION_POINTER_LEAVE, REGION_POINTER_MOTION, REGION_POINTER_SCROLL,
-    REQUEST_FULL_FRAME, TEXT_COMMIT,
+    CursorModeResultMsg, DisplayUpdateMsg, DisplayUpdateResultMsg, GestureMagnifyMsg,
+    HealthPingMsg, HealthPongMsg, InputCapabilityAvailability, KeyEventMsg, KeyResetModifiersMsg,
+    MicrophoneStreamStopMsg, MouseButtonMsg, MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg,
+    PenEventMsg, QualitySettings, RegionInputValidationError, RegionPenEventMsg,
+    RegionPointerButtonMsg, RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg,
+    RegionPointerScrollMsg, RequestFullFrameMsg, ResumeErrorCode, SequencedInput,
+    ServerMultiMonitorMsg, TabletModeCapabilitiesMsg, TabletModeMsg, TabletModeReason,
+    TabletModeResultMsg, TextCommitMsg, AUTH_METHOD_RESUME, AUTH_REQUEST, AUTH_RESULT,
+    CLIENT_HELLO, CLIPBOARD_DATA, DISPLAY_UPDATE, GESTURE_MAGNIFY, GESTURE_ROTATE,
+    GESTURE_SMART_ZOOM, GESTURE_SWIPE, HEALTH_PING, HEALTH_PONG, KEY_RESET_MODIFIERS,
+    MICROPHONE_STREAM_STOP, MOUSE_MOVE_RELATIVE, MOUSE_SCROLL, PEN_EVENT,
+    REGION_INPUT_PROTOCOL_VERSION, REGION_PEN_EVENT, REGION_POINTER_BUTTON, REGION_POINTER_ENTER,
+    REGION_POINTER_LEAVE, REGION_POINTER_MOTION, REGION_POINTER_SCROLL, REQUEST_FULL_FRAME,
+    TEXT_COMMIT,
 };
 use arcen_protocol::{decode_clipboard_chunk, decode_microphone_frame, AudioCodec, FrameType};
 use arcen_session::auth_throttle::{AttemptOutcome, HostAuthThrottle, THROTTLED_MESSAGE};
 use arcen_session::direct_reconnect::{
     DirectReconnect, MonotonicMillis, ReconnectEvent, ReconnectPolicy, ReconnectState,
+    ResumeHoldEnd,
 };
 use arcen_session::restore_lease::IanaTimeZone;
 use arcen_session::session_admission::{
@@ -707,11 +702,21 @@ async fn align_wayland_outputs(
 /// # Errors
 ///
 /// A Deck-facing reason when the desktop has ended.
+/// Why an attachment ends when the desktop it showed is gone (ended on the
+/// host, or terminated by an administrator), rather than its capture failing.
+const DESKTOP_ENDED_REASON: &str = "the desktop session on the host ended";
+
+/// Whether an X11 desktop's session agent has gone: the desktop it served
+/// ended, so a capture that stopped is not a failing capture.
+fn x11_desktop_ended(lease: &SessionLease) -> bool {
+    !std::path::Path::new(&format!("/proc/{}", lease.metadata.agent_pid)).exists()
+}
+
 async fn wayland_capture_source(
     ready: &crate::session::wayland::WaylandAgentReady,
     lease: &SessionLease,
 ) -> Result<crate::session::wayland::WaylandAgentReady, &'static str> {
-    const ENDED: &str = "the desktop session on the host ended";
+    const ENDED: &str = DESKTOP_ENDED_REASON;
     if ready.output_socket.is_some() {
         return crate::session::wayland::output_client::current(
             ready,
@@ -1587,12 +1592,179 @@ struct AuthenticatedConnection {
     session_config: Config,
 }
 
+/// A joined console's outputs are asked for the refresh each monitor's
+/// served rate needs (`cli::xorg_head_refresh_hz`: twice the rate where an
+/// output can run it), not the Deck display's own: a 30 Hz Deck display's
+/// monitor gets a 60 Hz head, so the desktop's animations are not held at
+/// 30 Hz. The console's mode nearest to that is taken; what it really runs
+/// at caps the served rate (`console_refresh_caps`). Other plans keep their
+/// requested refresh.
+fn with_console_head_refresh(
+    cfg: &Config,
+    mut plan: crate::display::topology::LinuxTopologyPlan,
+) -> crate::display::topology::LinuxTopologyPlan {
+    if plan.backend != crate::display::topology::LinuxTopologyBackend::ConsoleOutputs {
+        return plan;
+    }
+    for monitor in &mut plan.monitors {
+        let refresh_hz = crate::cli::xorg_head_refresh_hz(
+            monitor.width,
+            monitor.height,
+            cfg.monitor_fps(&monitor.client_display_id),
+            monitor.refresh_hz,
+        );
+        if refresh_hz != monitor.refresh_hz {
+            info!(
+                target: SESSION,
+                client_display_id = %monitor.client_display_id,
+                display_refresh_hz = monitor.refresh_hz,
+                refresh_hz,
+                "a console head is asked for the paced refresh of its monitor's served rate"
+            );
+            monitor.refresh_hz = refresh_hz;
+        }
+    }
+    plan
+}
+
+/// `cfg` capped by what a joined console's outputs refresh at
+/// (`Config::capture_refresh_caps`), read from its X server now (after the
+/// launcher applied any layout): each monitor of a console multi-monitor
+/// plan by the output that shows it (by name for a console shown as it is,
+/// else by RandR order, the order the launcher lays the plan out in), a
+/// single stream by the primary output (else the fastest). Unreadable
+/// outputs leave `cfg` as it is, and say so.
+async fn console_refresh_caps(cfg: Arc<Config>, lease: &SessionLease) -> Arc<Config> {
+    use crate::cli::CaptureRefreshCap;
+    use crate::display::topology::LinuxTopologyBackend;
+    let shown = match crate::session::console_layout::shown_outputs(
+        &lease.metadata.session_id,
+        lease.metadata.uid,
+    )
+    .await
+    {
+        Ok(shown) => shown,
+        Err(error) => {
+            warn!(
+                target: SESSION,
+                %error,
+                "the console's outputs could not be read; the served rate is not capped by their refresh"
+            );
+            return cfg;
+        }
+    };
+    let refresh_hz = |output: &arcen_outputs::console_layout::ShownOutput| {
+        (output.refresh_mhz > 0).then(|| output.refresh_mhz.saturating_add(500) / 1000)
+    };
+    let caps: Vec<CaptureRefreshCap> = match lease
+        .metadata
+        .multi_monitor_plan
+        .as_ref()
+        .filter(|plan| plan.backend == LinuxTopologyBackend::ConsoleOutputs)
+    {
+        Some(plan) => plan
+            .monitors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, monitor)| {
+                let output = match lease.metadata.console_shown_outputs.as_ref() {
+                    Some(names) => names
+                        .get(index)
+                        .and_then(|name| shown.iter().find(|output| &output.name == name)),
+                    None => shown.get(index),
+                }?;
+                Some(CaptureRefreshCap {
+                    client_display_id: Some(monitor.client_display_id.clone()),
+                    refresh_hz: refresh_hz(output)?.max(1),
+                })
+            })
+            .collect(),
+        None => shown
+            .iter()
+            .find(|output| output.primary)
+            .and_then(refresh_hz)
+            .or_else(|| shown.iter().filter_map(refresh_hz).max())
+            .map(|refresh_hz| CaptureRefreshCap {
+                client_display_id: None,
+                refresh_hz: refresh_hz.max(1),
+            })
+            .into_iter()
+            .collect(),
+    };
+    info!(
+        target: SESSION,
+        outputs = ?shown
+            .iter()
+            .map(|output| format!("{}@{}mHz", output.name, output.refresh_mhz))
+            .collect::<Vec<_>>(),
+        caps = ?caps,
+        "a joined console is served no faster than its outputs refresh"
+    );
+    Arc::new((*cfg).clone().with_capture_refresh_caps(caps))
+}
+
+/// Each monitor's own rate in a committed multi-monitor plan
+/// (`Config::monitor_fps`). A dedicated multi-head Xorg desktop's heads run
+/// the driver's default mode (`nvidia-auto-select`, which planning does not
+/// fit to a refresh), so no monitor there is promised more than
+/// [`crate::display::topology::DEDICATED_XORG_HEAD_REFRESH_HZ`].
+fn monitor_rates(
+    cfg: &Config,
+    plan: &crate::display::topology::LinuxTopologyPlan,
+) -> Vec<(String, u32)> {
+    use crate::display::topology::{LinuxTopologyBackend, DEDICATED_XORG_HEAD_REFRESH_HZ};
+    plan.monitors
+        .iter()
+        .map(|monitor| {
+            let rate = cfg.monitor_frame_rate(&monitor.client_display_id);
+            let rate = if plan.backend == LinuxTopologyBackend::DedicatedXorg {
+                rate.narrow(
+                    DEDICATED_XORG_HEAD_REFRESH_HZ,
+                    arcen_media::video::FrameRateBasis::CaptureSource,
+                )
+            } else {
+                rate
+            };
+            info!(
+                target: SESSION,
+                client_display_id = %monitor.client_display_id,
+                fps = rate.fps,
+                display_refresh_hz = ?rate.display_refresh_hz,
+                fps_basis = rate.basis.token(),
+                "monitor frame rate"
+            );
+            (monitor.client_display_id.clone(), rate.fps)
+        })
+        .collect()
+}
+
 fn config_with_initial_video_request(
     config: &Config,
     response: &AuthResponse,
 ) -> Result<Config, String> {
+    config_with_initial_video_request_as(config, response, true)
+}
+
+/// [`config_with_initial_video_request`] for a session served as
+/// `multi_monitor` (a committed multi-monitor plan: the rate follows the
+/// fastest requested display, and each monitor its own) or as one stream
+/// (the rate follows the display that shows it).
+fn config_with_initial_video_request_as(
+    config: &Config,
+    response: &AuthResponse,
+    multi_monitor: bool,
+) -> Result<Config, String> {
     let mut resolved = config.clone();
-    resolved.deck_display_refresh_hz = response.display_refresh_hz();
+    resolved.deck_display_refresh_hz = if multi_monitor {
+        response.display_refresh_hz()
+    } else {
+        response.stream_display_refresh_hz()
+    };
+    resolved.deck_monitor_refresh_hz = if multi_monitor {
+        response.monitor_display_refreshes()
+    } else {
+        Vec::new()
+    };
     if let Some(request) = response.initial_video.as_ref() {
         resolved.apply_initial_video_request(request)?;
     }
@@ -1607,10 +1779,11 @@ fn config_on_attached_desktop(
     config: &Config,
     response: &AuthResponse,
     depth: arcen_media::video::DesktopDepth,
+    multi_monitor: bool,
 ) -> Result<Config, String> {
     let mut attached = config.clone();
     attached.attached_desktop_depth = Some(depth);
-    config_with_initial_video_request(&attached, response)
+    config_with_initial_video_request_as(&attached, response, multi_monitor)
 }
 
 /// The session configuration a sign-in whose Wayland multi-monitor
@@ -2306,6 +2479,18 @@ where
                 }
                 None => session_config,
             };
+            // A multi-monitor request served as one stream (not admitted)
+            // follows the display that shows it, not its fastest display.
+            let session_config = if response.multi_monitor_v1.is_some()
+                && !matches!(
+                    &multi_monitor_outcome,
+                    multi_monitor::MultiMonitorOutcome::Planned { .. }
+                ) {
+                config_with_initial_video_request_as(cfg, &response, false)
+                    .unwrap_or(session_config)
+            } else {
+                session_config
+            };
             if let multi_monitor::MultiMonitorOutcome::Planned { plan, .. } = &multi_monitor_outcome
             {
                 if let Err(error) = multi_capenc::validate_monitor_resource_policy(
@@ -2631,18 +2816,27 @@ fn speed_guard_for(
     })
 }
 
-/// The live capture's per-second content proofs, followed across capture
-/// restarts so the health tick judges frame rate against the content the
-/// current capture saw over the whole health window.
-type ContentStatsCell = Arc<Mutex<Option<capenc::ContentWindowCell>>>;
+/// The live captures' per-second content proofs, one per monitor pipeline,
+/// followed across capture restarts so the health tick judges frame rate
+/// against the content each capture saw over the whole health window. A
+/// multi-monitor pipeline's carries its monitor and that monitor's own
+/// served rate; the single capture's carries `None` (the session's rate,
+/// which the governor may lower).
+type ContentStatsCell =
+    Arc<Mutex<Vec<(Option<(SessionMonitorId, u32)>, capenc::ContentWindowCell)>>>;
 
-/// Points the health tick at `handle`'s stats. A multi-monitor supervisor's
-/// sent count spans every output while each child reports only its own, so it
-/// proves nothing and frame rate is judged against the target as before.
+/// Points the health tick at `handle`'s stats: the single capture's, or
+/// every monitor pipeline's of a multi-monitor supervisor, whose frames the
+/// health tick counts together.
 fn follow_content_stats(cell: &ContentStatsCell, handle: Option<&CapencHandle>) {
     let stats = match handle {
-        Some(CapencHandle::Single(session)) => Some(session.content_window()),
-        Some(CapencHandle::Multi(_)) | None => None,
+        Some(CapencHandle::Single(session)) => vec![(None, session.content_window())],
+        Some(CapencHandle::Multi(supervisor)) => supervisor
+            .content_windows()
+            .into_iter()
+            .map(|(monitor, fps, window)| (Some((monitor, fps)), window))
+            .collect(),
+        None => Vec::new(),
     };
     *lock_recover(cell) = stats;
 }
@@ -2686,13 +2880,44 @@ fn take_pipeline_second(cell: &PipelineStatsCell) -> Option<capenc::PipelineStat
     second
 }
 
-/// The changed-content rate the live capture proved over the health window
-/// since the last tick — only when every stats second in it did
-/// (`arcen_telemetry::ContentWindow`) — for `QosSample::fps_content`.
-fn current_content_fps(cell: &ContentStatsCell) -> Option<u32> {
-    lock_recover(cell)
-        .as_ref()
-        .and_then(|content| lock_recover(content).take_fps())
+/// What the live captures proved over the health window since the last
+/// tick, each output only when every stats second in it did
+/// (`arcen_telemetry::ContentWindow`), each owing at most its own served
+/// rate (`session_fps` for the single capture), combined for
+/// `QosSample::fps_content` and the window's target
+/// (`arcen_telemetry::outputs_content`).
+///
+/// Also returns each multi-monitor pipeline's own evidence, for its line in
+/// `health_stats` (`arcen_observability::MonitorRates`).
+fn current_content(
+    cell: &ContentStatsCell,
+    session_fps: u32,
+) -> (
+    arcen_telemetry::OutputsContent,
+    Vec<(SessionMonitorId, u32, Option<u32>)>,
+) {
+    let windows = lock_recover(cell);
+    let outputs: Vec<(Option<SessionMonitorId>, u32, Option<u32>)> = windows
+        .iter()
+        .map(|(monitor, content)| {
+            (
+                monitor.map(|(id, _)| id),
+                monitor.map_or(session_fps, |(_, fps)| fps).max(1),
+                lock_recover(content).take_fps(),
+            )
+        })
+        .collect();
+    (
+        arcen_telemetry::outputs_content(
+            outputs
+                .iter()
+                .map(|(_, target, content)| (*target, *content)),
+        ),
+        outputs
+            .into_iter()
+            .filter_map(|(id, target, content)| Some((id?, target, content)))
+            .collect(),
+    )
 }
 
 /// The guard's verdict, once the epoch's counts give one; pending without a
@@ -2946,6 +3171,39 @@ fn emit_session_end_or_interrupted(
             fields,
         );
     }
+}
+
+/// Emits `RESUME_HOLD_ENDED` (1108): the Pier let go of the desktop it held
+/// since `held_since` for its Deck's resume, and why, at every log profile.
+fn emit_resume_hold_ended(
+    emitter: &LifecycleEmitter,
+    session_log_id: CorrelationId,
+    end: arcen_session::direct_reconnect::ResumeHoldEnd,
+    held_since: std::time::Instant,
+    user: &str,
+    peer_addr: &str,
+) {
+    tracing::info!(
+        target: SESSION,
+        reason_class = end.token(),
+        held_ms = u64::try_from(held_since.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "the resume hold ended; Arcen let go of the desktop"
+    );
+    let Some(fields) = end.fields(held_since.elapsed()) else {
+        return;
+    };
+    let context = emitter.session_context(
+        session_log_id,
+        Some(user.to_owned()),
+        Some(peer_addr.to_owned()),
+        None,
+    );
+    crate::emit_lifecycle_event_with_context(
+        emitter,
+        LifecycleEventKind::ResumeHoldEnded,
+        context,
+        fields,
+    );
 }
 
 /// Safe, closed reason-class mapping for a startup `std::io::Error`. Never
@@ -3222,36 +3480,6 @@ fn emit_service_loss_notices(emitter: &LifecycleEmitter) {
     emitter.emit_loss_notices();
 }
 
-#[cfg(feature = "wss-compat")]
-type CompatibilityListener = Option<TcpListener>;
-#[cfg(not(feature = "wss-compat"))]
-type CompatibilityListener = ();
-
-enum CompatibilityAccept {
-    #[cfg(feature = "wss-compat")]
-    Connected(TcpStream, SocketAddr),
-}
-
-#[cfg(feature = "wss-compat")]
-async fn accept_compatibility(
-    listener: &CompatibilityListener,
-) -> std::io::Result<CompatibilityAccept> {
-    match listener {
-        Some(listener) => listener
-            .accept()
-            .await
-            .map(|(stream, peer)| CompatibilityAccept::Connected(stream, peer)),
-        None => std::future::pending().await,
-    }
-}
-
-#[cfg(not(feature = "wss-compat"))]
-async fn accept_compatibility(
-    _listener: &CompatibilityListener,
-) -> std::io::Result<CompatibilityAccept> {
-    std::future::pending().await
-}
-
 /// Build TLS before binding, then serve QUIC connections until SIGINT/SIGTERM.
 ///
 /// `signals` were installed before start-up (`ServiceSignals::install`), so a
@@ -3310,21 +3538,6 @@ pub async fn serve(
             return Err(error);
         }
     };
-    #[cfg(feature = "wss-compat")]
-    let listener: CompatibilityListener = match cfg.wss_port {
-        Some(port) => {
-            let compatibility_addr = format!("{}:{port}", cfg.host);
-            Some(TcpListener::bind(&compatibility_addr).await.map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("bind dormant WSS compatibility listener {compatibility_addr}: {error}"),
-                )
-            })?)
-        }
-        None => None,
-    };
-    #[cfg(not(feature = "wss-compat"))]
-    let listener: CompatibilityListener = ();
     info!(
         target: NET,
         addr = %quic_addr,
@@ -3351,6 +3564,9 @@ pub async fn serve(
     {
         crate::session::console::recover_console().await;
         tokio::spawn(crate::session::console::guard_unsecured_console());
+        if cfg.joins_console() {
+            tokio::spawn(crate::session::console::guard_login_screen());
+        }
         warn_unweighed_domain_logons(&cfg.pam_service);
     }
 
@@ -3406,22 +3622,6 @@ pub async fn serve(
 
     loop {
         tokio::select! {
-            accepted = accept_compatibility(&listener) => {
-                #[cfg(feature = "wss-compat")]
-                match accepted {
-                    Ok(CompatibilityAccept::Connected(stream, peer)) => {
-                        let state = state.clone();
-                        connections.spawn(async move {
-                            if let Err(error) = handle_connection(stream, peer, state).await {
-                                debug!(target: NET, %peer, %error, "compatibility connection ended with error");
-                            }
-                        });
-                    }
-                    Err(error) => warn!(target: NET, %error, "compatibility accept failed"),
-                }
-                #[cfg(not(feature = "wss-compat"))]
-                let _ = accepted;
-            }
             incoming = quic_endpoint.accept() => {
                 if let Some(incoming) = incoming {
                     let state = state.clone();
@@ -3687,21 +3887,6 @@ fn ws_config() -> WebSocketConfig {
     }
 }
 
-#[allow(clippy::result_large_err)] // Callback signature is fixed by tungstenite.
-#[cfg(feature = "wss-compat")]
-fn reject_browser_origin(request: &Request, response: Response) -> Result<Response, ErrorResponse> {
-    if request.headers().contains_key("origin") {
-        warn!(target: NET, "rejecting browser-origin WebSocket upgrade");
-        return Err(tokio_tungstenite::tungstenite::http::Response::builder()
-            .status(403)
-            .body(Some(
-                "Browser WebSocket origins are not accepted".to_string(),
-            ))
-            .expect("static WebSocket rejection response"));
-    }
-    Ok(response)
-}
-
 /// Per-connection: optional TLS handshake, WS upgrade, then run the relay.
 #[derive(Clone)]
 struct ServerState {
@@ -3746,67 +3931,6 @@ fn peer_scope_id(peer: SocketAddr) -> Option<u32> {
         SocketAddr::V6(v6) if v6.scope_id() != 0 => Some(v6.scope_id()),
         _ => None,
     }
-}
-
-#[cfg(feature = "wss-compat")]
-async fn handle_connection(
-    stream: TcpStream,
-    peer: SocketAddr,
-    state: ServerState,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    stream.set_nodelay(true).ok();
-    let config = ws_config();
-    let preauth_permit = state.preauth_slots.try_enter(peer.ip())?;
-
-    let selected_host_identity = state
-        .tls_lifecycle
-        .host_identity()
-        .map_err(|_| "TLS host identity unavailable")?;
-    let tls_stream = tokio::time::timeout(
-        TLS_HANDSHAKE_TIMEOUT,
-        state.tls_lifecycle.acceptor().accept(stream),
-    )
-    .await
-    .map_err(|_| "TLS handshake timed out")??;
-    debug!(target: TLS, %peer, "TLS handshake ok");
-    let current_host_identity = state
-        .tls_lifecycle
-        .host_identity()
-        .map_err(|_| "TLS host identity unavailable")?;
-    if selected_host_identity != current_host_identity {
-        return Err("TLS host identity changed during handshake".into());
-    }
-    let ws = tokio::time::timeout(
-        WEBSOCKET_HANDSHAKE_TIMEOUT,
-        accept_hdr_async_with_config(tls_stream, reject_browser_origin, Some(config)),
-    )
-    .await
-    .map_err(|_| "WebSocket handshake timed out")??;
-    info!(target: NET, %peer, "client connected (WS+TLS)");
-    let span = tracing::info_span!("linux_connection", sid = tracing::field::Empty);
-    let remote_scope_id = peer_scope_id(peer);
-    super::setup_watch::scope(run_ws(
-        DirectSessionSocket::wss(ws),
-        state.cfg.clone(),
-        preauth_permit,
-        state.pam_slots.clone(),
-        state.session_slot.clone(),
-        state.session_registry.clone(),
-        state.emitter.clone(),
-        peer.ip().to_string(),
-        remote_scope_id,
-        current_host_identity,
-        state.shutdown.clone(),
-        Arc::clone(&state.service_health),
-        Arc::clone(&state.qos_targets),
-        Arc::clone(&state.admission_runtime),
-        Arc::clone(&state.incumbent),
-        None,
-    ))
-    .instrument(span)
-    .await;
-    debug!(target: NET, %peer, "connection closed");
-    Ok(())
 }
 
 async fn handle_quic_connection(
@@ -4312,6 +4436,7 @@ async fn run_ws(
                             "Wayland session output fitted to the software encoder's limits"
                         );
                     }
+                    let mut xorg_head_refresh_hz = None;
                     launcher.set_session_display(served.map(|monitor| {
                         let served_display = crate::session::launcher::SessionDisplayMsg::served(
                             monitor,
@@ -4333,6 +4458,11 @@ async fn run_ws(
                             session_height,
                             refresh_hz,
                         );
+                        if authenticated_config.desktop_provider
+                            == arcen_session::desktop_provider::DesktopProvider::Xorg
+                        {
+                            xorg_head_refresh_hz = Some(refresh_hz);
+                        }
                         if authenticated_config.wayland_speed_unqualified(
                             display_plan.width,
                             display_plan.height,
@@ -4359,6 +4489,22 @@ async fn run_ws(
                         }
                         served_display.with_refresh_hz(refresh_hz)
                     }));
+                    // A new Xorg head delivers at most its refresh: a rate the
+                    // head cannot run (an EDID timing too fast for the size)
+                    // is served at the head's, with the capture as the reason.
+                    // A joined console is capped by what its outputs really
+                    // run at, once attached (`console_refresh_caps`).
+                    if let Some(refresh_hz) =
+                        xorg_head_refresh_hz.filter(|_| !launcher.joins_console())
+                    {
+                        authenticated_config =
+                            authenticated_config.with_capture_refresh_caps(vec![
+                                crate::cli::CaptureRefreshCap {
+                                    client_display_id: None,
+                                    refresh_hz,
+                                },
+                            ]);
+                    }
                 }
                 let admitted_monitor_count = match &multi_monitor_outcome {
                     multi_monitor::MultiMonitorOutcome::Planned { plan, .. } => {
@@ -4367,12 +4513,14 @@ async fn run_ws(
                     multi_monitor::MultiMonitorOutcome::NotRequested
                     | multi_monitor::MultiMonitorOutcome::Degraded(_) => None,
                 };
-                let acquired = session_registry
-                    .acquire(
-                        launcher,
-                        multi_monitor_outcome.into_planned(),
-                        response.replace_incompatible_desktop,
+                let planned = multi_monitor_outcome.into_planned().map(|(plan, carrier)| {
+                    (
+                        with_console_head_refresh(&authenticated_config, plan),
+                        carrier,
                     )
+                });
+                let acquired = session_registry
+                    .acquire(launcher, planned, response.replace_incompatible_desktop)
                     .await;
                 if let Err(error) = &acquired {
                     record_desktop_failure(
@@ -4566,8 +4714,16 @@ async fn run_ws(
                         "attached to an Xorg desktop (console: the user's own session)"
                     );
                     if authenticated_config.exceeds_desktop_depth(depth) {
-                        match config_on_attached_desktop(&cfg, &response, depth) {
-                            Ok(config) => authenticated_config = config,
+                        match config_on_attached_desktop(
+                            &cfg,
+                            &response,
+                            depth,
+                            lease.metadata.multi_monitor_plan.is_some(),
+                        ) {
+                            Ok(config) => {
+                                let caps = authenticated_config.capture_refresh_caps.clone();
+                                authenticated_config = config.with_capture_refresh_caps(caps);
+                            }
                             Err(error) => {
                                 warn!(
                                     target: AUTH,
@@ -4791,6 +4947,9 @@ async fn run_ws(
                 let controller = NvControl::new(
                     session_config.display.clone(),
                     session_config.xauthority.clone(),
+                    session_lease
+                        .as_ref()
+                        .map(|lease| lease.execution.identity.uid),
                 );
                 let permit = session_permit
                     .take()
@@ -5158,6 +5317,44 @@ fn aligns_outputs_at_attach(resumed: bool) -> bool {
 ///
 /// Relative motion is unaffected by any of this: it uses a separate device
 /// with no raster dependency.
+/// The output a single-display Deck is shown of another product's desktop
+/// (`session_lease` a joined guest console without a multi-monitor plan),
+/// with the X screen's size; `None` when the desktop shows one output (or
+/// cannot be read: the whole screen is served, as before, and that is
+/// logged).
+async fn guest_single_picture(
+    lease: &SessionLease,
+) -> Option<(arcen_outputs::console_layout::ShownOutput, (u32, u32))> {
+    match crate::session::console_layout::shown_desktop(
+        &lease.metadata.session_id,
+        lease.metadata.uid,
+    )
+    .await
+    {
+        Ok((shown, screen)) => {
+            let output = arcen_outputs::console_layout::single_display_output(&shown)?.clone();
+            info!(
+                target: SESSION,
+                output = %output.name,
+                size = ?output.screen_extent(),
+                at = ?(output.x, output.y),
+                screen = ?screen,
+                shown = shown.len(),
+                "another product's desktop shows several outputs; a single-display Deck is shown the one its primary maps to"
+            );
+            Some((output, screen))
+        }
+        Err(error) => {
+            warn!(
+                target: SESSION,
+                %error,
+                "another product's desktop outputs could not be read; a single-display Deck is shown the whole screen"
+            );
+            None
+        }
+    }
+}
+
 fn resolve_input_raster(
     multi_monitor_virtual_size: Option<(u32, u32)>,
     display_raster_size: Option<(u32, u32)>,
@@ -5292,6 +5489,10 @@ async fn run_resumable_session(
     let mut force_fresh_idr = false;
     let mut display_is_held = false;
     let mut display_resources = Some(display_resources);
+    // While the desktop is held for the Deck's resume: since when, and why
+    // the hold ends if it ends without a resume (`RESUME_HOLD_ENDED`).
+    let mut held_since: Option<std::time::Instant> = None;
+    let mut hold_end = ResumeHoldEnd::OwnerFailed;
     'session: loop {
         let end = run_attachment(
             ws,
@@ -5400,6 +5601,8 @@ async fn run_resumable_session(
             );
             break;
         }
+        held_since = Some(std::time::Instant::now());
+        hold_end = ResumeHoldEnd::OwnerFailed;
         tracing::info!(
             target: SESSION,
             reason_class = end.reason.reason_class(),
@@ -5426,6 +5629,7 @@ async fn run_resumable_session(
             let now = session_registry.resume().monotonic_now();
             if now >= deadline {
                 let _ = reconnect.apply(ReconnectEvent::ExplicitDisconnect, now);
+                hold_end = ResumeHoldEnd::WindowExpired;
                 break 'session;
             }
             let remaining_ms = deadline.get().saturating_sub(now.get());
@@ -5447,12 +5651,23 @@ async fn run_resumable_session(
                         ReconnectEvent::ExplicitDisconnect,
                         session_registry.resume().monotonic_now(),
                     );
+                    if let Some(since) = held_since.take() {
+                        emit_resume_hold_ended(
+                            &emitter,
+                            session_log_id.clone(),
+                            ResumeHoldEnd::SameUserReattached,
+                            since,
+                            &lease.metadata.username,
+                            remote_host,
+                        );
+                    }
                     hand_over_detached_session(&session_registry, lease, &active_session_id).await;
                     return;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {
                     let timer_now = session_registry.resume().monotonic_now();
                     let _ = reconnect.apply(ReconnectEvent::DeadlineReached { timer_generation }, timer_now);
+                    hold_end = ResumeHoldEnd::WindowExpired;
                     break 'session;
                 }
                 command = commands.recv() => match command {
@@ -5467,9 +5682,12 @@ async fn run_resumable_session(
                             )
                             .await;
                             let _ = reconnect.apply(ReconnectEvent::ExplicitDisconnect, resume_now);
+                            hold_end = ResumeHoldEnd::ResumeRefused;
                             break 'session;
                         }
                         let _ = reconnect.apply(ReconnectEvent::BeginResume, resume_now);
+                        // Until the resume is accepted, an end is its refusal.
+                        hold_end = ResumeHoldEnd::ResumeRefused;
                         tracing::info!(
                             target: SESSION,
                             sid = %handoff.session_log_id,
@@ -5528,6 +5746,7 @@ async fn run_resumable_session(
                                 ReconnectEvent::OwnerCrashed,
                                 session_registry.resume().monotonic_now(),
                             );
+                            hold_end = ResumeHoldEnd::OwnerFailed;
                             break 'session;
                         }
                         let _ = session_registry.replace_session_log_id(
@@ -5593,6 +5812,7 @@ async fn run_resumable_session(
                             session_registry.resume().monotonic_now(),
                         );
                         force_fresh_idr = true;
+                        held_since = None;
                         continue 'session;
                     }
                     Some(OwnerCommand::TakeOver { claimant, claimant_uid, reply }) => {
@@ -5610,6 +5830,16 @@ async fn run_resumable_session(
                                     ReconnectEvent::ExplicitDisconnect,
                                     session_registry.resume().monotonic_now(),
                                 );
+                                if let Some(since) = held_since.take() {
+                                    emit_resume_hold_ended(
+                                        &emitter,
+                                        session_log_id.clone(),
+                                        ResumeHoldEnd::FreshSignIn,
+                                        since,
+                                        &lease.metadata.username,
+                                        remote_host,
+                                    );
+                                }
                                 hand_over_detached_session(&session_registry, lease, &active_session_id)
                                     .await;
                                 let _ = reply.send(resume::TakeoverOutcome::HandedOver);
@@ -5626,6 +5856,7 @@ async fn run_resumable_session(
                             ReconnectEvent::OwnerCrashed,
                             session_registry.resume().monotonic_now(),
                         );
+                        hold_end = ResumeHoldEnd::OwnerFailed;
                         break 'session;
                     }
                     Some(OwnerCommand::PierShutdown) | None => {
@@ -5633,6 +5864,7 @@ async fn run_resumable_session(
                             ReconnectEvent::ExplicitDisconnect,
                             session_registry.resume().monotonic_now(),
                         );
+                        hold_end = ResumeHoldEnd::PierStopping;
                         break 'session;
                     }
                 },
@@ -5642,6 +5874,7 @@ async fn run_resumable_session(
                             ReconnectEvent::NativeSessionEnded,
                             session_registry.resume().monotonic_now(),
                         );
+                        hold_end = ResumeHoldEnd::NativeSessionEnded;
                         break 'session;
                     }
                     if let Some(hold) = console_hold.as_mut() {
@@ -5662,6 +5895,7 @@ async fn run_resumable_session(
                                 ReconnectEvent::ExplicitDisconnect,
                                 session_registry.resume().monotonic_now(),
                             );
+                            hold_end = ResumeHoldEnd::Console(end);
                             break 'session;
                         }
                     }
@@ -5670,6 +5904,16 @@ async fn run_resumable_session(
         }
     }
 
+    if let Some(since) = held_since {
+        emit_resume_hold_ended(
+            &emitter,
+            session_log_id.clone(),
+            hold_end,
+            since,
+            &lease.metadata.username,
+            remote_host,
+        );
+    }
     log_lifecycle(
         &lease.metadata.session_id,
         "ended",
@@ -5779,6 +6023,12 @@ async fn run_attachment(
     // attachments have no lease and stay `None`, matching that mode's
     // existing no-identity behavior).
     let session_user = session_lease.map(|lease| lease.metadata.username.clone());
+    // A joined console's outputs are the console's own: no stream is served
+    // faster than the output that shows it refreshes.
+    let cfg = match session_lease.filter(|lease| lease.metadata.console) {
+        Some(lease) => console_refresh_caps(cfg, lease).await,
+        None => cfg,
+    };
     let active_transport = ws.transport_capability();
     let (mut owner_commands, refresh) = match resumable {
         Some(resumable) => (Some(resumable.owner_commands), Some(resumable.refresh)),
@@ -5964,6 +6214,21 @@ async fn run_attachment(
         initial_capenc.width = stream.width;
         initial_capenc.height = stream.height;
     }
+    // Another product's desktop with several outputs, and a Deck that asked
+    // for one display: the output its primary maps to, as it is, never the
+    // whole screen squeezed into one picture (the layout is never changed).
+    let single_picture = match session_lease {
+        Some(lease)
+            if lease.metadata.console_guest && lease.metadata.multi_monitor_plan.is_none() =>
+        {
+            guest_single_picture(lease).await
+        }
+        _ => None,
+    };
+    if let Some((output, _screen)) = single_picture.as_ref() {
+        initial_capenc.output_name = Some(output.name.clone());
+        (initial_capenc.width, initial_capenc.height) = output.screen_extent();
+    }
     // Exact still image (ADR 0016): a single-monitor attachment carries the
     // facts the shared plan needs into every capenc it spawns.
     let (refine_lane_tx, refine_lane_rx) = mpsc::channel(capenc::REFINE_LANE_RECORDS);
@@ -6022,6 +6287,7 @@ async fn run_attachment(
                 codec: initial_capenc.codec.clone(),
                 encoder: cfg.resolved_multi_monitor_encoder(),
                 fps: initial_capenc.fps,
+                monitor_fps: monitor_rates(&cfg, plan),
                 yuv444: initial_capenc.yuv444,
                 bit_depth: initial_capenc.bit_depth,
                 color_range: initial_capenc.color_range,
@@ -6039,6 +6305,10 @@ async fn run_attachment(
                 variant_pinned: initial_capenc.variant_pinned,
                 encoder_max_bitrate_bps: initial_capenc.encoder_max_bitrate_bps,
                 video_selection: initial_capenc.video_selection,
+                client_video: cfg
+                    .auth_video_request
+                    .as_ref()
+                    .map(|request| request.capabilities),
                 cursor_mode: initial_capenc.cursor_mode,
                 display: initial_capenc.display.clone(),
                 xauthority: initial_capenc.xauthority.clone(),
@@ -6412,7 +6682,8 @@ async fn run_attachment(
                 // relative device, never this absolute-device sizing.
                 let (device_w, device_h) = resolve_input_raster(
                     multi_monitor_committed
-                        .map(|(plan, _carrier)| (plan.virtual_width, plan.virtual_height)),
+                        .map(|(plan, _carrier)| (plan.virtual_width, plan.virtual_height))
+                        .or(single_picture.as_ref().map(|(_, screen)| *screen)),
                     display.as_ref().and_then(|r| r.raster_size()),
                     (media_plan.width, media_plan.height),
                 );
@@ -6462,6 +6733,8 @@ async fn run_attachment(
                 };
                 match InputController::new(device_w, device_h, region_input, identity) {
                     Ok((mut controller, stats)) => {
+                        controller
+                            .set_picture(single_picture.as_ref().map(|(output, _)| output.clone()));
                         // Committed text is typed on this session's own X
                         // server; without it the session types key
                         // positions only, as before.
@@ -7473,7 +7746,10 @@ async fn run_attachment(
     // pointer): an Xorg desktop's watcher reads it; a Wayland metadata
     // stream carries it. A multi-output Wayland desktop's streams are not
     // yet matched to their video monitors, so it does not report positions.
+    // Positions are the whole screen's: a Deck shown one output of it draws
+    // its own cursor.
     let deck_cursor_positions = client_hello.cursor_position_v1
+        && single_picture.is_none()
         && (x11_cursor_watcher
             || (wayland_cursor_hub.is_some() && multi_monitor_committed.is_none()));
     let cursor_result = CursorModeResultMsg {
@@ -8175,7 +8451,7 @@ async fn run_attachment(
     // watch channel: latest-wins coalescing, no queue growth during storms.
     let (resize_tx, mut resize_rx) = tokio::sync::watch::channel::<Option<ResizeRequest>>(None);
 
-    let video_write_wait_micros = Arc::new(AtomicU64::new(0));
+    let video_writes = Arc::new(arcen_media::video::VideoWriteMeter::default());
 
     // 3b. Sender: owns the sink; drains the queue + forwards control messages.
     //
@@ -8219,6 +8495,8 @@ async fn run_attachment(
     // Every monitor's queue, primary first: the rate controller samples the
     // whole session, because its target is applied to every pipeline.
     let mut rate_queues: Vec<Arc<FrameQueue>> = vec![queue.clone()];
+    // Each monitor's queue by its id, for its own line in health_stats.
+    let mut monitor_queues: Vec<(SessionMonitorId, Arc<FrameQueue>)> = Vec::new();
     let video_source = match multi_monitor_committed {
         None => VideoSource::Single(queue.clone()),
         Some((plan, _carrier)) => {
@@ -8241,6 +8519,7 @@ async fn run_attachment(
                     stream_epoch: plan.generation.get(),
                 });
             }
+            monitor_queues.clone_from(&mux_queues);
             match MonitorMux::new(mux_queues) {
                 Ok(mux) => {
                     let mux = Arc::new(mux);
@@ -8332,7 +8611,7 @@ async fn run_attachment(
         refresh,
         write_timeout,
         video: video_source,
-        video_write_wait_micros: Arc::clone(&video_write_wait_micros),
+        video_writes: Arc::clone(&video_writes),
         idrs: all_monitor_idrs.clone(),
         audio: sender_audio,
         audio_control: sender_audio_control,
@@ -9021,7 +9300,7 @@ async fn run_attachment(
         let pipeline_stats = Arc::clone(&pipeline_stats);
         let governed_fps = Arc::clone(&governed_fps);
         let rate_queues = rate_queues.clone();
-        let video_write_wait_micros = Arc::clone(&video_write_wait_micros);
+        let video_writes = Arc::clone(&video_writes);
         // The refinement budget from the link (ADR 0016 R6), only for an
         // attachment that refines.
         let mut refine_budget = match refine_plan {
@@ -9109,8 +9388,7 @@ async fn run_attachment(
                 let wait = arcen_media::video::VideoQueueWaitStats::combine(
                     rate_queues.iter().map(|queue| queue.take_wait_stats()),
                 );
-                let write_wait =
-                    Duration::from_micros(video_write_wait_micros.swap(0, Ordering::Relaxed));
+                let write_wait = video_writes.take_wait();
                 let mean_write_wait = if wait.frames == 0 {
                     Duration::ZERO
                 } else {
@@ -9148,6 +9426,9 @@ async fn run_attachment(
                 let hints = arcen_media::rate_control::RateHints {
                     keyframe_bytes: keyframe_bytes.saturating_sub(last_keyframe_bytes),
                     refine_active: refine_tick.is_some_and(|tick| tick.decision.refine_active),
+                    video_backlog: Some(
+                        video_writes.unsent(rate_queues.iter().any(|queue| queue.has_backlog())),
+                    ),
                 };
                 last_bytes = bytes;
                 last_frames = frames;
@@ -9165,7 +9446,11 @@ async fn run_attachment(
                         (governor.as_mut(), take_pipeline_second(&pipeline_stats))
                     {
                         if let Some(step) =
-                            governor.observe(second.encoded, second.delivered(), asked_fps)
+                            governor.observe(
+                                second.encoded,
+                                second.source_evidence().source_fps(),
+                                asked_fps,
+                            )
                         {
                             log_governor_step(step, plan.fps);
                             governed_fps.store(step.fps, Ordering::Relaxed);
@@ -9204,7 +9489,9 @@ async fn run_attachment(
                             delivered_bps = sample.delivered_bytes.saturating_mul(8),
                             keyframe_bytes = hints.keyframe_bytes,
                             rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
-                            queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                            queue_delay_ms = controller.last_queue_delay().map(|delay| delay.as_millis()),
+                            path_queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                            idle_queue = controller.last_idle_queue(),
                             loss_rate_permille =
                                 loss.map(|loss| (loss.rate * 1000.0).round() as u64),
                             loss_sample_packets = loss.map(|loss| loss.sent_packets),
@@ -9249,7 +9536,10 @@ async fn run_attachment(
     let content_stats = ContentStatsCell::default();
     follow_content_stats(&content_stats, Some(&capenc));
     let health_content_stats = Arc::clone(&content_stats);
-    let health_queue = queue.clone();
+    // Every monitor's queue: a multi-monitor session's health covers each
+    // output it streams, not only the primary.
+    let health_queues = rate_queues.clone();
+    let health_monitor_queues = monitor_queues;
     let health_input_stats = input_stats.clone();
     let health_session_health = Arc::clone(&session_health);
     let health_emitter = emitter.clone();
@@ -9266,6 +9556,7 @@ async fn run_attachment(
     let health = tokio::spawn(
         async move {
             let mut seq: u64 = 0;
+            let mut monitor_rates = arcen_observability::MonitorRates::default();
             let mut ticker = tokio::time::interval(HEALTH_BEAT);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await; // consume the immediate first tick
@@ -9319,18 +9610,27 @@ async fn run_attachment(
                         .saturating_add(stats.scroll_events())
                         .saturating_add(stats.pen_events())
                 });
+                // The rate the host holds the session at now (the governor's,
+                // below the session's when the host cannot keep up), so the
+                // Deck sees the lowered rate and health judges against it.
+                let target_fps = health_governed_fps.load(Ordering::Relaxed).max(1);
+                let (content, monitor_content) = current_content(&health_content_stats, target_fps);
                 let counters = arcen_observability::session_health::HostCounters {
-                    frames_sent: health_queue.frames_sent(),
-                    frames_dropped: health_queue.frames_dropped(),
-                    bytes_sent: health_queue.bytes_sent(),
+                    frames_sent: health_queues.iter().map(|queue| queue.frames_sent()).sum(),
+                    frames_dropped: health_queues
+                        .iter()
+                        .map(|queue| queue.frames_dropped())
+                        .sum(),
+                    bytes_sent: health_queues.iter().map(|queue| queue.bytes_sent()).sum(),
                     input_events,
                     // Not currently tracked by `InputController`/`InputStats`;
                     // a documented scoped gap rather than a fabricated value.
                     last_input_sequence: 0,
                     last_input_type: "",
-                    content: arcen_observability::ContentEvidence::Rate(current_content_fps(
-                        &health_content_stats,
-                    )),
+                    content: arcen_observability::ContentEvidence::Rate(content.fps_content),
+                    outputs: u32::try_from(health_queues.len()).unwrap_or(u32::MAX),
+                    // Each monitor at its own rate.
+                    outputs_fps_target: content.fps_target,
                 };
                 // SIGHUP may have replaced the validated thresholds since the
                 // last tick; apply the shared cell's current value before
@@ -9350,10 +9650,6 @@ async fn run_attachment(
                 // timestamp (`eventlog::canonical_now`), set independently.
                 let monotonic_now_ms =
                     u64::try_from(health_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                // The rate the host holds the session at now (the governor's,
-                // below the session's when the host cannot keep up), so the
-                // Deck sees the lowered rate and health judges against it.
-                let target_fps = health_governed_fps.load(Ordering::Relaxed).max(1);
                 let observation = lock_recover(&health_session_health).observe(
                     monotonic_now_ms,
                     target_fps,
@@ -9379,6 +9675,30 @@ async fn run_attachment(
                 stats.path = health_path_connection
                     .as_ref()
                     .map(|connection| path_quality.sample(health_started_at.elapsed(), connection));
+                // Each monitor's own rate, and the one that fell behind its
+                // content named with why (ADR 0026: degrade visibly).
+                if !health_monitor_queues.is_empty() {
+                    let counters: Vec<arcen_observability::MonitorCounters> = health_monitor_queues
+                        .iter()
+                        .map(|(id, queue)| {
+                            let evidence =
+                                monitor_content.iter().find(|(monitor, _, _)| monitor == id);
+                            arcen_observability::MonitorCounters {
+                                session_monitor_id: id.get(),
+                                fps_target: evidence.map_or(target_fps, |(_, fps, _)| *fps),
+                                frames_sent: queue.frames_sent(),
+                                content_fps: evidence.and_then(|(_, _, content)| *content),
+                            }
+                        })
+                        .collect();
+                    let targets = lock_recover(&health_session_health).targets();
+                    let (monitors, changes) =
+                        monitor_rates.observe(monotonic_now_ms, &counters, &targets);
+                    for change in &changes {
+                        arcen_observability::log_monitor_rate_change(change);
+                    }
+                    stats.monitors = monitors;
+                }
                 if let Some(path) = &stats.path {
                     debug!(
                         target: HEALTH,
@@ -9676,6 +9996,9 @@ async fn run_attachment(
                                     .await
                                     .err()
                                     .unwrap_or("video capture keeps failing on the host"),
+                                (None, Some(lease)) if x11_desktop_ended(lease) => {
+                                    DESKTOP_ENDED_REASON
+                                }
                                 _ => "video capture keeps failing on the host",
                             };
                             warn!(target: MEDIA, reason, "video capture could not be replaced; ending the attachment");
@@ -9686,6 +10009,12 @@ async fn run_attachment(
                         tokio::time::sleep(CAPTURE_RETRY_DELAY).await;
                     }
                     tries += 1;
+                    if let (None, Some(lease)) = (wayland_now.as_ref(), session_lease) {
+                        if x11_desktop_ended(lease) {
+                            warn!(target: MEDIA, "X11 desktop gone; ending the attachment");
+                            break Err(DESKTOP_ENDED_REASON);
+                        }
+                    }
                     warn!(target: MEDIA, attempt, "video capture epoch ended; starting a replacement");
                     // A Wayland session's stream may have been replaced (new
                     // node, next generation); a desktop whose agent is gone
@@ -12135,6 +12464,30 @@ fn handle_input_json(
                 Err(error) => debug!(target: INPUT, %error, "invalid mouse_scroll"),
             }
         }
+        GESTURE_MAGNIFY => {
+            let Some(input) = input else {
+                return;
+            };
+            match parse_sequenced_input::<GestureMagnifyMsg>(text, input_sequence) {
+                Ok(message) => {
+                    if let Err(error) = input.gesture_magnify(&message) {
+                        report_injection_error(&error, "gesture injection failed");
+                    }
+                }
+                Err(error) => debug!(target: INPUT, %error, "invalid gesture_magnify"),
+            }
+        }
+        GESTURE_ROTATE | GESTURE_SMART_ZOOM | GESTURE_SWIPE => {
+            if let Some(declined) =
+                arcen_input::gesture_fallback::DeclinedGesture::from_message_type(msg_type)
+            {
+                debug!(
+                    target: INPUT,
+                    gesture = declined.token(),
+                    "gesture declined: no equivalent on this host"
+                );
+            }
+        }
         PEN_EVENT => {
             let Some(input) = input else {
                 trace!(target: INPUT, "pen_event ignored: input backend disabled");
@@ -12223,40 +12576,6 @@ fn is_legacy_region_input_message(message_type: &str) -> bool {
         message_type,
         "mouse_move" | MOUSE_MOVE_RELATIVE | "mouse_button" | MOUSE_SCROLL | PEN_EVENT
     )
-}
-
-trait SequencedInput {
-    fn sequence(&self) -> u64;
-}
-
-impl SequencedInput for KeyEventMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for MouseMoveMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for MouseMoveRelativeMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for MouseButtonMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for MouseScrollMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
 }
 
 trait RegionWireInput: DeserializeOwned {
@@ -15651,26 +15970,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "wss-compat")]
-    fn websocket_upgrade_rejects_browser_origin() {
-        let request = Request::builder()
-            .header("Origin", "https://attacker.example")
-            .body(())
-            .unwrap();
-        let response = Response::new(());
-        let rejected = reject_browser_origin(&request, response).unwrap_err();
-        assert_eq!(rejected.status(), 403);
-    }
-
-    #[test]
-    #[cfg(feature = "wss-compat")]
-    fn websocket_upgrade_accepts_native_client_without_origin() {
-        let request = Request::new(());
-        let response = Response::new(());
-        assert!(reject_browser_origin(&request, response).is_ok());
-    }
-
-    #[test]
     fn session_log_id_accepts_deck_uuid_and_falls_back_for_legacy_clients() {
         let value = "01234567-89ab-4def-8123-456789abcdef";
         let (accepted, replaced) = resolve_session_log_id(Some(value)).unwrap();
@@ -16508,6 +16807,34 @@ mod tests {
         let recorded = crate::eventlog::test_support::recorded_events(&recorded);
         let fields = recorded[0].fields().as_map();
         assert_eq!(fields.get("degraded"), Some(&FieldValue::Boolean(false)));
+    }
+
+    #[test]
+    fn the_end_of_a_resume_hold_is_a_critical_profile_event_with_its_reason() {
+        let (emitter, recorded) = LifecycleEmitter::recording();
+
+        emit_resume_hold_ended(
+            &emitter,
+            test_session_log_id(),
+            ResumeHoldEnd::Console(
+                arcen_session::console_session::detached_hold::HoldEnd::DeskTookOver,
+            ),
+            std::time::Instant::now(),
+            "alice",
+            "198.51.100.7",
+        );
+
+        let recorded = crate::eventlog::test_support::recorded_events(&recorded);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].kind(), LifecycleEventKind::ResumeHoldEnded);
+        assert_eq!(
+            recorded[0].definition().minimum_profile,
+            arcen_telemetry::OperationalProfile::Critical
+        );
+        assert_eq!(
+            recorded[0].fields().as_map().get("reason_class"),
+            Some(&FieldValue::String("desk_took_over".to_string()))
+        );
     }
 
     #[test]

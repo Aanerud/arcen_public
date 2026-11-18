@@ -35,8 +35,12 @@ When a frame is shown is the served pipeline's shared rule
 from the shared media worker;
 [`docs/architecture/deck-presentation-timing.md`](../../docs/architecture/deck-presentation-timing.md)).
 The eight-bit Metal layer renders an Auto frame the moment it arrives
-(display sync on, one drawable in flight, the pacer keeps only the newest;
-the `CVDisplayLink` tick is the retry path), and Speed also turns
+(display sync on, the pacer keeps only the newest; one drawable in flight,
+two where the measured submission-to-glass time exceeds a refresh because
+the system composes the layer, `arcen_media::NewestPresentDepth`; a frame
+waiting for a slot goes the moment a presented handler frees one, from the
+presenter's slot thread, and the `CVDisplayLink` tick is the retry path),
+and Speed also turns
 `displaySyncEnabled` off, keeps two drawables in flight and presents without
 a minimum duration, so it may tear. Grading and HDR keep the `CVDisplayLink`-paced ten-bit layer with
 display sync, EDR and colour handling unchanged. Do not add a local preset
@@ -62,8 +66,26 @@ what the monitor had to queue. Keep it that way:
   predicted frame time (1/60 s), so a bare `request_repaint_after(16 ms)` is
   an immediate repaint, and with display sync off (multi-window) nothing
   caps it (786 passes/s measured).
+- Passes egui asks for itself (two settle passes after every input pass)
+  are paced at the event loop: `ui/pass_pacing.rs` sits between winit and
+  eframe (`run_native_app` uses `eframe::create_native`) and holds a root
+  `RedrawRequested` until one root refresh after the previous root pass
+  began (shared `arcen_deck_core::ui_pacing::PassPacer`; resize and scale
+  changes run at once). Input events reach egui at once; root pointer and
+  keys leave on the next pass, at most one refresh later, as with display
+  sync on. A pass the media worker asks for (`pass_pacing::MediaWake`) is
+  never held: in multi-window the root pass hands out every window's
+  decoded picture. Secondary windows are not paced there.
 - Pointer moves and buttons are forwarded in event order, at their own
   positions (`ordered_pointer_events`), not once per pass.
+- The root window's pointer leaves from `raw_input_hook` as the root pass
+  begins, before the UI runs (`forward_root_pointer_events`), from the
+  viewer's place in the pass just before (`RootPointerGate`); the viewer
+  pass only focuses the viewer after a press. Under pointer lock or a pen's
+  authority, without a gate from the previous root pass, and in a pass that
+  also carries a key, text or a modifier change, the viewer pass forwards
+  them as before, so a shift-click or a typed letter keeps its place before
+  the click. Test: `root_pointer_events_leave_before_the_ui_pass_unless_keys_came_with_them`.
 - A secondary Match My Layout viewport's pointer leaves from
   `raw_input_hook` as that viewport's pass begins
   (`forward_secondary_pointer_events`, shared
@@ -83,11 +105,12 @@ what the monitor had to queue. Keep it that way:
 - Tests: `pen_samples_at_200_hz_are_forwarded_at_200_hz_while_the_ui_runs_at_30_hz`,
   `samples_after_a_keyboard_edge_wait_for_the_ui_pass_and_keep_their_order`.
 
-Follow-up: keyboard (and secondary-viewport keys and scroll, gathered until
-root's next pass, which they wake) still leaves on the UI pass; a keyboard
-fast path is a separate package. Root passes still exceed the root display's
-refresh while the mouse moves over root in multi-window (egui's two settle
-passes per input pass with display sync off: ~165/s measured at 55 events/s).
+Follow-up: keyboard and scroll (and secondary-viewport keys and scroll,
+gathered until root's next pass, which they wake) still leave in the UI
+pass, and a pointer move still costs a root pass (at most one per
+refresh). Sending pointer and keys from the AppKit monitor as they are
+dispatched, as pen does, with plain moves over the video kept from egui,
+is a separate package.
 
 ## Native tablet: one path
 

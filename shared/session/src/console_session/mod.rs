@@ -18,11 +18,14 @@
 //! and macOS Piers reach the same model through their own console APIs.
 
 pub mod account_desktop;
+pub mod desk_privacy;
 pub mod detached_hold;
 pub mod domain_logon;
 pub mod foreign_service;
 pub mod greeter_token;
+pub mod login_screen;
 pub mod login_session;
+pub mod owner_death;
 
 pub use foreign_service::{ConsoleNotice, ForeignService, other_product_holder};
 
@@ -409,7 +412,12 @@ pub fn settle_sign_in(
     else {
         return SignInSettlement::Pending;
     };
-    if sessions.iter().any(|s| s.id == greeter) {
+    // A login screen that is closing is finished: only processes it left
+    // behind keep its session (an `ibus-daemon` of a crashed shell).
+    if sessions
+        .iter()
+        .any(|s| s.id == greeter && s.state != "closing")
+    {
         return SignInSettlement::Pending;
     }
     if mine.active {
@@ -718,9 +726,13 @@ pub fn other_product_started(
 pub enum UnlockedHandBack {
     /// It is gone, or nothing of it can be shown any more.
     Gone,
-    /// It is not in the foreground: given back as it is.
+    /// Another product's session that is not in the foreground: given back
+    /// as it is (nothing of Arcen's can lock it).
     InBackground,
-    /// In the foreground: put a login screen in front of it.
+    /// In the foreground: put a login screen in front of it. A display
+    /// manager's session then stays private behind it until it locks
+    /// ([`Self::KeepPrivate`]): the login screen is one virtual-terminal
+    /// switch away from it.
     BehindLoginScreen,
     /// Not given back: the desk stays private (monitors blank, its input
     /// disabled in the session's X server) and securing is retried.
@@ -731,9 +743,20 @@ pub enum UnlockedHandBack {
     /// and a background virtual terminal is one key chord away. It stays
     /// private until the account signs in through Arcen again or signs out
     /// (its X server ends). Nor is a session logind could not be asked
-    /// about: nothing is proven.
+    /// about: nothing is proven. Nor a display manager's session in the
+    /// background (behind its login screen, or another session): a key
+    /// chord at the desk switches to its virtual terminal, so it stays
+    /// private there until it locks.
     KeepPrivate,
 }
+
+/// How long a display manager's session that will not lock is kept
+/// private behind the login screen before it is given back there unlocked:
+/// one whose lock screen is turned off by policy never locks, and its
+/// owner, signing in at the login screen, would otherwise find it blank
+/// and unusable for good. A lock that only failed for a moment (a busy
+/// shell) is retried and taken well within it.
+pub const UNLOCKED_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What logind said about a console session.
 #[derive(Debug, Clone, Copy)]
@@ -769,8 +792,34 @@ pub fn unlocked_hand_back(lookup: SessionLookup<'_>) -> UnlockedHandBack {
             }
         }
         SessionLookup::Known { fact, .. } if fact.state == "closing" => UnlockedHandBack::Gone,
-        SessionLookup::Known { fact, .. } if !fact.active => UnlockedHandBack::InBackground,
-        SessionLookup::Known { .. } => UnlockedHandBack::BehindLoginScreen,
+        SessionLookup::Known { fact, .. } if fact.active => UnlockedHandBack::BehindLoginScreen,
+        SessionLookup::Known { fact, .. } if fact.origin() == ConsoleOrigin::DisplayManager => {
+            UnlockedHandBack::KeepPrivate
+        }
+        SessionLookup::Known { .. } => UnlockedHandBack::InBackground,
+    }
+}
+
+/// [`unlocked_hand_back`] for a session Arcen has failed to lock for
+/// `unlocked_for`: after [`UNLOCKED_GRACE`] a display manager's session in
+/// the background is given back there, as it was before it was kept
+/// private (`InBackground`).
+#[must_use]
+pub fn unlocked_hand_back_after(
+    lookup: SessionLookup<'_>,
+    unlocked_for: std::time::Duration,
+) -> UnlockedHandBack {
+    let decision = unlocked_hand_back(lookup);
+    match lookup {
+        SessionLookup::Known { fact, .. }
+            if decision == UnlockedHandBack::KeepPrivate
+                && fact.origin() == ConsoleOrigin::DisplayManager
+                && !fact.active
+                && unlocked_for >= UNLOCKED_GRACE =>
+        {
+            UnlockedHandBack::InBackground
+        }
+        _ => decision,
     }
 }
 
@@ -803,6 +852,63 @@ pub const DETACH_STEPS: [DetachStep; 5] = [
     DetachStep::RestoreAudio,
     DetachStep::ReleaseInput,
 ];
+
+/// The hand-back order on a host that lets only the session's own,
+/// unlocked desktop change its displays and input hooks (Windows refuses
+/// `SetDisplayConfig` from a process whose desktop is not the input
+/// desktop, and locking makes the secure desktop the input desktop): the
+/// outputs and the desk's input go back first, then the lock, and the sound
+/// only once the screen is locked. Nothing ends the session.
+pub const DETACH_STEPS_OUTPUTS_FIRST: [DetachStep; 5] = [
+    DetachStep::RestoreOutputs,
+    DetachStep::ReleaseInput,
+    DetachStep::LockSession,
+    DetachStep::AwaitLockScreen,
+    DetachStep::RestoreAudio,
+];
+
+/// Why a Deck's attachment to the user's session ended for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Departure {
+    /// The Deck disconnected, or did not ask to resume when its transport
+    /// was lost.
+    DeckLeft,
+    /// The Deck's reconnect window ended without a resume, or a resume was
+    /// refused.
+    ReconnectWindowEnded,
+    /// The Pier is stopping.
+    HostStopping,
+    /// The Pier's session agent failed.
+    AgentFailed,
+    /// A fresh sign-in of the same account took the session over.
+    HandedOver,
+    /// The session is no longer the one the Deck joined (signed out, locked
+    /// at the desk, moved to another station or account).
+    SessionChanged,
+}
+
+impl Departure {
+    /// Whether the session is locked when the Deck leaves this way: always,
+    /// except when its own account takes it over at once, or it is no
+    /// longer the session the Deck joined.
+    #[must_use]
+    pub const fn locks_session(self) -> bool {
+        !matches!(self, Self::HandedOver | Self::SessionChanged)
+    }
+
+    /// Stable log token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::DeckLeft => "deck_left",
+            Self::ReconnectWindowEnded => "reconnect_window_ended",
+            Self::HostStopping => "host_stopping",
+            Self::AgentFailed => "agent_failed",
+            Self::HandedOver => "handed_over",
+            Self::SessionChanged => "session_changed",
+        }
+    }
+}
 
 /// A local X display name (`:N` or `:N.S`) as its number, or `None` for a
 /// remote or malformed one: a console session's display is always local.
@@ -1503,6 +1609,36 @@ mod tests {
     }
 
     #[test]
+    fn the_outputs_first_order_still_locks_before_the_sound_comes_back() {
+        let position = |step| {
+            DETACH_STEPS_OUTPUTS_FIRST
+                .iter()
+                .position(|s| *s == step)
+                .unwrap()
+        };
+        assert!(position(DetachStep::RestoreOutputs) < position(DetachStep::LockSession));
+        assert!(position(DetachStep::LockSession) < position(DetachStep::AwaitLockScreen));
+        assert!(position(DetachStep::AwaitLockScreen) < position(DetachStep::RestoreAudio));
+        for step in DETACH_STEPS {
+            assert!(DETACH_STEPS_OUTPUTS_FIRST.contains(&step), "{step:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_successor_or_a_changed_session_leaves_it_unlocked() {
+        for departure in [
+            Departure::DeckLeft,
+            Departure::ReconnectWindowEnded,
+            Departure::HostStopping,
+            Departure::AgentFailed,
+        ] {
+            assert!(departure.locks_session(), "{}", departure.token());
+        }
+        assert!(!Departure::HandedOver.locks_session());
+        assert!(!Departure::SessionChanged.locks_session());
+    }
+
+    #[test]
     fn only_local_display_names_are_accepted() {
         assert_eq!(local_display_number(":1"), Some(1));
         assert_eq!(local_display_number(":100.0"), Some(100));
@@ -1550,6 +1686,13 @@ mod tests {
             settle_sign_in(&[greeter(false), mine.clone()], TIM, "c1"),
             SignInSettlement::Pending,
             "GDM has not finished its login screen yet"
+        );
+        let mut lingering = greeter(false);
+        lingering.state = "closing".into();
+        assert_eq!(
+            settle_sign_in(&[lingering, mine.clone()], TIM, "c1"),
+            SignInSettlement::Settled("7".into()),
+            "a closing login screen is finished; leftovers keep only its session"
         );
         assert_eq!(
             settle_sign_in(&[mine], TIM, "c1"),
@@ -1622,12 +1765,54 @@ mod tests {
         let gdm = session("8", TIM, "user", "x11", false);
         assert_eq!(
             unlocked_hand_back(known(&gdm, true)),
+            UnlockedHandBack::KeepPrivate,
+            "a display manager's unlocked session is one key chord away behind the login screen"
+        );
+        let mut other = session("9", OTHER, "user", "x11", false);
+        other.service = "labrdp-session".into();
+        assert_eq!(
+            unlocked_hand_back(known(&other, true)),
             UnlockedHandBack::InBackground
         );
         let gdm = session("8", TIM, "user", "x11", true);
         assert_eq!(
             unlocked_hand_back(known(&gdm, true)),
             UnlockedHandBack::BehindLoginScreen
+        );
+    }
+
+    #[test]
+    fn a_display_manager_session_that_never_locks_is_given_back_after_the_grace() {
+        use std::time::Duration;
+        let known = |fact| SessionLookup::Known {
+            fact,
+            display_alive: true,
+        };
+        let background = session("8", TIM, "user", "x11", false);
+        assert_eq!(
+            unlocked_hand_back_after(known(&background), Duration::from_secs(10)),
+            UnlockedHandBack::KeepPrivate
+        );
+        assert_eq!(
+            unlocked_hand_back_after(known(&background), UNLOCKED_GRACE),
+            UnlockedHandBack::InBackground,
+            "a lock screen turned off by policy: its owner gets it back at the login screen"
+        );
+        let front = session("8", TIM, "user", "x11", true);
+        assert_eq!(
+            unlocked_hand_back_after(known(&front), UNLOCKED_GRACE),
+            UnlockedHandBack::BehindLoginScreen
+        );
+        let mut own = session("7", TIM, "user", "x11", false);
+        own.service = login_session::PAM_SERVICE.into();
+        assert_eq!(
+            unlocked_hand_back_after(known(&own), UNLOCKED_GRACE * 100),
+            UnlockedHandBack::KeepPrivate,
+            "Arcen's own login session has no lock screen at all and stays private"
+        );
+        assert_eq!(
+            unlocked_hand_back_after(SessionLookup::Failed, UNLOCKED_GRACE * 100),
+            UnlockedHandBack::KeepPrivate
         );
     }
 }

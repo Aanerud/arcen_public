@@ -67,6 +67,32 @@ pub const K_CG_MOUSE_EVENT_PRESSURE: u32 = 2;
 /// `kCGEventTabletProximity`, the event type of a proximity edge.
 pub const K_CG_EVENT_TABLET_PROXIMITY: u32 = 24;
 
+/// The event a proximity edge rides on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProximityCarrier {
+    /// Its own `kCGEventTabletProximity` event: what `AppKit` delivers to
+    /// `tabletProximity:`.
+    TabletProximity,
+    /// A mouse move with the tablet-proximity subtype. Chromium turns only
+    /// this one, when it says the pen is leaving, into a pen `MouseLeave`
+    /// and so `pointerout`/`pointerleave` (`WebMouseEventBuilder`); from the
+    /// tablet event alone Chrome on macOS never learnt the pen had gone.
+    MouseProximity,
+}
+
+/// The events that carry a proximity edge, in posting order.
+#[must_use]
+pub const fn proximity_carriers(entering: bool) -> &'static [ProximityCarrier] {
+    if entering {
+        &[ProximityCarrier::TabletProximity]
+    } else {
+        &[
+            ProximityCarrier::TabletProximity,
+            ProximityCarrier::MouseProximity,
+        ]
+    }
+}
+
 /// `kCGTabletEventPointPressure`, a double in 0.0..=1.0.
 pub const K_CG_TABLET_EVENT_POINT_PRESSURE: u32 = 19;
 /// `kCGTabletEventTiltX`, a normalized double in -1.0..=1.0.
@@ -374,6 +400,23 @@ mod tests {
         event.buttons = 0;
         assert_eq!(tablet_point(&event).buttons, 0);
         assert_eq!(tablet_point_away(NX_TABLET_POINTER_PEN).buttons, 0);
+    }
+
+    #[test]
+    fn a_pen_leaving_is_also_told_as_a_mouse_move_for_browsers() {
+        assert_eq!(
+            proximity_carriers(false),
+            &[
+                ProximityCarrier::TabletProximity,
+                ProximityCarrier::MouseProximity
+            ]
+        );
+        // Entering stays one tablet event: the first tablet point already
+        // makes a browser's pointer a pen.
+        assert_eq!(
+            proximity_carriers(true),
+            &[ProximityCarrier::TabletProximity]
+        );
     }
 
     #[test]

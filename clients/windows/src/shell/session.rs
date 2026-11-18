@@ -194,6 +194,10 @@ pub(super) struct Connection {
     last_frame_at: Option<std::time::Instant>,
     max_fps: u32,
     exact_requested: bool,
+    /// Re-reports the display the window moved to, from what this
+    /// attachment's `AuthResponse` stated (a resume states the first
+    /// connection's), once its host follows (`display_follow`).
+    display_follow: arcen_deck_core::display_follow::StreamDisplayFollower,
     /// What this connection asked for (after
     /// `keep_profile_decodable`), for Negotiated Truth.
     requested_video: arcen_media::VideoConfiguration,
@@ -203,6 +207,9 @@ pub(super) struct Connection {
     telemetry: Arc<ClientTelemetry>,
     /// Match My Layout's windows, once the host applied a layout.
     multi: Option<MultiWindow>,
+    /// The host showed some Deck displays at another size or not at all
+    /// (`arcen_deck_core::multi_window::layout_note`).
+    layout_note: Option<String>,
     /// When each monitor's window presented frames in the last second
     /// (per-display rates of a multi-window session).
     monitor_presents: Mutex<
@@ -247,6 +254,7 @@ pub(super) fn connect_options(
     // Grading or HDR this GPU cannot decode is never asked for.
     let _ = keep_profile_decodable(&mut profile, &services.decode_capabilities());
     let mut options = ConnectOptions {
+        display_refresh: None,
         services: Arc::clone(services),
         host: draft.host.clone(),
         port: draft.port,
@@ -286,6 +294,9 @@ impl Connection {
         let telemetry = Arc::clone(&options.telemetry);
         let max_fps = options.profile.max_fps;
         let exact_requested = options.exact_still_image;
+        let display_follow = arcen_deck_core::display_follow::StreamDisplayFollower::new(
+            options.display_refresh.as_ref(),
+        );
         let requested_video = profile_video(&options.profile)
             .unwrap_or_else(arcen_media::VideoConfiguration::legacy_h264);
         let requested_selection = options.profile.video_selection;
@@ -303,7 +314,7 @@ impl Connection {
         let media = MediaSession::start(
             handle,
             surface,
-            Arc::new(ctx.clone()),
+            Arc::new(super::MediaWake(ctx.clone())),
             MediaStart {
                 generation,
                 resuming,
@@ -338,11 +349,13 @@ impl Connection {
             last_frame_at: None,
             max_fps,
             exact_requested,
+            display_follow,
             requested_video,
             requested_selection,
             requested_encode_intent,
             telemetry,
             multi: None,
+            layout_note: None,
             monitor_presents: Mutex::default(),
         })
     }
@@ -455,6 +468,30 @@ impl Connection {
             .is_some_and(|hello| hello.supports_display_update)
     }
 
+    /// The follower that re-reports the display the window moved to.
+    pub(super) fn display_follow(
+        &mut self,
+    ) -> &mut arcen_deck_core::display_follow::StreamDisplayFollower {
+        &mut self.display_follow
+    }
+
+    /// Whether the host follows the session window to another display
+    /// (`StreamRateMsg::follows_display_moves`), for a single stream.
+    pub(super) fn host_follows_display_moves(&self) -> bool {
+        self.media
+            .shared()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .server_hello
+            .as_ref()
+            .is_some_and(|hello| {
+                arcen_deck_core::display_follow::host_follows_display_moves(
+                    hello,
+                    hello.multi_monitor_v1().ok().flatten().is_some(),
+                )
+            })
+    }
+
     /// Whether a frame reached the glass in the last four seconds (the
     /// Mac's fresh-frame gate for display updates).
     pub(super) fn frame_fresh(&self) -> bool {
@@ -519,6 +556,11 @@ impl Connection {
         let Some((validated, _negotiated_plan)) = entry else {
             return Ok(());
         };
+        self.layout_note =
+            arcen_deck_core::multi_window::layout_note::hello_layout_note(requested, &hello);
+        if let Some(note) = self.layout_note.as_ref() {
+            tracing::info!(target: "arcen::display", note = %note, "host kept its own layout");
+        }
         if !arcen_protocol::messages::supports_region_input_v1(
             hello.input_protocol_version,
             hello.input_capabilities,
@@ -902,11 +944,41 @@ impl Connection {
         if let Some(refusal) = &state.decoder_refusal {
             lines.push(format!("Decoder: {refusal}"));
         }
+        lines.extend(state.decoder_behind.line());
+        let host_displays = state
+            .host_health
+            .as_ref()
+            .and_then(|stats| arcen_media::stats_overlay::host_display_rates_line(&stats.monitors));
+        let display_note = state.server_hello.as_ref().and_then(|hello| {
+            arcen_deck_core::display_note::display_negotiation_note(&hello.device_capabilities)
+        });
         drop(state);
         if let Some(text) = self.monitor_fps_text() {
             lines.push(format!("Displays fps: {text}"));
         }
+        lines.extend(self.layout_note.clone());
+        lines.extend(display_note);
+        lines.extend(host_displays);
         lines
+    }
+
+    /// The host-layout line ([`Self::begin_multi_window`]), if any.
+    pub(super) fn layout_note(&self) -> Option<&str> {
+        self.layout_note.as_deref()
+    }
+
+    /// What the host did with the requested display size and UI scale,
+    /// when it did not do exactly that (shared
+    /// `arcen_deck_core::display_note`, the Mac's words).
+    pub(super) fn display_note(&self) -> Option<String> {
+        let state = self
+            .media
+            .shared()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.server_hello.as_ref().and_then(|hello| {
+            arcen_deck_core::display_note::display_negotiation_note(&hello.device_capabilities)
+        })
     }
 
     /// Minimised or occluded: no presents.

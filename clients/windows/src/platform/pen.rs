@@ -78,6 +78,78 @@ pub fn pointer_device_types() -> Option<Vec<POINTER_DEVICE_TYPE>> {
     )
 }
 
+/// Whether a pen digitizer is attached as a HID device (listed by raw
+/// input whether or not Windows Ink routes it); `false` when the list cannot
+/// be read.
+#[must_use]
+pub fn digitizer_hid_present() -> bool {
+    use windows::Win32::UI::Input::{
+        GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RID_DEVICE_INFO,
+        RIDI_DEVICEINFO, RIM_TYPEHID,
+    };
+    let entry = u32::try_from(std::mem::size_of::<RAWINPUTDEVICELIST>()).unwrap_or(0);
+    let mut count = 0_u32;
+    // SAFETY: the sizing call passes no output buffer.
+    if unsafe { GetRawInputDeviceList(None, &raw mut count, entry) } == u32::MAX || count == 0 {
+        return false;
+    }
+    let mut devices = vec![RAWINPUTDEVICELIST::default(); count.min(256) as usize];
+    let mut filled = u32::try_from(devices.len()).unwrap_or(0);
+    // SAFETY: `devices` is writable for `filled` entries.
+    let read = unsafe { GetRawInputDeviceList(Some(devices.as_mut_ptr()), &raw mut filled, entry) };
+    if read == u32::MAX {
+        return false;
+    }
+    devices.truncate(read as usize);
+    devices
+        .iter()
+        .filter(|device| device.dwType == RIM_TYPEHID)
+        .any(|device| {
+            let mut info = RID_DEVICE_INFO {
+                cbSize: u32::try_from(std::mem::size_of::<RID_DEVICE_INFO>()).unwrap_or(0),
+                ..RID_DEVICE_INFO::default()
+            };
+            let mut size = info.cbSize;
+            // SAFETY: `info` is a RID_DEVICE_INFO of `size` bytes.
+            let got = unsafe {
+                GetRawInputDeviceInfoW(
+                    device.hDevice,
+                    RIDI_DEVICEINFO,
+                    Some(std::ptr::from_mut(&mut info).cast()),
+                    &raw mut size,
+                )
+            };
+            if got == u32::MAX || info.dwType != RIM_TYPEHID {
+                return false;
+            }
+            // SAFETY: a HID device's info carries the `hid` member.
+            let hid = unsafe { info.Anonymous.hid };
+            arcen_input::deck_pen::is_pen_digitizer_collection(
+                hid.dwVendorId,
+                hid.usUsagePage,
+                hid.usUsage,
+            )
+        })
+}
+
+/// Whether Tablet support would receive no pen from an attached tablet
+/// whose driver turns it into a mouse (Windows Ink off): the shared rule on
+/// this PC's facts.
+#[must_use]
+pub fn tablet_sends_mouse(tablet_support: bool) -> bool {
+    let pen_listed = pointer_device_types().is_some_and(|devices| {
+        devices.iter().any(|kind| {
+            *kind == POINTER_DEVICE_TYPE_INTEGRATED_PEN || *kind == POINTER_DEVICE_TYPE_EXTERNAL_PEN
+        })
+    });
+    arcen_input::deck_pen::tablet_sends_mouse(arcen_input::deck_pen::TabletFacts {
+        tablet_support,
+        digitizer_present: tablet_support && digitizer_hid_present(),
+        pen_pointer_listed: pen_listed,
+        pen_observed: pen_observed(),
+    })
+}
+
 /// Whether a pen tablet is attached or was used this run.
 #[must_use]
 pub fn tablet_presence() -> CapabilityAvailability {

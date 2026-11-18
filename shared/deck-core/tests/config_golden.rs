@@ -283,3 +283,27 @@ fn trusted_pins_json_golden_keeps_readable_pins_and_their_shape() {
         &std::fs::read(&single_path).unwrap(),
     );
 }
+
+#[test]
+fn a_symbolic_link_in_the_configurations_place_is_never_replaced() {
+    let dir = ScratchDir::new("symlink");
+    let target = dir.0.join("elsewhere.json");
+    std::fs::write(&target, b"{}").unwrap();
+    let link = dir.0.join("settings.json");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    // Creating a link on Windows needs Developer Mode or the privilege.
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+        return;
+    }
+    let refused = atomic_write_json(&link, b"{\"replaced\":true}");
+    assert!(matches!(refused, Err(ClientConfigError::Invalid(_))));
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+}

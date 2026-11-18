@@ -89,6 +89,10 @@ struct PipelineStats {
     pipeline_flushes: u64,
     capture_recreates: u64,
     stale_outputs_dropped: u64,
+    /// Frames the capture source generated while the loop was away (busy
+    /// encoding) and never grabbed; `None` for a loop that cannot count
+    /// them.
+    capture_behind: Option<u64>,
 }
 
 impl PipelineStats {
@@ -112,6 +116,7 @@ impl PipelineStats {
             pipeline_flushes: 0,
             capture_recreates: 0,
             stale_outputs_dropped: 0,
+            capture_behind: None,
         }
     }
 
@@ -143,6 +148,12 @@ impl PipelineStats {
     fn record_emitted(&mut self, bytes: usize) {
         self.emitted += 1;
         self.bytes += bytes as u64;
+    }
+
+    /// Records the frames the capture source generated since the last
+    /// stats line that the loop never grabbed because it was away.
+    const fn record_behind(&mut self, frames: u64) {
+        self.capture_behind = Some(frames);
     }
 
     const fn record_capture_recreate(&mut self) {
@@ -202,6 +213,9 @@ impl PipelineStats {
                 stats.mean_dirty_fraction()
             )
         });
+        let behind = self
+            .capture_behind
+            .map_or_else(String::new, |frames| format!(" capture_behind={frames}"));
         let summary = format!(
             "enc_fps={} encode_submitted={} avg_capture_ms={average_capture_ms:.2} \
              max_capture_ms={:.2} avg_stage_ms={average_stage_ms:.2} max_stage_ms={:.2} \
@@ -210,7 +224,7 @@ impl PipelineStats {
              capture_direct={} want_idr={want_idr} emit_first={} emit_idr={} \
              emit_activity={} emit_keepalive={} pipeline_flush={} \
              capture_recreated={} stale_outputs_dropped={} \
-             damage_source={damage_source}{qp_stats}",
+             damage_source={damage_source}{behind}{qp_stats}",
             self.emitted,
             self.submitted,
             self.capture_ms_max,
@@ -1331,7 +1345,7 @@ mod nvfbc {
         pub unsafe fn grab(
             &mut self,
             timeout_ms: u32,
-            dbg: &mut (u64, u64, u64),
+            dbg: &mut (u64, u64, u64, u64),
         ) -> Result<GrabOutcome, String> {
             let grab = self
                 .fl
@@ -1359,6 +1373,10 @@ mod nvfbc {
             if st != SUCCESS {
                 return Err(self.error("NvFBCToCudaGrabFrame", st));
             }
+            // Frames the server generated since the last grab that this one
+            // does not return (NvFBC's `dwMissedFrames`); the caller decides
+            // which of them the loop could have shown.
+            dbg.3 += u64::from(fi.dwMissedFrames);
             if fi.bDirectCapture == TRUE {
                 dbg.2 += 1;
             }
@@ -1536,12 +1554,32 @@ unsafe fn run_encode(
     let mut ready_announced = false;
     let mut stream_truth = crate::StreamTruthLog::new(codec);
 
-    let mut dbg = (0u64, 0u64, 0u64); // new, old/timeout, direct-capture frames
+    // new, old/timeout, direct-capture frames, frames the server generated
+    // that a grab did not return
+    let mut dbg = (0u64, 0u64, 0u64, 0u64);
+    let mut behind = 0u64;
+    let mut last_grab = Instant::now();
+    let mut contract_interval = crate::frame_interval_from_fps(fps);
     let mut sec = Instant::now();
     let mut stats = PipelineStats::new();
 
     while !control.stop_requested() {
-        match cap.grab(2, &mut dbg) {
+        let missed_before = dbg.3;
+        let away = last_grab.elapsed();
+        let grabbed = cap.grab(2, &mut dbg);
+        last_grab = Instant::now();
+        // The loop grabs between encodes, so an unchanged grab does not show
+        // the screen was still. In push mode the server generates a frame on
+        // every damage event, so frames it generated while the loop was away
+        // for a whole contract interval or longer are changes the session
+        // fell behind on. Frames superseded between grabs closer together
+        // than that would have been superseded by the pacer anyway (it
+        // submits at most one per interval); NvFBC also reports some
+        // between rapid polls that every change was grabbed around.
+        if away >= contract_interval {
+            behind += dbg.3.saturating_sub(missed_before);
+        }
+        match grabbed {
             Ok(nvfbc::GrabOutcome::New(frame)) => {
                 if !announced_layout {
                     log(&format!(
@@ -1606,7 +1644,8 @@ unsafe fn run_encode(
                     log("consuming IDR request");
                 }
                 if let Some(fps) = control.take_framerate_fps() {
-                    pacer.set_interval(crate::frame_interval_from_fps(fps));
+                    contract_interval = crate::frame_interval_from_fps(fps);
+                    pacer.set_interval(contract_interval);
                     if let Err(error) = encoder.reconfigure_framerate(fps) {
                         log_error(&format!("live framerate reconfigure failed: {error}"));
                     }
@@ -1680,14 +1719,16 @@ unsafe fn run_encode(
         }
 
         if sec.elapsed().as_secs_f64() >= 1.0 {
+            stats.record_behind(behind);
+            behind = 0;
             stats.log_and_reset(
-                dbg,
+                (dbg.0, dbg.1, dbg.2),
                 control.idr_pending(),
                 "nvfbc",
                 NVFBC_DAMAGE_SOURCE,
                 None,
             );
-            dbg = (0, 0, 0);
+            dbg = (0, 0, 0, 0);
             sec = Instant::now();
         }
     }

@@ -47,6 +47,40 @@ pub fn enumerate() -> Vec<ClientMonitor> {
     }
 }
 
+/// The display (`ClientMonitor::id`) the session window is on: the display
+/// that shows a single-stream session. `None` off the main thread, before
+/// the window exists, and on other platforms.
+pub fn session_window_display_id() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::session_window_display_id()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The refresh a display shows frames at, as the Deck reports it: the
+/// larger of the current mode's rate (`CGDisplayModeGetRefreshRate`, 0 for
+/// built-in panels) and `NSScreen.maximumFramesPerSecond` (a `ProMotion`
+/// panel's maximum), else 60 Hz when neither is known.
+#[must_use]
+pub fn reported_refresh_hz(mode_refresh_hz: f64, max_frames_per_second: Option<u32>) -> u32 {
+    let mode = if mode_refresh_hz.is_finite() && mode_refresh_hz > 0.0 {
+        // A finite positive rate in hertz.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rounded = mode_refresh_hz.round().min(f64::from(u32::MAX)) as u32;
+        rounded
+    } else {
+        0
+    };
+    match mode.max(max_frames_per_second.unwrap_or(0)) {
+        0 => 60,
+        refresh => refresh,
+    }
+}
+
 /// The gamut and HDR headroom the OS states for `display_id`. `None` off
 /// the main thread and on platforms that do not report them.
 pub fn display_color(display_id: u32) -> Option<arcen_protocol::messages::DisplayColorMsg> {
@@ -471,6 +505,9 @@ mod macos {
         /// when the primary screen's height could not be read, so the flip
         /// would have been guesswork.
         arrangement: Option<LogicalRect>,
+        /// `NSScreen.maximumFramesPerSecond`: the most frames a second the
+        /// screen shows (a `ProMotion` panel's maximum). `None` when unknown.
+        max_frames_per_second: Option<u32>,
     }
 
     /// Read `NSScreen.safeAreaInsets` and `NSScreen.frame` for the screen
@@ -548,7 +585,11 @@ mod macos {
                 },
                 ..Default::default()
             };
+            let max_frames_per_second = u32::try_from(screen.maximumFramesPerSecond())
+                .ok()
+                .filter(|rate| *rate > 0);
             return Some(AppKitScreenFacts {
+                max_frames_per_second,
                 name: (!localized_name.trim().is_empty()).then_some(localized_name),
                 color: Some(color),
                 insets: SafeAreaInsets {
@@ -573,6 +614,7 @@ mod macos {
             name: None,
             color: None,
             arrangement: None,
+            max_frames_per_second: None,
         })
     }
 
@@ -659,6 +701,25 @@ mod macos {
             .unwrap_or_default()
     }
 
+    /// The display the session window (the app's main, key or first
+    /// window) is on. `None` off the main thread or without a window.
+    pub fn session_window_display_id() -> Option<u32> {
+        let mtm = MainThreadMarker::new()?;
+        let app = NSApplication::sharedApplication(mtm);
+        let window = app
+            .mainWindow()
+            .or_else(|| app.keyWindow())
+            .or_else(|| app.windows().iter().next())?;
+        let number = window
+            .screen()?
+            .deviceDescription()
+            .objectForKey(&NSString::from_str("NSScreenNumber"))?;
+        number
+            .downcast::<NSNumber>()
+            .ok()
+            .map(|number| number.as_u32())
+    }
+
     /// The gamut and HDR headroom AppKit states for the screen backing `id`.
     /// `None` off the main thread, or when no `NSScreen` backs the display.
     pub fn display_color(id: u32) -> Option<arcen_protocol::messages::DisplayColorMsg> {
@@ -708,12 +769,13 @@ mod macos {
             .display_mode()
             .map_or(0.0, |mode| mode.refresh_rate());
         // Built-in Apple panels report 0.0 from CGDisplayModeGetRefreshRate;
-        // fall back to 60 Hz (CVDisplayLink can refine this later).
-        let refresh_hz = if refresh > 0.0 {
-            refresh.round() as u32
-        } else {
-            60
-        };
+        // AppKit states a ProMotion panel's maximum (120 Hz). Hosts follow
+        // this refresh; the virtual display mode a session asks for stays
+        // pinned (`arcen_deck_core::connect_plan::pinned_refresh_hz`).
+        let refresh_hz = super::reported_refresh_hz(
+            refresh,
+            appkit_screen_facts(id).and_then(|facts| facts.max_frames_per_second),
+        );
         let name = display_name(id, &display);
 
         // Physical size in millimetres (CGDisplayScreenSize) → the host derives
@@ -937,6 +999,18 @@ mod macos {
 mod tests {
     use super::*;
     use arcen_media::Rotation;
+
+    #[test]
+    fn a_promotion_panel_reports_its_maximum_not_sixty() {
+        // A built-in XDR panel: CG states no mode rate, AppKit 120.
+        assert_eq!(reported_refresh_hz(0.0, Some(120)), 120);
+        // An external 30 Hz panel stays 30; a 144 Hz one 144.
+        assert_eq!(reported_refresh_hz(30.0, Some(30)), 30);
+        assert_eq!(reported_refresh_hz(143.856, None), 144);
+        // Nothing known: 60 Hz, as before.
+        assert_eq!(reported_refresh_hz(0.0, None), 60);
+        assert_eq!(reported_refresh_hz(f64::NAN, Some(0)), 60);
+    }
 
     #[test]
     fn a_notched_panel_loses_the_menu_bar_not_just_the_notch_in_fullscreen() {

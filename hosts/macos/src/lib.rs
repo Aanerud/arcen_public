@@ -41,6 +41,8 @@ pub mod clipboard;
 pub mod clipboard_session;
 pub mod console;
 pub mod cursor_probe;
+/// The desk kept private while a Deck is attached (ADR 0025 §5).
+pub mod desk_privacy;
 pub mod displays;
 #[cfg(target_os = "macos")]
 pub mod encode;
@@ -50,6 +52,8 @@ pub mod host_cert;
 pub mod input;
 #[cfg(target_os = "macos")]
 pub mod input_session;
+#[cfg(target_os = "macos")]
+pub mod lock_guard;
 #[cfg(target_os = "macos")]
 pub mod media_probe;
 pub mod microphone_input;
@@ -64,10 +68,12 @@ pub mod observability;
 #[cfg(all(target_os = "macos", feature = "lab-pen-probe"))]
 pub mod pen_probe;
 pub mod permissions;
+pub mod power;
 #[cfg(target_os = "macos")]
 pub mod refine;
 #[cfg(target_os = "macos")]
 pub mod relay;
+pub mod screen_lock;
 #[cfg(target_os = "macos")]
 pub mod service;
 #[cfg(target_os = "macos")]
@@ -138,6 +144,31 @@ pub struct MacOsPlatformConfig {
     /// How keyboard input reaches a logged-in desktop.
     #[serde(default)]
     pub input_backend: InputBackendChoice,
+    /// The signed-in desktop, as the Windows host's `platform.desktop`.
+    #[serde(default)]
+    pub desktop: MacOsDesktopConfig,
+}
+
+/// `platform.desktop`.
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MacOsDesktopConfig {
+    /// Desk privacy while a Deck is attached.
+    pub deskside: MacOsDesksideConfig,
+}
+
+/// `platform.desktop.deskside`: the desk kept private while a Deck is
+/// attached to a signed-in user's session (`desk_privacy`), the Windows
+/// host's switch of the same name. Off unless set. Nothing to pin: macOS
+/// names no input device to an event filter, and both controls end with the
+/// process.
+#[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MacOsDesksideConfig {
+    /// Darken the desk's displays and drop its input while a Deck is
+    /// attached; a session that cannot be made private is refused
+    /// `console_privacy_unavailable`.
+    pub enabled: bool,
 }
 
 /// How keyboard input reaches a logged-in desktop.
@@ -213,6 +244,7 @@ impl Default for MacOsPlatformConfig {
             virtual_display_enabled: false,
             multi_monitor: MacOsMultiMonitorConfig::default(),
             input_backend: InputBackendChoice::Auto,
+            desktop: MacOsDesktopConfig::default(),
         }
     }
 }
@@ -231,6 +263,11 @@ impl MacOsPlatformConfig {
         }
         if self.service_user.as_deref().is_some_and(str::is_empty) {
             return Err("service_user must not be empty");
+        }
+        if self.desktop.deskside.enabled && self.input_backend == InputBackendChoice::VirtualHid {
+            return Err(
+                "platform.desktop.deskside cannot tell a virtual HID keyboard from the desk's: use input_backend auto or coregraphics",
+            );
         }
         Ok(())
     }
@@ -763,6 +800,32 @@ mod tests {
             ..MacOsPlatformConfig::default()
         };
         assert_eq!(config.validate(), Err("service_user must not be empty"));
+    }
+
+    #[test]
+    fn desk_privacy_is_off_unless_set_and_refuses_a_virtual_hid_keyboard() {
+        let path = std::path::Path::new("/tmp/arcen-deskside.json");
+        let parse = |platform: &str| {
+            parse_config(
+                format!(
+                    r#"{{"audio":{{"enabled":false,"compressed":true}},"microphone_input":{{"enabled":false}},"platform":{platform}}}"#
+                )
+                .as_bytes(),
+                path,
+            )
+        };
+        let off = parse("{}").expect("parses");
+        assert!(!off.platform.desktop.deskside.enabled);
+        let on = parse(r#"{"desktop":{"deskside":{"enabled":true}}}"#).expect("parses");
+        assert!(on.platform.desktop.deskside.enabled);
+        let refused =
+            parse(r#"{"input_backend":"virtual_hid","desktop":{"deskside":{"enabled":true}}}"#)
+                .expect_err("a virtual HID keyboard cannot be told from the desk's");
+        assert!(refused.to_string().contains("deskside"), "{refused}");
+        assert!(
+            parse(r#"{"desktop":{"deskside":{"enabled":true,"monitors":[]}}}"#).is_err(),
+            "Windows-only pins are not silently accepted"
+        );
     }
 
     fn valid_config(logging: &str) -> String {

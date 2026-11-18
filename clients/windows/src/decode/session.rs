@@ -194,6 +194,74 @@ pub struct DecoderSession {
     fence: Option<(ID3D11Fence, ID3D11DeviceContext4)>,
     fence_value: u64,
     pub leases: Arc<SlotLeases>,
+    timing: DecodeTiming,
+}
+
+/// Where a decode call's time goes, logged every five seconds: waiting for
+/// the shared context lock, retrying while the decoder is busy
+/// (`E_PENDING`), and submitting the picture. A decoder slower than the
+/// stream shows here first.
+#[derive(Debug)]
+struct DecodeTiming {
+    since: std::time::Instant,
+    decodes: u32,
+    pending_retries: u32,
+    lock_wait: std::time::Duration,
+    lock_wait_max: std::time::Duration,
+    total: std::time::Duration,
+    total_max: std::time::Duration,
+}
+
+impl Default for DecodeTiming {
+    fn default() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            decodes: 0,
+            pending_retries: 0,
+            lock_wait: std::time::Duration::ZERO,
+            lock_wait_max: std::time::Duration::ZERO,
+            total: std::time::Duration::ZERO,
+            total_max: std::time::Duration::ZERO,
+        }
+    }
+}
+
+impl DecodeTiming {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn note(
+        &mut self,
+        lock_wait: std::time::Duration,
+        retries: u32,
+        total: std::time::Duration,
+        size: (u32, u32),
+    ) {
+        self.decodes += 1;
+        self.pending_retries += retries;
+        self.lock_wait += lock_wait;
+        self.lock_wait_max = self.lock_wait_max.max(lock_wait);
+        self.total += total;
+        self.total_max = self.total_max.max(total);
+        if self.since.elapsed() < Self::EVERY {
+            return;
+        }
+        let avg_us = |sum: std::time::Duration| {
+            u64::try_from(sum.as_micros() / u128::from(self.decodes.max(1))).unwrap_or(u64::MAX)
+        };
+        let us = |value: std::time::Duration| u64::try_from(value.as_micros()).unwrap_or(u64::MAX);
+        tracing::info!(
+            target: arcen_deck_core::log_target::VIDEO,
+            size = ?size,
+            decodes = self.decodes,
+            pending_retries = self.pending_retries,
+            lock_wait_avg_us = avg_us(self.lock_wait),
+            lock_wait_max_us = us(self.lock_wait_max),
+            decode_call_avg_us = avg_us(self.total),
+            decode_call_max_us = us(self.total_max),
+            "decoder timing"
+        );
+        *self = Self::default();
+    }
 }
 
 impl DecoderSession {
@@ -306,6 +374,7 @@ impl DecoderSession {
                 fence,
                 fence_value: 0,
                 leases: SlotLeases::new(pool),
+                timing: DecodeTiming::default(),
             })
         }
     }
@@ -334,15 +403,19 @@ impl DecoderSession {
         // waiting decode never stalls presentation.
         let lock = Arc::clone(&self.context_lock);
         let mut attempts = 0;
+        let started = std::time::Instant::now();
+        let mut lock_wait = std::time::Duration::ZERO;
         // SAFETY: the decoder, context and view are live COM objects; every
         // buffer pointer comes from GetDecoderBuffer with its reported size
         // and is released before submission.
         #[allow(unsafe_code)]
         unsafe {
             let _guard = loop {
+                let asked = std::time::Instant::now();
                 let guard = lock
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                lock_wait += asked.elapsed();
                 match self
                     .context
                     .DecoderBeginFrame(&self.decoder, &view, 0, None)
@@ -367,6 +440,9 @@ impl DecoderSession {
                     .map_err(|error| format!("fence signal: {error}"))?;
             }
         }
+        let size = self.surface_size;
+        self.timing
+            .note(lock_wait, attempts, started.elapsed(), size);
         Ok(())
     }
 

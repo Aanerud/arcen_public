@@ -28,34 +28,19 @@ use arcen_transport::{ConnectionId, DirectResumeTransportBinding};
 use futures_util::{Sink, Stream};
 use ring::hmac;
 use sha2::{Digest, Sha256};
-#[cfg(feature = "wss-compat")]
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-#[cfg(feature = "wss-compat")]
-use tokio_rustls::server::TlsStream;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
-#[cfg(feature = "wss-compat")]
-use tokio_tungstenite::WebSocketStream;
 use zeroize::Zeroize;
 
-#[cfg(feature = "wss-compat")]
-type DirectWssSocket = WebSocketStream<TlsStream<TcpStream>>;
 type DirectQuicSocket = arcen_transport::quic::SessionLaneSocket;
 
 pub(crate) enum DirectSessionSocket {
-    #[cfg(feature = "wss-compat")]
-    Wss(DirectWssSocket),
     Quic(DirectQuicSocket),
 }
 
 impl DirectSessionSocket {
-    #[cfg(feature = "wss-compat")]
-    pub(crate) const fn wss(socket: DirectWssSocket) -> Self {
-        Self::Wss(socket)
-    }
-
     pub(crate) const fn quic(socket: DirectQuicSocket) -> Self {
         Self::Quic(socket)
     }
@@ -64,8 +49,6 @@ impl DirectSessionSocket {
     /// without lanes, which cannot carry a session.
     pub(crate) fn lanes(&self) -> Option<arcen_transport::quic::LaneConnection> {
         match self {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(_) => None,
             Self::Quic(socket) => Some(socket.lanes().clone()),
         }
     }
@@ -73,8 +56,6 @@ impl DirectSessionSocket {
     /// The control lane's sender, for writers that encode their own records.
     pub(crate) fn control_sender(&self) -> Option<arcen_transport::quic::LaneSender> {
         match self {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(_) => None,
             Self::Quic(socket) => Some(socket.control_sender()),
         }
     }
@@ -82,16 +63,12 @@ impl DirectSessionSocket {
     /// Clones the live QUIC connection for transport path sampling.
     pub(crate) fn path_signal_connection(&self) -> Option<quinn::Connection> {
         match self {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(_) => None,
             Self::Quic(socket) => Some(socket.lanes().connection().clone()),
         }
     }
 
     pub(crate) const fn transport_capability(&self) -> &'static str {
         match self {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(_) => arcen_protocol::CAPABILITY_TRANSPORT_WSS,
             Self::Quic(_) => arcen_protocol::CAPABILITY_TRANSPORT_QUIC,
         }
     }
@@ -105,8 +82,6 @@ impl Sink<Message> for DirectSessionSocket {
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match self.get_mut() {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(socket) => Pin::new(socket).poll_ready(context),
             Self::Quic(socket) => Pin::new(socket)
                 .poll_ready(context)
                 .map_err(lane_send_error),
@@ -115,8 +90,6 @@ impl Sink<Message> for DirectSessionSocket {
 
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
         match self.get_mut() {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(socket) => Pin::new(socket).start_send(item),
             Self::Quic(socket) => match message_to_record(item) {
                 Some(record) => Pin::new(socket).start_send(record).map_err(lane_send_error),
                 None => Ok(()),
@@ -129,8 +102,6 @@ impl Sink<Message> for DirectSessionSocket {
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match self.get_mut() {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(socket) => Pin::new(socket).poll_flush(context),
             Self::Quic(socket) => Pin::new(socket)
                 .poll_flush(context)
                 .map_err(lane_send_error),
@@ -142,8 +113,6 @@ impl Sink<Message> for DirectSessionSocket {
         context: &mut Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         match self.get_mut() {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(socket) => Pin::new(socket).poll_close(context),
             Self::Quic(socket) => Pin::new(socket)
                 .poll_close(context)
                 .map_err(lane_send_error),
@@ -156,8 +125,6 @@ impl Stream for DirectSessionSocket {
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
-            #[cfg(feature = "wss-compat")]
-            Self::Wss(socket) => Pin::new(socket).poll_next(context),
             Self::Quic(socket) => Pin::new(socket).poll_next(context).map(|item| {
                 item.map(|result| {
                     result
@@ -439,7 +406,7 @@ impl fmt::Debug for ResumeHandoff {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ResumeHandoff")
-            .field("socket", &"<direct-wss>")
+            .field("socket", &"<direct-quic>")
             .field("session_log_id", &self.session_log_id)
             .field("previous_session_log_id", &self.previous_session_log_id)
             .field("successor_grant", &"<redacted>")

@@ -63,7 +63,6 @@ use crate::runtime::session::{
     SessionEnd, SessionEvent, TerminalDisconnect,
 };
 use crate::runtime::tls::CertInfo;
-use crate::session_truth::ActiveContract;
 use arcen_media::{PresentationWindow, TransferCharacteristics, classify_presentation_window};
 use arcen_protocol::VideoHeader;
 use arcen_protocol::messages::{
@@ -403,6 +402,9 @@ pub struct SharedMediaState<M: MediaPlatform> {
     pub microphone_active: bool,
     pub display_update_result: Option<DisplayUpdateResultMsg>,
     pub host_health: Option<HealthStatsMsg>,
+    /// The host displays last reported limited (`HealthStatsMsg.monitors`),
+    /// with their reason, so each change is logged once.
+    pub host_limited_displays: Vec<(u16, String)>,
     pub last_health_pong: Option<HealthPongMsg>,
     /// When the host last answered a health ping: the session is alive
     /// even while every host monitor is still and sends no frames.
@@ -516,6 +518,9 @@ pub struct SharedMediaState<M: MediaPlatform> {
     /// (`arcen_media::MAX_MULTI_MONITOR_COUNT`), so this map can never grow
     /// beyond four entries.
     pub monitor_media: BTreeMap<arcen_media::SessionMonitorId, MonitorMediaCounters>,
+    /// How often this connection's decoder fell behind the stream and the
+    /// video skipped ahead ([`crate::runtime::decode_lag`]).
+    pub decoder_behind: crate::runtime::decode_lag::DecoderBehind,
     /// Recent offset-free video wire-delay samples by negotiated monitor.
     pub monitor_wire_delay_samples: BTreeMap<arcen_media::SessionMonitorId, VecDeque<f64>>,
     /// Cumulative UI presentations by monitor. Decode/receive counters are
@@ -594,6 +599,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             microphone_active: Default::default(),
             display_update_result: Default::default(),
             host_health: Default::default(),
+            host_limited_displays: Vec::new(),
             last_health_pong: Default::default(),
             last_health_pong_at: None,
             video_frames_seen: Default::default(),
@@ -639,6 +645,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             multi_monitor_root_monitor_id: Default::default(),
             secondary_frames: Default::default(),
             monitor_media: Default::default(),
+            decoder_behind: Default::default(),
             monitor_wire_delay_samples: Default::default(),
             monitor_presented_frames: Default::default(),
             monitor_presentation_targets: Default::default(),
@@ -813,6 +820,7 @@ pub fn spawn_media_worker<M, F>(
             // the per-monitor ones the router builds later in the session.
             let mut session_color = SessionColor::default();
             let mut decode_latency_policy = arcen_media::video::DecodeLatencyPolicy::default();
+            let mut decode_lag = crate::runtime::decode_lag::DecodeLagGuard::default();
             tracing::info!(target: crate::log_target::VIDEO, "media worker started");
 
             loop {
@@ -925,7 +933,7 @@ pub fn spawn_media_worker<M, F>(
                         // as what actually arrives. `None` (a host that
                         // does not report the axis at all) keeps the
                         // BT.709 SDR default rather than guessing.
-                        let active = ActiveContract::from_hello(&hello);
+                        session_color = SessionColor::from_hello(&hello);
                         decode_latency_policy = hello
                             .active_pipeline
                             .as_ref()
@@ -937,18 +945,6 @@ pub fn spawn_media_worker<M, F>(
                             let mut state = shared.lock().expect("media state poisoned");
                             state.server_hello = Some(hello);
                         }
-                        let color_metadata =
-                            arcen_media::VideoColorMetadata::from_optional_or_legacy(
-                                active.range,
-                                active.matrix,
-                                active.primaries,
-                                active.transfer,
-                            );
-                        let presentation_metadata = color_metadata.presentation_axes();
-                        session_color = SessionColor {
-                            primaries: presentation_metadata.primaries,
-                            transfer: presentation_metadata.transfer,
-                        };
                         tracing::info!(
                             target: crate::log_target::VIDEO,
                             primaries = session_color.primaries.token(),
@@ -978,6 +974,10 @@ pub fn spawn_media_worker<M, F>(
                             Some(HEALTH_STATS) => {
                                 if let Ok(stats) = serde_json::from_value::<HealthStatsMsg>(value) {
                                     let served_fps = served_fps_from_health(&stats);
+                                    note_host_limited_displays(
+                                        &mut state.host_limited_displays,
+                                        &stats,
+                                    );
                                     state.host_health = Some(stats);
                                     if served_fps.is_some() {
                                         state.served_source_fps = served_fps;
@@ -1106,6 +1106,8 @@ pub fn spawn_media_worker<M, F>(
                             decode_latency_policy,
                             &decoders,
                         );
+                        let mut batch = media.take_batch();
+                        skip_video_if_behind(&shared, &media, &mut decode_lag, &mut batch);
                         handle_media_batch(
                             &shared,
                             &mut decoder,
@@ -1113,7 +1115,7 @@ pub fn spawn_media_worker<M, F>(
                             &commands,
                             &mut full_frame_requests,
                             &mut pending_ingress_idr,
-                            media.take_batch(),
+                            batch,
                             &telemetry,
                             repaint,
                         );
@@ -1613,6 +1615,77 @@ fn maybe_commit_secondary_router<M, F>(
             );
         }
     }
+}
+
+/// An interactive contract whose decoder fell behind the stream skips the
+/// batch's video to the next keyframe of each monitor it carries none for
+/// ([`crate::runtime::decode_lag`]): the picture stays with the sound
+/// instead of drifting behind it until the inbox overflows.
+fn skip_video_if_behind<M: MediaPlatform>(
+    shared: &Arc<Mutex<SharedMediaState<M>>>,
+    media: &IncomingMediaReceiver,
+    guard: &mut crate::runtime::decode_lag::DecodeLagGuard,
+    batch: &mut IncomingMediaBatch,
+) {
+    let interactive = {
+        let state = shared.lock().expect("media state poisoned");
+        !present_timing_for_state(&state).waits_for_vsync()
+    };
+    let crate::runtime::decode_lag::DecodeLag::SkipAhead { waited } =
+        guard.judge(batch.oldest_video_wait, interactive)
+    else {
+        return;
+    };
+    let keyed: std::collections::BTreeSet<u16> = batch
+        .video
+        .iter()
+        .filter(|(header, _)| header.is_keyframe())
+        .map(|(header, _)| header.monitor_id)
+        .collect();
+    let behind: Vec<u16> = batch
+        .video
+        .iter()
+        .map(|(header, _)| header.monitor_id)
+        .filter(|monitor_id| !keyed.contains(monitor_id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if behind.is_empty() {
+        return;
+    }
+    let (mut packets, mut bytes) = (0_u64, 0_u64);
+    batch.video.retain(|(header, payload)| {
+        let skip = behind.contains(&header.monitor_id);
+        if skip {
+            packets += 1;
+            bytes += payload.len() as u64;
+        }
+        !skip
+    });
+    media.skip_to_keyframe(&behind, (packets, bytes));
+    for monitor_id in &behind {
+        if !batch.video_discontinuity_monitor_ids.contains(monitor_id) {
+            batch.video_discontinuity_monitor_ids.push(*monitor_id);
+        }
+        if !batch.idr_needed_monitor_ids.contains(monitor_id) {
+            batch.idr_needed_monitor_ids.push(*monitor_id);
+        }
+    }
+    batch.video_discontinuity = true;
+    batch.idr_needed = true;
+    let skips = {
+        let mut state = shared.lock().expect("media state poisoned");
+        state.decoder_behind.note(waited);
+        state.decoder_behind.skips
+    };
+    tracing::warn!(
+        target: crate::log_target::VIDEO,
+        waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+        monitors = ?behind,
+        skipped_packets = packets,
+        skips,
+        "the decoder fell behind the stream: video skipped ahead to the next keyframe",
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2641,6 +2714,36 @@ enum RoutedPrimaryPresentation {
     DedicatedFailure,
 }
 
+/// Logs each change of the host displays the Pier reports below what their
+/// content owed (`HealthStatsMsg.monitors`), with the reason: WARN when one
+/// falls behind, INFO when every display keeps up again.
+fn note_host_limited_displays(previous: &mut Vec<(u16, String)>, stats: &HealthStatsMsg) {
+    let limited: Vec<(u16, String)> = stats
+        .monitors
+        .iter()
+        .filter_map(|monitor| {
+            monitor
+                .limited_by_token()
+                .map(|token| (monitor.session_monitor_id, token.to_owned()))
+        })
+        .collect();
+    if limited == *previous {
+        return;
+    }
+    match arcen_media::stats_overlay::host_display_rates_line(&stats.monitors) {
+        Some(line) if !limited.is_empty() => tracing::warn!(
+            target: crate::log_target::VIDEO,
+            displays = %line,
+            "the host reports a display below its rate"
+        ),
+        _ => tracing::info!(
+            target: crate::log_target::VIDEO,
+            "every host display keeps up with its rate again"
+        ),
+    }
+    *previous = limited;
+}
+
 fn served_fps_from_health(stats: &HealthStatsMsg) -> Option<u32> {
     let fps = if stats.fps_target.is_finite() && stats.fps_target > 0.0 {
         stats.fps_target
@@ -2849,22 +2952,41 @@ fn publish_decoded_frame<M: MediaPlatform>(
         Egui,
     }
 
+    let mut waits_for_layer = false;
     let (route, source_fps, timing): (DedicatedRoute<M>, _, _) = {
         let state = shared.lock().expect("media state poisoned");
         let source_fps = source_fps_for_state(&state);
         let timing = present_timing_for_state(&state);
+        // A native frame goes to its layer only once the UI attached that
+        // layer. The decoder hands out native frames while either layer is
+        // attached: after a sign-in hand-over the held picture's eight-bit
+        // layer is, and the desktop's first ten-bit frame would otherwise
+        // find its own layer missing and turn the session's presentation
+        // to eight bits for good. On the UI path it tells the UI which
+        // layer to attach, and a fresh full frame is asked for: nothing
+        // shows this one, and the next may be a keepalive a second away.
         let route = if should_use_dedicated_eight_bit_layer(&frame, state.eight_bit_layer_disabled)
         {
-            if let Some(presenter) = state.eight_bit_video_presenter.as_ref() {
-                DedicatedRoute::EightBit(presenter.clone())
-            } else {
-                DedicatedRoute::Egui
+            match state.eight_bit_video_presenter.as_ref() {
+                Some(presenter) if state.eight_bit_layer_ready => {
+                    DedicatedRoute::EightBit(presenter.clone())
+                }
+                Some(_) => {
+                    waits_for_layer = true;
+                    DedicatedRoute::Egui
+                }
+                None => DedicatedRoute::Egui,
             }
         } else if should_use_dedicated_ten_bit_layer(&frame, state.ten_bit_layer_disabled) {
-            if let Some(presenter) = state.ten_bit_video_presenter.as_ref() {
-                DedicatedRoute::TenBit(presenter.clone())
-            } else {
-                DedicatedRoute::Egui
+            match state.ten_bit_video_presenter.as_ref() {
+                Some(presenter) if state.ten_bit_layer_ready => {
+                    DedicatedRoute::TenBit(presenter.clone())
+                }
+                Some(_) => {
+                    waits_for_layer = true;
+                    DedicatedRoute::Egui
+                }
+                None => DedicatedRoute::Egui,
             }
         } else {
             DedicatedRoute::Egui
@@ -3021,6 +3143,10 @@ fn publish_decoded_frame<M: MediaPlatform>(
     // immediately take the frame without contending on the mutex.
     drop(state);
     repaint.request_repaint();
+    if waits_for_layer {
+        full_frame_requests.request();
+        let _ = full_frame_requests.send_due(commands);
+    }
 }
 
 fn first_decodable_index(
@@ -3302,6 +3428,58 @@ mod tests {
         assert_eq!(rates.frames_dropped, 150);
         assert_eq!(rates.frames_superseded_by_refresh, 150);
         assert_eq!(rates.frames_dropped_before_presentation, 0);
+    }
+
+    #[test]
+    fn a_decoder_behind_an_interactive_stream_skips_its_batch_to_the_next_keyframe() {
+        use crate::runtime::frame_queue::{MediaPacket, incoming_media_inbox};
+        let shared = Arc::new(Mutex::new(SharedMediaState::default()));
+        let (inbox, media) = incoming_media_inbox();
+        let delta = |timestamp_ms| MediaPacket::Video {
+            header: VideoHeader {
+                frame_type: FrameType::VideoH264,
+                codec: VideoCodec::H264,
+                chroma: ChromaSubsampling::Yuv420,
+                flags: 0,
+                timestamp_ms,
+                monitor_id: 0,
+                topology_generation: 0,
+                stream_epoch: 0,
+            },
+            payload: vec![0; 3],
+        };
+        let mut keyframe = delta(1);
+        if let MediaPacket::Video { header, .. } = &mut keyframe {
+            header.flags = VIDEO_KEYFRAME_FLAG;
+        }
+        let mut guard = crate::runtime::decode_lag::DecodeLagGuard::default();
+        let mut late_batch = |packets: Vec<MediaPacket>, waited_ms| {
+            for packet in packets {
+                let _ = inbox.enqueue(packet);
+            }
+            let mut batch = media.take_batch();
+            batch.oldest_video_wait = Some(Duration::from_millis(waited_ms));
+            skip_video_if_behind(&shared, &media, &mut guard, &mut batch);
+            batch
+        };
+
+        let first = late_batch(vec![keyframe, delta(2)], 130);
+        assert_eq!(first.video.len(), 2);
+        assert!(!first.video_discontinuity);
+        let second = late_batch(vec![delta(3), delta(4)], 170);
+        assert!(second.video.is_empty());
+        assert!(second.video_discontinuity && second.idr_needed);
+        assert_eq!(second.video_discontinuity_monitor_ids, vec![0]);
+        assert_eq!(
+            shared
+                .lock()
+                .expect("media state poisoned")
+                .decoder_behind
+                .skips,
+            1
+        );
+        // Deltas are dropped on arrival until the keyframe it asked for.
+        assert!(!inbox.enqueue(delta(5)).accepted);
     }
 
     #[test]
@@ -4302,6 +4480,59 @@ mod tests {
             Some(7),
             "an async 10-bit layer failure must not publish an empty-RGBA frame over the fallback"
         );
+    }
+
+    /// After a sign-in hand-over the held picture keeps the eight-bit layer
+    /// attached, so the decoder hands out native frames before the
+    /// desktop's ten-bit layer exists. That frame goes to the UI, which then
+    /// attaches the ten-bit layer; it must not find the layer missing and
+    /// turn the session to eight bits.
+    #[test]
+    fn a_ten_bit_frame_before_its_layer_is_attached_reaches_the_ui_not_a_fallback() {
+        let mut ten_bit_presenter = TestPresenter::default();
+        ten_bit_presenter.set_surface_visible(true);
+        let shared = Arc::new(Mutex::new(SharedMediaState {
+            eight_bit_video_presenter: Some(Arc::new(Mutex::new(TestPresenter::default()))),
+            eight_bit_layer_ready: true,
+            ten_bit_video_presenter: Some(Arc::new(Mutex::new(ten_bit_presenter))),
+            ten_bit_layer_ready: false,
+            ..SharedMediaState::default()
+        }));
+        let telemetry = ClientTelemetry::default();
+        let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+        let commands = SessionCommandSender::for_test(commands_tx);
+        let mut gate = FullFrameRequestGate::default();
+        let mut pending_ingress_idr = false;
+        publish_decoded_frame(
+            &shared,
+            native_ten_bit_frame(5),
+            1.0,
+            "videotoolbox-iosurface",
+            Some(true),
+            &telemetry,
+            &NoRepaint,
+            &commands,
+            &mut gate,
+            &mut pending_ingress_idr,
+        );
+        let state = shared.lock().expect("media state poisoned");
+        assert!(!state.ten_bit_layer_disabled);
+        assert!(!state.ten_bit_presentation_status.is_fallback());
+        assert!(
+            state
+                .latest_frame
+                .as_ref()
+                .is_some_and(|frame| frame.native.is_some() && frame.timestamp_ms == 5),
+            "the UI sees the ten-bit frame and attaches its layer"
+        );
+        drop(state);
+        let mut full_frame_asked = false;
+        while let Ok(command) = commands_rx.try_recv() {
+            if let SessionCommand::Json(value) = command {
+                full_frame_asked |= value["type"] == arcen_protocol::messages::REQUEST_FULL_FRAME;
+            }
+        }
+        assert!(full_frame_asked, "a fresh frame follows for the new layer");
     }
 
     #[test]

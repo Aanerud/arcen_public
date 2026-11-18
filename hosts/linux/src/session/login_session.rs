@@ -108,6 +108,11 @@ pub(crate) struct LoginLaunch {
     /// The depth the session's X server is created at
     /// (`video.x11_desktop_depth`, decided for the first sign-in).
     pub(crate) depth: Option<u8>,
+    /// The Deck display the first sign-in serves (facts, never EDID
+    /// bytes): the session's head is created at its size with its EDID,
+    /// as a dedicated desktop's is. `None` for a multi-head request, which
+    /// keeps the template's heads.
+    pub(crate) display: Option<super::launcher::SessionDisplayMsg>,
 }
 
 fn stack_installed() -> bool {
@@ -231,6 +236,13 @@ pub(crate) async fn start(
     if let Some(depth) = launch.depth {
         run.args(["--depth", &depth.to_string()]);
     }
+    if let Some(facts) = launch
+        .display
+        .as_ref()
+        .and_then(|display| serde_json::to_string(display).ok())
+    {
+        run.args([DISPLAY_FACTS_FLAG, &facts]);
+    }
     match bounded(run).await {
         Some(output) if output.status.success() => {}
         output => {
@@ -297,6 +309,27 @@ async fn unit_active(unit: &str) -> bool {
     bounded(show)
         .await
         .is_some_and(|output| output.status.success())
+}
+
+/// The served Deck display's facts (JSON of
+/// [`super::launcher::SessionDisplayMsg`]).
+const DISPLAY_FACTS_FLAG: &str = "--display-facts";
+/// Longest facts argument accepted.
+const MAX_DISPLAY_FACTS_BYTES: usize = 4096;
+
+/// The served Deck display from `--display-facts`, when given and valid.
+fn display_facts(
+    args: &[String],
+) -> Result<Option<super::launcher::SessionDisplayMsg>, LauncherError> {
+    let Ok(facts) = argument(args, DISPLAY_FACTS_FLAG) else {
+        return Ok(None);
+    };
+    if facts.len() > MAX_DISPLAY_FACTS_BYTES {
+        return Err(LauncherError::Protocol);
+    }
+    serde_json::from_str(&facts)
+        .map(Some)
+        .map_err(|_| LauncherError::Protocol)
 }
 
 fn argument(args: &[String], flag: &str) -> Result<String, LauncherError> {
@@ -422,6 +455,7 @@ async fn run(args: &[String]) -> Result<(), LauncherError> {
         ),
         Err(_) => None,
     };
+    let served = display_facts(args)?;
     let identity = UserIdentity::resolve(&username)?;
     if identity.uid != uid || identity.uid == 0 {
         return Err(LauncherError::Protocol);
@@ -474,6 +508,15 @@ async fn run(args: &[String]) -> Result<(), LauncherError> {
         .ok_or(LauncherError::LogindSession)?;
     tracing::info!(target: target::SESSION, session_id, username, vt, x_display = %x_display, "login session opened");
 
+    // As a dedicated desktop's: a display the generator refuses keeps the
+    // template's EDID-less head.
+    let session_edid = served.as_ref().and_then(|display| match display.edid() {
+        Ok(edid) => Some(edid),
+        Err(error) => {
+            tracing::warn!(target: target::SESSION, %error, "the Deck display's EDID could not be generated; the head keeps no EDID");
+            None
+        }
+    });
     let provider = super::launcher::DedicatedXorgProvider::new(
         &xorg_binary,
         &template,
@@ -482,10 +525,12 @@ async fn run(args: &[String]) -> Result<(), LauncherError> {
         &gpu_head,
         &session_id,
         &identity,
-        None,
+        session_edid.as_ref(),
         arcen_outputs::SessionScreen {
             depth,
-            served_size: None,
+            served_size: served
+                .as_ref()
+                .map(super::launcher::SessionDisplayMsg::size),
         },
         XorgSeat::Console { vt },
     );
@@ -569,4 +614,43 @@ async fn run(args: &[String]) -> Result<(), LauncherError> {
     xorg.shutdown().await;
     drop(pam_session);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_served_display_reaches_the_login_session_as_facts() {
+        let monitor = arcen_protocol::messages::ClientMonitor {
+            width_px: 2560,
+            height_px: 1600,
+            refresh_hz: 60,
+            width_mm: 344.0,
+            height_mm: 215.0,
+            scale: 2.0,
+            ..Default::default()
+        };
+        let served = super::super::launcher::SessionDisplayMsg::served(&monitor, 1280, 800);
+        let args = vec![
+            "login-session".to_owned(),
+            DISPLAY_FACTS_FLAG.to_owned(),
+            serde_json::to_string(&served).expect("facts"),
+        ];
+        let parsed = display_facts(&args).expect("valid").expect("given");
+        assert_eq!(parsed, served);
+        assert_eq!(parsed.size(), (1280, 800));
+        assert!(parsed.edid().is_ok());
+        assert_eq!(
+            display_facts(&["login-session".to_owned()]).ok(),
+            Some(None)
+        );
+        let bad = vec![DISPLAY_FACTS_FLAG.to_owned(), "{\"width\":".to_owned()];
+        assert!(display_facts(&bad).is_err());
+        let long = vec![
+            DISPLAY_FACTS_FLAG.to_owned(),
+            "x".repeat(MAX_DISPLAY_FACTS_BYTES + 1),
+        ];
+        assert!(display_facts(&long).is_err());
+    }
 }

@@ -116,8 +116,11 @@ rate is the smaller of the target and that changed-content rate, reported as
   interval (paced from the previous sent frame's arrival, with half a frame
   of margin) counts as content that was not sent.
 - Linux: every capenc stats second in the window classified
-  `fps_limiter=no_damage` or, on the NvFBC loop, had grabs that found the
-  screen unchanged (`capture_old`).
+  `fps_limiter=no_damage` or, on the NvFBC loop (which grabs between its
+  encodes, so an unchanged grab proves nothing), counted its changes: the
+  grabs that returned a new frame (`capture_new`) plus the frames the NvFBC
+  server generated while the loop was away encoding (`capture_behind`). That
+  is the changed-content rate whatever pace the loop kept.
 - Windows (Desktop Duplication, WGC and Media Foundation alike): every capenc
   stats second in the window had an empty poll or an encode skipped for want
   of a new frame.
@@ -126,8 +129,22 @@ A host that falls behind the changes (an encoder or network backlog, a rate
 cap, frames superseded or shed) is still `degraded`/`critical`, because those
 frames count as content and never as sent; a window that sent nothing at all
 is a stall whatever the content; and a window with any second the capture
-path cannot prove (rate control, a busy pipeline, multi-monitor sessions, the
-X11 OpenH264 fallback) is judged against the target as before. The client side is
+path cannot prove (rate control, a busy pipeline, the X11 OpenH264 fallback)
+is judged against the target as before. A multi-monitor session is judged on
+every monitor's frames together, against the sum of every monitor's own
+served rate (a 30 Hz and a 120 Hz Deck display owe 150 a second, not twice
+the primary's rate), each monitor owing what its own capture proved (two
+still monitors owe nothing but their keepalives; a busy monitor that proved
+nothing owes its whole target). `health_stats.fps_target` and `fps_actual`
+stay per stream, the rate a Deck paces each monitor by; the Pier's `HEALTH_*`
+events and `HEALTH_SNAPSHOT` report the session's totals, which is what was
+judged. `health_stats.monitors` gives each monitor's own served and sent
+rate; a monitor that sent below what its content owed for two windows
+running carries `limited_by: host_shortfall`, the Pier logs it at WARN
+(`a monitor delivers below what its content owed`, with `owed_fps` and
+`fps_actual`) and INFO when it keeps up again, and both Decks show the line
+in Stream Statistics (`Host displays: 1 60/60 · 2 41/60 limited by the host
+keeping up`) and log each change. The client side is
 judged the same way against the frames it received: a Deck that presents
 every keepalive of a still desktop is healthy. One decoded frame still in
 flight at a window boundary is not counted as `unpresented`, and
@@ -279,6 +296,7 @@ against Level-0 log output, you will never see it fire.
 | 1102 | `SESSION_STREAM_START` | streaming | succeeded | information | 0 | audit-only |
 | 1103 | `SESSION_END` | cleanup | succeeded | information | 0 | audit-only |
 | 1104 | `SESSION_INTERRUPTED` | reconnect | failed | warning | 0 | investigate |
+| 1108 | `RESUME_HOLD_ENDED` | reconnect | succeeded | information | 0 | audit-only |
 | 1200 | `DISPLAY_ARMED` | health | started | information | 2 | audit-only |
 | 1201 | `DISPLAY_RESTORED` | cleanup | succeeded | information | 2 | audit-only |
 | 1202 | `DISPLAY_RESTORE_DEGRADED` | cleanup | succeeded | warning | 1 | investigate (gated, §3.2) |

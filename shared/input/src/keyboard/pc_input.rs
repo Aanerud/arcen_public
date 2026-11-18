@@ -175,12 +175,20 @@ pub fn resolve_pc_keyboard_policy(
 /// When the session takes the system shortcuts (the Windows key, Alt+Tab,
 /// Alt+Esc, Ctrl+Esc, Ctrl+Shift+Esc, Print Screen) from the Deck's
 /// computer.
+///
+/// By default whenever a session window has focus, windowed or fullscreen:
+/// a remote desktop is used as the computer it shows, so its shortcuts act
+/// on it. The Deck's own chords still reach the Deck (Ctrl+Alt+Home opens
+/// the connection bar and gives it the keyboard, Ctrl+Alt+F12 disconnects,
+/// F9 releases held keys), a click outside the window or the Keyboard Grab
+/// menu item gives the shortcuts back, and Windows+L and Ctrl+Alt+Del stay
+/// the Deck computer's by design of Windows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum KeyboardGrab {
     /// While the session is focused and fullscreen.
-    #[default]
     Fullscreen,
     /// Whenever the session is focused.
+    #[default]
     Always,
     /// Never: the Deck's computer keeps them.
     Never,
@@ -1410,6 +1418,10 @@ mod tests {
 
     #[test]
     fn the_grab_follows_focus_fullscreen_and_the_toggle() {
+        // A focused session window takes the system shortcuts by default,
+        // windowed too; an unfocused one never does.
+        assert!(KeyboardGrab::default().active(true, false, None));
+        assert!(!KeyboardGrab::default().active(false, true, None));
         assert!(KeyboardGrab::Fullscreen.active(true, true, None));
         assert!(!KeyboardGrab::Fullscreen.active(true, false, None));
         assert!(!KeyboardGrab::Always.active(false, true, Some(true)));

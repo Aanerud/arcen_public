@@ -2,6 +2,7 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 
 pub mod gpu_pci;
+pub mod nv_control;
 pub mod nvctrl;
 pub mod nvidia_discovery;
 pub mod topology;

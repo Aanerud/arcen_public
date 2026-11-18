@@ -21,17 +21,13 @@ use arcen_transport::host_material::{
     WindowsFileFacts,
 };
 use arcen_transport::tls::SystemUnixClock;
-#[cfg(feature = "wss-compat")]
-use tokio_rustls::TlsAcceptor;
 
 /// The process named in certificate lifecycle events.
 const COMPONENT: &str = "pier_broker";
 
-/// The material this Pier serves, and the WSS acceptor over it when built.
+/// The material this Pier serves.
 pub(crate) struct TlsLifecycle {
     material: HostTlsMaterial,
-    #[cfg(feature = "wss-compat")]
-    acceptor: TlsAcceptor,
 }
 
 impl TlsLifecycle {
@@ -42,18 +38,7 @@ impl TlsLifecycle {
             Arc::new(SystemUnixClock),
             COMPONENT,
         )?;
-        #[cfg(feature = "wss-compat")]
-        let acceptor = TlsAcceptor::from(Arc::new(material.server_config()?));
-        Ok(Self {
-            material,
-            #[cfg(feature = "wss-compat")]
-            acceptor,
-        })
-    }
-
-    #[cfg(feature = "wss-compat")]
-    pub(crate) fn acceptor(&self) -> TlsAcceptor {
-        self.acceptor.clone()
+        Ok(Self { material })
     }
 
     /// The rustls server configuration for the QUIC endpoint; the caller

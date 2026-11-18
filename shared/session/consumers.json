@@ -595,10 +595,12 @@
       "contracts": [
         "agent_relay",
         "auth_throttle",
+        "console_session",
         "deskside",
         "desktop_provider",
         "direct_reconnect",
         "host_lifecycle",
+        "local_playback",
         "pier_config",
         "restore_lease",
         "session_admission",
@@ -623,6 +625,24 @@
           "gate": 6,
           "symbol": "VideoReleased",
           "reason": "The service tells its desktop agent which video frames its lane relay released, in the shared broker-agent vocabulary."
+        },
+        {
+          "id": "windows-local-playback",
+          "gate": 4,
+          "symbol": "endpoint_report",
+          "reason": "The Windows Pier proves its own speakers silent with the shared endpoint-mute evidence and admits the session through local_playback::admit, as every Pier does."
+        },
+        {
+          "id": "windows-hand-back",
+          "gate": 4,
+          "symbol": "DETACH_STEPS_OUTPUTS_FIRST",
+          "reason": "A departing Deck's session is handed back in the shared order and locked per the shared Departure rule (ADR 0025, disconnect locks)."
+        },
+        {
+          "id": "windows-console-notice",
+          "gate": 4,
+          "symbol": "ConsoleNotice",
+          "reason": "A refused bind tells the Deck the shared typed console refusal, naming another remote-desktop service as Windows reports it."
         }
       ],
       "paths": [

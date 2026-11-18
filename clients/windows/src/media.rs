@@ -514,6 +514,7 @@ mod tests {
 
     fn options_for_a_closed_port() -> arcen_deck_core::runtime::session::ConnectOptions {
         arcen_deck_core::runtime::session::ConnectOptions {
+            display_refresh: None,
             services: Arc::new(arcen_deck_core::services::test_support::UnavailableServices),
             host: "127.0.0.1".to_owned(),
             port: 9,

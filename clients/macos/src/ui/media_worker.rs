@@ -77,7 +77,7 @@ pub(crate) fn spawn_media_worker(
         media,
         commands,
         shared,
-        Arc::new(repaint),
+        Arc::new(crate::ui::pass_pacing::MediaWake(repaint)),
         telemetry,
         VideoToolboxDecoders,
         crate::ui::audio_worker::macos_player,

@@ -33,6 +33,7 @@
 pub mod autostart;
 pub mod components;
 pub mod first_login;
+pub mod keyring_control;
 pub mod lock;
 pub mod login_environment;
 pub mod manager;

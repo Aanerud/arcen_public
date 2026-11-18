@@ -78,13 +78,29 @@ pub struct MonitorPipelineTemplate {
     /// Optional native encoder ceiling from the served pipeline contract.
     pub encoder_max_bitrate_bps: Option<u32>,
     pub fps: u32,
+    /// Each monitor's own rate (its Deck display's, within `fps`); a
+    /// monitor not listed takes `fps`.
+    pub monitor_fps: Vec<(SessionMonitorId, u32)>,
     pub encoder: Option<EncoderRequest>,
     pub video_selection: arcen_protocol::messages::VideoSelectionIntent,
+    /// What the Deck decodes, from its authenticated request: an adaptive
+    /// roster past a codec's picture ceiling may climb only to a codec in
+    /// it (`arcen_media::video::adaptive_codec_ladder_for_size`).
+    pub client_video: Option<arcen_protocol::messages::ClientVideoCapabilitiesMsg>,
     pub cursor_mode: CursorMode,
     pub session_log_id: CorrelationId,
 }
 
 impl MonitorPipelineTemplate {
+    /// The rate monitor `session_monitor_id`'s pipeline encodes at: its own
+    /// entry in [`Self::monitor_fps`], never above [`Self::fps`].
+    pub fn fps_for(&self, session_monitor_id: SessionMonitorId) -> u32 {
+        self.monitor_fps
+            .iter()
+            .find(|(id, _)| *id == session_monitor_id)
+            .map_or(self.fps, |(_, fps)| (*fps).clamp(1, self.fps.max(1)))
+    }
+
     fn qp_map_for_config(&self, config: &CapencConfig) -> arcen_media::video::QpMapPolicy {
         if config.encoder == Some(EncoderRequest::SoftwareH264) {
             return arcen_media::video::QpMapPolicy::Off;
@@ -336,13 +352,13 @@ pub fn resolve_pipeline_specs(
                 debug_diagnostics: template.debug_diagnostics,
                 encoder_max_bitrate_bps: template.encoder_max_bitrate_bps,
                 fps: if spec.encoder == Some(EncoderRequest::SoftwareH264) {
-                    template.fps.min(
+                    template.fps_for(spec.session_monitor_id).min(
                         arcen_media::video::EncoderBackend::OpenH264
                             .contract()
                             .max_fps,
                     )
                 } else {
-                    template.fps
+                    template.fps_for(spec.session_monitor_id)
                 },
                 width: spec.width,
                 height: spec.height,
@@ -779,6 +795,10 @@ mod tests {
             )
             .expect("logical rect"),
             scale: arcen_media::Scale120::new(120).expect("scale"),
+            ui_scale: arcen_outputs::WindowsUiScale::from_percent(
+                100,
+                arcen_outputs::ScaleBasis::Unknown,
+            ),
             refresh_hz: 60,
             rotation: Rotation::Degrees0,
             primary,
@@ -869,8 +889,10 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
+            monitor_fps: Vec::new(),
             encoder: Some(EncoderRequest::Auto),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            client_video: None,
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
         }
@@ -1495,6 +1517,10 @@ mod tests {
                 )
                 .expect("logical rect"),
                 scale: arcen_media::Scale120::new(120).expect("scale"),
+                ui_scale: arcen_outputs::WindowsUiScale::from_percent(
+                    100,
+                    arcen_outputs::ScaleBasis::Unknown,
+                ),
                 refresh_hz: output.current_refresh_hz,
                 rotation: Rotation::Degrees0,
                 primary: index == 0,
@@ -1541,8 +1567,10 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
+            monitor_fps: Vec::new(),
             encoder: Some(EncoderRequest::NativeNvenc),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            client_video: None,
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([7; 16]),
         };

@@ -176,13 +176,20 @@ impl Connection {
         let mut data = [0_u8; 4096];
         let mut control = nix::cmsg_space!([RawFd; 28]);
         let mut iov = [std::io::IoSliceMut::new(&mut data)];
-        let message = recvmsg::<()>(
-            self.stream.as_raw_fd(),
-            &mut iov,
-            Some(&mut control),
-            MsgFlags::MSG_CMSG_CLOEXEC,
-        )
-        .map_err(std::io::Error::from)?;
+        // A socket with a receive timeout is never restarted after a signal
+        // (signal(7)): a signal delivered to this thread (a child exiting, a
+        // runtime's own) is retried, not taken for a broken compositor.
+        let message = loop {
+            match recvmsg::<()>(
+                self.stream.as_raw_fd(),
+                &mut iov,
+                Some(&mut control),
+                MsgFlags::MSG_CMSG_CLOEXEC,
+            ) {
+                Err(nix::errno::Errno::EINTR) => {}
+                other => break other.map_err(std::io::Error::from)?,
+            }
+        };
         let read = message.bytes;
         for cmsg in message.cmsgs().map_err(std::io::Error::from)? {
             if let ControlMessageOwned::ScmRights(fds) = cmsg {

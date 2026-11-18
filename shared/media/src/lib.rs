@@ -69,7 +69,7 @@ pub use multi_monitor::{
     RequestedMonitorTopology, SessionMonitorId, TopologyGeneration,
 };
 pub use presentation::{
-    PacedOffer, PresentationWindow, PresentationWindowReport, RefreshPacedSlot,
+    NewestPresentDepth, PacedOffer, PresentationWindow, PresentationWindowReport, RefreshPacedSlot,
     classify_presentation_window, expected_presentable_fps, refresh_present_due,
 };
 pub use region::{

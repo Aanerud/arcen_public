@@ -648,7 +648,12 @@ the indices. The cursor is never part of a tile or a digest (R8).
   photographic content with grain. 32 Mpx/s decodes a full 1080p
   photographic frame in about 65 ms of one worker core, which a 25 Mbit/s
   budget delivers over about a second, so the Deck uses `ruzstd`; native
-  decoding stays a drop-in if budgets grow.
+  decoding stays a drop-in if budgets grow. The Pier's one compression
+  worker is not a bound either (benchmark `zstd_encode::bench`, 256×64
+  photographic 10-bit tiles with grain, ratio 3.9): a 4K frame's 510 tiles
+  take 225 ms on the lab EPYC 7742 core (450 Mbit/s of records) and 38 ms
+  on the M4 Pro, 18 and 100 times the 25 Mbit/s ceiling, so a second
+  worker is not added; a 4K photo's fill time is the link budget's.
 - **Coordinates.** Tile and block coordinates are visible source pixels of
   the captured monitor (before any Deck scaling); the Deck composites in
   source space, then scales.

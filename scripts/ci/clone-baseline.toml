@@ -12,7 +12,7 @@ window = 12
 [pairs]
 "clients/macos | hosts/capenc" = 24
 "hosts/linux | hosts/macos" = 12
-"hosts/linux | hosts/windows" = 1326
+"hosts/linux | hosts/windows" = 1314
 "hosts/linux | packaging" = 18
 "hosts/windows | clients/windows" = 14
 "hosts/windows | hosts/macos" = 103

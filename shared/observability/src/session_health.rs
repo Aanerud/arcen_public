@@ -120,8 +120,33 @@ pub struct HostCounters {
     pub last_input_sequence: u64,
     /// The last input type (last-value state, not a count).
     pub last_input_type: &'static str,
-    /// The content rate the capture source proved, if any.
+    /// The content rate the capture source proved, if any. A host that
+    /// captures several outputs reports their combined bound
+    /// ([`arcen_telemetry::outputs_content`]).
     pub content: ContentEvidence,
+    /// Outputs (monitors) whose frames the counts above include; `0` reads
+    /// as one.
+    pub outputs: u32,
+    /// The window's whole frame-rate target when the outputs run at their
+    /// own rates: the sum of each output's
+    /// ([`arcen_telemetry::OutputsContent::fps_target`]). `0` reads as the
+    /// `fps_target` passed to [`SessionHealth::observe`] times
+    /// [`Self::outputs`], every output at that one rate. The counts are the
+    /// whole session's, so the window is judged against the whole target.
+    pub outputs_fps_target: u32,
+}
+
+impl HostCounters {
+    fn output_count(&self) -> u32 {
+        self.outputs.max(1)
+    }
+
+    fn window_fps_target(&self, per_output: u32) -> u32 {
+        match self.outputs_fps_target {
+            0 => per_output.saturating_mul(self.output_count()),
+            whole => whole,
+        }
+    }
 }
 
 /// Result of one [`SessionHealth::observe`] tick.
@@ -246,6 +271,11 @@ impl SessionHealth {
     /// wall-clock time: it drives the window maths, the hysteresis and the
     /// 60-second snapshot cadence. Wall-clock time belongs only to the
     /// lifecycle record's own `timestamp`, set by the emitter.
+    ///
+    /// `fps_target` is the rate each output is served at; the window is
+    /// judged against it times [`HostCounters::outputs`], or against
+    /// [`HostCounters::outputs_fps_target`] when the outputs run at their
+    /// own rates.
     pub fn observe(
         &mut self,
         timestamp_ms: u64,
@@ -262,6 +292,7 @@ impl SessionHealth {
             ContentEvidence::Rate(_) => None,
             ContentEvidence::Offered { total, .. } => Some(total),
         };
+        let fps_target = counters.window_fps_target(fps_target);
         let window = self.window.observe(
             timestamp_ms,
             fps_target,
@@ -365,6 +396,11 @@ impl SessionHealth {
     /// `counters`; only the last-value `last_input_sequence` and
     /// `last_input_type` come from `counters`. Carries the assessed
     /// `overall` state, never a stand-in for `Ok`.
+    ///
+    /// `fps_target` and `fps_actual` are per stream, as a Deck paces each
+    /// monitor's stream by them: the rate each output is served at, and
+    /// the window's sent rate shared over the [`HostCounters::outputs`].
+    /// The frame counts stay the whole session's.
     #[must_use]
     pub fn health_stats(
         observation: &HealthObservation,
@@ -375,7 +411,8 @@ impl SessionHealth {
         resolution: String,
     ) -> HealthStatsMsg {
         HealthStatsMsg {
-            fps_actual: f64::from(observation.sample.fps_actual.unwrap_or(0)),
+            fps_actual: f64::from(observation.sample.fps_actual.unwrap_or(0))
+                / f64::from(counters.output_count()),
             fps_target: f64::from(fps_target),
             bandwidth_mbps: observation.bandwidth_mbps,
             frames_sent: observation.sample.frames_sent.unwrap_or(0),
@@ -411,6 +448,28 @@ fn apply_client_sample(sample: &mut QosSample, telemetry: Option<&ClientTelemetr
     if let (Some(received), Some(window)) = (qos.frames_received, qos.sample_window_secs) {
         sample.fps_content = u32::try_from(received / u64::from(window.get())).ok();
     }
+}
+
+/// An agent's `health_stats` with `path` filled from `measure`, for the
+/// process that owns the Deck's connection and relays the messages of a
+/// session agent that does not (the macOS network service, the Windows
+/// broker). `None` for any other message and for stats that already carry
+/// a path (an agent that owns its connection measured it), so the relay
+/// forwards those unchanged.
+pub fn health_stats_with_path(
+    text: &str,
+    measure: impl FnOnce() -> arcen_protocol::messages::PathQualityMsg,
+) -> Option<String> {
+    use arcen_protocol::messages::HEALTH_STATS;
+    if !text.contains(HEALTH_STATS) {
+        return None;
+    }
+    let mut stats = serde_json::from_str::<HealthStatsMsg>(text).ok()?;
+    if stats.msg_type != HEALTH_STATS || stats.path.is_some() {
+        return None;
+    }
+    stats.path = Some(measure());
+    serde_json::to_string(&stats).ok()
 }
 
 /// The wire form of a health state (`health_stats.health_state`).
@@ -722,6 +781,8 @@ fn insert_u32(fields: &mut StructuredFields, key: &str, value: Option<u32>) {
 fn saturating(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
+
+pub mod monitor_rates;
 
 #[cfg(test)]
 mod tests;

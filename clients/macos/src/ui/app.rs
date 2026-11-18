@@ -364,10 +364,6 @@ fn ui_poll_interval(transitioning: bool, since_local_input: Option<Duration>) ->
     }
 }
 
-/// Never ask for UI passes faster than the display under the root window
-/// refreshes: a faster request only blocks the main thread in
-/// `nextDrawable` until the next vblank, and while it is blocked AppKit
-/// cannot dispatch input.
 /// Longest pen samples wait for a swallowed key release to be recovered.
 /// Recovery sends it after `arcen_input::text::LOST_RELEASE_GRACE` (80 ms)
 /// on a pass; this only bounds a recovery that never runs.
@@ -401,6 +397,11 @@ impl PenRecoveryHold {
     }
 }
 
+/// Never ask for UI passes faster than the display under the root window
+/// refreshes: a faster request only blocks the main thread in
+/// `nextDrawable` until the next vblank, and while it is blocked AppKit
+/// cannot dispatch input. Passes egui asks for itself are held at the event
+/// loop (`pass_pacing`).
 fn paced_ui_poll_interval(interval: Duration, refresh_period: Option<Duration>) -> Duration {
     refresh_period.map_or(interval, |period| interval.max(period))
 }
@@ -989,96 +990,6 @@ fn stream_profile_video_variant(
     Some(arcen_media::video::VideoVariant::new(configuration))
 }
 
-/// Report what the host actually did with the requested display size.
-///
-/// Hosts publish `display_resolution` in `ServerHello.device_capabilities` with
-/// the size they were asked for, the size they settled on, and whether live
-/// resize is available. Until now the Deck discarded all of it, so a host that
-/// silently served a different desktop than the one requested looked simply
-/// broken. Returns `None` when the host honoured the request and can resize.
-fn display_negotiation_note(capabilities: &BTreeMap<String, serde_json::Value>) -> Option<String> {
-    let display = capabilities.get("display_resolution")?;
-    let dimension = |key: &str, axis: &str| display.get(key)?.get(axis)?.as_u64();
-    let mut notes: Vec<String> = Vec::new();
-
-    if let (Some(rw), Some(rh), Some(aw), Some(ah)) = (
-        dimension("requested", "width"),
-        dimension("requested", "height"),
-        dimension("applied", "width"),
-        dimension("applied", "height"),
-    ) {
-        if (rw, rh) != (aw, ah) {
-            let backend = display
-                .get("backend")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown display backend");
-            notes.push(format!(
-                "Host could not set {rw}x{rh}; it is serving {aw}x{ah} ({backend})."
-            ));
-        }
-    }
-
-    if display
-        .get("resize")
-        .and_then(|resize| resize.get("available"))
-        == Some(&serde_json::Value::Bool(false))
-    {
-        if let Some(explanation) = display
-            .get("resize")
-            .and_then(|resize| resize.get("explanation"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|explanation| !explanation.is_empty())
-        {
-            notes.push(format!("Windowed resize is unavailable: {explanation}."));
-        }
-    }
-
-    notes.extend(display_scale_mismatch_notes(display));
-
-    (!notes.is_empty()).then(|| notes.join(" "))
-}
-
-/// Report any monitor whose UI scale the host could not actually apply.
-///
-/// Windows hosts publish `effective_display_scale.monitors` -- the scale
-/// `GetDpiForMonitor` reports per applied monitor, next to the scale the
-/// client asked for. The host does not *set* per-monitor DPI at all (Windows
-/// exposes no documented API for it), so Windows keeps whatever default it
-/// picked for each panel and the requested scale is silently ignored.
-///
-/// Measured on pier-windows.example.internal: 200% was requested on both monitors and Windows
-/// resolved 250% on one -- the report of a remote desktop that looked
-/// oversized on a Philips panel -- and 100% on the other. Neither the user
-/// nor the log said why. Naming the monitor and both numbers turns an
-/// inexplicable "it just looks too big" into a one-line fix in Windows
-/// Display settings.
-fn display_scale_mismatch_notes(display: &serde_json::Value) -> Vec<String> {
-    let Some(monitors) = display
-        .get("effective_display_scale")
-        .and_then(|scale| scale.get("monitors"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Vec::new();
-    };
-
-    monitors
-        .iter()
-        .filter(|monitor| monitor.get("matches_requested") == Some(&serde_json::Value::Bool(false)))
-        .filter_map(|monitor| {
-            let requested = monitor.get("requested_scale_percent")?.as_u64()?;
-            let effective = monitor.get("effective_scale_percent")?.as_u64()?;
-            let label = monitor
-                .get("client_display_id")
-                .and_then(serde_json::Value::as_str)
-                .map_or_else(|| "A display".to_string(), |id| format!("Display {id}"));
-            Some(format!(
-                "{label} is showing at {effective}% instead of the requested {requested}%; \
-                 set it to {requested}% in Windows Display settings."
-            ))
-        })
-        .collect()
-}
-
 /// The fullscreen presentation size of the primary display, for pinned modes.
 ///
 /// Probes the real hardware, so callers that need deterministic behaviour (unit
@@ -1545,6 +1456,16 @@ pub struct ArcenApp {
     secondary_full_frame_refresh_sent: BTreeSet<arcen_media::SessionMonitorId>,
     last_pointer_norm: Option<(f64, f64, i32, i32)>,
     last_pointer_view_pos: Option<egui::Pos2>,
+    /// Where the root viewer was in its last pass: the next root pass's
+    /// pointer leaves from `raw_input_hook`, before the UI runs.
+    root_pointer_gate: Option<RootPointerGate>,
+    /// This root pass's pointer events already left from the hook.
+    root_pointer_forwarded: bool,
+    /// A press the hook sent landed on the viewer: the pass focuses it.
+    root_pointer_focus_request: bool,
+    /// A button pressed on the viewer is held, so moves follow it off the
+    /// viewer (egui's `dragged`).
+    root_pointer_drag: bool,
     pointer_lock: bool,
     relative_motion: FractionalMotionAccumulator,
     /// Which negotiated secondary viewport (if any) currently owns its own
@@ -1716,6 +1637,13 @@ pub struct ArcenApp {
     /// Compact stream statistics (P2-4): path, delivery, contract, dynamic
     /// range and lossless coverage. Off by default.
     show_stream_stats: bool,
+    /// Stream Statistics' text, rebuilt at most every
+    /// `arcen_deck_core::ui_pacing::STATS_PANEL_REFRESH`.
+    stream_stats_text: arcen_deck_core::ui_pacing::PacedValue<Vec<String>>,
+    /// The host showed some Deck displays at another size or not at all
+    /// (`arcen_deck_core::multi_window::layout_note`): a notice when the
+    /// layout is applied, and a Stream Statistics line for the session.
+    layout_note: Option<String>,
     /// Lossless-tile debug view: tints refined (amber) and verified (green)
     /// 16x16 blocks over the video. Off by default.
     show_lossless_tiles: bool,
@@ -1741,6 +1669,8 @@ pub struct ArcenApp {
     last_decoder_summary: String,
     last_audio_summary: String,
     last_decode_error: Option<String>,
+    /// How often this connection's decoder fell behind and skipped ahead.
+    decoder_behind: arcen_deck_core::runtime::decode_lag::DecoderBehind,
     media_inbox: IncomingMediaTelemetry,
     ingress_idr_requests: u64,
     malformed_media_packets: u64,
@@ -1960,6 +1890,14 @@ pub struct ArcenApp {
     last_viewport_log: Option<(u32, u32, bool)>,
     stream_sizing_policy: StreamSizingPolicy,
     display_fit: DisplayFitTracker,
+    /// Re-reports the display that shows a single-stream session when its
+    /// window moves (`display_follow`); `None` unless the host follows.
+    display_follow: Option<arcen_deck_core::display_follow::StreamDisplayFollower>,
+    /// When the window's display was last read for `display_follow`.
+    display_follow_polled: Option<std::time::Instant>,
+    /// The display refresh this connection's `AuthResponse` stated (a
+    /// resume states the same), where every attachment's follower starts.
+    stated_display_refresh: Option<arcen_protocol::messages::DeckDisplayRefreshMsg>,
     /// Local opt-in for typed tablet/pen input; mirrors
     /// `ClientSettings::tablet_input_enabled`.
     tablet_input_enabled: bool,
@@ -2359,6 +2297,10 @@ impl ArcenApp {
             secondary_full_frame_refresh_sent: BTreeSet::new(),
             last_pointer_norm: None,
             last_pointer_view_pos: None,
+            root_pointer_gate: None,
+            root_pointer_forwarded: false,
+            root_pointer_focus_request: false,
+            root_pointer_drag: false,
             pointer_lock: false,
             relative_motion: FractionalMotionAccumulator::default(),
             secondary_pointer_lock: None,
@@ -2420,6 +2362,10 @@ impl ArcenApp {
             // proof needs no input on the Mac running it.
             show_stream_stats: cfg!(feature = "dev-tools")
                 && std::env::var_os("ARCEN_SHOW_STREAM_STATS").is_some_and(|value| value == "1"),
+            stream_stats_text: arcen_deck_core::ui_pacing::PacedValue::new(
+                arcen_deck_core::ui_pacing::STATS_PANEL_REFRESH,
+            ),
+            layout_note: None,
             show_lossless_tiles: cfg!(feature = "dev-tools")
                 && std::env::var_os("ARCEN_SHOW_LOSSLESS_TILES").is_some_and(|value| value == "1"),
             served_pipeline_token: None,
@@ -2434,6 +2380,7 @@ impl ArcenApp {
             last_decoder_summary: "No decoded frames yet".to_string(),
             last_audio_summary: "No audio yet".to_string(),
             last_decode_error: None,
+            decoder_behind: Default::default(),
             media_inbox: IncomingMediaTelemetry::default(),
             ingress_idr_requests: 0,
             malformed_media_packets: 0,
@@ -2458,6 +2405,7 @@ impl ArcenApp {
                     settings_error
                         .map(|error| format!("Settings unavailable; microphone disabled: {error}"))
                 })
+                .or_else(crate::installed_copies::startup_notice)
                 .unwrap_or_else(|| "Ready".to_string()),
             connection_status_hint: None,
             native_menu_refreshed: false,
@@ -2542,6 +2490,9 @@ impl ArcenApp {
             last_viewport_log: None,
             stream_sizing_policy: StreamSizingPolicy::FollowWindow,
             display_fit: DisplayFitTracker::new(),
+            display_follow: None,
+            display_follow_polled: None,
+            stated_display_refresh: None,
             tablet_input_enabled: tablet_mode_allows_typed_pen(tablet_mode_requested),
             exact_still_image: settings.exact_still_image,
             tablet_mode_requested,
@@ -2589,7 +2540,12 @@ impl eframe::App for ArcenApp {
         }
         // eframe runs this hook for every viewport's pass, not only root's.
         let root_pass = raw_input.viewport_id == egui::ViewportId::ROOT;
-        if !root_pass {
+        if root_pass && raw_input.viewport().close_requested() {
+            crate::ui::pass_pacing::note_root_close_requested();
+        }
+        if root_pass {
+            self.root_pointer_forwarded = self.forward_root_pointer_events(ctx, raw_input);
+        } else {
             self.forward_secondary_pointer_events(
                 raw_input.viewport_id,
                 raw_input.focused,
@@ -3257,6 +3213,7 @@ impl ArcenApp {
             if state.last_decode_error.is_some() {
                 self.last_decode_error = state.last_decode_error.clone();
             }
+            self.decoder_behind = state.decoder_behind;
             let media_ready_wakes = state
                 .ui_wake_media_ready
                 .saturating_sub(self.last_ui_wake_media_ready);
@@ -3369,6 +3326,18 @@ impl ArcenApp {
             // reconnect: it is a manual declaration, not session state.
             self.pattern_accuracy = None;
             self.host_supports_display_update = hello.supports_display_update;
+            // Every attachment starts from what its `AuthResponse` stated
+            // (a resume states the first connection's display again).
+            self.display_follow = arcen_deck_core::display_follow::host_follows_display_moves(
+                &hello,
+                hello.multi_monitor_v1().ok().flatten().is_some(),
+            )
+            .then(|| {
+                arcen_deck_core::display_follow::StreamDisplayFollower::new(
+                    self.stated_display_refresh.as_ref(),
+                )
+            });
+            self.display_follow_polled = None;
             self.host_precise_scroll = hello.precise_scroll_v1;
             self.host_gestures_v1 = arcen_protocol::messages::supports_gestures_v1(
                 hello.input_protocol_version,
@@ -3613,7 +3582,9 @@ impl ArcenApp {
             {
                 return;
             }
-            if let Some(note) = display_negotiation_note(&hello.device_capabilities) {
+            if let Some(note) =
+                arcen_deck_core::display_note::display_negotiation_note(&hello.device_capabilities)
+            {
                 self.status.push_str(" · ");
                 self.status.push_str(&note);
                 self.display_note = Some(note.clone());
@@ -4108,6 +4079,8 @@ impl ArcenApp {
         self.relative_pointer_confirmed = false;
         self.region_input_confirmed = false;
         self.host_supports_display_update = false;
+        self.display_follow = None;
+        self.display_follow_polled = None;
         self.host_precise_scroll = false;
         self.host_gestures_v1 = false;
         self.text_input.reset();
@@ -4366,6 +4339,22 @@ impl ArcenApp {
     /// get any wire `monitor_id != 0` packet decoded through the legacy
     /// single-monitor decoder once topology has been accepted, regardless of
     /// how long window binding takes.
+    /// Says once, without stopping anything, which Deck displays the host
+    /// shows at another size or not at all; Stream Statistics keeps the
+    /// line for the session.
+    fn note_host_layout(
+        &mut self,
+        requested: Option<&arcen_media::RequestedMonitorTopology>,
+        hello: &ServerHelloMsg,
+    ) {
+        self.layout_note =
+            arcen_deck_core::multi_window::layout_note::hello_layout_note(requested, hello);
+        if let Some(note) = self.layout_note.as_ref() {
+            tracing::info!(target: "arcen::display", note = %note, "host kept its own layout");
+            self.text_input.notify(note.clone());
+        }
+    }
+
     fn begin_multi_window_if_applicable(
         &mut self,
         ctx: &egui::Context,
@@ -4417,6 +4406,7 @@ impl ArcenApp {
                     .as_ref()
                     .and_then(|options| options.multi_monitor_topology.as_ref())
                     .map(|selection| selection.topology.clone());
+                self.note_host_layout(requested_topology.as_ref(), hello);
                 let region_runtime = match DeckRegionRuntime::from_validated_topology(
                     &validated,
                     requested_topology.as_ref(),
@@ -5155,13 +5145,73 @@ impl ArcenApp {
     /// last of them overwrote the sample before root read it: on a still
     /// host monitor 4-7 of 120 moves reached the host, and a drag's release
     /// was lost, leaving the button held there.
+    /// Sends the root pass's pointer moves and buttons from `raw_input_hook`,
+    /// before the UI runs, as a secondary window's are
+    /// (`forward_secondary_pointer_events`); the viewer pass then only
+    /// focuses the viewer after a press. The viewer's place and layer come
+    /// from the root pass just before (`RootPointerGate`). Returns `false`,
+    /// leaving them to the viewer pass as before, when there is no such
+    /// pass, under pointer lock or a pen's authority, and when the pass
+    /// also carries keys or a modifier change: those leave in the pass, so
+    /// a shift-click or a typed letter keeps its place before a click.
+    fn forward_root_pointer_events(
+        &mut self,
+        ctx: &egui::Context,
+        raw_input: &egui::RawInput,
+    ) -> bool {
+        if !matches!(self.screen, AppScreen::InSession)
+            || self.pointer_lock
+            || self.pen_has_authority()
+        {
+            return false;
+        }
+        let Some(gate) = self.root_pointer_gate.clone() else {
+            return false;
+        };
+        if !gate.forwards(
+            ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT),
+            raw_input,
+        ) {
+            return false;
+        }
+        for event in ordered_pointer_events(&raw_input.events) {
+            match event {
+                OrderedPointerEvent::Moved(pos) => {
+                    if self.root_pointer_drag || gate.over_viewer(pos) {
+                        self.send_mouse_move(gate.image_rect, pos);
+                    }
+                }
+                OrderedPointerEvent::Button {
+                    pos,
+                    wire_button,
+                    pressed: true,
+                } => {
+                    if gate.rect.contains(pos) {
+                        self.root_pointer_focus_request = true;
+                        self.root_pointer_drag = true;
+                        self.send_mouse_button(gate.image_rect, pos, wire_button, true);
+                    }
+                }
+                OrderedPointerEvent::Button {
+                    pos,
+                    wire_button,
+                    pressed: false,
+                } => {
+                    self.root_pointer_drag = false;
+                    self.send_mouse_button(gate.image_rect, pos, wire_button, false);
+                }
+            }
+        }
+        true
+    }
+
     fn forward_secondary_pointer_events(
         &mut self,
         viewport_id: egui::ViewportId,
         focused: bool,
         events: &[egui::Event],
     ) {
-        use arcen_deck_core::input::viewport_pointer::{PictureRect, ViewportPointerEvent};
+        use arcen_deck_core::input::viewport_pointer::PictureRect;
 
         let MultiWindowSessionState::Active {
             validated,
@@ -5184,9 +5234,7 @@ impl ArcenApp {
         let Some(state) = self.secondary_deferred_viewports.get(&monitor_id).cloned() else {
             return;
         };
-        let mut samples = Vec::new();
-        let mut motion = egui::Vec2::ZERO;
-        {
+        let steps = {
             let mut state = state.lock().expect("secondary viewport state poisoned");
             let picture = state.image_rect.map(|rect| PictureRect {
                 left: rect.left(),
@@ -5194,62 +5242,36 @@ impl ArcenApp {
                 width: rect.width(),
                 height: rect.height(),
             });
-            for event in events {
-                let pointer_event = match event {
-                    egui::Event::PointerMoved(pos) => {
-                        ViewportPointerEvent::Moved { x: pos.x, y: pos.y }
-                    }
-                    egui::Event::PointerButton {
-                        pos,
-                        button,
-                        pressed,
-                        ..
-                    } => {
-                        let Some(index) = POINTER_BUTTON_WIRE_MAPPING
-                            .iter()
-                            .position(|(mapped, _)| mapped == button)
-                        else {
-                            continue;
-                        };
-                        ViewportPointerEvent::Button {
-                            x: pos.x,
-                            y: pos.y,
-                            button: index,
-                            pressed: *pressed,
-                        }
-                    }
-                    egui::Event::PointerGone => ViewportPointerEvent::Left,
-                    egui::Event::MouseMoved(delta) => {
-                        motion += *delta;
-                        continue;
-                    }
-                    _ => continue,
-                };
-                if let Some(sample) = state.pointer.apply(picture, pointer_event) {
-                    samples.push(sample);
-                }
-            }
-        }
-        if samples.is_empty() && motion == egui::Vec2::ZERO {
+            secondary_pointer_steps(&mut state.pointer, picture, events)
+        };
+        if steps.is_empty() {
             return;
         }
         // Root's relative lock must not swallow a press into this viewport.
         self.release_pointer_lock_if_secondary_focused(focused);
-        for sample in samples {
-            let mut buttons = POINTER_BUTTON_WIRE_MAPPING.map(|(_, wire)| (wire, false));
-            for ((_, down), held) in buttons.iter_mut().zip(sample.held) {
-                *down = held;
+        // In event order: relative motion under this viewport's lock leaves
+        // between the presses and releases it came between.
+        for step in steps {
+            match step {
+                SecondaryPointerStep::Sample(sample) => {
+                    let mut buttons = POINTER_BUTTON_WIRE_MAPPING.map(|(_, wire)| (wire, false));
+                    for ((_, down), held) in buttons.iter_mut().zip(sample.held) {
+                        *down = held;
+                    }
+                    self.dispatch_secondary_pointer_and_scroll_for_frame(
+                        &validated,
+                        monitor_id,
+                        sample.fraction,
+                        buttons,
+                        egui::Vec2::ZERO,
+                    );
+                }
+                SecondaryPointerStep::Motion(motion) => {
+                    if self.secondary_pointer_lock == Some(monitor_id) {
+                        self.send_secondary_mouse_relative(monitor_id, motion);
+                    }
+                }
             }
-            self.dispatch_secondary_pointer_and_scroll_for_frame(
-                &validated,
-                monitor_id,
-                sample.fraction,
-                buttons,
-                egui::Vec2::ZERO,
-            );
-        }
-        if self.secondary_pointer_lock == Some(monitor_id) && motion != egui::Vec2::ZERO {
-            self.send_secondary_mouse_relative(monitor_id, motion);
         }
     }
 
@@ -6274,6 +6296,8 @@ impl ArcenApp {
     /// drop the UI-side handles so `sync_media_state` becomes a no-op.
     fn disconnect(&mut self) {
         self.login_window_handover = None;
+        self.stream_stats_text.clear();
+        self.layout_note = None;
         if self.lead_cursor.is_hidden() {
             super::sharp_cursor::apply_lead_cursor(
                 self.lead_cursor
@@ -6656,6 +6680,44 @@ impl ArcenApp {
             MenuCommand::About
             | MenuCommand::SendSecureAttention
             | MenuCommand::ToggleKeyboardGrab => {}
+        }
+    }
+
+    /// Tells a host that follows it (`display_follow`) when the session
+    /// window has settled on another display, reading the displays at most
+    /// four times a second.
+    fn follow_window_display(&mut self, ctx: &egui::Context) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+        let now = std::time::Instant::now();
+        if self.display_follow.is_none()
+            || self
+                .display_follow_polled
+                .is_some_and(|polled| now.saturating_duration_since(polled) < POLL)
+        {
+            return;
+        }
+        self.display_follow_polled = Some(now);
+        let displays = crate::display::enumerate();
+        let window_display = crate::display::session_window_display_id();
+        let Some(follower) = self.display_follow.as_mut() else {
+            return;
+        };
+        let update = follower.observe(&displays, window_display, now);
+        if follower.is_settling() {
+            ctx.request_repaint_after(POLL);
+        }
+        let Some(update) = update else {
+            return;
+        };
+        if let Ok(value) = serde_json::to_value(&update) {
+            self.send_session_json(value);
+            tracing::info!(
+                target: "arcen::display",
+                display = ?update.refresh.stream_display_id,
+                refresh_hz = ?update.refresh.stream_refresh_hz(),
+                sequence = update.sequence,
+                "display_refresh_update sent: the session window moved to another display",
+            );
         }
     }
 
@@ -7122,11 +7184,24 @@ impl ArcenApp {
         // entry for another endpoint is dropped rather than honoured.
         let endpoint = connection_endpoint(draft);
         let saved = self.saved_displays_mode_for(draft);
-        arcen_deck_core::connect_plan::resolve_attempt_displays_mode(
+        let source = arcen_deck_core::connect_plan::displays_mode_source(
+            self.pending_displays_override.as_ref(),
+            &endpoint,
+            saved,
+        );
+        let resolved = arcen_deck_core::connect_plan::resolve_attempt_displays_mode(
             &mut self.pending_displays_override,
             &endpoint,
             saved,
-        )
+        );
+        tracing::info!(
+            target: "arcen::display",
+            mode = resolved.unwrap_or(self.displays_mode).as_wire(),
+            source,
+            settings = self.displays_mode.as_wire(),
+            "Displays mode for this connection attempt"
+        );
+        resolved
     }
 
     /// This connection's own saved Displays choice, or `None` when it is
@@ -7364,6 +7439,9 @@ impl ArcenApp {
         // Consumed here: the flag authorises exactly the attempt now under
         // way, never a later ordinary connect.
         self.pending_desktop_replacement = false;
+        // What this attempt states about the window's display; a resume
+        // states it again (`reconnect_options`).
+        self.stated_display_refresh = options.display_refresh.clone();
         self.stream_sizing_policy = policy;
         if let StreamSizingPolicy::PinPrimary {
             primary_size,
@@ -7541,6 +7619,7 @@ impl ArcenApp {
                 "root display refresh period",
             );
             self.root_refresh_period = refresh_period;
+            crate::ui::pass_pacing::publish_root_refresh_period(refresh_period);
         }
         if crate::ui::video_render::set_root_display_sync(decision.enabled) {
             if decision.log_transition {
@@ -8459,6 +8538,10 @@ impl ArcenApp {
                 self.support_bundle
                     .view(crate::platform_services::services().as_ref()),
             ),
+            connection_displays: self.tablet_mode_connection_id().and_then(|id| {
+                let saved = self.saved_connections.iter().find(|saved| saved.id == id)?;
+                Some((saved.name.clone(), saved.settings.displays_mode?))
+            }),
         };
         let mut values = SettingsValues {
             tab: self.settings_tab,
@@ -8523,6 +8606,17 @@ impl ArcenApp {
                         ctx: &ctx,
                     },
                 );
+            }
+        }
+        if actions.contains(&SettingsAction::FollowDisplaysSetting) {
+            if let Some(id) = self.tablet_mode_connection_id() {
+                match self.config_repository.set_displays_mode(&id, None) {
+                    Ok(store) => self.reconcile_saved_connections(store),
+                    Err(error) => {
+                        self.status =
+                            format!("The connection still keeps its own Displays choice: {error}");
+                    }
+                }
             }
         }
         if actions.contains(&SettingsAction::NativeTabletComponent) {
@@ -9026,6 +9120,13 @@ impl ArcenApp {
             );
         }
         options.displays_mode = self.effective_displays_mode().as_wire().to_string();
+        // The displays' own refresh (a ProMotion panel's 120 Hz), which hosts
+        // follow, and the display the window is on; the requested modes above
+        // stay pinned.
+        options.display_refresh = arcen_deck_core::connect_plan::deck_display_refresh(
+            &monitors,
+            crate::display::session_window_display_id(),
+        );
         // Read, not consumed: this builder takes `&self`. `start_connection`
         // clears the flag once the attempt it authorised is under way, so a
         // later ordinary connect can never carry it.
@@ -9720,6 +9821,10 @@ impl ArcenApp {
             }
         }
 
+        if in_session {
+            self.follow_window_display(ui.ctx());
+        }
+
         if root_viewer_should_take_keyboard_focus(
             matches!(self.screen, AppScreen::InSession),
             ui.input(|input| input.focused),
@@ -9783,7 +9888,11 @@ impl ArcenApp {
                 self.set_pointer_surface(root_monitor_id, viewport_placement(window, image_rect));
             }
         }
-        if !pen_has_authority {
+        if std::mem::take(&mut self.root_pointer_forwarded) {
+            if std::mem::take(&mut self.root_pointer_focus_request) {
+                response.request_focus();
+            }
+        } else if !pen_has_authority {
             let fallback_pos = pointer_pos.or(self.last_pointer_view_pos);
             let pointer_events = ui.input(|input| ordered_pointer_events(&input.events));
             for event in pointer_events {
@@ -9809,15 +9918,25 @@ impl ArcenApp {
                         if pressed {
                             if self.pointer_lock || rect.contains(pos) {
                                 response.request_focus();
+                                self.root_pointer_drag = true;
                                 self.send_mouse_button(image_rect, pos, wire_button, true);
                             }
                         } else {
+                            self.root_pointer_drag = false;
                             self.send_mouse_button(image_rect, pos, wire_button, false);
                         }
                     }
                 }
             }
         }
+        self.root_pointer_gate =
+            (!self.pointer_lock && !pen_has_authority).then(|| RootPointerGate {
+                pass: ui.ctx().cumulative_pass_nr_for(egui::ViewportId::ROOT),
+                rect,
+                image_rect,
+                overlays: root_overlay_rects(ui.ctx(), ui.layer_id()),
+                modifiers: ui.input(|input| input.modifiers),
+            });
 
         let smooth_scroll = ui.input(egui::InputState::smooth_scroll_delta);
         let wheel_events: Vec<(egui::MouseWheelUnit, egui::Vec2, egui::TouchPhase)> =
@@ -9884,7 +10003,7 @@ impl ArcenApp {
         self.complete_pen_pass();
     }
 
-    fn stream_stats_lines(&mut self) -> [String; 3] {
+    fn stream_stats_lines(&mut self) -> Vec<String> {
         self.expire_presentation_histories(Instant::now());
         let presented = Self::instant_rate(&self.presented_frame_times);
         let presented = if presented > 0.0 {
@@ -9897,7 +10016,7 @@ impl ArcenApp {
             .as_deref()
             .map(stream_pipeline_label);
         let refine = self.exact_status_line();
-        arcen_media::stats_overlay::stats_overlay_lines(
+        let mut lines = arcen_media::stats_overlay::stats_overlay_lines(
             &arcen_media::stats_overlay::StatsOverlayInputs {
                 path: self
                     .host_health
@@ -9910,6 +10029,10 @@ impl ArcenApp {
                 refine: Some(refine.as_str()),
             },
         )
+        .to_vec();
+        lines.extend(self.decoder_behind.line());
+        lines.extend(self.layout_note.clone());
+        lines
     }
 
     /// The Stream Statistics line for exact still image: why it is off, or
@@ -10009,8 +10132,14 @@ impl ArcenApp {
 
     /// The compact statistics box (P2-4), bottom left of the picture.
     fn paint_stream_stats(&mut self, ui: &mut egui::Ui, image_rect: egui::Rect) {
-        let lines = self.stream_stats_lines();
-        paint_stream_stats(ui, image_rect, &lines);
+        let now = Instant::now();
+        if self.stream_stats_text.is_due(now) {
+            let lines = self.stream_stats_lines();
+            self.stream_stats_text.set(now, lines);
+        }
+        if let Some(lines) = self.stream_stats_text.value() {
+            paint_stream_stats(ui, image_rect, lines);
+        }
     }
 
     /// Lossless-tile debug view: green = verified source codes, amber =
@@ -10034,7 +10163,7 @@ impl ArcenApp {
         arcen_deck_core::support_bundle::snapshot::record_session_snapshot(|| {
             arcen_deck_core::support_bundle::snapshot::SessionSnapshot {
                 captured_unix_seconds: 0,
-                stream_statistics: self.stream_stats_lines().to_vec(),
+                stream_statistics: self.stream_stats_lines(),
                 negotiated_truth: self
                     .negotiated_truth
                     .as_ref()
@@ -10573,6 +10702,12 @@ impl ArcenApp {
                     .0
                     .on_glass_latency_p50_us
                     .or(eight_bit.0.on_glass_latency_p50_us),
+                "dedicated presenter telemetry",
+            );
+            // The line above is at the structured-field cap
+            // (`arcen_telemetry::MAX_STRUCTURED_FIELDS`); the rest goes here.
+            tracing::info!(
+                target: crate::logging::target::SESSION,
                 on_glass_latency_p99_us = ?ten_bit
                     .0
                     .on_glass_latency_p99_us
@@ -10581,10 +10716,12 @@ impl ArcenApp {
                     .0
                     .presented_after_target_p50_us
                     .or(eight_bit.0.presented_after_target_p50_us),
+                submit_to_glass_p50_us = ?eight_bit.0.submit_to_glass_p50_us,
+                max_in_flight = ?eight_bit.0.max_in_flight.or(ten_bit.0.max_in_flight),
                 queue_depth_avg = format!("{queue_depth_avg:.2}"),
                 queue_depth_max,
                 refresh_period_us = ?ten_bit.0.refresh_period_us.or(eight_bit.0.refresh_period_us),
-                "dedicated presenter telemetry",
+                "dedicated presenter pipeline",
             );
         }
     }
@@ -13387,6 +13524,62 @@ fn resolve_secondary_dispatch_local_fraction(
 /// Whether a viewport's own input this frame included the pointer: a move,
 /// a button edge or a wheel. Repaints for other reasons (a new video frame)
 /// carry none, and must never move the remote pointer.
+/// The root viewer as its last pass laid it out, for the next root pass's
+/// pointer forwarding from `raw_input_hook`.
+#[derive(Debug, Clone, PartialEq)]
+struct RootPointerGate {
+    /// The completed-pass count of the root viewport during that pass.
+    pass: u64,
+    rect: egui::Rect,
+    image_rect: egui::Rect,
+    /// Root's visible egui areas above the viewer (windows, popups): the
+    /// pointer over one is not the viewer's. Recorded in the root pass,
+    /// because before it begins egui's area memory may be another
+    /// viewport's.
+    overlays: Vec<egui::Rect>,
+    modifiers: egui::Modifiers,
+}
+
+impl RootPointerGate {
+    /// The pointer at `pos` is over the viewer, not over an egui area
+    /// above it.
+    fn over_viewer(&self, pos: egui::Pos2) -> bool {
+        self.rect.contains(pos) && !self.overlays.iter().any(|rect| rect.contains(pos))
+    }
+
+    /// Whether the hook sends this root pass's pointer events: the gate is
+    /// from the pass just before, and the pass carries no key, text or
+    /// modifier change that must leave before a click.
+    fn forwards(&self, completed_root_passes: u64, raw_input: &egui::RawInput) -> bool {
+        self.pass.saturating_add(1) == completed_root_passes
+            && raw_input.modifiers == self.modifiers
+            && !raw_input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::Key { .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Copy
+                        | egui::Event::Cut
+                        | egui::Event::Paste(_)
+                        | egui::Event::Ime(_)
+                )
+            })
+    }
+}
+
+/// The rects of the visible egui areas above `viewer` in the current pass.
+fn root_overlay_rects(ctx: &egui::Context, viewer: egui::LayerId) -> Vec<egui::Rect> {
+    ctx.memory(|memory| {
+        memory
+            .layer_ids()
+            .filter(|layer| {
+                *layer != viewer && layer.order > viewer.order && memory.areas().is_visible(layer)
+            })
+            .filter_map(|layer| memory.area_rect(layer.id))
+            .collect()
+    })
+}
+
 /// One pointer move or button from a pass's events, in arrival order.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum OrderedPointerEvent {
@@ -13400,6 +13593,73 @@ enum OrderedPointerEvent {
 
 /// The pass's pointer moves and wire-mapped buttons, in the order they
 /// happened. Buttons without a wire mapping are skipped.
+/// A secondary viewport's pointer events of one pass as wire steps, in the
+/// order they happened.
+fn secondary_pointer_steps(
+    pointer: &mut arcen_deck_core::input::viewport_pointer::ViewportPointer,
+    picture: Option<arcen_deck_core::input::viewport_pointer::PictureRect>,
+    events: &[egui::Event],
+) -> Vec<SecondaryPointerStep> {
+    use arcen_deck_core::input::viewport_pointer::ViewportPointerEvent;
+
+    let mut steps = Vec::new();
+    for event in events {
+        let pointer_event = match event {
+            egui::Event::PointerMoved(pos) => ViewportPointerEvent::Moved { x: pos.x, y: pos.y },
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } => {
+                let Some(index) = POINTER_BUTTON_WIRE_MAPPING
+                    .iter()
+                    .position(|(mapped, _)| mapped == button)
+                else {
+                    continue;
+                };
+                ViewportPointerEvent::Button {
+                    x: pos.x,
+                    y: pos.y,
+                    button: index,
+                    pressed: *pressed,
+                }
+            }
+            egui::Event::PointerGone => ViewportPointerEvent::Left,
+            egui::Event::MouseMoved(delta) => {
+                push_secondary_motion(&mut steps, *delta);
+                continue;
+            }
+            _ => continue,
+        };
+        if let Some(sample) = pointer.apply(picture, pointer_event) {
+            steps.push(SecondaryPointerStep::Sample(sample));
+        }
+    }
+    steps
+}
+
+/// One step of a secondary viewport's pointer input, in event order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SecondaryPointerStep {
+    Sample(arcen_deck_core::input::viewport_pointer::ViewportPointerSample),
+    /// Raw relative motion, for the viewport holding pointer lock.
+    Motion(egui::Vec2),
+}
+
+/// Adds relative motion after `steps`, merged with motion directly before
+/// it (never across a press, release or move between them).
+fn push_secondary_motion(steps: &mut Vec<SecondaryPointerStep>, delta: egui::Vec2) {
+    if delta == egui::Vec2::ZERO {
+        return;
+    }
+    if let Some(SecondaryPointerStep::Motion(motion)) = steps.last_mut() {
+        *motion += delta;
+    } else {
+        steps.push(SecondaryPointerStep::Motion(delta));
+    }
+}
+
 fn ordered_pointer_events(events: &[egui::Event]) -> Vec<OrderedPointerEvent> {
     events
         .iter()
@@ -13892,6 +14152,7 @@ fn drive_root_windowed_monitor_test_target(
 
 fn connect_options_from_draft(draft: &ConnectionDraft) -> ConnectOptions {
     ConnectOptions {
+        display_refresh: None,
         services: crate::platform_services::services(),
         host: draft.host.clone(),
         port: draft.port,
@@ -14420,10 +14681,22 @@ pub fn run_native_app(mut initial_connect: Option<ConnectOptions>) -> eframe::Re
     };
     configure_native_menu(&mut options);
 
-    eframe::run_native(
+    // eframe's own `run_native`, with root passes paced to the root
+    // display's refresh between winit and eframe (`pass_pacing`).
+    let mut builder = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event();
+    if let Some(hook) = options.event_loop_builder.take() {
+        hook(&mut builder);
+    }
+    let mut event_loop = builder.build()?;
+    crate::ui::pass_pacing::install_media_proxy(event_loop.create_proxy());
+    crate::ui::pass_pacing::forget_root_close();
+    let created = std::rc::Rc::new(std::cell::Cell::new(false));
+    let app_created = std::rc::Rc::clone(&created);
+    let eframe_app = eframe::create_native(
         "Arcen Deck",
         options,
         Box::new(move |cc| {
+            app_created.set(true);
             let app = if let Some(connect_options) = initial_connect.take() {
                 ArcenApp::with_initial_session(cc, connect_options)
             } else {
@@ -14431,7 +14704,26 @@ pub fn run_native_app(mut initial_connect: Option<ConnectOptions>) -> eframe::Re
             };
             Ok(Box::new(app))
         }),
-    )
+        &event_loop,
+    );
+    let mut app = crate::ui::pass_pacing::PacedRootPasses::new(eframe_app);
+    {
+        use winit::platform::run_on_demand::EventLoopExtRunOnDemand as _;
+        event_loop.run_app_on_demand(&mut app)?;
+    }
+    // eframe ends the loop on an error without handing it back (eframe's
+    // `run_native` returned it): an end the Deck did not ask for is one.
+    if !created.get() {
+        Err(eframe::Error::AppCreation(
+            "the window or its renderer could not be created".into(),
+        ))
+    } else if crate::ui::pass_pacing::root_close_requested() {
+        Ok(())
+    } else {
+        Err(eframe::Error::AppCreation(
+            "the window system stopped the Deck's event loop".into(),
+        ))
+    }
 }
 
 /// The statistics row for the host's measured QUIC path.
@@ -14798,125 +15090,6 @@ mod tests {
         }
     }
 
-    fn display_capabilities(value: serde_json::Value) -> BTreeMap<String, serde_json::Value> {
-        BTreeMap::from([("display_resolution".to_string(), value)])
-    }
-
-    #[test]
-    fn display_note_is_silent_when_the_host_honoured_the_request() {
-        let capabilities = display_capabilities(serde_json::json!({
-            "requested": {"width": 2560, "height": 1440},
-            "applied": {"width": 2560, "height": 1440, "refresh_hz": 60},
-            "backend": "nvidia-nvapi-exact",
-            "resize": {"available": true, "explanation": ""},
-        }));
-        assert_eq!(display_negotiation_note(&capabilities), None);
-    }
-
-    /// The exact pier-windows.example.internal measurement: 200% requested on both monitors,
-    /// Windows resolved 250% on one (the oversized Philips) and 100% on the
-    /// other. Both must be named, with the number to set, because the host
-    /// cannot apply the scale itself.
-    #[test]
-    fn display_note_names_every_monitor_windows_scaled_differently() {
-        let capabilities = display_capabilities(serde_json::json!({
-            "requested": {"width": 1800, "height": 1169},
-            "applied": {"width": 1800, "height": 1169, "refresh_hz": 60},
-            "backend": "windows-ccd",
-            "resize": {"available": true, "explanation": ""},
-            "effective_display_scale": {
-                "source": "GetDpiForMonitor(MDT_EFFECTIVE_DPI)",
-                "baseline_dpi": 96,
-                "monitors": [
-                    {
-                        "client_display_id": "3",
-                        "requested_scale_percent": 200,
-                        "effective_scale_percent": 250,
-                        "matches_requested": false,
-                    },
-                    {
-                        "client_display_id": "1",
-                        "requested_scale_percent": 200,
-                        "effective_scale_percent": 100,
-                        "matches_requested": false,
-                    },
-                ],
-            },
-        }));
-        let note = display_negotiation_note(&capabilities).expect("mismatch must be reported");
-        assert!(
-            note.contains("Display 3"),
-            "names the oversized one: {note}"
-        );
-        assert!(note.contains("250%"), "names what Windows applied: {note}");
-        assert!(note.contains("Display 1"), "names the other one: {note}");
-        assert!(note.contains("100%"), "names its applied scale: {note}");
-        assert!(
-            note.contains("200%"),
-            "names the scale to set so the fix is actionable: {note}",
-        );
-    }
-
-    /// A host that scaled every monitor exactly as asked must stay silent --
-    /// the banner is for genuine mismatches, not a permanent fixture.
-    #[test]
-    fn display_note_is_silent_when_every_monitor_matched_the_requested_scale() {
-        let capabilities = display_capabilities(serde_json::json!({
-            "requested": {"width": 1800, "height": 1169},
-            "applied": {"width": 1800, "height": 1169, "refresh_hz": 60},
-            "backend": "windows-ccd",
-            "resize": {"available": true, "explanation": ""},
-            "effective_display_scale": {
-                "monitors": [
-                    {
-                        "client_display_id": "1",
-                        "requested_scale_percent": 200,
-                        "effective_scale_percent": 200,
-                        "matches_requested": true,
-                    },
-                ],
-            },
-        }));
-        assert_eq!(display_negotiation_note(&capabilities), None);
-    }
-
-    #[test]
-    fn display_note_reports_a_size_the_host_could_not_apply() {
-        let capabilities = display_capabilities(serde_json::json!({
-            "requested": {"width": 2560, "height": 1440},
-            "applied": {"width": 1280, "height": 800, "refresh_hz": 60},
-            "backend": "change-display-settings-ex-temporary-fallback",
-            "resize": {"available": true, "explanation": ""},
-        }));
-        let note = display_negotiation_note(&capabilities).expect("mismatch must be reported");
-        assert!(
-            note.contains("2560x1440"),
-            "names the requested size: {note}"
-        );
-        assert!(note.contains("1280x800"), "names the served size: {note}");
-        assert!(
-            note.contains("change-display-settings-ex-temporary-fallback"),
-            "names the backend: {note}"
-        );
-    }
-
-    #[test]
-    fn display_note_explains_why_windowed_resize_is_unavailable() {
-        let capabilities = display_capabilities(serde_json::json!({
-            "requested": {"width": 1920, "height": 1080},
-            "applied": {"width": 1920, "height": 1080, "refresh_hz": 60},
-            "backend": "change-display-settings-ex-temporary",
-            "resize": {
-                "available": false,
-                "reason": "display_backend_cannot_retarget",
-                "explanation": "display backend cannot retarget without NVAPI custom timings",
-            },
-        }));
-        let note = display_negotiation_note(&capabilities).expect("reason must be reported");
-        assert!(note.contains("Windowed resize is unavailable"), "{note}");
-        assert!(note.contains("NVAPI custom timings"), "{note}");
-    }
-
     #[test]
     fn display_note_text_rect_keeps_a_readable_margin_at_small_widths() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(864.0, 500.0));
@@ -14930,11 +15103,6 @@ mod tests {
         assert!(note.left() >= 0.0);
         assert!(note.right() <= 140.0);
         assert!(note.width() >= 120.0);
-    }
-
-    #[test]
-    fn display_note_is_silent_for_hosts_that_publish_no_display_capability() {
-        assert_eq!(display_negotiation_note(&BTreeMap::new()), None);
     }
 
     #[test]
@@ -21514,6 +21682,98 @@ mod tests {
         }
     }
 
+    /// The root viewer's moves and clicks leave as the root pass begins, from
+    /// the viewer's place in the pass before, as a secondary window's do; a
+    /// pass that also carries a key leaves them to the viewer pass, so the
+    /// key keeps its place before the click.
+    #[test]
+    fn root_pointer_events_leave_before_the_ui_pass_unless_keys_came_with_them() {
+        let (mut app, mut receiver, _validated, _main, builtin) = drag_test_app();
+        app.screen = AppScreen::InSession;
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        }
+        let gate = RootPointerGate {
+            pass: ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT) - 1,
+            rect: builtin,
+            image_rect: builtin,
+            overlays: vec![egui::Rect::from_min_size(
+                egui::pos2(1000.0, 400.0),
+                egui::vec2(300.0, 300.0),
+            )],
+            modifiers: egui::Modifiers::NONE,
+        };
+        let root_pass = |events| egui::RawInput {
+            viewport_id: egui::ViewportId::ROOT,
+            focused: true,
+            events,
+            ..egui::RawInput::default()
+        };
+        let button = |x: f32, pressed| egui::Event::PointerButton {
+            pos: egui::pos2(x, 500.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        app.root_pointer_gate = Some(gate.clone());
+        let mut raw = root_pass(vec![
+            egui::Event::PointerMoved(egui::pos2(100.0, 500.0)),
+            button(100.0, true),
+            egui::Event::PointerMoved(egui::pos2(200.0, 500.0)),
+            button(200.0, false),
+        ]);
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        assert!(app.root_pointer_forwarded);
+        assert!(app.root_pointer_focus_request);
+        let sent = drain_region_json(&mut receiver);
+        let buttons: Vec<bool> = sent
+            .iter()
+            .filter(|value| value["type"] == "region_pointer_button")
+            .map(|value| value["pressed"].as_bool().unwrap())
+            .collect();
+        assert_eq!(buttons, vec![true, false], "{sent:?}");
+        assert!(
+            regions_of(&sent, "region_pointer_enter").len()
+                + regions_of(&sent, "region_pointer_motion").len()
+                >= 2,
+            "{sent:?}"
+        );
+
+        // Over an egui window above the viewer the pointer is not the host's.
+        let mut raw = root_pass(vec![egui::Event::PointerMoved(egui::pos2(1100.0, 500.0))]);
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        assert!(drain_region_json(&mut receiver).is_empty());
+
+        app.root_pointer_forwarded = false;
+        app.root_pointer_focus_request = false;
+        let mut raw = root_pass(vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+            button(300.0, true),
+        ]);
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        assert!(!app.root_pointer_forwarded);
+        assert!(drain_region_json(&mut receiver)
+            .iter()
+            .all(|value| value["type"] != "region_pointer_button"));
+
+        // A gate from an older pass is stale: the viewer may have moved.
+        app.root_pointer_gate = Some(RootPointerGate {
+            pass: gate.pass.saturating_sub(1),
+            ..gate.clone()
+        });
+        let mut raw = root_pass(vec![button(300.0, true)]);
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        assert!(!app.root_pointer_forwarded);
+    }
+
     /// Live, Match My Layout on a still host monitor: of 120 hover moves over
     /// the secondary window 4-7 reached the host, and a title-bar drag sent
     /// its press but never its release (held on the host for 20 s). egui runs
@@ -21584,6 +21844,56 @@ mod tests {
             "{drag:?}"
         );
         assert_eq!(app.pointer_drag.origin(), None);
+    }
+
+    /// Review of #204: under a secondary viewport's pointer lock the pass's
+    /// relative motion was summed and sent after every press and release,
+    /// so a press-drag-release left as press, release, then the drag.
+    #[test]
+    fn secondary_relative_motion_keeps_its_place_between_presses_and_releases() {
+        let mut pointer = arcen_deck_core::input::viewport_pointer::ViewportPointer::default();
+        let picture = Some(arcen_deck_core::input::viewport_pointer::PictureRect {
+            left: 0.0,
+            top: 0.0,
+            width: 100.0,
+            height: 100.0,
+        });
+        let button = |pressed| egui::Event::PointerButton {
+            pos: egui::pos2(50.0, 50.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let steps = secondary_pointer_steps(
+            &mut pointer,
+            picture,
+            &[
+                egui::Event::MouseMoved(egui::vec2(1.0, 0.0)),
+                button(true),
+                egui::Event::MouseMoved(egui::vec2(2.0, 0.0)),
+                egui::Event::MouseMoved(egui::vec2(3.0, 1.0)),
+                button(false),
+                egui::Event::MouseMoved(egui::vec2(0.0, 0.0)),
+                egui::Event::MouseMoved(egui::vec2(-1.0, 0.0)),
+            ],
+        );
+        let shape: Vec<String> = steps
+            .iter()
+            .map(|step| match step {
+                SecondaryPointerStep::Motion(motion) => format!("motion {} {}", motion.x, motion.y),
+                SecondaryPointerStep::Sample(sample) => format!("held {}", sample.held[0]),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                "motion 1 0",
+                "held true",
+                "motion 5 1",
+                "held false",
+                "motion -1 0"
+            ]
+        );
     }
 
     #[test]

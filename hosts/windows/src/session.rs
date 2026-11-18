@@ -27,34 +27,35 @@ use arcen_protocol::fsm::ServerState;
 use arcen_protocol::messages::{
     msg_type, supports_region_input_v1, AudioStreamResultMsg, AuthMultiMonitorOfferMsg,
     AuthRequest, AuthResponse, AuthResult, ClientHelloMsg, CursorMode, CursorModeReason,
-    CursorModeResultMsg, DisplayUpdateMsg, DisplayUpdateResultMsg, HealthPingMsg, HealthPongMsg,
-    HealthStatsMsg, InputCapabilitiesMsg, InputCapabilityAvailability, KeyEventMsg,
-    KeyResetModifiersMsg, MicrophoneStreamStopMsg, MouseButtonMsg, MouseMoveMsg,
-    MouseMoveRelativeMsg, MouseScrollMsg, MultiMonitorCarrierMsg, PenEventMsg, QualitySettings,
-    RegionInputValidationError, RegionPenEventMsg, RegionPointerButtonMsg, RegionPointerEnterMsg,
-    RegionPointerLeaveMsg, RegionPointerMotionMsg, RegionPointerScrollMsg, RequestFullFrameMsg,
-    ResumeErrorCode, ServedPipelineMsg, ServerColorCaps, ServerHelloMsg, ServerMultiMonitorMsg,
+    CursorModeResultMsg, DisplayUpdateMsg, DisplayUpdateResultMsg, GestureMagnifyMsg,
+    HealthPingMsg, HealthPongMsg, HealthStatsMsg, InputCapabilitiesMsg,
+    InputCapabilityAvailability, KeyEventMsg, KeyResetModifiersMsg, MicrophoneStreamStopMsg,
+    MouseButtonMsg, MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, MultiMonitorCarrierMsg,
+    PenEventMsg, QualitySettings, RegionInputValidationError, RegionPenEventMsg,
+    RegionPointerButtonMsg, RegionPointerEnterMsg, RegionPointerLeaveMsg, RegionPointerMotionMsg,
+    RegionPointerScrollMsg, RequestFullFrameMsg, ResumeErrorCode, SequencedInput,
+    ServedPipelineMsg, ServerColorCaps, ServerHelloMsg, ServerMultiMonitorMsg,
     TabletModeCapabilitiesMsg, TabletModeMsg, TabletModeReason, TabletModeResultMsg, TextCommitMsg,
     AUTH_METHOD_RESUME, AUTH_REQUEST, AUTH_RESPONSE, AUTH_RESULT, CLIENT_HELLO, CLIPBOARD_DATA,
-    DISPLAY_UPDATE, HEALTH_PING, HEALTH_PONG, HEALTH_STATS, INPUT_PROTOCOL_VERSION,
-    KEY_RESET_MODIFIERS, MICROPHONE_STREAM_STOP, MOUSE_MOVE_RELATIVE, MOUSE_SCROLL, PEN_EVENT,
+    DISPLAY_UPDATE, GESTURE_MAGNIFY, GESTURE_ROTATE, GESTURE_SMART_ZOOM, GESTURE_SWIPE,
+    HEALTH_PING, HEALTH_PONG, HEALTH_STATS, INPUT_PROTOCOL_VERSION, KEY_RESET_MODIFIERS,
+    MICROPHONE_STREAM_STOP, MOUSE_MOVE_RELATIVE, MOUSE_SCROLL, PEN_EVENT,
     REGION_INPUT_PROTOCOL_VERSION, REGION_PEN_EVENT, REGION_POINTER_BUTTON, REGION_POINTER_ENTER,
     REGION_POINTER_LEAVE, REGION_POINTER_MOTION, REGION_POINTER_SCROLL, REQUEST_FULL_FRAME,
     SERVER_HELLO, TEXT_COMMIT,
 };
-#[cfg(feature = "wss-compat")]
-use arcen_protocol::CAPABILITY_TRANSPORT_WSS;
 use arcen_protocol::{
     decode_clipboard_chunk, encode_audio_header, encode_video_header, negotiate_transport,
     sanitize_transport_capabilities, AudioCodec, AudioHeader, ChromaSubsampling, FrameType,
     VideoCodec, VideoHeader, CAPABILITY_TRANSPORT_QUIC,
 };
+use arcen_session::console_session::{ConsoleRefusal, Departure, DetachStep};
 use arcen_session::deskside::{
     DesksideControl, DesksideEffect, DesksideEvent, DesksideLeaseSpec, DesksideProtection,
 };
 use arcen_session::direct_reconnect::{
     DirectReconnect, FreshAuthenticatedReconnectDecision, ReconnectEvent, ReconnectPolicy,
-    ReconnectState,
+    ReconnectState, ResumeHoldEnd,
 };
 use arcen_session::restore_lease::{LeaseOwnerId, StateFingerprint};
 use arcen_session::session_setup::SetupRefusal;
@@ -87,8 +88,8 @@ use crate::windows_session::{
 };
 use crate::{HostConfig, LifecycleEmitter};
 use arcen_session::session_admission::{
-    AUTH_RESPONSE_TIMEOUT, CREDENTIAL_CHECK_TIMEOUT, HANDSHAKE_MESSAGE_TIMEOUT,
-    INTERACTIVE_AUTH_RESPONSE_TIMEOUT,
+    DetachedTakeoverRefusal, AUTH_RESPONSE_TIMEOUT, CREDENTIAL_CHECK_TIMEOUT,
+    HANDSHAKE_MESSAGE_TIMEOUT, INTERACTIVE_AUTH_RESPONSE_TIMEOUT,
 };
 
 /// Failed sign-ins, per source address and per account, shared by every
@@ -156,6 +157,27 @@ pub struct BrokerAgentLease {
     /// The QUIC connection of the attachment that holds the display, so a
     /// same-user newcomer can prove it silent and displace it.
     incumbent: Arc<arcen_transport::quic::IncumbentAttachment>,
+    /// Accounts (SIDs) whose fresh sign-in waits for the display while the
+    /// departing broker hands the session back: that broker leaves the
+    /// session unlocked for them instead of locking it under them.
+    successors: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// A same-account sign-in waiting to take the session over; withdrawn when
+/// dropped.
+struct SuccessorWaiting {
+    successors: Arc<std::sync::Mutex<Vec<String>>>,
+    user_sid: String,
+}
+
+impl Drop for SuccessorWaiting {
+    fn drop(&mut self) {
+        if let Ok(mut successors) = self.successors.lock() {
+            if let Some(index) = successors.iter().position(|sid| *sid == self.user_sid) {
+                successors.swap_remove(index);
+            }
+        }
+    }
 }
 
 struct BrokerAgentPermit {
@@ -352,7 +374,29 @@ impl BrokerAgentLease {
             controls,
             active_log: RwLock::new(None),
             incumbent: Arc::new(arcen_transport::quic::IncumbentAttachment::new()),
+            successors: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Records that a fresh sign-in of `user_sid` waits to take its session
+    /// over, until the returned guard drops.
+    fn announce_successor(&self, user_sid: &str) -> SuccessorWaiting {
+        if let Ok(mut successors) = self.successors.lock() {
+            successors.push(user_sid.to_string());
+        }
+        SuccessorWaiting {
+            successors: Arc::clone(&self.successors),
+            user_sid: user_sid.to_string(),
+        }
+    }
+
+    /// Whether a fresh sign-in of `user_sid` waits to take its session over.
+    fn successor_waiting(&self, user_sid: &str) -> bool {
+        self.successors.lock().is_ok_and(|successors| {
+            successors
+                .iter()
+                .any(|sid| sid.eq_ignore_ascii_case(user_sid))
+        })
     }
 
     fn try_acquire(&self) -> Result<BrokerAgentPermit, String> {
@@ -369,7 +413,9 @@ impl BrokerAgentLease {
         // that completed the TLS handshake could drive that. Acquiring the
         // display permit first means the only fallible step after admission is
         // none at all. This matches the Linux Pier, which has always taken the
-        // session slot before admission.
+        // session slot before admission. (Credential verification and the
+        // fresh-sign-in decision now run first: a detached holder of the same
+        // account is pre-empted, never by an unauthenticated peer.)
         let display = self
             .slot
             .clone()
@@ -592,7 +638,7 @@ fn classify_bind_with_console_takeover(
 ) -> Result<crate::windows_session::BindStatus, String> {
     let status = crate::windows_session::classify_bind(account)?;
     let crate::windows_session::BindStatus::Reconnect { source, target } = status else {
-        if matches!(status, crate::windows_session::BindStatus::Rejected(_)) {
+        if matches!(status, crate::windows_session::BindStatus::Rejected(..)) {
             // The field report that motivated this path produced one terse
             // reason and nothing else, so the topology had to be guessed at.
             // Record the shape whenever a bind is refused.
@@ -625,6 +671,7 @@ fn classify_bind_with_console_takeover(
         );
         return Ok(crate::windows_session::BindStatus::Rejected(
             "the account's existing session could not be moved to the physical console",
+            None,
         ));
     }
     let status = crate::windows_session::classify_bind(account)?;
@@ -638,6 +685,7 @@ fn classify_bind_with_console_takeover(
         );
         return Ok(crate::windows_session::BindStatus::Rejected(
             "the account's session did not settle on the physical console",
+            None,
         ));
     }
     tracing::info!(
@@ -652,6 +700,37 @@ fn classify_bind_with_console_takeover(
 
 fn rejected_console_client_message(reason: &str) -> String {
     format!("Remote sign-in is unavailable: {reason}.")
+}
+
+struct RejectedBindMessage {
+    reason_class: &'static str,
+    text: String,
+}
+
+/// What the Deck is told about a refused console bind: the typed refusal
+/// (another account, or another remote-desktop service named as Windows
+/// reports it) when there is one, else the classifier's reason.
+fn rejected_bind_message(
+    reason: &'static str,
+    notice: Option<&arcen_session::console_session::ConsoleNotice>,
+) -> RejectedBindMessage {
+    let service = notice.and_then(arcen_session::console_session::ConsoleNotice::service);
+    let reason_class = notice.map_or("ineligible_console_state", |notice| notice.token());
+    tracing::warn!(
+        target: SESSION,
+        reason,
+        reason_class,
+        win_station = service.and_then(|service| service.pam_service()).unwrap_or(""),
+        protocol = service.and_then(|service| service.process()).unwrap_or(""),
+        "credential provider dispatch rejected for ambiguous console state"
+    );
+    RejectedBindMessage {
+        reason_class,
+        text: notice.map_or_else(
+            || rejected_console_client_message(reason),
+            arcen_session::console_session::ConsoleNotice::deck_reason,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -931,6 +1010,7 @@ async fn run_correlated_broker(
     // a request this host cannot serve is refused with its reason and is not a
     // failed sign-in.
     cfg.deck_display_refresh_hz = response.display_refresh_hz();
+    cfg.set_deck_monitor_refresh(&response);
     if let Some(request) = response.initial_video.as_ref() {
         tracing::debug!(
             target: SESSION,
@@ -1092,24 +1172,18 @@ async fn run_correlated_broker(
                 .await?;
                 return Ok(());
             }
-            Ok(crate::windows_session::BindStatus::Rejected(reason)) => {
+            Ok(crate::windows_session::BindStatus::Rejected(reason, notice)) => {
                 drop(credential);
-                tracing::warn!(
-                    target: SESSION,
-                    %peer,
-                    reason,
-                    "credential provider dispatch rejected for ambiguous console state"
-                );
+                let message = rejected_bind_message(reason, notice.as_ref());
                 emit_session_auth_fail(
                     emitter,
                     session_log_id.clone(),
                     Some(&response.username),
                     peer,
                     "session_bind",
-                    "ineligible_console_state",
+                    message.reason_class,
                 );
-                let message = rejected_console_client_message(reason);
-                send_session_setup_failure(&mut ws, &message).await?;
+                send_session_setup_failure(&mut ws, &message.text).await?;
                 return Ok(());
             }
             Ok(crate::windows_session::BindStatus::Error(error)) => {
@@ -1153,6 +1227,7 @@ async fn run_correlated_broker(
             .map_err(|_| "bound Windows SID is invalid".to_string())?,
         wts_session_id: identity.session_id,
     };
+    let mut took_over = false;
     let _agent_lease = match resume_registry
         .fresh_authentication_decision(&native_principal)
         .map_err(|error| format!("resume registry unavailable: {error:?}"))?
@@ -1185,7 +1260,9 @@ async fn run_correlated_broker(
                     incumbent = incumbent.token(),
                     "same authenticated Windows user is taking over its attached session from a silent Deck"
                 );
-                match agent_lease
+                took_over = true;
+                let successor = agent_lease.announce_successor(&native_user_sid);
+                let permit = match agent_lease
                     .acquire_after_authenticated_takeover(AUTHENTICATED_TAKEOVER_TIMEOUT)
                     .await
                 {
@@ -1194,7 +1271,12 @@ async fn run_correlated_broker(
                         send_session_setup_failure(&mut ws, &wait_error).await?;
                         return Err(format!("{error}; {wait_error}"));
                     }
+                };
+                drop(successor);
+                if !taken_over_session_is_usable(&identity, &native_user_sid, &mut ws).await? {
+                    return Ok(());
                 }
+                permit
             }
             Err(error) => {
                 send_session_setup_failure(&mut ws, &error).await?;
@@ -1207,13 +1289,16 @@ async fn run_correlated_broker(
             }
         },
         FreshAuthenticatedReconnectDecision::RefuseDifferentPrincipal => {
-            let error = "The Windows display is reserved for another authenticated session \
-                             until its resume window (auth.reconnect_window_secs) expires.";
-            send_session_setup_failure(&mut ws, error).await?;
+            // Only the session's own account may take a detached session
+            // over (`arcen_session::direct_reconnect::fresh_sign_in`); another
+            // account is told why without naming the desktop's owner.
+            let refusal = DetachedTakeoverRefusal::AnotherUsersDesktop;
+            send_session_setup_failure(&mut ws, refusal.deck_reason()).await?;
             tracing::warn!(
                 target: SESSION,
                 %peer,
                 windows_session_id = identity.session_id,
+                refusal = refusal.token(),
                 "fresh authentication refused while another principal owns the detached session"
             );
             return Ok(());
@@ -1226,9 +1311,11 @@ async fn run_correlated_broker(
                 target: SESSION,
                 %peer,
                 windows_session_id = identity.session_id,
-                "same authenticated Windows user is taking over detached direct session"
+                "same authenticated Windows user is pre-empting its detached direct session"
             );
-            match agent_lease
+            took_over = true;
+            let successor = agent_lease.announce_successor(&native_user_sid);
+            let permit = match agent_lease
                 .acquire_after_authenticated_takeover(AUTHENTICATED_TAKEOVER_TIMEOUT)
                 .await
             {
@@ -1237,9 +1324,61 @@ async fn run_correlated_broker(
                     send_session_setup_failure(&mut ws, &error).await?;
                     return Err(error);
                 }
+            };
+            drop(successor);
+            if !taken_over_session_is_usable(&identity, &native_user_sid, &mut ws).await? {
+                return Ok(());
             }
+            permit
         }
     };
+    // From here a refusal leaves the desk locked when this sign-in unlocked
+    // or signed the session in, or took it over from a Deck whose broker left
+    // it unlocked for this one (ADR 0025); `hand_back_session` takes over once
+    // the agent runs.
+    let mut early_lock = EarlyLock {
+        windows_session_id: identity.session_id,
+        user_sid: native_user_sid.clone(),
+        armed: took_over || identity_binding != "existing_session",
+    };
+    // The desk's speakers go silent before the session's agent starts and
+    // stay so until the session is locked again (`hand_back_session`).
+    let local_playback_policy = cfg.local_playback;
+    let (local_playback_lease, local_playback_report) = tokio::task::spawn_blocking(move || {
+        crate::local_playback::LocalPlaybackLease::begin(local_playback_policy)
+    })
+    .await
+    .map_err(|_| "local playback lease task failed".to_string())?;
+    if let Err(refusal) = arcen_session::local_playback::admit(
+        local_playback_policy,
+        Some(local_playback_report.evidence),
+    ) {
+        tracing::error!(
+            target: SESSION,
+            %peer,
+            %refusal,
+            basis = local_playback_report.basis.token(),
+            reason_class = "local_playback_refused",
+            "session refused: the host's own speakers could not be proven silent"
+        );
+        if let Some(lease) = local_playback_lease {
+            let _ = tokio::task::spawn_blocking(move || lease.end()).await;
+        }
+        emit_session_auth_fail(
+            emitter,
+            session_log_id.clone(),
+            Some(&response.username),
+            peer,
+            "desktop",
+            "local_playback_refused",
+        );
+        send_session_setup_failure(
+            &mut ws,
+            arcen_session::local_playback::DECK_REASON_NOT_MUTED,
+        )
+        .await?;
+        return Ok(());
+    }
     let timezone_lease = match timezone_controller.begin(
         cfg.timezone_redirection,
         response.timezone.as_deref(),
@@ -1319,6 +1458,12 @@ async fn run_correlated_broker(
             return Err(message);
         }
     };
+    let hand_back_session_id = identity.session_id;
+    let hand_back_sid = native_user_sid.clone();
+    early_lock.armed = false;
+    // A Deck that fails before streaming leaves the desk as a Deck that
+    // left: locked (ADR 0025).
+    let mut departure = Departure::AgentFailed;
     // Every result after spawn funnels through the cleanup below. In particular,
     // IPC send/receive/decode and auth-result failures may not rely on job Drop
     // while the system-wide timezone lease is still active.
@@ -1437,7 +1582,9 @@ async fn run_correlated_broker(
             .path_signal_connection()
             .map(|connection| agent_lease.incumbent.register(&native_user_sid, connection));
         let result = if let Some(commands) = resume_commands.as_mut() {
-            relay_resumable_client_and_agent(
+            let windows_user = identity.user.clone();
+            let mut hold = None;
+            let result = relay_resumable_client_and_agent(
                 ws,
                 &mut agent_ws,
                 identity,
@@ -1450,12 +1597,18 @@ async fn run_correlated_broker(
                 &mut session_shutdown,
                 incumbent.as_ref(),
                 refine_grant,
+                &mut departure,
+                &mut hold,
             )
-            .await
+            .await;
+            if let Some(hold) = hold {
+                emit_resume_hold_ended(emitter, &session_log_id, hold, &windows_user, peer);
+            }
+            result
         } else {
             let lanes = ws.lanes();
             let path_signal_connection = ws.path_signal_connection();
-            relay_client_and_agent(
+            let result = relay_client_and_agent(
                 &mut ws,
                 &mut agent_ws,
                 identity,
@@ -1465,8 +1618,16 @@ async fn run_correlated_broker(
                 lanes,
                 path_signal_connection,
                 refine_grant,
+                &mut departure,
             )
-            .await
+            .await;
+            if incumbent
+                .as_ref()
+                .is_some_and(arcen_transport::quic::IncumbentRegistration::displaced)
+            {
+                departure = Departure::HandedOver;
+            }
+            result
         };
         let _ = send_ws_with_timeout(&mut agent_ws, Message::Close(None), WS_WRITE_TIMEOUT).await;
         let _ = tokio::time::timeout(WS_WRITE_TIMEOUT, agent_ws.close(None)).await;
@@ -1478,6 +1639,14 @@ async fn run_correlated_broker(
             finish_agent_resources(launched, timezone_lease)
         })
         .await;
+    hand_back_session(
+        departure,
+        hand_back_session_id,
+        hand_back_sid,
+        &agent_lease,
+        local_playback_lease,
+    )
+    .await;
     match (result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
@@ -1527,6 +1696,183 @@ async fn finish_agent_resources(
         },
     )
     .await;
+}
+
+/// Gives the desk its session back after the Deck's agent has ended, in the
+/// order Windows allows (`DETACH_STEPS_OUTPUTS_FIRST`): the agent's exit
+/// already restored the outputs and released the desk's input, because a
+/// locked session's processes may not change its displays; then the session
+/// is locked (ADR 0025, "disconnect locks") unless `departure` hands it to
+/// a successor or it is no longer the Deck's; the desk's speakers come back
+/// last. Nothing ends the session.
+async fn hand_back_session(
+    departure: Departure,
+    windows_session_id: u32,
+    user_sid: String,
+    agent_lease: &BrokerAgentLease,
+    local_playback_lease: Option<crate::local_playback::LocalPlaybackLease>,
+) {
+    let mut local_playback_lease = local_playback_lease;
+    let mut departure = departure;
+    if departure == Departure::SessionChanged {
+        // Only a change that is seen counts: a session that is still the
+        // Deck's, active and unlocked, did not change (the observation that
+        // ended the attachment failed), and is locked like any other.
+        let sid = user_sid.clone();
+        let unchanged = tokio::task::spawn_blocking(move || {
+            crate::windows_session::still_unlocked_session_of(windows_session_id, &sid)
+        })
+        .await
+        .unwrap_or(false);
+        if unchanged {
+            departure = Departure::AgentFailed;
+        }
+    }
+    if departure.locks_session() && agent_lease.successor_waiting(&user_sid) {
+        departure = Departure::HandedOver;
+    }
+    for step in arcen_session::console_session::DETACH_STEPS_OUTPUTS_FIRST {
+        match step {
+            // The agent's exit restored them; a killed agent's watchdog
+            // restores the displays, and Windows refuses that once locked.
+            DetachStep::RestoreOutputs => {
+                if departure.locks_session() {
+                    await_display_restore().await;
+                }
+            }
+            DetachStep::ReleaseInput => {}
+            DetachStep::LockSession if departure.locks_session() => {
+                let sid = user_sid.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    crate::windows_session::lock_session(windows_session_id, &sid)
+                })
+                .await
+                .map_err(|_| "session lock task failed".to_string())
+                .and_then(|outcome| outcome);
+                match outcome {
+                    Ok(outcome) => tracing::info!(
+                        target: SESSION,
+                        windows_session_id,
+                        departure = departure.token(),
+                        outcome = outcome.token(),
+                        "the Deck left; the session is locked, not ended"
+                    ),
+                    Err(error) => tracing::error!(
+                        target: SESSION,
+                        windows_session_id,
+                        departure = departure.token(),
+                        %error,
+                        "the Deck left but the session could not be locked"
+                    ),
+                }
+            }
+            DetachStep::LockSession => tracing::info!(
+                target: SESSION,
+                windows_session_id,
+                departure = departure.token(),
+                "the Deck left; the session is not locked"
+            ),
+            // `lock_session` returns once Windows reports the session locked.
+            DetachStep::AwaitLockScreen => {}
+            DetachStep::RestoreAudio => {
+                if let Some(lease) = local_playback_lease.take() {
+                    let _ = tokio::task::spawn_blocking(move || lease.end()).await;
+                }
+            }
+        }
+    }
+}
+
+/// Locks the session when a sign-in that unlocked it, signed it in or took
+/// it over is refused before its agent runs (dropped while armed).
+struct EarlyLock {
+    windows_session_id: u32,
+    user_sid: String,
+    armed: bool,
+}
+
+impl Drop for EarlyLock {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let windows_session_id = self.windows_session_id;
+        let user_sid = std::mem::take(&mut self.user_sid);
+        let _ = std::thread::Builder::new()
+            .name("refused-sign-in-lock".to_string())
+            .spawn(move || {
+                match crate::windows_session::lock_session(windows_session_id, &user_sid) {
+                    Ok(outcome) => tracing::info!(
+                        target: SESSION,
+                        windows_session_id,
+                        outcome = outcome.token(),
+                        "the sign-in was refused after it opened the session; the session is locked"
+                    ),
+                    Err(error) => tracing::error!(
+                        target: SESSION,
+                        windows_session_id,
+                        %error,
+                        "the sign-in was refused after it opened the session, and the session could not be locked"
+                    ),
+                }
+            });
+    }
+}
+
+/// How long the session's lock waits for a display journal to be replayed.
+const DISPLAY_RESTORE_WAIT: Duration = Duration::from_secs(15);
+
+/// Waits, bounded, until no display recovery journal is left: a session
+/// agent that exits restores its displays itself, while a failed or
+/// terminated one leaves the replay to its watchdog, which Windows refuses
+/// once the session is locked. A journal still there afterwards is replayed
+/// by the console recovery at the next unlock.
+async fn await_display_restore() {
+    let journal = crate::recovery::default_path();
+    let deadline = tokio::time::Instant::now() + DISPLAY_RESTORE_WAIT;
+    while journal.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: SESSION,
+                journal = %journal.display(),
+                "the display journal is still there; the session is locked and its displays are restored at the next unlock"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A sign-in that waited for its own session to be handed over checks that
+/// the departing broker did not lock it meanwhile: a locked session cannot
+/// be joined without unlocking it, so the Deck is told to sign in again
+/// (which unlocks it). `Ok(false)` once the Deck has been told.
+async fn taken_over_session_is_usable(
+    identity: &WindowsSessionIdentity,
+    user_sid: &str,
+    ws: &mut crate::resume::DirectSessionSocket,
+) -> Result<bool, String> {
+    let observed_identity = identity.clone();
+    let sid = user_sid.to_string();
+    let observed = tokio::task::spawn_blocking(move || {
+        crate::windows_session::observe_bound(&observed_identity, &sid)
+    })
+    .await
+    .map_err(|_| "Windows session observation task failed".to_string())?;
+    match observed {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let refusal = ConsoleRefusal::SessionChanged;
+            tracing::warn!(
+                target: SESSION,
+                reason_class = refusal.token(),
+                %error,
+                "the session taken over was locked or changed while it was handed over"
+            );
+            send_session_setup_failure(ws, refusal.deck_reason()).await?;
+            Ok(false)
+        }
+    }
 }
 
 async fn finish_agent_then_timezone<FinishAgent, AgentFuture, FinishTimezone>(
@@ -2088,6 +2434,70 @@ impl ActiveDisplayLease {
     }
 }
 
+/// `request` with each monitor's refresh raised to the rate it is served at
+/// (`served_display_refresh_hz`: Desktop Duplication and WGC deliver once
+/// per composition, so a 120 Hz Deck monitor's display runs at 120 Hz where
+/// an EDID timing at its size carries it), never below the mode the Deck
+/// asked for. Logged for each monitor it raises.
+fn served_multi_monitor_request(
+    cfg: &HostConfig,
+    request: &arcen_protocol::messages::AuthMultiMonitorRequestMsg,
+) -> Result<arcen_protocol::messages::AuthMultiMonitorRequestMsg, String> {
+    let Some(ceiling) = created_display_refresh_ceiling(cfg) else {
+        return Ok(request.clone());
+    };
+    request
+        .with_monitor_refresh(|monitor| {
+            let requested_hz = monitor.refresh_hz.max(1);
+            let fps = cfg
+                .monitor_frame_rate(monitor.client_display_id.as_str(), cfg.fps)
+                .fps
+                .min(ceiling);
+            // The EDID describes the panel natively: a quarter-turned
+            // monitor's timing is its as-seen size transposed.
+            let size = match monitor.rotation {
+                arcen_protocol::messages::RotationMsg::Degrees90
+                | arcen_protocol::messages::RotationMsg::Degrees270 => DisplaySize {
+                    width: monitor.height_px,
+                    height: monitor.width_px,
+                },
+                _ => DisplaySize {
+                    width: monitor.width_px,
+                    height: monitor.height_px,
+                },
+            };
+            let refresh_hz = crate::display::served_display_refresh_hz(fps, requested_hz, size);
+            if refresh_hz != requested_hz {
+                tracing::info!(
+                    target: DISPLAY,
+                    client_display_id = %monitor.client_display_id.as_str(),
+                    size = %size,
+                    requested_refresh_hz = requested_hz,
+                    refresh_hz,
+                    fps,
+                    "virtual display raised to the served rate"
+                );
+            }
+            refresh_hz
+        })
+        .map_err(|error| format!("multi-monitor served refresh: {error}"))
+}
+
+/// The fastest refresh this host's multi-monitor provider creates a display
+/// at: an IddCx connector's limit, an NVIDIA headless EDID's own timing (the
+/// EDID check decides), or `None` when the Pier creates no display (physical
+/// outputs keep the modes they list). A single display never goes through
+/// IddCx; it is fitted by its own path (`DisplayRequest::refresh_for`).
+fn created_display_refresh_ceiling(cfg: &HostConfig) -> Option<u32> {
+    if cfg.iddcx.enabled {
+        Some(crate::iddcx::MAX_REFRESH_HZ)
+    } else if cfg.multi_monitor.nvidia_headless_effective() {
+        Some(u32::MAX)
+    } else {
+        None
+    }
+}
+
 fn resolved_display_hdr_intent(cfg: &HostConfig) -> bool {
     let resolved_hdr10 = cfg.transfer == arcen_media::TransferCharacteristics::Pq;
     arcen_media::video::session_wants_display_hdr(cfg.active_pipeline.as_ref(), resolved_hdr10)
@@ -2235,6 +2645,7 @@ where
     // function answering "what did this client ask for", on both sides of the
     // process boundary.
     cfg.deck_display_refresh_hz = response.display_refresh_hz();
+    cfg.set_deck_monitor_refresh(&response);
     if let Some(request) = response.initial_video.as_ref() {
         // An Auto host that resolved to OpenH264 before any NVENC child ran
         // did so for a hardware reason a fidelity refusal names.
@@ -2284,12 +2695,19 @@ where
     let multi_monitor_gate =
         crate::multi_monitor_gate::MultiMonitorGate::from_config(&cfg.multi_monitor, cfg.encoder);
     let multi_monitor_offer = crate::multi_monitor_gate::build_offer(&multi_monitor_gate);
+    // Every SDR monitor's display is created at the rate it is served at,
+    // as a single display is; HDR10 keeps the exact refresh the Deck asked
+    // for (its 10-bit link is admitted at that refresh).
+    let served_multi_monitor = match response.multi_monitor_v1.as_ref() {
+        Some(request) if !resolved_display_hdr_intent(&cfg) => {
+            Some(or_report!(ws, served_multi_monitor_request(&cfg, request)))
+        }
+        other => other.cloned(),
+    };
     let mut nvidia_headless_planning = None;
-    let mut multi_monitor_committed = if response.multi_monitor_v1.is_some() {
-        let requested_multi_monitor = response
-            .multi_monitor_v1
-            .as_ref()
-            .expect("checked as present");
+    let mut multi_monitor_committed = if let Some(requested_multi_monitor) =
+        served_multi_monitor.as_ref()
+    {
         let full_color_required = requested_multi_monitor
             .requested_topology()
             .monitors()
@@ -2415,7 +2833,7 @@ where
             &multi_monitor_gate,
             Some(&inventory),
             multi_monitor_offer.as_ref(),
-            response.multi_monitor_v1.as_ref(),
+            served_multi_monitor.as_ref(),
         ) {
             crate::multi_monitor_gate::MultiMonitorOutcome::Planned { plan, carrier } => {
                 if cfg.iddcx.enabled {
@@ -2532,6 +2950,29 @@ where
                 hdr10_refresh_hz = refresh_hz,
                 max_tmds_character_rate_mhz = crate::edid::HDR10_MAX_TMDS_CHARACTER_RATE_MHZ,
                 "HDR10 display refresh lowered to fit the 10-bit link; the stream rate is unchanged"
+            );
+            request.refresh_hz = refresh_hz;
+        }
+    } else if multi_monitor_committed.is_none() {
+        // Desktop Duplication and WGC deliver once per composition, so the
+        // virtual display runs at least at the served rate (a 120 Hz Deck
+        // panel's 120 fps) where an EDID timing at this size can carry it;
+        // the Deck's requested mode (at most 60 Hz) otherwise. Decided from
+        // the served rate, never the Deck display's own refresh.
+        // Kept on the request so a live resize (a window going Retina) fits
+        // its refresh again at the new size rather than keep one no EDID
+        // timing there carries.
+        request.deck_refresh_hz = request.refresh_hz;
+        request.sdr_stream_fps = cfg.fps;
+        let refresh_hz = or_report!(ws, request.refresh_for(request.size));
+        if refresh_hz != request.refresh_hz {
+            tracing::info!(
+                target: DISPLAY,
+                size = %request.size,
+                requested_refresh_hz = request.refresh_hz,
+                refresh_hz,
+                fps = cfg.fps,
+                "virtual display raised to the served rate"
             );
             request.refresh_hz = refresh_hz;
         }
@@ -4066,7 +4507,6 @@ const fn display_policy_name(policy: crate::display::DisplayPolicy) -> &'static 
     match policy {
         crate::display::DisplayPolicy::ExactIsolated => "exact_isolated",
         crate::display::DisplayPolicy::Negotiated => "negotiated",
-        crate::display::DisplayPolicy::NegotiatedMacroblock16 => "negotiated_macroblock16",
     }
 }
 
@@ -4880,8 +5320,19 @@ fn served_frame_rate(
     media_plan: &ResolvedMediaPlan,
     display: &DisplayReport,
 ) -> arcen_media::video::SessionFrameRate {
+    // A multi-monitor session states its primary monitor's own rate (listed
+    // first), each lowered to the refresh its display was applied at before
+    // the encoder's admission is read.
+    let resolved = match cfg.deck_monitor_refresh_hz.first() {
+        Some((primary, _)) => Some(cfg.monitor_frame_rate(primary, cfg.fps)),
+        None => cfg.frame_rate,
+    }
+    .map(|rate| match display.applied_refresh_hz {
+        0 => rate,
+        refresh => rate.narrow(refresh, arcen_media::video::FrameRateBasis::CaptureSource),
+    });
     let rate = arcen_media::video::served_stream_rate(
-        cfg.frame_rate,
+        resolved,
         media_plan.fps,
         arcen_media::video::FrameRateBasis::Encoder,
     );
@@ -5057,7 +5508,8 @@ fn build_server_hello_with_aggregate(
             relative_pointer: InputCapabilityAvailability::Available,
             host_cursor: InputCapabilityAvailability::Available,
             region_input: runtime_input_capability(region_input_available),
-            gestures: InputCapabilityAvailability::Unavailable,
+            // A pinch zooms as Control + wheel (shared `gesture_fallback`).
+            gestures: InputCapabilityAvailability::Available,
             pen: pen_capability,
             pen_pressure: pen_capability,
             pen_tilt: pen_capability,
@@ -5613,14 +6065,47 @@ impl PreparedVideo {
         }
     }
 
-    /// The single pipeline's proven content rate. A multi-monitor session's
-    /// sent count spans every output while each capenc reports only its own,
-    /// so it proves nothing and is judged against the target as before.
-    fn take_content_fps(&self) -> Option<u32> {
-        match self {
-            Self::Single(pipeline) => pipeline.capenc.take_content_fps(),
-            Self::Multi { .. } => None,
-        }
+    /// What every pipeline proved about its content over the health window,
+    /// each output owing at most the rate it is served at (`session_fps`
+    /// for a single display, which the governor may lower), and the
+    /// window's whole target (`arcen_telemetry::outputs_content`): the sent
+    /// count spans every output, so each one is judged on its own capenc's
+    /// evidence and rate.
+    ///
+    /// Also returns each multi-monitor pipeline's own evidence (monitor,
+    /// served rate, proven content rate) for its line in `health_stats`.
+    fn take_content(
+        &self,
+        session_fps: u32,
+    ) -> (
+        arcen_telemetry::OutputsContent,
+        Vec<(u16, u32, Option<u32>)>,
+    ) {
+        let single = matches!(self, Self::Single(_));
+        let outputs: Vec<(u16, u32, Option<u32>)> = self
+            .pipelines()
+            .iter()
+            .map(|pipeline| {
+                let target = if single {
+                    session_fps
+                } else {
+                    pipeline.plan.fps
+                };
+                (
+                    pipeline.monitor_id,
+                    target.max(1),
+                    pipeline.capenc.take_content_fps(),
+                )
+            })
+            .collect();
+        (
+            arcen_telemetry::outputs_content(
+                outputs
+                    .iter()
+                    .map(|(_, target, content)| (*target, *content)),
+            ),
+            if single { Vec::new() } else { outputs },
+        )
     }
 
     fn primary_pipeline_qp_map(&self) -> arcen_media::video::QpMapPolicy {
@@ -6174,8 +6659,36 @@ async fn prepare_multi_monitor_media(
                 arcen_media::video::pipeline_contract(pipeline).encoder_ceiling_bps()
             }),
         fps: template_fps,
+        monitor_fps: plan
+            .monitors
+            .iter()
+            .map(|monitor| {
+                // Each monitor at its own Deck display's rate, and never
+                // faster than its virtual display refreshes (Desktop
+                // Duplication and WGC deliver once per composition).
+                let rate = cfg
+                    .monitor_frame_rate(&monitor.client_display_id, template_fps)
+                    .narrow(
+                        monitor.refresh_hz.max(1),
+                        arcen_media::video::FrameRateBasis::CaptureSource,
+                    );
+                tracing::info!(
+                    target: SESSION,
+                    client_display_id = %monitor.client_display_id,
+                    fps = rate.fps,
+                    display_refresh_hz = ?rate.display_refresh_hz,
+                    fps_basis = rate.basis.token(),
+                    "monitor frame rate"
+                );
+                (monitor.session_monitor_id, rate.fps)
+            })
+            .collect(),
         encoder: Some(display_encoder),
         video_selection: cfg.video_selection,
+        client_video: cfg
+            .auth_video_request
+            .as_ref()
+            .map(|request| request.capabilities),
         cursor_mode,
         session_log_id: session_log_id.clone(),
     };
@@ -6761,7 +7274,7 @@ where
     let (control_tx, control_rx) = mpsc::channel::<WriterControl>(CONTROL_QUEUE_CAPACITY);
     let audio_send_state = audio_capture.send_state();
     let video_stats = Arc::new(WriterVideoStats::default());
-    let video_write_wait_micros = Arc::new(AtomicU64::new(0));
+    let video_writes = Arc::new(arcen_media::video::VideoWriteMeter::default());
     let mut writer = tokio::spawn(writer_loop(
         ws_tx,
         video.clone(),
@@ -6770,7 +7283,7 @@ where
         control_rx,
         Arc::clone(&audio_send_state),
         Arc::clone(&video_stats),
-        Arc::clone(&video_write_wait_micros),
+        Arc::clone(&video_writes),
     ));
     let rate_control_enabled = std::env::var("ARCEN_RATE_CONTROL").as_deref() != Ok("0");
     let latest_path_signal = Arc::new(std::sync::Mutex::new(None));
@@ -6795,7 +7308,7 @@ where
     let spawn_rate_task = |plan: ResolvedMediaPlan, video_pipelines: &PreparedVideo| {
         let video_stats = Arc::clone(&video_stats);
         let video_waits = Arc::clone(&video);
-        let video_write_wait_micros = Arc::clone(&video_write_wait_micros);
+        let video_writes = Arc::clone(&video_writes);
         let path_signal_connection = path_signal_connection.clone();
         let served_pipeline =
             served_stream_pipeline(cfg, &plan, video_pipelines.aggregate_accelerator_class());
@@ -6874,8 +7387,7 @@ where
                     .max()
                     .unwrap_or(0);
                 let wait = video_waits.take_wait_stats();
-                let write_wait =
-                    Duration::from_micros(video_write_wait_micros.swap(0, Ordering::Relaxed));
+                let write_wait = video_writes.take_wait();
                 let mean_write_wait = if wait.frames == 0 {
                     Duration::ZERO
                 } else {
@@ -6912,7 +7424,7 @@ where
                         path: sample.path,
                         interactive_bytes: sample.delivered_bytes,
                         refine_bytes_total: refine_meter.written_bytes(),
-                        video_backlog: false,
+                        video_backlog: video_waits.has_backlog(),
                         video_frame_wait: sample.mean_frame_wait,
                         video_target_bps: controller.target_bps(),
                     });
@@ -6925,6 +7437,7 @@ where
                 if rate_control_enabled {
                     let hints = arcen_media::rate_control::RateHints {
                         refine_active: refine_tick.is_some_and(|tick| tick.decision.refine_active),
+                        video_backlog: Some(video_writes.unsent(video_waits.has_unsent())),
                         ..arcen_media::rate_control::RateHints::default()
                     };
                     let change = controller.observe_with(sample, hints);
@@ -6964,7 +7477,9 @@ where
                             fps_reason = detail.map(|detail| detail.reason.token()),
                             bitrate_bound = controller.bitrate_bound(),
                             rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
-                            queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                            queue_delay_ms = controller.last_queue_delay().map(|delay| delay.as_millis()),
+                            path_queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                            idle_queue = controller.last_idle_queue(),
                             loss_rate_permille = controller
                                 .last_loss_evidence()
                                 .map(|loss| (loss.rate * 1000.0).round() as u64),
@@ -7012,6 +7527,7 @@ where
     let mut input_events = 0u64;
     let mut last_input_type = "";
     let mut input_sequence = InputSequenceTracker::default();
+    let mut monitor_rates = arcen_observability::MonitorRates::default();
     let mut session_health =
         arcen_observability::SessionHealth::new_with_fps_warmup(initial_qos_targets);
     // The health tracker needs a monotonic clock: a wall-clock step (NTP,
@@ -8068,10 +8584,19 @@ where
                 // capture delivered. A multi-monitor session is not governed.
                 if video_pipelines.pipelines().len() == 1 {
                     if let Some(step) = governor.as_mut().and_then(|governor| {
+                        // What capenc captured plus what the source
+                        // produced while it was away encoding.
+                        let source = arcen_media::video::SourceEvidence {
+                            delivered: (pipeline.capture_fps > 0.0)
+                                .then(|| pipeline.capture_fps.round() as u32),
+                            behind: pipeline
+                                .capture_behind
+                                .map(|behind| u32::try_from(behind).unwrap_or(u32::MAX)),
+                            pacing: None,
+                        };
                         governor.observe(
                             pipeline.encoder_fps.round() as u32,
-                            (pipeline.capture_fps > 0.0)
-                                .then(|| pipeline.capture_fps.round() as u32),
+                            source.source_fps(),
                             asked_fps.load(Ordering::Relaxed),
                         )
                     }) {
@@ -8080,6 +8605,7 @@ where
                     }
                 }
                 let target_fps = governed_fps.load(Ordering::Relaxed).max(1);
+                let (content, monitor_content) = video_pipelines.take_content(target_fps);
                 let counters = arcen_observability::HostCounters {
                     frames_sent: sent_frames,
                     frames_dropped: dropped_frames,
@@ -8087,9 +8613,10 @@ where
                     input_events,
                     last_input_sequence: input_sequence.last_nonzero(),
                     last_input_type,
-                    content: arcen_observability::ContentEvidence::Rate(
-                        video_pipelines.take_content_fps(),
-                    ),
+                    content: arcen_observability::ContentEvidence::Rate(content.fps_content),
+                    outputs: u32::try_from(video_pipelines.pipelines().len()).unwrap_or(1),
+                    // Each monitor at its own rate.
+                    outputs_fps_target: content.fps_target,
                 };
                 let observation = session_health.observe(timestamp_ms, target_fps, counters);
                 if let Some(error) = &observation.clock_error {
@@ -8113,6 +8640,29 @@ where
                 stats.path = path_signal_connection.as_ref().map(|connection| {
                     path_quality.sample(path_quality_started.elapsed(), connection)
                 });
+                // Each monitor's own rate, and the one that fell behind its
+                // content named with why (ADR 0026: degrade visibly).
+                if !monitor_content.is_empty() {
+                    let sent = video_stats.monitor_snapshot();
+                    let counters: Vec<arcen_observability::MonitorCounters> = monitor_content
+                        .iter()
+                        .map(|(monitor, target, content)| arcen_observability::MonitorCounters {
+                            session_monitor_id: *monitor,
+                            fps_target: *target,
+                            frames_sent: sent.get(monitor).map_or(0, |(frames, _)| *frames),
+                            content_fps: *content,
+                        })
+                        .collect();
+                    let (monitors, changes) = monitor_rates.observe(
+                        timestamp_ms,
+                        &counters,
+                        &session_health.targets(),
+                    );
+                    for change in &changes {
+                        arcen_observability::log_monitor_rate_change(change);
+                    }
+                    stats.monitors = monitors;
+                }
                 if let Some((kind, fields)) = observation.transition.as_ref() {
                     crate::emit_lifecycle_event_with_context(
                         emitter,
@@ -9045,6 +9595,27 @@ impl OutboundVideoMux {
         }
     }
 
+    /// A frame is queued that the writer has not taken: motion is waiting,
+    /// so refinement waits too (ADR 0016 R6).
+    fn has_backlog(&self) -> bool {
+        (0..self.roster.len())
+            .filter_map(|index| self.roster.entry(index))
+            .any(|(_, queue)| queue.has_backlog())
+    }
+
+    /// Encoded video waits before the transport: queued, or handed to the
+    /// broker's lane relay and not released by it yet.
+    fn has_unsent(&self) -> bool {
+        let relayed = {
+            let window = self
+                .relayed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            window.is_active() && window.outstanding() != 0
+        };
+        relayed || self.has_backlog()
+    }
+
     fn take_wait_stats(&self) -> arcen_media::video::VideoQueueWaitStats {
         let mut frames = 0_u64;
         let mut total = Duration::ZERO;
@@ -9221,7 +9792,7 @@ async fn writer_loop<S>(
     mut control: mpsc::Receiver<WriterControl>,
     audio_state: Arc<AudioSendState>,
     video_stats: Arc<WriterVideoStats>,
-    video_write_wait_micros: Arc<AtomicU64>,
+    video_writes: Arc<arcen_media::video::VideoWriteMeter>,
 ) -> WriterExit<S>
 where
     S: Sink<Message> + Unpin,
@@ -9235,7 +9806,7 @@ where
         &mut control,
         audio_state,
         video_stats,
-        video_write_wait_micros,
+        video_writes,
     )
     .await;
     WriterExit { sink, result }
@@ -9265,7 +9836,7 @@ async fn writer_loop_inner<S>(
     control: &mut mpsc::Receiver<WriterControl>,
     audio_state: Arc<AudioSendState>,
     video_stats: Arc<WriterVideoStats>,
-    video_write_wait_micros: Arc<AtomicU64>,
+    video_writes: Arc<arcen_media::video::VideoWriteMeter>,
 ) -> Result<(), String>
 where
     S: Sink<Message> + Unpin,
@@ -9315,6 +9886,9 @@ where
                 WriterItem::ClipboardCooldown
             },
         };
+        // A video frame's write, its refinement records included, is in
+        // progress until the transport takes it (`RateHints::video_backlog`).
+        let mut video_write = None;
         let (message, audio_bytes, video_bytes) = match outbound {
             WriterItem::Message(message) => {
                 clipboard_allowed = true;
@@ -9332,6 +9906,7 @@ where
                 refine,
             } => {
                 clipboard_allowed = true;
+                video_write = Some(video_writes.begin());
                 // Fences and barriers immediately precede their frame
                 // (ADR 0016 R2); a dropped frame's records go with this one.
                 if let Some(tag) = refine {
@@ -9401,12 +9976,8 @@ where
                 continue;
             }
         };
-        let write_started = Instant::now();
         send_ws_with_timeout(sink, message, WS_WRITE_TIMEOUT).await?;
-        if video_bytes.is_some() {
-            let micros = u64::try_from(write_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            video_write_wait_micros.fetch_add(micros, Ordering::Relaxed);
-        }
+        drop(video_write);
         if let Some((monitor_id, bytes)) = video_bytes {
             video_stats.record(monitor_id, bytes);
         }
@@ -9803,6 +10374,27 @@ async fn handle_inbound(
                 action.input_type = Some("key_event");
             }
         }
+        GESTURE_MAGNIFY => {
+            if let Some(message) = parse_input::<GestureMagnifyMsg>(text, sequence_tracker) {
+                match injector.gesture_magnify(&message) {
+                    Ok(()) => action.input_type = Some(GESTURE_MAGNIFY),
+                    Err(error) => {
+                        tracing::debug!(target: INPUT, ?error, "invalid gesture_magnify dropped")
+                    }
+                }
+            }
+        }
+        GESTURE_ROTATE | GESTURE_SMART_ZOOM | GESTURE_SWIPE => {
+            if let Some(declined) =
+                arcen_input::gesture_fallback::DeclinedGesture::from_message_type(message_type)
+            {
+                tracing::debug!(
+                    target: INPUT,
+                    gesture = declined.token(),
+                    "gesture declined: no equivalent on this host"
+                );
+            }
+        }
         PEN_EVENT => {
             if region_input.is_some() {
                 log_legacy_pointer_rejected(message_type);
@@ -10014,46 +10606,6 @@ fn log_region_input_rejected(message_type: &str, error: &impl std::fmt::Display)
         %error,
         "region input rejected without advancing the global input sequence"
     );
-}
-
-trait SequencedInput {
-    fn sequence(&self) -> u64;
-}
-
-impl SequencedInput for MouseMoveMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for MouseMoveRelativeMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for MouseButtonMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for MouseScrollMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for KeyEventMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-}
-
-impl SequencedInput for PenEventMsg {
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
 }
 
 trait RegionSequencedInput: DeserializeOwned {
@@ -10374,6 +10926,7 @@ async fn relay_client_and_agent<C, CE, A>(
     lanes: Option<arcen_transport::quic::LaneConnection>,
     path_signal_connection: Option<quinn::Connection>,
     refine_grant: bool,
+    departure: &mut Departure,
 ) -> Result<(), String>
 where
     C: Sink<Message> + Stream<Item = Result<Message, CE>> + Unpin,
@@ -10381,7 +10934,7 @@ where
     CE: std::fmt::Display,
     A: AsyncRead + AsyncWrite + Unpin,
 {
-    match relay_one_attachment(
+    let outcome = relay_one_attachment(
         client,
         agent,
         &windows_session,
@@ -10393,9 +10946,20 @@ where
         path_signal_connection,
         refine_grant,
     )
-    .await
-    {
-        RelayOutcome::ExplicitClose | RelayOutcome::BrokerShutdown => Ok(()),
+    .await;
+    *departure = match &outcome {
+        RelayOutcome::ExplicitClose | RelayOutcome::UnexpectedLoss(_) => Departure::DeckLeft,
+        RelayOutcome::BrokerShutdown => Departure::HostStopping,
+        RelayOutcome::HandedOver => Departure::HandedOver,
+        RelayOutcome::NativeSessionEnded(_) => Departure::SessionChanged,
+        RelayOutcome::AgentFailure(_) | RelayOutcome::ResumeAuthorityFailure(_) => {
+            Departure::AgentFailed
+        }
+    };
+    match outcome {
+        RelayOutcome::ExplicitClose | RelayOutcome::BrokerShutdown | RelayOutcome::HandedOver => {
+            Ok(())
+        }
         RelayOutcome::UnexpectedLoss(reason) => Err(reason.to_string()),
         RelayOutcome::AgentFailure(error) | RelayOutcome::NativeSessionEnded(error) => Err(error),
         RelayOutcome::ResumeAuthorityFailure(error) => {
@@ -10447,6 +11011,8 @@ where
 enum RelayOutcome {
     ExplicitClose,
     BrokerShutdown,
+    /// A fresh sign-in of the same account took the session over.
+    HandedOver,
     UnexpectedLoss(&'static str),
     AgentFailure(String),
     NativeSessionEnded(String),
@@ -10473,6 +11039,45 @@ fn resumable_write_timeout(window_secs: u32) -> Duration {
     WS_WRITE_TIMEOUT.min(resume_refresh_interval(window_secs))
 }
 
+/// A desktop the broker held for its Deck's resume and let go of without a
+/// resume: why, for how long, and the attachment's latest session id.
+struct ResumeHoldReport {
+    end: ResumeHoldEnd,
+    held: Duration,
+    session_log_id: Option<CorrelationId>,
+}
+
+/// Emits `RESUME_HOLD_ENDED` (1108), so an administrator sees why Arcen let
+/// go of a held desktop at every log profile, as the Linux Pier does.
+fn emit_resume_hold_ended(
+    emitter: &LifecycleEmitter,
+    session_log_id: &CorrelationId,
+    hold: ResumeHoldReport,
+    user: &str,
+    peer: &str,
+) {
+    tracing::info!(
+        target: SESSION,
+        reason_class = hold.end.token(),
+        held_ms = u64::try_from(hold.held.as_millis()).unwrap_or(u64::MAX),
+        "the resume hold ended; Arcen let go of the desktop"
+    );
+    let Some(fields) = hold.end.fields(hold.held) else {
+        return;
+    };
+    crate::emit_lifecycle_event_with_context(
+        emitter,
+        LifecycleEventKind::ResumeHoldEnded,
+        hold.session_log_id
+            .unwrap_or_else(|| session_log_id.clone()),
+        fields,
+        Some(user.to_owned()),
+        local_hostname(),
+        Some(peer.to_owned()),
+        None,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn relay_resumable_client_and_agent<A>(
     mut client: crate::resume::DirectSessionSocket,
@@ -10487,6 +11092,8 @@ async fn relay_resumable_client_and_agent<A>(
     session_shutdown: &mut watch::Receiver<bool>,
     incumbent: Option<&arcen_transport::quic::IncumbentRegistration>,
     refine_grant: bool,
+    departure: &mut Departure,
+    hold_report: &mut Option<ResumeHoldReport>,
 ) -> Result<(), String>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -10494,6 +11101,12 @@ where
     let policy = ReconnectPolicy::new(reconnect_window_secs)
         .map_err(|error| format!("invalid reconnect policy: {error}"))?;
     let mut reconnect = DirectReconnect::new(policy);
+    *departure = Departure::AgentFailed;
+    // While the desktop is held for the Deck's resume: since when, and why
+    // the hold ends if it ends without a resume (`RESUME_HOLD_ENDED`).
+    let mut held_since: Option<std::time::Instant> = None;
+    let mut hold_end = ResumeHoldEnd::OwnerFailed;
+    let mut resumed_session_log_id: Option<CorrelationId> = None;
     let result = async {
         'session: loop {
         // Per attachment: a resumed Deck arrives on a new connection.
@@ -10523,11 +11136,19 @@ where
             RelayOutcome::ExplicitClose => {
                 let _ =
                     reconnect.apply(ReconnectEvent::ExplicitDisconnect, registry.monotonic_now());
+                *departure = Departure::DeckLeft;
                 break Ok(());
             }
             RelayOutcome::BrokerShutdown => {
                 let _ =
                     reconnect.apply(ReconnectEvent::ExplicitDisconnect, registry.monotonic_now());
+                *departure = Departure::HostStopping;
+                break Ok(());
+            }
+            RelayOutcome::HandedOver => {
+                let _ =
+                    reconnect.apply(ReconnectEvent::ExplicitDisconnect, registry.monotonic_now());
+                *departure = Departure::HandedOver;
                 break Ok(());
             }
             RelayOutcome::AgentFailure(error) => {
@@ -10537,6 +11158,7 @@ where
             RelayOutcome::NativeSessionEnded(error) => {
                 let _ =
                     reconnect.apply(ReconnectEvent::NativeSessionEnded, registry.monotonic_now());
+                *departure = Departure::SessionChanged;
                 break Err(error);
             }
             RelayOutcome::ResumeAuthorityFailure(error) => {
@@ -10552,12 +11174,14 @@ where
                     target: SESSION,
                     "a same-user sign-in displaced this silent attachment; handing the desktop over"
                 );
+                *departure = Departure::HandedOver;
                 break Ok(());
             }
             RelayOutcome::UnexpectedLoss(reason) => {
                 let actions =
                     reconnect.apply(ReconnectEvent::UnexpectedLoss, registry.monotonic_now());
                 if !actions.hold_restore_leases {
+                    *departure = Departure::DeckLeft;
                     break Err("unexpected transport loss is not resumable".to_string());
                 }
                 registry
@@ -10575,6 +11199,8 @@ where
                     AGENT_ATTACHMENT_TIMEOUT,
                 )
                 .await?;
+                held_since = Some(std::time::Instant::now());
+                hold_end = ResumeHoldEnd::OwnerFailed;
                 tracing::info!(
                     target: SESSION,
                     reason_class = reason,
@@ -10597,6 +11223,8 @@ where
                     if now >= deadline {
                         let _ = reconnect
                             .apply(ReconnectEvent::DeadlineReached { timer_generation }, now);
+                        *departure = Departure::ReconnectWindowEnded;
+                        hold_end = ResumeHoldEnd::WindowExpired;
                         break 'session Err("direct resume window expired".to_string());
                     }
                     let remaining_ms = deadline.get().saturating_sub(now.get());
@@ -10609,6 +11237,8 @@ where
                                 ReconnectEvent::DeadlineReached { timer_generation },
                                 registry.monotonic_now(),
                             );
+                            *departure = Departure::ReconnectWindowEnded;
+                            hold_end = ResumeHoldEnd::WindowExpired;
                             break 'session Err("direct resume window expired".to_string());
                         }
                         () = wait_displaced(incumbent) => {
@@ -10620,6 +11250,8 @@ where
                                 target: SESSION,
                                 "a same-user sign-in displaced this detached attachment; handing the desktop over"
                             );
+                            *departure = Departure::HandedOver;
+                            hold_end = ResumeHoldEnd::SameUserReattached;
                             break 'session Ok(());
                         }
                         command = commands.recv() => {
@@ -10630,6 +11262,9 @@ where
                                         ReconnectEvent::BeginResume,
                                         registry.monotonic_now(),
                                     );
+                                    // Until the resume is accepted, an end
+                                    // is its refusal.
+                                    hold_end = ResumeHoldEnd::ResumeRefused;
                                     tracing::info!(
                                         target: SESSION,
                                         sid = %handoff.session_log_id,
@@ -10644,12 +11279,20 @@ where
                                     .await
                                     .map_err(|_| "Windows resume observation task failed".to_string())
                                     .and_then(|result| result);
-                                    if observed.is_err() {
+                                    if let Err(error) = observed {
+                                        let refusal = ConsoleRefusal::SessionChanged;
+                                        tracing::warn!(
+                                            target: SESSION,
+                                            reason_class = refusal.token(),
+                                            %error,
+                                            "the returning Deck is refused: its session is no longer the one it joined"
+                                        );
                                         let _ = send_resume_rejection(
                                             &mut handoff.socket,
-                                            "native session identity changed",
+                                            refusal.deck_reason(),
                                             ResumeErrorCode::NativeIdentityChanged,
                                         ).await;
+                                        *departure = Departure::SessionChanged;
                                         break 'session Err("native session identity changed".to_string());
                                     }
                                     send_json(
@@ -10669,6 +11312,7 @@ where
                                                 "resume topology changed",
                                                 ResumeErrorCode::TopologyChanged,
                                             ).await;
+                                            *departure = Departure::ReconnectWindowEnded;
                                             break 'session Err("held display topology changed".to_string());
                                         }
                                     }
@@ -10678,6 +11322,7 @@ where
                                             "resume grant expired",
                                             ResumeErrorCode::Expired,
                                         ).await;
+                                        *departure = Departure::ReconnectWindowEnded;
                                         break 'session Err("direct resume window expired".to_string());
                                     }
                                     if let Err(error) = send_successor_auth_result_or_drain(
@@ -10694,6 +11339,8 @@ where
                                             ReconnectEvent::OwnerCrashed,
                                             registry.monotonic_now(),
                                         );
+                                        *departure = Departure::ReconnectWindowEnded;
+                                        hold_end = ResumeHoldEnd::OwnerFailed;
                                         break 'session Err(format!(
                                             "resume successor delivery failed: {error:?}"
                                         ));
@@ -10709,6 +11356,7 @@ where
                                         AgentAttachmentCommand::TYPE,
                                     ).await?;
                                     client = handoff.socket;
+                                    resumed_session_log_id = Some(handoff.session_log_id.clone());
                                     if let (Some(incumbent), Some(connection)) =
                                         (incumbent, client.path_signal_connection())
                                     {
@@ -10721,6 +11369,7 @@ where
                                         ReconnectEvent::ResumeAccepted,
                                         registry.monotonic_now(),
                                     );
+                                    held_since = None;
                                     continue 'session;
                                 }
                                 Some(crate::resume::OwnerCommand::Terminal) => {
@@ -10728,13 +11377,30 @@ where
                                         ReconnectEvent::OwnerCrashed,
                                         registry.monotonic_now(),
                                     );
+                                    *departure = Departure::ReconnectWindowEnded;
+                                    hold_end = ResumeHoldEnd::OwnerFailed;
                                     break 'session Err("resume binding became terminal".to_string());
+                                }
+                                Some(crate::resume::OwnerCommand::TakenOver) => {
+                                    let _ = reconnect.apply(
+                                        ReconnectEvent::ExplicitDisconnect,
+                                        registry.monotonic_now(),
+                                    );
+                                    tracing::info!(
+                                        target: SESSION,
+                                        "a fresh sign-in of the same user pre-empted this detached session; handing the desktop over"
+                                    );
+                                    *departure = Departure::HandedOver;
+                                    hold_end = ResumeHoldEnd::FreshSignIn;
+                                    break 'session Ok(());
                                 }
                                 Some(crate::resume::OwnerCommand::BrokerShutdown) | None => {
                                     let _ = reconnect.apply(
                                         ReconnectEvent::ExplicitDisconnect,
                                         registry.monotonic_now(),
                                     );
+                                    *departure = Departure::HostStopping;
+                                    hold_end = ResumeHoldEnd::PierStopping;
                                     break 'session Ok(());
                                 }
                             }
@@ -10763,11 +11429,22 @@ where
                         _ = monitor.tick() => {
                             let identity = windows_session.clone();
                             let sid = native_user_sid.clone();
-                            tokio::task::spawn_blocking(move || {
+                            let observed = tokio::task::spawn_blocking(move || {
                                 crate::windows_session::observe_resumable_bound(&identity, &sid)
                             })
                             .await
-                            .map_err(|_| "Windows detached-session monitor task failed".to_string())??;
+                            .map_err(|_| "Windows detached-session monitor task failed".to_string())?;
+                            if let Err(error) = observed {
+                                tracing::info!(
+                                    target: SESSION,
+                                    reason_class = ConsoleRefusal::SessionChanged.token(),
+                                    %error,
+                                    "the held session changed at the workstation; its resume ends"
+                                );
+                                *departure = Departure::SessionChanged;
+                                hold_end = ResumeHoldEnd::NativeSessionEnded;
+                                break 'session Err(error);
+                            }
                         }
                         changed = session_shutdown.changed() => {
                             if changed.is_err() || *session_shutdown.borrow() {
@@ -10775,6 +11452,8 @@ where
                                     ReconnectEvent::ExplicitDisconnect,
                                     registry.monotonic_now(),
                                 );
+                                *departure = Departure::HostStopping;
+                                hold_end = ResumeHoldEnd::PierStopping;
                                 break 'session Ok(());
                             }
                         }
@@ -10785,6 +11464,11 @@ where
     }
     }
     .await;
+    *hold_report = held_since.map(|since| ResumeHoldReport {
+        end: hold_end,
+        held: since.elapsed(),
+        session_log_id: resumed_session_log_id,
+    });
     match registry.begin_drain(&active_session_id) {
         Ok(()) => result,
         Err(error) => {
@@ -10895,6 +11579,9 @@ where
     path_signal_tick.tick().await;
     let mut path_signal_state = arcen_telemetry::PathSignalState::default();
     let path_signal_started = tokio::time::Instant::now();
+    // The agent owns no connection, so the broker measures the path its
+    // `health_stats` carry to the Deck, as the macOS network service does.
+    let mut path_quality = arcen_transport::PathQualityTracker::default();
     let mut refresh_interval: Option<tokio::time::Interval> = None;
     let mut agent_streaming = false;
     let require_active_session = resumable.is_some();
@@ -11077,6 +11764,7 @@ where
                     Some(crate::resume::OwnerCommand::BrokerShutdown)
                     | Some(crate::resume::OwnerCommand::Terminal)
                     | None => return RelayOutcome::BrokerShutdown,
+                    Some(crate::resume::OwnerCommand::TakenOver) => return RelayOutcome::HandedOver,
                     Some(crate::resume::OwnerCommand::Resume(_)) => {
                         return RelayOutcome::AgentFailure(
                             "resume handoff arrived while attachment was active".to_string()
@@ -11122,6 +11810,14 @@ where
                             "session agent returned an unexpected attachment status".to_string()
                         );
                     }
+                    let text = match path_signal_connection.as_ref().and_then(|connection| {
+                        arcen_observability::health_stats_with_path(text.as_ref(), || {
+                            path_quality.sample(path_signal_started.elapsed(), connection)
+                        })
+                    }) {
+                        Some(filled) => filled.into(),
+                        None => text,
+                    };
                     let Some(message) = route_to_deck(lane_relay.as_mut().map(|relay| &mut relay.0), Message::Text(text)) else {
                         continue;
                     };
@@ -12144,10 +12840,12 @@ mod tests {
             fps: 30,
             fps_ceiling: None,
             deck_display_refresh_hz: None,
+            deck_monitor_refresh_hz: Vec::new(),
             frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
+            local_playback: arcen_session::pier_config::LocalPlayback::Muted,
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
@@ -12356,10 +13054,6 @@ mod tests {
         assert_eq!(
             display_policy_name(crate::display::DisplayPolicy::Negotiated),
             "negotiated"
-        );
-        assert_eq!(
-            display_policy_name(crate::display::DisplayPolicy::NegotiatedMacroblock16),
-            "negotiated_macroblock16"
         );
     }
 
@@ -13126,10 +13820,12 @@ mod tests {
             fps: 60,
             fps_ceiling: None,
             deck_display_refresh_hz: None,
+            deck_monitor_refresh_hz: Vec::new(),
             frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
+            local_playback: arcen_session::pier_config::LocalPlayback::Muted,
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
@@ -13183,6 +13879,141 @@ mod tests {
     }
 
     #[test]
+    fn an_sdr_display_runs_at_the_served_rate_where_an_edid_carries_it() {
+        use crate::display::{served_display_refresh_hz, DisplayRequest, DisplaySize};
+        let size = |width, height| DisplaySize { width, height };
+        // A 120 Hz Deck panel served 120 fps on a 60 Hz requested mode.
+        assert_eq!(served_display_refresh_hz(120, 60, size(1920, 1080)), 120);
+        // Never below the requested mode; never doubled.
+        assert_eq!(served_display_refresh_hz(30, 60, size(1920, 1080)), 60);
+        assert_eq!(served_display_refresh_hz(60, 30, size(1920, 1080)), 60);
+        // A Retina size no EDID timing carries at 120 Hz keeps its mode.
+        assert_eq!(served_display_refresh_hz(120, 60, size(3456, 2234)), 60);
+        // A live resize into a Retina size fits the refresh again.
+        let mut request = DisplayRequest::new(1728, 1116).expect("request");
+        request.refresh_hz = 60;
+        request.deck_refresh_hz = 60;
+        request.sdr_stream_fps = 120;
+        assert_eq!(request.refresh_for(request.size), Ok(120));
+        assert_eq!(request.refresh_for(size(3456, 2234)), Ok(60));
+    }
+
+    #[test]
+    fn every_multi_monitor_display_runs_at_its_own_served_rate() {
+        use arcen_protocol::messages::{
+            AuthMultiMonitorRequestMsg, ClientDisplayId, MonitorQualityIntentMsg,
+            MultiMonitorCarrierMsg, RequestedMonitorDescriptorMsg, RequestedMonitorTopologyMsg,
+            RotationMsg, SafeAreaPolicyMsg,
+        };
+        let mut cfg = crate::parse_args_from(
+            [
+                "--no-config",
+                "--tls-cert",
+                "host.crt",
+                "--tls-key",
+                "host.key",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .expect("args")
+        .config;
+        cfg.requested_pipeline = Some(arcen_media::video::PipelineId::Auto);
+        cfg.fps = 120;
+        cfg.frame_rate = Some(arcen_media::video::SessionFrameRate {
+            fps: 120,
+            display_refresh_hz: Some(120),
+            basis: arcen_media::video::FrameRateBasis::Display,
+        });
+        cfg.multi_monitor.nvidia_headless_enabled = Some(true);
+        cfg.deck_monitor_refresh_hz = vec![
+            ("slow".to_owned(), 30),
+            ("fast".to_owned(), 120),
+            ("portrait".to_owned(), 120),
+            ("retina".to_owned(), 120),
+        ];
+        let monitor = |id: &str, x: i32, (width_px, height_px): (u32, u32), rotation| {
+            RequestedMonitorDescriptorMsg {
+                client_display_id: ClientDisplayId::new(id.to_owned()).expect("id"),
+                client_monitor_id: x.unsigned_abs(),
+                x,
+                y: 0,
+                width_px,
+                height_px,
+                logical_width: width_px,
+                logical_height: height_px,
+                scale: 1.0,
+                refresh_hz: 60,
+                rotation,
+                is_primary: x == 0,
+                name: id.to_owned(),
+                width_mm: 0.0,
+                height_mm: 0.0,
+                vendor: 0,
+                model: 0,
+                serial: 0,
+                edid: String::new(),
+                color: None,
+                safe_area_policy: SafeAreaPolicyMsg::StandardFullscreen,
+                quality_intent: MonitorQualityIntentMsg::HostDefault,
+            }
+        };
+        let request = AuthMultiMonitorRequestMsg::new(
+            RequestedMonitorTopologyMsg::new(vec![
+                monitor("slow", 0, (1920, 1080), RotationMsg::Degrees0),
+                monitor("fast", 1920, (1920, 1080), RotationMsg::Degrees0),
+                monitor("portrait", 3840, (1080, 1920), RotationMsg::Degrees90),
+                monitor("retina", 4920, (3456, 2234), RotationMsg::Degrees0),
+            ])
+            .expect("topology"),
+            vec![MultiMonitorCarrierMsg::MuxedReliableStream],
+        )
+        .expect("request");
+
+        let served = served_multi_monitor_request(&cfg, &request).expect("served");
+        let refresh: Vec<u32> = served
+            .requested_topology()
+            .monitors()
+            .iter()
+            .map(|monitor| monitor.refresh_hz)
+            .collect();
+        // The 30 Hz display keeps the requested mode; the 120 Hz ones run at
+        // 120 where an EDID timing carries it, quarter-turned too; a Retina
+        // size no timing carries at 120 keeps its mode.
+        assert_eq!(refresh, [60, 120, 120, 60]);
+        assert_eq!(
+            served.requested_topology().monitors()[2].width_px,
+            1080,
+            "only the refresh changes"
+        );
+        let refreshes = |cfg: &HostConfig| -> Vec<u32> {
+            served_multi_monitor_request(cfg, &request)
+                .expect("served")
+                .requested_topology()
+                .monitors()
+                .iter()
+                .map(|monitor| monitor.refresh_hz)
+                .collect()
+        };
+        // An IddCx connector runs at most at its own limit.
+        cfg.deck_monitor_refresh_hz[1].1 = 144;
+        cfg.fps = 144;
+        cfg.frame_rate = cfg
+            .frame_rate
+            .map(|rate| arcen_media::video::SessionFrameRate {
+                fps: 144,
+                display_refresh_hz: Some(144),
+                ..rate
+            });
+        cfg.multi_monitor.nvidia_headless_enabled = None;
+        cfg.iddcx.enabled = true;
+        assert_eq!(refreshes(&cfg)[1], crate::iddcx::MAX_REFRESH_HZ);
+        // Physical outputs keep the modes they list.
+        cfg.iddcx.enabled = false;
+        assert_eq!(refreshes(&cfg), [60, 60, 60, 60]);
+    }
+
+    #[test]
     fn a_retina_hdr_display_is_created_at_a_refresh_its_link_carries() {
         // A 60 fps host profile still paces HDR at the contract's 30 fps.
         assert_eq!(hdr10_display_refresh_hz(60, 3600, 2260, 60), Ok(30));
@@ -13215,10 +14046,12 @@ mod tests {
             fps: 30,
             fps_ceiling: None,
             deck_display_refresh_hz: None,
+            deck_monitor_refresh_hz: Vec::new(),
             frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::NativeNvenc,
             audio_enabled: true,
             audio_compressed: false,
+            local_playback: arcen_session::pier_config::LocalPlayback::Muted,
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
@@ -13285,10 +14118,12 @@ mod tests {
             fps: 30,
             fps_ceiling: None,
             deck_display_refresh_hz: None,
+            deck_monitor_refresh_hz: Vec::new(),
             frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
+            local_playback: arcen_session::pier_config::LocalPlayback::Muted,
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
@@ -13335,10 +14170,12 @@ mod tests {
                 session_monitor_id: 2,
                 device_name: r"\\.\DISPLAY6".to_string(),
                 requested_scale_percent: 200,
+                step_percent: 200,
                 effective_dpi_x: 96,
                 effective_dpi_y: 96,
                 effective_scale_percent: 100,
                 matches_requested: false,
+                matches_step: false,
             }],
         };
 
@@ -13596,6 +14433,7 @@ mod tests {
         let compressed_hello = build_server_hello(
             &HostConfig {
                 audio_compressed: true,
+                local_playback: arcen_session::pier_config::LocalPlayback::Muted,
                 ..cfg.clone()
             },
             &report,
@@ -14090,10 +14928,12 @@ mod tests {
             fps: 60,
             fps_ceiling: None,
             deck_display_refresh_hz: None,
+            deck_monitor_refresh_hz: Vec::new(),
             frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: true,
             audio_compressed: false,
+            local_playback: arcen_session::pier_config::LocalPlayback::Muted,
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
@@ -14330,10 +15170,12 @@ mod tests {
             fps: 30,
             fps_ceiling: None,
             deck_display_refresh_hz: None,
+            deck_monitor_refresh_hz: Vec::new(),
             frame_rate: None,
             encoder: arcen_media::video::EncoderRequest::Auto,
             audio_enabled: false,
             audio_compressed: false,
+            local_playback: arcen_session::pier_config::LocalPlayback::Muted,
             microphone_input_enabled: false,
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
@@ -14681,7 +15523,7 @@ mod tests {
             control_rx,
             Arc::new(AudioSendState::default()),
             Arc::new(WriterVideoStats::default()),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         );
         let result = tokio::time::timeout(Duration::from_millis(50), writer)
             .await
@@ -14735,7 +15577,7 @@ mod tests {
             control_rx,
             Arc::new(AudioSendState::default()),
             Arc::new(WriterVideoStats::default()),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         );
         // The writer keeps waiting for more; what it wrote so far is what
         // matters.
@@ -14792,7 +15634,7 @@ mod tests {
             control_rx,
             Arc::new(AudioSendState::default()),
             Arc::clone(&rejected_stats),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         )
         .await
         .result
@@ -14829,7 +15671,7 @@ mod tests {
             control_rx,
             Arc::new(AudioSendState::default()),
             Arc::clone(&delivered_stats),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
             while delivered_stats.snapshot() != (1, 4) {
@@ -14902,7 +15744,7 @@ mod tests {
             control_rx,
             audio_state,
             Arc::new(WriterVideoStats::default()),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         ));
 
         tokio::time::timeout(Duration::from_millis(100), async {
@@ -14959,7 +15801,7 @@ mod tests {
             control_rx,
             Arc::clone(&audio_state),
             Arc::new(WriterVideoStats::default()),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         ));
         let policy = AudioPolicy {
             opus_available: true,
@@ -15116,7 +15958,7 @@ mod tests {
             control_rx,
             Arc::new(AudioSendState::default()),
             Arc::new(WriterVideoStats::default()),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         )
         .await
         .unwrap();
@@ -15148,7 +15990,7 @@ mod tests {
             control_rx,
             runtime.send_state(),
             Arc::new(WriterVideoStats::default()),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         ));
 
         runtime
@@ -15348,7 +16190,7 @@ mod tests {
             control_rx,
             audio_state,
             Arc::new(WriterVideoStats::default()),
-            Arc::new(AtomicU64::new(0)),
+            Arc::default(),
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
             while sent.lock().unwrap().len() < 2 {
@@ -15560,28 +16402,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "wss-compat")]
-    fn transport_negotiation_sanitizes_unknown_entries_and_keeps_wss() {
-        let input = [
-            "unknown:cap".to_string(),
-            CAPABILITY_TRANSPORT_WSS.to_string(),
-            arcen_protocol::CAPABILITY_TRANSPORT_QUIC.to_string(),
-            "transport:bogus-v9".to_string(),
-        ];
-        assert_eq!(
-            negotiate_client_transport(&input, CAPABILITY_TRANSPORT_WSS),
-            Some(CAPABILITY_TRANSPORT_WSS.to_string())
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "wss-compat")]
-    fn transport_negotiation_returns_none_for_no_common_capability() {
-        let input = [CAPABILITY_TRANSPORT_QUIC.to_string()];
-        assert!(negotiate_client_transport(&input, CAPABILITY_TRANSPORT_WSS).is_none());
-    }
-
-    #[test]
     fn quic_transport_requires_and_accepts_the_quic_capability() {
         let input = [CAPABILITY_TRANSPORT_QUIC.to_string()];
         assert_eq!(
@@ -15589,15 +16409,6 @@ mod tests {
             Some(CAPABILITY_TRANSPORT_QUIC.to_string())
         );
         assert!(negotiate_client_transport(&[], CAPABILITY_TRANSPORT_QUIC).is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "wss-compat")]
-    fn legacy_client_without_transport_capabilities_uses_wss() {
-        assert_eq!(
-            negotiate_client_transport(&[], CAPABILITY_TRANSPORT_WSS),
-            Some(CAPABILITY_TRANSPORT_WSS.to_string())
-        );
     }
 
     mod color_negotiation {
@@ -15956,8 +16767,6 @@ fn test_media_plan(
 }
 fn validate_direct_transport(value: &str) -> Result<&'static str, String> {
     match value {
-        #[cfg(feature = "wss-compat")]
-        CAPABILITY_TRANSPORT_WSS => Ok(CAPABILITY_TRANSPORT_WSS),
         CAPABILITY_TRANSPORT_QUIC => Ok(CAPABILITY_TRANSPORT_QUIC),
         _ => Err("direct transport capability is invalid".to_string()),
     }
@@ -15981,10 +16790,6 @@ fn negotiate_client_transport(
     active_transport: &'static str,
 ) -> Option<String> {
     if client_capabilities.is_empty() {
-        #[cfg(feature = "wss-compat")]
-        if active_transport == CAPABILITY_TRANSPORT_WSS {
-            return Some(CAPABILITY_TRANSPORT_WSS.to_string());
-        }
         return None;
     }
     let sanitized = sanitize_transport_capabilities(client_capabilities);

@@ -61,6 +61,14 @@ pub const MAX_HEAD_DIMENSION_PX: u32 = 7680;
 /// (`shared/media/src/video/plan.rs` NVENC `BackendLimits`). Both hardware
 /// release targets (4x1920x1080 and 2x3840x2160) fit well inside this bound.
 pub const MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX: u32 = 8192;
+/// Maximum X screen extent a joined console's layout is planned within.
+/// Each console monitor is captured and encoded on its own (one NvFBC or
+/// XShm capture of its RandR output, one encoder each), so no stream spans
+/// the screen and the encoder's ceiling above does not bound it; the X
+/// protocol's signed 16-bit coordinates do. The console's own X server
+/// proves its real maximum (RandR `GetScreenSizeRange`) before the layout
+/// is applied (`session::console_layout::apply`).
+pub const MAX_CONSOLE_SCREEN_DIMENSION_PX: u32 = 32_767;
 
 /// Representative NVIDIA RandR output tokens for tests and examples. Runtime
 /// validation accepts any syntactically valid `DFP-N` token reported by the
@@ -185,10 +193,8 @@ pub enum LinuxTopologyError {
     OddMonitorDimensions(String, u32, u32),
     #[error("monitor {0:?} requests rotation {1:?}, which assigned head {2:?} does not support")]
     UnsupportedRotationForHead(String, Rotation, String),
-    #[error(
-        "planned virtual framebuffer {0}x{1} exceeds the maximum {MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX}x{MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX}"
-    )]
-    VirtualFramebufferTooLarge(u32, u32),
+    #[error("planned virtual framebuffer {0}x{1} exceeds the maximum {2}x{2}")]
+    VirtualFramebufferTooLarge(u32, u32, u32),
     #[error("monitor {0:?} scale cannot be represented in shared Scale120 units")]
     RegionScaleOutOfRange(String),
     #[error("requested/applied topology is invalid: {0}")]
@@ -256,6 +262,11 @@ pub struct LinuxMonitorPlan {
     /// The client display's physical height in millimetres (zero unknown).
     pub height_mm: u32,
 }
+
+/// The refresh a dedicated multi-head Xorg desktop's heads run at: their
+/// MetaModes take the driver's default mode (`nvidia-auto-select`), which
+/// planning does not fit to a refresh.
+pub const DEDICATED_XORG_HEAD_REFRESH_HZ: u32 = 60;
 
 /// Which kind of outputs serve a Linux topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -663,6 +674,26 @@ pub fn plan_topology(
     generation: TopologyGeneration,
     inventory: &HeadInventory,
 ) -> Result<LinuxTopologyPlan, LinuxTopologyError> {
+    plan_topology_within(
+        requested,
+        generation,
+        inventory,
+        MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX,
+    )
+}
+
+/// [`plan_topology`] within an X screen of at most `max_screen_edge` pixels
+/// a side ([`MAX_CONSOLE_SCREEN_DIMENSION_PX`] for a joined console).
+///
+/// # Errors
+///
+/// As [`plan_topology`].
+pub fn plan_topology_within(
+    requested: &RequestedMonitorTopology,
+    generation: TopologyGeneration,
+    inventory: &HeadInventory,
+    max_screen_edge: u32,
+) -> Result<LinuxTopologyPlan, LinuxTopologyError> {
     let monitors = requested.monitors();
     if monitors.len() > inventory.len() {
         return Err(LinuxTopologyError::InsufficientHeads {
@@ -760,12 +791,11 @@ pub fn plan_topology(
         AppliedMonitorTopology::new(generation, translated)?
     };
 
-    if bounds.width > MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX
-        || bounds.height > MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX
-    {
+    if bounds.width > max_screen_edge || bounds.height > max_screen_edge {
         return Err(LinuxTopologyError::VirtualFramebufferTooLarge(
             bounds.width,
             bounds.height,
+            max_screen_edge,
         ));
     }
 
@@ -1232,7 +1262,36 @@ mod tests {
         .expect("requested");
         assert_eq!(
             plan_topology(&requested, generation(), &inventory(3)),
-            Err(LinuxTopologyError::VirtualFramebufferTooLarge(12288, 2160))
+            Err(LinuxTopologyError::VirtualFramebufferTooLarge(
+                12288,
+                2160,
+                MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX
+            ))
+        );
+    }
+
+    #[test]
+    fn a_console_screen_may_span_more_than_one_encoder() {
+        // Two 5K monitors side by side: each is its own stream, so only the
+        // X screen bounds the layout.
+        let requested = RequestedMonitorTopology::new(vec![
+            requested_monitor("a", 0, 0, 5120, 2880, true, Rotation::Degrees0),
+            requested_monitor("b", 5120, 0, 5120, 2880, false, Rotation::Degrees0),
+        ])
+        .expect("requested");
+        let plan = plan_topology_within(
+            &requested,
+            generation(),
+            &inventory(2),
+            MAX_CONSOLE_SCREEN_DIMENSION_PX,
+        )
+        .expect("a console takes two 5K monitors");
+        assert_eq!((plan.virtual_width, plan.virtual_height), (10240, 2880));
+        assert_eq!(
+            plan_topology_within(&requested, generation(), &inventory(2), 8192),
+            Err(LinuxTopologyError::VirtualFramebufferTooLarge(
+                10240, 2880, 8192
+            ))
         );
     }
 

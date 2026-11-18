@@ -37,6 +37,25 @@ pub fn service_start(component: &str, version: &str, pid: u32) -> Option<Structu
     Some(fields)
 }
 
+/// Builds the fields for `RESUME_HOLD_ENDED`.
+///
+/// `reason_class` says why the Pier let go of the desktop it held for its
+/// Deck's resume; `held_ms` how long it held it.
+#[must_use]
+pub fn resume_hold_ended(reason_class: &str, held_ms: u64) -> Option<StructuredFields> {
+    let mut fields = StructuredFields::default();
+    fields
+        .insert("reason_class", FieldValue::String(reason_class.to_owned()))
+        .ok()?;
+    fields
+        .insert(
+            "held_ms",
+            FieldValue::Integer(i64::try_from(held_ms).unwrap_or(i64::MAX)),
+        )
+        .ok()?;
+    Some(fields)
+}
+
 /// Builds the fields for `SESSION_AUTH_OK`.
 ///
 /// `identity_binding` says what the authenticated account was tied to — the

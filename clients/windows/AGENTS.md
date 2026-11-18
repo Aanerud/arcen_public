@@ -95,6 +95,14 @@ the moment Windows delivers them, before winit and egui see the message;
 the UI pass only publishes routing. Keep pointer events in order at their
 own positions, and release held keys on focus loss.
 
+The session window's UI passes begin at most once per refresh of its
+display (shared `arcen_deck_core::ui_pacing::PassPacer`, as on the Mac):
+egui asks for two more passes after every input pass, and a held pass runs
+when due through `repaint_at`. A resize or scale change runs at once. Text
+that changes on every pass presents the overlay on every pass, which moves
+the video's DWM deadline: pace it (Stream Statistics uses
+`ui_pacing::PacedValue`, `STATS_PANEL_REFRESH`).
+
 ## Native tablet
 
 The Native option stays visible but greyed, with the shared guidance

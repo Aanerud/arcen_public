@@ -44,7 +44,13 @@ and a fallback path that could quietly reverse that decision.
   may remain in source only behind the default-off `wss-compat` Cargo feature
   (with the matching `arcen-protocol` and `arcen-transport` features).
   Packaging, CI product builds, and release automation must never enable that
-  feature.
+  feature. *Amended 2026-11-18:* with both Decks QUIC-only, the Piers' dormant
+  listener, the `wss-compat` features of both Piers, `arcen-protocol` and
+  `arcen-transport`, the `transport:wss-v1` capability, the TLS 1.2 posture
+  and the transport fallback policy are removed from source, and
+  `tokio-rustls` (with `http`, `httparse`, `sha1`) leaves the lockfile.
+  Tungstenite stays only as the in-process message type and lane framing
+  codec.
 - Installers open only UDP `18444` and remove the legacy TCP `18443` firewall
   rule when upgrading.
 - CI verifies product feature graphs contain no `wss-compat`, TLS 1.2,

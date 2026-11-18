@@ -101,6 +101,14 @@ pub struct StreamStats {
     /// proves the content rate only when every display showed evidence.
     #[serde(skip)]
     pub unchanged_per_display: Vec<u64>,
+    /// Frames carrying changed content each display's capture handed over
+    /// (captured or shed), in display order; multi-display sessions only.
+    #[serde(skip)]
+    pub offered_per_display: Vec<u64>,
+    /// Frames sent per display, in display order; multi-display sessions
+    /// only.
+    #[serde(skip)]
+    pub sent_per_display: Vec<u64>,
     /// Audio packets dropped because they were too old to play in time.
     ///
     /// Reported rather than silent: a non-zero count says the host could not
@@ -700,6 +708,7 @@ async fn drive_writer<S>(
     sink: &mut S,
     priority: &mut tokio::sync::mpsc::Receiver<Message>,
     bulk: &mut tokio::sync::mpsc::Receiver<Message>,
+    bulk_writes: &arcen_media::video::VideoWriteMeter,
 ) -> Result<(), StreamError>
 where
     S: futures_util::Sink<Message> + Unpin,
@@ -713,23 +722,27 @@ where
     let mut priority_open = true;
     let mut bulk_open = true;
     while priority_open || bulk_open {
-        let message = tokio::select! {
+        let (message, from_bulk) = tokio::select! {
             biased;
             message = priority.recv(), if priority_open => {
                 if message.is_none() {
                     priority_open = false;
                 }
-                message
+                (message, false)
             }
             message = bulk.recv(), if bulk_open => {
                 if message.is_none() {
                     bulk_open = false;
                 }
-                message
+                (message, true)
             }
         };
         if let Some(message) = message {
+            // Video (and the refinement records on its queue) is unsent
+            // until the transport takes it (`RateHints::video_backlog`).
+            let write = from_bulk.then(|| bulk_writes.begin());
             send_message(sink, message).await?;
+            drop(write);
         }
     }
     Ok(())
@@ -874,6 +887,8 @@ enum Incoming {
     Continue,
     /// Transport path signal injected by a split service relay.
     PathSignal(arcen_telemetry::PathSignal),
+    /// The lane relay's running count of video frames it is done with.
+    VideoReleased(u64),
     /// Handled, and the client is owed this answer.
     Reply(String),
     /// A `health_ping`: the client is owed the pong, and the client
@@ -932,13 +947,16 @@ fn handle_control(
                     telemetry: health_ping.client_telemetry,
                 })
         }
-        "path_signal" => {
+        "path_signal" | "video_released" => {
             serde_json::from_value::<arcen_session::agent_relay::ServiceMessage>(value)
                 .ok()
                 .and_then(|message| match message {
                     arcen_session::agent_relay::ServiceMessage::PathSignal { signal, .. } => {
                         Some(Incoming::PathSignal(signal))
                     }
+                    arcen_session::agent_relay::ServiceMessage::VideoReleased {
+                        released, ..
+                    } => Some(Incoming::VideoReleased(released)),
                     _ => None,
                 })
         }
@@ -1161,6 +1179,9 @@ struct CaptureHealthCounters {
     /// capture starts and incremented by `ScreenCaptureKit`'s callback, so
     /// each health window reads the evidence as it arrived.
     source_unchanged: std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+    /// Each display's offered frames (see [`StreamStats::offered_per_display`]),
+    /// published by the multi-display loop.
+    display_offered: std::sync::Mutex<Vec<u64>>,
 }
 
 impl CaptureHealthCounters {
@@ -1169,6 +1190,24 @@ impl CaptureHealthCounters {
             .source_unchanged
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = counters;
+    }
+
+    fn publish_offered(&self, display: usize, offered: u64) {
+        let mut displays = self
+            .display_offered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if displays.len() <= display {
+            displays.resize(display + 1, 0);
+        }
+        displays[display] = offered;
+    }
+
+    fn offered_per_display(&self) -> Vec<u64> {
+        self.display_offered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Unchanged-frame evidence per display. A single display's evidence is
@@ -1209,6 +1248,7 @@ fn load_capture_counters(
         .detail_skipped
         .load(std::sync::atomic::Ordering::Relaxed);
     stats.unchanged_per_display = health.unchanged_per_display();
+    stats.offered_per_display = health.offered_per_display();
     stats.frames_unchanged = stats
         .unchanged_per_display
         .iter()
@@ -1598,8 +1638,93 @@ struct HealthStatsReporter {
     codec: &'static str,
     chroma: &'static str,
     resolution: String,
+    /// The rate each display is captured at (the primary's).
     fps_target: u32,
+    /// Displays whose frames the counts include.
+    outputs: u32,
+    /// The sum of every display's own rate (`0`: `fps_target` times
+    /// `outputs`), which the window is judged against.
+    outputs_fps_target: u32,
     idle: IdleEvidence,
+    /// Each display's own line, for a multi-display session.
+    displays: Option<DisplayRates>,
+}
+
+/// Each display's own rate in a multi-display session, and the one that fell
+/// behind its content named with why (`health_stats.monitors`, the shared
+/// `MonitorRates` the Linux and Windows Piers fill; ADR 0026: degrade
+/// visibly).
+///
+/// A display's content rate is proven only in a window where that display's
+/// capture showed positive evidence the screen did not change (an `Idle`
+/// buffer): `ScreenCaptureKit` falling behind a busy screen simply delivers
+/// fewer frames, so any other window owes the display's served rate.
+#[derive(Debug)]
+struct DisplayRates {
+    /// Session monitor id and served rate, in display (capture) order.
+    displays: Vec<(arcen_media::SessionMonitorId, u32)>,
+    rates: arcen_observability::MonitorRates,
+    offered_at: Vec<u64>,
+    unchanged_at: Vec<u64>,
+    window_started_ms: Option<u64>,
+}
+
+impl DisplayRates {
+    fn new(displays: Vec<(arcen_media::SessionMonitorId, u32)>) -> Self {
+        Self {
+            displays,
+            rates: arcen_observability::MonitorRates::default(),
+            offered_at: Vec::new(),
+            unchanged_at: Vec::new(),
+            window_started_ms: None,
+        }
+    }
+
+    /// One window at the session clock `elapsed_ms`.
+    fn observe(
+        &mut self,
+        elapsed_ms: u64,
+        stats: &StreamStats,
+        targets: &arcen_telemetry::QosTargets,
+    ) -> (
+        Vec<arcen_protocol::messages::MonitorRateMsg>,
+        Vec<arcen_observability::MonitorRateChange>,
+    ) {
+        let window_ms = self
+            .window_started_ms
+            .map_or(HEALTH_STATS_WINDOW.as_secs() * 1_000, |started| {
+                elapsed_ms.saturating_sub(started)
+            })
+            .max(1);
+        self.window_started_ms = Some(elapsed_ms);
+        let at = |counts: &[u64], display: usize| counts.get(display).copied().unwrap_or(0);
+        let counters: Vec<arcen_observability::MonitorCounters> = self
+            .displays
+            .iter()
+            .enumerate()
+            .map(|(display, (monitor, fps_target))| {
+                let offered = at(&stats.offered_per_display, display);
+                let still =
+                    at(&stats.unchanged_per_display, display) > at(&self.unchanged_at, display);
+                let content_fps = still.then(|| {
+                    let changed = offered.saturating_sub(at(&self.offered_at, display));
+                    u32::try_from(
+                        changed.saturating_mul(1_000).saturating_add(window_ms / 2) / window_ms,
+                    )
+                    .unwrap_or(u32::MAX)
+                });
+                arcen_observability::MonitorCounters {
+                    session_monitor_id: monitor.get(),
+                    fps_target: *fps_target,
+                    frames_sent: at(&stats.sent_per_display, display),
+                    content_fps,
+                }
+            })
+            .collect();
+        self.offered_at.clone_from(&stats.offered_per_display);
+        self.unchanged_at.clone_from(&stats.unchanged_per_display);
+        self.rates.observe(elapsed_ms, &counters, targets)
+    }
 }
 
 /// One health window: the message for the Deck, and the state change to log
@@ -1619,6 +1744,7 @@ impl HealthStatsReporter {
         width: usize,
         height: usize,
         fps_target: u32,
+        outputs: u32,
     ) -> Self {
         Self {
             health: arcen_observability::SessionHealth::new_with_fps_warmup(
@@ -1632,8 +1758,24 @@ impl HealthStatsReporter {
             chroma: chroma.token(),
             resolution: format!("{width}x{height}"),
             fps_target,
+            outputs,
+            outputs_fps_target: 0,
             idle: IdleEvidence::default(),
+            displays: None,
         }
+    }
+
+    /// Adds each display's own line (session monitor id and served rate, in
+    /// display order).
+    fn with_display_rates(mut self, displays: Vec<(arcen_media::SessionMonitorId, u32)>) -> Self {
+        self.displays = Some(DisplayRates::new(displays));
+        self
+    }
+
+    /// Judges the window against the sum of every display's own rate.
+    fn with_outputs_fps_target(mut self, outputs_fps_target: u32) -> Self {
+        self.outputs_fps_target = outputs_fps_target;
+        self
     }
 
     /// Records the client telemetry a `health_ping` carried, on the same
@@ -1669,6 +1811,8 @@ impl HealthStatsReporter {
                 total: frames_offered(stats),
                 proven: self.idle.proven(&stats.unchanged_per_display),
             },
+            outputs: self.outputs,
+            outputs_fps_target: self.outputs_fps_target,
             ..arcen_observability::HostCounters::default()
         };
         let observation = self.health.observe(elapsed_ms, self.fps_target, counters);
@@ -1690,6 +1834,13 @@ impl HealthStatsReporter {
         message.encode_time_ms = stats.mean_encode_ms;
         message.capture_time_ms = stats.mean_capture_wait_ms;
         message.path = connection.map(|connection| self.path.sample(elapsed, connection));
+        if let Some(displays) = self.displays.as_mut() {
+            let (monitors, changes) = displays.observe(elapsed_ms, stats, &self.health.targets());
+            for change in &changes {
+                arcen_observability::log_monitor_rate_change(change);
+            }
+            message.monitors = monitors;
+        }
         HealthReport {
             message,
             transition: observation.transition,
@@ -2126,6 +2277,7 @@ pub async fn stream(
         capture.width,
         capture.height,
         capture.fps,
+        1,
     );
     let mut stats = StreamStats::default();
     let mut total_queue = Duration::ZERO;
@@ -2169,7 +2321,12 @@ pub async fn stream(
         let (writer, mut writer_queue) = tokio::sync::mpsc::channel::<Message>(writer_queue_depth);
         let (priority, mut priority_queue) =
             tokio::sync::mpsc::channel::<Message>(PRIORITY_QUEUE_DEPTH);
-        let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue);
+        let bulk_writes = arcen_media::video::VideoWriteMeter::default();
+        // Frames the lane relay is done with, once it reports
+        // (`Incoming::VideoReleased`): until then it is unknown whether the
+        // relay still holds video, and the rate controller is told so.
+        let mut video_released: Option<u64> = None;
+        let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue, &bulk_writes);
         tokio::pin!(pump);
         send_input_mode_results(&priority, &input_mode_results).await?;
         // Native tablet (ADR 0022): inactive unless the handshake accepted it.
@@ -2263,6 +2420,10 @@ pub async fn stream(
                         Incoming::Continue => continue,
                         Incoming::PathSignal(signal) => {
                             latest_path_signal = Some(signal);
+                            continue;
+                        }
+                        Incoming::VideoReleased(released) => {
+                            video_released = Some(released);
                             continue;
                         }
                         Incoming::Reply(text) => {
@@ -2527,6 +2688,13 @@ pub async fn stream(
                         let hints = arcen_media::rate_control::RateHints {
                             refine_active: refine_tick
                                 .is_some_and(|tick| tick.decision.refine_active),
+                            video_backlog: video_released.map(|released| {
+                                bulk_writes.unsent(
+                                    pending_frame.is_some()
+                                        || writer.capacity() < writer.max_capacity()
+                                        || stats.frames_sent > released,
+                                )
+                            }),
                             ..arcen_media::rate_control::RateHints::default()
                         };
                         let change = rate_controller.observe_with(sample, hints);
@@ -2549,7 +2717,9 @@ pub async fn stream(
                                 reason = change.reason.token(),
                                 delivered_bps = sample.delivered_bytes * 8,
                                 rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
-                                queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                                queue_delay_ms = rate_controller.last_queue_delay().map(|delay| delay.as_millis()),
+                                path_queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                                idle_queue = rate_controller.last_idle_queue(),
                                 loss_rate_permille = sample.path.map(loss_rate_permille),
                                 mean_frame_wait_ms = sample.mean_frame_wait.as_secs_f64() * 1000.0,
                                 "encoder rate follows the path"
@@ -2760,11 +2930,17 @@ pub async fn stream_multi(
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
     // Counted before the plans are moved into the producer.
     let region_count = u32::try_from(monitors.len()).unwrap_or(1).max(1);
+    // Each display at its own rate: the window owes their sum.
     let fps_target = monitors
-        .first()
-        .map_or(0, |monitor| monitor.capture.fps)
-        .saturating_mul(region_count);
+        .iter()
+        .map(|monitor| monitor.capture.fps)
+        .fold(0_u32, u32::saturating_add);
     let primary_capture = monitors.first().map(|monitor| monitor.capture);
+    // Each display's identity and own rate, in capture order.
+    let display_rates: Vec<(arcen_media::SessionMonitorId, u32)> = monitors
+        .iter()
+        .map(|monitor| (monitor.monitor_id, monitor.capture.fps))
+        .collect();
     let operational_motion_priority =
         arcen_media::video::operational_motion_priority(served_pipeline.as_ref(), motion_priority);
     let Producer {
@@ -2824,9 +3000,17 @@ pub async fn stream_multi(
         }),
         primary_capture.map_or(0, |capture| capture.width),
         primary_capture.map_or(0, |capture| capture.height),
-        fps_target,
-    );
-    let mut stats = StreamStats::default();
+        // The primary display's own rate for the Deck; the shared session
+        // health judges the aggregate counts against every display's own.
+        primary_capture.map_or(0, |capture| capture.fps),
+        region_count,
+    )
+    .with_outputs_fps_target(fps_target)
+    .with_display_rates(display_rates.clone());
+    let mut stats = StreamStats {
+        sent_per_display: vec![0; display_rates.len()],
+        ..StreamStats::default()
+    };
     let mut total_queue = Duration::ZERO;
     let mut total_send = Duration::ZERO;
     let mut total_capture_wait = Duration::ZERO;
@@ -2860,7 +3044,12 @@ pub async fn stream_multi(
         let (writer, mut writer_queue) = tokio::sync::mpsc::channel::<Message>(writer_queue_depth);
         let (priority, mut priority_queue) =
             tokio::sync::mpsc::channel::<Message>(PRIORITY_QUEUE_DEPTH);
-        let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue);
+        let bulk_writes = arcen_media::video::VideoWriteMeter::default();
+        // Frames the lane relay is done with, once it reports
+        // (`Incoming::VideoReleased`): until then it is unknown whether the
+        // relay still holds video, and the rate controller is told so.
+        let mut video_released: Option<u64> = None;
+        let pump = drive_writer(&mut sink, &mut priority_queue, &mut writer_queue, &bulk_writes);
         tokio::pin!(pump);
         // Host pointer positions are reported only on the single-display
         // path, where a pen sample's fraction is the captured display's.
@@ -2965,6 +3154,10 @@ pub async fn stream_multi(
                             latest_path_signal = Some(signal);
                             continue;
                         }
+                        Incoming::VideoReleased(released) => {
+                            video_released = Some(released);
+                            continue;
+                        }
                         Incoming::Reply(text) => {
                             enqueue(&priority, Message::Text(text)).await?;
                             continue;
@@ -3011,6 +3204,7 @@ pub async fn stream_multi(
                         .map_err(|_| StreamError::PeerGone("writer stopped".to_owned()))?;
                     if let Some(frame) = pending_frame.take() {
                         account_monitor_bytes(&mut monitor_bytes, frame.monitor_id, frame.payload.len() as u64);
+                        account_display_frame(&mut stats.sent_per_display, &display_rates, frame.monitor_id);
                         let accumulators = Accumulators {
                             total_queue: &mut total_queue,
                             total_send: &mut total_send,
@@ -3049,7 +3243,17 @@ pub async fn stream_multi(
                     };
                     rate_marks.update(stats.bytes_sent, stats.frames_sent, total_queue, &monitor_bytes);
                     if rate_control {
-                        let change = rate_controller.observe(sample);
+                        let hints = arcen_media::rate_control::RateHints {
+                            video_backlog: video_released.map(|released| {
+                                bulk_writes.unsent(
+                                    pending_frame.is_some()
+                                        || writer.capacity() < writer.max_capacity()
+                                        || stats.frames_sent > released,
+                                )
+                            }),
+                            ..arcen_media::rate_control::RateHints::default()
+                        };
+                        let change = rate_controller.observe_with(sample, hints);
                         let target_bps = rate_controller.target_bps();
                         encode_rate.store(target_bps, std::sync::atomic::Ordering::Relaxed);
                         if let Some(change) = change {
@@ -3061,7 +3265,9 @@ pub async fn stream_multi(
                                 delivered_bps = sample.delivered_bytes * 8,
                                 pipelines = multi_pipeline_count,
                                 rtt_ms = sample.path.map(|path| path.rtt().as_millis()),
-                                queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                                queue_delay_ms = rate_controller.last_queue_delay().map(|delay| delay.as_millis()),
+                                path_queue_delay_ms = sample.path.map(|path| path.queue_delay().as_millis()),
+                                idle_queue = rate_controller.last_idle_queue(),
                                 loss_rate_permille = sample.path.map(loss_rate_permille),
                                 mean_frame_wait_ms = sample.mean_frame_wait.as_secs_f64() * 1000.0,
                                 "multi-monitor encoder rate follows the path"
@@ -3323,6 +3529,18 @@ fn account_monitor_bytes(
     if let Some(monitor_id) = monitor_id {
         let entry = monitor_bytes.entry(monitor_id).or_default();
         *entry = entry.saturating_add(bytes);
+    }
+}
+
+/// Counts one frame sent for its display ([`StreamStats::sent_per_display`]).
+fn account_display_frame(
+    sent_per_display: &mut [u64],
+    displays: &[(arcen_media::SessionMonitorId, u32)],
+    monitor_id: Option<arcen_media::SessionMonitorId>,
+) {
+    let display = monitor_id.and_then(|id| displays.iter().position(|(monitor, _)| *monitor == id));
+    if let Some(sent) = display.and_then(|display| sent_per_display.get_mut(display)) {
+        *sent = sent.saturating_add(1);
     }
 }
 
@@ -4584,6 +4802,9 @@ struct RegionEncoder {
     encoded: u64,
     encoded_keyframe_request: u64,
     last_frame: Option<CapturedFrame>,
+    /// When this monitor last sent a frame: a still monitor sends a
+    /// keepalive every [`KEEPALIVE`], as on the other Piers.
+    last_sent: Instant,
     /// This monitor's HDR white stage, when its capture is HDR.
     hdr_white: Option<crate::hdr_white::PqWhiteStage>,
     hdr_white_stats: HdrWhiteStats,
@@ -4722,6 +4943,7 @@ fn make_region_encoders(
                 encoded: 0,
                 encoded_keyframe_request: 0,
                 last_frame: None,
+                last_sent: Instant::now(),
                 hdr_white: hdr_white_stage_for(&plan.capture),
                 hdr_white_stats: HdrWhiteStats::default(),
             })
@@ -4868,6 +5090,10 @@ fn produce_multi(
             let Some(encoder) = encoders.get_mut(index) else {
                 continue;
             };
+            health.publish_offered(
+                index,
+                encoder.captured.saturating_add(monitor.dropped_frames()),
+            );
             let wait_started = Instant::now();
             let frame = match monitor.next_frame(frame_timeout) {
                 Ok(frame) => frame,
@@ -4894,7 +5120,8 @@ fn produce_multi(
                         let Some(frame) = encoder.last_frame.as_ref() else {
                             continue;
                         };
-                        if requested_keyframe == encoder.encoded_keyframe_request {
+                        let keyframe_due = requested_keyframe != encoder.encoded_keyframe_request;
+                        if !keyframe_due && encoder.last_sent.elapsed() < KEEPALIVE {
                             continue;
                         }
                         let frame_started = Instant::now();
@@ -4902,12 +5129,14 @@ fn produce_multi(
                         let encode_started = Instant::now();
                         let Some(unit) = encoder
                             .encoder
-                            .encode_with_keyframe_request(frame, true)
+                            .encode_with_keyframe_request(frame, keyframe_due)
                             .map_err(|error| StreamError::Encode(error.to_string()))?
                         else {
                             continue;
                         };
-                        encoder.encoded_keyframe_request = requested_keyframe;
+                        if keyframe_due {
+                            encoder.encoded_keyframe_request = requested_keyframe;
+                        }
                         let encode_took = encode_started.elapsed();
                         encoder.encoded += 1;
                         total_encoded += 1;
@@ -4938,6 +5167,7 @@ fn produce_multi(
                         if frames.blocking_send(Ok(produced)).is_err() {
                             return Ok(());
                         }
+                        encoder.last_sent = Instant::now();
                         sent += 1;
                         sent_any = true;
                         continue;
@@ -4948,6 +5178,10 @@ fn produce_multi(
             let frame_started = Instant::now();
             encoder.captured += 1;
             total_captured += 1;
+            health.publish_offered(
+                index,
+                encoder.captured.saturating_add(monitor.dropped_frames()),
+            );
             let encode_started = Instant::now();
             let requested_keyframe = keyframe_requests.load(std::sync::atomic::Ordering::Relaxed);
             let force_keyframe = requested_keyframe != encoder.encoded_keyframe_request;
@@ -4999,6 +5233,7 @@ fn produce_multi(
             if frames.blocking_send(Ok(produced)).is_err() {
                 return Ok(());
             }
+            encoder.last_sent = Instant::now();
             sent += 1;
             sent_any = true;
         }
@@ -5144,6 +5379,86 @@ fn read_clipboard_offer(text: &str) -> Option<arcen_protocol::messages::Clipboar
 #[cfg(test)]
 mod tests {
     #[test]
+    fn each_display_reports_its_own_rate_and_a_busy_one_that_falls_behind_is_named() {
+        let first = arcen_media::SessionMonitorId::new(1).expect("id");
+        let second = arcen_media::SessionMonitorId::new(2).expect("id");
+        let mut reporter = super::HealthStatsReporter::new(
+            super::EncoderCodec::Hevc,
+            arcen_media::ChromaSubsampling::Yuv420,
+            1920,
+            1080,
+            60,
+            2,
+        )
+        .with_outputs_fps_target(180)
+        .with_display_rates(vec![(first, 60), (second, 120)]);
+        let mut stats = super::StreamStats::default();
+        let mut limited = Vec::new();
+        // Display 1 keeps up with a busy screen; display 2 is busy (no `Idle`
+        // evidence) and sends 50 a second of the 120 it is served at.
+        for window in 1..=8_u64 {
+            stats.frames_sent = window * 340;
+            stats.sent_per_display = vec![window * 120, window * 100];
+            stats.offered_per_display = stats.sent_per_display.clone();
+            stats.unchanged_per_display = vec![0, 0];
+            let report = reporter.report(std::time::Duration::from_secs(window * 2), &stats, None);
+            let monitors = &report.message.monitors;
+            assert_eq!(monitors.len(), 2);
+            assert_eq!(monitors[0].session_monitor_id, 1);
+            assert_eq!(monitors[0].fps_target, 60);
+            assert_eq!(monitors[1].fps_target, 120);
+            assert!(monitors[0].limited_by.is_none(), "{monitors:?}");
+            limited.push(monitors[1].limited_by.clone());
+        }
+        assert_eq!(limited[..5], [None, None, None, None, None]);
+        assert_eq!(
+            limited[7].as_deref(),
+            Some(arcen_observability::MONITOR_LIMITED_HOST_SHORTFALL)
+        );
+
+        // Once display 2 proves its screen changed only 50 times a second, it
+        // keeps up with its content and is cleared.
+        for window in 9..=10_u64 {
+            stats.sent_per_display = vec![window * 120, window * 100];
+            stats.offered_per_display = stats.sent_per_display.clone();
+            stats.unchanged_per_display = vec![0, window];
+            let report = reporter.report(std::time::Duration::from_secs(window * 2), &stats, None);
+            assert!(report.message.monitors[1].limited_by.is_none());
+        }
+    }
+
+    #[test]
+    fn a_single_display_session_sends_no_display_lines() {
+        let mut reporter = super::HealthStatsReporter::new(
+            super::EncoderCodec::Hevc,
+            arcen_media::ChromaSubsampling::Yuv420,
+            1920,
+            1080,
+            60,
+            1,
+        );
+        let report = reporter.report(
+            std::time::Duration::from_secs(2),
+            &super::StreamStats::default(),
+            None,
+        );
+        assert!(report.message.monitors.is_empty());
+    }
+
+    #[test]
+    fn a_sent_frame_counts_for_its_own_display() {
+        let first = arcen_media::SessionMonitorId::new(3).expect("id");
+        let second = arcen_media::SessionMonitorId::new(7).expect("id");
+        let displays = [(first, 60), (second, 60)];
+        let mut sent = vec![0, 0];
+        super::account_display_frame(&mut sent, &displays, Some(second));
+        super::account_display_frame(&mut sent, &displays, Some(second));
+        super::account_display_frame(&mut sent, &displays, Some(first));
+        super::account_display_frame(&mut sent, &displays, None);
+        assert_eq!(sent, [1, 2]);
+    }
+
+    #[test]
     fn health_stats_report_windows_and_tell_a_still_desktop_from_a_stall() {
         use arcen_protocol::messages::HealthStateMsg;
         let mut reporter = super::HealthStatsReporter::new(
@@ -5152,6 +5467,7 @@ mod tests {
             3840,
             2160,
             60,
+            1,
         );
         let mut stats = super::StreamStats {
             frames_captured: 600,
@@ -5343,9 +5659,14 @@ mod tests {
             }
         });
         tokio::pin!(sink);
-        drive_writer(&mut sink, &mut priority, &mut bulk)
-            .await
-            .expect("drained");
+        drive_writer(
+            &mut sink,
+            &mut priority,
+            &mut bulk,
+            &arcen_media::video::VideoWriteMeter::default(),
+        )
+        .await
+        .expect("drained");
         assert_eq!(
             *written.lock().expect("written"),
             vec!["audio", "video-1", "video-2"],
@@ -6392,6 +6713,21 @@ mod tests {
         })
         .to_string();
         assert!(handle_control(&move_event, &mut stats, None, None, None).is_none());
+    }
+
+    #[test]
+    fn the_relay_s_release_count_reaches_the_rate_loop() {
+        let mut stats = StreamStats::default();
+        let report =
+            serde_json::to_string(&arcen_session::agent_relay::ServiceMessage::VideoReleased {
+                session: 1,
+                released: 3,
+            })
+            .expect("json");
+        assert!(matches!(
+            handle_control(&report, &mut stats, None, None, None),
+            Some(Incoming::VideoReleased(3))
+        ));
     }
 
     #[test]

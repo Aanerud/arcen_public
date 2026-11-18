@@ -77,6 +77,7 @@ use arcen_deck_core::settings::{
     ClientConfigRepository, ClientSettings, DisplaysMode, SecurityMode,
 };
 use arcen_deck_core::trusted_pins::TrustedPinStore;
+use arcen_deck_core::ui_pacing::{PacedValue, STATS_PANEL_REFRESH};
 use arcen_input::keyboard::pc::KEY_F4;
 
 use super::displays::DisplayPlan;
@@ -186,6 +187,9 @@ pub(super) struct Launcher {
     accepted_pins: TrustedPinStore,
     remembered_pins: TrustedPinStore,
     show_stream_stats: bool,
+    /// Stream Statistics' text, rebuilt at the Mac's rate: text that
+    /// changed every pass presented the overlay with every video frame.
+    stream_stats_text: PacedValue<Vec<String>>,
     show_negotiated_truth: bool,
     show_tablet_monitor: bool,
     /// `--quit-after-secs`: an unattended run ends this long after the
@@ -239,6 +243,9 @@ pub(super) struct Launcher {
     /// A recovery's one-shot Displays mode for the next attempt to that
     /// endpoint (the Mac's `pending_displays_override`).
     pending_displays_override: Option<(String, DisplaysMode)>,
+    /// The Windows Ink hint was shown this run
+    /// (`arcen_input::deck_pen::TABLET_AS_MOUSE_HINT`).
+    tablet_hint_shown: bool,
     /// The topology conflict's "Start fresh": the next attempt asks the
     /// host to replace its desktop.
     pending_desktop_replacement: bool,
@@ -251,6 +258,14 @@ pub(super) struct Launcher {
     requested_topology: Option<arcen_media::RequestedMonitorTopology>,
     /// Fit-to-window updates of a Windowed session.
     display_fit: DisplayFitTracker,
+    /// The display the window is on (`\\.\DISPLAYn`'s `n`), as the shell
+    /// last noted it.
+    window_display: Option<u32>,
+    /// The window moved to another display since the follower last looked
+    /// (`drive_display_follow`).
+    window_display_moved: bool,
+    /// When the follower last looked at the displays.
+    display_follow_polled: Option<std::time::Instant>,
     /// The fullscreen a pinned session holds.
     session_fullscreen: SessionFullscreen,
 }
@@ -298,6 +313,13 @@ impl Launcher {
                 (Vec::new(), None)
             }
         };
+        // As on the Mac: an older copy that may open instead of this one is
+        // named at start, after the errors above.
+        if status == "Ready"
+            && let Some(notice) = crate::platform::installed_copies::startup_notice()
+        {
+            status = notice;
+        }
         let monitors = super::displays::settings_monitors();
         let remembered_pins = repository
             .trusted_pins_file()
@@ -336,6 +358,7 @@ impl Launcher {
             accepted_pins: TrustedPinStore::default(),
             remembered_pins,
             show_stream_stats: false,
+            stream_stats_text: PacedValue::new(STATS_PANEL_REFRESH),
             show_negotiated_truth: false,
             show_tablet_monitor: false,
             quit_after: None,
@@ -363,12 +386,29 @@ impl Launcher {
             submitted_auth: None,
             login_window_handover: None,
             pending_displays_override: None,
+            tablet_hint_shown: false,
             pending_desktop_replacement: false,
             recovery_auth: None,
             display_plan: None,
             requested_topology: None,
             display_fit: DisplayFitTracker::new(),
+            window_display: None,
+            window_display_moved: false,
+            display_follow_polled: None,
             session_fullscreen: SessionFullscreen::default(),
+        }
+    }
+
+    /// **UI thread.** The window is now on display `display` (the shell
+    /// notes every change).
+    pub(super) fn note_window_display(&mut self, display: Option<u32>) {
+        self.window_moved_to(display);
+    }
+
+    fn window_moved_to(&mut self, display: Option<u32>) {
+        if display != self.window_display {
+            self.window_display = display;
+            self.window_display_moved = true;
         }
     }
 
@@ -663,6 +703,7 @@ impl Launcher {
                     }
                     Screen::InSession => {
                         self.drive_display_fit(ui);
+                        self.drive_display_follow(ui);
                         self.session_overlays(ui);
                     }
                     Screen::Reconnecting(..) | Screen::SigningIn => self.recovery_overlay(ui),
@@ -773,12 +814,24 @@ impl Launcher {
             .as_ref()
             .and_then(|id| self.saved.iter().find(|saved| &saved.id == id))
             .and_then(|saved| saved.settings.displays_mode);
+        let source = arcen_deck_core::connect_plan::displays_mode_source(
+            self.pending_displays_override.as_ref(),
+            &endpoint,
+            saved_mode,
+        );
         let mode = resolve_attempt_displays_mode(
             &mut self.pending_displays_override,
             &endpoint,
             saved_mode,
         )
         .unwrap_or(self.settings.displays_mode);
+        tracing::info!(
+            target: "arcen::display",
+            mode = mode.as_wire(),
+            source,
+            settings = self.settings.displays_mode.as_wire(),
+            "Displays mode for this connection attempt"
+        );
         // A simulated layout (developer builds) is always Match My Layout.
         #[cfg(feature = "dev-tools")]
         let mode = if super::windowed_test::layout().is_some() {
@@ -842,6 +895,7 @@ impl Launcher {
                 self.clipboard
                     .attach(self.generation, connection.media().clipboard().clone());
                 self.connection = Some(connection);
+                self.stream_stats_text.clear();
                 self.screen = Screen::Connecting(draft);
             }
             Err(error) => {
@@ -900,6 +954,15 @@ impl Launcher {
                     self.multi_window_failure(&reason, ctx);
                     return;
                 }
+                let layout_note = connection.layout_note().map(str::to_owned);
+                let display_note = connection.display_note();
+                if let Some(note) = &display_note {
+                    tracing::warn!(
+                        target: "arcen::display",
+                        note = %note,
+                        "host did not honour the requested display size"
+                    );
+                }
                 let attached = connection.attach_input(
                     self.hwnd,
                     self.session_keyboard,
@@ -911,7 +974,32 @@ impl Launcher {
                     tracing::warn!(%error, "the session window's input was not attached");
                     self.status = format!("Receiving video stream (no input: {error})");
                 }
+                // A window already fullscreen (a resumed session keeps it)
+                // gets no `set_fullscreen` call; the new input learns it here.
+                let fullscreen = self.fullscreen;
+                self.window_input(|input| input.set_fullscreen(fullscreen));
                 self.apply_typing_mode();
+                let tablet_hint = (!self.tablet_hint_shown
+                    && crate::platform::pen::tablet_sends_mouse(
+                        self.settings.tablet_mode_requested == TabletModeMsg::LocalTermination,
+                    ))
+                .then(|| {
+                    self.tablet_hint_shown = true;
+                    tracing::warn!(
+                        target: "arcen::input",
+                        "a pen tablet is attached but Windows does not route it as a pen \
+                         (Windows Ink off): Tablet support receives mouse input only"
+                    );
+                    arcen_input::deck_pen::TABLET_AS_MOUSE_HINT.to_owned()
+                });
+                let notes: Vec<String> = layout_note
+                    .into_iter()
+                    .chain(display_note)
+                    .chain(tablet_hint)
+                    .collect();
+                if !notes.is_empty() {
+                    self.notify(notes.join(" · "));
+                }
                 self.screen = Screen::InSession;
             }
             SessionNews::CertificateUntrusted(info) => {
@@ -1284,6 +1372,7 @@ impl Launcher {
                         self.clipboard
                             .attach(self.generation, connection.media().clipboard().clone());
                         self.connection = Some(connection);
+                        self.stream_stats_text.clear();
                     }
                     Err(error) => {
                         self.status = format!("Connection error: {error}");
@@ -1535,6 +1624,55 @@ impl Launcher {
         self.session_fullscreen
             .step(pinned, fullscreen)
             .map(|step| (step, display))
+    }
+
+    /// Tells a host that follows it (`display_follow`) when the session
+    /// window has settled on another display (the Mac's
+    /// `follow_window_display`). The displays are read only after the shell
+    /// noted a move and while the window settles, at most four times a
+    /// second: reading them costs DXGI and display-config queries.
+    fn drive_display_follow(&mut self, ui: &egui::Ui) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+        let window_display = self.window_display;
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        if !connection.host_follows_display_moves() {
+            return;
+        }
+        let follower = connection.display_follow();
+        if follower.has_observed() && !self.window_display_moved && !follower.is_settling() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .display_follow_polled
+            .is_some_and(|polled| now.saturating_duration_since(polled) < POLL)
+        {
+            ui.ctx().request_repaint_after(POLL);
+            return;
+        }
+        self.display_follow_polled = Some(now);
+        self.window_display_moved = false;
+        let follower = connection.display_follow();
+        let update = follower.observe(&crate::display::enumerate(), window_display, now);
+        if follower.is_settling() {
+            ui.ctx().request_repaint_after(POLL);
+        }
+        let Some(update) = update else {
+            return;
+        };
+        if let Ok(value) = serde_json::to_value(&update)
+            && connection.send_json(value)
+        {
+            tracing::info!(
+                target: "arcen::display",
+                display = ?update.refresh.stream_display_id,
+                refresh_hz = ?update.refresh.stream_refresh_hz(),
+                sequence = update.sequence,
+                "display_refresh_update sent: the session window moved to another display",
+            );
+        }
     }
 
     /// A Windowed session asks the host for the window's size once it
@@ -1811,7 +1949,12 @@ impl Launcher {
             return;
         };
         if self.show_stream_stats {
-            paint_stream_stats(ui, rect, &connection.stream_stats_lines());
+            let lines = self
+                .stream_stats_text
+                .get_or_refresh(std::time::Instant::now(), || {
+                    connection.stream_stats_lines()
+                });
+            paint_stream_stats(ui, rect, lines);
         }
         self.record_support_snapshot(connection);
         if self.show_tablet_monitor {
@@ -2024,6 +2167,10 @@ impl Launcher {
                 .control(self.services.as_ref(), DeckPlatform::Pc),
             decode: self.decode_report.get().cloned(),
             support_bundle: Some(self.support_bundle.view(self.services.as_ref())),
+            connection_displays: self.last_selected.as_ref().and_then(|id| {
+                let saved = self.saved.iter().find(|saved| &saved.id == id)?;
+                Some((saved.name.clone(), saved.settings.displays_mode?))
+            }),
         };
         let mut values = SettingsValues::from_client_settings(&self.settings, self.settings_tab);
         let actions = render_settings(ui, &mut values, &facts);
@@ -2054,6 +2201,18 @@ impl Launcher {
         for action in actions {
             match action {
                 SettingsAction::Close => self.screen = Screen::Home,
+                SettingsAction::FollowDisplaysSetting => {
+                    if let Some(id) = self.last_selected.clone() {
+                        match self.repository.set_displays_mode(&id, None) {
+                            Ok(store) => self.reconcile(store),
+                            Err(error) => {
+                                self.status = format!(
+                                    "The connection still keeps its own Displays choice: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
                 SettingsAction::RefreshDisplays => {
                     self.monitors = super::displays::settings_monitors();
                 }

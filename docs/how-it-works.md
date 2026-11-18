@@ -148,7 +148,9 @@ anything stale after a stall. Two lessons from real sessions are built in:
   the next burst bigger.
 
 The Deck logs `dedicated presenter telemetry` every second — received,
-submitted, confirmed, drops by cause, slot waits, and refresh intervals — and
+submitted, confirmed, drops by cause, slot waits, and refresh intervals — with
+`dedicated presenter pipeline` beside it (time from submission to the glass,
+pictures in flight, queue depth, refresh period), and
 the host's health check compares decoded against presented frames, so a
 presentation problem shows up even when nobody notices it on screen.
 

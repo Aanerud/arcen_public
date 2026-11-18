@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Usage: arcen-pier-macos [--config PATH] [daemon|agent|serve|install-service|uninstall-service|validate-config|inventory|permissions|diagnostics|probe-media|probe-input|probe-keyboard|probe-keymap|probe-clipboard|probe-cursor|probe-modes|probe-scroll|probe-audio|register-audio-consent|request-permissions|new-host-cert|support-bundle]"
+            "Usage: arcen-pier-macos [--config PATH] [daemon|agent|serve|install-service|uninstall-service|validate-config|inventory|permissions|diagnostics|probe-media|probe-input|probe-keyboard|probe-keymap|probe-clipboard|probe-cursor|probe-desk-privacy|probe-modes|probe-scroll|probe-audio|register-audio-consent|core-audio-ready|request-permissions|new-host-cert|support-bundle]"
         );
         return ExitCode::SUCCESS;
     }
@@ -101,6 +101,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    // The process that locks the session if the agent serving a Deck dies
+    // (`lock_guard`). Started by the agent; nothing else.
+    if command == arcen_pier_macos::lock_guard::SUBCOMMAND {
+        return arcen_pier_macos::lock_guard::run(&support_args);
     }
     // What the HID system sees of a bridged tablet (ADR 0022). Lab builds
     // only: it sends the Wacom mode switch (a feature report) to the device,
@@ -210,6 +215,17 @@ fn main() -> ExitCode {
         }
         // A refusal is a decision, not a failure of this command.
         return ExitCode::SUCCESS;
+    }
+    if command == "core-audio-ready" {
+        // For the package scripts, after they restart Core Audio: succeeds
+        // once Core Audio serves again with the Arcen microphone driver
+        // loaded. A fresh process for every question, so a Core Audio
+        // connection opened mid-restart is never asked twice.
+        return if arcen_pier_macos::microphone_input::hal_device_published() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     }
     if command == "register-audio-consent" {
         // macOS lists a subject under Privacy & Security only once it has
@@ -440,6 +456,14 @@ fn main() -> ExitCode {
             }
         }
         return ExitCode::SUCCESS;
+    }
+    // Desk privacy's facts on this Mac (ADR 0025 §5): which displays would go
+    // dark, who the window server says posted the input it sees, and with
+    // `--blank SECS [--capture]` the displays darkened for that long (and
+    // the main display captured before and while dark). Run it from the Aqua
+    // session at the Mac: it darkens the screens it is asked to.
+    if command == "probe-desk-privacy" {
+        return probe_desk_privacy(&support_args);
     }
     if command == "probe-cursor" {
         // Long enough for an operator to move the pointer across a text field
@@ -1004,7 +1028,7 @@ async fn serve_multi_desktop(
         .monitors
         .iter()
         .map(|monitor| arcen_pier_macos::stream::RegionStreamPlan {
-            capture: multi_capture_config(handshake.plan, handshake.fps, monitor),
+            capture: multi_capture_config(handshake.plan, monitor.fps, monitor),
             monitor_id: monitor.session_monitor_id,
             topology_generation: multi_monitor.generation,
             stream_epoch: epoch,
@@ -1642,13 +1666,17 @@ async fn relay_one(
             );
             // One lane per role; the lane setup already keeps the send
             // window interactive, so the agent's writes feel the path.
-            let relayed = arcen_pier_macos::relay::relay_lanes(
+            let relayed = arcen_pier_macos::relay::relay_lanes_gated(
                 deck,
                 agent,
                 session,
                 Some(audio_channel),
                 true,
                 refine_allowed,
+                Some(arcen_pier_macos::relay::SignInGate::new(
+                    &arcen_pier_macos::relay::SERVICE_AUTH_THROTTLE,
+                    Some(peer.ip()),
+                )),
             )
             .await;
             registry.end_session(session);
@@ -1768,6 +1796,14 @@ fn run_agent(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
             target: arcen_telemetry::names::target::HID,
             "no window-server connection; cursor shapes will not be reported"
         );
+    }
+    // A Deck the agent before this one was serving when it died: the
+    // session is locked before this agent serves anything (GAP-048).
+    if let Some(uid) = session_policy
+        .serving_uid
+        .filter(|_| !session_policy.login_window)
+    {
+        let _ = arcen_pier_macos::lock_guard::recover_at_start(uid, session_policy.desk_privacy);
     }
     if arcen_pier_macos::timezone::supported_in_this_process(session_policy.login_window) {
         restore_stale_agent_timezone("startup");
@@ -1935,6 +1971,39 @@ async fn agent_loop(
     ExitCode::FAILURE
 }
 
+/// Sessions this agent is serving now, across its sign-in slots.
+static ACTIVE_SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one served session for as long as it lives.
+struct ActiveSession;
+
+impl ActiveSession {
+    fn begin() -> Self {
+        ACTIVE_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Exits with 75, so launchd starts a fresh agent, once no session is being
+/// served: this process's Core Audio connection is stale, and only a new
+/// process gets a working one. A session in another slot runs to its end.
+async fn restart_when_idle() -> ! {
+    eprintln!(
+        "agent: this process's Core Audio connection is stale; exiting so launchd starts a fresh \
+         agent once no session is being served"
+    );
+    while ACTIVE_SESSIONS.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    std::process::exit(75);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn agent_slot(
     kind: arcen_session::agent_relay::DesktopSessionKind,
@@ -1949,6 +2018,9 @@ async fn agent_slot(
     let socket_path = std::path::Path::new(arcen_pier_macos::relay::AGENT_SOCKET);
     let mut backoff = std::time::Duration::from_secs(1);
     loop {
+        if arcen_pier_macos::audio::core_audio_connection_stale() {
+            restart_when_idle().await;
+        }
         match arcen_pier_macos::relay::park(socket_path, kind, service_uid).await {
             Ok(attached) => {
                 let arcen_pier_macos::relay::AttachedDeck {
@@ -1965,7 +2037,7 @@ async fn agent_slot(
                     arcen_pier_macos::net::PierStream::Relayed(stream),
                 )
                 .await;
-                let _ = serve_one(
+                let _ = Box::pin(serve_one(
                     &mut socket,
                     peer,
                     None,
@@ -1980,7 +2052,7 @@ async fn agent_slot(
                         service_uid,
                         session,
                     }),
-                )
+                ))
                 .await;
             }
             Err(error) => {
@@ -2030,6 +2102,19 @@ fn scope_with_user(
 struct SessionAudio {
     lease: Option<SessionAudioLease>,
     delivers: bool,
+    /// An abandoned startup whose tap mutes the Mac for this session.
+    _startup_mute: Option<StartupMuteCell>,
+}
+
+impl SessionAudio {
+    /// No lease and no sound.
+    const fn silent() -> Self {
+        Self {
+            lease: None,
+            delivers: false,
+            _startup_mute: None,
+        }
+    }
 }
 
 static CONSOLE_OWNER_SLOT: arcen_pier_macos::blocking::BlockingSlot =
@@ -2072,8 +2157,10 @@ fn audio_startup_kind(
 
 fn start_capture_with_mute_lease(
     local_playback: arcen_session::pier_config::LocalPlayback,
+    startup: &StartupMuteCell,
 ) -> Result<Option<SessionAudioLease>, arcen_pier_macos::audio::AudioError> {
     let tap = arcen_pier_macos::audio::SystemAudioTap::create(local_playback)?;
+    *lock_startup_mute(startup) = StartupMute::Held(tap.mute_evidence());
     match arcen_pier_macos::audio::AudioCaptureSession::start_with_tap(tap) {
         Ok(session) => Ok(Some(SessionAudioLease::Capture(session))),
         Err(error) => {
@@ -2081,6 +2168,114 @@ fn start_capture_with_mute_lease(
             Ok(Some(SessionAudioLease::Mute(error.tap)))
         }
     }
+}
+
+/// Where an audio startup's mute stands, shared between its worker and the
+/// sessions waiting for it or admitted on it.
+enum StartupMute {
+    /// No tap yet.
+    Pending,
+    /// The worker holds a tap; this is what it proved.
+    Held(arcen_pier_macos::audio::MuteEvidence),
+    /// A session stopped waiting while the worker held this tap.
+    Abandoned(arcen_pier_macos::audio::MuteEvidence),
+    /// The worker of an abandoned startup returned: its lease stays here,
+    /// muting the Mac, until the last session admitted on it ends and drops
+    /// the cell.
+    Kept {
+        evidence: arcen_pier_macos::audio::MuteEvidence,
+        _lease: SessionAudioLease,
+    },
+    /// The worker returned to the session that waited for it.
+    Finished,
+}
+
+type StartupMuteCell = std::sync::Arc<std::sync::Mutex<StartupMute>>;
+
+/// The startup a session stopped waiting for, while it still mutes the Mac:
+/// the System Audio Recording prompt blocks inside the capture start, after
+/// the tap (and its mute) exist. Weak: the sessions admitted on it own it,
+/// and its tap is released when the last of them ends.
+static ABANDONED_AUDIO_STARTUP: std::sync::Mutex<
+    Option<std::sync::Weak<std::sync::Mutex<StartupMute>>>,
+> = std::sync::Mutex::new(None);
+
+fn lock_startup_mute(cell: &StartupMuteCell) -> std::sync::MutexGuard<'_, StartupMute> {
+    cell.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What the worker returns: an abandoned startup's lease is kept in the cell
+/// instead of being dropped with the channel nobody reads any more, which
+/// would unmute the Mac under the sessions admitted on it.
+fn hand_over_startup(
+    startup: &StartupMuteCell,
+    result: Result<Option<SessionAudioLease>, arcen_pier_macos::audio::AudioError>,
+) -> Result<Option<SessionAudioLease>, arcen_pier_macos::audio::AudioError> {
+    let mut state = lock_startup_mute(startup);
+    if let (StartupMute::Abandoned(evidence), Ok(Some(_))) = (&*state, &result) {
+        let evidence = *evidence;
+        if let Ok(Some(lease)) = result {
+            *state = StartupMute::Kept {
+                evidence,
+                _lease: lease,
+            };
+        }
+        return Ok(None);
+    }
+    *state = StartupMute::Finished;
+    result
+}
+
+/// Ends a startup whose worker did not return normally (a panic dropped its
+/// tap on the way out), so nothing is admitted on a mute that is gone.
+struct StartupUnwound(StartupMuteCell);
+
+impl Drop for StartupUnwound {
+    fn drop(&mut self) {
+        let mut state = lock_startup_mute(&self.0);
+        if matches!(
+            *state,
+            StartupMute::Pending | StartupMute::Held(_) | StartupMute::Abandoned(_)
+        ) {
+            *state = StartupMute::Finished;
+        }
+    }
+}
+
+/// Stops waiting for `startup`, returning the mute its worker still holds.
+fn abandon_audio_startup(
+    startup: &StartupMuteCell,
+) -> Option<arcen_pier_macos::audio::MuteEvidence> {
+    let evidence = {
+        let mut state = lock_startup_mute(startup);
+        let StartupMute::Held(evidence) = *state else {
+            return None;
+        };
+        *state = StartupMute::Abandoned(evidence);
+        evidence
+    };
+    *ABANDONED_AUDIO_STARTUP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(std::sync::Arc::downgrade(startup));
+    Some(evidence)
+}
+
+/// The mute an abandoned startup still holds, and the cell a session admitted
+/// on it keeps alive.
+fn mute_held_by_abandoned_startup()
+-> Option<(arcen_pier_macos::audio::MuteEvidence, StartupMuteCell)> {
+    let abandoned = ABANDONED_AUDIO_STARTUP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()?
+        .upgrade()?;
+    let evidence = match &*lock_startup_mute(&abandoned) {
+        StartupMute::Abandoned(evidence) | StartupMute::Kept { evidence, .. } => *evidence,
+        StartupMute::Pending | StartupMute::Held(_) | StartupMute::Finished => return None,
+    };
+    Some((evidence, abandoned))
 }
 
 /// Starts the local-playback privacy lease and, when negotiated, host audio.
@@ -2091,7 +2286,11 @@ fn start_capture_with_mute_lease(
 /// privacy lease and refusing an otherwise usable desktop.
 ///
 /// Audio failing is not the session failing. The Linux host says "continuing
-/// without audio" and serves the desktop; so does this one.
+/// without audio" and serves the desktop; so does this one. That includes a
+/// capture start blocked on the System Audio Recording prompt once its tap
+/// has proved the mute: the session is served without sound (so whoever
+/// signed in can see and answer the prompt), and the waiting worker keeps the
+/// Mac muted until it returns.
 async fn start_session_audio(
     handshake: &arcen_pier_macos::session::Handshake,
     local_playback: arcen_session::pier_config::LocalPlayback,
@@ -2108,26 +2307,43 @@ async fn start_session_audio(
         );
     }
     if kind == AudioStartupKind::None {
+        return Ok(SessionAudio::silent());
+    }
+    if let Some((evidence, startup_mute)) = mute_held_by_abandoned_startup() {
+        mute_policy_allows_session(local_playback, Some(evidence))?;
+        eprintln!(
+            "host audio is still waiting on the System Audio Recording prompt from an earlier \
+             session; serving without sound, and that startup keeps local playback muted"
+        );
         return Ok(SessionAudio {
             lease: None,
             delivers: false,
+            _startup_mute: Some(startup_mute),
         });
     }
 
+    let startup: StartupMuteCell = std::sync::Arc::new(std::sync::Mutex::new(StartupMute::Pending));
+    let worker_startup = std::sync::Arc::clone(&startup);
     let result = tokio::time::timeout(
         AUDIO_START_BUDGET,
         arcen_pier_macos::blocking::run_exclusive(
             "arcen-macos-audio-startup",
             &AUDIO_STARTUP_SLOT,
             audio_startup_failure,
-            move || match kind {
-                AudioStartupKind::None => Ok(None),
-                AudioStartupKind::MuteOnly => {
-                    arcen_pier_macos::audio::SystemAudioTap::create(local_playback)
-                        .map(SessionAudioLease::Mute)
-                        .map(Some)
-                }
-                AudioStartupKind::Capture => start_capture_with_mute_lease(local_playback),
+            move || {
+                let _unwound = StartupUnwound(std::sync::Arc::clone(&worker_startup));
+                let result = match kind {
+                    AudioStartupKind::None => Ok(None),
+                    AudioStartupKind::MuteOnly => {
+                        arcen_pier_macos::audio::SystemAudioTap::create(local_playback)
+                            .map(SessionAudioLease::Mute)
+                            .map(Some)
+                    }
+                    AudioStartupKind::Capture => {
+                        start_capture_with_mute_lease(local_playback, &worker_startup)
+                    }
+                };
+                hand_over_startup(&worker_startup, result)
             },
         ),
     )
@@ -2145,6 +2361,7 @@ async fn start_session_audio(
             Ok(SessionAudio {
                 lease: Some(SessionAudioLease::Capture(session)),
                 delivers,
+                _startup_mute: None,
             })
         }
         Some(Ok(Some(SessionAudioLease::Mute(tap)))) => {
@@ -2152,12 +2369,10 @@ async fn start_session_audio(
             Ok(SessionAudio {
                 lease: Some(SessionAudioLease::Mute(tap)),
                 delivers: false,
+                _startup_mute: None,
             })
         }
-        Some(Ok(None)) => Ok(SessionAudio {
-            lease: None,
-            delivers: false,
-        }),
+        Some(Ok(None)) => Ok(SessionAudio::silent()),
         Some(Err(error)) => {
             if local_playback.requires_mute() {
                 Err(format!(
@@ -2165,32 +2380,46 @@ async fn start_session_audio(
                 ))
             } else {
                 eprintln!("host audio unavailable, continuing without it: {error}");
-                Ok(SessionAudio {
-                    lease: None,
-                    delivers: false,
-                })
+                Ok(SessionAudio::silent())
             }
         }
-        None => {
-            let message = format!(
-                "host audio did not start within {} ms. If this host has never been granted \
-                 system audio recording, approve \"Arcen Agent Helper\" under System Settings > \
-                 Privacy & Security > System Audio Recording; the prompt blocks capture until it \
-                 is answered.",
-                AUDIO_START_BUDGET.as_millis(),
-            );
-            if local_playback.requires_mute() {
-                Err(format!(
-                    "local playback mute could not be established: {message}"
-                ))
-            } else {
-                eprintln!("{message} continuing without audio.");
-                Ok(SessionAudio {
-                    lease: None,
-                    delivers: false,
-                })
-            }
-        }
+        None => audio_start_timed_out(local_playback, startup),
+    }
+}
+
+/// A startup that missed [`AUDIO_START_BUDGET`]: served without sound when
+/// its tap already proved the mute (the worker, blocked on the prompt, keeps
+/// it), refused when a mute is required and nothing proved it.
+fn audio_start_timed_out(
+    local_playback: arcen_session::pier_config::LocalPlayback,
+    startup: StartupMuteCell,
+) -> Result<SessionAudio, String> {
+    let message = format!(
+        "host audio did not start within {} ms. If this host has never been granted system \
+         audio recording, approve \"Arcen Agent Helper\" under System Settings > Privacy & \
+         Security > System Audio Recording; the prompt blocks capture until it is answered.",
+        AUDIO_START_BUDGET.as_millis(),
+    );
+    if let Some(evidence) = abandon_audio_startup(&startup)
+        && mute_policy_allows_session(local_playback, Some(evidence)).is_ok()
+    {
+        eprintln!(
+            "{message} Serving without sound meanwhile; the waiting startup keeps local playback \
+             muted for as long as a session admitted on it runs."
+        );
+        return Ok(SessionAudio {
+            lease: None,
+            delivers: false,
+            _startup_mute: Some(startup),
+        });
+    }
+    if local_playback.requires_mute() {
+        Err(format!(
+            "local playback mute could not be established: {message}"
+        ))
+    } else {
+        eprintln!("{message} continuing without audio.");
+        Ok(SessionAudio::silent())
     }
 }
 
@@ -2243,6 +2472,9 @@ async fn ask_for_permissions_in_turn(ask_audio: bool) {
                  permission meanwhile."
             ),
         }
+        if arcen_pier_macos::audio::core_audio_connection_stale() {
+            restart_when_idle().await;
+        }
     }
 
     if !permissions::probe().accessibility {
@@ -2276,7 +2508,9 @@ async fn ask_for_permissions_in_turn(ask_audio: bool) {
 /// A close frame holds about 120 bytes, so the full explanation stays in the
 /// agent log and the Deck gets the part its user can act on.
 fn deck_reason_for_audio_refusal(reason: &str) -> &'static str {
-    if reason.contains("System Audio Recording") {
+    if arcen_pier_macos::audio::core_audio_connection_stale() {
+        "The host's sound system restarted; reconnect in a few seconds."
+    } else if reason.contains("System Audio Recording") {
         "At the host, allow System Audio Recording for Arcen Agent Helper, then reconnect."
     } else {
         arcen_session::local_playback::DECK_REASON_NOT_MUTED
@@ -2746,6 +2980,7 @@ async fn serve_one(
     let mut session_policy = session_policy.clone();
     session_policy.microphone_backend_available =
         arcen_pier_macos::microphone_input::backend_available();
+    wake_displays().await;
     // One correlation id per accepted connection, so the auth result, the
     // stream start and the session end can be gathered from a log that
     // holds many sessions at once.
@@ -2756,7 +2991,7 @@ async fn serve_one(
     match arcen_pier_macos::session::perform_for_peer(socket, peer.ip(), &session_policy, admission)
         .await
     {
-        Ok(handshake) => {
+        Ok(mut handshake) => {
             println!(
                 "handshake complete: offered {}x{}",
                 handshake.capture_width, handshake.capture_height
@@ -2769,6 +3004,15 @@ async fn serve_one(
                 arcen_telemetry::names::target::AUTH,
                 "session auth ok",
             );
+            let _active = ActiveSession::begin();
+            // Never asleep under a Deck that is only watching.
+            let awake = arcen_pier_macos::power::SleepAssertion::hold("Arcen Deck session");
+            if !awake.is_held() {
+                tracing::warn!(
+                    target: arcen_telemetry::names::target::SESSION,
+                    "the power manager refused to keep this Mac awake for the session"
+                );
+            }
             let _timezone_lease = apply_session_timezone(
                 audio_channel_request.is_some(),
                 session_policy.login_window,
@@ -2791,6 +3035,29 @@ async fn serve_one(
                     return SessionOutcome::Refused;
                 }
             }
+            // Before anything of the session is shown: if this agent dies
+            // while the Deck is attached, the session is still locked
+            // (GAP-048).
+            let lock_guard = arm_lock_guard(&session_policy).await;
+            // The desk goes private before anything of the session is shown
+            // (ADR 0025 §5), or the session is refused.
+            let mut desk_privacy = match arm_desk_privacy(&session_policy).await {
+                Ok(privacy) => privacy,
+                Err(refusal) => {
+                    tracing::error!(
+                        target: arcen_telemetry::names::target::SESSION,
+                        reason = refusal.token(),
+                        "refusing the session: the desk could not be made private"
+                    );
+                    let _ = arcen_pier_macos::net::refuse_with_reason(
+                        socket,
+                        arcen_session::console_session::ConsoleRefusal::PrivacyUnavailable
+                            .deck_reason(),
+                    )
+                    .await;
+                    return SessionOutcome::Refused;
+                }
+            };
 
             let mut session_audio = match start_session_audio(&handshake, local_playback).await {
                 Ok(audio) => audio,
@@ -2924,7 +3191,10 @@ async fn serve_one(
                 ),
             );
 
-            let outcome = serve_desktop(
+            let privacy_lost = desk_privacy
+                .as_ref()
+                .map(arcen_pier_macos::desk_privacy::DeskPrivacy::lost);
+            let served = serve_desktop(
                 socket,
                 &handshake,
                 stream_frames,
@@ -2945,16 +3215,52 @@ async fn serve_one(
                     None
                 },
                 audio_channel,
-            )
-            .await;
+            );
+            // A desk that can no longer be kept private ends the session
+            // (`DeskPrivacy::lost`); the hand-back below locks it first.
+            let outcome = match privacy_lost {
+                None => Some(served.await),
+                Some(lost) => tokio::select! {
+                    outcome = served => Some(outcome),
+                    () = privacy_lost_wait(&lost) => None,
+                },
+            };
+            if outcome.is_none() {
+                let _ = arcen_pier_macos::net::refuse_with_reason(
+                    socket,
+                    arcen_session::console_session::ConsoleRefusal::PrivacyUnavailable
+                        .deck_reason(),
+                )
+                .await;
+            }
             if let Some(microphone) = session_microphone.as_mut() {
                 let _ = microphone.shutdown_wait("session_end").await;
             }
             let (reason_class, frames_sent) = match &outcome {
-                Ok(frames) => ("completed", *frames),
-                Err(ended) => {
+                None => {
+                    stream_failed = true;
+                    ("privacy_lost", 0)
+                }
+                Some(Ok(frames)) => ("completed", *frames),
+                Some(Err(ended)) => {
                     eprintln!("stream ended: {ended}");
                     stream_failed = true;
+                    // A capture or encoder that never started used to close
+                    // the session with no reason at all, after the Deck had
+                    // been told it was authenticated.
+                    if ended.stats.frames_sent == 0
+                        && matches!(
+                            ended.error,
+                            arcen_pier_macos::stream::StreamError::Capture(_)
+                                | arcen_pier_macos::stream::StreamError::Encode(_)
+                        )
+                    {
+                        let _ = arcen_pier_macos::net::refuse_with_reason(
+                            socket,
+                            arcen_session::session_setup::DECK_REASON_CAPTURE_START_FAILED,
+                        )
+                        .await;
+                    }
                     // The real count, not zero. A client that vanishes after
                     // an hour is the ordinary way a remote session ends, and
                     // reporting nothing sent made it indistinguishable from a
@@ -2993,8 +3299,54 @@ async fn serve_one(
                 arcen_telemetry::names::target::SESSION,
                 "session end",
             );
-            if !release_audio(session_audio.lease.take()) {
-                stream_failed = true;
+            // The shared hand-back order: the session locked (and, for a
+            // private desk, proved locked), then its displays, then its
+            // sound, then the desk's input.
+            let mut locked = LockOutcome::NotOurs;
+            for step in arcen_session::console_session::DETACH_STEPS {
+                use arcen_session::console_session::DetachStep;
+                match step {
+                    DetachStep::LockSession => {
+                        locked = lock_on_departure(session_policy.serving_uid).await;
+                    }
+                    // `lock_on_departure` proves the lock screen; a private
+                    // desk also waits for a lock that was refused.
+                    DetachStep::AwaitLockScreen => {
+                        if desk_privacy.is_some() {
+                            keep_private_until_locked(locked, session_policy.serving_uid).await;
+                        }
+                    }
+                    DetachStep::RestoreOutputs => {
+                        if let Some(privacy) = desk_privacy.as_mut() {
+                            privacy.restore_outputs();
+                        }
+                        drop((
+                            handshake.arranged_display.take(),
+                            handshake.multi_monitor_displays.take(),
+                        ));
+                    }
+                    DetachStep::RestoreAudio => {
+                        if !release_audio(session_audio.lease.take()) {
+                            stream_failed = true;
+                        }
+                    }
+                    DetachStep::ReleaseInput => {
+                        if let Some(privacy) = desk_privacy.take() {
+                            let counts = privacy.release_input();
+                            tracing::info!(
+                                target: arcen_telemetry::names::target::SESSION,
+                                displays = counts.displays,
+                                events_dropped = counts.events_dropped,
+                                filter_reenabled = counts.filter_reenabled,
+                                "the desk has its displays and input back"
+                            );
+                        }
+                    }
+                }
+            }
+            // Handed back by this agent: the guard stands down.
+            if let Some(guard) = lock_guard {
+                guard.release();
             }
             if stream_failed {
                 SessionOutcome::Failed
@@ -3008,6 +3360,227 @@ async fn serve_one(
         }
     }
 }
+
+/// Wakes sleeping displays before the handshake reads the inventory: a
+/// sleeping display is not an active one, and a Mac whose screen had gone
+/// dark refused every Deck with "inventory is empty".
+///
+/// Only when no display is awake. This runs before any password is checked,
+/// and declaring activity over an awake display would let any peer that
+/// connects postpone its idle sleep, and with it a "require password after
+/// the display turns off" lock, indefinitely.
+async fn wake_displays() {
+    let asleep = || arcen_pier_macos::displays::probe().is_ok_and(|displays| displays.is_empty());
+    if !asleep() || !arcen_pier_macos::power::declare_user_activity() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while asleep() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+static LOCK_GUARD_SLOT: arcen_pier_macos::blocking::BlockingSlot =
+    arcen_pier_macos::blocking::BlockingSlot::new();
+
+/// Records a signed-in user's attachment and starts its lock guard
+/// (`lock_guard`): never at the login window (nobody is signed in) nor in
+/// `serve`.
+async fn arm_lock_guard(
+    policy: &arcen_pier_macos::session::SessionPolicy,
+) -> Option<arcen_pier_macos::lock_guard::LockGuard> {
+    let uid = policy.serving_uid.filter(|_| !policy.login_window)?;
+    let private = policy.desk_privacy;
+    match arcen_pier_macos::blocking::run_exclusive(
+        "arcen-macos-lock-guard",
+        &LOCK_GUARD_SLOT,
+        |failure| format!("{failure:?}"),
+        move || arcen_pier_macos::lock_guard::LockGuard::arm(uid, private),
+    )
+    .await
+    {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            tracing::error!(
+                target: arcen_telemetry::names::target::SESSION,
+                %error,
+                "the lock guard could not be armed"
+            );
+            None
+        }
+    }
+}
+
+static DESK_PRIVACY_SLOT: arcen_pier_macos::blocking::BlockingSlot =
+    arcen_pier_macos::blocking::BlockingSlot::new();
+
+/// Makes the desk private for a signed-in user's session when the operator
+/// asked for it (`platform.desktop.deskside.enabled`): never at the login
+/// window (nothing private is shown, and its only input is virtual HID,
+/// which an event filter cannot tell from the desk's) nor in `serve`.
+async fn arm_desk_privacy(
+    policy: &arcen_pier_macos::session::SessionPolicy,
+) -> Result<
+    Option<arcen_pier_macos::desk_privacy::DeskPrivacy>,
+    arcen_session::console_session::desk_privacy::DeskPrivacyRefusal,
+> {
+    use arcen_session::console_session::desk_privacy::{
+        DeckInputRoute, DeskPrivacyRefusal, admits_input_route,
+    };
+    let Some(uid) = policy
+        .serving_uid
+        .filter(|_| policy.desk_privacy && !policy.login_window)
+    else {
+        return Ok(None);
+    };
+    admits_input_route(match arcen_pier_macos::input::input_backend() {
+        arcen_pier_macos::input::InputBackend::CoreGraphics => DeckInputRoute::PostedEvents,
+        arcen_pier_macos::input::InputBackend::VirtualKeyboard(_)
+        | arcen_pier_macos::input::InputBackend::VirtualHidOnly(_) => {
+            DeckInputRoute::VirtualHidDevices
+        }
+    })?;
+    let privacy = arcen_pier_macos::blocking::run_exclusive(
+        "arcen-macos-desk-privacy",
+        &DESK_PRIVACY_SLOT,
+        |_| DeskPrivacyRefusal::InputFilterUnavailable,
+        move || arcen_pier_macos::desk_privacy::DeskPrivacy::arm(uid),
+    )
+    .await??;
+    tracing::info!(
+        target: arcen_telemetry::names::target::SESSION,
+        "the desk is private while the Deck is attached"
+    );
+    Ok(Some(privacy))
+}
+
+/// Resolves once the desk's privacy is lost.
+async fn privacy_lost_wait(lost: &std::sync::atomic::AtomicBool) {
+    while !lost.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::time::sleep(arcen_session::console_session::desk_privacy::DISPLAY_CHECK).await;
+    }
+}
+
+/// Keeps a private desk private while its session refuses to lock, asking
+/// it again every [`LOCK_RETRY`](arcen_session::console_session::desk_privacy::LOCK_RETRY),
+/// for at most `UNLOCKED_GRACE` (shared `hand_back_unlocked`): the desk
+/// never sees an unlocked desktop that a lock could still cover, and an
+/// owner whose lock screen is off by policy gets the Mac back. A console
+/// that reads as another account's is handed over only after the shared
+/// consecutive readings (`PrivacyWatch::console`): one failed reading is not
+/// a switch of account.
+async fn keep_private_until_locked(mut locked: LockOutcome, serving_uid: Option<u32>) {
+    use arcen_session::console_session::desk_privacy::{
+        CONSOLE_CHECK, LOCK_RETRY, PrivacyWatch, UnlockedHandBack, WatchVerdict, hand_back_unlocked,
+    };
+    if serving_uid.is_none() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut console = PrivacyWatch::default();
+    loop {
+        match locked {
+            LockOutcome::Locked => return,
+            LockOutcome::NotOurs => {
+                if console.console(false) == WatchVerdict::ConsoleLeft {
+                    return;
+                }
+            }
+            LockOutcome::NotLocked => {
+                let _ = console.console(true);
+            }
+        }
+        if hand_back_unlocked(started.elapsed()) == UnlockedHandBack::GiveBack {
+            tracing::error!(
+                target: arcen_telemetry::names::target::SESSION,
+                "the session would not lock; the desk gets its displays and input back unlocked"
+            );
+            return;
+        }
+        tokio::time::sleep(if locked == LockOutcome::NotOurs {
+            CONSOLE_CHECK
+        } else {
+            LOCK_RETRY
+        })
+        .await;
+        locked = lock_on_departure(serving_uid).await;
+    }
+}
+
+/// What [`lock_on_departure`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockOutcome {
+    /// The session is locked.
+    Locked,
+    /// Not a session to lock: the login window, `serve`, or a console
+    /// another account took over.
+    NotOurs,
+    /// The lock was asked for and could not be proved.
+    NotLocked,
+}
+
+/// Locks a signed-in user's session as its Deck leaves (ADR 0025 §4,
+/// shared [`arcen_session::console_session::Departure`]): the desk finds
+/// the lock screen, never an unlocked desktop someone else was using. Not the
+/// login window (nobody is signed in) and not `serve`, which is a hand run
+/// with no agent of its own. A console another account took over meanwhile
+/// is that account's, and is left alone.
+async fn lock_on_departure(serving_uid: Option<u32>) -> LockOutcome {
+    use arcen_session::console_session::Departure;
+    let Some(uid) = serving_uid else {
+        return LockOutcome::NotOurs;
+    };
+    let departure = if arcen_pier_macos::console::console_holder()
+        == arcen_session::agent_relay::ConsoleHolder::User(uid)
+    {
+        Departure::DeckLeft
+    } else {
+        Departure::SessionChanged
+    };
+    if !departure.locks_session() {
+        tracing::info!(
+            target: arcen_telemetry::names::target::SESSION,
+            departure = departure.token(),
+            "the session is not locked: the console is no longer this account's"
+        );
+        return LockOutcome::NotOurs;
+    }
+    let locked = arcen_pier_macos::blocking::run_exclusive(
+        "arcen-macos-session-lock",
+        &SESSION_LOCK_SLOT,
+        |failure| format!("{failure:?}"),
+        || {
+            arcen_pier_macos::screen_lock::lock_and_confirm(
+                arcen_pier_macos::screen_lock::LOCK_CONFIRM_TIMEOUT,
+            )
+            .map_err(|error| error.to_string())
+        },
+    )
+    .await
+    .and_then(|locked| locked);
+    match locked {
+        Ok(()) => {
+            tracing::info!(
+                target: arcen_telemetry::names::target::SESSION,
+                departure = departure.token(),
+                "locked the session as its Deck left"
+            );
+            LockOutcome::Locked
+        }
+        Err(error) => {
+            tracing::error!(
+                target: arcen_telemetry::names::target::SESSION,
+                departure = departure.token(),
+                %error,
+                "the session could not be locked as its Deck left"
+            );
+            LockOutcome::NotLocked
+        }
+    }
+}
+
+static SESSION_LOCK_SLOT: arcen_pier_macos::blocking::BlockingSlot =
+    arcen_pier_macos::blocking::BlockingSlot::new();
 
 /// What one served connection did.
 enum SessionOutcome {
@@ -3423,6 +3996,39 @@ fn probe_virtual_keyboard() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn probe_desk_privacy(args: &[String]) -> ExitCode {
+    let seconds = |flag: &str| -> Result<Option<std::time::Duration>, String> {
+        match args.iter().position(|arg| arg == flag) {
+            None => Ok(None),
+            Some(index) => args
+                .get(index + 1)
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| (1..=30).contains(value))
+                .map(|value| Some(std::time::Duration::from_secs(value)))
+                .ok_or_else(|| format!("{flag} takes 1 to 30 seconds")),
+        }
+    };
+    let (listen, blank) = match (seconds("--listen"), seconds("--blank")) {
+        (Ok(listen), Ok(blank)) => (listen.unwrap_or(std::time::Duration::from_secs(3)), blank),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("probe-desk-privacy: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let capture = args.iter().any(|arg| arg == "--capture");
+    let report = arcen_pier_macos::desk_privacy::probe(listen, blank, capture);
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => println!("{json}"),
+        Err(error) => eprintln!("probe-desk-privacy: {error}"),
+    }
+    let blank_ok = report.darkened_and_restored.unwrap_or(true);
+    if report.filter_available && report.own_post_recognised && blank_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
     let mut command = "run";
     let mut config = PathBuf::from(arcen_pier_macos::DEFAULT_CONFIG_PATH);
@@ -3443,7 +4049,9 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
                 | "probe-audio"
                 | "register-audio-consent"
                 | "hid-injector"
-        ) || (cfg!(feature = "lab-pen-probe") && command == "probe-pen")
+        ) || command == "probe-desk-privacy"
+            || command == "lock-guard"
+            || (cfg!(feature = "lab-pen-probe") && command == "probe-pen")
             || (cfg!(feature = "lab-bridged-hid-probe") && command == "probe-bridged-hid")
         {
             support_args.extend_from_slice(&args[index..]);
@@ -3458,8 +4066,10 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
             "probe-input" => command = "probe-input",
             "probe-audio" => command = "probe-audio",
             "register-audio-consent" => command = "register-audio-consent",
+            "core-audio-ready" => command = "core-audio-ready",
             "request-permissions" => command = "request-permissions",
             "probe-cursor" => command = "probe-cursor",
+            "probe-desk-privacy" => command = "probe-desk-privacy",
             "probe-modes" => command = "probe-modes",
             "probe-scroll" => command = "probe-scroll",
             "probe-virtual-display" => command = "probe-virtual-display",
@@ -3476,6 +4086,7 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
             "agent" => command = "agent",
             "launchd-plist" => command = "launchd-plist",
             "hid-injector" => command = "hid-injector",
+            "lock-guard" => command = "lock-guard",
             #[cfg(feature = "lab-bridged-hid-probe")]
             "probe-bridged-hid" => command = "probe-bridged-hid",
             "virtual-display-child" => command = "virtual-display-child",
@@ -3510,6 +4121,40 @@ mod tests {
     };
     use std::time::{Duration, Instant};
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn a_startup_waiting_on_the_prompt_keeps_admitting_on_its_proven_mute() {
+        use super::{
+            StartupMute, abandon_audio_startup, hand_over_startup, mute_held_by_abandoned_startup,
+        };
+        let muted = arcen_session::local_playback::MuteEvidence::observed(true, Some(true));
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(StartupMute::Pending));
+        // Nothing to hold before the tap exists.
+        assert!(abandon_audio_startup(&startup).is_none());
+        *startup.lock().expect("startup") = StartupMute::Held(muted);
+        assert_eq!(abandon_audio_startup(&startup), Some(muted));
+        let (evidence, admitted) = mute_held_by_abandoned_startup().expect("still muting");
+        assert_eq!(evidence, muted);
+        assert!(
+            mute_policy_allows_session(
+                arcen_session::pier_config::LocalPlayback::Muted,
+                Some(evidence)
+            )
+            .is_ok()
+        );
+        // A worker that returned without a tap proves nothing more.
+        assert!(matches!(hand_over_startup(&startup, Ok(None)), Ok(None)));
+        assert!(mute_held_by_abandoned_startup().is_none());
+        // Nobody holds the startup: it is gone, not muting.
+        drop((startup, admitted));
+        assert!(mute_held_by_abandoned_startup().is_none());
+
+        // A worker that unwound dropped its tap: nothing is admitted on it.
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(StartupMute::Held(muted)));
+        assert_eq!(abandon_audio_startup(&startup), Some(muted));
+        drop(super::StartupUnwound(std::sync::Arc::clone(&startup)));
+        assert!(mute_held_by_abandoned_startup().is_none());
+    }
 
     #[test]
     fn relays_are_bounded_overall_and_per_source() {

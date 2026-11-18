@@ -10,7 +10,6 @@
 //! delays only video, and audio never falls back onto another lane.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -61,7 +60,7 @@ pub(super) struct LaneWriters<S> {
     pub(super) refresh: Option<ResumeRefreshContext>,
     pub(super) write_timeout: Duration,
     pub(super) video: VideoSource,
-    pub(super) video_write_wait_micros: Arc<AtomicU64>,
+    pub(super) video_writes: Arc<arcen_media::video::VideoWriteMeter>,
     pub(super) idrs: Vec<IdrRequester>,
     pub(super) audio: Arc<AudioQueue>,
     pub(super) audio_control: AudioControl,
@@ -104,7 +103,7 @@ where
         refresh,
         write_timeout,
         video,
-        video_write_wait_micros,
+        video_writes,
         idrs,
         audio,
         audio_control,
@@ -135,13 +134,7 @@ where
             span.clone(),
         )),
         tokio::spawn(tracing::Instrument::instrument(
-            video_lane_writer(
-                lanes.clone(),
-                video,
-                write_timeout,
-                video_write_wait_micros,
-                idrs,
-            ),
+            video_lane_writer(lanes.clone(), video, write_timeout, video_writes, idrs),
             span.clone(),
         )),
         tokio::spawn(tracing::Instrument::instrument(
@@ -293,7 +286,7 @@ async fn video_lane_writer(
     lanes: LaneConnection,
     video: VideoSource,
     write_timeout: Duration,
-    write_wait_micros: Arc<AtomicU64>,
+    writes: Arc<arcen_media::video::VideoWriteMeter>,
     idrs: Vec<IdrRequester>,
 ) -> SessionEndReason {
     let mut writer = match LocalLaneWriter::open(&lanes, LaneRole::Video).await {
@@ -310,7 +303,7 @@ async fn video_lane_writer(
             debug!(target: NET, "video lane writer ended");
             return SessionEndReason::WriterEnded;
         };
-        let started = Instant::now();
+        let write = writes.begin();
         // Refinement fences and barriers go out immediately before the
         // access unit they describe, on the same ordered lane (ADR 0016).
         for record in dequeued.refine {
@@ -350,8 +343,7 @@ async fn video_lane_writer(
                 return SessionEndReason::WriterEnded;
             }
         }
-        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        write_wait_micros.fetch_add(micros, Ordering::Relaxed);
+        drop(write);
     }
 }
 
@@ -1448,7 +1440,7 @@ mod tests {
             refresh: None,
             write_timeout: Duration::from_secs(30),
             video: VideoSource::Single(Arc::clone(&video)),
-            video_write_wait_micros: Arc::new(AtomicU64::new(0)),
+            video_writes: Arc::default(),
             idrs: vec![idr],
             audio: Arc::clone(&audio),
             audio_control: audio_control(),

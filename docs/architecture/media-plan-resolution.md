@@ -79,7 +79,20 @@ The implementation is split across:
   BGRA-to-NV12 and direct BGRA-to-I420 full/even-row-range conversion;
 - `shared/media/src/video/plan.rs`: `EncoderRequest`, concrete
   `EncoderBackend`, limits, typed unavailability, `ResolvedMediaPlan`, and
-  strict READY/UNAVAILABLE v1 formatting and parsing;
+  strict READY/UNAVAILABLE v1 formatting and parsing. Limits are per backend,
+  narrowed per codec where one stops short (`codec_dimension_ceiling`: NVENC
+  H.264 encodes at most 4096 px a side, its HEVC and AV1 8192), so a plan
+  never promises an H.264 picture NVENC refuses at `InitializeEncoder`;
+- `shared/media/src/video/policy.rs`: host colour policy, codec resolution,
+  and `adaptive_codec_ladder_for_size`, the adaptive codec candidates for a
+  stream's largest picture: codecs that cannot encode it drop out, and past
+  H.264's ceiling an Auto roster climbs to HEVC, then AV1, only when the Deck
+  decodes them. Both Piers' multi-monitor encoder admissions build their
+  uniform whole-roster candidates with `adaptive_roster_codec_ladder` (the
+  largest monitor decides), so an Auto Deck on 2×5120x2880 console monitors
+  is served HEVC under the default configuration, and the Linux Pier
+  refuses an exact codec that cannot encode a monitor by name before it
+  probes an encoder;
 - `shared/media/src/video/intent.rs`: bounded auth-time intent/token/capability
   validation and the client-decodable AV1 → HEVC → H.264 preference;
 - `shared/media/src/video/obu.rs`: shared AV1 low-overhead OBU recovery-frame

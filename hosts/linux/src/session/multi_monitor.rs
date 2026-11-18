@@ -467,9 +467,10 @@ pub fn admit_requested_topology(
 
 /// A Deck states each monitor as seen on its desk (a quarter-turned monitor
 /// in its portrait size, `AlreadyCompositorOriented`). The Xorg planner
-/// drives a head's native panel mode and rotates it, so a joined console's
-/// heads are planned from the native (unrotated) size: swapped for 90 and
-/// 270 degrees, the logical arrangement unchanged.
+/// drives a head's native panel mode and rotates it, so the heads of a
+/// joined console and of a dedicated Xorg desktop alike are planned from the
+/// native (unrotated) size: swapped for 90 and 270 degrees, the logical
+/// arrangement unchanged.
 fn native_oriented(
     topology: &RequestedMonitorTopology,
 ) -> Result<RequestedMonitorTopology, MediaContractError> {
@@ -583,13 +584,17 @@ impl RegionAdmissionPolicy for LinuxRegionAdmission<'_> {
                 let Some(inventory) = self.inventory else {
                     return Err(MultiMonitorDegradeReason::NoInventoryConfigured);
                 };
-                if self.gate.console {
-                    let native = native_oriented(topology)
-                        .map_err(MultiMonitorDegradeReason::InvalidRequestedTopology)?;
-                    topology::plan_topology(&native, generation, inventory)
+                let native = native_oriented(topology)
+                    .map_err(MultiMonitorDegradeReason::InvalidRequestedTopology)?;
+                // A joined console's monitors are captured one by one, so
+                // only its X screen bounds the layout; a dedicated Xorg
+                // desktop keeps the encoder's ceiling.
+                let max_screen_edge = if self.gate.console {
+                    topology::MAX_CONSOLE_SCREEN_DIMENSION_PX
                 } else {
-                    topology::plan_topology(topology, generation, inventory)
-                }
+                    topology::MAX_VIRTUAL_FRAMEBUFFER_DIMENSION_PX
+                };
+                topology::plan_topology_within(&native, generation, inventory, max_screen_edge)
             }
         }
         .map_err(MultiMonitorDegradeReason::PlanningFailed)?;
@@ -829,7 +834,9 @@ impl AppliedRegionAssembler for LinuxAppliedRegions {
             // MetaMode's rate, which planning does not track). Diagnostic
             // only — no invariant depends on this value.
             refresh_hz: match self.backend {
-                LinuxTopologyBackend::DedicatedXorg => 60,
+                LinuxTopologyBackend::DedicatedXorg => {
+                    crate::display::topology::DEDICATED_XORG_HEAD_REFRESH_HZ
+                }
                 LinuxTopologyBackend::VirtualOutputs | LinuxTopologyBackend::ConsoleOutputs => {
                     monitor.refresh_hz
                 }
@@ -1172,6 +1179,42 @@ mod tests {
         assert_eq!(portrait.mode_token, "1920x1200");
         assert_eq!((portrait.width, portrait.height), (1200, 1920));
         assert_eq!((portrait.x, portrait.y), (2560, 0));
+    }
+
+    #[test]
+    fn a_dedicated_desktop_plans_a_quarter_turned_monitor_from_its_native_panel() {
+        // The same portrait monitor on a dedicated Xorg desktop: its head
+        // stands in the X screen at the size the Deck sees (portrait), and
+        // drives the native landscape raster rotated.
+        let gate = enabled_gate(2);
+        let requested = sample_request(vec![
+            descriptor(
+                "primary",
+                1,
+                (0, 0),
+                (2560, 1600),
+                true,
+                RotationMsg::Degrees0,
+            ),
+            descriptor(
+                "portrait",
+                2,
+                (2560, 0),
+                (1200, 1920),
+                false,
+                RotationMsg::Degrees90,
+            ),
+        ]);
+        let (plan, _) = admit_request(&gate, Some(&sample_offer(2)), &requested).expect("planned");
+        assert_eq!(plan.backend, LinuxTopologyBackend::DedicatedXorg);
+        let portrait = &plan.monitors[1];
+        assert_eq!(portrait.mode_token, "1920x1200");
+        assert_eq!((portrait.width, portrait.height), (1200, 1920));
+        assert_eq!((portrait.x, portrait.y), (2560, 0));
+        assert_eq!(
+            (plan.virtual_width, plan.virtual_height),
+            (2560 + 1200, 1920)
+        );
     }
 
     #[cfg(target_os = "linux")]

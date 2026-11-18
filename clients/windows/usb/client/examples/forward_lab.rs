@@ -227,6 +227,7 @@ mod lab {
         tablet_mode: TabletModeMsg,
     ) -> Result<ConnectOptions, String> {
         Ok(ConnectOptions {
+            display_refresh: None,
             services: Arc::new(LabServices),
             host,
             port,

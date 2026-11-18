@@ -81,23 +81,32 @@ pub struct DisplayRequest {
     pub deck_refresh_hz: u32,
     /// The HDR stream rate an HDR10 display's refresh stays a multiple of.
     pub hdr_stream_fps: u32,
+    /// The rate an SDR display is served at (`0`: keep `refresh_hz`): the
+    /// display runs at least at it where an EDID timing at its size carries
+    /// it (see [`Self::refresh_for`]).
+    pub sdr_stream_fps: u32,
 }
 
 impl DisplayRequest {
     /// The refresh to create a display of `size` at, whether at session start
-    /// or on a live retarget. SDR keeps `refresh_hz`; HDR10 takes the Deck's
-    /// refresh when its 10-bit link fits and otherwise the shared
+    /// or on a live retarget. SDR keeps `refresh_hz`, or with a served rate
+    /// (`sdr_stream_fps`) runs at that rate where an EDID timing at `size`
+    /// carries it, else at the Deck's requested refresh; HDR10 takes the
+    /// Deck's refresh when its 10-bit link fits and otherwise the shared
     /// `hdr10_refresh_hz` step-down, refusing with `hdr_link_exceeded` when
     /// nothing fits.
     pub fn refresh_for(&self, size: DisplaySize) -> Result<u32, String> {
-        if !self.hdr10 {
-            return Ok(self.refresh_hz);
-        }
         let requested = if self.deck_refresh_hz == 0 {
             self.refresh_hz
         } else {
             self.deck_refresh_hz
         };
+        if !self.hdr10 {
+            return Ok(match self.sdr_stream_fps {
+                0 => self.refresh_hz,
+                fps => served_display_refresh_hz(fps, requested, size),
+            });
+        }
         crate::edid::hdr10_refresh_hz(
             size.width,
             size.height,
@@ -124,12 +133,25 @@ impl DisplayRequest {
             desired_hdr: false,
             color: None,
             deck_refresh_hz: 0,
+            sdr_stream_fps: 0,
             hdr_stream_fps: arcen_media::video::pipeline_contract(
                 arcen_media::video::PipelineId::Hdr,
             )
             .max_fps,
         })
     }
+}
+
+/// The refresh a single SDR virtual display serving `fps` is created at:
+/// the shared `served_head_refresh_hz` without the paced headroom (Windows
+/// capture is not refresh-paced the way NvFBC and Mutter are; doubling is
+/// not measured here), within what an EDID 1.4 timing at `size` describes,
+/// never below the Deck's `requested_hz`.
+pub(crate) fn served_display_refresh_hz(fps: u32, requested_hz: u32, size: DisplaySize) -> u32 {
+    arcen_media::video::served_head_refresh_hz(fps, requested_hz, |refresh| {
+        refresh <= fps
+            && arcen_outputs::edid::cvt_reduced_blanking(size.width, size.height, refresh).is_ok()
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,11 +271,18 @@ pub struct DisplayScaleReport {
     pub client_display_id: String,
     pub session_monitor_id: u16,
     pub device_name: String,
+    /// The UI scale the client asked for (its Remote UI scale on this
+    /// display's stream), in whole percent.
     pub requested_scale_percent: u16,
+    /// The Windows scale step the host applies for that request: Windows
+    /// offers only `arcen_outputs::WINDOWS_UI_SCALE_PERCENTS` per monitor.
+    pub step_percent: u16,
     pub effective_dpi_x: u32,
     pub effective_dpi_y: u32,
     pub effective_scale_percent: u16,
     pub matches_requested: bool,
+    /// Whether Windows shows the step the host applied.
+    pub matches_step: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,22 +355,13 @@ pub enum DisplayPolicy {
     ExactIsolated,
     /// The pre-existing negotiation ladder: exact, then safe driver
     /// fallbacks, then the healthy current mode. Topology is left as-is.
-    Negotiated,
-    /// The negotiated ladder restricted to complete H.264 macroblocks.
     ///
-    /// Media Foundation cannot encode partial 16x16 macroblocks. Filtering
-    /// before candidate ranking prevents a fixed-mode driver from selecting an
-    /// otherwise-close mode that capenc must reject after display mutation.
-    NegotiatedMacroblock16,
-}
-
-impl DisplayPolicy {
-    fn accepts_size(self, size: DisplaySize) -> bool {
-        match self {
-            Self::ExactIsolated | Self::Negotiated => true,
-            Self::NegotiatedMacroblock16 => size.width % 16 == 0 && size.height % 16 == 0,
-        }
-    }
+    /// Every mode the driver offers is a candidate. The software encoder
+    /// (OpenH264) pads its picture to whole macroblocks itself and crops it
+    /// in the stream, so no mode is discarded for its alignment (a 16-aligned
+    /// filter for the Media Foundation encoder, which the Pier no longer
+    /// serves, once threw away 1920x1080, 1680x1050 and 1600x900).
+    Negotiated,
 }
 
 trait DisplayBackend {
@@ -537,9 +557,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
 
         let already_satisfied = match policy {
             DisplayPolicy::ExactIsolated => original.is_isolated_primary_at(requested),
-            DisplayPolicy::Negotiated | DisplayPolicy::NegotiatedMacroblock16 => {
-                policy.accepts_size(original.size) && original.is_settled_at(requested)
-            }
+            DisplayPolicy::Negotiated => original.is_settled_at(requested),
         };
         let mut bound_mode_prepared = false;
         if already_satisfied && !contract_refresh_required {
@@ -650,7 +668,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
             match transaction.backend.test_mode(&target, requested) {
                 Ok(()) => match transaction.apply_mode_armed(requested) {
                     Ok(applied) if applied.is_settled_at(requested) => match policy {
-                        DisplayPolicy::Negotiated | DisplayPolicy::NegotiatedMacroblock16 => {
+                        DisplayPolicy::Negotiated => {
                             let backend = transaction.backend.applied_backend(true);
                             let restore_backend = transaction.backend.restore_backend();
                             transaction.report = report(
@@ -741,8 +759,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
                 return Err(error);
             }
         };
-        let candidates =
-            fallback_candidates_matching(requested, &supported, |size| policy.accepts_size(size));
+        let candidates = fallback_candidates(requested, &supported);
         let mut rejected = vec![format!("exact {requested}: {exact_failure}")];
         for fallback in candidates {
             tracing::warn!(
@@ -804,7 +821,6 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
         let current = transaction.backend.current(&target)?;
         if current == original
             && current.is_settled_at(original.size)
-            && policy.accepts_size(current.size)
             && DisplaySize::validate(current.size.width, current.size.height).is_ok()
         {
             transaction.disarm_after_rollback()?;
@@ -1111,6 +1127,53 @@ fn restore_mismatch(restored: ModeState, original: ModeState) -> String {
     )
 }
 
+impl DisplayTransaction<NativeBackend> {
+    /// Gives the session's single display the Windows UI scale step the
+    /// client asked for and reports what Windows shows, for the hello's
+    /// `effective_display_scale`. Restores the display and fails when an
+    /// NVIDIA display cannot take the step.
+    ///
+    /// The multi-display path has done this since it shipped; the
+    /// single-display path applied the mode and synthesized EDID and never
+    /// looked at the result. A lab probe inside an active console measured
+    /// 250% effective DPI on a stream that asked for a point-sized 1:1
+    /// desktop, and nothing in the host log said so. NVIDIA GRID can ignore
+    /// the EDID-derived recommendation entirely, so the guarded Windows
+    /// device-info path applies the Settings-equivalent step and fails
+    /// closed if it cannot be verified.
+    fn serve_ui_scale(&mut self, ui_scale: arcen_outputs::WindowsUiScale) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            let device_name = self.report.device_name.clone();
+            let rect = self.report.desktop_rect;
+            let mut ui_scale = ui_scale;
+            if self.target.vendor_id == 0x10de {
+                match windows_backend::apply_single_display_scale(&device_name, rect, ui_scale) {
+                    Ok(served) => ui_scale = served,
+                    Err(error) => {
+                        let restore = self.restore();
+                        return Err(match restore {
+                            Ok(()) => format!("apply requested Windows UI scale: {error}"),
+                            Err(restore) => format!(
+                                "apply requested Windows UI scale: {error}; display rollback \
+                                 failed: {restore}"
+                            ),
+                        });
+                    }
+                }
+            }
+            if let Some(scale_report) =
+                windows_backend::log_single_display_effective_scale(&device_name, rect, ui_scale)
+            {
+                self.report.effective_scale_reports = vec![scale_report];
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = ui_scale;
+        Ok(())
+    }
+}
+
 impl<B: DisplayBackend> Drop for DisplayTransaction<B> {
     fn drop(&mut self) {
         if self.snapshot.is_none() {
@@ -1288,24 +1351,11 @@ fn require_stable_recovery_schema(version: u32, has_stable_topology: bool) -> Re
     }
 }
 
-#[cfg(test)]
 fn fallback_candidates(requested: DisplaySize, supported: &[DisplaySize]) -> Vec<DisplaySize> {
-    fallback_candidates_matching(requested, supported, |_| true)
-}
-
-fn fallback_candidates_matching(
-    requested: DisplaySize,
-    supported: &[DisplaySize],
-    accepts: impl Fn(DisplaySize) -> bool,
-) -> Vec<DisplaySize> {
     let mut candidates: Vec<DisplaySize> = supported
         .iter()
         .copied()
-        .filter(|size| {
-            *size != requested
-                && accepts(*size)
-                && DisplaySize::validate(size.width, size.height).is_ok()
-        })
+        .filter(|size| *size != requested && DisplaySize::validate(size.width, size.height).is_ok())
         .collect();
     candidates.sort_by_key(|size| (size.width, size.height));
     candidates.dedup();
@@ -1457,7 +1507,7 @@ impl DisplayManager {
         }
 
         let requested = request.size;
-        let requested_scale_percent = requested_scale_percent_from_request(request)?;
+        let requested_ui_scale = requested_ui_scale_from_request(request)?;
         let mut session_windows =
             crate::window_layout::SessionWindows::capture(&crate::recovery::default_path());
         let mut inner = DisplayTransaction::acquire_observed(
@@ -1476,44 +1526,7 @@ impl DisplayManager {
         } else if let Some(session_windows) = session_windows.as_mut() {
             session_windows.set_session_displays(vec![report.device_name.clone()]);
         }
-        #[cfg(windows)]
-        if inner.target.vendor_id == 0x10de {
-            if let Err(error) = windows_backend::apply_single_display_scale(
-                &report.device_name,
-                report.desktop_rect,
-                requested_scale_percent,
-            ) {
-                let restore = inner.restore();
-                return Err(match restore {
-                    Ok(()) => format!("apply requested Windows UI scale: {error}"),
-                    Err(restore) => format!(
-                        "apply requested Windows UI scale: {error}; display rollback failed: \
-                         {restore}"
-                    ),
-                });
-            }
-        }
-        // Apply and verify the UI scale Windows actually resolved, not just
-        // the mode.
-        //
-        // The multi-display path has done this since it shipped; the
-        // single-display path applied the mode and synthesized EDID and never
-        // looked at the result. A lab probe inside an active console measured
-        // 250% effective DPI on a stream that asked for a point-sized 1:1
-        // desktop, and nothing in the host log said so — the defect was
-        // invisible here while being obvious on screen.
-        //
-        // NVIDIA GRID can ignore the EDID-derived recommendation entirely, so
-        // the guarded Windows device-info path above applies the exact
-        // Settings-equivalent step and fails closed if it cannot be verified.
-        #[cfg(windows)]
-        windows_backend::log_single_display_effective_scale(
-            &report.device_name,
-            report.desktop_rect,
-            requested_scale_percent,
-        );
-        #[cfg(not(windows))]
-        let _ = requested_scale_percent;
+        inner.serve_ui_scale(requested_ui_scale)?;
         tracing::info!(
             target: DISPLAY,
             requested = %report.requested,
@@ -1910,13 +1923,14 @@ impl HeadlessPlanningLease {
             let _ = (&selector, request, policy, &session_log_id, &deskside);
             return Err("NVIDIA headless provisioning is only available on Windows".to_string());
         };
-        let inner = DisplayTransaction::acquire_observed(
+        let mut inner = DisplayTransaction::acquire_observed(
             backend,
             &selector,
             request.size,
             policy,
             Some(Arc::clone(&self.restore_state)),
         )?;
+        inner.serve_ui_scale(requested_ui_scale_from_request(request)?)?;
         let mut session_windows = self.windows.take();
         if let Some(session_windows) = session_windows.as_mut() {
             session_windows.set_session_displays(vec![inner.report().device_name.clone()]);
@@ -2414,11 +2428,6 @@ struct LegacySourceEvidence {
 
 const EFFECTIVE_SCALE_MATCH_TOLERANCE_PERCENT: u16 = 5;
 
-fn requested_scale_percent(scale: arcen_media::Scale120) -> u16 {
-    let units = u32::from(scale.get());
-    u16::try_from((units * 100 + 60) / 120).unwrap_or(u16::MAX)
-}
-
 /// The client's requested presentation scale as the plain ratio
 /// [`crate::edid::EdidRequest::scale`] expects (`1.0` = 100%, `2.0` = 200%).
 ///
@@ -2452,11 +2461,13 @@ pub(crate) fn exact_mode_edid_request(
         refresh_hz: monitor.refresh_hz,
         width_mm: 0.0,
         height_mm: 0.0,
-        // Carry the client's requested per-monitor scale. Passing `1.0` here
-        // declared every synthesized display to be exactly 96 DPI, so Windows
-        // recommended 100% no matter what the client asked for -- measured on
-        // pier-windows.example.internal as 200% requested and 100% applied.
-        scale: edid_scale_ratio(monitor.scale).unwrap_or(1.0),
+        // Declare the Windows UI scale step this monitor gets (from the
+        // client's Remote UI scale, not the stream's backing ratio). Passing
+        // `1.0` here declared every synthesized display to be exactly 96 DPI,
+        // so Windows recommended 100% no matter what the client asked for --
+        // measured on pier-windows.example.internal as 200% requested and
+        // 100% applied.
+        scale: f32::from(monitor.ui_scale.step_percent) / 100.0,
         product_id: u16::try_from(monitor.target_id).unwrap_or(0),
         serial: monitor.target_id,
         color: monitor.color,
@@ -2475,8 +2486,15 @@ fn display_scale_matches_requested(requested_percent: u16, effective_percent: u1
     requested_percent.abs_diff(effective_percent) <= EFFECTIVE_SCALE_MATCH_TOLERANCE_PERCENT
 }
 
-fn requested_scale_percent_from_request(request: DisplayRequest) -> Result<u16, String> {
-    let ratio = if request.width_mm > 0.0 && request.height_mm > 0.0 {
+/// The Windows UI scale a single-display request asks for: from the
+/// millimetres the client advertised for its Remote UI scale, else its
+/// backing ratio, served by the nearest Windows step (shared
+/// [`arcen_outputs::WindowsUiScale`]).
+fn requested_ui_scale_from_request(
+    request: DisplayRequest,
+) -> Result<arcen_outputs::WindowsUiScale, String> {
+    let from_millimetres = request.width_mm > 0.0 && request.height_mm > 0.0;
+    let ratio = if from_millimetres {
         let horizontal = request.size.width as f32 * 25.4 / (96.0 * request.width_mm);
         let vertical = request.size.height as f32 * 25.4 / (96.0 * request.height_mm);
         if !horizontal.is_finite() || !vertical.is_finite() || horizontal <= 0.0 || vertical <= 0.0
@@ -2497,17 +2515,26 @@ fn requested_scale_percent_from_request(request: DisplayRequest) -> Result<u16, 
     if !percent.is_finite() || !(1.0..=1000.0).contains(&percent) {
         return Err("client display scale percentage is outside 1..=1000".to_string());
     }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok(percent as u16)
+    let basis = if from_millimetres {
+        arcen_outputs::ScaleBasis::RequestedDensity
+    } else if ratio > 1.0 {
+        arcen_outputs::ScaleBasis::BackingPixels
+    } else {
+        arcen_outputs::ScaleBasis::Unknown
+    };
+    Ok(arcen_outputs::WindowsUiScale::from_ratio(
+        f64::from(ratio),
+        basis,
+    ))
 }
 
 #[cfg(windows)]
 mod windows_backend {
     use super::{
         display_scale_matches_requested, effective_scale_percent_from_dpi, nvapi_exact_available,
-        report, requested_scale_percent, require_nvapi_exact_retarget,
-        take_nvapi_active_after_stage, DesktopRect, DisplayBackend, DisplayReport,
-        DisplayScaleReport, DisplaySize, DisplayTarget, ModeState, NativeBackend, OutputSelector,
+        report, require_nvapi_exact_retarget, take_nvapi_active_after_stage, DesktopRect,
+        DisplayBackend, DisplayReport, DisplayScaleReport, DisplaySize, DisplayTarget, ModeState,
+        NativeBackend, OutputSelector,
     };
     use crate::logging::DISPLAY;
     use crate::nvapi;
@@ -3008,7 +3035,10 @@ mod windows_backend {
             let report = multi_display_report(binding.plan(), effective_scale_reports)?;
             binding.evidence.set_report(report);
             let plan = binding.plan();
-            log_effective_scale_reports(&binding.evidence.report().effective_scale_reports);
+            log_effective_scale_reports(
+                &binding.evidence.report().effective_scale_reports,
+                "multi-display session",
+            );
             tracing::info!(
                 target: DISPLAY,
                 monitors = plan.monitors.len(),
@@ -3253,7 +3283,10 @@ mod windows_backend {
             let report =
                 multi_display_report(binding.evidence.applied_plan(), effective_scale_reports)?;
             binding.evidence.set_report(report);
-            log_effective_scale_reports(&binding.evidence.report().effective_scale_reports);
+            log_effective_scale_reports(
+                &binding.evidence.report().effective_scale_reports,
+                "multi-display session",
+            );
             tracing::info!(
                 target: DISPLAY,
                 generation = binding.generation,
@@ -3684,13 +3717,18 @@ mod windows_backend {
             }
         }
 
+        /// Gives every monitor its Windows UI scale step and records the
+        /// step served (Windows may offer a monitor fewer steps) in the
+        /// applied plan, which the session's scale report reads.
         fn apply_requested_dpi_scales(&mut self) -> Result<(), String> {
-            let monitors = self.plan().monitors.clone();
+            let mut plan = self.plan().clone();
             let mut applied = Vec::new();
-            for monitor in monitors {
-                match apply_monitor_dpi_scale(&monitor) {
-                    Ok(Some(scale)) => applied.push(scale),
-                    Ok(None) => {}
+            for monitor in &mut plan.monitors {
+                match apply_monitor_dpi_scale(monitor) {
+                    Ok((scale, served)) => {
+                        applied.extend(scale);
+                        monitor.ui_scale = served;
+                    }
                     Err(error) => {
                         for scale in applied.iter().rev() {
                             let _ = restore_applied_dpi_scale(scale);
@@ -3700,6 +3738,7 @@ mod windows_backend {
                 }
             }
             self.applied_dpi_scales = applied;
+            self.evidence.set_applied_plan(plan);
             Ok(())
         }
 
@@ -3823,6 +3862,10 @@ mod windows_backend {
                     )
                     .expect("logical rect"),
                     scale: arcen_media::Scale120::new(120).expect("scale"),
+                    ui_scale: arcen_outputs::WindowsUiScale::from_percent(
+                        100,
+                        arcen_outputs::ScaleBasis::Unknown,
+                    ),
                     refresh_hz: 60,
                     rotation: arcen_media::Rotation::Degrees0,
                     primary: true,
@@ -3905,8 +3948,7 @@ mod windows_backend {
         })
     }
 
-    const WINDOWS_DPI_SCALE_STEPS: [u16; 12] =
-        [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+    const WINDOWS_DPI_SCALE_STEPS: [u16; 12] = arcen_outputs::WINDOWS_UI_SCALE_PERCENTS;
     const DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE: DISPLAYCONFIG_DEVICE_INFO_TYPE =
         DISPLAYCONFIG_DEVICE_INFO_TYPE(-3);
     const DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE: DISPLAYCONFIG_DEVICE_INFO_TYPE =
@@ -4041,6 +4083,36 @@ mod windows_backend {
             .and_then(|index| i32::try_from(index).ok())
     }
 
+    /// The lowest and highest scale Windows offers a monitor that shows
+    /// `current_percent` at relative step `current_relative` of
+    /// `minimum_relative..=maximum_relative` (steps around the scale Windows
+    /// recommends for it).
+    pub(super) fn offered_scale_range(
+        current_percent: u16,
+        current_relative: i32,
+        minimum_relative: i32,
+        maximum_relative: i32,
+    ) -> Result<(u16, u16), String> {
+        let current_step = dpi_scale_step(current_percent).ok_or_else(|| {
+            format!("Windows effective scale {current_percent}% is not a supported DPI step")
+        })?;
+        let step = |relative: i32| {
+            current_step
+                .checked_sub(current_relative)
+                .and_then(|recommended| recommended.checked_add(relative))
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| WINDOWS_DPI_SCALE_STEPS.get(index).copied())
+                .ok_or_else(|| {
+                    format!(
+                        "Windows DPI range {minimum_relative}..={maximum_relative} around \
+                         {current_percent}% (relative {current_relative}) is outside the \
+                         supported table"
+                    )
+                })
+        };
+        Ok((step(minimum_relative)?, step(maximum_relative)?))
+    }
+
     pub(super) fn requested_relative_scale(
         current_percent: u16,
         requested_percent: u16,
@@ -4100,51 +4172,135 @@ mod windows_backend {
         }
     }
 
-    pub(super) fn apply_single_display_scale(
+    /// The active path that drives `adapter_luid`/`target_id`, with its
+    /// GDI name now. A plan's `device_name` is a planning-time snapshot:
+    /// Windows renumbers `\\.\DISPLAYn` while it commits a topology (lab:
+    /// two Arcen targets swapped DISPLAY1 and DISPLAY2 between planning and
+    /// verification), so a source looked up by that name is another
+    /// monitor's.
+    fn active_target_path(
+        adapter_luid: arcen_outputs::windows_topology::AdapterLuid,
+        target_id: u32,
+    ) -> Result<(DISPLAYCONFIG_PATH_INFO, String), String> {
+        let path = query_active_topology()?
+            .paths
+            .into_iter()
+            .find(|path| {
+                path.targetInfo.adapterId.LowPart == adapter_luid.low_part
+                    && path.targetInfo.adapterId.HighPart == adapter_luid.high_part
+                    && path.targetInfo.id == target_id
+            })
+            .ok_or_else(|| format!("no active path drives display target {target_id}"))?;
+        let name = source_gdi_name(&path)?;
+        Ok((path, name))
+    }
+
+    /// Gives the source of `path` (named `device_name`, whose desktop is
+    /// `rect`) the Windows UI scale step for `ui_scale`, limited to the
+    /// steps Windows offers that monitor, and waits until `GetDpiForMonitor`
+    /// shows it; restores the prior step when it does not. Returns what was
+    /// changed (`None` when Windows already shows the step) and the scale
+    /// served.
+    fn change_source_scale(
         device_name: &str,
+        path: &DISPLAYCONFIG_PATH_INFO,
         rect: DesktopRect,
-        requested_percent: u16,
-    ) -> Result<(), String> {
+        ui_scale: arcen_outputs::WindowsUiScale,
+    ) -> Result<(Option<AppliedDpiScale>, arcen_outputs::WindowsUiScale), String> {
         let (_, _, current_percent) = effective_scale_at(rect)?;
-        if display_scale_matches_requested(requested_percent, current_percent) {
-            return Ok(());
+        if display_scale_matches_requested(ui_scale.step_percent, current_percent) {
+            return Ok((None, ui_scale));
         }
-        let path = active_source_path(device_name)?;
-        let source = display_source_key(&path);
+        let source = display_source_key(path);
         let current = source_dpi_scale(source)?;
-        let requested_relative = requested_relative_scale(
+        let (lowest, highest) = offered_scale_range(
             current_percent,
-            requested_percent,
             current.current_scale_relative,
             current.min_scale_relative,
             current.max_scale_relative,
         )?;
+        let ui_scale = ui_scale.within(lowest, highest);
+        let step_percent = ui_scale.step_percent;
+        if display_scale_matches_requested(step_percent, current_percent) {
+            return Ok((None, ui_scale));
+        }
+        let requested_relative = requested_relative_scale(
+            current_percent,
+            step_percent,
+            current.current_scale_relative,
+            current.min_scale_relative,
+            current.max_scale_relative,
+        )?;
+        tracing::debug!(
+            target: DISPLAY,
+            device = %device_name,
+            current_percent,
+            step_percent,
+            current_relative = current.current_scale_relative,
+            min_relative = current.min_scale_relative,
+            max_relative = current.max_scale_relative,
+            requested_relative,
+            "changing the Windows UI scale step"
+        );
         set_source_dpi_scale(source, requested_relative)?;
-
-        if let Err(error) = wait_for_effective_scale(rect, requested_percent) {
+        if let Err(error) = wait_for_effective_scale(rect, step_percent) {
+            // What Windows recorded, to tell a step it refused from one it
+            // took but did not show in time.
+            let recorded = source_dpi_scale(source).map_or_else(
+                |error| format!("its scale step is unreadable ({error})"),
+                |now| {
+                    format!(
+                        "it records relative step {} of {}..={}, {requested_relative} was set",
+                        now.current_scale_relative, now.min_scale_relative, now.max_scale_relative
+                    )
+                },
+            );
             let rollback = set_source_dpi_scale(source, current.current_scale_relative)
                 .and_then(|()| wait_for_effective_scale(rect, current_percent));
             return Err(match rollback {
-                Ok(()) => format!("{error}; prior scale was restored and verified"),
+                Ok(()) => format!("{error}; {recorded}; prior scale was restored"),
                 Err(rollback) => {
-                    format!("{error}; restoring the prior scale failed: {rollback}")
+                    format!("{error}; {recorded}; restoring prior scale failed: {rollback}")
                 }
             });
         }
+        Ok((
+            Some(AppliedDpiScale {
+                source,
+                previous_relative: current.current_scale_relative,
+                previous_percent: current_percent,
+                rect,
+                device_name: device_name.to_owned(),
+            }),
+            ui_scale,
+        ))
+    }
+
+    pub(super) fn apply_single_display_scale(
+        device_name: &str,
+        rect: DesktopRect,
+        ui_scale: arcen_outputs::WindowsUiScale,
+    ) -> Result<arcen_outputs::WindowsUiScale, String> {
+        let path = active_source_path(device_name)?;
+        let (Some(applied), ui_scale) = change_source_scale(device_name, &path, rect, ui_scale)?
+        else {
+            return Ok(ui_scale);
+        };
         tracing::info!(
             target: DISPLAY,
             device = %device_name,
-            previous_scale_percent = current_percent,
-            requested_scale_percent = requested_percent,
-            relative_scale = requested_relative,
+            previous_scale_percent = applied.previous_percent,
+            requested_scale_percent = ui_scale.requested_percent,
+            step_percent = ui_scale.step_percent,
+            basis = ui_scale.basis.token(),
             "Windows UI scale applied and verified for single-display session"
         );
-        Ok(())
+        Ok(ui_scale)
     }
 
     fn apply_monitor_dpi_scale(
         monitor: &arcen_outputs::windows_topology::WindowsMonitorPlan,
-    ) -> Result<Option<AppliedDpiScale>, String> {
+    ) -> Result<(Option<AppliedDpiScale>, arcen_outputs::WindowsUiScale), String> {
         let rect = DesktopRect {
             left: monitor.x,
             top: monitor.y,
@@ -4153,51 +4309,29 @@ mod windows_backend {
             height: i32::try_from(monitor.height)
                 .map_err(|_| format!("monitor {} height exceeds i32", monitor.device_name))?,
         };
-        let requested_percent = requested_scale_percent(monitor.scale);
-        let (_, _, current_percent) = effective_scale_at(rect)?;
-        if display_scale_matches_requested(requested_percent, current_percent) {
-            return Ok(None);
+        let (path, device_name) = active_target_path(monitor.adapter_luid, monitor.target_id)
+            .map_err(|error| {
+                format!(
+                    "apply Windows UI scale for {}: {error}",
+                    monitor.client_display_id
+                )
+            })?;
+        let (applied, ui_scale) = change_source_scale(&device_name, &path, rect, monitor.ui_scale)
+            .map_err(|error| format!("apply Windows UI scale for {device_name}: {error}"))?;
+        if let Some(applied) = &applied {
+            tracing::info!(
+                target: DISPLAY,
+                device = %device_name,
+                planned_device = %monitor.device_name,
+                client_display_id = %monitor.client_display_id,
+                previous_scale_percent = applied.previous_percent,
+                requested_scale_percent = ui_scale.requested_percent,
+                step_percent = ui_scale.step_percent,
+                basis = ui_scale.basis.token(),
+                "Windows UI scale applied and verified for multi-display session"
+            );
         }
-        let path = active_source_path(&monitor.device_name)?;
-        let source = display_source_key(&path);
-        let current = source_dpi_scale(source)?;
-        let requested_relative = requested_relative_scale(
-            current_percent,
-            requested_percent,
-            current.current_scale_relative,
-            current.min_scale_relative,
-            current.max_scale_relative,
-        )?;
-        set_source_dpi_scale(source, requested_relative)?;
-        if let Err(error) = wait_for_effective_scale(rect, requested_percent) {
-            let rollback = set_source_dpi_scale(source, current.current_scale_relative)
-                .and_then(|()| wait_for_effective_scale(rect, current_percent));
-            return Err(match rollback {
-                Ok(()) => format!(
-                    "apply Windows UI scale for {}: {error}; prior scale was restored",
-                    monitor.device_name
-                ),
-                Err(rollback) => format!(
-                    "apply Windows UI scale for {}: {error}; restoring prior scale failed: {rollback}",
-                    monitor.device_name
-                ),
-            });
-        }
-        tracing::info!(
-            target: DISPLAY,
-            device = %monitor.device_name,
-            previous_scale_percent = current_percent,
-            requested_scale_percent = requested_percent,
-            relative_scale = requested_relative,
-            "Windows UI scale applied and verified for multi-display session"
-        );
-        Ok(Some(AppliedDpiScale {
-            source,
-            previous_relative: current.current_scale_relative,
-            previous_percent: current_percent,
-            rect,
-            device_name: monitor.device_name.clone(),
-        }))
+        Ok((applied, ui_scale))
     }
 
     fn restore_applied_dpi_scale(scale: &AppliedDpiScale) -> Result<(), String> {
@@ -4206,21 +4340,23 @@ mod windows_backend {
     }
 
     /// Report the effective UI scale Windows resolved for a single-display
-    /// session, warning when it disagrees with what the client asked for.
+    /// session, warning when it disagrees with what the client asked for,
+    /// and return it for the hello's `effective_display_scale` (the Deck
+    /// names a display Windows shows at another scale).
     ///
     /// The multi-display sibling is `effective_scale_reports`; this exists
     /// because the single-display lease had no equivalent and a 250% desktop
     /// went unremarked in the host log while being unmissable on screen.
     ///
     /// Deliberately non-fatal in every direction. A probe that cannot resolve
-    /// the monitor logs and returns: an unreadable DPI is not a reason to
-    /// refuse a session that is otherwise working, and this is a diagnostic,
-    /// not a gate.
+    /// the monitor logs and returns `None`: an unreadable DPI is not a reason
+    /// to refuse a session that is otherwise working, and this is a
+    /// diagnostic, not a gate.
     pub(super) fn log_single_display_effective_scale(
         device_name: &str,
         rect: DesktopRect,
-        requested_scale_percent: u16,
-    ) {
+        ui_scale: arcen_outputs::WindowsUiScale,
+    ) -> Option<DisplayScaleReport> {
         let (dpi_x, dpi_y, effective_scale_percent) = match effective_scale_at(rect) {
             Ok(report) => report,
             Err(error) => {
@@ -4230,33 +4366,29 @@ mod windows_backend {
                     %error,
                     "single-display effective scale could not be read"
                 );
-                return;
+                return None;
             }
         };
-        let matches_requested =
-            display_scale_matches_requested(requested_scale_percent, effective_scale_percent);
-        tracing::info!(
-            target: DISPLAY,
-            device = %device_name,
-            requested_scale_percent,
-            effective_dpi_x = dpi_x,
-            effective_dpi_y = dpi_y,
+        let report = DisplayScaleReport {
+            client_display_id: String::new(),
+            session_monitor_id: 1,
+            device_name: device_name.to_owned(),
+            requested_scale_percent: ui_scale.requested_percent,
+            step_percent: ui_scale.step_percent,
+            effective_dpi_x: dpi_x,
+            effective_dpi_y: dpi_y,
             effective_scale_percent,
-            matches_requested,
-            "Windows effective display scale resolved for single-display session"
-        );
-        if !matches_requested {
-            tracing::warn!(
-                target: DISPLAY,
-                device = %device_name,
-                requested_scale_percent,
+            matches_requested: display_scale_matches_requested(
+                ui_scale.requested_percent,
                 effective_scale_percent,
-                effective_dpi_x = dpi_x,
-                effective_dpi_y = dpi_y,
-                "Windows resolved a different UI scale than the client requested; the desktop \
-                 will look larger or smaller than the stream contract implies"
-            );
-        }
+            ),
+            matches_step: display_scale_matches_requested(
+                ui_scale.step_percent,
+                effective_scale_percent,
+            ),
+        };
+        log_effective_scale_reports(std::slice::from_ref(&report), "single-display session");
+        Some(report)
     }
 
     fn effective_scale_report(
@@ -4286,17 +4418,23 @@ mod windows_backend {
                     monitor.device_name
                 )
             })?;
-        let requested_scale_percent = requested_scale_percent(monitor.scale);
+        let ui_scale = monitor.ui_scale;
         Ok(DisplayScaleReport {
             client_display_id: monitor.client_display_id.clone(),
             session_monitor_id: monitor.session_monitor_id.get(),
-            device_name: monitor.device_name.clone(),
-            requested_scale_percent,
+            device_name: active_target_path(monitor.adapter_luid, monitor.target_id)
+                .map_or_else(|_| monitor.device_name.clone(), |(_, name)| name),
+            requested_scale_percent: ui_scale.requested_percent,
+            step_percent: ui_scale.step_percent,
             effective_dpi_x: dpi_x,
             effective_dpi_y: dpi_y,
             effective_scale_percent,
             matches_requested: display_scale_matches_requested(
-                requested_scale_percent,
+                ui_scale.requested_percent,
+                effective_scale_percent,
+            ),
+            matches_step: display_scale_matches_requested(
+                ui_scale.step_percent,
                 effective_scale_percent,
             ),
         })
@@ -4324,31 +4462,49 @@ mod windows_backend {
             .collect()
     }
 
-    fn log_effective_scale_reports(reports: &[DisplayScaleReport]) {
+    /// One line per display with the scale the client asked for, the
+    /// Windows step the host applied and what Windows shows; a warning
+    /// when Windows shows another scale than the step, and an info line
+    /// when Windows has no step for the request.
+    fn log_effective_scale_reports(reports: &[DisplayScaleReport], session: &str) {
         for report in reports {
             tracing::info!(
                 target: DISPLAY,
+                session,
                 client_display_id = %report.client_display_id,
                 session_monitor_id = report.session_monitor_id,
                 device = %report.device_name,
                 requested_scale_percent = report.requested_scale_percent,
+                step_percent = report.step_percent,
                 effective_dpi_x = report.effective_dpi_x,
                 effective_dpi_y = report.effective_dpi_y,
                 effective_scale_percent = report.effective_scale_percent,
                 matches_requested = report.matches_requested,
-                "Windows effective display scale resolved for applied monitor"
+                matches_step = report.matches_step,
+                "Windows effective display scale resolved"
             );
-            if !report.matches_requested {
+            if !report.matches_step {
                 tracing::warn!(
                     target: DISPLAY,
+                    session,
                     client_display_id = %report.client_display_id,
-                    session_monitor_id = report.session_monitor_id,
                     device = %report.device_name,
                     requested_scale_percent = report.requested_scale_percent,
+                    step_percent = report.step_percent,
                     effective_scale_percent = report.effective_scale_percent,
-                    effective_dpi_x = report.effective_dpi_x,
-                    effective_dpi_y = report.effective_dpi_y,
-                    "Windows effective display scale differs from requested client scale; continuing fail-loud so the session remains usable"
+                    "Windows shows another UI scale than the step the host applied; the desktop \
+                     will look larger or smaller than the client asked"
+                );
+            } else if !report.matches_requested {
+                tracing::info!(
+                    target: DISPLAY,
+                    session,
+                    client_display_id = %report.client_display_id,
+                    device = %report.device_name,
+                    requested_scale_percent = report.requested_scale_percent,
+                    step_percent = report.step_percent,
+                    "Windows has no UI scale step for the request; the display shows the \
+                     nearest step"
                 );
             }
         }
@@ -8710,6 +8866,10 @@ mod tests {
             )
             .expect("rect"),
             scale: arcen_media::Scale120::new(240).expect("scale"),
+            ui_scale: arcen_outputs::WindowsUiScale::from_percent(
+                300,
+                arcen_outputs::ScaleBasis::RequestedDensity,
+            ),
             // 3600x2260 carries HDR10 only at 30 Hz (`hdr10_refresh_hz`).
             refresh_hz: 30,
             rotation: arcen_media::Rotation::Degrees0,
@@ -8719,6 +8879,8 @@ mod tests {
 
         let request = exact_mode_edid_request(&monitor);
         assert_eq!(request.color, Some(color));
+        // The EDID declares the UI scale step, not the stream's 2x ratio.
+        assert!((request.scale - 3.0).abs() < f32::EPSILON);
         let edid = crate::edid::generate_hdr10(request).expect("EDID");
         let extension = &edid[128..];
         let mut offset = 4usize;
@@ -8752,31 +8914,36 @@ mod tests {
     }
 
     #[test]
-    fn requested_scale_percent_uses_shared_scale120_domain() {
-        assert_eq!(
-            requested_scale_percent(arcen_media::scale120_from_scale(1.0).expect("1x")),
-            100
-        );
-        assert_eq!(
-            requested_scale_percent(arcen_media::scale120_from_scale(1.25).expect("1.25x")),
-            125
-        );
-        assert_eq!(
-            requested_scale_percent(arcen_media::scale120_from_scale(2.0).expect("2x")),
-            200
-        );
-    }
-
-    #[test]
     fn requested_scale_percent_uses_the_synthesized_physical_size() {
         let mut request = DisplayRequest::new(3008, 1692).unwrap();
         request.scale = 2.0;
         request.width_mm = 3008.0 * 25.4 / 96.0;
         request.height_mm = 1692.0 * 25.4 / 96.0;
-        assert_eq!(requested_scale_percent_from_request(request).unwrap(), 100);
+        let scale = requested_ui_scale_from_request(request).unwrap();
+        assert_eq!((scale.requested_percent, scale.step_percent), (100, 100));
 
         request.size = DisplaySize::validate(6016, 3384).unwrap();
-        assert_eq!(requested_scale_percent_from_request(request).unwrap(), 200);
+        let scale = requested_ui_scale_from_request(request).unwrap();
+        assert_eq!((scale.requested_percent, scale.step_percent), (200, 200));
+    }
+
+    #[test]
+    fn a_scale_windows_has_no_step_for_takes_the_nearest_step() {
+        // A 1.5x Retina stream (2880x1800) at a Remote UI scale of 125%:
+        // 187.5% is not a Windows step; it used to refuse the session.
+        let mut request = DisplayRequest::new(2880, 1800).unwrap();
+        request.scale = 1.5;
+        request.width_mm = 2880.0 * 25.4 / (96.0 * 1.875);
+        request.height_mm = 1800.0 * 25.4 / (96.0 * 1.875);
+        let scale = requested_ui_scale_from_request(request).unwrap();
+        assert_eq!((scale.requested_percent, scale.step_percent), (188, 175));
+        assert!(scale.snapped());
+
+        // Without millimetres the backing ratio decides.
+        request.width_mm = 0.0;
+        request.height_mm = 0.0;
+        let scale = requested_ui_scale_from_request(request).unwrap();
+        assert_eq!((scale.requested_percent, scale.step_percent), (150, 150));
     }
 
     #[test]
@@ -8784,7 +8951,7 @@ mod tests {
         let mut request = DisplayRequest::new(3008, 1692).unwrap();
         request.width_mm = 3008.0 * 25.4 / 96.0;
         request.height_mm = 100.0;
-        assert!(requested_scale_percent_from_request(request)
+        assert!(requested_ui_scale_from_request(request)
             .unwrap_err()
             .contains("non-square"));
     }
@@ -8810,6 +8977,22 @@ mod tests {
                 .unwrap_err()
                 .contains("outside the supported table")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offered_scale_range_is_the_steps_around_the_recommendation() {
+        // The lab: a 2880x1800 Arcen head showing 200% at relative 0 of -4..=1.
+        assert_eq!(
+            windows_backend::offered_scale_range(200, 0, -4, 1).unwrap(),
+            (100, 225)
+        );
+        // 3840x2160 recommended 300%, shown at 100% (relative -7 of -7..=1).
+        assert_eq!(
+            windows_backend::offered_scale_range(100, -7, -7, 1).unwrap(),
+            (100, 350)
+        );
+        assert!(windows_backend::offered_scale_range(100, 0, -1, 0).is_err());
     }
 
     #[test]
@@ -11202,9 +11385,7 @@ mod tests {
             size(3840, 2160),
         ];
 
-        let ordered = fallback_candidates_matching(requested, &supported, |size| {
-            DisplayPolicy::NegotiatedMacroblock16.accepts_size(size)
-        });
+        let ordered = fallback_candidates(requested, &supported);
 
         assert_eq!(
             ordered.first().copied(),
@@ -11222,18 +11403,14 @@ mod tests {
         // the aspect but is far larger.
         let supported = [size(1680, 1050), size(2560, 1600)];
 
-        let ordered = fallback_candidates_matching(requested, &supported, |_| true);
+        let ordered = fallback_candidates(requested, &supported);
 
         assert_eq!(ordered.first().copied(), Some(size(1680, 1050)));
 
         // The same guard the penalty is calibrated against: a 3600x2338 request
         // must keep the fitting 2560x1600 rather than the larger 3840x2160,
         // whose shape is further from what was asked for.
-        let ordered = fallback_candidates_matching(
-            size(3600, 2338),
-            &[size(2560, 1600), size(3840, 2160)],
-            |_| true,
-        );
+        let ordered = fallback_candidates(size(3600, 2338), &[size(2560, 1600), size(3840, 2160)]);
         assert_eq!(ordered.first().copied(), Some(size(2560, 1600)));
     }
 
@@ -11250,34 +11427,40 @@ mod tests {
         assert!(ranked < ranked_fallback_score(requested, size(1280, 800)));
     }
 
+    /// Issue #125, measured on a QEMU stdvga host with no NVENC (2026-08-03):
+    /// a 1792x1120 request must land on 1680x1050, the best mode by the
+    /// host's own ranking and pixel-exact for that Deck, which a 16-aligned
+    /// filter used to discard (1050 is not a multiple of 16).
     #[test]
-    fn macroblock_policy_filters_unaligned_modes_before_fallback_ranking() {
-        let requested = size(1792, 1168);
-        let aligned = size(1280, 960);
+    fn the_best_driver_mode_is_taken_whatever_its_alignment() {
+        let requested = size(1792, 1120);
+        let best = size(1680, 1050);
         let mut backend = FakeBackend::new(size(1024, 768));
-        backend.supported = vec![size(1680, 1050), size(1600, 900), aligned];
+        backend.supported = vec![
+            size(1024, 768),
+            size(1280, 800),
+            size(1440, 900),
+            best,
+            size(1920, 1080),
+            size(1920, 1200),
+        ];
         backend.tests.push_back(Err("exact BADMODE".to_string()));
         backend.tests.push_back(Ok(()));
-        backend.applies.push_back(Ok(mode(aligned, 0)));
+        backend.applies.push_back(Ok(mode(best, 0)));
         let calls = Arc::clone(&backend.calls);
 
         let transaction = DisplayTransaction::acquire_observed(
             backend,
             &OutputSelector::GlobalIndex(0),
             requested,
-            DisplayPolicy::NegotiatedMacroblock16,
+            DisplayPolicy::Negotiated,
             None,
         )
-        .expect("aligned driver fallback");
+        .expect("driver fallback");
 
-        assert_eq!(transaction.report.requested, requested);
-        assert_eq!(transaction.report.applied, aligned);
+        assert_eq!(transaction.report.applied, best);
         assert!(!transaction.report.exact);
-        let calls = calls.lock().unwrap();
-        assert!(calls.contains(&Call::Test(requested)));
-        assert!(calls.contains(&Call::Test(aligned)));
-        assert!(!calls.contains(&Call::Test(size(1680, 1050))));
-        assert!(!calls.contains(&Call::Test(size(1600, 900))));
+        assert!(calls.lock().unwrap().contains(&Call::Test(best)));
     }
 
     #[test]
@@ -11319,32 +11502,6 @@ mod tests {
         assert!(exact_colour < rollback);
         assert!(rollback < fallback_colour);
         assert!(fallback_colour < fallback_apply);
-    }
-
-    #[test]
-    fn macroblock_policy_refuses_an_unaligned_current_mode_without_safe_candidates() {
-        let requested = size(1792, 1168);
-        let mut backend = FakeBackend::new(size(1680, 1050));
-        backend.supported = vec![size(1600, 900)];
-        backend.tests.push_back(Err("exact BADMODE".to_string()));
-        let calls = Arc::clone(&backend.calls);
-
-        let error = match DisplayTransaction::acquire_observed(
-            backend,
-            &OutputSelector::GlobalIndex(0),
-            requested,
-            DisplayPolicy::NegotiatedMacroblock16,
-            None,
-        ) {
-            Ok(_) => panic!("unaligned current mode must not satisfy MF"),
-            Err(error) => error,
-        };
-
-        assert!(error.contains("current state is unsafe"));
-        let calls = calls.lock().unwrap();
-        assert!(calls.contains(&Call::Test(requested)));
-        assert!(!calls.iter().any(|call| matches!(call, Call::Apply(_))));
-        assert!(!calls.contains(&Call::Restore));
     }
 
     #[test]

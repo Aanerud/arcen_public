@@ -36,6 +36,7 @@ use arcen_deck_core::password_text::read_password_text;
 use arcen_deck_core::quick_connect::parse_quick_connect;
 use arcen_deck_core::runtime::tls::{TlsTrustConfig, parse_fingerprint};
 use arcen_deck_core::screens::wording::{DeckPlatform, set_deck_platform};
+use arcen_deck_core::ui_pacing::PassPacer;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -54,6 +55,40 @@ const TITLE: &str = "Arcen Deck";
 #[derive(Debug, Clone, Copy)]
 enum UserEvent {
     Repaint(Duration),
+    /// The media worker published decoded frames ([`MediaWake`]).
+    Media,
+}
+
+/// The loop's proxy for [`MediaWake`], set once the loop exists.
+static MEDIA_PROXY: std::sync::OnceLock<std::sync::Mutex<EventLoopProxy<UserEvent>>> =
+    std::sync::OnceLock::new();
+
+/// A [`UserEvent::Media`] is on its way and not yet handled.
+static MEDIA_WAKE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The media worker's repaint requester, the macOS Deck's `MediaWake`:
+/// egui tells the loop about a repaint only when it is sooner than the one
+/// already pending, and a pass is pending while the pacer holds it, so a
+/// further window's frame would wait for the root window's next pass (one
+/// per refresh, in that pass's phase, the newer frame replacing the older).
+/// The worker's own event wakes the loop at once; `about_to_wait` hands
+/// the further windows their frames without a UI pass.
+pub(super) struct MediaWake(pub(super) egui::Context);
+
+impl arcen_deck_core::present::RepaintRequester for MediaWake {
+    fn request_repaint(&self) {
+        self.0.request_repaint_of(egui::ViewportId::ROOT);
+        if MEDIA_WAKE_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        if let Some(proxy) = MEDIA_PROXY.get()
+            && let Ok(proxy) = proxy.lock()
+            && proxy.send_event(UserEvent::Media).is_err()
+        {
+            MEDIA_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// What `--connect` asks the window to do once it is open.
@@ -122,6 +157,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let services: Arc<dyn arcen_deck_core::DeckServices> = platform.clone();
     let _log_file = crate::logging::init(&*services, arcen_deck_core::logging::startup_profile());
     crate::platform::prepare_process();
+    let _ = MEDIA_PROXY.set(std::sync::Mutex::new(event_loop.create_proxy()));
     let mut shell = Shell {
         proxy: event_loop.create_proxy(),
         services,
@@ -182,9 +218,19 @@ struct DeckWindow {
     /// What the overlay's last presented pass drew.
     overlay_shown: Option<ShownPass>,
     repaint_at: Option<Instant>,
+    /// Passes never begin sooner than one refresh of the window's display
+    /// apart (`arcen_deck_core::ui_pacing::PassPacer`).
+    pacer: PassPacer,
+    refresh_period: Option<Duration>,
     /// The display the window was last noted on (`\\.\DISPLAYn`'s `n`).
     display: Option<u32>,
     window: Arc<Window>,
+}
+
+/// One refresh of the display under most of the window.
+fn refresh_period_of(window: &Window) -> Option<Duration> {
+    let millihertz = window.current_monitor()?.refresh_rate_millihertz()?;
+    (millihertz > 0).then(|| Duration::from_secs_f64(1_000.0 / f64::from(millihertz)))
 }
 
 /// The roster id of the display under most of the window.
@@ -282,6 +328,8 @@ impl Shell {
             overlay_region: OverlayRegion::default(),
             overlay_shown: None,
             repaint_at: Some(Instant::now()),
+            pacer: PassPacer::default(),
+            refresh_period: refresh_period_of(&window),
             display: None,
             window,
         })
@@ -419,6 +467,7 @@ fn note_display(platform: &crate::platform::WindowsDeckServices, window: &mut De
     let display = display_of(&window.window);
     if display.is_some() && display != window.display {
         window.display = display;
+        window.launcher.note_window_display(display);
         if let Some(id) = display {
             platform.note_session_display(id);
         }
@@ -480,13 +529,29 @@ impl ApplicationHandler<UserEvent> for Shell {
                 window
                     .launcher
                     .set_visible(size.width > 0 && size.height > 0);
+                window.pacer.release();
                 window.resized(size);
             }
             WindowEvent::Occluded(occluded) => window.launcher.set_visible(!occluded),
-            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::Moved(_) => {
+                window.refresh_period = refresh_period_of(&window.window);
                 note_display(&self.platform, window);
             }
-            WindowEvent::RedrawRequested => window.paint(),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                window.pacer.release();
+                window.refresh_period = refresh_period_of(&window.window);
+                note_display(&self.platform, window);
+            }
+            WindowEvent::RedrawRequested => {
+                // egui asks for two more passes after every input pass: a
+                // pass asked for sooner than one refresh after the last is
+                // held until then and carries what arrived meanwhile.
+                if window.pacer.admit(Instant::now(), window.refresh_period) {
+                    window.paint();
+                } else if let Some(due) = window.pacer.held_until(window.refresh_period) {
+                    window.repaint_at = Some(window.repaint_at.map_or(due, |at| at.min(due)));
+                }
+            }
             _ => {}
         }
         if response.repaint {
@@ -495,7 +560,14 @@ impl ApplicationHandler<UserEvent> for Shell {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::Repaint(delay) = event;
+        let delay = match event {
+            UserEvent::Repaint(delay) => delay,
+            UserEvent::Media => {
+                // `about_to_wait` follows and hands out the frames.
+                MEDIA_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
+                return;
+            }
+        };
         if let Some(window) = self.window.as_mut() {
             let at = Instant::now() + delay;
             window.repaint_at = Some(window.repaint_at.map_or(at, |current| current.min(at)));
