@@ -6,13 +6,15 @@
 //! in `arcen-input` and emit [`arcen_input::deck_events::DeckInputEvent`]s;
 //! [`region_runtime`] owns the region-authoritative pointer state and wire
 //! encoding (shared by every Deck); [`pointer_drag`] follows a held-button
-//! drag across Match My Layout's windows.
+//! drag across Match My Layout's windows; [`viewport_pointer`] turns each
+//! pointer event of a further window into a sample of its own.
 
 pub mod overlay_pointer;
 pub mod pointer_drag;
 pub mod region_runtime;
 #[cfg(feature = "runtime")]
 mod session_input;
+pub mod viewport_pointer;
 
 #[cfg(feature = "runtime")]
 pub use session_input::{RELATIVE_UNAVAILABLE, SessionInput};

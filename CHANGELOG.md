@@ -151,6 +151,20 @@ Windows Pier is unchanged.
   Decks).** The pictures shown on further displays were not counted as
   presented, so every Match my layout session read as 40 % or more of its
   frames unpresented.
+- **The mouse on a further display of Match my layout barely worked, and
+  buttons stuck on the host (macOS Deck; came with the previous fix).**
+  Once the interface stopped spinning, the pointer of every window but the
+  main one was read only on that window's own repaints, one sample each,
+  and the interface's own follow-up repaints overwrote it: on a still host
+  monitor 4-7 of 120 moves reached the host, a title-bar drag sent its
+  press but not its release (the button stayed held on the host), and a
+  drag could not start there. Each move, button and release of every
+  window now leaves the moment it arrives, in order; keys and scroll typed
+  there are no longer dropped between repaints either.
+- **Holding a drag from the main window over another one released held
+  keys about 90 times a second (macOS Deck).** Each repaint of the other
+  window was read as the main window losing focus. Only the main window's
+  own focus counts now.
 
 ## [0.20.1] — 2026-11-17
 
