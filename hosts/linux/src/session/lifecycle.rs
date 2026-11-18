@@ -198,6 +198,10 @@ struct DesktopSession {
     /// desktop to another topology in place.
     multi_monitor_plan: Option<LinuxTopologyPlan>,
     multi_monitor_carrier: Option<MultiMonitorCarrierMsg>,
+    /// The Deck's own plan when [`Self::multi_monitor_plan`] serves it as
+    /// another product's desktop shows it (a joined guest console): a
+    /// reattach is the same topology when it asks for this one.
+    requested_multi_monitor_plan: Option<LinuxTopologyPlan>,
     /// See [`MultiMonitorEverUsable`]. Always starts `false` for a fresh
     /// `Create` (matching a freshly committed `multi_monitor_plan`), and
     /// is otherwise only ever latched to `true` via
@@ -464,7 +468,10 @@ impl SessionRegistry {
                                     let requested_plan =
                                         multi_monitor.as_ref().map(|(plan, _carrier)| plan);
                                     let topology_matches = match (
-                                        existing.multi_monitor_plan.as_ref(),
+                                        existing
+                                            .requested_multi_monitor_plan
+                                            .as_ref()
+                                            .or(existing.multi_monitor_plan.as_ref()),
                                         requested_plan,
                                     ) {
                                         (Some(existing), Some(requested)) => {
@@ -699,6 +706,20 @@ impl SessionRegistry {
         // A joined console that could not take the plan's layout commits no
         // plan; the Pier then ends the sign-in with the reason (ADR 0025 §6).
         let multi_monitor = multi_monitor.filter(|_| launcher.serves_committed_monitors());
+        // Another product's desktop is never laid out for the Deck: the plan
+        // is served as that desktop shows it, and the Deck's own plan is kept
+        // to recognise the same Deck when it resumes.
+        let requested_multi_monitor_plan = multi_monitor
+            .as_ref()
+            .filter(|_| launcher.is_console_guest())
+            .map(|(plan, _carrier)| plan.clone());
+        let multi_monitor = multi_monitor.and_then(|(plan, carrier)| {
+            launcher
+                .fit_committed_plan(plan)
+                .map(|plan| (plan, carrier))
+        });
+        let requested_multi_monitor_plan =
+            requested_multi_monitor_plan.filter(|_| multi_monitor.is_some());
         let desktop = DesktopSession {
             launcher,
             connected: true,
@@ -710,6 +731,7 @@ impl SessionRegistry {
             held_display: None,
             multi_monitor_plan: multi_monitor.as_ref().map(|(plan, _carrier)| plan.clone()),
             multi_monitor_carrier: multi_monitor.map(|(_plan, carrier)| carrier),
+            requested_multi_monitor_plan,
             multi_monitor_ever_usable: MultiMonitorEverUsable::new(),
             requested_outputs: if launcher_is_wayland {
                 requested_outputs

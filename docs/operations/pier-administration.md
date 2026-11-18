@@ -318,14 +318,22 @@ runs only on a host where no X server runs yet.
 **Another product's desktop is shown as it is.** On a session another
 remote-desktop product started (its own X server, a logind session whose PAM
 service is not the display manager's), Arcen changes nothing on the X
-server: no MetaMode, no RandR change, no hidden outputs. A Deck that matches
-its layout is served one stream per output that desktop shows, when the
-Deck's monitors have exactly that desktop's layout (sizes, rotation and
-relative positions); each monitor is captured from the output that shows it,
-by name. A Deck whose layout differs is answered "its console cannot take
-this layout" (the Pier logs `console_layout_differs`) and offered Primary
-Display Only, the whole screen as one picture. Heads the product forces
-connected without a picture are ignored. The desk's physical monitors are
+server: no MetaMode, no RandR change, no hidden outputs. That product lays
+the desktop out for its own client when the client connects and leaves it
+so; a Deck that matches its layout then gets one window per monitor that
+desktop shows, mapped by arrangement: the Deck's primary display shows the
+desktop's primary monitor, and each further display the monitor in the same
+direction from it (left, right, above, below). Each monitor is captured, by
+name, at its own size and fitted into the Deck's window: 1:1 when the sizes
+match, scaled otherwise, letterboxed only when the shapes differ. A desktop
+with more monitors than the Deck has displays shows the nearest ones; with
+fewer, the Deck's other displays get no window. The Pier log line "another
+product's desktop is laid out differently…" names the mapping and every
+difference (size, scale, rotation, refresh), and so does the Deck command
+line (`multi-monitor layout note`). Only a desktop that shows no monitor at
+all is answered "its console cannot take this layout" (the Pier logs
+`console_layout_differs`) and offered Primary Display Only. Heads the
+product forces connected without a picture are ignored. The desk's physical monitors are
 blanked and its physical keyboards and mice disabled as on any console; the
 product's own virtual keyboards and mice are never touched. While Arcen is
 attached, that product's client connecting (its virtual keyboard or pointer

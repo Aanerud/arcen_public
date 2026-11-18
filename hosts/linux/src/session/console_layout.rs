@@ -17,8 +17,9 @@ use std::path::Path;
 
 use arcen_media::Rotation;
 use arcen_outputs::console_layout::{
-    bind_shown_layout, console_monitor_capacity, plan_console_layout, takes_a_monitor,
-    ConsoleHeadRequest, ConsoleLayoutPlan, ConsoleOutput, OutputMode, ShownOutput,
+    console_monitor_capacity, match_shown_layout, plan_console_layout, takes_a_monitor,
+    ConsoleHeadRequest, ConsoleLayoutPlan, ConsoleOutput, OutputMode, ShownLayoutMatch,
+    ShownOutput,
 };
 use serde::{Deserialize, Serialize};
 use x11rb::connection::Connection as _;
@@ -190,6 +191,7 @@ fn read_shown(
             x: i32::from(crtc.x),
             y: i32::from(crtc.y),
             rotation,
+            refresh_mhz: refresh_mhz(mode),
             primary: primary.as_deref() == Some(fact.name.as_str()),
         });
     }
@@ -228,17 +230,178 @@ async fn read_live<T: Send + 'static>(
     }
 }
 
-/// Binds the Deck's monitors to a console shown as it is (another
-/// product's desktop): nothing is changed; the Deck's layout must be the
-/// desktop's own (`arcen_outputs::console_layout::bind_shown_layout`).
-pub(crate) async fn bind_shown(
+/// The outputs of a console's X server that show a picture now, and the
+/// size of its screen (the root window: what an absolute pointer spans).
+fn read_shown_screen(
+    connection: &RustConnection,
+    root: xproto::Window,
+) -> Result<(Vec<ShownOutput>, (u32, u32)), String> {
+    let shown = read_shown(connection, root)?;
+    let geometry = connection
+        .get_geometry(root)
+        .map_err(|error| format!("request root geometry: {error}"))?
+        .reply()
+        .map_err(|error| format!("root geometry: {error}"))?;
+    Ok((
+        shown,
+        (u32::from(geometry.width), u32::from(geometry.height)),
+    ))
+}
+
+/// One Deck monitor's output on a console shown as it is, as the launcher
+/// reports it to the Pier: the output's own mode (native, pre-rotation),
+/// rotation, refresh and place in the X screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ShownHead {
+    pub(crate) name: String,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rotation: Rotation,
+    pub(crate) refresh_mhz: u32,
+}
+
+impl ShownHead {
+    fn extent(&self) -> (u32, u32) {
+        match self.rotation {
+            Rotation::Degrees90 | Rotation::Degrees270 => (self.height, self.width),
+            Rotation::Degrees0 | Rotation::Degrees180 => (self.width, self.height),
+        }
+    }
+}
+
+/// A Deck's monitors mapped onto another product's desktop, which is only
+/// read (ADR 0025 §8): what each monitor of the committed plan is shown
+/// by, the X screen's size, and the mapping in words for the log and the
+/// Deck.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GuestLayout {
+    /// One entry per monitor of the committed plan, in plan order: the
+    /// output that shows it, or `None` (no window for it).
+    pub(crate) heads: Vec<Option<ShownHead>>,
+    /// The X screen (root window) size.
+    pub(crate) screen: (u32, u32),
+    /// `ShownLayoutMatch::describe`.
+    pub(crate) note: String,
+    /// The desktop is exactly the Deck's layout.
+    pub(crate) exact: bool,
+}
+
+impl GuestLayout {
+    fn from_match(
+        matched: &ShownLayoutMatch,
+        requests: &[ConsoleHeadRequest],
+        screen: (u32, u32),
+    ) -> Self {
+        let mut heads = vec![None; requests.len()];
+        for found in &matched.matches {
+            heads[found.request] = Some(ShownHead {
+                name: found.output.name.clone(),
+                x: found.output.x,
+                y: found.output.y,
+                width: found.output.width,
+                height: found.output.height,
+                rotation: found.output.rotation,
+                refresh_mhz: found.output.refresh_mhz,
+            });
+        }
+        Self {
+            heads,
+            screen,
+            note: matched.describe(requests),
+            exact: matched.exact(requests),
+        }
+    }
+
+    /// The outputs captured, one per served monitor, in plan order.
+    pub(crate) fn outputs(&self) -> Vec<String> {
+        self.heads
+            .iter()
+            .flatten()
+            .map(|head| head.name.clone())
+            .collect()
+    }
+
+    /// The committed plan as this desktop shows it: each Deck monitor that
+    /// has an output takes that output's place, extent, native size and
+    /// rotation (it is streamed as it is and the Deck fits the picture into
+    /// the monitor's window), a monitor without one is dropped, and the
+    /// absolute pointer spans the whole X screen. The Deck's logical
+    /// geometry stays, so its pointer maps proportionally onto the output.
+    ///
+    /// # Errors
+    ///
+    /// When the mapping does not belong to `plan` (another monitor count),
+    /// the Deck's primary has no output, or an output's geometry is not a
+    /// valid stream inside the screen.
+    pub(crate) fn fit(
+        &self,
+        plan: &crate::display::topology::LinuxTopologyPlan,
+    ) -> Result<crate::display::topology::LinuxTopologyPlan, String> {
+        if self.heads.len() != plan.monitors.len() {
+            return Err(format!(
+                "the mapping has {} monitors, the plan {}",
+                self.heads.len(),
+                plan.monitors.len()
+            ));
+        }
+        let (screen_width, screen_height) = self.screen;
+        let mut monitors = Vec::with_capacity(plan.monitors.len());
+        for (monitor, head) in plan.monitors.iter().zip(&self.heads) {
+            let Some(head) = head else {
+                if monitor.primary {
+                    return Err("the Deck's primary monitor has no output".to_owned());
+                }
+                continue;
+            };
+            let (width, height) = head.extent();
+            let fits = |origin: i32, extent: u32, limit: u32| {
+                u32::try_from(origin)
+                    .ok()
+                    .and_then(|origin| origin.checked_add(extent))
+                    .is_some_and(|end| end <= limit)
+            };
+            if !fits(head.x, width, screen_width) || !fits(head.y, height, screen_height) {
+                return Err(format!(
+                    "{} {width}x{height}+{}+{} lies outside the {screen_width}x{screen_height} screen",
+                    head.name, head.x, head.y
+                ));
+            }
+            let mut fitted = monitor.clone();
+            fitted.x = head.x;
+            fitted.y = head.y;
+            fitted.width = width;
+            fitted.height = height;
+            fitted.rotation = head.rotation;
+            fitted.physical_size = arcen_media::PhysicalSize::new(head.width, head.height)
+                .map_err(|error| format!("{}: {error}", head.name))?;
+            fitted.mode_token = format!("{}x{}", head.width, head.height);
+            monitors.push(fitted);
+        }
+        let mut fitted = plan.clone();
+        fitted.monitors = monitors;
+        fitted.virtual_width = screen_width;
+        fitted.virtual_height = screen_height;
+        fitted
+            .region_sets()
+            .map_err(|error| format!("the mapped plan is not a valid region set: {error}"))?;
+        Ok(fitted)
+    }
+}
+
+/// Maps the Deck's monitors onto a console shown as it is (another
+/// product's desktop): its outputs are only read, never changed; each Deck
+/// monitor gets the output in the same place of that desktop's own layout
+/// (`arcen_outputs::console_layout::match_shown_layout`).
+pub(crate) async fn match_shown(
     display: &SessionDisplay,
     requests: &[ConsoleHeadRequest],
-) -> Result<Vec<String>, LayoutFailure> {
-    let shown = read_live(display, read_shown)
+) -> Result<GuestLayout, LayoutFailure> {
+    let (shown, screen) = read_live(display, read_shown_screen)
         .await
         .map_err(|error| LayoutFailure::new("console_layout_unproven", error))?;
-    bind_shown_layout(requests, &shown).map_err(|error| {
+    let matched = match_shown_layout(requests, &shown).map_err(|error| {
         let detail = format!(
             "{error}; the desktop shows {}",
             shown
@@ -251,7 +414,8 @@ pub(crate) async fn bind_shown(
                 .join(", ")
         );
         LayoutFailure::new(error.token(), detail)
-    })
+    })?;
+    Ok(GuestLayout::from_match(&matched, requests, screen))
 }
 
 /// What a console's live X server can show a Deck, read at each sign-in
@@ -262,8 +426,9 @@ pub(crate) struct LiveConsole {
     pub(crate) session_id: String,
     pub(crate) origin: arcen_session::console_session::ConsoleOrigin,
     /// How many Deck monitors it can show: outputs that take a monitor
-    /// for a console Arcen lays out, the outputs showing a picture now for
-    /// one shown as it is (another product's).
+    /// for a console Arcen lays out; for one shown as it is (another
+    /// product's), as many as a Deck may have while it shows a picture at
+    /// all ([`guest_offer`]).
     pub(crate) monitors: usize,
     /// For the log: the outputs it counted.
     pub(crate) outputs: Vec<String>,
@@ -310,9 +475,7 @@ pub(crate) async fn live_console() -> Result<LiveConsole, String> {
         let result = if origin == ConsoleOrigin::OtherProduct {
             read_live(&display, read_shown).await.map(|shown| {
                 (
-                    shown
-                        .len()
-                        .min(arcen_outputs::console_layout::MAX_VIRTUAL_OUTPUTS),
+                    guest_offer(shown.len()),
                     shown.into_iter().map(|output| output.name).collect(),
                 )
             })
@@ -345,6 +508,19 @@ pub(crate) async fn live_console() -> Result<LiveConsole, String> {
         }
     }
     Err(last_error)
+}
+
+/// How many Deck monitors a desktop shown as it is (another product's)
+/// is offered for, given how many outputs it shows: every Deck layout is
+/// mapped onto what it shows (`match_shown_layout`: a Deck monitor without
+/// an output gets no window), so the offer never makes a Deck with more
+/// displays than the desktop shows refuse Match my layout.
+fn guest_offer(shown: usize) -> usize {
+    if shown == 0 {
+        0
+    } else {
+        arcen_outputs::console_layout::MAX_VIRTUAL_OUTPUTS
+    }
 }
 
 fn root_of(connection: &RustConnection) -> Result<xproto::Window, String> {

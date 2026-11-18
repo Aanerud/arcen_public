@@ -1,6 +1,6 @@
 # ADR 0025: Arcen joins the user's session
 
-**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop). Product-wide; the Linux Pier is its main
+**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement). Product-wide; the Linux Pier is its main
 part. Builds on [ADR 0005](0005-direct-transport-resume-authority.md)
 (resume), [ADR 0008](0008-virtual-display-for-windows-hosts.md) and
 [ADR 0014](0014-quic-lanes-and-capture-contracts.md); changes the Linux
@@ -454,11 +454,31 @@ product owned):*
   shared `x_server_peer_trustworthy`) are proved.
 - **Guest mode.** Such a desktop is shown as it is: Arcen never lays it out
   (no MetaMode, RandR or non-desktop change). A Deck that matches its layout
-  is served one stream per output the desktop shows when its monitors have
-  exactly that layout (shared `bind_shown_layout`), each captured from its
-  output by RandR name (capenc `output=<name>`); otherwise
-  `console_layout_differs` and Primary Display Only. Outputs forced
-  connected without a mode never take a monitor (shared `takes_a_monitor`).
+  is served one stream per output the desktop shows, each captured from its
+  output by RandR name (capenc `output=<name>`). Outputs forced connected
+  without a mode never take a monitor (shared `takes_a_monitor`).
+  *Amended in the 0.20.2 re-issue:* the Deck's monitors had to have exactly
+  the desktop's layout (sizes, rotation, relative places), else
+  `console_layout_differs` and Primary Display Only. The other product lays
+  the desktop out for its own client at connect (its client's resolutions,
+  positions and primary; it requests no restore at session end), so a Deck
+  on the same computer differed by scale, refresh or placement and fell
+  back. The Deck's monitors are now mapped by arrangement (shared
+  `match_shown_layout`): the Deck's primary on the desktop's primary, each
+  further monitor on the output nearest its own direction from the primary,
+  places measured in each primary's size so another scale maps the same.
+  Each mapped output is served at its own place, extent, mode and rotation
+  (`console_layout::GuestLayout::fit`: the committed plan keeps the Deck's
+  logical geometry, so its pointer maps proportionally, and the absolute
+  pointer spans the whole X screen); the Deck fits each picture into its
+  window, letterboxing only when the shapes differ. More outputs than Deck
+  monitors: the nearest are shown, the others named as not shown; fewer:
+  the Deck monitors left over get no window (the offer to a guest desktop is
+  therefore the full monitor count). The applied topology declares the
+  shown outputs' bounding box, which need not start at the screen origin.
+  `console_layout_differs` remains only for a desktop that shows nothing.
+  The mapping and each difference are logged by the Pier and named by the
+  Deck (`arcen_deck_core::multi_window::layout_note`).
 - **One remote product at a time.** While that product's client is connected
   the sign-in is refused `console_in_use_other_product`; when it connects
   during an attachment the attachment ends with that code. A connected

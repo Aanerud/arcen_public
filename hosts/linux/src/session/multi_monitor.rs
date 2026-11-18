@@ -714,12 +714,16 @@ pub fn build_applied_capability(
         translation,
     )?;
 
+    // The declared desktop is the applied monitors' bounding box: the whole
+    // virtual raster for a desktop Arcen lays out, the shown outputs only
+    // on another product's desktop that shows more than the Deck has.
+    let (desktop_x, desktop_y, desktop_width, desktop_height) = applied_bounds(plan);
     let applied_topology = AppliedMonitorTopologyMsg::new(
         plan.generation.get(),
-        0,
-        0,
-        plan.virtual_width,
-        plan.virtual_height,
+        desktop_x,
+        desktop_y,
+        desktop_width,
+        desktop_height,
         translation.x(),
         translation.y(),
         carrier,
@@ -738,6 +742,35 @@ pub fn build_applied_capability(
         OFFERED_CARRIERS.to_vec(),
         Some(applied_topology),
     )?)
+}
+
+/// The bounding box of `plan`'s monitors in the X screen (`0,0` and the
+/// virtual raster for an empty plan, which never reaches the wire).
+fn applied_bounds(plan: &LinuxTopologyPlan) -> (i32, i32, u32, u32) {
+    let Some(left) = plan.monitors.iter().map(|monitor| monitor.x).min() else {
+        return (0, 0, plan.virtual_width, plan.virtual_height);
+    };
+    let top = plan
+        .monitors
+        .iter()
+        .map(|monitor| monitor.y)
+        .min()
+        .unwrap_or(0);
+    let end = |origin: i32, extent: u32| i64::from(origin) + i64::from(extent);
+    let right = plan
+        .monitors
+        .iter()
+        .map(|monitor| end(monitor.x, monitor.width))
+        .max()
+        .unwrap_or(0);
+    let bottom = plan
+        .monitors
+        .iter()
+        .map(|monitor| end(monitor.y, monitor.height))
+        .max()
+        .unwrap_or(0);
+    let extent = |from: i32, to: i64| u32::try_from(to - i64::from(from)).unwrap_or(0);
+    (left, top, extent(left, right), extent(top, bottom))
 }
 
 /// This host's implementation of the shared applied-region join.
@@ -828,6 +861,8 @@ impl AppliedRegionAssembler for LinuxAppliedRegions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::session::console_layout::{GuestLayout, ShownHead};
     use arcen_media::Rotation;
     use arcen_protocol::messages::{RequestedMonitorDescriptorMsg, RequestedMonitorTopologyMsg};
 
@@ -1137,6 +1172,192 @@ mod tests {
         assert_eq!(portrait.mode_token, "1920x1200");
         assert_eq!((portrait.width, portrait.height), (1200, 1920));
         assert_eq!((portrait.x, portrait.y), (2560, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shown_head(name: &str, (width, height): (u32, u32), (x, y): (i32, i32)) -> ShownHead {
+        ShownHead {
+            name: name.to_owned(),
+            x,
+            y,
+            width,
+            height,
+            rotation: Rotation::Degrees0,
+            refresh_mhz: 60_000,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Another product's desktop shows four 3840x2160 outputs in a row; the
+    /// Deck has two 1920x1080 displays. The two the mapping chose (the
+    /// third and fourth) are served at their own size and place, the
+    /// pointer spans the whole screen, and the Deck is told the shown
+    /// outputs' box, which does not start at the screen's origin.
+    #[test]
+    fn a_guest_plan_is_served_as_the_desktop_shows_it() {
+        let gate = MultiMonitorGate {
+            console: true,
+            ..enabled_gate(4)
+        };
+        let requested = sample_request(vec![
+            descriptor("left", 1, (0, 0), (1920, 1080), true, RotationMsg::Degrees0),
+            descriptor(
+                "right",
+                2,
+                (1920, 0),
+                (1920, 1080),
+                false,
+                RotationMsg::Degrees0,
+            ),
+        ]);
+        let (plan, carrier) =
+            admit_request(&gate, Some(&sample_offer(4)), &requested).expect("planned");
+        let shown = GuestLayout {
+            heads: vec![
+                Some(shown_head("DVI-D-2", (3840, 2160), (7680, 0))),
+                Some(shown_head("DVI-D-3", (3840, 2160), (11520, 0))),
+            ],
+            screen: (15360, 2160),
+            note: String::new(),
+            exact: false,
+        };
+        let fitted = shown.fit(&plan).expect("fits");
+        assert_eq!((fitted.virtual_width, fitted.virtual_height), (15360, 2160));
+        let rects: Vec<_> = fitted
+            .monitors
+            .iter()
+            .map(|monitor| {
+                (
+                    monitor.client_display_id.as_str(),
+                    monitor.x,
+                    monitor.width,
+                    monitor.mode_token.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rects,
+            [
+                ("left", 7680, 3840, "3840x2160"),
+                ("right", 11520, 3840, "3840x2160")
+            ]
+        );
+        // The Deck's logical geometry stays: its pointer maps proportionally.
+        assert_eq!(
+            fitted.monitors[0].logical_rect,
+            plan.monitors[0].logical_rect
+        );
+        crate::input::region_adapter::RegionInputAdapter::from_plan(&fitted)
+            .expect("the pointer maps into the screen");
+        let media: Vec<(SessionMonitorId, ResolvedMediaPlan)> = fitted
+            .monitors
+            .iter()
+            .map(|monitor| {
+                (
+                    monitor.session_monitor_id,
+                    resolved_plan(monitor.width, monitor.height, 60),
+                )
+            })
+            .collect();
+        let capability = build_applied_capability(
+            &gate,
+            &fitted,
+            carrier,
+            &media,
+            &negotiated_roster(&fitted),
+            None,
+        )
+        .expect("applied capability must build");
+        let applied = capability.applied_topology().expect("applied");
+        assert_eq!(
+            (
+                applied.desktop_x(),
+                applied.desktop_width_px(),
+                applied.desktop_height_px()
+            ),
+            (7680, 7680, 2160)
+        );
+        assert_eq!(applied.monitors()[1].width_px, 3840);
+        assert_eq!(shown.outputs(), ["DVI-D-2", "DVI-D-3"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_deck_monitor_without_an_output_gets_no_window_but_its_primary_must_have_one() {
+        let gate = MultiMonitorGate {
+            console: true,
+            ..enabled_gate(4)
+        };
+        let requested = sample_request(vec![
+            descriptor("main", 1, (0, 0), (2560, 1440), true, RotationMsg::Degrees0),
+            descriptor(
+                "side",
+                2,
+                (2560, 0),
+                (1920, 1080),
+                false,
+                RotationMsg::Degrees0,
+            ),
+        ]);
+        let (plan, _) = admit_request(&gate, Some(&sample_offer(4)), &requested).expect("planned");
+        let mut shown = GuestLayout {
+            heads: vec![Some(shown_head("DP-0", (2560, 1440), (0, 0))), None],
+            screen: (2560, 1440),
+            note: String::new(),
+            exact: false,
+        };
+        let fitted = shown.fit(&plan).expect("fits");
+        assert_eq!(fitted.monitors.len(), 1);
+        assert_eq!(fitted.monitors[0].client_display_id, "main");
+        assert!(fitted.primary().primary);
+        shown.heads = vec![None, Some(shown_head("DP-0", (2560, 1440), (0, 0)))];
+        assert!(shown.fit(&plan).is_err(), "the primary must be shown");
+        shown.heads = vec![Some(shown_head("DP-0", (2560, 1440), (0, 0)))];
+        assert!(
+            shown.fit(&plan).is_err(),
+            "the mapping belongs to another plan"
+        );
+        shown.heads = vec![Some(shown_head("DP-0", (2560, 1440), (100, 0))), None];
+        assert!(shown.fit(&plan).is_err(), "an output outside the screen");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rotated_output_is_served_at_its_screen_extent() {
+        let gate = MultiMonitorGate {
+            console: true,
+            ..enabled_gate(4)
+        };
+        let requested = sample_request(vec![
+            descriptor("main", 1, (0, 0), (2560, 1440), true, RotationMsg::Degrees0),
+            descriptor(
+                "side",
+                2,
+                (2560, 0),
+                (1920, 1080),
+                false,
+                RotationMsg::Degrees0,
+            ),
+        ]);
+        let (plan, _) = admit_request(&gate, Some(&sample_offer(4)), &requested).expect("planned");
+        let mut portrait = shown_head("DP-2", (1920, 1080), (2560, 0));
+        portrait.rotation = Rotation::Degrees90;
+        let shown = GuestLayout {
+            heads: vec![
+                Some(shown_head("DP-0", (2560, 1440), (0, 0))),
+                Some(portrait),
+            ],
+            screen: (3640, 1920),
+            note: String::new(),
+            exact: false,
+        };
+        let fitted = shown.fit(&plan).expect("fits");
+        let side = &fitted.monitors[1];
+        assert_eq!((side.width, side.height), (1080, 1920));
+        assert_eq!(side.mode_token, "1920x1080");
+        assert_eq!(side.rotation, Rotation::Degrees90);
+        crate::input::region_adapter::RegionInputAdapter::from_plan(&fitted)
+            .expect("the pointer maps into the screen");
     }
 
     fn sample_request(monitors: Vec<RequestedMonitorDescriptorMsg>) -> AuthMultiMonitorRequestMsg {

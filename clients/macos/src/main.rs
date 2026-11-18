@@ -3134,7 +3134,19 @@ async fn media_smoke(
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?;
-                    if expected_monitor_ids.len() < 2 {
+                    // A host that keeps its own layout (another product's
+                    // desktop) may show fewer monitors than asked, and says
+                    // which; a smoke of such a host opts in with
+                    // ARCEN_MULTI_MONITOR_SMOKE_HOST_LAYOUT=1, so no other
+                    // host passes with a monitor lost.
+                    let layout_note = arcen_deck_core::multi_window::layout_note::applied_layout_note(
+                        &requested.topology,
+                        applied,
+                    );
+                    let host_layout_kept = std::env::var("ARCEN_MULTI_MONITOR_SMOKE_HOST_LAYOUT")
+                        .is_ok_and(|value| value == "1")
+                        && layout_note.is_some();
+                    if expected_monitor_ids.len() < 2 && !host_layout_kept {
                         return Err(format!(
                             "host applied only {} monitor(s)",
                             expected_monitor_ids.len()
@@ -3150,6 +3162,9 @@ async fn media_smoke(
                         applied.desktop_height_px(),
                         applied.selected_carrier()
                     );
+                    if let Some(note) = layout_note {
+                        println!("multi-monitor layout note: {note}");
+                    }
                 } else {
                     decoders.insert(0, NativeVideoDecoder::new());
                 }
@@ -3177,7 +3192,7 @@ async fn media_smoke(
             }
             SessionEvent::MediaReady => {
                 let batch = session.media.take_batch();
-                if require_multi_monitor && !input_probe_sent && input_probe_points.len() >= 2 {
+                if require_multi_monitor && !input_probe_sent && !input_probe_points.is_empty() {
                     send_multi_monitor_input_probe(
                         &session.commands,
                         &input_probe_points,
@@ -3732,11 +3747,12 @@ fn multi_monitor_input_probe_events(
     points: &[MultiMonitorInputProbePoint],
     pen: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
-    if points.len() < 2 {
-        return Err("multi-monitor input probe requires two regions".to_string());
-    }
-    let first = points[0];
-    let second = points[1];
+    // A host that shows fewer monitors than asked may apply one region: it
+    // is probed twice.
+    let Some(&first) = points.first() else {
+        return Err("multi-monitor input probe requires a region".to_string());
+    };
+    let second = points.get(1).copied().unwrap_or(first);
     let events = vec![
         serde_json::json!({
             "type":"region_pointer_enter",

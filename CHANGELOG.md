@@ -116,6 +116,20 @@ Windows Pier is unchanged.
   at most the reconnect window (`auth.reconnect_window_secs`), and no longer
   as soon as the other product's client connects, it starts a desktop of
   its own, or someone unlocks or signs in at the desk.
+- **Linux Pier: Match my layout on another remote-desktop product's
+  desktop fell back to one picture unless your displays matched it to the
+  pixel (reported on 0.20.2).** That product lays its desktop out for its
+  own client when it connects, and leaves it so; after switching to Arcen
+  from the same computer, a Deck whose displays differed by size, scale,
+  refresh or a few pixels of placement got Primary Display Only. Arcen
+  still never changes that desktop, but now shows each of its monitors in
+  the Deck window on the display in the same place (primary on primary,
+  then left, right, above, below), each at the host monitor's own size and
+  fitted into the window: 1:1 when the sizes match, scaled otherwise,
+  letterboxed only when the shapes differ. A host with more monitors than
+  your Deck shows the nearest ones; a host with fewer leaves your extra
+  displays without a window. The Pier log, and the Deck command line,
+  name the mapping and every difference.
 
 - **A drag stopped at the edge of a display in Match my layout (reported
   on 0.20.2).** Holding a mouse button and dragging, for example a window
