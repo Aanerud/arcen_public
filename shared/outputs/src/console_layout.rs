@@ -20,6 +20,8 @@
 //! desk monitor is never driven with a timing it did not offer. Outputs
 //! the layout does not use are switched off.
 
+use std::fmt::Write as _;
+
 use arcen_media::Rotation;
 
 /// Where the installer's forced virtual outputs live (a headless console).
@@ -219,8 +221,8 @@ pub enum ConsoleLayoutError {
     NoModes { output: String },
     /// Exactly one requested monitor must be primary.
     PrimaryCount(usize),
-    /// A console shown as it is (another product's desktop) has outputs
-    /// laid out other than the Deck's monitors; Arcen does not change them.
+    /// A console shown as it is (another product's desktop) shows no
+    /// output a Deck monitor could be mapped to; Arcen does not change it.
     ShownLayoutDiffers { requested: usize, shown: usize },
 }
 
@@ -258,7 +260,7 @@ impl std::fmt::Display for ConsoleLayoutError {
             }
             Self::ShownLayoutDiffers { requested, shown } => write!(
                 formatter,
-                "the desktop shows {shown} monitors laid out differently from the Deck's {requested}, and is not changed"
+                "the desktop shows {shown} monitors for the Deck's {requested}, and is not changed"
             ),
         }
     }
@@ -267,7 +269,7 @@ impl std::fmt::Display for ConsoleLayoutError {
 impl std::error::Error for ConsoleLayoutError {}
 
 /// One output of a console's X server that shows a picture now: its mode's
-/// native size, rotation and place in the X screen.
+/// native size, rotation, refresh and place in the X screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShownOutput {
     pub name: String,
@@ -276,60 +278,291 @@ pub struct ShownOutput {
     pub x: i32,
     pub y: i32,
     pub rotation: Rotation,
+    /// Refresh in millihertz (`0` when unknown).
+    pub refresh_mhz: u32,
     pub primary: bool,
 }
 
-/// Binds a Deck's monitors to a console shown as it is — another
-/// product's desktop, whose outputs Arcen never changes (ADR 0025 §8): the
-/// Deck's layout must be the desktop's own, monitor for monitor (native
-/// size, rotation and place, both normalised to the layout's top-left
-/// corner), and every shown output is used. Returns each request's output
-/// name in request order. A Deck whose layout differs is answered with
-/// [`ConsoleLayoutError::ShownLayoutDiffers`] and offered Primary Display
-/// Only (the whole screen as one picture).
+impl ShownOutput {
+    /// This output's extent in the X screen (axes swapped when rotated a
+    /// quarter turn).
+    #[must_use]
+    pub const fn screen_extent(&self) -> (u32, u32) {
+        match self.rotation {
+            Rotation::Degrees90 | Rotation::Degrees270 => (self.height, self.width),
+            Rotation::Degrees0 | Rotation::Degrees180 => (self.width, self.height),
+        }
+    }
+}
+
+/// How a host output shows the Deck monitor it was matched to. The Deck
+/// fits each picture into its window (1:1 when the sizes are equal, scaled
+/// otherwise, letterboxed only when the aspect ratios differ); nothing here
+/// changes the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "four independent observations, each reported on its own"
+)]
+pub struct ShownFit {
+    /// The output's extent equals the Deck monitor's.
+    pub same_size: bool,
+    /// The aspect ratios differ (more than 0.5 %): the Deck letterboxes.
+    pub aspect_differs: bool,
+    /// The output is rotated differently from the Deck monitor.
+    pub rotation_differs: bool,
+    /// The refresh rates differ by more than half a hertz (both known).
+    pub refresh_differs: bool,
+}
+
+impl ShownFit {
+    fn between(request: &ConsoleHeadRequest, output: &ShownOutput) -> Self {
+        let (deck_width, deck_height) = request.screen_extent();
+        let (width, height) = output.screen_extent();
+        let cross = |a: u32, b: u32| u64::from(a) * u64::from(b);
+        let left = cross(width, deck_height);
+        let right = cross(deck_width, height);
+        let refresh_mhz = u64::from(request.refresh_hz) * 1000;
+        Self {
+            same_size: (width, height) == (deck_width, deck_height),
+            // |w·H − W·h| > 0.5 % of W·h, in integers.
+            aspect_differs: left.abs_diff(right) * 200 > right.max(1),
+            rotation_differs: output.rotation != request.rotation,
+            refresh_differs: output.refresh_mhz != 0
+                && refresh_mhz != 0
+                && u64::from(output.refresh_mhz).abs_diff(refresh_mhz) > 500,
+        }
+    }
+
+    /// Whether the picture is shown exactly as the Deck monitor would be.
+    #[must_use]
+    pub const fn exact(&self) -> bool {
+        self.same_size && !self.aspect_differs && !self.rotation_differs && !self.refresh_differs
+    }
+}
+
+/// One Deck monitor and the host output that shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownMatch {
+    /// Index of the Deck monitor in the requests.
+    pub request: usize,
+    pub output: ShownOutput,
+    pub fit: ShownFit,
+}
+
+/// A Deck's monitors mapped onto a desktop shown as it is (another
+/// product's desktop, ADR 0025 §8): each Deck monitor that has a host
+/// output gets that output's own picture, in its own window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownLayoutMatch {
+    /// In request order; the Deck's primary is always one of them.
+    pub matches: Vec<ShownMatch>,
+    /// Host outputs no Deck monitor shows (the host has more monitors).
+    pub not_shown: Vec<String>,
+    /// Deck monitors without a host output (the host has fewer); they get
+    /// no window.
+    pub without_output: Vec<usize>,
+}
+
+impl ShownLayoutMatch {
+    /// Whether the desktop is exactly the Deck's layout: every monitor
+    /// matched, same sizes, rotations and relative places, nothing left
+    /// over.
+    #[must_use]
+    pub fn exact(&self, requests: &[ConsoleHeadRequest]) -> bool {
+        if !self.not_shown.is_empty() || !self.without_output.is_empty() {
+            return false;
+        }
+        let request_origin = origin(requests.iter().map(|request| (request.x, request.y)));
+        let shown_origin = origin(
+            self.matches
+                .iter()
+                .map(|matched| (matched.output.x, matched.output.y)),
+        );
+        self.matches.iter().all(|matched| {
+            let request = &requests[matched.request];
+            matched.fit.same_size
+                && !matched.fit.rotation_differs
+                && (
+                    matched.output.x - shown_origin.0,
+                    matched.output.y - shown_origin.1,
+                ) == (request.x - request_origin.0, request.y - request_origin.1)
+        })
+    }
+
+    /// One line for logs and the Deck: which output shows which Deck
+    /// monitor, and how each differs.
+    #[must_use]
+    pub fn describe(&self, requests: &[ConsoleHeadRequest]) -> String {
+        let mut parts: Vec<String> = self
+            .matches
+            .iter()
+            .map(|matched| {
+                let request = &requests[matched.request];
+                let (width, height) = matched.output.screen_extent();
+                let (deck_width, deck_height) = request.screen_extent();
+                let mut part = format!(
+                    "display {} <- {} {width}x{height}",
+                    matched.request + 1,
+                    matched.output.name
+                );
+                if !matched.fit.same_size {
+                    let _ = write!(part, " (Deck {deck_width}x{deck_height}, scaled");
+                    if matched.fit.aspect_differs {
+                        part.push_str(", letterboxed");
+                    }
+                    part.push(')');
+                }
+                if matched.fit.rotation_differs {
+                    part.push_str(" (rotated differently)");
+                }
+                if matched.fit.refresh_differs {
+                    let _ = write!(
+                        part,
+                        " ({}.{:03} Hz, Deck {} Hz)",
+                        matched.output.refresh_mhz / 1000,
+                        matched.output.refresh_mhz % 1000,
+                        request.refresh_hz
+                    );
+                }
+                part
+            })
+            .collect();
+        if !self.not_shown.is_empty() {
+            parts.push(format!("not shown: {}", self.not_shown.join(", ")));
+        }
+        if !self.without_output.is_empty() {
+            parts.push(format!(
+                "no host monitor for display {}",
+                self.without_output
+                    .iter()
+                    .map(|index| (index + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+fn origin(places: impl Iterator<Item = (i32, i32)>) -> (i32, i32) {
+    places.fold((i32::MAX, i32::MAX), |(x, y), (px, py)| {
+        (x.min(px), y.min(py))
+    })
+}
+
+/// A rectangle's centre relative to `anchor`'s, in units of `anchor`'s own
+/// extent, so a layout at another scale lands on the same numbers.
+fn relative_centre(
+    (x, y, width, height): (i32, i32, u32, u32),
+    (ax, ay, aw, ah): (i32, i32, u32, u32),
+) -> (f64, f64) {
+    let centre = |origin: i32, extent: u32| f64::from(origin) + f64::from(extent) / 2.0;
+    (
+        (centre(x, width) - centre(ax, aw)) / f64::from(aw.max(1)),
+        (centre(y, height) - centre(ay, ah)) / f64::from(ah.max(1)),
+    )
+}
+
+/// Maps a Deck's monitors onto a desktop shown as it is — another
+/// product's desktop, whose outputs Arcen never changes (ADR 0025 §8) —
+/// by arrangement, the way that product laid the desktop out for its own
+/// client: the Deck's primary on the desktop's primary output (the first
+/// shown output when none is primary), then each further Deck monitor on
+/// the output in the same direction from it (left, right, above, below),
+/// nearest first, with places measured in each primary's own size so a
+/// desktop at another scale maps the same way. Sizes, refresh and rotation
+/// may differ: each output is streamed as it is and the Deck fits it
+/// ([`ShownFit`]). Host outputs left over are not shown; Deck monitors left
+/// over get no window.
 ///
 /// # Errors
 ///
-/// [`ConsoleLayoutError`] when the layouts differ.
-pub fn bind_shown_layout(
+/// [`ConsoleLayoutError::Empty`] for no requests,
+/// [`ConsoleLayoutError::PrimaryCount`] unless exactly one is primary, and
+/// [`ConsoleLayoutError::ShownLayoutDiffers`] when the desktop shows
+/// nothing.
+pub fn match_shown_layout(
     requests: &[ConsoleHeadRequest],
     shown: &[ShownOutput],
-) -> Result<Vec<String>, ConsoleLayoutError> {
+) -> Result<ShownLayoutMatch, ConsoleLayoutError> {
     if requests.is_empty() {
         return Err(ConsoleLayoutError::Empty);
     }
-    let differs = || ConsoleLayoutError::ShownLayoutDiffers {
-        requested: requests.len(),
-        shown: shown.len(),
-    };
-    if requests.len() != shown.len() {
-        return Err(differs());
+    let primaries = requests.iter().filter(|request| request.primary).count();
+    if primaries != 1 {
+        return Err(ConsoleLayoutError::PrimaryCount(primaries));
     }
-    let request_origin = (
-        requests.iter().map(|request| request.x).min().unwrap_or(0),
-        requests.iter().map(|request| request.y).min().unwrap_or(0),
-    );
-    let shown_origin = (
-        shown.iter().map(|output| output.x).min().unwrap_or(0),
-        shown.iter().map(|output| output.y).min().unwrap_or(0),
-    );
-    let mut taken = vec![false; shown.len()];
-    let mut names = Vec::with_capacity(requests.len());
-    for request in requests {
-        let place = (request.x - request_origin.0, request.y - request_origin.1);
-        let found = shown.iter().enumerate().find(|(index, output)| {
-            !taken[*index]
-                && (output.x - shown_origin.0, output.y - shown_origin.1) == place
-                && (output.width, output.height) == (request.width, request.height)
-                && output.rotation == request.rotation
+    if shown.is_empty() {
+        return Err(ConsoleLayoutError::ShownLayoutDiffers {
+            requested: requests.len(),
+            shown: 0,
         });
-        let Some((index, output)) = found else {
-            return Err(differs());
-        };
-        taken[index] = true;
-        names.push(output.name.clone());
     }
-    Ok(names)
+    let deck_primary = requests
+        .iter()
+        .position(|request| request.primary)
+        .unwrap_or(0);
+    let host_primary = shown.iter().position(|output| output.primary).unwrap_or(0);
+    let request_rect = |request: &ConsoleHeadRequest| {
+        let (width, height) = request.screen_extent();
+        (request.x, request.y, width, height)
+    };
+    let output_rect = |output: &ShownOutput| {
+        let (width, height) = output.screen_extent();
+        (output.x, output.y, width, height)
+    };
+    let deck_anchor = request_rect(&requests[deck_primary]);
+    let host_anchor = output_rect(&shown[host_primary]);
+    let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+    for (request_index, request) in requests.iter().enumerate() {
+        if request_index == deck_primary {
+            continue;
+        }
+        let deck = relative_centre(request_rect(request), deck_anchor);
+        for (output_index, output) in shown.iter().enumerate() {
+            if output_index == host_primary {
+                continue;
+            }
+            let host = relative_centre(output_rect(output), host_anchor);
+            let distance = (deck.0 - host.0).powi(2) + (deck.1 - host.1).powi(2);
+            pairs.push((distance, request_index, output_index));
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut output_for: Vec<Option<usize>> = vec![None; requests.len()];
+    let mut taken = vec![false; shown.len()];
+    output_for[deck_primary] = Some(host_primary);
+    taken[host_primary] = true;
+    for (_, request_index, output_index) in pairs {
+        if output_for[request_index].is_none() && !taken[output_index] {
+            output_for[request_index] = Some(output_index);
+            taken[output_index] = true;
+        }
+    }
+    let mut matches = Vec::new();
+    let mut without_output = Vec::new();
+    for (request_index, output_index) in output_for.into_iter().enumerate() {
+        match output_index {
+            Some(output_index) => matches.push(ShownMatch {
+                request: request_index,
+                output: shown[output_index].clone(),
+                fit: ShownFit::between(&requests[request_index], &shown[output_index]),
+            }),
+            None => without_output.push(request_index),
+        }
+    }
+    let not_shown = shown
+        .iter()
+        .zip(&taken)
+        .filter(|(_, taken)| !**taken)
+        .map(|(output, _)| output.name.clone())
+        .collect();
+    Ok(ShownLayoutMatch {
+        matches,
+        not_shown,
+        without_output,
+    })
 }
 
 /// Whether `output` can show a Deck monitor: connected, and listing at
@@ -605,6 +838,7 @@ mod tests {
             x,
             y,
             rotation: Rotation::Degrees0,
+            refresh_mhz: 60_000,
             primary: false,
         }
     }
@@ -626,44 +860,185 @@ mod tests {
         assert_eq!(headless_console_outputs_advice(None, &found), None);
     }
 
-    #[test]
-    fn a_desktop_shown_as_it_is_takes_a_deck_whose_layout_is_its_own() {
-        // The desktop: DP-2 1920x1200 at 0,400 left of DP-0 2560x1600 at
-        // 1920,0. The Deck: its 2560x1600 primary first, the 1920x1200 to
-        // its left, as planned (non-negative origin).
-        let desktop = [
-            shown("DP-0", (2560, 1600), (1920, 0)),
+    fn primary(mut output: ShownOutput) -> ShownOutput {
+        output.primary = true;
+        output
+    }
+
+    fn names(matched: &ShownLayoutMatch) -> Vec<(usize, &str)> {
+        matched
+            .matches
+            .iter()
+            .map(|matched| (matched.request, matched.output.name.as_str()))
+            .collect()
+    }
+
+    /// The field desktop: DP-2 1920x1200 at 0,400 left of the primary DP-0
+    /// 2560x1600 at 1920,0; DP-4 and DP-6 forced connected and unlit.
+    fn field_desktop() -> [ShownOutput; 2] {
+        [
+            primary(shown("DP-0", (2560, 1600), (1920, 0))),
             shown("DP-2", (1920, 1200), (0, 400)),
-        ];
+        ]
+    }
+
+    #[test]
+    fn a_desktop_with_the_decks_own_layout_maps_exactly() {
         let deck = [
             request(2560, 1600, 1920, 0, true),
             request(1920, 1200, 0, 400, false),
         ];
+        let matched = match_shown_layout(&deck, &field_desktop()).expect("maps");
+        assert_eq!(names(&matched), [(0, "DP-0"), (1, "DP-2")]);
+        assert!(matched.exact(&deck));
+        assert!(matched.matches.iter().all(|matched| matched.fit.exact()));
         assert_eq!(
-            bind_shown_layout(&deck, &desktop).expect("the same layout"),
-            ["DP-0", "DP-2"]
+            matched.describe(&deck),
+            "display 1 <- DP-0 2560x1600; display 2 <- DP-2 1920x1200"
         );
-        // Shifted as a whole still matches (only relative places count).
+        // Shifted as a whole is still the same layout.
         let shifted = [
-            request(2560, 1600, 1920 + 7, 3, true),
+            request(2560, 1600, 1927, 3, true),
             request(1920, 1200, 7, 403, false),
         ];
-        assert!(bind_shown_layout(&shifted, &desktop).is_ok());
-        // Another size, another place, a monitor too many or too few.
-        for deck in [
-            vec![
-                request(2560, 1440, 1920, 0, true),
-                request(1920, 1200, 0, 400, false),
-            ],
-            vec![
-                request(2560, 1600, 0, 0, true),
-                request(1920, 1200, 2560, 0, false),
-            ],
-            vec![request(2560, 1600, 0, 0, true)],
-        ] {
-            let error = bind_shown_layout(&deck, &desktop).expect_err("differs");
-            assert_eq!(error.token(), "console_layout_differs");
-        }
+        assert!(
+            match_shown_layout(&shifted, &field_desktop())
+                .expect("maps")
+                .exact(&shifted)
+        );
+    }
+
+    #[test]
+    fn a_deck_at_another_scale_maps_by_arrangement_and_is_scaled() {
+        // The host was laid out at 2x 3840x2160 side by side; the Deck
+        // reports 2x 1920x1080 (logical), primary on the left.
+        let desktop = [
+            primary(shown("DP-0", (3840, 2160), (0, 0))),
+            shown("DP-2", (3840, 2160), (3840, 0)),
+        ];
+        let deck = [
+            request(1920, 1080, 0, 0, true),
+            request(1920, 1080, 1920, 0, false),
+        ];
+        let matched = match_shown_layout(&deck, &desktop).expect("maps");
+        assert_eq!(names(&matched), [(0, "DP-0"), (1, "DP-2")]);
+        assert!(!matched.exact(&deck));
+        assert!(matched.matches.iter().all(|matched| !matched.fit.same_size
+            && !matched.fit.aspect_differs
+            && !matched.fit.rotation_differs));
+        assert_eq!(
+            matched.describe(&deck),
+            "display 1 <- DP-0 3840x2160 (Deck 1920x1080, scaled); display 2 <- DP-2 3840x2160 (Deck 1920x1080, scaled)"
+        );
+    }
+
+    #[test]
+    fn the_secondary_follows_its_direction_not_the_randr_order() {
+        // RandR lists the right-hand output first; the Deck's second
+        // monitor is on the left of its primary, a little lower and smaller.
+        let desktop = [
+            shown("DP-4", (1920, 1080), (4480, 0)),
+            primary(shown("DP-0", (2560, 1440), (1920, 0))),
+            shown("DP-2", (1920, 1200), (0, 400)),
+        ];
+        let deck = [
+            request(1920, 1080, 0, 300, false),
+            request(2560, 1440, 1920, 0, true),
+        ];
+        let matched = match_shown_layout(&deck, &desktop).expect("maps");
+        assert_eq!(names(&matched), [(0, "DP-2"), (1, "DP-0")]);
+        assert_eq!(matched.not_shown, ["DP-4"]);
+        assert!(matched.without_output.is_empty());
+        let fit = matched.matches[0].fit;
+        assert!(!fit.same_size && fit.aspect_differs);
+        assert!(
+            matched
+                .describe(&deck)
+                .ends_with("display 2 <- DP-0 2560x1440; not shown: DP-4")
+        );
+    }
+
+    #[test]
+    fn four_host_monitors_for_two_deck_displays_show_the_nearest_two() {
+        // A 2x2 desktop; the Deck has its primary and one display above it.
+        let desktop = [
+            primary(shown("DP-0", (1920, 1080), (0, 1080))),
+            shown("DP-2", (1920, 1080), (1920, 1080)),
+            shown("DP-4", (1920, 1080), (0, 0)),
+            shown("DP-6", (1920, 1080), (1920, 0)),
+        ];
+        let deck = [
+            request(2560, 1440, 0, 1440, true),
+            request(2560, 1440, 0, 0, false),
+        ];
+        let matched = match_shown_layout(&deck, &desktop).expect("maps");
+        assert_eq!(names(&matched), [(0, "DP-0"), (1, "DP-4")]);
+        assert_eq!(matched.not_shown, ["DP-2", "DP-6"]);
+    }
+
+    #[test]
+    fn fewer_host_monitors_leave_deck_displays_without_a_window() {
+        let desktop = [primary(shown("DP-0", (2560, 1440), (0, 0)))];
+        let deck = [
+            request(1920, 1080, 0, 0, false),
+            request(2560, 1440, 1920, 0, true),
+        ];
+        let matched = match_shown_layout(&deck, &desktop).expect("maps");
+        assert_eq!(names(&matched), [(1, "DP-0")]);
+        assert_eq!(matched.without_output, [0]);
+        assert_eq!(
+            matched.describe(&deck),
+            "display 2 <- DP-0 2560x1440; no host monitor for display 1"
+        );
+    }
+
+    #[test]
+    fn without_a_primary_output_the_first_shown_is_the_primary() {
+        let desktop = [
+            shown("DP-0", (1920, 1080), (1920, 0)),
+            shown("DP-2", (1920, 1080), (0, 0)),
+        ];
+        let deck = [
+            request(1920, 1080, 1920, 0, true),
+            request(1920, 1080, 0, 0, false),
+        ];
+        let matched = match_shown_layout(&deck, &desktop).expect("maps");
+        assert_eq!(names(&matched), [(0, "DP-0"), (1, "DP-2")]);
+        assert!(matched.exact(&deck));
+    }
+
+    #[test]
+    fn refresh_and_rotation_differences_are_reported_never_refused() {
+        let mut portrait = shown("DP-2", (1920, 1200), (2560, 0));
+        portrait.rotation = Rotation::Degrees90;
+        let mut main = primary(shown("DP-0", (2560, 1600), (0, 0)));
+        main.refresh_mhz = 59_972;
+        let mut deck_main = request(2560, 1600, 0, 0, true);
+        deck_main.refresh_hz = 120;
+        let deck = [deck_main, request(1920, 1200, 2560, 0, false)];
+        let matched = match_shown_layout(&deck, &[main, portrait]).expect("maps");
+        assert!(matched.matches[0].fit.refresh_differs);
+        assert!(matched.matches[1].fit.rotation_differs);
+        assert!(matched.matches[1].fit.aspect_differs);
+        assert_eq!(matched.matches[1].output.screen_extent(), (1200, 1920));
+        let line = matched.describe(&deck);
+        assert!(line.contains("(59.972 Hz, Deck 120 Hz)"), "{line}");
+        assert!(line.contains("(rotated differently)"), "{line}");
+    }
+
+    #[test]
+    fn nothing_shown_or_no_primary_is_refused() {
+        let deck = [request(1920, 1080, 0, 0, true)];
+        let error = match_shown_layout(&deck, &[]).expect_err("nothing shown");
+        assert_eq!(error.token(), "console_layout_differs");
+        assert_eq!(
+            match_shown_layout(&[], &field_desktop()),
+            Err(ConsoleLayoutError::Empty)
+        );
+        assert_eq!(
+            match_shown_layout(&[request(10, 10, 0, 0, false)], &field_desktop()),
+            Err(ConsoleLayoutError::PrimaryCount(0))
+        );
     }
 
     #[test]

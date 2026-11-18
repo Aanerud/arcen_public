@@ -9,12 +9,15 @@
 //!   display) and the transactional enter engine that confirms every
 //!   window on its exact display, or aborts the whole layout;
 //! - [`activation`]: a `ServerHello`'s applied layout to a plan, and the
-//!   session state a Deck holds for it.
+//!   session state a Deck holds for it;
+//! - [`layout_note`]: the line naming displays a host showed at another
+//!   size, or not at all (another product's desktop, kept as it is).
 //!
 //! A Deck opens the windows (egui viewports on the Mac, Win32 windows on
 //! Windows), reports what it observes of each, and acts on the verdicts.
 
 pub mod activation;
+pub mod layout_note;
 pub mod runtime;
 pub mod session;
 #[cfg(feature = "dev-tools")]

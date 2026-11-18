@@ -674,6 +674,11 @@ struct LauncherResponse {
     /// output each committed monitor is captured from, in plan order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     console_outputs: Option<Vec<String>>,
+    /// A console shown as it is: what shows each monitor of the committed
+    /// plan (the Pier serves the plan as that desktop shows it).
+    #[cfg(target_os = "linux")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    console_shown: Option<super::console_layout::GuestLayout>,
     /// What `platform.session.default_desktop` did for a sign-in that
     /// started the account's session (`default_applied`,
     /// `account_choice`…); absent for a joined session.
@@ -745,6 +750,8 @@ impl LauncherResponse {
             console_service: None,
             console_layout: None,
             console_outputs: None,
+            #[cfg(target_os = "linux")]
+            console_shown: None,
             console_default_desktop: None,
             console_desktop: None,
         }
@@ -812,6 +819,8 @@ impl LauncherResponse {
             console_service: None,
             console_layout: None,
             console_outputs: None,
+            #[cfg(target_os = "linux")]
+            console_shown: None,
             console_default_desktop: None,
             console_desktop: None,
         }
@@ -1337,6 +1346,10 @@ impl AuthenticatedLauncher {
                 .console_outputs
                 .clone()
                 .filter(|_| response.console_layout.as_deref() == Some(CONSOLE_LAYOUT_SHOWN)),
+            console_shown: response
+                .console_shown
+                .clone()
+                .filter(|_| response.console_layout.as_deref() == Some(CONSOLE_LAYOUT_SHOWN)),
         })
     }
 
@@ -1590,6 +1603,8 @@ impl AuthenticatedLauncher {
             console_layout_applied: false,
             console_guest: false,
             console_shown_outputs: None,
+            #[cfg(target_os = "linux")]
+            console_shown: None,
         })
     }
 
@@ -1675,6 +1690,10 @@ pub struct SessionLauncher {
     console_guest: bool,
     /// Such a console's outputs, one per committed monitor, in plan order.
     console_shown_outputs: Option<Vec<String>>,
+    /// Such a console's mapping of the committed plan's monitors onto the
+    /// outputs it shows ([`Self::fit_committed_plan`]).
+    #[cfg(target_os = "linux")]
+    console_shown: Option<super::console_layout::GuestLayout>,
 }
 
 /// [`LauncherResponse::console_layout`] when the console took the layout.
@@ -1828,6 +1847,53 @@ impl SessionLauncher {
     /// The outputs a console shown as it is captures, in plan order.
     pub(crate) fn console_shown_outputs(&self) -> Option<Vec<String>> {
         self.console_shown_outputs.clone()
+    }
+
+    /// The committed plan as the joined console serves it: unchanged,
+    /// except on another product's desktop, which is never laid out for the
+    /// Deck: there each Deck monitor takes the output that shows it
+    /// (`console_layout::GuestLayout::fit`). `None` when that mapping does
+    /// not fit the plan (the sign-in then ends with the reason).
+    pub(crate) fn fit_committed_plan(
+        &self,
+        plan: crate::display::topology::LinuxTopologyPlan,
+    ) -> Option<crate::display::topology::LinuxTopologyPlan> {
+        #[cfg(target_os = "linux")]
+        if let Some(shown) = self.console_shown.as_ref() {
+            return match shown.fit(&plan) {
+                Ok(fitted) => {
+                    tracing::info!(
+                        target: target::SESSION,
+                        mapping = %shown.note,
+                        monitors = fitted.monitors.len(),
+                        requested_monitors = plan.monitors.len(),
+                        screen_w = fitted.virtual_width,
+                        screen_h = fitted.virtual_height,
+                        "the Deck's monitors are served as another product's desktop shows them"
+                    );
+                    Some(fitted)
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: target::SESSION,
+                        %error,
+                        mapping = %shown.note,
+                        "the Deck's monitors could not be served as another product's desktop shows them"
+                    );
+                    None
+                }
+            };
+        }
+        Some(plan)
+    }
+
+    /// How a console shown as it is maps the Deck's monitors, in words.
+    pub(crate) fn console_layout_note(&self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if let Some(shown) = self.console_shown.as_ref() {
+            return Some(shown.note.clone());
+        }
+        None
     }
 
     /// What another account is told while this joined console session is
@@ -3086,16 +3152,28 @@ async fn run_console(
         console_layout_requests(open)
     };
     let mut console_outputs = None;
+    let mut console_shown = None;
     let console_layout = match layout_requests.as_deref() {
+        // Read, never changed: each Deck monitor is shown by the output in
+        // the same place of the desktop's own layout.
         Some(requests) if guest => Some(
-            match super::console_layout::bind_shown(&session_display, requests).await {
-                Ok(names) => {
-                    tracing::info!(
-                        target: target::SESSION,
-                        outputs = ?names,
-                        "another product's desktop already has the Deck's layout; each monitor is captured as it is shown"
-                    );
-                    console_outputs = Some(names);
+            match super::console_layout::match_shown(&session_display, requests).await {
+                Ok(shown) => {
+                    if shown.exact {
+                        tracing::info!(
+                            target: target::SESSION,
+                            mapping = %shown.note,
+                            "another product's desktop has the Deck's layout; each monitor is captured as it is shown"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: target::SESSION,
+                            mapping = %shown.note,
+                            "another product's desktop is laid out differently from the Deck's monitors; it is never changed, each Deck monitor shows the output in its place, fitted"
+                        );
+                    }
+                    console_outputs = Some(shown.outputs());
+                    console_shown = Some(shown);
                     CONSOLE_LAYOUT_SHOWN.to_owned()
                 }
                 Err(failure) => {
@@ -3104,7 +3182,7 @@ async fn run_console(
                         reason_class = failure.token,
                         detail = %failure.detail,
                         monitors = requests.len(),
-                        "another product's desktop is not laid out as the Deck's monitors; it is never changed"
+                        "another product's desktop shows nothing the Deck's monitors can be mapped to; it is never changed"
                     );
                     failure.token.to_owned()
                 }
@@ -3203,6 +3281,7 @@ async fn run_console(
     }
     ready.console_layout = console_layout.clone();
     ready.console_outputs = console_outputs;
+    ready.console_shown = console_shown;
     if let Err(error) = write_response(&ready) {
         agent.shutdown().await;
         secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
