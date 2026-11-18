@@ -759,6 +759,56 @@ const fn codec_chroma_ceiling(backend: EncoderBackend, codec: VideoCodec) -> Chr
     }
 }
 
+/// The largest picture `backend` encodes with `codec`: the backend's own
+/// limits, narrowed where one of its codecs stops short of them. NVENC
+/// encodes H.264 at most 4096 px a side on every generation (its HEVC and
+/// AV1 reach 8192): a 5120x2880 H.264 encoder fails `InitializeEncoder`
+/// with `NV_ENC_ERR_INVALID_PARAM` (Linux lab, 2x5K console layout).
+#[must_use]
+pub const fn codec_dimension_ceiling(backend: EncoderBackend, codec: VideoCodec) -> (u32, u32) {
+    let limits = backend.contract();
+    match (backend, codec) {
+        (EncoderBackend::NativeNvenc, VideoCodec::H264) => (
+            min_u32(limits.max_width, NVENC_H264_MAX_DIMENSION),
+            min_u32(limits.max_height, NVENC_H264_MAX_DIMENSION),
+        ),
+        _ => (limits.max_width, limits.max_height),
+    }
+}
+
+/// NVENC's H.264 picture ceiling, in pixels a side.
+pub const NVENC_H264_MAX_DIMENSION: u32 = 4096;
+
+const fn min_u32(left: u32, right: u32) -> u32 {
+    if left < right { left } else { right }
+}
+
+/// Whether `backend` encodes a `width`x`height` picture with `codec`.
+#[must_use]
+pub const fn codec_fits_dimensions(
+    backend: EncoderBackend,
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+) -> bool {
+    let (max_width, max_height) = codec_dimension_ceiling(backend, codec);
+    width <= max_width && height <= max_height
+}
+
+/// `limits` with the picture ceiling of `codec` on `backend`.
+const fn with_codec_dimensions(
+    limits: BackendLimits,
+    backend: EncoderBackend,
+    codec: VideoCodec,
+) -> BackendLimits {
+    let (max_width, max_height) = codec_dimension_ceiling(backend, codec);
+    BackendLimits {
+        max_width: min_u32(limits.max_width, max_width),
+        max_height: min_u32(limits.max_height, max_height),
+        ..limits
+    }
+}
+
 fn validate_request(request: MediaRequest) -> Result<(), MediaPlanError> {
     if request.width == 0 || request.height == 0 || request.fps == 0 {
         return Err(MediaPlanError::InvalidGeometry);
@@ -797,6 +847,7 @@ fn resolve_available(
             .offered_bit_depths()
             .contains(request.video.bit_depth)
         && codec_chroma_ceiling(backend, request.video.codec).contains(request.video.chroma);
+    let limits = with_codec_dimensions(limits, backend, request.video.codec);
     if !format_supported
         || request.width > limits.max_width
         || request.height > limits.max_height
@@ -977,8 +1028,12 @@ fn degrade_to_limits(
         return Err(MediaPlanError::InvalidGeometry);
     }
 
-    let (width, height) = fit_geometry(request.width, request.height, limits)
-        .ok_or(MediaPlanError::InvalidGeometry)?;
+    let (width, height) = fit_geometry(
+        request.width,
+        request.height,
+        with_codec_dimensions(limits, backend, codec),
+    )
+    .ok_or(MediaPlanError::InvalidGeometry)?;
     degradation.geometry_clamped = width != request.width || height != request.height;
 
     let cursor_mode = if matches!(request.cursor_mode, CursorMode::Host) && !limits.cursor_in_video
@@ -1648,6 +1703,52 @@ mod tests {
         max_fps: 30,
         cursor_in_video: false,
     };
+
+    #[test]
+    fn nvenc_h264_stops_at_4096_while_its_hevc_reaches_8192() {
+        let nvenc = [BackendCandidate {
+            backend: EncoderBackend::NativeNvenc,
+            availability: BackendAvailability::Available(EncoderBackend::NativeNvenc.contract()),
+        }];
+        let five_k = MediaRequest {
+            encoder: EncoderRequest::NativeNvenc,
+            width: 5120,
+            height: 2880,
+            ..REQUEST
+        };
+        assert_eq!(
+            resolve_media_plan(five_k, &nvenc),
+            Err(MediaPlanError::UnsupportedFormat)
+        );
+        let hevc = MediaRequest {
+            video: VideoConfiguration {
+                codec: VideoCodec::H265,
+                ..H264_420
+            },
+            ..five_k
+        };
+        assert_eq!(
+            resolve_media_plan(hevc, &nvenc).map(|plan| (plan.width, plan.height)),
+            Ok((5120, 2880))
+        );
+        // A degrading resolution fits H.264 and says so.
+        let (plan, degradation) = resolve_media_plan_degrading(five_k, &nvenc).expect("fitted");
+        assert_eq!(plan.video.codec, VideoCodec::H264);
+        assert!(plan.width <= 4096 && plan.width > 4000, "{}", plan.width);
+        assert!(degradation.geometry_clamped);
+        assert!(codec_fits_dimensions(
+            EncoderBackend::NativeNvenc,
+            VideoCodec::H264,
+            4096,
+            4096
+        ));
+        assert!(!codec_fits_dimensions(
+            EncoderBackend::NativeNvenc,
+            VideoCodec::H264,
+            4098,
+            2160
+        ));
+    }
 
     #[test]
     fn accelerator_class_is_declared_not_inferred_from_the_backend_name() {

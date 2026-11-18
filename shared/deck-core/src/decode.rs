@@ -149,6 +149,30 @@ impl Default for SessionColor {
     }
 }
 
+impl SessionColor {
+    /// What the host says it actually serves: its hello's `active_*`
+    /// colour axes rather than what this Deck asked for, so a downgraded
+    /// session is presented as what arrives. An axis the host does not
+    /// report keeps the BT.709 SDR default rather than a guess. Every
+    /// consumer of a hello (the media worker, the CLI smokes) teaches its
+    /// decoders this before the first keyframe.
+    #[must_use]
+    pub fn from_hello(hello: &arcen_protocol::messages::ServerHelloMsg) -> Self {
+        let active = arcen_media::colour_check::ColourAxes::from_hello(hello);
+        let presentation = arcen_media::VideoColorMetadata::from_optional_or_legacy(
+            active.range,
+            active.matrix,
+            active.primaries,
+            active.transfer,
+        )
+        .presentation_axes();
+        Self {
+            primaries: presentation.primaries,
+            transfer: presentation.transfer,
+        }
+    }
+}
+
 /// The memory layout of a native decoded picture, so the presenter picks
 /// its sampling path without knowing the decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,5 +510,31 @@ mod tests {
         assert_eq!(video.matrix, arcen_media::ColorMatrix::Bt709);
         assert_eq!(video.primaries, ColorPrimaries::Bt2020);
         assert_eq!(video.transfer, TransferCharacteristics::Pq);
+    }
+
+    #[test]
+    fn the_session_colour_is_what_the_host_says_it_serves() {
+        let hello = |caps: serde_json::Value| -> arcen_protocol::messages::ServerHelloMsg {
+            serde_json::from_value(serde_json::json!({
+                "type": "server_hello",
+                "codec": "h265",
+                "color_caps": caps,
+            }))
+            .expect("minimal server_hello parses")
+        };
+        let hdr = hello(serde_json::json!({
+            "active_bit_depth": "10", "active_range": "limited", "active_matrix": "bt2020nc",
+            "active_primaries": "bt2020", "active_transfer": "pq",
+        }));
+        assert_eq!(
+            SessionColor::from_hello(&hdr),
+            SessionColor {
+                primaries: ColorPrimaries::Bt2020,
+                transfer: TransferCharacteristics::Pq,
+            }
+        );
+        // A host that reports neither axis is BT.709 SDR.
+        let legacy = hello(serde_json::json!({ "active_bit_depth": "8" }));
+        assert_eq!(SessionColor::from_hello(&legacy), SessionColor::default());
     }
 }

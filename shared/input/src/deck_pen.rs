@@ -224,8 +224,94 @@ impl WindowsInkMapper {
     }
 }
 
+/// The Deck's one-time hint when a pen tablet is attached but its pen
+/// reaches the Deck as a mouse (a Wacom with "Use Windows Ink" off for the
+/// Deck): Tablet support then sends no pen, and the host sees no pressure.
+pub const TABLET_AS_MOUSE_HINT: &str = "Your tablet is sending mouse input, so pressure can't \
+     reach the host. In Wacom Tablet Properties \u{203a} Mapping, turn on Use Windows Ink \
+     for this app (or Other Programs).";
+
+/// Whether to show [`TABLET_AS_MOUSE_HINT`]: Tablet support is chosen, the
+/// computer has a pen digitizer (a HID pen or digitizer collection, or a
+/// Wacom device), yet Windows lists no pen pointer device and no pen sample
+/// arrived. Windows lists a pen exactly when the tablet's driver routes it
+/// through Windows Ink, so a digitizer it does not list is one its driver
+/// turns into a mouse.
+#[must_use]
+pub const fn tablet_sends_mouse(facts: TabletFacts) -> bool {
+    facts.tablet_support
+        && facts.digitizer_present
+        && !facts.pen_pointer_listed
+        && !facts.pen_observed
+}
+
+/// What [`tablet_sends_mouse`] judges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools, reason = "four independent facts")]
+pub struct TabletFacts {
+    /// Tablet support is the chosen tablet mode.
+    pub tablet_support: bool,
+    /// A pen digitizer is attached ([`is_pen_digitizer_collection`]).
+    pub digitizer_present: bool,
+    /// The OS lists a pen pointer device.
+    pub pen_pointer_listed: bool,
+    /// A pen sample arrived this run.
+    pub pen_observed: bool,
+}
+
+/// Whether a HID top-level collection is a pen digitizer: the Digitizers
+/// page's digitizer or pen usage, or any collection of a Wacom device (whose
+/// driver may hide the standard one behind its own).
+#[must_use]
+pub const fn is_pen_digitizer_collection(vendor_id: u32, usage_page: u16, usage: u16) -> bool {
+    const WACOM: u32 = 0x056A;
+    const DIGITIZERS_PAGE: u16 = 0x0D;
+    const DIGITIZER: u16 = 0x01;
+    const PEN: u16 = 0x02;
+    vendor_id == WACOM || (usage_page == DIGITIZERS_PAGE && matches!(usage, DIGITIZER | PEN))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_tablet_whose_driver_makes_it_a_mouse_gets_the_windows_ink_hint() {
+        // The field case: a Wacom with Use Windows Ink off for other
+        // programs; Windows lists no pen, and none arrives.
+        let field = TabletFacts {
+            tablet_support: true,
+            digitizer_present: true,
+            ..TabletFacts::default()
+        };
+        assert!(tablet_sends_mouse(field));
+        // Windows Ink on: Windows lists the pen (or one was seen).
+        for ink in [
+            TabletFacts {
+                pen_pointer_listed: true,
+                ..field
+            },
+            TabletFacts {
+                pen_observed: true,
+                ..field
+            },
+            // No tablet, or the user chose another tablet mode.
+            TabletFacts {
+                digitizer_present: false,
+                ..field
+            },
+            TabletFacts {
+                tablet_support: false,
+                ..field
+            },
+        ] {
+            assert!(!tablet_sends_mouse(ink), "{ink:?}");
+        }
+        assert!(is_pen_digitizer_collection(0x056A, 0xFF0D, 0x01));
+        assert!(is_pen_digitizer_collection(0x045E, 0x0D, 0x02));
+        // A touch screen is a digitizer page collection, not a pen.
+        assert!(!is_pen_digitizer_collection(0x045E, 0x0D, 0x04));
+        assert!(!is_pen_digitizer_collection(0x046D, 0x01, 0x02));
+    }
     use super::*;
 
     const IMAGE: ImageRect = ImageRect {

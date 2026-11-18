@@ -1637,8 +1637,10 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
+            monitor_fps: Vec::new(),
             encoder: Some(arcen_media::video::EncoderRequest::SoftwareH264),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            client_video: None,
             cursor_mode: arcen_protocol::messages::CursorMode::Local,
             session_log_id: arcen_telemetry::CorrelationId::from_uuid_v4_bytes([0; 16]),
         };

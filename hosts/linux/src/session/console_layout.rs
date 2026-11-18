@@ -5,13 +5,17 @@
 //! The decision (which output shows which Deck monitor, in which mode) is
 //! `arcen_outputs::console_layout`'s. This module reads the console's
 //! outputs through RandR, applies the decision as one NVIDIA MetaMode over
-//! NV-CONTROL (`nvidia-settings`, as root with the session's cookie, like
-//! the privacy code), makes the Deck's primary the RandR primary, hides
+//! NV-CONTROL (`display::nv_control`, requests on the same proven X
+//! connection as RandR; no `nvidia-settings` child runs as root against the
+//! session's X server), makes the Deck's primary the RandR primary, hides
 //! the forced virtual heads the layout does not use (RandR `non-desktop`)
 //! and proves the result. Before it changes anything it journals the
 //! console's own MetaMode, primary and output visibility in
 //! `/run/arcen/console-layout.json`; the hand-back restores exactly that,
-//! and so does the Pier's recovery after a launcher that did not.
+//! and so does the Pier's recovery after a launcher that did not. The
+//! journal also holds the session's windows before the layout and once it
+//! settled, and the restore moves back the windows the layout moved
+//! (`console_windows`, GAP-046).
 
 use std::path::Path;
 
@@ -28,7 +32,7 @@ use x11rb::protocol::xproto::{self, ConnectionExt as _};
 use x11rb::rust_connection::RustConnection;
 
 use super::console::{connect, read_root_journal, write_root_journal, SessionDisplay};
-use crate::display::nvctrl::NvControl;
+use crate::display::nv_control;
 use crate::logging::target;
 
 const LAYOUT_JOURNAL: &str = "/run/arcen/console-layout.json";
@@ -55,6 +59,12 @@ struct LayoutJournal {
     primary: Option<String>,
     /// Outputs Arcen marked `non-desktop`.
     hidden: Vec<String>,
+    /// The session's windows before the layout (GAP-046).
+    #[serde(default)]
+    windows_before: Vec<super::console_windows::SavedWindow>,
+    /// Its windows once the Deck's layout had settled; `None` until then.
+    #[serde(default)]
+    windows_after: Option<Vec<super::console_windows::SavedWindow>>,
 }
 
 impl LayoutJournal {
@@ -108,6 +118,48 @@ impl AppliedLayout {
     /// Pier's recovery.
     pub(crate) async fn restore(self) -> bool {
         restore_journal(&self.journal).await
+    }
+
+    /// Journals the session's windows as the settled layout left them: a
+    /// window placed otherwise when the Deck leaves was moved by the Deck's
+    /// user, and stays (shared `plan_window_restore`).
+    pub(crate) fn note_settled_windows(&mut self) {
+        if self.journal.windows_before.is_empty() || self.journal.windows_after.is_some() {
+            return;
+        }
+        let Ok(connection) = connect(&self.journal.display) else {
+            return;
+        };
+        let Ok(root) = root_of(&connection) else {
+            return;
+        };
+        if let Ok(windows) = super::console_windows::read(&connection, root) {
+            self.journal.windows_after = Some(windows);
+            if let Err(error) = self.journal.write() {
+                tracing::warn!(target: target::SESSION, %error, "the console's settled windows could not be journalled");
+            }
+        }
+    }
+}
+
+/// The session's windows, or none (logged) when they cannot be read: the
+/// layout goes ahead without them.
+fn read_windows(
+    connection: &RustConnection,
+    root: xproto::Window,
+    session_id: &str,
+) -> Vec<super::console_windows::SavedWindow> {
+    match super::console_windows::read(connection, root) {
+        Ok(windows) => windows,
+        Err(error) => {
+            tracing::warn!(
+                target: target::SESSION,
+                session_id,
+                %error,
+                "the console's windows could not be read; they are not moved back after the Deck's layout"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -204,28 +256,167 @@ async fn read_live<T: Send + 'static>(
     display: &SessionDisplay,
     read: fn(&RustConnection, xproto::Window) -> Result<T, String>,
 ) -> Result<T, String> {
+    on_display(display, LIVE_READ_TIMEOUT, read)
+        .await
+        .map_err(|error| match error {
+            DisplayWorkError::Failed(error) => error,
+            DisplayWorkError::Unanswered => "the X server did not answer in time".to_owned(),
+        })
+}
+
+/// How long one NV-CONTROL request may take: a MetaMode change is a mode
+/// set on every head.
+const NV_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why work on a display did not finish.
+enum DisplayWorkError {
+    Failed(String),
+    /// The X server did not answer within the bound.
+    Unanswered,
+}
+
+/// The display's current MetaMode, read over NV-CONTROL (the joined
+/// console's, and the single-display resize of `display::nvctrl`).
+pub(crate) async fn nv_snapshot(display: &SessionDisplay) -> Result<String, String> {
+    on_display(display, NV_CONTROL_TIMEOUT, |connection, _| {
+        nv_control::current_metamode(connection, 0).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(nv_work_error)
+}
+
+/// Switches the display to `metamode` over NV-CONTROL.
+pub(crate) async fn nv_assign(display: &SessionDisplay, metamode: &str) -> Result<(), String> {
+    let metamode = metamode.to_owned();
+    on_display(display, NV_CONTROL_TIMEOUT, move |connection, _| {
+        nv_control::set_current_metamode(connection, 0, &metamode)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(nv_work_error)
+}
+
+/// [`nv_assign`] for a thread with no async runtime (a restore run from a
+/// `Drop`), bounded the same way.
+pub(crate) fn nv_assign_blocking(display: &SessionDisplay, metamode: &str) -> Result<(), String> {
+    let metamode = metamode.to_owned();
+    on_display_blocking(display, NV_CONTROL_TIMEOUT, move |connection, _| {
+        nv_control::set_current_metamode(connection, 0, &metamode)
+            .map_err(|error| error.to_string())
+    })
+    .map_err(nv_work_error)
+}
+
+fn nv_work_error(error: DisplayWorkError) -> String {
+    match error {
+        DisplayWorkError::Failed(error) => error,
+        DisplayWorkError::Unanswered => format!(
+            "NV-CONTROL did not answer within {} ms",
+            NV_CONTROL_TIMEOUT.as_millis()
+        ),
+    }
+}
+
+/// The X socket of one piece of display work, for the caller that gives up
+/// waiting: it shuts the socket down so the blocked thread wakes and ends,
+/// and a socket connected only after that is shut down at once.
+#[derive(Default)]
+struct WorkSocket(std::sync::Mutex<WorkSocketState>);
+
+#[derive(Default)]
+enum WorkSocketState {
+    #[default]
+    Connecting,
+    Connected(std::os::unix::net::UnixStream),
+    Abandoned,
+}
+
+impl WorkSocket {
+    fn connected(&self, stream: &std::os::unix::net::UnixStream) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, WorkSocketState::Abandoned) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        } else if let Ok(clone) = stream.try_clone() {
+            *state = WorkSocketState::Connected(clone);
+        }
+    }
+
+    fn abandon(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let WorkSocketState::Connected(stream) =
+            std::mem::replace(&mut *state, WorkSocketState::Abandoned)
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// Connects to `display` and runs `work`, reporting the socket to `socket`.
+fn display_work<T>(
+    display: &SessionDisplay,
+    socket: &WorkSocket,
+    work: impl FnOnce(&RustConnection, xproto::Window) -> Result<T, String>,
+) -> Result<T, String> {
+    let connection = super::console::connect_reporting(display, |stream| socket.connected(stream))?;
+    let root = root_of(&connection)?;
+    work(&connection, root)
+}
+
+/// Runs `work` on its own connection to `display`, off the async runtime
+/// and bounded: an X server that does not answer in `timeout` is no answer
+/// (its socket is shut down so the blocked thread ends).
+async fn on_display<T: Send + 'static>(
+    display: &SessionDisplay,
+    timeout: std::time::Duration,
+    work: impl FnOnce(&RustConnection, xproto::Window) -> Result<T, String> + Send + 'static,
+) -> Result<T, DisplayWorkError> {
     let display = display.clone();
-    let socket = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let socket = std::sync::Arc::new(WorkSocket::default());
     let reported = std::sync::Arc::clone(&socket);
-    let work = tokio::task::spawn_blocking(move || {
-        let connection = super::console::connect_reporting(&display, |stream| {
-            if let (Ok(clone), Ok(mut slot)) = (stream.try_clone(), reported.lock()) {
-                *slot = Some(clone);
-            }
-        })?;
-        let root = root_of(&connection)?;
-        read(&connection, root)
-    });
-    match tokio::time::timeout(LIVE_READ_TIMEOUT, work).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(format!("read the X server's outputs: {error}")),
+    let work = tokio::task::spawn_blocking(move || display_work(&display, &reported, work));
+    match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(result)) => result.map_err(DisplayWorkError::Failed),
+        Ok(Err(error)) => Err(DisplayWorkError::Failed(format!(
+            "work on the X server: {error}"
+        ))),
         Err(_) => {
-            // The blocked thread waits on this socket without a bound: shut
-            // it down so the thread wakes and ends.
-            if let Some(stream) = socket.lock().ok().and_then(|mut slot| slot.take()) {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-            }
-            Err("the X server did not answer in time".to_owned())
+            socket.abandon();
+            Err(DisplayWorkError::Unanswered)
+        }
+    }
+}
+
+/// [`on_display`] without an async runtime: the work runs on a thread of its
+/// own and is abandoned (its socket shut down) after `timeout`.
+fn on_display_blocking<T: Send + 'static>(
+    display: &SessionDisplay,
+    timeout: std::time::Duration,
+    work: impl FnOnce(&RustConnection, xproto::Window) -> Result<T, String> + Send + 'static,
+) -> Result<T, DisplayWorkError> {
+    let display = display.clone();
+    let socket = std::sync::Arc::new(WorkSocket::default());
+    let reported = std::sync::Arc::clone(&socket);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("arcen-x-work".to_owned())
+        .spawn(move || {
+            let _ = sender.send(display_work(&display, &reported, work));
+        })
+        .map_err(|error| DisplayWorkError::Failed(format!("start the X work: {error}")))?;
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result.map_err(DisplayWorkError::Failed),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(DisplayWorkError::Failed(
+            "the X work ended without an answer".to_owned(),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            socket.abandon();
+            Err(DisplayWorkError::Unanswered)
         }
     }
 }
@@ -510,6 +701,56 @@ pub(crate) async fn live_console() -> Result<LiveConsole, String> {
     Err(last_error)
 }
 
+/// The outputs of joined console session `session_id` (owned by `uid`)
+/// that show a picture now, in RandR order, with the refresh each runs at:
+/// what a capture of them can deliver.
+///
+/// # Errors
+///
+/// When the session's display cannot be found or does not answer.
+pub(crate) async fn shown_outputs(session_id: &str, uid: u32) -> Result<Vec<ShownOutput>, String> {
+    let home = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|user| user.dir)
+        .ok_or_else(|| "the session user has no home".to_owned())?;
+    let display = super::console::find_session_display(session_id, uid, &home)
+        .ok_or_else(|| format!("session {session_id} has no display Arcen can open"))?;
+    read_live(&display, read_shown).await
+}
+
+/// [`shown_outputs`] with the size of the X screen they are part of, for a
+/// single-display Deck shown one of them (its pointer is placed on the
+/// whole screen).
+///
+/// # Errors
+///
+/// As [`shown_outputs`].
+pub(crate) async fn shown_desktop(
+    session_id: &str,
+    uid: u32,
+) -> Result<(Vec<ShownOutput>, (u32, u32)), String> {
+    let home = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|user| user.dir)
+        .ok_or_else(|| "the session user has no home".to_owned())?;
+    let display = super::console::find_session_display(session_id, uid, &home)
+        .ok_or_else(|| format!("session {session_id} has no display Arcen can open"))?;
+    read_live(&display, |connection, root| {
+        let geometry = connection
+            .get_geometry(root)
+            .map_err(|error| format!("request the screen size: {error}"))?
+            .reply()
+            .map_err(|error| format!("screen size: {error}"))?;
+        Ok((
+            read_shown(connection, root)?,
+            (u32::from(geometry.width), u32::from(geometry.height)),
+        ))
+    })
+    .await
+}
+
 /// How many Deck monitors a desktop shown as it is (another product's)
 /// is offered for, given how many outputs it shows: every Deck layout is
 /// mapped onto what it shows (`match_shown_layout`: a Deck monitor without
@@ -581,6 +822,17 @@ fn read_outputs(
         });
     }
     Ok((outputs, facts))
+}
+
+/// The largest X screen this server can show (`RandR`
+/// `GetScreenSizeRange`).
+fn screen_maximum(connection: &RustConnection, root: xproto::Window) -> Result<(u32, u32), String> {
+    let range = connection
+        .randr_get_screen_size_range(root)
+        .map_err(|error| format!("request RandR screen range: {error}"))?
+        .reply()
+        .map_err(|error| format!("RandR screen range: {error}"))?;
+    Ok((u32::from(range.max_width), u32::from(range.max_height)))
 }
 
 fn refresh_mhz(mode: &randr::ModeInfo) -> u32 {
@@ -742,34 +994,42 @@ pub(crate) async fn apply(
         .map_err(|error| LayoutFailure::new("console_randr_failed", error))?;
     let plan = plan_console_layout(requests, &outputs)
         .map_err(|error| LayoutFailure::new(error.token(), error.to_string()))?;
-    let nvcontrol = NvControl::new(
-        display.display.clone(),
-        Some(display.xauthority.to_string_lossy().into_owned()),
-    );
+    let (max_width, max_height) = screen_maximum(&connection, root)
+        .map_err(|error| LayoutFailure::new("console_randr_failed", error))?;
+    if !plan.fits_screen(max_width, max_height) {
+        let (width, height) = plan.screen_size();
+        return Err(LayoutFailure::new(
+            "console_screen_too_large",
+            format!("the layout needs a {width}x{height} screen; this X server's largest is {max_width}x{max_height}"),
+        ));
+    }
     // A journal left by an earlier attachment of this console holds the
     // console's own layout; never replace it with Arcen's.
     let mut journal = match LayoutJournal::read() {
-        Some(journal) if journal.display == *display => journal,
+        // Its windows settle afresh in this layout.
+        Some(journal) if journal.display == *display => LayoutJournal {
+            windows_after: None,
+            ..journal
+        },
         _ => LayoutJournal {
             session_id: session_id.to_owned(),
             display: display.clone(),
-            metamode: nvcontrol.snapshot().await.map_err(|error| {
-                LayoutFailure::new("console_layout_unavailable", error.to_string())
-            })?,
+            metamode: nv_snapshot(display)
+                .await
+                .map_err(|error| LayoutFailure::new("console_layout_unavailable", error))?,
             primary: primary_name(&connection, root, &facts),
             hidden: Vec::new(),
+            windows_before: read_windows(&connection, root, session_id),
+            windows_after: None,
         },
     };
     journal
         .write()
         .map_err(|error| LayoutFailure::new("console_layout_unavailable", error))?;
     let metamode = plan.nvidia_metamode();
-    if let Err(error) = nvcontrol.assign(&metamode).await {
+    if let Err(error) = nv_assign(display, &metamode).await {
         restore_journal(&journal).await;
-        return Err(LayoutFailure::new(
-            "console_layout_refused",
-            error.to_string(),
-        ));
+        return Err(LayoutFailure::new("console_layout_refused", error));
     }
     let outcome = finish_apply(&connection, root, &plan, &mut journal);
     if let Err(error) = outcome {
@@ -847,6 +1107,12 @@ async fn restore_journal(journal: &LayoutJournal) -> bool {
         LayoutJournal::remove();
         return true;
     };
+    // Where the windows are as the Deck leaves, still in its layout.
+    let departing = if journal.windows_before.is_empty() {
+        Vec::new()
+    } else {
+        super::console_windows::read(&connection, root).unwrap_or_default()
+    };
     if let Ok((_, facts)) = read_outputs(&connection, root) {
         for name in &journal.hidden {
             if let Some(fact) = facts.iter().find(|fact| &fact.name == name) {
@@ -856,11 +1122,7 @@ async fn restore_journal(journal: &LayoutJournal) -> bool {
             }
         }
     }
-    let nvcontrol = NvControl::new(
-        journal.display.display.clone(),
-        Some(journal.display.xauthority.to_string_lossy().into_owned()),
-    );
-    if let Err(error) = nvcontrol.assign(&journal.metamode).await {
+    if let Err(error) = nv_assign(&journal.display, &journal.metamode).await {
         tracing::error!(
             target: target::SESSION,
             %error,
@@ -875,6 +1137,15 @@ async fn restore_journal(journal: &LayoutJournal) -> bool {
         }
     }
     let _ = connection.flush();
+    super::console_windows::restore(
+        &connection,
+        root,
+        &journal.session_id,
+        &journal.windows_before,
+        journal.windows_after.as_deref(),
+        &departing,
+    )
+    .await;
     LayoutJournal::remove();
     tracing::info!(
         target: target::SESSION,
@@ -1023,20 +1294,12 @@ impl SettleDesk for LiveSettleDesk<'_> {
     }
 
     async fn reapply(&mut self) -> Result<(), LayoutFailure> {
-        NvControl::new(
-            self.layout.journal.display.display.clone(),
-            Some(
-                self.layout
-                    .journal
-                    .display
-                    .xauthority
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+        nv_assign(
+            &self.layout.journal.display,
+            &self.layout.plan.nvidia_metamode(),
         )
-        .assign(&self.layout.plan.nvidia_metamode())
         .await
-        .map_err(|error| LayoutFailure::new("console_layout_refused", error.to_string()))?;
+        .map_err(|error| LayoutFailure::new("console_layout_refused", error))?;
         let (connection, root) = self.connection()?;
         let (_, facts) = read_outputs(&connection, root)
             .map_err(|error| LayoutFailure::new("console_randr_failed", error))?;

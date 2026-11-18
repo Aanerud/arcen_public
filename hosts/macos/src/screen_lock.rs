@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
+// Copyright (C) 2026 TUTTIFRUTTI AS
+//! Locking the user's session when the Deck leaves (ADR 0025: disconnect
+//! locks, never ends).
+//!
+//! macOS publishes no call that locks the screen. The system's own "Lock
+//! Screen" (Control-Command-Q, the Apple menu) is `SACLockScreenImmediate` in
+//! the private `login` framework, found here with `dlsym` and refused visibly
+//! when absent, like the other private symbols this host relies on
+//! (`SLSDisplayGetPotentialHeadroom`, `CGVirtualDisplay`). Whether the
+//! screen is locked is read back from `CGSessionCopyCurrentDictionary`'s
+//! `CGSSessionScreenIsLocked`, never assumed from the call returning.
+//!
+//! Nothing here unlocks: a Deck that comes back finds the lock screen and
+//! signs in to it, as at the desk. macOS offers no public unlock after a
+//! password check, which is what the Linux Pier does through logind.
+
+use std::time::{Duration, Instant};
+
+/// Why the session was not locked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// This macOS has no `SACLockScreenImmediate`.
+    Unavailable,
+    /// The call returned and the screen did not report itself locked in
+    /// time.
+    NotConfirmed,
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("this macOS offers no screen lock call"),
+            Self::NotConfirmed => {
+                formatter.write_str("the screen did not report itself locked in time")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LockError {}
+
+/// How long a lock is given to show before it is reported as failed.
+pub const LOCK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether this GUI session's screen is locked, or `None` when the window
+/// server does not say (no GUI session).
+#[must_use]
+pub fn screen_is_locked() -> Option<bool> {
+    native::screen_is_locked()
+}
+
+/// This GUI session's security session id (`kCGSSessionIDKey`), or `None`
+/// outside a GUI session. Unique among the sessions of one boot.
+#[must_use]
+pub fn login_session_id() -> Option<u64> {
+    native::login_session_id()
+}
+
+/// Locks this GUI session's screen and waits, up to `timeout`, until it
+/// reports itself locked. A screen that already is succeeds at once.
+///
+/// # Errors
+///
+/// [`LockError`] when there is nothing to call or the lock did not show.
+pub fn lock_and_confirm(timeout: Duration) -> Result<(), LockError> {
+    if screen_is_locked() == Some(true) {
+        return Ok(());
+    }
+    native::lock_screen()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if screen_is_locked() == Some(true) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(LockError::NotConfirmed);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod native {
+    // A handful of C entry points, each with its SAFETY note below.
+    #![allow(unsafe_code)]
+
+    use super::LockError;
+    use std::ffi::{c_char, c_void};
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(dictionary: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+        fn CFStringCreateWithCString(
+            allocator: CFTypeRef,
+            text: *const c_char,
+            encoding: u32,
+        ) -> CFTypeRef;
+        fn CFGetTypeID(value: CFTypeRef) -> usize;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFBooleanGetValue(value: CFTypeRef) -> u8;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFNumberGetValue(number: CFTypeRef, kind: isize, value: *mut c_void) -> bool;
+        fn CFRelease(value: CFTypeRef);
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFTypeRef;
+    }
+
+    unsafe extern "C" {
+        fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    const UTF8: u32 = 0x0800_0100;
+    const CF_NUMBER_SINT64: isize = 4;
+    const RTLD_LAZY: i32 = 0x1;
+
+    /// An owned Core Foundation string, released on drop.
+    struct CfString(CFTypeRef);
+
+    impl CfString {
+        fn new(text: &std::ffi::CStr) -> Option<Self> {
+            // SAFETY: a NUL-terminated UTF-8 string and the default allocator;
+            // the result follows the create rule and is released on drop.
+            let string =
+                unsafe { CFStringCreateWithCString(std::ptr::null(), text.as_ptr(), UTF8) };
+            (!string.is_null()).then_some(Self(string))
+        }
+    }
+
+    impl Drop for CfString {
+        fn drop(&mut self) {
+            // SAFETY: owned since creation, released once.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    pub(super) fn screen_is_locked() -> Option<bool> {
+        // SAFETY: no arguments; the result follows the copy rule (released
+        // below) and is null outside a GUI session.
+        let session = unsafe { CGSessionCopyCurrentDictionary() };
+        if session.is_null() {
+            return None;
+        }
+        let locked = CfString::new(c"CGSSessionScreenIsLocked").map(|key| {
+            // SAFETY: `session` is a live dictionary and `key` a live string;
+            // the value is borrowed from the dictionary, read before it is
+            // released, and checked to be a boolean before it is read as one.
+            unsafe {
+                let value = CFDictionaryGetValue(session, key.0);
+                !value.is_null()
+                    && CFGetTypeID(value) == CFBooleanGetTypeID()
+                    && CFBooleanGetValue(value) != 0
+            }
+        });
+        // SAFETY: owned under the copy rule, released once.
+        unsafe { CFRelease(session) };
+        locked
+    }
+
+    pub(super) fn login_session_id() -> Option<u64> {
+        // SAFETY: as in `screen_is_locked`.
+        let session = unsafe { CGSessionCopyCurrentDictionary() };
+        if session.is_null() {
+            return None;
+        }
+        let id = CfString::new(c"kCGSSessionIDKey").and_then(|key| {
+            let mut id: i64 = 0;
+            // SAFETY: `session` and `key` are live; the value is borrowed
+            // from the dictionary, checked to be a number before it is read,
+            // and read into an `i64`, which `kCFNumberSInt64Type` writes.
+            let read = unsafe {
+                let value = CFDictionaryGetValue(session, key.0);
+                !value.is_null()
+                    && CFGetTypeID(value) == CFNumberGetTypeID()
+                    && CFNumberGetValue(value, CF_NUMBER_SINT64, (&raw mut id).cast())
+            };
+            read.then_some(id).and_then(|id| u64::try_from(id).ok())
+        });
+        // SAFETY: owned under the copy rule, released once.
+        unsafe { CFRelease(session) };
+        id
+    }
+
+    pub(super) fn lock_screen() -> Result<(), LockError> {
+        // SAFETY: a NUL-terminated path; the private framework sits in the
+        // shared cache, and `dlopen` returns null when it is absent.
+        let framework = unsafe {
+            dlopen(
+                c"/System/Library/PrivateFrameworks/login.framework/Versions/Current/login"
+                    .as_ptr(),
+                RTLD_LAZY,
+            )
+        };
+        if framework.is_null() {
+            return Err(LockError::Unavailable);
+        }
+        // SAFETY: a live handle and a NUL-terminated name.
+        let address = unsafe { dlsym(framework, c"SACLockScreenImmediate".as_ptr()) };
+        if address.is_null() {
+            return Err(LockError::Unavailable);
+        }
+        // SAFETY: `int SACLockScreenImmediate(void)`, what the system's
+        // Lock Screen command calls. Its result is not documented, so the
+        // lock is proved by reading the session back instead.
+        let lock: extern "C" fn() -> i32 = unsafe { std::mem::transmute(address) };
+        let _ = lock();
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod native {
+    use super::LockError;
+
+    pub(super) fn screen_is_locked() -> Option<bool> {
+        None
+    }
+
+    pub(super) fn login_session_id() -> Option<u64> {
+        None
+    }
+
+    pub(super) fn lock_screen() -> Result<(), LockError> {
+        Err(LockError::Unavailable)
+    }
+}

@@ -2194,6 +2194,9 @@ pub struct PipelineStatsSample {
     pub limiter: Option<arcen_media::video::FrameRateLimiter>,
     /// The loop's pacing target in that second (`target_fps`).
     pub target_fps: Option<u32>,
+    /// Pacing deadlines the loop reached (`ticks_due`), when it classifies
+    /// its rate.
+    pub ticks_due: Option<u32>,
     /// Due frames that carried new content (`fresh_frames`), when the loop
     /// classifies its rate.
     pub fresh: Option<u32>,
@@ -2201,6 +2204,9 @@ pub struct PipelineStatsSample {
     /// the screen unchanged (`capture_old`), from the NvFBC loop.
     pub capture_new: Option<u32>,
     pub capture_old: Option<u32>,
+    /// Frames the NvFBC server generated that second while the loop was away
+    /// encoding, which no grab returned (`capture_behind`).
+    pub behind: Option<u32>,
 }
 
 impl PipelineStatsSample {
@@ -2223,31 +2229,64 @@ impl PipelineStatsSample {
             source: field("source_fps"),
             limiter,
             target_fps: field("target_fps"),
+            ticks_due: field("ticks_due"),
             fresh: field("fresh_frames"),
             capture_new: field("capture_new"),
             capture_old: field("capture_old"),
+            behind: field("capture_behind"),
         })
     }
 
-    /// Frames the capture source delivered that second: `source_fps` where
-    /// the loop reports it (Wayland), else the NvFBC grabs that returned a
-    /// new frame (`capture_new`). `None` when the loop reports neither.
+    /// What this second proves the capture source delivered, for the
+    /// frame-rate governor: `source_fps` where the loop reports it (Wayland);
+    /// else the pacing of a loop that classifies its rate (the serial Xorg
+    /// loops, software H.264 among them, which look only between encodes);
+    /// else the NvFBC grabs that returned a new frame plus the frames it
+    /// generated while the loop was away (`capture_behind`).
     #[must_use]
-    pub fn delivered(&self) -> Option<u32> {
-        self.source.or(self.capture_new)
+    pub fn source_evidence(&self) -> arcen_media::video::SourceEvidence {
+        if let Some(source) = self.source {
+            return arcen_media::video::SourceEvidence {
+                delivered: Some(source),
+                ..arcen_media::video::SourceEvidence::default()
+            };
+        }
+        let pacing = match (self.limiter, self.target_fps, self.ticks_due, self.fresh) {
+            (Some(_), Some(target_fps), Some(ticks_due), Some(fresh_frames)) => {
+                Some(arcen_media::video::SerialPacing {
+                    target_fps,
+                    ticks_due,
+                    fresh_frames,
+                })
+            }
+            _ => None,
+        };
+        if pacing.is_some() {
+            return arcen_media::video::SourceEvidence {
+                pacing,
+                ..arcen_media::video::SourceEvidence::default()
+            };
+        }
+        arcen_media::video::SourceEvidence {
+            delivered: self.capture_new,
+            behind: self.behind,
+            pacing: None,
+        }
     }
 
     /// Changed-content frames this second proves, for health
     /// (`arcen_telemetry::QosSample::fps_content`).
     ///
-    /// Only a second that shows the source, rather than the pipeline, set
-    /// the pace proves anything: one the loop classified as content-limited
-    /// (`fps_limiter=no_damage`: due deadlines found nothing new), or, on the
-    /// NvFBC loop that does not classify, one in which some grabs found the
-    /// screen unchanged (`capture_old`), so every change was grabbed
-    /// (`capture_new`). A pipeline- or rate-limited second, or a loop that
-    /// reports neither, proves nothing, and health then judges the frame rate
-    /// against the target as before.
+    /// A loop that classifies its rate proves it only in a second the
+    /// source, rather than the pipeline, set the pace
+    /// (`fps_limiter=no_damage`: due deadlines found nothing new). The NvFBC
+    /// loop grabs between its encodes, so an unchanged grab does not show the
+    /// screen was still; it counts instead every change it saw (the grabs
+    /// that returned a new frame) and every change the server generated while
+    /// it was away encoding (`capture_behind`, from NvFBC's own count). Their
+    /// sum is the content rate whatever pace the loop kept. A pipeline- or
+    /// rate-limited second, or a loop that reports neither, proves nothing,
+    /// and health then judges the frame rate against the target.
     #[must_use]
     pub fn content_fps(&self) -> Option<u32> {
         match self.limiter {
@@ -2256,9 +2295,8 @@ impl PipelineStatsSample {
             }
             Some(_) => None,
             None => self
-                .capture_old
-                .filter(|old| *old > 0)
-                .and(self.capture_new),
+                .behind
+                .map(|behind| behind.saturating_add(self.capture_new.unwrap_or(0))),
         }
     }
 }
@@ -3344,25 +3382,32 @@ mod tests {
 
     /// A health window spans two capenc seconds. A busy second the encoder
     /// fell behind in, followed by an idle one, must not read as a still
-    /// desktop just because the latest line was idle.
+    /// desktop just because the latest line was idle: the busy second's
+    /// changes count, and a second that proves nothing leaves the window
+    /// unproven.
     #[test]
     fn a_health_window_proves_content_only_if_every_stats_second_did() {
-        let line = |new: u32, old: u32| {
+        let line = |new: u32, old: u32, behind: Option<u32>| {
+            let behind =
+                behind.map_or_else(String::new, |frames| format!(" capture_behind={frames}"));
             PipelineStatsSample::parse(
                 &format!(
                     "[capenc] enc_fps=1 encode_submitted=1 capture_backend=nvfbc \
-                     capture_new={new} capture_old={old} emit_keepalive=1"
+                     capture_new={new} capture_old={old} emit_keepalive=1{behind}"
                 ),
                 1,
             )
             .expect("stats line")
         };
         let content = ContentWindowCell::default();
-        record_content_second(&content, &line(24, 0));
-        record_content_second(&content, &line(0, 480));
+        record_content_second(&content, &line(24, 0, Some(36)));
+        record_content_second(&content, &line(0, 480, Some(0)));
+        assert_eq!(content.lock().expect("lock").take_fps(), Some(30));
+        record_content_second(&content, &line(24, 0, None));
+        record_content_second(&content, &line(0, 480, Some(0)));
         assert_eq!(content.lock().expect("lock").take_fps(), None);
-        record_content_second(&content, &line(2, 470));
-        record_content_second(&content, &line(0, 480));
+        record_content_second(&content, &line(2, 470, Some(0)));
+        record_content_second(&content, &line(0, 480, Some(0)));
         assert_eq!(content.lock().expect("lock").take_fps(), Some(1));
     }
 
@@ -3378,9 +3423,11 @@ mod tests {
                 source: Some(57),
                 limiter: None,
                 target_fps: None,
+                ticks_due: None,
                 fresh: None,
                 capture_new: None,
                 capture_old: None,
+                behind: None,
             })
         );
         assert_eq!(
@@ -3401,22 +3448,48 @@ mod tests {
         assert_eq!(sample.target_fps, Some(8));
         // A still desktop: four changed frames, keepalives on top.
         assert_eq!(sample.content_fps(), Some(4));
+        assert_eq!(sample.source_evidence().source_fps(), Some(4));
+        // The software H.264 loop on moving content: 8 deadlines of 30
+        // reached, all new. The governor sees a 30 fps source.
+        let software = "[capenc] enc_fps=8 kbps=2100 backend=openh264 damage_source=xdamage \
+                        keel_enabled=true modeset_idr=false fps_limiter=pipeline \
+                        rate_capped=false contract_fps=30 target_fps=30 ticks_due=8 \
+                        ticks_no_change=0 fresh_frames=8 busy_ms=990 sid=7a2d";
+        let software = PipelineStatsSample::parse(software, 5).expect("software stats line");
+        assert_eq!(software.source_evidence().source_fps(), Some(30));
+        assert_eq!(software.content_fps(), None);
         // The NvFBC loop on a still desktop (from a lab session): only the
-        // keepalive went out, and every grab found the screen unchanged.
+        // keepalive went out, and nothing changed.
         let nvfbc = "[capenc] enc_fps=1 encode_submitted=1 avg_encode_ms=3.72 kbps=22 \
                      capture_backend=nvfbc capture_new=0 capture_old=484 capture_direct=0 \
-                     emit_first=0 emit_idr=0 emit_activity=0 emit_keepalive=1 sid=d57d";
+                     emit_first=0 emit_idr=0 emit_activity=0 emit_keepalive=1 \
+                     damage_source=unavailable_to_cuda capture_behind=0 sid=d57d";
         assert_eq!(
             PipelineStatsSample::parse(nvfbc, 6).and_then(|sample| sample.content_fps()),
             Some(0)
         );
-        // Every grab new: the encoder, not the screen, may have set the pace.
-        let nvfbc_busy = nvfbc.replace(
-            "capture_new=0 capture_old=484",
-            "capture_new=24 capture_old=0",
+        // Moving content the loop fell behind on (lab: two grabs in a second
+        // the loop was blocked, fifty-nine frames generated meanwhile):
+        // unchanged grabs elsewhere in the second no longer read as idleness.
+        let nvfbc_behind = nvfbc
+            .replace(
+                "capture_new=0 capture_old=484",
+                "capture_new=2 capture_old=12",
+            )
+            .replace("capture_behind=0", "capture_behind=59");
+        assert_eq!(
+            PipelineStatsSample::parse(&nvfbc_behind, 7).and_then(|sample| sample.content_fps()),
+            Some(61)
         );
         assert_eq!(
-            PipelineStatsSample::parse(&nvfbc_busy, 7).and_then(|sample| sample.content_fps()),
+            PipelineStatsSample::parse(&nvfbc_behind, 7)
+                .and_then(|sample| sample.source_evidence().source_fps()),
+            Some(61)
+        );
+        // An older line without the count proves nothing.
+        let legacy = nvfbc.replace(" capture_behind=0", "");
+        assert_eq!(
+            PipelineStatsSample::parse(&legacy, 9).and_then(|sample| sample.content_fps()),
             None
         );
         let busy = xorg_wide.replace("fps_limiter=no_damage", "fps_limiter=pipeline");

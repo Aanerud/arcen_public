@@ -251,6 +251,11 @@ pub(crate) struct DedicatedPresenterTelemetryDelta {
     pub(crate) submitted_presented_at: Vec<std::time::Instant>,
     pub(crate) confirmed_presented_at: Vec<std::time::Instant>,
     pub(crate) refresh_period_us: Option<u64>,
+    /// Submission to the glass, for pictures submitted while none other was
+    /// in flight (the eight-bit layer under `Newest`).
+    pub(crate) submit_to_glass_p50_us: Option<u64>,
+    /// Pictures the layer may keep in flight, as of the last presented one.
+    pub(crate) max_in_flight: Option<u64>,
 }
 
 /// A presentation layer's colour state, read back from Core Animation.

@@ -182,3 +182,18 @@ fn anything_but_a_socket_at_the_name_is_refused_and_left_alone() {
         assert!(directory.bind_socket(bad, uid).is_err(), "{bad:?}");
     }
 }
+
+#[test]
+fn a_socket_for_any_peer_is_roots_and_connectable_by_everyone() {
+    let (_scratch, directory, uid) = socket_directory("any");
+    let result = directory.bind_socket_for_any_peer("usb-helper.sock");
+    if uid == 0 {
+        let _listener = result.unwrap();
+        let metadata = std::fs::symlink_metadata(directory.path().join("usb-helper.sock")).unwrap();
+        assert_eq!((metadata.uid(), metadata.mode() & 0o7777), (0, 0o666));
+    } else {
+        // Only root can give the socket to root; a user's attempt fails and
+        // says so rather than leaving a socket of the wrong owner.
+        assert!(result.is_err());
+    }
+}

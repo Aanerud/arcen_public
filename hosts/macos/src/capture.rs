@@ -1197,6 +1197,47 @@ fn test_excludes_application_windows() -> bool {
     cfg!(debug_assertions) && std::env::var_os("ARCEN_TEST_CAPTURE_NO_WINDOWS").is_some()
 }
 
+/// The mean of a frame's first plane (luma for the eight-bit 4:2:0 capture),
+/// sampled every eighth pixel of every eighth row; `None` when the surface
+/// cannot be read.
+#[must_use]
+pub fn mean_luma(frame: &CapturedFrame) -> Option<f64> {
+    let surface = &frame.surface;
+    let guard = surface.lock_read_only().ok()?;
+    let (base, stride, width, height) = if surface.plane_count() > 0 {
+        (
+            guard.base_address_of_plane(0)?,
+            surface.bytes_per_row_of_plane(0),
+            surface.width_of_plane(0),
+            surface.height_of_plane(0),
+        )
+    } else {
+        (
+            guard.base_address(),
+            surface.bytes_per_row(),
+            surface.width().saturating_mul(4),
+            surface.height(),
+        )
+    };
+    if base.is_null() || width == 0 || height == 0 || stride < width {
+        return None;
+    }
+    let (mut total, mut samples) = (0_u64, 0_u64);
+    for row in (0..height).step_by(8) {
+        // SAFETY: the surface is locked for reading; `row < height` and the
+        // row holds `stride >= width` bytes.
+        let line = unsafe { std::slice::from_raw_parts(base.add(row * stride), width) };
+        for value in line.iter().step_by(8) {
+            total += u64::from(*value);
+            samples += 1;
+        }
+    }
+    drop(guard);
+    #[allow(clippy::cast_precision_loss, reason = "a mean of byte samples")]
+    let mean = total as f64 / samples.max(1) as f64;
+    Some(mean)
+}
+
 /// A running `ScreenCaptureKit` stream.
 pub struct CaptureSession {
     stream: Retained<SCStream>,

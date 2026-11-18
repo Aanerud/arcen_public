@@ -40,6 +40,23 @@ use support::{
 
 const STEP: Duration = Duration::from_secs(5);
 
+/// Waits until the relay holds no video: every frame it was handed has
+/// been released (taken by the lane's writer, or dropped), so its backlog
+/// has room for the next one however loaded the machine is.
+async fn video_backlog_empty(relay: &PierLaneRelay) {
+    let mut released = relay.video_released();
+    timed(async {
+        loop {
+            let stats = relay.stats();
+            if *released.borrow_and_update() >= stats.video_frames + stats.video_dropped {
+                return;
+            }
+            released.changed().await.unwrap();
+        }
+    })
+    .await;
+}
+
 async fn timed<T>(future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(STEP, future)
         .await
@@ -368,7 +385,7 @@ async fn a_stalled_video_lane_holds_neither_audio_nor_input() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // Let the drained backlog empty before the next delta.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    video_backlog_empty(&relay).await;
     assert_eq!(
         relay.route_to_deck(SessionRecord::Binary(video_frame(0, false, 16))),
         RelayRoute::Queued(LaneRole::Video)
@@ -1010,6 +1027,8 @@ async fn a_relayed_attachment_carries_refinement_and_never_loses_a_fence() {
         assert!(Instant::now() < deadline, "keyframe never admitted");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // The reader drains the backlog; the next delta needs room in it.
+    video_backlog_empty(&relay).await;
     fence += 1;
     relay.route_to_deck(SessionRecord::Binary(refine_fence(fence, 999)));
     sent_blocks.insert(999);

@@ -19,6 +19,12 @@ use std::time::Duration;
 use crate::video::MotionPriority;
 pub use arcen_telemetry::PathSignal;
 
+/// RTT growth per second treated as path drift (see
+/// [`RateControlPolicy::drift_tolerance_per_sec`]). Recorded on the lab VPN:
+/// 2–3 ms/s on average, single seconds up to about 7; a stream 1 % over its
+/// path's capacity grows the queue by 10 ms/s.
+pub const PATH_DRIFT_TOLERANCE_PER_SEC: Duration = Duration::from_millis(4);
+
 /// How a clear path probes upward before it reaches a remembered knee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeStep {
@@ -43,6 +49,18 @@ pub struct RateControlPolicy {
     pub ceiling_bps: u64,
     /// Queueing above the RTT baseline that means the path is filling.
     pub congested_queue_delay: Duration,
+    /// RTT growth per second the baseline follows as path drift rather than
+    /// queueing. Some paths (the lab VPN) drift 15–30 ms above their windowed
+    /// minimum over tens of seconds with no load; a stream that overfills its
+    /// path grows the queue many times faster. The baseline follows only while
+    /// the interval's queue is below [`Self::congested_queue_delay`], so a
+    /// congested queue is never absorbed. Zero turns drift tracking off.
+    pub drift_tolerance_per_sec: Duration,
+    /// Below this share of the target delivered in this interval and the
+    /// last, with no local frame wait and no loss, a stream is idle and
+    /// queueing is not answered with a cut: the stream cannot be filling the
+    /// path, and cutting it would free nothing. Zero answers every queue.
+    pub idle_delivery_share: f64,
     /// Queueing below this is treated as a clear path when loss is absent.
     pub clear_queue_delay: Duration,
     /// Frame wait remains a secondary local signal.
@@ -150,6 +168,8 @@ impl RateControlPolicy {
             start_bps,
             ceiling_bps,
             congested_queue_delay: Duration::from_millis(15),
+            drift_tolerance_per_sec: PATH_DRIFT_TOLERANCE_PER_SEC,
+            idle_delivery_share: IDLE_DELIVERY_SHARE,
             clear_queue_delay: Duration::from_millis(5),
             congested_frame_wait: Duration::from_millis(51),
             clear_frame_wait: Duration::from_millis(50),
@@ -241,6 +261,11 @@ pub struct RateHints {
     /// does not cut for delay then, and the next interval, with refinement
     /// idle, decides. Loss always counts.
     pub refine_active: bool,
+    /// Whether the host holds encoded video it has not handed to the
+    /// transport yet (a queued frame), when it can tell. An interval that
+    /// sent no frame is idle only when the host says nothing waits: a writer
+    /// blocked on the path for the whole interval also sends none.
+    pub video_backlog: Option<bool>,
 }
 
 /// Consecutive intervals a delay cut may wait for refinement to yield. A
@@ -347,7 +372,18 @@ pub struct RateController {
     target_bps: u64,
     hold: u32,
     queue_delay_streak: u32,
-    last_queue_delay: Option<Duration>,
+    prior_queue_delay: Option<Duration>,
+    /// The RTT queueing is measured from: the path's windowed minimum, raised
+    /// by slow drift (see [`RateControlPolicy::drift_tolerance_per_sec`]).
+    drift_baseline: Option<Duration>,
+    /// This interval's queueing above the drift baseline.
+    interval_queue_delay: Option<Duration>,
+    last_rtt: Option<Duration>,
+    last_delivered_bps: Option<f64>,
+    /// The target before the last interval.
+    prior_target_bps: u64,
+    /// Consecutive intervals whose queue went unanswered: the stream idled.
+    idle_queue_intervals: u32,
     frame_wait_streak: u32,
     last_frame_wait: Option<Duration>,
     loss_streak: u32,
@@ -368,6 +404,10 @@ pub struct RateController {
     last_refine_deferral: Option<RateChangeReason>,
 }
 
+/// Delivered share of the target under which a stream with no backlog is
+/// idle: queueing in its intervals is the path's, not its own.
+pub const IDLE_DELIVERY_SHARE: f64 = 0.1;
+
 /// Delivered share of the target at which a stream counts as spending it.
 const BITRATE_BOUND_SHARE: f64 = 0.9;
 /// Delivered share of the target below which a bound stream is content
@@ -383,7 +423,13 @@ impl RateController {
             target_bps: policy.start_bps,
             hold: 0,
             queue_delay_streak: 0,
-            last_queue_delay: None,
+            prior_queue_delay: None,
+            drift_baseline: None,
+            interval_queue_delay: None,
+            last_rtt: None,
+            last_delivered_bps: None,
+            prior_target_bps: policy.start_bps,
+            idle_queue_intervals: 0,
             frame_wait_streak: 0,
             last_frame_wait: None,
             loss_streak: 0,
@@ -420,6 +466,104 @@ impl RateController {
     #[must_use]
     pub const fn last_loss_evidence(&self) -> Option<LossEvidence> {
         self.interval_loss
+    }
+
+    /// The queueing the last interval was judged on: RTT above the path's
+    /// windowed minimum less the slow drift the baseline followed. `None`
+    /// for an interval without path truth.
+    #[must_use]
+    pub const fn last_queue_delay(&self) -> Option<Duration> {
+        self.interval_queue_delay
+    }
+
+    /// Queueing above the drift baseline, which then follows this
+    /// interval's RTT rise -- at most
+    /// [`RateControlPolicy::drift_tolerance_per_sec`] -- when the rise looks
+    /// like the path's drift and not a queue: no faster than twice the
+    /// tolerance, not lossy, not past the congestion threshold, and not while
+    /// this stream's own load grew (`may_follow`). A level is never absorbed,
+    /// only a slow slope, so a standing queue the stream builds stays visible
+    /// for the whole baseline window as before. The baseline never drops
+    /// below the windowed minimum and never rises above the RTT, so a path
+    /// that falls back resets it at once.
+    fn drift_queue_delay(
+        &mut self,
+        path: PathSignal,
+        elapsed: Duration,
+        may_follow: bool,
+    ) -> Duration {
+        let rtt = path.rtt();
+        let reference = self
+            .drift_baseline
+            .map_or(path.baseline_rtt(), |drift| drift.max(path.baseline_rtt()))
+            .min(rtt);
+        let queue_delay = rtt.saturating_sub(reference);
+        let rise = self
+            .last_rtt
+            .map_or(Duration::ZERO, |last| rtt.saturating_sub(last));
+        let allowance = self
+            .policy
+            .drift_tolerance_per_sec
+            .mul_f64(elapsed.as_secs_f64().min(10.0));
+        let follow = if may_follow
+            && queue_delay <= self.policy.congested_queue_delay
+            && rise <= allowance.saturating_mul(2)
+        {
+            rise.min(allowance)
+        } else {
+            Duration::ZERO
+        };
+        self.drift_baseline = Some(reference.saturating_add(follow).min(rtt));
+        self.last_rtt = Some(rtt);
+        queue_delay
+    }
+
+    /// Whether the stream delivered under
+    /// [`RateControlPolicy::idle_delivery_share`] of the target in this
+    /// interval and the last, with no local frame wait and no video waiting
+    /// to be sent. A queue left by the stream's own last interval is still
+    /// its own, and so is one behind a write the path holds up.
+    fn sends_next_to_nothing(&self, sample: RateSample, hints: RateHints) -> bool {
+        if hints.video_backlog == Some(true)
+            || (sample.frames == 0 && hints.video_backlog.is_none())
+            || (sample.frames != 0 && sample.mean_frame_wait > self.policy.clear_frame_wait)
+        {
+            return false;
+        }
+        let idle_below = self.target_bps as f64 * self.policy.idle_delivery_share;
+        let delivered = if sample.frames == 0 {
+            0.0
+        } else {
+            peak_pipeline_bps(sample)
+        };
+        delivered.is_finite()
+            && delivered < idle_below
+            && self
+                .last_delivered_bps
+                .is_some_and(|last| last < idle_below)
+    }
+
+    /// Whether the last interval's queueing went unanswered because the
+    /// stream sent next to nothing in it.
+    #[must_use]
+    pub const fn last_idle_queue(&self) -> bool {
+        self.idle_queue_intervals > 0
+    }
+
+    /// Whether this stream's own load grew into this interval: the last
+    /// interval raised the target of a stream that spends it, or delivery
+    /// rose by more than a tenth and a quarter megabit. Queue growth then may
+    /// be the stream's.
+    fn own_load_rose(&self, sample: RateSample) -> bool {
+        if self.target_bps > self.prior_target_bps && self.bitrate_bound {
+            return true;
+        }
+        if sample.frames == 0 {
+            return false;
+        }
+        let delivered = peak_pipeline_bps(sample);
+        self.last_delivered_bps
+            .is_some_and(|last| delivered.is_finite() && delivered > last * 1.1 + 250_000.0)
     }
 
     /// Whether the stream spent (most of) its target in the recent intervals.
@@ -546,6 +690,12 @@ impl RateController {
         if self.target_bps != previous && self.at_bound() {
             reason = reason.or(Some(RateChangeReason::Bound));
         }
+        self.prior_target_bps = previous;
+        self.last_delivered_bps = Some(if sample.frames == 0 {
+            0.0
+        } else {
+            peak_pipeline_bps(sample)
+        });
         let change = (self.target_bps as f64 - previous as f64).abs() / previous.max(1) as f64;
         (change >= self.policy.min_change || (self.target_bps != previous && self.at_bound()))
             .then_some(RateChange {
@@ -723,19 +873,23 @@ impl RateController {
         let keyframe_burst = hints.keyframe_bytes != 0;
         self.interval_loss = None;
         self.loss_unresolved = false;
+        let idle_queue_intervals = std::mem::take(&mut self.idle_queue_intervals);
         if let Some(path) = sample.path {
             let loss = self.pool_loss(path);
             self.interval_loss = loss;
             self.loss_unresolved = loss.is_none() && self.loss_pool.lost != 0;
             let loss_rate = loss.map_or(0.0, |loss| loss.rate);
             let congestion_events = loss.map_or(0, |loss| loss.congestion_events);
-            let queue_delay = path.queue_delay();
+            let lossy_interval = self.loss_unresolved || loss_rate >= self.policy.event_loss_rate;
+            let may_follow = !lossy_interval && !self.own_load_rose(sample);
+            let queue_delay = self.drift_queue_delay(path, sample.elapsed, may_follow);
+            self.interval_queue_delay = Some(queue_delay);
             // Growth, not jitter: a millisecond of RTT noise beside a lost
             // packet is not a queue building.
-            let rising_queue = self.last_queue_delay.is_some_and(|previous| {
+            let rising_queue = self.prior_queue_delay.is_some_and(|previous| {
                 queue_delay >= previous.saturating_add(self.policy.clear_queue_delay)
             });
-            self.last_queue_delay = Some(queue_delay);
+            self.prior_queue_delay = Some(queue_delay);
             let queue_congested = queue_delay > self.policy.congested_queue_delay;
             if queue_congested {
                 self.queue_delay_streak = self.queue_delay_streak.saturating_add(1);
@@ -757,7 +911,17 @@ impl RateController {
                     severe: severe_loss,
                 });
             }
+            // A stream that sends next to nothing, with no backlog of its own
+            // and no loss, cannot be what fills the path, and cutting it
+            // frees nothing: the queue is the path's (drift, another flow).
+            // The streak still counts, so the first interval that does send
+            // into the same queue is cut at once.
+            let idle_queue = !lossy_interval && self.sends_next_to_nothing(sample, hints);
+            if queue_congested && idle_queue {
+                self.idle_queue_intervals = idle_queue_intervals.saturating_add(1);
+            }
             if queue_congested
+                && !idle_queue
                 && (severe_queue_delay
                     || self.queue_delay_streak >= self.policy.queue_delay_samples)
             {
@@ -793,7 +957,9 @@ impl RateController {
             }
         } else {
             self.queue_delay_streak = 0;
-            self.last_queue_delay = None;
+            self.prior_queue_delay = None;
+            self.interval_queue_delay = None;
+            self.last_rtt = None;
             self.loss_streak = 0;
         }
         if sample.frames != 0 {
@@ -829,7 +995,7 @@ impl RateController {
         let transport_clear = sample.path.is_none_or(|path| {
             !self.loss_unresolved
                 && loss_rate < self.policy.congested_loss_rate
-                && path.queue_delay() <= self.policy.congested_queue_delay
+                && self.judged_queue_delay(path) <= self.policy.congested_queue_delay
         });
         let frames_clear =
             sample.frames == 0 || sample.mean_frame_wait <= self.policy.clear_frame_wait;
@@ -841,7 +1007,7 @@ impl RateController {
         sample.path.is_none_or(|path| {
             !self.loss_unresolved
                 && loss_rate < self.policy.event_loss_rate
-                && path.queue_delay() <= self.policy.clear_queue_delay
+                && self.judged_queue_delay(path) <= self.policy.clear_queue_delay
         })
     }
 
@@ -866,7 +1032,7 @@ impl RateController {
         }
         match (cause, sample.path) {
             (RateChangeReason::QueueDelay, Some(path)) => {
-                path.queue_delay()
+                self.judged_queue_delay(path)
                     >= self
                         .policy
                         .congested_queue_delay
@@ -878,6 +1044,13 @@ impl RateController {
             }
             _ => false,
         }
+    }
+
+    /// The queueing this interval was judged on (the path's own reading
+    /// only before [`Self::congestion_event`] has seen it).
+    fn judged_queue_delay(&self, path: PathSignal) -> Duration {
+        self.interval_queue_delay
+            .unwrap_or_else(|| path.queue_delay())
     }
 
     fn at_bound(&self) -> bool {
@@ -2249,5 +2422,197 @@ mod tests {
         // The deferrals fall inside the cooldown, so the video is cut as
         // often as without refinement.
         assert_eq!(cuts, plain_cuts);
+    }
+
+    /// Smoothed RTT (ms) every two seconds from the Deck's path reports on
+    /// the lab VPN with the stream idle (0.00-0.04 Mbit/s): a sawtooth that
+    /// climbs 2-3 ms/s for 15-20 s and falls back (Wayland Pier, 4K photo,
+    /// Exact still image off, 13 Nov 2026).
+    const VPN_SAWTOOTH_RTT_MS: [u64; 53] = [
+        51, 54, 55, 62, 65, 70, 72, 76, 86, 46, 49, 52, 59, 64, 68, 72, 86, 61, 46, 42, 41, 50, 54,
+        61, 65, 70, 74, 85, 50, 54, 58, 63, 65, 70, 73, 76, 91, 66, 72, 68, 70, 75, 73, 78, 78, 85,
+        95, 93, 53, 56, 59, 63, 67,
+    ];
+
+    /// The same VPN to the macOS Pier, idle, Exact still image off: jitter
+    /// spikes and a slow rise from 33 to the 40s (13 Nov 2026).
+    const VPN_JITTER_RTT_MS: [u64; 58] = [
+        33, 35, 34, 49, 40, 33, 35, 34, 33, 34, 34, 34, 33, 49, 43, 38, 36, 34, 33, 36, 34, 33, 35,
+        48, 53, 34, 58, 49, 48, 46, 52, 59, 43, 44, 41, 40, 40, 45, 41, 51, 62, 53, 56, 60, 45, 42,
+        43, 46, 38, 50, 46, 51, 44, 43, 64, 44, 43, 40,
+    ];
+
+    /// One-second RTTs from a two-second trace, linearly in between.
+    fn per_second(trace: &[u64]) -> Vec<u64> {
+        let mut seconds = Vec::with_capacity(trace.len() * 2);
+        for pair in trace.windows(2) {
+            seconds.push(pair[0]);
+            seconds.push(u64::midpoint(pair[0], pair[1]));
+        }
+        seconds.extend(trace.last());
+        seconds
+    }
+
+    /// Feeds one-second RTTs through the shared windowed-minimum tracker
+    /// every Pier uses, with `extra_queue_ms(second)` of this stream's own
+    /// queueing on top and `delivered_mbps` sent; returns the cuts.
+    fn replay(
+        policy: &RateControlPolicy,
+        rtts_ms: &[u64],
+        delivered_mbps: f64,
+        extra_queue_ms: impl Fn(usize) -> u64,
+    ) -> Vec<(usize, RateChange)> {
+        use arcen_telemetry::{PathSignalCounters, PathSignalState};
+        let mut rate = RateController::new(*policy);
+        let mut state = PathSignalState::default();
+        let mut cuts = Vec::new();
+        for (second, rtt_ms) in rtts_ms.iter().enumerate() {
+            let signal = state.observe(
+                Duration::from_secs(second as u64),
+                PathSignalCounters {
+                    rtt: Duration::from_millis(rtt_ms + extra_queue_ms(second)),
+                    congestion_window_bytes: 300_000,
+                    bytes_in_flight: None,
+                    congestion_events: 0,
+                    lost_packets: 0,
+                    lost_bytes: 0,
+                    sent_packets: (second as u64 + 1) * 250,
+                },
+            );
+            if let Some(change) = rate.observe(sample(delivered_mbps, 1, signal)) {
+                if change.target_bps < change.previous_bps {
+                    cuts.push((second, change));
+                }
+            }
+        }
+        cuts
+    }
+
+    /// The controller before drift tracking: queueing above the windowed
+    /// minimum, answered whatever the stream sends.
+    fn without_drift_tracking(mut policy: RateControlPolicy) -> RateControlPolicy {
+        policy.drift_tolerance_per_sec = Duration::ZERO;
+        policy.idle_delivery_share = 0.0;
+        policy
+    }
+
+    #[test]
+    fn an_idle_stream_on_a_drifting_vpn_keeps_its_rate() {
+        let policy = RateControlPolicy::for_bounds(START, CEILING);
+        for (name, trace) in [
+            ("sawtooth", &VPN_SAWTOOTH_RTT_MS[..]),
+            ("jitter", &VPN_JITTER_RTT_MS[..]),
+        ] {
+            let rtts = per_second(trace);
+            // The recorded drift alone cut the windowed-minimum controller.
+            let before = replay(&without_drift_tracking(policy), &rtts, 0.03, |_| 0);
+            assert!(
+                before
+                    .iter()
+                    .any(|(_, change)| change.reason == RateChangeReason::QueueDelay),
+                "{name}: the trace should have cut without drift tracking"
+            );
+            let after = replay(&policy, &rtts, 0.03, |_| 0);
+            assert!(after.is_empty(), "{name}: drift cut the stream: {after:?}");
+        }
+    }
+
+    #[test]
+    fn a_bound_stream_on_a_drifting_vpn_keeps_its_rate() {
+        // The same drift under a stream that spends its whole target.
+        let policy = RateControlPolicy::for_bounds(START, START);
+        let rtts = per_second(&VPN_SAWTOOTH_RTT_MS);
+        let bound = START as f64 / 1e6;
+        let before = replay(&without_drift_tracking(policy), &rtts, bound, |_| 0);
+        assert!(
+            !before.is_empty(),
+            "the trace should have cut a bound stream"
+        );
+        let after = replay(&policy, &rtts, bound, |_| 0);
+        assert!(after.is_empty(), "drift cut a bound stream: {after:?}");
+    }
+
+    #[test]
+    fn congestion_on_a_drifting_path_cuts_as_fast_as_on_a_steady_one() {
+        let policy = RateControlPolicy::for_bounds(START, START);
+        let drifting = per_second(&VPN_SAWTOOTH_RTT_MS);
+        let steady = vec![50; drifting.len()];
+        let bound = START as f64 / 1e6;
+        // Mid-climb (second 30) this stream overfills the path: its own
+        // queue grows 10, 20 or 60 ms a second on top of the RTT, or steps
+        // to a standing 20 ms.
+        let onset = 30;
+        let ramps: [(&str, &dyn Fn(usize) -> u64); 4] = [
+            ("10 ms/s", &|s| (s.saturating_sub(onset) as u64) * 10),
+            ("20 ms/s", &|s| (s.saturating_sub(onset) as u64) * 20),
+            ("60 ms/s", &|s| (s.saturating_sub(onset) as u64) * 60),
+            ("standing 20 ms", &|s| if s > onset { 20 } else { 0 }),
+        ];
+        for (name, queue) in ramps {
+            let first_cut = |policy, rtts: &[u64]| {
+                replay(&policy, rtts, bound, queue)
+                    .into_iter()
+                    .find(|(second, _)| *second > onset)
+                    .map(|(second, change)| (second, change.reason))
+            };
+            let reference = first_cut(without_drift_tracking(policy), &steady);
+            assert!(reference.is_some(), "{name}: congestion was not cut");
+            assert_eq!(first_cut(policy, &steady), reference, "{name}: steady path");
+            let on_drift = first_cut(policy, &drifting);
+            assert!(
+                on_drift.is_some_and(|(second, _)| second <= reference.unwrap().0),
+                "{name}: drifting path cut at {on_drift:?}, steady at {reference:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_stream_answers_the_queue_the_moment_it_sends_into_it() {
+        let policy = RateControlPolicy::for_bounds(START, CEILING);
+        let mut rate = RateController::new(policy);
+        // Cross traffic holds 40 ms of queue while the desktop is still.
+        let _ = rate.observe(sample(0.03, 1, path(50, 50, 0, 0)));
+        for _ in 0..5 {
+            assert_eq!(rate.observe(sample(0.03, 1, path(90, 50, 0, 0))), None);
+            assert!(rate.last_idle_queue());
+        }
+        // Motion starts into the same queue: cut at once.
+        let change = rate
+            .observe(sample(START as f64 / 1e6, 1, path(90, 50, 0, 0)))
+            .expect("the queue is cut once the stream sends into it");
+        assert_eq!(change.reason, RateChangeReason::QueueDelay);
+        assert!(!rate.last_idle_queue());
+    }
+
+    #[test]
+    fn a_writer_the_path_holds_up_is_not_idle() {
+        let policy = RateControlPolicy::for_bounds(START, CEILING);
+        let quiet = |path: PathSignal| RateSample {
+            frames: 0,
+            ..sample(0.0, 0, path)
+        };
+        let backlog = RateHints {
+            video_backlog: Some(true),
+            ..RateHints::default()
+        };
+        for hints in [backlog, RateHints::default()] {
+            let mut rate = RateController::new(policy);
+            let _ = rate.observe(sample(0.03, 1, path(50, 50, 0, 0)));
+            let _ = rate.observe_with(quiet(path(90, 50, 0, 0)), hints);
+            let change = rate
+                .observe_with(quiet(path(90, 50, 0, 0)), hints)
+                .expect("a blocked writer's queue is cut");
+            assert_eq!(change.reason, RateChangeReason::QueueDelay);
+        }
+        // A host that says nothing waits keeps a frameless second idle.
+        let mut rate = RateController::new(policy);
+        let idle = RateHints {
+            video_backlog: Some(false),
+            ..RateHints::default()
+        };
+        let _ = rate.observe(sample(0.03, 1, path(50, 50, 0, 0)));
+        for _ in 0..3 {
+            assert_eq!(rate.observe_with(quiet(path(90, 50, 0, 0)), idle), None);
+        }
     }
 }

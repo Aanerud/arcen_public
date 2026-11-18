@@ -4,10 +4,11 @@
 
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_EXPAND_SZ,
-    REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW,
-    RegGetValueW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_SET_VALUE, REG_DWORD,
+    REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
 };
+use windows::core::PWSTR;
 use windows::core::{HSTRING, PCWSTR};
 
 /// A registry root.
@@ -58,6 +59,58 @@ pub fn read_string(hive: Hive, key: &str, value: &str) -> Option<String> {
         .position(|unit| *unit == 0)
         .unwrap_or(text.len());
     String::from_utf16(&text[..end]).ok()
+}
+
+/// The names of `key`'s subkeys (at most 4096), empty when it cannot be
+/// opened.
+#[must_use]
+pub fn subkeys(hive: Hive, key: &str) -> Vec<String> {
+    let key = HSTRING::from(key);
+    let mut handle = HKEY::default();
+    // SAFETY: the key name is a NUL-terminated HSTRING; `handle` is a live
+    // out-parameter closed below.
+    let status = unsafe {
+        RegOpenKeyExW(
+            hive.key(),
+            PCWSTR(key.as_ptr()),
+            0,
+            KEY_ENUMERATE_SUB_KEYS,
+            &raw mut handle,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for index in 0..4096_u32 {
+        // A key name is at most 255 characters.
+        let mut name = [0_u16; 256];
+        let mut length = 256_u32;
+        // SAFETY: `handle` is open for KEY_ENUMERATE_SUB_KEYS; `name` is
+        // writable for `length` characters, both live for the call.
+        let status = unsafe {
+            RegEnumKeyExW(
+                handle,
+                index,
+                PWSTR(name.as_mut_ptr()),
+                &raw mut length,
+                None,
+                PWSTR::null(),
+                None,
+                None,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            break;
+        }
+        let length = usize::try_from(length).unwrap_or(0).min(name.len());
+        if let Ok(text) = String::from_utf16(&name[..length]) {
+            names.push(text);
+        }
+    }
+    // SAFETY: `handle` was opened above and is closed once.
+    let _ = unsafe { RegCloseKey(handle) };
+    names
 }
 
 /// A `REG_DWORD` value, `None` when absent or unreadable.

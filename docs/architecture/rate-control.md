@@ -15,6 +15,35 @@ bitrate target when the change is worth reconfiguring for.
   neighbours and its queue drains by itself, so the queue must still be there
   an interval later. Hosts that do not report keyframe bytes keep the old,
   immediate behaviour.
+  - **Drift is not queueing.** The baseline is the path's 10 s windowed
+    minimum RTT, raised by slow drift: when an interval's RTT rises by no more
+    than twice `drift_tolerance_per_sec` (4 ms/s), the baseline follows up to
+    that tolerance, unless the interval is lossy, already queued past the
+    threshold, or the stream's own load just grew (a raised target it spends,
+    or delivery up by a tenth and 0.25 Mbit/s). A level is never absorbed,
+    only a slope: a standing queue the stream builds stays visible for the
+    whole window, and a queue growing 10 ms/s or more is never followed. The
+    lab VPN drifts 2–3 ms/s for 15–20 s and falls back (a sawtooth 15–30 ms
+    above its minimum, with no load), which cut idle and loaded streams
+    alike before; recorded traces are unit tests.
+  - **An idle stream does not answer a queue.** When the busiest pipeline
+    delivered under `idle_delivery_share` (10 %) of the target in this
+    interval and the last, with no local frame wait and no loss, the queue is
+    the path's or another flow's: cutting would free nothing. An interval
+    that sent no frame counts as idle only when the host says no encoded
+    video waits (`RateHints::video_backlog`): a writer the path holds up
+    also sends none. Every Pier reports it the same way, through
+    `arcen_media::video::VideoWriteMeter::unsent`: a frame in its send
+    queues, a video write the transport has not finished, or (Windows and
+    macOS, whose session hands video to a lane relay that never waits) a
+    frame the relay has not released (`ServiceMessage::VideoReleased`). A
+    macOS session whose relay has not reported yet says it cannot tell. The
+    streak
+    still counts, so the first interval that sends into the same queue is
+    cut at once. Exact still image traffic does not count as the video's:
+    refinement yields to the path through its own budget.
+  - Pier logs state `queue_delay_ms` (what the controller judged),
+    `path_queue_delay_ms` (RTT over the windowed minimum) and `idle_queue`.
 - **Loss.** A loss rate counts only when it is measured over at least
   `min_loss_sample_packets` (200) sent packets. A quiet stream pools its
   packets across intervals until it reaches that. After

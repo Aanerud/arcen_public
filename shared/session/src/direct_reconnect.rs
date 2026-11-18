@@ -562,6 +562,57 @@ pub fn fresh_sign_in(
     }
 }
 
+/// Why a Pier let go of a desktop it held for its Deck's resume without the
+/// Deck resuming it: the `reason_class` of `RESUME_HOLD_ENDED`, the same on
+/// every Pier that holds one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeHoldEnd {
+    /// The resume window ran out.
+    WindowExpired,
+    /// A Deck asked to resume and was refused (its grant expired meanwhile,
+    /// the desktop's identity or topology changed, or the console could not
+    /// be attached again).
+    ResumeRefused,
+    /// The desktop session itself ended.
+    NativeSessionEnded,
+    /// The same user reattached, and the desktop was handed to that Deck.
+    SameUserReattached,
+    /// A fresh sign-in of the same user took the desktop over.
+    FreshSignIn,
+    /// The Pier is stopping.
+    PierStopping,
+    /// The process holding the desktop failed.
+    OwnerFailed,
+    /// A joined console became someone else's again (ADR 0025 §4).
+    Console(crate::console_session::detached_hold::HoldEnd),
+}
+
+impl ResumeHoldEnd {
+    /// The reason class logged.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::WindowExpired => "resume_window_expired",
+            Self::ResumeRefused => "resume_refused",
+            Self::NativeSessionEnded => "native_session_ended",
+            Self::SameUserReattached => "same_user_reattached",
+            Self::FreshSignIn => "fresh_sign_in",
+            Self::PierStopping => "pier_stopping",
+            Self::OwnerFailed => "owner_failed",
+            Self::Console(end) => end.token(),
+        }
+    }
+
+    /// The fields of `RESUME_HOLD_ENDED` for a hold that lasted `held`.
+    #[must_use]
+    pub fn fields(self, held: std::time::Duration) -> Option<arcen_telemetry::StructuredFields> {
+        arcen_telemetry::lifecycle_fields::resume_hold_ended(
+            self.token(),
+            u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,5 +914,36 @@ mod tests {
             fresh_sign_in(nobody, nobody, SessionAttachment::Detached),
             FreshSignIn::Refuse
         );
+    }
+
+    #[test]
+    fn every_resume_hold_end_names_its_reason_in_the_canonical_event() {
+        use crate::console_session::detached_hold::HoldEnd;
+        let ends = [
+            ResumeHoldEnd::WindowExpired,
+            ResumeHoldEnd::ResumeRefused,
+            ResumeHoldEnd::NativeSessionEnded,
+            ResumeHoldEnd::SameUserReattached,
+            ResumeHoldEnd::FreshSignIn,
+            ResumeHoldEnd::PierStopping,
+            ResumeHoldEnd::OwnerFailed,
+            ResumeHoldEnd::Console(HoldEnd::OtherProductClient),
+            ResumeHoldEnd::Console(HoldEnd::OtherProductStarted),
+            ResumeHoldEnd::Console(HoldEnd::DeskTookOver),
+        ];
+        let mut tokens = std::collections::BTreeSet::new();
+        for end in ends {
+            assert!(tokens.insert(end.token()), "{} is ambiguous", end.token());
+            let fields = end
+                .fields(std::time::Duration::from_secs(180))
+                .expect("declared fields");
+            arcen_telemetry::ValidatedLifecycleEvent::new(
+                arcen_telemetry::LifecycleEventKind::ResumeHoldEnded,
+                arcen_telemetry::CorrelationId::parse_uuid("01234567-89ab-4def-8123-456789abcdef")
+                    .expect("correlation id"),
+                fields,
+            )
+            .expect("RESUME_HOLD_ENDED accepts its fields");
+        }
     }
 }

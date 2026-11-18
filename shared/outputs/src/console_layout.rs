@@ -293,6 +293,38 @@ impl ShownOutput {
             Rotation::Degrees0 | Rotation::Degrees180 => (self.width, self.height),
         }
     }
+
+    /// A point of this output's picture (`0.0..=1.0` across it) as a point
+    /// of the whole X screen of `screen` pixels (`0.0..=1.0` across that):
+    /// where a single-display Deck's pointer lands when it is shown only
+    /// this output ([`single_display_output`]).
+    #[must_use]
+    pub fn screen_point(&self, x: f64, y: f64, screen: (u32, u32)) -> (f64, f64) {
+        let (width, height) = self.screen_extent();
+        let across = |origin: i32, extent: u32, at: f64, total: u32| {
+            ((f64::from(origin) + at.clamp(0.0, 1.0) * f64::from(extent)) / f64::from(total.max(1)))
+                .clamp(0.0, 1.0)
+        };
+        (
+            across(self.x, width, x, screen.0),
+            across(self.y, height, y, screen.1),
+        )
+    }
+}
+
+/// The output a single-display Deck is shown on a desktop shown as it is
+/// (another product's, ADR 0025 §8): the one its primary maps to by
+/// [`match_shown_layout`]'s rule, the desktop's primary output (the first
+/// shown when none is). `None` when the desktop shows fewer than two
+/// outputs: its whole screen is then that one picture.
+#[must_use]
+pub fn single_display_output(shown: &[ShownOutput]) -> Option<&ShownOutput> {
+    (shown.len() > 1).then(|| &shown[host_primary_index(shown)])
+}
+
+/// The desktop's primary output, else the first shown.
+fn host_primary_index(shown: &[ShownOutput]) -> usize {
+    shown.iter().position(|output| output.primary).unwrap_or(0)
 }
 
 /// How a host output shows the Deck monitor it was matched to. The Deck
@@ -503,7 +535,7 @@ pub fn match_shown_layout(
         .iter()
         .position(|request| request.primary)
         .unwrap_or(0);
-    let host_primary = shown.iter().position(|output| output.primary).unwrap_or(0);
+    let host_primary = host_primary_index(shown);
     let request_rect = |request: &ConsoleHeadRequest| {
         let (width, height) = request.screen_extent();
         (request.x, request.y, width, height)
@@ -720,6 +752,75 @@ impl ConsoleLayoutPlan {
             .find(|head| head.primary)
             .map(|head| head.output.as_str())
     }
+
+    /// The X screen the layout needs: the bounding box of every head's
+    /// extent from the screen's origin.
+    #[must_use]
+    pub fn screen_size(&self) -> (u32, u32) {
+        self.heads.iter().fold((0, 0), |(width, height), head| {
+            let (head_width, head_height) = head.screen_extent();
+            let right = u32::try_from(head.x.max(0))
+                .unwrap_or(0)
+                .saturating_add(head_width);
+            let bottom = u32::try_from(head.y.max(0))
+                .unwrap_or(0)
+                .saturating_add(head_height);
+            (width.max(right), height.max(bottom))
+        })
+    }
+
+    /// Whether the layout fits an X screen whose largest size is
+    /// `max_width`x`max_height` (`RandR` `GetScreenSizeRange`).
+    #[must_use]
+    pub fn fits_screen(&self, max_width: u32, max_height: u32) -> bool {
+        let (width, height) = self.screen_size();
+        width <= max_width && height <= max_height
+    }
+}
+
+#[cfg(test)]
+mod single_display_tests {
+    use super::*;
+
+    fn shown(name: &str, x: i32, y: i32, width: u32, height: u32, primary: bool) -> ShownOutput {
+        ShownOutput {
+            name: name.to_owned(),
+            width,
+            height,
+            x,
+            y,
+            rotation: Rotation::Degrees0,
+            refresh_mhz: 60_000,
+            primary,
+        }
+    }
+
+    #[test]
+    fn a_single_display_deck_is_shown_the_primary_output_of_a_wider_desktop() {
+        // The field shape: two 2560x1600 outputs side by side, the right one
+        // primary; the X screen is 5120x1600.
+        let outputs = [
+            shown("DP-1", 0, 0, 2560, 1600, false),
+            shown("DP-2", 2560, 0, 2560, 1600, true),
+        ];
+        let output = single_display_output(&outputs).expect("two outputs");
+        assert_eq!(output.name, "DP-2");
+        assert_eq!(output.screen_point(0.0, 0.0, (5120, 1600)), (0.5, 0.0));
+        assert_eq!(output.screen_point(1.0, 1.0, (5120, 1600)), (1.0, 1.0));
+        assert_eq!(output.screen_point(0.5, 0.25, (5120, 1600)), (0.75, 0.25));
+        // No primary: the first shown, as Match my layout maps its primary.
+        let unnamed = [
+            shown("DFP-1", 0, 400, 1920, 1200, false),
+            shown("DFP-0", 1920, 0, 2560, 1600, false),
+        ];
+        assert_eq!(
+            single_display_output(&unnamed).map(|o| o.name.as_str()),
+            Some("DFP-1")
+        );
+        // One output: the whole screen is that picture, nothing to choose.
+        assert_eq!(single_display_output(&outputs[..1]), None);
+        assert_eq!(single_display_output(&[]), None);
+    }
 }
 
 #[cfg(test)]
@@ -794,6 +895,26 @@ mod tests {
             "DVI-D-0: 2560x1600 @2560x1600 +1920+0 {ViewPortIn=2560x1600, ViewPortOut=2560x1600+0+0, Rotation=normal}, \
              DVI-D-1: 1920x1200 @1920x1200 +0+400 {ViewPortIn=1920x1200, ViewPortOut=1920x1200+0+0, Rotation=normal}"
         );
+    }
+
+    #[test]
+    fn the_screen_a_layout_needs_spans_every_head() {
+        // Two 5K monitors and a portrait one: wider than any one encoder,
+        // within a console X server's own maximum.
+        let mut portrait = request(1920, 1200, 10240, 0, false);
+        portrait.rotation = Rotation::Degrees90;
+        let plan = plan_console_layout(
+            &[
+                request(5120, 2880, 0, 0, true),
+                request(5120, 2880, 5120, 0, false),
+                portrait,
+            ],
+            &[vgx("DVI-D-0"), vgx("DVI-D-1"), vgx("DVI-D-2")],
+        )
+        .expect("plan");
+        assert_eq!(plan.screen_size(), (10240 + 1200, 2880));
+        assert!(plan.fits_screen(30720, 17280));
+        assert!(!plan.fits_screen(8192, 8192));
     }
 
     #[test]

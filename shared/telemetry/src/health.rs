@@ -754,6 +754,49 @@ impl ContentWindow {
     }
 }
 
+/// What a window owes across every output a host captures, each output
+/// judged against its own target ([`outputs_content`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputsContent {
+    /// The window's whole target: the sum of every output's own, for
+    /// [`QosSample::fps_target`]. A multi-monitor session serves each
+    /// monitor at its own Deck display's rate, so a 30 Hz monitor beside a
+    /// 120 Hz one owes 30, not the primary's rate.
+    pub fps_target: u32,
+    /// The rate the window had to deliver, for [`QosSample::fps_content`]:
+    /// `None` when no output proved anything (the whole target is owed) or
+    /// there are no outputs.
+    pub fps_content: Option<u32>,
+}
+
+/// Judges each output a host captures on its own target and evidence:
+/// `outputs` yields one `(target, proven)` per output, `proven` being its
+/// capture's content rate (`Some`, see [`ContentWindow::take_fps`]) or
+/// `None`. An output that proved its content rate owes that rate, up to its
+/// target; one that proved nothing owes its full target. A still second
+/// display therefore no longer makes a busy first one look idle, nor does a
+/// busy one make a still one look stalled, and a fast display is judged at
+/// its own rate rather than the primary's.
+///
+/// Every rate is consumed, so a caller may pass each output's
+/// `take_fps()` directly and every window still starts afresh.
+#[must_use]
+pub fn outputs_content(outputs: impl IntoIterator<Item = (u32, Option<u32>)>) -> OutputsContent {
+    let mut proven = false;
+    let mut owed = 0_u32;
+    let mut target = 0_u32;
+    for (output_target, rate) in outputs {
+        proven |= rate.is_some();
+        target = target.saturating_add(output_target);
+        owed =
+            owed.saturating_add(rate.map_or(output_target, |content| content.min(output_target)));
+    }
+    OutputsContent {
+        fps_target: target,
+        fps_content: proven.then_some(owed),
+    }
+}
+
 /// Turns a host's cumulative counters into per-window samples, so every host
 /// reports the window its `sample_window_secs` declares rather than session
 /// totals.
@@ -855,6 +898,75 @@ mod tests {
         // Taking starts the next window.
         window.record(Some(4));
         assert_eq!(window.take_fps(), Some(4));
+    }
+
+    #[test]
+    fn every_output_owes_only_what_it_proved() {
+        let judged = |sent: u64, rates: [Option<u32>; 2]| {
+            let content = outputs_content(rates.map(|rate| (60, rate)));
+            let sample = QosSample {
+                fps_actual: u32::try_from(sent / 2).ok(),
+                fps_target: Some(content.fps_target),
+                fps_content: content.fps_content,
+                frames_sent: Some(sent),
+                frames_dropped: Some(0),
+                ..QosSample::default()
+            };
+            assess_health(&sample, &QosTargets::default())
+                .host_delivery
+                .state
+        };
+        // Two still displays sending their keepalives: nothing owed.
+        assert_eq!(judged(4, [Some(0), Some(1)]), Some(HealthState::Ok));
+        // A still display beside one that proved nothing still owes the
+        // busy one's whole target.
+        assert_eq!(judged(4, [Some(0), None]), Some(HealthState::Critical));
+        // A display whose content outran its target owes only the target.
+        assert_eq!(judged(240, [Some(90), Some(60)]), Some(HealthState::Ok));
+        // Moving content the pipeline fell behind on is still caught.
+        assert_eq!(
+            judged(120, [Some(60), Some(60)]),
+            Some(HealthState::Critical)
+        );
+        assert_eq!(outputs_content([(60, None), (60, None)]).fps_content, None);
+        assert_eq!(outputs_content([]), OutputsContent::default());
+    }
+
+    #[test]
+    fn each_output_is_judged_at_its_own_rate() {
+        let judged = |sent: u64, outputs: [(u32, Option<u32>); 2]| {
+            let content = outputs_content(outputs);
+            let sample = QosSample {
+                fps_actual: u32::try_from(sent / 2).ok(),
+                fps_target: Some(content.fps_target),
+                fps_content: content.fps_content,
+                frames_sent: Some(sent),
+                frames_dropped: Some(0),
+                ..QosSample::default()
+            };
+            (
+                content.fps_target,
+                assess_health(&sample, &QosTargets::default())
+                    .host_delivery
+                    .state,
+            )
+        };
+        // A 30 Hz and a 120 Hz monitor, both moving: 150 a second is owed.
+        // At the primary's rate (30 each) the 120 Hz one's shortfall to 60
+        // was invisible; at its own it is caught.
+        assert_eq!(
+            judged(2 * 150, [(30, Some(30)), (120, Some(120))]),
+            (150, Some(HealthState::Ok))
+        );
+        assert_eq!(
+            judged(2 * 90, [(30, Some(30)), (120, Some(120))]).1,
+            Some(HealthState::Critical)
+        );
+        // A still fast monitor owes nothing beyond its keepalive.
+        assert_eq!(
+            judged(2 * 31, [(30, Some(30)), (120, Some(1))]).1,
+            Some(HealthState::Ok)
+        );
     }
 
     #[test]

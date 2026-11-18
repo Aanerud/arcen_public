@@ -629,6 +629,98 @@ pub fn pacer_clock_time(callback_time: Duration, target_time: Duration) -> Durat
     }
 }
 
+const NEWEST_DEPTH_WINDOW: usize = 16;
+const NEWEST_DEPTH_MIN_SAMPLES: usize = 6;
+
+/// How many pictures a "present the newest at once" timing
+/// ([`crate::video::PresentTiming::Newest`]) keeps in flight towards a
+/// display that shows them in order, one per refresh, chosen from how long a
+/// picture measurably takes from submission to the glass.
+///
+/// A presenter that releases its slot only when the picture reaches the
+/// glass can submit at most one picture per round trip. Where the display
+/// path shows a picture within the refresh it was submitted in (a
+/// full-screen surface scanned out directly), one picture in flight shows
+/// every frame and lets the newest replace an older one that is still
+/// waiting. Where the system composes the surface first (a scaled or
+/// windowed display), the round trip is two or three refreshes: one in
+/// flight then shows a picture every second or third refresh (measured: 20
+/// presented of 40-48 received per second on a 60 Hz scaled display), so a
+/// second picture is sent while the first is still on its way. It never
+/// shows a picture later: the display would not have shown the waiting one
+/// before the first anyway. The measurement only counts pictures submitted
+/// while none other was in flight, so a picture queued behind another does
+/// not lengthen it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewestPresentDepth {
+    samples: VecDeque<Duration>,
+    in_flight: u8,
+}
+
+impl Default for NewestPresentDepth {
+    fn default() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(NEWEST_DEPTH_WINDOW),
+            in_flight: 1,
+        }
+    }
+}
+
+impl NewestPresentDepth {
+    /// The most pictures in flight: with one on the glass this fills a
+    /// three-drawable pool.
+    pub const MAX_IN_FLIGHT: u8 = 2;
+
+    /// Records the submission-to-glass time of a picture submitted while no
+    /// other was in flight, and returns the new in-flight count when it
+    /// changes. A second picture is allowed once the median exceeds one
+    /// `refresh`, and withdrawn below three quarters of one.
+    pub fn record(&mut self, submit_to_glass: Duration, refresh: Duration) -> Option<u8> {
+        if refresh.is_zero() {
+            return None;
+        }
+        if self.samples.len() == NEWEST_DEPTH_WINDOW {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(submit_to_glass);
+        let median = self.median()?;
+        let next = if median > refresh {
+            Self::MAX_IN_FLIGHT
+        } else if median * 4 < refresh * 3 {
+            1
+        } else {
+            self.in_flight
+        };
+        (next != self.in_flight).then(|| {
+            self.in_flight = next;
+            next
+        })
+    }
+
+    /// Pictures the presenter may keep in flight now.
+    #[must_use]
+    pub const fn in_flight(&self) -> u8 {
+        self.in_flight
+    }
+
+    /// The median submission-to-glass time, once enough pictures were
+    /// measured.
+    #[must_use]
+    pub fn median(&self) -> Option<Duration> {
+        if self.samples.len() < NEWEST_DEPTH_MIN_SAMPLES {
+            return None;
+        }
+        let mut sorted: Vec<Duration> = self.samples.iter().copied().collect();
+        sorted.sort_unstable();
+        sorted.get(sorted.len() / 2).copied()
+    }
+
+    /// Forgets the measurement (another display, another layer).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Presenter frames the health model may count as presented.
 ///
 /// A Metal-style presented handler fires for every drawable that left the
@@ -687,6 +779,58 @@ mod present_timing_tests {
         pacer.enqueue(5, Duration::from_millis(20));
         pacer.enqueue(6, Duration::from_millis(21));
         assert_eq!(pacer.queue_depth(), 2);
+    }
+
+    fn ms(value: f64) -> Duration {
+        Duration::from_secs_f64(value / 1000.0)
+    }
+
+    #[test]
+    fn a_composed_display_gets_a_second_picture_in_flight_and_a_direct_one_keeps_one() {
+        let refresh = ms(16.667);
+        // Composed 60 Hz display: two to three refreshes from submission
+        // to the glass (the 5K scaled display: 20 of 40-48 fps shown).
+        let mut composed = NewestPresentDepth::default();
+        let mut changes = Vec::new();
+        for sample in [35.0, 48.0, 41.0, 50.0, 38.0, 47.0, 44.0] {
+            if let Some(next) = composed.record(ms(sample), refresh) {
+                changes.push(next);
+            }
+        }
+        assert_eq!(changes, [2], "switches once, after enough samples");
+        assert_eq!(composed.in_flight(), NewestPresentDepth::MAX_IN_FLIGHT);
+
+        // Direct scan-out on a 120 Hz panel: within the refresh (7.3 ms
+        // measured), one in flight stays.
+        let mut direct = NewestPresentDepth::default();
+        for sample in [4.0, 7.3, 8.0, 6.1, 3.2, 7.9, 5.5, 8.2] {
+            assert_eq!(direct.record(ms(sample), ms(8.333)), None);
+        }
+        assert_eq!(direct.in_flight(), 1);
+    }
+
+    #[test]
+    fn the_second_picture_is_withdrawn_only_when_the_path_is_clearly_direct_again() {
+        let refresh = ms(16.667);
+        let mut depth = NewestPresentDepth::default();
+        for _ in 0..8 {
+            depth.record(ms(30.0), refresh);
+        }
+        assert_eq!(depth.in_flight(), 2);
+        // Around one refresh: no flapping.
+        for _ in 0..16 {
+            assert_eq!(depth.record(ms(14.0), refresh), None);
+        }
+        assert_eq!(depth.in_flight(), 2);
+        let mut changed = None;
+        for _ in 0..16 {
+            changed = changed.or(depth.record(ms(8.0), refresh));
+        }
+        assert_eq!(changed, Some(1));
+        depth.reset();
+        assert_eq!(depth.in_flight(), 1);
+        assert_eq!(depth.median(), None);
+        assert_eq!(depth.record(ms(40.0), Duration::ZERO), None);
     }
 }
 

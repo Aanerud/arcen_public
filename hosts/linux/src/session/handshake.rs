@@ -21,8 +21,6 @@ use arcen_protocol::messages::{
     InputCapabilitiesMsg, InputCapabilityAvailability, ServerColorCaps, ServerHelloMsg,
     TabletModeCapabilitiesMsg, INPUT_PROTOCOL_VERSION, SERVER_HELLO,
 };
-#[cfg(feature = "wss-compat")]
-use arcen_protocol::CAPABILITY_TRANSPORT_WSS;
 use arcen_protocol::{
     negotiate_transport, sanitize_transport_capabilities, CAPABILITY_TRANSPORT_QUIC,
 };
@@ -187,7 +185,8 @@ pub fn build_server_hello(
             } else {
                 InputCapabilityAvailability::Unavailable
             },
-            gestures: InputCapabilityAvailability::Unavailable,
+            // A pinch zooms as Control + wheel (shared `gesture_fallback`).
+            gestures: InputCapabilityAvailability::Available,
             // Runtime-established truth only, axis by axis. On Xorg every
             // axis but rotation lives on the one tablet-tool uinput device
             // created before this hello (no target has proven the
@@ -254,17 +253,10 @@ pub(crate) fn negotiate_client_transport(
     active_transport: &'static str,
 ) -> Option<String> {
     let active_transport_known = active_transport == CAPABILITY_TRANSPORT_QUIC;
-    #[cfg(feature = "wss-compat")]
-    let active_transport_known =
-        active_transport_known || active_transport == CAPABILITY_TRANSPORT_WSS;
     if !active_transport_known {
         return None;
     }
     if client_capabilities.is_empty() {
-        #[cfg(feature = "wss-compat")]
-        if active_transport == CAPABILITY_TRANSPORT_WSS {
-            return Some(CAPABILITY_TRANSPORT_WSS.to_string());
-        }
         return None;
     }
     let sanitized = sanitize_transport_capabilities(client_capabilities);
@@ -747,31 +739,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "wss-compat")]
-    fn transport_negotiation_sanitizes_unknown_entries_and_keeps_wss() {
-        let negotiated = negotiate_client_transport(
-            &[
-                "unknown:cap".to_string(),
-                CAPABILITY_TRANSPORT_WSS.to_string(),
-                CAPABILITY_TRANSPORT_QUIC.to_string(),
-                "transport:bogus-v9".to_string(),
-            ],
-            CAPABILITY_TRANSPORT_WSS,
-        );
-        assert_eq!(negotiated.as_deref(), Some(CAPABILITY_TRANSPORT_WSS));
-    }
-
-    #[test]
-    #[cfg(feature = "wss-compat")]
-    fn transport_negotiation_returns_none_for_no_common_capability() {
-        let negotiated = negotiate_client_transport(
-            &[CAPABILITY_TRANSPORT_QUIC.to_string()],
-            CAPABILITY_TRANSPORT_WSS,
-        );
-        assert!(negotiated.is_none());
-    }
-
-    #[test]
     fn quic_transport_requires_and_accepts_the_quic_capability() {
         assert_eq!(
             negotiate_client_transport(
@@ -781,14 +748,5 @@ mod tests {
             Some(CAPABILITY_TRANSPORT_QUIC.to_string())
         );
         assert!(negotiate_client_transport(&[], CAPABILITY_TRANSPORT_QUIC).is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "wss-compat")]
-    fn legacy_client_without_transport_capabilities_uses_wss() {
-        assert_eq!(
-            negotiate_client_transport(&[], CAPABILITY_TRANSPORT_WSS),
-            Some(CAPABILITY_TRANSPORT_WSS.to_string())
-        );
     }
 }

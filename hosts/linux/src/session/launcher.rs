@@ -337,7 +337,12 @@ impl SessionDisplayMsg {
         self
     }
 
-    fn edid(&self) -> Result<[u8; 128], String> {
+    /// The size the session streams.
+    pub(crate) const fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub(crate) fn edid(&self) -> Result<[u8; 128], String> {
         arcen_outputs::edid::generate(arcen_outputs::edid::EdidRequest {
             width: self.width,
             height: self.height,
@@ -2478,6 +2483,11 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     // A headless Wayland desktop hands the login password to its own
     // keyring (see `session::wayland::keyring`); nothing else keeps a copy.
     let keyring_password = wayland.then(|| Zeroizing::new(auth.password.as_bytes().to_vec()));
+    // A console sign-in GDM's login screen or Arcen's login session
+    // completes never shows the password to `pam_gnome_keyring`: the
+    // launcher unlocks the login keyring with it (`login_keyring`).
+    let console_keyring_password =
+        (!wayland).then(|| Zeroizing::new(auth.password.as_bytes().to_vec()));
     let conversation = SecretConversation {
         username: auth.username.clone(),
         password: Zeroizing::new(std::mem::take(&mut auth.password)),
@@ -2558,6 +2568,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
             desktop: desktop.clone(),
             default_desktop: default_desktop.clone(),
             depth: x11_desktop_depth.map(arcen_media::video::DesktopDepth::x11_depth),
+            display: open.display.clone(),
         };
         return run_console(
             &identity,
@@ -2567,9 +2578,11 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
             &session_log_id,
             &mut commands,
             &launch,
+            console_keyring_password,
         )
         .await;
     }
+    drop(console_keyring_password);
 
     context
         .putenv(format!("XDG_SESSION_DESKTOP={desktop}"))
@@ -2927,6 +2940,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
 /// ends a session of its own: a remote-first sign-in is completed by GDM's
 /// login screen, and the session lives on after the Deck leaves.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)] // The console launch context and the password it may need.
 async fn run_console(
     identity: &UserIdentity,
     open: &OpenRequest,
@@ -2935,6 +2949,8 @@ async fn run_console(
     session_log_id: &CorrelationId,
     commands: &mut Lines<LauncherCommands>,
     launch: &super::login_session::LoginLaunch,
+    // Only a sign-in that starts the session uses it.
+    mut keyring_password: Option<Zeroizing<Vec<u8>>>,
 ) -> Result<(), LauncherError> {
     use super::console;
     use arcen_session::console_session::{self as model, ConsoleDecision, ConsoleRefusal};
@@ -3013,6 +3029,12 @@ async fn run_console(
                 .await
                 .token(),
             );
+            // A login screen GDM left waiting for its terminal is brought
+            // there first; one still starting is waited for.
+            let greeter = match console::ready_login_screen(&greeter).await {
+                Ok(greeter) => greeter,
+                Err(refusal) => return Err(refuse(refusal.into())),
+            };
             match console::sign_in_through_greeter(&greeter, &identity.username, identity.uid).await
             {
                 Ok(session) => {
@@ -3138,6 +3160,7 @@ async fn run_console(
             secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
             return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
         }
+        console::end_finished_login_screen(greeter).await;
     }
     // The Deck's layout, while the monitors are blank and the session not
     // yet open (ADR 0025 §6). A console that cannot take it is left as it
@@ -3264,6 +3287,19 @@ async fn run_console(
             return Err(error.into());
         }
     };
+    if signed_in {
+        if let Some(password) = keyring_password.take() {
+            super::login_keyring::unlock_in_background(
+                agent_binary,
+                identity,
+                &environment,
+                session_log_id.as_str(),
+                &session_id,
+                password,
+            );
+        }
+    }
+    drop(keyring_password.take());
     // The desk's sound goes back with the desk when the Deck leaves.
     privacy.hold_audio_with(agent.take_audio_control());
     let mut ready =

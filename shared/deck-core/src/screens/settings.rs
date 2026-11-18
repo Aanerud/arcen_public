@@ -375,6 +375,9 @@ pub struct SettingsFacts<'a> {
     pub decode: Option<crate::decode_report::DecodeReport>,
     /// Settings › Logs › support bundle, or `None` on a Deck without one.
     pub support_bundle: Option<super::support_bundle::SupportBundleView>,
+    /// The selected saved connection's own Displays choice, which wins over
+    /// Settings › Displays for it: its name and the mode.
+    pub connection_displays: Option<(String, DisplaysMode)>,
 }
 
 /// What the user asked for on the Settings screen, besides editing values.
@@ -386,6 +389,9 @@ pub enum SettingsAction {
     ShowLogFolder,
     /// Displays › Refresh.
     RefreshDisplays,
+    /// Displays › "Use this setting for …": the selected saved connection
+    /// drops its own Displays choice and follows Settings.
+    FollowDisplaysSetting,
     /// Streaming › Colour check….
     OpenColourCheck,
     /// The Native tablet component's button.
@@ -759,6 +765,26 @@ pub fn render_settings(
                                 mode.label(),
                                 mode.description(),
                             );
+                        }
+                        if let Some((connection, mode)) = &facts.connection_displays {
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    crate::connect_plan::connection_displays_note(
+                                        connection, *mode,
+                                    ),
+                                )
+                                .color(egui::Color32::from_rgb(0x8A, 0x6D, 0x3B)),
+                            );
+                            ui.add_space(4.0);
+                            if ui
+                                .button(crate::connect_plan::connection_displays_follow_label(
+                                    connection,
+                                ))
+                                .clicked()
+                            {
+                                actions.push(SettingsAction::FollowDisplaysSetting);
+                            }
                         }
 
                         // A screen with no notch at all (the Windows Deck)
@@ -2128,6 +2154,7 @@ mod tests {
                 native_tablet: None,
                 decode: Some(report.clone()),
                 support_bundle: None,
+                connection_displays: None,
             };
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 assert!(render_settings(ui, &mut values, &facts).is_empty());
@@ -2168,6 +2195,7 @@ mod tests {
                         open: true,
                         ..super::super::support_bundle::SupportBundleView::default()
                     }),
+                    connection_displays: Some(("Studio".to_owned(), DisplaysMode::MatchLayout)),
                 };
                 let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                     assert!(render_settings(ui, &mut values, &facts).is_empty());

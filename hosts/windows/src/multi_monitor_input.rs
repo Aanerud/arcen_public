@@ -600,6 +600,10 @@ mod tests {
             mode_height: height,
             logical_rect: logical,
             scale: Scale120::new(scale).expect("scale"),
+            ui_scale: arcen_outputs::WindowsUiScale::from_percent(
+                100,
+                arcen_outputs::ScaleBasis::Unknown,
+            ),
             refresh_hz: 60,
             rotation: arcen_media::Rotation::Degrees0,
             primary,

@@ -577,6 +577,85 @@ pub fn display_of(window: DesktopArea, displays: &[LocalDisplay]) -> Option<Stri
         .map(|(_, display)| display.key.clone())
 }
 
+/// Where a top-level window is, as the window manager reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowPlacement {
+    pub id: u64,
+    /// The client area, in desktop coordinates.
+    pub area: DesktopArea,
+    pub maximized: bool,
+    pub fullscreen: bool,
+}
+
+/// The windows of a session whose own displays a Pier laid out for a Deck
+/// and has now put back (the Linux Pier's joined console, ADR 0025 §6).
+#[derive(Debug, Clone, Copy)]
+pub struct WindowRestoreInput<'a> {
+    /// Before the Pier changed the displays.
+    pub before: &'a [WindowPlacement],
+    /// Once the Deck's layout had settled; `None` when they could not be
+    /// read then.
+    pub after_layout: Option<&'a [WindowPlacement]>,
+    /// As the Deck left, still in its layout.
+    pub departing: &'a [WindowPlacement],
+    /// With the session's own displays back.
+    pub now: &'a [WindowPlacement],
+    /// The session's own displays, back.
+    pub displays_now: &'a [DesktopArea],
+}
+
+/// Decides which windows go back where they were before a Deck's layout.
+///
+/// A window manager moves windows off a display that a layout removes or
+/// shrinks, but it does not move them back when the display returns. So
+/// each window recorded before the layout goes back to its recorded place,
+/// size, maximised and fullscreen state, when:
+///
+/// - it is not there now;
+/// - nobody moved it while the Deck was attached. If it was placed
+///   differently as the Deck left than once the layout had settled, the
+///   Deck's user moved it, and that choice stays. With no reading after the
+///   layout, the window goes back;
+/// - its recorded place is on a display that is back.
+///
+/// A window opened while the Deck was attached has no recorded place and
+/// stays where the window manager put it.
+#[must_use]
+pub fn plan_window_restore(input: &WindowRestoreInput<'_>) -> Vec<WindowPlacement> {
+    let by_id = |list: &[WindowPlacement]| -> BTreeMap<u64, WindowPlacement> {
+        list.iter().map(|window| (window.id, *window)).collect()
+    };
+    let before = by_id(input.before);
+    let after_layout = input.after_layout.map(by_id);
+    let departing = by_id(input.departing);
+    let mut restore = Vec::new();
+    for now in input.now {
+        let Some(recorded) = before.get(&now.id) else {
+            continue;
+        };
+        if recorded == now {
+            continue;
+        }
+        let moved_by_deck = after_layout
+            .as_ref()
+            .and_then(|after| after.get(&now.id))
+            .zip(departing.get(&now.id))
+            .is_some_and(|(settled, left)| settled != left);
+        if moved_by_deck {
+            continue;
+        }
+        if !input
+            .displays_now
+            .iter()
+            .any(|display| recorded.area.intersection_area(*display) > 0)
+        {
+            continue;
+        }
+        restore.push(*recorded);
+    }
+    restore
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,5 +1009,105 @@ mod tests {
             display_of(DesktopArea::new(-900, 0, 400, 300), &displays),
             None
         );
+    }
+
+    fn placed(id: u64, x: i32, y: i32, maximized: bool) -> WindowPlacement {
+        WindowPlacement {
+            id,
+            area: DesktopArea::new(x, y, 800, 600),
+            maximized,
+            fullscreen: false,
+        }
+    }
+
+    /// Two 1920x1080 monitors side by side: a layout without the right one
+    /// gathered its windows onto the left one.
+    const MONITORS: [DesktopArea; 2] = [
+        DesktopArea::new(0, 0, 1920, 1080),
+        DesktopArea::new(1920, 0, 1920, 1080),
+    ];
+
+    #[test]
+    fn windows_a_layout_moved_go_back_where_they_were() {
+        let before = [placed(1, 2100, 100, false), placed(2, 100, 100, false)];
+        let moved = [placed(1, 180, 100, false), placed(2, 100, 100, false)];
+        let input = WindowRestoreInput {
+            before: &before,
+            after_layout: Some(&moved),
+            departing: &moved,
+            now: &moved,
+            displays_now: &MONITORS,
+        };
+        assert_eq!(plan_window_restore(&input), vec![before[0]]);
+        // Unreadable after the layout: the window still goes back.
+        let input = WindowRestoreInput {
+            after_layout: None,
+            ..input
+        };
+        assert_eq!(plan_window_restore(&input), vec![before[0]]);
+    }
+
+    #[test]
+    fn a_maximised_window_goes_back_maximised_on_its_own_monitor() {
+        let before = [WindowPlacement {
+            id: 7,
+            area: DesktopArea::new(1920, 27, 1920, 1053),
+            maximized: true,
+            fullscreen: false,
+        }];
+        let now = [WindowPlacement {
+            id: 7,
+            area: DesktopArea::new(0, 27, 1920, 1053),
+            maximized: true,
+            fullscreen: false,
+        }];
+        let input = WindowRestoreInput {
+            before: &before,
+            after_layout: Some(&now),
+            departing: &now,
+            now: &now,
+            displays_now: &MONITORS,
+        };
+        assert_eq!(plan_window_restore(&input), vec![before[0]]);
+    }
+
+    #[test]
+    fn what_the_decks_user_did_stays() {
+        let before = [placed(1, 2100, 100, false)];
+        let settled = [placed(1, 180, 100, false)];
+        // Moved by the Deck's user while attached.
+        let departing = [placed(1, 600, 300, false)];
+        let input = WindowRestoreInput {
+            before: &before,
+            after_layout: Some(&settled),
+            departing: &departing,
+            now: &departing,
+            displays_now: &MONITORS,
+        };
+        assert!(plan_window_restore(&input).is_empty());
+        // Opened while attached: no recorded place.
+        let opened = [placed(9, 180, 100, false)];
+        let input = WindowRestoreInput {
+            before: &before,
+            after_layout: Some(&settled),
+            departing: &opened,
+            now: &opened,
+            displays_now: &MONITORS,
+        };
+        assert!(plan_window_restore(&input).is_empty());
+    }
+
+    #[test]
+    fn a_window_already_in_place_or_recorded_off_every_display_is_left() {
+        let before = [placed(1, 100, 100, false), placed(2, 5000, 100, false)];
+        let now = [placed(1, 100, 100, false), placed(2, 100, 400, false)];
+        let input = WindowRestoreInput {
+            before: &before,
+            after_layout: Some(&now),
+            departing: &now,
+            now: &now,
+            displays_now: &MONITORS,
+        };
+        assert!(plan_window_restore(&input).is_empty());
     }
 }

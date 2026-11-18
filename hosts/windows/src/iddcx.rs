@@ -19,6 +19,9 @@ use arcen_outputs::windows_topology::{
 
 pub(crate) const CONTROL_PATH: &str = r"\\.\Global\ArcenIddCx";
 
+/// The fastest refresh an IddCx connector runs at.
+pub(crate) const MAX_REFRESH_HZ: u32 = arcen_iddcx_provider::abi::MAX_REFRESH_MILLIHZ / 1_000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedRenderAdapter {
     pub(crate) stable_id: String,
@@ -606,6 +609,10 @@ mod tests {
                 )
                 .expect("rect"),
                 scale: Scale120::new(120).expect("scale"),
+                ui_scale: arcen_outputs::WindowsUiScale::from_percent(
+                    100,
+                    arcen_outputs::ScaleBasis::Unknown,
+                ),
                 refresh_hz: 60,
                 rotation: Rotation::Degrees90,
                 primary: true,

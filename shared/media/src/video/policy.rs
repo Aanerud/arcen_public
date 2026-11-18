@@ -207,6 +207,77 @@ pub fn adaptive_codec_ladder(preferred: VideoCodec) -> &'static [VideoCodec] {
     crate::video::pipeline_codec_ladder(crate::video::PipelineId::Auto, preferred)
 }
 
+/// Ordered hardware codec candidates for an adaptive stream whose largest
+/// picture is `width`x`height` on `backend`.
+///
+/// The [`adaptive_codec_ladder`] from `preferred`, without the codecs the
+/// backend cannot encode at that size ([`super::codec_dimension_ceiling`]).
+/// When none of those can, the next richer codecs follow, HEVC before AV1,
+/// each only when the Deck decodes it (`client`): a Deck that asked for
+/// H.264 under an adaptive contract authorized the host's choice, and a
+/// 5120 px monitor is served with HEVC rather than refused. Empty when no
+/// codec the Deck decodes fits; the caller then fits the picture or
+/// refuses, as before.
+#[must_use]
+pub fn adaptive_codec_ladder_for_size(
+    preferred: VideoCodec,
+    backend: super::EncoderBackend,
+    width: u32,
+    height: u32,
+    client: Option<arcen_protocol::messages::ClientVideoCapabilitiesMsg>,
+) -> Vec<VideoCodec> {
+    let fits = |codec: VideoCodec| super::codec_fits_dimensions(backend, codec, width, height);
+    let ladder: Vec<VideoCodec> = adaptive_codec_ladder(preferred)
+        .iter()
+        .copied()
+        .filter(|codec| fits(*codec))
+        .collect();
+    if !ladder.is_empty() {
+        return ladder;
+    }
+    let Some(client) = client else {
+        return ladder;
+    };
+    [VideoCodec::H265, VideoCodec::Av1]
+        .into_iter()
+        .filter(|codec| {
+            *codec != preferred
+                && backend.contract().supports(*codec)
+                && fits(*codec)
+                && codec_supported_by_client(*codec, client)
+        })
+        .collect()
+}
+
+/// The uniform codec candidates of an adaptive multi-monitor roster on
+/// `backend`: [`adaptive_codec_ladder_for_size`] for its largest monitor
+/// (ceilings are square, so the longer side is held against the width), or
+/// the plain [`adaptive_codec_ladder`] when no codec the Deck decodes fits,
+/// so the refusal stays the encoder's. Every Pier's roster admission uses it.
+#[must_use]
+pub fn adaptive_roster_codec_ladder(
+    preferred: VideoCodec,
+    backend: super::EncoderBackend,
+    monitors: impl IntoIterator<Item = (u32, u32)>,
+    client: Option<arcen_protocol::messages::ClientVideoCapabilitiesMsg>,
+) -> Vec<VideoCodec> {
+    let (longer, shorter) =
+        monitors
+            .into_iter()
+            .fold((0, 0), |(longer, shorter), (width, height)| {
+                (
+                    longer.max(width.max(height)),
+                    shorter.max(width.min(height)),
+                )
+            });
+    let sized = adaptive_codec_ladder_for_size(preferred, backend, longer, shorter, client);
+    if sized.is_empty() {
+        adaptive_codec_ladder(preferred).to_vec()
+    } else {
+        sized
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostInitialVideoPolicy {
     pub current: VideoConfiguration,
@@ -779,6 +850,86 @@ mod tests {
         assert_eq!(
             (pinned.max_fps, pinned.frame_rate.basis),
             (30, crate::video::FrameRateBasis::Request)
+        );
+    }
+
+    #[test]
+    fn an_adaptive_stream_past_h264s_ceiling_is_served_with_a_codec_that_fits() {
+        use super::super::EncoderBackend;
+        let deck = |h265: bool, av1: bool| arcen_protocol::messages::ClientVideoCapabilitiesMsg {
+            h264: true,
+            h265,
+            av1,
+            ..arcen_protocol::messages::ClientVideoCapabilitiesMsg::default()
+        };
+        let nvenc = EncoderBackend::NativeNvenc;
+        // A 2560x1440 monitor keeps the Deck's H.264.
+        assert_eq!(
+            adaptive_codec_ladder_for_size(
+                VideoCodec::H264,
+                nvenc,
+                2560,
+                1440,
+                Some(deck(true, true))
+            ),
+            [VideoCodec::H264]
+        );
+        // A 5120x2880 monitor: NVENC's H.264 stops at 4096, so HEVC, then AV1.
+        assert_eq!(
+            adaptive_codec_ladder_for_size(
+                VideoCodec::H264,
+                nvenc,
+                5120,
+                2880,
+                Some(deck(true, true))
+            ),
+            [VideoCodec::H265, VideoCodec::Av1]
+        );
+        // Only what the Deck decodes, and nothing for a Deck that said nothing.
+        assert_eq!(
+            adaptive_codec_ladder_for_size(
+                VideoCodec::H264,
+                nvenc,
+                5120,
+                2880,
+                Some(deck(false, true))
+            ),
+            [VideoCodec::Av1]
+        );
+        assert!(
+            adaptive_codec_ladder_for_size(
+                VideoCodec::H264,
+                nvenc,
+                5120,
+                2880,
+                Some(deck(false, false))
+            )
+            .is_empty()
+        );
+        assert!(
+            adaptive_codec_ladder_for_size(VideoCodec::H264, nvenc, 5120, 2880, None).is_empty()
+        );
+        // From AV1, the codecs below that still fit.
+        assert_eq!(
+            adaptive_codec_ladder_for_size(
+                VideoCodec::Av1,
+                nvenc,
+                5120,
+                2880,
+                Some(deck(true, true))
+            ),
+            [VideoCodec::Av1, VideoCodec::H265]
+        );
+        // Past every ceiling: nothing; the caller fits or refuses.
+        assert!(
+            adaptive_codec_ladder_for_size(
+                VideoCodec::H264,
+                nvenc,
+                10240,
+                2880,
+                Some(deck(true, true))
+            )
+            .is_empty()
         );
     }
 }

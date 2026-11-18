@@ -109,7 +109,10 @@ pub use provider::{
     OutputContext, OutputDemand, OutputProvider, OutputStage, OutputSurface, OutputTransaction,
     OutputTransactionError, OutputTransactionState, RollbackGuarantee, admits,
 };
-pub use ui_scale::{OutputScaleChoice, OutputScaleFacts, ScaleBasis, choose_output_scale};
+pub use ui_scale::{
+    OutputScaleChoice, OutputScaleFacts, ScaleBasis, WINDOWS_UI_SCALE_PERCENTS, WindowsUiScale,
+    choose_output_scale,
+};
 pub use virtual_topology::{
     VirtualOutputLimits, VirtualOutputPlan, VirtualTopologyError, VirtualTopologyPlan,
     plan_virtual_topology,

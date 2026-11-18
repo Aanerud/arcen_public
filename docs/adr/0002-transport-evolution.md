@@ -3,7 +3,8 @@
 **Status:** Superseded for product selection by
 [ADR 0007](0007-quic-only-product-transport.md). This remains the historical
 record of the staged WSS-to-QUIC migration and the richer stream/datagram
-design. Revised 2026-07-31.
+design. Revised 2026-07-31. The dormant `wss-compat` surface it describes
+was removed from every crate on 2026-11-18 (ADR 0007 amendment).
 
 ## Decision
 

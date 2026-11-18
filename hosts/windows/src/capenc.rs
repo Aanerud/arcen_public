@@ -208,6 +208,9 @@ pub struct Capenc {
 pub struct PipelineTelemetrySnapshot {
     pub encoder_fps: f64,
     pub capture_fps: f64,
+    /// Frames the source produced that second while capenc was away
+    /// encoding (`capture_behind`); `None` from a capenc that does not say.
+    pub capture_behind: Option<u64>,
     pub average_stage_ms: f64,
     pub maximum_stage_ms: f64,
     pub average_readback_ms: f64,
@@ -224,6 +227,8 @@ pub struct PipelineTelemetrySnapshot {
 struct PipelineTelemetry {
     encoder_fps: AtomicU64,
     capture_fps: AtomicU64,
+    /// `capture_behind + 1`, zero while not reported.
+    capture_behind: AtomicU64,
     average_stage_ms: AtomicU64,
     maximum_stage_ms: AtomicU64,
     average_readback_ms: AtomicU64,
@@ -251,6 +256,12 @@ impl PipelineTelemetry {
         );
         self.capture_fps.store(
             stats.capture_fps.unwrap_or_default().to_bits(),
+            Ordering::Relaxed,
+        );
+        self.capture_behind.store(
+            stats
+                .capture_behind
+                .map_or(0, |behind| behind.saturating_add(1)),
             Ordering::Relaxed,
         );
         self.average_stage_ms.store(
@@ -295,6 +306,7 @@ impl PipelineTelemetry {
         PipelineTelemetrySnapshot {
             encoder_fps: f64::from_bits(self.encoder_fps.load(Ordering::Relaxed)),
             capture_fps: f64::from_bits(self.capture_fps.load(Ordering::Relaxed)),
+            capture_behind: self.capture_behind.load(Ordering::Relaxed).checked_sub(1),
             average_stage_ms: f64::from_bits(self.average_stage_ms.load(Ordering::Relaxed)),
             maximum_stage_ms: f64::from_bits(self.maximum_stage_ms.load(Ordering::Relaxed)),
             average_readback_ms: f64::from_bits(self.average_readback_ms.load(Ordering::Relaxed)),
@@ -1786,6 +1798,7 @@ struct PipelineStats {
     capture_timeouts: Option<u64>,
     capture_cursor_only: Option<u64>,
     capture_pointer_updates: Option<u64>,
+    capture_behind: Option<u64>,
     encode_submitted: Option<u64>,
     encode_skipped_no_new: Option<u64>,
     kilobits_per_second: Option<u64>,
@@ -1853,6 +1866,7 @@ fn parse_pipeline_stats(line: &str) -> PipelineStats {
             "timeout" => stats.capture_timeouts = value.parse().ok(),
             "cursor_only" => stats.capture_cursor_only = value.parse().ok(),
             "pointer_updates" => stats.capture_pointer_updates = value.parse().ok(),
+            "capture_behind" => stats.capture_behind = value.parse().ok(),
             "encode_submitted" => stats.encode_submitted = value.parse().ok(),
             "encode_skipped_no_new" => stats.encode_skipped_no_new = value.parse().ok(),
             "kbps" => stats.kilobits_per_second = value.parse().ok(),
@@ -2435,6 +2449,7 @@ mod tests {
             PipelineTelemetrySnapshot {
                 encoder_fps: 8.0,
                 capture_fps: 9.0,
+                capture_behind: None,
                 average_stage_ms: 108.5,
                 maximum_stage_ms: 140.0,
                 average_readback_ms: 18.5,

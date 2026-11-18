@@ -106,6 +106,97 @@ pub fn ideal_output_scale(facts: &OutputScaleFacts) -> (f64, ScaleBasis) {
 #[must_use]
 pub fn choose_output_scale(facts: &OutputScaleFacts, supported: &[f64]) -> OutputScaleChoice {
     let (ideal, basis) = ideal_output_scale(facts);
+    choose_output_scale_from_ideal(ideal, basis, supported)
+}
+
+/// The per-monitor UI scales Windows offers (Settings › Display › Scale),
+/// in percent. A per-monitor scale takes no other value: Windows' custom
+/// scaling is one value for every monitor and needs a sign-out.
+pub const WINDOWS_UI_SCALE_PERCENTS: [u16; 12] =
+    [100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500];
+
+/// A Windows monitor's UI scale: what the client asked for, and the Windows
+/// step that serves it ([`choose_output_scale`] over
+/// [`WINDOWS_UI_SCALE_PERCENTS`]: the nearest step, the smaller one when the
+/// request sits halfway). A 1.5× Retina stream at a Remote UI scale of 125%
+/// asks for 187.5% and gets 175%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsUiScale {
+    /// The scale the client asked for, in whole percent.
+    pub requested_percent: u16,
+    /// The Windows step the host applies, in percent.
+    pub step_percent: u16,
+    /// What decided the request.
+    pub basis: ScaleBasis,
+}
+
+impl WindowsUiScale {
+    /// The scale for the client display `facts` describe.
+    #[must_use]
+    pub fn from_facts(facts: &OutputScaleFacts) -> Self {
+        let (ideal, basis) = ideal_output_scale(facts);
+        Self::from_ratio(ideal, basis)
+    }
+
+    /// The scale for a request already expressed as a percentage.
+    #[must_use]
+    pub fn from_percent(requested_percent: u16, basis: ScaleBasis) -> Self {
+        Self::from_ratio(f64::from(requested_percent) / 100.0, basis)
+    }
+
+    /// The scale for a request expressed as a ratio (`1.0` is 100%); a
+    /// non-finite or non-positive ratio counts as 100%.
+    #[must_use]
+    pub fn from_ratio(ideal: f64, basis: ScaleBasis) -> Self {
+        let supported = WINDOWS_UI_SCALE_PERCENTS.map(|percent| f64::from(percent) / 100.0);
+        let ideal = if ideal.is_finite() && ideal > 0.0 {
+            ideal
+        } else {
+            1.0
+        };
+        let step = choose_output_scale_from_ideal(ideal, basis, &supported).scale;
+        Self {
+            requested_percent: whole_percent(ideal),
+            step_percent: whole_percent(step),
+            basis,
+        }
+    }
+
+    /// The same request served by the nearest Windows step from `lowest`
+    /// to `highest` percent: the steps Windows offers this monitor (it caps
+    /// the scale by resolution: a 2880x1800 display stops at 300%). An
+    /// empty range keeps the step.
+    #[must_use]
+    pub fn within(self, lowest: u16, highest: u16) -> Self {
+        let mut offered = WINDOWS_UI_SCALE_PERCENTS
+            .iter()
+            .copied()
+            .filter(|percent| (lowest..=highest).contains(percent));
+        let (Some(first), last) = (offered.next(), offered.next_back()) else {
+            return self;
+        };
+        let last = last.unwrap_or(first);
+        // The offered steps are contiguous, so a step outside them is
+        // nearest to the request at the end it passed.
+        Self {
+            step_percent: self.step_percent.clamp(first, last),
+            ..self
+        }
+    }
+
+    /// Whether Windows cannot show the request exactly (more than the
+    /// rounding of the client's millimetres away from the step).
+    #[must_use]
+    pub const fn snapped(self) -> bool {
+        self.requested_percent.abs_diff(self.step_percent) > 1
+    }
+}
+
+fn choose_output_scale_from_ideal(
+    ideal: f64,
+    basis: ScaleBasis,
+    supported: &[f64],
+) -> OutputScaleChoice {
     let mut usable: Vec<f64> = supported
         .iter()
         .copied()
@@ -130,6 +221,29 @@ pub fn choose_output_scale(facts: &OutputScaleFacts, supported: &[f64]) -> Outpu
         scale: best,
         ideal,
         basis,
+    }
+}
+
+fn whole_percent(scale: f64) -> u16 {
+    let percent = (scale * 100.0).round().clamp(1.0, f64::from(u16::MAX));
+    // Clamped to the u16 range above.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let percent = percent as u16;
+    percent
+}
+
+/// Whole millimetres from a client's reported size; zero when it is not a
+/// usable length.
+#[must_use]
+pub fn whole_millimetres(value: f32) -> u32 {
+    if value.is_finite() && value > 0.0 && value < 100_000.0 {
+        // Range-checked above; rounding to whole millimetres is the
+        // precision clients report.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rounded = value.round() as u32;
+        rounded
+    } else {
+        0
     }
 }
 
@@ -275,5 +389,95 @@ mod tests {
             choose_output_scale(&deck(3024, 1964, 200), &[f64::NAN, 0.0]).scale,
             1.0
         );
+    }
+
+    /// What a Deck advertises for an effective `ratio` (the Remote UI
+    /// scale times the stream's backing ratio).
+    fn deck_ratio(width_px: u32, height_px: u32, ratio: f64) -> OutputScaleFacts {
+        let millimetres = |pixels: u32| {
+            #[allow(clippy::cast_possible_truncation)]
+            let value = (f64::from(pixels) * 25.4 / (96.0 * ratio)) as f32;
+            whole_millimetres(value)
+        };
+        facts(
+            width_px,
+            height_px,
+            millimetres(width_px),
+            millimetres(height_px),
+        )
+    }
+
+    #[test]
+    fn a_windows_monitor_gets_the_nearest_windows_step() {
+        // A 1.5x scaled Retina mode streamed in backing pixels (2880x1800):
+        // 125%, 175% and 250% ask for 187.5%, 262.5% and 375%, which
+        // Windows does not have; halfway takes the smaller step.
+        for (ratio, requested, step) in [(1.875, 188, 175), (2.625, 263, 250), (3.75, 375, 350)] {
+            let scale = WindowsUiScale::from_facts(&deck_ratio(2880, 1800, ratio));
+            assert_eq!(
+                (scale.requested_percent, scale.step_percent, scale.basis),
+                (requested, step, ScaleBasis::RequestedDensity),
+                "{ratio}"
+            );
+            assert!(scale.snapped());
+        }
+        // Every menu value on a 2x stream is a Windows step.
+        for percent in [100_u16, 125, 150, 175, 200] {
+            let effective = f64::from(percent) * 2.0 / 100.0;
+            let scale = WindowsUiScale::from_facts(&deck_ratio(5120, 2880, effective));
+            assert_eq!(scale.step_percent, percent * 2, "{percent}");
+            assert!(!scale.snapped(), "{percent}");
+        }
+        // A fixed 150% on a point stream is 150%, not the stream's 100%.
+        let scale = WindowsUiScale::from_facts(&OutputScaleFacts {
+            logical_width: Some(1920),
+            ..deck(1920, 1080, 150)
+        });
+        assert_eq!((scale.requested_percent, scale.step_percent), (150, 150));
+    }
+
+    #[test]
+    fn a_windows_monitor_without_millimetres_takes_its_backing_ratio() {
+        let scale = WindowsUiScale::from_facts(&OutputScaleFacts {
+            logical_width: Some(1920),
+            ..facts(3840, 2160, 0, 0)
+        });
+        assert_eq!(
+            (scale.requested_percent, scale.step_percent, scale.basis),
+            (200, 200, ScaleBasis::BackingPixels)
+        );
+        let unscaled = WindowsUiScale::from_facts(&facts(3840, 2160, 0, 0));
+        assert_eq!(
+            (unscaled.step_percent, unscaled.basis),
+            (100, ScaleBasis::Unknown)
+        );
+        assert_eq!(
+            WindowsUiScale::from_ratio(f64::NAN, ScaleBasis::Unknown).step_percent,
+            100
+        );
+        assert_eq!(
+            WindowsUiScale::from_ratio(9.0, ScaleBasis::Unknown).step_percent,
+            500
+        );
+    }
+
+    #[test]
+    fn a_windows_monitor_gets_the_nearest_step_windows_offers_it() {
+        // 250% on a 1.5x Retina stream asks for 375%; Windows offers a
+        // 2880x1800 display 100..=300%.
+        let scale = WindowsUiScale::from_percent(375, ScaleBasis::RequestedDensity);
+        assert_eq!(scale.step_percent, 350);
+        let served = scale.within(100, 300);
+        assert_eq!(
+            (served.requested_percent, served.step_percent, served.basis),
+            (375, 300, ScaleBasis::RequestedDensity)
+        );
+        assert!(served.snapped());
+        assert_eq!(scale.within(400, 500).step_percent, 400);
+        assert_eq!(scale.within(100, 500).step_percent, 350);
+        assert_eq!(scale.within(310, 340).step_percent, 350);
+        // 187.5% keeps its halfway choice (175%) when Windows offers it.
+        let retina_125 = WindowsUiScale::from_ratio(1.875, ScaleBasis::RequestedDensity);
+        assert_eq!(retina_125.within(100, 300).step_percent, 175);
     }
 }

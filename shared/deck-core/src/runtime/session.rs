@@ -484,6 +484,13 @@ pub struct ConnectOptions {
     /// The user's **Exact still image** switch (lossless refinement, ADR
     /// 0016). Off: the Deck does not ask for it and the host sends nothing.
     pub exact_still_image: bool,
+    /// The refresh each Deck display shows frames at, and the display the
+    /// session window is on, read on the UI thread when the connection is
+    /// planned ([`crate::connect_plan::deck_display_refresh`]). `monitors`
+    /// and `multi_monitor_topology` carry the virtual display mode to create
+    /// (at most 60 Hz); this carries the displays' own rates, which hosts
+    /// follow. `None` states nothing (hosts follow the mode's refresh).
+    pub display_refresh: Option<arcen_protocol::messages::DeckDisplayRefreshMsg>,
     /// The platform's services (ADR 0024): decode capabilities, microphone,
     /// network facts, build identity, pen capture, Native tablet.
     pub services: Arc<dyn crate::DeckServices>,
@@ -509,6 +516,7 @@ impl fmt::Debug for ConnectOptions {
             .field("microphone_enabled", &self.microphone_enabled)
             .field("tablet_input_enabled", &self.tablet_input_enabled)
             .field("tablet_mode_requested", &self.tablet_mode_requested)
+            .field("display_refresh", &self.display_refresh)
             .field("telemetry", &"<atomic counters>")
             .finish()
     }
@@ -544,6 +552,7 @@ impl ConnectOptions {
             tablet_mode_requested: self.tablet_mode_requested,
             telemetry: Arc::clone(&self.telemetry),
             exact_still_image: self.exact_still_image,
+            display_refresh: self.display_refresh.clone(),
             services: Arc::clone(&self.services),
         }
     }
@@ -1526,6 +1535,11 @@ pub enum ConnectSmokeError {
     Tls(#[from] TlsTrustError),
     #[error("TLS identity error: {0}")]
     TlsIdentity(String),
+    /// Security mode High (the system's certificate authorities only) met a
+    /// certificate no trusted authority issued: the plain-words refusal
+    /// ([`crate::runtime::tls::high_security_untrusted_issuer`]).
+    #[error("{0}")]
+    UntrustedIssuer(String),
     #[error("untrusted server certificate")]
     CertificateUntrusted(CertInfo),
     #[error("connection timed out")]
@@ -2335,6 +2349,16 @@ async fn run_session_correlated(
                     sid = %session_log_id,
                     health = ?health.overall,
                     missed_health,
+                    // Why a window was not ok, from the info log alone.
+                    dominant_cause = health
+                        .client_experience
+                        .dominant_cause
+                        .map(health_cause_name),
+                    fps_actual = sample.fps_actual,
+                    fps_content = sample.fps_content,
+                    frames_decoded = sample.frames_decoded,
+                    frames_presented = sample.frames_presented,
+                    unpresented_basis_points = arcen_telemetry::unpresented_basis_points(&sample),
                     "five-second client QoS snapshot",
                 );
                 if let Some(feedback) = ws.quic_feedback() {
@@ -3321,7 +3345,11 @@ async fn open_quic_socket(
                         return Ok(socket);
                     }
                     Some((Err(error), attempt_tls, remote_addr)) => {
-                        let mapped = lane_setup_error(error);
+                        let mapped = explain_untrusted_issuer(
+                            lane_setup_error(error),
+                            &attempt_tls.mode,
+                            &options.host,
+                        );
                         if is_tofu_capture_reject_message(&mapped.to_string()) {
                             // Read the capture from the attempt that actually failed,
                             // and record which peer it was, so the user is approving a
@@ -3643,6 +3671,27 @@ fn quic_transport_code_is_tls(code: quinn::TransportErrorCode) -> bool {
 
 fn quic_tls_identity_error(message: String) -> ConnectSmokeError {
     ConnectSmokeError::TlsIdentity(message)
+}
+
+/// Security mode High trusts only the system's certificate authorities; a
+/// host presenting a certificate none of them issued (an Arcen Pier's own
+/// self-signed one) is refused in plain words, not as a handshake alert.
+fn explain_untrusted_issuer(
+    error: ConnectSmokeError,
+    mode: &crate::runtime::tls::TlsTrustMode,
+    host: &str,
+) -> ConnectSmokeError {
+    match error {
+        ConnectSmokeError::TlsIdentity(message)
+            if *mode == crate::runtime::tls::TlsTrustMode::SystemCa
+                && message.contains("UnknownIssuer") =>
+        {
+            ConnectSmokeError::UntrustedIssuer(crate::runtime::tls::high_security_untrusted_issuer(
+                host,
+            ))
+        }
+        other => other,
+    }
 }
 
 /// Additive multi-monitor-v1 negotiation applied to an in-progress
@@ -4040,7 +4089,8 @@ fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions)
         .with_optional_timezone(options.timezone.clone())
         .with_cursor_preference(options.cursor_preference)
         .with_cursor_image_v1(DECK_DRAWS_CURSOR_IMAGES)
-        .with_cursor_position_v1(DECK_FOLLOWS_HOST_POINTER);
+        .with_cursor_position_v1(DECK_FOLLOWS_HOST_POINTER)
+        .with_display_refresh(options.display_refresh.clone());
     let capabilities = options.services.decode_capabilities();
     // `options.profile` is already decodable (`keep_profile_decodable` at
     // the start of every session), so this request, the later quality
@@ -5001,6 +5051,7 @@ fn connect_error_class(error: &ConnectSmokeError) -> &'static str {
         ConnectSmokeError::NetworkReachability(failure) => failure.reason_class(),
         ConnectSmokeError::Tls(_)
         | ConnectSmokeError::TlsIdentity(_)
+        | ConnectSmokeError::UntrustedIssuer(_)
         | ConnectSmokeError::CertificateUntrusted(_) => "tls",
         ConnectSmokeError::AuthFailed(_)
         | ConnectSmokeError::AuthDeclined
@@ -5620,6 +5671,7 @@ fn classify_disconnect_at(error: &ConnectSmokeError, observed_at: Instant) -> Se
         ConnectSmokeError::WebSocket(WebSocketError::Tls(_))
         | ConnectSmokeError::Tls(_)
         | ConnectSmokeError::TlsIdentity(_)
+        | ConnectSmokeError::UntrustedIssuer(_)
         | ConnectSmokeError::CertificateUntrusted(_) => {
             DisconnectReason::Terminal(TerminalDisconnect::TlsIdentity)
         }
@@ -5915,6 +5967,7 @@ mod tests {
 
     fn transport_test_options() -> ConnectOptions {
         ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "127.0.0.1".to_string(),
             port: 18_444,
@@ -6066,6 +6119,7 @@ mod tests {
     #[tokio::test]
     async fn quic_setup_failure_on_every_candidate_returns_the_setup_error_not_a_timeout() {
         let options = ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "127.0.0.1".to_string(),
             port: 9,
@@ -6947,6 +7001,7 @@ mod tests {
         });
 
         let mut options = ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "localhost".to_string(),
             port,
@@ -7750,6 +7805,32 @@ mod tests {
     }
 
     #[test]
+    fn high_security_refuses_an_unknown_issuer_in_plain_words() {
+        use crate::runtime::tls::TlsTrustMode;
+        let alert = || {
+            quic_tls_identity_error(
+                "quic connection failure: the cryptographic handshake failed: error 48: \
+                 invalid peer certificate: UnknownIssuer"
+                    .to_owned(),
+            )
+        };
+        let refused = explain_untrusted_issuer(alert(), &TlsTrustMode::SystemCa, "pier.example");
+        let text = refused.to_string();
+        assert!(text.starts_with("Security mode is High"), "{text}");
+        assert!(text.contains("pier.example presented a certificate no trusted authority issued"));
+        assert!(text.contains("set Security mode to Medium"));
+        assert_eq!(
+            classify_disconnect(&refused).reason,
+            DisconnectReason::Terminal(TerminalDisconnect::TlsIdentity)
+        );
+        // Medium's own trust paths keep their errors.
+        assert!(matches!(
+            explain_untrusted_issuer(alert(), &TlsTrustMode::TofuPending, "pier.example"),
+            ConnectSmokeError::TlsIdentity(_)
+        ));
+    }
+
+    #[test]
     fn quic_connect_error_maps_monitor_stream_timeout_like_establishment_timeout() {
         // The direct-monitor stream preface's own bounded deadline
         // (`MonitorStreamTimedOut`) must surface exactly like the primary
@@ -7854,6 +7935,7 @@ mod tests {
     #[test]
     fn connect_options_debug_redacts_password() {
         let options = ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "example.test".to_string(),
             port: 4443,
@@ -8015,6 +8097,7 @@ mod tests {
     #[test]
     fn auth_and_hello_use_the_same_captured_timezone() {
         let options = ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "example.test".to_string(),
             port: 4443,
@@ -8066,6 +8149,7 @@ mod tests {
     #[test]
     fn clipboard_capability_requires_local_opt_in_and_exact_host_v1() {
         let options = ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "example.test".to_string(),
             port: 4443,
@@ -8422,6 +8506,7 @@ mod tests {
         });
 
         let result = connect_smoke(ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "127.0.0.1".to_string(),
             port: pier_port,
@@ -8476,6 +8561,7 @@ mod tests {
         });
 
         let mut handle = spawn_session(ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "127.0.0.1".to_string(),
             port: pier_port,
@@ -8565,6 +8651,7 @@ mod tests {
 
         let mut handle = spawn_session_opt_in(
             ConnectOptions {
+                display_refresh: None,
                 services: crate::runtime::test_services(),
                 host: "127.0.0.1".to_string(),
                 port: pier_port,
@@ -8692,6 +8779,7 @@ mod tests {
         });
 
         let mut handle = spawn_session(ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "127.0.0.1".to_string(),
             port: pier_port,
@@ -8769,6 +8857,7 @@ mod tests {
         });
 
         let mut handle = spawn_session(ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "127.0.0.1".to_string(),
             port: pier_port,
@@ -8829,6 +8918,7 @@ mod tests {
         });
 
         let error = connect_smoke(ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "127.0.0.1".to_string(),
             port: pier_port,
@@ -8896,6 +8986,7 @@ mod tests {
         });
 
         let mut handle = spawn_session(ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "127.0.0.1".to_string(),
             port: pier_port,

@@ -263,6 +263,7 @@ mod tests {
 
     fn options() -> ConnectOptions {
         ConnectOptions {
+            display_refresh: None,
             services: crate::runtime::test_services(),
             host: "203.0.113.5".to_owned(),
             port: 18_444,

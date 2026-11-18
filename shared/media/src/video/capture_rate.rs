@@ -45,6 +45,32 @@ pub const fn paced_output_refresh_hz(display_refresh_hz: u32, served_fps: u32) -
     }
 }
 
+/// The refresh a host creates a head at (a dedicated or console Xorg head,
+/// a virtual display) to serve `served_fps`.
+///
+/// Decided from the served rate, never from the Deck display's own refresh:
+/// the head is the host's clock, the Deck display is the Deck's. The head
+/// gets [`paced_source_offer_fps`] (one spare refresh for every captured
+/// frame, so arrival jitter never puts two frames into one encoder
+/// interval) when the host can create that, else the served rate itself,
+/// else `requested_hz`, the mode the Deck asked for. Never below
+/// `requested_hz`. `creatable` says whether the host can create a head at a
+/// refresh (an EDID timing's pixel clock, a console output's modes, an output
+/// bound).
+#[must_use]
+pub fn served_head_refresh_hz(
+    served_fps: u32,
+    requested_hz: u32,
+    creatable: impl Fn(u32) -> bool,
+) -> u32 {
+    let served_fps = served_fps.max(1);
+    [paced_source_offer_fps(served_fps), served_fps]
+        .into_iter()
+        .filter(|refresh| *refresh > requested_hz)
+        .find(|refresh| creatable(*refresh))
+        .unwrap_or(requested_hz)
+}
+
 /// The rate to ask a refresh-paced capture of a copying route for when a
 /// follow-display contract (Auto) serves `served_fps`: up to
 /// [`super::UNQUALIFIED_COPY_FPS`] the rate itself, so the source skips
@@ -309,6 +335,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_head_runs_at_twice_the_served_rate_when_the_host_can_create_it() {
+        let any = |_| true;
+        // A 30 Hz Deck display serving 30 fps: a 60 Hz head, not 30.
+        assert_eq!(served_head_refresh_hz(30, 30, any), 60);
+        assert_eq!(served_head_refresh_hz(60, 60, any), 120);
+        // 120 fps where 240 Hz cannot be created: the served rate.
+        assert_eq!(served_head_refresh_hz(120, 60, |hz| hz <= 144), 120);
+        // Nothing faster can be created: the requested mode.
+        assert_eq!(served_head_refresh_hz(120, 60, |hz| hz <= 60), 60);
+        // Never below the requested mode.
+        assert_eq!(served_head_refresh_hz(24, 60, any), 60);
+        assert_eq!(served_head_refresh_hz(0, 60, any), 60);
+    }
 
     #[test]
     fn rate_evidence_tokens_round_trip() {

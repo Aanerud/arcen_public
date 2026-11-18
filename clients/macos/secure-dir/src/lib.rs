@@ -220,6 +220,28 @@ impl TrustedDir {
     /// Refuses an invalid name or an entry that is not a socket, and returns
     /// the I/O error of a failed bind, ownership change or check.
     pub fn bind_socket(&self, name: &str, client_uid: u32) -> std::io::Result<UnixListener> {
+        self.bind_socket_as(name, client_uid, 0o600)
+    }
+
+    /// Binds the Unix socket `name` for whichever local user the caller
+    /// admits by the peer's credentials: owned by root, mode 0666, so no
+    /// user owns the inode (none can change its mode or ACL to keep the next
+    /// client out), and the peer-uid check is the only gate. Otherwise as
+    /// [`Self::bind_socket`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::bind_socket`].
+    pub fn bind_socket_for_any_peer(&self, name: &str) -> std::io::Result<UnixListener> {
+        self.bind_socket_as(name, 0, 0o666)
+    }
+
+    fn bind_socket_as(
+        &self,
+        name: &str,
+        owner_uid: u32,
+        bits: u32,
+    ) -> std::io::Result<UnixListener> {
         check_entry_name(name).map_err(refused)?;
         match rustix::fs::statat(self.fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Socket => {
@@ -235,22 +257,22 @@ impl TrustedDir {
             Err(error) => return Err(error.into()),
         }
         let listener = UnixListener::bind(self.path.join(name))?;
-        rustix::fs::chmodat(self.fd(), name, mode(0o600), AtFlags::SYMLINK_NOFOLLOW)?;
+        rustix::fs::chmodat(self.fd(), name, mode(bits), AtFlags::SYMLINK_NOFOLLOW)?;
         rustix::fs::chownat(
             self.fd(),
             name,
-            Some(Uid::from_raw(client_uid)),
+            Some(Uid::from_raw(owner_uid)),
             None,
             AtFlags::SYMLINK_NOFOLLOW,
         )?;
         let stat = rustix::fs::statat(self.fd(), name, AtFlags::SYMLINK_NOFOLLOW)?;
         let permissions = u32::from(stat.st_mode) & 0o7777;
         if FileType::from_raw_mode(stat.st_mode) != FileType::Socket
-            || stat.st_uid != client_uid
-            || permissions != 0o600
+            || stat.st_uid != owner_uid
+            || permissions != bits
         {
             return Err(refused(format!(
-                "{} is not the expected 0600 socket of uid {client_uid} (uid {}, mode {permissions:o})",
+                "{} is not the expected {bits:04o} socket of uid {owner_uid} (uid {}, mode {permissions:o})",
                 self.path.join(name).display(),
                 stat.st_uid
             )));

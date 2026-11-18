@@ -379,6 +379,9 @@ struct Capture {
     /// pointer to Windows reports none, because Windows draws it into the
     /// picture instead, and a Deck that draws its own pointer then shows two.
     pointer_updates: u64,
+    /// Presents Desktop Duplication accumulated beyond the one each new
+    /// acquisition returned: frames the loop never saw because it was away.
+    frames_behind: u64,
 }
 
 impl Capture {
@@ -413,6 +416,7 @@ impl Capture {
             move_rects: Vec::new(),
             damage_first_frame: true,
             pointer_updates: 0,
+            frames_behind: 0,
         })
     }
 
@@ -713,6 +717,9 @@ impl Capture {
                 }
                 if new_image {
                     dbg.0 += 1;
+                    self.frames_behind = self
+                        .frames_behind
+                        .saturating_add(u64::from(info.AccumulatedFrames.saturating_sub(1)));
                     let tex: ID3D11Texture2D = resource.unwrap().cast()?;
                     if let Some(ref mut damage) = damage {
                         self.collect_frame_damage(&info, damage);
@@ -811,6 +818,15 @@ impl Source {
         match self {
             Source::Dda { .. } => 0,
             Source::Wgc(w) => w.take_raw_frames_superseded(),
+        }
+    }
+    /// Desktop Duplication presents the loop was away for (see
+    /// `Capture::frames_behind`); Windows.Graphics.Capture counts its own as
+    /// superseded frames.
+    fn take_frames_behind(&mut self) -> u64 {
+        match self {
+            Source::Dda { capture, .. } => std::mem::take(&mut capture.frames_behind),
+            Source::Wgc(_) => 0,
         }
     }
     fn width(&self) -> u32 {
@@ -1682,6 +1698,7 @@ unsafe fn run_encode(
     let mut restage_skipped = 0u64;
     let mut restage_unavailable = 0u64;
     let mut raw_superseded_sum = 0u64;
+    let mut dda_behind_sum = 0u64;
     let mut bytes_sum = 0u64;
     let mut encode_submitted = 0u64;
     let mut encode_skipped_no_new = 0u64;
@@ -1737,6 +1754,7 @@ unsafe fn run_encode(
             }
         };
         raw_superseded_sum = raw_superseded_sum.saturating_add(cap.take_raw_frames_superseded());
+        dda_behind_sum = dda_behind_sum.saturating_add(cap.take_frames_behind());
         if let Some(e) = copy_error {
             log(&format!("stage failed: {e}"));
             return 3;
@@ -2077,7 +2095,7 @@ unsafe fn run_encode(
                  restage_copied={} restage_skipped={} restage_unavailable={} kbps={} \
                  capture_new={} capture_empty={} raw_superseded={} encode_submitted={} \
                  encode_skipped_no_new={} timeout={} cursor_only={} pointer_updates={} \
-                 want_idr={}",
+                 capture_behind={} want_idr={}",
                 enc_count,
                 dbg.0,
                 stage_avg,
@@ -2115,6 +2133,10 @@ unsafe fn run_encode(
                 dbg.1,
                 dbg.2,
                 cap.take_pointer_updates(),
+                // Frames the source produced while the loop was away
+                // encoding: the frame-rate governor's evidence that the
+                // source outpaced the encoder.
+                raw_superseded_sum.saturating_add(dda_behind_sum),
                 control.idr_pending()
             ));
             // A line of its own: the Pier parses the stats line above into
@@ -2160,6 +2182,7 @@ unsafe fn run_encode(
             restage_skipped = 0;
             restage_unavailable = 0;
             raw_superseded_sum = 0;
+            dda_behind_sum = 0;
             bytes_sum = 0;
             encode_submitted = 0;
             encode_skipped_no_new = 0;

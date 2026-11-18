@@ -154,6 +154,9 @@ pub struct SessionPolicy {
     pub lossless_refinement: bool,
     /// `video.fps`: the administrator's frame-rate ceiling, when configured.
     pub fps_ceiling: Option<u32>,
+    /// `platform.desktop.deskside.enabled`: keep the desk private while a
+    /// Deck is attached to a signed-in user's session (`desk_privacy`).
+    pub desk_privacy: bool,
 }
 
 impl SessionPolicy {
@@ -169,7 +172,12 @@ impl SessionPolicy {
             audio_enabled: config.audio.enabled,
             audio_compressed: config.audio.compressed,
             microphone_enabled: config.microphone_input.enabled,
-            microphone_backend_available: crate::microphone_input::backend_available(),
+            // Probed for each connection (`serve_one`), never at start-up:
+            // launchd starts agents while an install is restarting Core Audio,
+            // and a Core Audio connection opened then is the likeliest cause
+            // of an agent whose taps Core Audio did not know
+            // (`audio::core_audio_connection_stale`).
+            microphone_backend_available: false,
             clipboard: crate::clipboard_policy_from_config(config)?,
             encoder: encoder_capabilities(),
             serving_uid: None,
@@ -178,6 +186,7 @@ impl SessionPolicy {
                 config.video.lossless_refinement,
             ),
             fps_ceiling: config.video.fps,
+            desk_privacy: config.platform.desktop.deskside.enabled,
         })
     }
 }
@@ -196,6 +205,7 @@ impl Default for SessionPolicy {
             login_window: false,
             lossless_refinement: true,
             fps_ceiling: None,
+            desk_privacy: false,
         }
     }
 }
@@ -560,8 +570,6 @@ pub enum HandshakeError {
     ApplicationHandshakeTimeout,
     /// The client could not prove an account.
     Rejected(crate::auth::AuthFailure),
-    /// The client's multi-monitor request was not safe to apply.
-    MultiMonitor(String),
     /// The client's auth-time video request was invalid.
     VideoRequest(String),
     /// The credentials were accepted and the Deck was told why the session
@@ -585,7 +593,6 @@ impl std::fmt::Display for HandshakeError {
                 formatter.write_str("the client did not complete the application handshake in time")
             }
             Self::Rejected(failure) => write!(formatter, "authentication refused: {failure}"),
-            Self::MultiMonitor(detail) => write!(formatter, "multi-monitor refused: {detail}"),
             Self::VideoRequest(detail) => write!(formatter, "video request refused: {detail}"),
             Self::SetupRefused(refusal) => write!(formatter, "session setup refused: {refusal}"),
             Self::EncoderUnavailable(detail) => write!(formatter, "encoder unavailable: {detail}"),
@@ -1351,6 +1358,7 @@ async fn perform_application_handshake(
         admission,
         deck_refine,
         admitted_video,
+        multi_monitor,
     ) = authenticate(
         socket,
         &advertised,
@@ -1377,11 +1385,7 @@ async fn perform_application_handshake(
     // represents is also HDR. A bright SDR Deck panel may state luminance but
     // must not make the host create a PQ/BT.2020 desktop.
     let pq_requested = initial_video.as_ref().is_some_and(requests_pq);
-    // `ARCEN_HDR_PANEL=sdr` is a measurement lever: it serves an HDR request
-    // on an SDR panel, which is how the degradation path is exercised on a
-    // host that could otherwise prove HDR.
-    let force_sdr_panel = std::env::var("ARCEN_HDR_PANEL").as_deref() == Ok("sdr");
-    let panel = select_virtual_panel(pq_requested, force_sdr_panel, client_display.as_ref());
+    let panel = select_virtual_panel(pq_requested, force_sdr_panel(), client_display.as_ref());
     if let Some(client_monitor) = client_display.as_ref() {
         let color = client_monitor
             .color
@@ -1442,6 +1446,7 @@ async fn perform_application_handshake(
             "HDR desktop proof"
         );
     }
+    let monitor_refresh_hz = admitted_video.monitor_refresh_hz.clone();
     let resolved_video = plan_initial_video(admitted_video, &advertised, hdr_output);
     let plan = resolved_video.plan;
     // Resolved before the hello is built, because the hello states the codec
@@ -1458,20 +1463,27 @@ async fn perform_application_handshake(
     let motion_priority = resolved_video.motion_priority;
     let requested_pipeline = resolved_video.requested_pipeline;
     let active_pipeline = resolved_video.active_pipeline;
-    let multi_monitor = crate::multi_monitor::admit_virtual_request(
-        advertised.multi_monitor_v1.as_ref(),
-        requested_multi_monitor.as_ref(),
-        plan,
-        codec,
-        fps,
-        pq_requested,
-        force_sdr_panel,
-    )
-    .map_err(|error| HandshakeError::MultiMonitor(error.to_string()))?;
+    // Each monitor at its own Deck display's rate, never above the
+    // session's: a slow display never caps a fast one.
+    let monitor_rate = |client_display_id: &str| {
+        monitor_rate_for(
+            stream_rate,
+            requested_pipeline,
+            &monitor_refresh_hz,
+            client_display_id,
+        )
+    };
     let (multi_monitor, multi_monitor_displays) = match multi_monitor {
         Some((plan, displays)) => (Some(plan), Some(displays)),
         None => (None, None),
     };
+    // A multi-monitor session states its primary monitor's own rate.
+    let stream_rate = multi_monitor
+        .as_ref()
+        .and_then(|plan| plan.monitors.iter().find(|monitor| monitor.is_primary))
+        .map_or(stream_rate, |primary| {
+            monitor_rate(primary.client_display_id.as_str())
+        });
 
     // Native tablet must work on the first connection (ADR 0022 §8): the
     // capability probe started before authentication; a probe still running
@@ -1992,7 +2004,7 @@ fn requests_pq(video: &arcen_protocol::messages::InitialVideoRequestMsg) -> bool
 /// The auth-time video request checked against this host: everything about
 /// it that can be refused, decided before the Deck is answered
 /// (`arcen_session::session_setup`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AdmittedInitialVideo {
     /// What the Deck asked for and what this host resolved it to; `None`
     /// when the Deck stated no request.
@@ -2001,6 +2013,11 @@ struct AdmittedInitialVideo {
         arcen_media::video::ResolvedHostInitialVideo,
     )>,
     codec: crate::encode::EncoderCodec,
+    /// Each requested monitor's own Deck display refresh, by client display
+    /// id (`AuthResponse::monitor_display_refresh_hz`); empty without a
+    /// multi-monitor request. Each monitor is served at its own
+    /// (`arcen_media::video::monitor_frame_rate`).
+    monitor_refresh_hz: Vec<(String, u32)>,
 }
 
 impl AdmittedInitialVideo {
@@ -2034,6 +2051,7 @@ fn admit_initial_video(
 
     let Some(video) = video else {
         return Ok(AdmittedInitialVideo {
+            monitor_refresh_hz: Vec::new(),
             request: None,
             codec: if capabilities.hevc {
                 crate::encode::EncoderCodec::Hevc
@@ -2116,6 +2134,7 @@ fn admit_initial_video(
     Ok(AdmittedInitialVideo {
         request: Some((client, host_resolved)),
         codec,
+        monitor_refresh_hz: Vec::new(),
     })
 }
 
@@ -2235,6 +2254,82 @@ fn resolve_initial_video(
 /// correct password, and does so in a way that looks exactly like a bad
 /// password, which is why this is separated out and tested directly.
 #[must_use]
+/// Match My Layout's plan and the virtual displays it runs on, when the Deck
+/// asked for it.
+type AdmittedMultiMonitor = Option<(
+    crate::multi_monitor::MacOsMultiMonitorPlan,
+    crate::multi_monitor::MacOsVirtualDisplays,
+)>;
+
+/// Whether `ARCEN_HDR_PANEL=sdr` asks for an HDR request to be served on an
+/// SDR panel: a measurement lever for the degradation path on a host that
+/// could otherwise prove HDR.
+fn force_sdr_panel() -> bool {
+    std::env::var("ARCEN_HDR_PANEL").as_deref() == Ok("sdr")
+}
+
+/// Admits a Match My Layout request: one virtual display per requested
+/// monitor, planned for the session's video. In that mode HDR is proved per
+/// display after creation, so the request, not the primary physical display,
+/// decides the video tier.
+///
+/// # Errors
+///
+/// The reason the layout cannot be served.
+fn admit_multi_monitor(
+    capabilities: &AdvertisedCapabilities,
+    initial_video: Option<&arcen_protocol::messages::InitialVideoRequestMsg>,
+    request: Option<&arcen_protocol::messages::AuthMultiMonitorRequestMsg>,
+    video: &AdmittedInitialVideo,
+) -> Result<AdmittedMultiMonitor, String> {
+    if request.is_none() {
+        return Ok(None);
+    }
+    let pq_requested = initial_video.is_some_and(requests_pq);
+    let resolved = plan_initial_video(video.clone(), capabilities, pq_requested);
+    let stream_rate = arcen_media::video::served_stream_rate(
+        resolved.frame_rate,
+        resolved.fps,
+        arcen_media::video::FrameRateBasis::Encoder,
+    );
+    let monitor_fps = |client_display_id: &str| {
+        monitor_rate_for(
+            stream_rate,
+            resolved.requested_pipeline,
+            &video.monitor_refresh_hz,
+            client_display_id,
+        )
+        .fps
+    };
+    crate::multi_monitor::admit_virtual_request(
+        capabilities.multi_monitor_v1.as_ref(),
+        request,
+        resolved.plan,
+        resolved.codec,
+        &monitor_fps,
+        pq_requested,
+        force_sdr_panel(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// A monitor's rate: its own Deck display's, never above the session's.
+fn monitor_rate_for(
+    stream_rate: arcen_media::video::SessionFrameRate,
+    requested_pipeline: Option<arcen_media::video::PipelineId>,
+    monitor_refresh_hz: &[(String, u32)],
+    client_display_id: &str,
+) -> arcen_media::video::SessionFrameRate {
+    arcen_media::video::monitor_frame_rate(
+        stream_rate,
+        requested_pipeline,
+        monitor_refresh_hz
+            .iter()
+            .find(|(id, _)| id == client_display_id)
+            .map(|(_, refresh)| *refresh),
+    )
+}
+
 fn credentials_from(response: &arcen_protocol::messages::AuthResponse) -> Option<(&str, &str)> {
     // Only PAM is offered, so anything else is a client asking for a scheme
     // this host did not advertise.
@@ -2271,6 +2366,7 @@ async fn authenticate(
         Option<AdmissionGuard>,
         Option<arcen_protocol::refine::LosslessRefineCapability>,
         AdmittedInitialVideo,
+        AdmittedMultiMonitor,
     ),
     HandshakeError,
 > {
@@ -2363,7 +2459,10 @@ async fn authenticate(
                 response.display_refresh_hz(),
                 capabilities,
             ) {
-                Ok(video) => Ok((authenticated, video)),
+                Ok(mut video) => {
+                    video.monitor_refresh_hz = response.monitor_display_refreshes();
+                    Ok((authenticated, video))
+                }
                 Err(error) => {
                     let refusal =
                         arcen_session::session_setup::SetupRefusal::video_request(match error {
@@ -2400,6 +2499,34 @@ async fn authenticate(
             Err(_) => Err(crate::auth::AuthFailure::HostBusy),
         },
     });
+    // Match My Layout's displays, once the slot is held and before the Deck
+    // is answered, as the Linux Pier admits its topology: a layout this host
+    // cannot build is refused with its reason (`multi_monitor_refused`), not
+    // closed without a word after "authenticated".
+    let outcome = match outcome {
+        Ok((authenticated, admission, video)) => match admit_multi_monitor(
+            capabilities,
+            response.initial_video.as_ref(),
+            response.multi_monitor_v1.as_ref(),
+            &video,
+        ) {
+            Ok(multi_monitor) => Ok((authenticated, admission, video, multi_monitor)),
+            Err(detail) => {
+                drop(admission);
+                let refusal = arcen_session::session_setup::SetupRefusal::multi_monitor(detail);
+                let result =
+                    serde_json::to_string(&AuthResult::session_setup_refused(refusal.message()))
+                        .map_err(|error| {
+                            HandshakeError::Transport(format!("encode auth_result: {error}"))
+                        })?;
+                net::send_json(socket, result)
+                    .await
+                    .map_err(HandshakeError::Transport)?;
+                return Err(HandshakeError::SetupRefused(refusal));
+            }
+        },
+        Err(failure) => Err(failure),
+    };
 
     // The reply says only whether it worked. Which half was wrong, and
     // whether the account exists at all, stay on this side.
@@ -2408,6 +2535,9 @@ async fn authenticate(
         success: outcome.is_ok(),
         message: match &outcome {
             Ok(_) => "Authenticated".to_owned(),
+            Err(crate::auth::AuthFailure::NotConsoleOwner) => {
+                crate::console::other_user_refusal(crate::console::console_owner().as_deref())
+            }
             Err(failure) => failure.to_string(),
         },
         resume_grant: None,
@@ -2427,7 +2557,7 @@ async fn authenticate(
         // credentials, so it is carried out of here rather than re-read later:
         // the hello the Deck is told and the capture the host starts must come
         // from one decision.
-        Ok((authenticated, admission, video)) => Ok((
+        Ok((authenticated, admission, video, multi_monitor)) => Ok((
             authenticated.user,
             response.initial_video.take(),
             response.multi_monitor_v1.take(),
@@ -2442,6 +2572,7 @@ async fn authenticate(
             admission,
             response.lossless_refine_v1.take(),
             video,
+            multi_monitor,
         )),
         Err(failure) => Err(HandshakeError::Rejected(failure)),
     }
@@ -3878,6 +4009,51 @@ mod tests {
         let pier_side = authenticate(&mut pier, &capabilities, None, None, None, None);
         let (result, outcome) = tokio::join!(deck_side, pier_side);
         (result, outcome.map(|_| ()))
+    }
+
+    #[tokio::test]
+    async fn a_layout_this_host_did_not_offer_is_refused_with_its_reason_before_the_answer() {
+        use arcen_protocol::messages::{AuthResponse, AuthResult};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let _turn = SIGN_IN_TESTS.lock().await;
+        let (pier_end, deck_end) = tokio::net::UnixStream::pair().expect("socket pair");
+        let mut pier = net::framed(net::PierStream::Relayed(pier_end)).await;
+        let mut deck =
+            tokio_tungstenite::WebSocketStream::from_raw_socket(deck_end, Role::Client, None).await;
+        let mut response = AuthResponse::pam("layout-refusal-test", "valid");
+        response.multi_monitor_v1 = Some(crate::multi_monitor::tests::two_request());
+        let deck_side = async {
+            let _request = deck.next().await.expect("auth_request").expect("frame");
+            deck.send(Message::Text(
+                serde_json::to_string(&response).expect("encode"),
+            ))
+            .await
+            .expect("send auth_response");
+            let Message::Text(result) = deck.next().await.expect("auth_result").expect("frame")
+            else {
+                panic!("auth_result is text");
+            };
+            serde_json::from_str::<AuthResult>(&result).expect("auth_result parses")
+        };
+        // This host offered no multi-monitor support at all.
+        let capabilities = capabilities();
+        let pier_side = authenticate(&mut pier, &capabilities, None, None, None, None);
+        let (result, outcome) = tokio::join!(deck_side, pier_side);
+        assert!(!result.success);
+        assert!(result.session_setup_failed, "{result:?}");
+        assert!(
+            result.message.starts_with("multi_monitor_refused: "),
+            "{}",
+            result.message
+        );
+        assert!(matches!(
+            outcome,
+            Err(HandshakeError::SetupRefused(
+                arcen_session::session_setup::SetupRefusal::MultiMonitor(_)
+            ))
+        ));
     }
 
     #[tokio::test]

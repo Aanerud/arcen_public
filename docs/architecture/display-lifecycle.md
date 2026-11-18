@@ -77,14 +77,19 @@ cannot move an elevated window (UIPI) leaves it and logs it.
 | | Linux | Windows | macOS |
 | --- | --- | --- | --- |
 | Displays Arcen creates | Private Xorg outputs, Mutter `RecordVirtual` monitors | NVIDIA headless EDIDs; IddCx monitors (dormant) | `CGVirtualDisplay` |
-| Host displays Arcen changes | None (deskside xrandr blanking has its own restore) | Isolation, primary, position, mode, UI scale, HDR | None (virtual display origins only, `kCGConfigureForSession`) |
+| Host displays Arcen changes | A joined console: its NV-CONTROL MetaMode, RandR primary and unused heads (journalled, restored exactly); deskside xrandr blanking has its own restore | Isolation, primary, position, mode, UI scale, HDR | None (virtual display origins only, `kCGConfigureForSession`) |
 | Removal | With the desktop (idle timeout or sign-out) | Journal restore | Child process exit (pipe closed) |
 | Unclean exit | Processes; outputs go with their server | Watchdog; console recovery at start and console change | Child exits on the closed pipe |
-| Stranded windows | Die with the desktop | Moved back (`window_layout`) | macOS moves them off a departed display |
+| Stranded windows | Die with the desktop; a joined console's windows that the layout moved go back to their recorded places (`console_windows`, `plan_window_restore`) | Moved back (`window_layout`) | macOS moves them off a departed display |
 
-The differences are earned (ledger PD-032): only the Windows Pier attaches to a
-console session and changes displays it did not create, and only Windows leaves
-windows on a re-activated path. The macOS Pier has no direct resume yet
+The differences are earned (ledger PD-032) for the desktops a Pier creates. A
+Linux console join also changes displays it did not create. It records the
+console's windows (EWMH) before the layout and once the layout has settled. The
+hand-back then moves back every window the layout moved and the Deck's user did
+not (`plan_window_restore`). On the lab host, GNOME Shell 40 already returned
+windows to a monitor when it came back, so the Pier had nothing to move there.
+Other EWMH window managers get the same result from the Pier. The Windows Pier attaches to a console session, changes
+its displays and repatriates its windows. The macOS Pier has no direct resume yet
 (GAP-003), so a transport loss there removes its virtual displays at once.
 
 ## Research

@@ -95,6 +95,8 @@ use arcen_media::{
     TopologyGeneration, TopologyPlacementError, TransformConvention,
 };
 
+use crate::ui_scale::{OutputScaleFacts, WindowsUiScale, whole_millimetres};
+
 /// A Windows adapter LUID (`LUID`: `LowPart`, `HighPart`), the stable
 /// identity of the adapter that owns an output for one boot.
 ///
@@ -653,8 +655,14 @@ pub struct WindowsMonitorPlan {
     /// Requested logical desktop rectangle retained in shared fixed-point
     /// units so region input never re-derives it from applied pixels.
     pub logical_rect: LogicalRect,
-    /// Requested presentation scale in the shared 1/120 representation.
+    /// Requested presentation scale in the shared 1/120 representation:
+    /// the stream's logical-to-physical ratio, for regions. Never the UI
+    /// scale (see `ui_scale`).
     pub scale: Scale120,
+    /// The Windows UI scale this monitor is given: the client's request
+    /// from the millimetres it advertised (its Remote UI scale), and the
+    /// Windows step that serves it.
+    pub ui_scale: WindowsUiScale,
     pub refresh_hz: u32,
     pub rotation: Rotation,
     pub primary: bool,
@@ -752,6 +760,29 @@ fn region_logical_rect(monitor: &RequestedMonitor) -> Result<LogicalRect, Window
     Ok(arcen_media::logical_rect_from_layout(
         monitor.logical_arrangement_rect()?,
     )?)
+}
+
+/// The Windows UI scale for one requested client display: from the
+/// millimetres the client advertised for its Remote UI scale, else from its
+/// backing ratio ([`crate::ui_scale`]).
+#[must_use]
+pub fn monitor_ui_scale(monitor: &arcen_media::Monitor) -> WindowsUiScale {
+    let logical_width = (monitor.scale.is_finite() && monitor.scale > 0.0)
+        .then(|| f64::from(monitor.width_px) / f64::from(monitor.scale))
+        .filter(|logical| logical.is_finite() && *logical >= 1.0 && *logical <= f64::from(u32::MAX))
+        .map(|logical| {
+            // Range-checked above.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let logical = logical.round() as u32;
+            logical
+        });
+    WindowsUiScale::from_facts(&OutputScaleFacts {
+        width_px: monitor.width_px,
+        height_px: monitor.height_px,
+        logical_width,
+        width_mm: whole_millimetres(monitor.width_mm),
+        height_mm: whole_millimetres(monitor.height_mm),
+    })
 }
 
 fn region_scale(client_display_id: &str, scale: f32) -> Result<Scale120, WindowsTopologyError> {
@@ -890,6 +921,7 @@ pub fn plan_current_topology(
             mode_height: ccd_mode.target_height,
             logical_rect: region_logical_rect(&requested_monitors[monitor_index])?,
             scale: region_scale(&monitor.identity.id, monitor.scale)?,
+            ui_scale: monitor_ui_scale(monitor),
             refresh_hz: output.current_refresh_hz.max(1),
             rotation: ccd_mode.target_rotation,
             primary: monitor.primary,
@@ -1108,6 +1140,7 @@ pub fn plan_topology(
             mode_height: ccd_mode.target_height,
             logical_rect: region_logical_rect(applied_monitor.requested_monitor())?,
             scale,
+            ui_scale: monitor_ui_scale(applied_monitor.monitor()),
             refresh_hz,
             rotation: ccd_mode.target_rotation,
             primary: applied_monitor.monitor().primary,
@@ -1446,6 +1479,61 @@ mod tests {
             .expect("second monitor");
         assert_eq!(second.x, 1_920);
         assert_eq!(second.y, 0);
+    }
+
+    #[test]
+    fn each_monitor_gets_the_ui_scale_its_millimetres_ask_for_not_its_stream_ratio() {
+        // Match my layout with a fixed Remote UI scale of 150%: a point
+        // stream (ratio 1) and a 2x backing stream; and, without
+        // millimetres, a 2x stream keeps its ratio.
+        let inventory = PhysicalOutputInventory::new(vec![
+            output(luid(1), 0, 1_920, 1_080),
+            output(luid(1), 1, 2_880, 1_800),
+            output(luid(1), 2, 2_880, 1_800),
+        ])
+        .expect("inventory");
+        let mm = |pixels: u16, percent: f32| f32::from(pixels) * 25.4 / (96.0 * percent / 100.0);
+        let mut point = monitor("point", (0, 0), (1_920, 1_080), true, Rotation::Degrees0);
+        point.monitor.width_mm = mm(1_920, 150.0);
+        point.monitor.height_mm = mm(1_080, 150.0);
+        let mut backing = monitor_scaled(
+            "backing",
+            (1_920, 0),
+            (2_880, 1_800),
+            (1_440, 900),
+            2.0,
+            false,
+            Rotation::Degrees0,
+        );
+        backing.monitor.width_mm = mm(2_880, 300.0);
+        backing.monitor.height_mm = mm(1_800, 300.0);
+        let legacy = monitor_scaled(
+            "legacy",
+            (3_360, 0),
+            (2_880, 1_800),
+            (1_440, 900),
+            2.0,
+            false,
+            Rotation::Degrees0,
+        );
+        let requested =
+            RequestedMonitorTopology::new(vec![point, backing, legacy]).expect("topology");
+        let plan = plan_topology(&requested, generation(), &inventory).expect("plan");
+        let scales = ["point", "backing", "legacy"].map(|id| {
+            let monitor = monitor_plan(&plan, id);
+            (monitor.ui_scale.step_percent, monitor.ui_scale.basis)
+        });
+        assert_eq!(
+            scales,
+            [
+                (150, crate::ScaleBasis::RequestedDensity),
+                (300, crate::ScaleBasis::RequestedDensity),
+                (200, crate::ScaleBasis::BackingPixels),
+            ]
+        );
+        // The region scale stays the stream's ratio.
+        assert_eq!(monitor_plan(&plan, "point").scale.get(), 120);
+        assert_eq!(monitor_plan(&plan, "backing").scale.get(), 240);
     }
 
     #[test]

@@ -426,7 +426,8 @@ a Developer ID profile cannot silently be reused in development mode either.
 - Product message framing remains local. The active dependency-light
   `arcen-transport` default supplies shared TLS lifecycle and pin contracts,
   while its Quinn surface supplies the direct QUIC stream carrier. The Deck has
-  no WSS networking (removed 2026-11-15, with its `wss-compat` feature); a
+  no WSS networking (removed 2026-11-15, with its `wss-compat` feature; the
+  Piers' dormant listener followed on 2026-11-18); a
   connection saved as WSS by an older Deck loads as QUIC.
 - Windows Pier pen: shipped as a Windows Ink pen from typed pen events
   (`InjectSyntheticPointerInput`); raw HID reports and Native tablet are not

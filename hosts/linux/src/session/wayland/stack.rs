@@ -253,6 +253,22 @@ impl MemberEnvironment {
     }
 }
 
+impl MemberEnvironment {
+    /// [`Self::command`] for the compositor: without the user's GPU and
+    /// driver selection, which its applications keep
+    /// (`login_environment::selects_gpu_or_driver`); every other variable,
+    /// Arcen's own (`DCONF_PROFILE`, the keyring's) included, stays.
+    pub fn compositor_command(&self, binary: impl AsRef<OsStr>) -> Command {
+        let mut command = self.command(binary);
+        for (name, _) in &self.extra {
+            if arcen_session::desktop_session::login_environment::selects_gpu_or_driver(name) {
+                command.env_remove(name);
+            }
+        }
+        command
+    }
+}
+
 /// Mutter's environment switch that forces every colour device into an HDR
 /// (BT.2100) colour state.
 pub const FORCE_HDR_ENV: &str = "MUTTER_DEBUG_FORCE_HDR";
@@ -381,7 +397,9 @@ impl HeadlessStack {
         // private bus to activate it (see `start_accessibility_bus`).
         stack.start_accessibility_bus().await;
 
-        let mut shell = stack.command(&compositor_binary(compositor));
+        let mut shell = stack
+            .members
+            .compositor_command(compositor_binary(compositor));
         let arguments = compositor_arguments(outputs, mode, x11);
         if super::native_seat() {
             shell.args(super::native_seat_arguments(arguments));
@@ -1260,6 +1278,56 @@ mod tests {
         );
         assert_eq!(environment.get("DISPLAY"), Some(&None));
         assert_eq!(environment.get("WAYLAND_DISPLAY"), Some(&None));
+    }
+
+    #[test]
+    fn the_compositor_starts_without_the_users_gpu_selection_that_members_keep() {
+        let mut members = MemberEnvironment::new(Path::new("/run/user/1000/arcen-wayland-7"));
+        members.set("__NV_PRIME_RENDER_OFFLOAD", "1");
+        members.set("MESA_LOADER_DRIVER_OVERRIDE", "zink");
+        members.set("LM_LICENSE_FILE", "27000@licence.example.internal");
+        // Arcen's own session variables reach the compositor.
+        members.set(
+            "DCONF_PROFILE",
+            "/run/user/1000/arcen-wayland-7/dconf/profile",
+        );
+        members.set("SSH_AUTH_SOCK", "/run/user/1000/keyring/ssh");
+        let env_of = |command: &Command, wanted: &str| {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == wanted)
+                .map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+        };
+        let compositor = members.compositor_command("/usr/bin/gnome-shell");
+        assert_eq!(env_of(&compositor, "__NV_PRIME_RENDER_OFFLOAD"), Some(None));
+        assert_eq!(
+            env_of(&compositor, "MESA_LOADER_DRIVER_OVERRIDE"),
+            Some(None)
+        );
+        assert_eq!(
+            env_of(&compositor, "LM_LICENSE_FILE"),
+            Some(Some("27000@licence.example.internal".to_owned()))
+        );
+        assert_eq!(
+            env_of(&compositor, "DCONF_PROFILE"),
+            Some(Some(
+                "/run/user/1000/arcen-wayland-7/dconf/profile".to_owned()
+            ))
+        );
+        assert_eq!(
+            env_of(&compositor, "SSH_AUTH_SOCK"),
+            Some(Some("/run/user/1000/keyring/ssh".to_owned()))
+        );
+        let bus = members.command("/usr/bin/dbus-daemon");
+        assert_eq!(
+            env_of(&bus, "__NV_PRIME_RENDER_OFFLOAD"),
+            Some(Some("1".to_owned()))
+        );
+        assert_eq!(
+            env_of(&bus, "MESA_LOADER_DRIVER_OVERRIDE"),
+            Some(Some("zink".to_owned()))
+        );
     }
 
     #[test]

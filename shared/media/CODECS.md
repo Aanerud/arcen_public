@@ -107,11 +107,11 @@ Then prove it on hardware, because a plan that resolves is not a session that
 streams:
 
 ```sh
-PROBE_HOST=<host> PROBE_USER=<user> PROBE_PASS="$PW" \
-  python3 tools/session-probe/arcen-session-probe.py
+"/Applications/Arcen Deck.app/Contents/MacOS/arcen-deck" media-smoke <host> \
+  --username <user> --credentials-stdin
 ```
 
-Assert on `encoder_backend` and `codec` in the output. A test that passes
+Assert on `encoder` and `codec` in the hello line it prints. A test that passes
 because it silently fell back to H.264 has told you nothing.
 
 ---

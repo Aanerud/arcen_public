@@ -456,6 +456,7 @@ fn show(args: &[String]) -> Result<bool, String> {
         (String::new(), String::new())
     };
     let options = ConnectOptions {
+        display_refresh: None,
         services: Arc::new(ShowServices {
             decode: probe.capabilities,
         }),

@@ -53,6 +53,19 @@ const SIGN_IN_KEEPS_GREETER: Duration = Duration::from_secs(8);
 /// How often the signed-in session is brought back in front of a new login
 /// screen before the sign-in gives up.
 const SIGN_IN_BRING_FORWARD_ATTEMPTS: u32 = 3;
+/// How long a remote-first sign-in waits for the login screen's shell
+/// (GDM restarted, or a login screen brought to its terminal).
+const LOGIN_SCREEN_READY: Duration = Duration::from_secs(15);
+/// How often a sign-in brings a login screen that lost its terminal switch
+/// to its terminal.
+const LOGIN_SCREEN_BRING_ATTEMPTS: u32 = 2;
+/// A login screen's shell takes the sign-in token only once its login
+/// dialog listens; one that started a moment ago may not yet. While the
+/// token is unspent it is given again after this long.
+const TOKEN_RESEND_AFTER: Duration = Duration::from_secs(5);
+const TOKEN_RESENDS: u32 = 3;
+/// How often the Pier looks for a login screen left without its terminal.
+const LOGIN_SCREEN_WATCH_TICK: Duration = Duration::from_secs(2);
 /// How long a joined session's X display may take to answer (a session the
 /// login screen just started).
 const DISPLAY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -411,9 +424,12 @@ pub(crate) fn connect_reporting(
 ) -> Result<RustConnection, String> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    // Non-blocking: a FIFO put where the authority file was would block
+    // the open itself, before the file type is checked (a regular file's
+    // reads ignore the flag).
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
         .open(&display.xauthority)
         .map_err(|error| format!("open X authority: {error}"))?;
     let metadata = file
@@ -434,7 +450,7 @@ pub(crate) fn connect_reporting(
         .read_to_end(&mut cookie)
         .map_err(|error| format!("read X authority: {error}"))?;
     let cookie = model::mit_magic_cookie(&cookie, display.number);
-    let stream = std::os::unix::net::UnixStream::connect(socket_path(display.number))
+    let stream = connect_without_waiting(&socket_path(display.number))
         .map_err(|error| format!("connect X socket: {error}"))?;
     let peer = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
         .map_err(|error| format!("X socket peer: {error}"))?;
@@ -453,6 +469,34 @@ pub(crate) fn connect_reporting(
     };
     RustConnection::connect_to_stream_with_auth_info(stream, 0, name, data)
         .map_err(|error| format!("X setup: {error}"))
+}
+
+/// Connects to a local socket without waiting for a listener that does not
+/// accept: a full backlog (a squatter that listens and never accepts) is
+/// an error at once, never a thread blocked in `connect` beyond any bound.
+fn connect_without_waiting(path: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, UnixAddr};
+    use std::os::fd::AsRawFd as _;
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    )?;
+    let address = UnixAddr::new(path)?;
+    match connect(fd.as_raw_fd(), &address) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EAGAIN) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "the X socket accepts no connection",
+            ))
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let stream = std::os::unix::net::UnixStream::from(fd);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
 }
 
 /// Writes a root-only journal (`0600`, atomically renamed into place) in a
@@ -1246,14 +1290,18 @@ impl ConsolePrivacy {
         })
     }
 
-    /// Makes the console private: input disabled, monitors blank.
+    /// Makes the console private: input disabled, monitors blank. A Deck
+    /// is attached again: the next hand-back's failed lock starts its own
+    /// grace ([`model::UNLOCKED_GRACE`]).
     pub(crate) fn arm(
         &mut self,
         display: &SessionDisplay,
         session_id: &str,
     ) -> Result<(), ConsoleRefusal> {
         self.disable_input()?;
-        self.blank(display, session_id)
+        self.blank(display, session_id)?;
+        UnlockedSince::clear();
+        Ok(())
     }
 
     /// Blanks the desk's monitors (proving them blank again when they
@@ -1319,8 +1367,12 @@ impl ConsolePrivacy {
         }
         let work = async {
             super::console_layout::wait_for_desktop_settled(uid).await;
-            let applied = super::console_layout::apply(display, session_id, requests).await?;
-            match applied.settle().await {
+            let mut applied = super::console_layout::apply(display, session_id, requests).await?;
+            let settled = applied.settle().await;
+            if settled.is_ok() {
+                applied.note_settled_windows();
+            }
+            match settled {
                 Ok(0) => {}
                 Ok(times) => tracing::info!(
                     target: target::SESSION,
@@ -1643,6 +1695,10 @@ impl SessionState {
     fn hand_back(&self) -> model::UnlockedHandBack {
         model::unlocked_hand_back(self.lookup())
     }
+
+    fn hand_back_after(&self, unlocked_for: Duration) -> model::UnlockedHandBack {
+        model::unlocked_hand_back_after(self.lookup(), unlocked_for)
+    }
 }
 
 /// Where logind keeps a state file for every session it knows.
@@ -1705,31 +1761,98 @@ async fn session_display_alive(session_id: &str) -> bool {
 }
 
 /// Whether `session_id` may be shown at the desk again: locked, gone, or
-/// no longer in the foreground. A session that will not lock is sent
-/// behind a login screen instead; Arcen's own login session, and one
-/// logind could not describe, never are
-/// ([`model::UnlockedHandBack::KeepPrivate`]).
+/// another product's session no longer in the foreground. A session that
+/// will not lock is sent behind a login screen; a display manager's stays
+/// private there until it locks (a key chord would switch to it), and
+/// Arcen's own login session, and one logind could not describe, are never
+/// given back unlocked ([`model::UnlockedHandBack::KeepPrivate`]).
 pub(crate) async fn secure_session(session_id: &str) -> bool {
     if lock_session(session_id).await {
+        UnlockedSince::clear();
         return true;
     }
-    match session_state(session_id).await.hand_back() {
+    let unlocked_for = UnlockedSince::of(session_id);
+    let secured = secure_unlocked(session_id, unlocked_for).await;
+    if secured {
+        UnlockedSince::clear();
+    }
+    secured
+}
+
+/// When Arcen first failed to lock a console session (root-only, survives
+/// launchers and Pier restarts), for [`model::UNLOCKED_GRACE`].
+#[derive(Debug, Serialize, Deserialize)]
+struct UnlockedSince {
+    session_id: String,
+    since: u64,
+}
+
+impl UnlockedSince {
+    const PATH: &'static str = "/run/arcen/console-unlocked.json";
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs())
+    }
+
+    /// How long `session_id` has stayed unlocked; starts the clock now
+    /// for a session not seen before.
+    fn of(session_id: &str) -> Duration {
+        let now = Self::now();
+        let recorded = read_root_journal(Path::new(Self::PATH))
+            .and_then(|text| serde_json::from_slice::<Self>(&text).ok())
+            .filter(|record| record.session_id == session_id && record.since <= now);
+        if let Some(record) = recorded {
+            return Duration::from_secs(now - record.since);
+        }
+        let record = Self {
+            session_id: session_id.to_owned(),
+            since: now,
+        };
+        if let Ok(text) = serde_json::to_vec(&record) {
+            let _ = write_root_journal(Path::new(Self::PATH), &text);
+        }
+        Duration::ZERO
+    }
+
+    fn clear() {
+        let _ = std::fs::remove_file(Self::PATH);
+    }
+}
+
+async fn secure_unlocked(session_id: &str, unlocked_for: Duration) -> bool {
+    match session_state(session_id)
+        .await
+        .hand_back_after(unlocked_for)
+    {
         model::UnlockedHandBack::Gone | model::UnlockedHandBack::InBackground => return true,
         model::UnlockedHandBack::KeepPrivate => return false,
         model::UnlockedHandBack::BehindLoginScreen => {}
     }
     if switch_to_login_screen().await {
         for _ in 0..20 {
-            if matches!(
-                session_state(session_id).await.hand_back(),
-                model::UnlockedHandBack::Gone | model::UnlockedHandBack::InBackground
-            ) {
-                tracing::warn!(
-                    target: target::SESSION,
-                    session_id,
-                    "the console session did not lock; a login screen covers it instead"
-                );
-                return true;
+            match session_state(session_id)
+                .await
+                .hand_back_after(unlocked_for)
+            {
+                model::UnlockedHandBack::Gone | model::UnlockedHandBack::InBackground => {
+                    tracing::warn!(
+                        target: target::SESSION,
+                        session_id,
+                        "the console session did not lock; a login screen covers it instead"
+                    );
+                    return true;
+                }
+                model::UnlockedHandBack::KeepPrivate => {
+                    tracing::warn!(
+                        target: target::SESSION,
+                        session_id,
+                        "the console session did not lock; the login screen is in front and the session stays private behind it until it locks (at most a minute)"
+                    );
+                    return false;
+                }
+                model::UnlockedHandBack::BehindLoginScreen => {}
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -1852,19 +1975,48 @@ static RECOVERY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Callers hold [`RECOVERY`].
 async fn recover(retry: bool) -> bool {
-    let Some(mut journal) = PrivacyJournal::read() else {
+    recover_with(&mut LiveRecovery, retry).await
+}
+
+/// What recovering a console left by a launcher that did not hand it back
+/// does to the console ([`recover_with`]); the live one is
+/// [`LiveRecovery`].
+trait ConsoleRecovery {
+    fn read_journal(&mut self) -> Option<PrivacyJournal>;
+    /// The session of a layout journal with no privacy journal beside it.
+    fn layout_session(&mut self) -> Option<String>;
+    /// Blanks the journalled monitors again and disables the desk's
+    /// devices; never restores anything.
+    fn keep_desk_unusable(&mut self, journal: &mut PrivacyJournal);
+    /// Locks the session (proved), keeping the desk unusable meanwhile.
+    async fn secure(&mut self, session_id: &str, journal: Option<&mut PrivacyJournal>) -> bool;
+    async fn kept_private_by_design(&mut self, session_id: &str) -> bool;
+    /// Restores the console's own layout (and windows).
+    async fn restore_layout(&mut self);
+    /// Gives the monitors their own ramps and the desk its devices;
+    /// `false` when a device stayed disabled.
+    fn give_back(&mut self, journal: &PrivacyJournal) -> bool;
+    fn remove_journal(&mut self);
+}
+
+/// Recovers a console a launcher left private or laid out: the session is
+/// secured (locked) before anything is given back, and while it cannot be,
+/// the desk stays unusable and the journal stays. Returns whether nothing
+/// is left to recover.
+async fn recover_with(host: &mut impl ConsoleRecovery, retry: bool) -> bool {
+    let Some(mut journal) = host.read_journal() else {
         // Monitors already shown again but the layout not restored (the
         // launcher died between the two): the session is secured first.
-        if let Some(session_id) = super::console_layout::journalled_session() {
-            if secure_session(&session_id).await {
-                super::console_layout::recover().await;
+        if let Some(session_id) = host.layout_session() {
+            if host.secure(&session_id, None).await {
+                host.restore_layout().await;
             }
         }
         return true;
     };
     // Unusable first: securing the session can take seconds, and nothing
     // grabs the desk's devices while no launcher runs.
-    keep_desk_unusable(&mut journal);
+    host.keep_desk_unusable(&mut journal);
     if !retry {
         tracing::warn!(
             target: target::SESSION,
@@ -1872,9 +2024,61 @@ async fn recover(retry: bool) -> bool {
             "a console was left private by a launcher that did not hand it back; locking it and restoring its monitors"
         );
     }
-    let secured = {
-        let session_id = journal.session_id.clone();
-        let secure = secure_session(&session_id);
+    let session_id = journal.session_id.clone();
+    if !host.secure(&session_id, Some(&mut journal)).await {
+        if !retry {
+            if host.kept_private_by_design(&session_id).await {
+                tracing::info!(
+                    target: target::SESSION,
+                    session_id = %session_id,
+                    "the login session stays private (no lock screen without a display manager) until its account signs in through Arcen again or signs out"
+                );
+            } else {
+                tracing::error!(
+                    target: target::SESSION,
+                    session_id = %session_id,
+                    "the console session could not be locked; its monitors stay blank and the desk's input disabled until it is (retried every 10 s; or sign the session out)"
+                );
+            }
+        }
+        host.keep_desk_unusable(&mut journal);
+        return false;
+    }
+    // The layout while the monitors are still blank (ADR 0025 §6).
+    host.restore_layout().await;
+    if !host.give_back(&journal) {
+        return false;
+    }
+    host.remove_journal();
+    tracing::info!(
+        target: target::SESSION,
+        session_id = %session_id,
+        "the console left private is secured and handed back to the desk"
+    );
+    true
+}
+
+/// The console itself: X, logind, the root journals.
+struct LiveRecovery;
+
+impl ConsoleRecovery for LiveRecovery {
+    fn read_journal(&mut self) -> Option<PrivacyJournal> {
+        PrivacyJournal::read()
+    }
+
+    fn layout_session(&mut self) -> Option<String> {
+        super::console_layout::journalled_session()
+    }
+
+    fn keep_desk_unusable(&mut self, journal: &mut PrivacyJournal) {
+        keep_desk_unusable(journal);
+    }
+
+    async fn secure(&mut self, session_id: &str, journal: Option<&mut PrivacyJournal>) -> bool {
+        let Some(journal) = journal else {
+            return secure_session(session_id).await;
+        };
+        let secure = secure_session(session_id);
         tokio::pin!(secure);
         let mut tick = tokio::time::interval(UNUSABLE_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1882,51 +2086,39 @@ async fn recover(retry: bool) -> bool {
         loop {
             tokio::select! {
                 secured = &mut secure => break secured,
-                _ = tick.tick() => keep_desk_unusable(&mut journal),
+                _ = tick.tick() => keep_desk_unusable(journal),
             }
         }
-    };
-    if !secured {
-        if !retry {
-            if kept_private_by_design(&journal.session_id).await {
-                tracing::info!(
-                    target: target::SESSION,
-                    session_id = %journal.session_id,
-                    "the login session stays private (no lock screen without a display manager) until its account signs in through Arcen again or signs out"
-                );
-            } else {
-                tracing::error!(
-                    target: target::SESSION,
-                    session_id = %journal.session_id,
-                    "the console session could not be locked; its monitors stay blank and the desk's input disabled until it is (retried every 10 s; or sign the session out)"
-                );
-            }
-        }
-        keep_desk_unusable(&mut journal);
-        return false;
     }
-    // The layout while the monitors are still blank (ADR 0025 §6).
-    super::console_layout::recover().await;
-    match connect(&journal.display) {
-        Ok(connection) => {
-            restore_gamma(&connection, &journal.gamma);
-            if !enable_x_devices(&connection, &journal.x_disabled) {
-                return false;
+
+    async fn kept_private_by_design(&mut self, session_id: &str) -> bool {
+        kept_private_by_design(session_id).await
+    }
+
+    async fn restore_layout(&mut self) {
+        super::console_layout::recover().await;
+    }
+
+    fn give_back(&mut self, journal: &PrivacyJournal) -> bool {
+        match connect(&journal.display) {
+            Ok(connection) => {
+                restore_gamma(&connection, &journal.gamma);
+                enable_x_devices(&connection, &journal.x_disabled)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: target::SESSION,
+                    %error,
+                    "the console's display is gone; nothing to restore"
+                );
+                true
             }
         }
-        Err(error) => tracing::warn!(
-            target: target::SESSION,
-            %error,
-            "the console's display is gone; nothing to restore"
-        ),
     }
-    PrivacyJournal::remove();
-    tracing::info!(
-        target: target::SESSION,
-        session_id = %journal.session_id,
-        "the console left private is secured and handed back to the desk"
-    );
-    true
+
+    fn remove_journal(&mut self) {
+        PrivacyJournal::remove();
+    }
 }
 
 /// Blanks the journalled display again and disables the desk's devices in
@@ -2118,6 +2310,83 @@ pub(crate) async fn guard_unsecured_console() {
     }
 }
 
+/// The Pier's watch over the console's login screen: one that GDM left
+/// waiting for its terminal after a session ended (no X server, no shell,
+/// nothing in front of the seat) is brought there, so the person at the
+/// desk gets the login screen back. Only while no console launcher runs
+/// (a sign-in brings it there itself).
+pub(crate) async fn guard_login_screen() {
+    let mut tick = tokio::time::interval(LOGIN_SCREEN_WATCH_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut watch = model::login_screen::StalledLoginScreens::default();
+    loop {
+        tick.tick().await;
+        let Ok(gate) = std::sync::Arc::clone(&CONSOLE_GATE).try_lock_owned() else {
+            continue;
+        };
+        let sessions = read_sessions().await;
+        let mut without_shell = Vec::new();
+        for greeter in sessions.iter().filter(|fact| fact.is_console_greeter()) {
+            if session_processes(&greeter.id, greeter.uid).is_empty() {
+                without_shell.push(greeter.id.clone());
+            }
+        }
+        let foreground_vt = foreground_vt();
+        if let Some(id) = watch.observe(
+            &sessions,
+            &without_shell,
+            foreground_vt,
+            std::time::Instant::now(),
+        ) {
+            let activated = activate_session(&id).await;
+            // A display manager fault: recorded at every profile.
+            tracing::error!(
+                target: target::SESSION,
+                greeter_session = %id,
+                activated,
+                attempt = watch.attempts(&id),
+                "the login screen was left waiting for its terminal after a session ended (GDM's switch was lost); it is brought there"
+            );
+        }
+        drop(gate);
+    }
+}
+
+/// The virtual terminal in front (`/sys/class/tty/tty0/active`), 0 unknown.
+fn foreground_vt() -> u32 {
+    std::fs::read_to_string("/sys/class/tty/tty0/active")
+        .ok()
+        .and_then(|active| active.trim().strip_prefix("tty")?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Ends the login screen session that took a remote-first sign-in when GDM
+/// has finished it but processes it left behind keep it (an `ibus-daemon`
+/// of a crashed greeter shell): they keep the display manager's account
+/// manager running, which lets the next login screen lose its terminal
+/// switch when this session ends.
+pub(crate) async fn end_finished_login_screen(greeter_session: &str) {
+    let Some(fact) = session_fact(greeter_session).await else {
+        return;
+    };
+    let leader_alive = fact.leader != 0 && process_state(fact.leader).is_some();
+    if !model::login_screen::finished_but_lingering(&fact, leader_alive) {
+        return;
+    }
+    let leftovers = session_processes(greeter_session, fact.uid);
+    let mut terminate = Command::new(LOGINCTL);
+    terminate.args(["terminate-session", greeter_session]);
+    let ended = bounded_output(terminate).await.is_some();
+    tracing::info!(
+        target: target::SESSION,
+        greeter_session,
+        leftovers = leftovers.len(),
+        processes = %leftovers.iter().map(|process| process.comm.as_str()).collect::<Vec<_>>().join(","),
+        ended,
+        "the finished login screen's leftover processes are ended"
+    );
+}
+
 /// SSSD's configuration as SSSD loads it: `sssd.conf` and every
 /// `conf.d/*.conf` snippet (root's, bounded), for the domain logon check.
 pub(crate) fn sssd_files() -> Vec<model::domain_logon::SssdFile> {
@@ -2262,74 +2531,175 @@ fn write_record(
     Ok(path)
 }
 
-/// Sends the token to the login screen's own bus connections only (never
-/// broadcast): the processes of gnome-shell in the login screen's session.
-async fn send_token(greeter_session: &str, token: &str) -> Result<usize, String> {
-    use zbus::fdo::{DBusProxy, RequestNameFlags, RequestNameReply};
-    let greeter_uid = session_fact(greeter_session)
+/// The login screen's processes that are its own (not the display
+/// manager's worker, which runs as root): its display server and shell.
+async fn login_screen_processes(greeter_session: &str) -> Option<Vec<SessionProcess>> {
+    let uid = session_fact(greeter_session)
         .await
         .filter(|fact| fact.class == "greeter")
-        .map(|fact| fact.uid)
-        .ok_or("the login screen's session is gone")?;
-    let shells: Vec<u32> = session_processes(greeter_session, greeter_uid)
-        .into_iter()
+        .map(|fact| fact.uid)?;
+    Some(session_processes(greeter_session, uid))
+}
+
+fn shell_pids(processes: &[SessionProcess]) -> Vec<u32> {
+    processes
+        .iter()
         .filter(|process| process.comm == "gnome-shell")
         .map(|process| process.pid)
-        .collect();
-    if shells.is_empty() {
-        return Err("the login screen's shell is not running".to_owned());
-    }
-    let connection = zbus::Connection::system()
-        .await
-        .map_err(|error| format!("system bus: {error}"))?;
-    let reply = connection
-        .request_name_with_flags(greeter_token::BUS_NAME, RequestNameFlags::DoNotQueue.into())
-        .await
-        .map_err(|error| format!("credential name: {error}"))?;
-    if reply != RequestNameReply::PrimaryOwner {
-        return Err("another service owns the login screen's credential name".to_owned());
-    }
-    let proxy = DBusProxy::new(&connection)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut targets = Vec::new();
-    for name in proxy
-        .list_names()
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        if !name.as_str().starts_with(':') {
-            continue;
+        .collect()
+}
+
+/// Waits (bounded) until the login screen a remote-first sign-in goes
+/// through runs its shell, and returns that login screen. One that lost
+/// GDM's terminal switch while nothing is in front of the seat
+/// ([`model::login_screen`]) is brought to its terminal, which lets GDM
+/// start its X server and shell; a login screen GDM replaced meanwhile is
+/// followed.
+pub(crate) async fn ready_login_screen(greeter_session: &str) -> Result<String, ConsoleRefusal> {
+    use model::login_screen::LoginScreenStep;
+    let deadline = tokio::time::Instant::now() + LOGIN_SCREEN_READY;
+    let mut greeter = greeter_session.to_owned();
+    let mut brought = 0_u32;
+    loop {
+        let sessions = read_sessions().await;
+        let processes = login_screen_processes(&greeter).await.unwrap_or_default();
+        let shell_running = !shell_pids(&processes).is_empty();
+        match model::login_screen::step(&sessions, &greeter, shell_running) {
+            LoginScreenStep::Ready => {
+                if brought > 0 {
+                    tracing::info!(
+                        target: target::SESSION,
+                        greeter_session = %greeter,
+                        "the login screen runs after it was brought to its terminal"
+                    );
+                }
+                return Ok(greeter);
+            }
+            LoginScreenStep::BringToTerminal(id) if brought < LOGIN_SCREEN_BRING_ATTEMPTS => {
+                brought += 1;
+                let activated = activate_session(&id).await;
+                // A display manager fault: recorded at every profile.
+                tracing::error!(
+                    target: target::SESSION,
+                    greeter_session = %id,
+                    activated,
+                    "the login screen was waiting for its terminal with nothing in front (GDM's switch was lost while the previous session ended); it is brought there"
+                );
+            }
+            LoginScreenStep::Gone => {
+                if let Some(next) = sessions.iter().find(|fact| fact.is_console_greeter()) {
+                    next.id.clone_into(&mut greeter);
+                    continue;
+                }
+            }
+            LoginScreenStep::BringToTerminal(_) | LoginScreenStep::Wait => {}
         }
-        if let Ok(pid) = proxy.get_connection_unix_process_id(name.as_ref()).await {
-            if shells.contains(&pid) {
-                targets.push(name);
+        if tokio::time::Instant::now() >= deadline {
+            tracing::error!(
+                target: target::SESSION,
+                greeter_session = %greeter,
+                brought,
+                processes = processes.len(),
+                "the login screen's shell is not running"
+            );
+            return Err(ConsoleRefusal::SignInUnavailable);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Gives the sign-in token to the login screen's own bus connections only
+/// (never broadcast): the processes of gnome-shell in the login screen's
+/// session. Owns the credential name until the sign-in completes: the
+/// login screen checks the sender against the name's owner.
+struct TokenSender {
+    connection: zbus::Connection,
+    greeter_session: String,
+}
+
+impl TokenSender {
+    async fn new(greeter_session: &str) -> Result<Self, String> {
+        use zbus::fdo::{RequestNameFlags, RequestNameReply};
+        let connection = zbus::Connection::system()
+            .await
+            .map_err(|error| format!("system bus: {error}"))?;
+        let reply = connection
+            .request_name_with_flags(greeter_token::BUS_NAME, RequestNameFlags::DoNotQueue.into())
+            .await
+            .map_err(|error| format!("credential name: {error}"))?;
+        if reply != RequestNameReply::PrimaryOwner {
+            return Err("another service owns the login screen's credential name".to_owned());
+        }
+        // The login screen's proxy follows the name's owner: give it a
+        // moment to see the new owner before the signal arrives.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Ok(Self {
+            connection,
+            greeter_session: greeter_session.to_owned(),
+        })
+    }
+
+    /// Sends `token` to every shell connection of the login screen; how
+    /// many took it. `unspent`, when given, is checked again just before
+    /// each signal: a shell that receives the token while its conversation
+    /// already runs restarts it, which must never happen once the PAM
+    /// module has spent the record.
+    async fn send(&self, token: &str, unspent: Option<&Path>) -> Result<usize, String> {
+        use zbus::fdo::DBusProxy;
+        let shells = shell_pids(
+            &login_screen_processes(&self.greeter_session)
+                .await
+                .ok_or("the login screen's session is gone")?,
+        );
+        if shells.is_empty() {
+            return Err("the login screen's shell is not running".to_owned());
+        }
+        let proxy = DBusProxy::new(&self.connection)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut targets = Vec::new();
+        for name in proxy
+            .list_names()
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            if !name.as_str().starts_with(':') {
+                continue;
+            }
+            if let Ok(pid) = proxy.get_connection_unix_process_id(name.as_ref()).await {
+                if shells.contains(&pid) {
+                    targets.push(name);
+                }
             }
         }
+        for target in &targets {
+            if unspent.is_some_and(|record| !record.exists()) {
+                break;
+            }
+            self.connection
+                .emit_signal(
+                    Some(target.as_ref()),
+                    greeter_token::OBJECT_PATH,
+                    greeter_token::INTERFACE,
+                    greeter_token::SIGNAL,
+                    &(token,),
+                )
+                .await
+                .map_err(|error| format!("credential signal: {error}"))?;
+        }
+        Ok(targets.len())
     }
-    // The login screen's proxy follows the name's owner: give it a moment
-    // to see the new owner before the signal arrives.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    for target in &targets {
-        connection
-            .emit_signal(
-                Some(target.as_ref()),
-                greeter_token::OBJECT_PATH,
-                greeter_token::INTERFACE,
-                greeter_token::SIGNAL,
-                &(token,),
-            )
-            .await
-            .map_err(|error| format!("credential signal: {error}"))?;
+}
+
+impl Drop for TokenSender {
+    /// Keeps owning the name until a late sign-in could still complete.
+    fn drop(&mut self) {
+        let connection = self.connection.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SIGN_IN_TIMEOUT).await;
+            let _ = connection.release_name(greeter_token::BUS_NAME).await;
+        });
     }
-    // Keep owning the name until the sign-in completes: the login screen
-    // checks the sender against the name's owner.
-    let sent = targets.len();
-    tokio::spawn(async move {
-        tokio::time::sleep(SIGN_IN_TIMEOUT).await;
-        let _ = connection.release_name(greeter_token::BUS_NAME).await;
-    });
-    Ok(sent)
 }
 
 /// Completes a remote-first sign-in through GDM's login screen and returns
@@ -2372,10 +2742,17 @@ pub(crate) async fn sign_in_through_greeter(
         }
     }
     let _spend = Spend(record_path.clone());
-    match send_token(greeter_session, &token).await {
+    let sender = TokenSender::new(greeter_session).await.map_err(|error| {
+        tracing::error!(target: target::SESSION, %error, "the login screen could not be given the sign-in");
+        ConsoleRefusal::SignInUnavailable
+    })?;
+    let sent = sender.send(&token, None).await;
+    let mut sent_at = tokio::time::Instant::now();
+    let mut resends = 0_u32;
+    match sent {
+        // A shell that has not joined the system bus yet: given again below.
         Ok(0) => {
-            tracing::error!(target: target::SESSION, "no login-screen connection took the sign-in token");
-            return Err(ConsoleRefusal::SignInUnavailable);
+            tracing::warn!(target: target::SESSION, "no login-screen connection took the sign-in token yet");
         }
         Ok(connections) => tracing::info!(
             target: target::SESSION,
@@ -2389,7 +2766,6 @@ pub(crate) async fn sign_in_through_greeter(
             return Err(ConsoleRefusal::SignInUnavailable);
         }
     }
-    drop(token);
     let deadline = tokio::time::Instant::now() + SIGN_IN_TIMEOUT;
     let mut spent_logged = false;
     let mut brought_forward = 0_u32;
@@ -2397,6 +2773,23 @@ pub(crate) async fn sign_in_through_greeter(
         if !spent_logged && !record_path.exists() {
             spent_logged = true;
             tracing::info!(target: target::SESSION, "the login screen spent the sign-in token");
+        }
+        // A shell that started a moment ago may not have listened yet: the
+        // token goes again while nothing has spent it.
+        if !spent_logged
+            && resends < TOKEN_RESENDS
+            && sent_at.elapsed() >= TOKEN_RESEND_AFTER
+            && record_path.exists()
+        {
+            resends += 1;
+            sent_at = tokio::time::Instant::now();
+            let sent = sender.send(&token, Some(&record_path)).await;
+            tracing::warn!(
+                target: target::SESSION,
+                resends,
+                connections = sent.as_ref().map_or(0, |count| *count),
+                "the login screen had not taken the sign-in token; it is given again"
+            );
         }
         let sessions = read_sessions().await;
         if let Some(session) = sessions
@@ -2701,6 +3094,150 @@ impl ConsoleDesk for LiveDesk<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A console left behind by a launcher that died (killed, crashed):
+    /// records what recovery does to it, in order.
+    struct DeadLauncherConsole {
+        journal: Option<PrivacyJournal>,
+        layout_session: Option<String>,
+        locks: bool,
+        devices_back: bool,
+        log: Vec<&'static str>,
+    }
+
+    impl DeadLauncherConsole {
+        fn new(locks: bool) -> Self {
+            Self {
+                journal: Some(PrivacyJournal {
+                    session_id: "c7".to_owned(),
+                    display: SessionDisplay {
+                        display: ":1".to_owned(),
+                        number: 1,
+                        xauthority: PathBuf::from("/run/user/1000/gdm/Xauthority"),
+                        uid: Some(1000),
+                    },
+                    gamma: Vec::new(),
+                    x_disabled: Vec::new(),
+                }),
+                layout_session: Some("c7".to_owned()),
+                locks,
+                devices_back: true,
+                log: Vec::new(),
+            }
+        }
+
+        fn recover(&mut self) -> bool {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+                .block_on(recover_with(self, false))
+        }
+    }
+
+    impl ConsoleRecovery for DeadLauncherConsole {
+        fn read_journal(&mut self) -> Option<PrivacyJournal> {
+            self.journal.clone()
+        }
+        fn layout_session(&mut self) -> Option<String> {
+            self.layout_session.clone()
+        }
+        fn keep_desk_unusable(&mut self, _journal: &mut PrivacyJournal) {
+            self.log.push("unusable");
+        }
+        async fn secure(
+            &mut self,
+            _session_id: &str,
+            _journal: Option<&mut PrivacyJournal>,
+        ) -> bool {
+            self.log.push("lock");
+            self.locks
+        }
+        async fn kept_private_by_design(&mut self, _session_id: &str) -> bool {
+            false
+        }
+        async fn restore_layout(&mut self) {
+            self.log.push("layout");
+        }
+        fn give_back(&mut self, _journal: &PrivacyJournal) -> bool {
+            self.log.push("give_back");
+            self.devices_back
+        }
+        fn remove_journal(&mut self) {
+            self.log.push("journal_removed");
+            self.journal = None;
+        }
+    }
+
+    #[test]
+    fn a_console_a_dead_launcher_left_is_locked_before_anything_is_given_back() {
+        let mut console = DeadLauncherConsole::new(true);
+        assert!(console.recover());
+        assert_eq!(
+            console.log,
+            ["unusable", "lock", "layout", "give_back", "journal_removed"]
+        );
+    }
+
+    #[test]
+    fn a_console_that_will_not_lock_stays_unusable_and_journalled() {
+        let mut console = DeadLauncherConsole::new(false);
+        assert!(!console.recover());
+        assert_eq!(console.log, ["unusable", "lock", "unusable"]);
+        assert!(console.journal.is_some());
+        // A device that stays disabled keeps the journal too.
+        let mut console = DeadLauncherConsole::new(true);
+        console.devices_back = false;
+        assert!(!console.recover());
+        assert!(console.journal.is_some());
+    }
+
+    #[test]
+    fn a_layout_left_without_privacy_is_restored_only_once_locked() {
+        let mut console = DeadLauncherConsole::new(false);
+        console.journal = None;
+        assert!(console.recover());
+        assert_eq!(console.log, ["lock"]);
+        let mut console = DeadLauncherConsole::new(true);
+        console.journal = None;
+        assert!(console.recover());
+        assert_eq!(console.log, ["lock", "layout"]);
+    }
+
+    /// A listener that never accepts fills its backlog; the next connect
+    /// fails at once instead of blocking the root Pier's thread.
+    #[test]
+    fn connecting_to_a_listener_that_never_accepts_fails_at_once() {
+        use nix::sys::socket::{
+            bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, UnixAddr,
+        };
+        let path = std::env::temp_dir().join(format!("arcen-x-squat-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = socket(
+            AddressFamily::Unix,
+            SockType::Stream,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        bind(
+            std::os::fd::AsRawFd::as_raw_fd(&listener),
+            &UnixAddr::new(&path).unwrap(),
+        )
+        .unwrap();
+        listen(&listener, Backlog::new(0).unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let mut held = Vec::new();
+        let refused = loop {
+            match connect_without_waiting(&path) {
+                Ok(stream) => held.push(stream),
+                Err(error) => break error,
+            }
+            assert!(held.len() < 64, "the backlog never filled");
+        };
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock, "{refused}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[tokio::test]
     async fn the_desk_gets_its_sound_back_once_and_a_returning_deck_silences_it_again() {

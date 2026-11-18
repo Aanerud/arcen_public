@@ -67,3 +67,67 @@ impl TileEncoder {
             .map_err(TileEncodeError::Zstd)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::cast_precision_loss)]
+mod bench {
+    use super::*;
+
+    /// A photo-like 10-bit tile: smooth light plus sensor noise.
+    fn photo_tile(seed: u32) -> TileCodes {
+        let (width, height) = (256_u32, 64_u32);
+        let mut state = seed.wrapping_mul(2_654_435_761).max(1);
+        let mut samples = Vec::with_capacity((width * height * 3) as usize);
+        for plane in 0..3_u32 {
+            for y in 0..height {
+                for x in 0..width {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let base = 300 + (x * 2 + y * 3 + plane * 50 + seed % 200) % 400;
+                    let noise = state % 9;
+                    samples.push(u16::try_from(base + noise).unwrap_or(1023));
+                }
+            }
+        }
+        TileCodes::new(width, height, samples).expect("tile")
+    }
+
+    /// Throughput of one and two encoders over a 4K frame's tiles (510);
+    /// run with `--ignored --nocapture` on the target host.
+    #[test]
+    #[ignore = "benchmark"]
+    fn worker_throughput() {
+        let tiles: Vec<TileCodes> = (0..510).map(photo_tile).collect();
+        let raw = tiles.len() * 256 * 64 * 6;
+        let run = |workers: usize| {
+            let started = std::time::Instant::now();
+            let compressed: usize = std::thread::scope(|scope| {
+                let handles: Vec<_> = tiles
+                    .chunks(tiles.len().div_ceil(workers))
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            let mut encoder = TileEncoder::new().expect("encoder");
+                            chunk
+                                .iter()
+                                .map(|tile| encoder.encode(tile, 10).expect("encode").len())
+                                .sum::<usize>()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("join")).sum()
+            });
+            let secs = started.elapsed().as_secs_f64();
+            println!(
+                "workers={workers} frame_ms={:.1} raw_mbyte_s={:.0} out_mbit_s={:.0} ratio={:.2}",
+                secs * 1000.0,
+                raw as f64 / secs / 1e6,
+                compressed as f64 * 8.0 / secs / 1e6,
+                raw as f64 / compressed as f64
+            );
+        };
+        for workers in [1, 2, 1, 2] {
+            run(workers);
+        }
+    }
+}

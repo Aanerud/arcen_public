@@ -7,7 +7,7 @@
 //! Xorg head/output index; no measurement adapter is allowed to auto-select a
 //! different GPU or backend.
 
-use arcen_media::video::{adaptive_codec_ladder, EncoderBackend};
+use arcen_media::video::{adaptive_roster_codec_ladder, EncoderBackend};
 use arcen_media::{
     admit_encoder_sets, ActivityClass, BitrateBudgetKbps, ChromaSubsampling, DirtyRatio,
     EncoderAdmissionError, EncoderAdmissionThresholds, EncoderBindingId, EncoderMeasurementAdapter,
@@ -49,6 +49,18 @@ pub enum LinuxEncoderAdmissionError {
     },
     #[error("monitor {monitor_id} uses unsupported Annex-B codec {codec:?}")]
     UnsupportedCodec { monitor_id: u16, codec: String },
+    #[error(
+        "the requested {codec} cannot encode a {width}x{height} monitor on NVENC (at most \
+         {max_width}x{max_height}); an exact request keeps its codec, Auto would climb to one \
+         that fits"
+    )]
+    CodecExceedsEncoder {
+        codec: String,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -230,7 +242,10 @@ pub fn plan_encoder_sets(
             vec![hardware_max]
         };
 
-    let codec_templates = adaptive_codec_templates(template);
+    let codec_templates = adaptive_codec_templates(topology, template);
+    if let [only] = codec_templates.as_slice() {
+        refuse_oversize_codec(topology, only)?;
+    }
     let mut sets = Vec::with_capacity(hardware_counts.len() * codec_templates.len());
     // Exhaust same-GPU codec options before moving any region to software.
     // This preserves the product ranking: hardware AV1 -> hardware HEVC ->
@@ -267,8 +282,13 @@ pub fn plan_encoder_sets(
 /// Expand one adaptive NVENC preference into uniform, whole-roster codec
 /// candidates. The aggregate admission framework measures candidate zero for
 /// every region before moving to candidate one, so no monitor can independently
-/// fall back to a different codec.
-fn adaptive_codec_templates(template: &MonitorPipelineTemplate) -> Vec<MonitorPipelineTemplate> {
+/// fall back to a different codec. A codec that cannot encode the largest
+/// monitor is no candidate; past H.264's ceiling the roster climbs to a codec
+/// the Deck decodes (`adaptive_codec_ladder_for_size`).
+fn adaptive_codec_templates(
+    topology: &LinuxTopologyPlan,
+    template: &MonitorPipelineTemplate,
+) -> Vec<MonitorPipelineTemplate> {
     if template.encoder != EncoderSelection::NativeNvenc
         || template.video_selection
             != arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance
@@ -279,7 +299,16 @@ fn adaptive_codec_templates(template: &MonitorPipelineTemplate) -> Vec<MonitorPi
     let Some(preferred) = VideoCodec::from_token(&template.codec) else {
         return vec![template.clone()];
     };
-    adaptive_codec_ladder(preferred)
+    let ladder = adaptive_roster_codec_ladder(
+        preferred,
+        EncoderBackend::NativeNvenc,
+        topology
+            .monitors
+            .iter()
+            .map(|monitor| (monitor.width, monitor.height)),
+        template.client_video,
+    );
+    ladder
         .iter()
         .map(|codec| {
             let mut candidate = template.clone();
@@ -291,6 +320,41 @@ fn adaptive_codec_templates(template: &MonitorPipelineTemplate) -> Vec<MonitorPi
             candidate
         })
         .collect()
+}
+
+/// Refuses, before any encoder is probed, a roster whose one NVENC codec
+/// cannot encode its largest monitor (`codec_dimension_ceiling`): an exact
+/// H.264 request on 5120 px monitors otherwise fails `InitializeEncoder`
+/// and reads as a capacity refusal.
+fn refuse_oversize_codec(
+    topology: &LinuxTopologyPlan,
+    template: &MonitorPipelineTemplate,
+) -> Result<(), LinuxEncoderAdmissionError> {
+    if template.encoder != EncoderSelection::NativeNvenc {
+        return Ok(());
+    }
+    let Some(codec) = VideoCodec::from_token(&template.codec) else {
+        return Ok(());
+    };
+    let (max_width, max_height) =
+        arcen_media::video::codec_dimension_ceiling(EncoderBackend::NativeNvenc, codec);
+    match topology.monitors.iter().find(|monitor| {
+        !arcen_media::video::codec_fits_dimensions(
+            EncoderBackend::NativeNvenc,
+            codec,
+            monitor.width,
+            monitor.height,
+        )
+    }) {
+        Some(monitor) => Err(LinuxEncoderAdmissionError::CodecExceedsEncoder {
+            codec: template.codec.clone(),
+            width: monitor.width,
+            height: monitor.height,
+            max_width,
+            max_height,
+        }),
+        None => Ok(()),
+    }
 }
 
 fn activity_profiles(
@@ -630,6 +694,7 @@ mod tests {
             codec: "h265".to_owned(),
             encoder: EncoderSelection::NativeNvenc,
             fps: 60,
+            monitor_fps: Vec::new(),
             yuv444: true,
             bit_depth: arcen_media::BitDepth::Ten,
             color_range: arcen_media::ColorRange::Full,
@@ -647,6 +712,7 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            client_video: None,
             cursor_mode: CursorMode::Local,
             display: Some(":99".to_owned()),
             xauthority: None,
@@ -772,6 +838,71 @@ mod tests {
             .specs
             .iter()
             .all(|spec| spec.config.bit_depth == arcen_media::BitDepth::Eight));
+    }
+
+    /// Two 5K console monitors and a Deck that asked for H.264 under Auto:
+    /// NVENC's H.264 stops at 4096, so the roster is offered HEVC, then AV1,
+    /// and never an H.264 candidate that fails `InitializeEncoder`.
+    #[test]
+    fn a_5k_roster_past_h264s_ceiling_climbs_to_a_codec_the_deck_decodes() {
+        let mut topology = topology();
+        topology.monitors = vec![
+            sized_monitor(
+                1,
+                "DFP-0",
+                true,
+                MonitorQualityIntentMsg::HostDefault,
+                5_120,
+                2_880,
+            ),
+            sized_monitor(
+                2,
+                "DFP-1",
+                false,
+                MonitorQualityIntentMsg::HostDefault,
+                5_120,
+                2_880,
+            ),
+        ];
+        let mut template = template();
+        template.codec = "h264".to_string();
+        template.yuv444 = false;
+        template.video_selection =
+            arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance;
+        let codecs = |template: &MonitorPipelineTemplate| {
+            plan_encoder_sets(&topology, template, None, false)
+                .expect("plan")
+                .sets
+                .iter()
+                .map(|set| set.specs[0].config.codec.clone())
+                .collect::<Vec<_>>()
+        };
+        template.client_video = Some(arcen_protocol::messages::ClientVideoCapabilitiesMsg {
+            h264: true,
+            h265: true,
+            av1: true,
+            ..arcen_protocol::messages::ClientVideoCapabilitiesMsg::default()
+        });
+        assert_eq!(codecs(&template), ["h265", "av1"]);
+        // A Deck that decodes only H.264, and an exact H.264 request, keep
+        // their codec and are refused by name before any encoder is probed.
+        template.client_video = Some(arcen_protocol::messages::ClientVideoCapabilitiesMsg {
+            h264: true,
+            ..arcen_protocol::messages::ClientVideoCapabilitiesMsg::default()
+        });
+        let refused = |template: &MonitorPipelineTemplate| {
+            matches!(
+                plan_encoder_sets(&topology, template, None, false),
+                Err(LinuxEncoderAdmissionError::CodecExceedsEncoder {
+                    width: 5_120,
+                    max_width: 4_096,
+                    ..
+                })
+            )
+        };
+        assert!(refused(&template));
+        template.video_selection = arcen_protocol::messages::VideoSelectionIntent::Exact;
+        assert!(refused(&template));
     }
 
     #[test]

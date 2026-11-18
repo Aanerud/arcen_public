@@ -16,6 +16,7 @@ pub mod multi_window_diagnostic;
 pub mod multi_window_runtime;
 pub mod multi_window_session;
 mod option_keys;
+mod pass_pacing;
 mod paste_keys;
 pub(crate) mod pen_input;
 #[cfg(target_os = "macos")]

@@ -272,6 +272,10 @@ pub fn session_seat(
         Some(session) if session.session_type == "wayland" || session.wayland.is_some() => {
             arcen_usb_bridge::HardUsbSessionSeat::Seatless
         }
+        // The console's own X server (GDM's, or another remote product's
+        // such as a field workstation's `:100`) never admits a bridged
+        // device: refused before the bridge starts, with the reason.
+        Some(session) if session.console => arcen_usb_bridge::HardUsbSessionSeat::JoinedConsole,
         Some(_) => arcen_usb_bridge::HardUsbSessionSeat::X11Desktop,
         None => arcen_usb_bridge::HardUsbSessionSeat::ConsoleSeat,
     }
@@ -1996,6 +2000,16 @@ mod session_admission_tests {
             arcen_usb_bridge::HardUsbSessionSeat::X11Desktop
         );
         assert_eq!(session_admission(Some(&session("x11"))), Ok(()));
+        // The desktop on the machine's own monitors (GDM's, or another
+        // product's `:100` joined as a guest) is refused up front, with why.
+        let mut console = session("x11");
+        console.console = true;
+        console.console_guest = true;
+        console.display = ":100".into();
+        assert_eq!(
+            session_admission(Some(&console)),
+            Err(arcen_usb_bridge::HardUsbSessionDenial::JoinedConsole)
+        );
         // Without a desktop there is only the console seat: a bridged
         // device would reach the login screen.
         let denial = session_admission(None).unwrap_err();

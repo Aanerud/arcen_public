@@ -84,10 +84,10 @@ such a host anyway.
 | macOS | A Core Audio process tap captures the system output and mutes it; it needs System Audio Recording. | The tap captures without muting. |
 | Linux, X11 session | The session agent loads an Arcen session sink in the user's audio server (PulseAudio or `pipewire-pulse`), makes it the default, mutes **every other sink** and moves every stream onto it, and keeps that true for the whole session. Arcen records the session sink. Every change is journalled; at the end only what the lease changed is restored (a sink the user had muted stays muted), and a journal left by a killed agent is restored by the launcher. If the same user is also signed in at the console, that console's speakers are silent during the remote session too. | Nothing in the user's audio server changes; Arcen records the default sink. |
 | Linux, Wayland session | The session's audio is a private graph: its own sink and its own PulseAudio-protocol server, with no speaker, so nothing reaches the room; the same check proves it. On a host whose audio server is PulseAudio itself (no `pipewire-pulse`), the session's graph is bridged into the user's PulseAudio, which gets the X11 lease. | The session sink is also played into the user's own default sink. |
-| Windows | Not implemented yet. | — |
+| Windows | The service mutes every active output device (`IAudioEndpointVolume`), which leaves the session's audio capture (WASAPI loopback) untouched, and keeps them muted for the whole session, detached time included, until the session is locked; a device plugged in, or unmuted, meanwhile is muted again within a second. Each mute is journalled first (`%ProgramData%\Arcen\recovery\local-playback.json`) and only those devices are unmuted at the end (a device the user had muted stays muted); a journal a stopped service left is undone at its next start. | Nothing changes. |
 
-A Linux host with neither an audio server nor a sound card is silent by
-construction and is served under `muted`.
+A Linux host with neither an audio server nor a sound card, or a Windows host
+with no output device, is silent by construction and is served under `muted`.
 
 **Upgrading a Linux host.** Linux Piers before this release ignored the
 setting. An existing configuration without `local_playback` now gets the

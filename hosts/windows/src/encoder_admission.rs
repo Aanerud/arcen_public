@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use arcen_media::video::{adaptive_codec_ladder, EncoderBackend};
+use arcen_media::video::{adaptive_roster_codec_ladder, EncoderBackend};
 use arcen_media::{
     admit_encoder_sets, ActivityClass, BitrateBudgetKbps,
     ChromaSubsampling as MediaChromaSubsampling, DirtyRatio, EncoderAdmissionError,
@@ -399,7 +399,7 @@ pub fn plan_encoder_sets(
     } else {
         vec![hardware_max]
     };
-    let codec_templates = adaptive_codec_templates(template);
+    let codec_templates = adaptive_codec_templates(topology, template);
     let mut sets = Vec::with_capacity(hardware_counts.len() * codec_templates.len());
     // Exhaust same-GPU codec options before moving any region to OpenH264.
     for hardware_count in hardware_counts {
@@ -434,25 +434,41 @@ pub fn plan_encoder_sets(
     Ok(WindowsEncoderAdmissionPlan { sets, profiles })
 }
 
-fn adaptive_codec_templates(template: &MonitorPipelineTemplate) -> Vec<MonitorPipelineTemplate> {
+/// Uniform whole-roster codec candidates for an adaptive NVENC roster. A
+/// codec that cannot encode the largest monitor is no candidate; past
+/// H.264's ceiling the roster climbs to a codec the Deck decodes
+/// (`adaptive_codec_ladder_for_size`).
+fn adaptive_codec_templates(
+    topology: &WindowsTopologyPlan,
+    template: &MonitorPipelineTemplate,
+) -> Vec<MonitorPipelineTemplate> {
     if template.encoder != Some(EncoderRequest::NativeNvenc)
         || template.video_selection
             != arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance
     {
         return vec![template.clone()];
     }
-    adaptive_codec_ladder(crate::capenc::media_codec(template.codec))
+    let sizes = topology
+        .monitors
         .iter()
-        .map(|codec| {
-            let mut candidate = template.clone();
-            candidate.codec = crate::capenc::protocol_codec(*codec);
-            candidate.chroma = ChromaSubsampling::Yuv420;
-            if *codec == MediaVideoCodec::H264 {
-                candidate.bit_depth = arcen_media::BitDepth::Eight;
-            }
-            candidate
-        })
-        .collect()
+        .map(|monitor| (monitor.width, monitor.height));
+    adaptive_roster_codec_ladder(
+        crate::capenc::media_codec(template.codec),
+        EncoderBackend::NativeNvenc,
+        sizes,
+        template.client_video,
+    )
+    .iter()
+    .map(|codec| {
+        let mut candidate = template.clone();
+        candidate.codec = crate::capenc::protocol_codec(*codec);
+        candidate.chroma = ChromaSubsampling::Yuv420;
+        if *codec == MediaVideoCodec::H264 {
+            candidate.bit_depth = arcen_media::BitDepth::Eight;
+        }
+        candidate
+    })
+    .collect()
 }
 
 fn activity_profiles(
@@ -693,10 +709,10 @@ fn candidate_from_specs(
         let software = backend == EncoderBackend::OpenH264;
         let fps = if software {
             template
-                .fps
+                .fps_for(monitor.session_monitor_id)
                 .min(EncoderBackend::OpenH264.contract().max_fps)
         } else {
-            template.fps
+            template.fps_for(monitor.session_monitor_id)
         };
         plans.push(RegionMediaPlan::new(
             monitor.session_monitor_id,
@@ -800,6 +816,10 @@ mod tests {
             )
             .expect("rect"),
             scale: Scale120::new(120).expect("scale"),
+            ui_scale: arcen_outputs::WindowsUiScale::from_percent(
+                100,
+                arcen_outputs::ScaleBasis::Unknown,
+            ),
             refresh_hz: 60,
             rotation: Rotation::Degrees0,
             primary,
@@ -841,8 +861,10 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
+            monitor_fps: Vec::new(),
             encoder: Some(EncoderRequest::NativeNvenc),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            client_video: None,
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
         }
@@ -1054,8 +1076,10 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             fps: 60,
+            monitor_fps: Vec::new(),
             encoder: Some(EncoderRequest::SoftwareH264),
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            client_video: None,
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
         }

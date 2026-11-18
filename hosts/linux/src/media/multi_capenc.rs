@@ -76,6 +76,10 @@ pub struct MonitorPipelineTemplate {
     pub codec: String,
     pub encoder: EncoderSelection,
     pub fps: u32,
+    /// Each monitor's own rate, by client display id
+    /// (`Config::monitor_fps`): its Deck display's refresh within `fps`. A
+    /// monitor not listed takes `fps`.
+    pub monitor_fps: Vec<(String, u32)>,
     pub yuv444: bool,
     pub bit_depth: arcen_media::BitDepth,
     pub color_range: arcen_media::ColorRange,
@@ -102,6 +106,10 @@ pub struct MonitorPipelineTemplate {
     /// Optional native encoder ceiling from the served pipeline contract.
     pub encoder_max_bitrate_bps: Option<u32>,
     pub video_selection: arcen_protocol::messages::VideoSelectionIntent,
+    /// What the Deck decodes, from its authenticated request: an adaptive
+    /// roster past a codec's picture ceiling may climb only to a codec in
+    /// it (`arcen_media::video::adaptive_codec_ladder_for_size`).
+    pub client_video: Option<arcen_protocol::messages::ClientVideoCapabilitiesMsg>,
     pub cursor_mode: CursorMode,
     pub display: Option<String>,
     pub xauthority: Option<String>,
@@ -135,6 +143,15 @@ pub struct MonitorCaptureBinding {
 }
 
 impl MonitorPipelineTemplate {
+    /// The rate `client_display_id`'s pipeline encodes at: its own entry in
+    /// [`Self::monitor_fps`], never above [`Self::fps`].
+    fn fps_for(&self, client_display_id: &str) -> u32 {
+        self.monitor_fps
+            .iter()
+            .find(|(id, _)| id == client_display_id)
+            .map_or(self.fps, |(_, fps)| (*fps).clamp(1, self.fps.max(1)))
+    }
+
     fn qp_map_for_config(&self, config: &CapencConfig) -> arcen_media::video::QpMapPolicy {
         if config.encoder == EncoderSelection::SoftwareH264 {
             return arcen_media::video::QpMapPolicy::Off;
@@ -402,7 +419,7 @@ pub fn build_pipeline_specs(
                     output_name: template.output_names.get(position).cloned(),
                     codec: template.codec.clone(),
                     encoder: template.encoder,
-                    fps: template.fps,
+                    fps: template.fps_for(&monitor.client_display_id),
                     yuv444: template.yuv444,
                     // Auth-time intent is resolved before the topology is
                     // committed, so every monitor receives the same final
@@ -428,7 +445,7 @@ pub fn build_pipeline_specs(
                         output_name: None,
                         codec: template.codec.clone(),
                         encoder: template.encoder,
-                        fps: template.fps,
+                        fps: template.fps_for(&monitor.client_display_id),
                         yuv444: template.yuv444,
                         bit_depth: template.bit_depth,
                         color_range: template.color_range,
@@ -751,6 +768,29 @@ impl MultiCapencSupervisor {
             .collect()
     }
 
+    /// Every monitor pipeline's per-second content proofs, in start order
+    /// (`arcen_telemetry::ContentWindow`), each with its monitor and the
+    /// rate that monitor is served at, for session health.
+    #[must_use]
+    pub fn content_windows(
+        &self,
+    ) -> Vec<(
+        SessionMonitorId,
+        u32,
+        crate::media::capenc::ContentWindowCell,
+    )> {
+        self.pipelines
+            .iter()
+            .map(|pipeline| {
+                (
+                    pipeline.session_monitor_id,
+                    pipeline.handle.plan.fps,
+                    pipeline.handle.session.content_window(),
+                )
+            })
+            .collect()
+    }
+
     /// Returns a cloneable keyframe-request handle for one monitor's
     /// pipeline, or `None` when `session_monitor_id` is not running.
     #[must_use]
@@ -1047,6 +1087,7 @@ mod tests {
             // `validate_uniform_exact_encoder_policy_*` below for that).
             encoder: EncoderSelection::NativeNvenc,
             fps: 60,
+            monitor_fps: Vec::new(),
             yuv444: false,
             bit_depth: arcen_media::BitDepth::Eight,
             color_range: arcen_media::ColorRange::Limited,
@@ -1064,6 +1105,7 @@ mod tests {
             variant_pinned: false,
             encoder_max_bitrate_bps: None,
             video_selection: arcen_protocol::messages::VideoSelectionIntent::Exact,
+            client_video: None,
             cursor_mode: CursorMode::Local,
             display: None,
             xauthority: None,
@@ -1438,6 +1480,25 @@ mod tests {
             build_pipeline_specs(&plan, &template_with_encoder(EncoderSelection::NativeNvenc))
                 .expect("nvenc pin must be accepted unconditionally at preflight");
         assert_eq!(specs.len(), 2);
+    }
+
+    #[test]
+    fn each_monitor_pipeline_encodes_at_its_own_rate_within_the_session() {
+        let plan = two_head_plan_sized(1920, 1080);
+        let mut template = template_with_encoder(EncoderSelection::NativeNvenc);
+        template.fps = 120;
+        template.monitor_fps = vec![
+            (plan.monitors[0].client_display_id.clone(), 30),
+            // A listed rate above the session's is held to it.
+            (plan.monitors[1].client_display_id.clone(), 240),
+        ];
+        let specs = build_pipeline_specs(&plan, &template).expect("specs");
+        assert_eq!(specs[0].config.fps, 30);
+        assert_eq!(specs[1].config.fps, 120);
+        // A monitor not listed takes the session's rate.
+        template.monitor_fps.clear();
+        let specs = build_pipeline_specs(&plan, &template).expect("specs");
+        assert!(specs.iter().all(|spec| spec.config.fps == 120));
     }
 
     #[test]

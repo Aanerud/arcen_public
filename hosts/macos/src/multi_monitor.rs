@@ -50,6 +50,9 @@ pub struct MacOsMonitorPlan {
     pub height_px: u32,
     pub refresh_hz: u32,
     pub is_primary: bool,
+    /// The rate this monitor is served at: its own Deck display's, within
+    /// the session's.
+    pub fps: u32,
 }
 
 /// The live virtual displays created for one multi-monitor session.
@@ -280,7 +283,7 @@ pub fn admit_virtual_request(
     request: Option<&AuthMultiMonitorRequestMsg>,
     video: arcen_media::session_plan::ResolvedVideoPlan,
     codec: crate::encode::EncoderCodec,
-    fps: u32,
+    monitor_fps: &dyn Fn(&str) -> u32,
     pq_requested: bool,
     force_sdr_panel: bool,
 ) -> Result<Option<(MacOsMultiMonitorPlan, MacOsVirtualDisplays)>, MacOsMultiMonitorError> {
@@ -291,9 +294,9 @@ pub fn admit_virtual_request(
         return Err(MacOsMultiMonitorError::NotAdvertised);
     };
     let carrier = validate_request(offer, request)?;
-    let specs = planned_virtual_specs(request, fps, pq_requested, force_sdr_panel)?;
+    let specs = planned_virtual_specs(request, monitor_fps, pq_requested, force_sdr_panel)?;
     let (lease, displays) = create_virtual_displays(&specs)?;
-    let plan = plan_from_virtual_displays(&specs, &displays, offer, carrier, video, codec, fps)?;
+    let plan = plan_from_virtual_displays(&specs, &displays, offer, carrier, video, codec)?;
     Ok(Some((plan, lease)))
 }
 
@@ -321,6 +324,7 @@ struct PlannedVirtualMonitor {
     panel: crate::virtual_display::VirtualPanel,
     identity: crate::virtual_display::PanelIdentity,
     refresh_hz: u32,
+    fps: u32,
 }
 
 impl PlannedVirtualMonitor {
@@ -335,7 +339,7 @@ impl PlannedVirtualMonitor {
 
 fn planned_virtual_specs(
     request: &AuthMultiMonitorRequestMsg,
-    fps: u32,
+    monitor_fps: &dyn Fn(&str) -> u32,
     pq_requested: bool,
     force_sdr_panel: bool,
 ) -> Result<Vec<PlannedVirtualMonitor>, MacOsMultiMonitorError> {
@@ -377,6 +381,7 @@ fn planned_virtual_specs(
                         .map_err(|_| MacOsMultiMonitorError::CoordinateOverflow("monitor id"))?,
                 )?;
                 let panel = virtual_panel_for(pq_requested, force_sdr_panel, requested_wire);
+                let fps = monitor_fps(requested_wire.client_display_id.as_str()).max(1);
                 Ok(PlannedVirtualMonitor {
                     requested_wire: (*requested_wire).clone(),
                     requested_monitor,
@@ -386,6 +391,7 @@ fn planned_virtual_specs(
                     panel,
                     identity: panel_identity(requested_wire, display_set),
                     refresh_hz: arranged_refresh_hz(fps, requested_wire.refresh_hz),
+                    fps,
                 })
             },
         )
@@ -573,7 +579,6 @@ fn plan_from_virtual_displays(
     carrier: MultiMonitorCarrierMsg,
     video: arcen_media::session_plan::ResolvedVideoPlan,
     codec: crate::encode::EncoderCodec,
-    fps: u32,
 ) -> Result<MacOsMultiMonitorPlan, MacOsMultiMonitorError> {
     let raw_rects = specs
         .iter()
@@ -598,6 +603,7 @@ fn plan_from_virtual_displays(
                 height_px: spec.requested_wire.height_px,
                 refresh_hz: spec.refresh_hz,
                 is_primary: spec.requested_wire.is_primary,
+                fps: spec.fps,
             })
         })
         .collect::<Result<Vec<_>, MacOsMultiMonitorError>>()?;
@@ -606,7 +612,6 @@ fn plan_from_virtual_displays(
         arcen_media::TopologyGeneration::FIRST,
         video,
         codec,
-        fps,
     )?;
     let applied_regions = region_sets(&monitors, arcen_media::TopologyGeneration::FIRST)?.1;
     let server_capability = server_capability(
@@ -637,12 +642,12 @@ fn media_roster(
     generation: arcen_media::TopologyGeneration,
     video: arcen_media::session_plan::ResolvedVideoPlan,
     codec: crate::encode::EncoderCodec,
-    fps: u32,
 ) -> Result<arcen_media::RegionMediaRoster, MacOsMultiMonitorError> {
     let epoch = arcen_media::MediaStreamEpoch::new(generation.get())?;
     let plans = monitors
         .iter()
         .map(|monitor| {
+            let fps = monitor.fps;
             let bitrate_budget =
                 encoder_bitrate_budget(monitor.width_px, monitor.height_px, codec, fps)?;
             arcen_media::RegionMediaPlan::new(
@@ -865,7 +870,7 @@ fn checked_add_axis(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn requested_at(
@@ -914,7 +919,7 @@ mod tests {
             .expect("offer")
     }
 
-    fn two_request() -> AuthMultiMonitorRequestMsg {
+    pub(crate) fn two_request() -> AuthMultiMonitorRequestMsg {
         request(vec![
             requested_at("secondary", 2, false, 1920, 0, 1920, 1080),
             requested_at("primary", 1, true, 0, 0, 1920, 1080),
@@ -923,7 +928,7 @@ mod tests {
 
     #[test]
     fn planned_two_display_layout_is_primary_first_and_mirrors_arrangement() {
-        let specs = planned_virtual_specs(&two_request(), 60, false, false).expect("specs");
+        let specs = planned_virtual_specs(&two_request(), &|_| 60, false, false).expect("specs");
         assert_eq!(specs.len(), 2);
         assert_eq!(
             specs[0].requested_wire.client_display_id.as_str(),
@@ -942,7 +947,7 @@ mod tests {
                 requested_at("right", 3, false, 1920, 0, 1280, 1024),
                 requested_at("above", 4, false, 0, -900, 1600, 900),
             ]),
-            30,
+            &|_| 30,
             false,
             false,
         )
@@ -964,7 +969,7 @@ mod tests {
                 requested_at("primary", 2, true, 0, 0, 2560, 1440),
                 requested_at("built-in", 1, false, -1800, 832, 1800, 1130),
             ]),
-            60,
+            &|_| 60,
             false,
             false,
         )
@@ -991,7 +996,6 @@ mod tests {
             MultiMonitorCarrierMsg::MuxedReliableStream,
             arcen_media::session_plan::ResolvedVideoPlan::standard(None),
             crate::encode::EncoderCodec::Hevc,
-            60,
         )
         .expect("plan");
         assert_eq!(plan.desktop_width_px, 4360);
@@ -1011,7 +1015,7 @@ mod tests {
                 requested_at("primary", 1, true, 0, 0, 2560, 1600),
                 portrait,
             ]),
-            60,
+            &|_| 60,
             false,
             false,
         )
@@ -1045,7 +1049,6 @@ mod tests {
             MultiMonitorCarrierMsg::MuxedReliableStream,
             arcen_media::session_plan::ResolvedVideoPlan::standard(None),
             crate::encode::EncoderCodec::Hevc,
-            60,
         )
         .expect("plan");
         let applied = plan.server_capability.applied_topology().expect("applied");
@@ -1056,6 +1059,47 @@ mod tests {
             .expect("portrait applied");
         assert_eq!((turned.width_px, turned.height_px), (1200, 1920));
         assert_eq!(turned.rotation, RotationMsg::Degrees90);
+    }
+
+    #[test]
+    fn each_monitor_is_served_and_arranged_at_its_own_rate() {
+        // A 30 Hz primary beside a 120 Hz display: neither caps the other.
+        let rate = |id: &str| if id == "primary" { 30 } else { 120 };
+        let specs = planned_virtual_specs(&two_request(), &rate, false, false).expect("specs");
+        assert_eq!((specs[0].fps, specs[0].refresh_hz), (30, 60));
+        assert_eq!((specs[1].fps, specs[1].refresh_hz), (120, 120));
+        let displays = specs
+            .iter()
+            .map(|spec| DisplaySnapshot {
+                display_id: u32::from(spec.session_monitor_id.get()),
+                pixel_width: spec.requested_wire.width_px as usize,
+                pixel_height: spec.requested_wire.height_px as usize,
+                origin_x: f64::from(spec.layout_rect.x),
+                origin_y: f64::from(spec.layout_rect.y),
+            })
+            .collect::<Vec<_>>();
+        let plan = plan_from_virtual_displays(
+            &specs,
+            &displays,
+            &offer(2),
+            MultiMonitorCarrierMsg::MuxedReliableStream,
+            arcen_media::session_plan::ResolvedVideoPlan::standard(None),
+            crate::encode::EncoderCodec::Hevc,
+        )
+        .expect("plan");
+        let applied = plan.server_capability.applied_topology().expect("applied");
+        let fps = |id: &str| {
+            applied
+                .monitors()
+                .iter()
+                .find(|monitor| monitor.client_display_id.as_str() == id)
+                .map(|monitor| monitor.media_plan.fps)
+        };
+        assert_eq!(fps("primary"), Some(30));
+        assert_eq!(
+            plan.monitors.iter().map(|monitor| monitor.fps).max(),
+            Some(120)
+        );
     }
 
     #[test]
@@ -1076,7 +1120,7 @@ mod tests {
                 self.0.set(self.0.get() + 1);
             }
         }
-        let specs = planned_virtual_specs(&two_request(), 60, false, false).expect("specs");
+        let specs = planned_virtual_specs(&two_request(), &|_| 60, false, false).expect("specs");
         let drops = std::rc::Rc::new(std::cell::Cell::new(0));
         let mut calls = 0;
         let error = create_virtual_displays_with(&specs, |spec| {
@@ -1101,7 +1145,7 @@ mod tests {
 
     #[test]
     fn admitted_plan_uses_nonzero_session_monitor_ids_and_regions() {
-        let specs = planned_virtual_specs(&two_request(), 60, false, false).expect("specs");
+        let specs = planned_virtual_specs(&two_request(), &|_| 60, false, false).expect("specs");
         let displays = specs
             .iter()
             .map(|spec| DisplaySnapshot {
@@ -1119,7 +1163,6 @@ mod tests {
             MultiMonitorCarrierMsg::MuxedReliableStream,
             arcen_media::session_plan::ResolvedVideoPlan::standard(None),
             crate::encode::EncoderCodec::Hevc,
-            60,
         )
         .expect("plan");
         assert_eq!(plan.monitors[0].session_monitor_id.get(), 1);
@@ -1140,7 +1183,7 @@ mod tests {
             Some(&two_request()),
             arcen_media::session_plan::ResolvedVideoPlan::standard(None),
             crate::encode::EncoderCodec::Hevc,
-            60,
+            &|_| 60,
             false,
             false,
         )
@@ -1150,7 +1193,7 @@ mod tests {
 
     #[test]
     fn refusal_message_names_exact_virtual_display_creation() {
-        let specs = planned_virtual_specs(&two_request(), 60, false, false).expect("specs");
+        let specs = planned_virtual_specs(&two_request(), &|_| 60, false, false).expect("specs");
         let error =
             create_virtual_displays_with::<()>(&specs, |_| Err("unsupported mode".to_owned()))
                 .expect_err("refused");

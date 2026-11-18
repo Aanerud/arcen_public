@@ -324,6 +324,39 @@ pub fn apply_automatic_remote_ui_scale_to_topology(
     )
 }
 
+/// What a Deck states about its displays' own refresh
+/// (`AuthResponse::display_refresh_v1`): each display's refresh as the
+/// shell read it, before [`pinned_refresh_hz`] limits the virtual display
+/// mode the Deck asks for, and the display the session window is on.
+///
+/// Hosts serve Auto and Speed at the refresh of the display that shows the
+/// picture (each monitor its own in Match My Layout), so a 120 Hz panel gets
+/// 120 fps even though its virtual display mode stays at 60 Hz. `displays`
+/// must be the shell's own reading (`DeckServices::displays`, primary
+/// first), not a pinned roster; a refresh of zero states nothing. `None`
+/// for no displays.
+#[must_use]
+pub fn deck_display_refresh(
+    displays: &[ClientMonitor],
+    stream_display_id: Option<u32>,
+) -> Option<arcen_protocol::messages::DeckDisplayRefreshMsg> {
+    use arcen_protocol::messages::{DeckPanelRefreshMsg, MAX_DECK_DISPLAY_REFRESH_ENTRIES};
+    let stated: Vec<_> = displays
+        .iter()
+        .filter(|display| display.refresh_hz > 0)
+        .take(MAX_DECK_DISPLAY_REFRESH_ENTRIES)
+        .map(|display| DeckPanelRefreshMsg {
+            id: display.id,
+            refresh_hz: display.refresh_hz,
+        })
+        .collect();
+    (!stated.is_empty()).then(|| arcen_protocol::messages::DeckDisplayRefreshMsg {
+        stream_display_id: stream_display_id
+            .filter(|id| displays.iter().any(|display| display.id == *id)),
+        displays: stated,
+    })
+}
+
 #[must_use]
 pub fn primary_only_monitors(
     monitors: &[ClientMonitor],
@@ -357,7 +390,21 @@ pub fn monitors_for_policy(
     monitors: &[ClientMonitor],
 ) -> Vec<ClientMonitor> {
     match policy {
-        StreamSizingPolicy::FollowWindow => monitors.to_vec(),
+        // A windowed session asks for no faster a mode than a pinned one:
+        // the panel's own refresh is stated apart (`deck_display_refresh`),
+        // and a faster mode would leave a Retina resize without an EDID
+        // timing.
+        StreamSizingPolicy::FollowWindow => monitors
+            .iter()
+            .map(|monitor| ClientMonitor {
+                // Zero stays "unknown", never 1 Hz.
+                refresh_hz: match monitor.refresh_hz {
+                    0 => 0,
+                    refresh => pinned_refresh_hz(refresh),
+                },
+                ..monitor.clone()
+            })
+            .collect(),
         StreamSizingPolicy::PinPrimary { primary_size, .. } => {
             primary_only_monitors(monitors, primary_size)
         }
@@ -729,6 +776,42 @@ pub fn resolve_attempt_displays_mode(
     saved
 }
 
+/// Where an attempt's Displays mode came from, for the log (a field report
+/// of "Primary display only changes nothing" was a saved connection keeping
+/// its own choice): a recovery's one-shot for this endpoint, the saved
+/// connection's own choice, or Settings › Displays.
+#[must_use]
+pub fn displays_mode_source(
+    pending_override: Option<&(String, DisplaysMode)>,
+    endpoint: &str,
+    saved: Option<DisplaysMode>,
+) -> &'static str {
+    if pending_override.is_some_and(|(owner, _)| owner == endpoint) {
+        "recovery"
+    } else if saved.is_some() {
+        "connection"
+    } else {
+        "settings"
+    }
+}
+
+/// The note Settings › Displays shows while the selected saved connection
+/// keeps its own Displays choice, which wins over the setting there.
+#[must_use]
+pub fn connection_displays_note(connection: &str, mode: DisplaysMode) -> String {
+    format!(
+        "\u{201c}{connection}\u{201d} has its own Displays choice, {}, and connects with \
+         it whatever is chosen here.",
+        mode.label()
+    )
+}
+
+/// The button that hands a saved connection back to Settings › Displays.
+#[must_use]
+pub fn connection_displays_follow_label(connection: &str) -> String {
+    format!("Use this setting for \u{201c}{connection}\u{201d}")
+}
+
 /// A display recovery the user has to choose, recognised from how a
 /// connection ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -966,6 +1049,42 @@ mod tests {
     use crate::display::metrics::{DisplayMetrics, LogicalRect, SafeAreaInsets};
     use crate::display::topology::build_requested_topology_from;
 
+    #[test]
+    fn a_saved_connections_own_displays_choice_wins_and_says_so() {
+        // The field case: Settings › Displays is Primary display only, the
+        // saved connection keeps Match my layout, so the attempt asks for
+        // both monitors. The log and Settings now name why.
+        let saved = Some(DisplaysMode::MatchLayout);
+        let mut pending = None;
+        assert_eq!(
+            displays_mode_source(pending.as_ref(), "pier.example:18444", saved),
+            "connection"
+        );
+        assert_eq!(
+            resolve_attempt_displays_mode(&mut pending, "pier.example:18444", saved)
+                .unwrap_or(DisplaysMode::SinglePrimary),
+            DisplaysMode::MatchLayout
+        );
+        assert_eq!(
+            displays_mode_source(None, "pier.example:18444", None),
+            "settings"
+        );
+        let recovery = Some(("pier.example:18444".to_owned(), DisplaysMode::SinglePrimary));
+        assert_eq!(
+            displays_mode_source(recovery.as_ref(), "pier.example:18444", saved),
+            "recovery"
+        );
+        assert_eq!(
+            displays_mode_source(recovery.as_ref(), "other.example:18444", saved),
+            "connection"
+        );
+        assert_eq!(
+            connection_displays_note("Studio", DisplaysMode::MatchLayout),
+            "\u{201c}Studio\u{201d} has its own Displays choice, Match my layout, and connects \
+             with it whatever is chosen here."
+        );
+    }
+
     /// A 4K panel at 150 % running at 144 Hz, and a 1080p panel beside it.
     fn displays() -> Vec<(ClientMonitor, DisplayMetrics)> {
         let pair = |id: u32, x: i32, logical: (u32, u32), backing: (u32, u32), hz: u32| {
@@ -995,6 +1114,32 @@ mod tests {
             pair(1, 0, (2560, 1440), (3840, 2160), 144),
             pair(2, 2560, (1920, 1080), (1920, 1080), 60),
         ]
+    }
+
+    #[test]
+    fn the_displays_own_refresh_is_stated_apart_from_the_pinned_mode() {
+        let monitors: Vec<ClientMonitor> =
+            displays().into_iter().map(|(monitor, _)| monitor).collect();
+        // The mode the host is asked to create stays pinned …
+        let pinned = primary_only_monitors(&monitors, None);
+        assert_eq!(pinned[0].refresh_hz, PINNED_MAX_REFRESH_HZ);
+        // … while the panel's own 144 Hz is stated beside it.
+        let stated = deck_display_refresh(&monitors, Some(2)).expect("stated");
+        assert_eq!(stated.stream_display_id, Some(2));
+        assert_eq!(stated.refresh_of(1), Some(144));
+        assert_eq!(stated.refresh_of(2), Some(60));
+        // A window on a display the Deck does not list names none.
+        assert_eq!(
+            deck_display_refresh(&monitors, Some(9))
+                .expect("stated")
+                .stream_display_id,
+            None
+        );
+        assert_eq!(deck_display_refresh(&[], Some(1)), None);
+        // A windowed session's roster is pinned the same way.
+        let windowed = monitors_for_policy(StreamSizingPolicy::FollowWindow, &monitors);
+        assert_eq!(windowed[0].refresh_hz, PINNED_MAX_REFRESH_HZ);
+        assert_eq!(windowed[1].refresh_hz, 60);
     }
 
     /// The reconnect baseline of a negotiated layout and a later live

@@ -1735,6 +1735,12 @@ impl WaylandInjector {
     /// # Errors
     ///
     /// When the connection is down or its queue collapsed.
+    /// Whether the Deck holds either Control key in this session.
+    #[must_use]
+    pub fn control_held(&self) -> bool {
+        super::edges::control_held(&self.planner.held_keys)
+    }
+
     pub fn key_event(&mut self, message: &KeyEventMsg) -> Result<(), InputError> {
         let unmapped = self.submit(|planner| {
             let plan = planner.key_event(message);

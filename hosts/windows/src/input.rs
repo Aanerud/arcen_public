@@ -55,8 +55,9 @@ use arcen_input::keyboard::scancode::{
     set1_scancode, Set1Scancode, LEFT_ALT, LEFT_CONTROL, LEFT_META, LEFT_SHIFT,
 };
 use arcen_protocol::messages::{
-    KeyEventMsg, MouseButtonMsg, MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg,
-    PenToolMsg, PointerMotionMode, ScrollUnitMsg, TextCommitMsg,
+    GestureMagnifyMsg, GestureValidationError, KeyEventMsg, MouseButtonMsg, MouseMoveMsg,
+    MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenToolMsg, PointerMotionMode,
+    ScrollUnitMsg, TextCommitMsg,
 };
 
 use arcen_protocol::keys::{MOD_ALT, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT};
@@ -622,10 +623,11 @@ mod windows_impl {
         is_identity_dxgi_rotation, modifier_targets, pen_injection_point, pen_ink_flags,
         pen_pixel_location, pen_pressure_to_windows, pen_rotation_to_windows, pen_tilt_to_windows,
         qt_key_to_host_key, selected_output_to_virtual_abs, wheel_delta_from_scroll, DesktopRect,
-        HostKey, KeyEventMsg, MappedRegionButton, MappedRegionPen, MappedRegionPoint,
-        MappedRegionScroll, MetaReleaseMask, MouseButtonMsg, MouseMoveMsg, MouseMoveRelativeMsg,
-        MouseScrollMsg, PenEventMsg, PenPointerEdge, PenPointerState, PenToolMsg, TextCommitMsg,
-        INPUT, VK_CAPITAL, VK_MENU_MASK, VK_NUMLOCK, VK_SCROLL,
+        GestureMagnifyMsg, GestureValidationError, HostKey, KeyEventMsg, MappedRegionButton,
+        MappedRegionPen, MappedRegionPoint, MappedRegionScroll, MetaReleaseMask, MouseButtonMsg,
+        MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenPointerEdge,
+        PenPointerState, PenToolMsg, TextCommitMsg, INPUT, VK_CAPITAL, VK_MENU_MASK, VK_NUMLOCK,
+        VK_SCROLL,
     };
     use arcen_input::keyboard::scancode::{Set1Scancode, LEFT_CONTROL, LEFT_SHIFT, RIGHT_ALT};
     use arcen_input::text::{CharRoute, LayoutProbe};
@@ -1233,6 +1235,28 @@ mod windows_impl {
                 ]);
                 tracing::debug!(target: INPUT, "Windows key release masked after pointer input");
             }
+        }
+
+        /// A trackpad pinch as Control + wheel at the pointer (the shared
+        /// `arcen_input::gesture_fallback` chord): Control goes down only
+        /// when the Deck does not already hold it, and up again after the
+        /// wheel step, so nothing stays held.
+        pub fn gesture_magnify(
+            &mut self,
+            msg: &GestureMagnifyMsg,
+        ) -> Result<(), GestureValidationError> {
+            use arcen_input::gesture_fallback::{magnify_chord, GestureFallbackInput};
+            let control = HostKey::Scan(LEFT_CONTROL);
+            let chord = magnify_chord(msg, self.keys_down.contains(&control))?;
+            for step in chord {
+                match step {
+                    GestureFallbackInput::Key(key) => {
+                        self.inject_key_edge(control, key.pressed);
+                    }
+                    GestureFallbackInput::Scroll(wheel) => self.scroll(&wheel),
+                }
+            }
+            Ok(())
         }
 
         fn inject_key_edge(&mut self, key: HostKey, pressed: bool) -> bool {
@@ -1867,6 +1891,12 @@ impl Injector {
     pub fn scroll(&self, msg: &MouseScrollMsg) {}
     pub fn scroll_region(&self, mapped: MappedRegionScroll, sequence: u64) {}
     pub fn key_event(&mut self, msg: &KeyEventMsg) {}
+    pub fn gesture_magnify(
+        &mut self,
+        msg: &GestureMagnifyMsg,
+    ) -> Result<(), GestureValidationError> {
+        msg.validate()
+    }
     pub fn text_commit(&self, msg: &TextCommitMsg) {}
     pub fn reset_modifiers(&mut self) {}
     pub fn close(&mut self) {}

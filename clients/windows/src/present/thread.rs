@@ -7,7 +7,10 @@
 //! The media worker hands frames to a **latest-frame slot** (a newer frame
 //! replaces one not yet presented; replacements are counted, never queued);
 //! the thread waits on the swapchain's frame-latency waitable object
-//! (latency 1), converts the newest frame and presents it. A still screen
+//! (latency 1) holding no lock, then takes the newest frame, converts it and
+//! presents it. The wait lasts until the display's next refresh or
+//! composition; the decoder and every other window's presenter share the
+//! device's immediate context and must never wait behind it. A still screen
 //! re-presents the last frame when Exact still image tiles changed
 //! ([`PresenterHandle::represent`]). Contract changes (Grading ↔ HDR, a new
 //! source size) are applied to the swapchain on this thread; the video
@@ -100,6 +103,93 @@ struct Owned {
     composer: FrameComposer,
     tree: Option<(SharedTree, usize)>,
     path: PathWatch,
+    /// The frame-latency wait returned and no present has used it yet: the
+    /// waitable object counts frames, so a wait that is not followed by a
+    /// present must not be repeated (the next would block for its timeout).
+    ready: bool,
+    timing: PresentTiming5s,
+    /// The last present's draw, `Present` call and composition update.
+    phases: [Duration; 3],
+}
+
+/// Where a present's time goes, logged every five seconds: the swapchain's
+/// frame-latency wait (no lock held), the shared context lock, and the draw
+/// and `Present` call under it.
+struct PresentTiming5s {
+    since: Instant,
+    presents: u32,
+    wait: Duration,
+    wait_max: Duration,
+    lock: Duration,
+    lock_max: Duration,
+    work: Duration,
+    work_max: Duration,
+    phases: [Duration; 3],
+    phases_max: [Duration; 3],
+}
+
+impl Default for PresentTiming5s {
+    fn default() -> Self {
+        Self {
+            since: Instant::now(),
+            presents: 0,
+            wait: Duration::ZERO,
+            wait_max: Duration::ZERO,
+            lock: Duration::ZERO,
+            lock_max: Duration::ZERO,
+            work: Duration::ZERO,
+            work_max: Duration::ZERO,
+            phases: [Duration::ZERO; 3],
+            phases_max: [Duration::ZERO; 3],
+        }
+    }
+}
+
+impl PresentTiming5s {
+    fn note(
+        &mut self,
+        wait: Duration,
+        lock: Duration,
+        work: Duration,
+        phases: [Duration; 3],
+        size: (u32, u32),
+    ) {
+        self.presents += 1;
+        for (index, phase) in phases.into_iter().enumerate() {
+            self.phases[index] += phase;
+            self.phases_max[index] = self.phases_max[index].max(phase);
+        }
+        self.wait += wait;
+        self.wait_max = self.wait_max.max(wait);
+        self.lock += lock;
+        self.lock_max = self.lock_max.max(lock);
+        self.work += work;
+        self.work_max = self.work_max.max(work);
+        if self.since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        let avg = |sum: Duration| {
+            u64::try_from(sum.as_micros() / u128::from(self.presents.max(1))).unwrap_or(u64::MAX)
+        };
+        let us = |value: Duration| u64::try_from(value.as_micros()).unwrap_or(u64::MAX);
+        tracing::info!(
+            target: arcen_deck_core::log_target::VIDEO,
+            size = ?size,
+            presents = self.presents,
+            latency_wait_avg_us = avg(self.wait),
+            latency_wait_max_us = us(self.wait_max),
+            lock_wait_avg_us = avg(self.lock),
+            lock_wait_max_us = us(self.lock_max),
+            draw_present_avg_us = avg(self.work),
+            draw_present_max_us = us(self.work_max),
+            draw_avg_us = avg(self.phases[0]),
+            present_call_avg_us = avg(self.phases[1]),
+            present_call_max_us = us(self.phases_max[1]),
+            composition_avg_us = avg(self.phases[2]),
+            "video presenter timing"
+        );
+        *self = Self::default();
+    }
 }
 
 /// How DWM shows this swapchain (`GetFrameStatisticsMedia`), read every
@@ -270,6 +360,9 @@ impl PresenterThread {
             composer,
             tree,
             path: PathWatch::default(),
+            ready: false,
+            timing: PresentTiming5s::default(),
+            phases: [Duration::ZERO; 3],
         };
         let thread_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
@@ -312,37 +405,73 @@ fn poll(owned: &mut Owned, shared: &Shared) {
         .fetch_add(unconfirmed, Ordering::Relaxed);
 }
 
+/// Teardown: queued frames are discarded, never shown late, and
+/// unconfirmed fences are never reported.
+fn stop(owned: &mut Owned, shared: &Shared) {
+    lock(&shared.slot).frame = None;
+    owned.composer.discard();
+    if let Some((tree, owner)) = &owned.tree {
+        let _ = lock(tree).hide_swapchain(*owner);
+    }
+}
+
+/// Blocks until a frame or a re-present waits in the slot (`true`) or the
+/// thread is stopped (`false`, after [`stop`]). Presented fences are
+/// reported meanwhile.
+fn wait_for_work(owned: &mut Owned, shared: &Shared) -> bool {
+    let mut slot = lock(&shared.slot);
+    loop {
+        if slot.stop {
+            drop(slot);
+            stop(owned, shared);
+            return false;
+        }
+        if slot.frame.is_some() || slot.represent {
+            return true;
+        }
+        let (guard, _) = shared
+            .wake
+            .wait_timeout(slot, Duration::from_millis(8))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(guard);
+        poll(owned, shared);
+        slot = lock(&shared.slot);
+    }
+}
+
 fn run(mut owned: Owned, shared: &Shared) {
     let mut last: Option<DecodedFrame> = None;
     loop {
+        // Wait for something to show, then for the swapchain to take it, and
+        // only then take the newest frame: one that arrived during the wait
+        // replaces the older one instead of queueing behind it.
+        if !wait_for_work(&mut owned, shared) {
+            return;
+        }
+        let waited = Instant::now();
+        if shared.visible.load(Ordering::Relaxed) && !owned.ready {
+            // Holding no lock: the swapchain accepts a frame at the display's
+            // next refresh or composition, and the decoder and every other
+            // window's presenter share this device's immediate context.
+            owned.swapchain.wait(100);
+            owned.ready = true;
+        }
+        let waited = waited.elapsed();
         let next = {
             let mut slot = lock(&shared.slot);
-            loop {
-                if slot.stop {
-                    // Teardown: queued frames are discarded, never shown
-                    // late, and unconfirmed fences are never reported.
-                    slot.frame = None;
-                    owned.composer.discard();
-                    if let Some((tree, owner)) = &owned.tree {
-                        let _ = lock(tree).hide_swapchain(*owner);
-                    }
-                    return;
-                }
-                if let Some(pending) = slot.frame.take() {
-                    slot.represent = false;
-                    break Some(pending);
-                }
-                if slot.represent {
-                    slot.represent = false;
-                    break None;
-                }
-                // Wake periodically so presented fences are reported.
-                let (guard, _) = shared
-                    .wake
-                    .wait_timeout(slot, Duration::from_millis(8))
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                slot = guard;
-                poll(&mut owned, shared);
+            if slot.stop {
+                drop(slot);
+                stop(&mut owned, shared);
+                return;
+            }
+            if let Some(pending) = slot.frame.take() {
+                slot.represent = false;
+                Some(pending)
+            } else if slot.represent {
+                slot.represent = false;
+                None
+            } else {
+                continue;
             }
         };
         let represent = next.is_none();
@@ -362,14 +491,13 @@ fn run(mut owned: Owned, shared: &Shared) {
             continue;
         }
         let result = {
-            let context_lock = std::sync::Arc::clone(&owned.gpu.context_lock);
-            let _context = context_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let result = present_one(&mut owned, shared, &frame);
-            if result.is_err() {
-                owned.composer.abandon_unsubmitted();
-            }
+            let work = Instant::now();
+            let (result, locked) = present_one(&mut owned, shared, &frame);
+            let size = (owned.swapchain.width, owned.swapchain.height);
+            let phases = owned.phases;
+            owned
+                .timing
+                .note(waited, locked, work.elapsed(), phases, size);
             result
         };
         match result {
@@ -412,7 +540,68 @@ fn run(mut owned: Owned, shared: &Shared) {
     }
 }
 
-fn present_one(owned: &mut Owned, shared: &Shared, frame: &DecodedFrame) -> Result<()> {
+/// Draws `frame` and presents it. Only the draw and the bookkeeping after
+/// `Present` hold the device's shared context lock; `Present` itself does
+/// not: a composed present can block until the next composition (lab: 16
+/// ms per present with two windows), and the decoder and every other
+/// window's presenter must not wait behind it. The device is
+/// multithread-protected, and `Present` is one call. Returns the time spent
+/// waiting for the lock.
+fn present_one(owned: &mut Owned, shared: &Shared, frame: &DecodedFrame) -> (Result<()>, Duration) {
+    let context_lock = std::sync::Arc::clone(&owned.gpu.context_lock);
+    let asked = Instant::now();
+    let context = context_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut locked = asked.elapsed();
+    let drawn = draw_one(owned, shared, frame);
+    let (first, resized, changed) = match drawn {
+        Ok(facts) => facts,
+        Err(error) => {
+            owned.composer.abandon_unsubmitted();
+            return (Err(error), locked);
+        }
+    };
+    drop(context);
+    let presenting = Instant::now();
+    let presented = owned.swapchain.present(shared.timing());
+    let present = presenting.elapsed();
+    owned.ready = false;
+    let asked = Instant::now();
+    let _context = context_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locked += asked.elapsed();
+    let composing = Instant::now();
+    let finished = presented.and_then(|()| {
+        let present_id = owned.swapchain.last_present_id();
+        owned.composer.submitted(&owned.gpu, present_id)?;
+        if let Some((tree, owner)) = &owned.tree {
+            // Every present: the other pipeline may have taken the visual
+            // since, or torn down and cleared it.
+            let mut tree = lock(tree);
+            if first || resized || changed || !tree.shows(*owner) {
+                tree.show_swapchain(*owner, &owned.swapchain, frame.picture.size())?;
+            }
+        }
+        Ok(())
+    });
+    if finished.is_err() {
+        owned.composer.abandon_unsubmitted();
+    }
+    owned.phases[1] = present;
+    owned.phases[2] = composing.elapsed();
+    (finished, locked)
+}
+
+/// The draw half of [`present_one`], under the context lock: the contract
+/// applied to the swapchain and the frame drawn into its back buffer.
+/// Returns whether this was the first present, a resize, a mode change.
+fn draw_one(
+    owned: &mut Owned,
+    shared: &Shared,
+    frame: &DecodedFrame,
+) -> Result<(bool, bool, bool)> {
     let mode = PresentMode::for_contract(
         frame.contract,
         shared.scrgb_fallback.load(Ordering::Relaxed),
@@ -428,7 +617,7 @@ fn present_one(owned: &mut Owned, shared: &Shared, frame: &DecodedFrame) -> Resu
         *lock(&shared.mode) = Some(mode);
         lock(&shared.events).push(PresenterEvent::ModeChanged(mode));
     }
-    owned.swapchain.wait(100);
+    let drawing = Instant::now();
     let back = owned.swapchain.back_buffer()?;
     let rtv = owned.gpu.rtv(&back)?;
     owned
@@ -436,18 +625,8 @@ fn present_one(owned: &mut Owned, shared: &Shared, frame: &DecodedFrame) -> Resu
         .draw(&owned.gpu, frame, &rtv, mode.output())?;
     drop(rtv);
     drop(back);
-    owned.swapchain.present(shared.timing())?;
-    let present_id = owned.swapchain.last_present_id();
-    owned.composer.submitted(&owned.gpu, present_id)?;
-    if let Some((tree, owner)) = &owned.tree {
-        // Every present: the other pipeline may have taken the visual
-        // since, or torn down and cleared it.
-        let mut tree = lock(tree);
-        if first || resized || changed || !tree.shows(*owner) {
-            tree.show_swapchain(*owner, &owned.swapchain, size)?;
-        }
-    }
-    Ok(())
+    owned.phases[0] = drawing.elapsed();
+    Ok((first, resized, changed))
 }
 
 super::opaque_debug!(PresenterHandle, PresenterThread);

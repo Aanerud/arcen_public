@@ -496,6 +496,21 @@ these numbers instead of inferring a path type.
   old Pier (and the macOS Pier today) omits it, and the Deck says the path is
   not reported rather than showing a perfect path.
 
+### Each monitor's rate (`HealthStatsMsg.monitors`, additive)
+
+`HealthStatsMsg.monitors: Vec<MonitorRateMsg>` (absent when empty) carries,
+for a multi-monitor session whose monitors run at their own rates, one entry
+per monitor: `session_monitor_id`, `fps_target` (the rate it is served at),
+`fps_actual` (frames it sent per second over the window) and, while it sent
+below what its content owed for two windows running, `limited_by` (a
+frame-rate basis token; `host_shortfall` today). The Deck shows the reason
+(`MonitorRateMsg::limited_by_token` accepts at most 32 lowercase ASCII
+letters, digits or `_`; anything else is shown as no reason).
+
+- Compatibility: no version bump. An old Deck ignores the field; an old Pier
+  omits it, and the Deck shows no per-display host line. Every Pier (Linux,
+  Windows, macOS) fills it for a multi-monitor session.
+
 ### Modeled in Rust today (Tier A)
 `quality_settings`, `auth_request`, `auth_response` (+ `monitors[]` of
 `ClientMonitor`, `displays_mode`, optional `session_log_id`), `auth_result`,
@@ -959,6 +974,30 @@ parameter sets + IDR — the client decoder rebuilds from the SPS change; the
 video framing itself is unchanged. Hosts that predate the message ignore the
 unknown type (existing dispatcher contract), which the capability flag makes
 unreachable anyway.
+
+### A single stream follows its window to another display (protocol v3, additive — `display_refresh_update`)
+
+A single-stream session's rate follows the Deck display that shows it
+(`AuthResponse.display_refresh_v1.stream_display_id`, stated at connect).
+When the window moves to another display, or that display's refresh changes,
+the Deck says so mid-session. One message type and one capability flag; no
+`PROTOCOL_VERSION` bump.
+
+| Message | Field | Contract |
+|---|---|---|
+| `ServerHello.stream_rate` | `follows_display_moves: bool = false` | The host follows `display_refresh_update`. Absent on hosts that do not (parses false); a Deck must not send the message then. |
+| `DisplayRefreshUpdate` (client→host) | `sequence: u64` | Client-monotonic from 1 within one attachment (a resumed attachment starts again at 1); a host ignores a sequence not greater than the last it applied on that attachment. |
+| | `refresh: DeckDisplayRefreshMsg` | The displays' refresh and `stream_display_id`, the display the window is on now. |
+
+Rules: sent only in a single-stream session, once the window has stayed on
+the new display for 500 ms (`arcen_deck_core::display_follow::SETTLE`), so a
+window dragged across a display reports nothing for it. Each attachment
+starts from what its own `AuthResponse` stated (a resume states the first
+connection's display), so a Deck re-reports a move the resumed host has not
+seen. The host serves the
+session at the new display's refresh within the limits it applied at connect
+(administrator, encoder, capture source) and reports the rate it serves in
+`health_pong.fps_target`. No reply message.
 
 ### Direct-session resume (protocol v3, additive)
 

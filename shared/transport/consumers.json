@@ -85,11 +85,6 @@
         "tls"
       ],
       "features": ["quic"],
-      "forwarded_features": {
-        "wss-compat": [
-          "wss-compat"
-        ]
-      },
       "production_uses": [
         {
           "id": "lane-session",
@@ -264,11 +259,6 @@
         "tls"
       ],
       "features": ["quic"],
-      "forwarded_features": {
-        "wss-compat": [
-          "wss-compat"
-        ]
-      },
       "production_uses": [
         {
           "id": "lane-session",

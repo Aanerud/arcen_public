@@ -21,9 +21,6 @@ use crate::display::topology::{HeadCapability, HeadInventory};
 use crate::media::capenc::{parse_encoder_selection, CapencConfig, EncoderSelection};
 use crate::session::identity::UserExecution;
 
-#[cfg(feature = "wss-compat")]
-const TLS_VERSION_REQUIREMENT: &str = "TLS1.2 or TLS1.3";
-#[cfg(not(feature = "wss-compat"))]
 const TLS_VERSION_REQUIREMENT: &str = "TLS1.3";
 
 /// Message returned whenever a release build is asked to disable authentication.
@@ -39,6 +36,28 @@ const NO_AUTH_REFUSED: &str = "refusing to disable authentication: this build ha
 /// Highest refresh a dedicated Xorg desktop's head is created at (the
 /// launcher's own bound on a served display).
 const MAX_XORG_HEAD_REFRESH_HZ: u32 = 240;
+
+/// The refresh an Xorg head at `width`x`height` serving `served_fps` is
+/// asked for: the shared `served_head_refresh_hz` (twice the rate, else the
+/// rate, else the Deck's requested mode) within what an EDID 1.4 timing at
+/// this size can describe and [`MAX_XORG_HEAD_REFRESH_HZ`]. Decided from the
+/// served rate, never from the Deck display's own refresh.
+#[must_use]
+pub fn xorg_head_refresh_hz(width: u32, height: u32, served_fps: u32, requested_hz: u32) -> u32 {
+    arcen_media::video::served_head_refresh_hz(served_fps, requested_hz, |refresh| {
+        refresh <= MAX_XORG_HEAD_REFRESH_HZ
+            && arcen_outputs::edid::cvt_reduced_blanking(width, height, refresh).is_ok()
+    })
+}
+
+/// What one captured output refreshes at ([`Config::capture_refresh_caps`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureRefreshCap {
+    /// The monitor of a multi-monitor session; `None` for a single stream.
+    pub client_display_id: Option<String>,
+    /// The output's refresh, in whole hertz (at least one).
+    pub refresh_hz: u32,
+}
 
 static IGNORED_HELPER_PATH_WARNINGS: OnceLock<Mutex<std::collections::BTreeSet<&'static str>>> =
     OnceLock::new();
@@ -191,9 +210,20 @@ pub struct Config {
     /// one is configured. Without one, Auto and Speed follow the Deck
     /// display (`arcen_media::video::resolve_session_frame_rate`).
     pub fps_ceiling: Option<u32>,
-    /// The refresh of the Deck display this sign-in is sized for
-    /// (`AuthResponse::display_refresh_hz`).
+    /// The refresh of the Deck display the session's rate follows
+    /// (`AuthResponse::display_refresh_hz`: the fastest display of a
+    /// multi-monitor request, else the display that shows the stream).
     pub deck_display_refresh_hz: Option<u32>,
+    /// Each requested monitor's own Deck display refresh, by client display
+    /// id (`AuthResponse::monitor_display_refresh_hz`), the primary first;
+    /// empty unless a multi-monitor plan serves the session. Each monitor is served at its own
+    /// ([`Self::monitor_fps`]).
+    pub deck_monitor_refresh_hz: Vec<(String, u32)>,
+    /// What the session's captured outputs refresh at, when the host cannot
+    /// create the head itself (a joined console's outputs): a monitor is
+    /// never served faster than its output refreshes. Empty when the head
+    /// is the session's own.
+    pub capture_refresh_caps: Vec<CaptureRefreshCap>,
     /// The session's frame rate and what decided it, once the initial video
     /// request is resolved (READY, the hello and `SESSION_STREAM_START`).
     pub frame_rate: Option<arcen_media::video::SessionFrameRate>,
@@ -310,10 +340,6 @@ pub struct Config {
     /// Deprecated legacy alias for the QUIC UDP port. Product configurations
     /// use `port`; an existing `quic_port` value wins during migration.
     pub quic_port: Option<u16>,
-    /// Dormant compatibility listener. This field and its CLI flag do not
-    /// exist in product binaries.
-    #[cfg(feature = "wss-compat")]
-    pub wss_port: Option<u16>,
 }
 
 impl Config {
@@ -525,8 +551,14 @@ impl Config {
     pub fn served_frame_rate(&self, served_fps: u32) -> arcen_media::video::SessionFrameRate {
         use arcen_media::video::FrameRateBasis;
         use arcen_session::desktop_provider::DesktopProvider;
+        // A multi-monitor session states its primary monitor's own rate
+        // (listed first).
+        let resolved = match self.deck_monitor_refresh_hz.first() {
+            Some((primary, _)) => Some(self.monitor_frame_rate(primary)),
+            None => self.frame_rate,
+        };
         arcen_media::video::served_stream_rate(
-            self.frame_rate,
+            resolved,
             served_fps,
             if self.desktop_provider == DesktopProvider::Wayland {
                 FrameRateBasis::CaptureSource
@@ -534,6 +566,58 @@ impl Config {
                 FrameRateBasis::Encoder
             },
         )
+    }
+
+    /// The rate monitor `client_display_id` of a multi-monitor session is
+    /// served at: the session's rate lowered to that monitor's own Deck
+    /// display (`arcen_media::video::monitor_frame_rate`) and to what its
+    /// captured output refreshes at, so a slow display never caps a fast one
+    /// and no monitor is promised more than its head delivers.
+    #[must_use]
+    pub fn monitor_frame_rate(
+        &self,
+        client_display_id: &str,
+    ) -> arcen_media::video::SessionFrameRate {
+        use arcen_media::video::{monitor_frame_rate, served_stream_rate, FrameRateBasis};
+        let session = served_stream_rate(self.frame_rate, self.fps, FrameRateBasis::Encoder);
+        let refresh = self
+            .deck_monitor_refresh_hz
+            .iter()
+            .find(|(id, _)| id == client_display_id)
+            .map(|(_, refresh)| *refresh);
+        let rate = monitor_frame_rate(session, self.requested_pipeline, refresh);
+        self.capture_refresh_caps
+            .iter()
+            .find(|cap| cap.client_display_id.as_deref() == Some(client_display_id))
+            .map_or(rate, |cap| {
+                rate.narrow(cap.refresh_hz, FrameRateBasis::CaptureSource)
+            })
+    }
+
+    /// [`Self::monitor_frame_rate`]'s frames per second.
+    #[must_use]
+    pub fn monitor_fps(&self, client_display_id: &str) -> u32 {
+        self.monitor_frame_rate(client_display_id).fps
+    }
+
+    /// The session lowered to what its captured output refreshes at
+    /// (`capture_refresh_caps` without a monitor: a single stream), with the
+    /// capture as the reason; unchanged otherwise.
+    #[must_use]
+    pub fn with_capture_refresh_caps(mut self, caps: Vec<CaptureRefreshCap>) -> Self {
+        use arcen_media::video::FrameRateBasis;
+        if let Some(cap) = caps.iter().find(|cap| cap.client_display_id.is_none()) {
+            if cap.refresh_hz < self.fps {
+                self.fps = cap.refresh_hz.max(1);
+                self.frame_rate = Some(arcen_media::video::served_stream_rate(
+                    self.frame_rate,
+                    self.fps,
+                    FrameRateBasis::CaptureSource,
+                ));
+            }
+        }
+        self.capture_refresh_caps = caps;
+        self
     }
 
     /// Whether this Pier's Wayland sessions run the compositor's Xwayland:
@@ -725,20 +809,11 @@ impl Config {
     /// [`Self::wayland_session_refresh_hz`]). A desktop keeps the refresh it
     /// was created at across reattachments.
     pub fn xorg_session_refresh_hz(&self, width: u32, height: u32, display_refresh_hz: u32) -> u32 {
-        use arcen_media::video::paced_output_refresh_hz;
         use arcen_session::desktop_provider::DesktopProvider;
         if self.desktop_provider != DesktopProvider::Xorg || self.requested_pipeline.is_none() {
             return display_refresh_hz;
         }
-        let paced =
-            paced_output_refresh_hz(display_refresh_hz, self.fps).min(MAX_XORG_HEAD_REFRESH_HZ);
-        if paced > display_refresh_hz
-            && arcen_outputs::edid::cvt_reduced_blanking(width, height, paced).is_ok()
-        {
-            paced
-        } else {
-            display_refresh_hz
-        }
+        xorg_head_refresh_hz(width, height, self.fps, display_refresh_hz)
     }
 
     /// Whether this is a Wayland Speed session the host's record has no
@@ -1350,6 +1425,8 @@ impl Default for Config {
             fps: 60,
             fps_ceiling: None,
             deck_display_refresh_hz: None,
+            deck_monitor_refresh_hz: Vec::new(),
+            capture_refresh_caps: Vec::new(),
             frame_rate: None,
             monitor: 1,
             display: ":0".to_string(),
@@ -1405,8 +1482,6 @@ impl Default for Config {
             width: 0,
             height: 0,
             quic_port: None,
-            #[cfg(feature = "wss-compat")]
-            wss_port: None,
         }
     }
 }
@@ -1546,10 +1621,6 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     }
     if let Some(v) = flag_value(args, "--quic-port") {
         cfg.quic_port = Some(v.parse().map_err(|_| format!("invalid --quic-port: {v}"))?);
-    }
-    #[cfg(feature = "wss-compat")]
-    if let Some(v) = flag_value(args, "--wss-port") {
-        cfg.wss_port = Some(v.parse().map_err(|_| format!("invalid --wss-port: {v}"))?);
     }
 
     if args.iter().any(|a| a == "--no-auth") {
@@ -1821,10 +1892,6 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
     if !cfg.tls_enabled() {
         return Err("direct QUIC requires --tls-cert and --tls-key".to_string());
     }
-    #[cfg(feature = "wss-compat")]
-    if cfg.wss_port == Some(cfg.direct_quic_port()) {
-        return Err("dormant WSS compatibility cannot share the QUIC UDP port".to_string());
-    }
     if !cfg.multi_monitor.heads.is_empty() {
         // Every individual head token is already validated above
         // (`validate_gpu_head`, both the `--multi-monitor-head` and
@@ -1895,8 +1962,6 @@ fn validate_known_arguments(args: &[String]) -> Result<(), String> {
         "--width",
         "--height",
         "--quic-port",
-        #[cfg(feature = "wss-compat")]
-        "--wss-port",
         "--auth-mode",
         "--pam-service",
         "--reconnect-window-secs",
@@ -2821,6 +2886,69 @@ mod tests {
         };
         assert!(!native.wayland_software_sessions());
         assert_eq!(native.session_encoder(), EncoderSelection::Auto);
+    }
+
+    #[test]
+    fn each_monitor_follows_its_own_deck_display_and_its_captured_output() {
+        use arcen_media::video::{
+            resolve_session_frame_rate, FrameRateBasis, FrameRateRequest, PipelineId,
+        };
+        // A 30 Hz primary and a 120 Hz display: the session follows the
+        // fastest, each monitor its own.
+        let config = Config {
+            requested_pipeline: Some(PipelineId::Auto),
+            fps: 120,
+            frame_rate: Some(resolve_session_frame_rate(FrameRateRequest {
+                pipeline: Some(PipelineId::Auto),
+                requested_fps: 30,
+                display_refresh_hz: Some(120),
+                administrator_max_fps: None,
+            })),
+            deck_monitor_refresh_hz: vec![("phl".to_owned(), 30), ("xdr".to_owned(), 120)],
+            ..Config::default()
+        };
+        assert_eq!(config.monitor_fps("phl"), 30);
+        assert_eq!(config.monitor_fps("xdr"), 120);
+        // The hello states the primary's (listed first) rate.
+        assert_eq!(config.served_frame_rate(30).fps, 30);
+        assert_eq!(config.served_frame_rate(30).basis, FrameRateBasis::Display);
+        // A console output refreshing at 60 Hz holds its monitor to 60.
+        let capped = config.with_capture_refresh_caps(vec![CaptureRefreshCap {
+            client_display_id: Some("xdr".to_owned()),
+            refresh_hz: 60,
+        }]);
+        let xdr = capped.monitor_frame_rate("xdr");
+        assert_eq!((xdr.fps, xdr.basis), (60, FrameRateBasis::CaptureSource));
+        // A single stream on a 60 Hz output is served at 60, for that reason.
+        let single = Config {
+            requested_pipeline: Some(PipelineId::Auto),
+            fps: 120,
+            frame_rate: Some(resolve_session_frame_rate(FrameRateRequest {
+                pipeline: Some(PipelineId::Auto),
+                requested_fps: 30,
+                display_refresh_hz: Some(120),
+                administrator_max_fps: None,
+            })),
+            ..Config::default()
+        }
+        .with_capture_refresh_caps(vec![CaptureRefreshCap {
+            client_display_id: None,
+            refresh_hz: 60,
+        }]);
+        assert_eq!(single.fps, 60);
+        let rate = single.served_frame_rate(60);
+        assert_eq!((rate.fps, rate.basis), (60, FrameRateBasis::CaptureSource));
+        assert_eq!(rate.display_refresh_hz, Some(120));
+    }
+
+    #[test]
+    fn an_xorg_head_is_paced_from_the_served_rate_not_the_deck_display() {
+        // A 30 Hz Deck display served 30 fps: a 60 Hz head.
+        assert_eq!(xorg_head_refresh_hz(2560, 1440, 30, 30), 60);
+        // 120 fps where 240 Hz has no EDID timing: the served rate.
+        assert_eq!(xorg_head_refresh_hz(2560, 1440, 120, 60), 120);
+        // A size no faster timing carries keeps the requested mode.
+        assert_eq!(xorg_head_refresh_hz(3456, 2234, 120, 60), 60);
     }
 
     #[test]

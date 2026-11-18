@@ -1272,6 +1272,17 @@ fn run_admission_probe(
     code
 }
 
+/// The submission a Keel cadence decision stands for, for the pacing window.
+const fn submission_mode(mode: EmitMode) -> crate::linux_policy::SubmissionMode {
+    use crate::linux_policy::SubmissionMode;
+    match mode {
+        EmitMode::FirstFrame => SubmissionMode::FirstFrame,
+        EmitMode::Idr => SubmissionMode::Idr,
+        EmitMode::Activity => SubmissionMode::Activity,
+        EmitMode::Keepalive => SubmissionMode::Keepalive,
+    }
+}
+
 fn run_inner(args: Vec<String>) -> i32 {
     let output_index = args
         .get(1)
@@ -1383,6 +1394,12 @@ fn run_inner(args: Vec<String>) -> i32 {
     let mut bytes = 0u64;
     let mut modeset_idr = false;
     let mut bgra_scratch = Vec::new();
+    // A serial loop: it looks at the screen only between its own encodes, so
+    // the stats line carries its pacing for the Pier's frame-rate governor
+    // (`arcen_media::video::SerialPacing`).
+    let mut pacing = crate::linux_policy::PacingWindow::default();
+    let mut busy = Duration::ZERO;
+    let mut paced_fps = fps;
     // Region-owned activity scheduler (`arcen_media::RegionActivityScheduler`).
     // It contains the Keel damage tracker that skips unchanged rows during
     // BGRA→I420 conversion — matching the Windows MF path — and additionally
@@ -1440,6 +1457,7 @@ fn run_inner(args: Vec<String>) -> i32 {
             match session.reconfigure_framerate(fps) {
                 Ok(LiveChange::Applied(fps)) => {
                     interval = crate::frame_interval_from_fps(fps);
+                    paced_fps = fps;
                     if live_framerate_reconfigure_policy().force_idr {
                         session.force_idr();
                     }
@@ -1465,10 +1483,12 @@ fn run_inner(args: Vec<String>) -> i32 {
         if now >= next_tick {
             let idr_requested = control.take_idr();
             let decision = cadence.decision(idr_requested || modeset_idr, last_emit.elapsed());
+            pacing.record_due(decision.map(submission_mode));
             if let Some(mode) = decision {
                 if matches!(mode, EmitMode::Idr) || idr_requested || modeset_idr {
                     session.force_idr();
                 }
+                let work_started = Instant::now();
                 let mut service_attempted = false;
                 let encoded = {
                     let source = match capture.capture_bgra(&mut bgra_scratch) {
@@ -1496,6 +1516,11 @@ fn run_inner(args: Vec<String>) -> i32 {
                         control.take_input_activity(),
                         ActivityHint::None,
                     );
+                    let fresh_mode = !matches!(mode, EmitMode::Keepalive);
+                    if fresh_mode && (!service.serve || service.summary.is_clean()) {
+                        // The deadline found the same pixels.
+                        pacing.note_unchanged_content();
+                    }
                     if service.serve {
                         service_attempted = true;
                         if service.keyframe {
@@ -1536,6 +1561,7 @@ fn run_inner(args: Vec<String>) -> i32 {
                         None
                     }
                 };
+                busy = busy.saturating_add(work_started.elapsed());
                 if let Some(access_unit) = encoded {
                     if !ready {
                         if let Err(error) = crate::announce_ready_from(
@@ -1568,7 +1594,7 @@ fn run_inner(args: Vec<String>) -> i32 {
         }
         if last_stats.elapsed() >= Duration::from_secs(1) {
             crate::log(&format!(
-                "enc_fps={emitted} kbps={} backend=openh264 damage_source={} keel_enabled={} modeset_idr={modeset_idr} {}",
+                "enc_fps={emitted} kbps={} backend=openh264 damage_source={} keel_enabled={} modeset_idr={modeset_idr} {}{}",
                 bytes.saturating_mul(8) / 1000,
                 if capture.has_damage() {
                     "xdamage"
@@ -1577,9 +1603,12 @@ fn run_inner(args: Vec<String>) -> i32 {
                 },
                 schedule.is_active(),
                 schedule.telemetry_fragment(),
+                pacing.verdict_fields(fps, paced_fps, busy, last_stats.elapsed()),
             ));
             emitted = 0;
             bytes = 0;
+            pacing = crate::linux_policy::PacingWindow::default();
+            busy = Duration::ZERO;
             last_stats = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(1));

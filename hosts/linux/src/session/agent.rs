@@ -111,6 +111,7 @@ enum AgentDispatch {
     Clipboard,
     Microphone,
     LocalPlaybackRecover,
+    LoginKeyringUnlock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -873,8 +874,10 @@ pub async fn run_user_agent(args: &[String]) -> Result<(), AgentError> {
 
         let shell_args = gnome_shell_arguments(&display);
         let mut desktop_process = Command::new("/usr/bin/gnome-shell");
+        // The compositor without the user's GPU and driver selection; the
+        // activation environment above gives it to the applications.
         desktop_process
-            .envs(login_environment.imported)
+            .envs(compositor_environment(login_environment.imported))
             .args(&shell_args);
         desktop_shell_stdio(&mut desktop_process);
         // SAFETY: this runs in the child immediately before exec and only arms
@@ -1335,6 +1338,20 @@ async fn start_bridge(
     Some(PulseBridge::start(server, &user_server, runtime, None, reconnect, session_sink).await)
 }
 
+/// `session-agent` mode that unlocks the user's login keyring
+/// (`session::login_keyring`).
+pub(crate) const LOGIN_KEYRING_UNLOCK_FLAG: &str = "--login-keyring-unlock";
+
+#[cfg(target_os = "linux")]
+async fn run_login_keyring_unlock() -> Result<(), String> {
+    super::login_keyring::run_unlock().await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_login_keyring_unlock() -> Result<(), String> {
+    Err("the keyring unlock runs on Linux only".to_owned())
+}
+
 #[cfg(not(target_os = "linux"))]
 async fn run_local_playback_recovery(_args: &[String]) -> Result<(), String> {
     Err("local playback recovery runs on Linux only".to_owned())
@@ -1408,6 +1425,17 @@ fn activation_arguments(
     arguments
 }
 
+/// The imported variables the compositor starts with
+/// (`login_environment::compositor_may_inherit`).
+fn compositor_environment(imported: Vec<(String, String)>) -> Vec<(String, String)> {
+    imported
+        .into_iter()
+        .filter(|(name, _)| {
+            arcen_session::desktop_session::login_environment::compositor_may_inherit(name)
+        })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 async fn update_activation_environment(imported: &[(String, String)]) -> Result<(), AgentError> {
     let mut command = Command::new("/usr/bin/dbus-update-activation-environment");
@@ -1460,9 +1488,16 @@ fn agent_dispatch(args: &[String]) -> Result<AgentDispatch, AgentError> {
     let microphone_setup = microphone_codec != 0 || microphone_generation != 0;
     let parent_pid = count(PARENT_PID_FLAG);
     let local_playback_recover = count(crate::media::local_playback::RECOVER_FLAG);
+    let keyring_unlock = count(LOGIN_KEYRING_UNLOCK_FLAG);
 
-    if microphone_agent + microphone_recover + clipboard + desktop + local_playback_recover > 1
-        || (local_playback_recover != 0 && (parent_pid != 0 || microphone_setup))
+    if microphone_agent
+        + microphone_recover
+        + clipboard
+        + desktop
+        + local_playback_recover
+        + keyring_unlock
+        > 1
+        || (local_playback_recover + keyring_unlock != 0 && (parent_pid != 0 || microphone_setup))
         || microphone_codec > 1
         || microphone_generation > 1
         || parent_pid > 1
@@ -1477,6 +1512,8 @@ fn agent_dispatch(args: &[String]) -> Result<AgentDispatch, AgentError> {
     }
     if local_playback_recover != 0 {
         Ok(AgentDispatch::LocalPlaybackRecover)
+    } else if keyring_unlock != 0 {
+        Ok(AgentDispatch::LoginKeyringUnlock)
     } else if microphone_agent != 0 || microphone_recover != 0 {
         Ok(AgentDispatch::Microphone)
     } else if clipboard != 0 {
@@ -1624,6 +1661,7 @@ pub fn agent_main(args: &[String]) -> ExitCode {
         Ok(AgentDispatch::LocalPlaybackRecover) => {
             runtime.block_on(run_local_playback_recovery(args))
         }
+        Ok(AgentDispatch::LoginKeyringUnlock) => runtime.block_on(run_login_keyring_unlock()),
         Ok(AgentDispatch::Desktop) => runtime
             .block_on(run_user_agent(args))
             .map_err(|error| error.to_string()),
@@ -1885,6 +1923,38 @@ mod tests {
     }
 
     #[test]
+    fn the_login_keyring_unlock_is_its_own_helper_mode() {
+        let unlock = [
+            "agent",
+            LOGIN_KEYRING_UNLOCK_FLAG,
+            "--session-log-id",
+            "00000000-0000-0000-0000-000000000001",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            agent_dispatch(&unlock).unwrap(),
+            AgentDispatch::LoginKeyringUnlock
+        );
+        for conflicting in [
+            vec![
+                "agent",
+                LOGIN_KEYRING_UNLOCK_FLAG,
+                "--desktop-session",
+                "gnome",
+            ],
+            vec!["agent", LOGIN_KEYRING_UNLOCK_FLAG, PARENT_PID_FLAG, "7"],
+            vec![
+                "agent",
+                LOGIN_KEYRING_UNLOCK_FLAG,
+                crate::media::local_playback::RECOVER_FLAG,
+            ],
+        ] {
+            let conflicting: Vec<String> = conflicting.into_iter().map(str::to_owned).collect();
+            assert!(agent_dispatch(&conflicting).is_err(), "{conflicting:?}");
+        }
+    }
+
+    #[test]
     fn local_playback_recovery_is_its_own_helper_mode() {
         let recover = [
             "agent",
@@ -2064,6 +2134,27 @@ mod tests {
     #[test]
     fn activation_environment_includes_process_timezone() {
         assert!(ACTIVATION_ENVIRONMENT_KEYS.contains(&"TZ"));
+    }
+
+    #[test]
+    fn the_x11_compositor_starts_without_the_users_gpu_selection() {
+        let imported = vec![
+            ("PATH".to_owned(), "/home/u/bin:/usr/bin".to_owned()),
+            ("__GLX_VENDOR_LIBRARY_NAME".to_owned(), "mesa".to_owned()),
+            ("DRI_PRIME".to_owned(), "1".to_owned()),
+        ];
+        assert_eq!(
+            compositor_environment(imported.clone()),
+            [("PATH".to_owned(), "/home/u/bin:/usr/bin".to_owned())]
+        );
+        // The applications (the activation environment) keep all three.
+        let arguments = activation_arguments(|_| None, &imported);
+        for expected in ["__GLX_VENDOR_LIBRARY_NAME=mesa", "DRI_PRIME=1"] {
+            assert!(
+                arguments.iter().any(|argument| argument == expected),
+                "{arguments:?}"
+            );
+        }
     }
 
     #[test]

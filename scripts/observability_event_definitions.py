@@ -216,6 +216,16 @@ EVENT_DEFINITIONS = {
             ("reason", STRING),
         ),
     ),
+    # Level 0. Why a desktop held for its Deck's resume was let go.
+    1108: _event(
+        "RESUME_HOLD_ENDED",
+        0,
+        "info",
+        "reconnect",
+        "succeeded",
+        (("reason_class", STRING),),
+        (("held_ms", INTEGER),),
+    ),
     1200: _event(
         "DISPLAY_ARMED",
         2,

@@ -198,6 +198,43 @@ pre-authenticated credential hook:
    when the bound runs out is secured and the sign-in is refused
    (`console_session_unreachable`).
 
+*Amended 2026-11-18 (GDM's login screen did not come back after a
+session ended).* When a console session ends, GDM 40 opens a new login
+screen session on terminal 1 and, before it starts the X server, switches
+the console to that terminal and waits for the switch (`VT_ACTIVATE`,
+`VT_WAITACTIVE`). The switch is asked of the ending session's terminal,
+which logind still holds in process mode. If the login screen opens
+quickly — the display manager's account still has a running user manager,
+kept alive by a login screen that is still closing (an `ibus-daemon` a
+crashed greeter shell left behind, or the login screen that just took a
+sign-in) — logind restores that terminal to automatic mode before it
+answers the request, and restoring the mode drops the pending switch. GDM
+then waits forever: the login screen session is `online`, never `active`,
+with no X server or shell; the desk shows an empty text terminal; and every
+remote-first sign-in was refused `console_sign_in_unavailable`. Lab (GDM
+40.1, systemd 252): reproduced deterministically with a process left in a
+closing login screen's scope, and by ending a session a few seconds after
+its sign-in; GDM's worker sits in `__vt_event_wait`, and switching the
+console to terminal 1 releases it. The same defect occurs with 0.20.1.
+Shared `console_session::login_screen` decides when the console is in that
+state (a login screen on `seat0` that is `online`, not in front, without
+any process of its own account, while no session is in front of the
+seat). Before a remote-first sign-in the launcher brings such a login
+screen to its terminal (logind `ActivateSession`, at most twice) and waits
+(15 s bound) for its shell; between sign-ins the Pier watches the console
+(every 2 s, after a 5 s grace, at most three times per login screen, only
+while no console launcher runs) so the person at the desk gets the login
+screen back too. Arcen never switches a session in front away. A shell
+that started a moment ago may not listen for the token yet: while nothing
+has spent it, the token is given again after 5 s (at most three times; the
+record is checked again just before each signal, so a token whose
+conversation already started is never sent again: the shell would restart
+it). A login screen that is `closing` counts
+as finished when the sign-in settles, and once it has, the finished login
+screen's leftover processes are ended (logind `TerminateSession`, only for
+a `closing` greeter session whose worker is gone), so they do not keep the
+next login screen's race open. `ibus` itself is not touched.
+
 **Security analysis.** The Pier issues a token only after the user's own
 password passed the Pier's PAM service and account checks; the token
 replaces that password inside GDM, nothing more.
@@ -216,9 +253,19 @@ replaces that password inside GDM, nothing more.
 | Overwriting another product | The installer writes `/etc/pam.d/gdm-ovirtcred` and the bus policy only when absent or Arcen's (marker line); otherwise it keeps them and the sign-in is refused `console_sign_in_unavailable`. |
 | Audit | The PAM module logs every acceptance and refusal (`pam_arcen_greeter: … accepted for <user>` / `token refused (<reason>)`) to the journal; the Pier logs the sign-in and `SESSION_AUTH_OK`. |
 
-Residual: the login keyring is not unlocked by a token (no password reaches
-GDM), as with any pre-authenticated login; the desktop asks for it on first
-use.
+**The login keyring** (amended 2026-11-18). No password reaches GDM with a
+token, so `pam_gnome_keyring` starts the user's keyring daemon locked. The
+launcher keeps a copy of the password the Pier just proved (zeroized, until
+the session's agent is up) and, for a sign-in that started the session
+(through the login screen, or Arcen's own login session, §10), hands it on
+standard input to a short-lived helper running as the session user
+(`session-agent --login-keyring-unlock`): it waits (30 s bound) for the
+user's keyring daemon, checks the daemon's peer credentials and sends the
+one `UNLOCK` request `pam_gnome_keyring` sends on the daemon's control
+socket (shared `desktop_session::keyring_control`), which opens the login
+keyring or creates it with that password. A joined existing session is not
+touched; every failure is logged and the desktop asks for the keyring
+password as before.
 
 **Domain accounts.** On a host whose SSSD enforces Active Directory Group
 Policy access control, SSSD decides a PAM service's logon right by its name
@@ -265,7 +312,7 @@ SSSD would not weigh the login screen's service as interactive.
 | The user logs out (at the desk is impossible while attached; from the Deck) | The attachment ends |
 | The Pier or its launcher dies | The kernel releases the input grabs; the monitors stay blank; the Pier locks the session, then restores the monitors, from its journal (`/run/arcen/console-privacy.json`, directory kept by the tmpfiles rule) when the launcher is cleaned up and at service start |
 | A refusal after the login screen started, or logind brought forward, the session | The session is handed back locked before the refusal |
-| The session will not lock (no lock screen, lock disabled) | GDM is asked for a login screen on a new VT (`CreateTransientDisplay`) so the session goes to the background; failing that, the desk stays blank and its input disabled while the launcher retries. From the first failed hand-back the session's X server is also told to ignore the desk's devices (XInput `Device Enabled` 0, journalled): an `EVIOCGRAB` ends with the launcher, the X server's state does not. A launcher that is stopped or killed therefore leaves the desk blank and unusable; the Pier retries every 10 s (`console::guard_unsecured_console`, also re-blanking a monitor that came back and disabling a newly plugged device) and gives the desk its monitors and devices back only once the session is locked, behind a login screen, or gone. One Pier-wide gate keeps a retry and a console launcher apart |
+| The session will not lock (no lock screen, lock disabled) | GDM is asked for a login screen on a new VT (`CreateTransientDisplay`) so the session goes to the background; failing that, the desk stays blank and its input disabled while the launcher retries. From the first failed hand-back the session's X server is also told to ignore the desk's devices (XInput `Device Enabled` 0, journalled): an `EVIOCGRAB` ends with the launcher, the X server's state does not. A launcher that is stopped or killed therefore leaves the desk blank and unusable; the Pier retries every 10 s (`console::guard_unsecured_console`, also re-blanking a monitor that came back and disabling a newly plugged device) and gives the desk its monitors and devices back only once the session is locked, behind a login screen, or gone. One Pier-wide gate keeps a retry and a console launcher apart. *Amended 2026-11-18:* a display manager's session is "behind a login screen" only for the desk's picture: the login screen is put in front, but the session stays private (blank, the desk's devices disabled in its X server) until it locks, because a key chord switches to its terminal (`console_session::unlocked_hand_back` returns `KeepPrivate` for it in the background), for at most a minute (`UNLOCKED_GRACE`, counted from the first failed lock in `/run/arcen/console-unlocked.json`): a session whose lock screen is turned off by policy never locks, and its owner signing in at the login screen must get it back. Another product's session in the background is given back as before |
 
 **Resume order** (`console::reattach`): a session that waits behind a
 login screen (a hand-back whose lock failed puts it there unlocked) is
@@ -478,7 +525,12 @@ product owned):*
   shown outputs' bounding box, which need not start at the screen origin.
   `console_layout_differs` remains only for a desktop that shows nothing.
   The mapping and each difference are logged by the Pier and named by the
-  Deck (`arcen_deck_core::multi_window::layout_note`).
+  Deck (`arcen_deck_core::multi_window::layout_note`). A single-display
+  Deck is shown the output its primary maps to by the same rule
+  (`arcen_outputs::console_layout::single_display_output`), captured by
+  name at its own size, its absolute pointer and pen placed on that output
+  of the whole screen (`ShownOutput::screen_point`); the whole screen in one
+  picture only when one output is shown (amended 2026-11-18, field report).
 - **One remote product at a time.** While that product's client is connected
   the sign-in is refused `console_in_use_other_product`; when it connects
   during an attachment the attachment ends with that code. A connected
@@ -604,12 +656,18 @@ without a display manager has no switching between sessions and a Pier
 serves one desktop. A domain account needs `arcen-login` weighed as an
 interactive logon (the installer's SSSD snippet, §3 "Domain accounts").
 
-Known limits: the keyring is not unlocked (no password reaches the
-session), as with a remote-first sign-in through GDM; without a display
-manager nobody can use the session at the desk (there is no lock screen
-to unlock, see above), so it is resumed only by an Arcen sign-in of its
-owner; the session keeps the size of its first head (a joined console is
-never resized, §6).
+*Amended 2026-11-18:* the session's head is created at the size of the
+Deck display the first sign-in serves, with that display's generated EDID,
+as a dedicated desktop's head is (the launcher passes the display's facts
+to `login-session`, never EDID bytes; a display the generator refuses keeps
+the template's EDID-less head, a multi-head request keeps the template's
+heads); later sign-ins join it at that size (a joined console is never
+resized, §6). The login keyring is unlocked with the sign-in's password
+(§3, "The login keyring").
+
+Known limits: without a display manager nobody can use the session at the
+desk (there is no lock screen to unlock, see above), so it is resumed only
+by an Arcen sign-in of its owner.
 
 `platform.session.mode = dedicated` stays an **explicit administrator
 opt-in**, never a default, for one technical reason: it is the only mode
@@ -654,15 +712,28 @@ records its log tail and keeps its logs.
 | --- | --- | --- |
 | Joins the user's session | Yes: binds the account's WTS session against `WTSGetActiveConsoleSessionId` (`hosts/windows/src/windows_session.rs:1253-1262`) and moves the account's disconnected session onto the console (`:1671`, `WTSConnectSessionW`) | Yes: serves the console owner's Aqua session (`hosts/macos/src/console.rs:86-113`, `wait_for_console_owner` `:128`) |
 | Remote-first creates the OS's real session | Yes: Credential Provider logon; Winlogon creates the console session the desk later sees (`windows_session.rs:1430-1446`, `first_login.rs:24`) | Yes, interactively: the login window is streamed and the user signs in there; cold boot with FileVault is not served (open, README) |
-| Another account at the console | Refused, typed (`windows_session.rs:888`; `docs/architecture/windows-console-policy.md`) | Refused at once with who holds it (`console.rs` tests `a_different_account_at_the_screen_is_refused_at_once_not_waited_out`) |
-| Disconnect locks, never ends | **Gap:** never logs off, but no lock on detach (no `LockWorkStation` in `hosts/windows/src`); the console is left unlocked | **Gap:** no lock on detach |
-| Desk private while attached | Optional deskside policy, off by default (`hosts/windows/src/deskside.rs:38-48`) | **Gap:** none (GAP-014) |
+| Another account at the console | Refused, typed with the shared codes (`console_other_user`; `console_other_user_other_product` naming the session's WinStation listener and protocol when another remote-desktop service is attached; `windows_session::console_refusal`, `docs/architecture/windows-console-policy.md`) | Refused at once, led by the shared `console_other_user` code and naming the account at the console (`console::other_user_refusal`; `console.rs` tests `a_different_account_at_the_screen_is_refused_at_once_not_waited_out`) |
+| Disconnect locks, never ends | Yes (amended 2026-11-18): a Deck that leaves for good gets the session locked (`LockWorkStation` as the user in that session, then disconnected from the console if it would not lock), outputs first (`DETACH_STEPS_OUTPUTS_FIRST`, PD-033), speakers last; a same-account takeover and a changed session are not locked (shared `Departure`). **Gap** GAP-044: while held for a resume the session stays unlocked | Yes (amended 2026-11-18): a signed-in user's session is locked as its Deck leaves (the system's Lock Screen, `SACLockScreenImmediate` found with `dlsym`, proved from `CGSessionCopyCurrentDictionary`), then its displays and sound are given back (`DETACH_STEPS`); a console another account took over is left alone (shared `Departure`). The macOS Pier has no resume hold, so every departure is final. Joining a locked session does not unlock it: the Deck signs in at the streamed lock screen (no public unlock after a password check) |
+| Desk private while attached | Optional deskside policy, off by default (`hosts/windows/src/deskside.rs:38-48`) | Optional, off by default (amended 2026-11-18, `platform.desktop.deskside.enabled`): every display but the Pier's virtual ones dark through an all-zero transfer table, read back; an active HID event tap passes only the Pier's own events (`hosts/macos/src/desk_privacy.rs`, shared `console_session::desk_privacy`); handed back in `DETACH_STEPS` order; dies with the process, after which the agent's lock guard darkens the displays again and locks the session (`hosts/macos/src/lock_guard.rs`, shared `console_session::owner_death`; GAP-048 closed 2026-11-18) |
 | No leftovers | Display journal and console recovery (`hosts/windows/src/console_recovery.rs:1-20`); window repatriation caveat (PD-032) | Virtual displays live in a child process and die with it (`hosts/macos/src/virtual_display.rs:58`, `:125`) |
 
-Follow-ups (not in this change): `windows-lock-on-detach`,
-`windows-deskside-default`, `macos-lock-on-detach`, `macos-deskside`
-(GAP-014). Each should adopt `console_session::DETACH_STEPS` and
+Follow-ups (not in this change): `windows-lock-on-detach` (landed
+2026-11-18, except the held-for-resume case, GAP-044),
+`windows-deskside-default`, `macos-lock-on-detach` (landed 2026-11-18),
+`macos-deskside` (landed 2026-11-18, opt-in like Windows; its lab proof
+that capture reads before the transfer table is
+`arcen-pier-macos probe-desk-privacy --blank 2 --capture`). Each should adopt `console_session::DETACH_STEPS` and
 `disables_while_attached`.
+
+Audit 2026-11-18 (every Pier, after the day's merges): the open differences
+against the principle are ledger gaps GAP-042 (Linux: Wayland consoles are
+refused), GAP-044 (Windows: a session held for resume stays unlocked),
+GAP-047 (Windows service that dies while attached: nothing locks the session
+afterwards) and GAP-049 (Windows: the desk's input stays live unless deskside
+is enabled). Closed the same day: GAP-046 (a Linux console's windows go back
+after the Deck's layout, `console_windows`) and GAP-048 (a macOS agent that
+dies is followed by its lock guard, and a restarted agent locks first,
+`console_session::owner_death`).
 
 ## Consequences
 

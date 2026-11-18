@@ -9,9 +9,9 @@
 > `arcen-transport`'s opt-in QUIC feature is active in the Linux, Windows and
 > macOS Piers and the macOS Deck while its default dependency graph stays
 > Quinn-free. Shipped transport is
-> **direct QUIC only**, using the shared TLS trust lifecycle. The Decks carry no
-> WSS code; the Piers' dormant WSS listener is isolated behind `wss-compat` and
-> is not enabled by product builds.
+> **direct QUIC only**, using the shared TLS trust lifecycle. No Deck or Pier
+> carries WSS network code (the Piers' dormant listener was removed on
+> 2026-11-18).
 > Current status is the repository `README.md`; see
 > [`observability.md`](observability.md) for the direct Pier/Deck observability
 > implementation. This is not a release claim.
@@ -39,8 +39,7 @@ authenticated connection carries isolated lanes — control, video, audio out,
 microphone, input/cursor and bulk — each on its own stream with its own worker, declared
 by a bounded lane preface (protocol v5,
 [ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md)). The Decks
-have no WSS network code; the Piers' is dormant behind `wss-compat` and absent
-from product feature graphs.
+and the Piers have no WSS network code.
 The products do not use QUIC datagrams. See
 [`transport.md`](transport.md) for API usage and known gaps, and
 [`../adr/0007-quic-only-product-transport.md`](../adr/0007-quic-only-product-transport.md)

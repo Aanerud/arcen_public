@@ -272,11 +272,6 @@
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
       "contracts": ["build_identity", "clipboard", "crate", "cursor", "cursor_position", "lanes", "messages", "wire"],
-      "forwarded_features": {
-        "wss-compat": [
-          "wss-compat"
-        ]
-      },
       "paths": [
         {
           "id": "linux-wayland-input",
@@ -512,11 +507,6 @@
       "package": "arcen-pier-windows",
       "dependency_kind": "normal",
       "contracts": ["auth", "build_identity", "clipboard", "crate", "fsm", "messages", "wire"],
-      "forwarded_features": {
-        "wss-compat": [
-          "wss-compat"
-        ]
-      },
       "paths": [
         {
           "id": "windows-auto",
@@ -632,12 +622,7 @@
     {
       "package": "arcen-transport",
       "dependency_kind": "normal",
-      "contracts": ["crate", "lanes", "wire"],
-      "forwarded_features": {
-        "wss-compat": [
-          "wss-compat"
-        ]
-      }
+      "contracts": ["crate", "lanes", "wire"]
     },
     {
       "package": "arcen-usb-service",

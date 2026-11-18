@@ -854,9 +854,55 @@ mod imp {
         }
         if opts.purge {
             preserve_config_before_purge(opts)?;
-            remove_dir_all(opts, &opts.programdata)?;
+            purge_programdata(opts)?;
         }
         credential_provider
+    }
+
+    /// What other Arcen products keep in `%ProgramData%\Arcen`: the Windows
+    /// Deck's USB component (its state and prepared packages in `USB`, and
+    /// the leftover list its uninstall writes beside it). `--purge` removes
+    /// the Pier's state, never theirs.
+    const OTHER_PRODUCTS_PROGRAMDATA: [&str; 2] = ["USB", "usb-component-uninstall.txt"];
+
+    /// Deletes the Pier's state under ProgramData, and the directory itself
+    /// once nothing else is left in it.
+    fn purge_programdata(opts: &Options) -> Result<(), String> {
+        let entries = match fs::read_dir(&opts.programdata) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("read {}: {error}", opts.programdata.display())),
+        };
+        let mut kept = false;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read {}: {e}", opts.programdata.display()))?;
+            let name = entry.file_name();
+            let other_product = OTHER_PRODUCTS_PROGRAMDATA
+                .iter()
+                .any(|other| name.to_string_lossy().eq_ignore_ascii_case(other));
+            if other_product {
+                println!(
+                    "purge: kept {} (another Arcen product)",
+                    entry.path().display()
+                );
+                kept = true;
+                continue;
+            }
+            let path = entry.path();
+            let directory = entry
+                .file_type()
+                .map_err(|e| format!("inspect {}: {e}", path.display()))?
+                .is_dir();
+            if directory {
+                remove_dir_all(opts, &path)?;
+            } else {
+                remove_file(opts, &path)?;
+            }
+        }
+        if !kept {
+            remove_dir_all(opts, &opts.programdata)?;
+        }
+        Ok(())
     }
 
     /// Copy `pier.json` clear of the tree `--purge` is about to delete.
@@ -1883,7 +1929,7 @@ mod imp {
             };
 
             preserve_config_before_purge(&opts).expect("preserve config");
-            remove_dir_all(&opts, &programdata).expect("purge programdata");
+            purge_programdata(&opts).expect("purge programdata");
 
             assert!(
                 !programdata.exists(),
@@ -1904,6 +1950,51 @@ mod imp {
                 tuned,
                 "preserved copy must be byte-identical to the tuned config"
             );
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        /// A Windows Deck on the same machine keeps its USB component's state
+        /// under `%ProgramData%\Arcen\USB`; `--purge` must not take it.
+        #[test]
+        fn purge_keeps_the_deck_usb_components_state() {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let root = std::env::temp_dir().join(format!(
+                "arcen-windows-installer-purge-usb-{}-{unique}",
+                std::process::id()
+            ));
+            let programdata = root.join("Arcen");
+            for directory in ["logs", "tls", "recovery", "USB\\packages"] {
+                fs::create_dir_all(programdata.join(directory)).expect("create tree");
+            }
+            fs::write(programdata.join("pier.json"), b"{}").expect("write config");
+            fs::write(programdata.join("USB").join("state.json"), b"{}").expect("write state");
+            fs::write(programdata.join("usb-component-uninstall.txt"), b"x").expect("write report");
+            let opts = Options {
+                prefix: root.join("prefix"),
+                programdata: programdata.clone(),
+                dry_run: false,
+                uninstall: true,
+                purge: true,
+                version: false,
+                force: false,
+                adopt_legacy: false,
+                service_name: SERVICE_NAME.to_string(),
+                extra_sans: Vec::new(),
+            };
+
+            purge_programdata(&opts).expect("purge programdata");
+
+            let mut left: Vec<_> = fs::read_dir(&programdata)
+                .expect("ProgramData\\Arcen stays while the Deck's state is in it")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            left.sort();
+            assert_eq!(left, ["USB", "usb-component-uninstall.txt"]);
+            assert!(programdata.join("USB").join("state.json").exists());
+            assert!(programdata.join("USB").join("packages").exists());
             let _ = fs::remove_dir_all(&root);
         }
 

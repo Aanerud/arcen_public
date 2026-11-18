@@ -30,7 +30,23 @@ HDR are `Quality` (P6, `HIGH_QUALITY`, still no reordering).
 The video swapchain is a flip-model composition swapchain
 (`DXGI_SWAP_EFFECT_FLIP_DISCARD`, two buffers, waitable, maximum frame
 latency 1, created with `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING` where DXGI
-reports support).
+reports support). Each window's presenter thread waits for the swapchain
+holding no lock, takes the newest frame, draws it under the device's shared
+immediate-context lock (the decoder and the other windows' presenters take
+it too), and calls `Present` outside that lock. Both the decoder and each
+presenter log where their time goes every five seconds (`decoder timing`,
+`video presenter timing`).
+
+Open (2026-11-18 field report, two 2560x1600 monitors): on the lab's
+virtual GPU with two windows on two displays, `Present` itself takes
+15-16 ms (one with a single window takes 1-2 ms), and the device's own
+multithread lock then holds every decode call for about 11 ms, so the two
+monitors decode about 60 frames a second between them (55 + 25 shown). A
+third buffer, a larger device frame latency and
+`DXGI_PRESENT_DO_NOT_WAIT` were measured and change nothing. The Auto
+contract's skip-ahead keeps the video with the sound meanwhile, and Stream
+Statistics says so. Next: decode on a device of its own (textures shared
+with the presenters), so a blocking present cannot stall decode.
 
 | Timing | `Present` |
 | --- | --- |
@@ -55,7 +71,7 @@ The eight-bit layer (`BGRA8Unorm`, Auto and Speed) and the ten-bit layer
 | Timing | Eight-bit layer |
 | --- | --- |
 | `Vsync` | rendered on a `CVDisplayLink` tick from a FIFO pacer (up to three frames), `displaySyncEnabled` on, `present(_:afterMinimumDuration:)` half a refresh, two drawables in flight |
-| `Newest` | rendered the moment the frame arrives; the pacer keeps only the newest; one drawable in flight (Core Animation shows display-synced drawables in order, so a second one would queue behind the first); `displaySyncEnabled` on; the display-link tick is the retry path when the drawable is busy |
+| `Newest` | rendered the moment the frame arrives; the pacer keeps only the newest; `displaySyncEnabled` on; one drawable in flight where a picture reaches the glass within a refresh, two where the system composes the layer and it measurably takes longer (`arcen_media::NewestPresentDepth`, below); a frame that finds the slots busy is rendered the moment a drawable's presented handler frees one (the presenter's slot thread), the display-link tick stays the retry path |
 | `Tearing` | as `Newest`, with `displaySyncEnabled` off, two drawables in flight (without display sync a drawable is shown as soon as it is ready, so the second does not wait behind the first) and `present(_:)` without a minimum duration |
 
 `displaySyncEnabled`: "If false, the layer presents new content more
@@ -64,7 +80,26 @@ quickly, but possibly with brief visual artifacts (tearing)"
 `maximumDrawableCount` stays 3 (only 2 or 3 are allowed,
 [maximumDrawableCount](https://developer.apple.com/documentation/quartzcore/cametallayer/maximumdrawablecount));
 the in-flight gate, not the pool size, keeps one drawable pending.
-`presentsWithTransaction` stays off. The ten-bit layer is unchanged:
+`presentsWithTransaction` stays off.
+
+**How many pictures `Newest` keeps in flight.** The slot is released by
+the drawable's presented handler, so one picture in flight shows at most
+one picture per round trip from submission to the glass. On a full-screen
+layer scanned out directly that round trip is under a refresh. Where the
+system composes the layer first (a window, a scaled display mode) it is
+two to three refreshes: Apple notes the latency "may be bigger if the
+system needs more time, such as for windowed modes on macOS"
+([CAMetalDisplayLink.preferredFrameLatency](https://developer.apple.com/documentation/quartzcore/cametaldisplaylink/preferredframelatency)).
+One picture in flight then shows every second or third refresh: the owner's
+5K-scaled 60 Hz display showed 20 of 40-48 frames a second. The presenter
+measures the round trip of pictures submitted while none other was in
+flight and keeps a second one in flight once its median exceeds a refresh
+(withdrawn below three quarters of one); the shared rule is
+`arcen_media::NewestPresentDepth`. Two in flight with a three-drawable pool
+leaves one drawable for the picture on the glass, so `nextDrawable` never
+waits. Log: `eight-bit video layer pictures in flight follow the display
+path`, and `submit_to_glass_p50_us`/`max_in_flight` in the per-second
+`dedicated presenter pipeline` line. The ten-bit layer is unchanged:
 `CVDisplayLink` pacing, display sync on, EDR and the PQ colour space only
 when the host returns PQ.
 
@@ -115,6 +150,16 @@ median per run, three to four runs per cell (each run is one phase sample).
 | Speed | fullscreen | 12.8 ms | **4.3 ms** | 0 |
 | Speed | windowed | 24.2 ms | **17.2 ms** | 0 (17 % with one drawable in flight, hence two) |
 | Grading | fullscreen | — | 13.0 ms, ten-bit layer, EDR off (unchanged path) | 0 |
+
+**macOS Deck, composed 60 Hz display** (2026-11-18; MacBook with a DELL
+U2723QE in its 5K-backed "looks like 2560x1440" mode, Auto, a Linux X11
+Pier serving a 60 fps animation; one 35-40 s run per cell; "shown" is
+confirmed presents over frames received):
+
+| Window | Before (one in flight) | After (two once measured) |
+| --- | --- | --- |
+| windowed | 27.4 of 59.7 fps shown (46 %), 34 ms to glass | 38.7 of 60.2 (64 %), 54 ms; the round trip alone is three refreshes (49 ms), so two in flight cap it at 40 |
+| fullscreen | 29.1 of 60.1 (48 %), 34 ms | 56.2 of 59.4 (95 %), 37 ms |
 
 ## Several monitors: one timeline
 

@@ -62,6 +62,12 @@
 # feeds capenc's CursorEmitter (over the PipeWire CursorState) into it. The record
 # format and writer are shared (arcen_media::capenc_stream::write_record); it moves to
 # shared/ with pipelines/mod.rs and wayland/cursor.rs.
+# hosts/linux/src/display/nvctrl.rs is the Linux Pier's reversible single-display
+# MetaMode transaction (snapshot, ViewPortIn assign, Drop restore with the session
+# permit held, the Pier's LifecycleEmitter events). Its X traffic moved to
+# session::console_layout's proven NV-CONTROL connection, which left it free of OS
+# calls; the MetaMode text is NVIDIA X driver syntax no other product speaks. It
+# moves to shared/ with the emitter seam, as net/setup_watch.rs does.
 # hosts/linux/src/net/setup_watch.rs is the Linux Pier's connection-scoped
 # lifecycle glue (a tokio task-local and the Pier's LifecycleEmitter), as
 # hosts/*/src/observability.rs are; its trace moves to shared/ with the emitter seam.
@@ -80,6 +86,7 @@ hosts/capenc/src/wayland/pipelines/speed.rs 71
 hosts/capenc/src/wayland/reference.rs 62
 hosts/capenc/src/wayland/telemetry.rs 58
 hosts/linux/src/bounded_io.rs 64
+hosts/linux/src/display/nvctrl.rs 427
 hosts/linux/src/display/topology.rs 398
 hosts/linux/src/input/edges.rs 152
 hosts/linux/src/input/eis.rs 515

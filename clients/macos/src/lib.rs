@@ -21,6 +21,7 @@ pub mod display;
 pub mod gestures;
 #[cfg(feature = "experimental-raw-hid")]
 pub mod hid;
+pub mod installed_copies;
 pub mod logging;
 pub mod microphone;
 pub mod netinfo;

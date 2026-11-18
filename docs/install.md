@@ -151,12 +151,14 @@ installer:
 
 ```powershell
 .\install-arcen-pier.exe --uninstall          # keeps C:\ProgramData\Arcen
-.\install-arcen-pier.exe --uninstall --purge  # removes it as well
+.\install-arcen-pier.exe --uninstall --purge  # removes the Pier's part of it as well
 ```
 
 It removes the service, the binaries, the credential provider registration, the
 event source and the installer's firewall rule. `--purge` first saves
-`pier.json` as `C:\ProgramData\arcen-pier.json.purged-<epoch>`. If it reports
+`pier.json` as `C:\ProgramData\arcen-pier.json.purged-<epoch>`. It leaves the
+Windows Deck's USB component alone: `C:\ProgramData\Arcen\USB` (and the
+directory itself) stays while that component is installed. If it reports
 that the credential provider is still loaded by the sign-in screen, reboot and
 confirm the directory is gone.
 

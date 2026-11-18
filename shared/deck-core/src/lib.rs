@@ -61,7 +61,11 @@ pub mod decode_report;
 pub mod directories;
 pub mod display;
 pub mod display_fit;
+#[cfg(feature = "runtime")]
+pub mod display_follow;
+pub mod display_note;
 pub mod input;
+pub mod installed_copies;
 pub mod keymap;
 pub mod log_target;
 #[cfg(feature = "runtime")]

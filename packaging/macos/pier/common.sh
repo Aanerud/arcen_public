@@ -169,16 +169,44 @@ arcen_microphone_driver_process_running() {
   pgrep -f 'ArcenMicrophone[.]driver' >/dev/null 2>&1
 }
 
+# Restarts Core Audio and returns once the new instance serves. With
+# --expect-driver it also waits until Core Audio publishes the Arcen
+# microphone device, which it does only after loading the HAL plug-ins.
+#
+# Returning while Core Audio was still restarting is the likeliest cause of a
+# login-window agent that refused every session after an install until the Mac
+# restarted: launchd started it at once, and every tap it created was then
+# unknown to Core Audio ('!obj'), so it could not prove the mute.
 arcen_restart_coreaudiod() {
+  local old pid _
+  old="$(pgrep -x coreaudiod 2>/dev/null | tr '\n' ' ')"
   # Under SIP, launchctl kickstart is not enough to evict AudioServerPlugIn
   # host processes. root may signal coreaudiod; launchd respawns it and reloads
   # the HAL driver set.
   /usr/bin/killall coreaudiod >/dev/null 2>&1 \
     || /bin/launchctl kickstart -k system/com.apple.audio.coreaudiod >/dev/null 2>&1 \
     || true
-  local _
+  # The signalled instance has to be gone first: right after the signal,
+  # pgrep still finds it exiting.
+  for pid in $old; do
+    for _ in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.5
+    done
+  done
+  # launchd starts it again on demand. A fresh process asks each time, so the
+  # question itself never holds a connection opened mid-restart.
+  if [ "${1:-}" = "--expect-driver" ] && [ -x "$ARCEN_PIER_BIN" ]; then
+    for _ in $(seq 1 30); do
+      "$ARCEN_PIER_BIN" core-audio-ready >/dev/null 2>&1 && return 0
+      sleep 1
+    done
+    arcen_log "Core Audio did not publish the Arcen microphone within 30 s; continuing"
+    return 0
+  fi
   for _ in 1 2 3 4 5; do
-    pgrep -x coreaudiod >/dev/null 2>&1 && break
+    pgrep -x coreaudiod >/dev/null 2>&1 && return 0
     sleep 1
   done
+  return 0
 }

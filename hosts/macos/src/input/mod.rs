@@ -461,7 +461,9 @@ pub fn text_injection_available() -> bool {
         && crate::permissions::probe().capabilities().keyboard_input
 }
 
-fn input_backend() -> InputBackend {
+/// The input backend this process chose (`CoreGraphics` unless set).
+#[must_use]
+pub fn input_backend() -> InputBackend {
     INPUT_BACKEND
         .get()
         .copied()
@@ -1141,10 +1143,14 @@ impl InputController {
         for edge in edges {
             match *edge {
                 PenEdge::ToolIn(tool) => {
-                    self.post_pen_proximity(point, pen_pointer_type(tool), true)?;
+                    for carrier in pen::proximity_carriers(true) {
+                        self.post_pen_proximity(point, pen_pointer_type(tool), true, *carrier)?;
+                    }
                 }
                 PenEdge::ToolOut(tool) => {
-                    self.post_pen_proximity(point, pen_pointer_type(tool), false)?;
+                    for carrier in pen::proximity_carriers(false) {
+                        self.post_pen_proximity(point, pen_pointer_type(tool), false, *carrier)?;
+                    }
                 }
                 PenEdge::TipDown => self.post_pen_button(1, true, point, annotations)?,
                 PenEdge::TipUp => self.post_pen_button(1, false, point, annotations)?,
@@ -1256,6 +1262,7 @@ impl InputController {
         point: CGPoint,
         pointer_type: i64,
         entering: bool,
+        carrier: pen::ProximityCarrier,
     ) -> Result<(), InputError> {
         // SAFETY: the source is live for the controller's lifetime.
         let event = unsafe {
@@ -1273,8 +1280,11 @@ impl InputController {
         unsafe {
             // A proximity edge is its own event type. Posted as a mouse move
             // with the proximity subtype, AppKit delivered it as a plain move
-            // and `tabletProximity:` never ran.
-            CGEventSetType(event, pen::K_CG_EVENT_TABLET_PROXIMITY);
+            // and `tabletProximity:` never ran. The mouse move is posted as
+            // well when the pen leaves (`pen::proximity_carriers`).
+            if carrier == pen::ProximityCarrier::TabletProximity {
+                CGEventSetType(event, pen::K_CG_EVENT_TABLET_PROXIMITY);
+            }
             CGEventSetIntegerValueField(
                 event,
                 pen::K_CG_MOUSE_EVENT_SUBTYPE,
@@ -1325,7 +1335,10 @@ impl InputController {
             CGEventPost(K_CG_HID_EVENT_TAP, event);
             CFRelease(event.cast_const());
         }
-        self.stats.pen_proximity_edges += 1;
+        // One edge, however many events carry it.
+        if carrier == pen::ProximityCarrier::TabletProximity {
+            self.stats.pen_proximity_edges += 1;
+        }
         Ok(())
     }
 
@@ -1599,6 +1612,30 @@ pub fn warp_pointer(position: (f64, f64)) {
             y: position.1,
         });
         CGAssociateMouseAndMouseCursorPosition(true);
+    }
+}
+
+/// Posts one pointer move to where the pointer already is, as this process
+/// (`probe-desk-privacy` checks the window server attributes it here).
+pub(crate) fn post_pointer_nudge() -> bool {
+    let Some(point) = current_pointer_point() else {
+        return false;
+    };
+    // SAFETY: creating an event source has no preconditions.
+    let source = unsafe { CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM) };
+    if source.is_null() {
+        return false;
+    }
+    // SAFETY: a live source; the event and the source are released once.
+    unsafe {
+        let event = CGEventCreateMouseEvent(source, K_CG_EVENT_MOUSE_MOVED, point, 0);
+        let posted = !event.is_null();
+        if posted {
+            CGEventPost(K_CG_HID_EVENT_TAP, event);
+            CFRelease(event.cast_const());
+        }
+        CFRelease(source.cast_const());
+        posted
     }
 }
 

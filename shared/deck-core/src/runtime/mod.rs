@@ -16,6 +16,7 @@ pub mod audio_worker;
 pub mod clipboard_controller;
 pub mod clipboard_session;
 pub mod connector;
+pub mod decode_lag;
 pub mod frame_queue;
 pub mod frame_sync;
 pub mod lanes;

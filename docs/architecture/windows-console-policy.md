@@ -27,19 +27,51 @@ takeover rule applies only to this state.
 | Requested account owns the active console, **locked** | Unlock it through the Credential Provider | Credential Provider failures are reported separately |
 | Nobody owns the console, nothing else competes for it | Sign the account in at the console | Credential Provider failures are reported separately |
 | Requested account has exactly one disconnected session elsewhere, console otherwise free | Move that session onto the console, then bind | `…: the account's existing session could not be moved to the physical console.` |
-| **Another account owns the console, WTS reports `Active`** | **Refuse.** A locked console counts as active | `…: another account is actively using the physical console.` |
+| **Another account owns the console, WTS reports `Active`** | **Refuse.** A locked console counts as active | `console_other_user: another account is signed in at this workstation.` |
+| **Another account's session is attached through another remote-desktop service** (an RDP or ICA client is connected to it) | **Refuse** | `console_other_user_other_product: another remote-desktop service (RDP-Tcp, rdp) uses this workstation.` — the session's WinStation listener and client protocol, as Windows reports them |
+| The requested account's own desktop is attached through another remote-desktop service | Refuse; one remote product at a time | `console_in_use_other_product: this desktop is in use through another remote-desktop product.` |
 | **Another account owns the console, WTS reports `Disconnected`, and this account has a parked session** | **Take over**: move this account's session onto the console | — unless a later Windows operation fails |
 | Another account owns the console, WTS reports `Disconnected`, and this account has nothing to move | Refuse | `…: another account holds the console and this account has no session to move onto it.` |
 | The console owner cannot be verified | Refuse; Arcen does not guess ownership | `…: active console account could not be verified.` |
 | Console is ambiguous, non-console, stale, or has unverifiable interactive sessions | Refuse | The specific classifier reason follows `Remote sign-in is unavailable:` |
+| The requested account's session is held for another Deck's resume, and that Deck's connection is gone | **Take over** at once: the held session is handed to this sign-in, unlocked (the resume grant is invalidated) | — |
+| Another account's session is held for its Deck's resume | Refuse | `Another user's remote desktop is waiting for its owner to reconnect; try again later.` |
 | The requested account appears to own more than one possible desktop | Refuse; choosing one would be a guess | `…: authenticated account session is ambiguous.` |
 
-Every client message is prefixed `Remote sign-in is unavailable:` and abbreviated
-above with `…` for width.
+A refusal Arcen can name leads with its code (the shared console refusals, the
+same codes a Linux Pier uses; see [error codes](../operations/error-codes.md)).
+Every other client message is prefixed `Remote sign-in is unavailable:` and
+abbreviated above with `…` for width. The Pier log records the code as
+`reason_class`, and for another remote-desktop service its `win_station` and
+`protocol`.
 
 Client-facing messages name the situation, not the other account. Operators need to know that
 another account owns or is using the console; naming the account would expose avoidable user
 identity information to a remote client and is not needed to resolve the policy decision.
+
+## When the Deck leaves
+
+Arcen joins the user's session and never ends it (ADR 0025). When a Deck
+leaves for good (it disconnects, it did not ask to resume, its reconnect window
+ends, a resume is refused, or the Pier stops), the session agent restores the
+displays and gives the desk its input back, then the Pier locks the session
+(`LockWorkStation`, run as the user in that session) and waits until Windows
+reports it locked; the desk's speakers come back last. A session that will not
+lock is disconnected from the console instead, so the desk shows the sign-in
+screen and the account's next sign-in reconnects the same session. Windows
+refuses display changes from a locked session, which is why the displays are
+restored before the lock (`console_session::DETACH_STEPS_OUTPUTS_FIRST`).
+
+The session is not locked when a sign-in of the same account takes it over
+(including one that waits while the departing Deck's session is handed back),
+or when it is no longer the session the Deck joined (signed out, locked or
+taken over at the desk). A sign-in refused after it unlocked or signed the
+session in, or took it over, leaves it locked. If the departing broker locked
+it just before a same-account sign-in took it over, that sign-in is refused
+with `console_session_changed`, and signing in again unlocks it. While a Deck's session is held for its resume it stays
+unlocked: Windows cannot unlock it again without the user's password, and a
+resume carries none (tracked as GAP-044). A returning Deck whose session
+changed meanwhile is refused with `console_session_changed`.
 
 ## Takeover configuration
 

@@ -167,6 +167,11 @@ fn apply_display_plan_with(
         .is_pinned()
         .then(|| primary_monitor(&monitors).map(|monitor| monitor.id))
         .flatten();
+    // The displays' own refresh (a 144 Hz panel's 144), which hosts follow;
+    // the requested modes above stay pinned. A pinned session is shown on
+    // its pinned display, a windowed one on the primary.
+    options.display_refresh =
+        arcen_deck_core::connect_plan::deck_display_refresh(&monitors, pinned_display);
     if policy.is_pinned() {
         tracing::info!(
             target: "arcen::display",
@@ -290,6 +295,7 @@ mod tests {
 
     fn options() -> ConnectOptions {
         ConnectOptions {
+            display_refresh: None,
             services: Arc::new(crate::platform::WindowsDeckServices::new()),
             host: "pier.example.internal".to_owned(),
             port: 18444,
@@ -383,6 +389,28 @@ mod tests {
             (options.monitors[0].width_px, options.monitors[0].height_px),
             (3840, 2160)
         );
+    }
+
+    #[test]
+    fn a_fast_panel_states_its_own_refresh_beside_the_pinned_mode() {
+        let mut fast = monitor(1, 0, 1920, 1080, 96, true);
+        fast.refresh_hz = Some(143.97);
+        let displays = roster_with_metrics(&[fast, monitor(2, 1920, 1920, 1080, 96, false)]);
+        let mut options = options();
+        let plan = apply_display_plan_with(
+            &mut options,
+            &ClientSettings::default(),
+            DisplaysMode::SinglePrimary,
+            None,
+            &displays,
+        );
+        // The virtual display mode stays pinned; the panel's 144 Hz is
+        // stated for the host to follow, on the display that shows it.
+        assert_eq!(options.monitors[0].refresh_hz, 60);
+        let stated = options.display_refresh.clone().expect("stated");
+        assert_eq!(stated.stream_display_id, plan.pinned_display);
+        assert_eq!(stated.refresh_of(1), Some(144));
+        assert_eq!(stated.refresh_of(2), Some(60));
     }
 
     #[test]

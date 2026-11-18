@@ -584,7 +584,10 @@ fn lookup_service() -> Result<MachSendRight, MicrophoneDeviceError> {
     }
 }
 
-fn hal_device_published() -> bool {
+/// Whether Core Audio publishes the Arcen microphone device: Core Audio is
+/// serving and has loaded the driver.
+#[must_use]
+pub fn hal_device_published() -> bool {
     let uid = match cf_string("tech.arcen.microphone.input") {
         Some(uid) => uid,
         None => return false,

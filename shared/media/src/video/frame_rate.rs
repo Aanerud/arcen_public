@@ -198,6 +198,7 @@ impl SessionFrameRate {
             fps: self.fps,
             display_refresh_hz: self.display_refresh_hz,
             basis: self.basis.token().to_owned(),
+            follows_display_moves: false,
         }
     }
 
@@ -275,6 +276,43 @@ pub fn resolve_session_frame_rate(request: FrameRateRequest) -> SessionFrameRate
     match request.administrator_max_fps {
         Some(ceiling) => resolved.narrow(ceiling, FrameRateBasis::Administrator),
         None => resolved,
+    }
+}
+
+/// The rate one monitor of a multi-monitor session is served at.
+///
+/// `session` is the session's rate, resolved for its fastest Deck display
+/// (`AuthResponse::display_refresh_hz`) and narrowed by the host's own
+/// limits. A follow-display contract lowers it to the monitor's own Deck
+/// display, `monitor_refresh_hz` (`AuthResponse::monitor_display_refresh_hz`,
+/// raised to the contract's floor), so every monitor gets its own display's
+/// rate and a slow display never caps a fast one. Never raises the session
+/// rate; a fixed contract, an exact stream and an unknown refresh keep it.
+#[must_use]
+pub fn monitor_frame_rate(
+    session: SessionFrameRate,
+    pipeline: Option<PipelineId>,
+    monitor_refresh_hz: Option<u32>,
+) -> SessionFrameRate {
+    let Some(refresh) = monitor_refresh_hz
+        .filter(|refresh| *refresh > 0)
+        .map(|refresh| refresh.min(MAX_SESSION_FPS))
+    else {
+        return session;
+    };
+    let session = SessionFrameRate {
+        display_refresh_hz: Some(refresh),
+        ..session
+    };
+    match pipeline.map(|pipeline| pipeline_contract(pipeline).frame_rate) {
+        Some(FrameRatePolicy::FollowDisplay { floor_fps, .. }) => {
+            if refresh < floor_fps {
+                session.narrow(floor_fps, FrameRateBasis::MotionFloor)
+            } else {
+                session.narrow(refresh, FrameRateBasis::Display)
+            }
+        }
+        Some(FrameRatePolicy::Fixed { .. }) | None => session,
     }
 }
 
@@ -366,6 +404,62 @@ pub struct GovernorStep {
     pub reason: GovernorReason,
 }
 
+/// One stats second of a serial capture loop's pacing: a loop that looks at
+/// the screen only between its own encodes (Xorg `XShm`, software H.264), so
+/// the frames it captured cannot tell a slow encoder from a still screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialPacing {
+    /// The rate the loop paced to.
+    pub target_fps: u32,
+    /// Deadlines the loop reached (`ticks_due`); a late loop skips the rest.
+    pub ticks_due: u32,
+    /// Of those, deadlines that found new content (`fresh_frames`).
+    pub fresh_frames: u32,
+}
+
+/// What one second of a capture loop proves its source delivered, for
+/// [`HostRateGovernor::observe`]. Every Pier fills it from its own counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceEvidence {
+    /// Frames the source delivered that the loop took: an asynchronous
+    /// source's own count (compositor buffers, `ScreenCaptureKit` samples), or
+    /// a grab loop's grabs that returned a new frame.
+    pub delivered: Option<u32>,
+    /// Frames the source produced that a grab loop never took because it
+    /// was away encoding (`NvFBC`'s missed frames, Desktop Duplication's
+    /// accumulated presents, Windows.Graphics.Capture frames superseded in
+    /// its pool).
+    pub behind: Option<u32>,
+    /// A serial loop's pacing, for a loop that can count neither.
+    pub pacing: Option<SerialPacing>,
+}
+
+impl SourceEvidence {
+    /// The source's rate this second, or `None` when nothing proves it.
+    ///
+    /// Delivered plus behind where the loop counts them. A serial loop that
+    /// counts neither proves its source by its pacing: deadlines it reached
+    /// found new content in `fresh / due` of them, and the deadlines it
+    /// skipped while away encoding are assumed to have found the same share.
+    /// A loop that looked at every deadline and found the screen still
+    /// proves a still screen; a loop that reached 8 of 30 deadlines and found
+    /// new content at every one proves a source at 30 and an encoder at 8.
+    #[must_use]
+    pub fn source_fps(&self) -> Option<u32> {
+        if let Some(delivered) = self.delivered {
+            return Some(delivered.saturating_add(self.behind.unwrap_or(0)));
+        }
+        let pacing = self.pacing?;
+        if pacing.ticks_due == 0 {
+            return None;
+        }
+        let fresh = pacing.fresh_frames.min(pacing.ticks_due);
+        let skipped = pacing.target_fps.saturating_sub(pacing.ticks_due);
+        let skipped_fresh = u64::from(skipped) * u64::from(fresh) / u64::from(pacing.ticks_due);
+        Some(fresh.saturating_add(u32::try_from(skipped_fresh).unwrap_or(u32::MAX)))
+    }
+}
+
 /// Holds a follow-display session at the rate the host proves it encodes,
 /// on the host's own once-a-second counts (encoded access units and the
 /// frames the capture source delivered), never on what a Deck received.
@@ -414,11 +508,14 @@ impl HostRateGovernor {
     }
 
     /// The governor of a session served under `pipeline` at `session_fps`,
-    /// or `None` for a contract whose rate does not follow the display.
+    /// or `None` for a fidelity contract (Grading, HDR), whose fixed rate is
+    /// part of what it promises. The software contract's fixed 30 is the
+    /// encoder's ceiling, not a promise: a CPU that encodes 8 is held at an
+    /// even divisor of it like Auto.
     #[must_use]
     pub fn for_pipeline(pipeline: PipelineId, session_fps: u32) -> Option<Self> {
         let policy = pipeline_contract(pipeline).frame_rate;
-        if !policy.follows_display() {
+        if !policy.follows_display() && pipeline != PipelineId::Software {
             return None;
         }
         let floor = match pipeline {
@@ -578,6 +675,40 @@ mod tests {
     }
 
     #[test]
+    fn each_monitor_follows_its_own_display_and_never_the_slowest() {
+        // A 30 Hz primary and a 120 Hz display: the session follows the
+        // fastest, each monitor its own.
+        let session = resolve_session_frame_rate(request(Some(PipelineId::Auto), 30, Some(120)));
+        assert_eq!(session.fps, 120);
+        let slow = monitor_frame_rate(session, Some(PipelineId::Auto), Some(30));
+        assert_eq!((slow.fps, slow.basis), (30, FrameRateBasis::Display));
+        assert_eq!(slow.display_refresh_hz, Some(30));
+        let fast = monitor_frame_rate(session, Some(PipelineId::Auto), Some(120));
+        assert_eq!((fast.fps, fast.basis), (120, FrameRateBasis::Display));
+        // A host limit on the session stays: a monitor is never raised.
+        let capped = session.narrow(60, FrameRateBasis::Encoder);
+        let fast = monitor_frame_rate(capped, Some(PipelineId::Auto), Some(120));
+        assert_eq!((fast.fps, fast.basis), (60, FrameRateBasis::Encoder));
+        assert!(fast.below_display());
+        // Speed keeps its floor on a slow display.
+        let speed = resolve_session_frame_rate(request(Some(PipelineId::Speed), 60, Some(144)));
+        let slow = monitor_frame_rate(speed, Some(PipelineId::Speed), Some(30));
+        assert_eq!((slow.fps, slow.basis), (60, FrameRateBasis::MotionFloor));
+        // A fixed contract, an exact stream and an unknown refresh keep the
+        // session rate.
+        let grading = resolve_session_frame_rate(request(Some(PipelineId::Grading), 30, Some(120)));
+        assert_eq!(
+            monitor_frame_rate(grading, Some(PipelineId::Grading), Some(24)).fps,
+            30
+        );
+        assert_eq!(monitor_frame_rate(session, None, Some(30)).fps, 120);
+        assert_eq!(
+            monitor_frame_rate(session, Some(PipelineId::Auto), None),
+            session
+        );
+    }
+
+    #[test]
     fn speed_keeps_its_sixty_fps_floor_and_follows_faster_displays() {
         let slow = resolve_session_frame_rate(request(Some(PipelineId::Speed), 60, Some(30)));
         assert_eq!((slow.fps, slow.basis), (60, FrameRateBasis::MotionFloor));
@@ -701,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn speed_never_steps_below_its_floor_and_fixed_contracts_are_not_governed() {
+    fn speed_never_steps_below_its_floor_and_fidelity_contracts_are_not_governed() {
         let mut speed = HostRateGovernor::for_pipeline(PipelineId::Speed, 60).expect("speed");
         assert!(run(&mut speed, 10, 20, 60).is_empty());
         assert_eq!(speed.fps(), 60);
@@ -711,10 +842,65 @@ mod tests {
             Some(60)
         );
         assert!(HostRateGovernor::for_pipeline(PipelineId::Grading, 30).is_none());
+        assert!(HostRateGovernor::for_pipeline(PipelineId::Hdr, 30).is_none());
+        let mut software =
+            HostRateGovernor::for_pipeline(PipelineId::Software, 30).expect("software");
+        assert_eq!(
+            run(&mut software, 3, 8, 30).last().map(|step| step.fps),
+            Some(GOVERNOR_MIN_FPS)
+        );
         let mut auto = HostRateGovernor::for_pipeline(PipelineId::Auto, 60).expect("auto");
         assert_eq!(
             run(&mut auto, 3, 3, 60).last().map(|step| step.fps),
             Some(GOVERNOR_MIN_FPS)
         );
+    }
+
+    #[test]
+    fn a_serial_loop_proves_a_slow_encoder_by_the_deadlines_it_missed() {
+        let serial = |ticks_due, fresh_frames| SourceEvidence {
+            pacing: Some(SerialPacing {
+                target_fps: 30,
+                ticks_due,
+                fresh_frames,
+            }),
+            ..SourceEvidence::default()
+        };
+        // Software H.264 over XShm on moving content: 8 deadlines reached,
+        // all new. The source kept 30; the encoder 8.
+        assert_eq!(serial(8, 8).source_fps(), Some(30));
+        // A still screen: every deadline reached, none new.
+        assert_eq!(serial(30, 0).source_fps(), Some(0));
+        // Typing: every deadline reached, a few new.
+        assert_eq!(serial(30, 6).source_fps(), Some(6));
+        // Busy and half-moving: half of the skipped ones count.
+        assert_eq!(serial(10, 5).source_fps(), Some(15));
+        assert_eq!(serial(0, 0).source_fps(), None);
+        // The governor steps the slow encoder down, never the still screen.
+        let mut governor = HostRateGovernor::new(30, GOVERNOR_MIN_FPS);
+        let still: Vec<_> = (0..10)
+            .filter_map(|_| governor.observe(0, serial(30, 0).source_fps(), 30))
+            .collect();
+        assert!(still.is_empty());
+        let step = (0..GOVERNOR_SHORT_WINDOWS)
+            .find_map(|_| governor.observe(8, serial(8, 8).source_fps(), 30))
+            .expect("a slow serial encoder steps down");
+        assert_eq!((step.previous_fps, step.fps), (30, 10));
+    }
+
+    #[test]
+    fn a_grab_loop_counts_the_frames_it_was_away_for() {
+        let grab = SourceEvidence {
+            delivered: Some(9),
+            behind: Some(51),
+            pacing: None,
+        };
+        assert_eq!(grab.source_fps(), Some(60));
+        let asynchronous = SourceEvidence {
+            delivered: Some(60),
+            ..SourceEvidence::default()
+        };
+        assert_eq!(asynchronous.source_fps(), Some(60));
+        assert_eq!(SourceEvidence::default().source_fps(), None);
     }
 }

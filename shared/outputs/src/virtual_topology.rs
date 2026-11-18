@@ -246,18 +246,6 @@ impl From<MediaContractError> for VirtualTopologyError {
     }
 }
 
-fn millimetres(value: f32) -> u32 {
-    if value.is_finite() && value > 0.0 && value < 100_000.0 {
-        // Range-checked above; rounding to whole millimetres is the
-        // precision clients report.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let rounded = value.round() as u32;
-        rounded
-    } else {
-        0
-    }
-}
-
 /// Plans `requested` onto one virtual output per monitor, as `generation`.
 ///
 /// Atomic: either every monitor is planned or the whole topology is refused.
@@ -350,8 +338,8 @@ pub fn plan_virtual_topology(
             )?,
             physical_size,
             scale: arcen_media::scale120_from_scale(raw.scale)?,
-            width_mm: millimetres(raw.width_mm),
-            height_mm: millimetres(raw.height_mm),
+            width_mm: crate::ui_scale::whole_millimetres(raw.width_mm),
+            height_mm: crate::ui_scale::whole_millimetres(raw.height_mm),
             rotation: raw.rotation,
             primary: raw.primary,
         });

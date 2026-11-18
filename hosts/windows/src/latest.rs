@@ -273,6 +273,15 @@ impl<T> VideoQueue<T> {
         self.state.lock().expect("video queue lock poisoned").len()
     }
 
+    /// A frame is queued that the writer has not taken.
+    pub fn has_backlog(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .expect("video queue lock poisoned")
+            .is_empty()
+    }
+
     pub fn take_wait_stats(&self) -> arcen_media::video::VideoQueueWaitStats {
         self.state
             .lock()

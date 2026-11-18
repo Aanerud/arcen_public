@@ -15,6 +15,7 @@ pub mod cursor;
 pub mod deck_events;
 pub mod deck_pen;
 pub mod deck_wheel;
+pub mod gesture_fallback;
 mod gestures;
 pub mod hid_digitizer;
 pub mod hid_reports;

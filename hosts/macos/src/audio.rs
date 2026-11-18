@@ -101,6 +101,42 @@ pub struct TapFormat {
 /// all decide admission on it through [`arcen_session::local_playback::admit`].
 pub use arcen_session::local_playback::MuteEvidence;
 
+/// `kAudioHardwareBadObjectError` (`'!obj'`).
+pub const BAD_OBJECT_STATUS: i32 = 0x216F_626A;
+
+static CORE_AUDIO_CONNECTION_STALE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process's Core Audio connection stopped knowing the objects it
+/// creates.
+///
+/// Measured on a lab Mac after a package install restarted Core Audio: the
+/// login-window agent created a tap (status 0) and every property read of it
+/// then failed with `'!obj'`, so the mute could not be proved and every
+/// session was refused; the same agent restarted got past it at once. The
+/// process cannot reset its own Core Audio client, so an agent that sees this
+/// exits once the session is over and launchd starts a fresh one.
+#[must_use]
+pub fn core_audio_connection_stale() -> bool {
+    CORE_AUDIO_CONNECTION_STALE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Records a property read of an object this process just created.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn note_object_status(status: i32) {
+    if status == BAD_OBJECT_STATUS
+        && !CORE_AUDIO_CONNECTION_STALE.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        tracing::error!(
+            target: "arcen::audio",
+            status,
+            "Core Audio does not know the tap this process just created; this process's \
+             connection to Core Audio is stale (Core Audio was restarted, for example by an \
+             install), and it must be restarted"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod native {
     // Native Core Audio calls, like the capture and encode adapters beside
@@ -317,6 +353,7 @@ mod native {
                 )
             };
             if status != 0 {
+                super::note_object_status(status);
                 return None;
             }
 
@@ -385,6 +422,7 @@ mod native {
                 )
             };
             if status != 0 {
+                super::note_object_status(status);
                 return Err(AudioError::FormatUnavailable { status });
             }
 
@@ -1620,6 +1658,21 @@ pub struct CaptureObservation {
     pub contended_buffers: u64,
     /// Callbacks dropped because framing could not keep up.
     pub dropped_buffers: u64,
+    /// Frames delivered after the first ones arrived, and the time they
+    /// took: the device's clock without capture start-up in it. A busy Mac
+    /// can take a third of a short probe to deliver its first buffer.
+    pub steady_frames: u64,
+    pub steady_ms: u64,
+}
+
+impl CaptureObservation {
+    /// Frames per second once audio was flowing, when it flowed long enough
+    /// to say (at least 200 ms).
+    #[must_use]
+    pub fn steady_rate_hz(&self) -> Option<f64> {
+        #[allow(clippy::cast_precision_loss, reason = "a rate, not a count")]
+        (self.steady_ms >= 200).then(|| self.steady_frames as f64 * 1000.0 / self.steady_ms as f64)
+    }
 }
 
 /// Establishes a tap, reads its real format, then releases it.
@@ -1731,23 +1784,40 @@ pub fn probe_for(local_playback: LocalPlayback, duration: std::time::Duration) -
     let mute = session.mute_evidence();
 
     let started = std::time::Instant::now();
+    let mut flowing: Option<(std::time::Instant, u64)> = None;
     // Drain periodically rather than once at the end, which is what a session
     // does: framing has to keep up with capture or the bounded queue fills and
     // audio is dropped.
     while started.elapsed() < duration {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = session.drain_packets();
+        if flowing.is_none() {
+            let frames = session
+                .counters()
+                .frames
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if frames > 0 {
+                flowing = Some((std::time::Instant::now(), frames));
+            }
+        }
     }
     let _ = session.drain_packets();
     let elapsed = started.elapsed();
 
     let counters = session.counters();
+    let frames = counters.frames.load(std::sync::atomic::Ordering::Relaxed);
+    let (steady_frames, steady_ms) = flowing.map_or((0, 0), |(since, at)| {
+        (
+            frames.saturating_sub(at),
+            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+    });
     let observation = CaptureObservation {
         duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         callbacks: counters
             .callbacks
             .load(std::sync::atomic::Ordering::Relaxed),
-        frames: counters.frames.load(std::sync::atomic::Ordering::Relaxed),
+        frames,
         peak_micro: counters
             .peak_micro
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -1771,6 +1841,8 @@ pub fn probe_for(local_playback: LocalPlayback, duration: std::time::Duration) -
         dropped_buffers: counters
             .dropped_buffers
             .load(std::sync::atomic::Ordering::Relaxed),
+        steady_frames,
+        steady_ms,
     };
 
     let restored = session.stop().is_ok();
@@ -1840,6 +1912,16 @@ mod tests {
     }
 
     #[test]
+    fn only_an_unknown_object_marks_the_core_audio_connection_stale() {
+        // `kAudioHardwareUnknownPropertyError` is a question this code asked
+        // badly, not a connection that forgot its objects.
+        note_object_status(0x7768_6F3F);
+        assert!(!core_audio_connection_stale());
+        note_object_status(560_947_818);
+        assert!(core_audio_connection_stale());
+    }
+
+    #[test]
     fn errors_say_which_problem_occurred() {
         // An operator seeing "unsupported" installs a newer macOS; one seeing
         // "not permitted" grants consent. Collapsing them wastes their time.
@@ -1881,7 +1963,10 @@ mod tests {
         // Runs against real Core Audio. A machine without the entitlement or
         // consent reports that instead, which is evidence rather than a
         // failure of this test.
-        let report = probe(LocalPlayback::Muted);
+        let report = probe_for(
+            LocalPlayback::Muted,
+            std::time::Duration::from_millis(1_500),
+        );
         if !report.tap_created {
             eprintln!(
                 "audio tap unavailable on this machine: {}",
@@ -1921,13 +2006,17 @@ mod tests {
         );
         assert!(capture.frames > 0, "frames must arrive: {capture:?}");
 
-        // Roughly the tap's own sample rate. Generous bounds, because this is
-        // checking that the clock is real rather than measuring it.
-        let seconds = capture.duration_ms as f64 / 1000.0;
-        let rate = capture.frames as f64 / seconds;
+        // Roughly the tap's own sample rate, measured once audio was flowing.
+        // Over the whole window it read 23.5 kHz from a 48 kHz device on a
+        // busy Mac: the window also holds capture start-up, which is not the
+        // device's clock. Generous bounds, because this is checking that the
+        // clock is real rather than measuring it.
+        let rate = capture
+            .steady_rate_hz()
+            .unwrap_or_else(|| panic!("audio must flow for a measurable time: {capture:?}"));
         assert!(
             rate > format.sample_rate_hz * 0.5 && rate < format.sample_rate_hz * 1.5,
-            "delivered rate {rate:.0} should resemble the declared {:.0} Hz",
+            "delivered rate {rate:.0} should resemble the declared {:.0} Hz ({capture:?})",
             format.sample_rate_hz,
         );
         assert!(report.usable);

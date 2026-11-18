@@ -118,10 +118,12 @@ NVIDIA GPU and driver on the build/test host.
   lead (application warps, a remapped tablet, sessions without a bridged
   pen), and proves the mapping once a second from the pen's
   `xf86-input-wacom` devices (`x11_wacom_mapping`).
-- `xf86-input-wacom` averages raw samples ("Wacom Sample and Suppress" 2, 4),
-  so the X pointer and application ink trail the bridged pen by about one
-  and a half reports (one report per network round trip); the Deck's dot
-  does not.
+- `xf86-input-wacom` averages raw samples ("Wacom Sample and Suppress" 2, 4
+  by default); with one report per network round trip that made the X
+  pointer and application ink trail the bridged pen by about one and a half
+  reports. The desktop's bridge class therefore sets `RawSample` 1
+  (`bridge_seat::XORG_BRIDGE_RAW_SAMPLE`); keep it, and keep `Suppress` at
+  the driver's default.
 - Prove pen changes with a real tablet or a real browser, not only the
   emulated Intuos5; read `BTN_STYLUS*` before blaming timing ("pen but no
   ink" is usually a held side switch).

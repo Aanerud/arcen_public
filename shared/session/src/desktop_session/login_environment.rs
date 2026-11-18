@@ -69,17 +69,12 @@ const DENIED_NAMES: &[&str] = &[
     // and with it the pinned power and lock keys.
     "GSETTINGS_BACKEND",
     "SHELL_DEBUG",
-    // GPU and driver selection: the compositor's render node and the
-    // qualified GPU import route are proven for the host's own driver.
-    "DRI_PRIME",
-    "EGL_PLATFORM",
 ];
 
 /// Prefixes of names Arcen owns, that change how programs load or
-/// authenticate, or that change how the compositor composes and on which
-/// GPU (Mutter, Clutter and Cogl debug and driver switches such as
-/// `MUTTER_DEBUG_FORCE_HDR`, GNOME Shell's session mode, EGL/GLX vendor and
-/// Mesa driver overrides).
+/// authenticate, or that change how the compositor composes (Mutter,
+/// Clutter and Cogl debug and driver switches such as
+/// `MUTTER_DEBUG_FORCE_HDR`, GNOME Shell's session mode).
 const DENIED_PREFIXES: &[&str] = &[
     "DBUS_",
     "LD_",
@@ -95,13 +90,16 @@ const DENIED_PREFIXES: &[&str] = &[
     "CLUTTER_",
     "COGL_",
     "GNOME_SHELL_",
-    "__EGL_",
-    "__GLX_",
-    "__NV_",
-    "LIBGL_",
-    "MESA_",
-    "GBM_",
 ];
+
+/// GPU and driver selection (EGL/GLX vendor, PRIME offload, Mesa and GBM
+/// overrides): the user's choice for their applications, but never the
+/// compositor's, whose render node and qualified GPU import route are
+/// proven for the host's own driver. Applications get them; the compositor
+/// (and the Xwayland it starts) is started without them.
+const COMPOSITOR_DENIED_NAMES: &[&str] = &["DRI_PRIME", "EGL_PLATFORM"];
+const COMPOSITOR_DENIED_PREFIXES: &[&str] =
+    &["__EGL_", "__GLX_", "__NV_", "LIBGL_", "MESA_", "GBM_"];
 
 /// Why a variable was not imported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +142,25 @@ pub fn name_allowed(name: &str) -> bool {
         && !DENIED_PREFIXES
             .iter()
             .any(|prefix| name.starts_with(prefix))
+}
+
+/// Whether `name` selects the GPU or the graphics driver (EGL/GLX vendor,
+/// PRIME offload, Mesa or GBM overrides): the applications' choice, never
+/// the compositor's. A compositor's environment drops exactly these, and
+/// keeps every variable Arcen itself sets (`DCONF_PROFILE`, the keyring's).
+#[must_use]
+pub fn selects_gpu_or_driver(name: &str) -> bool {
+    COMPOSITOR_DENIED_NAMES.contains(&name)
+        || COMPOSITOR_DENIED_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// Whether the compositor may start with an imported login-shell variable
+/// `name`: everything the session takes except GPU and driver selection.
+#[must_use]
+pub fn compositor_may_inherit(name: &str) -> bool {
+    name_allowed(name) && !selects_gpu_or_driver(name)
 }
 
 /// Filters a NUL-separated `env -0` dump. `current` gives the session's
@@ -268,15 +285,9 @@ EDITOR=vim\0QT_QPA_PLATFORM=xcb\0BASH_FUNC_x%%=() { :; }\0EDITOR=nano\0";
             "COGL_DRIVER",
             "GNOME_SHELL_SESSION_MODE",
             "GSETTINGS_BACKEND",
-            "__EGL_VENDOR_LIBRARY_FILENAMES",
-            "__GLX_VENDOR_LIBRARY_NAME",
-            "__NV_PRIME_RENDER_OFFLOAD",
-            "LIBGL_ALWAYS_SOFTWARE",
-            "MESA_LOADER_DRIVER_OVERRIDE",
-            "GBM_BACKEND",
-            "DRI_PRIME",
         ] {
             assert!(!name_allowed(name), "{name} must be denied");
+            assert!(!compositor_may_inherit(name), "{name} must be denied");
         }
         for name in [
             "XDG_CONFIG_HOME",
@@ -285,7 +296,33 @@ EDITOR=vim\0QT_QPA_PLATFORM=xcb\0BASH_FUNC_x%%=() { :; }\0EDITOR=nano\0";
             "QT_QPA_PLATFORM",
         ] {
             assert!(name_allowed(name), "{name} is the user's");
+            assert!(compositor_may_inherit(name), "{name} is the user's");
         }
+    }
+
+    #[test]
+    fn gpu_selection_reaches_applications_but_not_the_compositor() {
+        for name in [
+            "__EGL_VENDOR_LIBRARY_FILENAMES",
+            "__GLX_VENDOR_LIBRARY_NAME",
+            "__NV_PRIME_RENDER_OFFLOAD",
+            "LIBGL_ALWAYS_SOFTWARE",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+            "GBM_BACKEND",
+            "DRI_PRIME",
+            "EGL_PLATFORM",
+        ] {
+            assert!(name_allowed(name), "{name} is the applications' choice");
+            assert!(
+                !compositor_may_inherit(name),
+                "{name} is not the compositor's"
+            );
+        }
+        assert!(!compositor_may_inherit("LD_PRELOAD"));
+        for name in ["DCONF_PROFILE", "SSH_AUTH_SOCK", "PATH", "LD_PRELOAD"] {
+            assert!(!selects_gpu_or_driver(name), "{name}");
+        }
+        assert!(selects_gpu_or_driver("__NV_PRIME_RENDER_OFFLOAD"));
     }
 
     #[test]

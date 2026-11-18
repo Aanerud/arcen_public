@@ -327,7 +327,15 @@ direction from it (left, right, above, below). Each monitor is captured, by
 name, at its own size and fitted into the Deck's window: 1:1 when the sizes
 match, scaled otherwise, letterboxed only when the shapes differ. A desktop
 with more monitors than the Deck has displays shows the nearest ones; with
-fewer, the Deck's other displays get no window. The Pier log line "another
+fewer, the Deck's other displays get no window. A Deck that asks for one
+display (Primary Display Only, Windowed) is shown the monitor its primary
+maps to the same way, by name and at its own size, with its pointer and pen
+placed on that monitor; the whole desktop squeezed into one picture is
+served only when the desktop shows a single monitor (the Pier logs "a
+single-display Deck is shown the one its primary maps to"). Native tablet is
+not offered on such a desktop, nor on any desktop of the machine's own
+monitors: Arcen did not start its X server, so a bridged tablet could not
+be kept to the session (Tablet support works). The Pier log line "another
 product's desktop is laid out differently…" names the mapping and every
 difference (size, scale, rotation, refresh), and so does the Deck command
 line (`multi-monitor layout note`). Only a desktop that shows no monitor at
@@ -395,8 +403,20 @@ files and removes them on uninstall:
 An existing `gdm-ovirtcred` stack or bus policy that is not Arcen's (oVirt's
 guest agent) is kept; the remote-first sign-in is then refused
 `console_sign_in_unavailable`. Every token accepted or refused is in the
-journal (`journalctl | grep pam_arcen_greeter`). The keyring is not unlocked
-by a token: GNOME asks for it on first use.
+journal (`journalctl | grep pam_arcen_greeter`). The token carries no
+password, so the Pier unlocks the user's login keyring itself once GDM has
+started the session, with the password it just checked (creating the login
+keyring with it when there is none), exactly as a password sign-in at the
+login screen would; a password that does not open it leaves it locked and
+GNOME asks for it on first use.
+
+GDM 40 sometimes loses the switch to its new login screen when a session
+ends (the login screen is then `online` in `loginctl list-sessions`, with no
+X server, and the monitor shows an empty text console). A Pier in console
+mode brings that login screen to its terminal itself, within about
+10 seconds, and before any remote-first sign-in; its log says "the login
+screen was waiting for its terminal". It never switches away from a
+session in front or from a text console somebody switched to.
 
 **Domain accounts (SSSD with Active Directory Group Policy).** On a host
 joined to Active Directory through SSSD with GPO access control
@@ -458,8 +478,9 @@ would, and joins it ([ADR 0025 §10](../adr/0025-arcen-joins-the-users-session.m
   has no lock screen without GDM. Its monitors stay blank and the desk's
   keyboard and mouse stay disabled in its X server until the owner signs in
   through Arcen again or logs out. The Pier logs "the login session stays
-  private". Nobody can use the session at the desk. The keyring is not
-  unlocked (no password reaches the session).
+  private". Nobody can use the session at the desk. The login keyring is
+  unlocked with the sign-in's password, and the session's monitor is
+  created at the size of the first Deck display that signs in.
 
 The installer writes `/etc/pam.d/arcen-login` from the host's own
 `/etc/pam.d/login` (first line `# arcen-login v1`; `auth pam_deny`, the host's
@@ -1288,7 +1309,16 @@ with its reason (`fps_basis`) in `SESSION_STREAM_START` and the hello's
 `stream_rate`. At run time a frame-rate governor lowers the rate to an even
 divisor of the display's (60 → 30 → 20) when the host encodes below it while
 the capture delivers it, and probes back up; the link's Detail shedding still
-lowers Auto's rate before its sharpness. Grading requests HEVC 4:4:4 10-bit
+lowers Auto's rate before its sharpness. A capture loop that grabs only
+between its own encodes cannot show what it never grabbed, so each Pier counts
+what the source produced meanwhile (NvFBC `capture_behind`, Desktop
+Duplication's accumulated presents and Windows.Graphics.Capture's superseded
+frames as `capture_behind`), and the Xorg XShm loops, software H.264 among
+them, state their pacing (`ticks_due`, `fresh_frames`): deadlines they
+skipped while encoding count at the share of reached deadlines that found new
+content (`arcen_media::video::SourceEvidence`). The software contract's 30 fps
+is OpenH264's ceiling, not a promise, so a CPU that encodes fewer is governed
+the same way; Grading and HDR keep their fixed 30. Grading requests HEVC 4:4:4 10-bit
 BT.709 at 30 fps. HDR requests
 HEVC 4:4:4 10-bit BT.2020/PQ at 30 fps and remains active only when the host
 proves a real HDR desktop source.
@@ -1739,6 +1769,7 @@ Key lifecycle event IDs:
 | 1102 | `SESSION_STREAM_START` | Media/input streaming active. |
 | 1103 | `SESSION_END` | Clean session end. |
 | 1104 | `SESSION_INTERRUPTED` | Transport or component failure. |
+| 1108 | `RESUME_HOLD_ENDED` | A desktop held for its Deck's resume was let go without a resume; `reason_class` says why (`resume_window_expired`, `resume_refused`, `native_session_ended`, `same_user_reattached`, `fresh_sign_in`, `pier_stopping`, `owner_failed`, `other_product_client`, `other_product_started`, `desk_took_over`), `held_ms` for how long. |
 | 1200-1204 | Display events | Display arm, restore, degraded restore, failed restore, watchdog restore. |
 | 1300-1301 | CP events | Windows Credential Provider logon outcome. |
 | 1400-1404 | TLS events | Active, expiring, reloaded, reload failed, expired. |
@@ -1862,6 +1893,19 @@ Remove-NetFirewallRule -DisplayName 'Arcen Pier QUIC 18444' -ErrorAction Silentl
 
 Preserve `%ProgramData%\Arcen\tls` and logs unless the host is being decommissioned.
 
+**Host speakers go silent by default, and the session locks when the Deck
+leaves (Windows, from the next release after 0.20.2).** Earlier Windows Piers
+ignored `audio.local_playback`. The Windows Pier now honours it, and its
+default is `muted`, including in an existing `pier.json` that does not name
+it: during a session every output device is muted, so nobody beside the host
+hears the remote user, and a host that cannot prove it refuses the session
+("The host could not mute its own speakers"). To keep the speakers playing,
+set `"local_playback": "audible"` in the `audio` section and restart the
+service (see [Local playback](pier-configuration.md#local-playback)). When a
+Deck leaves for good, the Pier now locks the session it joined instead of
+leaving it unlocked at the desk; the session itself keeps running (see
+[Windows console policy](../architecture/windows-console-policy.md#when-the-deck-leaves)).
+
 ## 9. Security posture for admins
 
 | Area | Current posture |
@@ -1881,28 +1925,20 @@ Preserve `%ProgramData%\Arcen\tls` and logs unless the host is being decommissio
 ## Proving a host actually streams
 
 Service state and a healthy log together still do
-not prove a host delivers video. To prove that end to end, use the session
-probe:
+not prove a host delivers video. To prove that end to end, run a real Deck
+session from a Mac with the macOS Deck's command-line smoke (it speaks the
+product's QUIC transport and the full handshake, without a window):
 
 ```sh
-PROBE_HOST=<host-ip> PROBE_USER=<account> PROBE_PASS="$PASSWORD" \
-  PROBE_SECONDS=30 python3 tools/session-probe/arcen-session-probe.py
+"/Applications/Arcen Deck.app/Contents/MacOS/arcen-deck" media-smoke <host-ip> \
+  --username <account> --credentials-stdin --pipeline auto
 ```
 
-It completes the full handshake and reports frame count, bytes and time to
-first frame as JSON, exiting non-zero if no frame arrived. A healthy Linux host
-with hardware encode looks like this:
-
-```json
-{"auth_ok": true, "binary_frames": 64, "binary_bytes": 1014750,
- "first_frame_ms": 1899, "errors": [],
- "server_hello": {"codec": "h265", "encoder_backend": "native-nvenc",
-                  "screen_width": 1800, "screen_height": 1168,
-                  "supports_display_update": true}}
-```
-
-Check `encoder_backend` rather than assuming: `native-nvenc` is the hardware
-path, and a fallback to software encode will show up here rather than silently.
+It prints the host's hello (`codec`, `encoder`, `active_pipeline`, the
+session colour) and the frames it decodes, and exits non-zero if the session
+fails or no frame arrives. Check `encoder` rather than assuming: `native-nvenc`
+is the hardware path, and a fallback to software encode shows here rather than
+silently.
 
 A low frame count against a long collection window is not by itself a fault —
 an idle desktop legitimately produces few frames. Drive some screen motion
@@ -2057,6 +2093,15 @@ advertises `pixels * 25.4 / (96 * percent / 100)` millimetres instead. The
 percentage is *apparent* size: a HiDPI request carries twice as many pixels per
 point, so the Deck doubles the advertised percentage to keep the same physical
 result. This changes the remote desktop's layout only — the stream stays 1:1.
+Windows offers each display only fixed steps (100, 125, 150, 175, 200, 225,
+250, 300, 350, 400, 450 and 500%) and caps them by the display's size, so the
+Windows Pier sets each display, found by its stable adapter and target rather
+than its `\\.\DISPLAYn` name (Windows renumbers those while it applies a
+layout), to the nearest step that display offers, verifies it with
+`GetDpiForMonitor`, and reports the requested and applied scale in its hello:
+125% on a 1.5× Retina display asks for 187.5% and gets 175%; 250% asks for
+375% and gets 300%, the most Windows offers a 2880×1800 display. The Deck
+names a display shown at another scale than asked.
 A Linux Pier serving a headless Wayland desktop reads the same rule back for
 each virtual output (96 DPI is 100%) and sets the nearest scale GNOME offers for
 that output's mode — 100% or 200% unless fractional scaling is available,

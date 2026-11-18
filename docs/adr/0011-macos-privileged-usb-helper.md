@@ -149,6 +149,20 @@ checked who was listening. Now:
   refuses, with a logged reason, any peer that is not root.
 - The helper's own `getpeereid` check of the client is unchanged.
 
+*Amended 2026-11-18 (fast user switching).* The authorized uid was the owner
+of `/dev/console` read once when launchd started the helper, so after fast user
+switching the first user kept the socket and the device, and a helper started
+at the login window (console owned by root) exited and was restarted until
+someone logged in. Without `--allow-uid` the helper now follows the console:
+every connection and every request must come from the console's current owner
+(root, the login window, admits nobody); a session whose user is no longer at
+the console is ended within 0.5 s even if it sends nothing. The socket is then
+root's, mode 0666 (set and checked relative to the pinned directory): handing a
+0600 socket from user to user would leave the previous owner able to change its
+mode or ACL and lock the next user out, and the peer-uid check, run on every
+connection and request, is the gate. `--allow-uid` keeps one fixed uid and its
+0600 socket owned by that uid.
+
 `/private/var/db/arcen` survives a restart and is not removed when the Deck is
 deleted; it holds only this empty `run` directory (and the IOUSBHost marker
 directory, ADR 0019). After a Deck update, a helper that launchd started from

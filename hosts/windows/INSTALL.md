@@ -21,8 +21,10 @@ enforces the signature gate on the in-process CP DLL because LogonUI loads it
 directly.
 
 The script builds with `x86_64-pc-windows-msvc`, static CRT linkage, locked
-dependencies, and the `nvenc,mf` feature set (NVENC hardware path plus the
-Media Foundation SW H.264 fallback for non-NVIDIA hosts, e.g. VMware SVGA).
+dependencies, and capenc's `nvenc,software-h264` feature set (the NVENC
+hardware path plus the OpenH264 software fallback for hosts without NVENC,
+e.g. VMware SVGA or QEMU stdvga). The Media Foundation encoder variant
+(`--features mf`) is not part of the Pier.
 It writes these untracked artifacts to `target\arcen-windows-x64\`:
 
 - `arcen-pier.exe`

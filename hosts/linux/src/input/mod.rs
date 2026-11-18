@@ -284,6 +284,52 @@ impl PierInput {
         }
     }
 
+    /// Whether the Deck holds Control (either side) on this session, so a
+    /// gesture's Control + wheel chord uses it rather than pressing and
+    /// releasing it (`arcen_input::gesture_fallback`).
+    #[must_use]
+    pub fn control_held(&self) -> bool {
+        match self {
+            Self::Uinput(controller) => controller.control_held(),
+            Self::Wayland(injector) => injector.control_held(),
+        }
+    }
+
+    /// A trackpad pinch as Control + wheel at the pointer: the shared
+    /// `arcen_input::gesture_fallback` chord through this session's own key
+    /// and scroll paths, nothing left held.
+    ///
+    /// # Errors
+    ///
+    /// When the backend cannot inject a step; an invalid message injects
+    /// nothing and is `Ok`, logged at debug.
+    pub fn gesture_magnify(
+        &mut self,
+        message: &arcen_protocol::messages::GestureMagnifyMsg,
+    ) -> Result<(), InputError> {
+        use arcen_input::gesture_fallback::{magnify_chord, GestureFallbackInput};
+        let chord = match magnify_chord(message, self.control_held()) {
+            Ok(chord) => chord,
+            Err(error) => {
+                tracing::debug!(target: crate::logging::target::INPUT, ?error, "invalid gesture_magnify dropped");
+                return Ok(());
+            }
+        };
+        let mut result = Ok(());
+        for step in chord {
+            let step_result = match step {
+                GestureFallbackInput::Key(key) => self.key_event(&key),
+                GestureFallbackInput::Scroll(wheel) => self.mouse_scroll(&wheel),
+            };
+            // Keep going after a failed step: the closing Control release
+            // must still be attempted.
+            if result.is_ok() {
+                result = step_result;
+            }
+        }
+        result
+    }
+
     /// Whether this attachment owns a region input adapter.
     #[must_use]
     pub fn region_input_available(&self) -> bool {

@@ -156,6 +156,9 @@ pub struct IncomingMediaBatch {
     pub idr_needed_monitor_ids: Vec<u16>,
     pub malformed_error: Option<String>,
     pub telemetry: IncomingMediaTelemetry,
+    /// How long the oldest video packet of the batch waited in the inbox:
+    /// how far the decoder is behind the stream (`None` without video).
+    pub oldest_video_wait: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -185,7 +188,8 @@ struct SharedInbox {
 
 struct InboxInner {
     limits: IncomingMediaLimits,
-    video: VecDeque<(VideoHeader, Vec<u8>)>,
+    /// Each packet with the instant it was queued.
+    video: VecDeque<(VideoHeader, Vec<u8>, Instant)>,
     audio: VecDeque<(AudioHeader, Vec<u8>)>,
     video_bytes: usize,
     audio_bytes: usize,
@@ -416,8 +420,48 @@ impl IncomingMediaReceiver {
 
     #[must_use]
     pub fn take_batch(&self) -> IncomingMediaBatch {
+        self.take_batch_at(Instant::now())
+    }
+
+    /// The decoder fell behind the stream ([`crate::runtime::decode_lag`]):
+    /// each route in `monitor_ids` drops what it has queued, and every
+    /// packet until its next keyframe on arrival. `skipped` counts the
+    /// packets and bytes the worker dropped from the batch it took.
+    pub fn skip_to_keyframe(&self, monitor_ids: &[u16], skipped: (u64, u64)) {
         let mut inner = self.shared.inner.lock().expect("media inbox poisoned");
-        let video = inner.video.drain(..).collect();
+        let (mut packets, mut bytes) = skipped;
+        for &monitor_id in monitor_ids {
+            let keyframe_queued = inner
+                .video
+                .iter()
+                .any(|(header, _, _)| header.monitor_id == monitor_id && header.is_keyframe());
+            if keyframe_queued {
+                // The next batch starts at it.
+                continue;
+            }
+            let (cleared, cleared_bytes) = inner.clear_video_route(monitor_id);
+            packets += cleared as u64;
+            bytes += cleared_bytes as u64;
+            inner.awaiting_keyframes.insert(monitor_id);
+        }
+        inner.telemetry.video_dropped_packets += packets;
+        inner.telemetry.video_dropped_bytes += bytes;
+        inner.telemetry_dirty = true;
+    }
+
+    fn take_batch_at(&self, now: Instant) -> IncomingMediaBatch {
+        let mut inner = self.shared.inner.lock().expect("media inbox poisoned");
+        let oldest_video_wait = inner
+            .video
+            .iter()
+            .map(|(_, _, queued)| *queued)
+            .min()
+            .map(|queued| now.saturating_duration_since(queued));
+        let video = inner
+            .video
+            .drain(..)
+            .map(|(header, payload, _)| (header, payload))
+            .collect();
         let audio = inner.audio.drain(..).collect();
         let video_discontinuity_monitor_ids = inner
             .pending_video_discontinuities
@@ -443,6 +487,7 @@ impl IncomingMediaReceiver {
             idr_needed_monitor_ids,
             malformed_error,
             telemetry: inner.current_telemetry(),
+            oldest_video_wait,
         }
     }
 
@@ -492,7 +537,7 @@ impl InboxInner {
                 self.video_first_enqueued_at = Some(now);
             }
             self.video_bytes += packet_bytes;
-            self.video.push_back((header, payload));
+            self.video.push_back((header, payload, now));
             self.update_high_water();
             return true;
         }
@@ -515,7 +560,7 @@ impl InboxInner {
             self.video_first_enqueued_at = Some(now);
         }
         self.video_bytes += packet_bytes;
-        self.video.push_back((header, payload));
+        self.video.push_back((header, payload, now));
         self.update_high_water();
         true
     }
@@ -601,8 +646,8 @@ impl InboxInner {
     fn video_route_usage(&self, monitor_id: u16) -> (usize, usize) {
         self.video
             .iter()
-            .filter(|(header, _)| header.monitor_id == monitor_id)
-            .fold((0usize, 0usize), |(packets, bytes), (_, payload)| {
+            .filter(|(header, _, _)| header.monitor_id == monitor_id)
+            .fold((0usize, 0usize), |(packets, bytes), (_, payload, _)| {
                 (packets + 1, bytes.saturating_add(payload.len()))
             })
     }
@@ -610,7 +655,7 @@ impl InboxInner {
     fn clear_video_route(&mut self, monitor_id: u16) -> (usize, usize) {
         let mut packets = 0usize;
         let mut bytes = 0usize;
-        self.video.retain(|(header, payload)| {
+        self.video.retain(|(header, payload, _)| {
             if header.monitor_id == monitor_id {
                 packets += 1;
                 bytes = bytes.saturating_add(payload.len());
@@ -864,6 +909,43 @@ mod tests {
         assert!(rx.take_batch().idr_needed);
         tx.enqueue(video(10, true, 1));
         assert!(!rx.take_batch().idr_needed);
+    }
+
+    #[test]
+    fn a_batch_says_how_long_its_oldest_video_waited_and_skipping_ahead_keeps_a_queued_keyframe() {
+        let (tx, rx) = incoming_media_inbox_with_limits(limits(8, 64, 2));
+        let start = Instant::now();
+        assert!(
+            tx.enqueue_at(video_for_monitor(1, 1, true, 1), start)
+                .accepted
+        );
+        tx.enqueue_at(video_for_monitor(2, 10, true, 1), start);
+        tx.enqueue_at(
+            video_for_monitor(1, 2, false, 1),
+            start + Duration::from_millis(30),
+        );
+        let batch = rx.take_batch_at(start + Duration::from_millis(120));
+        assert_eq!(batch.oldest_video_wait, Some(Duration::from_millis(120)));
+        assert_eq!(rx.take_batch().oldest_video_wait, None);
+
+        // The decoder fell behind on both monitors; monitor 2's keyframe is
+        // already queued and stays, monitor 1 drops its queue and every
+        // delta until its next keyframe.
+        tx.enqueue(video_for_monitor(1, 3, false, 4));
+        tx.enqueue(video_for_monitor(2, 11, true, 1));
+        rx.skip_to_keyframe(&[1, 2], (5, 50));
+        assert!(!tx.enqueue(video_for_monitor(1, 4, false, 1)).accepted);
+        let batch = rx.take_batch();
+        assert_eq!(
+            batch
+                .video
+                .iter()
+                .map(|(header, _)| (header.monitor_id, header.timestamp_ms))
+                .collect::<Vec<_>>(),
+            vec![(2, 11)]
+        );
+        assert_eq!(batch.telemetry.video_dropped_packets, 5 + 1 + 1);
+        assert!(tx.enqueue(video_for_monitor(1, 5, true, 1)).accepted);
     }
 
     #[test]

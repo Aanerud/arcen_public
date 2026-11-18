@@ -14,9 +14,6 @@ use arcen_pier_linux::cli;
 use arcen_pier_linux::logging::{self, target};
 use arcen_pier_linux::net;
 
-#[cfg(feature = "wss-compat")]
-const TLS_VERSION_USAGE: &str = "TLS1.2|TLS1.3";
-#[cfg(not(feature = "wss-compat"))]
 const TLS_VERSION_USAGE: &str = "TLS1.3";
 
 fn main() -> ExitCode {

@@ -10,7 +10,7 @@
 
 use crate::colour_check::ColourAxes;
 use crate::{BitDepth, ChromaSubsampling, ColorPrimaries, TransferCharacteristics, VideoCodec};
-use arcen_protocol::messages::PathQualityMsg;
+use arcen_protocol::messages::{MonitorRateMsg, PathQualityMsg};
 
 /// Inputs of [`stats_overlay_lines`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -120,9 +120,60 @@ pub fn stats_overlay_lines(inputs: &StatsOverlayInputs<'_>) -> [String; 3] {
     [path, stream, refine]
 }
 
+/// The Pier's per-display rates of a multi-monitor session, one entry per
+/// display ("Host displays: 1 60/60 · 2 41/60 limited by the host keeping
+/// up"), each limited one with its reason; `None` without per-display rates.
+#[must_use]
+pub fn host_display_rates_line(monitors: &[MonitorRateMsg]) -> Option<String> {
+    if monitors.is_empty() {
+        return None;
+    }
+    let entries = monitors
+        .iter()
+        .map(|monitor| {
+            let rate = format!(
+                "{} {:.0}/{}",
+                monitor.session_monitor_id, monitor.fps_actual, monitor.fps_target
+            );
+            match monitor.limited_by_token() {
+                Some(token) => format!(
+                    "{rate} limited by {}",
+                    crate::video::FrameRateBasis::from_token(token)
+                        .map_or(token, |basis| basis.describe())
+                ),
+                None => rate,
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(format!("Host displays: {}", entries.join(" · ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_display_the_host_cannot_keep_up_with_names_its_reason() {
+        let line = host_display_rates_line(&[
+            MonitorRateMsg {
+                session_monitor_id: 1,
+                fps_target: 60,
+                fps_actual: 59.6,
+                limited_by: None,
+            },
+            MonitorRateMsg {
+                session_monitor_id: 2,
+                fps_target: 60,
+                fps_actual: 41.0,
+                limited_by: Some("host_shortfall".to_owned()),
+            },
+        ]);
+        assert_eq!(
+            line.as_deref(),
+            Some("Host displays: 1 60/60 · 2 41/60 limited by the host keeping up")
+        );
+        assert_eq!(host_display_rates_line(&[]), None);
+    }
 
     #[test]
     fn grading_is_sdr_and_hdr_needs_a_pq_or_hlg_transfer() {

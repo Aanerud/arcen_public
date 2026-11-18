@@ -59,6 +59,8 @@ pub const CURSOR_MODE_RESULT: &str = "cursor_mode_result";
 pub const TABLET_MODE_RESULT: &str = "tablet_mode_result";
 pub const DISPLAY_UPDATE: &str = "display_update";
 pub const DISPLAY_UPDATE_RESULT: &str = "display_update_result";
+/// Client→host [`DisplayRefreshUpdateMsg`].
+pub const DISPLAY_REFRESH_UPDATE: &str = "display_refresh_update";
 pub const KEY_RESET_MODIFIERS: &str = "key_reset_modifiers";
 /// `KeyResetModifiersMsg::reason` asking the host to release everything held
 /// (keys, buttons, pen and region focus), not only keys: sent by a Pier's
@@ -1212,6 +1214,66 @@ pub struct AuthResponse {
     /// then never grants the refine lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_refine_v1: Option<crate::refine::LosslessRefineCapability>,
+    /// The refresh each Deck display shows frames at, apart from the
+    /// virtual display mode the Deck asks the host to create
+    /// (`ClientMonitor::refresh_hz`, which a Deck keeps at or below 60 Hz so
+    /// a `HiDPI` mode fits an EDID 1.4 timing), and which display shows a
+    /// single-stream session. Absent from a Deck that predates it: a host
+    /// then follows the requested mode's refresh, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_refresh_v1: Option<DeckDisplayRefreshMsg>,
+}
+
+/// The most displays [`DeckDisplayRefreshMsg::displays`] is read for; any
+/// further entry is ignored.
+pub const MAX_DECK_DISPLAY_REFRESH_ENTRIES: usize = 16;
+
+/// The highest display refresh a host reads from a Deck; a larger value is
+/// read as this.
+pub const MAX_DECK_DISPLAY_REFRESH_HZ: u32 = 240;
+
+/// The Deck displays' own refresh rates ([`AuthResponse::display_refresh_v1`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeckDisplayRefreshMsg {
+    /// The display (`ClientMonitor::id`) that shows a single-stream session:
+    /// the one its window is on when the Deck connects. Absent when the Deck
+    /// cannot tell; the host then takes the primary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_display_id: Option<u32>,
+    /// Each display's refresh, by `ClientMonitor::id` (also
+    /// `RequestedMonitorDescriptorMsg::client_monitor_id`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub displays: Vec<DeckPanelRefreshMsg>,
+}
+
+/// One Deck display's refresh.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeckPanelRefreshMsg {
+    /// `ClientMonitor::id`.
+    pub id: u32,
+    /// The highest nominal rate the display shows frames at (a variable-rate
+    /// panel's maximum), in hertz.
+    pub refresh_hz: u32,
+}
+
+impl DeckDisplayRefreshMsg {
+    /// The refresh of the display that shows a single-stream session
+    /// ([`Self::stream_display_id`]), when the Deck stated both.
+    #[must_use]
+    pub fn stream_refresh_hz(&self) -> Option<u32> {
+        self.stream_display_id.and_then(|id| self.refresh_of(id))
+    }
+
+    /// The refresh of display `id`, when the Deck stated a usable one.
+    #[must_use]
+    pub fn refresh_of(&self, id: u32) -> Option<u32> {
+        self.displays
+            .iter()
+            .take(MAX_DECK_DISPLAY_REFRESH_ENTRIES)
+            .find(|display| display.id == id)
+            .map(|display| display.refresh_hz.min(MAX_DECK_DISPLAY_REFRESH_HZ))
+            .filter(|refresh| *refresh > 0)
+    }
 }
 
 impl std::fmt::Debug for AuthResponse {
@@ -1247,6 +1309,7 @@ impl std::fmt::Debug for AuthResponse {
             .field("cursor_image_v1", &self.cursor_image_v1)
             .field("cursor_position_v1", &self.cursor_position_v1)
             .field("lossless_refine_v1", &self.lossless_refine_v1)
+            .field("display_refresh_v1", &self.display_refresh_v1)
             .finish()
     }
 }
@@ -1295,6 +1358,7 @@ impl AuthResponse {
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
+            display_refresh_v1: None,
         }
     }
 
@@ -1321,6 +1385,7 @@ impl AuthResponse {
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
+            display_refresh_v1: None,
         }
     }
 
@@ -1347,6 +1412,7 @@ impl AuthResponse {
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
+            display_refresh_v1: None,
         }
     }
 
@@ -1374,6 +1440,7 @@ impl AuthResponse {
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
+            display_refresh_v1: None,
         }
     }
 
@@ -1386,30 +1453,107 @@ impl AuthResponse {
         response
     }
 
+    /// The Deck display refresh a session's frame rate follows. `None` when
+    /// the Deck named none.
+    ///
+    /// A multi-monitor request follows its fastest display: the host serves
+    /// each monitor at no more than its own display
+    /// ([`Self::monitor_display_refresh_hz`]), so a slow display never caps
+    /// a fast one. A single stream follows the display that shows it
+    /// ([`DeckDisplayRefreshMsg::stream_display_id`]), else the primary (or
+    /// first) legacy monitor. Each display's own refresh
+    /// ([`Self::display_refresh_v1`]) is taken when the Deck stated it, else
+    /// the refresh of the mode it asked for (an older Deck: exactly what
+    /// hosts followed before).
+    #[must_use]
+    pub fn display_refresh_hz(&self) -> Option<u32> {
+        if let Some(request) = self.multi_monitor_v1.as_ref() {
+            return request
+                .requested_topology()
+                .monitors()
+                .iter()
+                .filter_map(|monitor| self.monitor_display_refresh_hz(monitor))
+                .max();
+        }
+        self.stream_display_refresh_hz()
+    }
+
+    /// The refresh of the Deck display that shows a single-stream session
+    /// (also a multi-monitor request a host serves as one stream): the
+    /// display [`DeckDisplayRefreshMsg::stream_display_id`] names, else the
+    /// primary (or first) legacy monitor; its stated refresh, else its
+    /// requested mode's. `None` when the Deck named none.
+    #[must_use]
+    pub fn stream_display_refresh_hz(&self) -> Option<u32> {
+        let stated = self.display_refresh_v1.as_ref();
+        let shown = stated
+            .and_then(|stated| stated.stream_display_id)
+            .and_then(|id| self.monitors.iter().find(|monitor| monitor.id == id))
+            .or_else(|| self.monitors.iter().find(|monitor| monitor.is_primary))
+            .or_else(|| self.monitors.first())?;
+        stated
+            .and_then(|stated| stated.refresh_of(shown.id))
+            .or_else(|| {
+                Some(shown.refresh_hz.min(MAX_DECK_DISPLAY_REFRESH_HZ)).filter(|hz| *hz > 0)
+            })
+    }
+
+    /// The refresh of the Deck display that shows `monitor` of this
+    /// response's multi-monitor request: what the Deck stated for it
+    /// ([`Self::display_refresh_v1`]), else the refresh of the mode it asked
+    /// for. `None` when neither is known.
+    #[must_use]
+    pub fn monitor_display_refresh_hz(
+        &self,
+        monitor: &crate::multi_monitor::RequestedMonitorDescriptorMsg,
+    ) -> Option<u32> {
+        self.display_refresh_v1
+            .as_ref()
+            .and_then(|stated| stated.refresh_of(monitor.client_monitor_id))
+            .or_else(|| {
+                Some(monitor.refresh_hz.min(MAX_DECK_DISPLAY_REFRESH_HZ)).filter(|hz| *hz > 0)
+            })
+    }
+
+    /// [`Self::monitor_display_refresh_hz`] of every monitor of this
+    /// response's multi-monitor request that has one, by client display id,
+    /// the primary first. Empty without a multi-monitor request.
+    #[must_use]
+    pub fn monitor_display_refreshes(&self) -> Vec<(String, u32)> {
+        let Some(request) = self.multi_monitor_v1.as_ref() else {
+            return Vec::new();
+        };
+        let topology = request.requested_topology();
+        std::iter::once(topology.primary())
+            .chain(
+                topology
+                    .monitors()
+                    .iter()
+                    .filter(|monitor| !monitor.is_primary),
+            )
+            .filter_map(|monitor| {
+                self.monitor_display_refresh_hz(monitor)
+                    .map(|refresh| (monitor.client_display_id.as_str().to_owned(), refresh))
+            })
+            .collect()
+    }
+
+    /// [`Self::monitor_display_refresh_hz`] for the requested monitor
+    /// `client_display_id`; `None` without a multi-monitor request naming it.
+    #[must_use]
+    pub fn display_refresh_hz_for(&self, client_display_id: &str) -> Option<u32> {
+        self.multi_monitor_v1
+            .as_ref()?
+            .requested_topology()
+            .monitors()
+            .iter()
+            .find(|monitor| monitor.client_display_id.as_str() == client_display_id)
+            .and_then(|monitor| self.monitor_display_refresh_hz(monitor))
+    }
+
     /// Attach the enumerated client display layout. Sets `screen_width/height`
     /// from the primary monitor (falling back to the first monitor) so the host
     /// sizes the session's X server to the client's real primary resolution.
-    /// The refresh rate of the Deck display the session is sized for: the
-    /// multi-monitor request's primary, else the primary (or first) legacy
-    /// monitor. `None` when the Deck named none.
-    #[must_use]
-    pub fn display_refresh_hz(&self) -> Option<u32> {
-        let multi = self
-            .multi_monitor_v1
-            .as_ref()
-            .map(|request| request.requested_topology().primary().refresh_hz);
-        let legacy = || {
-            self.monitors
-                .iter()
-                .find(|monitor| monitor.is_primary)
-                .or_else(|| self.monitors.first())
-                .map(|monitor| monitor.refresh_hz)
-        };
-        multi
-            .filter(|refresh| *refresh > 0)
-            .or_else(|| legacy().filter(|refresh| *refresh > 0))
-    }
-
     pub fn with_displays(
         mut self,
         monitors: Vec<ClientMonitor>,
@@ -1488,6 +1632,14 @@ impl AuthResponse {
     #[must_use]
     pub const fn with_cursor_position_v1(mut self, supported: bool) -> Self {
         self.cursor_position_v1 = supported;
+        self
+    }
+
+    /// States the Deck displays' own refresh rates
+    /// ([`Self::display_refresh_v1`]); `None` sends nothing.
+    #[must_use]
+    pub fn with_display_refresh(mut self, refresh: Option<DeckDisplayRefreshMsg>) -> Self {
+        self.display_refresh_v1 = refresh;
         self
     }
 }
@@ -2467,6 +2619,11 @@ pub struct StreamRateMsg {
     /// What decided `fps`.
     #[serde(default)]
     pub basis: String,
+    /// The host follows [`DisplayRefreshUpdateMsg`]: a single-stream
+    /// session's rate follows its window to another Deck display. Absent
+    /// (false) on hosts that do not; a Deck must not send the message then.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub follows_display_moves: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3045,6 +3202,45 @@ impl Default for CursorShapeMsg {
             msg_type: default_cursor_shape_type(),
             shape: CursorShapeKind::Default,
             sequence: 0,
+        }
+    }
+}
+
+/// Client→host: the Deck display that shows a single-stream session changed
+/// (its window moved to another display) or that display's refresh did.
+///
+/// Sent only to a host whose `server_hello.stream_rate` states
+/// [`StreamRateMsg::follows_display_moves`], never in a multi-monitor
+/// session (each monitor already follows its own display). The host serves
+/// the session at the new display's refresh within the same limits it
+/// applied at connect (administrator, encoder, capture source), and reports
+/// the rate through `health_pong`'s `fps_target`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayRefreshUpdateMsg {
+    #[serde(rename = "type", default = "default_display_refresh_update_type")]
+    pub msg_type: String,
+    /// Client-monotonic, starting at 1 on each attachment (a resume starts
+    /// again); a host ignores a sequence that is not greater than the last
+    /// one it applied on that attachment.
+    #[serde(default)]
+    pub sequence: u64,
+    /// The displays' refresh and the one that now shows the session.
+    #[serde(default)]
+    pub refresh: DeckDisplayRefreshMsg,
+}
+
+fn default_display_refresh_update_type() -> String {
+    DISPLAY_REFRESH_UPDATE.to_owned()
+}
+
+impl DisplayRefreshUpdateMsg {
+    /// The update numbered `sequence`.
+    #[must_use]
+    pub fn new(sequence: u64, refresh: DeckDisplayRefreshMsg) -> Self {
+        Self {
+            msg_type: default_display_refresh_update_type(),
+            sequence,
+            refresh,
         }
     }
 }
@@ -3628,6 +3824,50 @@ pub struct HealthStatsMsg {
     /// never a stand-in for a perfect path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathQualityMsg>,
+    /// Each monitor's own rate over the window, in a multi-monitor session
+    /// whose monitors run at their own rates; empty otherwise (and from
+    /// hosts that predate it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<MonitorRateMsg>,
+}
+
+/// Longest `limited_by` token a [`MonitorRateMsg`] may carry.
+pub const MAX_MONITOR_RATE_REASON_BYTES: usize = 32;
+
+/// One monitor's frame rate in a [`HealthStatsMsg`] window: what it is
+/// served at, what it sent, and, while it falls short of what its content
+/// owed, what holds it down. A Deck shows the reason rather than leaving a
+/// slow display unexplained.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MonitorRateMsg {
+    pub session_monitor_id: u16,
+    /// The rate this monitor is served at.
+    #[serde(default)]
+    pub fps_target: u32,
+    /// Frames it sent per second over the window.
+    #[serde(default)]
+    pub fps_actual: f64,
+    /// A frame-rate basis token (`host_shortfall`: the host did not keep
+    /// up) while the monitor delivers below what its content owed; absent
+    /// while it keeps up. Untrusted text: see [`Self::limited_by_token`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limited_by: Option<String>,
+}
+
+impl MonitorRateMsg {
+    /// `limited_by` when it is a plausible token (at most
+    /// [`MAX_MONITOR_RATE_REASON_BYTES`] ASCII lowercase letters, digits or
+    /// `_`), else `None`.
+    #[must_use]
+    pub fn limited_by_token(&self) -> Option<&str> {
+        self.limited_by.as_deref().filter(|token| {
+            !token.is_empty()
+                && token.len() <= MAX_MONITOR_RATE_REASON_BYTES
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    }
 }
 
 /// Longest congestion-controller token a [`PathQualityMsg`] may carry.
@@ -3757,6 +3997,7 @@ impl Default for HealthStatsMsg {
             health_state: None,
             sample_window_secs: None,
             path: None,
+            monitors: Vec::new(),
         }
     }
 }
@@ -4039,6 +4280,36 @@ pub enum SwipeDirectionMsg {
     Up,
     Down,
 }
+
+/// An input message carrying the session's global input `sequence`, which
+/// a Pier checks before injecting it (duplicates and stale messages are
+/// dropped). One trait for every Pier, not a copy in each.
+pub trait SequencedInput {
+    /// The message's input sequence number.
+    fn sequence(&self) -> u64;
+}
+
+macro_rules! sequenced_input {
+    ($($message:ty),+ $(,)?) => {
+        $(
+            impl SequencedInput for $message {
+                fn sequence(&self) -> u64 {
+                    self.sequence
+                }
+            }
+        )+
+    };
+}
+
+sequenced_input!(
+    KeyEventMsg,
+    MouseMoveMsg,
+    MouseMoveRelativeMsg,
+    MouseButtonMsg,
+    MouseScrollMsg,
+    PenEventMsg,
+    GestureMagnifyMsg,
+);
 
 /// Magnification gesture delta. `scale_delta` is additive: `0.10` means
 /// roughly 10% larger than the previous sample.
@@ -4810,6 +5081,7 @@ mod tests {
             fps: 120,
             display_refresh_hz: Some(120),
             basis: "display".to_owned(),
+            follows_display_moves: false,
         });
         let round_trip: ServerHelloMsg =
             serde_json::from_value(serde_json::to_value(&hello).expect("json")).expect("hello");
@@ -4833,6 +5105,125 @@ mod tests {
         let response = AuthResponse::password("user", "secret")
             .with_displays(vec![monitor(0, true)], "single_primary");
         assert_eq!(response.display_refresh_hz(), None);
+    }
+
+    #[test]
+    fn a_single_stream_follows_the_stated_refresh_of_the_display_that_shows_it() {
+        let monitor = |id, refresh_hz, is_primary| ClientMonitor {
+            id,
+            refresh_hz,
+            is_primary,
+            width_px: 1920,
+            height_px: 1080,
+            ..ClientMonitor::default()
+        };
+        // The Deck asks for 30 Hz and 60 Hz modes; its displays run at 30 Hz
+        // (primary) and 120 Hz, and the window is on the 120 Hz one.
+        let displays = vec![monitor(1, 30, true), monitor(2, 60, false)];
+        let stated = DeckDisplayRefreshMsg {
+            stream_display_id: Some(2),
+            displays: vec![
+                DeckPanelRefreshMsg {
+                    id: 1,
+                    refresh_hz: 30,
+                },
+                DeckPanelRefreshMsg {
+                    id: 2,
+                    refresh_hz: 120,
+                },
+            ],
+        };
+        let response = AuthResponse::password("user", "secret")
+            .with_displays(displays.clone(), "windowed")
+            .with_display_refresh(Some(stated.clone()));
+        assert_eq!(response.display_refresh_hz(), Some(120));
+        // No window display named: the primary's stated refresh.
+        let primary = AuthResponse::password("user", "secret")
+            .with_displays(displays.clone(), "windowed")
+            .with_display_refresh(Some(DeckDisplayRefreshMsg {
+                stream_display_id: None,
+                ..stated.clone()
+            }));
+        assert_eq!(primary.display_refresh_hz(), Some(30));
+        // A display the Deck stated nothing for keeps its mode's refresh.
+        let unstated = AuthResponse::password("user", "secret")
+            .with_displays(displays, "windowed")
+            .with_display_refresh(Some(DeckDisplayRefreshMsg {
+                stream_display_id: Some(2),
+                displays: Vec::new(),
+            }));
+        assert_eq!(unstated.display_refresh_hz(), Some(60));
+        // Absurd rates are bounded; zero is no statement.
+        let bounded = DeckDisplayRefreshMsg {
+            stream_display_id: None,
+            displays: vec![
+                DeckPanelRefreshMsg {
+                    id: 1,
+                    refresh_hz: 100_000,
+                },
+                DeckPanelRefreshMsg {
+                    id: 2,
+                    refresh_hz: 0,
+                },
+            ],
+        };
+        assert_eq!(bounded.refresh_of(1), Some(MAX_DECK_DISPLAY_REFRESH_HZ));
+        assert_eq!(bounded.refresh_of(2), None);
+    }
+
+    #[test]
+    fn a_display_refresh_update_round_trips_and_the_capability_is_additive() {
+        let update = DisplayRefreshUpdateMsg::new(
+            3,
+            DeckDisplayRefreshMsg {
+                stream_display_id: Some(2),
+                displays: vec![
+                    DeckPanelRefreshMsg {
+                        id: 1,
+                        refresh_hz: 120,
+                    },
+                    DeckPanelRefreshMsg {
+                        id: 2,
+                        refresh_hz: 60,
+                    },
+                ],
+            },
+        );
+        let json = serde_json::to_value(&update).expect("json");
+        assert_eq!(json["type"], DISPLAY_REFRESH_UPDATE);
+        let parsed: DisplayRefreshUpdateMsg = serde_json::from_value(json).expect("parse");
+        assert_eq!(parsed, update);
+        assert_eq!(parsed.refresh.stream_refresh_hz(), Some(60));
+
+        let old: StreamRateMsg =
+            serde_json::from_str(r#"{"fps":60,"basis":"display"}"#).expect("old rate");
+        assert!(!old.follows_display_moves);
+        assert!(!serde_json::to_string(&old)
+            .expect("json")
+            .contains("follows_display_moves"));
+    }
+
+    #[test]
+    fn display_refresh_v1_is_additive() {
+        let old: AuthResponse = serde_json::from_str(
+            r#"{"type":"auth_response","method":"pam","username":"u","credential":"p","screen_width":0,"screen_height":0}"#,
+        )
+        .expect("old response parses");
+        assert_eq!(old.display_refresh_v1, None);
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("display_refresh_v1"));
+        let stated =
+            AuthResponse::password("u", "p").with_display_refresh(Some(DeckDisplayRefreshMsg {
+                stream_display_id: Some(4),
+                displays: vec![DeckPanelRefreshMsg {
+                    id: 4,
+                    refresh_hz: 144,
+                }],
+            }));
+        let round_trip: AuthResponse =
+            serde_json::from_value(serde_json::to_value(&stated).expect("json")).expect("parse");
+        assert_eq!(round_trip.display_refresh_v1, stated.display_refresh_v1);
     }
 
     #[test]

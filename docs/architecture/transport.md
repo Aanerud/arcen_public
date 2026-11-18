@@ -7,9 +7,9 @@
 > "QUIC lanes" below); a released single-stream peer is refused with the
 > shared "update the Deck and the Pier to the same release" message. The
 > Decks have no WSS code at all (removed 2026-11-15); a connection an older
-> Deck saved as WSS opens over QUIC. The Piers' WSS listener is dormant source
-> behind the default-off `wss-compat` feature and is excluded from product
-> builds. `arcen-transport` remains dependency-light by default; product
+> Deck saved as WSS opens over QUIC. The Piers' dormant WSS listener and the
+> `wss-compat` features were removed on 2026-11-18. `arcen-transport` remains
+> dependency-light by default; product
 > crates opt into its Quinn feature.
 
 **Owner:** Shared/Architecture. See
@@ -21,10 +21,8 @@ the earlier migration design and exact library/version selection.
 The default `arcen-transport` build supplies the shared rustls posture,
 certificate validation, typed certificate/SPKI pins, atomic reload resolver,
 and product-neutral contract: payload caps, reliability classes, delivery
-mechanisms, bounded queues, and lifecycle events. Its default-off
-`wss-compat` surface, used only by the Piers' dormant listener, preserves
-dormant migration policy without placing a WSS network path in product
-binaries. The opt-in `arcen_transport::quic` module
+mechanisms, bounded queues, and lifecycle events. QUIC is its only transport
+profile. The opt-in `arcen_transport::quic` module
 supplies both the active direct carrier and a richer stream/datagram adapter
 that direct sessions do not yet use.
 
@@ -1018,11 +1016,14 @@ with `media-smoke` and `ARCEN_MEDIA_SMOKE_STATS`.
   send buffer, still to pace. The cap there was a Windows QoS throttle, not a
   router queue, so these figures are not comparable with the Linux ones
   above.
-- **Path indicator**: every `health_stats` from the Linux and Windows Piers
-  carries `path` (`PathQualityMsg`, see `shared/protocol/WIRE.md`): the
+- **Path indicator**: every `health_stats` from the Linux, Windows and macOS
+  Piers carries `path` (`PathQualityMsg`, see `shared/protocol/WIRE.md`): the
   controller, smoothed and minimum RTT, cwnd, packets sent and declared lost,
   congestion events and wire bytes for the window, sampled by
-  `PathQualityTracker` on the connection that carries the video. The Deck's
+  `PathQualityTracker` on the connection that carries the video. Where a
+  session agent does not own that connection (the Windows broker, the macOS
+  network service), the relaying process fills it in
+  (`arcen_observability::health_stats_with_path`). The Deck's
   Session → Connection Health overlay shows it as one `Path:` row with a
   good/fair/poor grade (`PathGrade`: RTT 80/150 ms, queueing 30/100 ms,
   loss 0.5 %/2 %), formatted by `path_quality_summary` so a future Deck
