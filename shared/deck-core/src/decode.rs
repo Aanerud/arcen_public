@@ -10,7 +10,9 @@
 //! - macOS: `VideoToolbox`, native picture `CVPixelBuffer`
 //!   (`clients/macos/src/pipeline/video_decoder.rs`).
 //! - Windows: our own `ID3D11VideoDecoder` (DXVA) decoder, native picture
-//!   a D3D11 texture slice on the presenter's device
+//!   a D3D11 texture on a decode device of its own, shared with the
+//!   presenters' devices where [`decode_device_split`] allows it, otherwise
+//!   a texture slice on the presenter's device
 //!   (`clients/windows/src/decode/`, ADR 0024). The portable
 //!   bitstream parsing, DPB and reference lists live in `arcen-media`.
 //!
@@ -447,9 +449,130 @@ pub fn header_video_configuration(
     ))
 }
 
+/// PCI vendor ids [`decode_device_split`] knows.
+pub mod pci_vendor {
+    pub const INTEL: u32 = 0x8086;
+    pub const NVIDIA: u32 = 0x10DE;
+    pub const AMD: u32 = 0x1002;
+}
+
+/// The first NVIDIA driver release (×100) whose shared textures between
+/// devices are reliable (Moonlight's documented boundary, about 471.11; it
+/// also excludes Fermi, whose last driver is 391).
+pub const NVIDIA_SPLIT_MIN_RELEASE: u32 = 47_111;
+
+/// What a Deck knows about a GPU before it decodes on a device separate
+/// from the devices that present (the Windows Deck): the presenters open
+/// the decoded pictures as shared textures and order their reads with
+/// shared fences, so a blocking present can never stall decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeDeviceFacts {
+    /// The adapter's PCI vendor id.
+    pub vendor_id: u32,
+    /// The user-mode driver version as Windows reports it (four fields,
+    /// most significant first), when known.
+    pub driver_version: Option<[u16; 4]>,
+    /// The driver shares more than the guaranteed texture formats
+    /// (D3D11 extended resource sharing).
+    pub extended_resource_sharing: bool,
+    /// The devices have GPU fences that can be shared between them.
+    pub shared_fences: bool,
+    /// Pixel shaders run at 16-bit minimum precision (on AMD: Vega and
+    /// later).
+    pub min_precision_16_bit: bool,
+}
+
+/// An NVIDIA driver version's release number ×100 (`31.0.15.5384` →
+/// 55384, i.e. 553.84): the last digit of the third field and the fourth.
+#[must_use]
+pub fn nvidia_release(version: [u16; 4]) -> u32 {
+    u32::from(version[2] % 10) * 10_000 + u32::from(version[3])
+}
+
+/// Whether a Deck may decode on a device of its own, separate from the
+/// presenters' devices, or why not (then decoder and presenters share one
+/// device).
+///
+/// The split needs extended resource sharing and shareable fences, and
+/// only adapters where it is known to work: Intel; NVIDIA from driver
+/// 471.11; AMD from Vega (16-bit minimum precision). Pre-Vega AMD corrupts
+/// pictures, older NVIDIA drivers and Qualcomm and Moore Threads drivers
+/// break shared decode textures (reference clients' measured exclusions,
+/// `docs/architecture/deck-presentation-timing.md`). Unknown vendors
+/// share one device.
+///
+/// # Errors
+///
+/// The reason, for the log.
+pub fn decode_device_split(facts: &DecodeDeviceFacts) -> Result<(), &'static str> {
+    if !facts.extended_resource_sharing {
+        return Err("the driver has no extended resource sharing");
+    }
+    if !facts.shared_fences {
+        return Err("the driver has no shareable fences");
+    }
+    match facts.vendor_id {
+        pci_vendor::INTEL => Ok(()),
+        pci_vendor::NVIDIA => match facts.driver_version {
+            Some(version) if nvidia_release(version) >= NVIDIA_SPLIT_MIN_RELEASE => Ok(()),
+            Some(_) => Err("NVIDIA drivers before 471.11 corrupt shared decode textures"),
+            None => Err("the NVIDIA driver version is unknown"),
+        },
+        pci_vendor::AMD if facts.min_precision_16_bit => Ok(()),
+        pci_vendor::AMD => Err("AMD GPUs before Vega corrupt shared decode textures"),
+        _ => Err("this GPU vendor is not qualified for a separate decode device"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn qualified(vendor_id: u32) -> DecodeDeviceFacts {
+        DecodeDeviceFacts {
+            vendor_id,
+            driver_version: None,
+            extended_resource_sharing: true,
+            shared_fences: true,
+            min_precision_16_bit: false,
+        }
+    }
+
+    #[test]
+    fn a_separate_decode_device_only_where_it_is_known_to_work() {
+        assert_eq!(decode_device_split(&qualified(pci_vendor::INTEL)), Ok(()));
+        let nvidia = |version| DecodeDeviceFacts {
+            driver_version: version,
+            ..qualified(pci_vendor::NVIDIA)
+        };
+        assert_eq!(nvidia_release([30, 0, 14, 7111]), 47_111);
+        assert_eq!(nvidia_release([31, 0, 15, 5384]), 55_384);
+        assert!(decode_device_split(&nvidia(Some([30, 0, 14, 7111]))).is_ok());
+        assert!(decode_device_split(&nvidia(Some([31, 0, 15, 5384]))).is_ok());
+        assert!(decode_device_split(&nvidia(Some([30, 0, 14, 7110]))).is_err());
+        assert!(decode_device_split(&nvidia(Some([23, 21, 13, 9135]))).is_err());
+        assert!(decode_device_split(&nvidia(None)).is_err());
+        assert!(decode_device_split(&qualified(pci_vendor::AMD)).is_err());
+        let vega = DecodeDeviceFacts {
+            min_precision_16_bit: true,
+            ..qualified(pci_vendor::AMD)
+        };
+        assert!(decode_device_split(&vega).is_ok());
+        // Qualcomm, Moore Threads, Microsoft Basic Render: one device.
+        for vendor in [0x5143, 0x1ED5, 0x1414] {
+            assert!(decode_device_split(&qualified(vendor)).is_err());
+        }
+        let no_sharing = DecodeDeviceFacts {
+            extended_resource_sharing: false,
+            ..qualified(pci_vendor::INTEL)
+        };
+        assert!(decode_device_split(&no_sharing).is_err());
+        let no_fences = DecodeDeviceFacts {
+            shared_fences: false,
+            ..qualified(pci_vendor::INTEL)
+        };
+        assert!(decode_device_split(&no_fences).is_err());
+    }
 
     #[test]
     fn backend_labels_follow_the_family_and_hardware_answer() {

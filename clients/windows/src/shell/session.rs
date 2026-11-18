@@ -322,6 +322,7 @@ impl Connection {
                 audio_player: Box::new(|| {
                     Box::new(crate::audio::output::Player::awaiting_stream_result())
                 }),
+                requested_video: Some(requested_video),
             },
         )?;
         let local_input = Arc::new(Mutex::new(Vec::new()));
@@ -391,7 +392,11 @@ impl Connection {
         if confirmed > 0 || submitted > 0 {
             self.last_frame_at = Some(now);
             if let Some(root) = self.multi_window_root_monitor() {
-                self.note_monitor_presents(root, confirmed.max(submitted));
+                // Presents handed to the presenter, as each further window
+                // counts its own: a frame is submitted in one pass and
+                // confirmed in a later one, so counting either per pass
+                // would count it twice.
+                self.note_monitor_presents(root, submitted);
             }
         }
         for window in [&mut self.presented, &mut self.submitted] {
@@ -945,6 +950,7 @@ impl Connection {
             lines.push(format!("Decoder: {refusal}"));
         }
         lines.extend(state.decoder_behind.line());
+        lines.push(self.media.decode_device_line().to_owned());
         let host_displays = state
             .host_health
             .as_ref()

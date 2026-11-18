@@ -10,6 +10,11 @@
 //! fills DXVA structures and drives `ID3D11VideoContext`. No `FFmpeg`, no
 //! Media Foundation decoder (ADR 0024).
 //!
+//! The decoder runs on a D3D11 device of its own on the presenters'
+//! adapter and hands pictures over through shared textures and fences
+//! ([`shared`]), so no presenter can stall decode; where the driver cannot
+//! share them it runs on the presenters' device instead.
+//!
 //! Capabilities are probed per adapter, never assumed: every advertised
 //! profile needs its format, a configuration and a decoder at 3840x2160,
 //! and a real keyframe of our own encoder decoded sample-exact against an
@@ -28,10 +33,12 @@ pub mod dxva;
 pub mod probe;
 pub mod readback;
 pub mod session;
+pub mod shared;
 
-pub use backend::{D3d11DecoderFactory, D3d11VideoDecoder, PRESENTER_SLOTS};
+pub use backend::{D3d11DecoderFactory, D3d11VideoDecoder, HandOver, PRESENTER_SLOTS};
 pub use device::{DecoderProfile, HardwareAdapter, VideoDevice, hardware_adapters};
 pub use probe::{
     ProbeReport, probe_decode_capabilities, probe_for_adapter, probe_report_for_adapter, prove,
 };
 pub use session::D3d11Picture;
+pub use shared::{ShareProof, SharedPicture, prove_sharing};

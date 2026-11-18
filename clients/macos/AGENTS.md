@@ -40,9 +40,9 @@ two where the measured submission-to-glass time exceeds a refresh because
 the system composes the layer, `arcen_media::NewestPresentDepth`; a frame
 waiting for a slot goes the moment a presented handler frees one, from the
 presenter's slot thread, and the `CVDisplayLink` tick is the retry path),
-and Speed also turns
-`displaySyncEnabled` off, keeps two drawables in flight and presents without
-a minimum duration, so it may tear. Grading and HDR keep the `CVDisplayLink`-paced ten-bit layer with
+and no preset tears: Speed
+uses the same newest-frame timing as Auto; display sync stays on for every
+timing. Grading and HDR keep the `CVDisplayLink`-paced ten-bit layer with
 display sync, EDR and colour handling unchanged. Do not add a local preset
 or tearing rule here: change the shared contract. Fullscreen draws nothing
 over the video: the system menu bar auto-hides and drops down at the top

@@ -132,12 +132,29 @@ pub type ProfileProbe = (DecoderProfile, Result<(), String>);
 pub struct VideoDevice {
     pub device: ID3D11Device,
     pub video: ID3D11VideoDevice,
-    /// Held across every multi-call sequence on the immediate context, which
-    /// the decoder shares with the presenters (`present::Gpu::context_lock`).
+    /// Held across every multi-call sequence on the immediate context (the
+    /// presenters' `present::Gpu::context_lock` when the decoder shares
+    /// their device, its own otherwise).
     pub context_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub adapter_name: String,
     pub vendor_id: u32,
     pub device_id: u32,
+    /// The user-mode driver version (four fields, most significant first),
+    /// when known.
+    pub driver_version: Option<[u16; 4]>,
+}
+
+/// The adapter's user-mode driver version, as Windows reports it.
+#[must_use]
+pub fn driver_version(adapter: &IDXGIAdapter1) -> Option<[u16; 4]> {
+    // SAFETY: a read-only query; the GUID outlives the call.
+    #[allow(unsafe_code)]
+    let packed =
+        unsafe { adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID) }
+            .ok()?;
+    let packed = packed.cast_unsigned();
+    let field = |shift: u32| u16::try_from((packed >> shift) & 0xFFFF).unwrap_or(0);
+    Some([field(48), field(32), field(16), field(0)])
 }
 
 /// A hardware adapter: interface, name, PCI vendor and device id, LUID.
@@ -178,8 +195,8 @@ pub fn hardware_adapters() -> windows::core::Result<Vec<HardwareAdapter>> {
 
 impl VideoDevice {
     /// Creates a device with video and BGRA support on `adapter`, with
-    /// multithread protection on: the media worker decodes and the
-    /// presenter samples on the same device.
+    /// multithread protection on (lab readbacks may share it with the
+    /// decoder's thread).
     ///
     /// # Errors
     ///
@@ -241,6 +258,7 @@ impl VideoDevice {
             adapter_name,
             vendor_id,
             device_id,
+            driver_version: None,
         })
     }
 
@@ -254,6 +272,25 @@ impl VideoDevice {
         let mut device = Self::from_device(gpu.device.clone(), gpu.adapter_name.clone(), 0, 0)?;
         device.context_lock = std::sync::Arc::clone(&gpu.context_lock);
         Ok(device)
+    }
+
+    /// A device of the decoder's own on the presenter's adapter (the same
+    /// LUID): its own immediate context, so nothing a presenter does on its
+    /// device can stall decode (`super::shared`).
+    ///
+    /// # Errors
+    ///
+    /// The adapter is gone or has no video device.
+    pub fn own_for(gpu: &crate::present::Gpu) -> Result<Self, String> {
+        let adapters = hardware_adapters().map_err(|error| format!("adapters: {error}"))?;
+        let (adapter, name, vendor, device, _) = adapters
+            .into_iter()
+            .find(|(_, _, _, _, luid)| *luid == gpu.luid)
+            .ok_or("the presenter's adapter is not a hardware adapter")?;
+        let mut created = Self::create(&adapter, name, vendor, device)
+            .map_err(|error| format!("decode device: {error}"))?;
+        created.driver_version = driver_version(&adapter);
+        Ok(created)
     }
 
     /// The decoder configuration Arcen uses for `profile` at the given

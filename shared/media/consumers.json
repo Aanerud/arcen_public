@@ -327,7 +327,7 @@
         {
           "id": "deck-present-timing",
           "symbol": "operational_present_timing",
-          "reason": "Every Deck presents a frame when the served pipeline's shared PresentTiming says (Auto newest without tearing, Speed may tear, Grading and HDR on the refresh); the shared media worker derives it once for both Decks."
+          "reason": "Every Deck presents a frame when the served pipeline's shared PresentTiming says (Auto and Speed newest without tearing, Grading and HDR on the refresh); the shared media worker derives it once for both Decks."
         }
       ]
     },
@@ -376,7 +376,7 @@
         {
           "id": "macos-present-timing",
           "symbol": "PresentTiming",
-          "reason": "The eight-bit Metal layer maps the shared timing onto present-on-arrival and displaySyncEnabled instead of a local preset rule."
+          "reason": "The eight-bit Metal layer maps the shared timing onto present-on-arrival or the display link and its drawables in flight instead of a local preset rule."
         }
       ],
       "paths": [
@@ -1244,7 +1244,7 @@
         {
           "id": "windows-present-timing",
           "symbol": "PresentTiming",
-          "reason": "The presenters map the shared timing onto the DXGI sync interval and ALLOW_TEARING instead of a local Speed rule or tearing switch."
+          "reason": "The presenters map the shared timing onto the DXGI sync interval (no preset tears) instead of a local Speed rule or tearing switch."
         }
       ],
       "paths": [

@@ -113,7 +113,13 @@ drifted apart in features.
      in `arcen-media`; the shell only fills the DXVA structures. Parsing is
      scoped to what Arcen Piers emit and anything else is refused with a
      reason. Decoder and presenter share one D3D11 device, on the adapter
-     that drives the window's monitor.
+     that drives the window's monitor. (Amended 2026-11-18: the decoder
+     now runs on a device of its own on that adapter, and each window
+     presents on its own device, with pictures shared through NT-handle
+     textures and fences, wherever the shared rule
+     `decode_device_split` qualifies the driver; otherwise one device as
+     before. See `clients/windows/AGENTS.md` and
+     [Deck presentation timing](../architecture/deck-presentation-timing.md).)
    - **Present.** A Deck-owned DirectComposition tree: a D3D11 flip-model
      composition swapchain for video at the bottom, and egui drawn by wgpu
      into a caller-owned composition visual on top. The session window

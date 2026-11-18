@@ -33,5 +33,5 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
     favours: "a sharp picture at your display's refresh rate, shown the moment it is decoded without tearing",
     gives_up: "frame rate first when the link or the host cannot keep up, and climbs back when they can",
-    summary: "Favours a sharp picture at your display's refresh rate, shown without tearing; gives up frame rate first when the link or the host cannot keep up, and climbs back when they can.",
+    summary: "Sharp picture at your display's refresh rate. On a weak link it lowers the frame rate first and keeps the picture sharp.",
 };

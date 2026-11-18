@@ -134,7 +134,7 @@ capability's proof pattern, and a PD or GAP cell must not be.
 | Connection test screen | yes | GAP-024 |
 | Colour check screen | yes | GAP-024 |
 | Session-truth badge | yes | yes |
-| Presentation timing from the shared pipeline contract (Auto newest frame, Speed may tear, Grading/HDR on the refresh) | yes | yes |
+| Presentation timing from the shared pipeline contract (Auto and Speed newest frame, no preset tears, Grading/HDR on the refresh) | yes | yes |
 | Wheel accumulation through arcen_input::deck_wheel | GAP-028 | yes |
 | Colour uniform from arcen_media::video::present | yes | yes |
 | Stream statistics debug overlay | yes | GAP-032 |

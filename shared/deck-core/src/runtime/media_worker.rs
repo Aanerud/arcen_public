@@ -3290,7 +3290,7 @@ mod tests {
         assert_eq!(present_timing_for_state(&state), PresentTiming::Newest);
         for (served, timing) in [
             (ServedStreamPipeline::Auto, PresentTiming::Newest),
-            (ServedStreamPipeline::Speed, PresentTiming::Tearing),
+            (ServedStreamPipeline::Speed, PresentTiming::Newest),
             (ServedStreamPipeline::Grading, PresentTiming::Vsync),
             (ServedStreamPipeline::Hdr, PresentTiming::Vsync),
         ] {

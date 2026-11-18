@@ -8,6 +8,7 @@
 use super::Result;
 use super::convert::{ConvertUniform, Converter, OutputKind, RefineDomain, SourcePlanes};
 use super::device::Gpu;
+use super::handover::SharedReads;
 use super::picture::D3d11Picture;
 use super::refine::{D3d11RefineOverlay, PendingReadback};
 pub use arcen_deck_core::present::RefineFrameTag;
@@ -67,6 +68,8 @@ pub struct FrameComposer {
     in_flight: VecDeque<InFlight>,
     /// The visible picture, copied out when it cannot be sampled in place.
     scratch: Option<ID3D11Texture2D>,
+    /// Pictures from the decoder's own device (`super::handover`).
+    reads: SharedReads,
     pub refine_refusals: u64,
 }
 
@@ -92,16 +95,13 @@ impl FrameComposer {
             overlay: D3d11RefineOverlay::new(),
             in_flight: VecDeque::new(),
             scratch: None,
+            reads: SharedReads::default(),
             refine_refusals: 0,
         })
     }
 
     /// Draws `frame` into `target` (source-sized). Call [`Self::submitted`]
     /// after the frame was presented (or the target otherwise consumed).
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one draw: refinement writes, plane views, uniforms and the pass, in order"
-    )]
     pub fn draw(
         &mut self,
         gpu: &Gpu,
@@ -109,17 +109,28 @@ impl FrameComposer {
         target: &ID3D11RenderTargetView,
         output: OutputKind,
     ) -> Result<()> {
-        if let Some(fence) = &frame.picture.fence {
-            // The decoder's work, GPU-side, before anything samples it.
-            let context4: ID3D11DeviceContext4 = super::hr(
-                "ID3D11DeviceContext4",
-                windows::core::Interface::cast(&gpu.context),
-            )?;
-            super::hr("Wait(decode fence)", unsafe {
-                context4.Wait(fence, frame.picture.fence_value)
-            })?;
-        }
-        let planes = SourcePlanes::of_picture(gpu, &frame.picture, &mut self.scratch)?;
+        // The decoder's work, GPU-side, before anything samples it; a
+        // picture from the decoder's own device is opened on this one.
+        let picture = self.reads.acquire(gpu, &frame.picture)?;
+        let drawn = self.draw_picture(gpu, frame, &picture, target, output);
+        // After every draw that read it, failed or not.
+        let released = self.reads.release(gpu, &frame.picture);
+        drawn.and(released)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one draw: refinement writes, plane views, uniforms and the pass, in order"
+    )]
+    fn draw_picture(
+        &mut self,
+        gpu: &Gpu,
+        frame: &DecodedFrame,
+        picture: &D3d11Picture,
+        target: &ID3D11RenderTargetView,
+        output: OutputKind,
+    ) -> Result<()> {
+        let planes = SourcePlanes::of_picture(gpu, picture, &mut self.scratch)?;
         let uniform = ConvertUniform::new(
             VideoUniform::from_contract(frame.contract, planes.luma_size, planes.chroma_size),
             output,
@@ -296,6 +307,17 @@ impl FrameComposer {
 
     pub fn in_flight(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Teardown: the GPU passed this presenter's reads of decoded pictures
+    /// (bounded wait), so the decoder may write them again.
+    pub fn finish_reads(&self) {
+        self.reads.finish(std::time::Duration::from_millis(200));
+    }
+
+    /// Pictures whose decode was still running on the GPU when drawn.
+    pub fn take_decode_pending(&mut self) -> u64 {
+        self.reads.take_decode_pending()
     }
 }
 

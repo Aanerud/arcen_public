@@ -327,7 +327,7 @@ do not send a wire pipeline. Each named file owns one contract:
 - `auto.rs`: adaptive 8-bit 4:2:0 at the Deck display's refresh
   (`FrameRatePolicy::FollowDisplay`), detail-first, newest-frame present.
 - `speed.rs`: adaptive 8-bit 4:2:0 at the display's refresh but never below
-  60 fps, motion-first, one-frame buffer, tearing present,
+  60 fps, motion-first, one-frame buffer, newest-frame present,
   a safe link-capped start with a true 60 fps shape ceiling, and
   Speed-specific low-latency decode policy for clients that consume the
   served pipeline.

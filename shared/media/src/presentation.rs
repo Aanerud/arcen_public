@@ -754,7 +754,6 @@ mod present_timing_tests {
     fn a_frame_presented_at_once_keeps_only_the_newest_waiting() {
         assert_eq!(FramePacerConfig::queue_cap_for(PresentTiming::Vsync), 3);
         assert_eq!(FramePacerConfig::queue_cap_for(PresentTiming::Newest), 1);
-        assert_eq!(FramePacerConfig::queue_cap_for(PresentTiming::Tearing), 1);
 
         let mut pacer = FramePacer::new();
         for (frame, at) in [(1, 0), (2, 5), (3, 10)] {

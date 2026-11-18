@@ -25,14 +25,14 @@ use super::readback::read_planar;
 /// `shared/media/tests/data/bitstream/`), and the FNV-1a 64 of its planar
 /// picture as an independent software decoder (ffmpeg, offline, never
 /// shipped) reconstructs it.
-struct ProbeKeyframe {
-    profile: DecoderProfile,
-    codec: StreamCodecKind,
-    stream: &'static [u8],
-    fnv: u64,
+pub(crate) struct ProbeKeyframe {
+    pub(crate) profile: DecoderProfile,
+    pub(crate) codec: StreamCodecKind,
+    pub(crate) stream: &'static [u8],
+    pub(crate) fnv: u64,
 }
 
-const PROBE_KEYFRAMES: [ProbeKeyframe; 4] = [
+pub(crate) const PROBE_KEYFRAMES: [ProbeKeyframe; 4] = [
     ProbeKeyframe {
         profile: H264,
         codec: StreamCodecKind::H264,
@@ -67,7 +67,7 @@ const PROBE_KEYFRAMES: [ProbeKeyframe; 4] = [
     },
 ];
 
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })

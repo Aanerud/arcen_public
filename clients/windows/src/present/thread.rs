@@ -110,11 +110,14 @@ struct Owned {
     timing: PresentTiming5s,
     /// The last present's draw, `Present` call and composition update.
     phases: [Duration; 3],
+    /// Which window and pipeline, for the log.
+    label: String,
 }
 
 /// Where a present's time goes, logged every five seconds: the swapchain's
-/// frame-latency wait (no lock held), the shared context lock, and the draw
-/// and `Present` call under it.
+/// frame-latency wait (no lock held), the device's context lock, the draw,
+/// the `Present` call (entry to exit) and the composition update, and how
+/// many pictures were drawn before their decode had finished on the GPU.
 struct PresentTiming5s {
     since: Instant,
     presents: u32,
@@ -126,6 +129,7 @@ struct PresentTiming5s {
     work_max: Duration,
     phases: [Duration; 3],
     phases_max: [Duration; 3],
+    decode_pending: u64,
 }
 
 impl Default for PresentTiming5s {
@@ -141,20 +145,28 @@ impl Default for PresentTiming5s {
             work_max: Duration::ZERO,
             phases: [Duration::ZERO; 3],
             phases_max: [Duration::ZERO; 3],
+            decode_pending: 0,
         }
     }
 }
 
 impl PresentTiming5s {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one present's measurements, logged together"
+    )]
     fn note(
         &mut self,
+        label: &str,
         wait: Duration,
         lock: Duration,
         work: Duration,
         phases: [Duration; 3],
         size: (u32, u32),
+        decode_pending: u64,
     ) {
         self.presents += 1;
+        self.decode_pending += decode_pending;
         for (index, phase) in phases.into_iter().enumerate() {
             self.phases[index] += phase;
             self.phases_max[index] = self.phases_max[index].max(phase);
@@ -174,6 +186,7 @@ impl PresentTiming5s {
         let us = |value: Duration| u64::try_from(value.as_micros()).unwrap_or(u64::MAX);
         tracing::info!(
             target: arcen_deck_core::log_target::VIDEO,
+            window = label,
             size = ?size,
             presents = self.presents,
             latency_wait_avg_us = avg(self.wait),
@@ -186,6 +199,7 @@ impl PresentTiming5s {
             present_call_avg_us = avg(self.phases[1]),
             present_call_max_us = us(self.phases_max[1]),
             composition_avg_us = avg(self.phases[2]),
+            decode_pending = self.decode_pending,
             "video presenter timing"
         );
         *self = Self::default();
@@ -222,7 +236,6 @@ impl PathWatch {
                 mode = swapchain.mode.name(),
                 size = ?(swapchain.width, swapchain.height),
                 timing = timing.token(),
-                tearing = timing.allows_tearing() && swapchain.tearing_supported,
                 "video presentation path: {reading}"
             );
             self.last = Some(name);
@@ -237,7 +250,6 @@ const fn timing_code(timing: PresentTiming) -> u8 {
     match timing {
         PresentTiming::Vsync => 0,
         PresentTiming::Newest => 1,
-        PresentTiming::Tearing => 2,
     }
 }
 
@@ -245,7 +257,6 @@ impl Shared {
     fn timing(&self) -> PresentTiming {
         match self.timing.load(Ordering::Relaxed) {
             1 => PresentTiming::Newest,
-            2 => PresentTiming::Tearing,
             _ => PresentTiming::Vsync,
         }
     }
@@ -341,6 +352,7 @@ impl PresenterThread {
         gpu: Gpu,
         swapchain: VideoSwapchain,
         tree: Option<(SharedTree, usize)>,
+        label: String,
     ) -> Result<Self> {
         let composer = FrameComposer::new(&gpu)?;
         let shared = Arc::new(Shared {
@@ -363,6 +375,7 @@ impl PresenterThread {
             ready: false,
             timing: PresentTiming5s::default(),
             phases: [Duration::ZERO; 3],
+            label,
         };
         let thread_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
@@ -410,6 +423,7 @@ fn poll(owned: &mut Owned, shared: &Shared) {
 fn stop(owned: &mut Owned, shared: &Shared) {
     lock(&shared.slot).frame = None;
     owned.composer.discard();
+    owned.composer.finish_reads();
     if let Some((tree, owner)) = &owned.tree {
         let _ = lock(tree).hide_swapchain(*owner);
     }
@@ -451,8 +465,10 @@ fn run(mut owned: Owned, shared: &Shared) {
         let waited = Instant::now();
         if shared.visible.load(Ordering::Relaxed) && !owned.ready {
             // Holding no lock: the swapchain accepts a frame at the display's
-            // next refresh or composition, and the decoder and every other
-            // window's presenter share this device's immediate context.
+            // next refresh or composition, and this device's other users
+            // (the other pipeline, the cursor layer; the decoder and the
+            // other windows only where the driver cannot share pictures)
+            // must not wait behind it.
             owned.swapchain.wait(100);
             owned.ready = true;
         }
@@ -495,9 +511,16 @@ fn run(mut owned: Owned, shared: &Shared) {
             let (result, locked) = present_one(&mut owned, shared, &frame);
             let size = (owned.swapchain.width, owned.swapchain.height);
             let phases = owned.phases;
-            owned
-                .timing
-                .note(waited, locked, work.elapsed(), phases, size);
+            let pending = owned.composer.take_decode_pending();
+            owned.timing.note(
+                &owned.label,
+                waited,
+                locked,
+                work.elapsed(),
+                phases,
+                size,
+                pending,
+            );
             result
         };
         match result {

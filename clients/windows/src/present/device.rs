@@ -2,10 +2,12 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! D3D11 device and adapter selection, plus texture helpers.
 //!
-//! One adapter for the decoder and the presenter: the one that owns the
+//! One adapter for the decoder and the presenters: the one that owns the
 //! window's monitor (matched by LUID), never "whatever DXGI lists first".
 //! A hybrid laptop's integrated GPU drives the panel; decoding on the
-//! discrete GPU would add a cross-adapter copy per frame.
+//! discrete GPU would add a cross-adapter copy per frame. Each window has a
+//! device of its own on that adapter, and so does the decoder
+//! (`crate::decode::shared`), unless the driver cannot share pictures.
 
 use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::*;
@@ -17,7 +19,8 @@ use windows::core::Interface;
 
 use super::{Result, created, hr};
 
-/// The device the presenter (and the decoder) run on.
+/// A window's device: its presenters, composition tree and cursor layer
+/// run on it (and the decoder, where the driver cannot share pictures).
 #[derive(Clone)]
 pub struct Gpu {
     pub device: ID3D11Device,
@@ -29,9 +32,9 @@ pub struct Gpu {
     pub feature_level: D3D_FEATURE_LEVEL,
     /// Held across every multi-call sequence on `context` (state setup +
     /// draw, copy + map, resize): several threads share this immediate
-    /// context (each pipeline's presenter, the decoder's video context, the
-    /// cursor layer), and multithread protection only makes single calls
-    /// atomic.
+    /// context (each pipeline's presenter, the cursor layer, and the
+    /// decoder's video context where it shares this device), and
+    /// multithread protection only makes single calls atomic.
     pub context_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
@@ -41,6 +44,9 @@ pub enum AdapterChoice {
     Monitor(isize),
     /// The first adapter whose description contains this text.
     Name(String),
+    /// The adapter with this LUID (a further window on the root window's
+    /// adapter).
+    Luid(LUID),
     /// The Microsoft Basic Render Driver (WARP), for shader tests.
     Warp,
     /// DXGI's high-performance preference (diagnostics only).
@@ -202,6 +208,10 @@ impl Gpu {
         let chosen = match choice {
             AdapterChoice::Monitor(monitor) => adapter_for_monitor(HMONITOR(*monitor as _))?
                 .ok_or_else(|| "no adapter owns the window's monitor".to_owned())?,
+            AdapterChoice::Luid(luid) => adapters()?
+                .into_iter()
+                .find(|(_, facts)| facts.luid == *luid)
+                .ok_or_else(|| format!("no adapter with LUID {}", luid_text(*luid)))?,
             AdapterChoice::Name(name) => adapters()?
                 .into_iter()
                 .find(|(_, facts)| facts.name.to_lowercase().contains(&name.to_lowercase()))
@@ -220,7 +230,8 @@ impl Gpu {
         };
         let (adapter, facts) = chosen;
         let (device, context, level) = create_on(Some(&adapter), false)?;
-        // Decoder and presenter threads share this device.
+        // Presenter threads (and, where pictures cannot be shared, the
+        // decoder) share this device.
         if let Ok(multithread) = device.cast::<ID3D11Multithread>() {
             unsafe {
                 let _ = multithread.SetMultithreadProtected(true);

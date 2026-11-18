@@ -146,7 +146,11 @@ because the destination buffer is wider.
   BGRA conversion moved to `arcen-media`.
 - `linux_x11.rs` — XRandR/XDamage/MIT-SHM 1.2 capture, depth-24 BGRA and
   depth-30 mask-derived RGB10 layouts, bounded GetImage degradation, checked
-  modeset recreation, and shared OpenH264 loop.
+  modeset recreation, and shared OpenH264 loop. Every read first copies the
+  output into a server-side snapshot pixmap (`CopyArea`, `IncludeInferiors`)
+  and reads that: a read of the root itself takes milliseconds, and a
+  fullscreen, unredirected OpenGL client swapping during it was captured torn
+  (up to 98 % of reads); NvFBC needs no such copy.
 - `wayland/` (feature `wayland`, default off) — Wayland provider capture: the
   session hand-off, a `PipeWire` consumer with bounded, revocable buffer
   leases, the `host-copy` route into the NVENC CUDA slot (proven on GNOME 40

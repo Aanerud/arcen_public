@@ -513,13 +513,9 @@ pub enum PresentTiming {
     Vsync,
     /// Hand each frame to the display the moment it is decoded, without
     /// tearing: the newest frame wins at the next refresh or composition and
-    /// an older one still waiting there is discarded ("mailbox"). The
-    /// default for interactive pipelines (Auto).
+    /// an older one still waiting there is discarded ("mailbox"). Every
+    /// interactive pipeline (Auto, Speed, Software). No timing tears.
     Newest,
-    /// Like [`Self::Newest`], and a frame may also replace the one being
-    /// scanned out mid-refresh (a tear) where the display path allows it:
-    /// speed over the last 1 % of picture quality (Speed).
-    Tearing,
 }
 
 impl PresentTiming {
@@ -527,12 +523,6 @@ impl PresentTiming {
     #[must_use]
     pub const fn waits_for_vsync(self) -> bool {
         matches!(self, Self::Vsync)
-    }
-
-    /// Whether a frame may tear.
-    #[must_use]
-    pub const fn allows_tearing(self) -> bool {
-        matches!(self, Self::Tearing)
     }
 
     /// The timing a presenter applies to a picture of `depth`. A deeper than
@@ -552,7 +542,6 @@ impl PresentTiming {
         match self {
             Self::Vsync => "vsync",
             Self::Newest => "newest",
-            Self::Tearing => "tearing",
         }
     }
 }
@@ -1878,7 +1867,7 @@ mod tests {
         );
         assert_eq!(
             pipeline_contract(PipelineId::Speed).present_timing,
-            PresentTiming::Tearing
+            PresentTiming::Newest
         );
         assert_eq!(
             pipeline_contract(PipelineId::Software).present_timing,
@@ -1887,12 +1876,11 @@ mod tests {
         for fidelity in [PipelineId::Grading, PipelineId::Hdr] {
             let timing = pipeline_contract(fidelity).present_timing;
             assert_eq!(timing, PresentTiming::Vsync, "{fidelity:?}");
-            assert!(timing.waits_for_vsync() && !timing.allows_tearing());
+            assert!(timing.waits_for_vsync());
         }
-        // Only Speed may tear; only the fidelity contracts wait.
+        // Only the fidelity contracts wait.
         for id in PipelineId::ALL {
             let timing = pipeline_contract(*id).present_timing;
-            assert_eq!(timing.allows_tearing(), *id == PipelineId::Speed, "{id:?}");
             assert_eq!(
                 timing.waits_for_vsync(),
                 matches!(id, PipelineId::Grading | PipelineId::Hdr),
@@ -1905,7 +1893,7 @@ mod tests {
     fn present_timing_is_read_from_what_the_host_serves() {
         assert_eq!(
             operational_present_timing(Some(&ServedStreamPipeline::Speed)),
-            PresentTiming::Tearing
+            PresentTiming::Newest
         );
         assert_eq!(
             operational_present_timing(Some(&ServedStreamPipeline::Grading)),
@@ -1934,11 +1922,7 @@ mod tests {
 
     #[test]
     fn a_ten_bit_picture_always_waits_for_the_refresh() {
-        for timing in [
-            PresentTiming::Vsync,
-            PresentTiming::Newest,
-            PresentTiming::Tearing,
-        ] {
+        for timing in [PresentTiming::Vsync, PresentTiming::Newest] {
             assert_eq!(timing.for_depth(BitDepth::Eight), timing);
             assert_eq!(timing.for_depth(BitDepth::Ten), PresentTiming::Vsync);
             assert_eq!(timing.for_depth(BitDepth::Twelve), PresentTiming::Vsync);

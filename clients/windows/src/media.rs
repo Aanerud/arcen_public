@@ -4,7 +4,10 @@
 //!
 //! The composition the macOS Deck's `ui/media_worker.rs` makes for
 //! `VideoToolbox` and Metal, made here for Windows: Arcen's own D3D11 decoder
-//! ([`crate::decode`]) on the window's GPU, the two dedicated presenters
+//! ([`crate::decode`]) on a device of its own on the window's GPU (pictures
+//! reach the presenters through shared textures and fences, so no window's
+//! `Present` can stall decode; on a driver that cannot share them the
+//! decoder runs on the window's device instead), the two dedicated presenters
 //! ([`crate::present::D3d11VideoSink`]) drawing into the window's video
 //! visual, and the shared media worker, monitor router and audio worker
 //! from `arcen-deck-core`. Everything after the composition (decode order,
@@ -137,7 +140,9 @@ pub type AudioPlayerFactory = Box<dyn FnOnce() -> Box<dyn AudioPlayback> + Send>
 
 /// The window's video surface, from the shell: the GPU of the adapter that
 /// owns the window's monitor and the window's composition tree. The decoder
-/// runs on the same device (the decode stream's same-device rule).
+/// runs on a device of its own on the same adapter, or on this device when
+/// the driver cannot share pictures between devices
+/// ([`MediaSession::decodes_on_own_device`]).
 #[derive(Clone)]
 pub struct VideoSurface {
     /// The presenter's device.
@@ -165,6 +170,9 @@ pub struct MediaStart {
     pub telemetry: Arc<ClientTelemetry>,
     /// The audio player (platform: `PcmAudioPlayer` on the WASAPI output).
     pub audio_player: AudioPlayerFactory,
+    /// The picture the connection asks for (its chroma and depth decide
+    /// which decoder output formats it may need); `None`: any.
+    pub requested_video: Option<arcen_media::VideoConfiguration>,
 }
 
 impl std::fmt::Debug for MediaStart {
@@ -194,6 +202,11 @@ pub struct MediaSession {
     telemetry: Arc<ClientTelemetry>,
     /// Whether a presenter has confirmed a frame on glass yet.
     presented_time_reported: bool,
+    /// The decoder has a device of its own: pictures can be presented on
+    /// any device of the adapter.
+    own_decode_device: bool,
+    /// Stream Statistics' line about the decoder's device.
+    decode_device_line: String,
 }
 
 impl std::fmt::Debug for MediaSession {
@@ -228,16 +241,35 @@ impl MediaSession {
             commands,
             clipboard,
         } = handle;
-        let device = match VideoDevice::from_gpu(&surface.gpu) {
-            Ok(device) => device,
-            Err(error) => {
-                let _ = commands.send(SessionCommand::Close);
-                return Err(format!(
-                    "this PC's graphics adapter has no D3D11 video decoder: {error}"
-                ));
+        let mut decode_device_line =
+            "Decode device: its own (never waits for the display)".to_owned();
+        let decoders = match decode_device_of_its_own(&surface.gpu, start.requested_video.as_ref())
+        {
+            Ok(decoders) => decoders,
+            Err(reason) => {
+                decode_device_line = format!(
+                    "Decode device: the window's ({})",
+                    reason.split(';').next().unwrap_or_default()
+                );
+                let device = match VideoDevice::from_gpu(&surface.gpu) {
+                    Ok(device) => device,
+                    Err(error) => {
+                        let _ = commands.send(SessionCommand::Close);
+                        return Err(format!(
+                            "this PC's graphics adapter has no D3D11 video decoder: {error}"
+                        ));
+                    }
+                };
+                tracing::info!(
+                    target: arcen_deck_core::log_target::VIDEO,
+                    adapter = %surface.gpu.adapter_name,
+                    %reason,
+                    "video decode device: the window's device (pictures are not shared between devices)"
+                );
+                D3d11DecoderFactory::new(device)
             }
         };
-        let decoders = D3d11DecoderFactory::new(device);
+        let own_decode_device = decoders.has_own_device();
         let eight_bit = Arc::new(Mutex::new(WindowSink::new(D3d11VideoSink::new(
             PresenterPipeline::EightBit,
             surface.gpu.clone(),
@@ -293,7 +325,24 @@ impl MediaSession {
             frames_confirmed: 0,
             telemetry: start.telemetry,
             presented_time_reported: false,
+            own_decode_device,
+            decode_device_line,
         })
+    }
+
+    /// Whether the decoder runs on a device of its own. Then every window
+    /// presents on a device of its own too; otherwise every window must
+    /// present on the root window's device, where the pictures are.
+    #[must_use]
+    pub const fn decodes_on_own_device(&self) -> bool {
+        self.own_decode_device
+    }
+
+    /// Stream Statistics' line saying which device the decoder runs on,
+    /// and why not its own.
+    #[must_use]
+    pub fn decode_device_line(&self) -> &str {
+        &self.decode_device_line
     }
 
     /// Frames a further window of a multi-window session presented: they
@@ -456,6 +505,45 @@ impl Drop for MediaSession {
     }
 }
 
+/// A decoder factory on a D3D11 device of its own on `gpu`'s adapter, when
+/// the driver can share decoded pictures with `gpu`'s device (and so with
+/// any other device on the adapter).
+fn decode_device_of_its_own(
+    gpu: &Gpu,
+    requested: Option<&arcen_media::VideoConfiguration>,
+) -> Result<D3d11DecoderFactory, String> {
+    let device = VideoDevice::own_for(gpu)?;
+    let proof = crate::decode::prove_sharing(&device, &gpu.device, &gpu.context_lock, gpu.luid)?;
+    // Any 4:2:0 picture the adapter decodes may arrive (a fidelity request
+    // can be served as Auto); 4:4:4 only when the connection asks for it.
+    let full_chroma =
+        requested.is_none_or(|video| video.chroma == arcen_media::ChromaSubsampling::Yuv444);
+    if let Some((format, why)) = proof.refused.iter().find(|(format, _)| {
+        full_chroma
+            || !matches!(
+                *format,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_Y410
+                    | windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_AYUV
+            )
+    }) {
+        return Err(format!(
+            "{} pictures this connection may need are not shared exactly ({why}); {}",
+            crate::decode::shared::format_name(*format),
+            proof.describe()
+        ));
+    }
+    tracing::info!(
+        target: arcen_deck_core::log_target::VIDEO,
+        adapter = %device.adapter_name,
+        proof = %proof.describe(),
+        "video decode device: a device of its own, pictures shared with the windows' devices"
+    );
+    Ok(D3d11DecoderFactory::own_device(
+        device,
+        proof.formats.into(),
+    ))
+}
+
 /// Whether the host's hello turned Exact still image on for this session.
 fn refine_offered(state: &SharedMediaState) -> bool {
     state
@@ -589,6 +677,7 @@ mod tests {
                     SilentOutput,
                 >::awaiting_stream_result())
             }),
+            requested_video: None,
         };
         let mut session = match MediaSession::start(
             handle,

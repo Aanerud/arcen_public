@@ -1737,46 +1737,26 @@ pub struct DedicatedEightBitVideoLayer {
     slot_freed: Option<SlotFreed>,
 }
 
-/// How the eight-bit layer presents under a pipeline's timing.
+/// How the eight-bit layer presents under a pipeline's timing. Display
+/// sync stays on for every timing, so no frame tears.
 ///
-/// `displaySyncEnabled` is off only where the timing allows tearing
-/// (Speed): Core Animation then shows a drawable as soon as it is ready
-/// instead of at the next refresh, "possibly with brief visual artifacts
-/// (tearing)" (`CAMetalLayer.displaySyncEnabled`). Auto starts with one
-/// drawable in flight, so a newer frame waits as the newest in the pacer
-/// instead of queueing behind an older drawable (Core Animation shows
-/// display-synced drawables in order, each for a refresh); where the system
-/// composes the layer and a picture measurably takes longer than a refresh
-/// to reach the glass, it keeps a second one ([`NewestPresentDepth`]), or
-/// it would show only every second or third refresh. Speed keeps two: without
-/// display sync a drawable is shown as soon as it is ready, so a second one
-/// does not wait behind the first, and fewer frames are replaced unseen.
+/// Auto and Speed (`Newest`) start with one drawable in flight, so a newer
+/// frame waits as the newest in the pacer instead of queueing behind an
+/// older drawable (Core Animation shows display-synced drawables in order,
+/// each for a refresh); where the system composes the layer and a picture
+/// measurably takes longer than a refresh to reach the glass, it keeps a
+/// second one ([`NewestPresentDepth`]), or it would show only every second
+/// or third refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EightBitLayerTiming {
-    pub(crate) display_sync: bool,
     pub(crate) max_in_flight: u8,
-    /// Present without a minimum on-screen time for the previous drawable.
-    pub(crate) present_at_once: bool,
 }
 
 impl EightBitLayerTiming {
     pub(crate) const fn for_timing(timing: PresentTiming) -> Self {
         match timing {
-            PresentTiming::Vsync => Self {
-                display_sync: true,
-                max_in_flight: 2,
-                present_at_once: false,
-            },
-            PresentTiming::Newest => Self {
-                display_sync: true,
-                max_in_flight: 1,
-                present_at_once: false,
-            },
-            PresentTiming::Tearing => Self {
-                display_sync: false,
-                max_in_flight: 2,
-                present_at_once: true,
-            },
+            PresentTiming::Vsync => Self { max_in_flight: 2 },
+            PresentTiming::Newest => Self { max_in_flight: 1 },
         }
     }
 }
@@ -1868,7 +1848,6 @@ impl DedicatedEightBitVideoLayer {
             return;
         }
         let plan = EightBitLayerTiming::for_timing(timing);
-        self.layer.setDisplaySyncEnabled(plan.display_sync);
         let follows_depth = timing == PresentTiming::Newest;
         let max_in_flight = if follows_depth {
             self.newest_depth
@@ -2107,14 +2086,10 @@ impl DedicatedEightBitVideoLayer {
         encoder.endEncoding();
         let drawable_for_present: &ProtocolObject<dyn MTLDrawable> =
             ProtocolObject::from_ref(&*drawable);
-        if EightBitLayerTiming::for_timing(self.timing).present_at_once {
-            command_buffer.presentDrawable(drawable_for_present);
-        } else {
-            command_buffer.presentDrawable_afterMinimumDuration(
-                drawable_for_present,
-                present_minimum_duration_s(refresh_period),
-            );
-        }
+        command_buffer.presentDrawable_afterMinimumDuration(
+            drawable_for_present,
+            present_minimum_duration_s(refresh_period),
+        );
         telemetry.record_submitted(target_host_time, frame.arrival_host_time, refresh_period);
         let measure =
             (submitted_alone && self.timing == PresentTiming::Newest).then(|| DepthMeasure {
@@ -3081,8 +3056,8 @@ fn drive_display_link_vsync_at<L, F, S>(
 }
 
 /// Presents the newest queued frame the moment it arrives, for a timing
-/// that does not wait for the refresh (`PresentTiming::Newest`,
-/// `PresentTiming::Tearing`). The display link stays the retry path: a frame
+/// that does not wait for the refresh (`PresentTiming::Newest`). The
+/// display link stays the retry path: a frame
 /// that finds the drawable slot busy waits in the pacer (which keeps only the
 /// newest) for the next refresh.
 fn present_on_arrival<L, F, S>(
@@ -3492,7 +3467,6 @@ where
                 match timing {
                     PresentTiming::Vsync => "on the display link, display sync on",
                     PresentTiming::Newest => "each frame on arrival, newest wins, display sync on",
-                    PresentTiming::Tearing => "each frame on arrival, display sync off (may tear)",
                 }
             );
             state.timing = timing;
@@ -4626,30 +4600,31 @@ mod tests {
 
     #[test]
     fn auto_and_speed_frames_are_presented_on_arrival_and_the_newest_wins() {
-        for timing in [PresentTiming::Newest, PresentTiming::Tearing] {
-            let layer = FakeGeometryLayer::default();
-            let probe = layer.clone();
-            let thread = timed_thread(layer);
-            let frame = |id| TimedFrame { id, timing };
-            // No display-link tick needed: drawn the moment it arrives.
-            assert!(thread.submit(frame(1), current_host_time()));
-            assert_eq!(probe.rendered(), vec![1]);
-            // The drawable slot is busy: newer frames replace older ones.
-            probe.set_slots_busy(true);
-            assert!(thread.submit(frame(2), current_host_time()));
-            assert!(thread.submit(frame(3), current_host_time()));
-            assert_eq!(thread.queue_depth_for_test(), 1);
-            probe.set_slots_busy(false);
-            drive_display_link_vsync(
-                &thread.shared,
-                Arc::clone(&thread.telemetry),
-                1,
-                current_host_time().saturating_add(Duration::from_millis(16)),
-                Duration::from_millis(16),
-            );
-            assert_eq!(probe.rendered(), vec![1, 3], "{timing:?}");
-            assert_eq!(thread.pacer_counters_for_test().dropped_overflow, 1);
-        }
+        let layer = FakeGeometryLayer::default();
+        let probe = layer.clone();
+        let thread = timed_thread(layer);
+        let frame = |id| TimedFrame {
+            id,
+            timing: PresentTiming::Newest,
+        };
+        // No display-link tick needed: drawn the moment it arrives.
+        assert!(thread.submit(frame(1), current_host_time()));
+        assert_eq!(probe.rendered(), vec![1]);
+        // The drawable slot is busy: newer frames replace older ones.
+        probe.set_slots_busy(true);
+        assert!(thread.submit(frame(2), current_host_time()));
+        assert!(thread.submit(frame(3), current_host_time()));
+        assert_eq!(thread.queue_depth_for_test(), 1);
+        probe.set_slots_busy(false);
+        drive_display_link_vsync(
+            &thread.shared,
+            Arc::clone(&thread.telemetry),
+            1,
+            current_host_time().saturating_add(Duration::from_millis(16)),
+            Duration::from_millis(16),
+        );
+        assert_eq!(probe.rendered(), vec![1, 3]);
+        assert_eq!(thread.pacer_counters_for_test().dropped_overflow, 1);
     }
 
     #[test]
@@ -4702,23 +4677,13 @@ mod tests {
     }
 
     #[test]
-    fn only_speed_turns_display_sync_off() {
+    fn newest_starts_with_one_drawable_in_flight_and_vsync_keeps_two() {
         let vsync = EightBitLayerTiming::for_timing(PresentTiming::Vsync);
         let newest = EightBitLayerTiming::for_timing(PresentTiming::Newest);
-        let tearing = EightBitLayerTiming::for_timing(PresentTiming::Tearing);
-        assert!(vsync.display_sync && newest.display_sync && !tearing.display_sync);
-        assert_eq!(
-            (
-                vsync.max_in_flight,
-                newest.max_in_flight,
-                tearing.max_in_flight
-            ),
-            (2, 1, 2)
-        );
-        assert!(!vsync.present_at_once && !newest.present_at_once && tearing.present_at_once);
+        assert_eq!((vsync.max_in_flight, newest.max_in_flight), (2, 1));
         // A ten-bit frame never leaves the refresh, whatever was served.
         assert_eq!(
-            PresentTiming::Tearing.for_depth(arcen_media::BitDepth::Ten),
+            PresentTiming::Newest.for_depth(arcen_media::BitDepth::Ten),
             PresentTiming::Vsync
         );
     }
