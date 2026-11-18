@@ -33,7 +33,7 @@ pub struct SlotLeases {
 }
 
 impl SlotLeases {
-    fn new(size: u8) -> Arc<Self> {
+    pub(crate) fn new(size: u8) -> Arc<Self> {
         Arc::new(Self {
             counts: (0..size).map(|_| AtomicU32::new(0)).collect(),
         })
@@ -57,7 +57,7 @@ pub struct SlotLease {
 }
 
 impl SlotLease {
-    fn new(leases: &Arc<SlotLeases>, slot: Slot) -> Arc<Self> {
+    pub(crate) fn new(leases: &Arc<SlotLeases>, slot: Slot) -> Arc<Self> {
         if let Some(count) = leases.counts.get(slot.index()) {
             count.fetch_add(1, Ordering::AcqRel);
         }
@@ -77,12 +77,16 @@ impl Drop for SlotLease {
 }
 
 /// The decoder → presenter picture (the Windows
-/// `VideoDecoderBackend::NativeFrame`): one slice of the decoder's texture
-/// array on the shared device.
+/// `VideoDecoderBackend::NativeFrame`): one slice of a texture on the
+/// decoder's device.
 ///
-/// Sample it only after waiting GPU-side on `fence` (when present) for
-/// `fence_value` (the readiness rule); the slice is not decoded into again
-/// while any clone of this value lives (the slot-lifetime rule).
+/// When the decoder runs on the presenter's device, sample `texture` only
+/// after waiting GPU-side on `fence` (when present) for `fence_value` (the
+/// readiness rule). When it runs on a device of its own, `shared` says how
+/// a presenter opens the picture on its device and orders its reads
+/// against the decoder (`super::shared`). Either way the texture is not
+/// written again while any clone of this value lives (the slot-lifetime
+/// rule).
 #[derive(Clone)]
 pub struct D3d11Picture {
     /// NV12, P010, Y410 or AYUV.
@@ -102,6 +106,9 @@ pub struct D3d11Picture {
     /// Keeps the decoder's slot alive (a [`SlotLease`] for decoded
     /// pictures).
     pub lease: Arc<dyn Any + Send + Sync>,
+    /// Set when the texture lives on the decoder's own device: the NT
+    /// handles and fences a presenter on another device reads it through.
+    pub shared: Option<super::shared::SharedPicture>,
 }
 
 impl D3d11Picture {
@@ -125,6 +132,7 @@ impl D3d11Picture {
             fence_value: 0,
             shader_resource: true,
             lease: Arc::new(()),
+            shared: None,
         }
     }
 
@@ -154,6 +162,7 @@ impl std::fmt::Debug for D3d11Picture {
             .field("visible", &self.visible)
             .field("fence_value", &self.fence_value)
             .field("shader_resource", &self.shader_resource)
+            .field("shared", &self.shared.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -203,6 +212,8 @@ pub struct DecoderSession {
 /// stream shows here first.
 #[derive(Debug)]
 struct DecodeTiming {
+    /// Which decoder (one per monitor stream) this is.
+    decoder: u64,
     since: std::time::Instant,
     decodes: u32,
     pending_retries: u32,
@@ -212,9 +223,10 @@ struct DecodeTiming {
     total_max: std::time::Duration,
 }
 
-impl Default for DecodeTiming {
-    fn default() -> Self {
+impl DecodeTiming {
+    fn new(decoder: u64) -> Self {
         Self {
+            decoder,
             since: std::time::Instant::now(),
             decodes: 0,
             pending_retries: 0,
@@ -224,9 +236,7 @@ impl Default for DecodeTiming {
             total_max: std::time::Duration::ZERO,
         }
     }
-}
 
-impl DecodeTiming {
     const EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
     fn note(
@@ -251,6 +261,7 @@ impl DecodeTiming {
         let us = |value: std::time::Duration| u64::try_from(value.as_micros()).unwrap_or(u64::MAX);
         tracing::info!(
             target: arcen_deck_core::log_target::VIDEO,
+            decoder = self.decoder,
             size = ?size,
             decodes = self.decodes,
             pending_retries = self.pending_retries,
@@ -260,7 +271,7 @@ impl DecodeTiming {
             decode_call_max_us = us(self.total_max),
             "decoder timing"
         );
-        *self = Self::default();
+        *self = Self::new(self.decoder);
     }
 }
 
@@ -275,6 +286,7 @@ impl DecoderSession {
         profile: DecoderProfile,
         format: StreamFormat,
         pool: u8,
+        decoder_number: u64,
     ) -> Result<Self, String> {
         let (desc, config) =
             device.configuration(&profile, format.coded_width, format.coded_height)?;
@@ -374,7 +386,7 @@ impl DecoderSession {
                 fence,
                 fence_value: 0,
                 leases: SlotLeases::new(pool),
-                timing: DecodeTiming::default(),
+                timing: DecodeTiming::new(decoder_number),
             })
         }
     }
@@ -524,6 +536,7 @@ impl DecoderSession {
             fence_value: self.fence_value,
             shader_resource: self.shader_resource,
             lease: SlotLease::new(&self.leases, slot) as Arc<dyn Any + Send + Sync>,
+            shared: None,
         }
     }
 }

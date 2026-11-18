@@ -486,6 +486,7 @@ fn show(args: &[String]) -> Result<bool, String> {
         exact_still_image: args.exact_still_image,
     };
     let mut auth = Some(AuthSubmission { username, password });
+    let requested_video = arcen_deck_core::connect_plan::profile_video(&options.profile);
     let handle = spawn_session(options);
     let mut session = MediaSession::start(
         handle,
@@ -498,6 +499,7 @@ fn show(args: &[String]) -> Result<bool, String> {
             audio_player: Box::new(|| {
                 Box::new(PcmAudioPlayer::<NoAudioOutput>::awaiting_stream_result())
             }),
+            requested_video,
         },
     )?;
 

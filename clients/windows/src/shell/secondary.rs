@@ -11,8 +11,11 @@
 //! reports what Windows says of every window (fullscreen, the display under
 //! it, a close) and, once the layout is committed, presents each monitor's
 //! frames through that window's own composition tree and swapchain
-//! presenters on the shared D3D11 device, and hands the window's input to
-//! the session for its monitor.
+//! presenters, and hands the window's input to the session for its
+//! monitor. Each window presents on a D3D11 device of its own on the root
+//! window's adapter, so one window's `Present` never holds up another's
+//! (or decode); where the decoder cannot share pictures between devices,
+//! every window presents on the root window's device instead.
 
 use std::sync::Arc;
 
@@ -32,7 +35,7 @@ use super::launcher::Launcher;
 use super::session::{ROOT_WINDOW, WindowObservation};
 use super::{display_number, display_of, hwnd_of};
 use crate::present::composition::{CompositionTree, SharedTree};
-use crate::present::{D3d11VideoSink, Gpu};
+use crate::present::{AdapterChoice, D3d11VideoSink, Gpu};
 
 /// One further window of a multi-window session.
 struct SecondaryWindow {
@@ -253,6 +256,9 @@ impl Secondaries {
                 .iter()
                 .any(|(monitor, display)| *monitor == window.monitor && *display == window.display)
         });
+        let own_devices = launcher
+            .connection()
+            .is_some_and(|connection| connection.media().decodes_on_own_device());
         for (monitor, screen) in &planned {
             if self.windows.iter().any(|window| window.monitor == *monitor) {
                 continue;
@@ -264,7 +270,27 @@ impl Secondaries {
             else {
                 continue;
             };
-            match Self::open(event_loop, gpu, *monitor, *screen, attributes, fullscreen) {
+            let window_gpu = if own_devices {
+                Gpu::create(&AdapterChoice::Luid(gpu.luid)).unwrap_or_else(|error| {
+                    tracing::warn!(
+                        target: "arcen::display",
+                        %error,
+                        monitor = monitor.get(),
+                        "a multi-window session's window presents on the root window's device"
+                    );
+                    gpu.clone()
+                })
+            } else {
+                gpu.clone()
+            };
+            match Self::open(
+                event_loop,
+                &window_gpu,
+                *monitor,
+                *screen,
+                attributes,
+                fullscreen,
+            ) {
                 Ok(window) => self.windows.push(window),
                 Err(error) => tracing::error!(
                     target: "arcen::display",
@@ -386,8 +412,10 @@ impl Secondaries {
                 PresenterPipeline::EightBit,
                 gpu.clone(),
                 Arc::clone(&tree),
-            ),
-            ten_bit: D3d11VideoSink::new(PresenterPipeline::TenBit, gpu.clone(), Arc::clone(&tree)),
+            )
+            .for_window(format!("monitor {}", monitor.get())),
+            ten_bit: D3d11VideoSink::new(PresenterPipeline::TenBit, gpu.clone(), Arc::clone(&tree))
+                .for_window(format!("monitor {}", monitor.get())),
             tree,
             _backdrop: backdrop,
             hwnd,

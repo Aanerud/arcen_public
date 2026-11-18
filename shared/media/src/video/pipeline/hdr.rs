@@ -32,5 +32,5 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
     favours: "proven HDR10 PQ/BT.2020 fidelity, up to 30 fps",
     gives_up: "interaction latency by using the quality encoder path with an 8-frame buffer; falls back visibly when the host cannot prove HDR",
-    summary: "Favours proven HDR10 PQ/BT.2020 fidelity, up to 30 fps; gives up interaction latency by using the quality encoder path with an 8-frame buffer and falls back visibly when the host cannot prove HDR.",
+    summary: "10-bit HDR (PQ, BT.2020), at 30 fps. Exact HDR comes first, so it responds more slowly; tells you when it falls back because the host cannot show HDR.",
 };

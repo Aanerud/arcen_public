@@ -863,7 +863,7 @@ status = { "clients/macos" = "present", "clients/windows" = "present" }
 
 [[capability]]
 id = "deck_present_timing"
-description = "Presentation timing from the shared pipeline contract (Auto newest frame, Speed may tear, Grading/HDR on the refresh)"
+description = "Presentation timing from the shared pipeline contract (Auto and Speed newest frame, no preset tears, Grading/HDR on the refresh)"
 proof = 'PresentTiming'
 status = { "clients/macos" = "present", "clients/windows" = "present" }
 

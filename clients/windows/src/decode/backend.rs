@@ -22,11 +22,20 @@ use super::dxva::{
     hevc_qmatrix,
 };
 use super::session::{D3d11Picture, DecoderSession, PictureBuffers};
+use super::shared::SharedExport;
+use std::sync::Arc;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
 /// Pictures the presenter may hold beyond the stream's own buffer: the
 /// frame queue's latest picture, the one on glass and one in flight, plus
 /// the frames a multi-monitor session's timeline holds back (ADR 0026).
 pub const PRESENTER_SLOTS: u8 = 4 + arcen_deck_core::runtime::frame_sync::MAX_HELD_PER_MONITOR;
+
+/// Shared textures per decoder when it runs on a device of its own: every
+/// picture the presenters may hold, plus the one being written.
+pub const SHARED_POOL: u8 = PRESENTER_SLOTS + 1;
+
+static NEXT_DECODER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 enum Parser {
     H264(H264Parser),
@@ -69,6 +78,25 @@ pub struct D3d11VideoDecoder {
     collapsed: u64,
     name: &'static str,
     tags: SlotTags<FrameTag>,
+    /// This decoder's number in the log (one decoder per monitor stream).
+    decoder: u64,
+    /// How pictures reach the presenters; a shared hand-over is made on
+    /// first use.
+    hand_over: HandOver,
+    export: Option<SharedExport>,
+}
+
+/// How a decoder's pictures reach the presenters.
+#[derive(Debug, Clone)]
+pub enum HandOver {
+    /// The decoder runs on the presenters' device: pictures are used in
+    /// place.
+    InPlace,
+    /// The decoder runs on a device of its own: pictures are copied into
+    /// shared textures (`super::shared`), only in these formats (the ones
+    /// proven to read back exactly on another device; `None`: any, for the
+    /// proof itself).
+    Shared(Option<Arc<[DXGI_FORMAT]>>),
 }
 
 impl std::fmt::Debug for D3d11VideoDecoder {
@@ -81,6 +109,7 @@ impl std::fmt::Debug for D3d11VideoDecoder {
                 &self.session.as_ref().map(|session| session.profile.name),
             )
             .field("waiting_for_keyframe", &self.waiting_for_keyframe)
+            .field("hand_over", &self.hand_over)
             .finish_non_exhaustive()
     }
 }
@@ -107,7 +136,58 @@ impl D3d11VideoDecoder {
             collapsed: 0,
             name: "d3d11va",
             tags: SlotTags::default(),
+            decoder: NEXT_DECODER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            hand_over: HandOver::InPlace,
+            export: None,
         }
+    }
+
+    /// A decoder on a device of its own: every picture is handed to the
+    /// presenters through a shared texture (`super::shared`), in `formats`
+    /// only (`None`: any).
+    #[must_use]
+    pub fn exporting(device: VideoDevice, formats: Option<Arc<[DXGI_FORMAT]>>) -> Self {
+        Self {
+            hand_over: HandOver::Shared(formats),
+            ..Self::new(device)
+        }
+    }
+
+    /// `picture` as the presenters receive it: through a shared texture
+    /// when this decoder has a device of its own (`None`: every shared
+    /// texture is still held, so the picture is dropped).
+    ///
+    /// # Errors
+    ///
+    /// [`VideoDecodeError::Unsupported`] for a format this driver does not
+    /// share exactly (the connection chose a device of its own for a
+    /// picture that needs none of those), [`VideoDecodeError::Backend`] for
+    /// a failed hand-over.
+    fn hand_over(
+        &mut self,
+        picture: D3d11Picture,
+    ) -> Result<Option<D3d11Picture>, VideoDecodeError> {
+        match &self.hand_over {
+            HandOver::InPlace => return Ok(Some(picture)),
+            HandOver::Shared(Some(formats)) if !formats.contains(&picture.format) => {
+                return Err(VideoDecodeError::Unsupported(format!(
+                    "this PC's graphics driver does not pass {} pictures between devices exactly",
+                    super::shared::format_name(picture.format)
+                )));
+            }
+            HandOver::Shared(_) => {}
+        }
+        if self.export.is_none() {
+            self.export = Some(
+                SharedExport::new(&self.device, SHARED_POOL, self.decoder)
+                    .map_err(VideoDecodeError::Backend)?,
+            );
+        }
+        let export = self
+            .export
+            .as_mut()
+            .ok_or_else(|| VideoDecodeError::Backend("no picture hand-over".into()))?;
+        export.export(&picture).map_err(VideoDecodeError::Backend)
     }
 
     /// The device this decoder runs on.
@@ -128,7 +208,9 @@ impl D3d11VideoDecoder {
     }
 
     /// Decodes one Annex B access unit of `codec` and returns the pictures
-    /// ready to show (normally exactly the one just decoded).
+    /// ready to show (normally exactly the one just decoded; none when this
+    /// decoder hands pictures over through shared textures and every one
+    /// is still held).
     ///
     /// # Errors
     ///
@@ -141,8 +223,12 @@ impl D3d11VideoDecoder {
         codec: StreamCodecKind,
         access_unit: &[u8],
     ) -> Result<Vec<D3d11Picture>, VideoDecodeError> {
-        self.decode_tagged(codec, access_unit)
-            .map(|(_, pictures)| pictures.into_iter().map(|(_, picture)| picture).collect())
+        let (_, pictures) = self.decode_tagged(codec, access_unit)?;
+        let mut shown = Vec::with_capacity(pictures.len());
+        for (_, picture) in pictures {
+            shown.extend(self.hand_over(picture)?);
+        }
+        Ok(shown)
     }
 
     /// [`Self::decode_annex_b`] with the slot this unit decoded into and the
@@ -234,7 +320,7 @@ impl D3d11VideoDecoder {
                 .format
                 .ok_or_else(|| VideoDecodeError::Backend("picture without a format".into()))?;
             let profile = profile_for(&format).map_err(VideoDecodeError::Unsupported)?;
-            let session = DecoderSession::create(&self.device, profile, format, pool)
+            let session = DecoderSession::create(&self.device, profile, format, pool, self.decoder)
                 .map_err(VideoDecodeError::Unsupported)?;
             if session.pool_size() < pool {
                 return Err(VideoDecodeError::Backend("decoder pool too small".into()));
@@ -400,17 +486,21 @@ impl VideoDecoderBackend for D3d11VideoDecoder {
             .session
             .as_ref()
             .ok_or_else(|| VideoDecodeError::Backend("no decoder session".into()))?;
+        let profile_native = session.profile.native;
+        let Some(picture) = self.hand_over(picture)? else {
+            return Ok(None);
+        };
         let (_, _, width, height) = picture.visible;
         Ok(Some(DecodedVideoFrame {
             width: width as usize,
             height: height as usize,
             rgba: Vec::new(),
             timestamp_ms: tag.timestamp_ms,
-            pixel_format: format!("{:?}", session.profile.native),
+            pixel_format: format!("{profile_native:?}"),
             backend: self.name,
             native: Some(NativeDecodedVideoFrame {
                 picture,
-                format: session.profile.native,
+                format: profile_native,
                 video: tag.video,
             }),
         }))
@@ -437,21 +527,45 @@ impl VideoDecoderBackend for D3d11VideoDecoder {
     }
 }
 
-/// Creates decoders on the presenter's device.
+/// Creates decoders: on a device of their own that hands pictures over
+/// through shared textures, or on the presenter's device.
 #[derive(Debug, Clone)]
 pub struct D3d11DecoderFactory {
     device: VideoDevice,
+    hand_over: HandOver,
 }
 
 // SAFETY: the D3D11 device is free-threaded and multithread-protected
 // (`VideoDevice::from_device`); decoders are created on the worker thread.
+// `D3d11VideoDecoder` holds the same interfaces.
 #[allow(unsafe_code)]
 unsafe impl Send for D3d11DecoderFactory {}
 
 impl D3d11DecoderFactory {
+    /// Decoders on the presenter's own device (`VideoDevice::from_gpu`).
     #[must_use]
     pub const fn new(device: VideoDevice) -> Self {
-        Self { device }
+        Self {
+            device,
+            hand_over: HandOver::InPlace,
+        }
+    }
+
+    /// Decoders on `device`, a device of their own
+    /// (`VideoDevice::own_for`), whose pictures reach the presenters through
+    /// shared textures in the proven `formats`.
+    #[must_use]
+    pub const fn own_device(device: VideoDevice, formats: Arc<[DXGI_FORMAT]>) -> Self {
+        Self {
+            device,
+            hand_over: HandOver::Shared(Some(formats)),
+        }
+    }
+
+    /// Whether the decoders have a device of their own.
+    #[must_use]
+    pub const fn has_own_device(&self) -> bool {
+        matches!(self.hand_over, HandOver::Shared(_))
     }
 }
 
@@ -459,6 +573,9 @@ impl VideoDecoderFactory for D3d11DecoderFactory {
     type Decoder = D3d11VideoDecoder;
 
     fn create(&self) -> D3d11VideoDecoder {
-        D3d11VideoDecoder::new(self.device.clone())
+        D3d11VideoDecoder {
+            hand_over: self.hand_over.clone(),
+            ..D3d11VideoDecoder::new(self.device.clone())
+        }
     }
 }

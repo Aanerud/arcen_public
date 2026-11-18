@@ -19,7 +19,8 @@ use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    ConnectionExt as _, ImageFormat, ImageOrder, VisualClass, Visualid, Window,
+    ConnectionExt as _, CreateGCAux, Drawable, Gcontext, ImageFormat, ImageOrder, Pixmap,
+    SubwindowMode, VisualClass, Visualid, Window,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -45,6 +46,7 @@ const GREEN_MASK: u32 = 0x0000_ff00;
 const BLUE_MASK: u32 = 0x0000_00ff;
 static DAMAGE_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
 static SHM_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
+static SNAPSHOT_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LiveFramerateReconfigurePolicy {
@@ -329,6 +331,88 @@ pub(crate) struct X11Capture {
     /// frame read by [`Self::capture_wide_diffed`]; `None` once a region read
     /// or anything else overwrote it.
     latest_whole: Option<usize>,
+    /// Server-side copy every read goes through; `None` reads the root.
+    snapshot: Option<Snapshot>,
+}
+
+/// A pixmap the size of the output that each read first copies the screen
+/// into (`CopyArea`, `IncludeInferiors`) and then reads.
+///
+/// Reading the root window directly takes milliseconds while a fullscreen,
+/// unredirected OpenGL client may swap at any moment, so the picture is torn
+/// between two of its frames (measured: up to 98 % of reads of a fullscreen
+/// 60 fps producer). The copy is one accelerated blit in the server's request
+/// order and the read then sees one frame; NvFBC is atomic on its own.
+struct Snapshot {
+    pixmap: Pixmap,
+    gc: Gcontext,
+}
+
+impl Snapshot {
+    fn create(
+        connection: &RustConnection,
+        root: Window,
+        depth: u8,
+        rect: CaptureRect,
+    ) -> Result<Self, String> {
+        let pixmap = connection
+            .generate_id()
+            .map_err(|error| format!("allocate snapshot pixmap id: {error}"))?;
+        connection
+            .create_pixmap(depth, pixmap, root, rect.width, rect.height)
+            .map_err(|error| format!("create snapshot pixmap: {error}"))?
+            .check()
+            .map_err(|error| format!("create snapshot pixmap: {error}"))?;
+        let gc = match connection.generate_id() {
+            Ok(gc) => gc,
+            Err(error) => {
+                let _ = connection.free_pixmap(pixmap);
+                return Err(format!("allocate snapshot GC id: {error}"));
+            }
+        };
+        let created = connection
+            .create_gc(
+                gc,
+                pixmap,
+                &CreateGCAux::new()
+                    .subwindow_mode(SubwindowMode::INCLUDE_INFERIORS)
+                    .graphics_exposures(0),
+            )
+            .map_err(|error| format!("create snapshot GC: {error}"))
+            .and_then(|cookie| {
+                cookie
+                    .check()
+                    .map_err(|error| format!("create snapshot GC: {error}"))
+            });
+        if let Err(error) = created {
+            let _ = connection.free_pixmap(pixmap);
+            return Err(error);
+        }
+        Ok(Self { pixmap, gc })
+    }
+}
+
+/// Where a read of the root rectangle at `x`,`y` finds its pixels: the
+/// snapshot pixmap (output-relative, after the copy) or the root itself.
+fn read_origin(output: CaptureRect, snapshot: bool, x: i16, y: i16) -> (i16, i16) {
+    if snapshot {
+        (x - output.x, y - output.y)
+    } else {
+        (x, y)
+    }
+}
+
+/// The reply layout a read must match: `GetImage` of a pixmap reports no
+/// visual.
+fn read_layout(layout: PixelLayout, snapshot: bool) -> PixelLayout {
+    if snapshot {
+        PixelLayout {
+            visual: x11rb::NONE,
+            ..layout
+        }
+    } else {
+        layout
+    }
 }
 
 impl X11Capture {
@@ -423,6 +507,18 @@ impl X11Capture {
         .map_err(|error| format!("select XRandR events: {error}"))?;
 
         let damage = install_damage(&connection, root)?;
+        let snapshot = match Snapshot::create(&connection, root, screen.root_depth, rect) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                warn_once(&SNAPSHOT_DEGRADED_WARNED, || {
+                    format!(
+                        "WARNING: no server-side snapshot ({error}); reading the root directly, \
+                         a fullscreen OpenGL client can be captured torn"
+                    )
+                });
+                None
+            }
+        };
         let transfer = match install_shm(&connection, layout.byte_len) {
             Ok(transfer) => transfer,
             Err(error) => {
@@ -439,7 +535,7 @@ impl X11Capture {
             .map_err(|error| format!("flush X11 capture setup: {error}"))?;
         crate::log(&format!(
             "X11 capture ready: rect={}x{}+{}+{} stride={} depth={} visual={:#x} \
-             masks={:#010x}/{:#010x}/{:#010x} format={} transfer={}",
+             masks={:#010x}/{:#010x}/{:#010x} format={} transfer={} read={}",
             rect.width,
             rect.height,
             rect.x,
@@ -455,6 +551,11 @@ impl X11Capture {
                 "mit-shm-1.2"
             } else {
                 "get-image"
+            },
+            if snapshot.is_some() {
+                "snapshot"
+            } else {
+                "root"
             }
         ));
         Ok(Self {
@@ -473,7 +574,40 @@ impl X11Capture {
             transfer,
             spare: None,
             latest_whole: None,
+            snapshot,
         })
+    }
+
+    /// Prepares a read of the root rectangle `x`,`y`,`width`,`height`: copies
+    /// it into the snapshot when there is one. Returns the drawable, origin
+    /// and reply layout the read uses.
+    fn read_source(
+        &self,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        layout: PixelLayout,
+    ) -> Result<(Drawable, i16, i16, PixelLayout), String> {
+        let snapshot = self.snapshot.as_ref();
+        let (read_x, read_y) = read_origin(self.rect, snapshot.is_some(), x, y);
+        let Some(snapshot) = snapshot else {
+            return Ok((self.root, read_x, read_y, layout));
+        };
+        self.connection
+            .copy_area(
+                self.root,
+                snapshot.pixmap,
+                snapshot.gc,
+                x,
+                y,
+                read_x,
+                read_y,
+                width,
+                height,
+            )
+            .map_err(|error| format!("request snapshot CopyArea: {error}"))?;
+        Ok((snapshot.pixmap, read_x, read_y, read_layout(layout, true)))
     }
 
     pub(crate) fn width(&self) -> u32 {
@@ -551,14 +685,21 @@ impl X11Capture {
         if self.latest_whole == Some(0) {
             self.latest_whole = None;
         }
+        let (drawable, x, y, layout) = self.read_source(
+            self.rect.x,
+            self.rect.y,
+            self.rect.width,
+            self.rect.height,
+            self.layout,
+        )?;
         let bytes = match &mut self.transfer {
             Transfer::Shm { segment, mapping } => {
                 let reply = self
                     .connection
                     .shm_get_image(
-                        self.root,
-                        self.rect.x,
-                        self.rect.y,
+                        drawable,
+                        x,
+                        y,
                         self.rect.width,
                         self.rect.height,
                         u32::MAX,
@@ -574,7 +715,7 @@ impl X11Capture {
                     reply.visual,
                     usize::try_from(reply.size)
                         .map_err(|_| "XShm image size overflow".to_string())?,
-                    self.layout,
+                    layout,
                 )?;
                 mapping.bytes()
             }
@@ -583,9 +724,9 @@ impl X11Capture {
                     .connection
                     .get_image(
                         ImageFormat::Z_PIXMAP,
-                        self.root,
-                        self.rect.x,
-                        self.rect.y,
+                        drawable,
+                        x,
+                        y,
                         self.rect.width,
                         self.rect.height,
                         u32::MAX,
@@ -593,7 +734,7 @@ impl X11Capture {
                     .map_err(|error| format!("request XGetImage: {error}"))?
                     .reply()
                     .map_err(|error| format!("XGetImage: {error}"))?;
-                validate_image_reply(reply.depth, reply.visual, reply.data.len(), self.layout)?;
+                validate_image_reply(reply.depth, reply.visual, reply.data.len(), layout)?;
                 storage.clear();
                 storage
                     .try_reserve_exact(reply.data.len())
@@ -645,6 +786,20 @@ impl X11Capture {
         let (x, y, width, height) = region_on_root(self.rect, region)?;
         let stride = usize::from(width) * 4;
         let byte_len = stride * usize::from(height);
+        if !matches!(self.transfer, Transfer::Shm { .. }) {
+            return Err("region capture needs MIT-SHM".to_string());
+        }
+        let (drawable, x, y, layout_read) = self.read_source(
+            x,
+            y,
+            width,
+            height,
+            PixelLayout {
+                byte_len,
+                stride,
+                ..self.layout
+            },
+        )?;
         let Transfer::Shm { segment, mapping } = &mut self.transfer else {
             return Err("region capture needs MIT-SHM".to_string());
         };
@@ -654,7 +809,7 @@ impl X11Capture {
         let reply = self
             .connection
             .shm_get_image(
-                self.root,
+                drawable,
                 x,
                 y,
                 width,
@@ -671,11 +826,7 @@ impl X11Capture {
             reply.depth,
             reply.visual,
             usize::try_from(reply.size).map_err(|_| "XShm image size overflow".to_string())?,
-            PixelLayout {
-                byte_len,
-                stride,
-                ..self.layout
-            },
+            layout_read,
         )?;
         Ok(WideX11Frame {
             bytes: &mapping.bytes()[..byte_len],
@@ -725,6 +876,16 @@ impl X11Capture {
                 self.pixel_format.token()
             ));
         };
+        if !matches!(self.transfer, Transfer::Shm { .. }) || self.spare.is_none() {
+            return Err("whole-frame differencing needs two MIT-SHM segments".to_string());
+        }
+        let (drawable, read_x, read_y, layout_read) = self.read_source(
+            self.rect.x,
+            self.rect.y,
+            self.rect.width,
+            self.rect.height,
+            self.layout,
+        )?;
         let (Transfer::Shm { segment, mapping }, Some((spare_segment, spare_mapping))) =
             (&mut self.transfer, self.spare.as_mut())
         else {
@@ -742,9 +903,9 @@ impl X11Capture {
         let reply = self
             .connection
             .shm_get_image(
-                self.root,
-                self.rect.x,
-                self.rect.y,
+                drawable,
+                read_x,
+                read_y,
                 self.rect.width,
                 self.rect.height,
                 u32::MAX,
@@ -759,7 +920,7 @@ impl X11Capture {
             reply.depth,
             reply.visual,
             usize::try_from(reply.size).map_err(|_| "XShm image size overflow".to_string())?,
-            self.layout,
+            layout_read,
         )?;
         let previous_valid = self.latest_whole == Some(1 - target);
         self.latest_whole = Some(target);
@@ -863,6 +1024,10 @@ impl Drop for X11Capture {
         }
         if let Some((segment, _)) = &self.spare {
             let _ = self.connection.shm_detach(*segment);
+        }
+        if let Some(snapshot) = self.snapshot.take() {
+            let _ = self.connection.free_gc(snapshot.gc);
+            let _ = self.connection.free_pixmap(snapshot.pixmap);
         }
         let _ = self.connection.flush();
     }
@@ -1825,6 +1990,27 @@ mod tests {
         assert!(validate_image_reply(24, 42, layout.byte_len, layout).is_ok());
         assert!(validate_image_reply(24, 43, layout.byte_len, layout).is_err());
         assert!(validate_image_reply(24, 42, layout.byte_len - 1, layout).is_err());
+    }
+
+    #[test]
+    fn snapshot_reads_are_output_relative_and_carry_no_visual() {
+        let output = CaptureRect {
+            x: 2560,
+            y: 0,
+            width: 2560,
+            height: 1600,
+        };
+        assert_eq!(read_origin(output, true, 2560 + 16, 32), (16, 32));
+        assert_eq!(read_origin(output, false, 2560 + 16, 32), (2560 + 16, 32));
+
+        let mut layout =
+            checked_layout(1280, 720, 24, 32, 32, SOFTWARE_MAX_CAPTURE_BYTES).expect("layout");
+        layout.visual = 42;
+        // GetImage of a pixmap replies with visual None.
+        let snapshot = read_layout(layout, true);
+        assert!(validate_image_reply(24, x11rb::NONE, layout.byte_len, snapshot).is_ok());
+        assert!(validate_image_reply(24, 42, layout.byte_len, snapshot).is_err());
+        assert_eq!(read_layout(layout, false), layout);
     }
 
     #[test]

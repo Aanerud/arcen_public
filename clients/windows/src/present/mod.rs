@@ -27,16 +27,20 @@
 //!   the presenter's own immediate context before the draw that samples
 //!   them, presented fences after an event query, level-2/3 readbacks; all
 //!   decisions are `arcen_media::refine`'s.
-//! - **One adapter**: the one that owns the window's monitor
-//!   ([`device::AdapterChoice::Monitor`]); the decoder shares the device.
+//! - **One adapter, a device per window**: the one that owns the root
+//!   window's monitor ([`device::AdapterChoice::Monitor`]); each further
+//!   window presents on a device of its own on the same adapter, and the
+//!   decoder decodes on its own device and hands pictures over through
+//!   shared textures and fences ([`handover`]), so one window's `Present`
+//!   never holds up decode or another window. Where the driver cannot share
+//!   them, everything shares the root window's device, as before.
 //! - **Ten bits at the glass are measured, not assumed** ([`depth`]).
 //! - **DWM composes unless the video alone covers the monitor** ([`flip`]):
 //!   fullscreen, 1:1, opaque, nothing drawn over it (the connection bar
 //!   appears only on demand).
 //! - **When a frame is presented is the pipeline's shared
-//!   `PresentTiming`**: Auto at once without tearing (sync interval 0),
-//!   Speed at once and may tear (`ALLOW_TEARING`), Grading and HDR on the
-//!   refresh (sync interval 1).
+//!   `PresentTiming`**: Auto and Speed at once without tearing (sync
+//!   interval 0), Grading and HDR on the refresh (sync interval 1).
 
 #![allow(
     unsafe_code,
@@ -63,6 +67,7 @@ pub mod depth;
 pub mod device;
 pub mod display;
 pub mod flip;
+pub mod handover;
 #[cfg(any(test, arcen_present_hub_e2e))]
 pub mod hub_e2e;
 pub mod picture;

@@ -6,6 +6,53 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.3] — 2026-11-18
+
+Speed no longer tears on either Deck, the Windows Deck keeps 60 frames a
+second on two monitors by decoding on a graphics device of its own, a Linux
+Pier no longer captures torn fullscreen video through MIT-SHM, and every
+streaming preset explains itself in one line. 0.20.3 speaks protocol v5 and
+works with every 0.17.0 to 0.20.2 Deck and Pier.
+
+### Changed
+
+- **Speed no longer tears, on either Deck.** Speed keeps what makes it
+  quick: at least 60 fps, a one-frame encoder buffer, and motion kept smooth
+  on a weak link. Each frame now waits for the display's next refresh or
+  composition instead of replacing a picture mid-scan, which costs about
+  3 ms on average. No preset tears now.
+- The unused tearing presentation timing and both Decks' tearing present
+  paths were removed (internal clean-up, no change in behaviour).
+- **Each streaming preset now has a one-line explanation in Settings, on both
+  Decks.** The line says what the preset favours and what it gives up first
+  on a weak link. For example, Auto lowers the frame rate and keeps the picture
+  sharp, while Speed keeps the frame rate and lets the picture soften.
+
+### Fixed
+
+- **The Windows Deck no longer slows down with two monitors.** Decoding and
+  showing the picture used one graphics device, so on some graphics
+  drivers (the lab's virtual GPU among them) one window waiting for the
+  display held up decoding and the other window: with Match my layout on two
+  2560x1600 monitors, each showed about 26 frames a second and the video
+  kept skipping ahead. The Deck now decodes on a graphics device of its own
+  and each window shows its picture on its own, so both monitors show 60
+  frames a second on the same machine, with no skipping. Graphics drivers
+  that cannot pass pictures between devices exactly (older AMD and NVIDIA
+  drivers, among others) keep working as before, and Stream Statistics
+  says which way the Deck decodes. With Match my layout the first display's
+  frame rate in Stream Statistics is no longer counted twice.
+- **Fullscreen video could arrive torn from a Linux Pier's MIT-SHM capture.**
+  A fullscreen OpenGL player (a broadcast monitor, a video player) that draws
+  straight to the screen could be captured with the top of one of its frames
+  and the bottom of the next whenever the Pier read the screen directly:
+  Grading on a depth-30 desktop and the software encoder on graphics cards
+  without NVENC. On the lab, up to 98 % of such pictures were torn. The Pier
+  now copies the screen in one step on the graphics card before reading it,
+  and no torn picture remains. The eight-bit NvFBC path (Auto and Speed on
+  NVIDIA) never tore and is unchanged. No preset tears on the Deck either
+  (see Speed above).
+
 ## [0.20.2] — 2026-11-17
 
 A field release for 0.20.1. A Linux Pier now works beside another

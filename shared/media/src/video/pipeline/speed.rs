@@ -29,9 +29,9 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     keel: KEEL_IDLE_QP_OFF,
     queue: DEFAULT_QUEUE_POLICY,
     decode_latency: DecodeLatencyPolicy::SPEED,
-    present_timing: super::PresentTiming::Tearing,
+    present_timing: super::PresentTiming::Newest,
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
-    favours: "the lowest latency: at least 60 fps (your display's refresh when faster), the lowest-latency encoder settings (1-frame buffer), and frames shown even mid-refresh",
-    gives_up: "sharpness first when the link is tight, and may tear",
-    summary: "Favours the lowest latency: at least 60 fps (your display's refresh when faster) with the lowest-latency encoder settings (1-frame buffer); gives up sharpness first when the link is tight, and may tear.",
+    favours: "the lowest latency: at least 60 fps (your display's refresh when faster), the lowest-latency encoder settings (1-frame buffer), and each frame shown as soon as it is decoded, without tearing",
+    gives_up: "sharpness first when the link is tight",
+    summary: "Smoothest motion, at least 60 fps and quickest to respond. On a weak link it keeps the frame rate and lets the picture soften.",
 };

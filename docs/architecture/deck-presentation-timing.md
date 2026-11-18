@@ -14,9 +14,15 @@ onto its display API and nothing else.
 
 | Pipeline | Timing | Meaning |
 | --- | --- | --- |
-| Auto (and Software, custom, unknown) | `Newest` | Present each frame the moment it is decoded, without tearing: the newest frame wins at the next refresh or composition; an older one still waiting there is discarded. |
-| Speed | `Tearing` | As `Newest`, and a frame may also replace the one being scanned out (a tear) where the display path allows it: speed over the last 1 % of picture quality. |
+| Auto, Speed (and Software, custom, unknown) | `Newest` | Present each frame the moment it is decoded, without tearing: the newest frame wins at the next refresh or composition; an older one still waiting there is discarded. |
 | Grading, HDR | `Vsync` | Wait for the refresh. Every frame is shown whole and none is skipped: a fidelity contract shows exactly what was encoded. |
+
+No preset tears. Speed presented with tearing until 2026-11-18; the owner
+decided that Speed keeps its low latency (60 fps floor, 1-frame encoder
+buffer, motion kept on a weak link) without tearing. It cost about 3 ms on
+average (Mac fullscreen 7.3 vs 4.3 ms, table below). The `Tearing` timing
+and both presenters' tearing paths were then removed. The measurements
+below that mention Speed's tearing are history.
 
 `PresentTiming::for_depth` keeps any ten-bit picture on `Vsync`, whatever
 the stream was served as. The encoder side already matches: Auto and Speed
@@ -29,39 +35,57 @@ HDR are `Quality` (P6, `HIGH_QUALITY`, still no reordering).
 
 The video swapchain is a flip-model composition swapchain
 (`DXGI_SWAP_EFFECT_FLIP_DISCARD`, two buffers, waitable, maximum frame
-latency 1, created with `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING` where DXGI
-reports support). Each window's presenter thread waits for the swapchain
-holding no lock, takes the newest frame, draws it under the device's shared
-immediate-context lock (the decoder and the other windows' presenters take
-it too), and calls `Present` outside that lock. Both the decoder and each
-presenter log where their time goes every five seconds (`decoder timing`,
-`video presenter timing`).
+latency 1, created without `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`). Each window's presenter thread waits for the swapchain
+holding no lock (also before its first frame), takes the newest frame,
+draws it under its device's immediate-context lock, and calls `Present`
+outside that lock. The decoder and the presenters log where their time
+goes every five seconds (`decoder timing` per decoder, `decoded picture
+hand-over timing`, `video presenter timing` per window and pipeline).
 
-Open (2026-11-18 field report, two 2560x1600 monitors): on the lab's
-virtual GPU with two windows on two displays, `Present` itself takes
-15-16 ms (one with a single window takes 1-2 ms), and the device's own
-multithread lock then holds every decode call for about 11 ms, so the two
-monitors decode about 60 frames a second between them (55 + 25 shown). A
-third buffer, a larger device frame latency and
-`DXGI_PRESENT_DO_NOT_WAIT` were measured and change nothing. The Auto
-contract's skip-ahead keeps the video with the sound meanwhile, and Stream
-Statistics says so. Next: decode on a device of its own (textures shared
-with the presenters), so a blocking present cannot stall decode.
+**Decode never waits for presentation.** The decoder runs on a D3D11
+device of its own on the root window's adapter, and every window presents
+on a device of its own on that adapter
+(`clients/windows/src/decode/shared.rs`, `present/handover.rs`). The
+decoder copies each picture it outputs into one of a bounded pool of
+NT-handle shared textures (never a shared decoder array, which some
+drivers corrupt) and signals a shared fence; the presenter opens the
+texture and fence on its device, waits GPU-side for the fence before it
+samples (decode → render), and signals a fence of its own after its
+draws, which the decoder waits for GPU-side before it writes that texture
+again (render → decode). Nothing waits on the CPU; a full pool drops the
+newest picture rather than waiting. The split is used only where the
+shared rule `arcen_deck_core::decode::decode_device_split` qualifies the
+driver (extended resource sharing, shareable fences; Intel, NVIDIA from
+driver 471.11, AMD from Vega: other streaming clients found shared decode
+textures corrupt on pre-Vega AMD, older NVIDIA, Qualcomm and Moore
+Threads drivers) and, per output format, a real keyframe handed over reads
+back sample-exact on the presenter's device. On the lab's virtual GPU
+NV12 and P010 do and `Y410` does not (it opens, but reads differently), so
+there a connection that asks for 4:4:4 (Grading, HDR) decodes on the
+window's device as before; Auto and Speed get the split. Everything else
+falls back to one device for the decoder and every window, as before.
+
+Before the split (2026-11-18 field report, two 2560x1600 monitors): on the
+lab's virtual GPU with two windows on two displays, `Present` itself took
+15-16 ms (1-2 ms with a single window) while holding the shared device's
+own multithread lock, which held every decode call for about 11 ms and the
+other window's draws, so the two monitors decoded about 60 frames a
+second between them (55 + 25 shown). A third buffer, a larger device frame
+latency and `DXGI_PRESENT_DO_NOT_WAIT` changed nothing. Measured after the
+split: see the end of this page.
 
 | Timing | `Present` |
 | --- | --- |
 | `Vsync` | sync interval 1, no flags |
 | `Newest` | sync interval 0, no flags |
-| `Tearing` | sync interval 0, `DXGI_PRESENT_ALLOW_TEARING` when supported |
 
 For the flip model, sync interval 0 means "cancel the remaining time on the
 previously presented frame and discard this frame if a newer frame is
 queued" ([`IDXGISwapChain::Present`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-present)):
-mailbox behaviour without tearing. `DXGI_PRESENT_ALLOW_TEARING` is valid
-only with sync interval 0 and a swapchain created with the tearing flag
-([variable refresh rate displays](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/variable-refresh-rate-displays)).
-A frame can tear only where DWM flips the swapchain directly (independent
-flip); while DWM composes, it is shown whole at the next composition.
+mailbox behaviour without tearing. Without `DXGI_PRESENT_ALLOW_TEARING`
+(and a swapchain created with the tearing flag,
+[variable refresh rate displays](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/variable-refresh-rate-displays))
+no present tears, whether DWM composes it or flips the swapchain directly.
 
 ## macOS Deck (CAMetalLayer)
 
@@ -72,10 +96,10 @@ The eight-bit layer (`BGRA8Unorm`, Auto and Speed) and the ten-bit layer
 | --- | --- |
 | `Vsync` | rendered on a `CVDisplayLink` tick from a FIFO pacer (up to three frames), `displaySyncEnabled` on, `present(_:afterMinimumDuration:)` half a refresh, two drawables in flight |
 | `Newest` | rendered the moment the frame arrives; the pacer keeps only the newest; `displaySyncEnabled` on; one drawable in flight where a picture reaches the glass within a refresh, two where the system composes the layer and it measurably takes longer (`arcen_media::NewestPresentDepth`, below); a frame that finds the slots busy is rendered the moment a drawable's presented handler frees one (the presenter's slot thread), the display-link tick stays the retry path |
-| `Tearing` | as `Newest`, with `displaySyncEnabled` off, two drawables in flight (without display sync a drawable is shown as soon as it is ready, so the second does not wait behind the first) and `present(_:)` without a minimum duration |
 
-`displaySyncEnabled`: "If false, the layer presents new content more
-quickly, but possibly with brief visual artifacts (tearing)"
+`displaySyncEnabled` stays on for every timing: "If false, the layer
+presents new content more quickly, but possibly with brief visual
+artifacts (tearing)"
 ([CAMetalLayer.displaySyncEnabled](https://developer.apple.com/documentation/quartzcore/cametallayer/displaysyncenabled)).
 `maximumDrawableCount` stays 3 (only 2 or 3 are allowed,
 [maximumDrawableCount](https://developer.apple.com/documentation/quartzcore/cametallayer/maximumdrawablecount));
@@ -160,6 +184,29 @@ confirmed presents over frames received):
 | --- | --- | --- |
 | windowed | 27.4 of 59.7 fps shown (46 %), 34 ms to glass | 38.7 of 60.2 (64 %), 54 ms; the round trip alone is three refreshes (49 ms), so two in flight cap it at 40 |
 | fullscreen | 29.1 of 60.1 (48 %), 34 ms | 56.2 of 59.4 (95 %), 37 ms |
+
+**Windows Deck, separate decode device** (2026-11-18; the same GRID vGPU
+virtual machine, two 2560x1600 windows on two displays with Match my
+layout, Auto, against a Linux X11 Pier serving a 60 fps animation on each
+of its two monitors; the Deck's five-second `decoder timing` and `video
+presenter timing` lines, medians while moving; one decoder per monitor):
+
+| | Before (one device) | After (own decode device, a device per window) |
+| --- | --- | --- |
+| Two windows: presented fps per window | 26 / 26 | **59.9 / 59.8** |
+| Two windows: decoded fps per monitor | 27.3 / 27.2 | **59.9 / 59.9** |
+| Two windows: decode call | 13.6 ms average (lock wait 4.6 ms) | **0.26 ms** (no lock wait); hand-over copy 0.16 ms |
+| Two windows: `Present` (root / other window) | 15.7 ms each, holding the device | 14.0-14.9 / 4.0-5.4 ms, holding nothing the decoder or the other window needs |
+| Two windows: skip-ahead to a keyframe in 3 min | 211 | **0** |
+| One window: presented / decoded fps | 60 / 60 | 60 / 60 |
+| One window: decode call | 2.8 ms average, 16.9 ms worst | **0.26 ms**, 0.7 ms worst |
+
+The vGPU's `Present` still blocks for most of a refresh in the root
+window; it now costs nothing else. Two swapchain buffers do not starve
+with frame latency 1 there: five buffers (a lab-only build) gave the same
+60 / 60 fps, the same `Present` and frame-latency waits, and the same
+8-9 frames replaced unseen in 2 minutes. AMD, where another client found
+three buffers starving, is not in the lab.
 
 ## Several monitors: one timeline
 

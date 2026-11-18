@@ -16,7 +16,7 @@
 //! Composed or not, a present at sync interval 1 waits for a vsync before
 //! DWM may use it: one refresh later than at interval 0 (Windows lab,
 //! phase-swept, composed: 25.9 → 12.2 ms present to glass). When each frame
-//! is presented, and whether it may tear, is the served pipeline's shared
+//! is presented is the served pipeline's shared
 //! [`arcen_media::video::PresentTiming`] ([`super::swapchain::VideoSwapchain::present`]).
 //!
 //! Fullscreen draws nothing over the video for every preset: the connection

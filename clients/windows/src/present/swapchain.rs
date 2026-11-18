@@ -109,37 +109,13 @@ pub struct VideoSwapchain {
     pub mode: PresentMode,
     pub width: u32,
     pub height: u32,
-    pub tearing_supported: bool,
     flags: u32,
     applied: Option<PresentMode>,
 }
 
-pub fn tearing_supported(gpu: &Gpu) -> bool {
-    let Ok(factory5) = gpu.factory.cast::<IDXGIFactory5>() else {
-        return false;
-    };
-    let mut allow = windows::Win32::Foundation::BOOL(0);
-    unsafe {
-        factory5
-            .CheckFeatureSupport(
-                DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                std::ptr::from_mut(&mut allow).cast(),
-                std::mem::size_of::<windows::Win32::Foundation::BOOL>() as u32,
-            )
-            .is_ok()
-            && allow.as_bool()
-    }
-}
-
 impl VideoSwapchain {
     pub fn create(gpu: &Gpu, width: u32, height: u32, mode: PresentMode) -> Result<Self> {
-        let tearing = tearing_supported(gpu);
-        // ALLOW_TEARING cannot be added later: always created when possible,
-        // passed per present only when the timing allows tearing (Speed).
-        let mut flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
-        if tearing {
-            flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32;
-        }
+        let flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
             Height: height,
@@ -171,7 +147,6 @@ impl VideoSwapchain {
             mode,
             width,
             height,
-            tearing_supported: tearing,
             flags,
             applied: None,
         };
@@ -266,24 +241,17 @@ impl VideoSwapchain {
     /// ([`arcen_media::video::PresentTiming`]):
     ///
     /// - `Vsync`: sync interval 1, every frame shown for a refresh.
-    /// - `Newest`: sync interval 0 without `ALLOW_TEARING`. For the flip
-    ///   model that cancels the rest of the previous frame's refresh and
-    ///   discards this frame if a newer one is queued: the newest frame wins
-    ///   at the next vblank or composition, never torn (`IDXGISwapChain::Present`,
-    ///   `SyncInterval`).
-    /// - `Tearing`: sync interval 0 with `DXGI_PRESENT_ALLOW_TEARING` where
-    ///   DXGI supports it. A frame tears only where DWM flips this swapchain
-    ///   directly; composed, it is shown at DWM's next composition.
+    /// - `Newest`: sync interval 0. For the flip model that cancels the rest
+    ///   of the previous frame's refresh and discards this frame if a newer
+    ///   one is queued: the newest frame wins at the next vblank or
+    ///   composition, never torn (`IDXGISwapChain::Present`, `SyncInterval`).
+    ///
+    /// The swapchain is created without `ALLOW_TEARING`, so no present tears.
     pub fn present(&self, timing: PresentTiming) -> Result<()> {
-        let flags = if timing.allows_tearing() && self.tearing_supported {
-            DXGI_PRESENT_ALLOW_TEARING
-        } else {
-            DXGI_PRESENT(0)
-        };
         let interval = u32::from(timing.waits_for_vsync());
         hr(
             "Present",
-            unsafe { self.swapchain.Present(interval, flags) }.ok(),
+            unsafe { self.swapchain.Present(interval, DXGI_PRESENT(0)) }.ok(),
         )
     }
 
@@ -375,11 +343,10 @@ pub fn probe(gpu: &Gpu) -> Vec<String> {
                     })
                     .collect();
                 lines.push(format!(
-                    "swapchain {} format={:?} applied={} tearing={} support[{}]",
+                    "swapchain {} format={:?} applied={} support[{}]",
                     mode.name(),
                     mode.format(),
                     super::display::color_space_name(mode.color_space()),
-                    chain.tearing_supported,
                     support.join(", ")
                 ));
             }

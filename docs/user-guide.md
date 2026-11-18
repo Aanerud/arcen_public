@@ -149,7 +149,7 @@ host, not a label on the same picture.
 | Preset | What it promises | Use it for |
 | --- | --- | --- |
 | **Auto** (default) | A sharp picture at your display's refresh (60 frames a second on a 60 Hz display, 120 on a 120 Hz one where the host can show it; with Match my layout each monitor at its own), 8-bit 4:2:0, shown without tearing. When the network or the host cannot keep up it gives up frame rate, not sharpness, and climbs back when it can. | Everyday work: email, browsing, most editing. |
-| **Speed** | The lowest latency: at least 60 frames a second (your display's refresh when faster), 8-bit 4:2:0, the lowest-latency encoder settings, frames shown even mid-refresh (it may tear). When the network is tight it gives up sharpness. | Playback, scrubbing, animation, anything where motion matters more than fine detail. |
+| **Speed** | The lowest latency: at least 60 frames a second (your display's refresh when faster), 8-bit 4:2:0, the lowest-latency encoder settings, each frame shown as soon as it is decoded, without tearing. When the network is tight it gives up sharpness. | Playback, scrubbing, animation, anything where motion matters more than fine detail. |
 | **Grading** | 10-bit 4:4:4 BT.709 **SDR**, up to 30 frames a second. It trades some interaction latency for detail. | Colour-critical SDR work. Also the cure for coloured fringes on fine text. |
 | **HDR** | HDR10: PQ transfer, BT.2020 primaries, 10-bit 4:4:4, up to 30 frames a second. It falls back visibly when the host cannot prove HDR. | HDR grading on a Mac display that can show HDR. |
 

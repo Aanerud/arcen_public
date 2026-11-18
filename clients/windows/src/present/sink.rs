@@ -49,6 +49,8 @@ pub struct D3d11VideoSink {
     /// The served pipeline's presentation timing (before this pipeline's
     /// depth is applied).
     timing: PresentTiming,
+    /// Which window, for the log ("root", "monitor 2").
+    window: String,
 }
 
 const fn failure(stage: PresenterFailureStage, detail: &'static str) -> PresenterFailure {
@@ -56,8 +58,9 @@ const fn failure(stage: PresenterFailureStage, detail: &'static str) -> Presente
 }
 
 impl D3d11VideoSink {
-    /// A sink for `pipeline` on `gpu` (the adapter that owns the window's
-    /// monitor; the decoder shares it), drawing into `tree`'s video visual.
+    /// A sink for `pipeline` on `gpu` (the window's device, on the adapter
+    /// that owns the root window's monitor), drawing into `tree`'s video
+    /// visual.
     #[must_use]
     pub fn new(pipeline: PresenterPipeline, gpu: Gpu, tree: SharedTree) -> Self {
         Self {
@@ -69,7 +72,15 @@ impl D3d11VideoSink {
             baseline: Mutex::new(Baseline::default()),
             visible: true,
             timing: PresentTiming::Vsync,
+            window: "root".to_owned(),
         }
+    }
+
+    /// Names the window in the presenter's log lines.
+    #[must_use]
+    pub fn for_window(mut self, window: impl Into<String>) -> Self {
+        self.window = window.into();
+        self
     }
 
     /// When each frame is presented: the served pipeline's shared
@@ -99,18 +110,15 @@ impl D3d11VideoSink {
         let timing = self.effective_timing();
         tracing::info!(
             target: arcen_deck_core::log_target::VIDEO,
+            window = %self.window,
             pipeline = self.owner(),
             served = self.timing.token(),
             timing = timing.token(),
-            tearing_supported = timing.allows_tearing()
-                && super::swapchain::tearing_supported(&self.gpu),
             "video presentation timing: {}",
             match timing {
                 PresentTiming::Vsync => "on the refresh (sync interval 1)",
                 PresentTiming::Newest =>
                     "each frame at once, newest wins, no tearing (sync interval 0)",
-                PresentTiming::Tearing =>
-                    "each frame at once, may tear (sync interval 0, ALLOW_TEARING)",
             }
         );
     }
@@ -147,6 +155,7 @@ impl D3d11VideoSink {
             self.gpu.clone(),
             swapchain,
             Some((self.tree.clone(), self.owner())),
+            format!("{} {}-bit", self.window, self.owner()),
         )
         .map_err(|_| {
             failure(

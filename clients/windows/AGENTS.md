@@ -44,7 +44,23 @@ an empty program. There is no single-platform `--workspace` build.
   never decoded at lower fidelity.
 - Measure the effective output depth; an eight-bit result keeps a
   persistent visible warning.
-- Decoder and presenter share one D3D11 device. No FFmpeg and no Media
+- The decoder never waits for presentation. It decodes on a D3D11 device
+  of its own on the root window's adapter, and every window presents on a
+  device of its own on that adapter (`decode/shared.rs`,
+  `present/handover.rs`): each output picture is copied into a bounded
+  pool of NT-handle shared textures (never a shared decoder array) and
+  ordered by two shared fences, decode → render before sampling and
+  render → decode before a texture is written again. No CPU waits, no
+  keyed mutex. Where the shared rule
+  `arcen_deck_core::decode::decode_device_split` or the format probe
+  refuses (no extended resource sharing or shareable fences, AMD before
+  Vega, NVIDIA before 471.11, any other vendor), the decoder and every
+  window share the root window's device, as before. This replaces the
+  earlier one-device rule (changed 2026-11-18 to remove the contention
+  measured in
+  [Deck presentation timing](../../docs/architecture/deck-presentation-timing.md));
+  established streaming clients decode on a separate device too,
+  Moonlight with fences and the same vendor gate. No FFmpeg and no Media
   Foundation decoder in the product.
 - Reconnect creates a fresh decoder and waits for a fresh keyframe.
   Teardown discards queued frames.
@@ -55,10 +71,10 @@ an empty program. There is no single-platform `--workspace` build.
   (`arcen_media::video::PresentTiming`, carried by every
   `PresentableFrame` from the shared media worker;
   [`docs/architecture/deck-presentation-timing.md`](../../docs/architecture/deck-presentation-timing.md)).
-  Auto presents each frame at once without tearing (sync interval 0, no
-  `ALLOW_TEARING`: the flip model shows the newest frame at the next
-  vblank or composition and discards an older queued one); Speed at once
-  with `DXGI_PRESENT_ALLOW_TEARING` where DXGI supports it; Grading and HDR
+  Auto and Speed present each frame at once without tearing (sync interval
+  0; the swapchain has no `ALLOW_TEARING`: the flip model shows the newest frame at the next
+  vblank or composition and discards an older queued one); no preset tears;
+  Grading and HDR
   at sync interval 1, and the ten-bit presenter always. All keep the
   waitable swapchain with frame latency 1. Never add a local Speed rule,
   tearing switch or environment toggle: change the shared contract.

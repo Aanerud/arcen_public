@@ -34,5 +34,5 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     keyframe: KeyframePolicy::ON_DEMAND_ONLY,
     favours: "10-bit 4:4:4 BT.709 SDR detail, up to 30 fps",
     gives_up: "interaction latency by using the quality encoder path with an 8-frame buffer",
-    summary: "Favours 10-bit 4:4:4 BT.709 SDR detail, up to 30 fps; gives up interaction latency by using the quality encoder path with an 8-frame buffer.",
+    summary: "10-bit 4:4:4 colour for grading, at 30 fps. Exact colour comes first, so it responds more slowly.",
 };
