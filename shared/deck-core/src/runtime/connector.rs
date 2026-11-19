@@ -111,6 +111,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         }
     }
 

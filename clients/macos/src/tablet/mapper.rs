@@ -17,7 +17,8 @@
 
 use arcen_input::{LowLatencyMetadata, PenEvent, PenTool};
 
-use super::sample::{NativeTabletPoint, NativeTabletProximity, NativeTabletTool};
+use super::sample::{NativeTabletPoint, NativeTabletProximity, NativeTabletTool, TabletButtonMask};
+use arcen_input::pen_buttons::{DriverClick, PenButtonMap, PenButtonsHeld};
 
 /// The target area a native AppKit window-space point is normalized into.
 ///
@@ -101,10 +102,17 @@ impl ViewSize {
 /// sample) and whether we are in proximity at all. The caller supplies
 /// sequencing/timestamp metadata explicitly, so this type has no wall-clock
 /// or global-counter dependency and stays fully deterministic in tests.
+///
+/// Barrel buttons go through the session's [`PenButtonMap`]: the lower and
+/// upper side switch by position (`buttonMask`), and a right or middle click
+/// the tablet driver performs (`NativeTabletPoint::driver_click`), held
+/// until the driver releases it or the pen leaves proximity.
 #[derive(Debug, Clone, Copy)]
 pub struct TabletMapper {
     tool: PenTool,
     in_proximity: bool,
+    buttons: PenButtonMap,
+    held: PenButtonsHeld,
 }
 
 impl Default for TabletMapper {
@@ -112,6 +120,8 @@ impl Default for TabletMapper {
         Self {
             tool: PenTool::Tip,
             in_proximity: false,
+            buttons: PenButtonMap::default(),
+            held: PenButtonsHeld::default(),
         }
     }
 }
@@ -120,6 +130,20 @@ impl TabletMapper {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A mapper with the session's pen-button mapping.
+    #[must_use]
+    pub fn with_button_map(buttons: PenButtonMap) -> Self {
+        Self {
+            buttons,
+            ..Self::default()
+        }
+    }
+
+    /// The session's pen-button mapping.
+    pub const fn set_button_map(&mut self, buttons: PenButtonMap) {
+        self.buttons = buttons;
     }
 
     #[must_use]
@@ -152,6 +176,7 @@ impl TabletMapper {
         let tool = pen_tool(sample.tool)?;
         self.in_proximity = sample.entering;
         self.tool = tool;
+        self.held = PenButtonsHeld::default();
 
         // A proximity transition carries no pressure/tilt/rotation/button
         // payload of its own (those only arrive on `NSEventTypeTabletPoint`).
@@ -200,7 +225,15 @@ impl TabletMapper {
         // The tip button bit is contact, not a barrel button; pressure > 0 is
         // an additional signal some drivers only expose through pressure.
         let touching = sample.buttons.tip_down() || pressure > 0.0;
-        let buttons = sample.buttons.wire_barrel_buttons();
+        let side = sample.buttons.barrel_bits();
+        self.held.lower = side & TabletButtonMask::LOWER_SIDE != 0;
+        self.held.upper = side & TabletButtonMask::UPPER_SIDE != 0;
+        match sample.driver_click {
+            Some((DriverClick::Right, held)) => self.held.driver_right = held,
+            Some((DriverClick::Middle, held)) => self.held.driver_middle = held,
+            None => {}
+        }
+        let buttons = self.buttons.wire_buttons(self.held);
 
         let event = PenEvent {
             x,
@@ -350,6 +383,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: 0.0,
             buttons: TabletButtonMask::new(buttons),
+            driver_click: None,
             device_id: 1,
             tool: NativeTabletTool::Pen,
             window_number: 1,
@@ -501,6 +535,62 @@ mod tests {
             assert_eq!(event.buttons, wire);
             assert!(!event.touching);
         }
+    }
+
+    /// A Wacom side switch set to Right Click arrives as right-mouse events
+    /// with tablet data; its driver's click is honoured whatever the
+    /// position settings say, held across the drag, released by the up
+    /// event or by leaving proximity.
+    #[test]
+    fn a_click_the_tablet_driver_performs_is_the_pens() {
+        use arcen_input::pen_buttons::{PenButtonAction, PenButtonSettings};
+        use arcen_protocol::messages::{PEN_BUTTON_MIDDLE_CLICK, PEN_BUTTON_RIGHT_CLICK};
+        let mut mapper = TabletMapper::with_button_map(PenButtonMap {
+            settings: PenButtonSettings {
+                lower: PenButtonAction::MiddleClick,
+                upper: PenButtonAction::Off,
+                ..PenButtonSettings::default()
+            },
+            ..PenButtonMap::default()
+        });
+        let mut sample = |driver_click, buttons: u16| {
+            let mut raw = point(0.0, 0.0, 0.0, buttons);
+            raw.driver_click = driver_click;
+            mapper
+                .on_point(raw, view(), metadata(1))
+                .expect("valid point sample maps")
+                .buttons
+        };
+        // The driver's right click (its down event may still carry the side
+        // switch's position bit: the driver's meaning wins).
+        let down = Some((DriverClick::Right, true));
+        assert_eq!(
+            sample(down, TabletButtonMask::LOWER_SIDE),
+            PEN_BUTTON_RIGHT_CLICK
+        );
+        assert_eq!(
+            sample(None, 0),
+            PEN_BUTTON_RIGHT_CLICK,
+            "held across a plain sample"
+        );
+        assert_eq!(sample(Some((DriverClick::Right, false)), 0), 0);
+        // With no driver click the position settings apply.
+        assert_eq!(
+            sample(None, TabletButtonMask::LOWER_SIDE),
+            PEN_BUTTON_MIDDLE_CLICK
+        );
+        assert_eq!(sample(None, TabletButtonMask::UPPER_SIDE), 0);
+        assert_eq!(
+            sample(Some((DriverClick::Middle, true)), 0),
+            PEN_BUTTON_MIDDLE_CLICK
+        );
+        // Leaving proximity forgets a click the driver never released.
+        let _ = mapper.on_proximity(proximity(false, NativeTabletTool::Pen), view(), metadata(2));
+        let _ = mapper.on_proximity(proximity(true, NativeTabletTool::Pen), view(), metadata(3));
+        let event = mapper
+            .on_point(point(0.0, 0.0, 0.0, 0), view(), metadata(4))
+            .expect("valid point sample maps");
+        assert_eq!(event.buttons, 0);
     }
 
     #[test]

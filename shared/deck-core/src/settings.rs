@@ -737,10 +737,21 @@ pub struct ClientSettings {
     /// still turn this off explicitly in Advanced settings.
     pub tablet_input_enabled: bool,
     pub tablet_mode_requested: TabletModeMsg,
+    /// What the pen's barrel buttons click on the host (Tablet support).
+    pub pen_buttons: arcen_input::pen_buttons::PenButtonSettings,
     /// Exact still image (lossless refinement, ADR 0016): ask the host to
     /// send still pictures' exact pixels. On by default; the host decides
     /// whether it offers it.
     pub exact_still_image: bool,
+    /// Canvas screen updates (ADR 0028): with a host that encodes in
+    /// software, keep the picture on this Deck and receive only what
+    /// changed. On by default; asked for only where this Deck's presenter
+    /// has a canvas executor, and the host decides whether it serves it.
+    pub canvas: bool,
+    /// The canvas cache budget in MiB (default
+    /// [`crate::canvas::DEFAULT_CACHE_MIB`]); never advertised below
+    /// [`crate::canvas::MIN_CACHE_MIB`].
+    pub canvas_cache_mib: u32,
     /// Colour-fidelity preset plus any Advanced overrides and explicit
     /// probe-matrix variant. See `ColorFidelitySettings::resolved_variant`
     /// for how these combine into the effective video contract.
@@ -758,6 +769,10 @@ pub struct ClientSettings {
     pub option_key_mode: arcen_input::text::OptionKeyPreference,
     /// Paste as Keystrokes: confirmation threshold and typing rate.
     pub paste: arcen_input::text::PasteSettings,
+    /// When Alt+Tab, the Windows key and Print Screen go to the host
+    /// (`arcen_input::keyboard::KeyboardCapturePolicy`; the host whenever a
+    /// session window has focus by default).
+    pub keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
 }
 
 pub const SAVED_CONNECTIONS_VERSION: u32 = 2;
@@ -810,12 +825,16 @@ impl Default for ClientSettings {
             hidpi_display_mask: 0,
             tablet_input_enabled: true,
             tablet_mode_requested: TabletModeMsg::LocalTermination,
+            pen_buttons: arcen_input::pen_buttons::PenButtonSettings::default(),
             exact_still_image: true,
+            canvas: true,
+            canvas_cache_mib: crate::canvas::DEFAULT_CACHE_MIB,
             color_fidelity: ColorFidelitySettings::default(),
             encode_intent: arcen_media::EncodeIntent::default(),
             typing_mode: arcen_input::text::TypingMode::default(),
             option_key_mode: arcen_input::text::OptionKeyPreference::default(),
             paste: arcen_input::text::PasteSettings::default(),
+            keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::default(),
         }
     }
 }

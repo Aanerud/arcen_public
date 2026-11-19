@@ -118,12 +118,17 @@ pub struct AgentConfig {
     timezone_redirection: bool,
     #[serde(default)]
     font_smoothing: crate::font_smoothing::FontSmoothingPolicy,
+    #[serde(default = "media_foundation_hardware_default")]
+    media_foundation_hardware: bool,
     #[serde(default)]
     qos_targets: arcen_telemetry::QosTargets,
     #[serde(default)]
     debug_diagnostics: bool,
     #[serde(default)]
     deskside: crate::deskside::DesksideConfig,
+    /// `privacy.desk = "off"`; absent keeps the desk private.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    desk_privacy_off: bool,
     #[serde(default)]
     iddcx: crate::config::WindowsIddCxConfig,
     #[serde(default)]
@@ -132,6 +137,10 @@ pub struct AgentConfig {
     /// as in `pier.json`.
     #[serde(default = "default_lossless_refinement")]
     lossless_refinement: bool,
+}
+
+const fn media_foundation_hardware_default() -> bool {
+    true
 }
 
 const fn default_lossless_refinement() -> bool {
@@ -196,9 +205,11 @@ impl AgentConfig {
             clipboard_policy: config.clipboard_policy,
             timezone_redirection: config.timezone_redirection,
             font_smoothing: config.font_smoothing,
+            media_foundation_hardware: config.media_foundation_hardware,
             qos_targets: config.qos_targets,
             debug_diagnostics: config.debug_diagnostics,
             deskside: config.deskside.clone(),
+            desk_privacy_off: !config.desk_privacy.enabled,
             iddcx: config.iddcx.clone(),
             multi_monitor: config.multi_monitor.clone(),
         }
@@ -252,6 +263,7 @@ impl AgentConfig {
         let encoder = match self.encoder.as_deref() {
             None | Some("") | Some("auto") => arcen_media::video::EncoderRequest::Auto,
             Some("nvenc") => arcen_media::video::EncoderRequest::NativeNvenc,
+            Some("mf-hw") => arcen_media::video::EncoderRequest::MediaFoundationHardware,
             Some("software-h264") | Some("openh264") => {
                 arcen_media::video::EncoderRequest::SoftwareH264
             }
@@ -313,14 +325,23 @@ impl AgentConfig {
             clipboard_policy: self.clipboard_policy,
             timezone_redirection: self.timezone_redirection,
             font_smoothing: self.font_smoothing,
+            media_foundation_hardware: self.media_foundation_hardware,
+            media_foundation_codecs: Vec::new(),
             reconnect_window_secs: 0,
             qos_targets: self.qos_targets,
             debug_diagnostics: self.debug_diagnostics,
             deskside: self.deskside,
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::resolve(
+                self.desk_privacy_off.then_some(
+                    arcen_session::console_session::desk_privacy::DeskPrivacySetting::Off,
+                ),
+            ),
             iddcx: self.iddcx,
             multi_monitor: self.multi_monitor,
             lossless_refinement: self.lossless_refinement,
             deck_refine: None,
+            deck_canvas: None,
+            software_cpu_share: arcen_media::canvas::CpuShare::default(),
         };
         config.apply_software_h264_backend(encoder)?;
         Ok(config)
@@ -2839,9 +2860,11 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy_off: false,
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
         };
@@ -4002,9 +4025,11 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy_off: false,
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
         };
@@ -4040,9 +4065,11 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy_off: false,
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
         };
@@ -4078,9 +4105,11 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy_off: false,
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
         };

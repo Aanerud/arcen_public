@@ -51,6 +51,26 @@ const fn input_availability(
 /// `InputController::region_input_available`; it is true only when this
 /// attachment owns the shared region adapter for a committed Match My Layout
 /// session.
+/// What the desk shows while this Deck is attached: a joined console's
+/// desk is blanked unless the administrator turned desk privacy off; a
+/// headless Wayland desktop is on no desk monitor. A dedicated X11 desktop
+/// says nothing.
+fn desk_privacy_status(
+    cfg: &Config,
+    session: Option<&SessionMetadata>,
+) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+    use arcen_session::console_session::desk_privacy::DeskExposure;
+    let session = session?;
+    let exposure = if session.console {
+        DeskExposure::PhysicalDesk
+    } else if session.wayland.is_some() {
+        DeskExposure::NotShown
+    } else {
+        return None;
+    };
+    Some(cfg.desk_privacy.plan(exposure).status())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_server_hello(
     cfg: &Config,
@@ -200,6 +220,8 @@ pub fn build_server_hello(
             pen_eraser: input_availability(pen.eraser),
             pen_proximity: input_availability(pen.proximity),
             pen_barrel_buttons: input_availability(pen.barrel_buttons),
+            // Bit 0 right click (`BTN_STYLUS2`), bit 1 middle (`input/pen.rs`).
+            pen_button_actions: input_availability(pen.barrel_buttons),
             // Committed text reaches only a Wayland session that proves it
             // can type (the attachment sets it from its injector); an Xorg
             // session's uinput keyboard types key positions only.
@@ -208,6 +230,12 @@ pub fn build_server_hello(
             // AltGr is KEY_RIGHTALT and the ISO key KEY_102ND (input/keymap.rs).
             extended_keys: InputCapabilityAvailability::Available,
             meta_pointer_mask: InputCapabilityAvailability::Unavailable,
+            // Insert, Print, Scroll Lock, Pause, Menu and F13-F24 by their
+            // evdev codes (input/keymap.rs, the shared PC-key table), on
+            // Xorg and Wayland alike.
+            pc_keys: arcen_input::keyboard::host_keys::advertised_pc_keys(
+                arcen_protocol::messages::HostPlatform::Linux,
+            ),
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: input_availability(pen.pen),
@@ -222,11 +250,13 @@ pub fn build_server_hello(
         device_capabilities: Default::default(),
         negotiated_transport: None, // set from the active socket before transmission
         lossless_refine: None,
+        canvas: None,
         // This host emits REL_WHEEL_HI_RES/REL_HWHEEL_HI_RES (120 units per
         // detent) plus compatible legacy detents, so trackpad point travel can
         // stay precise when the Deck advertises it.
         precise_scroll_v1: true,
         login_window: false,
+        desk_privacy: desk_privacy_status(cfg, session).map(|status| status.token().to_owned()),
     }
     .with_build_identity(crate::build_identity())
 }
@@ -736,6 +766,37 @@ mod tests {
         assert_eq!(hello.session_type, "x11");
         assert_eq!(hello.desktop, "gnome-classic");
         assert!(!hello.device_capabilities.contains_key("session"));
+        // A dedicated desktop says nothing about the desk.
+        assert_eq!(hello.desk_privacy, None);
+
+        let console = SessionMetadata {
+            console: true,
+            ..metadata.clone()
+        };
+        let hello_for = |cfg: &Config, metadata: &SessionMetadata| {
+            build_server_hello(
+                cfg,
+                &plan,
+                Some(plan.backend.accelerator_class()),
+                Some(metadata),
+                false,
+                false,
+                PenCapabilityTruth::UNAVAILABLE,
+                false,
+            )
+            .desk_privacy
+        };
+        assert_eq!(
+            hello_for(&Config::default(), &console).as_deref(),
+            Some("blanked")
+        );
+        let off = Config {
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::resolve(
+                Some(arcen_session::console_session::desk_privacy::DeskPrivacySetting::Off),
+            ),
+            ..Config::default()
+        };
+        assert_eq!(hello_for(&off, &console).as_deref(), Some("off"));
     }
 
     #[test]

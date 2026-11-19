@@ -57,6 +57,8 @@ pub struct InputController {
     /// Committed text, typed through this keyboard on the session's own X
     /// server; `None` until attached (or when it could not connect).
     x11_text: Option<Box<super::x11_text::X11Text>>,
+    /// Refuses key presses while the kernel's console would read them.
+    console: super::console_guard::ConsoleGuard,
     /// Text results for the Deck: the sender, and the receiver until the
     /// session takes it.
     text_notices: Option<(
@@ -213,6 +215,7 @@ impl InputController {
                 pen_proximity_timeout: Default::default(),
                 stats: stats.clone(),
                 x11_text: None,
+                console: super::console_guard::ConsoleGuard::default(),
                 text_notices: None,
             },
             stats,
@@ -226,12 +229,25 @@ impl InputController {
     }
 
     pub fn key_event(&mut self, message: &KeyEventMsg) -> Result<(), InputError> {
+        // A release message too: its modifier bits and lock states can
+        // press Control, Shift or a lock key.
+        if !self.admit_keys()? {
+            return Ok(());
+        }
         self.sync_lock_states(message)?;
         let Some(code) = qt_key_to_evdev(message.scan_code, message.modifiers) else {
             self.stats.unmapped_keys.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
         let code = kernel_safe_key(code);
+        if message.pressed {
+            // F13-F24 type F13-F24, not the stock keymap's XF86Tools...
+            if let Some(text) = self.x11_text.as_mut() {
+                if let Err(error) = text.pin_function_key(code) {
+                    tracing::debug!(target: "input", %error, code, "function key keysym not set");
+                }
+            }
+        }
         let edges = plan_key_edges(
             &mut self.held_keys,
             code,
@@ -250,6 +266,22 @@ impl InputController {
         }
         self.stats.key_events.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Whether key input may reach the keyboard now: not while the
+    /// foreground virtual terminal reads kernel keyboards
+    /// ([`super::console_guard`]). When refusing starts, every held key is
+    /// let go once, so no modifier stays held in the console's shift state.
+    fn admit_keys(&mut self) -> Result<bool, InputError> {
+        let was_refusing = self.console.refusing();
+        if self.console.admit() {
+            return Ok(true);
+        }
+        self.stats.console_refused.fetch_add(1, Ordering::Relaxed);
+        if !was_refusing {
+            self.reset_keyboard_held()?;
+        }
+        Ok(false)
     }
 
     /// Releases only keyboard keys/modifiers.
@@ -628,8 +660,8 @@ impl InputController {
         for &(code, pressed) in edges.iter().filter(|_| pen_as_mouse) {
             let mouse_btn = match code {
                 pen::BTN_TOUCH => Some(KeyCode::BTN_LEFT.0), // tip contact → left click
-                pen::BTN_STYLUS => Some(KeyCode::BTN_MIDDLE.0), // lower barrel → middle, as a tablet
-                pen::BTN_STYLUS2 => Some(KeyCode::BTN_RIGHT.0), // upper barrel → right, as a tablet
+                pen::BTN_STYLUS => Some(KeyCode::BTN_MIDDLE.0), // middle click, as a tablet
+                pen::BTN_STYLUS2 => Some(KeyCode::BTN_RIGHT.0), // right click, as a tablet
                 _ => None,
             };
             if let Some(btn) = mouse_btn {
@@ -803,12 +835,15 @@ impl InputController {
         message: &arcen_protocol::messages::TextCommitMsg,
     ) -> Result<(), InputError> {
         use arcen_protocol::messages::{TextCommitResultMsg, TextRefusalReason};
+        if self.x11_text.is_none() || message.validate().is_err() {
+            return Err(InputError::TextUnavailable);
+        }
+        if !self.admit_keys()? {
+            return Ok(());
+        }
         let Some(text) = self.x11_text.as_mut() else {
             return Err(InputError::TextUnavailable);
         };
-        if message.validate().is_err() {
-            return Err(InputError::TextUnavailable);
-        }
         let keys_held = !self.held_keys.is_empty();
         let device = &mut self.absolute_device;
         let mut emit = |(code, pressed): super::x11_text::KeyEdge| {

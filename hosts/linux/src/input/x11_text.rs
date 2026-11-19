@@ -13,8 +13,9 @@
 //!   held: exactly as a person would type it, so terminals, consoles and
 //!   applications that read keys see ordinary key presses.
 //! - **By a borrowed key** otherwise (a character the layout lacks, or keys
-//!   are held): one of a few keys no layout uses (F13–F24 and two Japanese
-//!   keys, only while the server maps nothing to them) is mapped to the
+//!   are held): one of a few keys no layout uses (the Japanese, Korean and
+//!   Yen keys and a few rare keys the stock keymap leaves empty, only while
+//!   the server maps nothing to them) is mapped to the
 //!   character's keysym for as long as it is needed, then given back. This
 //!   is the only way to type an arbitrary character into an X session
 //!   without an input method; the borrowed key carries the keysym at both
@@ -24,6 +25,13 @@
 //! turned back on after, so what is typed is what was sent. Keys the
 //! kernel or logind act on (power, sleep, `SysRq`) are never borrowed. The
 //! text is never logged.
+//!
+//! F13–F24 are never borrowed: a Deck presses them as keys, and the
+//! connection makes them type their own keysyms (`F13` … `F24`) while it is
+//! attached, where a stock keymap has `XF86Tools`, `XF86Launch5`…,
+//! `XF86AudioMicMute` or nothing: at attach, again after the session
+//! reloads its layout, and before each press. It gives the keys their own
+//! symbols back when the session ends.
 //!
 //! The same connection tells the Deck what the session's active layout
 //! types at each printable key position (`host_keymap`, source
@@ -48,15 +56,28 @@ const KEYSYM_ISO_LEVEL3_SHIFT: u32 = 0xfe03;
 const LOCK_MASK: u16 = 0x02;
 /// `Caps_Lock`.
 const KEYSYM_CAPS_LOCK: u32 = 0xffe5;
-/// The Linux evdev codes a character may borrow: F13–F24 and the Japanese,
-/// Korean and Yen keys (`KEY_ZENKAKUHANKAKU`, `KEY_RO`, `KEY_KATAKANA` …
-/// `KEY_KPJPCOMMA`, `KEY_HANGEUL`, `KEY_HANJA`, `KEY_YEN`). Nothing below
-/// the X server acts on them, and a layout that does not use them maps
-/// nothing to most of them.
-pub const BORROWABLE_EVDEV: [u16; 23] = [
-    183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 85, 89, 90, 91, 92, 93, 94, 95,
-    122, 123, 124,
+/// The Linux evdev codes a character may borrow: the Japanese, Korean and
+/// Yen keys (`KEY_ZENKAKUHANKAKU`, `KEY_RO`, `KEY_KATAKANA` …
+/// `KEY_KPJPCOMMA`, `KEY_HANGEUL`, `KEY_HANJA`, `KEY_YEN`), and keys the
+/// stock evdev keymap leaves without symbols (`KEY_MACRO`, `KEY_SETUP`,
+/// `KEY_DELETEFILE`, `KEY_ISO`, `KEY_MOVE`, `KEY_EDIT`, `KEY_BASSBOOST`,
+/// `KEY_HP`, `KEY_QUESTION`, `KEY_ALTERASE`). Nothing below the X server
+/// acts on them, and a layout that does not use them maps nothing to most
+/// of them. Never F13–F24 or Menu: a Deck presses those as keys.
+pub const BORROWABLE_EVDEV: [u16; 21] = [
+    85, 89, 90, 91, 92, 93, 94, 95, 122, 123, 124, 112, 141, 146, 170, 175, 176, 209, 211, 214, 222,
 ];
+/// `KEY_F13`; `KEY_F24` is 194.
+const EVDEV_F13: u16 = 183;
+/// The keysym `F13`; `F24` is `0xffd5`.
+const KEYSYM_F13: u32 = 0xffca;
+
+/// The keysym a function key above F12 types, by its evdev code.
+#[must_use]
+pub fn function_keysym(evdev: u16) -> Option<u32> {
+    let offset = evdev.checked_sub(EVDEV_F13).filter(|offset| *offset < 12)?;
+    Some(KEYSYM_F13 + u32::from(offset))
+}
 /// How long a borrowed key keeps its keysym after use before it may carry
 /// another: an X client fetches a changed mapping lazily, so the mapping
 /// must still be there when it reads the key press.
@@ -139,10 +160,13 @@ impl CoreKeymap {
     }
 
     /// The uinput key (evdev code) for an X keycode, when the session's
-    /// keyboard has it.
+    /// keyboard has it. Never `KEY_SYSRQ`, whatever the session's keymap
+    /// puts there: the kernel's SysRq filter reads the Arcen keyboard, and
+    /// any X client may remap an Alt key to a symbol this path types or
+    /// holds (`input/keymap.rs::kernel_safe_key`).
     fn evdev(keycode: u8) -> Option<u16> {
         let code = u16::from(keycode).checked_sub(8)?;
-        (1..=247).contains(&code).then_some(code)
+        ((1..=247).contains(&code) && code != super::keymap::KEY_SYSRQ).then_some(code)
     }
 
     /// The keysym at `group` (0 or 1) and `level` (0–3) of a keycode's list.
@@ -162,12 +186,13 @@ impl CoreKeymap {
     }
 
     /// The first key with `keysym` as its own (unshifted, first-group)
-    /// symbol, as an evdev code.
+    /// symbol that this keyboard may press, as an evdev code (a later key
+    /// with it when the first is the SysRq key).
     #[must_use]
     pub fn modifier_key(&self, keysym: u32) -> Option<u16> {
         self.keycodes()
-            .find(|(_, syms)| syms.first() == Some(&keysym))
-            .and_then(|(keycode, _)| Self::evdev(keycode))
+            .filter(|(_, syms)| syms.first() == Some(&keysym))
+            .find_map(|(keycode, _)| Self::evdev(keycode))
     }
 
     /// Where `group` of the layout types `character`: the first key, in
@@ -485,8 +510,9 @@ impl X11Text {
             sender: notices,
             notices: arcen_input::text::host_layout::HostKeymapNotices::default(),
         };
-        if let Ok(session) = session.lock() {
+        if let Ok(mut session) = session.lock() {
             session.offer_layout(&mut layout);
+            session.pin_function_keys();
         }
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let watcher = {
@@ -513,6 +539,7 @@ impl X11Text {
                         ticks = ticks.wrapping_add(1);
                         if ticks % LAYOUT_TICKS == 0 {
                             session.offer_layout(&mut layout);
+                            session.pin_function_keys();
                         }
                     }
                 })
@@ -523,6 +550,21 @@ impl X11Text {
             stop,
             watcher: Some(watcher),
         })
+    }
+
+    /// Makes the function key above F12 with evdev code `evdev` type its
+    /// own keysym (`F13` … `F24`) before it is pressed, should the session
+    /// have reloaded its layout since attach; nothing for any other key.
+    /// Given back when the session ends.
+    ///
+    /// # Errors
+    ///
+    /// When the X server stops answering.
+    pub fn pin_function_key(&mut self, evdev: u16) -> Result<(), String> {
+        self.session
+            .lock()
+            .map_err(|_| "committed-text session poisoned".to_owned())?
+            .pin_function_key(evdev)
     }
 
     /// Types `text`; see [`Session::type_text`].
@@ -555,16 +597,51 @@ impl Drop for X11Text {
         }
         if let Ok(mut session) = self.session.lock() {
             session.return_borrowed(Instant::now(), true);
+            session.unpin_function_keys();
             let _ = session.connection.flush();
         }
     }
 }
 
-/// The X connection and the keys it has borrowed.
+/// A function key above F12 made to type its own keysym, and the symbols it
+/// had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinnedKey {
+    evdev: u16,
+    original: Vec<u32>,
+}
+
+/// What pressing a function key above F12 needs first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinPlan {
+    /// The key already types its keysym, or is not a function key.
+    Nothing,
+    /// The key must be given its keysym; these are its symbols now.
+    Pin { keysym: u32, original: Vec<u32> },
+}
+
+impl CoreKeymap {
+    fn pin_plan(&self, evdev: u16) -> PinPlan {
+        let (Some(keysym), Some(syms)) = (function_keysym(evdev), self.syms_of_evdev(evdev)) else {
+            return PinPlan::Nothing;
+        };
+        if syms.first() == Some(&keysym) {
+            return PinPlan::Nothing;
+        }
+        PinPlan::Pin {
+            keysym,
+            original: syms.to_vec(),
+        }
+    }
+}
+
+/// The X connection, the keys it has borrowed and the function keys it
+/// made type their own keysyms.
 struct Session {
     connection: RustConnection,
     root: u32,
     borrowed: Vec<Borrowed>,
+    pinned: Vec<PinnedKey>,
     per_keycode: u8,
 }
 
@@ -597,6 +674,7 @@ impl Session {
                         connection,
                         root,
                         borrowed: Vec::new(),
+                        pinned: Vec::new(),
                         per_keycode: 2,
                     });
                 }
@@ -690,6 +768,76 @@ impl Session {
             .change_keyboard_mapping(1, keycode, self.per_keycode, &keysyms)
             .map_err(|error| error.to_string())?;
         self.sync()
+    }
+
+    /// Makes a function key above F12 type its own keysym before the Deck
+    /// presses it (evdev `evdev`); nothing for any other key.
+    fn pin_function_key(&mut self, evdev: u16) -> Result<(), String> {
+        if function_keysym(evdev).is_none() {
+            return Ok(());
+        }
+        let keymap = self.keymap()?;
+        self.pin_on(&keymap, evdev)
+    }
+
+    /// Makes F13–F24 type their own keysyms: at attach and again whenever
+    /// the session reloads its layout. Done ahead of any press, because a
+    /// desktop grabs keys by keycode (GNOME's `XF86Tools`, mic-mute and
+    /// touchpad keys) and moves its grabs only once it has read the new
+    /// mapping; a key changed at its own press would reach the old grab.
+    fn pin_function_keys(&mut self) {
+        let Ok(keymap) = self.keymap() else {
+            return;
+        };
+        for evdev in EVDEV_F13..EVDEV_F13 + 12 {
+            if let Err(error) = self.pin_on(&keymap, evdev) {
+                tracing::debug!(target: "input", %error, evdev, "function key keysym not set");
+                return;
+            }
+        }
+    }
+
+    fn pin_on(&mut self, keymap: &CoreKeymap, evdev: u16) -> Result<(), String> {
+        let PinPlan::Pin { keysym, original } = keymap.pin_plan(evdev) else {
+            return Ok(());
+        };
+        if !self.pinned.iter().any(|key| key.evdev == evdev) {
+            self.pinned.push(PinnedKey { evdev, original });
+        }
+        self.per_keycode = u8::try_from(keymap.per_keycode().clamp(1, 8)).unwrap_or(2);
+        self.map_key(evdev, keysym)
+    }
+
+    /// Gives every pinned function key the symbols it had, unless the
+    /// session changed it since.
+    fn unpin_function_keys(&mut self) {
+        if self.pinned.is_empty() {
+            return;
+        }
+        let Ok(keymap) = self.keymap() else {
+            return;
+        };
+        for key in std::mem::take(&mut self.pinned) {
+            let current = keymap
+                .syms_of_evdev(key.evdev)
+                .and_then(|syms| syms.first())
+                .copied();
+            if current != function_keysym(key.evdev) {
+                continue;
+            }
+            let (Ok(keycode), Ok(per)) = (
+                u8::try_from(key.evdev + 8),
+                u8::try_from(key.original.len()),
+            ) else {
+                continue;
+            };
+            if per > 0 {
+                let _ = self
+                    .connection
+                    .change_keyboard_mapping(1, keycode, per, &key.original);
+            }
+        }
+        let _ = self.sync();
     }
 
     /// Gives back borrowed keys unused for a while (all of them with
@@ -922,6 +1070,26 @@ mod tests {
         }
     }
 
+    /// A keymap that puts a typed character or a modifier on the SysRq key
+    /// (X keycode 107) never makes the text path press `KEY_SYSRQ`.
+    #[test]
+    fn the_text_path_never_types_or_holds_the_sysrq_key() {
+        let mut keysyms = vec![NO_SYMBOL; 248 * usize::from(PER)];
+        set(&mut keysyms, PER, 107, &[0x78, 0x58, 0x78, 0x58]);
+        set(&mut keysyms, PER, 64, &[KEYSYM_SHIFT_L]);
+        let map = CoreKeymap::new(8, PER, keysyms.clone());
+        assert!(map.probe('x', 0, true).is_none());
+        assert_eq!(map.modifier_key(KEYSYM_SHIFT_L), Some(56));
+        set(&mut keysyms, PER, 64, &[NO_SYMBOL]);
+        set(&mut keysyms, PER, 107, &[KEYSYM_ISO_LEVEL3_SHIFT]);
+        let map = CoreKeymap::new(8, PER, keysyms.clone());
+        assert_eq!(map.modifier_key(KEYSYM_ISO_LEVEL3_SHIFT), None);
+        // A later key with the modifier is used instead.
+        set(&mut keysyms, PER, 108, &[KEYSYM_ISO_LEVEL3_SHIFT]);
+        let map = CoreKeymap::new(8, PER, keysyms);
+        assert_eq!(map.modifier_key(KEYSYM_ISO_LEVEL3_SHIFT), Some(100));
+    }
+
     #[test]
     fn the_layout_notice_describes_the_active_groups_printable_keys() {
         let mut keysyms = vec![NO_SYMBOL; 248 * usize::from(PER)];
@@ -1124,13 +1292,60 @@ mod tests {
     fn only_free_borrowable_keys_are_borrowed() {
         let map = keymap(false);
         let free = map.free_borrowable();
-        assert!(!free.contains(&183), "F13 carries XF86Tools here");
         assert_eq!(map.modifier_key(KEYSYM_CAPS_LOCK), Some(58));
-        assert!(free.contains(&189) && free.contains(&194));
+        assert!(free.contains(&112) && free.contains(&85) && free.contains(&222));
+        // F19 is free in this keymap, but a Deck presses it as F19.
+        assert!(!free.contains(&189));
         for evdev in free {
             // Never a key the kernel or logind acts on.
             assert!(![99, 116, 142, 143, 205, 247].contains(&evdev));
         }
+    }
+
+    /// A Deck's F13–F24 and Menu are keys of their own: the text path never
+    /// borrows them, so a held F13 is never remapped under the user.
+    #[test]
+    fn keys_a_deck_presses_are_never_borrowed() {
+        for key in arcen_input::keyboard::host_keys::PC_HOST_KEYS {
+            assert!(
+                !BORROWABLE_EVDEV.contains(&key.evdev),
+                "{} is borrowable",
+                key.name
+            );
+        }
+        for evdev in BORROWABLE_EVDEV {
+            assert!(function_keysym(evdev).is_none());
+            assert!(CoreKeymap::evdev(u8::try_from(evdev + 8).unwrap()).is_some());
+        }
+    }
+
+    #[test]
+    fn function_keys_above_f12_are_pinned_to_their_own_keysyms() {
+        assert_eq!(function_keysym(183), Some(0xffca));
+        assert_eq!(function_keysym(194), Some(0xffd5));
+        assert_eq!(function_keysym(182), None);
+        assert_eq!(function_keysym(195), None);
+        let map = keymap(false);
+        // F13 carries XF86Tools: pinned, and its symbols kept for later.
+        assert_eq!(
+            map.pin_plan(183),
+            PinPlan::Pin {
+                keysym: 0xffca,
+                original: vec![0x1008_ff81, NO_SYMBOL, 0x1008_ff81, NO_SYMBOL],
+            }
+        );
+        // F19 carries nothing: pinned too.
+        assert!(matches!(
+            map.pin_plan(189),
+            PinPlan::Pin { keysym: 0xffd0, .. }
+        ));
+        // A key that already types F13, and keys that are no F13–F24.
+        let mut keysyms = map.keysyms.clone();
+        set(&mut keysyms, PER, 191, &[0xffca, 0xffca]);
+        let pinned = CoreKeymap::new(8, PER, keysyms);
+        assert_eq!(pinned.pin_plan(183), PinPlan::Nothing);
+        assert_eq!(map.pin_plan(30), PinPlan::Nothing);
+        assert_eq!(map.pin_plan(127), PinPlan::Nothing);
     }
 
     #[test]

@@ -732,8 +732,9 @@ without NVENC could not stream; an Xorg one could).
    what every Linux software path shares (contract bitrate bounds, retained
    I420 planes, selective conversion, keepalive/keyframe re-encodes, live
    rate rules, admission-probe pictures). The Xorg MIT-SHM loop and the
-   Wayland composition both run on it; `SoftwareEncodeLoop` adds Keel's hash
-   and idle cadence for sources that deliver a picture only on change.
+   Wayland composition both run on it through the one shared software loop,
+   `arcen_media::canvas::CanvasEncodeLoop` (ADR 0028), which adds Keel's
+   hash and idle cadence and, for a Deck that offers it, the canvas.
 3. **Source-drawn cursor.** A backend contract's `cursor_in_video` says
    whether that backend's capture path can put the cursor into its pictures.
    `BackendLimits::with_source_cursor` widens only that axis, only from

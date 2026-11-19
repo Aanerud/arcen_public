@@ -947,7 +947,7 @@ mod tests {
             assert!(build_offer(&gate).is_some(), "{encoder:?}");
         }
         for encoder in [
-            EncoderRequest::WindowsMediaFoundation,
+            EncoderRequest::MediaFoundationHardware,
             EncoderRequest::SoftwareAv1,
         ] {
             let gate = MultiMonitorGate {

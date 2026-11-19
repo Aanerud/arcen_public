@@ -880,11 +880,36 @@ pub fn load_client_settings(
         settings.tablet_input_enabled =
             tablet_mode_allows_typed_pen(settings.tablet_mode_requested);
     }
+    let pen_button = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(arcen_input::pen_buttons::PenButtonAction::from_token)
+    };
+    if let Some(action) = pen_button("pen_barrel_button") {
+        settings.pen_buttons.barrel = action;
+    }
+    if let Some(action) = pen_button("pen_lower_button") {
+        settings.pen_buttons.lower = action;
+    }
+    if let Some(action) = pen_button("pen_upper_button") {
+        settings.pen_buttons.upper = action;
+    }
     if let Some(enabled) = value
         .get("exact_still_image")
         .and_then(serde_json::Value::as_bool)
     {
         settings.exact_still_image = enabled;
+    }
+    if let Some(enabled) = value.get("canvas").and_then(serde_json::Value::as_bool) {
+        settings.canvas = enabled;
+    }
+    if let Some(mib) = value
+        .get("canvas_cache_mib")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|mib| u32::try_from(mib).ok())
+    {
+        settings.canvas_cache_mib = mib;
     }
     let mut color_fidelity = ColorFidelitySettings::default();
     if let Some(key) = value
@@ -944,6 +969,15 @@ pub fn load_client_settings(
         .and_then(arcen_input::text::TypingMode::from_token)
     {
         settings.typing_mode = mode;
+    }
+    // `keyboard_capture`; a settings file with only the keyboard grab's
+    // token (`always`, `fullscreen`, `never`) keeps its meaning.
+    if let Some(policy) = ["keyboard_capture", "keyboard_grab"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .and_then(arcen_input::keyboard::KeyboardCapturePolicy::from_token)
+    {
+        settings.keyboard_capture = policy;
     }
     // `option_keys` knows Automatic; older builds wrote only
     // `option_key_mode`, their default included (see `from_settings`).
@@ -1023,6 +1057,10 @@ pub fn save_client_settings(
         settings.typing_mode.token().into(),
     );
     value.insert(
+        "keyboard_capture".to_string(),
+        settings.keyboard_capture.token().into(),
+    );
+    value.insert(
         "option_keys".to_string(),
         settings.option_key_mode.token().into(),
     );
@@ -1067,6 +1105,11 @@ pub fn save_client_settings(
         "exact_still_image".to_string(),
         settings.exact_still_image.into(),
     );
+    value.insert("canvas".to_string(), settings.canvas.into());
+    value.insert(
+        "canvas_cache_mib".to_string(),
+        settings.canvas_cache_mib.into(),
+    );
     value.insert(
         "tablet_mode_requested".to_string(),
         match settings.tablet_mode_requested {
@@ -1076,6 +1119,13 @@ pub fn save_client_settings(
         }
         .into(),
     );
+    for (key, action) in [
+        ("pen_barrel_button", settings.pen_buttons.barrel),
+        ("pen_lower_button", settings.pen_buttons.lower),
+        ("pen_upper_button", settings.pen_buttons.upper),
+    ] {
+        value.insert(key.to_string(), action.token().into());
+    }
     value.insert(
         "color_fidelity".to_string(),
         settings.color_fidelity.preset.key().into(),

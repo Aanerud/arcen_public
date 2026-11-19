@@ -7,13 +7,14 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arcen_keel::{ActivityHint, BgraFrame, EmitMode, IdleCadence};
+use arcen_keel::{BgraFrame, ExternalDamage};
+use arcen_media::canvas::serve::CanvasCapencArgs;
+use arcen_media::capenc_control::CapencControlCommand;
 use arcen_media::video::{
-    changed_bounds, convert_packed_rgb10_to_bgra8, union_regions, CaptureDamage, CaptureRegion,
-    EncoderBackend, FrameRegion, LiveChange, PackedRgb10Layout, RegionPolicy, ResolvedMediaPlan,
-    SoftwareH264Session, SoftwareSessionConfig, StageDamage,
+    changed_bounds, convert_packed_rgb10_to_bgra8, open_software_loop, union_regions,
+    CaptureDamage, CaptureRegion, EncoderBackend, FrameRegion, PackedRgb10Layout, RegionPolicy,
+    ResolvedMediaPlan, SoftwareLoop, SoftwareLoopConfig,
 };
-use arcen_media::ForcedKeyframe;
 use x11rb::connection::Connection as _;
 use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::randr::{self, ConnectionExt as _};
@@ -25,40 +26,29 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
-const SOFTWARE_MAX_WIDTH: u32 = 1920;
-const SOFTWARE_MAX_HEIGHT: u32 = 1200;
-const SOFTWARE_MAX_CAPTURE_BYTES: usize = 1920 * 1200 * 4;
+/// The software path's only size and rate bounds: OpenH264's own
+/// (`EncoderBackend::OpenH264`). The Pier's frame-rate governor holds a
+/// session at what the CPU encodes.
+const SOFTWARE_LIMITS: arcen_media::video::BackendLimits = EncoderBackend::OpenH264.contract();
+const SOFTWARE_MAX_WIDTH: u32 = SOFTWARE_LIMITS.max_width;
+const SOFTWARE_MAX_HEIGHT: u32 = SOFTWARE_LIMITS.max_height;
+const SOFTWARE_MAX_CAPTURE_BYTES: usize =
+    SOFTWARE_MAX_WIDTH as usize * SOFTWARE_MAX_HEIGHT as usize * 4;
 /// The wide path is budgeted in pixels, not as a 3840 by 2160 box: see
 /// `arcen_media::video::host_converted_capture_fits`.
 const WIDE_MAX_CAPTURE_BYTES: usize =
     arcen_media::video::HOST_CONVERTED_CAPTURE_MAX_PIXELS as usize * 4;
-const MAX_FPS: u32 = 30;
+const MAX_FPS: u32 = SOFTWARE_LIMITS.max_fps;
 const KEEPALIVE: Duration = Duration::from_secs(1);
-/// Bounded recovery keyframe interval for one region's activity scheduler.
-/// Long enough that a busy region's bitrate is unchanged in practice, short
-/// enough that a suppressed static region can never go without a complete
-/// picture for an unbounded time.
-const REGION_KEYFRAME_INTERVAL: Duration = Duration::from_secs(10);
-/// How long input/focus activity keeps a region responsive without new pixels.
-const REGION_INPUT_WAKE_GRACE: Duration = Duration::from_millis(100);
+/// XDamage rectangles kept between two pictures; more mark the whole
+/// picture.
+const MAX_DAMAGE_RECTS: usize = 256;
 const RED_MASK: u32 = 0x00ff_0000;
 const GREEN_MASK: u32 = 0x0000_ff00;
 const BLUE_MASK: u32 = 0x0000_00ff;
 static DAMAGE_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
 static SHM_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
 static SNAPSHOT_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LiveFramerateReconfigurePolicy {
-    force_idr: bool,
-}
-
-fn live_framerate_reconfigure_policy() -> LiveFramerateReconfigurePolicy {
-    // OpenH264 applies ENCODER_OPTION_FRAME_RATE live without requiring a
-    // recovery point; forcing IDR here made Detail-priority telemetry cadence
-    // visible as once-per-second keyframe pops on the Software pipeline.
-    LiveFramerateReconfigurePolicy { force_idr: false }
-}
 
 fn warn_once(flag: &AtomicBool, message: impl FnOnce() -> String) {
     if flag
@@ -323,6 +313,10 @@ pub(crate) struct X11Capture {
     /// What changed since the last picture, in output pixels. Cell because
     /// event polling reads through `&self`.
     pending: std::cell::Cell<CaptureDamage>,
+    /// The XDamage rectangles since the last [`Self::take_damage_into`],
+    /// for Keel's narrowed hashing (the software loop); `None` once more
+    /// arrived than are worth keeping.
+    rects: std::cell::RefCell<Option<Vec<(i64, i64, u64, u64)>>>,
     transfer: Transfer,
     /// A second MIT-SHM segment for [`Self::capture_wide_diffed`], so the
     /// last whole frame stays readable while the next one is read.
@@ -567,6 +561,7 @@ impl X11Capture {
             pixel_format,
             purpose,
             damage,
+            rects: std::cell::RefCell::new(Some(Vec::new())),
             pending: std::cell::Cell::new(CaptureDamage::new(
                 usize::from(rect.width),
                 usize::from(rect.height),
@@ -664,6 +659,24 @@ impl X11Capture {
                         u64::from(event.area.height),
                     );
                     self.pending.set(pending);
+                    {
+                        let mut rects = self.rects.borrow_mut();
+                        let keep = rects
+                            .as_ref()
+                            .is_some_and(|rects| rects.len() < MAX_DAMAGE_RECTS);
+                        if keep {
+                            if let Some(rects) = rects.as_mut() {
+                                rects.push((
+                                    i64::from(event.area.x) - i64::from(self.rect.x),
+                                    i64::from(event.area.y) - i64::from(self.rect.y),
+                                    u64::from(event.area.width),
+                                    u64::from(event.area.height),
+                                ));
+                            }
+                        } else {
+                            *rects = None;
+                        }
+                    }
                     if let Some(damage) = self.damage {
                         self.connection
                             .damage_subtract(damage, 0u32, 0u32)
@@ -744,6 +757,31 @@ impl X11Capture {
             }
         };
         Ok(bytes)
+    }
+
+    /// Moves the XDamage rectangles since the last call into `damage` for
+    /// Keel. `false` without XDamage: nothing is vouched for, so Keel
+    /// hashes the whole picture.
+    pub(crate) fn take_damage_into(&self, damage: &mut ExternalDamage) -> bool {
+        if self.damage.is_none() {
+            return false;
+        }
+        let rects = self.rects.replace(Some(Vec::new()));
+        damage.reset();
+        match rects {
+            Some(rects) => {
+                for (x, y, width, height) in rects {
+                    damage.mark_rect_bounds(
+                        x,
+                        y,
+                        x.saturating_add(i64::try_from(width).unwrap_or(i64::MAX)),
+                        y.saturating_add(i64::try_from(height).unwrap_or(i64::MAX)),
+                    );
+                }
+            }
+            None => damage.mark_full_frame(),
+        }
+        true
     }
 
     /// Whether this capture can read a rectangle on its own: only through
@@ -1437,17 +1475,7 @@ fn run_admission_probe(
     code
 }
 
-/// The submission a Keel cadence decision stands for, for the pacing window.
-const fn submission_mode(mode: EmitMode) -> crate::linux_policy::SubmissionMode {
-    use crate::linux_policy::SubmissionMode;
-    match mode {
-        EmitMode::FirstFrame => SubmissionMode::FirstFrame,
-        EmitMode::Idr => SubmissionMode::Idr,
-        EmitMode::Activity => SubmissionMode::Activity,
-        EmitMode::Keepalive => SubmissionMode::Keepalive,
-    }
-}
-
+#[allow(clippy::too_many_lines)]
 fn run_inner(args: Vec<String>) -> i32 {
     let output_index = args
         .get(1)
@@ -1464,10 +1492,9 @@ fn run_inner(args: Vec<String>) -> i32 {
     };
     // The single resolved colour contract for this run (see
     // `crate::requested_color`): an explicit `variant=<id>` wins over the
-    // legacy default, and it is this one value — never a separately
-    // re-derived `ColorSpec::legacy(...)` — that must reach both
-    // `software_plan`'s READY line and the `ColorTransform` the BGRA -> I420
-    // conversion below actually applies, so the two cannot disagree.
+    // legacy default, and it is this one value that reaches both
+    // `software_plan`'s READY line and the conversion the full-frame session
+    // applies, so the two cannot disagree.
     let color = match crate::requested_color(&args, false) {
         Ok(color) => color,
         Err(error) => return failure_code(&error, 2),
@@ -1483,6 +1510,10 @@ fn run_inner(args: Vec<String>) -> i32 {
     let qp_map_policy = match crate::requested_qp_map(&args) {
         Ok(policy) => policy,
         Err(error) => return failure_code(&format!("invalid qp-map: {error}"), 2),
+    };
+    let canvas = match CanvasCapencArgs::from_args(&args) {
+        Ok(canvas) => canvas,
+        Err(error) => return failure_code(&error, 2),
     };
     if priority != arcen_media::video::MotionPriority::Detail {
         crate::log("software-h264 ignores priority=motion; motion preference applies to NVENC rate control");
@@ -1502,7 +1533,7 @@ fn run_inner(args: Vec<String>) -> i32 {
         || cursor.include_cursor()
     {
         return failure_code(
-            "software-h264 requires h264/yuv420 8-bit, local cursor, and 1..=30 fps",
+            "software-h264 requires h264/yuv420 8-bit, local cursor, and 1..=60 fps",
             2,
         );
     }
@@ -1510,7 +1541,10 @@ fn run_inner(args: Vec<String>) -> i32 {
         Ok(options) => options,
         Err(error) => return failure_code(&error, 2),
     };
-    let framed = crate::framed_output_from_args(&args);
+    let framed_v1 = crate::framed_output_from_args(&args);
+    let framed_v2 = args
+        .iter()
+        .any(|arg| arg == arcen_media::capenc_stream::FRAMED_OUTPUT_V2);
     let capture = match X11Capture::connect_software(output_index) {
         Ok(capture) => capture,
         Err(error) => {
@@ -1521,79 +1555,65 @@ fn run_inner(args: Vec<String>) -> i32 {
         return run_admission_probe(capture, fps, color, options);
     }
     let mut capture = capture;
-    let width = u32::from(capture.rect.width);
-    let height = u32::from(capture.rect.height);
-    let width_usize = usize::from(capture.rect.width);
-    let height_usize = usize::from(capture.rect.height);
-    // The session's BGRA -> I420 conversion applies the same colour contract
-    // `software_plan` announces in the READY line, not an implicit default.
-    let mut session = match SoftwareH264Session::new(SoftwareSessionConfig::for_stream(
+    let mut width = u32::from(capture.rect.width);
+    let mut height = u32::from(capture.rect.height);
+    let video = color.video(arcen_media::VideoCodec::H264);
+    let loop_config = |width: u32, height: u32, fps: u32| SoftwareLoopConfig {
         width,
         height,
         fps,
-        color.video(arcen_media::VideoCodec::H264),
-    )) {
-        Ok(session) => session,
-        Err(error) => {
-            return failure_code(&format!("OpenH264 initialization failed: {error}"), 4);
-        }
+        video,
+        canvas,
+        start_bitrate_bps: None,
+        keepalive: KEEPALIVE,
     };
-    let (start_bps, ceiling_bps) = session.bitrate_bounds();
+    let SoftwareLoop {
+        mut encode,
+        bitrate_bounds: (start_bps, ceiling_bps),
+        threading,
+    } = match open_software_loop(loop_config(width, height, fps)) {
+        Ok(built) => built,
+        Err(error) => return failure_code(&error, 4),
+    };
     let plan = match software_plan(width, height, fps, cursor, color) {
         Ok(plan) => plan,
         Err(error) => return failure_code(&error, 2),
     };
     let control = crate::spawn_control_thread("OpenH264");
     crate::log(&format!(
-        "OpenH264 software bitrate policy: start={start_bps}bps ceiling={ceiling_bps}bps"
+        "OpenH264 software bitrate policy: start={start_bps}bps ceiling={ceiling_bps}bps {threading}"
     ));
-    let mut cadence = IdleCadence::new(KEEPALIVE);
-    cadence.note_frame();
+    match canvas {
+        Some(canvas) => crate::log(&format!(
+            "software loop: canvas=on monitor={} max_surfaces={} cache_bytes={} cpu_share={}",
+            canvas.monitor_id,
+            canvas.terms.max_surfaces_per_monitor,
+            canvas.terms.cache_bytes,
+            canvas.cpu_share.percent()
+        )),
+        None => crate::log("software loop: canvas=off (full frames)"),
+    }
     let mut interval = crate::frame_interval_from_fps(fps);
     let mut next_tick = Instant::now();
-    let mut last_emit = Instant::now();
     let mut ready = false;
     let mut stdout = std::io::stdout();
     let mut last_stats = Instant::now();
     let mut emitted = 0u64;
     let mut bytes = 0u64;
-    let mut modeset_idr = false;
     let mut bgra_scratch = Vec::new();
-    // A serial loop: it looks at the screen only between its own encodes, so
+    let mut damage_pending = true;
+    let mut os_damage = arcen_keel::ExternalDamage::new(width as usize, height as usize).ok();
+    // A serial loop: it looks at the screen only between its own ticks, so
     // the stats line carries its pacing for the Pier's frame-rate governor
     // (`arcen_media::video::SerialPacing`).
     let mut pacing = crate::linux_policy::PacingWindow::default();
     let mut busy = Duration::ZERO;
     let mut paced_fps = fps;
-    // Region-owned activity scheduler (`arcen_media::RegionActivityScheduler`).
-    // It contains the Keel damage tracker that skips unchanged rows during
-    // BGRA→I420 conversion — matching the Windows MF path — and additionally
-    // turns that same single hash pass into a serve/skip decision so a static
-    // region stops paying for conversion, encode, and emission between its
-    // bounded refresh and keyframe deadlines.
-    let mut schedule = match crate::region_schedule::CaptureRegionScheduler::try_new(
-        output_index,
-        width_usize,
-        height_usize,
-        fps,
-        KEEPALIVE,
-        REGION_KEYFRAME_INTERVAL,
-        REGION_INPUT_WAKE_GRACE,
-    ) {
-        Ok(schedule) => schedule,
-        Err(error) => {
-            crate::log(&format!(
-                "OpenH264: region activity scheduler init failed ({error}); falling back to full-frame conversion"
-            ));
-            // Degraded mode reports full damage and serves every frame, which
-            // is exactly the pre-activity full-conversion behaviour.
-            crate::region_schedule::CaptureRegionScheduler::degraded(interval)
-        }
-    };
+    let mut last_error: Option<Instant> = None;
 
     while !control.stop_requested() {
         match capture.poll_activity() {
-            Ok(Activity::Damage) => cadence.note_frame(),
+            Ok(Activity::Damage) => damage_pending = true,
             Ok(Activity::Modeset) => {
                 capture = match capture.recreate() {
                     Ok(capture) => capture,
@@ -1601,155 +1621,126 @@ fn run_inner(args: Vec<String>) -> i32 {
                         return failure_code(&format!("X11 modeset recreation failed: {error}"), 3);
                     }
                 };
-                cadence.reset();
-                cadence.note_frame();
-                session.force_idr();
-                modeset_idr = true;
-                // Modeset invalidates the previous frame buffer and every
-                // activity/deadline observation derived from it.
-                schedule.reset();
-            }
-            Ok(Activity::None) => {
-                if !capture.has_damage() {
-                    cadence.note_frame();
+                damage_pending = true;
+                let (new_width, new_height) = (
+                    u32::from(capture.rect.width),
+                    u32::from(capture.rect.height),
+                );
+                if (new_width, new_height) == (width, height) {
+                    encode.request_recovery();
+                } else {
+                    // A new size is a new loop: a new canvas generation or
+                    // a new session at the new size.
+                    (width, height) = (new_width, new_height);
+                    encode = match open_software_loop(loop_config(width, height, paced_fps)) {
+                        Ok(built) => built.encode,
+                        Err(error) => return failure_code(&error, 4),
+                    };
+                    os_damage =
+                        arcen_keel::ExternalDamage::new(width as usize, height as usize).ok();
                 }
             }
+            Ok(Activity::None) => {}
             Err(error) => return failure_code(&error, 3),
         }
 
         let now = Instant::now();
         if let Some(fps) = control.take_framerate_fps() {
-            match session.reconfigure_framerate(fps) {
-                Ok(LiveChange::Applied(fps)) => {
-                    interval = crate::frame_interval_from_fps(fps);
-                    paced_fps = fps;
-                    if live_framerate_reconfigure_policy().force_idr {
-                        session.force_idr();
-                    }
-                    crate::log(&format!("OpenH264 live framerate reconfigured: fps={fps}"));
-                }
-                Ok(LiveChange::Unchanged) => {}
-                Err(error) => crate::log(&format!(
-                    "OpenH264 live framerate reconfigure failed: {error}"
-                )),
+            if encode.set_frame_rate(fps) {
+                interval = crate::frame_interval_from_fps(fps);
+                paced_fps = fps;
+                crate::log(&format!("OpenH264 live framerate reconfigured: fps={fps}"));
             }
         }
         if let Some(bps) = control.take_bitrate_bps() {
-            match session.reconfigure_bitrate(bps) {
-                Ok(LiveChange::Applied(bps)) => crate::log(&format!(
-                    "OpenH264 live bitrate reconfigured: target={bps}bps"
-                )),
-                Ok(LiveChange::Unchanged) => {}
-                Err(error) => crate::log(&format!(
-                    "OpenH264 live bitrate reconfigure failed: {error}"
-                )),
+            encode.set_link_bitrate(bps);
+            crate::log(&format!("software loop live bitrate: target={bps}bps"));
+        }
+        for command in control.take_canvas_controls() {
+            match command {
+                CapencControlCommand::CanvasInput { x, y } => encode.note_input(x, y, now),
+                command => {
+                    if let Some(message) = command.canvas_control() {
+                        encode.on_control(&message);
+                    }
+                }
             }
         }
+        if control.take_idr() {
+            encode.request_recovery();
+        }
+        if control.take_input_activity() {
+            damage_pending = true;
+        }
         if now >= next_tick {
-            let idr_requested = control.take_idr();
-            let decision = cadence.decision(idr_requested || modeset_idr, last_emit.elapsed());
-            pacing.record_due(decision.map(submission_mode));
-            if let Some(mode) = decision {
-                if matches!(mode, EmitMode::Idr) || idr_requested || modeset_idr {
-                    session.force_idr();
-                }
+            // Without XDamage nothing is vouched for: every tick looks.
+            let wanted = encode.wants_frame(now, damage_pending || !capture.has_damage());
+            pacing.record_due(wanted.then_some(crate::linux_policy::SubmissionMode::Activity));
+            if wanted {
                 let work_started = Instant::now();
-                let mut service_attempted = false;
-                let encoded = {
+                let narrowed = os_damage
+                    .as_mut()
+                    .is_some_and(|damage| capture.take_damage_into(damage));
+                damage_pending = false;
+                let tick = {
                     let source = match capture.capture_bgra(&mut bgra_scratch) {
                         Ok(source) => source,
                         Err(error) => return failure_code(&error, 3),
                     };
-                    // One hash pass over this frame produces both the 16×16
-                    // damage map that drives selective BGRA→I420 conversion
-                    // (matching the Windows MF path) and this region's
-                    // serve/skip decision. Host-forced keyframes always win
-                    // over measured activity.
-                    let forced_keyframe = if modeset_idr {
-                        Some(ForcedKeyframe::Recovery)
-                    } else if idr_requested || matches!(mode, EmitMode::Idr) {
-                        Some(ForcedKeyframe::ClientRequest)
-                    } else if matches!(mode, EmitMode::FirstFrame) {
-                        Some(ForcedKeyframe::Startup)
-                    } else {
-                        None
-                    };
-                    let service = schedule.observe(
+                    encode.tick(
                         source,
+                        if narrowed { os_damage.as_ref() } else { None },
                         now,
-                        forced_keyframe,
-                        control.take_input_activity(),
-                        ActivityHint::None,
-                    );
-                    let fresh_mode = !matches!(mode, EmitMode::Keepalive);
-                    if fresh_mode && (!service.serve || service.summary.is_clean()) {
-                        // The deadline found the same pixels.
-                        pacing.note_unchanged_content();
-                    }
-                    if service.serve {
-                        service_attempted = true;
-                        if service.keyframe {
-                            session.force_idr();
-                        }
-                        let summary = service.summary;
-                        // Baseline, recovery and full-damage frames rebuild
-                        // every plane; otherwise only dirty block-row bands
-                        // (a degraded scheduler has no map: convert fully).
-                        // A clean mandatory refresh re-encodes the retained
-                        // planes; nothing changed to convert.
-                        let damage = if service.keyframe || summary.is_full_damage() {
-                            StageDamage::Full
-                        } else if summary.is_clean() {
-                            StageDamage::Clean
-                        } else {
-                            schedule
-                                .damage_map()
-                                .map_or(StageDamage::Full, StageDamage::Rows)
-                        };
-                        if let Err(error) = session.stage(source, damage) {
-                            return failure_code(&format!("stage BGRA into I420: {error}"), 3);
-                        }
-                        match session.encode() {
-                            Ok(encoded) => encoded,
-                            Err(error) => {
-                                return failure_code(
-                                    &format!("OpenH264 encode failed: {error}"),
-                                    5,
-                                );
-                            }
-                        }
-                    } else {
-                        // Static region: no conversion, no encode, no wire
-                        // bytes. The bounded max-idle refresh and keyframe
-                        // deadlines still force a service on their own
-                        // schedule, so suppression can never starve it.
-                        None
-                    }
+                    )
                 };
                 busy = busy.saturating_add(work_started.elapsed());
-                if let Some(access_unit) = encoded {
-                    if !ready {
-                        if let Err(error) = crate::announce_ready_from(
-                            plan,
-                            Some(arcen_media::video::CaptureBackend::XShm),
-                        ) {
-                            return failure_code(&format!("emit READY: {error}"), 5);
+                match tick {
+                    Ok(tick) => {
+                        if tick.records.is_empty() {
+                            // The tick found the same pixels.
+                            pacing.note_unchanged_content();
                         }
-                        ready = true;
+                        if let Some(event) = tick.event {
+                            crate::log(&format!("canvas governor: {event:?}"));
+                        }
+                        if let Some((generation, digest)) = tick.digest {
+                            crate::log(&format!(
+                                "canvas mirror digest {}",
+                                arcen_media::canvas::digest_fields(generation, &digest)
+                            ));
+                        }
+                        for record in &tick.records {
+                            if !ready {
+                                if let Err(error) = crate::announce_ready_from(
+                                    plan,
+                                    Some(arcen_media::video::CaptureBackend::XShm),
+                                ) {
+                                    return failure_code(&format!("emit READY: {error}"), 5);
+                                }
+                                ready = true;
+                            }
+                            if crate::write_loop_record(&mut stdout, record, framed_v1, framed_v2)
+                                .is_err()
+                            {
+                                return 0;
+                            }
+                            bytes = bytes.saturating_add(record.bytes().len() as u64);
+                        }
+                        if !tick.records.is_empty() {
+                            emitted = emitted.saturating_add(1);
+                        }
                     }
-                    if crate::write_access_unit(&mut stdout, access_unit.bytes, framed).is_err() {
-                        return 0;
+                    Err(arcen_media::canvas::LoopError::Geometry) => {
+                        return failure_code("software loop: capture size changed", 3);
                     }
-                    emitted = emitted.saturating_add(1);
-                    bytes = bytes.saturating_add(access_unit.bytes.len() as u64);
-                    cadence.on_submitted();
-                    last_emit = now;
-                    modeset_idr = false;
-                } else if service_attempted {
-                    // The encoder buffered this frame instead of returning an
-                    // access unit. Re-arm the region so its deadlines are not
-                    // consumed and a pending keyframe is not downgraded.
-                    schedule.note_service_failed();
+                    Err(error) => {
+                        // The loop recovers by itself at its next tick.
+                        damage_pending = true;
+                        if last_error.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                            crate::log(&format!("software loop tick failed: {error}"));
+                            last_error = Some(Instant::now());
+                        }
+                    }
                 }
             }
             next_tick += interval;
@@ -1758,17 +1749,18 @@ fn run_inner(args: Vec<String>) -> i32 {
             }
         }
         if last_stats.elapsed() >= Duration::from_secs(1) {
+            let canvas_on = encode.is_canvas();
+            let state = encode.governor_state();
             crate::log(&format!(
-                "enc_fps={emitted} kbps={} backend=openh264 damage_source={} keel_enabled={} modeset_idr={modeset_idr} {}{}",
+                "enc_fps={emitted} kbps={} backend=openh264 damage_source={} keel_enabled=true {} {}",
                 bytes.saturating_mul(8) / 1000,
                 if capture.has_damage() {
                     "xdamage"
                 } else {
                     "full_poll"
                 },
-                schedule.is_active(),
-                schedule.telemetry_fragment(),
                 pacing.verdict_fields(fps, paced_fps, busy, last_stats.elapsed()),
+                encode.take_stats().line(canvas_on, state),
             ));
             emitted = 0;
             bytes = 0;
@@ -1796,15 +1788,6 @@ mod tests {
             .expect("Philips layout");
         assert_eq!(secondary.byte_len, 1800 * 1130 * 4);
         assert!(checked_layout(1920, 1080, 24, 24, 32, SOFTWARE_MAX_CAPTURE_BYTES).is_err());
-    }
-
-    #[test]
-    fn live_framerate_reconfigure_does_not_request_idr() {
-        assert_eq!(
-            live_framerate_reconfigure_policy(),
-            LiveFramerateReconfigurePolicy { force_idr: false },
-            "OpenH264 ENCODER_OPTION_FRAME_RATE is a live rate-control update, not a recovery point"
-        );
     }
 
     /// Depth 30 is accepted and lays out exactly like depth 24, because both
@@ -1938,6 +1921,26 @@ mod tests {
                 y: 0,
                 width: 2560,
                 height: 1600,
+            },
+            CapturePurpose::Software,
+        )
+        .is_ok());
+        assert!(validate_capture_geometry(
+            CaptureRect {
+                x: 0,
+                y: 0,
+                width: 3840,
+                height: 2160,
+            },
+            CapturePurpose::Software,
+        )
+        .is_ok());
+        assert!(validate_capture_geometry(
+            CaptureRect {
+                x: 0,
+                y: 0,
+                width: 3842,
+                height: 2160,
             },
             CapturePurpose::Software,
         )

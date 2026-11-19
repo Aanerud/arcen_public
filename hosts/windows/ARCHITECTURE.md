@@ -8,9 +8,10 @@ The native Rust control plane for a Windows workstation host: a QUIC/TLS 1.3 ser
 authentication (`LogonUserW`), cold first-login through the Credential Provider or attach
 to the authenticated user's interactive desktop session, `SendInput` injection, exact
 per-encoder display mirroring with transactional restore, WASAPI system-audio capture, and
-capture/encode via the `arcen-capenc` engine — DXGI/WGC → NVENC on NVIDIA hosts, WGC →
-source-built OpenH264 on non-NVIDIA hosts (VMware SVGA, Intel-only). No Python,
-no ffmpeg.
+capture/encode via the `arcen-capenc` engine — DXGI/WGC → NVENC on NVIDIA hosts,
+DXGI/WGC → GPU NV12 → a vendor's Media Foundation hardware encoder MFT (**Alpha**) on
+other GPUs that register one and pass admission, WGC → source-built OpenH264 otherwise
+(VMware SVGA, no proven hardware MFT). No Python, no ffmpeg.
 
 ## How it's grounded
 
@@ -706,9 +707,41 @@ in `display.rs` takes a `DisplayPolicy`:
   an unaligned current mode cannot become the terminal fallback. The applied size is
   honestly reported in ServerHello. Topology is left as-is.
 
-The shipped Windows graph is NVENC plus source-built OpenH264. Media Foundation
-remains an optional standalone comparison feature in `arcen-capenc`, but is not
-accepted by Windows Pier configuration or compiled into the product graph.
+The shipped Windows graph is NVENC, the Media Foundation hardware encoder
+(Alpha) and source-built OpenH264, ranked in that order by the shared
+`EncoderRequest::resolve_auto_ranked`. The comparison-only Media Foundation
+*software* MFT path was removed once the hardware path existed.
+
+### Media Foundation hardware encoder (Alpha)
+
+For a GPU without NVENC (Intel Quick Sync, AMD AMF, any vendor that registers a
+hardware encoder MFT). Auto serves SDR only; Grading, HDR and colour-fidelity
+requests are refused with `gpu_format_unsupported`
+(`arcen_media::video::eight_bit_hardware_refusal`).
+
+- **Selection.** Before Auto resolves, the agent runs an admission probe in a
+  child (`arcen-pier capenc … encoder=mf-hw mf-hw-admit=WxH
+  mf-hw-codecs=h264,h265`, at most 8 s): one real encode per codec on the
+  session's adapter, whose SPS the shared `prove_encoded_access_unit` must
+  accept (H.264 Constrained Baseline/Main/High or HEVC Main, 4:2:0 8-bit, the
+  asked size and colour). Only proven codecs are advertised. The probe runs
+  only when NVENC is not the answer and `platform.media_foundation_hardware`
+  is on (default). `video.encoder: "mf-hw"` pins it.
+- **Pipeline.** DDA (after its real-frame probe) or WGC BGRA8 → GPU copy into a
+  landing texture → D3D11 video processor BGRA → NV12 (BT.709 or BT.601,
+  limited or full, as the plan says) → the encoder MFT through an
+  `IMFDXGIDeviceManager` on the capture device, so no frame crosses host
+  memory. The MFT is enumerated with `MFTEnum2` and the capture adapter's LUID,
+  driven through its async event model, with low-latency mode, CBR with a VBV
+  buffer, no B-frames, on-demand IDR and four slices where exposed. The first
+  access unit's SPS is proven again before READY; READY names
+  `backend=media-foundation-hw`, `conversion=gpu`.
+- **Fallback.** A typed `UNAVAILABLE` from the live child sends Auto to
+  OpenH264, as an NVENC failure does. VMware SVGA and other adapters without
+  a hardware MFT enumerate nothing and fall through cleanly; the lab switch
+  `ARCEN_LAB_MF_HW_ENUM=none` (user environment) simulates that.
+- **Not yet.** Multi-monitor sessions on such a host run every display on
+  OpenH264; Intel and AMD qualification by external testers is pending.
 
 For an exact isolated lease, `ServerHello.supports_display_update` is true only
 when the live display backend also proves an owned NVAPI exact-timing snapshot
@@ -816,8 +849,8 @@ existed.
   packaged Pier. The Windows installer upgrade path was also rerun after the
   localized ACL fix.
 - **Next Windows work:** production Authenticode and driver signing, broader
-  non-NVIDIA physical acceptance, and optional Media Foundation comparison
-  improvements. These do not merge or replace the three native NVENC capture
+  non-NVIDIA physical acceptance, and Intel/AMD qualification of the Media
+  Foundation hardware encoder (Alpha). These do not merge or replace the three native NVENC capture
   pipelines documented below.
 - **Cert note:** each Windows Pier needs a TLS certificate whose SAN covers
   every configured connection name; enterprise PEM is administrator-managed,

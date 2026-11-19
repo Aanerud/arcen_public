@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use arcen_deck_core::decode::VideoDecoderFactory;
 use arcen_deck_core::present::{
-    LayerColourState, PresentOutcome, PresentableFrame, PresenterFailure, PresenterFailureStage,
-    PresenterPipeline, PresenterTelemetryDelta, VideoPresenterSink,
+    CanvasExecution, CanvasExecutorFacts, CanvasOutcome, LayerColourState, PresentOutcome,
+    PresentableFrame, PresenterFailure, PresenterFailureStage, PresenterPipeline,
+    PresenterTelemetryDelta, VideoPresenterSink,
 };
 use arcen_deck_core::runtime::media_worker as core;
 use tokio::sync::mpsc;
@@ -26,6 +27,7 @@ use crate::ui::video_metal_layer::{
     current_host_time, DedicatedEightBitLayerFrame, DedicatedEightBitPresentationStatus,
     DedicatedEightBitVideoPresenter, DedicatedLayerFrame, DedicatedLayerOutcome,
     DedicatedPresentationStatus, DedicatedPresenterTelemetryDelta, DedicatedVideoPresenter,
+    EightBitLayerSource,
 };
 
 pub use arcen_deck_core::runtime::media_worker::{
@@ -93,6 +95,14 @@ fn host_time_at(arrival: Instant) -> Duration {
 impl VideoPresenterSink for DedicatedVideoPresenter {
     type NativeFrame = NativePixelBuffer;
 
+    // Grading and HDR never carry a canvas (ADR 0028: the Software
+    // contract's eight-bit pipeline only).
+    const CANVAS_EXECUTOR: Option<CanvasExecutorFacts> = None;
+
+    fn execute(&mut self, _canvas: &CanvasExecution<'_, '_, NativePixelBuffer>) -> CanvasOutcome {
+        CanvasOutcome::Unsupported
+    }
+
     fn pipeline(&self) -> PresenterPipeline {
         PresenterPipeline::TenBit
     }
@@ -142,6 +152,29 @@ impl VideoPresenterSink for DedicatedVideoPresenter {
 impl VideoPresenterSink for DedicatedEightBitVideoPresenter {
     type NativeFrame = NativePixelBuffer;
 
+    // The Metal canvas executor (`canvas_metal.rs`, ADR 0028). Off macOS
+    // there is none: that build never advertises `canvas_v1`.
+    #[cfg(target_os = "macos")]
+    const CANVAS_EXECUTOR: Option<CanvasExecutorFacts> =
+        Some(crate::ui::canvas_metal::EXECUTOR_FACTS);
+    #[cfg(not(target_os = "macos"))]
+    const CANVAS_EXECUTOR: Option<CanvasExecutorFacts> = None;
+
+    #[cfg(target_os = "macos")]
+    fn execute(&mut self, canvas: &CanvasExecution<'_, '_, NativePixelBuffer>) -> CanvasOutcome {
+        self.execute_canvas(canvas)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn execute(&mut self, _canvas: &CanvasExecution<'_, '_, NativePixelBuffer>) -> CanvasOutcome {
+        CanvasOutcome::Unsupported
+    }
+
+    #[cfg(target_os = "macos")]
+    fn take_canvas_readback(&mut self) -> Option<arcen_deck_core::present::CanvasReadback> {
+        Self::take_canvas_readback(self)
+    }
+
     fn pipeline(&self) -> PresenterPipeline {
         PresenterPipeline::EightBit
     }
@@ -150,7 +183,7 @@ impl VideoPresenterSink for DedicatedEightBitVideoPresenter {
     #[cfg_attr(not(target_os = "macos"), allow(unreachable_code, unused_variables))]
     fn present(&mut self, frame: &PresentableFrame<NativePixelBuffer>) -> PresentOutcome {
         let layer_frame = DedicatedEightBitLayerFrame {
-            pixel_buffer: frame.picture.clone(),
+            source: EightBitLayerSource::Picture(frame.picture.clone()),
             contract: frame.contract.into(),
             arrival_host_time: host_time_at(frame.arrival),
             source_fps: frame.source_fps,

@@ -142,7 +142,10 @@ pub enum DeliveryMechanism {
 ///
 /// | Byte(s)     | Frame kind              | Class             |
 /// |-------------|-------------------------|-------------------|
-/// | 0x01–0x05   | Video (full/partial/codec) | `MediaLowLatency` |
+/// | 0x01, 0x03–0x09 | Video (full/codec/region) | `MediaLowLatency` |
+/// | 0x0A, 0x0D  | Refine fence/barrier    | `MediaLowLatency` |
+/// | 0x0B, 0x0C  | Refine tile/digest      | `Control`         |
+/// | 0x0E        | Canvas reset/frame      | `MediaReliable`   |
 /// | 0x10        | Audio (downstream)      | `MediaLowLatency` |
 /// | 0x11        | `AudioUpstream` (mic)   | `MediaLowLatency` |
 /// | 0x20        | Clipboard               | `Control`         |
@@ -160,7 +163,6 @@ pub fn reliability_class_for_frame_byte(frame_type_byte: u8) -> ReliabilityClass
     match FrameType::try_from(frame_type_byte) {
         Ok(
             FrameType::VideoFull
-            | FrameType::VideoPartial
             | FrameType::VideoH264
             | FrameType::VideoH265
             | FrameType::VideoAv1
@@ -173,6 +175,9 @@ pub fn reliability_class_for_frame_byte(frame_type_byte: u8) -> ReliabilityClass
             | FrameType::Audio
             | FrameType::AudioUpstream,
         ) => ReliabilityClass::MediaLowLatency,
+        // A canvas record changes Deck state that later records build on
+        // (ADR 0028): it is never discarded and never a datagram.
+        Ok(FrameType::Canvas) => ReliabilityClass::MediaReliable,
         Ok(
             FrameType::Clipboard
             | FrameType::RefineTiles
@@ -1299,13 +1304,26 @@ mod routing_tests {
 
     #[test]
     fn video_bytes_map_to_media_low_latency() {
-        for byte in 0x01u8..=0x05 {
+        for byte in [0x01u8, 0x03, 0x04, 0x05] {
             assert_eq!(
                 reliability_class_for_frame_byte(byte),
                 ReliabilityClass::MediaLowLatency,
                 "frame byte 0x{byte:02X}"
             );
         }
+        // 0x02 is reserved: an unknown byte is a control frame.
+        assert_eq!(
+            reliability_class_for_frame_byte(0x02),
+            ReliabilityClass::Control
+        );
+    }
+
+    #[test]
+    fn canvas_records_are_reliable_media() {
+        assert_eq!(
+            reliability_class_for_frame_byte(0x0E),
+            ReliabilityClass::MediaReliable
+        );
     }
 
     #[test]

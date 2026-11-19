@@ -6,9 +6,7 @@
 
 use arcen_input::text::KeyboardMode;
 
-use arcen_input::keyboard::DeckShortcut;
-
-use super::wording::{DeckPlatform, chord};
+use super::wording::DeckPlatform;
 
 /// How long a typing notice stays over the video.
 pub const NOTICE_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
@@ -98,10 +96,9 @@ pub const fn characters_unavailable_notice(connected: bool) -> &'static str {
 pub fn keyboard_mode_notice(platform: DeckPlatform, mode: KeyboardMode) -> String {
     match mode {
         KeyboardMode::Characters => format!(
-            "Keyboard: Characters. Typed characters arrive as on {}; shortcuts stay keys. {} for \
-             physical keys.",
+            "Keyboard: Characters. Typed characters arrive as on {}; shortcuts stay keys. \
+             Connection ▸ Keyboard: Physical Keys switches back.",
             platform.this_machine(),
-            chord(platform, DeckShortcut::KeyboardPhysical),
         ),
         KeyboardMode::Physical => {
             "Keyboard: Physical keys. The remote keyboard layout decides each character.".to_owned()
@@ -114,16 +111,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_keyboard_mode_notice_names_this_machine_and_its_chord() {
+    fn the_keyboard_mode_notice_names_this_machine_and_the_menu_item() {
         assert_eq!(
             keyboard_mode_notice(DeckPlatform::Mac, KeyboardMode::Characters),
             "Keyboard: Characters. Typed characters arrive as on this Mac; shortcuts stay keys. \
-             Control-Command-K for physical keys."
+             Connection ▸ Keyboard: Physical Keys switches back."
         );
         assert_eq!(
             keyboard_mode_notice(DeckPlatform::Pc, KeyboardMode::Characters),
             "Keyboard: Characters. Typed characters arrive as on this PC; shortcuts stay keys. \
-             Ctrl+Win+K for physical keys."
+             Connection ▸ Keyboard: Physical Keys switches back."
         );
     }
 }

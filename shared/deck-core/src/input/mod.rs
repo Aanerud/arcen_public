@@ -19,6 +19,22 @@ pub mod viewport_pointer;
 #[cfg(feature = "runtime")]
 pub use session_input::{RELATIVE_UNAVAILABLE, SessionInput};
 
+/// What the host does with a pen's barrel buttons, from its hello, with
+/// this Deck's pen-button settings.
+#[must_use]
+pub fn pen_button_map(
+    hello: &arcen_protocol::messages::ServerHelloMsg,
+    settings: arcen_input::pen_buttons::PenButtonSettings,
+) -> arcen_input::pen_buttons::PenButtonMap {
+    arcen_input::pen_buttons::PenButtonMap {
+        settings,
+        host: arcen_input::pen_buttons::HostPenButtons::for_host(
+            hello.host_platform(),
+            hello.input_capabilities,
+        ),
+    }
+}
+
 /// What a session's input needs to know of its host, from its hello.
 #[must_use]
 pub fn host_input_facts(

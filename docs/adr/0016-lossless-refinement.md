@@ -120,7 +120,7 @@ platform code does not decide it:
 | Contract | v1 default once qualified | Notes |
 | --- | --- | --- |
 | Speed | **off, always** | Never touches the eight-bit fast path. |
-| Auto | off | Auto is 8-bit and presented through the ordinary SDR path. An eight-bit refinement for CPU-resident Auto captures (WGC BGRA8) is a possible later extension through the egui presenter, never NvFBC. |
+| Auto | off | Auto is 8-bit and presented through the ordinary SDR path. An eight-bit refinement for CPU-resident Auto captures (WGC BGRA8) is a possible later extension through the egui presenter, never NvFBC. A Software-contract Auto session to a canvas Deck carries eight-bit lossless tiles inside its canvas frames instead ([ADR 0028](0028-canvas-damage-first-software-pipeline.md)). |
 | Grading | **on** | The case this exists for. |
 | HDR | **on** | RGB domain in PQ/BT.2020, or YCbCr on the macOS Pier. |
 
@@ -635,6 +635,11 @@ the indices. The cursor is never part of a tile or a digest (R8).
 - If the Deck's 10-bit layer falls back to 8 bits, the Deck disables
   refinement for that monitor; the Pier stops sending tiles for it. A later
   re-enable starts a new generation.
+- **Amended by [ADR 0028](0028-canvas-damage-first-software-pipeline.md)
+  (2026-11-18):** eight-bit RGB tiles (`delta-zstd1` at depth 8, these tile
+  limits and this digest) are allowed inside canvas frames for the Software
+  contract, on the video lane, gated by `canvas_v1`. The refine lane, its
+  ten-bit plan and the gating above are unchanged.
 
 ### R8. Non-blocking amendments
 

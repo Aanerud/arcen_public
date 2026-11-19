@@ -359,7 +359,9 @@ const fn pen_pointer_type(tool: PenTool) -> i64 {
     }
 }
 
-/// Maps a barrel button index onto a mouse button.
+/// Maps a barrel button index onto a mouse button: the wire names what a
+/// button does (`PenEventMsg::buttons`, `pen_button_actions`), bit 0 the
+/// right click and bit 1 the middle click.
 ///
 /// Returns `None` for indices with no agreed meaning, so an unusual pen
 /// reports fewer buttons rather than inventing clicks the user did not make.
@@ -1155,10 +1157,10 @@ impl InputController {
                 PenEdge::TipDown => self.post_pen_button(1, true, point, annotations)?,
                 PenEdge::TipUp => self.post_pen_button(1, false, point, annotations)?,
                 PenEdge::Barrel { index, pressed } => {
-                    // Barrel one is the right button and barrel two the middle
-                    // one, which is what tablet drivers commonly do. Further
-                    // buttons have no agreed meaning, so they are dropped
-                    // rather than assigned an invented one.
+                    // Bit 0 is the right click and bit 1 the middle click
+                    // (the wire's meaning). Further buttons have no agreed
+                    // meaning, so they are dropped rather than assigned an
+                    // invented one.
                     if let Some(button) = barrel_button(index) {
                         self.post_pen_button(button, pressed, point, annotations)?;
                     }

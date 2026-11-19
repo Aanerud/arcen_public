@@ -36,7 +36,31 @@ pub struct PierConfig<P> {
     /// Physical USB devices bridged from a Deck (Native tablet).
     #[serde(default)]
     pub usb: UsbConfig,
+    /// What the desk shows and accepts while a Deck is attached.
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
     pub platform: P,
+}
+
+/// Privacy policy (`privacy`).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacyConfig {
+    /// `on`, or absent: while a Deck is attached to a desktop the desk's
+    /// monitors show, those monitors are blanked and the desk's keyboard
+    /// and mouse blocked, on every Pier; a desk that cannot be made private
+    /// refuses the attachment. `off`: the desk stays live (logged at start
+    /// and shown on the Deck). See
+    /// [`crate::console_session::desk_privacy::DeskPrivacyPolicy`].
+    pub desk: Option<crate::console_session::desk_privacy::DeskPrivacySetting>,
+}
+
+impl PrivacyConfig {
+    /// The effective desk privacy policy.
+    #[must_use]
+    pub const fn desk_policy(self) -> crate::console_session::desk_privacy::DeskPrivacyPolicy {
+        crate::console_session::desk_privacy::DeskPrivacyPolicy::resolve(self.desk)
+    }
 }
 
 /// USB bridging policy (`usb`).
@@ -237,6 +261,58 @@ pub struct VideoConfig {
     pub variant: Option<String>,
     pub fps: Option<u32>,
     pub encoder: Option<String>,
+    /// How the software pipeline spends the host (`video.software`).
+    pub software: Option<SoftwareVideoConfig>,
+}
+
+impl VideoConfig {
+    /// `video.software.cpu_share`, when the administrator set it.
+    #[must_use]
+    pub fn software_cpu_share_percent(&self) -> Option<u8> {
+        self.software
+            .and_then(|software| software.cpu_share)
+            .map(CpuSharePercent::percent)
+    }
+}
+
+/// `video.software`: how the software (canvas) pipeline spends the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SoftwareVideoConfig {
+    /// The share of the host's logical cores the software pipeline may
+    /// spend, a whole percentage from 1 to 100. Absent: 50 (the shared
+    /// default, `arcen_media::canvas::DEFAULT_CPU_SHARE_PERCENT`).
+    pub cpu_share: Option<CpuSharePercent>,
+}
+
+/// A whole percentage from 1 to 100, refused at load otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CpuSharePercent(u8);
+
+impl CpuSharePercent {
+    /// The percentage.
+    #[must_use]
+    pub const fn percent(self) -> u8 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CpuSharePercent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        u8::try_from(value)
+            .ok()
+            .filter(|percent| (1..=100).contains(percent))
+            .map(Self)
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "Pier config video.software.cpu_share {value}: expected a whole percentage from 1 to 100"
+                ))
+            })
+    }
 }
 
 /// The administrator's exact-still-image choice (`video.lossless_refinement`).
@@ -617,6 +693,33 @@ mod tests {
     }
 
     #[test]
+    fn desk_privacy_is_on_by_default_and_only_on_or_off_parse() {
+        let base = r#""audio":{"enabled":false,"compressed":false},
+            "microphone_input":{"enabled":false},"platform":{"name":"test"}"#;
+        let default: PierConfig<TestPlatform> =
+            serde_json::from_str(&format!("{{{base}}}")).expect("config without privacy");
+        assert!(default.privacy.desk_policy().enabled);
+        let off: PierConfig<TestPlatform> =
+            serde_json::from_str(&format!(r#"{{"privacy":{{"desk":"off"}},{base}}}"#))
+                .expect("privacy off");
+        assert!(!off.privacy.desk_policy().enabled);
+        for bad in [
+            r#"{"desk":"false"}"#,
+            r#"{"desk":false}"#,
+            r#"{"desk":"dim"}"#,
+            r#"{"monitors":"off"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<PierConfig<TestPlatform>>(&format!(
+                    r#"{{"privacy":{bad},{base}}}"#
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn first_login_setup_defaults_to_run_and_rejects_unknown_tokens() {
         use crate::desktop_session::first_login::FirstLoginSetup;
         let base = r#""audio":{"enabled":false,"compressed":false},
@@ -836,6 +939,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn software_cpu_share_is_a_percentage_and_absent_by_default() {
+        let parse = |video: &str| {
+            serde_json::from_str::<PierConfig<TestPlatform>>(&format!(
+                r#"{{"video":{video},"audio":{{"enabled":true,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},"platform":{{"name":"test"}}}}"#
+            ))
+        };
+        let unset = parse("{}").expect("valid config");
+        assert_eq!(unset.video.software_cpu_share_percent(), None);
+        let set = parse(r#"{"software":{"cpu_share":25}}"#).expect("valid config");
+        assert_eq!(set.video.software_cpu_share_percent(), Some(25));
+        for refused in [
+            r#"{"software":{"cpu_share":0}}"#,
+            r#"{"software":{"cpu_share":101}}"#,
+            r#"{"software":{"cpu_share":0.5}}"#,
+            r#"{"software":{"cpu_shares":50}}"#,
+        ] {
+            assert!(parse(refused).is_err(), "{refused}");
+        }
     }
 
     #[test]

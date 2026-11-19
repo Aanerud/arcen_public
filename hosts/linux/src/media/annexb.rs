@@ -21,6 +21,9 @@ pub struct AccessUnit {
     /// capenc wrote immediately before this access unit (ADR 0016); the
     /// video writer sends them first. Empty unless the session refines.
     pub refine: Vec<Vec<u8>>,
+    /// A canvas record (ADR 0028), not an access unit: `data` is the whole
+    /// wire frame (type `0x0E`) and `is_keyframe` marks a reset.
+    pub canvas: bool,
 }
 
 impl AccessUnit {
@@ -32,6 +35,24 @@ impl AccessUnit {
             is_keyframe,
             read_at: std::time::Instant::now(),
             refine: Vec::new(),
+            canvas: false,
         }
+    }
+
+    /// A canvas record read from the encoder now. Its kind decides whether
+    /// it is a recovery point (a reset supersedes what queued before it).
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::ErrorKind::InvalidData`] for bytes that are not a canvas
+    /// record's prefix.
+    pub fn canvas(data: Vec<u8>) -> std::io::Result<Self> {
+        let reset = arcen_media::canvas::serve::canvas_record_is_reset(&data).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "not a canvas record")
+        })?;
+        Ok(Self {
+            canvas: true,
+            ..Self::new(data, reset)
+        })
     }
 }

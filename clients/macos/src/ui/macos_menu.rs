@@ -137,6 +137,27 @@ mod platform {
                 push_menu_command(MenuCommand::KeyboardCharacters);
             }
 
+            #[unsafe(method(arcenSendKey:))]
+            fn send_key(&self, sender: *mut AnyObject) {
+                // The item's tag is its index in the shared Send Key list.
+                let tag: isize = if sender.is_null() {
+                    -1
+                } else {
+                    unsafe { msg_send![sender, tag] }
+                };
+                if let Some(key) = usize::try_from(tag)
+                    .ok()
+                    .and_then(|index| arcen_input::keyboard::SendKey::ALL.get(index))
+                {
+                    push_menu_command(MenuCommand::SendKey(*key));
+                }
+            }
+
+            #[unsafe(method(arcenKeyboardShortcuts:))]
+            fn keyboard_shortcuts(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::KeyboardShortcuts);
+            }
+
             #[unsafe(method(arcenTogglePointerLock:))]
             fn toggle_pointer_lock(&self, _sender: *mut AnyObject) {
                 push_menu_command(MenuCommand::TogglePointerLock);
@@ -373,22 +394,30 @@ mod platform {
             sel!(arcenReleaseModifiers:),
             None,
         ));
+        // Connection ▸ Send Key: the shared list (tag = its index).
+        let send_key_menu = make_menu(mtm, "Send Key");
+        for (index, key) in arcen_input::keyboard::SendKey::ALL.iter().enumerate() {
+            let item = action_item(
+                mtm,
+                &menu_target,
+                title(MenuCommand::SendKey(*key)),
+                sel!(arcenSendKey:),
+                None,
+            );
+            item.setTag(isize::try_from(index).unwrap_or(-1));
+            send_key_menu.addItem(&item);
+        }
+        add_submenu(mtm, &connection_menu, "Send Key", &send_key_menu);
         connection_menu.addItem(&NSMenuItem::separatorItem(mtm));
-        // Windows App's own chords for its scancode and Unicode modes;
-        // none of the three is a macOS or Deck shortcut.
+        // No key equivalents: Control-Option-Command-V, Control-Command-K
+        // and Control-Command-U reach the host (Release Stuck Keys, the
+        // keyboard modes and Paste as Keystrokes are menu items only).
         connection_menu.addItem(&action_item(
             mtm,
             &menu_target,
             title(MenuCommand::PasteAsKeystrokes),
             sel!(arcenPasteAsKeystrokes:),
-            Some(KeyEquivalent {
-                key: "v",
-                modifiers: Some(
-                    NSEventModifierFlags::Control
-                        | NSEventModifierFlags::Option
-                        | NSEventModifierFlags::Command,
-                ),
-            }),
+            None,
         ));
         let stop_typing = action_item(
             mtm,
@@ -405,10 +434,7 @@ mod platform {
             &menu_target,
             title(MenuCommand::KeyboardPhysical),
             sel!(arcenKeyboardPhysical:),
-            Some(KeyEquivalent {
-                key: "k",
-                modifiers: Some(NSEventModifierFlags::Control | NSEventModifierFlags::Command),
-            }),
+            None,
         );
         physical.setState(1);
         connection_menu.addItem(&physical);
@@ -417,10 +443,7 @@ mod platform {
             &menu_target,
             title(MenuCommand::KeyboardCharacters),
             sel!(arcenKeyboardCharacters:),
-            Some(KeyEquivalent {
-                key: "u",
-                modifiers: Some(NSEventModifierFlags::Control | NSEventModifierFlags::Command),
-            }),
+            None,
         );
         connection_menu.addItem(&characters);
         KEYBOARD_ITEMS.with(|items| {
@@ -504,6 +527,17 @@ mod platform {
             None,
         ));
         add_submenu(mtm, &menubar, "Session", &session_menu);
+
+        let help_menu = make_menu(mtm, "Help");
+        help_menu.addItem(&action_item(
+            mtm,
+            &menu_target,
+            title(MenuCommand::KeyboardShortcuts),
+            sel!(arcenKeyboardShortcuts:),
+            None,
+        ));
+        add_submenu(mtm, &menubar, "Help", &help_menu);
+        app.setHelpMenu(Some(&help_menu));
 
         app.setServicesMenu(Some(&services_menu));
         app.setMainMenu(Some(&menubar));

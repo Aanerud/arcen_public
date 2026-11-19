@@ -13,12 +13,14 @@
 //!    claim) and run the requested contract's shared admission with
 //!    `OpenH264`; open the session for the served plan; state the decision
 //!    (`ADMISSION`);
-//! 4. stage that frame (Keel hash, converted rows) and release it; then, at
-//!    the served cadence, stage the newest leased frame and encode as Keel's
-//!    idle cadence decides;
-//! 5. `READY` after the first access unit (`backend=openh264-sw-h264`,
-//!    `capture=pipewire`, `conversion_backend=cpu`), then framed access
-//!    units and a stats line every second.
+//! 4. hand that frame to the shared software loop
+//!    (`arcen_media::canvas::CanvasEncodeLoop`, ADR 0028) with the
+//!    producer's damage regions and release it; then, at the served
+//!    cadence, hand it the newest leased frame whenever it wants one;
+//! 5. `READY` before the first record (`backend=openh264-sw-h264`,
+//!    `capture=pipewire`, `conversion_backend=cpu`), then the loop's records
+//!    (canvas records for a canvas Deck, framed access units otherwise) and
+//!    a stats line every second.
 //!
 //! As on the NVENC path, a quiet stream is not a dead one; the epoch ends
 //! when the source closes, the producer renegotiates another size, or the
@@ -27,12 +29,14 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use arcen_keel::{BgraFrame, EmitMode};
+use arcen_keel::{BgraFrame, ExternalDamage};
+use arcen_media::canvas::{CanvasEncodeLoop, LoopError, LoopTick};
+use arcen_media::capenc_control::CapencControlCommand;
 use arcen_media::video::{
-    AdmissionRequest, BackendUnavailableReason, CaptureAdmissionNotice, CaptureBackend,
-    CaptureMemory, CaptureTakeError, ConversionBackend, CursorEvidence, EncoderBackend,
-    FirstFrameEvidence, LiveChange, PresetAdmission, SoftwareEncodeLoop, SoftwareH264Session,
-    SoftwareSessionConfig, StagedPicture, SustainedRateMeter,
+    open_software_loop, AdmissionRequest, BackendUnavailableReason, CaptureAdmissionNotice,
+    CaptureBackend, CaptureMemory, CaptureTakeError, ConversionBackend, CursorEvidence,
+    DamageEvidence, EncoderBackend, FirstFrameEvidence, PresetAdmission, SoftwareLoop,
+    SoftwareLoopConfig, SoftwareSurfaces, SustainedRateMeter,
 };
 use arcen_media::VideoCodec;
 
@@ -86,10 +90,9 @@ pub fn run(
             ));
             return 2;
         }
-        let fps = software.contract().max_fps.min(request.fps.max(1));
         return crate::admission_probe::run_software_probe(
             sdr8_video(VideoCodec::H264),
-            fps,
+            super::software::software_fps(request.fps),
             options,
         );
     }
@@ -218,41 +221,63 @@ pub fn run(
         log("ERROR: the admitted plan states no cursor truth");
         return 5;
     };
-    // OpenH264 is opened for the served plan before the decision is
-    // announced, as NVENC is on the native path.
-    let session = match SoftwareH264Session::new(SoftwareSessionConfig::for_stream(
-        width, height, plan.fps, plan.video,
-    )) {
-        Ok(session) => session,
+    // The loop (OpenH264 for the served plan) is opened before the decision
+    // is announced, as NVENC is on the native path.
+    let SoftwareLoop {
+        encode: mut encoder,
+        bitrate_bounds: (start_bps, ceiling_bps),
+        threading,
+    } = match open_software_loop(SoftwareLoopConfig {
+        width,
+        height,
+        fps: plan.fps,
+        video: plan.video,
+        canvas: request.canvas,
+        start_bitrate_bps: None,
+        keepalive: IDLE_KEEPALIVE,
+    }) {
+        Ok(built) => built,
         Err(error) => {
-            log(&format!("ERROR: OpenH264 initialization failed: {error}"));
+            log(&format!("ERROR: {error}"));
             return 4;
         }
     };
-    let (start_bps, ceiling_bps) = session.bitrate_bounds();
-    let threads = session.encoder_config().num_threads;
-    let mut encoder = SoftwareEncodeLoop::new(session, IDLE_KEEPALIVE);
     if let Err(error) = crate::announce_admission(&notice) {
         log(&format!("ERROR: emit ADMISSION: {error}"));
         return 5;
     }
-    let first_convert = match stage_lease(&mut encoder, &first) {
-        Ok(Some(_)) => encoder.take_stats().convert_ms_sum,
-        Ok(None) => {
+    let mut os_damage = ExternalDamage::new(width as usize, height as usize).ok();
+    let mut retained = Vec::new();
+    let mut narrowed = false;
+    match copy_lease(&first, &mut retained, &mut os_damage, &mut narrowed) {
+        Ok(true) => {}
+        Ok(false) => {
             log("ERROR: the first frame was revoked before it was read");
             return 3;
         }
         Err(error) => {
-            log(&format!("ERROR: Wayland software stage: {error}"));
+            log(&format!("ERROR: Wayland software loop: {error}"));
+            return 5;
+        }
+    }
+    drop(first);
+    let first_tick = match tick_retained(
+        &mut encoder,
+        &retained,
+        (width, height),
+        None,
+        Instant::now(),
+    ) {
+        Ok(tick) => tick,
+        Err(error) => {
+            log(&format!("ERROR: Wayland software loop: {error}"));
             return 5;
         }
     };
-    drop(first);
     log(&format!(
         "Wayland epoch serving {} for {} at up to {} fps: priority={} intent={} codec={} \
-         backend={} copy_path={} route={} memory={} colour={} cursor={} threads={threads} \
-         bitrate_start={start_bps} bitrate_ceiling={ceiling_bps} damage={} \
-         first_convert_ms={first_convert:.2}{}",
+         backend={} copy_path={} route={} memory={} colour={} cursor={} {threading} \
+         bitrate_start={start_bps} bitrate_ceiling={ceiling_bps} damage=keel canvas={}{}",
         plan.pipeline.token(),
         requested.preset().pipeline().token(),
         plan.fps,
@@ -269,11 +294,7 @@ pub fn run(
             "bt709-limited-reported"
         },
         cursor.token(),
-        if encoder.damage_tracked() {
-            "keel"
-        } else {
-            "full"
-        },
+        if encoder.is_canvas() { "on" } else { "off" },
         match admission {
             PresetAdmission::Downgrade { reason, .. } => format!(
                 " downgraded_from={} reason={}",
@@ -317,7 +338,6 @@ pub fn run(
     let mut stdout = std::io::stdout();
     let mut target_dt = crate::frame_interval_from_fps(plan.fps);
     let mut next = Instant::now();
-    let mut last_emit = Instant::now();
     let mut ready_announced = false;
     let mut second = Instant::now();
     let mut rate = SustainedRateMeter::new(Instant::now());
@@ -325,11 +345,12 @@ pub fn run(
     let leases = source.lease_counters();
     let mut source_frames_seen = source_stats.frames.load(Ordering::Relaxed);
     let mut superseded_seen = leases.superseded.load(Ordering::Relaxed);
-    let (mut emitted, mut bytes, mut keyframes) = (0u64, 0u64, 0u64);
+    let (mut emitted, mut bytes, mut keyframes, mut changed) = (0u64, 0u64, 0u64, 0u64);
     let (mut total_emitted, mut total_bytes, mut total_keyframes) = (0u64, 0u64, 0u64);
-    let mut total_modes = [0u64; 4];
     // Cursor events only after READY.
     let mut epoch_output = super::output::EpochOutput::new(request, cursor);
+    let mut pending = Some(first_tick);
+    let mut last_error: Option<Instant> = None;
 
     let exit = 'epoch: loop {
         if control.stop_requested() {
@@ -339,56 +360,76 @@ pub fn run(
             break 'epoch 0;
         }
         if let Some(fps) = control.take_framerate_fps() {
-            match encoder
-                .session_mut()
-                .reconfigure_framerate(plan.live_fps(fps))
-            {
-                Ok(LiveChange::Applied(fps)) => {
-                    target_dt = crate::frame_interval_from_fps(fps);
-                    log(&format!("OpenH264 live framerate reconfigured: fps={fps}"));
-                }
-                Ok(LiveChange::Unchanged) => {}
-                Err(error) => log(&format!(
-                    "OpenH264 live framerate reconfigure failed: {error}"
-                )),
+            let fps = plan.live_fps(fps);
+            if encoder.set_frame_rate(fps) {
+                target_dt = crate::frame_interval_from_fps(fps);
+                log(&format!("OpenH264 live framerate reconfigured: fps={fps}"));
             }
         }
         if let Some(bps) = control.take_bitrate_bps() {
-            match encoder.session_mut().reconfigure_bitrate(bps) {
-                Ok(LiveChange::Applied(bps)) => {
-                    log(&format!(
-                        "OpenH264 live bitrate reconfigured: target={bps}bps"
-                    ));
-                }
-                Ok(LiveChange::Unchanged) => {}
-                Err(error) => log(&format!(
-                    "OpenH264 live bitrate reconfigure failed: {error}"
-                )),
-            }
+            encoder.set_link_bitrate(bps);
+            log(&format!("software loop live bitrate: target={bps}bps"));
         }
         let now = Instant::now();
-        if now < next {
+        for command in control.take_canvas_controls() {
+            match command {
+                CapencControlCommand::CanvasInput { x, y } => encoder.note_input(x, y, now),
+                command => {
+                    if let Some(message) = command.canvas_control() {
+                        encoder.on_control(&message);
+                    }
+                }
+            }
+        }
+        if control.take_idr() {
+            encoder.request_recovery();
+        }
+        if now < next && pending.is_none() {
             std::thread::sleep((next - now).min(Duration::from_millis(50)));
             continue;
         }
         // The newest frame only; anything older was already returned to the
-        // producer (its damage is re-measured by Keel's hash).
-        match source.next_frame(Duration::ZERO) {
-            Ok(Some(lease)) => {
-                if let Err(error) = stage_lease(&mut encoder, &lease) {
-                    log(&format!("ERROR: Wayland software stage: {error}"));
-                    break 5;
+        // producer with its damage merged into this one's.
+        let tick = match pending.take() {
+            Some(tick) => Some(Ok(tick)),
+            None => {
+                let delivered = match source.next_frame(Duration::ZERO) {
+                    Ok(Some(lease)) => {
+                        match copy_lease(&lease, &mut retained, &mut os_damage, &mut narrowed) {
+                            Ok(read) => read,
+                            Err(error) => {
+                                log(&format!("ERROR: Wayland software loop: {error}"));
+                                break 5;
+                            }
+                        }
+                    }
+                    Ok(None) => false,
+                    Err(CaptureTakeError::Closed) => {
+                        log(&format!(
+                            "ERROR: Wayland capture: the stream closed (phase {:?})",
+                            source.phase()
+                        ));
+                        break 3;
+                    }
+                };
+                if delivered {
+                    changed += 1;
+                } else if let Some(damage) = os_damage.as_mut() {
+                    // Nothing new: the retained picture, unchanged.
+                    damage.reset();
+                    narrowed = true;
                 }
+                (delivered || encoder.wants_frame(now, false)).then(|| {
+                    tick_retained(
+                        &mut encoder,
+                        &retained,
+                        (width, height),
+                        if narrowed { os_damage.as_ref() } else { None },
+                        now,
+                    )
+                })
             }
-            Ok(None) => {}
-            Err(CaptureTakeError::Closed) => {
-                log(&format!(
-                    "ERROR: Wayland capture: the stream closed (phase {:?})",
-                    source.phase()
-                ));
-                break 3;
-            }
-        }
+        };
         if let Some(current) = source.current_format() {
             if (current.width, current.height) != (width, height) {
                 log(&format!(
@@ -398,54 +439,52 @@ pub fn run(
                 break 3;
             }
         }
-
-        let idr_pending = control.idr_pending();
-        if let Some(mode) = encoder.decision(idr_pending, last_emit.elapsed()) {
-            if idr_pending && control.take_idr() && mode != EmitMode::FirstFrame {
-                log("consuming IDR request");
-            }
-            match encoder.encode(mode) {
-                Ok(Some(access_unit)) => {
+        match tick {
+            Some(Ok(tick)) => {
+                if let Some(event) = tick.event {
+                    log(&format!("canvas governor: {event:?}"));
+                }
+                if let Some((generation, digest)) = tick.digest {
+                    log(&format!(
+                        "canvas mirror digest {}",
+                        arcen_media::canvas::digest_fields(generation, &digest)
+                    ));
+                }
+                for record in &tick.records {
                     if !ready_announced {
-                        if let Err(error) =
-                            crate::validate_access_unit(access_unit.bytes, epoch_output.framed())
-                        {
-                            log(&format!(
-                                "ERROR: first access unit failed output validation: {error}"
-                            ));
-                            break 5;
-                        }
                         if let Err(error) = crate::announce_ready_from_with_conversion(
                             ready,
                             Some(CaptureBackend::PipeWire),
                             Some(ConversionBackend::Cpu),
                         ) {
                             log(&format!("ERROR: emit READY: {error}"));
-                            break 5;
+                            break 'epoch 5;
                         }
                         ready_announced = true;
                     }
-                    if access_unit.is_keyframe {
+                    if record.is_recovery_point() {
                         keyframes += 1;
                     }
-                    let length = access_unit.bytes.len() as u64;
-                    if epoch_output
-                        .access_unit(&mut stdout, access_unit.bytes)
-                        .is_err()
-                    {
+                    if epoch_output.loop_record(&mut stdout, record).is_err() {
                         break 'epoch 0;
                     }
-                    emitted += 1;
-                    bytes += length;
-                    last_emit = now;
+                    bytes += record.bytes().len() as u64;
                 }
-                // OpenH264 skipped the picture; the cadence stays due.
-                Ok(None) => {}
-                Err(error) => {
-                    log(&format!("ERROR: OpenH264 encode failed: {error}"));
-                    break 5;
+                if !tick.records.is_empty() {
+                    emitted += 1;
                 }
             }
+            Some(Err(LoopError::Geometry)) => {
+                log("ERROR: Wayland capture: a picture of another size arrived");
+                break 3;
+            }
+            Some(Err(error)) => {
+                if last_error.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                    log(&format!("software loop tick failed: {error}"));
+                    last_error = Some(Instant::now());
+                }
+            }
+            None => {}
         }
         next += target_dt;
         if next < now {
@@ -460,65 +499,45 @@ pub fn run(
         );
         source_frames_seen = frames;
         if now.duration_since(second) >= Duration::from_secs(1) {
-            let stats = encoder.take_stats();
             let superseded = leases.superseded.load(Ordering::Relaxed);
+            let canvas_on = encoder.is_canvas();
+            let state = encoder.governor_state();
             log(&format!(
-                "enc_fps={emitted} encode_submitted={} source_fps={} source_superseded={} \
-                 staged={} clean_frames={} dirty_blocks={} avg_convert_ms={:.2} \
-                 avg_encode_ms={:.2} max_encode_ms={:.2} kbps={} keyframes={keyframes} \
-                 backend={} capture_backend=pipewire copy_path={} route={} served={} \
-                 fps_ceiling={} emit_first={} emit_idr={} emit_activity={} emit_keepalive={} \
-                 want_idr={} damage_source={} cursor={}",
-                stats.submitted,
-                rate.last_window().unwrap_or(0),
+                "enc_fps={emitted} source_fps={} source_superseded={} kbps={} \
+                 keyframes={keyframes} backend={} capture_backend=pipewire copy_path={} route={} \
+                 served={} fps_ceiling={} want_idr={} damage_source=pipewire_meta cursor={} {}",
+                // The rate the Pier's governor judges the encoder against:
+                // pictures the compositor delivered (it delivers only on a
+                // change), including those superseded while the loop was busy.
+                changed.saturating_add(superseded - superseded_seen),
                 superseded - superseded_seen,
-                stats.staged,
-                stats.clean,
-                stats.dirty_blocks,
-                average(stats.convert_ms_sum, stats.staged),
-                average(stats.encode_ms_sum, stats.submitted),
-                stats.encode_ms_max,
                 bytes * 8 / 1000,
                 BACKEND.ready_token(),
                 ROUTE.copy_path().token(),
                 ROUTE.token(),
                 plan.pipeline.token(),
                 plan.fps,
-                stats.by_mode[0],
-                stats.by_mode[1],
-                stats.by_mode[2],
-                stats.by_mode[3],
                 control.idr_pending(),
-                if encoder.damage_tracked() {
-                    "keel_hash"
-                } else {
-                    "unknown_full"
-                },
                 cursor.token(),
+                encoder.take_stats().line(canvas_on, state),
             ));
             superseded_seen = superseded;
             total_emitted += emitted;
             total_bytes += bytes;
             total_keyframes += keyframes;
-            for (total, mode) in total_modes.iter_mut().zip(stats.by_mode) {
-                *total += mode;
-            }
-            (emitted, bytes, keyframes) = (0, 0, 0);
+            (emitted, bytes, keyframes, changed) = (0, 0, 0, 0);
             second = now;
         }
     };
     log(&format!(
         "Wayland epoch summary served={} requested={} backend={} emitted={} keyframes={} \
-         keepalives={} activity={} idr={} bytes={} source_frames={} superseded={} \
+         bytes={} source_frames={} superseded={} \
          best_sustained_source_fps={} cursor_events={} cursor_unknown_formats={}",
         plan.pipeline.token(),
         requested.preset().pipeline().token(),
         BACKEND.ready_token(),
         total_emitted + emitted,
         total_keyframes + keyframes,
-        total_modes[3],
-        total_modes[2],
-        total_modes[1],
         total_bytes + bytes,
         source_stats.frames.load(Ordering::Relaxed),
         leases.superseded.load(Ordering::Relaxed),
@@ -533,21 +552,18 @@ pub fn run(
     exit
 }
 
-fn average(sum: f64, count: u64) -> f64 {
-    if count == 0 {
-        0.0
-    } else {
-        sum / count as f64
-    }
-}
-
-/// Stages a leased shared-memory frame into the encode loop while the lease
-/// is held. `Ok(None)`: the lease was revoked (renegotiation) and nothing
-/// was read.
-fn stage_lease(
-    encoder: &mut SoftwareEncodeLoop,
+/// Copies a leased shared-memory frame into `retained` (packed rows) while
+/// the lease is held, and puts the damage the producer reported for it and
+/// every frame it superseded into `os_damage`. The loop then runs on the
+/// retained picture, so the lease goes back to the compositor at once and a
+/// keepalive, a reset or deferred work never waits for the next delivery.
+/// `Ok(false)`: the lease was revoked (renegotiation) and nothing was read.
+fn copy_lease(
     lease: &arcen_media::video::CaptureLease<BufferToken>,
-) -> Result<Option<StagedPicture>, String> {
+    retained: &mut Vec<u8>,
+    os_damage: &mut Option<ExternalDamage>,
+    narrowed: &mut bool,
+) -> Result<bool, String> {
     let frame = lease.frame();
     let surface = frame.surface.surface();
     if surface.memory != CaptureMemory::HostShared {
@@ -556,11 +572,23 @@ fn stage_lease(
             surface.memory.token()
         ));
     }
+    // PipeWire's damage meta narrows Keel's hash; without it Keel hashes
+    // the whole picture.
+    *narrowed = match (os_damage.as_mut(), &frame.damage) {
+        (Some(damage), DamageEvidence::Regions(regions)) => {
+            damage.reset();
+            for region in regions {
+                damage.mark_rect(*region);
+            }
+            true
+        }
+        _ => false,
+    };
     let width = surface.geometry.coded_width as usize;
     let height = surface.geometry.coded_height as usize;
     let plane = surface.planes[0];
     let stride = plane.stride as usize;
-    let result = frame.token.read(|views| -> Result<_, String> {
+    let result = frame.token.read(|views| -> Result<(), String> {
         let PlaneView::Host(buffer) = views[usize::from(plane.buffer)] else {
             return Err("the shared-memory plane is not mapped".to_owned());
         };
@@ -568,10 +596,35 @@ fn stage_lease(
             .ok_or("the plane lies outside its mapping")?;
         let picture = BgraFrame::new(rows, width, height, stride)
             .map_err(|error| format!("BGRx layout: {error}"))?;
-        encoder.stage(picture).map_err(|error| error.to_string())
+        retained.resize(width * height * 4, 0);
+        for row in 0..height {
+            let source = picture
+                .active_row(row)
+                .ok_or("a row lies outside the picture")?;
+            retained[row * width * 4..(row + 1) * width * 4].copy_from_slice(source);
+        }
+        Ok(())
     });
     match result {
-        Ok(staged) => staged.map(Some),
-        Err(_) => Ok(None),
+        Ok(read) => read.map(|()| true),
+        Err(_) => Ok(false),
     }
+}
+
+/// Runs one tick of the loop on the retained picture.
+fn tick_retained(
+    encoder: &mut CanvasEncodeLoop<SoftwareSurfaces>,
+    retained: &[u8],
+    (width, height): (u32, u32),
+    os_damage: Option<&ExternalDamage>,
+    now: Instant,
+) -> Result<LoopTick, LoopError> {
+    let picture = BgraFrame::new(
+        retained,
+        width as usize,
+        height as usize,
+        width as usize * 4,
+    )
+    .map_err(|_| LoopError::Geometry)?;
+    encoder.tick(picture, os_damage, now)
 }

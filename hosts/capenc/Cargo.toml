@@ -63,10 +63,9 @@ windows = { version = "0.58", features = [
     "Win32_System_WinRT",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
-    # Media Foundation software H.264 encoder MFT — the VMware-SVGA / no-NVENC
-    # fallback encoder path. Gated behind the `mf` cargo feature at module
-    # level so the plain NVENC build stays lean; the windows-crate feature list
-    # is additive and has no runtime cost when `mf` is off.
+    # Media Foundation hardware encoder MFTs (`mf-hw`), and the D3D11 video
+    # processor that converts captured BGRA to NV12 for them. Gated at module
+    # level; the windows-crate feature list is additive.
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
@@ -94,15 +93,15 @@ arcen-observability = { workspace = true, optional = true }
 # Guards the NVENC module so the capture-only skeleton still builds during
 # incremental bring-up.
 nvenc = []
-# Media Foundation software H.264 encoder path. Selected at runtime when
-# NVENC cannot open a session (e.g. VMware SVGA 3D adapters with no
-# NVIDIA hardware). Both features can be enabled at once so a single
-# capenc binary supports both hardware classes; the runtime picks NVENC
-# first and falls back to MF.
-mf = []
+# Media Foundation hardware encoder (Alpha): a GPU vendor's hardware encoder
+# MFT (Intel Quick Sync, AMD AMF, any vendor that registers one) fed NV12
+# textures from the DDA/WGC capture device. It shares the NVENC path's
+# capture source selection, hence the `nvenc` dependency; nothing NVIDIA-only
+# runs unless the session selects NVENC.
+mf-hw = ["nvenc"]
 # Portable OpenH264 path. The shared crate owns the safe wrapper and builds the
 # codec from source; capenc never links a runtime-downloaded binary.
-software-h264 = ["arcen-media/software-h264-source"]
+software-h264 = ["arcen-media/software-h264-source", "arcen-media/refine-zstd-encode"]
 # Lossless refinement producer on the Xorg depth-30 path (ADR 0016): native
 # libzstd for tile compression. The Linux Pier enables it by default; it runs
 # only when the Pier passes `refine=on`.

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Build-time half of the presenter: compiles `shaders/present.hlsl` to
-//! DXBC with the Windows SDK's `fxc.exe`, so the Deck never loads
-//! `D3DCompiler` at run time.
+//! Build-time half of the presenter: compiles `shaders/present.hlsl` (the
+//! conversion pass) and `shaders/canvas.hlsl` (the canvas passes) to DXBC
+//! with the Windows SDK's `fxc.exe`, so the Deck never loads `D3DCompiler`
+//! at run time.
 //!
 //! The crate's `build.rs` includes this file:
 //!
@@ -25,19 +26,31 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Shader source, relative to the crate's manifest directory.
-pub const SHADER: &str = "src/present/shaders/present.hlsl";
-
-/// Entry points and profiles; the blobs land in `$OUT_DIR/present/`.
-pub const ENTRIES: &[(&str, &str)] = &[
-    ("vs_main", "vs_5_0"),
-    ("ps_biplanar", "ps_5_0"),
-    ("ps_y410", "ps_5_0"),
-    ("ps_ayuv", "ps_5_0"),
-    ("ps_biplanar_refined_rgb", "ps_5_0"),
-    ("ps_biplanar_refined_ycbcr", "ps_5_0"),
-    ("ps_y410_refined_rgb", "ps_5_0"),
-    ("ps_y410_refined_ycbcr", "ps_5_0"),
+/// Shader sources, relative to the crate's manifest directory, with their
+/// entry points and profiles; the blobs land in `$OUT_DIR/present/`
+/// (entry names are unique across sources).
+pub const SHADERS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "src/present/shaders/present.hlsl",
+        &[
+            ("vs_main", "vs_5_0"),
+            ("ps_biplanar", "ps_5_0"),
+            ("ps_y410", "ps_5_0"),
+            ("ps_ayuv", "ps_5_0"),
+            ("ps_biplanar_refined_rgb", "ps_5_0"),
+            ("ps_biplanar_refined_ycbcr", "ps_5_0"),
+            ("ps_y410_refined_rgb", "ps_5_0"),
+            ("ps_y410_refined_ycbcr", "ps_5_0"),
+        ],
+    ),
+    (
+        "src/present/shaders/canvas.hlsl",
+        &[
+            ("vs_rect", "vs_5_0"),
+            ("ps_fill", "ps_5_0"),
+            ("ps_paint", "ps_5_0"),
+        ],
+    ),
 ];
 
 fn find_fxc() -> Option<PathBuf> {
@@ -56,12 +69,9 @@ fn find_fxc() -> Option<PathBuf> {
 
 /// Compiles every entry point; panics (failing the build) on an HLSL error.
 pub fn compile() {
-    compile_from(Path::new(SHADER));
-}
-
-/// [`compile`] with the shader at `source`.
-pub fn compile_from(source: &Path) {
-    println!("cargo:rerun-if-changed={}", source.display());
+    for (source, _) in SHADERS {
+        println!("cargo:rerun-if-changed={source}");
+    }
     println!("cargo:rerun-if-env-changed=ARCEN_FXC");
     println!("cargo::rustc-check-cfg=cfg(arcen_shaders_missing)");
     println!("cargo::rustc-check-cfg=cfg(arcen_present_hub_e2e)");
@@ -74,22 +84,26 @@ pub fn compile_from(source: &Path) {
             "cargo:warning=fxc.exe is not available on this host: presenter shaders are empty"
         );
         println!("cargo:rustc-cfg=arcen_shaders_missing");
-        for (entry, _) in ENTRIES {
-            std::fs::write(out.join(format!("{entry}.cso")), []).expect("write placeholder");
+        for (_, entries) in SHADERS {
+            for (entry, _) in *entries {
+                std::fs::write(out.join(format!("{entry}.cso")), []).expect("write placeholder");
+            }
         }
         return;
     };
-    for (entry, profile) in ENTRIES {
-        let target = out.join(format!("{entry}.cso"));
-        // /Gis: strict IEEE, so the GPU stays close to the CPU reference.
-        let status = Command::new(&fxc)
-            .args([
-                "/nologo", "/O3", "/Gis", "/WX", "/T", profile, "/E", entry, "/Fo",
-            ])
-            .arg(&target)
-            .arg(source)
-            .status()
-            .expect("run fxc.exe");
-        assert!(status.success(), "fxc failed for {entry}");
+    for (source, entries) in SHADERS {
+        for (entry, profile) in *entries {
+            let target = out.join(format!("{entry}.cso"));
+            // /Gis: strict IEEE, so the GPU stays close to the CPU reference.
+            let status = Command::new(&fxc)
+                .args([
+                    "/nologo", "/O3", "/Gis", "/WX", "/T", profile, "/E", entry, "/Fo",
+                ])
+                .arg(&target)
+                .arg(Path::new(source))
+                .status()
+                .expect("run fxc.exe");
+            assert!(status.success(), "fxc failed for {entry}");
+        }
     }
 }

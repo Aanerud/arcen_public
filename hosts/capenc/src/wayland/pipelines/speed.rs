@@ -293,7 +293,7 @@ mod tests {
                     served,
                     reason: AdmissionReason::SoftwareFallback(_),
                     ..
-                } if served.pipeline == PipelineId::Software && served.fps_ceiling == 30
+                } if served.pipeline == PipelineId::Software && served.fps_ceiling == 60
             ),
             "{admission:?}"
         );

@@ -1644,6 +1644,10 @@ pub struct ArcenApp {
     /// (`arcen_deck_core::multi_window::layout_note`): a notice when the
     /// layout is applied, and a Stream Statistics line for the session.
     layout_note: Option<String>,
+    /// What the desk at the host shows while attached
+    /// (`arcen_deck_core::session_truth::desk_privacy_note`): a notice when
+    /// the session starts, and a Stream Statistics line for the session.
+    desk_note: Option<&'static str>,
     /// Lossless-tile debug view: tints refined (amber) and verified (green)
     /// 16x16 blocks over the video. Off by default.
     show_lossless_tiles: bool,
@@ -1861,6 +1865,11 @@ pub struct ArcenApp {
     encode_intent: arcen_media::EncodeIntent,
     /// Mirrors `ClientSettings::typing_mode`.
     typing_mode: arcen_input::text::TypingMode,
+    /// Mirrors `ClientSettings::keyboard_capture` (kept and saved; the Mac
+    /// acts on it with the event tap, K4).
+    keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
+    /// Help ▸ Keyboard Shortcuts is open.
+    keyboard_shortcuts_open: bool,
     /// Mirrors `ClientSettings::option_key_mode`.
     option_key_mode: arcen_input::text::OptionKeyPreference,
     /// Paste as Keystrokes for the session; its settings mirror
@@ -1903,6 +1912,12 @@ pub struct ArcenApp {
     tablet_input_enabled: bool,
     /// `ClientSettings::exact_still_image`: asked for on the next connection.
     exact_still_image: bool,
+    /// `ClientSettings::canvas` and `canvas_cache_mib`: asked for on the next
+    /// connection where the eight-bit presenter executes canvas work.
+    canvas: bool,
+    canvas_cache_mib: u32,
+    /// `ClientSettings::pen_buttons`: what the pen's side switches click.
+    pen_buttons: arcen_input::pen_buttons::PenButtonSettings,
     tablet_mode_requested: TabletModeMsg,
     tablet_mode_active: TabletModeMsg,
     tablet_mode_reason: String,
@@ -2106,6 +2121,11 @@ impl ArcenApp {
             options.monitors = monitors_for_policy(stream_sizing_policy, &options.monitors);
         }
         options.displays_mode = display_mode.as_wire().to_string();
+        options.canvas = connection_canvas_request(
+            app.canvas,
+            app.canvas_cache_mib,
+            options.multi_monitor_topology.is_some(),
+        );
 
         if options.password.is_empty() {
             app.status = "Ready".to_string();
@@ -2366,6 +2386,7 @@ impl ArcenApp {
                 arcen_deck_core::ui_pacing::STATS_PANEL_REFRESH,
             ),
             layout_note: None,
+            desk_note: None,
             show_lossless_tiles: cfg!(feature = "dev-tools")
                 && std::env::var_os("ARCEN_SHOW_LOSSLESS_TILES").is_some_and(|value| value == "1"),
             served_pipeline_token: None,
@@ -2469,6 +2490,8 @@ impl ArcenApp {
             color_fidelity: settings.color_fidelity,
             encode_intent: settings.encode_intent,
             typing_mode: settings.typing_mode,
+            keyboard_capture: settings.keyboard_capture,
+            keyboard_shortcuts_open: false,
             option_key_mode: settings.option_key_mode,
             paste_keys: {
                 let mut paste_keys = crate::ui::paste_keys::PasteKeys::default();
@@ -2495,6 +2518,9 @@ impl ArcenApp {
             stated_display_refresh: None,
             tablet_input_enabled: tablet_mode_allows_typed_pen(tablet_mode_requested),
             exact_still_image: settings.exact_still_image,
+            canvas: settings.canvas,
+            canvas_cache_mib: settings.canvas_cache_mib,
+            pen_buttons: settings.pen_buttons,
             tablet_mode_requested,
             tablet_mode_active: tablet_mode_requested,
             tablet_mode_reason: String::new(),
@@ -2830,6 +2856,7 @@ impl eframe::App for ArcenApp {
                             form_username: &mut self.add_connection_username,
                             form_displays_mode: &mut self.add_connection_displays_mode,
                             form_keyboard: &mut self.add_connection_keyboard,
+                            app_displays_mode: self.displays_mode,
                             connection_error: conn_error,
                             remember_username: &mut self.remember_username,
                             connection_test: self.connection_test.as_ref(),
@@ -3062,6 +3089,12 @@ impl eframe::App for ArcenApp {
         if self.colour_check.open {
             self.show_colour_check(ui.ctx());
         }
+        arcen_deck_core::screens::keyboard_help::render_keyboard_shortcuts(
+            ui.ctx(),
+            arcen_deck_core::screens::wording::DeckPlatform::Mac,
+            false,
+            &mut self.keyboard_shortcuts_open,
+        );
         // A pass that drew no video (another screen, a closed session)
         // gives the system cursor back.
         if !self.lead_cursor_wanted && self.lead_cursor.is_hidden() {
@@ -3310,6 +3343,11 @@ impl ArcenApp {
         if let Some(hello) = hello {
             self.remember_authenticated_username();
             self.note_hello_desktop(hello.login_window);
+            self.desk_note = arcen_deck_core::session_truth::desk_privacy_note(&hello);
+            if let Some(note) = self.desk_note {
+                tracing::info!(target: "arcen::session", note, "host desk privacy");
+                self.text_input.notify(note.to_owned());
+            }
             self.session_hello_handled = true;
             // A current Pier serves Auto and Speed at this Deck display's
             // refresh, not the legacy rate the request carried.
@@ -3405,6 +3443,15 @@ impl ArcenApp {
             // Tablet Monitor shows empirical data for this session only —
             // capabilities observed in a previous session do not carry over.
             self.pen.borrow_mut().reset_for_session();
+            let pen_buttons = arcen_deck_core::input::pen_button_map(&hello, self.pen_buttons);
+            tracing::info!(
+                target: crate::logging::target::INPUT,
+                host = ?pen_buttons.host,
+                lower = pen_buttons.settings.lower.token(),
+                upper = pen_buttons.settings.upper.token(),
+                "pen buttons"
+            );
+            self.pen.borrow_mut().set_button_map(pen_buttons);
             // Presence hint: if a pen tablet is already
             // plugged in when the session connects, surface a one-time log so
             // the user knows to move the pen near the tablet surface.  On
@@ -3489,13 +3536,12 @@ impl ArcenApp {
                 "{}",
                 arcen_telemetry::names::refine::PLAN
             );
+            let encoder_name =
+                arcen_media::video::encoder_backend_display_name(&negotiated_truth.encoder_backend);
             let path_note = if negotiated_truth.encoder_hardware == Some(true) {
-                format!(
-                    "Native optimized media path: {}",
-                    negotiated_truth.encoder_backend
-                )
+                format!("Native optimized media path: {encoder_name}")
             } else {
-                format!("Fallback media path: {}", negotiated_truth.encoder_backend)
+                format!("Fallback media path: {encoder_name}")
             };
             self.colour_check_host = Some(arcen_media::colour_check::HostFacts::from_hello(
                 &hello,
@@ -4151,10 +4197,13 @@ impl ArcenApp {
             self.dedicated_video_frame = None;
         }
         if !preserve_eight_bit_hold {
-            self.dedicated_eight_bit_video_presenter
+            let mut presenter = self
+                .dedicated_eight_bit_video_presenter
                 .lock()
-                .expect("8-bit presenter poisoned")
-                .teardown();
+                .expect("8-bit presenter poisoned");
+            presenter.teardown();
+            presenter.release_canvas();
+            drop(presenter);
             self.dedicated_eight_bit_presentation = DedicatedEightBitPresentationStatus::Inactive;
             self.dedicated_eight_bit_layer_has_picture = false;
         }
@@ -6298,6 +6347,7 @@ impl ArcenApp {
         self.login_window_handover = None;
         self.stream_stats_text.clear();
         self.layout_note = None;
+        self.desk_note = None;
         if self.lead_cursor.is_hidden() {
             super::sharp_cursor::apply_lead_cursor(
                 self.lead_cursor
@@ -6501,10 +6551,13 @@ impl ArcenApp {
                 .is_dedicated_eight_bit()
             && eight_bit_picture;
         if !preserve_eight_bit_hold {
-            self.dedicated_eight_bit_video_presenter
+            let mut presenter = self
+                .dedicated_eight_bit_video_presenter
                 .lock()
-                .expect("8-bit presenter poisoned")
-                .teardown();
+                .expect("8-bit presenter poisoned");
+            presenter.teardown();
+            presenter.release_canvas();
+            drop(presenter);
             self.dedicated_eight_bit_presentation = DedicatedEightBitPresentationStatus::Inactive;
             self.dedicated_eight_bit_layer_has_picture = false;
         }
@@ -6621,8 +6674,16 @@ impl ArcenApp {
                 }
             }
             MenuCommand::ReleaseModifiers => {
+                // Release Stuck Keys: the pointer lock too (what F9 did).
+                if let Some(monitor_id) = self.secondary_pointer_lock {
+                    self.release_secondary_pointer_lock(monitor_id, "release_stuck_keys");
+                } else if self.pointer_lock {
+                    self.release_pointer_lock("release_stuck_keys");
+                }
                 self.release_remote_keys("menu_release_modifiers");
             }
+            MenuCommand::SendKey(key) => self.send_menu_key(key),
+            MenuCommand::KeyboardShortcuts => self.keyboard_shortcuts_open = true,
             MenuCommand::PasteAsKeystrokes => self.request_paste_as_keystrokes(),
             MenuCommand::StopTyping => self.stop_paste_by_user(),
             MenuCommand::KeyboardPhysical => {
@@ -6677,9 +6738,11 @@ impl ArcenApp {
             // commands and its About window are not on the Mac's menu bar.
             #[cfg(not(feature = "dev-tools"))]
             MenuCommand::CycleTestPattern => {}
+            // Giving the keyboard to this Mac and back needs the event tap
+            // (K4); a Mac's Ctrl+Alt+Del is Send Key ▸ Ctrl+Alt+Del.
             MenuCommand::About
             | MenuCommand::SendSecureAttention
-            | MenuCommand::ToggleKeyboardGrab => {}
+            | MenuCommand::ToggleKeyboardCapture => {}
         }
     }
 
@@ -6925,7 +6988,7 @@ impl ArcenApp {
         self.pointer_lock = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-        self.status = "Pointer lock enabled; press F9 to release".to_string();
+        self.status = "Pointer lock enabled; press Control-Option-Home to release".to_string();
     }
 
     /// Secondary counterpart to `toggle_pointer_lock`'s own root
@@ -6958,7 +7021,9 @@ impl ArcenApp {
             egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked),
         );
         ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::CursorVisible(false));
-        self.status = "Pointer lock enabled on secondary display; press F9 to release".to_string();
+        self.status =
+            "Pointer lock enabled on secondary display; press Control-Option-Home to release"
+                .to_string();
     }
 
     fn release_pointer_lock(&mut self, reason: &'static str) {
@@ -8542,6 +8607,8 @@ impl ArcenApp {
                 let saved = self.saved_connections.iter().find(|saved| saved.id == id)?;
                 Some((saved.name.clone(), saved.settings.displays_mode?))
             }),
+            canvas_available: canvas_request(true, self.canvas_cache_mib)
+                != arcen_deck_core::canvas::CanvasRequest::Unavailable,
         };
         let mut values = SettingsValues {
             tab: self.settings_tab,
@@ -8562,7 +8629,10 @@ impl ArcenApp {
             clipboard_enabled: self.clipboard_enabled,
             microphone_enabled: self.microphone_enabled,
             tablet_mode_requested: self.tablet_mode_requested,
+            pen_buttons: self.pen_buttons,
             exact_still_image: self.exact_still_image,
+            canvas: self.canvas,
+            keyboard_capture: self.keyboard_capture,
         };
         let actions = render_settings(ui, &mut values, &facts);
         let SettingsValues {
@@ -8584,7 +8654,10 @@ impl ArcenApp {
             clipboard_enabled,
             microphone_enabled,
             mut tablet_mode_requested,
+            pen_buttons,
             exact_still_image,
+            canvas,
+            keyboard_capture: _,
         } = values;
         let mut close = actions.contains(&SettingsAction::Close);
         let show_in_folder = actions.contains(&SettingsAction::ShowLogFolder);
@@ -8655,6 +8728,8 @@ impl ArcenApp {
             || clipboard_enabled != self.clipboard_enabled
             || microphone_enabled != self.microphone_enabled
             || exact_still_image != self.exact_still_image
+            || canvas != self.canvas
+            || pen_buttons != self.pen_buttons
             || tablet_mode_requested != self.tablet_mode_requested;
         self.settings_tab = tab;
         self.log_level = log_level;
@@ -8683,6 +8758,11 @@ impl ArcenApp {
         self.clipboard_enabled = clipboard_enabled;
         self.microphone_enabled = microphone_enabled;
         self.exact_still_image = exact_still_image;
+        self.canvas = canvas;
+        if pen_buttons != self.pen_buttons {
+            self.pen_buttons = pen_buttons;
+            self.pen.borrow_mut().set_button_settings(pen_buttons);
+        }
         self.tablet_mode_requested = tablet_mode_requested;
         self.tablet_input_enabled = new_tablet_input_enabled;
         let persistence_failed = if changed {
@@ -8986,12 +9066,16 @@ impl ArcenApp {
                 hidpi_display_mask: self.hidpi_display_mask,
                 tablet_input_enabled: self.tablet_input_enabled,
                 tablet_mode_requested: self.tablet_mode_requested,
+                pen_buttons: self.pen_buttons,
                 exact_still_image: self.exact_still_image,
+                canvas: self.canvas,
+                canvas_cache_mib: self.canvas_cache_mib,
                 color_fidelity: self.color_fidelity,
                 encode_intent: self.encode_intent,
                 typing_mode: self.typing_mode,
                 option_key_mode: self.option_key_mode,
                 paste: self.paste_keys.settings(),
+                keyboard_capture: self.keyboard_capture,
             },
         )
     }
@@ -9138,6 +9222,11 @@ impl ArcenApp {
         options.tablet_input_enabled = self.tablet_input_enabled;
         options.tablet_mode_requested = self.tablet_mode_requested;
         options.exact_still_image = self.exact_still_image;
+        options.canvas = connection_canvas_request(
+            self.canvas,
+            self.canvas_cache_mib,
+            options.multi_monitor_topology.is_some(),
+        );
         options.telemetry = Arc::new(ClientTelemetry::default());
         (options, policy)
     }
@@ -10027,11 +10116,22 @@ impl ArcenApp {
                 axes: self.negotiated_truth.as_ref().map(|truth| &truth.active),
                 pipeline,
                 refine: Some(refine.as_str()),
+                encoder: self
+                    .negotiated_truth
+                    .as_ref()
+                    .map(|truth| truth.encoder_backend.as_str()),
             },
         )
         .to_vec();
         lines.extend(self.decoder_behind.line());
         lines.extend(self.layout_note.clone());
+        lines.extend(self.media.as_ref().and_then(|media| {
+            media
+                .lock()
+                .expect("media state poisoned")
+                .canvas_status_line()
+        }));
+        lines.extend(self.desk_note.map(str::to_owned));
         lines
     }
 
@@ -11090,7 +11190,13 @@ impl ArcenApp {
                 .lock()
                 .expect("8-bit presenter poisoned")
                 .last_presented()
-                .map(|frame| (frame.pixel_buffer, video(frame.contract)))
+                .and_then(|frame| {
+                    let contract = frame.contract;
+                    frame
+                        .pixel_buffer()
+                        .cloned()
+                        .map(|picture| (picture, video(contract)))
+                })
         } else {
             None
         }
@@ -12335,14 +12441,19 @@ impl ArcenApp {
     }
 
     fn process_keyboard_event(&mut self, event: &egui::Event) {
-        if matches!(
+        let escape_chord = matches!(
             event,
             egui::Event::Key {
-                key: egui::Key::F9,
+                key: egui::Key::Home,
                 pressed: true,
+                repeat: false,
+                modifiers,
                 ..
-            }
-        ) {
+            } if modifiers.ctrl && modifiers.alt && !modifiers.shift && !modifiers.mac_cmd
+        );
+        if escape_chord {
+            // Control-Option-Home (the Deck's escape chord; F9 reaches the
+            // host).
             // Panic-release must clear whichever viewport actually owns a
             // pointer lock. If a secondary owns it, release exactly that
             // owner via the same path `drive_multi_window` uses -- root's
@@ -12351,9 +12462,9 @@ impl ArcenApp {
             // survive a root-only release. Root is the fallback only when
             // no secondary currently owns a lock.
             if let Some(monitor_id) = self.secondary_pointer_lock {
-                self.release_secondary_pointer_lock(monitor_id, "panic_f9");
+                self.release_secondary_pointer_lock(monitor_id, "release_keyboard");
             } else {
-                self.release_pointer_lock("panic_f9");
+                self.release_pointer_lock("release_keyboard");
             }
         }
         let native = self
@@ -12485,6 +12596,21 @@ impl ArcenApp {
             self.record_input_sent("key_event");
         }
         (sent, sequence)
+    }
+
+    /// Connection ▸ Send Key: every key held on the host is released, then
+    /// the key is pressed and released with no modifier.
+    fn send_menu_key(&mut self, key: arcen_input::keyboard::SendKey) {
+        self.release_remote_keys("send_key");
+        for edge in key.edges() {
+            let (sent, _) = self.send_key_event(edge.qt_key, edge.pressed, edge.modifiers);
+            self.keyboard.record_delivery(sent);
+        }
+        tracing::info!(
+            target: crate::logging::target::INPUT,
+            key = key.title(),
+            "send key"
+        );
     }
 
     fn release_remote_keys(&mut self, reason: &'static str) {
@@ -14185,7 +14311,33 @@ fn connect_options_from_draft(draft: &ConnectionDraft) -> ConnectOptions {
         tablet_mode_requested: TabletModeMsg::LocalTermination,
         telemetry: Arc::new(ClientTelemetry::default()),
         exact_still_image: false,
+        canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
     }
+}
+
+/// The canvas this Deck asks for (ADR 0028): from the eight-bit presenter's
+/// canvas executor, so nothing is advertised until it has one.
+fn canvas_request(enabled: bool, cache_mib: u32) -> arcen_deck_core::canvas::CanvasRequest {
+    arcen_deck_core::canvas::CanvasRequest::for_sink::<DedicatedEightBitVideoPresenter>(
+        enabled, cache_mib,
+    )
+}
+
+/// The canvas one connection asks for. The canvas is executed and shown by
+/// the root window's dedicated eight-bit layer; a multi-monitor request is
+/// shown in egui windows that have no canvas presenter, so it asks for
+/// none and is served full frames (not implemented yet: each secondary
+/// window needs its own eight-bit layer, registered in
+/// `SharedMediaState::canvas_presenters`).
+fn connection_canvas_request(
+    enabled: bool,
+    cache_mib: u32,
+    multi_monitor: bool,
+) -> arcen_deck_core::canvas::CanvasRequest {
+    if multi_monitor {
+        return arcen_deck_core::canvas::CanvasRequest::Unavailable;
+    }
+    canvas_request(enabled, cache_mib)
 }
 
 /// GUI sessions inherit the profile the process was launched with (the
@@ -16112,6 +16264,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: 0.0,
             buttons: crate::tablet::TabletButtonMask::new(crate::tablet::TabletButtonMask::TIP),
+            driver_click: None,
             device_id: 1,
             tool: crate::tablet::NativeTabletTool::Pen,
             window_number: 1,
@@ -16161,6 +16314,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: 0.0,
             buttons: crate::tablet::TabletButtonMask::new(crate::tablet::TabletButtonMask::TIP),
+            driver_click: None,
             device_id: 1,
             tool: crate::tablet::NativeTabletTool::Pen,
             window_number: 1,
@@ -16243,6 +16397,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: 0.0,
             buttons: crate::tablet::TabletButtonMask::new(0),
+            driver_click: None,
             device_id: 1,
             tool: crate::tablet::NativeTabletTool::Pen,
             window_number: 1,
@@ -16297,6 +16452,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: 0.0,
             buttons: crate::tablet::TabletButtonMask::new(0),
+            driver_click: None,
             device_id: 1,
             tool: crate::tablet::NativeTabletTool::Pen,
             window_number: 1,
@@ -17533,16 +17689,24 @@ mod tests {
         }
     }
 
+    fn control_option() -> egui::Modifiers {
+        egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        }
+    }
+
     #[test]
-    fn f9_releases_unique_held_keys_before_modifier_reset_without_remote_f9() {
+    fn the_escape_chord_releases_unique_held_keys_before_modifier_reset() {
         let (mut app, mut receiver) = app_with_command_channel();
         seed_non_modifier_and_modifier(&mut app, &mut receiver);
         app.pointer_lock = true;
         app.relative_motion.accumulate(0.5, -0.5).unwrap();
 
-        app.process_keyboard_event(&key_event(egui::Key::F9, true, egui::Modifiers::NONE));
+        app.process_keyboard_event(&key_event(egui::Key::Home, true, control_option()));
 
-        assert_releases_before_reset(&mut receiver, "panic_f9");
+        assert_releases_before_reset(&mut receiver, "release_keyboard");
         assert!(receiver.try_recv().is_err());
         assert_eq!(app.keyboard.held_count(), 0);
         assert!(!app.pointer_lock);
@@ -17550,7 +17714,7 @@ mod tests {
     }
 
     #[test]
-    fn f9_releases_the_secondary_lock_owner_and_leaves_root_untouched() {
+    fn the_escape_chord_releases_the_secondary_lock_owner_and_leaves_root_untouched() {
         // Item 3: F9 must check `secondary_pointer_lock` first and release
         // exactly that owner via `release_secondary_pointer_lock`, never
         // root's own `release_pointer_lock` -- root never held the lock in
@@ -17569,7 +17733,7 @@ mod tests {
         app.pointer_lock = false;
         app.relative_motion.accumulate(0.25, 0.25).unwrap();
 
-        app.process_keyboard_event(&key_event(egui::Key::F9, true, egui::Modifiers::NONE));
+        app.process_keyboard_event(&key_event(egui::Key::Home, true, control_option()));
 
         let release = receive_json(&mut receiver);
         assert_eq!(release["type"], "mouse_button");
@@ -17585,7 +17749,7 @@ mod tests {
         // proving no *further* traffic follows.
         let reset = receive_json(&mut receiver);
         assert_eq!(reset["type"], "key_reset_modifiers");
-        assert_eq!(reset["reason"], "panic_f9");
+        assert_eq!(reset["reason"], "release_keyboard");
         assert!(receiver.try_recv().is_err());
         assert!(
             app.secondary_pointer_lock.is_none(),
@@ -17603,7 +17767,7 @@ mod tests {
     }
 
     #[test]
-    fn f9_still_releases_root_when_no_secondary_owns_the_lock() {
+    fn the_escape_chord_still_releases_root_when_no_secondary_owns_the_lock() {
         // Regression guard: root's own F9 panic-release path must keep
         // working unchanged when no secondary currently owns a lock.
         let (mut app, mut receiver) = app_with_command_channel();
@@ -17612,14 +17776,14 @@ mod tests {
         app.remote_pointer_buttons = [true, false, false];
         app.relative_motion.accumulate(0.5, -0.5).unwrap();
 
-        app.process_keyboard_event(&key_event(egui::Key::F9, true, egui::Modifiers::NONE));
+        app.process_keyboard_event(&key_event(egui::Key::Home, true, control_option()));
 
         let release = receive_json(&mut receiver);
         assert_eq!(release["type"], "mouse_button");
         assert_eq!(release["pressed"], false);
         let reset = receive_json(&mut receiver);
         assert_eq!(reset["type"], "key_reset_modifiers");
-        assert_eq!(reset["reason"], "panic_f9");
+        assert_eq!(reset["reason"], "release_keyboard");
         assert!(receiver.try_recv().is_err());
         assert!(!app.pointer_lock);
         assert_eq!(app.relative_motion.residual(), (0.0, 0.0));
@@ -21227,6 +21391,28 @@ mod tests {
         assert!(options.multi_monitor_topology.is_some());
     }
 
+    /// The canvas is shown by the root window's eight-bit layer only: a
+    /// single-window connection asks for it, a multi-monitor one does not.
+    #[test]
+    fn only_a_single_window_connection_asks_for_the_canvas() {
+        let app = ArcenApp::default();
+        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        draft.host = "host.local".to_string();
+
+        let single = app.connect_options(&draft);
+        let multi = app.connect_options_with_test_approval(
+            &draft,
+            Some(test_requested_multi_monitor_selection()),
+        );
+
+        assert!(app.canvas, "on by default");
+        assert!(single.canvas.capability().is_some());
+        assert_eq!(
+            multi.canvas,
+            arcen_deck_core::canvas::CanvasRequest::Unavailable
+        );
+    }
+
     #[test]
     fn match_layout_status_never_claims_primary_only_after_attaching_an_approved_topology() {
         // Ties `approved_multi_monitor_selection` (the send-side gate over
@@ -24457,7 +24643,10 @@ mod tests {
                 hidpi_display_mask: 0b0010,
                 tablet_input_enabled: false,
                 tablet_mode_requested: TabletModeMsg::DisabledMouseCompat,
+                pen_buttons: arcen_input::pen_buttons::PenButtonSettings::default(),
                 exact_still_image: false,
+                canvas: false,
+                canvas_cache_mib: 32,
                 color_fidelity: ColorFidelitySettings {
                     preset: ColorFidelity::GradingReference,
                     overrides: ColorFidelityOverrides {
@@ -24479,6 +24668,7 @@ mod tests {
                     confirm_above: 500,
                     chars_per_second: 10,
                 },
+                keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Fullscreen,
             },
         )
         .unwrap();
@@ -29773,6 +29963,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: 0.0,
             buttons: crate::tablet::TabletButtonMask::new(0),
+            driver_click: None,
             device_id: 1,
             tool: crate::tablet::NativeTabletTool::Eraser,
             window_number: 42,

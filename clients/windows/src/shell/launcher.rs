@@ -53,6 +53,7 @@ use arcen_deck_core::screens::connecting::{
     render_displays_unsupported, render_topology_conflict,
 };
 use arcen_deck_core::screens::home::{HomeEffect, HomeViewState, apply_home_action, render_home};
+use arcen_deck_core::screens::keyboard_help::{keyboard_status_line, render_keyboard_shortcuts};
 use arcen_deck_core::screens::launcher::{LauncherAction, render_launcher_top_bar};
 use arcen_deck_core::screens::menu::{
     MenuCommand, QuitHoldStep, connection_bar_reveal_zone, paint_quit_hold_notice, quit_hold_step,
@@ -94,7 +95,7 @@ use arcen_deck_core::screens::text_input::{
     NOTICE_DURATION, characters_unavailable_notice, keyboard_mode_notice, paint_text_input_overlays,
 };
 use arcen_input::deck_pen::ImageRect;
-use arcen_input::keyboard::{DeckShortcut, KeyboardGrab, KeyboardSettings};
+use arcen_input::keyboard::{DeckShortcut, KeyboardSettings};
 use arcen_input::text::{KeyboardMode, TypingMode};
 use arcen_media::SessionMonitorId;
 use arcen_protocol::messages::TabletModeMsg;
@@ -166,6 +167,8 @@ pub(super) struct Launcher {
     form_keyboard: KeyboardSettings,
     remember_username: bool,
     about_open: bool,
+    /// Help ▸ Keyboard Shortcuts is open.
+    shortcuts_open: bool,
     native_tablet: NativeTabletComponent,
     /// Settings › Logs › "Create support bundle…" (shared panel).
     support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel,
@@ -347,6 +350,7 @@ impl Launcher {
             form_keyboard: KeyboardSettings::default(),
             remember_username: true,
             about_open: false,
+            shortcuts_open: false,
             native_tablet: NativeTabletComponent::default(),
             support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel::default(),
             decode_report,
@@ -594,7 +598,12 @@ impl Launcher {
             MenuCommand::SendSecureAttention => {
                 self.window_input(WindowInput::send_secure_attention);
             }
-            MenuCommand::ToggleKeyboardGrab => self.window_input(WindowInput::toggle_grab),
+            MenuCommand::ToggleKeyboardCapture => {
+                self.window_input(WindowInput::toggle_keyboard);
+                self.keyboard_owner_changed();
+            }
+            MenuCommand::SendKey(key) => self.window_input(|input| input.send_key(key)),
+            MenuCommand::KeyboardShortcuts => self.shortcuts_open = true,
             MenuCommand::TogglePointerLock => self.window_input(|input| {
                 let locked = input.pointer_locked();
                 input.set_pointer_lock(!locked);
@@ -621,7 +630,8 @@ impl Launcher {
             connection.sync_window_input(&self.surface.tree, bridged_pen);
             for news in connection.take_local_input() {
                 match news {
-                    LocalInput::Shortcut(DeckShortcut::ShowConnectionBar) => {
+                    LocalInput::Shortcut(DeckShortcut::ReleaseKeyboard) => {
+                        // The input already gave the keyboard away (or back).
                         show_connection_bar = true;
                     }
                     LocalInput::Shortcut(shortcut) => {
@@ -640,7 +650,7 @@ impl Launcher {
             ui.ctx().request_repaint_after(CLIPBOARD_POLL);
         }
         if show_connection_bar {
-            self.pin_bar();
+            self.keyboard_owner_changed();
         }
         self.drive_quit_hold(&ui.ctx().clone());
         let available = ui.available_size();
@@ -712,10 +722,51 @@ impl Launcher {
                     }
                 }
             });
+        self.help_windows(ui.ctx());
+    }
+
+    /// Help ▸ About and Help ▸ Keyboard Shortcuts, while open.
+    fn help_windows(&mut self, ctx: &egui::Context) {
         if self.about_open
-            && render_about(ui.ctx(), crate::VERSION, crate::VERSION) == AboutAction::Close
+            && render_about(ctx, crate::VERSION, crate::VERSION) == AboutAction::Close
         {
             self.about_open = false;
+        }
+        render_keyboard_shortcuts(ctx, DeckPlatform::Pc, true, &mut self.shortcuts_open);
+    }
+
+    /// Settings changed: what takes effect at once does, and they are saved.
+    fn settings_changed(&mut self) {
+        // Logs › Log level takes effect at once, as on the Mac.
+        arcen_deck_core::logging::set_level(self.settings.log_level.profile());
+        let policy = self.settings.keyboard_capture;
+        self.window_input(|input| input.set_capture_policy(policy));
+        if let Err(error) = save_client_settings(&self.repository, &self.settings) {
+            self.status = format!("Settings were not saved: {error}");
+        }
+    }
+
+    /// Who has the keyboard, as the indicator says it ("Keyboard: Z8
+    /// (Ctrl+Alt+Home to release)"); empty outside a session.
+    pub(super) fn keyboard_status_line(&self) -> String {
+        self.window_input_value(WindowInput::keyboard_status)
+            .map(|status| keyboard_status_line(status, &self.session_title, DeckPlatform::Pc))
+            .unwrap_or_default()
+    }
+
+    /// The keyboard went to this PC or back: say so, and in fullscreen pin
+    /// the connection bar while this PC has it (the bar is then the
+    /// indicator; fullscreen draws nothing over the video otherwise).
+    fn keyboard_owner_changed(&mut self) {
+        let released = self.window_input_value(WindowInput::keyboard_released) == Some(true);
+        if released {
+            self.pin_bar();
+        } else if self.bar_pinned {
+            self.bar_pinned = false;
+        }
+        let line = self.keyboard_status_line();
+        if !line.is_empty() {
+            self.notify(line);
         }
     }
 
@@ -739,6 +790,7 @@ impl Launcher {
             form_username: &mut self.form_username,
             form_displays_mode: &mut self.form_displays_mode,
             form_keyboard: &mut self.form_keyboard,
+            app_displays_mode: self.settings.displays_mode,
             connection_error,
             remember_username: &mut self.remember_username,
             connection_test: None,
@@ -956,6 +1008,7 @@ impl Launcher {
                 }
                 let layout_note = connection.layout_note().map(str::to_owned);
                 let display_note = connection.display_note();
+                let desk_note = connection.desk_note().map(str::to_owned);
                 if let Some(note) = &display_note {
                     tracing::warn!(
                         target: "arcen::display",
@@ -967,8 +1020,11 @@ impl Launcher {
                     self.hwnd,
                     self.session_keyboard,
                     self.settings.option_key_mode,
-                    self.settings.tablet_mode_requested,
-                    KeyboardGrab::default(),
+                    (
+                        self.settings.tablet_mode_requested,
+                        self.settings.pen_buttons,
+                    ),
+                    self.settings.keyboard_capture,
                 );
                 if let Err(error) = attached {
                     tracing::warn!(%error, "the session window's input was not attached");
@@ -992,8 +1048,9 @@ impl Launcher {
                     );
                     arcen_input::deck_pen::TABLET_AS_MOUSE_HINT.to_owned()
                 });
-                let notes: Vec<String> = layout_note
+                let notes: Vec<String> = desk_note
                     .into_iter()
+                    .chain(layout_note)
                     .chain(display_note)
                     .chain(tablet_hint)
                     .collect();
@@ -1820,7 +1877,7 @@ impl Launcher {
             monitor,
             keyboard,
             option_keys,
-            KeyboardGrab::default(),
+            self.settings.keyboard_capture,
         ) {
             tracing::warn!(%error, monitor = monitor.get(), "a secondary window's input was not attached");
         }
@@ -1841,19 +1898,21 @@ impl Launcher {
         }
     }
 
-    /// Ctrl+Alt+Home: the fullscreen connection bar opens and takes the
-    /// keyboard (Remote Desktop's chord), until a command is chosen, Esc, or
-    /// a click into the picture.
+    /// Ctrl+Alt+Home gave the keyboard to this PC: in fullscreen the
+    /// connection bar opens and stays open (Remote Desktop's chord) until
+    /// the keyboard goes back: the chord again, a click into the picture, a
+    /// command chosen, or Esc.
     fn pin_bar(&mut self) {
         if self.fullscreen && self.connection.is_some() {
             self.bar_pinned = true;
-            self.window_input(|input| input.set_connection_bar(true));
         }
     }
 
+    /// The pinned bar closes (Esc, a command): the keyboard goes back to the
+    /// host.
     fn unpin_bar(&mut self) {
         if std::mem::take(&mut self.bar_pinned) {
-            self.window_input(|input| input.set_connection_bar(false));
+            self.window_input(|input| input.set_keyboard_released(false));
         }
     }
 
@@ -1868,23 +1927,33 @@ impl Launcher {
     fn connection_bar(&mut self, ctx: &egui::Context) {
         if self.bar_pinned
             && (self.connection.is_none()
-                || self.window_input_value(WindowInput::connection_bar) == Some(false)
+                || self.window_input_value(WindowInput::keyboard_released) == Some(false)
                 || ctx.input(|input| input.key_pressed(egui::Key::Escape)))
         {
             // A click into the picture took the keyboard back, or Esc.
             self.unpin_bar();
         }
+        let status = self.keyboard_status_line();
+        let title = if status.is_empty() {
+            self.session_title.clone()
+        } else {
+            format!("{} · {status}", self.session_title)
+        };
         let pass = render_connection_bar(
             ctx,
             DeckPlatform::Pc,
-            &self.session_title,
+            &title,
             self.bar_pinned,
             // As the menu bar: the Windows Deck has no Colour check yet.
             |command| command != MenuCommand::ToggleColourCheck,
         );
         if let Some(command) = pass.command {
             self.bar_commands.push(command);
-            self.unpin_bar();
+            // The keyboard item gives the keyboard back itself (and closes
+            // the bar); every other command closes it here.
+            if command != MenuCommand::ToggleKeyboardCapture {
+                self.unpin_bar();
+            }
         }
         let ppp = f64::from(ctx.pixels_per_point());
         let pixels = |rect: egui::Rect| ImageRect {
@@ -2171,6 +2240,10 @@ impl Launcher {
                 let saved = self.saved.iter().find(|saved| &saved.id == id)?;
                 Some((saved.name.clone(), saved.settings.displays_mode?))
             }),
+            canvas_available: arcen_deck_core::canvas::CanvasRequest::for_sink::<
+                crate::media::WindowSink,
+            >(true, self.settings.canvas_cache_mib)
+                != arcen_deck_core::canvas::CanvasRequest::Unavailable,
         };
         let mut values = SettingsValues::from_client_settings(&self.settings, self.settings_tab);
         let actions = render_settings(ui, &mut values, &facts);
@@ -2192,11 +2265,7 @@ impl Launcher {
             }
         }
         if values.apply_to(&mut self.settings) {
-            // Logs › Log level takes effect at once, as on the Mac.
-            arcen_deck_core::logging::set_level(self.settings.log_level.profile());
-            if let Err(error) = save_client_settings(&self.repository, &self.settings) {
-                self.status = format!("Settings were not saved: {error}");
-            }
+            self.settings_changed();
         }
         for action in actions {
             match action {

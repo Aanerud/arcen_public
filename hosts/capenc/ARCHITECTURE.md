@@ -157,16 +157,6 @@ because the destination buffer is wider.
   shared memory), an unqualified DMA-BUF EGL/CUDA route, capture-path
   telemetry, and the `wayland-capture-probe` lab harness. See
   `docs/architecture/linux-wayland-provider.md`.
-- `region_schedule.rs` — host-neutral binding of `arcen-media`'s
-  `RegionActivityScheduler` for both software capture loops. It owns the Keel
-  damage tracker that already drives selective conversion, so one hash pass per
-  frame yields the damage map, this region's serve/skip decision, and bounded
-  fixed-field `activity_*` diagnostics on the per-second stats line. Suppression
-  applies only to provably unchanged pixels: capture and hashing still run every
-  tick, and startup baselines, client IDRs, recovery/modeset keyframes, the
-  keyframe deadline, the max-idle refresh, and input/focus wakes are all
-  mandatory services it can never skip. Encoder backend, codec/chroma, bitrate,
-  and frame-rate policy stay host-authoritative.
 - `nvenc.rs` + `nvenc_sys/{mod,guid,version}.rs` — Windows NVENC FFI and
   staging, including separate FP16-scRGB-to-SDR and FP16-scRGB-to-PQ row
   conversions.

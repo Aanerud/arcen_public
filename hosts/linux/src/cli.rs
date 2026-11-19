@@ -187,6 +187,11 @@ pub struct Config {
     /// What this sign-in's Deck asked for (`AuthResponse.lossless_refine_v1`);
     /// absent for an older Deck or one whose switch is off.
     pub deck_refine: Option<arcen_protocol::refine::LosslessRefineCapability>,
+    /// What this sign-in's Deck offered for the canvas
+    /// (`AuthResponse.canvas_v1`, ADR 0028); absent for an older Deck.
+    pub deck_canvas: Option<arcen_protocol::canvas::CanvasCapability>,
+    /// `video.software.cpu_share`: what the canvas loop may spend.
+    pub software_cpu_share: arcen_media::canvas::CpuShare,
     pub requested_pipeline: Option<arcen_media::video::PipelineId>,
     /// This sign-in's headless Wayland desktop serves a committed
     /// multi-monitor topology: the record's wide-composition proof is a
@@ -327,6 +332,9 @@ pub struct Config {
     pub clipboard_policy: ClipboardPolicy,
     /// Operator-enforced physical-console privacy, disabled by default.
     pub deskside: crate::deskside::LinuxDesksideConfig,
+    /// `privacy.desk`: a joined console's desk is private while a Deck is
+    /// attached unless the administrator turned it off.
+    pub desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy,
     /// `multi_monitor_v1` advertisement gate. Defaults to advertised when
     /// startup NVIDIA-head discovery succeeds; `advertise_enabled: false`
     /// remains the administrator off switch.
@@ -534,6 +542,7 @@ impl Config {
             gpu_import_verified: self.wayland_gpu_import_verified(),
             wayland_fidelity_args: self.wayland_fidelity_args(),
             refine: None,
+            canvas: None,
             display: Some(self.display.clone()),
             xauthority: match execution.as_ref() {
                 Some(user) => user.environment.get("XAUTHORITY").map(str::to_string),
@@ -1418,6 +1427,8 @@ impl Default for Config {
             wayland_multi_output: false,
             lossless_refinement: true,
             deck_refine: None,
+            deck_canvas: None,
+            software_cpu_share: arcen_media::canvas::CpuShare::default(),
             x11_desktop_depth: arcen_media::video::DesktopDepthPolicy::default(),
             attached_desktop_depth: None,
             desktop_depth_downgraded: false,
@@ -1477,6 +1488,8 @@ impl Default for Config {
             managed_log: None,
             clipboard_policy: ClipboardPolicy::default(),
             deskside: crate::deskside::LinuxDesksideConfig::default(),
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
+            ),
             multi_monitor: crate::config::LinuxMultiMonitorConfig::default(),
             unsafe_allow_remote_no_auth: false,
             width: 0,
@@ -1839,6 +1852,12 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         &cfg.session_display,
         &cfg.session_gpu_head,
     )?;
+    if cfg.deskside.enabled && !cfg.desk_privacy.enabled {
+        return Err(
+            "platform.deskside (pinned physical-console privacy) contradicts privacy.desk = \"off\""
+                .to_string(),
+        );
+    }
     if cfg.tls_cert.is_some() != cfg.tls_key.is_some() {
         return Err("--tls-cert and --tls-key must be provided together".to_string());
     }
@@ -1913,7 +1932,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
             .map_err(|error| format!("platform.multi_monitor.heads is invalid: {error}"))?;
     }
     if cfg.multi_monitor.advertise_enabled
-        && cfg.encoder == EncoderSelection::WindowsMediaFoundation
+        && cfg.encoder == EncoderSelection::MediaFoundationHardware
     {
         return Err(format!(
             "platform.multi_monitor.advertise_enabled requires an explicit encoder pin \
@@ -2069,6 +2088,8 @@ fn find_config_request(args: &[String]) -> Result<ConfigRequest, String> {
 }
 
 fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> Result<(), String> {
+    cfg.software_cpu_share =
+        arcen_media::canvas::CpuShare::from_setting(file.video.software_cpu_share_percent());
     if let Some(value) = file.listen.host {
         cfg.host = value;
     }
@@ -2200,6 +2221,7 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     cfg.lossless_refinement = arcen_session::pier_config::LosslessRefinementSetting::resolve(
         file.video.lossless_refinement,
     );
+
     if let Some(value) = file.video.variant {
         apply_variant(cfg, &value)
             .map_err(|error| format!("Pier config video.variant: {error}"))?;
@@ -2236,6 +2258,7 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
         cfg.timezone_redirection = value;
     }
     cfg.native_tablet = file.usb.native_tablet;
+    cfg.desk_privacy = file.privacy.desk_policy();
     // `LoggingConfig::deserialize` already validated the canonical/legacy
     // fields; `resolved_profile` is called here only as defense-in-depth so
     // a manually constructed conflict fails fast with a clear message.
@@ -2842,8 +2865,8 @@ mod tests {
             software_host.session_encoder(),
             EncoderSelection::SoftwareH264
         );
-        assert_eq!(software_host.wayland_session_size(2560, 1600), (1920, 1200));
-        assert_eq!(software_host.wayland_session_size(1800, 1130), (1800, 1130));
+        assert_eq!(software_host.wayland_session_size(7680, 4320), (3840, 2160));
+        assert_eq!(software_host.wayland_session_size(2560, 1600), (2560, 1600));
         // Its multi-monitor roster is planned on the same encoder.
         assert_eq!(
             software_host.wayland_multi_monitor_encoder(),
@@ -2863,7 +2886,7 @@ mod tests {
             pinned.wayland_multi_monitor_encoder(),
             EncoderSelection::NativeNvenc
         );
-        assert_eq!(pinned.wayland_session_size(2560, 1600), (2560, 1600));
+        assert_eq!(pinned.wayland_session_size(7680, 4320), (7680, 4320));
         // A software pin on Wayland fits too; on Xorg nothing changes here.
         let wayland_pin = Config {
             encoder: EncoderSelection::SoftwareH264,
@@ -2877,7 +2900,7 @@ mod tests {
             ..Config::default()
         };
         assert!(!xorg_pin.wayland_software_sessions());
-        assert_eq!(xorg_pin.wayland_session_size(2560, 1600), (2560, 1600));
+        assert_eq!(xorg_pin.wayland_session_size(7680, 4320), (7680, 4320));
         assert_eq!(xorg_pin.session_encoder(), EncoderSelection::SoftwareH264);
         // A record with a native encoder, or none read yet, stays native.
         let native = Config {
@@ -3868,6 +3891,28 @@ mod tests {
             !argv.iter().any(|arg| arg.starts_with("desktop-encoding=")),
             "{argv:?}"
         );
+    }
+
+    #[test]
+    fn desk_privacy_is_on_unless_the_pier_file_turns_it_off() {
+        let file_with = |privacy: &str| -> crate::config::PierFileConfig {
+            serde_json::from_str(&format!(
+                r#"{{
+                    "audio":{{"enabled":true,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    {privacy}
+                    "platform": {{}}
+                }}"#
+            ))
+            .expect("config")
+        };
+        let mut cfg = Config::default();
+        assert!(cfg.desk_privacy.enabled);
+        apply_file_config(&mut cfg, file_with("")).expect("apply file config");
+        assert!(cfg.desk_privacy.enabled);
+        apply_file_config(&mut cfg, file_with(r#""privacy":{"desk":"off"},"#))
+            .expect("apply file config");
+        assert!(!cfg.desk_privacy.enabled);
     }
 
     #[test]

@@ -261,14 +261,15 @@ Full field-level contract: [`shared/protocol/WIRE.md`](../../shared/protocol/WIR
 - `PenToolMsg` (`tip` \| `eraser`) and `PenEventMsg`/`PEN_EVENT`
   (`"pen_event"`) carry normalized `x`/`y`, `-1`-sentinel `server_x`/`server_y`,
   `pressure`, `tilt_x_degrees`/`tilt_y_degrees`, `rotation_degrees`, `tool`,
-  `in_proximity`/`touching`, a `buttons` bitset (bit 0 = first barrel button,
-  bit 1 = second), and the shared `sequence`/`timestamp_ns`/`coalescable`
-  metadata used by every other input message. This is not AppKit's layout:
-  `-[NSEvent buttonMask]` keeps bit 0 for the tip and puts the lower/upper
-  barrel buttons on bits 1 and 2. The macOS Deck shifts them down
-  (`TabletButtonMask::wire_barrel_buttons`) and the macOS Pier builds AppKit's
-  layout back from `touching` + `buttons` for `kCGTabletEventPointButtons`
-  (`pen::tablet_button_mask`); before 0.19 both copied the bits verbatim.
+  `in_proximity`/`touching`, a `buttons` bitset, and the shared
+  `sequence`/`timestamp_ns`/`coalescable` metadata used by every other input
+  message. `buttons` names what a barrel button **does**, not where it sits:
+  bit 0 is the pen's right click (`PEN_BUTTON_RIGHT_CLICK`), bit 1 its middle
+  click (`PEN_BUTTON_MIDDLE_CLICK`). See [Barrel buttons](#barrel-buttons).
+  This is not AppKit's layout either: `-[NSEvent buttonMask]` keeps bit 0 for
+  the tip and puts the lower/upper side switch on bits 1 and 2, and the macOS
+  Pier builds that layout back from `touching` + `buttons` for
+  `kCGTabletEventPointButtons` (`pen::tablet_button_mask`).
 - **Validation is `PenEventMsg::validate()`, not a custom `Deserialize`.**
   `serde` alone accepts an untrusted peer's out-of-range finite value (e.g.
   `pressure: 2.0`); every product boundary calls `validate()` — checked
@@ -287,6 +288,54 @@ Full field-level contract: [`shared/protocol/WIRE.md`](../../shared/protocol/WIR
   out-of-order sequence never advances product state, and coalescing may only
   drop superseded hover/move samples — proximity, contact, tool, and button
   edges are never dropped.
+
+## Barrel buttons
+
+Field case (2026-11-19): a Windows Deck's Wacom barrel button, which Windows
+Ink reports as Windows' right click (`PEN_FLAG_BARREL`), reached a Linux Pier
+as bit 0, `BTN_STYLUS`, which X and every Linux desktop make a **middle**
+click; and a side switch the Wacom driver performs as a mouse click (Middle
+Click, Right Click) was dropped by the Deck while the pen hovered. Before the
+fix the Piers disagreed on bit 0: right click on macOS and Windows, middle
+click on Linux.
+
+**One meaning, shared** (`arcen_input::pen_buttons`):
+
+- The wire carries actions: bit 0 right click, bit 1 middle click. A host
+  that gives them that meaning says `pen_button_actions = available` in its
+  hello. A Linux Pier that predates the field pressed `BTN_STYLUS` for bit 0;
+  a Deck swaps the two bits for it (`HostPenButtons::LinuxLegacy`), so a new
+  Deck right-clicks on an old Pier too (the Z8 needs no Pier update). Older
+  macOS and Windows Piers already right-clicked for bit 0.
+- **The tablet driver's mapping is honoured as it arrives.** A Windows Ink
+  barrel is the button the driver set to Right Click. A click the driver
+  performs as a mouse click while the pen is in range is that click on the
+  pen: the Windows Deck answers every pen `WM_POINTER` message, so Windows
+  promotes none to mouse messages, and `deck_pen::route_mouse_while_pen`
+  sends `WM_RBUTTON*`/`WM_MBUTTON*` as the pen's right/middle click (a release
+  whose press the pen did not take stays the mouse's), a hovering
+  `WM_LBUTTON*` (a switch set to Left Click) as the mouse's left button, and
+  drops a left click in contact (the tip is the left button) and mouse
+  movement (the pen owns the pointer). The macOS Deck reads the same from
+  right/other-mouse tablet events (`driver_click_for_event`); while the driver
+  holds a click, the side switches' position bits are not read.
+- **Settings** (Settings › Input › Tablet support, `pen_barrel_button`,
+  `pen_lower_button`, `pen_upper_button`): Right click, Middle click or Off for
+  the buttons the operating system reports by position: the Windows Ink
+  barrel (default Right click) on Windows; the lower (default Right click) and
+  upper (default Middle click) side switch on a Mac. A Wacom pen's own
+  defaults differ (upper Right Click, lower Pan/Scroll); where its driver
+  performs the click, that click is sent.
+- **Hosts.** Linux: right click `BTN_STYLUS2` (X button 3), middle
+  `BTN_STYLUS` (button 2), on the tablet device, or `BTN_RIGHT`/`BTN_MIDDLE`
+  on the absolute pointer when there is none; Wayland's emulated stylus the
+  same codes. Windows: right click = the Windows Ink barrel; middle click =
+  the mouse's middle button (`SendInput`, the Arcen injection marker) where
+  the pen put the cursor, released before the pen leaves range (Windows Ink
+  has no second barrel switch). macOS: right/other mouse events with the
+  tablet annotations (`barrel_button`).
+- Earned differences: `PD-035` in
+  [`platform-differences.md`](platform-differences.md).
 
 ## Tablet mode contract (requested vs active)
 
@@ -448,16 +497,17 @@ unit-testable off Linux) and `hosts/linux/src/input/uinput.rs`
 - **The tablet device is the pen; the mouse device is not used for it.**
   xf86-input-libinput puts the tablet device on the master keyboard and gives
   each tool in proximity its own slave pointer (`"… Pen (0)"` in
-  `xinput list`), which moves the cursor and presses button 1 for the tip and
-  buttons 2 and 3 for the lower and upper barrel switch, as with a USB tablet.
+  `xinput list`), which moves the cursor and presses button 1 for the tip,
+  button 3 for the right click (`BTN_STYLUS2`) and button 2 for the middle
+  click (`BTN_STYLUS`), as with a USB tablet.
   Until 0.17.0 the pen also moved the cursor and clicked through the
   absolute mouse device, so X clients received each sample twice from two
   source devices: Firefox began every stroke with a `mouse` pointerdown and
   switched pointer type and id inside strokes, and pages that end a stroke on
   `pointerleave` lost ink. Without a tablet device (creation failed, or Hard
   USB released it) the pen falls back to cursor and clicks on the absolute
-  device, without pressure or tilt, with the same buttons (tip = left, lower
-  barrel = middle, upper barrel = right).
+  device, without pressure or tilt, with the same buttons (tip = left, right
+  click = right, middle click = middle).
 - **Contact comes from pressure.** libinput ignores `BTN_TOUCH` on a tablet
   with a pressure axis and puts the tool in contact when pressure reaches 5 %
   of the range, out of it at 1 % (`evdev-tablet.c`, libinput 1.19 to 1.31). A
@@ -571,10 +621,12 @@ Module: `hosts/windows/src/input.rs` (`PenInjector`, `PenPointerState`,
   `POINTER_PEN_INFO` as a real digitizer reports it (`pen_ink_flags`): the
   eraser end in range sets `PEN_FLAG_INVERTED`, and only an eraser end in
   contact adds `PEN_FLAG_ERASER` — Windows treats that flag as the eraser's
-  tip switch, so setting it while hovering clicks. Either barrel button
-  (bit 0 or bit 1 of `PenEventMsg::buttons`) sets `PEN_FLAG_BARREL`, which
-  Windows reports as the second pointer button; Windows Ink has one barrel
-  switch and ignores an injected `POINTER_FLAG_SECONDBUTTON` for a pen.
+  tip switch, so setting it while hovering clicks. The right click (bit 0 of
+  `PenEventMsg::buttons`) sets `PEN_FLAG_BARREL`, which Windows reports as the
+  second pointer button; Windows Ink has one barrel switch and ignores an
+  injected `POINTER_FLAG_SECONDBUTTON` for a pen, so the middle click (bit 1)
+  is the mouse's middle button (`pen_middle_click`, `SendInput`). Before
+  `pen_button_actions` bit 1 also set the barrel.
   `PenPointerState`/`PenPointerEdge` is a small,
   unit-tested proximity/hover/contact transition state machine
   (`Out -> Hovering -> Contact` and back) driving the exact
@@ -617,8 +669,8 @@ vendor-neutral 65535; no tablet of another make has been physically tested.
 | Hover/proximity | ✅ `BTN_TOOL_PEN` | ✅ `POINTER_FLAG_INRANGE` | Enter/leave tracked |
 | Tip contact | ✅ `BTN_TOUCH` | ✅ `POINTER_FLAG_INCONTACT` | |
 | Eraser end | ✅ `BTN_TOOL_RUBBER` | ✅ `PEN_FLAG_INVERTED`, `+ PEN_FLAG_ERASER` in contact | |
-| Lower barrel button | ✅ `BTN_STYLUS` → right-click | ✅ `PEN_FLAG_BARREL` | |
-| Upper barrel button | ✅ `BTN_STYLUS2` → middle-click | ⚠️ `PEN_FLAG_BARREL` | Windows Ink has one barrel switch: both buttons press it |
+| Right click (bit 0) | ✅ `BTN_STYLUS2` → button 3 | ✅ `PEN_FLAG_BARREL` | The Deck's settings or its tablet driver decide which physical button |
+| Middle click (bit 1) | ✅ `BTN_STYLUS` → button 2 | ✅ mouse middle button (`SendInput`) | Windows Ink has one barrel switch |
 | Rotation | ❌ Not injected | ✅ `PEN_MASK_ROTATION` | Protocol carries it; Linux omitted intentionally |
 
 ### Hard OS ceilings (not fixable in Arcen code)

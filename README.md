@@ -21,7 +21,7 @@ Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
 | Host | Requirements |
 | --- | --- |
 | **Linux**, X11 | Rocky Linux 9 or 10 with Xorg and an **NVIDIA GPU** and driver (capture and encode run on it). |
-| **Linux**, GNOME Wayland | Rocky Linux 9 or 10 with GNOME 40+ and any GPU with a DRM render node. NVENC is used on NVIDIA; other GPUs get software H.264 (up to 30 fps). Grading and HDR need GNOME 50+. |
+| **Linux**, GNOME Wayland | Rocky Linux 9 or 10 with GNOME 40+ and any GPU with a DRM render node. NVENC is used on NVIDIA; other GPUs get software H.264 at the rate the CPU encodes. Grading and HDR need GNOME 50+. |
 | **Windows** | Windows 10 1809+, 11, or Server 2022+. Grading and HDR need an NVIDIA GPU; without one the Pier encodes H.264 in software. |
 | **macOS** (preview) | **macOS 14.2 or later**, with a user **signed in** at the console (the preview serves that signed-in desktop). |
 

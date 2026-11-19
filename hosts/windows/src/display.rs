@@ -998,6 +998,73 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
             .map_err(ArmedApplyError::MutationFailed)
     }
 
+    /// Desk privacy on a host that cannot darken a monitor: the target
+    /// becomes the only active output, so every monitor at the desk is
+    /// detached from the desktop while the Deck is attached. The detach is a
+    /// mutation under the same armed recovery journal as the mode, so the
+    /// lease's restore (and, after a crash, the watchdog or the console
+    /// recovery at service start) brings back the exact saved topology.
+    /// Returns whether the topology changed; a detach that fails or does
+    /// not settle is rolled back and refused.
+    fn isolate_for_desk(&mut self) -> Result<bool, String> {
+        let current = self.backend.current(&self.target)?;
+        if current.active_outputs <= 1 {
+            return Ok(false);
+        }
+        let isolated = if self.snapshot.is_some() {
+            // The mode was already changed under the armed journal.
+            self.backend.isolate_topology(&self.target)
+        } else {
+            // Nothing changed yet: the topology to bring back is now.
+            self.snapshot = Some(self.backend.snapshot(&self.target)?);
+            self.original = current;
+            self.isolate_armed().map_err(|error| match error {
+                ArmedApplyError::MutationFailed(error)
+                | ArmedApplyError::RecoveryNotReady(error) => error,
+            })
+        };
+        match isolated {
+            Ok(isolated) if isolated.active_outputs == 1 => {
+                let requested = self.report.requested;
+                let exact = self.report.exact;
+                let backend = self.report.backend;
+                let restore_backend = self.backend.restore_backend();
+                let scale = std::mem::take(&mut self.report.effective_scale_reports);
+                self.report = report(
+                    requested,
+                    self.original,
+                    isolated,
+                    exact,
+                    true,
+                    backend,
+                    restore_backend,
+                    &self.target,
+                );
+                self.report.effective_scale_reports = scale;
+                self.record_restore_active();
+                Ok(true)
+            }
+            outcome => {
+                let failure = match outcome {
+                    Ok(isolated) => format!(
+                        "{} outputs stayed active after detaching the desk's monitors",
+                        isolated.active_outputs
+                    ),
+                    Err(error) => error,
+                };
+                self.restore_keeping_armed().map_err(|restore| {
+                    format!("detaching the desk's monitors failed ({failure}); rollback also failed: {restore}")
+                })?;
+                self.disarm_after_rollback()?;
+                self.snapshot = None;
+                self.record_restore_success();
+                Err(format!(
+                    "the desk's monitors could not be detached: {failure}"
+                ))
+            }
+        }
+    }
+
     fn isolate_armed(&mut self) -> Result<ModeState, ArmedApplyError> {
         self.arm_for_mutation()?;
         self.backend
@@ -2118,6 +2185,12 @@ impl Drop for MultiDisplayLease {
 }
 
 impl DisplayLease {
+    /// Detaches every monitor but the session's display from the desktop
+    /// for desk privacy (see `DisplayTransaction::isolate_for_desk`).
+    pub fn detach_desk_monitors(&mut self) -> Result<bool, String> {
+        self.inner.isolate_for_desk()
+    }
+
     pub fn report(&self) -> &DisplayReport {
         self.inner.report()
     }
@@ -10930,6 +11003,95 @@ mod tests {
             ],
             "a matching mode on a multi-output desktop must still isolate the session output"
         );
+    }
+
+    #[test]
+    fn desk_privacy_detaches_the_desk_s_monitors_and_restores_the_saved_topology() {
+        // A negotiated session whose mode already fits leaves the desktop on
+        // two outputs: desk privacy detaches the other one under the armed
+        // journal, and the lease's restore brings the topology back.
+        let backend = FakeBackend::new(size(1920, 1080));
+        let calls = Arc::clone(&backend.calls);
+        let restore_state = Arc::new(Mutex::new(RestoreJournal {
+            state: RestoreState::Clean,
+            last_failure: None,
+        }));
+        let mut transaction = DisplayTransaction::acquire_observed(
+            backend,
+            &OutputSelector::GlobalIndex(0),
+            size(1920, 1080),
+            DisplayPolicy::Negotiated,
+            Some(Arc::clone(&restore_state)),
+        )
+        .unwrap();
+        assert!(!transaction.report.changed);
+        assert_eq!(transaction.isolate_for_desk(), Ok(true));
+        assert!(transaction.report.changed);
+        assert!(matches!(
+            lock_restore_state(&restore_state).state,
+            RestoreState::Active { .. }
+        ));
+        // Already the only output: nothing more to detach.
+        assert_eq!(transaction.isolate_for_desk(), Ok(false));
+        transaction.restore().unwrap();
+        assert_eq!(
+            lock_restore_state(&restore_state).state,
+            RestoreState::Clean
+        );
+        drop(transaction);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                Call::Select(0),
+                Call::Snapshot,
+                Call::Current,
+                Call::Current,
+                Call::Snapshot,
+                Call::Arm,
+                Call::Isolate,
+                Call::Current,
+                Call::Restore,
+                Call::Disarm,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_desk_that_cannot_be_detached_is_rolled_back_and_refused() {
+        let mut backend = FakeBackend::new(size(1920, 1080));
+        backend
+            .isolates
+            .push_back(Err("SetDisplayConfig returned -1".to_string()));
+        let calls = Arc::clone(&backend.calls);
+        let restore_state = Arc::new(Mutex::new(RestoreJournal {
+            state: RestoreState::Clean,
+            last_failure: None,
+        }));
+        let mut transaction = DisplayTransaction::acquire_observed(
+            backend,
+            &OutputSelector::GlobalIndex(0),
+            size(1920, 1080),
+            DisplayPolicy::Negotiated,
+            Some(Arc::clone(&restore_state)),
+        )
+        .unwrap();
+        let error = transaction.isolate_for_desk().unwrap_err();
+        assert!(error.contains("could not be detached"), "{error}");
+        assert_eq!(
+            lock_restore_state(&restore_state).state,
+            RestoreState::Clean
+        );
+        let locked = calls.lock().unwrap();
+        let isolate = locked
+            .iter()
+            .position(|call| *call == Call::Isolate)
+            .unwrap();
+        let rollback = locked
+            .iter()
+            .position(|call| *call == Call::Restore)
+            .unwrap();
+        assert!(isolate < rollback);
+        assert_eq!(locked.last(), Some(&Call::Disarm));
     }
 
     #[test]

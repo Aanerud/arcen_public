@@ -2,7 +2,9 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! Writes a small Annex B test stream from Arcen's OpenH264 software encoder:
 //! a synthetic picture with moving blocks, so decoders can be tested against
-//! a stream Arcen itself produces. `software_h264_vector OUT [W H FRAMES]`.
+//! a stream Arcen itself produces.
+//! `software_h264_vector OUT [W H FRAMES [THREADS]]`: more than one thread
+//! cuts every picture into that many fixed slices (at most four).
 
 use std::io::Write as _;
 
@@ -12,14 +14,15 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     let out = args
         .get(1)
-        .ok_or("usage: software_h264_vector OUT [W H FRAMES]")?;
+        .ok_or("usage: software_h264_vector OUT [W H FRAMES [THREADS]]")?;
     let number = |index: usize, default: u32| {
         args.get(index)
             .and_then(|value| value.parse().ok())
             .unwrap_or(default)
     };
     let (width, height, frames) = (number(2, 320), number(3, 180), number(4, 60));
-    let config = SoftwareH264Config::legacy_bt709_limited(width, height, 30, 2_000_000, 1);
+    let threads = u16::try_from(number(5, 1)).map_err(|error| error.to_string())?;
+    let config = SoftwareH264Config::legacy_bt709_limited(width, height, 30, 2_000_000, threads);
     let mut encoder = SoftwareH264Encoder::new(config).map_err(|error| error.to_string())?;
     let (w, h) = (width as usize, height as usize);
     let mut y = vec![0_u8; w * h];

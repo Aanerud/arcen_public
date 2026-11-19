@@ -64,6 +64,14 @@ an empty program. There is no single-platform `--workspace` build.
   Foundation decoder in the product.
 - Reconnect creates a fresh decoder and waits for a fresh keyframe.
   Teardown discards queued frames.
+- **The canvas (ADR 0028)** is the eight-bit sink's executor of the shared
+  `CanvasWork` (`present/canvas.rs`, shaders `present/shaders/canvas.hlsl`):
+  no decisions here, only D3D11 calls, every write on the presenter
+  device's immediate context under its context lock, before the copy into
+  the swapchain; a record in parts is never presented half applied. Its
+  oracle is `arcen_media::canvas::CanvasPixels`: run
+  `the_canvas_matches_the_cpu_executor_*` (WARP in `cargo test`, GPUs with
+  `--ignored`) after any change. Grading and HDR never touch it.
 
 ## Presentation timing and pixel-perfect fullscreen
 

@@ -13,6 +13,7 @@ wallpaper or third-party applications) stay out of the repository.
 | `nvenc-hevc-rext444-10-640x360.265` | NVENC (Linux X11 Pier, Grading: HEVC Main 4:4:4 10, BT.709 sRGB, full range) | as above | as above |
 | `nvenc-hevc-rext444-10-pq-640x360.265` | NVENC (Linux Wayland Pier, HDR: HEVC Main 4:4:4 10, BT.2020 PQ) | Arcen's exact-still-image ramps picture (`wlpat.py ramps`) with its moving block | as above |
 | `openh264-160x96.264` | OpenH264 through `arcen_media::video::SoftwareH264Encoder` (Constrained Baseline, POC type 2) | Moving checkerboard and ramps, 24 frames, forced IDR at frame 12 | `cargo run -p arcen-media --features software-h264-source --example software_h264_vector -- openh264-160x96.264 160 96 24` |
+| `openh264-4slice-320x192.264` | OpenH264 through `arcen_media::video::SoftwareH264Encoder` with four threads: four fixed slices per picture (Constrained Baseline, POC type 2) | Moving checkerboard and ramps, 12 frames, forced IDR at frame 6 | `cargo run -p arcen-media --features software-h264-source --example software_h264_vector -- openh264-4slice-320x192.264 320 192 12 4` |
 
 Larger lab recordings (NVENC from the Linux Piers, VideoToolbox from the
 macOS Pier) are replayed with `ARCEN_DECODER_VECTORS=<dir> cargo test -p

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! Protocol-v3 Qt key identifiers to Linux evdev key codes.
 
+use arcen_input::keyboard::host_keys::pc_host_key;
 use arcen_input::keyboard::scancode::set1_position;
 use arcen_input::text::host_layout;
 use arcen_protocol::messages::HostKeymapMsg;
@@ -53,8 +54,9 @@ pub fn host_keymap_msg(
 
 /// The evdev code of a Qt key identifier. A main-block position's code is
 /// its PC set-1 make code (the shared [`set1_position`] table, which evdev
-/// was numbered after); `E0`-prefixed keys, locks, Print and Pause, and the
-/// keypad (with [`MOD_KEYPAD`]) have evdev codes of their own.
+/// was numbered after); `E0`-prefixed keys, locks, the keypad (with
+/// [`MOD_KEYPAD`]), and Insert, Print, Pause, Menu and F13–F24 (the shared
+/// [`pc_host_key`] table) have evdev codes of their own.
 pub fn qt_key_to_evdev(qt_key: u32, modifiers: u32) -> Option<u16> {
     if modifiers & MOD_KEYPAD != 0 {
         if let Some(code) = keypad_key(qt_key) {
@@ -84,17 +86,15 @@ fn evdev_only_key(qt_key: u32) -> Option<u16> {
         0x0100_0011 => 107,
         0x0100_0016 => 104,
         0x0100_0017 => 109,
-        // Editing: Insert, Delete, and Enter as Return.
-        0x0100_0006 => 110,
+        // Editing: Delete, and Enter as Return.
         0x0100_0007 => 111,
         0x0100_0005 => 28,
-        // Locks / print / pause.
+        // Caps Lock and Num Lock.
         0x0100_0024 => 58,
         0x0100_0025 => 69,
-        0x0100_0026 => 70,
-        0x0100_0009 => 99,
-        0x0100_0008 => 119,
-        _ => return None,
+        // Insert, Print Screen, Scroll Lock, Pause, Menu and F13-F24: the
+        // shared table every Pier presses them from.
+        _ => return pc_host_key(qt_key).map(|key| key.evdev),
     })
 }
 
@@ -228,7 +228,8 @@ mod tests {
 
     /// Every identifier's evdev code, with and without the keypad flag, as
     /// the Linux Pier's own table gave them before the main block moved to
-    /// the shared set-1 table: the move changed no key.
+    /// the shared set-1 table (the move changed no key), plus F13–F24 and
+    /// Menu (`KEY_COMPOSE`) from the shared PC-key table.
     #[test]
     fn evdev_codes_are_unchanged_by_the_shared_set1_table() {
         const PINNED: &[(u32, u32, u16)] = &[
@@ -402,6 +403,32 @@ mod tests {
             (0x100003A, 16, 87),
             (0x100003B, 0, 88),
             (0x100003B, 16, 88),
+            (0x100003C, 0, 183),
+            (0x100003C, 16, 183),
+            (0x100003D, 0, 184),
+            (0x100003D, 16, 184),
+            (0x100003E, 0, 185),
+            (0x100003E, 16, 185),
+            (0x100003F, 0, 186),
+            (0x100003F, 16, 186),
+            (0x1000040, 0, 187),
+            (0x1000040, 16, 187),
+            (0x1000041, 0, 188),
+            (0x1000041, 16, 188),
+            (0x1000042, 0, 189),
+            (0x1000042, 16, 189),
+            (0x1000043, 0, 190),
+            (0x1000043, 16, 190),
+            (0x1000044, 0, 191),
+            (0x1000044, 16, 191),
+            (0x1000045, 0, 192),
+            (0x1000045, 16, 192),
+            (0x1000046, 0, 193),
+            (0x1000046, 16, 193),
+            (0x1000047, 0, 194),
+            (0x1000047, 16, 194),
+            (0x1000055, 0, 127),
+            (0x1000055, 16, 127),
             (0x1001103, 0, 100),
             (0x1001103, 16, 100),
             (0x1001104, 0, 86),

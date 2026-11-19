@@ -31,6 +31,21 @@ pub enum CapencControlCommand {
     /// replaces the video-target floor from then on; `hold` freezes the
     /// bucket and cancels queued tiles until the next `REFINE-RATE`.
     RefineRate { bps: u64, hold: bool },
+    /// Canvas (ADR 0028): a Deck's `canvas_ack`, relayed after the Pier
+    /// validated it.
+    CanvasAck {
+        monitor_id: u16,
+        generation: u32,
+        fence: u64,
+        unprocessed_bytes: u64,
+        decode_ms_p95: u32,
+    },
+    /// Canvas: a Deck's `canvas_reset_request`; the loop answers with a
+    /// reset (reason `reset request`).
+    CanvasReset { monitor_id: u16, generation: u32 },
+    /// Canvas: local input at monitor pixel `(x, y)`; its neighbourhood is
+    /// never deferred.
+    CanvasInput { x: u32, y: u32 },
 }
 
 impl CapencControlCommand {
@@ -48,6 +63,81 @@ impl CapencControlCommand {
             Self::RefineResume => "REFINE-RESUME".to_owned(),
             Self::RefineRate { bps, hold: false } => format!("REFINE-RATE {bps}"),
             Self::RefineRate { bps, hold: true } => format!("REFINE-RATE {bps} HOLD"),
+            Self::CanvasAck {
+                monitor_id,
+                generation,
+                fence,
+                unprocessed_bytes,
+                decode_ms_p95,
+            } => format!(
+                "CANVAS-ACK {monitor_id} {generation} {fence} {unprocessed_bytes} {decode_ms_p95}"
+            ),
+            Self::CanvasReset {
+                monitor_id,
+                generation,
+            } => format!("CANVAS-RESET {monitor_id} {generation}"),
+            Self::CanvasInput { x, y } => format!("CANVAS-INPUT {x} {y}"),
+        }
+    }
+
+    /// The relay line for a Deck's canvas control message, or `None` for
+    /// one that fails `CanvasControlMsg::validate`.
+    #[must_use]
+    pub fn from_canvas_control(message: &arcen_protocol::canvas::CanvasControlMsg) -> Option<Self> {
+        use arcen_protocol::canvas::CanvasControlMsg;
+        message.validate().ok()?;
+        Some(match *message {
+            CanvasControlMsg::CanvasAck {
+                monitor_id,
+                generation,
+                fence,
+                unprocessed_bytes,
+                decode_ms_p95,
+            } => Self::CanvasAck {
+                monitor_id,
+                generation,
+                fence,
+                unprocessed_bytes,
+                decode_ms_p95,
+            },
+            CanvasControlMsg::CanvasResetRequest {
+                monitor_id,
+                generation,
+                ..
+            } => Self::CanvasReset {
+                monitor_id,
+                generation,
+            },
+        })
+    }
+
+    /// The canvas control message a relayed line stands for.
+    #[must_use]
+    pub fn canvas_control(self) -> Option<arcen_protocol::canvas::CanvasControlMsg> {
+        use arcen_protocol::canvas::CanvasControlMsg;
+        match self {
+            Self::CanvasAck {
+                monitor_id,
+                generation,
+                fence,
+                unprocessed_bytes,
+                decode_ms_p95,
+            } => Some(CanvasControlMsg::CanvasAck {
+                monitor_id,
+                generation,
+                fence,
+                unprocessed_bytes,
+                decode_ms_p95,
+            }),
+            Self::CanvasReset {
+                monitor_id,
+                generation,
+            } => Some(CanvasControlMsg::CanvasResetRequest {
+                monitor_id,
+                generation,
+                reason: "deck".to_owned(),
+            }),
+            _ => None,
         }
     }
 
@@ -72,6 +162,7 @@ pub enum CapencControlParseError {
     InvalidFramerate(String),
     ZeroFramerate,
     InvalidRefineRate(String),
+    InvalidCanvas(String),
 }
 
 impl Display for CapencControlParseError {
@@ -85,6 +176,7 @@ impl Display for CapencControlParseError {
             Self::MissingFramerate => formatter.write_str("FRAMERATE requires an fps value"),
             Self::InvalidFramerate(value) => write!(formatter, "invalid FRAMERATE value {value:?}"),
             Self::ZeroFramerate => formatter.write_str("FRAMERATE must be non-zero"),
+            Self::InvalidCanvas(line) => write!(formatter, "invalid canvas control line {line:?}"),
             Self::InvalidRefineRate(line) => write!(
                 formatter,
                 "REFINE-RATE takes bits per second and an optional HOLD: {line:?}"
@@ -98,6 +190,7 @@ impl std::error::Error for CapencControlParseError {}
 impl FromStr for CapencControlCommand {
     type Err = CapencControlParseError;
 
+    #[allow(clippy::too_many_lines)]
     fn from_str(line: &str) -> Result<Self, Self::Err> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -124,6 +217,37 @@ impl FromStr for CapencControlCommand {
         }
         if command.eq_ignore_ascii_case("REFINE-RESUME") {
             return Ok(Self::RefineResume);
+        }
+        if command.eq_ignore_ascii_case("CANVAS-ACK")
+            || command.eq_ignore_ascii_case("CANVAS-RESET")
+            || command.eq_ignore_ascii_case("CANVAS-INPUT")
+        {
+            let invalid = || CapencControlParseError::InvalidCanvas(trimmed.to_owned());
+            let values: Vec<u64> = parts
+                .map(|value| value.parse::<u64>().map_err(|_| invalid()))
+                .collect::<Result<_, _>>()?;
+            let narrow16 = |value: u64| u16::try_from(value).map_err(|_| invalid());
+            let narrow32 = |value: u64| u32::try_from(value).map_err(|_| invalid());
+            return match (command.to_ascii_uppercase().as_str(), values.as_slice()) {
+                ("CANVAS-ACK", [monitor, generation, fence, unprocessed, decode]) => {
+                    Ok(Self::CanvasAck {
+                        monitor_id: narrow16(*monitor)?,
+                        generation: narrow32(*generation)?,
+                        fence: *fence,
+                        unprocessed_bytes: *unprocessed,
+                        decode_ms_p95: narrow32(*decode)?,
+                    })
+                }
+                ("CANVAS-RESET", [monitor, generation]) => Ok(Self::CanvasReset {
+                    monitor_id: narrow16(*monitor)?,
+                    generation: narrow32(*generation)?,
+                }),
+                ("CANVAS-INPUT", [x, y]) => Ok(Self::CanvasInput {
+                    x: narrow32(*x)?,
+                    y: narrow32(*y)?,
+                }),
+                _ => Err(invalid()),
+            };
         }
         if command.eq_ignore_ascii_case("REFINE-RATE") {
             let invalid = || CapencControlParseError::InvalidRefineRate(trimmed.to_owned());
@@ -180,6 +304,51 @@ impl FromStr for CapencControlCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_lines_round_trip_and_bad_ones_are_refused() {
+        use arcen_protocol::canvas::CanvasControlMsg;
+        for command in [
+            CapencControlCommand::CanvasAck {
+                monitor_id: 0,
+                generation: 3,
+                fence: 99,
+                unprocessed_bytes: 4096,
+                decode_ms_p95: 2,
+            },
+            CapencControlCommand::CanvasReset {
+                monitor_id: 1,
+                generation: 2,
+            },
+            CapencControlCommand::CanvasInput { x: 10, y: 2159 },
+        ] {
+            assert_eq!(command.as_line().parse(), Ok(command));
+        }
+        for bad in [
+            "CANVAS-ACK 1 2 3 4",
+            "CANVAS-ACK 70000 2 3 4 5",
+            "CANVAS-RESET 1",
+            "CANVAS-RESET 1 x",
+            "CANVAS-INPUT 1 2 3",
+        ] {
+            assert!(bad.parse::<CapencControlCommand>().is_err(), "{bad}");
+        }
+        let ack = CanvasControlMsg::CanvasAck {
+            monitor_id: 0,
+            generation: 1,
+            fence: 5,
+            unprocessed_bytes: 0,
+            decode_ms_p95: 1,
+        };
+        let relayed = CapencControlCommand::from_canvas_control(&ack).unwrap();
+        assert_eq!(relayed.canvas_control(), Some(ack));
+        let bad_reason = CanvasControlMsg::CanvasResetRequest {
+            monitor_id: 0,
+            generation: 1,
+            reason: "NOT A TOKEN".to_owned(),
+        };
+        assert_eq!(CapencControlCommand::from_canvas_control(&bad_reason), None);
+    }
 
     #[test]
     fn parses_legacy_and_bitrate_commands() {

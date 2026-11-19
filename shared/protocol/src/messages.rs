@@ -670,6 +670,12 @@ pub struct ServedPipelineMsg {
     /// downgrade with nothing the user can change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The concrete encoder backend's wire token (`native-nvenc`,
+    /// `media-foundation-hw`, `openh264-sw-h264`, …) serving the stream, so a
+    /// Deck can name it after a mid-session change. `backend` above is only
+    /// its class. Absent from older hosts; a Deck then keeps the hello's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<String>,
 }
 
 impl ServedPipelineMsg {
@@ -685,7 +691,15 @@ impl ServedPipelineMsg {
             backend: backend.into(),
             reason,
             detail: None,
+            encoder: None,
         }
+    }
+
+    /// The same message naming the concrete encoder backend (its wire token).
+    #[must_use]
+    pub fn with_encoder(mut self, encoder: impl Into<String>) -> Self {
+        self.encoder = Some(encoder.into());
+        self
     }
 
     /// The same message carrying a sentence the Deck shows the user.
@@ -1214,6 +1228,13 @@ pub struct AuthResponse {
     /// then never grants the refine lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_refine_v1: Option<crate::refine::LosslessRefineCapability>,
+    /// The client keeps a per-monitor canvas and applies canvas records
+    /// (ADR 0028), within these limits. Sent at authentication, like
+    /// `lossless_refine_v1`. Absent for every older client and whenever the
+    /// client's canvas is switched off; the host then never sends a canvas
+    /// record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_v1: Option<crate::canvas::CanvasCapability>,
     /// The refresh each Deck display shows frames at, apart from the
     /// virtual display mode the Deck asks the host to create
     /// (`ClientMonitor::refresh_hz`, which a Deck keeps at or below 60 Hz so
@@ -1309,6 +1330,7 @@ impl std::fmt::Debug for AuthResponse {
             .field("cursor_image_v1", &self.cursor_image_v1)
             .field("cursor_position_v1", &self.cursor_position_v1)
             .field("lossless_refine_v1", &self.lossless_refine_v1)
+            .field("canvas_v1", &self.canvas_v1)
             .field("display_refresh_v1", &self.display_refresh_v1)
             .finish()
     }
@@ -1358,6 +1380,7 @@ impl AuthResponse {
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
+            canvas_v1: None,
             display_refresh_v1: None,
         }
     }
@@ -1385,6 +1408,7 @@ impl AuthResponse {
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
+            canvas_v1: None,
             display_refresh_v1: None,
         }
     }
@@ -1412,6 +1436,7 @@ impl AuthResponse {
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
+            canvas_v1: None,
             display_refresh_v1: None,
         }
     }
@@ -1440,6 +1465,7 @@ impl AuthResponse {
             cursor_position_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
+            canvas_v1: None,
             display_refresh_v1: None,
         }
     }
@@ -1837,6 +1863,14 @@ pub struct InputCapabilitiesMsg {
     /// `Unknown`.
     #[serde(default)]
     pub pen_barrel_buttons: InputCapabilityAvailability,
+    /// From a host: it gives [`PenEventMsg::buttons`] bit 0 the desktop's
+    /// right click and bit 1 its middle click, whatever its pen device calls
+    /// them (see [`PenEventMsg::buttons`]). `Unknown` is a host that predates
+    /// the field: a Linux one of those clicks the middle button for bit 0 and
+    /// the right button for bit 1, so a client swaps the two bits for it.
+    /// Clients leave it `Unknown`.
+    #[serde(default)]
+    pub pen_button_actions: InputCapabilityAvailability,
     /// Committed text (`text_commit`). From a client: it sends committed text
     /// and understands [`TextCommitResultMsg`] and [`HostKeymapMsg`]. From a
     /// host: it types committed text into the desktop and reports what it
@@ -1864,6 +1898,49 @@ pub struct InputCapabilitiesMsg {
     /// `Unknown`.
     #[serde(default)]
     pub meta_pointer_mask: InputCapabilityAvailability,
+    /// From a host: which PC keys outside the main block and F1–F12 it
+    /// injects (Insert, Print Screen, Scroll Lock, Pause, Menu, F13–F24), so
+    /// a client can grey out what the host would drop. Absent from a host
+    /// that predates it and from clients, which leave it unknown.
+    #[serde(default, skip_serializing_if = "PcKeysMsg::is_unknown")]
+    pub pc_keys: PcKeysMsg,
+}
+
+/// The PC keys a host injects beyond the main block and F1–F12
+/// ([`InputCapabilitiesMsg::pc_keys`]). Every field is `Unknown` (and
+/// `last_function_key` 0) on a host that predates it; such a host injects
+/// what its platform always did, which
+/// `arcen_input::keyboard::host_keys::host_accepts` knows.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PcKeysMsg {
+    /// Insert.
+    #[serde(default)]
+    pub insert: InputCapabilityAvailability,
+    /// Print Screen (with Alt: `SysRq`, which a host never passes to its
+    /// kernel).
+    #[serde(default)]
+    pub print_screen: InputCapabilityAvailability,
+    /// Scroll Lock.
+    #[serde(default)]
+    pub scroll_lock: InputCapabilityAvailability,
+    /// Pause (with Control: Break).
+    #[serde(default)]
+    pub pause: InputCapabilityAvailability,
+    /// The Menu (application, context menu) key.
+    #[serde(default)]
+    pub menu: InputCapabilityAvailability,
+    /// The highest function key the host injects: 24 for F1–F24, 12 when
+    /// it injects none above F12. 0: the host does not say.
+    #[serde(default)]
+    pub last_function_key: u8,
+}
+
+impl PcKeysMsg {
+    /// Nothing is known: a host that predates the field, or a client.
+    #[must_use]
+    pub fn is_unknown(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Whether a host masks a pointer-only Meta release itself.
@@ -2771,6 +2848,20 @@ pub struct ServerHelloMsg {
     /// Present only when the client asked for it; absent from older hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_refine: Option<crate::refine::LosslessRefineStatusMsg>,
+    /// Whether this session streams through the canvas (ADR 0028), for
+    /// which monitors, and why not when it does not. Present only when the
+    /// client sent `canvas_v1`; absent from older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<crate::canvas::CanvasStatusMsg>,
+    /// What the desk at the host shows while this Deck is attached:
+    /// `blanked` (its monitors are blank and its input blocked), `off` (the
+    /// administrator turned desk privacy off; the desk shows the session) or
+    /// `not_shown` (no monitor at the desk shows this desktop). A free-form
+    /// token so a newer host's state never fails an older Deck's hello;
+    /// absent from hosts that predate it. `arcen_session::console_session::
+    /// desk_privacy::DeskPrivacyStatus` reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk_privacy: Option<String>,
 }
 
 /// A host's operating system, as its hello tells it.
@@ -4653,7 +4744,12 @@ pub struct PenEventMsg {
     /// Whether the tip is touching the surface.
     #[serde(default)]
     pub touching: bool,
-    /// Bitset of barrel/auxiliary buttons.
+    /// Barrel buttons held, by what they do: bit 0 is the pen's right click
+    /// (Windows Ink's barrel button), bit 1 its middle click. A client
+    /// decides which physical button means which (its pen settings, or what
+    /// its tablet driver already decided); a host presses its desktop's
+    /// right and middle buttons for them. Further bits are further barrel
+    /// buttons with no agreed click.
     #[serde(default)]
     pub buttons: u16,
     /// Sequence participating in the one globally ordered input stream
@@ -4666,6 +4762,11 @@ pub struct PenEventMsg {
     #[serde(default = "default_true")]
     pub coalescable: bool,
 }
+
+/// [`PenEventMsg::buttons`]: the pen's right click.
+pub const PEN_BUTTON_RIGHT_CLICK: u16 = 1 << 0;
+/// [`PenEventMsg::buttons`]: the pen's middle click.
+pub const PEN_BUTTON_MIDDLE_CLICK: u16 = 1 << 1;
 
 fn default_pen_event_type() -> String {
     PEN_EVENT.to_string()
@@ -6231,6 +6332,30 @@ mod tests {
         assert!(supports_extended_keys_v1(hello.input_capabilities));
         assert!(!supports_meta_pointer_mask_v1(hello.input_capabilities));
         assert_eq!(serde_json::to_value(&hello).unwrap()["platform"], "windows");
+    }
+
+    #[test]
+    fn pc_keys_are_absent_until_a_host_states_them() {
+        let legacy = serde_json::to_value(
+            serde_json::from_str::<ServerHelloMsg>(r#"{"type":"server_hello"}"#).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy["input_capabilities"].get("pc_keys").is_none());
+        let hello: ServerHelloMsg = serde_json::from_str(
+            r#"{"type":"server_hello","input_capabilities":{"pc_keys":
+                {"menu":"available","print_screen":"unavailable","last_function_key":20}}}"#,
+        )
+        .unwrap();
+        let keys = hello.input_capabilities.pc_keys;
+        assert_eq!(keys.menu, InputCapabilityAvailability::Available);
+        assert_eq!(keys.print_screen, InputCapabilityAvailability::Unavailable);
+        assert_eq!(keys.insert, InputCapabilityAvailability::Unknown);
+        assert_eq!(keys.last_function_key, 20);
+        let json = serde_json::to_value(&hello).unwrap();
+        assert_eq!(
+            json["input_capabilities"]["pc_keys"]["last_function_key"],
+            20
+        );
     }
 
     #[test]

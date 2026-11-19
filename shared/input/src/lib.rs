@@ -25,6 +25,7 @@ mod lane_outbox;
 mod negotiation;
 mod output_local;
 pub mod pen_axes;
+pub mod pen_buttons;
 mod pen_edges;
 pub mod pen_emulation;
 mod pen_forwarding;
@@ -611,7 +612,8 @@ pub struct PenEvent {
     pub in_proximity: bool,
     /// Whether the tip is touching the surface.
     pub touching: bool,
-    /// Bitset of barrel and auxiliary buttons.
+    /// Barrel buttons by what they do (`pen_buttons`): bit 0 right click,
+    /// bit 1 middle click.
     pub buttons: u16,
     /// Low-latency metadata.
     pub metadata: LowLatencyMetadata,

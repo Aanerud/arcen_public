@@ -21,7 +21,9 @@
 //!   platform presenter can sample without a copy.
 //! - [`present::VideoPresenterSink`]: the dedicated eight-bit and ten-bit
 //!   video presenters, including the frame-exact Exact still image fences
-//!   ([`arcen_media::refine::hub::RefineCompositor`]).
+//!   ([`arcen_media::refine::hub::RefineCompositor`]) and the canvas
+//!   executor ([`present::VideoPresenterSink::execute`], ADR 0028; the
+//!   shared half is [`canvas`]).
 //!
 //! # Features
 //!
@@ -50,6 +52,7 @@
 )]
 
 pub mod about;
+pub mod canvas;
 pub mod client_telemetry;
 pub mod clipboard;
 pub mod config;

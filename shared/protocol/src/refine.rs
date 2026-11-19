@@ -19,6 +19,7 @@
 
 pub mod carry;
 
+use crate::bytes::{ByteReader, Short};
 use crate::wire::FrameType;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -114,6 +115,12 @@ impl Display for RefineRecordError {
 }
 
 impl std::error::Error for RefineRecordError {}
+
+impl From<Short> for RefineRecordError {
+    fn from(_: Short) -> Self {
+        Self::Short
+    }
+}
 
 /// Identity every refinement record carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -416,42 +423,8 @@ fn put_prefix(out: &mut Vec<u8>, frame_type: FrameType, scope: &RefineScope) {
     out.extend_from_slice(&scope.generation.get().to_be_bytes());
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], RefineRecordError> {
-        let end = self.at.checked_add(N).ok_or(RefineRecordError::Short)?;
-        let slice = self
-            .bytes
-            .get(self.at..end)
-            .ok_or(RefineRecordError::Short)?;
-        self.at = end;
-        let mut out = [0_u8; N];
-        out.copy_from_slice(slice);
-        Ok(out)
-    }
-    fn u8(&mut self) -> Result<u8, RefineRecordError> {
-        Ok(self.take::<1>()?[0])
-    }
-    fn u16(&mut self) -> Result<u16, RefineRecordError> {
-        Ok(u16::from_be_bytes(self.take()?))
-    }
-    fn u32(&mut self) -> Result<u32, RefineRecordError> {
-        Ok(u32::from_be_bytes(self.take()?))
-    }
-    fn u64(&mut self) -> Result<u64, RefineRecordError> {
-        Ok(u64::from_be_bytes(self.take()?))
-    }
-    fn rest(&self) -> &'a [u8] {
-        self.bytes.get(self.at..).unwrap_or_default()
-    }
-}
-
 fn read_prefix(
-    reader: &mut Reader<'_>,
+    reader: &mut ByteReader<'_>,
     expected: FrameType,
 ) -> Result<RefineScope, RefineRecordError> {
     let frame_type = reader.u8()?;
@@ -474,7 +447,7 @@ fn read_prefix(
     })
 }
 
-fn put_runs(out: &mut Vec<u8>, runs: &BlockRuns) {
+pub(crate) fn put_runs(out: &mut Vec<u8>, runs: &BlockRuns) {
     out.extend_from_slice(
         &u32::try_from(runs.0.len())
             .unwrap_or(u32::MAX)
@@ -486,15 +459,33 @@ fn put_runs(out: &mut Vec<u8>, runs: &BlockRuns) {
     }
 }
 
-fn read_runs(reader: &mut Reader<'_>, block_count: u32) -> Result<BlockRuns, RefineRecordError> {
+fn read_runs(
+    reader: &mut ByteReader<'_>,
+    block_count: u32,
+) -> Result<BlockRuns, RefineRecordError> {
     let count = reader.u32()?;
-    // Bound before allocating: the record must hold every declared run.
+    parse_runs(reader.rest(), count, block_count)
+}
+
+/// Parses `count` runs that must fill `bytes` exactly. The count is bounded
+/// by the bytes present and by the grid **before** the run list is
+/// allocated.
+///
+/// # Errors
+///
+/// [`RefineRecordError::Short`], [`RefineRecordError::TrailingBytes`] or
+/// [`RefineRecordError::Runs`].
+pub(crate) fn parse_runs(
+    bytes: &[u8],
+    count: u32,
+    block_count: u32,
+) -> Result<BlockRuns, RefineRecordError> {
     let needed = usize::try_from(count)
         .ok()
         .and_then(|count| count.checked_mul(REFINE_RUN_BYTES))
         .ok_or(RefineRecordError::Runs)?;
-    if needed != reader.rest().len() {
-        return Err(if needed > reader.rest().len() {
+    if needed != bytes.len() {
+        return Err(if needed > bytes.len() {
             RefineRecordError::Short
         } else {
             RefineRecordError::TrailingBytes
@@ -503,6 +494,7 @@ fn read_runs(reader: &mut Reader<'_>, block_count: u32) -> Result<BlockRuns, Ref
     if count > block_count {
         return Err(RefineRecordError::Runs);
     }
+    let mut reader = ByteReader::new(bytes);
     let mut runs = Vec::with_capacity(count as usize);
     for _ in 0..count {
         runs.push((reader.u32()?, reader.u32()?));
@@ -510,7 +502,7 @@ fn read_runs(reader: &mut Reader<'_>, block_count: u32) -> Result<BlockRuns, Ref
     BlockRuns::new(runs, block_count)
 }
 
-fn check_block_count(block_count: u32) -> Result<u32, RefineRecordError> {
+pub(crate) fn check_block_count(block_count: u32) -> Result<u32, RefineRecordError> {
     if block_count == 0 || block_count > MAX_GRID_BLOCKS {
         Err(RefineRecordError::BlockCount)
     } else {
@@ -538,7 +530,7 @@ impl RefineFence {
     ///
     /// [`RefineRecordError`].
     pub fn decode(bytes: &[u8]) -> Result<Self, RefineRecordError> {
-        let mut reader = Reader { bytes, at: 0 };
+        let mut reader = ByteReader::new(bytes);
         let scope = read_prefix(&mut reader, FrameType::RefineFence)?;
         let fence = reader.u64()?;
         let block_count = check_block_count(reader.u32()?)?;
@@ -585,7 +577,7 @@ impl RefineBarrier {
             std::cmp::Ordering::Greater => return Err(RefineRecordError::TrailingBytes),
             std::cmp::Ordering::Equal => {}
         }
-        let mut reader = Reader { bytes, at: 0 };
+        let mut reader = ByteReader::new(bytes);
         let scope = read_prefix(&mut reader, FrameType::RefineBarrier)?;
         let reason = BarrierReason::from_wire(reader.u8()?).ok_or(RefineRecordError::Value)?;
         let raw: [u8; 7] = reader.take()?;
@@ -650,7 +642,7 @@ impl RefineTileHeader {
     ///
     /// [`RefineRecordError`].
     pub fn decode(bytes: &[u8]) -> Result<(Self, &[u8]), RefineRecordError> {
-        let mut reader = Reader { bytes, at: 0 };
+        let mut reader = ByteReader::new(bytes);
         let scope = read_prefix(&mut reader, FrameType::RefineTiles)?;
         let valid_from_fence = reader.u64()?;
         let domain = RefineDomain::from_wire(reader.u8()?).ok_or(RefineRecordError::Value)?;
@@ -705,7 +697,7 @@ impl RefineDigest {
     ///
     /// [`RefineRecordError`].
     pub fn decode(bytes: &[u8]) -> Result<Self, RefineRecordError> {
-        let mut reader = Reader { bytes, at: 0 };
+        let mut reader = ByteReader::new(bytes);
         let scope = read_prefix(&mut reader, FrameType::RefineDigest)?;
         let fence = reader.u64()?;
         let digest = reader.take::<16>()?;

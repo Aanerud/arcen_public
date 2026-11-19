@@ -72,8 +72,8 @@ pub fn deck_platform(ctx: &egui::Context) -> DeckPlatform {
         .unwrap_or_default()
 }
 
-/// A Deck chord as the menus spell it: "Control-Command-U" on a Mac,
-/// "Ctrl+Win+U" on a PC (PARITY §4.1).
+/// A Deck chord as the menus spell it: "Control-Option-Home" on a Mac,
+/// "Ctrl+Alt+Home" on a PC (PARITY §4.1); empty for an action without one.
 pub fn chord(platform: DeckPlatform, shortcut: DeckShortcut) -> String {
     match platform {
         DeckPlatform::Mac => shortcut.mac_chord().map_or_else(String::new, |chord| {
@@ -118,7 +118,7 @@ pub fn chord(platform: DeckPlatform, shortcut: DeckShortcut) -> String {
 
 /// The printed name of a Qt key code in a chord.
 fn key_name(key: u32) -> String {
-    use arcen_input::keyboard::pc::{KEY_END, KEY_PAUSE};
+    use arcen_input::keyboard::pc::{KEY_END, KEY_HOME, KEY_PAUSE};
     const KEY_F1: u32 = 0x0100_0030;
     const KEY_F35: u32 = 0x0100_0052;
     match key {
@@ -126,6 +126,7 @@ fn key_name(key: u32) -> String {
         KEY_F1..=KEY_F35 => format!("F{}", key - KEY_F1 + 1),
         KEY_PAUSE => "Break".to_owned(),
         KEY_END => "End".to_owned(),
+        KEY_HOME => "Home".to_owned(),
         _ => format!("{key:#x}"),
     }
 }

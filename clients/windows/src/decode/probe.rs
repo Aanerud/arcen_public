@@ -233,3 +233,82 @@ pub fn probe_decode_capabilities() -> DecodeCapabilities {
         .and_then(|adapters| adapters.into_iter().next())
         .map_or_else(nothing, |(_, _, _, _, luid)| probe_for_adapter(luid))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FNV-1a 64 of each picture of `openh264-4slice-320x192.264` as an
+    /// independent software decoder (ffmpeg, offline, yuv420p) reconstructs
+    /// it.
+    const FOUR_SLICE_PICTURES: [u64; 12] = [
+        0xd785_d92b_052d_4d09,
+        0x55be_7b78_9efc_e255,
+        0x072f_1535_f834_6a3b,
+        0x0cd2_20f9_034e_2936,
+        0xd5e4_ee79_34a5_07aa,
+        0x852e_57f6_2123_7441,
+        0xbcdc_6468_577f_43c1,
+        0xd00c_1bca_c52d_8693,
+        0xa842_7dff_333a_2d57,
+        0xb125_9170_f945_f9c4,
+        0x5616_0348_4a98_6386,
+        0xb324_1ead_7cf9_6ee4,
+    ];
+
+    /// The Pier's threaded software stream (four slices per picture) decodes
+    /// sample-exact on every hardware decoder of this machine that lists
+    /// H.264; a machine without one has nothing to prove.
+    #[test]
+    fn the_software_encoders_sliced_stream_decodes_sample_exact() {
+        let stream = include_bytes!(
+            "../../../../shared/media/tests/data/bitstream/openh264-4slice-320x192.264"
+        );
+        let devices: Vec<VideoDevice> = hardware_adapters()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(adapter, name, vendor, device, _)| {
+                VideoDevice::create(&adapter, name, vendor, device).ok()
+            })
+            .collect();
+        let mut proven = 0;
+        for device in devices {
+            let (_, results) = device.capabilities();
+            let lists_h264 = results
+                .iter()
+                .any(|(profile, result)| *profile == H264 && result.is_ok());
+            if !lists_h264 {
+                continue;
+            }
+            prove_keyframe(&device, &H264).unwrap_or_else(|error| {
+                panic!(
+                    "{} lists H.264 but fails its probe: {error}",
+                    device.adapter_name
+                )
+            });
+            let mut decoder = D3d11VideoDecoder::new(device.clone());
+            let units = split_access_units(NalCodec::H264, stream);
+            assert_eq!(units.len(), FOUR_SLICE_PICTURES.len());
+            for (index, (unit, expected)) in units.into_iter().zip(FOUR_SLICE_PICTURES).enumerate()
+            {
+                let pictures = decoder
+                    .decode_annex_b(StreamCodecKind::H264, unit)
+                    .unwrap_or_else(|error| panic!("picture {index}: {error}"));
+                let picture = pictures.first().expect("one picture per access unit");
+                let planar = read_planar(&device.device, &device.context_lock, picture)
+                    .unwrap_or_else(|error| panic!("picture {index}: {error}"));
+                assert_eq!(
+                    fnv1a(&planar),
+                    expected,
+                    "picture {index} on {}",
+                    device.adapter_name
+                );
+            }
+            eprintln!("{}: four-slice stream sample-exact", device.adapter_name);
+            proven += 1;
+        }
+        if proven == 0 {
+            eprintln!("no hardware H.264 decoder: nothing to prove");
+        }
+    }
+}

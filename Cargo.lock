@@ -327,6 +327,7 @@ version = "0.20.3"
 dependencies = [
  "arcen-deck-core",
  "arcen-input",
+ "arcen-keel",
  "arcen-media",
  "arcen-protocol",
  "arcen-telemetry",

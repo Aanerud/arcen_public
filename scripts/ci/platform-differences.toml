@@ -114,13 +114,14 @@ config = ["hosts/linux:platform.capture.*", "hosts/windows:platform.desktop.outp
 id = "PD-006"
 area = "encode"
 products = ["hosts/linux", "hosts/windows", "hosts/macos", "hosts/capenc"]
-difference = "Hardware encoder. The OpenH264 software encoder is shared."
-earned_by = "NVENC with CUDA (Linux, Windows); Media Foundation H.264 MFT (Windows); VideoToolbox VTCompressionSession (macOS)."
+difference = "Hardware encoder. The OpenH264 software encoder is shared: every Linux and Windows software loop (Xorg, Wayland, Windows Graphics Capture) runs the one arcen-media SoftwareH264Session (Keel damage, retained planes, fixed-slice threads, no size or rate cap of its own); only capture differs."
+earned_by = "NVENC with CUDA (Linux, Windows); a GPU vendor's Media Foundation hardware encoder MFT, Alpha (Windows without NVIDIA); VideoToolbox VTCompressionSession (macOS)."
 code = [
   { path = "hosts/capenc/src/nvenc.rs", symbol = "nvEncOpenEncodeSessionEx" },
-  { path = "hosts/capenc/src/mf_encoder.rs", symbol = "MFTEnumEx" },
+  { path = "hosts/capenc/src/mf_encoder.rs", symbol = "MFTEnum2" },
   { path = "hosts/macos/src/encode.rs", symbol = "VTCompressionSessionCreate" },
 ]
+config = ["hosts/windows:platform.media_foundation_hardware"]
 
 [[difference]]
 id = "PD-007"
@@ -174,6 +175,17 @@ code = [
   { path = "hosts/linux/src/input/keymap.rs", symbol = "kernel_safe_key" },
   { path = "hosts/windows/src/input.rs", symbol = "set1_scancode" },
   { path = "hosts/macos/src/input/keymap.rs", symbol = "qt_key_to_macos" },
+]
+
+[[difference]]
+id = "PD-034"
+area = "keyboard"
+products = ["hosts/macos"]
+difference = "The macOS Pier injects F13-F20 and the PC Menu key but not F21-F24, Insert, Print Screen, Scroll Lock or Pause; its hello says so (pc_keys), and the Linux and Windows Piers inject all of them."
+earned_by = "macOS virtual key codes (HIToolbox Events.h) end at kVK_F20 and have no Insert (the key in its place is kVK_Help, a different key), Print Screen, Scroll Lock or Pause; a PC keyboard's Menu key is kVK_ContextualMenu."
+code = [
+  { path = "shared/input/src/keyboard/host_keys.rs", symbol = "macos_key" },
+  { path = "hosts/macos/src/input/keymap.rs", symbol = "pc_host_key" },
 ]
 
 [[difference]]
@@ -336,6 +348,18 @@ code = [
   { path = "clients/windows/src/input/hook.rs", symbol = "SetWindowsHookExW" },
 ]
 
+[[gap]]
+id = "GAP-052"
+area = "Deck keyboard"
+products = ["clients/macos"]
+difference = "The Windows Deck gives the keyboard to this computer and back (shared KeyboardCapture: Ctrl+Alt+Home, a consumed click into the picture, the menu bar indicator, Settings > Input > System shortcuts go to) and takes the system shortcuts for the host; the macOS Deck sends no Command+Tab, Command+Space or Mission Control chord to the host, its Control-Option-Home only releases held keys and the pointer lock, and it shows no capture indicator or setting."
+why_open = "Not implemented yet (work package K4). The macOS route is an active CGEventTap installed only while the host has the keyboard and the session window is key, which needs the Accessibility permission (a Release/Security decision: entitlement and TCC wording in ENTITLEMENTS.md), re-armed on kCGEventTapDisabledByTimeout and released under Secure Event Input. The shared state machine, chords, wording and cheat sheet are ready for it."
+owner = "macOS Client"
+code = [
+  { path = "shared/input/src/keyboard/capture.rs", symbol = "KeyboardCapture" },
+  { path = "clients/windows/src/input/mod.rs", symbol = "toggle_keyboard" },
+]
+
 [[difference]]
 id = "PD-025"
 area = "Deck time zone"
@@ -359,14 +383,17 @@ cfg_sites = [
 id = "PD-027"
 area = "deskside privacy"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
-difference = "Which local devices deskside privacy blanks and grabs, and how they are named."
-earned_by = "Linux names evdev input devices and DRM outputs (with the firmware they run); Windows names its monitors. macOS names neither: its window server shows an event filter who posted each event (kCGEventSourceUnixProcessID), never which device made it, so the macOS Pier drops every event its own process did not post and darkens every display but its own virtual ones through the display's transfer table, with nothing to pin (platform.desktop.deskside.enabled only); a virtual HID keyboard cannot be told from the desk's, so input_backend virtual_hid with deskside is refused. The policy is shared (arcen_session::deskside, arcen_session::console_session::desk_privacy)."
+difference = "How each Pier makes the desk private (desk privacy, on by default: privacy.desk), and which local devices the pinned deskside variants blank and grab, and how they are named."
+earned_by = "Darkening: Linux sets every CRTC's RandR gamma ramp to zero (journalled, restored byte for byte) and grabs the seat's evdev devices (EVIOCGRAB); macOS gives each display an all-zero transfer table and runs an event tap; Windows cannot (GDI's SetDeviceGammaRamp silently refuses an all-black ramp, per its documentation), so it serves the session on a virtual display or a head with nothing connected, detaches every other monitor from the desktop with SetDisplayConfig under the display lease's recovery journal, proves no lit output has a monitor physically connected behind it (NVAPI display flags, software-enumerated indirect adapters) and blocks keyboard and mouse with low-level hooks. Naming: Linux pins evdev input devices and DRM outputs (with the firmware they run); Windows pins its monitors. macOS names neither: its window server shows an event filter who posted each event (kCGEventSourceUnixProcessID), never which device made it, so the macOS Pier drops every event its own process did not post, with nothing to pin; a virtual HID keyboard cannot be told from the desk's, so input_backend virtual_hid with desk privacy on refuses every signed-in session (or the configuration, when privacy.desk is on explicitly). The policy is shared (arcen_session::deskside, arcen_session::console_session::desk_privacy)."
 code = [
   { path = "hosts/linux/src/deskside.rs", symbol = "deskside" },
   { path = "hosts/windows/src/deskside.rs" },
   { path = "hosts/macos/src/desk_privacy.rs", symbol = "SOURCE_UNIX_PROCESS_ID" },
+  { path = "hosts/linux/src/session/console.rs", symbol = "randr_set_crtc_gamma" },
+  { path = "hosts/windows/src/deskside.rs", symbol = "prove_desk_dark" },
+  { path = "hosts/windows/src/display.rs", symbol = "detach_desk_monitors" },
 ]
-config = ["hosts/linux:platform.deskside.*", "hosts/windows:platform.desktop.deskside.*", "hosts/macos:platform.desktop.deskside.*"]
+config = ["hosts/linux:platform.deskside.*", "hosts/windows:platform.desktop.deskside.*"]
 
 [[difference]]
 id = "PD-028"
@@ -446,7 +473,34 @@ code = [
 ]
 decision = "docs/architecture/display-lifecycle.md"
 
+[[difference]]
+id = "PD-035"
+area = "pen barrel buttons"
+products = ["hosts/linux", "hosts/windows", "hosts/macos", "clients/windows", "clients/macos"]
+difference = "Where a pen's barrel buttons come from and how they are clicked. The wire names what a button does (PenEventMsg.buttons: bit 0 right click, bit 1 middle; capability pen_button_actions) and the mapping, settings and legacy-host layout are shared (arcen_input::pen_buttons). Decks: Windows reads one barrel button (PEN_FLAG_BARREL) and its tablet driver's mouse clicks while the pen is in range, so its settings show one Pen button; macOS reads the lower and upper side switch by position (buttonMask) and its driver's right/other-mouse tablet events, so its settings show two. Piers: Linux presses BTN_STYLUS2 for the right click and BTN_STYLUS for the middle; Windows sets the Windows Ink barrel for the right click and sends a mouse middle click for the middle; macOS posts right/other mouse events with tablet data."
+earned_by = "Windows Ink has one barrel switch (POINTER_PEN_INFO.penFlags PEN_FLAG_BARREL; an injected POINTER_FLAG_SECONDBUTTON is ignored for a synthetic pen), AppKit reports a pen's two side switches by position (NSEventButtonMaskPenLowerSide/UpperSide), and Linux desktops make BTN_STYLUS a middle and BTN_STYLUS2 a right click (xf86-input-libinput, xf86-input-wacom, GNOME/KDE stylus defaults)."
+code = [
+  { path = "hosts/linux/src/input/pen.rs", symbol = "BUTTON_STYLUS2_BIT" },
+  { path = "hosts/windows/src/input.rs", symbol = "pen_middle_click" },
+  { path = "hosts/macos/src/input/mod.rs", symbol = "barrel_button" },
+  { path = "clients/windows/src/input/pen.rs", symbol = "route_mouse_while_pen" },
+  { path = "clients/macos/src/tablet/sample.rs", symbol = "driver_click_for_event" },
+]
+decision = "docs/architecture/pen-tablet-input.md"
+
 # --- Open gaps (unearned) -------------------------------------------------------
+
+[[gap]]
+id = "GAP-053"
+area = "keyboard"
+products = ["hosts/linux"]
+difference = "On a Wayland session F13-F24 type what the compositor's keymap names them (stock xkeyboard-config: XF86Tools, XF86Launch5-9, XF86AudioMicMute, XF86Touchpad*); an Xorg session gets the keysyms F13-F24."
+why_open = "Mutter's RemoteDesktop injects keycodes into the compositor's own keymap and its keysym call presses only keys that already carry the keysym; the xkb option fkeys:basic_13-24 (xkeyboard-config 2.43 and later) gives F13-F24 keysyms but is the user's input-source setting. Not proven on a live Wayland session yet."
+owner = "Linux Host"
+code = [
+  { path = "hosts/linux/src/input/x11_text.rs", symbol = "pin_function_key" },
+  { path = "hosts/linux/src/input/wayland.rs", symbol = "qt_key_to_evdev" },
+]
 
 [[gap]]
 id = "GAP-003"
@@ -696,15 +750,29 @@ code = [
 ]
 
 [[gap]]
-id = "GAP-049"
+id = "GAP-050"
 area = "deskside privacy"
 products = ["hosts/windows"]
-difference = "While a Deck is attached to the user's session, the Linux and macOS Piers always keep the desk private (Linux: zeroed gamma ramps, grabbed seat0 input, console_session::disables_while_attached, on virtual machines too; macOS: zeroed transfer tables and an event tap, desk_privacy); the Windows Pier takes the desk's input only with deskside enabled (platform.desktop.deskside, off by default, armed only on proven physical hardware), so by default the local keyboard and mouse keep driving the session the Deck shows."
-why_open = "Not implemented yet (ADR 0025 follow-up windows-deskside-default): low-level hooks that pass only Arcen's injected input are already in hosts/windows/src/deskside.rs. Whether input privacy may arm without the physical-evidence gate (as Linux does), and what the desk's monitors show then, is issue #107's decision; the physical validation matrix is unrun."
+difference = "With desk privacy on (the default on every Pier), the Linux and macOS Piers make the desk dark before the session is shown (Linux blanks and grabs before GDM completes a remote sign-in; macOS before it serves the session); the Windows Pier detaches the desk's monitors from the desktop only once its session agent holds the display lease, so between a sign-in that unlocks or moves the session to the console and the detach (a few seconds) the desk's monitors show the session; and a desk whose session can only be shown on a monitor at the desk (no virtual display, the NVIDIA head is a desk monitor, or another vendor's GPU NVAPI cannot describe) is refused rather than served."
+why_open = "Not implemented yet. Darkening a monitor is earned (GDI's SetDeviceGammaRamp silently refuses all-black ramps, per its Microsoft Learn documentation; DDC/CI power-off through VCP 0xD6 is optional per monitor, slow, and undone by the monitor's own power button; a black topmost window is drawn under the Start menu, notifications, the task switcher and the secure desktop), so the Windows Pier detaches the monitors (SetDisplayConfig under the display lease's recovery journal). Routes for the window: detach before the sign-in opens the session, as LocalSystem on the console's input desktop (the technique console_recovery already uses for restore-display --console); for the refused desks: prefer an NVIDIA head with nothing physically connected in nvapi_headless provisioning when desk privacy is on, or a supported virtual display. Proved on the lab vGPU guest only (a head reporting itself physically connected detached and restored after the Deck left and after the session agent was killed); not on a physical workstation. The GeForce-plus-virtual-display case (a negotiated display, deskside::virtual_output_instead_of, DisplayLease::detach_desk_monitors) is covered by unit tests only, not on a real PC."
 owner = "Windows Host"
 code = [
-  { path = "hosts/windows/src/deskside.rs" },
-  { path = "shared/session/src/console_session/mod.rs", symbol = "disables_while_attached" },
+  { path = "hosts/windows/src/display.rs", symbol = "detach_desk_monitors" },
+  { path = "hosts/windows/src/deskside.rs", symbol = "virtual_output_instead_of" },
+  { path = "hosts/windows/src/deskside.rs", symbol = "prove_desk_dark" },
+  { path = "shared/session/src/console_session/desk_privacy.rs", symbol = "desk_outputs_dark" },
+]
+
+[[gap]]
+id = "GAP-051"
+area = "deskside privacy"
+products = ["hosts/windows"]
+difference = "While a Deck is attached with desk privacy on, the Linux Pier blocks every input device a person at the desk can drive the desktop with (keyboards, mice, touchpads, tablets, touch screens: EVIOCGRAB) and the macOS Pier every event its own process did not post; the Windows Pier's low-level hooks (WH_KEYBOARD_LL, WH_MOUSE_LL) block the desk's keyboard and mouse only, so a pen tablet or touch screen at the desk still reaches the session through WM_POINTER."
+why_open = "Not implemented yet. Low-level hooks do not see pointer (pen and touch) input on Windows; the routes considered are taking the desk's HID digitizers (disable or exclusive open while attached, re-enabled on detach and by the display watchdog's recovery) or a pointer-input redirection of the console session. Neither is built; the lab Windows Pier has no desk pen or touch screen to prove either on. The mouse hook's liveness is not proved by a canary either: on the lab vGPU guest Windows never calls WH_MOUSE_LL for an injected move (relative or absolute) while the keyboard hook on the same thread is called at once, so desk privacy's default proves the hook thread with the keyboard canary (InputHookGuard::install_keyboard_proved); blocking a physical desk mouse is unit-tested, not lab-proven."
+owner = "Windows Host"
+code = [
+  { path = "hosts/windows/src/deskside.rs", symbol = "InputHookGuard" },
+  { path = "hosts/windows/src/input.rs", symbol = "InjectSyntheticPointerInput" },
 ]
 
 [[gap]]
@@ -980,6 +1048,12 @@ status = { "hosts/linux" = "GAP-040", "hosts/windows" = "GAP-040", "hosts/macos"
 paths = { "clients/macos" = ["shared/deck-core/src/support_bundle"], "clients/windows" = ["shared/deck-core/src/support_bundle"] }
 
 [[capability]]
+id = "pc_keys_hello"
+description = "The hello says which PC keys beyond F12 and the main block the Pier injects (pc_keys), from the shared PC-key table"
+proof = 'advertised_pc_keys'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
 id = "lock_on_detach"
 description = "Locks the user's session when a Deck leaves, then gives the desk its monitors and input back"
 proof = 'DETACH_STEPS'
@@ -996,3 +1070,15 @@ id = "names_conflicting_service"
 description = "A refusal because another remote-desktop service holds the workstation names that service as the host reports it"
 proof = 'ConsoleNotice'
 status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "GAP-043" }
+
+[[capability]]
+id = "pen_button_actions"
+description = "Clicks the desktop's right button for pen button bit 0 and its middle button for bit 1, and says so (pen_button_actions)"
+proof = 'pen_button_actions'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
+id = "deck_pen_buttons"
+description = "Sends the pen's barrel buttons by what they do: its settings, its tablet driver's own clicks, and an old Linux Pier's swapped layout"
+proof = 'PenButtonMap'
+status = { "clients/macos" = "present", "clients/windows" = "present" }

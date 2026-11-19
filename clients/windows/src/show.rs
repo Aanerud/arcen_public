@@ -484,6 +484,7 @@ fn show(args: &[String]) -> Result<bool, String> {
         tablet_mode_requested: TabletModeMsg::LocalTermination,
         telemetry: Arc::clone(&telemetry),
         exact_still_image: args.exact_still_image,
+        canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
     };
     let mut auth = Some(AuthSubmission { username, password });
     let requested_video = arcen_deck_core::connect_plan::profile_video(&options.profile);

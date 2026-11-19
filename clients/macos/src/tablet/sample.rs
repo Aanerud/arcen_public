@@ -11,6 +11,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
+
+use arcen_input::pen_buttons::DriverClick;
 use std::time::Duration;
 
 /// Pointing-device kind reported by `-[NSEvent pointingDeviceType]`.
@@ -83,15 +85,43 @@ impl TabletButtonMask {
     pub const fn barrel_bits(self) -> u16 {
         self.0 & Self::BARREL_MASK
     }
+}
 
-    /// The barrel buttons in the wire's `PenEventMsg::buttons` layout: bit 0
-    /// the first (lower side) barrel button, bit 1 the second (upper side).
-    /// AppKit keeps bit 0 for the tip, so its barrel bits sit one higher;
-    /// forwarded unshifted, a host read the lower button as the second barrel
-    /// button and dropped the upper one.
-    #[must_use]
-    pub const fn wire_barrel_buttons(self) -> u16 {
-        self.barrel_bits() >> 1
+/// `NSEventTypeRightMouseDown`.
+const NS_RIGHT_MOUSE_DOWN: usize = 3;
+/// `NSEventTypeRightMouseUp`.
+const NS_RIGHT_MOUSE_UP: usize = 4;
+/// `NSEventTypeRightMouseDragged`.
+const NS_RIGHT_MOUSE_DRAGGED: usize = 7;
+/// `NSEventTypeOtherMouseDown`.
+const NS_OTHER_MOUSE_DOWN: usize = 25;
+/// `NSEventTypeOtherMouseUp`.
+const NS_OTHER_MOUSE_UP: usize = 26;
+/// `NSEventTypeOtherMouseDragged`.
+const NS_OTHER_MOUSE_DRAGGED: usize = 27;
+/// `-[NSEvent buttonNumber]` of the middle button.
+const MIDDLE_BUTTON_NUMBER: isize = 2;
+
+/// What a tablet event's own type says about a click its driver performs:
+/// right-mouse down or dragged holds the right click, up releases it; the
+/// same for the other-mouse events of the middle button. Anything else (a
+/// left or plain move, a standalone tablet point) says nothing, so a held
+/// click stays held across it.
+#[must_use]
+pub const fn driver_click_for_event(
+    event_type: usize,
+    button_number: isize,
+) -> Option<(DriverClick, bool)> {
+    match event_type {
+        NS_RIGHT_MOUSE_DOWN | NS_RIGHT_MOUSE_DRAGGED => Some((DriverClick::Right, true)),
+        NS_RIGHT_MOUSE_UP => Some((DriverClick::Right, false)),
+        NS_OTHER_MOUSE_DOWN | NS_OTHER_MOUSE_DRAGGED if button_number == MIDDLE_BUTTON_NUMBER => {
+            Some((DriverClick::Middle, true))
+        }
+        NS_OTHER_MOUSE_UP if button_number == MIDDLE_BUTTON_NUMBER => {
+            Some((DriverClick::Middle, false))
+        }
+        _ => None,
     }
 }
 
@@ -115,6 +145,11 @@ pub struct NativeTabletPoint {
     /// into 0..360 rather than trusting the raw sign/range.
     pub rotation_degrees: f32,
     pub buttons: TabletButtonMask,
+    /// A right or middle click the tablet driver performs for a pen button
+    /// (a Wacom side switch set to Right Click arrives as a right-mouse
+    /// event with tablet data): `Some((click, held))` from this event's
+    /// type ([`driver_click_for_event`]), `None` when it says nothing.
+    pub driver_click: Option<(DriverClick, bool)>,
     /// `-[NSEvent deviceID]`, used only to detect the tool identity changing
     /// underneath us; never logged.
     pub device_id: u64,
@@ -342,6 +377,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: 0.0,
             buttons: TabletButtonMask::new(0),
+            driver_click: None,
             device_id: 1,
             tool: NativeTabletTool::Pen,
             window_number: 7,
@@ -403,6 +439,23 @@ mod tests {
     }
 
     #[test]
+    fn a_driver_click_is_read_from_the_events_type() {
+        use arcen_input::pen_buttons::DriverClick::{Middle, Right};
+        assert_eq!(driver_click_for_event(3, 1), Some((Right, true)));
+        assert_eq!(driver_click_for_event(7, 1), Some((Right, true)));
+        assert_eq!(driver_click_for_event(4, 1), Some((Right, false)));
+        assert_eq!(driver_click_for_event(25, 2), Some((Middle, true)));
+        assert_eq!(driver_click_for_event(27, 2), Some((Middle, true)));
+        assert_eq!(driver_click_for_event(26, 2), Some((Middle, false)));
+        // Another "other" button (a side button numbered 3+) is not the
+        // middle click; left and move events say nothing.
+        assert_eq!(driver_click_for_event(25, 3), None);
+        for left_or_move in [1, 2, 5, 6, 23] {
+            assert_eq!(driver_click_for_event(left_or_move, 0), None);
+        }
+    }
+
+    #[test]
     fn button_mask_separates_tip_from_barrel_bits() {
         let tip_only = TabletButtonMask::new(TabletButtonMask::TIP);
         assert!(tip_only.tip_down());
@@ -422,8 +475,6 @@ mod tests {
             everything.barrel_bits(),
             TabletButtonMask::LOWER_SIDE | TabletButtonMask::UPPER_SIDE
         );
-        assert_eq!(everything.wire_barrel_buttons(), 0b11);
-        assert_eq!(tip_only.wire_barrel_buttons(), 0);
     }
 
     #[test]

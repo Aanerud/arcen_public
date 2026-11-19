@@ -108,13 +108,32 @@ impl RefineTag {
 
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
+    /// An access unit, or (with [`Self::canvas`]) a whole canvas record.
     pub data: Vec<u8>,
     pub keyframe: bool,
     pub timestamp_ms: u32,
     /// Exact still image: where this frame's refinement records wait;
     /// `None` unless the capture refines.
     pub refine: Option<RefineTag>,
+    /// A canvas record (ADR 0028), not an access unit: `data` is the whole
+    /// wire frame (type `0x0E`) and `keyframe` marks a reset.
+    pub canvas: bool,
 }
+
+/// What the canvas plan of one capture needs from the session (ADR 0028):
+/// the Deck's offer and the operator's CPU share. Present only for a
+/// single-monitor capture whose Deck offered it.
+#[derive(Debug, Clone)]
+pub struct CanvasForward {
+    /// `AuthResponse.canvas_v1`.
+    pub deck: arcen_protocol::canvas::CanvasCapability,
+    /// `video.software.cpu_share`.
+    pub cpu_share: arcen_media::canvas::CpuShare,
+}
+
+/// Whether this Pier's capenc carries the shared software loop: always,
+/// since every Pier links `arcen-capenc/software-h264`.
+pub const SOFTWARE_COMPILED: bool = true;
 
 pub struct CapencConfig {
     pub binary: String,
@@ -157,9 +176,36 @@ pub struct CapencConfig {
     /// this capture refines is [`Self::refine_plan`], decided by the
     /// shared plan.
     pub refine: Option<RefineForward>,
+    /// The canvas (ADR 0028) for a single-monitor capture whose Deck
+    /// offered it; whether it runs is [`Self::canvas_plan`].
+    pub canvas: Option<CanvasForward>,
 }
 
 impl CapencConfig {
+    /// The shared canvas plan for this capture (ADR 0028): only the
+    /// Software contract, one monitor, within the Deck's terms.
+    #[must_use]
+    pub fn canvas_plan(&self) -> arcen_media::canvas::serve::CanvasServePlan {
+        let monitors = [(0u16, self.width, self.height)];
+        arcen_media::canvas::serve::plan_canvas(&arcen_media::canvas::serve::CanvasServeFacts {
+            offer: self.canvas.as_ref().map(|forward| &forward.deck),
+            software: self.encoder == Some(EncoderRequest::SoftwareH264)
+                && self.chroma == ChromaSubsampling::Yuv420
+                && self.bit_depth == BitDepth::Eight,
+            monitors: &monitors,
+            operator_enabled: true,
+            built: SOFTWARE_COMPILED,
+        })
+    }
+
+    /// The canvas argument for capenc when the plan serves it.
+    fn canvas_args(&self) -> Option<arcen_media::canvas::serve::CanvasCapencArgs> {
+        let forward = self.canvas.as_ref()?;
+        self.canvas_plan().terms.map(|terms| {
+            arcen_media::canvas::serve::CanvasCapencArgs::single_monitor(terms, forward.cpu_share)
+        })
+    }
+
     /// The shared exact-still-image plan for this capture (ADR 0016).
     #[must_use]
     pub fn refine_plan(&self) -> arcen_media::refine::RefinePlan {
@@ -202,6 +248,8 @@ pub struct Capenc {
     refine_plan: arcen_media::refine::RefinePlan,
     refine_lane: Option<mpsc::Receiver<Vec<u8>>>,
     refine_control: mpsc::UnboundedSender<arcen_media::capenc_control::CapencControlCommand>,
+    /// The canvas plan this capenc was started with (ADR 0028).
+    canvas_plan: arcen_media::canvas::serve::CanvasServePlan,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -790,20 +838,28 @@ impl Capenc {
             device = cfg.device_name.as_deref().unwrap_or("<resolved-by-engine>"),
         );
         let refine_plan = cfg.refine_plan();
-        let refine_lane = if refine_plan.is_on() {
-            let (lane_tx, lane_rx) = mpsc::channel(REFINE_LANE_RECORDS);
-            let target = RefineTarget {
-                carry: Arc::new(std::sync::Mutex::new(
-                    arcen_protocol::refine::carry::RefineVideoCarry::new(),
-                )),
-                lane: lane_tx,
-                control: refine_tx.clone(),
+        let canvas_plan = cfg.canvas_plan();
+        let refine_lane = if refine_plan.is_on() || canvas_plan.is_on() {
+            let (target, lane_rx) = if refine_plan.is_on() {
+                let (lane_tx, lane_rx) = mpsc::channel(REFINE_LANE_RECORDS);
+                (
+                    Some(RefineTarget {
+                        carry: Arc::new(std::sync::Mutex::new(
+                            arcen_protocol::refine::carry::RefineVideoCarry::new(),
+                        )),
+                        lane: lane_tx,
+                        control: refine_tx.clone(),
+                    }),
+                    Some(lane_rx),
+                )
+            } else {
+                (None, None)
             };
             tokio::spawn(
                 read_framed_v2(stdout, codec, frames.clone(), idr.clone(), target)
                     .instrument(helper_span.clone()),
             );
-            Some(lane_rx)
+            lane_rx
         } else {
             tokio::spawn(
                 read_length_prefixed(stdout, codec, frames.clone(), idr.clone())
@@ -830,6 +886,7 @@ impl Capenc {
                 refine_plan,
                 refine_lane,
                 refine_control: refine_tx,
+                canvas_plan,
             },
             frames,
             plan,
@@ -915,7 +972,7 @@ impl Capenc {
         let allowed_backends: &'static [EncoderBackend] = match encoder {
             EncoderRequest::Auto => &[EncoderBackend::NativeNvenc, EncoderBackend::OpenH264],
             EncoderRequest::NativeNvenc => &[EncoderBackend::NativeNvenc],
-            EncoderRequest::WindowsMediaFoundation => &[EncoderBackend::WindowsMediaFoundation],
+            EncoderRequest::MediaFoundationHardware => &[EncoderBackend::MediaFoundationHardware],
             EncoderRequest::SoftwareH264 => &[EncoderBackend::OpenH264],
             EncoderRequest::SoftwareAv1 => &[EncoderBackend::Rav1e],
         };
@@ -1098,12 +1155,17 @@ impl Capenc {
         // Exact still image: only on a plan the shared rule grants (never
         // an eight-bit capture); its records need framed-v2 (ADR 0016).
         let refine = cfg.refine_plan();
-        args.push(if refine.is_on() {
+        let canvas = cfg.canvas_args();
+        args.push(if refine.is_on() || canvas.is_some() {
             arcen_media::capenc_stream::FRAMED_OUTPUT_V2.to_string()
         } else {
             "framed-v1".to_string()
         });
         args.extend(refine.capenc_args(REFINE_SCOPE));
+        // Canvas: only the software loop, for a Deck that offered it.
+        if let Some(canvas) = canvas {
+            args.push(canvas.to_arg());
+        }
         if let Some(encoder) = cfg.encoder {
             args.push(format!("encoder={}", encoder.as_arg()));
         }
@@ -1156,6 +1218,21 @@ impl Capenc {
         }
     }
 
+    /// The canvas plan this capenc was started with (ADR 0028), for the
+    /// hello.
+    pub fn canvas_plan(&self) -> &arcen_media::canvas::serve::CanvasServePlan {
+        &self.canvas_plan
+    }
+
+    /// A Deck canvas control (`canvas_ack` / `canvas_reset_request`,
+    /// already validated) for this capenc; ignored when it serves no
+    /// canvas.
+    pub fn request_canvas(&self, command: arcen_media::capenc_control::CapencControlCommand) {
+        if self.canvas_plan.is_on() {
+            let _ = self.refine_control.send(command);
+        }
+    }
+
     /// Real IDR-on-demand: one line on the engine's stdin, no restart.
     pub fn request_keyframe(&self, reason: &'static str) -> bool {
         self.idr.request(reason)
@@ -1195,6 +1272,130 @@ pub(crate) fn admission_probe_command(cfg: &CapencConfig) -> Result<std::process
         command.env("ARCEN_CAPENC_DEBUG", "1");
     }
     Ok(command)
+}
+
+/// How long the Media Foundation hardware admission probe may take: inside
+/// the agent's 25 s setup budget with room for the display work after it.
+const MEDIA_FOUNDATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(8);
+/// Codecs the admission probe tries, in the order a Pier prefers them.
+const MEDIA_FOUNDATION_ADMISSION_CODECS: &str = "h264,h265";
+
+/// What a Media Foundation hardware (Alpha) admission probe proved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MediaFoundationAdmission {
+    /// One proven encode per codec, in probe order.
+    pub proven: Vec<arcen_media::video::HardwareEncoderAdmission>,
+    /// Why nothing (or not everything) was proven, for the log.
+    pub detail: String,
+}
+
+impl MediaFoundationAdmission {
+    pub(crate) fn codecs(&self) -> Vec<arcen_media::VideoCodec> {
+        self.proven.iter().map(|proof| proof.codec).collect()
+    }
+
+    /// Reads the probe's stdout (`ADMITTED` lines) and stderr (its typed
+    /// `UNAVAILABLE` reason and last log line). Only proofs for this backend
+    /// at the asked size count.
+    pub(crate) fn from_probe_output(stdout: &str, stderr: &str, width: u32, height: u32) -> Self {
+        let proven = stdout
+            .lines()
+            .filter_map(arcen_media::video::HardwareEncoderAdmission::parse_line)
+            .filter(|proof| {
+                proof.backend == EncoderBackend::MediaFoundationHardware
+                    && proof.width == width
+                    && proof.height == height
+            })
+            .collect();
+        let detail = stderr
+            .lines()
+            .find_map(|line| parse_unavailable_v1(line).ok())
+            .map(|notice| format!("{:?}", notice.reason))
+            .into_iter()
+            .chain(
+                stderr
+                    .lines()
+                    .rev()
+                    .find(|line| line.contains("not admitted") || line.contains("unavailable"))
+                    .map(|line| line.chars().take(240).collect::<String>()),
+            )
+            .collect::<Vec<_>>()
+            .join(": ");
+        Self { proven, detail }
+    }
+}
+
+/// Runs the Media Foundation hardware (Alpha) admission probe on the
+/// session's adapter: the Pier's own binary as `capenc … encoder=mf-hw
+/// mf-hw-admit=WxH`, one real encode per codec whose SPS the shared parsers
+/// check. A probe that fails, times out or proves nothing admits nothing,
+/// and Auto falls through to OpenH264.
+pub(crate) async fn media_foundation_hardware_admission(
+    session_log_id: &CorrelationId,
+    adapter_name: &str,
+    adapter_output_index: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> MediaFoundationAdmission {
+    let (width, height) = (width & !1, height & !1);
+    let binary = match std::env::current_exe() {
+        Ok(binary) => binary,
+        Err(error) => {
+            return MediaFoundationAdmission {
+                detail: format!("resolve current executable: {error}"),
+                ..MediaFoundationAdmission::default()
+            }
+        }
+    };
+    let mut command = Command::new(binary);
+    command
+        .args([
+            "capenc".to_string(),
+            "0".to_string(),
+            "h264".to_string(),
+            fps.max(1).to_string(),
+            "encoder=mf-hw".to_string(),
+            format!("mf-hw-admit={width}x{height}"),
+            format!("mf-hw-codecs={MEDIA_FOUNDATION_ADMISSION_CODECS}"),
+            format!("adapter={adapter_name}"),
+            format!("adapter-output={adapter_output_index}"),
+        ])
+        .env("ARCEN_SESSION_LOG_ID", session_log_id.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output =
+        match tokio::time::timeout(MEDIA_FOUNDATION_ADMISSION_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                return MediaFoundationAdmission {
+                    detail: format!("admission probe did not start: {error}"),
+                    ..MediaFoundationAdmission::default()
+                }
+            }
+            Err(_) => {
+                return MediaFoundationAdmission {
+                    detail: format!(
+                        "admission probe exceeded {} s",
+                        MEDIA_FOUNDATION_ADMISSION_TIMEOUT.as_secs()
+                    ),
+                    ..MediaFoundationAdmission::default()
+                }
+            }
+        };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+        tracing::debug!(target: CAPENC, sid = %session_log_id, line, "MF hardware admission probe");
+    }
+    let mut admission =
+        MediaFoundationAdmission::from_probe_output(&stdout, &stderr, width, height);
+    if !output.status.success() && admission.detail.is_empty() {
+        admission.detail = format!("admission probe exited with {}", output.status);
+    }
+    admission
 }
 
 async fn shutdown_child(
@@ -1303,6 +1504,7 @@ async fn read_length_prefixed_inner<R>(
             keyframe,
             timestamp_ms: now_ms(),
             refine: None,
+            canvas: false,
         };
         // Back-pressure, not loss: while the router is held back by the
         // outbound backlog budget the engine stalls on its pipe. Past the
@@ -1337,7 +1539,7 @@ async fn read_framed_v2<R>(
     codec: VideoCodec,
     frames: Arc<VideoQueue<EncodedFrame>>,
     idr: IdrRequester,
-    refine: RefineTarget,
+    refine: Option<RefineTarget>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -1350,7 +1552,7 @@ async fn read_framed_v2_inner<R>(
     codec: VideoCodec,
     frames: Arc<VideoQueue<EncodedFrame>>,
     idr: IdrRequester,
-    refine: RefineTarget,
+    refine: Option<RefineTarget>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -1407,7 +1609,7 @@ async fn read_framed_v2_inner<R>(
                 }
                 let seq = next_seq;
                 next_seq = next_seq.wrapping_add(1);
-                if !prefix.is_empty() {
+                if let Some(refine) = refine.as_ref().filter(|_| !prefix.is_empty()) {
                     if let Ok(mut carry) = refine.carry.lock() {
                         carry.push(seq, std::mem::take(&mut prefix));
                     }
@@ -1419,12 +1621,38 @@ async fn read_framed_v2_inner<R>(
                     data: body,
                     keyframe,
                     timestamp_ms: now_ms(),
-                    refine: Some(RefineTag {
+                    refine: refine.as_ref().map(|refine| RefineTag {
                         carry: Arc::clone(&refine.carry),
                         seq,
                     }),
+                    canvas: false,
                 };
                 if !crate::latest::video_backlog_legacy() {
+                    frames
+                        .wait_for_room(Some(arcen_media::video::VIDEO_ROOM_WAIT))
+                        .await;
+                }
+                if !enqueue_encoded_frame(&frames, &idr, frame) {
+                    break;
+                }
+            }
+            // Canvas (ADR 0028), produced only with `canvas=`: the record
+            // is its own wire frame and a reset its recovery point. The Deck
+            // validates every record.
+            CapencRecordKind::Canvas => {
+                let Some(reset) = arcen_media::canvas::serve::canvas_record_is_reset(&body) else {
+                    tracing::error!(target: CAPENC, "invalid canvas record — stopping reader");
+                    break;
+                };
+                frame_count += 1;
+                let frame = EncodedFrame {
+                    data: body,
+                    keyframe: reset,
+                    timestamp_ms: now_ms(),
+                    refine: None,
+                    canvas: true,
+                };
+                if !reset && !crate::latest::video_backlog_legacy() {
                     frames
                         .wait_for_room(Some(arcen_media::video::VIDEO_ROOM_WAIT))
                         .await;
@@ -1439,6 +1667,9 @@ async fn read_framed_v2_inner<R>(
                 }
             }
             CapencRecordKind::RefineLane => {
+                let Some(refine) = refine.as_ref() else {
+                    continue;
+                };
                 if refine.lane.try_send(body).is_err() {
                     // A dropped tile leaves the Deck's digest incomplete:
                     // start a new generation instead, at most once a second.
@@ -2004,6 +2235,7 @@ mod tests {
             cursor_mode: CursorMode::Host,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             refine: None,
+            canvas: None,
         }
     }
 
@@ -2102,6 +2334,42 @@ mod tests {
     }
 
     #[test]
+    fn media_foundation_admission_counts_only_matching_proofs() {
+        let proof = |codec: &str, width: u32| {
+            format!(
+                "[capenc] ADMITTED version=1 backend=media-foundation-hw codec={codec} \
+                 width={width} height=1080 profile=77 encoder=Vendor H.264 Encoder MFT"
+            )
+        };
+        let stdout = [
+            proof("h264", 1920),
+            proof("h265", 1280),
+            "[capenc] ADMITTED version=1 backend=native-nvenc codec=h265 width=1920 \
+             height=1080 profile=1 encoder=x"
+                .to_string(),
+            "noise".to_string(),
+        ]
+        .join("\n");
+        let admission = MediaFoundationAdmission::from_probe_output(&stdout, "", 1920, 1080);
+        assert_eq!(admission.codecs(), vec![arcen_media::VideoCodec::H264]);
+        assert_eq!(admission.proven[0].encoder_name, "Vendor H.264 Encoder MFT");
+
+        let refused = MediaFoundationAdmission::from_probe_output(
+            "",
+            "[capenc] MF hardware: no-op\n[capenc] UNAVAILABLE version=1 \
+             backend=media-foundation-hw code=hardware_unavailable\n",
+            1920,
+            1080,
+        );
+        assert!(refused.codecs().is_empty());
+        assert!(
+            refused.detail.contains("HardwareUnavailable"),
+            "{}",
+            refused.detail
+        );
+    }
+
+    #[test]
     fn embedded_capenc_keeps_windows_encoder_backends() {
         let features = arcen_capenc::compiled_backend_features();
         assert!(
@@ -2113,8 +2381,8 @@ mod tests {
             "single-binary Pier must embed source-built OpenH264 fallback"
         );
         assert!(
-            !features.mf,
-            "shipped Pier must not depend on the inbox MF encoder"
+            features.mf_hw,
+            "single-binary Pier must embed the Media Foundation hardware encoder (Alpha)"
         );
     }
 
@@ -2489,6 +2757,7 @@ mod tests {
             keyframe,
             timestamp_ms: 0,
             refine: None,
+            canvas: false,
         };
         assert!(enqueue_encoded_frame(&queue, &idr, frame(1, false)));
         assert!(enqueue_encoded_frame(&queue, &idr, frame(2, false)));
@@ -2666,6 +2935,7 @@ mod tests {
             bit_depth: BitDepth::Ten,
             chroma: ChromaSubsampling::Yuv444,
             refine: None,
+            canvas: None,
             ..test_config()
         };
         if REFINE_COMPILED {
@@ -2713,7 +2983,7 @@ mod tests {
             VideoCodec::H264,
             frames.clone(),
             IdrRequester::new(tx),
-            target,
+            Some(target),
         ));
         let records = [
             encode_record(CapencRecordKind::RefineVideo, &[0x0D, 1, 1]).unwrap(),

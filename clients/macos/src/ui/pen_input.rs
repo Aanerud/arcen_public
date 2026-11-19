@@ -145,12 +145,14 @@ pub(crate) struct PenInput {
     activity: bool,
     stats: PenForwardStats,
     edge_wake: Option<Box<dyn Fn()>>,
+    /// What the pen's barrel buttons click on this session's host.
+    buttons: arcen_input::pen_buttons::PenButtonMap,
 }
 
 impl PenInput {
     pub(crate) fn new(region_runtime: SharedRegionRuntime, sequence: SharedInputSequence) -> Self {
         Self {
-            mapper: TabletMapper::new(),
+            mapper: TabletMapper::with_button_map(arcen_input::pen_buttons::PenButtonMap::default()),
             dispatcher: PenForwardingDispatcher::new(),
             probe: TabletCapabilityProbe::default(),
             last_event: None,
@@ -171,11 +173,30 @@ impl PenInput {
             activity: false,
             stats: PenForwardStats::default(),
             edge_wake: None,
+            buttons: arcen_input::pen_buttons::PenButtonMap::default(),
         }
     }
 
     /// Runs after a pen edge (proximity, contact, tool, button) so the UI
     /// updates mouse-emulation suppression; plain motion never wakes the UI.
+    /// The session's pen-button mapping (its host's layout and this Deck's
+    /// pen settings); a pen in range keeps its state.
+    pub(crate) fn set_button_map(&mut self, buttons: arcen_input::pen_buttons::PenButtonMap) {
+        self.buttons = buttons;
+        self.mapper.set_button_map(buttons);
+    }
+
+    /// New pen settings for the session's host.
+    pub(crate) fn set_button_settings(
+        &mut self,
+        settings: arcen_input::pen_buttons::PenButtonSettings,
+    ) {
+        self.set_button_map(arcen_input::pen_buttons::PenButtonMap {
+            settings,
+            ..self.buttons
+        });
+    }
+
     pub(crate) fn set_edge_wake(&mut self, wake: impl Fn() + 'static) {
         self.edge_wake = Some(Box::new(wake));
     }
@@ -626,7 +647,7 @@ impl PenInput {
         self.barrier = false;
         self.emit_final_release_if_in_proximity();
         self.dispatcher.reset();
-        self.mapper = TabletMapper::new();
+        self.mapper = TabletMapper::with_button_map(self.buttons);
         self.overflow_resets = self.overflow_resets.saturating_add(1);
         tracing::error!(
             target: crate::logging::target::INPUT,
@@ -645,7 +666,7 @@ impl PenInput {
         self.barrier = false;
         self.emit_final_release_if_in_proximity();
         self.dispatcher.reset();
-        self.mapper = TabletMapper::new();
+        self.mapper = TabletMapper::with_button_map(self.buttons);
         if had_authority {
             tracing::debug!(
                 target: crate::logging::target::INPUT,
@@ -662,7 +683,7 @@ impl PenInput {
         self.held.clear();
         self.barrier = false;
         self.dispatcher.reset();
-        self.mapper = TabletMapper::new();
+        self.mapper = TabletMapper::with_button_map(self.buttons);
         self.probe = TabletCapabilityProbe::default();
     }
 }
@@ -778,6 +799,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: 0.0,
             buttons: TabletButtonMask::new(if tip { TabletButtonMask::TIP } else { 0 }),
+            driver_click: None,
             device_id: 1,
             tool: NativeTabletTool::Pen,
             window_number,

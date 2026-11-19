@@ -56,10 +56,7 @@ mod nvenc_policy;
 /// geometry and the Keel block-size invariant stay under test everywhere,
 /// not only where NVENC happens to compile.
 mod qp_map;
-#[cfg(all(
-    any(feature = "nvenc", feature = "mf", feature = "software-h264"),
-    windows
-))]
+#[cfg(all(any(feature = "nvenc", feature = "software-h264"), windows))]
 mod wgc;
 #[cfg(windows)]
 mod win;
@@ -71,10 +68,12 @@ mod win_color_probe;
 #[cfg(all(feature = "nvenc", windows))]
 mod win_refine;
 
-#[cfg(all(feature = "mf", windows))]
+#[cfg(all(feature = "mf-hw", windows))]
 mod mf_encoder;
-#[cfg(all(any(feature = "mf", feature = "software-h264"), windows))]
+#[cfg(all(feature = "software-h264", windows))]
 mod win_mf;
+#[cfg(all(feature = "mf-hw", windows))]
+mod win_mf_hw;
 
 #[cfg(all(feature = "nvenc", target_os = "linux"))]
 mod linux;
@@ -94,17 +93,6 @@ mod linux_x11;
 mod nvenc_cuda;
 // Wayland provider capture (`wayland` feature). The portable lease, layout,
 // hand-off and evidence modules also build under `test` on every target.
-#[cfg(any(
-    test,
-    all(windows, any(feature = "mf", feature = "software-h264")),
-    all(target_os = "linux", feature = "software-h264")
-))]
-// Host-neutral binding shared by the Linux X11 and Windows MF capture loops.
-// Neither platform consumes the whole surface (Linux needs the degraded
-// fallback and re-arm, Windows needs the hash kernel and bypass accounting), so
-// per-platform builds legitimately leave part of it unused.
-#[allow(dead_code)]
-mod region_schedule;
 #[cfg(any(test, all(feature = "wayland", target_os = "linux")))]
 mod wayland;
 
@@ -236,7 +224,20 @@ pub(crate) struct ControlState {
     refine_enable: AtomicU32,
     /// The latest `REFINE-RATE`, packed by [`pack_refine_rate`]; 0 = none.
     refine_rate: AtomicU64,
+    /// Canvas control lines (ADR 0028) in arrival order, bounded: the
+    /// oldest acknowledgements go first when the loop falls behind.
+    canvas: std::sync::Mutex<
+        std::collections::VecDeque<arcen_media::capenc_control::CapencControlCommand>,
+    >,
 }
+
+/// Canvas control lines kept for the loop.
+#[cfg(any(
+    test,
+    windows,
+    all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
+))]
+const MAX_CANVAS_CONTROLS: usize = 256;
 
 /// Packs a `REFINE-RATE` into one non-zero word: the hold flag in bit 0,
 /// the rate above it (saturated far beyond any link).
@@ -270,7 +271,34 @@ impl ControlState {
             refine_reset: AtomicBool::new(false),
             refine_enable: AtomicU32::new(0),
             refine_rate: AtomicU64::new(0),
+            canvas: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    fn push_canvas(&self, command: arcen_media::capenc_control::CapencControlCommand) {
+        let mut queue = self
+            .canvas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.len() >= MAX_CANVAS_CONTROLS {
+            queue.pop_front();
+        }
+        queue.push_back(command);
+    }
+
+    /// Takes the canvas control lines that arrived since the last call.
+    #[cfg_attr(
+        not(any(windows, all(target_os = "linux", feature = "software-h264"))),
+        allow(dead_code, reason = "only the shared software loop serves a canvas")
+    )]
+    pub(crate) fn take_canvas_controls(
+        &self,
+    ) -> Vec<arcen_media::capenc_control::CapencControlCommand> {
+        let mut queue = self
+            .canvas
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.drain(..).collect()
     }
 
     /// Consumes a pending `REFINE-RATE`: `(bps, hold)`.
@@ -405,6 +433,17 @@ fn read_control<R: BufRead>(reader: R, state: &ControlState, label: &str) {
                             .refine_rate
                             .store(pack_refine_rate(bps, hold), Ordering::Release);
                     }
+                    Ok(
+                        command @ (arcen_media::capenc_control::CapencControlCommand::CanvasAck {
+                            ..
+                        }
+                        | arcen_media::capenc_control::CapencControlCommand::CanvasReset {
+                            ..
+                        }
+                        | arcen_media::capenc_control::CapencControlCommand::CanvasInput {
+                            ..
+                        }),
+                    ) => state.push_canvas(command),
                     Ok(arcen_media::capenc_control::CapencControlCommand::Stop) => break,
                     Err(error) => log(&format!(
                         "{label}: unknown stdin command: {command:?}: {error}"
@@ -496,7 +535,8 @@ pub(crate) fn requested_output_name() -> Option<&'static str> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompiledBackendFeatures {
     pub nvenc: bool,
-    pub mf: bool,
+    /// The Media Foundation hardware encoder (Alpha).
+    pub mf_hw: bool,
     pub software_h264: bool,
     /// Whether the `rav1e` software AV1 backend (`EncoderBackend::Rav1e`) is
     /// compiled in. Always `false` today: unlike `software_h264`, capenc's
@@ -509,11 +549,50 @@ pub struct CompiledBackendFeatures {
     pub software_av1: bool,
 }
 
+/// One Media Foundation hardware encoder MFT a host registers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaFoundationHardwareEncoder {
+    pub adapter: String,
+    pub codec: arcen_media::VideoCodec,
+    pub name: String,
+    pub vendor: String,
+}
+
+/// The Media Foundation hardware encoder MFTs (Alpha) on every adapter, for
+/// host diagnostics. Enumeration only: a session admits one only after a real
+/// encode (`encoder=mf-hw mf-hw-admit=WxH`).
+///
+/// # Errors
+///
+/// Media Foundation or DXGI did not start, or this build has no `mf-hw`.
+pub fn media_foundation_hardware_encoders() -> Result<Vec<MediaFoundationHardwareEncoder>, String> {
+    #[cfg(all(feature = "mf-hw", windows))]
+    {
+        mf_encoder::inventory().map(|found| {
+            found
+                .into_iter()
+                .map(
+                    |(adapter, codec, name, vendor)| MediaFoundationHardwareEncoder {
+                        adapter,
+                        codec,
+                        name,
+                        vendor,
+                    },
+                )
+                .collect()
+        })
+    }
+    #[cfg(not(all(feature = "mf-hw", windows)))]
+    {
+        Err("this build has no Media Foundation hardware encoder".to_string())
+    }
+}
+
 #[must_use]
 pub const fn compiled_backend_features() -> CompiledBackendFeatures {
     CompiledBackendFeatures {
         nvenc: cfg!(feature = "nvenc"),
-        mf: cfg!(feature = "mf"),
+        mf_hw: cfg!(feature = "mf-hw"),
         software_h264: cfg!(feature = "software-h264"),
         software_av1: cfg!(feature = "software-av1"),
     }
@@ -752,7 +831,7 @@ pub(crate) fn requested_qp_map(args: &[String]) -> Result<crate::qp_map::QpMapPo
 ///
 /// An explicit `variant=` wins; otherwise the legacy contract is reconstructed
 /// from the positional `yuv444` token. Every real run entry point
-/// (`win::run_with_args`, `win_mf`'s `MfRunOpts`/`OpenH264RunOpts`
+/// (`win::run_with_args`, `win_mf`'s `OpenH264RunOpts`, `win_mf_hw`'s `RunOpts`
 /// construction, `linux::run_with_args`/`probe_with_args`,
 /// `linux_x11::run_with_args`) must call this rather than constructing
 /// `ColorSpec::legacy(...)` directly, and must feed the *same* resolved
@@ -956,7 +1035,7 @@ pub(crate) fn resolved_media_plan_for_source(
     })?;
     let encoder = match backend {
         EncoderBackend::NativeNvenc => EncoderRequest::NativeNvenc,
-        EncoderBackend::WindowsMediaFoundation => EncoderRequest::WindowsMediaFoundation,
+        EncoderBackend::MediaFoundationHardware => EncoderRequest::MediaFoundationHardware,
         EncoderBackend::OpenH264 => EncoderRequest::SoftwareH264,
         EncoderBackend::Rav1e => EncoderRequest::SoftwareAv1,
         // VideoToolbox exists in the shared vocabulary because the macOS Pier
@@ -1152,6 +1231,29 @@ pub(crate) fn write_access_unit(
     writer.flush()
 }
 
+/// Writes one record of the shared software loop
+/// (`arcen_media::canvas::CanvasEncodeLoop`) in the framing the parent
+/// asked for: a canvas record as a framed-v2 `Canvas` record, an access
+/// unit as framed-v2, framed-v1 or raw Annex-B.
+#[cfg(any(windows, all(target_os = "linux", feature = "software-h264")))]
+pub(crate) fn write_loop_record(
+    writer: &mut impl Write,
+    record: &arcen_media::canvas::LoopRecord,
+    framed_v1: bool,
+    framed_v2: bool,
+) -> std::io::Result<()> {
+    use arcen_media::canvas::LoopRecord;
+    use arcen_media::capenc_stream::{write_record, CapencRecordKind};
+    match record {
+        LoopRecord::AccessUnit { bytes, .. } if framed_v2 => {
+            validate_access_unit(bytes, true)?;
+            write_record(writer, CapencRecordKind::AccessUnit, bytes)
+        }
+        LoopRecord::AccessUnit { bytes, .. } => write_access_unit(writer, bytes, framed_v1),
+        LoopRecord::Canvas { bytes, .. } => write_record(writer, CapencRecordKind::Canvas, bytes),
+    }
+}
+
 /// Writes one access unit in the framing the parent asked for: a framed-v2
 /// `AccessUnit` record whenever `framed-v2` was requested — also when lossless
 /// refinement was refused — otherwise framed-v1 or raw Annex-B.
@@ -1208,8 +1310,16 @@ pub fn run_with_args(args: Vec<String>) {
     #[cfg(windows)]
     {
         // framed-v2 and refinement are honoured only by the FP16 NVENC
-        // path; `win` refuses them on every other path it dispatches to.
-        refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::WindowsWide);
+        // path, framed-v2 and the canvas only by the software loop; `win`
+        // refuses them on every other path it dispatches to.
+        refuse_unsupported_output(
+            &args,
+            if args.iter().any(|arg| arg == "encoder=software-h264") {
+                arcen_media::capenc_stream::CapencRoute::Software
+            } else {
+                arcen_media::capenc_stream::CapencRoute::WindowsWide
+            },
+        );
         win::run_with_args(args);
     }
 
@@ -1304,7 +1414,7 @@ pub fn run_with_args(args: Vec<String>) {
                 );
                 std::process::exit(2);
             }
-            refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::XorgOther);
+            refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::Software);
             #[cfg(feature = "software-h264")]
             linux_x11::run_with_args(args);
             #[cfg(not(feature = "software-h264"))]

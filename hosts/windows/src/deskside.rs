@@ -417,6 +417,11 @@ fn approved_capture_connector(value: i32) -> bool {
     value == 16
 }
 
+/// `DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED` or `_INDIRECT_VIRTUAL`.
+fn indirect_connector(value: i32) -> bool {
+    matches!(value, 16 | 17)
+}
+
 fn validate_hash(value: &str, field: &str) -> Result<(), String> {
     if value.len() != HASH_HEX_BYTES
         || !value
@@ -680,6 +685,308 @@ fn session_protocol(session_id: u32) -> Result<u16, String> {
     Ok(protocol)
 }
 
+/// Whether this console session's desktop is on the desk's monitors: the
+/// active console session over the local protocol is; a session that is
+/// not (a remote protocol, another session on the console) is not. A fact
+/// that cannot be read counts as on the desk (fail closed).
+#[cfg(windows)]
+pub fn desk_exposure(
+    session: &WindowsSessionIdentity,
+) -> arcen_session::console_session::desk_privacy::DeskExposure {
+    use arcen_session::console_session::desk_privacy::DeskExposure;
+    let console = crate::logon_activation::active_console_session().ok();
+    let remote = session_protocol(session.session_id)
+        .ok()
+        .map(|protocol| protocol != 0);
+    if console.is_some_and(|console| console != session.session_id) || remote == Some(true) {
+        DeskExposure::NotShown
+    } else {
+        DeskExposure::PhysicalDesk
+    }
+}
+
+#[cfg(not(windows))]
+pub fn desk_exposure(
+    _session: &WindowsSessionIdentity,
+) -> arcen_session::console_session::desk_privacy::DeskExposure {
+    arcen_session::console_session::desk_privacy::DeskExposure::PhysicalDesk
+}
+
+/// The lit outputs a dark desk was proved with (adapter LUID, output).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DarkDeskProof {
+    lit: std::collections::BTreeSet<(String, u32)>,
+}
+
+/// What is behind one lit output: nothing for a virtual display (an
+/// indirect display whose adapter software enumerated: a virtual display
+/// driver, the Pier's IddCx display); on an NVIDIA GPU, a monitor when any
+/// display NVAPI reports active is physically connected (NVAPI's
+/// per-display facts are not tied to a DXGI output here, so one lit monitor
+/// counts for every output of its GPU); otherwise unknown. Windows cannot
+/// darken a monitor, so the desk's monitors are detached from the desktop
+/// while a Deck is attached and this proves nothing at the desk is lit
+/// (shared `desk_outputs_dark`).
+fn desk_monitor(
+    virtual_display: bool,
+    nvidia_gpu_lights_a_monitor: Option<bool>,
+) -> arcen_session::console_session::desk_privacy::DeskMonitor {
+    use arcen_session::console_session::desk_privacy::DeskMonitor;
+    match (virtual_display, nvidia_gpu_lights_a_monitor) {
+        (true, _) => DeskMonitor::Absent,
+        (false, Some(true)) => DeskMonitor::Present,
+        (false, Some(false)) => DeskMonitor::Absent,
+        (false, None) => DeskMonitor::Unknown,
+    }
+}
+
+#[cfg(windows)]
+fn lit_outputs(report: &HostCapabilityReport) -> std::collections::BTreeSet<(String, u32)> {
+    report
+        .adapters
+        .iter()
+        .flat_map(|adapter| {
+            adapter
+                .outputs
+                .iter()
+                .filter(|output| output.attached_to_desktop && output.ccd_active == Some(true))
+                .map(|output| (adapter.session_luid.clone(), output.adapter_output_index))
+        })
+        .collect()
+}
+
+/// NVAPI's `NV_VIRTUALIZATION_MODE_VGX`: a virtual GPU in a guest.
+const NVAPI_VIRTUALIZATION_VGPU_GUEST: u32 = 2;
+
+/// Whether NVAPI proved a monitor physically connected on `gpu` (only
+/// active displays when `active_only`): `None` unless its display-id
+/// enumeration succeeded, so a failed or missing call never reads as "no
+/// monitor". A virtual GPU in a guest drives no monitor at a desk: its
+/// heads report themselves physically connected (lab: the active head of a
+/// GRID V100D-16Q guest), but nothing is behind them; who may watch a
+/// virtual machine's console is the platform's to decide (issue #107).
+fn nvidia_gpu_monitor(gpu: &crate::nvapi_inventory::GpuEntry, active_only: bool) -> Option<bool> {
+    if gpu.virtualization_mode == Some(NVAPI_VIRTUALIZATION_VGPU_GUEST) {
+        return Some(false);
+    }
+    let succeeded = |call: &str| {
+        gpu.calls
+            .iter()
+            .any(|outcome| outcome.call == call && outcome.succeeded())
+    };
+    if !succeeded("NvAPI_GPU_GetAllDisplayIds")
+        || !succeeded("NvAPI_GPU_GetConnectedDisplayIds(uncached)")
+    {
+        return None;
+    }
+    Some(gpu.displays.iter().any(|display| {
+        display.flags.physically_connected && (display.flags.active || !active_only)
+    }))
+}
+
+/// Classifies every output the desktop lights and returns them once no
+/// monitor at the desk is behind any (shared `desk_outputs_dark`).
+#[cfg(windows)]
+fn dark_lit_outputs() -> Result<
+    std::collections::BTreeSet<(String, u32)>,
+    arcen_session::console_session::desk_privacy::DeskPrivacyRefusal,
+> {
+    use arcen_session::console_session::desk_privacy::{
+        desk_outputs_dark, DeskOutputFact, DeskPrivacyRefusal,
+    };
+    let report = crate::gpu_probe::probe().map_err(|_| DeskPrivacyRefusal::DeskMonitorUnknown)?;
+    if report.topology_error.is_some() {
+        return Err(DeskPrivacyRefusal::DeskMonitorUnknown);
+    }
+    let nvapi = crate::nvapi_inventory::inventory().ok();
+    let gpu_lights_a_monitor = |luid: &str| -> Option<bool> {
+        let gpu = nvapi.as_ref()?.gpus.iter().find(|gpu| {
+            gpu.adapter_luid.is_some_and(|gpu_luid| {
+                format!(
+                    "{:08x}:{:08x}",
+                    gpu_luid.high_part as u32, gpu_luid.low_part
+                ) == luid
+            })
+        })?;
+        nvidia_gpu_monitor(gpu, true)
+    };
+    let mut facts = Vec::new();
+    for adapter in &report.adapters {
+        for output in &adapter.outputs {
+            let lit = output.attached_to_desktop && output.ccd_active == Some(true);
+            if !lit {
+                continue;
+            }
+            let monitor = desk_monitor(
+                virtual_display(output),
+                gpu_lights_a_monitor(&adapter.session_luid),
+            );
+            tracing::debug!(
+                target: crate::logging::SESSION,
+                adapter = %adapter.description,
+                output = output.adapter_output_index,
+                monitor = ?monitor,
+                "desk privacy: a lit output"
+            );
+            facts.push(DeskOutputFact { lit, monitor });
+        }
+    }
+    desk_outputs_dark(&facts)?;
+    Ok(lit_outputs(&report))
+}
+
+/// Proves that no monitor at the desk shows the desktop: every output the
+/// desktop lights has nothing physically connected behind it.
+///
+/// # Errors
+///
+/// The shared refusal when a lit output drives a monitor, or when that
+/// cannot be told.
+/// A virtual display: an indirect display (`DISPLAYCONFIG_OUTPUT_TECHNOLOGY_
+/// INDIRECT_*`) whose adapter software enumerated (`\\?\ROOT#…`: a virtual
+/// display driver, the Pier's IddCx display). A hardware indirect adapter (a
+/// USB display adapter, for example) drives a monitor at the desk.
+fn virtual_display(output: &crate::gpu_probe::OutputCapability) -> bool {
+    output.output_technology.is_some_and(indirect_connector)
+        && output
+            .target_adapter_path
+            .as_deref()
+            .is_some_and(software_enumerated_adapter)
+        && output
+            .edid_manufacture_id
+            .is_some_and(viewerless_virtual_display_manufacturer)
+}
+
+/// EDID manufacturers of virtual display drivers that show their display
+/// nowhere: Arcen's own (`ARN`) and the Virtual Display Driver the GeForce
+/// guide uses (`MTT`, its default `MTT1337` monitor). Software-enumerated
+/// indirect displays also include screen extenders whose whole purpose is to
+/// show the desktop on a tablet at the desk, so any other one is not trusted
+/// (`desk_monitor_unknown`).
+fn viewerless_virtual_display_manufacturer(id: u16) -> bool {
+    const MTT: u16 = edid_manufacturer(*b"MTT");
+    [arcen_outputs::edid::EDID_MANUFACTURER_ID, MTT]
+        .iter()
+        .any(|known| id == *known || id.swap_bytes() == *known)
+}
+
+const fn edid_manufacturer(letters: [u8; 3]) -> u16 {
+    (((letters[0] - b'@') as u16) << 10)
+        | (((letters[1] - b'@') as u16) << 5)
+        | ((letters[2] - b'@') as u16)
+}
+
+fn software_enumerated_adapter(path: &str) -> bool {
+    path.get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\ROOT#"))
+}
+
+/// The output to serve a desk-private session on when the configured one
+/// shows on a monitor at the desk: the first virtual display on the same
+/// adapter, whose encoder was already chosen (`None`: keep the configured
+/// output). Windows cannot darken a monitor, so a session shown on one
+/// could not be private.
+#[cfg(windows)]
+pub fn virtual_output_instead_of(
+    configured: &crate::display::OutputSelector,
+) -> Option<crate::display::OutputSelector> {
+    let resolved = crate::display::resolve_output_selector(configured).ok()?;
+    let report = crate::gpu_probe::probe().ok()?;
+    let configured_is_virtual = report.adapters.iter().any(|adapter| {
+        adapter
+            .outputs
+            .iter()
+            .any(|output| output.device_name == resolved.device_name && virtual_display(output))
+    });
+    if configured_is_virtual {
+        return None;
+    }
+    report
+        .adapters
+        .iter()
+        .filter(|adapter| {
+            adapter
+                .description
+                .eq_ignore_ascii_case(&resolved.adapter_name)
+        })
+        .find_map(|adapter| {
+            adapter
+                .outputs
+                .iter()
+                .find(|output| output.attached_to_desktop && virtual_display(output))
+                .map(|output| crate::display::OutputSelector::Adapter {
+                    name: adapter.description.clone(),
+                    output_index: output.adapter_output_index,
+                })
+        })
+}
+
+#[cfg(not(windows))]
+pub fn virtual_output_instead_of(
+    _configured: &crate::display::OutputSelector,
+) -> Option<crate::display::OutputSelector> {
+    None
+}
+
+#[cfg(windows)]
+pub fn prove_desk_dark(
+) -> Result<DarkDeskProof, arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
+    dark_lit_outputs().map(|lit| DarkDeskProof { lit })
+}
+
+#[cfg(not(windows))]
+pub fn prove_desk_dark(
+) -> Result<DarkDeskProof, arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
+    Err(arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskMonitorUnknown)
+}
+
+static DARK_DESK: std::sync::Mutex<Option<DarkDeskProof>> = std::sync::Mutex::new(None);
+
+/// Holds the proof the agent's supervision checks the desk against while
+/// the Deck is attached and held (one session per agent process).
+pub fn hold_dark_desk(proof: Option<DarkDeskProof>) {
+    *DARK_DESK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = proof;
+}
+
+/// The held proof, if the desk is kept dark by default desk privacy.
+#[must_use]
+pub fn held_dark_desk() -> Option<DarkDeskProof> {
+    DARK_DESK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Proves the desk dark again: still no monitor behind any lit output, and
+/// the desktop still lights exactly the outputs it was proved with.
+///
+/// # Errors
+///
+/// The shared refusal of [`prove_desk_dark`], or
+/// [`DeskPrivacyRefusal::DeskOutputsChanged`](arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskOutputsChanged)
+/// when the lit outputs changed.
+#[cfg(windows)]
+pub fn verify_desk_dark(
+    proof: &DarkDeskProof,
+) -> Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
+    use arcen_session::console_session::desk_privacy::DeskPrivacyRefusal;
+    // The whole proof again (a monitor plugged into a lit head changes no
+    // lit output), and the same outputs.
+    if dark_lit_outputs()? != proof.lit {
+        return Err(DeskPrivacyRefusal::DeskOutputsChanged);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn verify_desk_dark(
+    _proof: &DarkDeskProof,
+) -> Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
+    Err(arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskOutputsChanged)
+}
+
 /// Returns the process-random marker attached to Arcen `SendInput` events.
 pub(crate) fn injection_marker() -> usize {
     injection_markers().remote
@@ -797,6 +1104,12 @@ pub const fn swallow_mouse_event(flags: u32, extra_info: usize, marker: usize) -
 #[derive(Clone)]
 pub struct HookProof {
     active: Arc<AtomicBool>,
+    /// The mouse canary must arrive too (pinned deskside). Desk privacy's
+    /// default proves the hook thread with the keyboard canary: on the lab
+    /// vGPU guest Windows never calls `WH_MOUSE_LL` for an injected move,
+    /// relative or absolute, while the keyboard hook on the same thread is
+    /// called at once.
+    require_mouse: bool,
 }
 
 impl HookProof {
@@ -808,14 +1121,15 @@ impl HookProof {
     #[cfg(windows)]
     fn probe_with_sender<F>(&self, send: F, timeout: Duration) -> Result<(), String>
     where
-        F: FnOnce() -> Result<(), String>,
+        F: FnOnce(bool) -> Result<(), String>,
     {
         if !self.active.load(Ordering::Acquire) {
             return Err("deskside hook thread exited".to_string());
         }
         let keyboard_before = KEYBOARD_CANARY_HEARTBEAT.load(Ordering::Acquire);
         let mouse_before = MOUSE_CANARY_HEARTBEAT.load(Ordering::Acquire);
-        send()?;
+        let mouse_required = self.require_mouse;
+        send(mouse_required)?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if Self::canaries_advanced(
@@ -823,11 +1137,25 @@ impl HookProof {
                 mouse_before,
                 KEYBOARD_CANARY_HEARTBEAT.load(Ordering::Acquire),
                 MOUSE_CANARY_HEARTBEAT.load(Ordering::Acquire),
+                mouse_required,
             ) {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return Err("deskside hook canary deadline expired".to_string());
+                return Err(format!(
+                    "deskside hook canary deadline expired (keyboard {}, mouse {}, mouse required {})",
+                    if KEYBOARD_CANARY_HEARTBEAT.load(Ordering::Acquire) > keyboard_before {
+                        "seen"
+                    } else {
+                        "missing"
+                    },
+                    if MOUSE_CANARY_HEARTBEAT.load(Ordering::Acquire) > mouse_before {
+                        "seen"
+                    } else {
+                        "missing"
+                    },
+                    mouse_required,
+                ));
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -838,8 +1166,9 @@ impl HookProof {
         mouse_before: u64,
         keyboard_after: u64,
         mouse_after: u64,
+        mouse_required: bool,
     ) -> bool {
-        keyboard_after > keyboard_before && mouse_after > mouse_before
+        keyboard_after > keyboard_before && (mouse_after > mouse_before || !mouse_required)
     }
 
     #[cfg(not(windows))]
@@ -851,6 +1180,7 @@ impl HookProof {
 /// Process-owned low-level hooks running on a dedicated native message thread.
 pub struct InputHookGuard {
     active: Arc<AtomicBool>,
+    require_mouse: bool,
     shutdown_requested: Arc<AtomicBool>,
     thread_id: u32,
     join: Option<JoinHandle<Result<(), String>>>,
@@ -904,9 +1234,19 @@ impl InputHookGuard {
         };
         Ok(Self {
             active,
+            require_mouse: true,
             shutdown_requested,
             thread_id,
             join: Some(join),
+        })
+    }
+
+    /// [`Self::install`] for desk privacy's default: its liveness proof is
+    /// the keyboard canary (see [`HookProof`]).
+    pub fn install_keyboard_proved() -> Result<Self, String> {
+        Self::install().map(|mut guard| {
+            guard.require_mouse = false;
+            guard
         })
     }
 
@@ -925,20 +1265,48 @@ impl InputHookGuard {
     pub fn proof(&self) -> HookProof {
         HookProof {
             active: Arc::clone(&self.active),
+            require_mouse: self.require_mouse,
         }
     }
 
     #[cfg(windows)]
-    fn send_hook_canaries() -> Result<(), String> {
+    fn send_hook_canaries(with_mouse: bool) -> Result<(), String> {
+        use windows::Win32::Foundation::POINT;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-            MOUSEEVENTF_MOVE, MOUSEINPUT, VIRTUAL_KEY,
+            MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+            VIRTUAL_KEY,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
         };
 
         let markers = injection_markers();
         if markers.keyboard_canary == 0 || markers.mouse_canary == 0 {
             return Err("deskside hook canary markers are unavailable".to_string());
         }
+        let mut cursor = POINT::default();
+        // SAFETY: cursor is a valid, writable POINT; a failure leaves it at
+        // the origin, which is still a valid absolute target.
+        let _ = unsafe { GetCursorPos(&mut cursor) };
+        // SAFETY: GetSystemMetrics has no pointer arguments.
+        let (left, top, width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
+            )
+        };
+        let normalize = |value: i32, origin: i32, extent: i32| -> i32 {
+            let offset = i64::from((value - origin).clamp(0, extent - 1));
+            i32::try_from(offset * 65_535 / i64::from(extent - 1)).unwrap_or(0)
+        };
+        // One pixel beside the cursor: a move to where it already is never
+        // reached the hook (lab vGPU guest); the hook swallows this one.
+        let canary_x = normalize(cursor.x.saturating_add(1), left, width);
+        let canary_y = normalize(cursor.y, top, height);
         let inputs = [
             INPUT {
                 r#type: INPUT_KEYBOARD,
@@ -969,18 +1337,25 @@ impl InputHookGuard {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
                     mi: MOUSEINPUT {
-                        dx: 0,
-                        dy: 0,
+                        dx: canary_x,
+                        dy: canary_y,
                         mouseData: 0,
-                        dwFlags: MOUSEEVENTF_MOVE,
+                        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                         time: 0,
                         dwExtraInfo: markers.mouse_canary,
                     },
                 },
             },
         ];
+        // Without the mouse canary nothing moves, even where Windows never
+        // calls the mouse hook for an injected move.
+        let inputs = if with_mouse {
+            &inputs[..]
+        } else {
+            &inputs[..2]
+        };
         // SAFETY: inputs is a valid initialized slice and cbsize matches INPUT.
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
         if sent as usize == inputs.len() {
             Ok(())
         } else {
@@ -1190,6 +1565,124 @@ unsafe extern "system" fn mouse_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_software_enumerated_indirect_display_is_virtual() {
+        assert!(software_enumerated_adapter(
+            r"\\?\ROOT#DISPLAY#0000#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}"
+        ));
+        assert!(software_enumerated_adapter(r"\\?\root#mttvdd#0000#{x}"));
+        assert!(!software_enumerated_adapter(
+            r"\\?\USB#VID_17E9&PID_6006#0001#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}"
+        ));
+        assert!(!software_enumerated_adapter(
+            r"\\?\PCI#VEN_10DE&DEV_2704#4&1#{5b45201d}"
+        ));
+        assert!(!software_enumerated_adapter("short"));
+        // Only virtual displays that show nowhere: Arcen's and the GeForce
+        // guide's driver, in either byte order.
+        let mtt = edid_manufacturer(*b"MTT");
+        assert!(viewerless_virtual_display_manufacturer(mtt));
+        assert!(viewerless_virtual_display_manufacturer(mtt.swap_bytes()));
+        assert!(viewerless_virtual_display_manufacturer(
+            arcen_outputs::edid::EDID_MANUFACTURER_ID
+        ));
+        assert!(!viewerless_virtual_display_manufacturer(edid_manufacturer(
+            *b"DEL"
+        )));
+    }
+
+    #[test]
+    fn only_the_pier_s_own_display_or_a_gpu_with_nothing_connected_is_dark() {
+        use arcen_session::console_session::desk_privacy::DeskMonitor;
+        assert_eq!(desk_monitor(true, Some(true)), DeskMonitor::Absent);
+        assert_eq!(desk_monitor(true, None), DeskMonitor::Absent);
+        assert_eq!(desk_monitor(false, Some(true)), DeskMonitor::Present);
+        assert_eq!(desk_monitor(false, Some(false)), DeskMonitor::Absent);
+        assert_eq!(desk_monitor(false, None), DeskMonitor::Unknown);
+    }
+
+    #[test]
+    fn a_gpu_whose_display_enumeration_failed_is_never_read_as_having_no_monitor() {
+        use crate::nvapi_inventory::{
+            CallOutcome, DisplayIdEntry, DisplayIdFlags, EdidProbe, GpuEntry,
+        };
+        let display = |active, physically_connected| DisplayIdEntry {
+            display_id: 1,
+            connector_type: 0,
+            flags: DisplayIdFlags {
+                active,
+                connected: true,
+                physically_connected,
+                ..DisplayIdFlags::default()
+            },
+            sources: Vec::new(),
+            output_id: None,
+            edid: EdidProbe::default(),
+            in_nvapi_display_config: false,
+        };
+        let gpu = |displays: Vec<DisplayIdEntry>, calls: Vec<CallOutcome>| GpuEntry {
+            index: 0,
+            full_name: None,
+            gpu_type: None,
+            system_type: None,
+            quadro: None,
+            virtualization_mode: None,
+            virtualization_mode_name: None,
+            board_number: None,
+            vbios_version: None,
+            pci: None,
+            physical_framebuffer_kib: None,
+            adapter_luid: None,
+            all_outputs_mask: None,
+            connected_outputs_mask: None,
+            active_outputs_mask: None,
+            outputs: Vec::new(),
+            displays,
+            calls,
+        };
+        let proved = || {
+            vec![
+                CallOutcome::ok("NvAPI_GPU_GetAllDisplayIds"),
+                CallOutcome::ok("NvAPI_GPU_GetConnectedDisplayIds(uncached)"),
+            ]
+        };
+        assert_eq!(
+            nvidia_gpu_monitor(&gpu(Vec::new(), proved()), true),
+            Some(false)
+        );
+        assert_eq!(
+            nvidia_gpu_monitor(&gpu(vec![display(true, false)], proved()), true),
+            Some(false)
+        );
+        assert_eq!(
+            nvidia_gpu_monitor(&gpu(vec![display(true, true)], proved()), true),
+            Some(true)
+        );
+        // An inactive desk monitor is dark while attached, but would light
+        // on a sign-in that moves the session to the console.
+        assert_eq!(
+            nvidia_gpu_monitor(&gpu(vec![display(false, true)], proved()), true),
+            Some(false)
+        );
+        assert_eq!(
+            nvidia_gpu_monitor(&gpu(vec![display(false, true)], proved()), false),
+            Some(true)
+        );
+        let failed = vec![
+            CallOutcome::failed("NvAPI_GPU_GetAllDisplayIds", -1, "error"),
+            CallOutcome::ok("NvAPI_GPU_GetConnectedDisplayIds(uncached)"),
+        ];
+        assert_eq!(nvidia_gpu_monitor(&gpu(Vec::new(), failed), true), None);
+        assert_eq!(nvidia_gpu_monitor(&gpu(Vec::new(), Vec::new()), true), None);
+        // A virtual GPU in a guest: its heads report a physical connection
+        // with nothing at a desk behind them.
+        let mut vgpu = gpu(vec![display(true, true)], Vec::new());
+        vgpu.virtualization_mode = Some(2);
+        assert_eq!(nvidia_gpu_monitor(&vgpu, true), Some(false));
+        vgpu.virtualization_mode = Some(1);
+        assert_eq!(nvidia_gpu_monitor(&vgpu, true), None);
+    }
     #[cfg(windows)]
     use super::{collect_evidence_from_report, output_facts};
     #[cfg(windows)]
@@ -1278,30 +1771,34 @@ mod tests {
             keyboard_hook_decision(0x10, 99, markers),
             HookDecision::Swallow
         );
-        assert!(!HookProof::canaries_advanced(1, 1, 2, 1));
-        assert!(HookProof::canaries_advanced(1, 1, 2, 2));
+        assert!(!HookProof::canaries_advanced(1, 1, 2, 1, true));
+        assert!(HookProof::canaries_advanced(1, 1, 2, 2, true));
+        assert!(HookProof::canaries_advanced(1, 1, 2, 1, false));
+        assert!(!HookProof::canaries_advanced(1, 1, 1, 2, false));
 
         #[cfg(windows)]
         {
             let inactive = HookProof {
                 active: Arc::new(AtomicBool::new(false)),
+                require_mouse: true,
             };
             assert!(inactive
-                .probe_with_sender(|| Ok(()), Duration::from_millis(1))
+                .probe_with_sender(|_| Ok(()), Duration::from_millis(1))
                 .unwrap_err()
                 .contains("exited"));
             let active = HookProof {
                 active: Arc::new(AtomicBool::new(true)),
+                require_mouse: true,
             };
             assert!(active
                 .probe_with_sender(
-                    || Err("SendInput failed".to_string()),
+                    |_| Err("SendInput failed".to_string()),
                     Duration::from_millis(1)
                 )
                 .unwrap_err()
                 .contains("SendInput"));
             assert!(active
-                .probe_with_sender(|| Ok(()), Duration::from_millis(1))
+                .probe_with_sender(|_| Ok(()), Duration::from_millis(1))
                 .unwrap_err()
                 .contains("deadline"));
         }
@@ -1341,6 +1838,7 @@ mod tests {
             edid_manufacture_id: Some(manufacturer),
             edid_product_code_id: Some(product),
             connector_instance: Some(output_index),
+            target_adapter_path: None,
             deskside_identity_sha256: Some(normalized_identity_hash(path)),
             deskside_edid_sha256: Some(edid_tuple_hash(manufacturer, product, output_index)),
             deskside_capture_sha256: capture_pin_hash(
@@ -1400,6 +1898,7 @@ mod tests {
             recommendation: None,
             hypervisor_present: Some(false),
             firmware_sha256: Some("f".repeat(HASH_HEX_BYTES)),
+            media_foundation_hardware: Default::default(),
         };
         let capture = ResolvedOutput {
             global_index: 0,

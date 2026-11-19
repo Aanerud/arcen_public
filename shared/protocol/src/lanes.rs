@@ -375,7 +375,6 @@ impl LaneRole {
     pub const fn for_frame_type(frame_type: FrameType) -> Self {
         match frame_type {
             FrameType::VideoFull
-            | FrameType::VideoPartial
             | FrameType::VideoH264
             | FrameType::VideoH265
             | FrameType::VideoAv1
@@ -384,7 +383,8 @@ impl LaneRole {
             | FrameType::RegionVideoH265
             | FrameType::RegionVideoAv1
             | FrameType::RefineFence
-            | FrameType::RefineBarrier => Self::Video,
+            | FrameType::RefineBarrier
+            | FrameType::Canvas => Self::Video,
             FrameType::RefineTiles | FrameType::RefineDigest => Self::Refine,
             FrameType::Audio => Self::AudioOutput,
             FrameType::AudioUpstream => Self::Microphone,
@@ -1953,5 +1953,16 @@ mod tests {
         assert_eq!(LaneRole::Refine.shape(), LaneShape::Unidirectional);
         assert!(!LaneRole::Refine.may_send(LaneEndpoint::Deck));
         assert_eq!(LaneRole::from_wire(7), Some(LaneRole::Refine));
+    }
+
+    #[test]
+    fn canvas_records_ride_the_video_lane() {
+        assert_eq!(LaneRole::for_frame_type(FrameType::Canvas), LaneRole::Video);
+        assert_eq!(
+            lane_for_binary_message(&[0x0E, 1, 2]),
+            Some(LaneRole::Video)
+        );
+        // 0x02 is reserved and names no frame type.
+        assert_eq!(lane_for_binary_message(&[0x02]), None);
     }
 }

@@ -34,6 +34,12 @@
 //!   shared textures and fences ([`handover`]), so one window's `Present`
 //!   never holds up decode or another window. Where the driver cannot share
 //!   them, everything shares the root window's device, as before.
+//! - **The canvas** ([`canvas`], ADR 0028): the eight-bit sink keeps one
+//!   persistent `B8G8R8A8` canvas per monitor on its device, applies each
+//!   canvas record to it in order on the immediate context (copies, fills,
+//!   tiles, cache, surface paints through the same conversion pass) and
+//!   presents it by copying it into the swapchain; its oracle is the shared
+//!   CPU executor `arcen_media::canvas::CanvasPixels`.
 //! - **Ten bits at the glass are measured, not assumed** ([`depth`]).
 //! - **DWM composes unless the video alone covers the monitor** ([`flip`]):
 //!   fullscreen, 1:1, opaque, nothing drawn over it (the connection bar
@@ -60,6 +66,7 @@
               coordinates; errors are named in every message"
 )]
 
+pub mod canvas;
 pub mod compose;
 pub mod composition;
 pub mod convert;

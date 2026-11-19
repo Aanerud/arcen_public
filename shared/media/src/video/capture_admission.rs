@@ -1149,16 +1149,17 @@ mod tests {
             copy_path: CopyPath::HostCopy,
             ..sdr8()
         };
+        // OpenH264's own 3840x2160 is the only bound.
         let limit = AdmissionRequest {
-            width: 1920,
-            height: 1200,
+            width: 3840,
+            height: 2160,
             ..request(StreamingPreset::Auto)
         };
         assert_eq!(
             admitted(admit_auto(limit, &source, &openh264())).pipeline,
             PipelineId::Software
         );
-        for (width, height) in [(1922, 1080), (1920, 1202), (2560, 1600)] {
+        for (width, height) in [(3842, 2160), (3840, 2162), (5120, 2880)] {
             let oversize = AdmissionRequest {
                 width,
                 height,
@@ -1189,8 +1190,8 @@ mod tests {
         }
         // NVENC holds the same size.
         let large = AdmissionRequest {
-            width: 2560,
-            height: 1600,
+            width: 5120,
+            height: 2880,
             ..request(StreamingPreset::Auto)
         };
         assert_eq!(
@@ -1293,7 +1294,9 @@ mod tests {
             panic!("expected downgrade, got {admission:?}");
         };
         assert_eq!(served.pipeline, PipelineId::Software);
-        assert_eq!(served.fps_ceiling, 30);
+        // No fixed software rate: the request's 60, which OpenH264 encodes;
+        // the host's governor lowers it to what the CPU sustains.
+        assert_eq!(served.fps_ceiling, 60);
         assert!(matches!(reason, AdmissionReason::SoftwareFallback(_)));
     }
 

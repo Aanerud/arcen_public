@@ -87,7 +87,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 #[repr(u8)]
 pub enum FrameType {
     VideoFull = 0x01,
-    VideoPartial = 0x02,
+    // 0x02 is reserved: it was a partial-frame type no product sent.
     VideoH264 = 0x03,
     VideoH265 = 0x04,
     VideoAv1 = 0x05,
@@ -104,6 +104,9 @@ pub enum FrameType {
     RefineDigest = 0x0C,
     /// Lossless refinement generation barrier (`crate::refine`), video lane.
     RefineBarrier = 0x0D,
+    /// Canvas reset or frame (`crate::canvas`, ADR 0028), video lane,
+    /// capability-gated.
+    Canvas = 0x0E,
     Audio = 0x10,
     AudioUpstream = 0x11,
     Clipboard = 0x20,
@@ -373,7 +376,6 @@ impl TryFrom<u8> for FrameType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0x01 => Ok(Self::VideoFull),
-            0x02 => Ok(Self::VideoPartial),
             0x03 => Ok(Self::VideoH264),
             0x04 => Ok(Self::VideoH265),
             0x05 => Ok(Self::VideoAv1),
@@ -385,6 +387,7 @@ impl TryFrom<u8> for FrameType {
             0x0B => Ok(Self::RefineTiles),
             0x0C => Ok(Self::RefineDigest),
             0x0D => Ok(Self::RefineBarrier),
+            0x0E => Ok(Self::Canvas),
             0x10 => Ok(Self::Audio),
             0x11 => Ok(Self::AudioUpstream),
             0x20 => Ok(Self::Clipboard),
@@ -417,11 +420,7 @@ impl FrameType {
     pub const fn is_legacy_video(self) -> bool {
         matches!(
             self,
-            Self::VideoFull
-                | Self::VideoPartial
-                | Self::VideoH264
-                | Self::VideoH265
-                | Self::VideoAv1
+            Self::VideoFull | Self::VideoH264 | Self::VideoH265 | Self::VideoAv1
         )
     }
 }
@@ -588,6 +587,11 @@ pub fn decode_video_header(data: &[u8]) -> Result<VideoHeader, ProtocolError> {
         return Err(ProtocolError::ShortHeader);
     }
     let frame_type = FrameType::try_from(data[0])?;
+    // Only video frame types carry this header: refinement and canvas
+    // records must never parse as an access unit.
+    if !frame_type.is_region_video() && !frame_type.is_legacy_video() {
+        return Err(ProtocolError::UnknownFrameType(data[0]));
+    }
     let monitor_id = u16::from_be_bytes([data[8], data[9]]);
     let (topology_generation, stream_epoch) = if frame_type.is_region_video() {
         if data.len() < REGION_VIDEO_HEADER_SIZE {
@@ -1188,6 +1192,22 @@ mod tests {
         let encoded = encode_video_header(header);
         assert_eq!(encoded.len(), VIDEO_HEADER_SIZE);
         assert_eq!(decode_video_header(&encoded).unwrap(), header);
+    }
+
+    #[test]
+    fn only_video_frame_types_parse_as_a_video_header() {
+        // A canvas record's prefix happens to read as a valid H.264 header
+        // (version 1 = H.264, kind = chroma, reserved = flags); a refine
+        // fence likewise. Neither may ever reach a video path.
+        for byte in [0x0A_u8, 0x0D, 0x0E, 0x10, 0x50] {
+            let mut bytes = vec![byte, 1, 2, 0];
+            bytes.resize(REGION_VIDEO_HEADER_SIZE, 1);
+            assert_eq!(
+                decode_video_header(&bytes),
+                Err(ProtocolError::UnknownFrameType(byte)),
+                "frame type 0x{byte:02X}"
+            );
+        }
     }
 
     #[test]

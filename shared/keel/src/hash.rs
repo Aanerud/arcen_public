@@ -39,13 +39,13 @@ impl HashKernel {
         match self {
             // A 16x16 BGRA block is pitch-separated in the mapped capture.
             // XXH3's short-input path is faster here than a streaming state:
-            // hash each active row directly, then position-mix the row hashes
-            // into one session-local 64-bit fingerprint.
+            // hash each active row directly, then fold the row hashes in
+            // order into one session-local 64-bit fingerprint.
             Self::Xxh3 => {
                 let mut combined = ROW_SEED ^ bounds.height as u64;
                 for row_offset in 0..bounds.height {
                     let row = frame.block_row_segment(bounds.y + row_offset, bounds);
-                    combined = mix_row(combined, row, row_offset, ROW_SEED);
+                    combined = fold_row(combined, row_segment_hash(row), row_offset);
                 }
                 finish_mix(combined)
             }
@@ -65,6 +65,50 @@ impl HashKernel {
             }
         }
     }
+
+    /// Hashes a block and writes each row segment's position-independent
+    /// hash ([`row_segment_hash`]) to `rows`, which holds at least
+    /// `bounds.height` entries. Returns the same block hash as
+    /// [`Self::hash_block`].
+    pub(crate) fn hash_block_rows(
+        self,
+        frame: BgraFrame<'_>,
+        bounds: BlockBounds,
+        rows: &mut [u64],
+    ) -> u64 {
+        match self {
+            Self::Xxh3 => {
+                let mut combined = ROW_SEED ^ bounds.height as u64;
+                for (row_offset, slot) in rows.iter_mut().enumerate().take(bounds.height) {
+                    let row = frame.block_row_segment(bounds.y + row_offset, bounds);
+                    *slot = row_segment_hash(row);
+                    combined = fold_row(combined, *slot, row_offset);
+                }
+                finish_mix(combined)
+            }
+            Self::Crc32c => {
+                for (row_offset, slot) in rows.iter_mut().enumerate().take(bounds.height) {
+                    *slot =
+                        row_segment_hash(frame.block_row_segment(bounds.y + row_offset, bounds));
+                }
+                self.hash_block(frame, bounds)
+            }
+        }
+    }
+}
+
+/// Position-independent hash of one block-row segment: equal pixels give an
+/// equal hash wherever they sit vertically, which is what motion search
+/// matches on.
+#[inline]
+pub(crate) fn row_segment_hash(row: &[u8]) -> u64 {
+    xxh3_64_with_seed(row, ROW_SEED)
+}
+
+#[inline]
+const fn fold_row(combined: u64, row_hash: u64, row_offset: usize) -> u64 {
+    (combined.rotate_left(17) ^ row_hash ^ (row_offset as u64).wrapping_mul(CRC_MIX_SEED))
+        .wrapping_mul(COMBINE_PRIME)
 }
 
 #[inline]

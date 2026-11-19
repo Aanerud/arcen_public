@@ -4,6 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+mod canvas_smoke;
+
 use arcen_deck::credentials::credentials_from_args;
 use arcen_deck::display::metrics::{DisplayMetrics, LogicalRect, SafeAreaInsets};
 use arcen_deck::pipeline::audio::PcmAudioPlayer;
@@ -1275,6 +1277,8 @@ fn connect_options_from_parts_with_monitors(
         tablet_mode_requested,
         telemetry: std::sync::Arc::new(arcen_deck::observability::ClientTelemetry::default()),
         exact_still_image: false,
+        // The command-line smokes present nothing: no canvas executor.
+        canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
     })
 }
 
@@ -1502,6 +1506,7 @@ async fn input_smoke(
             | SessionEvent::CursorUpdate(_)
             | SessionEvent::CursorPosition(_)
             | SessionEvent::CursorLaneReset
+            | SessionEvent::CanvasTick
             | SessionEvent::PresentationRecoveryRequested => {}
         }
     }
@@ -1556,7 +1561,19 @@ async fn input_smoke(
                 end_in_contact,
             } => pen_full_smoke(&mut session, wait_ms, end_in_contact).await,
             PenSmokeScript::File { samples, go_file } => {
-                pen_file_smoke(&mut session, &samples, go_file.as_deref()).await
+                // The file names what a button does; a Deck sends it in the
+                // host's layout (an old Linux Pier swaps the two clicks).
+                let layout = host_hello.as_ref().map_or_else(
+                    arcen_input::pen_buttons::HostPenButtons::default,
+                    |hello| {
+                        arcen_input::pen_buttons::HostPenButtons::for_host(
+                            hello.host_platform(),
+                            hello.input_capabilities,
+                        )
+                    },
+                );
+                println!("input-smoke pen buttons layout={layout:?}");
+                pen_file_smoke(&mut session, &samples, go_file.as_deref(), layout).await
             }
         };
     }
@@ -1684,7 +1701,23 @@ fn smoke_deck_key(
         "up" => DeckKey::Other(0x0100_0013),
         "right" => DeckKey::Other(0x0100_0014),
         "down" => DeckKey::Other(0x0100_0015),
+        "delete" => DeckKey::Other(0x0100_0007),
+        "insert" => DeckKey::Other(arcen_input::keyboard::host_keys::KEY_INSERT),
+        "print" => DeckKey::Other(arcen_input::keyboard::pc::KEY_PRINT),
+        "scrolllock" => DeckKey::Other(arcen_input::keyboard::pc::KEY_SCROLL_LOCK),
+        "pause" => DeckKey::Other(arcen_input::keyboard::pc::KEY_PAUSE),
+        "menu" => DeckKey::Other(arcen_input::keyboard::pc::KEY_MENU),
         _ => {
+            // `f1` ... `f24`.
+            if let Some(number) = name
+                .strip_prefix('f')
+                .and_then(|number| number.parse::<u32>().ok())
+                .filter(|number| (1..=24).contains(number))
+            {
+                return Some(DeckKey::Other(
+                    arcen_input::keyboard::pc::KEY_F1 + number - 1,
+                ));
+            }
             let [byte] = name.as_bytes() else {
                 return None;
             };
@@ -1976,8 +2009,10 @@ enum PenSmokeScript {
 
 /// Parses a `--pen-file` script: one sample per line,
 /// `x y pressure tilt_x tilt_y rotation tip|eraser in_proximity touching buttons pause_ms`
-/// (`x`/`y` normalized 0..=1, flags 0/1); blank lines and `#` comments are
-/// skipped. Every line is checked before anything is sent.
+/// (`x`/`y` normalized 0..=1, flags 0/1, `buttons` by action: bit 0 right
+/// click, bit 1 middle click, sent in the host's layout as a Deck sends
+/// them); blank lines and `#` comments are skipped. Every line is checked
+/// before anything is sent.
 fn parse_pen_file(text: &str) -> Result<Vec<(PenScriptSample, u64)>, String> {
     let mut samples = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -2032,6 +2067,7 @@ async fn pen_file_smoke(
     session: &mut SessionHandle,
     samples: &[(PenScriptSample, u64)],
     go_file: Option<&str>,
+    layout: arcen_input::pen_buttons::HostPenButtons,
 ) -> Result<(), String> {
     if let Some(path) = go_file {
         println!("input-smoke pen waiting for go file");
@@ -2052,6 +2088,10 @@ async fn pen_file_smoke(
     }
     for (index, (sample, pause)) in samples.iter().enumerate() {
         let sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+        let sample = PenScriptSample {
+            buttons: layout.wire(sample.buttons),
+            ..*sample
+        };
         session
             .commands
             .send(SessionCommand::Json(sample.json(sequence)))
@@ -2697,6 +2737,18 @@ async fn media_smoke(
     if exact_smoke {
         options.exact_still_image = true;
     }
+    // ARCEN_MEDIA_SMOKE_CANVAS=1 asks for the canvas (ADR 0028) and applies
+    // it with the shared CPU executor (`canvas_smoke`), until
+    // ARCEN_MEDIA_SMOKE_SECONDS.
+    let mut canvas_smoke = None;
+    if std::env::var("ARCEN_MEDIA_SMOKE_CANVAS").is_ok_and(|value| value == "1") {
+        options.canvas = canvas_smoke::request();
+        canvas_smoke = options
+            .canvas
+            .capability()
+            .and_then(canvas_smoke::CanvasSmoke::new);
+    }
+    let mut canvas_report = Instant::now();
     let mut exact_status = String::new();
     let mut auth = Some(AuthSubmission {
         username: std::mem::take(&mut options.username),
@@ -3069,6 +3121,16 @@ async fn media_smoke(
                 return Err("server certificate requires interactive trust".to_string());
             }
             SessionEvent::ServerHello(hello) => {
+                if canvas_smoke.is_some() {
+                    println!(
+                        "canvas-smoke hello canvas={}",
+                        hello
+                            .canvas
+                            .as_ref()
+                            .and_then(|canvas| serde_json::to_string(canvas).ok())
+                            .unwrap_or_else(|| "absent".to_owned())
+                    );
+                }
                 if let Some(rate) = hello.stream_rate.as_ref() {
                     println!(
                         "stream rate fps={} display_refresh_hz={} basis={}",
@@ -3318,6 +3380,46 @@ async fn media_smoke(
             }
             SessionEvent::MediaReady => {
                 let batch = session.media.take_batch();
+                if let Some(smoke) = canvas_smoke.as_mut() {
+                    let lost = batch.canvas_lost_monitor_ids.iter().map(|monitor_id| {
+                        arcen_protocol::canvas::CanvasControlMsg::CanvasResetRequest {
+                            monitor_id: *monitor_id,
+                            generation: 0,
+                            reason: "lost".to_owned(),
+                        }
+                    });
+                    let replies: Vec<_> = batch
+                        .canvas
+                        .iter()
+                        .filter_map(|(monitor_id, record)| smoke.apply(*monitor_id, record))
+                        .chain(lost)
+                        .collect();
+                    for reply in replies {
+                        if let Ok(value) = serde_json::to_value(&reply) {
+                            let _ = session.commands.send(SessionCommand::Json(value));
+                        }
+                    }
+                    if canvas_report.elapsed() >= Duration::from_secs(1) {
+                        println!("{} video_packets={}", smoke.take_line(), batch.telemetry.video_received);
+                        canvas_report = Instant::now();
+                    }
+                    if target_duration.is_some_and(|target| started.elapsed() >= target) {
+                        let _ = smoke.take_line();
+                        let total = smoke.total;
+                        println!(
+                            "canvas-smoke complete seconds={:.1} wire_bytes={} frames={} resets={} refused={} digests={} video_packets={}",
+                            started.elapsed().as_secs_f64(),
+                            total.bytes,
+                            total.frames,
+                            total.resets,
+                            total.refused,
+                            total.digests,
+                            batch.telemetry.video_received
+                        );
+                        let _ = session.commands.send(SessionCommand::Close);
+                        return Ok(());
+                    }
+                }
                 if require_multi_monitor && !input_probe_sent && !input_probe_points.is_empty() {
                     send_multi_monitor_input_probe(
                         &session.commands,
@@ -3711,8 +3813,9 @@ async fn media_smoke(
                     }
                 }
             }
-            SessionEvent::PresentationRecoveryRequested | SessionEvent::ConnectionStatusHint(_) => {
-            }
+            SessionEvent::PresentationRecoveryRequested
+            | SessionEvent::ConnectionStatusHint(_)
+            | SessionEvent::CanvasTick => {}
             // ARCEN_MEDIA_SMOKE_CURSOR=1: report every host cursor record,
             // applied in lane order as the Deck applies them.
             SessionEvent::CursorUpdate(bytes) => {

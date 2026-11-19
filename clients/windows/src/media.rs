@@ -25,8 +25,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use arcen_deck_core::client_telemetry::ClientTelemetry;
 use arcen_deck_core::present::{
-    LayerColourState, PresentOutcome, PresentableFrame, PresenterPipeline, PresenterTelemetryDelta,
-    RepaintRequester, VideoPresenterSink,
+    CanvasExecution, CanvasExecutorFacts, CanvasOutcome, CanvasReadback, LayerColourState,
+    PresentOutcome, PresentableFrame, PresenterPipeline, PresenterTelemetryDelta, RepaintRequester,
+    VideoPresenterSink,
 };
 use arcen_deck_core::runtime::audio_worker::AudioPlayback;
 use arcen_deck_core::runtime::clipboard_session::ClipboardSession;
@@ -86,6 +87,20 @@ impl std::fmt::Debug for WindowSink {
 
 impl VideoPresenterSink for WindowSink {
     type NativeFrame = D3d11Picture;
+
+    const CANVAS_EXECUTOR: Option<CanvasExecutorFacts> =
+        <crate::present::D3d11VideoSink as VideoPresenterSink>::CANVAS_EXECUTOR;
+
+    fn execute(&mut self, canvas: &CanvasExecution<'_, '_, D3d11Picture>) -> CanvasOutcome {
+        if self.closed {
+            return CanvasOutcome::Unsupported;
+        }
+        self.inner.execute(canvas)
+    }
+
+    fn take_canvas_readback(&mut self) -> Option<CanvasReadback> {
+        self.inner.take_canvas_readback()
+    }
 
     fn pipeline(&self) -> PresenterPipeline {
         self.inner.pipeline()
@@ -624,6 +639,7 @@ mod tests {
             tablet_mode_requested: arcen_protocol::messages::TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
         }
     }
 

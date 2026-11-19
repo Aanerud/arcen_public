@@ -28,6 +28,19 @@ strict Clippy gates. There is no single-platform `--workspace` build.
 - Reconnect creates a fresh decoder/inbox and waits for a fresh keyframe.
   Teardown must discard queued frames rather than let stale data delay resume.
 
+## Canvas (ADR 0028 §10)
+
+`ui/canvas_metal.rs` is a pure executor of the shared `CanvasWork`: never
+add a decision there (what to paint, cache or copy is the Pier's planner's,
+checked by `arcen_media::canvas::CanvasState`). Canvases belong to the
+connection, not the layer: `teardown` keeps them, `release_canvas` (session
+start and end) drops them. Every write is a GPU command on the canvas's
+queue, never a CPU write into the canvas texture, and the eight-bit layer
+presents it on the same queue under `CanvasTarget`'s lock. Any change must
+keep `the_metal_canvas_equals_the_cpu_executor_on_the_corpus` and
+`every_operation_matches_the_cpu_executor` passing. Only single-window
+connections ask for canvas until secondary windows have eight-bit layers.
+
 ## Presentation timing
 
 When a frame is shown is the served pipeline's shared rule

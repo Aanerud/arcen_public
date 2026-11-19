@@ -67,6 +67,9 @@
       "heartbeat_critical_misses": 3
     }
   },
+  "privacy": {
+    "desk": "on"
+  },
   "platform": {
     "auth": {
       "mode": "pam",

@@ -57,9 +57,10 @@ use arcen_input::keyboard::scancode::{
 use arcen_protocol::messages::{
     GestureMagnifyMsg, GestureValidationError, KeyEventMsg, MouseButtonMsg, MouseMoveMsg,
     MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenToolMsg, PointerMotionMode,
-    ScrollUnitMsg, TextCommitMsg,
+    ScrollUnitMsg, TextCommitMsg, PEN_BUTTON_MIDDLE_CLICK, PEN_BUTTON_RIGHT_CLICK,
 };
 
+use arcen_input::keyboard::host_keys::pc_host_key;
 use arcen_protocol::keys::{MOD_ALT, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT};
 
 fn wheel_delta_from_scroll(value: f64, unit: ScrollUnitMsg) -> i32 {
@@ -187,7 +188,11 @@ fn qt_key_to_windows(qt_key: u32, modifiers: u32) -> Option<(u16, bool)> {
         0x2A => (0x38, false),        // *
         0x28 => (0x39, false),        // (
         0x29 => (0x30, false),        // )
-        _ => return None,
+        // Menu (VK_APPS) and F13-F24 (VK_F13..VK_F24): the shared PC-key
+        // table, which also holds Insert, Pause, Print and Scroll Lock above.
+        _ => {
+            return pc_host_key(qt_key).map(|key| (key.windows_vk, key.windows_extended));
+        }
     };
     Some(mapping)
 }
@@ -469,10 +474,12 @@ fn pen_pixel_location(x: f64, y: f64, output: DesktopRect) -> Option<(i32, i32)>
 ///   this flag as the eraser's tip switch, so setting it while hovering turns
 ///   the hover into a contact (an eraser hover with the flag set arrives as
 ///   `WM_POINTERDOWN` and clicks).
-/// - `barrel` (`PEN_FLAG_BARREL`): either barrel button. Windows Ink has a
-///   single barrel switch and reports it as the second pointer button; an
-///   injected `POINTER_FLAG_SECONDBUTTON` is ignored for a synthetic pen, so
-///   bit 1 would otherwise do nothing.
+/// - `barrel` (`PEN_FLAG_BARREL`): the right-click button (`buttons` bit 0).
+///   Windows Ink has a single barrel switch, Windows' right click, and
+///   reports it as the second pointer button; an injected
+///   `POINTER_FLAG_SECONDBUTTON` is ignored for a synthetic pen. The middle
+///   click (bit 1) has no Windows Ink switch and is a mouse middle click
+///   ([`pen_middle_click`]).
 ///
 /// Nothing is set on an edge that leaves range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +487,34 @@ struct PenInkFlags {
     barrel: bool,
     inverted: bool,
     eraser: bool,
+}
+
+/// Whether the pen's middle click (`buttons` bit 1) is held after `edge`:
+/// only while the pen is in range, so leaving range releases it.
+fn pen_middle_click(buttons: u16, edge: PenPointerEdge) -> bool {
+    matches!(
+        edge,
+        PenPointerEdge::Hover
+            | PenPointerEdge::ContactDown
+            | PenPointerEdge::ContactMove
+            | PenPointerEdge::ContactUp
+    ) && buttons & PEN_BUTTON_MIDDLE_CLICK != 0
+}
+
+/// The `SendInput` absolute (`MOUSEEVENTF_VIRTUALDESK`) position of a
+/// desktop pixel, so the pen's middle click lands where the pen is rather
+/// than wherever the mouse cursor was left.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn pen_click_virtual_abs(desktop: (i32, i32), virtual_desktop: DesktopRect) -> (i32, i32) {
+    let axis = |value: i32, origin: i32, extent: i32| {
+        norm_to_abs(
+            (f64::from(value) - f64::from(origin)) / f64::from(extent.saturating_sub(1).max(1)),
+        )
+    };
+    (
+        axis(desktop.0, virtual_desktop.left, virtual_desktop.width),
+        axis(desktop.1, virtual_desktop.top, virtual_desktop.height),
+    )
 }
 
 fn pen_ink_flags(tool: PenToolMsg, buttons: u16, edge: PenPointerEdge) -> PenInkFlags {
@@ -496,7 +531,7 @@ fn pen_ink_flags(tool: PenToolMsg, buttons: u16, edge: PenPointerEdge) -> PenInk
     );
     let eraser_end = matches!(tool, PenToolMsg::Eraser);
     PenInkFlags {
-        barrel: in_range && buttons & 0b11 != 0,
+        barrel: in_range && buttons & PEN_BUTTON_RIGHT_CLICK != 0,
         inverted: in_range && eraser_end,
         eraser: in_contact && eraser_end,
     }
@@ -620,14 +655,14 @@ mod windows_impl {
         committed_route, is_input_method_layout, layout_level, layout_thread, scan_from_mapped,
     };
     use super::{
-        is_identity_dxgi_rotation, modifier_targets, pen_injection_point, pen_ink_flags,
-        pen_pixel_location, pen_pressure_to_windows, pen_rotation_to_windows, pen_tilt_to_windows,
-        qt_key_to_host_key, selected_output_to_virtual_abs, wheel_delta_from_scroll, DesktopRect,
-        GestureMagnifyMsg, GestureValidationError, HostKey, KeyEventMsg, MappedRegionButton,
-        MappedRegionPen, MappedRegionPoint, MappedRegionScroll, MetaReleaseMask, MouseButtonMsg,
-        MouseMoveMsg, MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenPointerEdge,
-        PenPointerState, PenToolMsg, TextCommitMsg, INPUT, VK_CAPITAL, VK_MENU_MASK, VK_NUMLOCK,
-        VK_SCROLL,
+        is_identity_dxgi_rotation, modifier_targets, pen_click_virtual_abs, pen_injection_point,
+        pen_ink_flags, pen_middle_click, pen_pixel_location, pen_pressure_to_windows,
+        pen_rotation_to_windows, pen_tilt_to_windows, qt_key_to_host_key,
+        selected_output_to_virtual_abs, wheel_delta_from_scroll, DesktopRect, GestureMagnifyMsg,
+        GestureValidationError, HostKey, KeyEventMsg, MappedRegionButton, MappedRegionPen,
+        MappedRegionPoint, MappedRegionScroll, MetaReleaseMask, MouseButtonMsg, MouseMoveMsg,
+        MouseMoveRelativeMsg, MouseScrollMsg, PenEventMsg, PenPointerEdge, PenPointerState,
+        PenToolMsg, TextCommitMsg, INPUT, VK_CAPITAL, VK_MENU_MASK, VK_NUMLOCK, VK_SCROLL,
     };
     use arcen_input::keyboard::scancode::{Set1Scancode, LEFT_CONTROL, LEFT_SHIFT, RIGHT_ALT};
     use arcen_input::text::{CharRoute, LayoutProbe};
@@ -1579,6 +1614,8 @@ mod windows_impl {
         state: PenPointerState,
         pointer_id: u32,
         frame_id: u32,
+        /// The pen's middle click is held as a mouse middle button.
+        middle_down: bool,
     }
 
     impl PenInjector {
@@ -1605,6 +1642,7 @@ mod windows_impl {
                 state: PenPointerState::released(),
                 pointer_id: 0,
                 frame_id: 0,
+                middle_down: false,
             })
         }
 
@@ -1625,6 +1663,7 @@ mod windows_impl {
                 state: PenPointerState::released(),
                 pointer_id: 0,
                 frame_id: 0,
+                middle_down: false,
             })
         }
 
@@ -1715,6 +1754,11 @@ mod windows_impl {
                 "pen_inject: InjectSyntheticPointerInput"
             );
             let ink_flags = pen_ink_flags(tool, buttons, edge);
+            let middle = pen_middle_click(buttons, edge);
+            if !middle {
+                // Released before the frame that may take the pen away.
+                self.middle_click(false, (x, y));
+            }
             self.inject(
                 edge,
                 x,
@@ -1725,6 +1769,52 @@ mod windows_impl {
                 tilt_y_degrees,
                 ink_flags,
             );
+            if middle {
+                // Pressed after the pen's frame, at the pen.
+                self.middle_click(true, (x, y));
+            }
+        }
+
+        /// The pen's middle click: Windows Ink has no such switch, so it is
+        /// the mouse's middle button, moved to the pen first in the same
+        /// `SendInput` (as `Injector` places every click), with the Arcen
+        /// injection marker: the mouse cursor need not be where the pen is,
+        /// and a bare button lands wherever the cursor was left.
+        fn middle_click(&mut self, pressed: bool, desktop: (i32, i32)) {
+            if self.middle_down == pressed {
+                return;
+            }
+            self.middle_down = pressed;
+            let flags = if pressed {
+                MOUSEEVENTF_MIDDLEDOWN
+            } else {
+                MOUSEEVENTF_MIDDLEUP
+            };
+            // SAFETY: plain metric queries.
+            let virtual_desktop = unsafe {
+                DesktopRect {
+                    left: GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    top: GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    width: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    height: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                }
+            };
+            let (ax, ay) = pen_click_virtual_abs(desktop, virtual_desktop);
+            let inputs = [
+                Injector::mouse_input(
+                    ax,
+                    ay,
+                    0,
+                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                ),
+                Injector::mouse_input(0, 0, 0, flags),
+            ];
+            // SAFETY: correctly-initialised INPUTs; cbsize matches their size.
+            let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            tracing::debug!(target: INPUT, pressed, ax, ay, sent, "pen middle click");
+            if sent as usize != inputs.len() {
+                tracing::warn!(target: INPUT, pressed, sent, "pen middle click: SendInput dropped it");
+            }
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -1787,6 +1877,11 @@ mod windows_impl {
         /// digitizer never appears "stuck" in proximity/contact. Used by
         /// `Drop` and by explicit reset/disconnect/reconnect handling.
         pub fn release(&mut self) {
+            let at = (
+                self.output.left + self.output.width / 2,
+                self.output.top + self.output.height / 2,
+            );
+            self.middle_click(false, at);
             let Some(edge) = self.state.release() else {
                 return;
             };
@@ -1927,10 +2022,11 @@ impl PenInjector {
 mod tests {
     use super::{
         committed_route, display_wake_plan, is_identity_dxgi_rotation, is_input_method_layout,
-        layout_level, layout_thread, modifier_targets, norm_to_abs, pen_injection_point,
-        pen_ink_flags, pen_pixel_location, pen_pressure_to_windows, pen_rotation_to_windows,
-        pen_tilt_to_windows, prepends_absolute_position, qt_key_to_host_key, qt_key_to_vk,
-        qt_key_to_windows, relative_move_plan, scan_from_mapped, selected_output_to_virtual_abs,
+        layout_level, layout_thread, modifier_targets, norm_to_abs, pen_click_virtual_abs,
+        pen_injection_point, pen_ink_flags, pen_middle_click, pen_pixel_location,
+        pen_pressure_to_windows, pen_rotation_to_windows, pen_tilt_to_windows,
+        prepends_absolute_position, qt_key_to_host_key, qt_key_to_vk, qt_key_to_windows,
+        relative_move_plan, scan_from_mapped, selected_output_to_virtual_abs,
         wheel_delta_from_scroll, DesktopRect, HostKey, MetaReleaseMask, PenPointerEdge,
         PenPointerState, MOD_ALT, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT, VK_CAPITAL,
     };
@@ -2257,6 +2353,37 @@ mod tests {
     }
 
     #[test]
+    fn menu_and_f13_to_f24_inject_their_virtual_keys() {
+        for (index, qt_key) in (0x0100_003C..=0x0100_0047_u32).enumerate() {
+            assert_eq!(
+                qt_key_to_host_key(qt_key, 0),
+                Some(HostKey::Vk {
+                    vk: 0x7C + u16::try_from(index).unwrap(),
+                    extended: false
+                }),
+                "F{}",
+                index + 13
+            );
+        }
+        assert_eq!(
+            qt_key_to_host_key(0x0100_0055, 0),
+            Some(HostKey::Vk {
+                vk: 0x5D,
+                extended: true
+            })
+        );
+        // The shared table and this Pier agree on every key in it.
+        for key in arcen_input::keyboard::host_keys::PC_HOST_KEYS {
+            assert_eq!(
+                qt_key_to_windows(key.qt_key, 0),
+                Some((key.windows_vk, key.windows_extended)),
+                "{}",
+                key.name
+            );
+        }
+    }
+
+    #[test]
     fn keypad_and_lock_keys_keep_their_virtual_keys() {
         assert_eq!(
             qt_key_to_host_key(0x31, MOD_KEYPAD),
@@ -2276,7 +2403,11 @@ mod tests {
             let Some((vk, _)) = qt_key_to_windows(qt_key, 0) else {
                 continue;
             };
-            if matches!(vk, 0x13 | 0x2C | 0x0C | 0x14 | 0x90 | 0x91) {
+            // Pause, Print, Clear, the locks, and Menu and F13-F24.
+            if matches!(
+                vk,
+                0x13 | 0x2C | 0x0C | 0x14 | 0x90 | 0x91 | 0x5D | 0x7C..=0x87
+            ) {
                 continue;
             }
             assert!(
@@ -2387,9 +2518,55 @@ mod tests {
         assert!(!tip.inverted && !tip.eraser && !tip.barrel);
     }
 
+    /// Bit 0 is the right click: the Windows Ink barrel. Bit 1, the middle
+    /// click, is not (it clicked the barrel, a right click, before
+    /// `pen_button_actions`) but a mouse middle click while in range.
     #[test]
-    fn either_barrel_button_presses_the_windows_ink_barrel() {
-        for buttons in [0b01, 0b10, 0b11] {
+    fn the_right_click_presses_the_windows_ink_barrel_and_the_middle_click_does_not() {
+        for edge in [
+            PenPointerEdge::Hover,
+            PenPointerEdge::ContactDown,
+            PenPointerEdge::ContactMove,
+            PenPointerEdge::ContactUp,
+        ] {
+            assert!(
+                !pen_ink_flags(PenToolMsg::Tip, 0b10, edge).barrel,
+                "{edge:?}"
+            );
+            assert!(pen_middle_click(0b10, edge), "{edge:?}");
+            assert!(pen_middle_click(0b11, edge), "{edge:?}");
+            assert!(!pen_middle_click(0b01, edge), "{edge:?}");
+        }
+        for edge in [
+            PenPointerEdge::NoChange,
+            PenPointerEdge::HoverLeave,
+            PenPointerEdge::ContactLeave,
+        ] {
+            assert!(!pen_middle_click(0b11, edge), "{edge:?}");
+        }
+    }
+
+    #[test]
+    fn the_pen_middle_click_is_placed_at_the_pen_on_the_virtual_desktop() {
+        // A display left of the primary: the virtual screen starts at -1920.
+        let virtual_desktop = DesktopRect {
+            left: -1920,
+            top: 0,
+            width: 1920 + 2560,
+            height: 1440,
+        };
+        assert_eq!(pen_click_virtual_abs((-1920, 0), virtual_desktop), (0, 0));
+        assert_eq!(
+            pen_click_virtual_abs((2559, 1439), virtual_desktop),
+            (65535, 65535)
+        );
+        let (x, _) = pen_click_virtual_abs((0, 0), virtual_desktop);
+        assert!((x - 28_093).abs() <= 1, "{x}");
+    }
+
+    #[test]
+    fn the_right_click_button_presses_the_windows_ink_barrel() {
+        for buttons in [0b01, 0b11] {
             for edge in [
                 PenPointerEdge::Hover,
                 PenPointerEdge::ContactDown,

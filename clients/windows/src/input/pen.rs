@@ -7,10 +7,19 @@
 //! A pen message is answered here, so the default procedure never turns it
 //! into mouse messages: while the pen is in range it owns the pointer, as on
 //! the macOS Deck. Touch is not captured (Windows makes it mouse input).
+//!
+//! Barrel buttons: the Windows Ink barrel (the button the tablet driver set
+//! to Right Click) goes through the session's `PenButtonMap`; a click the
+//! driver performs as a mouse click while the pen is in range (a Wacom side
+//! switch set to Middle Click) arrives as a mouse message and is routed by
+//! `arcen_input::deck_pen::route_mouse_while_pen` ([`Pen::mouse_message`]).
 
 use std::time::Instant;
 
-use arcen_input::deck_pen::{ImageRect, WindowsInkMapper, WindowsInkSample};
+use arcen_input::deck_pen::{
+    ImageRect, PenMouseRoute, WindowsInkMapper, WindowsInkSample, route_mouse_while_pen,
+};
+use arcen_input::pen_buttons::PenButtonMap;
 use arcen_input::{LowLatencyMetadata, PenEvent};
 use windows::Win32::Foundation::{HWND, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
@@ -97,11 +106,51 @@ impl Pen {
         Some(LRESULT(0))
     }
 
-    /// Whether a pen is in range: it then owns the pointer, and the mouse
-    /// (Windows' own emulation of it included) waits, as on the macOS Deck
-    /// (`PenInput::holds_authority`).
-    pub(super) const fn in_proximity(&self) -> bool {
-        self.mapper.in_proximity()
+    /// The session's pen-button mapping (its settings and its host).
+    pub(super) const fn set_button_map(&mut self, map: PenButtonMap) {
+        self.mapper.set_button_map(map);
+    }
+
+    /// A mouse message while a pen is in range (it then owns the pointer,
+    /// as on the macOS Deck, `PenInput::holds_authority`): `Some` when the pen takes
+    /// it (its driver's right or middle click, sent as the pen's) or it is
+    /// dropped (movement: the pen owns the pointer); `None` when it is the
+    /// mouse's (a hovering left click, a release the pen did not press, the
+    /// wheel), or no pen is in range.
+    pub(super) fn mouse_message(
+        &mut self,
+        msg: u32,
+        epoch: Instant,
+        mut emit: impl FnMut(PenEvent),
+    ) -> Option<LRESULT> {
+        if !self.mapper.in_proximity() {
+            return None;
+        }
+        match route_mouse_while_pen(msg, &self.mapper) {
+            PenMouseRoute::Mouse => None,
+            PenMouseRoute::Drop => Some(LRESULT(0)),
+            PenMouseRoute::PenClick(click, pressed) => {
+                let metadata = self.metadata(epoch);
+                if let Some(event) = self.mapper.on_driver_click(click, pressed, metadata) {
+                    tracing::debug!(
+                        target: arcen_deck_core::log_target::INPUT,
+                        ?click,
+                        pressed,
+                        buttons = event.buttons,
+                        "pen button from the tablet driver's mouse click"
+                    );
+                    emit(event);
+                }
+                Some(LRESULT(0))
+            }
+        }
+    }
+
+    /// Whether the pen holds a click its tablet driver performed: its
+    /// release must reach the pen wherever the pointer is.
+    pub(super) const fn holds_driver_click(&self) -> bool {
+        use arcen_input::pen_buttons::DriverClick;
+        self.mapper.driver_held(DriverClick::Right) || self.mapper.driver_held(DriverClick::Middle)
     }
 
     /// The pen left (or the window lost it): a clean leave, if one was in

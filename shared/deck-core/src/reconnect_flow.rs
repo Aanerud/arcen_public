@@ -285,6 +285,7 @@ mod tests {
             tablet_mode_requested: arcen_protocol::messages::TabletModeMsg::LocalTermination,
             telemetry: std::sync::Arc::new(crate::client_telemetry::ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         }
     }
 

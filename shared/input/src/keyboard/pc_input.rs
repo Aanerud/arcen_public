@@ -18,7 +18,8 @@ use std::collections::BTreeSet;
 use arcen_protocol::messages::HostPlatform;
 
 use super::deck_shortcuts::{DeckShortcut, PcModifierState};
-use super::pc::{KEY_DELETE, KEY_F9, LockKey, PcKey, PcModifier, iso_key_identifier};
+use super::pc::{KEY_DELETE, LockKey, PcKey, PcModifier, iso_key_identifier};
+use super::send_keys::SendKey;
 use super::{
     DeckKey, DeckModifiers, HostKeyEdge, KeyboardPolicy, KeyboardSettings, ShortcutMode,
     ShortcutPreference, ShortcutTranslator,
@@ -169,66 +170,7 @@ pub fn resolve_pc_keyboard_policy(
         left_option_altgr: false,
         intl_backslash: extended_keys,
         host_masks_meta_release: false,
-    }
-}
-
-/// When the session takes the system shortcuts (the Windows key, Alt+Tab,
-/// Alt+Esc, Ctrl+Esc, Ctrl+Shift+Esc, Print Screen) from the Deck's
-/// computer.
-///
-/// By default whenever a session window has focus, windowed or fullscreen:
-/// a remote desktop is used as the computer it shows, so its shortcuts act
-/// on it. The Deck's own chords still reach the Deck (Ctrl+Alt+Home opens
-/// the connection bar and gives it the keyboard, Ctrl+Alt+F12 disconnects,
-/// F9 releases held keys), a click outside the window or the Keyboard Grab
-/// menu item gives the shortcuts back, and Windows+L and Ctrl+Alt+Del stay
-/// the Deck computer's by design of Windows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum KeyboardGrab {
-    /// While the session is focused and fullscreen.
-    Fullscreen,
-    /// Whenever the session is focused.
-    #[default]
-    Always,
-    /// Never: the Deck's computer keeps them.
-    Never,
-}
-
-impl KeyboardGrab {
-    /// Every setting, in menu order.
-    pub const ALL: [Self; 3] = [Self::Fullscreen, Self::Always, Self::Never];
-
-    /// The settings token.
-    #[must_use]
-    pub const fn token(self) -> &'static str {
-        match self {
-            Self::Fullscreen => "fullscreen",
-            Self::Always => "always",
-            Self::Never => "never",
-        }
-    }
-
-    /// The setting a token names.
-    #[must_use]
-    pub fn from_token(token: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|grab| grab.token() == token)
-    }
-
-    /// Whether the grab is on. A session's toggle overrides the setting
-    /// until the session ends; nothing is grabbed without focus.
-    #[must_use]
-    pub const fn active(self, focused: bool, fullscreen: bool, toggled: Option<bool>) -> bool {
-        if !focused {
-            return false;
-        }
-        if let Some(toggled) = toggled {
-            return toggled;
-        }
-        match self {
-            Self::Fullscreen => fullscreen,
-            Self::Always => true,
-            Self::Never => false,
-        }
+        pc_print_keys: false,
     }
 }
 
@@ -449,12 +391,6 @@ pub enum PcKeyAction {
     Host(Vec<HostKeyEdge>),
     /// The Deck's own action; the key's release stays on the Deck.
     Shortcut(DeckShortcut),
-    /// F9: release everything on the host and reset its modifiers, as a Mac
-    /// Deck does.
-    Reset {
-        /// Why, for the reset message.
-        reason: &'static str,
-    },
     /// The Deck's operating system or input method has it.
     Local,
     /// The key's characters go as committed text, the key itself not.
@@ -488,6 +424,9 @@ pub struct PcKeyboardInput {
     /// characters (`SuppressReason::ComposingOption`).
     composing: BTreeSet<PcModifier>,
     grabbed: bool,
+    /// This computer has the keyboard ([`super::KeyboardCapture`]): keys
+    /// are only watched for the escape chord.
+    released: bool,
     raw_count: u64,
     suppressed_count: u64,
 }
@@ -627,9 +566,81 @@ impl PcKeyboardInput {
             .key(DeckKey::Command, false, false, modifiers)
     }
 
+    /// This computer has the keyboard (`true`), or the host again. Giving it
+    /// to this computer releases every key held on the host; while it has
+    /// it, every key is this computer's and only the escape chord
+    /// ([`DeckShortcut::ReleaseKeyboard`]) is reported. Giving it back
+    /// forgets what was held meanwhile: the host never saw those presses
+    /// (the platform seeds the modifiers still down).
+    pub fn set_released(&mut self, released: bool) -> Vec<HostKeyEdge> {
+        if released == self.released {
+            return Vec::new();
+        }
+        let edges = if released {
+            self.release_all()
+        } else {
+            self.held.clear();
+            self.composing.clear();
+            Vec::new()
+        };
+        self.released = released;
+        edges
+    }
+
+    /// Whether this computer has the keyboard.
+    #[must_use]
+    pub const fn released(&self) -> bool {
+        self.released
+    }
+
+    /// A Send Key menu item: every key held on the host is released, then
+    /// the key is pressed and released with no modifier (Ctrl+Alt+Del as
+    /// [`Self::secure_attention`]). Keys still physically held are pressed
+    /// again on the host with the next key.
+    pub fn send_key(&mut self, key: SendKey) -> Vec<HostKeyEdge> {
+        if key == SendKey::ControlAltDelete {
+            return self.secure_attention();
+        }
+        let mut edges = self.translator.release_all();
+        edges.extend(key.edges());
+        edges
+    }
+
+    /// A key edge while this computer has the keyboard: modifiers are
+    /// tracked for the escape chord, nothing reaches the host.
+    fn local_key(&mut self, held: HeldKey, event: PcKeyEvent) -> PcKeyAction {
+        match held {
+            HeldKey::Modifier(_) if !event.repeat => {
+                if event.pressed {
+                    self.held.insert(held);
+                } else {
+                    self.held.remove(&held);
+                }
+            }
+            HeldKey::Position { qt_key, .. } => {
+                if !event.pressed && self.deck_keys.remove(&qt_key) {
+                    return self.suppress("deck_shortcut");
+                }
+                if event.pressed
+                    && !event.repeat
+                    && DeckShortcut::for_pc_key(qt_key, self.modifiers())
+                        == Some(DeckShortcut::ReleaseKeyboard)
+                {
+                    self.deck_keys.insert(qt_key);
+                    return PcKeyAction::Shortcut(DeckShortcut::ReleaseKeyboard);
+                }
+            }
+            HeldKey::Modifier(_) => {}
+        }
+        PcKeyAction::Local
+    }
+
     /// One key edge.
     pub fn key(&mut self, event: PcKeyEvent) -> PcKeyAction {
         self.raw_count = self.raw_count.saturating_add(1);
+        if self.released && matches!(event.key, PcKey::CharacterOnly | PcKey::Synthetic) {
+            return PcKeyAction::Local;
+        }
         if let PcKey::Modifier(modifier @ (PcModifier::LeftWindows | PcModifier::RightWindows)) =
             event.key
         {
@@ -655,14 +666,10 @@ impl PcKeyboardInput {
             PcKey::CharacterOnly => return PcKeyAction::Text,
             PcKey::Synthetic => return self.suppress("synthetic"),
         };
+        if self.released {
+            return self.local_key(held, event);
+        }
         if let HeldKey::Position { qt_key, .. } = held {
-            if qt_key == KEY_F9 {
-                return if event.pressed && !event.repeat {
-                    PcKeyAction::Reset { reason: "panic_f9" }
-                } else {
-                    self.suppress("local_f9_edge")
-                };
-            }
             if !event.pressed && self.deck_keys.remove(&qt_key) {
                 return self.suppress("deck_shortcut");
             }
@@ -751,8 +758,8 @@ impl PcKeyboardInput {
     }
 
     /// Releases everything held on the host and forgets every held key
-    /// (focus loss, F9, Release Modifiers, a paste taking the keyboard), as
-    /// a Mac Deck does.
+    /// (focus loss, Release Stuck Keys, the keyboard going to this computer,
+    /// a paste taking the keyboard), as a Mac Deck does.
     pub fn release_all(&mut self) -> Vec<HostKeyEdge> {
         self.held.clear();
         self.composing.clear();
@@ -1138,33 +1145,91 @@ mod tests {
     }
 
     #[test]
-    fn f9_resets_and_deck_chords_keep_their_release() {
+    fn f9_reaches_the_host_and_deck_chords_keep_their_release() {
         let mut input = PcKeyboardInput::default();
+        let f9 = position(crate::keyboard::pc::KEY_F9);
         assert_eq!(
-            input.key(press(position(KEY_F9))),
-            PcKeyAction::Reset { reason: "panic_f9" }
-        );
-        assert_eq!(
-            input.key(release(position(KEY_F9))),
-            PcKeyAction::Suppressed {
-                reason: "local_f9_edge"
-            }
+            host_edges(&mut input, &[press(f9), release(f9)]),
+            [
+                edge(crate::keyboard::pc::KEY_F9, true, 0),
+                edge(crate::keyboard::pc::KEY_F9, false, 0)
+            ]
         );
         let control = modifier(PcModifier::LeftControl);
-        let windows = modifier(PcModifier::LeftWindows);
-        host_edges(&mut input, &[press(control)]);
-        // Without the grab the Windows key stays local, yet still makes the
-        // Deck's chord.
-        assert_eq!(input.key(press(windows)), PcKeyAction::Local);
+        let alt = modifier(PcModifier::LeftAlt);
+        host_edges(&mut input, &[press(control), press(alt)]);
+        let home = position(crate::keyboard::pc::KEY_HOME);
         assert_eq!(
-            input.key(press(position(0x4B))),
-            PcKeyAction::Shortcut(DeckShortcut::KeyboardPhysical)
+            input.key(press(home)),
+            PcKeyAction::Shortcut(DeckShortcut::ReleaseKeyboard)
         );
         assert_eq!(
-            input.key(release(position(0x4B))),
+            input.key(release(home)),
             PcKeyAction::Suppressed {
                 reason: "deck_shortcut"
             }
+        );
+    }
+
+    #[test]
+    fn released_keys_stay_local_except_the_escape_chord() {
+        let policy =
+            resolve_pc_keyboard_policy(HostPlatform::Linux, true, PcKeyboardSettings::default());
+        let mut input = PcKeyboardInput::new(policy);
+        let control = modifier(PcModifier::LeftControl);
+        let alt = modifier(PcModifier::LeftAlt);
+        let a = position(0x41);
+        host_edges(&mut input, &[press(control), press(a)]);
+        // Leaving releases what the host holds, once.
+        assert_eq!(
+            input.set_released(true),
+            [edge(0x41, false, MOD_CTRL), edge(KEY_CONTROL, false, 0)]
+        );
+        assert!(input.set_released(true).is_empty());
+        assert!(input.released());
+        assert_eq!(input.key(release(a)), PcKeyAction::Local);
+        assert_eq!(input.key(press(position(0x42))), PcKeyAction::Local);
+        // Leaving forgot what was held; the platform seeds the modifiers
+        // still down, or they are pressed again.
+        assert_eq!(input.key(release(control)), PcKeyAction::Local);
+        assert_eq!(input.key(press(control)), PcKeyAction::Local);
+        assert_eq!(input.key(press(alt)), PcKeyAction::Local);
+        let home = position(crate::keyboard::pc::KEY_HOME);
+        assert_eq!(
+            input.key(press(home)),
+            PcKeyAction::Shortcut(DeckShortcut::ReleaseKeyboard)
+        );
+        assert_eq!(
+            input.key(release(home)),
+            PcKeyAction::Suppressed {
+                reason: "deck_shortcut"
+            }
+        );
+        assert!(input.set_released(false).is_empty());
+        assert!(!input.released());
+        assert_eq!(input.held_count(), 0);
+        let b = position(0x42);
+        assert_eq!(host_edges(&mut input, &[press(b)]), [edge(0x42, true, 0)]);
+    }
+
+    #[test]
+    fn a_sent_key_releases_what_the_host_holds_first() {
+        let policy =
+            resolve_pc_keyboard_policy(HostPlatform::Linux, true, PcKeyboardSettings::default());
+        let mut input = PcKeyboardInput::new(policy);
+        host_edges(&mut input, &[press(modifier(PcModifier::LeftShift))]);
+        let print = crate::keyboard::pc::KEY_PRINT;
+        assert_eq!(
+            input.send_key(SendKey::PrintScreen),
+            [
+                edge(arcen_protocol::keys::KEY_SHIFT, false, 0),
+                edge(print, true, 0),
+                edge(print, false, 0)
+            ]
+        );
+        assert_eq!(
+            input.send_key(SendKey::ControlAltDelete),
+            input.secure_attention()
         );
     }
 
@@ -1363,19 +1428,36 @@ mod tests {
             router.route(position(0x45), false, false),
             HookRoute::System
         );
-        // Ctrl+Windows+K: the Deck's, and Windows must not open Start when
-        // the Windows key goes up.
+        // Ctrl+Windows+K is the host's now (no Deck chord has the Windows
+        // key).
         assert_eq!(router.route(control, true, false), HookRoute::System);
         let k = position(0x4B);
+        assert_eq!(router.route(k, true, false), HookRoute::System);
+        assert_eq!(router.route(k, false, false), HookRoute::System);
+        assert_eq!(router.route(control, false, false), HookRoute::System);
+        assert_eq!(router.route(windows, false, false), HookRoute::System);
+        // A Windows key down before routing began is the system's: a key
+        // the grab takes meanwhile masks it, so Start stays shut.
+        let mut masked = HookRouter::default();
+        masked.begin([windows]);
         assert_eq!(
-            router.route(k, true, false),
+            masked.route(position(0x0100_0001), true, true),
             HookRoute::SessionMaskingWindowsKey
         );
-        // Control let go while K repeats: the repeat stays with its press.
+        assert_eq!(
+            masked.route(position(0x0100_0001), false, true),
+            HookRoute::Session
+        );
+        // Control let go while a taken key repeats: the repeat stays with
+        // its press.
+        router.route(control, true, false);
+        router.route(modifier(PcModifier::LeftAlt), true, false);
+        let home = position(crate::keyboard::pc::KEY_HOME);
+        assert_eq!(router.route(home, true, false), HookRoute::Session);
         assert_eq!(router.route(control, false, false), HookRoute::System);
-        assert_eq!(router.route(k, true, false), HookRoute::Session);
-        assert_eq!(router.route(k, false, false), HookRoute::Session);
-        assert_eq!(router.route(windows, false, false), HookRoute::System);
+        assert_eq!(router.route(home, true, false), HookRoute::Session);
+        assert_eq!(router.route(home, false, false), HookRoute::Session);
+        router.route(modifier(PcModifier::LeftAlt), false, false);
         // Ctrl+Alt+End with no Windows key: taken, nothing to mask.
         router.route(control, true, false);
         router.route(modifier(PcModifier::LeftAlt), true, false);
@@ -1414,22 +1496,6 @@ mod tests {
         let mut expected = vec![caps, iso];
         expected.sort();
         assert_eq!(held, expected);
-    }
-
-    #[test]
-    fn the_grab_follows_focus_fullscreen_and_the_toggle() {
-        // A focused session window takes the system shortcuts by default,
-        // windowed too; an unfocused one never does.
-        assert!(KeyboardGrab::default().active(true, false, None));
-        assert!(!KeyboardGrab::default().active(false, true, None));
-        assert!(KeyboardGrab::Fullscreen.active(true, true, None));
-        assert!(!KeyboardGrab::Fullscreen.active(true, false, None));
-        assert!(!KeyboardGrab::Always.active(false, true, Some(true)));
-        assert!(KeyboardGrab::Never.active(true, false, Some(true)));
-        assert!(!KeyboardGrab::Always.active(true, true, Some(false)));
-        for grab in KeyboardGrab::ALL {
-            assert_eq!(KeyboardGrab::from_token(grab.token()), Some(grab));
-        }
     }
 
     #[test]

@@ -713,6 +713,46 @@ digits and punctuation (which are their ASCII/US character codes):
   `arcen_input::keyboard::scancode` table for every key with one; keypad,
   lock, Pause and Print keys keep their Virtual-Keys.
 
+### PC keys a host injects (additive)
+
+`InputCapabilitiesMsg.pc_keys` (`PcKeysMsg`, omitted while unknown) tells a
+client which PC keys outside the main block and F1–F12 a host presses, so a
+Send Key menu can grey out what the host would drop:
+
+```json
+"pc_keys": {"insert": "available", "print_screen": "available",
+            "scroll_lock": "available", "pause": "available",
+            "menu": "available", "last_function_key": 24}
+```
+
+Each key field is an `InputCapabilityAvailability`; `last_function_key` is
+the highest function key injected (24 for F1–F24, 12 for none above F12, 0
+when the host does not say). The identifiers are Qt's: `Qt::Key_Insert`
+`0x01000006`, `Qt::Key_Print` `0x01000009`, `Qt::Key_ScrollLock`
+`0x01000026`, `Qt::Key_Pause` `0x01000008`, `Qt::Key_Menu` `0x01000055`,
+`Qt::Key_F13` `0x0100003C` … `Qt::Key_F24` `0x01000047`. One shared table,
+`arcen_input::keyboard::host_keys::PC_HOST_KEYS`, holds every Pier's code
+for them; a Pier's hello is `advertised_pc_keys(platform)` and a client reads
+one with `host_accepts(pc_keys, platform, qt_key)`, which answers for a host
+that predates the field from its platform (Linux and Windows took Insert,
+Print Screen, Scroll Lock and Pause; nobody took Menu or F13–F24; the macOS
+Pier none of them).
+
+| Key | Linux evdev | Windows | macOS |
+| --- | --- | --- | --- |
+| Insert | `KEY_INSERT` 110 | `VK_INSERT` (scan `E0 52`) | — (the Mac key there is Help) |
+| Print Screen | `KEY_PRINT` 210 (never `KEY_SYSRQ`) | `VK_SNAPSHOT` | — |
+| Scroll Lock | `KEY_SCROLLLOCK` 70 | `VK_SCROLL` | — |
+| Pause | `KEY_PAUSE` 119 | `VK_PAUSE` | — |
+| Menu | `KEY_COMPOSE` 127 (keysym `Menu`) | `VK_APPS`, extended | `kVK_ContextualMenu` `0x6E` |
+| F13–F24 | `KEY_F13` 183 … `KEY_F24` 194 | `VK_F13` … `VK_F24` | `kVK_F13` … `kVK_F20`; no F21–F24 |
+
+The Linux, Windows and macOS Piers advertise their columns. On an Xorg
+session the Linux Pier makes F13–F24 type the keysyms `F13` … `F24` (stock
+keymaps put `XF86Tools`, `XF86Launch5`… there) while a Deck uses them; on
+Wayland the compositor's keymap names them (`fkeys:basic_13-24` in
+xkeyboard-config 2.43 and later).
+
 ### Pointer-only Meta release mask (additive)
 
 `InputCapabilitiesMsg.meta_pointer_mask` (`supports_meta_pointer_mask_v1`),
@@ -1180,6 +1220,99 @@ generation) and `refine_control {monitor_id, enabled}` (stop or resume tiles
 for a monitor, for example when the Deck falls back to eight-bit
 presentation).
 
+### Canvas v1 (protocol v5, additive, capability-gated; ADR 0028)
+
+The records, capability and messages are modelled in
+`arcen_protocol::canvas`. Every Pier's software loop sends them to a Deck
+that offers `canvas_v1`; no Deck offers it yet. The checks
+that need the canvas size belong to the shared state owner
+(`arcen_media::canvas::CanvasState`), which every receiver must use. A Deck keeps one
+persistent eight-bit canvas per monitor and applies ordered commands to it;
+the Pier keeps a bit-exact mirror (lossless commands) of the same canvas.
+
+**Capability (additive, serde-default).** `AuthResponse.canvas_v1`
+(`{max_canvas_px, max_surfaces_per_monitor, cache_bytes, cache_slots,
+tile_codecs: ["delta-zstd1"]}`): sent at authentication, only by a Deck that
+implements canvas v1 and has it on. A Pier clamps it to the protocol bounds
+(`CanvasCapability::terms`: canvas side ≤ 16,384, surfaces ≤ 4, cache ≤ 1 GiB
+and ≤ 65,536 slots) and refuses it without `delta-zstd1`, without a surface
+or with a canvas smaller than one block. `ServerHelloMsg.canvas`
+(`{state: "on"|"off", reason?, tile_codec?, cache_bytes?, cache_slots?,
+max_surfaces_per_monitor?, monitors: [{monitor_id, state, reason?}]}`) is sent
+only to a Deck that asked; terms never exceed the Deck's, at most 16 distinct
+monitors are listed, reasons are lowercase tokens of at most 32 bytes
+(`CanvasStatusMsg::validate`); an unknown `state` reads as off. Canvas
+records arrive only for a monitor listed `on`. No lane role is added.
+
+**Record `0x0E` (`Canvas`), video lane, reliable.** It is never a datagram
+and never dropped on its own: a sender that must discard canvas records
+discards the rest of the generation and starts a new one with a reset
+(reason 2). Common prefix, 26 bytes: `frame_type u8` (0x0E), `version u8`
+(= 1), `kind u8` (1 reset, 2 frame), reserved `u8` zero, `monitor_id u16`,
+`topology_generation u64`, `stream_epoch u64`, `canvas_generation u32`
+(nonzero). The whole record is at most 16 MiB, checked first.
+
+Reset (kind 1), 38 bytes: prefix (with the **new** generation), `reason u8`
+(1 start, 2 recovery, 3 geometry, 4 reset request), `format u8` (1 = opaque
+BGRA8, the desktop's own sRGB-coded values), reserved `u16` zero,
+`width u32`, `height u32` (1..=16,384; the largest canvas is exactly the
+largest grid, 2^20 blocks). A reset clears the canvas to
+opaque black, closes every surface and empties the cache.
+
+Frame (kind 2): prefix, `fence u64` (nonzero, strictly increasing within a
+generation), `timestamp_ms u32` (wire clock), `block_count u32` (the
+canvas's 16×16 grid, 1..=2^20, equal to the generation's),
+`command_count u32` (≤ 65,536 and ≤ what the record can hold at 10 bytes a
+command, checked before the list is allocated), then the commands. A frame
+is applied whole, in order, before the canvas is presented. The area a
+frame's commands write (every `Fill`, `Copy`, `Tile`, `CacheStore` and
+`CachePaint` rectangle and every block a `SurfacePaint` lists) is at most
+four times the canvas area (`MAX_FRAME_AREA_FACTOR`); the state owner
+refuses a frame above it.
+
+Command: `type u8`, reserved `u8` zero, `length u32`, then exactly `length`
+bytes of body. An unknown type, a nonzero reserved field, an unknown flag or
+a body of the wrong length refuses the record. Rectangles are
+`x u16, y u16, width u16, height u16`, nonempty and inside 16,384 × 16,384;
+the receiver's state owner also checks them against the canvas. "Grid" means the origin
+is a multiple of 16 and each size is whole blocks unless it ends at the
+canvas's right or bottom edge.
+
+| Type | Command | Body |
+|---|---|---|
+| 1 | `Fill` | rect (any pixels), `r u8, g u8, b u8`, reserved `u8` — 12 bytes |
+| 2 | `Copy` | source rect, `dst_x u16, dst_y u16` — 12 bytes; overlap allowed (as if through a temporary) |
+| 3 | `Tile` | rect (grid, ≤ 256 × 64), `codec u8` (1 = `delta-zstd1`), `depth u8` (= 8), reserved `u16`, payload (1..=131,072 bytes, the rest of the body) |
+| 4 | `CacheStore` | `slot u32` (< 65,536), rect (grid, ≤ 256 × 64) — 12 bytes; canvas pixels into the slot |
+| 5 | `CachePaint` | `slot u32`, `dst_x u16, dst_y u16` (multiples of 16) — 8 bytes |
+| 6 | `CacheEvict` | `slot u32` — 4 bytes |
+| 7 | `SurfaceOpen` | `surface u8` (< 4), `codec u8` (1 = H.264 Constrained Baseline 4:2:0 8-bit, Annex-B), reserved `u16`, `width u16, height u16` (even, ≤ 8,192, ≤ 139,264 macroblocks) — 8 bytes; opens or replaces the surface, whose next paint is an IDR |
+| 8 | `SurfaceClose` | `surface u8`, reserved `[u8; 3]` — 4 bytes |
+| 9 | `SurfacePaint` | `surface u8`, `flags u8` (bit 0 IDR), reserved `u16`, dest rect (grid, any size), `run_count u32`, runs as in `RefineFence` (`< block_count`, inside dest), `au_len u32` (1..=8 MiB, exactly the rest of the body), one access unit |
+
+`Tile` payloads are refine's `delta-zstd1` at depth 8: planes R′, G′, B′,
+each residual modulo 256 zigzag-folded and written as the low-byte plane
+then the (all-zero) high-byte plane; expanded size `width × height × 6`
+≤ 98,304, checked before decoding. A `SurfacePaint` with no runs is decoded
+(it stays in the prediction chain) and paints nothing; with runs, those
+blocks take the decoded picture scaled from the surface size to the dest
+rect. Lossless commands (`Fill`, `Copy`, `Tile`, `Cache*`) are exact; a
+surface paint is lossy.
+
+Admission on the Deck: a single-monitor session's records name monitor 0
+with topology generation and stream epoch 0, as its legacy video records; a
+multi-monitor session's records pass region-frame admission (the committed
+topology generation, a monitor of the roster, that monitor's stream epoch).
+A record that is not admitted is dropped as stale without touching the
+canvas.
+
+Control (session JSON, control lane, only for a monitor the hello listed
+`on`): Deck → Pier `canvas_ack {monitor_id, generation, fence,
+unprocessed_bytes, decode_ms_p95}` (flow control only, never correctness;
+once per presented frame, and at least every 250 ms while frames
+arrive) and `canvas_reset_request {monitor_id, generation,
+reason}` (the Pier answers with a reset, reason 4).
+
 ## Auth
 
 - `auth::hash_password(password, challenge)` = `sha256(f"{password}:{challenge}")`
@@ -1199,6 +1332,19 @@ legacy `common/session_fsm.py` contract.
 
 ## Changelog
 
+- **2026-11-19 — PC keys a host injects (additive)** — Add
+  `InputCapabilitiesMsg.pc_keys` (`PcKeysMsg`, omitted while unknown):
+  Insert, Print Screen, Scroll Lock, Pause and Menu availability and the
+  highest function key a host injects. Older peers ignore it; a client
+  reads an older host's silence by its platform. No version bump. Needs
+  Shared/Architecture review.
+
+- **2026-11-18 — canvas v1 (additive, capability-gated, not yet enabled)**
+  — `AuthResponse.canvas_v1`, `ServerHelloMsg.canvas`, record `0x0E`
+  (reset and frame), `canvas_ack` and `canvas_reset_request` are modelled
+  in `arcen_protocol::canvas` (ADR 0028); no product sends them. Frame type
+  `0x02` (a partial-frame type no product sent) is removed and reserved; a
+  peer reading it treats it as an unknown frame type. No version bump.
 - **2026-11-13 — Y′CbCr tiles in use (values only, no format change)** —
   A macOS Pier refines its `xf44` Grading and HDR captures in the `ycbcr`
   domain (2), already defined: barriers carry the codes' matrix and range,

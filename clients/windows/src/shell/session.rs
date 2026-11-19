@@ -44,7 +44,9 @@ use arcen_input::cursor::DeckCursor;
 use arcen_input::deck_events::{DeckInputEvent, DeckInputSink, LedCursor};
 use arcen_input::deck_pen::ImageRect;
 use arcen_input::host_pointer::LedPointerMark;
-use arcen_input::keyboard::{DeckShortcut, KeyboardGrab, KeyboardSettings, PcKeyboardSettings};
+use arcen_input::keyboard::{
+    DeckShortcut, KeyboardCapturePolicy, KeyboardSettings, PcKeyboardSettings,
+};
 use arcen_input::text::{HostTextTruth, OptionKeyPreference, TypingMode};
 use arcen_media::SessionMonitorId;
 use arcen_protocol::messages::{AuthRequest, DisplayUpdateResultMsg, TabletModeMsg};
@@ -183,6 +185,9 @@ pub(super) struct Connection {
     input_window: Option<(HWND, Option<ImageRect>, (u32, u32))>,
     /// The host's input facts, once the input is attached.
     host_facts: Option<arcen_input::deck_events::HostInputFacts>,
+    /// What the pen's barrel buttons click on this host (from its hello and
+    /// the pen settings), for every window's input.
+    pen_buttons: arcen_input::pen_buttons::PenButtonMap,
     streaming: bool,
     /// When frames reached the glass in the last second, and how many.
     presented: std::collections::VecDeque<(std::time::Instant, u64)>,
@@ -277,8 +282,20 @@ pub(super) fn connect_options(
         tablet_mode_requested: settings.tablet_mode_requested,
         telemetry: Arc::clone(telemetry),
         exact_still_image: settings.exact_still_image,
+        // From the eight-bit presenter's canvas executor: nothing is
+        // advertised until it has one (ADR 0028).
+        canvas: arcen_deck_core::canvas::CanvasRequest::for_sink::<crate::media::WindowSink>(
+            settings.canvas,
+            settings.canvas_cache_mib,
+        ),
     };
     let plan = super::displays::apply_display_plan(&mut options, settings, mode, approved);
+    // Only the root window's presenter executes the canvas: a secondary
+    // window does not register one with the media worker yet, so a
+    // multi-window session asks for full frames (ADR 0028 §9).
+    if options.multi_monitor_topology.is_some() {
+        options.canvas = arcen_deck_core::canvas::CanvasRequest::Unavailable;
+    }
     (options, plan)
 }
 
@@ -344,6 +361,7 @@ impl Connection {
             pointer_texture: None,
             input_window: None,
             host_facts: None,
+            pen_buttons: arcen_input::pen_buttons::PenButtonMap::default(),
             streaming: false,
             presented: std::collections::VecDeque::new(),
             submitted: std::collections::VecDeque::new(),
@@ -800,7 +818,7 @@ impl Connection {
         monitor: SessionMonitorId,
         keyboard: KeyboardSettings,
         option_keys: OptionKeyPreference,
-        grab: KeyboardGrab,
+        grab: KeyboardCapturePolicy,
     ) -> Result<(), String> {
         let Some(facts) = self.host_facts else {
             return Err("the session's input is not attached".to_owned());
@@ -817,8 +835,10 @@ impl Connection {
         )
         .map_err(|error| format!("input: {error}"))?;
         let keys = PcKeyboardSettings::from_settings(&keyboard, option_keys);
+        let pen_buttons = self.pen_buttons;
         crate::input::with_input(hwnd, |input| {
             input.set_session(Some((facts, keys)));
+            input.set_pen_buttons(pen_buttons);
             input.set_fullscreen(true);
             input.set_host_cursor_shown(Some(self.shown_cursor.clone()), false);
         });
@@ -943,6 +963,17 @@ impl Connection {
                     })
                     .map(arcen_deck_core::screens::statistics::stream_pipeline_label),
                 refine: Some(refine.as_str()),
+                // The served-pipeline update's backend, else the hello's.
+                encoder: state
+                    .served_pipeline
+                    .as_ref()
+                    .and_then(|served| served.encoder.as_deref())
+                    .or_else(|| {
+                        state
+                            .server_hello
+                            .as_ref()
+                            .map(|hello| hello.encoder_backend.as_str())
+                    }),
             },
         )
         .to_vec();
@@ -950,6 +981,7 @@ impl Connection {
             lines.push(format!("Decoder: {refusal}"));
         }
         lines.extend(state.decoder_behind.line());
+        lines.extend(state.canvas_status_line());
         lines.push(self.media.decode_device_line().to_owned());
         let host_displays = state
             .host_health
@@ -958,12 +990,17 @@ impl Connection {
         let display_note = state.server_hello.as_ref().and_then(|hello| {
             arcen_deck_core::display_note::display_negotiation_note(&hello.device_capabilities)
         });
+        let desk_note = state
+            .server_hello
+            .as_ref()
+            .and_then(arcen_deck_core::session_truth::desk_privacy_note);
         drop(state);
         if let Some(text) = self.monitor_fps_text() {
             lines.push(format!("Displays fps: {text}"));
         }
         lines.extend(self.layout_note.clone());
         lines.extend(display_note);
+        lines.extend(desk_note.map(str::to_owned));
         lines.extend(host_displays);
         lines
     }
@@ -987,6 +1024,20 @@ impl Connection {
         })
     }
 
+    /// What the desk at the host shows while attached (shared
+    /// `arcen_deck_core::session_truth::desk_privacy_note`, the Mac's words).
+    pub(super) fn desk_note(&self) -> Option<&'static str> {
+        let state = self
+            .media
+            .shared()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state
+            .server_hello
+            .as_ref()
+            .and_then(arcen_deck_core::session_truth::desk_privacy_note)
+    }
+
     /// Minimised or occluded: no presents.
     pub(super) fn set_visible(&self, visible: bool) {
         self.media.set_visible(visible);
@@ -1000,8 +1051,8 @@ impl Connection {
         hwnd: HWND,
         keyboard: KeyboardSettings,
         option_keys: OptionKeyPreference,
-        tablet_mode: TabletModeMsg,
-        grab: KeyboardGrab,
+        (tablet_mode, pen_buttons): (TabletModeMsg, arcen_input::pen_buttons::PenButtonSettings),
+        grab: KeyboardCapturePolicy,
     ) -> Result<(), String> {
         if self.input_window.is_some() {
             return Ok(());
@@ -1041,7 +1092,18 @@ impl Connection {
         .map_err(|error| format!("input: {error}"))?;
         let facts = host_input_facts(&hello);
         let keys = PcKeyboardSettings::from_settings(&keyboard, option_keys);
-        crate::input::with_input(hwnd, |input| input.set_session(Some((facts, keys))));
+        let pen_buttons = arcen_deck_core::input::pen_button_map(&hello, pen_buttons);
+        tracing::info!(
+            target: arcen_deck_core::log_target::INPUT,
+            host = ?pen_buttons.host,
+            barrel = pen_buttons.settings.barrel.token(),
+            "pen buttons"
+        );
+        self.pen_buttons = pen_buttons;
+        crate::input::with_input(hwnd, |input| {
+            input.set_session(Some((facts, keys)));
+            input.set_pen_buttons(pen_buttons);
+        });
         self.input_window = Some((hwnd, None, source));
         self.host_facts = Some(facts);
         Ok(())

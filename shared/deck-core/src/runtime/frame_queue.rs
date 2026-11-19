@@ -28,6 +28,11 @@ pub const HDR_VIDEO_PACKET_LIMIT: usize = 30;
 pub const HDR_VIDEO_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 pub const AUDIO_PACKET_LIMIT: usize = 8;
 pub const AUDIO_BYTE_LIMIT: usize = 32 * 1024;
+/// Canvas record bytes the inbox holds across monitors (four records of
+/// the largest size). Canvas records are never dropped on their own: past
+/// this the monitor's queued records are discarded and its canvas waits
+/// for the next reset (ADR 0028 §5).
+pub const CANVAS_BYTE_LIMIT: usize = 4 * arcen_protocol::canvas::MAX_CANVAS_FRAME_BYTES;
 
 const MEDIA_BURST_GAP: Duration = Duration::from_millis(2);
 
@@ -41,6 +46,8 @@ pub enum MediaPacket {
         header: AudioHeader,
         payload: Vec<u8>,
     },
+    /// A canvas record (ADR 0028), whole; decoded by the media worker.
+    Canvas { monitor_id: u16, bytes: Vec<u8> },
 }
 
 impl MediaPacket {
@@ -49,6 +56,7 @@ impl MediaPacket {
         match self {
             Self::Video { header, .. } => header.timestamp_ms,
             Self::Audio { header, .. } => header.timestamp_ms,
+            Self::Canvas { .. } => 0,
         }
     }
 
@@ -56,6 +64,7 @@ impl MediaPacket {
     pub fn payload_len(&self) -> usize {
         match self {
             Self::Video { payload, .. } | Self::Audio { payload, .. } => payload.len(),
+            Self::Canvas { bytes, .. } => bytes.len(),
         }
     }
 
@@ -63,6 +72,7 @@ impl MediaPacket {
     pub fn payload(&self) -> &[u8] {
         match self {
             Self::Video { payload, .. } | Self::Audio { payload, .. } => payload,
+            Self::Canvas { bytes, .. } => bytes,
         }
     }
 }
@@ -96,7 +106,6 @@ pub fn parse_media_packet(data: &[u8]) -> Result<Option<MediaPacket>, ProtocolEr
                     .to_vec(),
             }))
         }
-        FrameType::VideoPartial => Ok(None),
         FrameType::Clipboard
         | FrameType::HidDeviceAdded
         | FrameType::HidDeviceRemoved
@@ -113,6 +122,16 @@ pub fn parse_media_packet(data: &[u8]) -> Result<Option<MediaPacket>, ProtocolEr
         | FrameType::RefineDigest
         | FrameType::RefineBarrier
         | FrameType::AudioUpstream => Err(ProtocolError::UnknownFrameType(frame_type)),
+        // Canvas records (ADR 0028) are queued whole; the inbox refuses
+        // them for a connection that did not send `canvas_v1`.
+        FrameType::Canvas => crate::canvas::record_monitor(data)
+            .map(|monitor_id| {
+                Some(MediaPacket::Canvas {
+                    monitor_id,
+                    bytes: data.to_vec(),
+                })
+            })
+            .ok_or(ProtocolError::ShortHeader),
     }
 }
 
@@ -129,6 +148,16 @@ pub struct IncomingMediaTelemetry {
     pub malformed_packets: u64,
     pub malformed_video_packets: u64,
     pub malformed_audio_packets: u64,
+    /// Canvas records queued (ADR 0028).
+    pub canvas_received: u64,
+    /// Canvas records discarded before the media worker: superseded by a
+    /// reset of their monitor, discarded by an overflow, or arriving while
+    /// their monitor waits for a reset.
+    pub canvas_dropped: u64,
+    /// Times the canvas queue overflowed and a monitor's canvas was lost.
+    pub canvas_overflow_events: u64,
+    /// Canvas record bytes queued now.
+    pub canvas_bytes: usize,
     pub video_loss_epochs: u64,
     pub video_queue_overflow_events: u64,
     pub video_overflow_last_oldest_age_ms: u64,
@@ -149,6 +178,11 @@ pub struct IncomingMediaTelemetry {
 #[derive(Debug)]
 pub struct IncomingMediaBatch {
     pub video: Vec<(VideoHeader, Vec<u8>)>,
+    /// Canvas records `(monitor, record)`, in lane order.
+    pub canvas: Vec<(u16, Vec<u8>)>,
+    /// Monitors whose queued canvas records were discarded since the last
+    /// batch: their canvas is lost until a reset.
+    pub canvas_lost_monitor_ids: Vec<u16>,
     pub audio: Vec<(AudioHeader, Vec<u8>)>,
     pub video_discontinuity: bool,
     pub video_discontinuity_monitor_ids: Vec<u16>,
@@ -184,6 +218,9 @@ struct SharedInbox {
     /// connection: one state owner shared by the lane readers, the decode
     /// worker, the presenter and the session.
     refine: arcen_media::refine::hub::DeckRefineHub,
+    /// What this connection advertised for the canvas (ADR 0028); canvas
+    /// records are queued only when it was requested.
+    canvas: Mutex<crate::canvas::CanvasRequest>,
 }
 
 struct InboxInner {
@@ -191,8 +228,14 @@ struct InboxInner {
     /// Each packet with the instant it was queued.
     video: VecDeque<(VideoHeader, Vec<u8>, Instant)>,
     audio: VecDeque<(AudioHeader, Vec<u8>)>,
+    canvas: VecDeque<(u16, Vec<u8>)>,
+    canvas_accepting: bool,
+    /// Monitors whose canvas records are discarded until their next reset.
+    canvas_awaiting_reset: BTreeSet<u16>,
+    pending_canvas_lost: BTreeSet<u16>,
     video_bytes: usize,
     audio_bytes: usize,
+    canvas_bytes: usize,
     telemetry: IncomingMediaTelemetry,
     seen_video_routes: BTreeSet<u16>,
     awaiting_keyframes: BTreeSet<u16>,
@@ -277,8 +320,13 @@ pub fn incoming_media_inbox_with_limits(
             },
             video: VecDeque::with_capacity(limits.video_packets.max(1)),
             audio: VecDeque::with_capacity(limits.audio_packets.max(1)),
+            canvas: VecDeque::new(),
+            canvas_accepting: false,
+            canvas_awaiting_reset: BTreeSet::new(),
+            pending_canvas_lost: BTreeSet::new(),
             video_bytes: 0,
             audio_bytes: 0,
+            canvas_bytes: 0,
             telemetry: IncomingMediaTelemetry::default(),
             seen_video_routes: BTreeSet::new(),
             awaiting_keyframes: BTreeSet::from([0]),
@@ -294,6 +342,7 @@ pub fn incoming_media_inbox_with_limits(
             current_audio_burst_packets: 0,
         }),
         refine: arcen_media::refine::hub::DeckRefineHub::new(),
+        canvas: Mutex::new(crate::canvas::CanvasRequest::default()),
     });
     let (audio_sender, audio_receiver) = crate::runtime::audio_lane::audio_lane_queue();
     (
@@ -314,6 +363,28 @@ impl IncomingMediaReceiver {
     pub fn refine(&self) -> &arcen_media::refine::hub::DeckRefineHub {
         &self.shared.refine
     }
+
+    /// What this connection advertised for the canvas.
+    #[must_use]
+    pub fn canvas_request(&self) -> crate::canvas::CanvasRequest {
+        self.shared
+            .canvas
+            .lock()
+            .expect("media inbox poisoned")
+            .clone()
+    }
+
+    /// Canvas record bytes queued for `monitor_id` and not yet taken.
+    #[must_use]
+    pub fn canvas_queued_bytes(&self, monitor_id: u16) -> u64 {
+        let inner = self.shared.inner.lock().expect("media inbox poisoned");
+        inner
+            .canvas
+            .iter()
+            .filter(|(monitor, _)| *monitor == monitor_id)
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum()
+    }
 }
 
 impl IncomingMediaSender {
@@ -330,6 +401,19 @@ impl IncomingMediaSender {
         &self.audio_lane
     }
 
+    /// Records what this connection advertised for the canvas (ADR 0028),
+    /// before any record can arrive. Canvas records are queued only when it
+    /// was requested; otherwise they are malformed media, as before.
+    pub fn set_canvas_request(&self, request: crate::canvas::CanvasRequest) {
+        let accepting = request.capability().is_some();
+        *self.shared.canvas.lock().expect("media inbox poisoned") = request;
+        self.shared
+            .inner
+            .lock()
+            .expect("media inbox poisoned")
+            .canvas_accepting = accepting;
+    }
+
     pub fn set_limits(&self, limits: IncomingMediaLimits) {
         let mut inner = self.shared.inner.lock().expect("media inbox poisoned");
         inner.limits = IncomingMediaLimits {
@@ -342,6 +426,16 @@ impl IncomingMediaSender {
 
     pub fn enqueue_bytes(&self, bytes: &[u8]) -> Result<IncomingMediaEnqueue, ProtocolError> {
         match parse_media_packet(bytes)? {
+            Some(MediaPacket::Canvas { .. })
+                if !self
+                    .shared
+                    .inner
+                    .lock()
+                    .expect("media inbox poisoned")
+                    .canvas_accepting =>
+            {
+                Err(ProtocolError::UnknownFrameType(FrameType::Canvas as u8))
+            }
             Some(packet) => Ok(self.enqueue(packet)),
             None => Ok(IncomingMediaEnqueue::default()),
         }
@@ -357,6 +451,7 @@ impl IncomingMediaSender {
         let accepted = match packet {
             MediaPacket::Video { header, payload } => inner.enqueue_video(header, payload, now),
             MediaPacket::Audio { header, payload } => inner.enqueue_audio(header, payload, now),
+            MediaPacket::Canvas { monitor_id, bytes } => inner.enqueue_canvas(monitor_id, bytes),
         };
         let notify = !inner.notified && inner.has_work();
         if notify {
@@ -463,6 +558,11 @@ impl IncomingMediaReceiver {
             .map(|(header, payload, _)| (header, payload))
             .collect();
         let audio = inner.audio.drain(..).collect();
+        let canvas = inner.canvas.drain(..).collect();
+        inner.canvas_bytes = 0;
+        let canvas_lost_monitor_ids = std::mem::take(&mut inner.pending_canvas_lost)
+            .into_iter()
+            .collect();
         let video_discontinuity_monitor_ids = inner
             .pending_video_discontinuities
             .iter()
@@ -480,6 +580,8 @@ impl IncomingMediaReceiver {
         inner.notified = false;
         IncomingMediaBatch {
             video,
+            canvas,
+            canvas_lost_monitor_ids,
             audio,
             video_discontinuity,
             video_discontinuity_monitor_ids,
@@ -563,6 +665,55 @@ impl InboxInner {
         self.video.push_back((header, payload, now));
         self.update_high_water();
         true
+    }
+
+    /// Queues one canvas record. A reset supersedes what its monitor has
+    /// queued (it starts the canvas over) and ends a wait for one; past
+    /// [`CANVAS_BYTE_LIMIT`] the monitor's queued records are discarded and
+    /// its canvas is lost until the next reset.
+    fn enqueue_canvas(&mut self, monitor_id: u16, bytes: Vec<u8>) -> bool {
+        self.telemetry.canvas_received += 1;
+        self.telemetry_dirty = true;
+        let reset = crate::canvas::record_is_reset(&bytes);
+        if reset {
+            let (cleared, _) = self.clear_canvas_monitor(monitor_id);
+            self.telemetry.canvas_dropped += cleared;
+            self.canvas_awaiting_reset.remove(&monitor_id);
+        } else if self.canvas_awaiting_reset.contains(&monitor_id) {
+            self.telemetry.canvas_dropped += 1;
+            return false;
+        }
+        if self
+            .canvas_bytes
+            .checked_add(bytes.len())
+            .is_none_or(|total| total > CANVAS_BYTE_LIMIT)
+        {
+            let (cleared, _) = self.clear_canvas_monitor(monitor_id);
+            self.telemetry.canvas_dropped += cleared + 1;
+            self.telemetry.canvas_overflow_events += 1;
+            self.canvas_awaiting_reset.insert(monitor_id);
+            self.pending_canvas_lost.insert(monitor_id);
+            return false;
+        }
+        self.canvas_bytes += bytes.len();
+        self.canvas.push_back((monitor_id, bytes));
+        true
+    }
+
+    fn clear_canvas_monitor(&mut self, monitor_id: u16) -> (u64, usize) {
+        let mut records = 0_u64;
+        let mut bytes = 0_usize;
+        self.canvas.retain(|(monitor, record)| {
+            if *monitor == monitor_id {
+                records += 1;
+                bytes += record.len();
+                false
+            } else {
+                true
+            }
+        });
+        self.canvas_bytes = self.canvas_bytes.saturating_sub(bytes);
+        (records, bytes)
     }
 
     fn enqueue_audio(&mut self, header: AudioHeader, payload: Vec<u8>, now: Instant) -> bool {
@@ -693,6 +844,8 @@ impl InboxInner {
     fn has_work(&self) -> bool {
         !self.video.is_empty()
             || !self.audio.is_empty()
+            || !self.canvas.is_empty()
+            || !self.pending_canvas_lost.is_empty()
             || !self.pending_video_discontinuities.is_empty()
             || self.telemetry_dirty
     }
@@ -703,6 +856,7 @@ impl InboxInner {
             video_bytes: self.video_bytes,
             audio_depth: self.audio.len(),
             audio_bytes: self.audio_bytes,
+            canvas_bytes: self.canvas_bytes,
             ..self.telemetry
         }
     }
@@ -1328,6 +1482,108 @@ mod tests {
         assert!(!batch.video_discontinuity);
         assert!(!batch.idr_needed);
         assert_eq!(rx.snapshot().video_loss_epochs, 0);
+    }
+
+    /// A canvas record of `len` bytes: a valid prefix, then zeros (the
+    /// inbox reads only the prefix).
+    fn canvas_record(monitor_id: u16, reset: bool, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0_u8; len.max(arcen_protocol::canvas::CANVAS_PREFIX_BYTES)];
+        bytes[0] = FrameType::Canvas as u8;
+        bytes[1] = arcen_protocol::canvas::CANVAS_RECORD_VERSION;
+        bytes[2] = if reset { 1 } else { 2 };
+        bytes[4..6].copy_from_slice(&monitor_id.to_be_bytes());
+        bytes
+    }
+
+    fn requested() -> crate::canvas::CanvasRequest {
+        crate::canvas::CanvasRequest::for_executor(
+            Some(crate::present::CanvasExecutorFacts {
+                max_canvas_px: 16_384,
+            }),
+            true,
+            true,
+            crate::canvas::DEFAULT_CACHE_MIB,
+        )
+    }
+
+    #[test]
+    fn canvas_records_are_refused_unless_this_connection_asked_for_them() {
+        let (tx, rx) = incoming_media_inbox();
+        let record = canvas_record(0, true, 64);
+        assert_eq!(
+            tx.enqueue_bytes(&record),
+            Err(ProtocolError::UnknownFrameType(FrameType::Canvas as u8))
+        );
+        tx.set_canvas_request(requested());
+        assert!(tx.enqueue_bytes(&record).unwrap().accepted);
+        assert_eq!(rx.canvas_queued_bytes(0), 64);
+        let batch = rx.take_batch();
+        assert_eq!(batch.canvas, [(0, record)]);
+        assert_eq!(rx.canvas_queued_bytes(0), 0);
+    }
+
+    #[test]
+    fn canvas_records_stay_in_order_and_a_reset_supersedes_its_monitors_queue() {
+        let (tx, rx) = incoming_media_inbox();
+        tx.set_canvas_request(requested());
+        let first = canvas_record(1, false, 40);
+        let other = canvas_record(2, false, 41);
+        let reset = canvas_record(1, true, 42);
+        let after = canvas_record(1, false, 43);
+        for record in [&first, &other, &reset, &after] {
+            assert!(tx.enqueue_bytes(record).unwrap().accepted);
+        }
+        let batch = rx.take_batch();
+        assert_eq!(batch.canvas, [(2, other), (1, reset), (1, after)]);
+        assert_eq!(batch.telemetry.canvas_dropped, 1);
+        assert!(batch.canvas_lost_monitor_ids.is_empty());
+    }
+
+    #[test]
+    fn a_canvas_overflow_loses_only_that_monitor_until_its_reset() {
+        let (tx, rx) = incoming_media_inbox();
+        tx.set_canvas_request(requested());
+        let big = arcen_protocol::canvas::MAX_CANVAS_FRAME_BYTES;
+        assert!(
+            tx.enqueue_bytes(&canvas_record(2, false, 64))
+                .unwrap()
+                .accepted
+        );
+        for _ in 0..4 {
+            assert!(
+                tx.enqueue_bytes(&canvas_record(1, false, big - 64))
+                    .unwrap()
+                    .accepted
+            );
+        }
+        assert!(
+            !tx.enqueue_bytes(&canvas_record(1, false, big))
+                .unwrap()
+                .accepted
+        );
+        // Frames of the lost canvas are discarded until its reset.
+        assert!(
+            !tx.enqueue_bytes(&canvas_record(1, false, 64))
+                .unwrap()
+                .accepted
+        );
+        assert!(
+            tx.enqueue_bytes(&canvas_record(1, true, 64))
+                .unwrap()
+                .accepted
+        );
+        let batch = rx.take_batch();
+        assert_eq!(batch.canvas_lost_monitor_ids, [1]);
+        assert_eq!(
+            batch
+                .canvas
+                .iter()
+                .map(|(monitor, record)| (*monitor, record.len()))
+                .collect::<Vec<_>>(),
+            [(2, 64), (1, 64)]
+        );
+        assert_eq!(batch.telemetry.canvas_overflow_events, 1);
+        assert_eq!(batch.telemetry.canvas_dropped, 6);
     }
 
     #[test]

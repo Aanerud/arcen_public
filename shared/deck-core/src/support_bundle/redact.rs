@@ -37,6 +37,8 @@ pub const NON_SECRET_KEYS: &[&str] = &[
     "option_key_mode",
     "option_keys",
     "keyboard",
+    "keyboard_capture",
+    "keyboard_grab",
     "keyboard_mode",
     "keyboard_shortcuts",
 ];

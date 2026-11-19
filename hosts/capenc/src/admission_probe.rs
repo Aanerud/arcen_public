@@ -144,9 +144,12 @@ where
 
 /// `admission-v1` for the software encoder: representative pictures through
 /// a real `OpenH264` session at the binding's exact geometry. It needs no
-/// capture, so the Xorg and Wayland software paths run the identical probe.
-/// Returns the process exit code.
-#[cfg(all(target_os = "linux", any(feature = "software-h264", feature = "nvenc")))]
+/// capture, so the Xorg, Wayland and Windows software paths run the
+/// identical probe. Returns the process exit code.
+#[cfg(any(
+    all(target_os = "linux", any(feature = "software-h264", feature = "nvenc")),
+    all(windows, feature = "software-h264")
+))]
 pub(crate) fn run_software_probe(
     video: arcen_media::VideoConfiguration,
     fps: u32,

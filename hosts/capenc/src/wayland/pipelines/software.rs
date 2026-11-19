@@ -6,21 +6,22 @@
 //! The request still resolves to Auto or Speed with the shared preset rule
 //! (`super::WaylandPipeline::select`); this composition serves it with the
 //! shared `OpenH264` session under the shared Software contract
-//! (`arcen_media::video::pipeline` `software`): H.264 4:2:0 eight-bit at up
-//! to 30 fps. Admission is the requested contract's own shared admission
+//! (`arcen_media::video::pipeline` `software`): H.264 4:2:0 eight-bit at the
+//! rate the CPU encodes (the Pier's governor), at most `OpenH264`'s 60 fps.
+//! Admission is the requested contract's own shared admission
 //! (`admit_auto`/`admit_speed`) given an `OpenH264` encoder, which applies
 //! the shared software rule: Auto is served as Software, Speed is visibly
 //! downgraded to it, and a stream larger than `OpenH264`'s limits is refused
 //! by name. The source is the proven shared-memory route only; DMA-BUF is
 //! never offered, and nothing here touches CUDA, EGL or NVENC.
 //!
-//! The epoch's encode half is the shared
-//! `arcen_media::video::SoftwareEncodeLoop`: each delivered picture is
-//! hashed once by Keel, only its changed 16x16 block rows are converted into
-//! the retained I420 planes, an unchanged picture costs no encode, and
-//! Keel's idle cadence encodes on change, on a requested keyframe, and
-//! otherwise only at the one-second keepalive, re-encoding the retained
-//! picture.
+//! The epoch's encode half is the shared software loop of every Pier,
+//! `arcen_media::canvas::CanvasEncodeLoop` (ADR 0028): each delivered
+//! picture is hashed once by Keel within the producer's damage regions; a
+//! Deck that offered `canvas_v1` gets canvas records, any other Deck full
+//! frames whose changed 16x16 block rows alone are converted, encoded on
+//! change, on a requested keyframe, and otherwise only at the one-second
+//! keepalive.
 
 #![cfg_attr(not(all(feature = "wayland", target_os = "linux")), allow(dead_code))]
 
@@ -63,12 +64,13 @@ impl SoftwarePipeline {
         }
     }
 
-    /// The eight-bit SDR family over shared memory, at no more than the
-    /// Software contract's ceiling: asking the compositor for frames
-    /// `OpenH264` will never encode only costs it read-backs.
+    /// The eight-bit SDR family over shared memory, at no more than
+    /// `OpenH264` encodes (60 fps): asking the compositor for frames it will
+    /// never encode only costs it read-backs. The Pier's governor lowers the
+    /// served rate to what this CPU encodes.
     #[must_use]
     pub fn offer(self, requested_fps: u32) -> FormatOffer {
-        FormatOffer::sdr8_host(self.contract().max_fps.min(requested_fps.max(1)))
+        FormatOffer::sdr8_host(software_fps(requested_fps))
     }
 
     /// The requested contract's own shared admission, given `OpenH264`.
@@ -80,6 +82,13 @@ impl SoftwarePipeline {
     ) -> PresetAdmission {
         self.requested.admit(request, source, &Self::encoder())
     }
+}
+
+/// The rate a software epoch runs at: the request, within what `OpenH264`
+/// encodes (`EncoderBackend::OpenH264`).
+#[must_use]
+pub fn software_fps(requested_fps: u32) -> u32 {
+    requested_fps.clamp(1, EncoderBackend::OpenH264.contract().max_fps)
 }
 
 #[cfg(test)]
@@ -109,8 +118,8 @@ mod tests {
     #[test]
     fn the_offer_is_shared_memory_at_the_software_ceiling() {
         let software = SoftwarePipeline::new(WaylandPipeline::Speed(SpeedPipeline::new(None)));
-        let offer = software.offer(60);
-        assert_eq!(offer.max_fps, 30);
+        let offer = software.offer(120);
+        assert_eq!(offer.max_fps, 60);
         assert_eq!(offer.memory, MemoryOffer::HostOnly);
         assert_eq!(software.offer(24).max_fps, 24);
     }
@@ -155,12 +164,14 @@ mod tests {
             panic!("{admission:?}");
         };
         assert_eq!(served.pipeline, PipelineId::Software);
-        assert_eq!(served.fps_ceiling, 30);
+        // No fixed software rate: Speed's 60, held by the Pier's governor to
+        // what the CPU encodes.
+        assert_eq!(served.fps_ceiling, 60);
         assert!(matches!(reason, AdmissionReason::SoftwareFallback(_)));
         let auto = SoftwarePipeline::new(WaylandPipeline::Auto(AutoPipeline::default()));
         assert!(matches!(
             auto.admit(
-                request(StreamingPreset::Auto, 2560, 1600, 30),
+                request(StreamingPreset::Auto, 5120, 2880, 30),
                 &gnome40_host_copy()
             ),
             PresetAdmission::Unavailable {

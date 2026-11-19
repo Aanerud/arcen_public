@@ -167,7 +167,11 @@ impl NegotiatedTruth {
         served: Option<&ServedPipelineMsg>,
     ) {
         if let Some(served) = served {
-            self.encoder_backend.clone_from(&served.backend);
+            // `backend` is only the class; the concrete backend comes from
+            // `encoder` when the host names it, else the hello's stays.
+            if let Some(encoder) = served.encoder.as_ref().filter(|token| !token.is_empty()) {
+                self.encoder_backend.clone_from(encoder);
+            }
             self.encoder_hardware = AcceleratorClass::from_token(&served.backend)
                 .map(|class| class == AcceleratorClass::Hardware);
         }
@@ -432,6 +436,21 @@ pub fn served_max_fps(
         .map_or(requested_max_fps, |rate| rate.fps)
 }
 
+/// The one line the Deck shows about the desk at the host
+/// (`server_hello.desk_privacy`): "Host screens are blanked for privacy"
+/// while they are, a warning when the host's administrator turned desk
+/// privacy off, nothing for a desktop no desk monitor shows, an unknown
+/// token, or a host that does not say.
+#[must_use]
+pub fn desk_privacy_note(hello: &ServerHelloMsg) -> Option<&'static str> {
+    use arcen_session::console_session::desk_privacy::DeskPrivacyStatus;
+    hello
+        .desk_privacy
+        .as_deref()
+        .and_then(DeskPrivacyStatus::from_token)
+        .and_then(DeskPrivacyStatus::deck_note)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +458,25 @@ mod tests {
         BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange,
         TransferCharacteristics, VideoCodec,
     };
+
+    #[test]
+    fn the_desk_privacy_note_follows_the_host_and_ignores_what_it_does_not_know() {
+        let hello = |desk: Option<&str>| -> ServerHelloMsg {
+            let mut value = serde_json::json!({"type": "server_hello"});
+            if let Some(desk) = desk {
+                value["desk_privacy"] = serde_json::json!(desk);
+            }
+            serde_json::from_value(value).expect("server_hello parses")
+        };
+        assert_eq!(
+            desk_privacy_note(&hello(Some("blanked"))),
+            Some("Host screens are blanked for privacy")
+        );
+        assert!(desk_privacy_note(&hello(Some("off"))).is_some_and(|note| note.contains("off")));
+        assert_eq!(desk_privacy_note(&hello(Some("not_shown"))), None);
+        assert_eq!(desk_privacy_note(&hello(Some("dimmed"))), None);
+        assert_eq!(desk_privacy_note(&hello(None)), None);
+    }
 
     fn hello_with_color_caps(color_caps: serde_json::Value, codec: &str) -> ServerHelloMsg {
         serde_json::from_value(serde_json::json!({

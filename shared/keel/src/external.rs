@@ -5,6 +5,14 @@ use crate::{BLOCK_SIZE, BlockGrid, DamageMap, DamageSummary, KeelError};
 
 const WORD_BITS: usize = u64::BITS as usize;
 
+/// Most move vectors one [`ExternalDamage`] retains for a pending frame.
+///
+/// A desktop reports a handful of moves per frame (one scroll, one dragged
+/// window). Past this bound the list is dropped as a whole and only the
+/// conservative damage bits remain, because a partial ordered list could make
+/// a later move copy content an omitted earlier move should have placed.
+pub const MAX_MOVE_RECTS: usize = 32;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PixelRect {
     pub x: usize,
@@ -13,10 +21,68 @@ pub struct PixelRect {
     pub height: usize,
 }
 
+impl PixelRect {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    /// Exclusive right edge, saturating.
+    #[must_use]
+    pub const fn right(self) -> usize {
+        self.x.saturating_add(self.width)
+    }
+
+    /// Exclusive bottom edge, saturating.
+    #[must_use]
+    pub const fn bottom(self) -> usize {
+        self.y.saturating_add(self.height)
+    }
+}
+
+/// Pixels copied from `source` to `destination` within one frame.
+///
+/// A move is a hint, never a promise: the frame that produced it may have
+/// been coalesced with others, and the source may have held content the
+/// receiver never saw. A consumer must verify a move against what the
+/// receiver shows (an exact comparison of the moved band) before it sends it
+/// as a copy. The destination and source blocks are always also marked in
+/// the damage bits, so a rejected move falls back to ordinary damage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MoveRect {
+    pub source_x: usize,
+    pub source_y: usize,
+    pub destination: PixelRect,
+}
+
+impl MoveRect {
+    #[must_use]
+    pub const fn source(self) -> PixelRect {
+        PixelRect {
+            x: self.source_x,
+            y: self.source_y,
+            width: self.destination.width,
+            height: self.destination.height,
+        }
+    }
+
+    /// Displacement `(dx, dy)` from source to destination in pixels.
+    #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
+    pub const fn offset(self) -> (i64, i64) {
+        (
+            self.destination.x as i64 - self.source_x as i64,
+            self.destination.y as i64 - self.source_y as i64,
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct ExternalDamage {
     grid: BlockGrid,
     dirty_bits: Vec<u64>,
+    moves: Vec<MoveRect>,
+    moves_overflowed: bool,
 }
 
 /// Reusable latest-wins accumulator for OS-provided damage.
@@ -52,6 +118,8 @@ impl ExternalDamage {
         Ok(Self {
             grid,
             dirty_bits: vec![0; grid.block_count().div_ceil(WORD_BITS)],
+            moves: Vec::with_capacity(MAX_MOVE_RECTS),
+            moves_overflowed: false,
         })
     }
 
@@ -62,6 +130,23 @@ impl ExternalDamage {
 
     pub fn reset(&mut self) {
         self.dirty_bits.fill(0);
+        self.moves.clear();
+        self.moves_overflowed = false;
+    }
+
+    /// Move vectors in report order, clipped so source and destination both
+    /// lie inside the frame. Empty when none were reported or when more than
+    /// [`MAX_MOVE_RECTS`] arrived (see [`Self::moves_overflowed`]).
+    #[must_use]
+    pub fn move_rects(&self) -> &[MoveRect] {
+        &self.moves
+    }
+
+    /// Whether moves were reported but dropped because the bound was
+    /// exceeded. The damage bits still cover every source and destination.
+    #[must_use]
+    pub const fn moves_overflowed(&self) -> bool {
+        self.moves_overflowed
     }
 
     pub fn mark_full_frame(&mut self) {
@@ -122,12 +207,16 @@ impl ExternalDamage {
         });
     }
 
-    /// Conservatively marks a moved rectangle's destination and source.
+    /// Records a move vector and conservatively marks its destination and
+    /// source.
     ///
     /// Move-rect APIs often describe pixels copied from `source` to
     /// `destination`. The destination is definitely damaged; the source is
     /// marked as well because another OS damage rect may cover the reveal, and
     /// over-marking spends bits while under-marking starves changed content.
+    /// The vector itself is kept (clipped to the frame) in
+    /// [`Self::move_rects`], so a consumer that can copy may do so; the
+    /// marked bits remain the fallback for one that cannot.
     pub fn mark_move_rect(
         &mut self,
         source_x: i64,
@@ -154,6 +243,50 @@ impl ExternalDamage {
             source_x.saturating_add(width),
             source_y.saturating_add(height),
         );
+        if let Some(clipped) = clip_move(
+            self.grid,
+            source_x,
+            source_y,
+            destination_left,
+            destination_top,
+            width,
+            height,
+        ) {
+            self.push_move(clipped);
+        }
+    }
+
+    fn push_move(&mut self, rect: MoveRect) {
+        if self.moves_overflowed {
+            return;
+        }
+        if self.moves.len() == MAX_MOVE_RECTS {
+            self.moves.clear();
+            self.moves_overflowed = true;
+            return;
+        }
+        self.moves.push(rect);
+    }
+
+    /// Merges another accumulator for the same frame geometry: damage bits
+    /// are unioned and its move vectors are appended after this one's, in
+    /// order, under the same [`MAX_MOVE_RECTS`] bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeelError::GeometryChanged`] when `other` was built for a
+    /// different frame size.
+    pub fn merge_external(&mut self, other: &Self) -> Result<(), KeelError> {
+        self.merge_from(other.damage_map())?;
+        if other.moves_overflowed {
+            self.moves.clear();
+            self.moves_overflowed = true;
+            return Ok(());
+        }
+        for rect in &other.moves {
+            self.push_move(*rect);
+        }
+        Ok(())
     }
 
     /// Merges another damage map for the same frame geometry.
@@ -301,6 +434,41 @@ impl PendingExternalDamage {
         Ok(())
     }
 
+    /// Like [`Self::observe`], and also keeps the observation's move
+    /// vectors, appended in capture order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeelError::GeometryChanged`] when `damage` describes another
+    /// frame size.
+    pub fn observe_external(&mut self, damage: &ExternalDamage) -> Result<(), KeelError> {
+        if damage.grid() != self.damage.grid() {
+            return Err(KeelError::GeometryChanged {
+                expected: self.damage.grid(),
+                actual: damage.grid(),
+            });
+        }
+        if !self.pending {
+            self.damage.reset();
+        }
+        self.damage.merge_external(damage)?;
+        self.pending = true;
+        Ok(())
+    }
+
+    /// Move vectors of the pending frame, in capture order.
+    #[must_use]
+    pub fn move_rects(&self) -> &[MoveRect] {
+        self.damage.move_rects()
+    }
+
+    /// Whether the pending frame's moves were dropped for exceeding the
+    /// bound.
+    #[must_use]
+    pub const fn moves_overflowed(&self) -> bool {
+        self.damage.moves_overflowed()
+    }
+
     pub fn mark_submitted(&mut self) {
         self.pending = false;
     }
@@ -344,6 +512,64 @@ pub const fn report_only_dirty_regions_status(
     } else {
         DamageMetadataStatus::Complete
     }
+}
+
+/// Clips a move so both its source and its destination lie in the frame,
+/// trimming the same edges of each. `None` for an empty or zero-length move.
+fn clip_move(
+    grid: BlockGrid,
+    source_x: i64,
+    source_y: i64,
+    destination_left: i64,
+    destination_top: i64,
+    width: i64,
+    height: i64,
+) -> Option<MoveRect> {
+    let (dst_x, src_x, width) = clip_axis(destination_left, source_x, width, grid.width())?;
+    let (dst_y, src_y, height) = clip_axis(destination_top, source_y, height, grid.height())?;
+    if dst_x == src_x && dst_y == src_y {
+        return None;
+    }
+    Some(MoveRect {
+        source_x: src_x,
+        source_y: src_y,
+        destination: PixelRect {
+            x: dst_x,
+            y: dst_y,
+            width,
+            height,
+        },
+    })
+}
+
+/// One axis of [`clip_move`]: the span `[start, start + len)` at the
+/// destination and its paired span at the source, intersected with
+/// `[0, extent)` on both sides.
+fn clip_axis(
+    destination: i64,
+    source: i64,
+    length: i64,
+    extent: usize,
+) -> Option<(usize, usize, usize)> {
+    let extent = i64::try_from(extent).ok()?;
+    let lead = 0i64
+        .saturating_sub(destination)
+        .max(0i64.saturating_sub(source))
+        .max(0);
+    let trail = destination
+        .saturating_add(length)
+        .saturating_sub(extent)
+        .max(source.saturating_add(length).saturating_sub(extent))
+        .max(0);
+    let clipped = length.saturating_sub(lead).saturating_sub(trail);
+    if clipped <= 0 {
+        return None;
+    }
+    Some((
+        usize::try_from(destination.saturating_add(lead)).ok()?,
+        usize::try_from(source.saturating_add(lead)).ok()?,
+        usize::try_from(clipped).ok()?,
+    ))
 }
 
 fn clamp_signed_to_extent(value: i64, extent: usize) -> usize {
@@ -413,6 +639,110 @@ mod tests {
             damage.damage_map().dirty_blocks().collect::<Vec<_>>(),
             [0, 2]
         );
+    }
+
+    #[test]
+    fn move_rect_keeps_its_vector() {
+        let mut damage = ExternalDamage::new(64, 32).unwrap();
+        damage.mark_move_rect(0, 8, 0, 0, 64, 24);
+        assert_eq!(
+            damage.move_rects(),
+            [MoveRect {
+                source_x: 0,
+                source_y: 8,
+                destination: PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 24,
+                },
+            }]
+        );
+        assert_eq!(damage.move_rects()[0].offset(), (0, -8));
+        damage.reset();
+        assert!(damage.move_rects().is_empty());
+    }
+
+    #[test]
+    fn move_rect_clips_source_and_destination_together() {
+        let mut damage = ExternalDamage::new(64, 32).unwrap();
+        // Destination hangs off the left and bottom; source off the top.
+        damage.mark_move_rect(10, -4, -6, 4, 26, 40);
+        let [moved] = damage.move_rects() else {
+            panic!("one clipped move expected");
+        };
+        assert_eq!(
+            moved.source(),
+            PixelRect {
+                x: 16,
+                y: 0,
+                width: 26,
+                height: 24
+            }
+        );
+        assert_eq!(
+            moved.destination,
+            PixelRect {
+                x: 0,
+                y: 8,
+                width: 26,
+                height: 24
+            }
+        );
+        assert_eq!(moved.offset(), (-16, 8));
+    }
+
+    #[test]
+    fn empty_or_zero_moves_keep_no_vector() {
+        let mut damage = ExternalDamage::new(64, 32).unwrap();
+        damage.mark_move_rect(16, 0, 16, 0, 32, 16);
+        damage.mark_move_rect(0, 100, 0, 0, 16, 16);
+        assert!(damage.move_rects().is_empty());
+        assert!(!damage.moves_overflowed());
+        assert_eq!(
+            damage.damage_map().dirty_blocks().collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn move_overflow_drops_the_whole_list_but_keeps_bits() {
+        let mut damage = ExternalDamage::new(64, 64).unwrap();
+        for _ in 0..=MAX_MOVE_RECTS {
+            damage.mark_move_rect(0, 0, 0, 16, 16, 32);
+        }
+        assert!(damage.moves_overflowed());
+        assert!(damage.move_rects().is_empty());
+        assert_eq!(
+            damage.damage_map().dirty_blocks().collect::<Vec<_>>(),
+            [0, 4]
+        );
+        damage.mark_move_rect(0, 0, 0, 16, 16, 32);
+        assert!(damage.move_rects().is_empty(), "overflow holds until reset");
+    }
+
+    #[test]
+    fn pending_damage_keeps_moves_in_capture_order() {
+        let mut first = ExternalDamage::new(64, 64).unwrap();
+        let mut second = ExternalDamage::new(64, 64).unwrap();
+        first.mark_move_rect(0, 16, 0, 0, 64, 48);
+        second.mark_move_rect(0, 32, 0, 0, 64, 32);
+        let mut pending = PendingExternalDamage::new(64, 64).unwrap();
+        pending.observe_external(&first).unwrap();
+        pending.observe_external(&second).unwrap();
+        let offsets = pending
+            .move_rects()
+            .iter()
+            .map(|rect| rect.offset())
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, [(0, -16), (0, -32)]);
+        pending.mark_submitted();
+        pending.observe(first.damage_map()).unwrap();
+        assert!(pending.move_rects().is_empty(), "a new frame starts clean");
+        assert!(matches!(
+            pending.observe_external(&ExternalDamage::new(32, 32).unwrap()),
+            Err(KeelError::GeometryChanged { .. })
+        ));
     }
 
     #[test]

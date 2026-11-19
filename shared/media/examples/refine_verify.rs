@@ -103,7 +103,9 @@ fn main() {
                     deck.on_presented(monitor_id, fence, now);
                 }
             }
-            CapencRecordKind::Cursor | CapencRecordKind::CursorPosition => {}
+            CapencRecordKind::Cursor
+            | CapencRecordKind::CursorPosition
+            | CapencRecordKind::Canvas => {}
             CapencRecordKind::RefineVideo => match deck.on_video_record(&body, now) {
                 Ok(VideoRecord::Fence { monitor_id, fence }) => {
                     monitor = monitor_id;

@@ -1289,6 +1289,16 @@ fn load_session_host(config_path: &std::path::Path) -> Result<SessionHost, ExitC
             "video.qp_map is accepted but not supported by the macOS Pier VideoToolbox encoder"
         );
     }
+    let (desk_private, desk_notes) = arcen_pier_macos::desk_privacy_startup_notes(&file_config);
+    // Off, or a desk it cannot make private, at error level: every log
+    // profile records it.
+    for (index, note) in desk_notes.into_iter().enumerate() {
+        if index == 0 && desk_private {
+            tracing::info!(target: arcen_telemetry::names::target::SESSION, "{note}");
+        } else {
+            tracing::error!(target: arcen_telemetry::names::target::SESSION, "{note}");
+        }
+    }
     Ok(SessionHost {
         _observability: observability,
         telemetry,
@@ -3414,8 +3424,8 @@ async fn arm_lock_guard(
 static DESK_PRIVACY_SLOT: arcen_pier_macos::blocking::BlockingSlot =
     arcen_pier_macos::blocking::BlockingSlot::new();
 
-/// Makes the desk private for a signed-in user's session when the operator
-/// asked for it (`platform.desktop.deskside.enabled`): never at the login
+/// Makes the desk private for a signed-in user's session unless the
+/// administrator turned it off (`privacy.desk = "off"`): never at the login
 /// window (nothing private is shown, and its only input is virtual HID,
 /// which an event filter cannot tell from the desk's) nor in `serve`.
 async fn arm_desk_privacy(

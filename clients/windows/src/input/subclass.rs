@@ -86,7 +86,7 @@ pub fn detach(hwnd: HWND) {
             drop(cell);
         }
     }
-    hook::uninstall();
+    hook::uninstall(hwnd);
 }
 
 /// Runs `apply` on the window's input (the shell's calls: a session began,

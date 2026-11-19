@@ -217,6 +217,39 @@ impl ActivityGrid {
         hint: ActivityHint,
     ) -> Result<ActivityDiagnostics, KeelError> {
         let summary = self.damage.update(frame)?;
+        Ok(self.observe(summary, hint))
+    }
+
+    /// Updates activity from narrowed hashing: only the OS-reported damage
+    /// and the rotating audit stripe are hashed
+    /// ([`DamageTracker::update_within`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeelError::GeometryChanged`] without changing activity state
+    /// when the frame or damage geometry differs from this grid.
+    pub fn update_within(
+        &mut self,
+        frame: BgraFrame<'_>,
+        os_damage: DamageMap<'_>,
+        hint: ActivityHint,
+    ) -> Result<ActivityDiagnostics, KeelError> {
+        let summary = self.damage.update_within(frame, os_damage)?;
+        Ok(self.observe(summary, hint))
+    }
+
+    /// The wrapped tracker, for its audit period and hashed-block count.
+    #[must_use]
+    pub const fn damage_tracker(&self) -> &DamageTracker {
+        &self.damage
+    }
+
+    /// See [`DamageTracker::set_audit_period`].
+    pub fn set_audit_period(&mut self, period: usize) {
+        self.damage.set_audit_period(period);
+    }
+
+    fn observe(&mut self, summary: DamageSummary, hint: ActivityHint) -> ActivityDiagnostics {
         let baseline_refresh = !self.has_baseline;
         self.has_baseline = true;
 
@@ -254,7 +287,7 @@ impl ActivityGrid {
             class_streak,
             baseline_refresh,
         };
-        Ok(self.diagnostics)
+        self.diagnostics
     }
 }
 

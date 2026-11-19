@@ -5,6 +5,11 @@
 //! Linux and Windows consume this contract when no GPU encoder is usable.
 //! macOS Pier intentionally does not: every supported macOS host has
 //! `VideoToolbox`, so there is no separate software-fallback pipeline to select.
+//!
+//! The contract sets no size or rate of its own. It follows the Deck display
+//! like Auto; `OpenH264`'s own limits (the `EncoderBackend::OpenH264` row:
+//! 3840x2160, 60 fps) bound what it can encode, and the host's frame-rate
+//! governor (`HostRateGovernor`) lowers the rate to what the CPU encodes.
 
 use arcen_protocol::messages::VideoSelectionIntent;
 
@@ -20,7 +25,10 @@ use crate::video::MotionPriority;
 pub(super) const CONTRACT: PipelineContract = PipelineContract {
     id: PipelineId::Software,
     max_fps: 30,
-    frame_rate: super::FrameRatePolicy::Fixed { fps: 30 },
+    frame_rate: super::FrameRatePolicy::FollowDisplay {
+        floor_fps: 1,
+        ceiling_fps: crate::video::MAX_SESSION_FPS,
+    },
     priority: MotionPriority::Detail,
     intent: EncodeIntent::Interactive,
     encoder_buffer_frames: buffer(MotionPriority::Detail, EncodeIntent::Interactive),
@@ -38,9 +46,9 @@ pub(super) const CONTRACT: PipelineContract = PipelineContract {
     decode_latency: super::DecodeLatencyPolicy::DEFAULT,
     present_timing: super::PresentTiming::Newest,
     keyframe: KeyframePolicy::SOFTWARE_FALLBACK,
-    favours: "CPU-only VM compatibility with H.264 4:2:0 at up to 30 fps",
-    gives_up: "60 fps Speed, Grading, HDR, host cursor composition, and GPU encoder efficiency",
-    summary: "Fallback for CPU-only hosts: H.264 4:2:0 at up to 30 fps; Speed is visibly degraded, while Grading and HDR require hardware and are refused.",
+    favours: "CPU-only host compatibility with H.264 4:2:0 at the rate the CPU sustains",
+    gives_up: "Speed's motion floor, Grading, HDR, host cursor composition, and GPU encoder efficiency",
+    summary: "Fallback for CPU-only hosts: H.264 4:2:0 following the Deck display up to the rate the CPU encodes; Speed is visibly degraded, while Grading and HDR require hardware and are refused.",
 };
 
 pub(super) const fn fallback_decision(
@@ -49,7 +57,7 @@ pub(super) const fn fallback_decision(
 ) -> SoftwareFallbackDecision {
     match requested {
         Some(PipelineId::Speed) => SoftwareFallbackDecision::Degrade {
-            reason: "software fallback serves Speed as Software/Auto H.264 8-bit 4:2:0 at 30 fps",
+            reason: "software fallback serves Speed as Software/Auto H.264 8-bit 4:2:0 at the rate the CPU encodes",
         },
         Some(PipelineId::Grading) => SoftwareFallbackDecision::Refuse {
             reason: "Grading requires a hardware 10-bit 4:4:4 encoder; software fallback is H.264 8-bit 4:2:0 only",

@@ -63,6 +63,16 @@ impl EpochOutput {
         self.framed || self.framed_v2
     }
 
+    /// Writes one record of the shared software loop in the parent's
+    /// framing.
+    pub(super) fn loop_record(
+        &self,
+        writer: &mut impl Write,
+        record: &arcen_media::canvas::LoopRecord,
+    ) -> std::io::Result<()> {
+        crate::write_loop_record(writer, record, self.framed, self.framed_v2)
+    }
+
     /// Writes one access unit in the parent's framing.
     pub(super) fn access_unit(
         &self,

@@ -350,6 +350,8 @@ impl DeckWindow {
         let launcher = &mut self.launcher;
         let output = ctx.run_ui(raw, |ui| launcher.ui(ui));
         self.menu_bar.set_session_active(self.launcher.in_session());
+        self.menu_bar
+            .set_keyboard_status(&self.launcher.keyboard_status_line());
         self.backdrop.set_fill(if self.launcher.in_session() {
             egui::Color32::BLACK
         } else {

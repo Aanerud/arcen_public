@@ -190,6 +190,9 @@ followed by what you can do. Common cases:
   Grading.
 - **A host without a suitable graphics card** serves Auto and Speed in
   software and refuses Grading and HDR, with the reason.
+- **A Windows host with an Intel or AMD graphics card** may encode Auto and
+  Speed on that card through Media Foundation; this path is **Alpha**, and
+  Stream Statistics names it "Media Foundation hardware (Alpha)".
 
 If the warning says the Deck fell back to eight-bit presentation, reconnect.
 If it stays, choose Auto and send the Deck log to your administrator.
@@ -432,15 +435,18 @@ for shortcuts and games. When the host's layout differs from your Mac's
 (say, a US layout on the host under a Norwegian Mac keyboard), switch the
 session to characters:
 
-| Connection menu | Shortcut | What reaches the host |
-| --- | --- | --- |
-| **Keyboard: Physical Keys** | ⌃⌘K | Keys by position, as the Typing setting says. |
-| **Keyboard: Characters** | ⌃⌘U | Every character as your Mac typed it (`æøå`, accents, ⌥ characters, input methods), whatever the host's layout. |
+| Connection menu | What reaches the host |
+| --- | --- |
+| **Keyboard: Physical Keys** | Keys by position, as the Typing setting says. |
+| **Keyboard: Characters** | Every character as your Mac typed it (`æøå`, accents, ⌥ characters, input methods), whatever the host's layout. |
+
+These are menu items without a shortcut: ⌃⌘K and ⌃⌘U go to the host
+(after Arcen 0.20.3).
 
 In Characters mode the picture shows a small **Keyboard: Characters**
 badge. Shortcuts, arrows, function keys, Esc, Return, Tab and Backspace stay
 keys. A game or a virtual-machine console that reads key positions may
-misbehave; switch back with ⌃⌘K. A saved connection can start in either
+misbehave; switch back with **Connection › Keyboard: Physical Keys**. A saved connection can start in either
 mode (**Edit** › **Keyboard mode**). Characters mode needs a Windows or
 Linux host from Arcen 0.18.0; a host that cannot type text says so and
 keeps physical keys.
@@ -455,7 +461,8 @@ and right ⌥ keys do.
 
 Clipboard sharing does not reach a sign-in screen, a lock screen, a
 Windows elevation prompt or a virtual-machine console. **Connection › Paste
-as Keystrokes** (⌃⌥⌘V) types your Mac clipboard's plain text there instead.
+as Keystrokes** types your Mac clipboard's plain text there instead (a
+menu item; ⌃⌥⌘V goes to the host).
 
 - It waits until you let go of every modifier key ("Release the modifier
   keys to start typing"), so no character becomes a shortcut.
@@ -473,13 +480,66 @@ as Keystrokes** (⌃⌥⌘V) types your Mac clipboard's plain text there instead
 It needs a host that types text (Windows or Linux from Arcen 0.18.0). The
 Mac host does not type text yet and says so.
 
+### Print Screen, Scroll Lock and Pause
+
+A Mac keyboard has no Print Screen, Scroll Lock or Pause key. On a Windows
+or Linux host, **F13**, **F14** and **F15** are those keys: an Apple
+extended keyboard has them in those places, and macOS reports a PC
+keyboard's Print Screen, Scroll Lock and Pause as F13–F15. A Mac host gets
+F13–F15.
+
+From a PC keyboard every Pier takes F13–F24 and the Menu key too, except a
+Mac host, which has no F21–F24, Insert, Print Screen, Scroll Lock or Pause
+(macOS has no such keys); it takes F13–F20 and gives the Menu key to the
+application as a PC keyboard's Menu key on a Mac.
+
+### Send Key
+
+**Connection › Send Key** sends a key your keyboard lacks, on both Decks:
+Print Screen, Scroll Lock, Pause, Insert, Ctrl+Alt+Del, Menu and F13–F24.
+Each is one press and release, after every key held on the host is let go.
+
+### Who has the keyboard (Windows Deck)
+
+While a session window has focus, the host has the keyboard, and its system
+shortcuts go there too: Alt+Tab and Alt+Shift+Tab switch the host's
+windows, the Windows key opens the host's launcher and Print Screen reaches
+the host's application, windowed and fullscreen. The right end of the menu
+bar says so: **Keyboard: Z8 (Ctrl+Alt+Home to release)**.
+
+- **Ctrl+Alt+Home** gives the keyboard to this PC. Every key held on the
+  host is released first, then nothing more reaches the host, Alt+Tab
+  switches this PC's windows, and the menu bar says **Keyboard: this PC
+  (click to return)**. In fullscreen the connection bar stays open and says
+  the same.
+- **Ctrl+Alt+Home** again, or a click into the picture, gives it back. That
+  click is not sent to the host, so it never paints a stroke or presses a
+  button there.
+- **Settings › Input › System shortcuts go to** chooses when the system
+  shortcuts go to the host: **The remote computer** (the default), **The
+  remote computer when fullscreen**, or **This computer**. Windows+L and
+  Ctrl+Alt+Del always stay with this PC; use **Connection › Send Key ›
+  Ctrl+Alt+Del** (or Ctrl+Alt+End) for the host's.
+
+On a Mac Deck, ⌃⌥Home (Fn+⌃⌥← on a laptop) releases every key held on the
+host and the pointer lock; giving the whole keyboard, ⌘Tab included, to the
+host comes with a later release.
+
+### Help › Keyboard Shortcuts
+
+**Help › Keyboard Shortcuts** lists every key the Deck keeps for itself and
+where everything else went. F9, Ctrl+Win+K/U and Ctrl+Alt+Win+V (on a Mac
+⌃⌘K/U and ⌃⌥⌘V) are not the Deck's any more: they reach the host.
+
 ### Two keys to remember
 
 - **⌘Q in a session goes to the host.** Tap it and the host application
   gets it. Hold it for three seconds to quit the Deck. Choosing **Quit Arcen
   Deck** from the menu quits at once.
-- **Connection › Release Modifiers** lets go of any modifier key the host
-  still thinks is held, if keys start acting strangely after switching apps.
+- **Connection › Release Stuck Keys** lets go of every key and button the
+  host still thinks is held, and of the pointer lock, if keys start acting
+  strangely after switching apps. (F9 did this up to Arcen 0.20.3; F9 now
+  reaches the host.)
 
 ## 7. Clipboard
 
@@ -556,6 +616,12 @@ negotiated with this host". For that host, edit the connection and set its
 **Displays** to **Primary display only**; other connections keep the
 default.
 
+A connection's own **Displays** choice wins over Settings › Displays.
+Select the connection on Home: its **Displays** line says which choice it
+connects with, and where it comes from. When the connection's own choice
+overrides the setting the line says so, and **Use Settings** hands the
+connection back to Settings › Displays.
+
 If you reconnect to a desktop that was started without your current
 layout, the Deck asks: **Reconnect to your session** keeps your open
 applications on your main display only; **Start fresh with my layout**
@@ -618,7 +684,8 @@ session while you work, off until you turn it on. It has three lines: the
 round trip, loss and rate of the path; the frames shown per second against
 the preset's ceiling, the codec, chroma and depth, the preset the host is
 serving, and **SDR** or **HDR** (read from the transfer, never from the bit
-depth) with the primaries; and a **Lossless** line, which reads "Refinement
+depth) with the primaries, followed by the host's encoder (for example
+"NVIDIA NVENC", or "Media Foundation hardware (Alpha)"); and a **Lossless** line, which reads "Refinement
 off" because this release does not turn lossless refinement on. The box
 sits at the bottom left of the picture.
 
@@ -702,9 +769,10 @@ and says what to do. Then look for what you see below. Anything marked
 | A web page on a Mac host says *Pointer type: Mouse*, pressure 0.50 | The page is open in Safari. Safari on macOS reports every pen as a mouse, including one plugged straight into that Mac: WebKit takes no pen data from macOS. | Use Chrome on the host (it reports pen, pressure, tilt and rotation), or a native drawing application. |
 | "Native tablet is not enabled on this host…" | The host's administrator has not turned Native tablet on (`usb.native_tablet`). | Choose **Tablet support**, or ask the administrator to enable it. |
 | "Native tablet (USB bridged) unavailable…" or "…refused…" | The host cannot take a bridged tablet, or reads no pen from this one; the reason says which. | Choose **Tablet support**. |
-| Wrong characters, `z` and `y` swapped, `æøå` as punctuation | The host's keyboard layout differs from your Mac's. | **Connection › Keyboard: Characters** (⌃⌘U), or match the layouts. |
+| Wrong characters, `z` and `y` swapped, `æøå` as punctuation | The host's keyboard layout differs from your Mac's. | **Connection › Keyboard: Characters**, or match the layouts. |
 | "This host cannot type text sent from the Deck…" | The host cannot type characters (the Mac host, or a host older than 0.18.0). | Use physical keys; ask about updating the host. |
-| Keys stuck, or every key acting like a shortcut | The host thinks a modifier is still held. | **Connection › Release Modifiers**. |
+| Keys stuck, or every key acting like a shortcut | The host thinks a modifier is still held. | **Connection › Release Stuck Keys**. |
+| Alt+Tab or Print Screen act on the Windows Deck's own PC | This PC has the keyboard (the menu bar says **Keyboard: this PC**), or Settings › Input keeps the system shortcuts here. | Click the picture or press Ctrl+Alt+Home; check **Settings › Input › System shortcuts go to**. |
 | A black screen just after a Windows sign-in | Windows waits for its desktop to settle before showing it. | Wait about 25 seconds. |
 | The picture does not change | A still desktop sends no new frames; the Deck keeps the last one. | Move the pointer. If it still never updates, run Test connection. |
 | Clipboard does nothing | The host's policy turns it off or one way, or the copy is too large. | Check **Settings › Clipboard › Effective host policy**. |

@@ -100,13 +100,6 @@
           "owner": "Windows Host"
         },
         {
-          "id": "windows-capenc-mf",
-          "entry_points": ["hosts/capenc/src/lib.rs"],
-          "build_profiles": ["windows-capenc-mf"],
-          "validation": ["windows-capenc-mf-build"],
-          "owner": "Windows Host"
-        },
-        {
           "id": "linux-wayland-capture-import",
           "entry_points": [
             "hosts/capenc/src/wayland/evidence.rs",

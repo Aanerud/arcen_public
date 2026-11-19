@@ -135,6 +135,7 @@ async fn open_session(
         desktop: config.desktop_session.clone(),
         default_desktop: None,
         deskside: crate::deskside::LinuxDesksideConfig::default(),
+        desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(),
         provider: DesktopProvider::Wayland,
         audio: crate::session::agent::AgentAudioArguments {
             local_playback: config.local_playback,

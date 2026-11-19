@@ -170,6 +170,21 @@ pub struct RefineForward {
     pub lane: mpsc::Sender<Vec<u8>>,
 }
 
+/// What a single-monitor attachment knows about the canvas (ADR 0028):
+/// the Deck's offer and the operator's CPU share. Whether this capture
+/// serves it is [`CapencConfig::canvas_plan`], the shared plan's decision.
+#[derive(Debug, Clone)]
+pub struct CanvasForward {
+    /// `AuthResponse.canvas_v1`.
+    pub deck: arcen_protocol::canvas::CanvasCapability,
+    /// `video.software.cpu_share`.
+    pub cpu_share: arcen_media::canvas::CpuShare,
+}
+
+/// Whether this Pier's capenc carries the shared software loop: always,
+/// since every Pier links `arcen-capenc/software-h264`.
+pub const SOFTWARE_COMPILED: bool = true;
+
 #[derive(Debug, Clone)]
 pub struct CapencConfig {
     pub binary: PathBuf,
@@ -260,6 +275,10 @@ pub struct CapencConfig {
     /// multi-monitor pipelines. Whether this capture refines is
     /// [`Self::refine_plan`], decided per spawn by the shared plan.
     pub refine: Option<RefineForward>,
+    /// The canvas (ADR 0028) for a single-monitor attachment whose Deck
+    /// offered it. `None` for probes, multi-monitor pipelines and older
+    /// Decks.
+    pub canvas: Option<CanvasForward>,
     /// `DISPLAY` for the child (e.g. `":0"`). None ⇒ inherit.
     pub display: Option<String>,
     /// `XAUTHORITY` for the child. None ⇒ inherit.
@@ -366,6 +385,29 @@ impl CapencConfig {
         )
     }
 
+    /// The shared canvas plan for this capture (ADR 0028): only the
+    /// Software contract, one monitor, within the Deck's terms.
+    pub(crate) fn canvas_plan(&self) -> arcen_media::canvas::serve::CanvasServePlan {
+        let monitors = [(0u16, self.width, self.height)];
+        arcen_media::canvas::serve::plan_canvas(&arcen_media::canvas::serve::CanvasServeFacts {
+            offer: self.canvas.as_ref().map(|forward| &forward.deck),
+            software: self.encoder == EncoderRequest::SoftwareH264
+                && !self.yuv444
+                && self.bit_depth == arcen_media::BitDepth::Eight,
+            monitors: &monitors,
+            operator_enabled: true,
+            built: SOFTWARE_COMPILED,
+        })
+    }
+
+    /// The canvas argument for capenc when the plan serves it.
+    fn canvas_args(&self) -> Option<arcen_media::canvas::serve::CanvasCapencArgs> {
+        let forward = self.canvas.as_ref()?;
+        self.canvas_plan().terms.map(|terms| {
+            arcen_media::canvas::serve::CanvasCapencArgs::single_monitor(terms, forward.cpu_share)
+        })
+    }
+
     /// Build the argv exactly as `capenc_backend.start()` does.
     ///
     /// A `variant=<id>` token is appended whenever this config's full colour
@@ -388,14 +430,21 @@ impl CapencConfig {
             v.push("yuv444".to_string());
         }
         let refine = self.refine_plan();
-        v.push(if self.cursor_events() || refine.is_on() {
-            arcen_media::capenc_stream::FRAMED_OUTPUT_V2.to_string()
-        } else {
-            FRAMED_OUTPUT_V1.to_string()
-        });
+        let canvas = self.canvas_args();
+        v.push(
+            if self.cursor_events() || refine.is_on() || canvas.is_some() {
+                arcen_media::capenc_stream::FRAMED_OUTPUT_V2.to_string()
+            } else {
+                FRAMED_OUTPUT_V1.to_string()
+            },
+        );
         // Exact still image: only on a plan the shared rule grants, which
         // is never the eight-bit NvFBC path (ADR 0016).
         v.extend(refine.capenc_args(REFINE_SCOPE));
+        // Canvas: only the software loop, for a Deck that offered it.
+        if let Some(canvas) = canvas {
+            v.push(canvas.to_arg());
+        }
         // The desktop's cursor hub reports host-caused pointer motion to a
         // Deck that asks for it; positions are cheap (one small record per
         // Mutter cursor update, bounded by the stream rate).
@@ -706,7 +755,7 @@ where
                         EncoderRequest::NativeNvenc => &[EncoderBackend::NativeNvenc],
                         EncoderRequest::SoftwareH264 => &[EncoderBackend::OpenH264],
                         EncoderRequest::Auto
-                        | EncoderRequest::WindowsMediaFoundation
+                        | EncoderRequest::MediaFoundationHardware
                         | EncoderRequest::SoftwareAv1 => &[],
                     };
                     let plan = parse_ready_v1(
@@ -761,7 +810,7 @@ where
                         EncoderRequest::NativeNvenc => EncoderBackend::NativeNvenc,
                         EncoderRequest::SoftwareH264 => EncoderBackend::OpenH264,
                         EncoderRequest::Auto
-                        | EncoderRequest::WindowsMediaFoundation
+                        | EncoderRequest::MediaFoundationHardware
                         | EncoderRequest::SoftwareAv1 => {
                             return Err(CapencStartError::ReadyProtocol(
                                 "capenc attempt used an unsupported or non-concrete Linux encoder"
@@ -801,7 +850,7 @@ pub(crate) enum StdinCmd {
     Bitrate(u64),
     /// Apply a live frame-rate target.
     Framerate(u32),
-    /// A lossless-refinement control (`REFINE-RESET`/`-PAUSE`/`-RESUME`).
+    /// A lossless-refinement or canvas control line.
     Refine(arcen_media::capenc_control::CapencControlCommand),
     /// Request graceful encoder teardown, then close stdin.
     Stop,
@@ -827,6 +876,7 @@ enum ChildShutdown {
 pub struct IdrRequester {
     idr_tx: std::sync::Arc<std::sync::RwLock<mpsc::UnboundedSender<()>>>,
     control_tx: std::sync::Arc<std::sync::RwLock<mpsc::Sender<StdinCmd>>>,
+    canvas: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -835,11 +885,22 @@ pub struct BitrateRequester {
 }
 
 impl IdrRequester {
-    fn new(idr_tx: mpsc::UnboundedSender<()>, control_tx: mpsc::Sender<StdinCmd>) -> Self {
+    fn new(
+        idr_tx: mpsc::UnboundedSender<()>,
+        control_tx: mpsc::Sender<StdinCmd>,
+        canvas: bool,
+    ) -> Self {
         Self {
             idr_tx: std::sync::Arc::new(std::sync::RwLock::new(idr_tx)),
             control_tx: std::sync::Arc::new(std::sync::RwLock::new(control_tx)),
+            canvas: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(canvas)),
         }
+    }
+
+    /// The capture serves the canvas (ADR 0028): the Deck recovers with
+    /// `canvas_reset_request`, not a keyframe request.
+    pub fn serves_canvas(&self) -> bool {
+        self.canvas.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Request one keyframe. Non-blocking and independent of bitrate/framerate
@@ -875,6 +936,16 @@ impl IdrRequester {
         tx.try_send(StdinCmd::Refine(command)).is_ok()
     }
 
+    /// A canvas control (`CANVAS-ACK`/`-RESET`/`-INPUT`, ADR 0028) for
+    /// whichever capenc currently serves this slot. Non-blocking: a full
+    /// mailbox drops it (acknowledgements are throttling hints only).
+    pub fn request_canvas(
+        &self,
+        command: arcen_media::capenc_control::CapencControlCommand,
+    ) -> bool {
+        self.request_refine(command)
+    }
+
     /// Point this requester — and every clone sharing its slot — at a newly
     /// spawned capenc. Used by the mid-session stream resize after the old
     /// child was shut down.
@@ -889,6 +960,10 @@ impl IdrRequester {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *control_tx = session.stdin_tx.clone();
+        self.canvas.store(
+            session.canvas_plan().is_on(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -924,6 +999,8 @@ impl BitrateRequester {
 /// the latest pipeline statistics.
 struct ObservedCapture {
     admission: Option<CaptureAdmissionNotice>,
+    /// The canvas plan this child was started with (ADR 0028).
+    canvas: arcen_media::canvas::serve::CanvasServePlan,
     stats: tokio::sync::watch::Receiver<Option<PipelineStatsSample>>,
     content: ContentWindowCell,
 }
@@ -968,6 +1045,11 @@ impl CapencSession {
     /// first real frame that proves the session's capture step.
     pub fn capture_admission(&self) -> Option<&CaptureAdmissionNotice> {
         self.observed.admission.as_ref()
+    }
+
+    /// The canvas plan this child serves (ADR 0028), for the hello.
+    pub fn canvas_plan(&self) -> &arcen_media::canvas::serve::CanvasServePlan {
+        &self.observed.canvas
     }
 
     /// Follows capenc's once-a-second pipeline statistics: the latest
@@ -1415,7 +1497,7 @@ pub fn fit_to_encoder_limits(encoder: EncoderRequest, width: u32, height: u32) -
 /// Why a Wayland session's software fallback is refused: its output was
 /// created at its size before any encoder existed and cannot be fitted now.
 pub(crate) const WAYLAND_SOFTWARE_GEOMETRY_REFUSAL: &str =
-    "the Wayland session's output is larger than the software encoder's 1920x1200 and \
+    "the Wayland session's output is larger than the software encoder's 3840x2160 and \
      no hardware encoder is available";
 
 /// What the session's own stream says about the cursor, for a Wayland
@@ -1617,7 +1699,7 @@ async fn spawn_one(
     config.media_request()?;
     if matches!(
         config.encoder,
-        EncoderRequest::Auto | EncoderRequest::WindowsMediaFoundation
+        EncoderRequest::Auto | EncoderRequest::MediaFoundationHardware
     ) {
         return Err(CapencStartError::InvalidConfig(
             "Linux capenc attempts must use a concrete encoder".to_string(),
@@ -1714,8 +1796,9 @@ async fn spawn_one(
             lane: forward.lane.clone(),
             control: stdin_tx.clone(),
         });
+    let canvas = config.canvas_args().is_some();
     match (cursor.flatten(), refine) {
-        (None, None) => {
+        (None, None) if !canvas => {
             tokio::spawn(read_stdout(stdout, nal_codec, frames_tx).instrument(helper_span.clone()));
         }
         (cursor, refine) => {
@@ -1749,15 +1832,18 @@ async fn spawn_one(
         "capenc ready"
     );
 
+    let canvas_plan = config.canvas_plan();
+    let canvas_on = canvas_plan.is_on();
     Ok((
         CapencSession {
             frames: Some(frames_rx),
             observed: Box::new(ObservedCapture {
                 admission,
+                canvas: canvas_plan,
                 stats,
                 content,
             }),
-            idr: IdrRequester::new(idr_tx.clone(), stdin_tx.clone()),
+            idr: IdrRequester::new(idr_tx.clone(), stdin_tx.clone(), canvas_on),
             child,
             idr_tx,
             stdin_tx,
@@ -1869,7 +1955,7 @@ pub(crate) fn admission_probe_command(
     config.media_request()?;
     if matches!(
         config.encoder,
-        EncoderRequest::Auto | EncoderRequest::WindowsMediaFoundation
+        EncoderRequest::Auto | EncoderRequest::MediaFoundationHardware
     ) {
         return Err(CapencStartError::InvalidConfig(
             "Linux admission probes require a concrete NVENC or OpenH264 backend".to_string(),
@@ -2006,6 +2092,11 @@ async fn read_framed_v2(
                         .apply_position(&cursor.connector, cursor.stream_size, &position);
                 }
             }
+            Ok(Some(FramedV2Record::Canvas(au))) => {
+                if frames_tx.send(au).await.is_err() {
+                    return;
+                }
+            }
             Ok(Some(FramedV2Record::RefineVideo(record))) => {
                 if refine.is_some() && refine_prefix.len() < MAX_REFINE_PREFIX_RECORDS {
                     refine_prefix.push(record);
@@ -2050,6 +2141,8 @@ enum FramedV2Record {
     Position(arcen_media::capenc_stream::CapencCursorPosition),
     RefineVideo(Vec<u8>),
     RefineLane(Vec<u8>),
+    /// A canvas record (ADR 0028), carried to the video lane as it is.
+    Canvas(AccessUnit),
 }
 
 async fn read_framed_v2_record<R>(
@@ -2099,6 +2192,9 @@ where
         // The Deck validates every record; the Pier only routes them.
         CapencRecordKind::RefineVideo => FramedV2Record::RefineVideo(body),
         CapencRecordKind::RefineLane => FramedV2Record::RefineLane(body),
+        // Canvas (ADR 0028), produced only with `canvas=`. A reset is the
+        // recovery point the queue keeps; the Deck validates every record.
+        CapencRecordKind::Canvas => FramedV2Record::Canvas(AccessUnit::canvas(body)?),
     }))
 }
 
@@ -2403,7 +2499,14 @@ pub(crate) mod test_support {
     pub(crate) fn fake_idr() -> (IdrRequester, mpsc::UnboundedReceiver<()>) {
         let (idr_tx, idr_rx) = mpsc::unbounded_channel();
         let (control_tx, _control_rx) = mpsc::channel::<StdinCmd>(8);
-        (IdrRequester::new(idr_tx, control_tx), idr_rx)
+        (IdrRequester::new(idr_tx, control_tx, false), idr_rx)
+    }
+
+    /// [`fake_idr`] for a capture that serves the canvas.
+    pub(crate) fn fake_canvas_idr() -> (IdrRequester, mpsc::UnboundedReceiver<()>) {
+        let (idr_tx, idr_rx) = mpsc::unbounded_channel();
+        let (control_tx, _control_rx) = mpsc::channel::<StdinCmd>(8);
+        (IdrRequester::new(idr_tx, control_tx, true), idr_rx)
     }
 
     pub(crate) fn fake_bitrate(idr: &IdrRequester) -> BitrateRequester {
@@ -2455,6 +2558,7 @@ mod tests {
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
             refine: None,
+            canvas: None,
             display: None,
             xauthority: None,
             execution: None,
@@ -2515,6 +2619,7 @@ mod tests {
             },
             CapencConfig {
                 refine: None,
+                canvas: None,
                 ..grading.clone()
             },
         ] {
@@ -2590,6 +2695,7 @@ mod tests {
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
             refine: None,
+            canvas: None,
             display: None,
             xauthority: None,
             execution: None,
@@ -2749,12 +2855,12 @@ mod tests {
         config.codec = "h264".to_string();
         config.encoder = EncoderRequest::SoftwareH264;
         config.yuv444 = false;
-        config.width = 3840;
-        config.height = 2160;
+        config.width = 5120;
+        config.height = 2880;
         config.cursor_mode = CursorMode::Local;
         let (fitted, degradation) =
             software_fallback_config(config).expect("oversized geometry must be fitted");
-        assert_eq!((fitted.width, fitted.height), (1920, 1080));
+        assert_eq!((fitted.width, fitted.height), (3840, 2160));
         assert!(degradation.geometry_clamped);
         assert_eq!(fitted.encoder, EncoderRequest::SoftwareH264);
 
@@ -2838,8 +2944,8 @@ mod tests {
         config.color_range = ColorRange::Full;
         config.color_matrix = ColorMatrix::Identity;
         config.fps = 60;
-        config.width = 2560;
-        config.height = 1600;
+        config.width = 5120;
+        config.height = 3200;
         config.cursor_mode = CursorMode::Local;
         let (resolved, degradation) =
             software_fallback_config(config).expect("shipped default must degrade, not refuse");
@@ -2848,11 +2954,13 @@ mod tests {
         assert_eq!(resolved.bit_depth, BitDepth::Eight);
         assert_eq!(resolved.color_range, ColorRange::Full);
         assert_eq!(resolved.color_matrix, ColorMatrix::Bt709);
-        assert_eq!(resolved.fps, 30);
-        assert_eq!((resolved.width, resolved.height), (1920, 1200));
+        // 60 fps is within OpenH264's own limit: kept, and governed at run
+        // time to what the CPU encodes. The geometry is fitted to 3840x2160.
+        assert_eq!(resolved.fps, 60);
+        assert_eq!((resolved.width, resolved.height), (3454, 2158));
         assert!(degradation.codec_changed);
         assert!(degradation.chroma_changed);
-        assert!(degradation.fps_clamped);
+        assert!(!degradation.fps_clamped);
         assert!(degradation.geometry_clamped);
     }
 
@@ -3067,16 +3175,22 @@ mod tests {
             software_fallback_config(wayland_config(30, false, ScreenCastCursorMode::Metadata))
                 .expect("metadata");
         assert_eq!(resolved.cursor_mode, CursorMode::Local);
-        // Speed is visibly degraded to 30 fps, never refused.
-        let (resolved, degradation) =
+        // Speed keeps its 60 fps request on software, never refused: the
+        // governor lowers it to what the CPU encodes; above OpenH264's 60
+        // the rate is visibly degraded.
+        let (resolved, _) =
             software_fallback_config(wayland_config(60, true, ScreenCastCursorMode::Embedded))
                 .expect("speed");
-        assert_eq!(resolved.fps, 30);
+        assert_eq!(resolved.fps, 60);
+        let (resolved, degradation) =
+            software_fallback_config(wayland_config(120, true, ScreenCastCursorMode::Embedded))
+                .expect("speed at 120");
+        assert_eq!(resolved.fps, 60);
         assert!(degradation.fps_clamped);
         // An output larger than OpenH264's cannot be fitted after the fact.
         let mut large = wayland_config(30, false, ScreenCastCursorMode::Embedded);
-        large.width = 2560;
-        large.height = 1600;
+        large.width = 5120;
+        large.height = 2880;
         assert!(matches!(
             software_fallback_config(large),
             Err(CapencStartError::PipelineRefused(reason))
@@ -3235,6 +3349,7 @@ mod tests {
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
             refine: None,
+            canvas: None,
             display: Some(":0".into()),
             xauthority: Some("/home/artist/.Xauthority".into()),
             execution: Some(UserExecution::new(identity, environment)),
@@ -3286,6 +3401,7 @@ mod tests {
             gpu_import_verified: true,
             wayland_fidelity_args: Vec::new(),
             refine: None,
+            canvas: None,
             ..wayland_config(60, true, ScreenCastCursorMode::Embedded)
         };
         assert!(rated.argv().contains(&"capture-rate=58".to_owned()));
@@ -3302,6 +3418,7 @@ mod tests {
             gpu_import_verified: true,
             wayland_fidelity_args: Vec::new(),
             refine: None,
+            canvas: None,
             ..native_config()
         };
         assert!(!xorg
@@ -3356,6 +3473,7 @@ mod tests {
             bit_depth: BitDepth::Ten,
             wayland_fidelity_args: fidelity.clone(),
             refine: None,
+            canvas: None,
             ..wayland_config(60, false, ScreenCastCursorMode::Embedded)
         };
         let argv = ten_bit.argv();
@@ -3363,12 +3481,14 @@ mod tests {
         let eight_bit = CapencConfig {
             wayland_fidelity_args: fidelity.clone(),
             refine: None,
+            canvas: None,
             ..wayland_config(60, false, ScreenCastCursorMode::Embedded)
         };
         let xorg = CapencConfig {
             bit_depth: BitDepth::Ten,
             wayland_fidelity_args: fidelity,
             refine: None,
+            canvas: None,
             ..native_config()
         };
         for config in [eight_bit, xorg] {

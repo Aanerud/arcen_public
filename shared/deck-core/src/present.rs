@@ -17,11 +17,16 @@
 //! falls back to the egui path (CPU RGBA) and the Deck shows a persistent
 //! warning for a ten-bit contract.
 
+use std::num::NonZeroU32;
 use std::time::Instant;
 
 use arcen_media::VideoConfiguration;
+use arcen_media::canvas::CanvasWork;
 use arcen_media::refine::hub::DeckRefineHub;
+use arcen_media::refine::tile::TileCodes;
 use arcen_media::video::PresentTiming;
+
+use crate::decode::NativeDecodedVideoFrame;
 
 /// The Exact still image identity of a frame (ADR 0016 R2).
 ///
@@ -262,6 +267,85 @@ pub trait RepaintRequester: Send + Sync {
     fn request_repaint(&self);
 }
 
+/// What a sink's canvas executor can hold (ADR 0028). A sink without one
+/// states `None` ([`VideoPresenterSink::CANVAS_EXECUTOR`]); its Deck then
+/// never sends `canvas_v1` ([`crate::canvas::CanvasRequest::for_sink`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasExecutorFacts {
+    /// Largest canvas side in pixels the executor creates (its texture
+    /// limit).
+    pub max_canvas_px: u32,
+}
+
+/// What the Deck decoded for one canvas operation, aligned index for index
+/// with [`CanvasWork::ops`].
+#[derive(Debug, Clone)]
+pub enum CanvasOpInput<N> {
+    /// The operation needs nothing decoded (reset, fill, copy, cache and
+    /// surface lifecycle operations).
+    None,
+    /// A `Tile`'s lossless codes: depth-8 planar R′G′B′ of the tile's
+    /// rectangle ([`crate::canvas::tile_bgra`] writes them as BGRA8).
+    Tile(TileCodes),
+    /// A `SurfacePaint`'s decoded picture; `None` when the access unit
+    /// produced no picture, which paints nothing.
+    Surface(Option<NativeDecodedVideoFrame<N>>),
+}
+
+/// One canvas record's work for a sink's canvas executor.
+#[derive(Debug)]
+pub struct CanvasExecution<'w, 'a, N> {
+    /// The validated operations, in order (the shared state owner,
+    /// `arcen_media::canvas::CanvasState`, already checked every rectangle
+    /// against the canvas).
+    pub work: &'w CanvasWork<'a>,
+    /// What the Deck decoded for each operation.
+    pub inputs: &'w [CanvasOpInput<N>],
+    /// When the media worker received the record.
+    pub arrival: Instant,
+    /// When to show the canvas: the served pipeline's shared timing.
+    pub timing: PresentTiming,
+    /// Whether this is the record's last part. A record whose decoded tiles
+    /// are large reaches the sink in parts, all for the same fence: only
+    /// the last one presents, so the record is shown whole.
+    pub present: bool,
+    /// Read the whole canvas back once this record's writes completed and
+    /// hand it over through [`VideoPresenterSink::take_canvas_readback`]
+    /// (the Deck's canvas digest).
+    pub readback: bool,
+}
+
+/// The result of one [`VideoPresenterSink::execute`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasOutcome {
+    /// Applied to the canvas, and the canvas was handed to the presenter.
+    Presented,
+    /// Applied to the canvas, which is not shown now (hidden, occluded or
+    /// no free drawable); the next present shows it.
+    Applied,
+    /// This sink has no canvas executor. Its Deck never advertises canvas,
+    /// so this answer means the work reached the wrong sink.
+    Unsupported,
+    /// The executor could not apply the work; the canvas is lost and the
+    /// Deck asks the Pier for a reset.
+    Failed(PresenterFailure),
+}
+
+/// A canvas the executor read back ([`CanvasExecution::readback`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasReadback {
+    /// Monitor.
+    pub monitor_id: u16,
+    /// Canvas generation of the record that asked.
+    pub generation: NonZeroU32,
+    /// Fence of the record that asked (0 for a reset).
+    pub fence: u64,
+    /// Bytes per row of `bgra`.
+    pub stride: usize,
+    /// The canvas, opaque BGRA8, top row first.
+    pub bgra: Vec<u8>,
+}
+
 /// A dedicated video presenter, driven by the media worker.
 ///
 /// The sink is shared between the UI thread (attach, resize, visibility,
@@ -306,6 +390,51 @@ pub trait VideoPresenterSink {
     /// Detaches from the window and releases GPU resources. Queued frames
     /// are discarded, never shown late.
     fn teardown(&mut self);
+
+    /// The sink's canvas executor (ADR 0028), or `None` when it has none.
+    /// A sink stating `None` refuses every [`Self::execute`] with
+    /// [`CanvasOutcome::Unsupported`], and its Deck never advertises
+    /// `canvas_v1`: the request is built from this constant
+    /// ([`crate::canvas::CanvasRequest::for_sink`]).
+    const CANVAS_EXECUTOR: Option<CanvasExecutorFacts>;
+
+    /// Applies one canvas record to the monitor's canvas
+    /// (`canvas.work.monitor_id`), then presents the canvas. An eight-bit
+    /// sink with a canvas executor:
+    ///
+    /// 1. keeps one persistent opaque BGRA8 canvas per monitor, created by
+    ///    the work's `Reset` operation at its size (opaque black, cache
+    ///    emptied) and kept across presents, resizes and visibility changes
+    ///    (a canvas the sink lost is a [`CanvasOutcome::Failed`]);
+    /// 2. performs the operations in order, exactly as the CPU executor
+    ///    `arcen_media::canvas::CanvasPixels` does (the oracle its tests
+    ///    compare against): fills, copies as if through a temporary, tiles
+    ///    from [`CanvasOpInput::Tile`], cache stores and paints, and surface
+    ///    paints that write only the listed blocks from
+    ///    [`CanvasOpInput::Surface`] scaled into the destination;
+    /// 3. orders every write before the composite that samples the canvas
+    ///    (the [`RefineFrameTag`] rule, ADR 0016 R2: never a CPU write into
+    ///    a texture a GPU command in flight may read), then, when
+    ///    `canvas.present` is set, presents the canvas with `canvas.timing`
+    ///    (a part without it is applied and returns
+    ///    [`CanvasOutcome::Applied`]);
+    /// 4. applies the work even while the surface is hidden or no drawable
+    ///    is free ([`CanvasOutcome::Applied`]): skipping a record would
+    ///    desynchronise the canvas from the Pier's mirror;
+    /// 5. when `canvas.readback` is set, reads the canvas back after the
+    ///    record's writes completed and returns it through
+    ///    [`Self::take_canvas_readback`].
+    ///
+    /// Surface decoders are the media worker's (one per surface, from the
+    /// Deck's `VideoDecoderFactory`); the sink only samples their pictures.
+    fn execute(&mut self, canvas: &CanvasExecution<'_, '_, Self::NativeFrame>) -> CanvasOutcome;
+
+    /// A canvas read back for an earlier [`CanvasExecution::readback`], at
+    /// most once per request. A sink that cannot read back returns `None`;
+    /// the canvas digest is then not shown.
+    fn take_canvas_readback(&mut self) -> Option<CanvasReadback> {
+        None
+    }
 }
 
 #[cfg(test)]

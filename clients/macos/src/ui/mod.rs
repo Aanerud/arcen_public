@@ -3,6 +3,8 @@
 
 pub mod app;
 pub mod audio_worker;
+#[cfg(target_os = "macos")]
+mod canvas_metal;
 pub mod colour_check;
 pub mod connection_test;
 pub mod display_fit;

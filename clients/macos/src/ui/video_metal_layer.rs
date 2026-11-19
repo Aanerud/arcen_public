@@ -320,6 +320,7 @@ use objc2_quartz_core::{
     CAMetalDrawable, CAMetalLayer, CATransaction,
 };
 
+use super::canvas_metal::{CanvasTarget, MetalCanvasExecutor};
 use super::video_render::{
     presentation_colorspace_for, PresentationColorSpace, ReferenceColorSpace, VideoColorContract,
     VideoUniform,
@@ -630,7 +631,7 @@ pub struct DedicatedLayerFrame {
 /// texture-cache and shader helpers.
 #[derive(Debug, Clone)]
 pub struct DedicatedEightBitLayerFrame {
-    pub pixel_buffer: apple_cf::cv::CVPixelBuffer,
+    pub source: EightBitLayerSource,
     pub contract: VideoColorContract,
     pub arrival_host_time: Duration,
     pub source_fps: Option<u32>,
@@ -638,6 +639,26 @@ pub struct DedicatedEightBitLayerFrame {
     /// (`arcen_media::video::PresentTiming`). Auto presents on arrival and
     /// never tears, Speed presents on arrival with display sync off.
     pub timing: PresentTiming,
+}
+
+/// What the eight-bit layer shows: a decoded picture, or a monitor's canvas
+/// (ADR 0028), which the layer samples as it stands when it renders.
+#[derive(Debug, Clone)]
+pub enum EightBitLayerSource {
+    /// A decoded picture, converted by `fs_convert`.
+    Picture(apple_cf::cv::CVPixelBuffer),
+    /// A canvas, copied texel for texel by `fs_canvas_present`.
+    Canvas(Arc<CanvasTarget>),
+}
+
+impl DedicatedEightBitLayerFrame {
+    /// The decoded picture, when the frame is one.
+    pub(crate) fn pixel_buffer(&self) -> Option<&apple_cf::cv::CVPixelBuffer> {
+        match &self.source {
+            EightBitLayerSource::Picture(picture) => Some(picture),
+            EightBitLayerSource::Canvas(_) => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -712,14 +733,14 @@ pub(crate) fn plane_pixel_formats(depth: arcen_media::BitDepth) -> PlanePixelFor
 /// module doc for exactly why Metal needs that extra field and WGSL does
 /// not.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct MetalVideoUniform {
+pub(crate) struct MetalVideoUniform {
     shared: VideoUniform,
     /// See [`PlanePixelFormatPlan::code_unnormalize_scale`]'s own doc.
     code_unnormalize_scale: f32,
 }
 
 impl MetalVideoUniform {
-    fn from_contract(
+    pub(crate) fn from_contract(
         contract: VideoColorContract,
         luma_size: (u32, u32),
         chroma_size: (u32, u32),
@@ -739,7 +760,7 @@ impl MetalVideoUniform {
     /// for why: MSL, like WGSL, only forces extra alignment on
     /// vector/struct/array *members*, none of which appear in this
     /// uniform).
-    fn to_bytes(self) -> Vec<u8> {
+    pub(crate) fn to_bytes(self) -> Vec<u8> {
         let mut bytes = self.shared.to_bytes().to_vec();
         bytes.extend_from_slice(&self.code_unnormalize_scale.to_le_bytes());
         debug_assert_eq!(bytes.len(), 52);
@@ -791,13 +812,24 @@ fn build_pipeline_state(
 }
 
 /// [`build_pipeline_state`] with a named fragment function: `fs_convert`,
-/// or `fs_convert_refined` (the lossless-refinement composite, ADR 0016,
-/// not yet used by a presenter).
-fn build_pipeline_state_for(
+/// `fs_convert_refined` (the lossless-refinement composite, ADR 0016, not
+/// yet used by a presenter) or `fs_canvas_present` (the eight-bit canvas).
+pub(crate) fn build_pipeline_state_for(
     device: &ProtocolObject<dyn MTLDevice>,
     color_format: MTLPixelFormat,
     fragment: &str,
 ) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>, DedicatedLayerOutcome> {
+    let [pipeline] = build_pipeline_states(device, color_format, [fragment])?;
+    Ok(pipeline)
+}
+
+/// One pipeline per named fragment function (each with `vs_main`), from a
+/// single compilation of `video_metal_layer.metal`.
+pub(crate) fn build_pipeline_states<const N: usize>(
+    device: &ProtocolObject<dyn MTLDevice>,
+    color_format: MTLPixelFormat,
+    fragments: [&str; N],
+) -> Result<[Retained<ProtocolObject<dyn MTLRenderPipelineState>>; N], DedicatedLayerOutcome> {
     let source = NSString::from_str(include_str!("video_metal_layer.metal"));
     let library = device
         .newLibraryWithSource_options_error(&source, None)
@@ -805,21 +837,69 @@ fn build_pipeline_state_for(
     let vertex_function = library
         .newFunctionWithName(&NSString::from_str("vs_main"))
         .ok_or(DedicatedLayerOutcome::ShaderCompilationFailed)?;
-    let fragment_function = library
-        .newFunctionWithName(&NSString::from_str(fragment))
-        .ok_or(DedicatedLayerOutcome::ShaderCompilationFailed)?;
-
-    let descriptor = MTLRenderPipelineDescriptor::new();
-    descriptor.setVertexFunction(Some(&*vertex_function));
-    descriptor.setFragmentFunction(Some(&*fragment_function));
-    // SAFETY: index 0 is always a valid colour-attachment slot; every Metal
-    // device supports at least one.
-    let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-    color_attachment.setPixelFormat(color_format);
-
-    device
-        .newRenderPipelineStateWithDescriptor_error(&descriptor)
+    let mut pipelines = Vec::with_capacity(N);
+    for fragment in fragments {
+        let fragment_function = library
+            .newFunctionWithName(&NSString::from_str(fragment))
+            .ok_or(DedicatedLayerOutcome::ShaderCompilationFailed)?;
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        descriptor.setVertexFunction(Some(&*vertex_function));
+        descriptor.setFragmentFunction(Some(&*fragment_function));
+        // SAFETY: index 0 is always a valid colour-attachment slot; every
+        // Metal device supports at least one.
+        let color_attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        color_attachment.setPixelFormat(color_format);
+        pipelines.push(
+            device
+                .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                .map_err(|_| DedicatedLayerOutcome::PipelineStateCreationFailed)?,
+        );
+    }
+    pipelines
+        .try_into()
         .map_err(|_| DedicatedLayerOutcome::PipelineStateCreationFailed)
+}
+
+/// Wraps plane `plane_index` of an IOSurface-backed `pixel_buffer` as a
+/// Metal texture of `format` through `texture_cache`, without a copy. The
+/// returned `CVBuffer` owns the texture: keep it alive until the GPU has
+/// finished with the raw texture pointer.
+pub(crate) fn create_cv_plane_texture(
+    texture_cache: &apple_cf::cv::CVMetalTextureCache,
+    pixel_buffer: &apple_cf::cv::CVPixelBuffer,
+    format: MTLPixelFormat,
+    width: usize,
+    height: usize,
+    plane_index: usize,
+) -> Option<(apple_cf::cv::CVBuffer, *mut c_void)> {
+    let mut texture_out: apple_cf::raw::CVMetalTextureRef = std::ptr::null_mut();
+    // SAFETY: the texture cache, pixel buffer and out-pointer are live for
+    // the call, and the returned Create-rule object is owned immediately
+    // below.
+    let status = unsafe {
+        apple_cf::raw::CVMetalTextureCacheCreateTextureFromImage(
+            std::ptr::null(),
+            texture_cache.as_ptr().cast(),
+            pixel_buffer.as_ptr().cast(),
+            std::ptr::null(),
+            format.0,
+            width,
+            height,
+            plane_index,
+            &mut texture_out,
+        )
+    };
+    if status != 0 || texture_out.is_null() {
+        return None;
+    }
+    let cv_texture = apple_cf::cv::CVBuffer::from_raw(texture_out.cast())?;
+    // SAFETY: the returned raw texture is +0 and remains valid while
+    // `cv_texture` retains the owning `CVMetalTextureRef`.
+    let raw_texture = unsafe { apple_cf::raw::CVMetalTextureGetTexture(texture_out.cast()) };
+    if raw_texture.is_null() {
+        return None;
+    }
+    Some((cv_texture, raw_texture))
 }
 
 /// The refined conversion pipeline, for the overlay's own tests.
@@ -1735,6 +1815,8 @@ pub struct DedicatedEightBitVideoLayer {
     newest_depth: Arc<Mutex<NewestPresentDepth>>,
     /// Wakes the presenter when a slot frees ([`SlotFreed`]).
     slot_freed: Option<SlotFreed>,
+    /// The canvas present pass, built with the first canvas frame.
+    canvas_pipeline: Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>>,
 }
 
 /// How the eight-bit layer presents under a pipeline's timing. Display
@@ -1838,6 +1920,7 @@ impl DedicatedEightBitVideoLayer {
             timing: PresentTiming::Vsync,
             newest_depth: Arc::new(Mutex::new(NewestPresentDepth::default())),
             slot_freed: None,
+            canvas_pipeline: None,
         })
     }
 
@@ -1912,34 +1995,14 @@ impl DedicatedEightBitVideoLayer {
         height: usize,
         plane_index: usize,
     ) -> Option<(apple_cf::cv::CVBuffer, *mut c_void)> {
-        let mut texture_out: apple_cf::raw::CVMetalTextureRef = std::ptr::null_mut();
-        // SAFETY: same invariants as the 10-bit path above: the texture cache,
-        // pixel buffer and out-pointer are live for the call, and the returned
-        // Create-rule object is owned immediately below.
-        let status = unsafe {
-            apple_cf::raw::CVMetalTextureCacheCreateTextureFromImage(
-                std::ptr::null(),
-                self.texture_cache.as_ptr().cast(),
-                pixel_buffer.as_ptr().cast(),
-                std::ptr::null(),
-                format.0,
-                width,
-                height,
-                plane_index,
-                &mut texture_out,
-            )
-        };
-        if status != 0 || texture_out.is_null() {
-            return None;
-        }
-        let cv_texture = apple_cf::cv::CVBuffer::from_raw(texture_out.cast())?;
-        // SAFETY: the returned raw texture is +0 and remains valid while
-        // `cv_texture` retains the owning `CVMetalTextureRef`.
-        let raw_texture = unsafe { apple_cf::raw::CVMetalTextureGetTexture(texture_out.cast()) };
-        if raw_texture.is_null() {
-            return None;
-        }
-        Some((cv_texture, raw_texture))
+        create_cv_plane_texture(
+            &self.texture_cache,
+            pixel_buffer,
+            format,
+            width,
+            height,
+            plane_index,
+        )
     }
 
     fn render_at(
@@ -1990,9 +2053,30 @@ impl DedicatedEightBitVideoLayer {
         telemetry: Arc<DedicatedPresenterTelemetry>,
         submitted_alone: bool,
     ) -> Result<(), DedicatedLayerOutcome> {
+        let submission = EightBitSubmission {
+            in_flight,
+            target_host_time,
+            refresh_period,
+            telemetry,
+            submitted_alone,
+            arrival_host_time: frame.arrival_host_time,
+        };
+        match &frame.source {
+            EightBitLayerSource::Picture(pixel_buffer) => {
+                self.render_picture(frame, pixel_buffer, submission)
+            }
+            EightBitLayerSource::Canvas(canvas) => self.render_canvas(canvas, submission),
+        }
+    }
+
+    fn render_picture(
+        &mut self,
+        frame: &DedicatedEightBitLayerFrame,
+        pixel_buffer: &apple_cf::cv::CVPixelBuffer,
+        submission: EightBitSubmission,
+    ) -> Result<(), DedicatedLayerOutcome> {
         self.ensure_colorspace(frame.contract.primaries, frame.contract.transfer);
         let plan = plane_pixel_formats(frame.contract.depth);
-        let pixel_buffer = &frame.pixel_buffer;
         if pixel_buffer.plane_count() != 2 {
             return Err(DedicatedLayerOutcome::PlaneTextureCreationFailed);
         }
@@ -2020,15 +2104,8 @@ impl DedicatedEightBitVideoLayer {
         ) else {
             return Err(DedicatedLayerOutcome::PlaneTextureCreationFailed);
         };
-        let Some(drawable) = self.layer.nextDrawable() else {
-            return Err(DedicatedLayerOutcome::NoDrawableAvailable);
-        };
+        let drawable = self.next_bgra8_drawable()?;
         let drawable_texture = drawable.texture();
-        if self.layer.pixelFormat() != MTLPixelFormat::BGRA8Unorm
-            || drawable_texture.pixelFormat() != MTLPixelFormat::BGRA8Unorm
-        {
-            return Err(DedicatedLayerOutcome::PixelFormatMismatch);
-        }
 
         let uniform = MetalVideoUniform::from_contract(
             frame.contract,
@@ -2048,26 +2125,12 @@ impl DedicatedEightBitVideoLayer {
         }
         .ok_or(DedicatedLayerOutcome::UniformBufferCreationFailed)?;
 
-        let render_pass = MTLRenderPassDescriptor::renderPassDescriptor();
-        // SAFETY: colour attachment 0 is valid on every render pass.
-        let color_attachment =
-            unsafe { render_pass.colorAttachments().objectAtIndexedSubscript(0) };
-        color_attachment.setTexture(Some(&*drawable_texture));
-        color_attachment.setLoadAction(MTLLoadAction::Clear);
-        color_attachment.setStoreAction(MTLStoreAction::Store);
-        color_attachment.setClearColor(MTLClearColor {
-            red: 0.0,
-            green: 0.0,
-            blue: 0.0,
-            alpha: 1.0,
-        });
-
         let command_buffer = self
             .command_queue
             .commandBuffer()
             .ok_or(DedicatedLayerOutcome::CommandBufferCreationFailed)?;
         let encoder = command_buffer
-            .renderCommandEncoderWithDescriptor(&render_pass)
+            .renderCommandEncoderWithDescriptor(&drawable_pass(&drawable_texture))
             .ok_or(DedicatedLayerOutcome::RenderEncoderCreationFailed)?;
         encoder.setRenderPipelineState(&self.pipeline_state);
         // SAFETY: the raw texture pointers are valid while `_luma_cv` and
@@ -2084,13 +2147,120 @@ impl DedicatedEightBitVideoLayer {
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
         encoder.endEncoding();
+        let retained_frame = EightBitInFlightFrame {
+            _pixel_buffer: pixel_buffer.clone(),
+            _luma_cv: luma_cv,
+            _chroma_cv: chroma_cv,
+            _uniform_buffer: uniform_buffer,
+        };
+        self.submit_drawable(&command_buffer, &drawable, submission, retained_frame);
+        command_buffer.commit();
+        Ok(())
+    }
+
+    /// Presents a monitor's canvas (ADR 0028): a texel-for-texel copy into a
+    /// drawable of the canvas's size, encoded on the canvas's queue while
+    /// no canvas write can be committed, so the drawable shows exactly the
+    /// whole records committed before it.
+    fn render_canvas(
+        &mut self,
+        canvas: &Arc<CanvasTarget>,
+        submission: EightBitSubmission,
+    ) -> Result<(), DedicatedLayerOutcome> {
+        if canvas.is_lost() {
+            return Err(DedicatedLayerOutcome::NoDrawableAvailable);
+        }
+        if canvas.device_id() != self.device.registryID() {
+            return Err(DedicatedLayerOutcome::PixelFormatMismatch);
+        }
+        if self.canvas_pipeline.is_none() {
+            self.canvas_pipeline = Some(build_pipeline_state_for(
+                &self.device,
+                MTLPixelFormat::BGRA8Unorm,
+                "fs_canvas_present",
+            )?);
+        }
+        let pipeline = self.canvas_pipeline.clone().expect("built above");
+        // The canvas holds the desktop's own sRGB-coded values (ADR 0028).
+        self.ensure_colorspace(
+            arcen_media::ColorPrimaries::Bt709,
+            arcen_media::TransferCharacteristics::Srgb,
+        );
+        sync_source_drawable_and_scaling(
+            &self.layer,
+            source_drawable_size(canvas.width() as usize, canvas.height() as usize),
+            &mut self.applied_scaling,
+        );
+        let drawable = self.next_bgra8_drawable()?;
+        let drawable_texture = drawable.texture();
+        let retained = Arc::clone(canvas);
+        canvas
+            .with_whole_canvas(|queue, texture| {
+                let command_buffer = queue
+                    .commandBuffer()
+                    .ok_or(DedicatedLayerOutcome::CommandBufferCreationFailed)?;
+                let encoder = command_buffer
+                    .renderCommandEncoderWithDescriptor(&drawable_pass(&drawable_texture))
+                    .ok_or(DedicatedLayerOutcome::RenderEncoderCreationFailed)?;
+                encoder.setRenderPipelineState(&pipeline);
+                // SAFETY: the encoder is live; index 0 is
+                // `fs_canvas_present`'s canvas binding.
+                unsafe {
+                    encoder.setFragmentTexture_atIndex(Some(texture), 0);
+                    encoder.drawPrimitives_vertexStart_vertexCount(
+                        MTLPrimitiveType::Triangle,
+                        0,
+                        3,
+                    );
+                }
+                encoder.endEncoding();
+                self.submit_drawable(&command_buffer, &drawable, submission, retained);
+                command_buffer.commit();
+                Ok(())
+            })
+            // A record's parts are still arriving: its last part presents.
+            .unwrap_or(Err(DedicatedLayerOutcome::NoDrawableAvailable))
+    }
+
+    fn next_bgra8_drawable(
+        &self,
+    ) -> Result<Retained<ProtocolObject<dyn CAMetalDrawable>>, DedicatedLayerOutcome> {
+        let Some(drawable) = self.layer.nextDrawable() else {
+            return Err(DedicatedLayerOutcome::NoDrawableAvailable);
+        };
+        if self.layer.pixelFormat() != MTLPixelFormat::BGRA8Unorm
+            || drawable.texture().pixelFormat() != MTLPixelFormat::BGRA8Unorm
+        {
+            return Err(DedicatedLayerOutcome::PixelFormatMismatch);
+        }
+        Ok(drawable)
+    }
+
+    /// Schedules `drawable`'s present on `command_buffer` with the layer's
+    /// timing, records the submission, installs the presented handler and
+    /// keeps `retained` alive until the GPU completed. The caller commits.
+    fn submit_drawable<T: Send + 'static>(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        drawable: &ProtocolObject<dyn CAMetalDrawable>,
+        submission: EightBitSubmission,
+        retained: T,
+    ) {
+        let EightBitSubmission {
+            in_flight,
+            target_host_time,
+            refresh_period,
+            telemetry,
+            submitted_alone,
+            arrival_host_time,
+        } = submission;
         let drawable_for_present: &ProtocolObject<dyn MTLDrawable> =
-            ProtocolObject::from_ref(&*drawable);
+            ProtocolObject::from_ref(drawable);
         command_buffer.presentDrawable_afterMinimumDuration(
             drawable_for_present,
             present_minimum_duration_s(refresh_period),
         );
-        telemetry.record_submitted(target_host_time, frame.arrival_host_time, refresh_period);
+        telemetry.record_submitted(target_host_time, arrival_host_time, refresh_period);
         let measure =
             (submitted_alone && self.timing == PresentTiming::Newest).then(|| DepthMeasure {
                 depth: Arc::clone(&self.newest_depth),
@@ -2100,27 +2270,18 @@ impl DedicatedEightBitVideoLayer {
         install_presented_handler(
             drawable_for_present,
             telemetry,
-            Arc::clone(&in_flight),
-            frame.arrival_host_time,
+            in_flight,
+            arrival_host_time,
             target_host_time,
             PresentedFollowUp {
                 measure,
                 slot_freed: self.slot_freed.clone(),
             },
         );
-        let retained_frame = EightBitInFlightFrame {
-            _pixel_buffer: pixel_buffer.clone(),
-            _luma_cv: luma_cv,
-            _chroma_cv: chroma_cv,
-            _uniform_buffer: uniform_buffer,
-        };
-        let retained_frame = Arc::new(Mutex::new(Some(retained_frame)));
+        let retained = Arc::new(Mutex::new(Some(retained)));
         let completion = RcBlock::new(
             move |_buffer: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                retained_frame
-                    .lock()
-                    .expect("retained frame poisoned")
-                    .take();
+                retained.lock().expect("retained frame poisoned").take();
             },
         );
         // SAFETY: `completion` is a valid heap block for this call. Metal
@@ -2130,9 +2291,34 @@ impl DedicatedEightBitVideoLayer {
         unsafe {
             command_buffer.addCompletedHandler(RcBlock::as_ptr(&completion).cast());
         }
-        command_buffer.commit();
-        Ok(())
     }
+}
+
+/// What one eight-bit submission records once its drawable is scheduled.
+struct EightBitSubmission {
+    in_flight: Arc<Mutex<LayerInFlightGate>>,
+    target_host_time: Duration,
+    refresh_period: Duration,
+    telemetry: Arc<DedicatedPresenterTelemetry>,
+    submitted_alone: bool,
+    arrival_host_time: Duration,
+}
+
+/// A render pass that clears `texture` to opaque black and stores it.
+fn drawable_pass(texture: &ProtocolObject<dyn MTLTexture>) -> Retained<MTLRenderPassDescriptor> {
+    let render_pass = MTLRenderPassDescriptor::renderPassDescriptor();
+    // SAFETY: colour attachment 0 is valid on every render pass.
+    let color_attachment = unsafe { render_pass.colorAttachments().objectAtIndexedSubscript(0) };
+    color_attachment.setTexture(Some(texture));
+    color_attachment.setLoadAction(MTLLoadAction::Clear);
+    color_attachment.setStoreAction(MTLStoreAction::Store);
+    color_attachment.setClearColor(MTLClearColor {
+        red: 0.0,
+        green: 0.0,
+        blue: 0.0,
+        alpha: 1.0,
+    });
+    render_pass
 }
 
 impl Drop for DedicatedEightBitVideoLayer {
@@ -2153,6 +2339,13 @@ pub struct DedicatedEightBitVideoPresenter {
     /// What the last "dedicated video presenter window state" line said, so
     /// the per-egui-pass sync logs a change once instead of every pass.
     logged_window_state: Option<WindowStateKey>,
+    /// The canvas executor (ADR 0028). Its canvases belong to the
+    /// connection, not to the layer: they survive the layer's teardown and
+    /// re-attachment, and are released by [`Self::release_canvas`].
+    canvas: MetalCanvasExecutor,
+    /// The canvas frame shown last, presented again when a layer is
+    /// installed (a still desktop sends no new record).
+    canvas_shown: Option<DedicatedEightBitLayerFrame>,
 }
 
 // SAFETY: all cross-thread rendering is guarded by the presenter's external
@@ -3699,6 +3892,9 @@ impl DedicatedEightBitVideoPresenter {
                 Ok(layer) => {
                     self.thread
                         .install_layer(layer, self.surface_visible, geometry, display_id);
+                    if let Some(frame) = self.canvas_shown.clone() {
+                        self.show_canvas_frame(frame);
+                    }
                     DedicatedLayerOutcome::Ready
                 }
                 Err(outcome) => outcome,
@@ -3714,6 +3910,9 @@ impl DedicatedEightBitVideoPresenter {
         &mut self,
         frame: &DedicatedEightBitLayerFrame,
     ) -> DedicatedEightBitPresentationStatus {
+        if frame.pixel_buffer().is_some() {
+            self.canvas_shown = None;
+        }
         if !self.surface_visible {
             let _ = self
                 .thread
@@ -3732,6 +3931,70 @@ impl DedicatedEightBitVideoPresenter {
             return self.presentation_status;
         }
         self.record_outcome(outcome)
+    }
+
+    /// Applies one canvas record part to its monitor's canvas (ADR 0028),
+    /// then, for a record's last part, presents the canvas. The work is
+    /// applied whether or not a layer is attached or visible: skipping it
+    /// would desynchronise the canvas from the Pier's mirror.
+    pub(crate) fn execute_canvas(
+        &mut self,
+        execution: &arcen_deck_core::present::CanvasExecution<'_, '_, apple_cf::cv::CVPixelBuffer>,
+    ) -> arcen_deck_core::present::CanvasOutcome {
+        use arcen_deck_core::present::CanvasOutcome;
+        let canvas = match self.canvas.execute(execution) {
+            Ok(canvas) => canvas,
+            Err(failure) => return CanvasOutcome::Failed(failure),
+        };
+        if !execution.present {
+            return CanvasOutcome::Applied;
+        }
+        let arrival_host_time = current_host_time().saturating_sub(execution.arrival.elapsed());
+        let frame = DedicatedEightBitLayerFrame {
+            source: EightBitLayerSource::Canvas(canvas),
+            contract: VideoColorContract {
+                chroma: arcen_media::ChromaSubsampling::Yuv444,
+                range: arcen_media::ColorRange::Full,
+                depth: arcen_media::BitDepth::Eight,
+                matrix: arcen_media::ColorMatrix::Identity,
+                primaries: arcen_media::ColorPrimaries::Bt709,
+                transfer: arcen_media::TransferCharacteristics::Srgb,
+            },
+            arrival_host_time,
+            source_fps: None,
+            timing: execution.timing,
+        };
+        self.canvas_shown = Some(frame.clone());
+        if self.show_canvas_frame(frame) {
+            CanvasOutcome::Presented
+        } else {
+            CanvasOutcome::Applied
+        }
+    }
+
+    /// Hands a canvas frame to the layer, or keeps it for when the surface
+    /// is shown again. `false` when it is not shown now.
+    fn show_canvas_frame(&mut self, frame: DedicatedEightBitLayerFrame) -> bool {
+        let arrival = frame.arrival_host_time;
+        if !self.surface_visible {
+            let _ = self.thread.retain_latest_while_hidden(frame, arrival);
+            self.thread.telemetry.skips.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.thread.submit(frame, arrival)
+    }
+
+    /// A canvas read back for an earlier execution.
+    pub(crate) fn take_canvas_readback(
+        &mut self,
+    ) -> Option<arcen_deck_core::present::CanvasReadback> {
+        self.canvas.take_readback()
+    }
+
+    /// Releases every canvas (the connection ended, or a new one starts).
+    pub(crate) fn release_canvas(&mut self) {
+        self.canvas.release();
+        self.canvas_shown = None;
     }
 
     pub(crate) fn set_surface_visible(&mut self, visible: bool) {

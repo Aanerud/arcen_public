@@ -157,18 +157,16 @@ pub struct MacOsDesktopConfig {
     pub deskside: MacOsDesksideConfig,
 }
 
-/// `platform.desktop.deskside`: the desk kept private while a Deck is
-/// attached to a signed-in user's session (`desk_privacy`), the Windows
-/// host's switch of the same name. Off unless set. Nothing to pin: macOS
-/// names no input device to an event filter, and both controls end with the
-/// process.
+/// `platform.desktop.deskside`: superseded by the common `privacy.desk`,
+/// which is on unless turned off. Still accepted so an existing
+/// configuration loads: `true` is what every Pier does now (and contradicts
+/// `privacy.desk = "off"`); `false`, which the 0.20 package wrote as the
+/// default, no longer turns desk privacy off (logged at start).
 #[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MacOsDesksideConfig {
-    /// Darken the desk's displays and drop its input while a Deck is
-    /// attached; a session that cannot be made private is refused
-    /// `console_privacy_unavailable`.
-    pub enabled: bool,
+    /// The superseded switch, as written.
+    pub enabled: Option<bool>,
 }
 
 /// How keyboard input reaches a logged-in desktop.
@@ -263,11 +261,6 @@ impl MacOsPlatformConfig {
         }
         if self.service_user.as_deref().is_some_and(str::is_empty) {
             return Err("service_user must not be empty");
-        }
-        if self.desktop.deskside.enabled && self.input_backend == InputBackendChoice::VirtualHid {
-            return Err(
-                "platform.desktop.deskside cannot tell a virtual HID keyboard from the desk's: use input_backend auto or coregraphics",
-            );
         }
         Ok(())
     }
@@ -391,6 +384,7 @@ pub fn default_config() -> PierFileConfig {
         logging: arcen_session::pier_config::LoggingConfig::default(),
         wayland: arcen_session::pier_config::WaylandConfig::default(),
         usb: arcen_session::pier_config::UsbConfig::default(),
+        privacy: arcen_session::pier_config::PrivacyConfig::default(),
         platform: MacOsPlatformConfig::default(),
     }
 }
@@ -470,7 +464,55 @@ pub fn parse_config(bytes: &[u8], path: &Path) -> Result<PierFileConfig, ConfigE
                 message,
             })?;
     }
+    validate_desk_privacy(&config).map_err(|message| ConfigError::Platform {
+        path: path.to_path_buf(),
+        message,
+    })?;
     Ok(config)
+}
+
+/// Contradictions in what the administrator wrote about desk privacy. A
+/// virtual HID keyboard with desk privacy left at its default is not one: the
+/// Pier starts, says so, and refuses each signed-in session
+/// (`console_privacy_unavailable`) rather than show it unprotected.
+fn validate_desk_privacy(config: &PierFileConfig) -> Result<(), &'static str> {
+    use arcen_session::console_session::desk_privacy::DeskPrivacySetting;
+    let legacy = config.platform.desktop.deskside.enabled;
+    match (config.privacy.desk, legacy) {
+        (Some(DeskPrivacySetting::Off), Some(true)) => Err(
+            "platform.desktop.deskside.enabled = true contradicts privacy.desk = \"off\": remove platform.desktop.deskside",
+        ),
+        (Some(DeskPrivacySetting::On), _) | (None, Some(true))
+            if config.platform.input_backend == InputBackendChoice::VirtualHid =>
+        {
+            Err(
+                "desk privacy cannot tell a virtual HID keyboard from the desk's: use input_backend auto or coregraphics, or privacy.desk = \"off\"",
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+/// What the Pier logs at start about desk privacy: the effective choice, a
+/// superseded switch it no longer reads, and a desk it cannot make private.
+#[must_use]
+pub fn desk_privacy_startup_notes(config: &PierFileConfig) -> (bool, Vec<&'static str>) {
+    let policy = config.privacy.desk_policy();
+    let mut notes = vec![policy.startup_line()];
+    if config.platform.desktop.deskside.enabled == Some(false) && config.privacy.desk.is_none() {
+        notes.push(
+            "platform.desktop.deskside.enabled = false is superseded and no longer turns desk \
+             privacy off; set privacy.desk = \"off\" to turn it off",
+        );
+    }
+    if policy.enabled && config.platform.input_backend == InputBackendChoice::VirtualHid {
+        notes.push(
+            "input_backend virtual_hid: the desk cannot be made private, so every signed-in \
+             session is refused (console_privacy_unavailable); use input_backend auto or \
+             coregraphics, or privacy.desk = \"off\"",
+        );
+    }
+    (policy.enabled, notes)
 }
 
 /// Returns the validated host-authoritative clipboard policy.
@@ -803,27 +845,69 @@ mod tests {
     }
 
     #[test]
-    fn desk_privacy_is_off_unless_set_and_refuses_a_virtual_hid_keyboard() {
+    fn desk_privacy_is_on_unless_turned_off_and_refuses_a_virtual_hid_keyboard() {
         let path = std::path::Path::new("/tmp/arcen-deskside.json");
-        let parse = |platform: &str| {
+        let parse = |privacy: &str, platform: &str| {
             parse_config(
                 format!(
-                    r#"{{"audio":{{"enabled":false,"compressed":true}},"microphone_input":{{"enabled":false}},"platform":{platform}}}"#
+                    r#"{{"audio":{{"enabled":false,"compressed":true}},"microphone_input":{{"enabled":false}},{privacy}"platform":{platform}}}"#
                 )
                 .as_bytes(),
                 path,
             )
         };
-        let off = parse("{}").expect("parses");
-        assert!(!off.platform.desktop.deskside.enabled);
-        let on = parse(r#"{"desktop":{"deskside":{"enabled":true}}}"#).expect("parses");
-        assert!(on.platform.desktop.deskside.enabled);
-        let refused =
-            parse(r#"{"input_backend":"virtual_hid","desktop":{"deskside":{"enabled":true}}}"#)
-                .expect_err("a virtual HID keyboard cannot be told from the desk's");
-        assert!(refused.to_string().contains("deskside"), "{refused}");
+        let default = parse("", "{}").expect("parses");
+        assert!(default.privacy.desk_policy().enabled);
+        assert!(crate::session::SessionPolicy::default().desk_privacy);
+        // The 0.20 package's `false` no longer turns it off, and says so.
+        let legacy_off =
+            parse("", r#"{"desktop":{"deskside":{"enabled":false}}}"#).expect("parses");
+        assert!(legacy_off.privacy.desk_policy().enabled);
+        let (enabled, notes) = desk_privacy_startup_notes(&legacy_off);
+        assert!(enabled);
         assert!(
-            parse(r#"{"desktop":{"deskside":{"enabled":true,"monitors":[]}}}"#).is_err(),
+            notes.iter().any(|note| note.contains("superseded")),
+            "{notes:?}"
+        );
+        let off = parse(r#""privacy":{"desk":"off"},"#, "{}").expect("parses");
+        assert!(!off.privacy.desk_policy().enabled);
+        assert!(desk_privacy_startup_notes(&off).1[0].contains("OFF"));
+        assert!(
+            parse(
+                r#""privacy":{"desk":"off"},"#,
+                r#"{"desktop":{"deskside":{"enabled":true}}}"#
+            )
+            .is_err(),
+            "a contradiction is refused, not resolved silently"
+        );
+        // A virtual HID keyboard: refused at load when privacy was asked for
+        // explicitly, refused per session (and said at start) by default.
+        let refused = parse(
+            r#""privacy":{"desk":"on"},"#,
+            r#"{"input_backend":"virtual_hid"}"#,
+        )
+        .expect_err("a virtual HID keyboard cannot be told from the desk's");
+        assert!(refused.to_string().contains("virtual HID"), "{refused}");
+        let default_hid = parse("", r#"{"input_backend":"virtual_hid"}"#).expect("parses");
+        assert!(
+            desk_privacy_startup_notes(&default_hid)
+                .1
+                .iter()
+                .any(|note| note.contains("console_privacy_unavailable"))
+        );
+        assert!(
+            parse(
+                r#""privacy":{"desk":"off"},"#,
+                r#"{"input_backend":"virtual_hid"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            parse(
+                "",
+                r#"{"desktop":{"deskside":{"enabled":true,"monitors":[]}}}"#
+            )
+            .is_err(),
             "Windows-only pins are not silently accepted"
         );
     }

@@ -13,7 +13,8 @@ use openh264::encoder::{
 };
 use openh264::formats::YUVSlices;
 use openh264_sys2::{
-    ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo,
+    ENCODER_OPTION_BITRATE, ENCODER_OPTION_FRAME_RATE, ENCODER_OPTION_MAX_BITRATE,
+    ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, SBitrateInfo, SEncParamExt, SM_FIXEDSLCNUM_SLICE,
     SPATIAL_LAYER_0,
 };
 
@@ -24,9 +25,18 @@ use super::{I420Frame, KeyframePolicy};
 /// Hard cap for one software H.264 Annex-B access unit.
 pub const MAX_SOFTWARE_H264_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PARAMETER_SET_BYTES: usize = 64 * 1024;
-const MAX_SOFTWARE_WIDTH: u32 = 1920;
-const MAX_SOFTWARE_HEIGHT: u32 = 1200;
-const MAX_SOFTWARE_FPS: u32 = 30;
+/// `OpenH264`'s own picture ceiling: 3840x2160 in either orientation (its
+/// README, enforced again by the `openh264` crate). The Software pipeline
+/// contract is narrower and is held by [`super::SoftwareH264Session`].
+const OPENH264_MAX_LONG_EDGE: u32 = 3840;
+const OPENH264_MAX_SHORT_EDGE: u32 = 2160;
+/// The highest frame rate this wrapper configures `OpenH264` for.
+pub const MAX_SOFTWARE_H264_FPS: u32 = 60;
+/// The most slices `OpenH264` encodes in parallel: its worker pool is capped
+/// at `MAX_THREADS_NUM` (4, `codec/encoder/core/inc/wels_const.h`), and a
+/// thread only ever encodes whole slices, so more slices would only cost
+/// coding efficiency.
+pub const MAX_SOFTWARE_H264_THREADS: u16 = 4;
 const OPENH264_I32_MAX: usize = 2_147_483_647;
 
 /// Validated `OpenH264` stream configuration.
@@ -36,6 +46,10 @@ pub struct SoftwareH264Config {
     pub height: u32,
     pub fps: u32,
     pub bitrate_bps: u32,
+    /// Worker threads offered to `OpenH264`, 1 to 64. Each picture is cut
+    /// into `min(num_threads, MAX_SOFTWARE_H264_THREADS)` fixed slices that
+    /// are encoded in parallel; one thread keeps the single-slice stream.
+    /// [`SoftwareH264Encoder::threading`] reports what `OpenH264` applied.
     pub num_threads: u16,
     /// Coded sample range this stream's VUI must state truthfully. Silently
     /// tagging full-range samples as limited (or vice versa) is the class of
@@ -56,6 +70,19 @@ pub struct SoftwareH264Config {
     pub transfer: TransferCharacteristics,
     /// Shared pipeline keyframe policy consumed by the native `OpenH264` GOP.
     pub keyframe: KeyframePolicy,
+    /// What the pictures show, which picks `OpenH264`'s usage mode.
+    pub content: SoftwareH264Content,
+}
+
+/// What a software stream's pictures show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SoftwareH264Content {
+    /// A desktop (text and UI): `OpenH264`'s screen-content mode.
+    #[default]
+    Screen,
+    /// Motion only (a canvas surface: Keel sends text as tiles), which
+    /// `OpenH264`'s camera mode encodes for less CPU.
+    Motion,
 }
 
 impl SoftwareH264Config {
@@ -85,6 +112,7 @@ impl SoftwareH264Config {
             primaries: ColorPrimaries::Bt709,
             transfer: TransferCharacteristics::Bt709,
             keyframe: KeyframePolicy::SOFTWARE_FALLBACK,
+            content: SoftwareH264Content::Screen,
         }
     }
 }
@@ -271,7 +299,30 @@ pub struct SoftwareH264Encoder {
     parameter_sets: Vec<u8>,
     force_pending: bool,
     native_initialized: bool,
+    threading: SoftwareH264Threading,
     stats: SoftwareH264Stats,
+}
+
+/// The slices and worker threads `OpenH264` encodes each picture with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftwareH264Threading {
+    /// Slices per picture (fixed count, row-aligned by `OpenH264`).
+    pub slices: u16,
+    /// Worker threads `OpenH264` runs, at most one per slice.
+    pub threads: u16,
+}
+
+impl SoftwareH264Threading {
+    const SINGLE: Self = Self {
+        slices: 1,
+        threads: 1,
+    };
+
+    /// The slice (and thread) count `num_threads` asks for.
+    #[must_use]
+    pub fn requested(num_threads: u16) -> u16 {
+        num_threads.clamp(1, MAX_SOFTWARE_H264_THREADS)
+    }
 }
 
 impl std::fmt::Debug for SoftwareH264Encoder {
@@ -279,31 +330,56 @@ impl std::fmt::Debug for SoftwareH264Encoder {
         formatter
             .debug_struct("SoftwareH264Encoder")
             .field("config", &self.config)
+            .field("threading", &self.threading)
             .field("stats", &self.stats)
             .finish_non_exhaustive()
     }
 }
 
 impl SoftwareH264Encoder {
-    /// Construct the Baseline, screen-content, bitrate-controlled encoder.
+    /// Construct the Baseline, bitrate-controlled encoder.
+    ///
+    /// With more than one thread the native encoder is opened here, not on
+    /// the first frame: see [`Self::enable_slice_threads`].
     ///
     /// # Errors
     ///
-    /// Rejects geometry above 1920x1200p30, odd dimensions, zero bitrate, excessive
-    /// thread counts, or native initialization failure. Also rejects
-    /// [`ColorPrimaries::DisplayP3`] with
+    /// Rejects geometry above `OpenH264`'s 3840x2160 (either orientation),
+    /// frame rates above [`MAX_SOFTWARE_H264_FPS`], odd dimensions, zero
+    /// bitrate, excessive thread counts, or native initialization failure.
+    /// Also rejects [`ColorPrimaries::DisplayP3`] with
     /// [`SoftwareH264Error::UnsupportedColorPrimaries`], since `openh264`
     /// cannot signal it in the VUI — see [`build_vui`].
-    #[allow(clippy::cast_precision_loss)]
     pub fn new(config: SoftwareH264Config) -> Result<Self, SoftwareH264Error> {
+        let mut encoder = Self::single_slice(config)?;
+        let slices = SoftwareH264Threading::requested(config.num_threads);
+        if slices > 1
+            && !(encoder.enable_slice_threads(slices).is_ok() && encoder.threading.slices > 1)
+        {
+            // `OpenH264` refused or collapsed the slice layout for this
+            // picture (too few macroblocks, or rows for its rate control):
+            // serve the untouched single-slice encoder instead of one that
+            // has already encoded the opening picture.
+            encoder = Self::single_slice(config)?;
+        }
+        Ok(encoder)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn single_slice(config: SoftwareH264Config) -> Result<Self, SoftwareH264Error> {
+        let (long_edge, short_edge) = if config.width >= config.height {
+            (config.width, config.height)
+        } else {
+            (config.height, config.width)
+        };
         if config.width == 0
             || config.height == 0
             || config.width % 2 != 0
             || config.height % 2 != 0
-            || config.width > MAX_SOFTWARE_WIDTH
-            || config.height > MAX_SOFTWARE_HEIGHT
+            || long_edge > OPENH264_MAX_LONG_EDGE
+            || short_edge > OPENH264_MAX_SHORT_EDGE
             || config.fps == 0
-            || config.fps > MAX_SOFTWARE_FPS
+            || config.fps > MAX_SOFTWARE_H264_FPS
             || config.bitrate_bps == 0
             || config.num_threads == 0
             || config.num_threads > 64
@@ -316,18 +392,29 @@ impl SoftwareH264Encoder {
             config.primaries,
             config.transfer,
         )?;
+        // The crate always opens a single slice; `enable_slice_threads`
+        // moves the opened encoder to fixed slices.
         let native = EncoderConfig::new()
             .profile(Profile::Baseline)
-            .usage_type(UsageType::ScreenContentRealTime)
+            .usage_type(match config.content {
+                SoftwareH264Content::Screen => UsageType::ScreenContentRealTime,
+                SoftwareH264Content::Motion => UsageType::CameraVideoRealTime,
+            })
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(config.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(config.fps as f32))
             .intra_frame_period(IntraFramePeriod::from_num_frames(
                 config.keyframe.scheduled_period_frames(config.fps),
             ))
-            .num_threads(config.num_threads)
+            .num_threads(1)
             .adaptive_quantization(false)
             .background_detection(false)
+            // Never drop a picture to pay for bits: OpenH264's frame skip
+            // froze full-motion 1080p at 2 fps and every keyframe for about
+            // nine pictures. Rate control holds the bitrate through QP; the
+            // shared controller and the host's frame-rate governor own the
+            // rest, as they do for the hardware encoders.
+            .skip_frames(false)
             .vui(vui);
         let inner = Encoder::with_api_config(OpenH264API::from_source(), native)
             .map_err(SoftwareH264Error::Native)?;
@@ -338,8 +425,104 @@ impl SoftwareH264Encoder {
             parameter_sets: Vec::new(),
             force_pending: true,
             native_initialized: false,
+            threading: SoftwareH264Threading::SINGLE,
             stats: SoftwareH264Stats::default(),
         })
+    }
+
+    /// Opens the native encoder and moves it to `slices` fixed slices, each
+    /// encoded on its own `OpenH264` worker thread.
+    ///
+    /// The `openh264` 0.9.7 crate hard-codes `SM_SINGLE_SLICE`, and
+    /// `OpenH264` clamps its worker threads to the slice count, so the crate
+    /// alone always encodes on one thread. The crate opens the native
+    /// encoder lazily inside its first `encode`; this encodes one discarded
+    /// black picture to open it, reads the effective parameters back, and
+    /// re-applies them with fixed slices. `OpenH264` treats a changed thread
+    /// count as a full reset (`WelsEncoderParamAdjust`): a fresh context,
+    /// fresh rate control, and an IDR with new parameter sets as the first
+    /// picture the caller encodes. Nothing of the discarded picture reaches
+    /// the stream. Deblocking across slice edges is turned off by `OpenH264`
+    /// itself whenever slices are threaded.
+    fn enable_slice_threads(&mut self, slices: u16) -> Result<(), SoftwareH264Error> {
+        let width = self.config.width as usize;
+        let height = self.config.height as usize;
+        let luma = width
+            .checked_mul(height)
+            .ok_or(SoftwareH264Error::InvalidConfig)?;
+        let mut planes = Vec::new();
+        planes
+            .try_reserve_exact(luma + luma / 2)
+            .map_err(|_| SoftwareH264Error::OutputAllocation)?;
+        planes.resize(luma, 16);
+        planes.resize(luma + luma / 2, 128);
+        let (y, chroma) = planes.split_at(luma);
+        let (u, v) = chroma.split_at(luma / 4);
+        let yuv = YUVSlices::new((y, u, v), (width, height), (width, width / 2, width / 2));
+        self.inner.encode(&yuv).map_err(SoftwareH264Error::Native)?;
+        self.native_initialized = true;
+
+        let mut params = self.native_params()?;
+        params.iMultipleThreadIdc = slices;
+        let layer = &mut params.sSpatialLayers[0];
+        layer.sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
+        layer.sSliceArgument.uiSliceNum = u32::from(slices);
+        layer.sSliceArgument.uiSliceMbNum.fill(0);
+        layer.sSliceArgument.uiSliceSizeConstraint = 0;
+        // SAFETY: the native encoder context exists (the encode above
+        // opened it) and `&mut self` excludes concurrent native access.
+        // `params` is the `#[repr(C)]` `SEncParamExt` `OpenH264` documents
+        // for this option, read back from the same encoder and changed only
+        // in its slice layout and thread count; `OpenH264` copies it before
+        // returning. A refused layout is rejected by `ParamValidationExt`
+        // before the context is touched, so a failure leaves the opened
+        // single-slice encoder intact (and `new` discards it).
+        let status = unsafe {
+            self.inner.raw_api().set_option(
+                ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                (&raw mut params).cast(),
+            )
+        };
+        native_status(status, "ENCODER_OPTION_SVC_ENCODE_PARAM_EXT")?;
+        let applied = self.native_params()?;
+        let applied_slices =
+            u16::try_from(applied.sSpatialLayers[0].sSliceArgument.uiSliceNum).unwrap_or(1);
+        self.threading = SoftwareH264Threading {
+            slices: applied_slices.max(1),
+            threads: applied.iMultipleThreadIdc.max(1),
+        };
+        self.inner.force_intra_frame();
+        self.force_pending = true;
+        Ok(())
+    }
+
+    fn native_params(&mut self) -> Result<SEncParamExt, SoftwareH264Error> {
+        let mut params = SEncParamExt::default();
+        // SAFETY: called only after the native encoder context exists, with
+        // `&mut self` excluding concurrent native access. `OpenH264` copies
+        // exactly `sizeof(SEncParamExt)` bytes of its effective parameters
+        // into the valid, uniquely borrowed `#[repr(C)]` struct.
+        let status = unsafe {
+            self.inner.raw_api().get_option(
+                ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                (&raw mut params).cast(),
+            )
+        };
+        if status == 0 {
+            Ok(params)
+        } else {
+            Err(SoftwareH264Error::Native(openh264::Error::msg_string(
+                format!(
+                    "OpenH264 GetOption(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT) failed with native status {status}"
+                ),
+            )))
+        }
+    }
+
+    /// The slices and worker threads `OpenH264` applied.
+    #[must_use]
+    pub const fn threading(&self) -> SoftwareH264Threading {
+        self.threading
     }
 
     /// Force a recovery IDR on the next submitted frame.
@@ -383,10 +566,10 @@ impl SoftwareH264Encoder {
     ///
     /// # Errors
     ///
-    /// Returns [`SoftwareH264Error::InvalidConfig`] outside the software H.264
-    /// `1..=30` fps contract or native failures from `OpenH264`.
+    /// Returns [`SoftwareH264Error::InvalidConfig`] outside
+    /// `1..=`[`MAX_SOFTWARE_H264_FPS`] or native failures from `OpenH264`.
     pub fn reconfigure_framerate(&mut self, fps: u32) -> Result<(), SoftwareH264Error> {
-        if fps == 0 || fps > MAX_SOFTWARE_FPS {
+        if fps == 0 || fps > MAX_SOFTWARE_H264_FPS {
             return Err(SoftwareH264Error::InvalidConfig);
         }
         if fps == self.config.fps {
@@ -482,7 +665,7 @@ impl SoftwareH264Encoder {
         // OpenH264 documents `ENCODER_OPTION_FRAME_RATE` as a pointer to a
         // `float`; `fps` is a local `f32` (C `float` on the supported targets),
         // valid and uniquely mutable for the synchronous call. The value has
-        // already been range-checked to OpenH264's 1..=30 contract.
+        // already been range-checked to 1..=MAX_SOFTWARE_H264_FPS.
         let status = unsafe {
             self.inner
                 .raw_api()
@@ -753,11 +936,101 @@ mod tests {
         assert_eq!(encoder.stats().forced_idrs, 2);
     }
 
+    fn count_nal_type(bytes: &[u8], expected: u8) -> usize {
+        NalRanges::new(bytes)
+            .filter(|range| nal_header(&bytes[range.clone()]) == Some(expected))
+            .count()
+    }
+
+    #[test]
+    fn threads_cut_every_picture_into_fixed_slices_that_decode() {
+        let (width, height) = (640_usize, 368_usize);
+        let config = SoftwareH264Config::legacy_bt709_limited(640, 368, 30, 2_000_000, 4);
+        let mut encoder = SoftwareH264Encoder::new(config).expect("encoder");
+        assert_eq!(encoder.threading().slices, 4);
+        assert!((1..=MAX_SOFTWARE_H264_THREADS).contains(&encoder.threading().threads));
+        let mut decoder = openh264::decoder::Decoder::new().expect("decoder");
+        let mut y = vec![0_u8; width * height];
+        let (u, v) = (
+            vec![128_u8; width * height / 4],
+            vec![128_u8; width * height / 4],
+        );
+        for index in 0..6 {
+            for (offset, sample) in y.iter_mut().enumerate() {
+                *sample = u8::try_from((offset % width + index * 8 + offset / width) % 220 + 16)
+                    .expect("sample");
+            }
+            if index == 3 {
+                encoder.force_idr();
+            }
+            let frame =
+                I420Frame::new(640, 368, &y, width, &u, width / 2, &v, width / 2).expect("frame");
+            let unit = encoder.encode(frame).expect("encode").expect("access unit");
+            // The discarded opening picture never reaches the stream: the
+            // first picture is an IDR with its own parameter sets.
+            if index == 0 || index == 3 {
+                assert!(unit.is_keyframe, "picture {index}");
+                assert!(contains_nal_type(unit.bytes, 7) && contains_nal_type(unit.bytes, 8));
+                assert_eq!(count_nal_type(unit.bytes, 5), 4, "picture {index}");
+            } else {
+                assert!(!unit.is_keyframe, "picture {index}");
+                assert_eq!(count_nal_type(unit.bytes, 1), 4, "picture {index}");
+            }
+            let bytes = unit.bytes.to_vec();
+            let picture = decoder
+                .decode(&bytes)
+                .expect("decode")
+                .expect("decoded picture");
+            assert_eq!(
+                openh264::formats::YUVSource::dimensions(&picture),
+                (width, height)
+            );
+        }
+        assert_eq!(encoder.stats().forced_idrs, 2);
+    }
+
+    #[test]
+    fn no_picture_is_dropped_to_pay_for_a_keyframe() {
+        // A detailed keyframe far above the per-picture budget used to make
+        // OpenH264 skip the pictures after it (a visible freeze).
+        let config = SoftwareH264Config::legacy_bt709_limited(320, 192, 30, 150_000, 1);
+        let mut encoder = SoftwareH264Encoder::new(config).expect("encoder");
+        let mut state = 0x1234_5678_u32;
+        let mut y = vec![0_u8; 320 * 192];
+        let (u, v) = (vec![128_u8; 160 * 96], vec![128_u8; 160 * 96]);
+        for index in 0..12 {
+            for sample in &mut y {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *sample = u8::try_from(state % 220 + 16).expect("sample");
+            }
+            let frame = I420Frame::new(320, 192, &y, 320, &u, 160, &v, 160).expect("frame");
+            assert!(
+                encoder.encode(frame).expect("encode").is_some(),
+                "picture {index} was skipped"
+            );
+        }
+        assert_eq!(encoder.stats().skipped_frames, 0);
+    }
+
+    #[test]
+    fn a_picture_too_small_for_slices_keeps_one() {
+        let config = SoftwareH264Config::legacy_bt709_limited(64, 64, 30, 500_000, 4);
+        let mut encoder = SoftwareH264Encoder::new(config).expect("encoder");
+        assert_eq!(encoder.threading().slices, 1);
+        let (y, u, v) = black_frame();
+        let frame = I420Frame::new(64, 64, &y, 64, &u, 32, &v, 32).expect("frame");
+        let first = encoder.encode(frame).expect("encode").expect("access unit");
+        assert!(first.is_keyframe);
+        assert_eq!(count_nal_type(first.bytes, 5), 1);
+    }
+
     #[test]
     fn invalid_config_and_frame_mismatch_fail_closed() {
         assert!(matches!(
             SoftwareH264Encoder::new(SoftwareH264Config::legacy_bt709_limited(
-                1922, 1080, 30, 1, 1
+                3842, 2160, 30, 1, 1
             )),
             Err(SoftwareH264Error::InvalidConfig)
         ));
@@ -1053,7 +1326,7 @@ mod tests {
         assert_eq!(encoder.config().fps, 15);
         assert_eq!(encoder.stats().forced_idrs, forced_after_startup);
         assert!(matches!(
-            encoder.reconfigure_framerate(31),
+            encoder.reconfigure_framerate(MAX_SOFTWARE_H264_FPS + 1),
             Err(SoftwareH264Error::InvalidConfig)
         ));
     }

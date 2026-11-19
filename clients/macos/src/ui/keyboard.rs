@@ -58,7 +58,12 @@ pub struct KeyboardInput {
     raw_count: u64,
     emitted_count: u64,
     suppressed_count: u64,
+    /// The escape chord's Home is down: its release is the Deck's too.
+    escape_home_held: bool,
 }
+
+/// `Qt::Key_Home`, the escape chord's key.
+const QT_KEY_HOME: u32 = arcen_input::keyboard::pc::KEY_HOME;
 
 /// The identifier a physical key is tracked by: its key identifier, with
 /// the two Option keys told apart.
@@ -134,22 +139,49 @@ impl KeyboardInput {
                 reason: "unmapped",
             };
         };
+        // F13-F15 are Print Screen, Scroll Lock and Pause on a PC host.
+        let deck_key = match deck_key {
+            DeckKey::Other(qt_key) => DeckKey::Other(arcen_input::keyboard::mac_key_on_host(
+                qt_key,
+                self.translator.policy(),
+            )),
+            other => other,
+        };
         let qt_key = physical_id(deck_key);
 
-        if qt_key == QT_KEY_F9 {
+        // Control-Option-Home, the Deck's escape chord: every key held on
+        // the host is released and the pointer lock lets go (F9 reaches
+        // the host). Its own Home edges never do.
+        let escape = *pressed
+            && !*repeat
+            && arcen_input::keyboard::DeckShortcut::for_mac_chord(
+                arcen_input::keyboard::MacChord {
+                    shift: modifiers.shift,
+                    ..arcen_input::keyboard::MacChord::new(
+                        modifiers.ctrl,
+                        modifiers.alt,
+                        modifiers.mac_cmd,
+                        qt_key,
+                    )
+                },
+            ) == Some(arcen_input::keyboard::DeckShortcut::ReleaseKeyboard);
+        if escape || (qt_key == QT_KEY_HOME && self.escape_home_held) {
             self.suppressed_count = self.suppressed_count.saturating_add(1);
             if *pressed && !*repeat {
+                self.escape_home_held = true;
                 return KeyboardAction::Reset {
                     qt_key,
                     modifiers: wire_modifiers,
-                    reason: "panic_f9",
+                    reason: "release_keyboard",
                 };
             }
-
+            if !*pressed {
+                self.escape_home_held = false;
+            }
             return KeyboardAction::Suppressed {
                 qt_key,
                 modifiers: wire_modifiers,
-                reason: "local_f9_edge",
+                reason: "deck_shortcut",
             };
         }
 
@@ -787,6 +819,42 @@ mod tests {
     }
 
     #[test]
+    fn f13_and_f14_are_print_screen_and_scroll_lock_on_a_pc_host() {
+        let mut input = windows_input();
+        let none = egui::Modifiers::NONE;
+        for (key, qt_key) in [
+            (egui::Key::F13, 0x0100_0009),
+            (egui::Key::F14, 0x0100_0026),
+            (egui::Key::F15, 0x0100_0008),
+        ] {
+            assert_eq!(
+                edges(input.handle_event(&key_event(key, Some(key), true, false, none))),
+                vec![(qt_key, true, 0)]
+            );
+            assert_eq!(
+                edges(input.handle_event(&key_event(key, Some(key), false, false, none))),
+                vec![(qt_key, false, 0)]
+            );
+        }
+        let mut mac = KeyboardInput::default();
+        mac.set_policy(resolve_keyboard_policy(
+            HostPlatform::MacOs,
+            true,
+            KeyboardSettings::default(),
+        ));
+        assert_eq!(
+            edges(mac.handle_event(&key_event(
+                egui::Key::F13,
+                Some(egui::Key::F13),
+                true,
+                false,
+                none
+            ))),
+            vec![(0x0100_003C, true, 0)]
+        );
+    }
+
+    #[test]
     fn linux_policy_sends_command_as_control() {
         let mut input = KeyboardInput::default();
         assert_eq!(
@@ -1155,21 +1223,80 @@ mod tests {
     }
 
     #[test]
-    fn f9_is_local_reset_and_never_held() {
+    fn f9_reaches_the_host_and_control_option_home_is_the_decks() {
         let mut input = KeyboardInput::default();
-        assert!(matches!(
-            input.handle_event(&key_event(
+        assert_eq!(
+            edges(input.handle_event(&key_event(
                 egui::Key::F9,
                 Some(egui::Key::F9),
                 true,
                 false,
                 egui::Modifiers::NONE,
+            ))),
+            vec![(QT_KEY_F9, true, 0)]
+        );
+        let control_option = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        assert!(matches!(
+            input.handle_event(&key_event(
+                egui::Key::Home,
+                Some(egui::Key::Home),
+                true,
+                false,
+                control_option,
             )),
             KeyboardAction::Reset {
-                reason: "panic_f9",
+                reason: "release_keyboard",
                 ..
             }
         ));
-        assert_eq!(input.held_count(), 0);
+        // Its release stays on the Deck, whatever was let go first.
+        assert!(matches!(
+            input.handle_event(&key_event(
+                egui::Key::Home,
+                Some(egui::Key::Home),
+                false,
+                false,
+                egui::Modifiers::NONE,
+            )),
+            KeyboardAction::Suppressed {
+                reason: "deck_shortcut",
+                ..
+            }
+        ));
+        // A Home the host holds keeps its release, Control and Option
+        // pressed meanwhile or not.
+        assert_eq!(
+            edges(input.handle_event(&key_event(
+                egui::Key::Home,
+                Some(egui::Key::Home),
+                true,
+                false,
+                egui::Modifiers::NONE,
+            ))),
+            vec![(QT_KEY_HOME, true, 0)]
+        );
+        assert!(!matches!(
+            input.handle_event(&key_event(
+                egui::Key::Home,
+                Some(egui::Key::Home),
+                false,
+                false,
+                control_option,
+            )),
+            KeyboardAction::Suppressed { .. } | KeyboardAction::Reset { .. }
+        ));
+        // Home alone is the host's.
+        assert!(edges(input.handle_event(&key_event(
+            egui::Key::Home,
+            Some(egui::Key::Home),
+            true,
+            false,
+            egui::Modifiers::NONE,
+        )))
+        .contains(&(QT_KEY_HOME, true, 0)));
     }
 }

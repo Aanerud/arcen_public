@@ -4,6 +4,9 @@
 //! (`arcen_deck_core::screens::menu`) as a Win32 menu, each item showing its
 //! chord the PC way. A click queues the item's [`MenuCommand`] and wakes the
 //! UI, which applies it on its own pass, like the Mac's `NSMenu` target.
+//! At its right end the bar says who has the keyboard ("Keyboard: Z8
+//! (Ctrl+Alt+Home to release)"); clicking it gives the keyboard away or
+//! back.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -13,12 +16,15 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateMenu, CreatePopupMenu, DrawMenuBar, EnableMenuItem, HMENU, MF_BYCOMMAND,
-    MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, SetMenu, WM_COMMAND,
+    MF_ENABLED, MF_GRAYED, MF_POPUP, MF_RIGHTJUSTIFY, MF_SEPARATOR, MF_STRING, ModifyMenuW,
+    SetMenu, WM_COMMAND,
 };
 use windows::core::HSTRING;
 
 /// Menu item ids start here (id = `FIRST_ID` + index into the command list).
 const FIRST_ID: usize = 0x4100;
+/// The keyboard indicator at the bar's right end.
+const STATUS_ID: usize = FIRST_ID - 1;
 const SUBCLASS_ID: usize = 0x4152_4d42; // "ARMB"
 
 struct Installed {
@@ -35,6 +41,8 @@ pub(super) struct MenuBar {
     hwnd: HWND,
     menu: HMENU,
     session_active: Option<bool>,
+    /// The keyboard indicator's text now.
+    status: String,
 }
 
 fn wide(text: &str) -> HSTRING {
@@ -63,17 +71,18 @@ impl MenuBar {
                                 .map_err(|error| format!("AppendMenuW: {error}"))?;
                         }
                         MenuEntry::Command(command) => {
-                            let mut text = command.title(DeckPlatform::Pc).to_owned();
-                            if let Some(shortcut) = command.shortcut() {
-                                let keys = chord(DeckPlatform::Pc, shortcut);
-                                if !keys.is_empty() {
-                                    text.push('\t');
-                                    text.push_str(&keys);
-                                }
+                            append_command(popup, *command, &mut commands)?;
+                        }
+                        MenuEntry::Submenu {
+                            title,
+                            commands: items,
+                        } => {
+                            let submenu = CreatePopupMenu()
+                                .map_err(|error| format!("CreatePopupMenu: {error}"))?;
+                            for command in *items {
+                                append_command(submenu, *command, &mut commands)?;
                             }
-                            let id = FIRST_ID + commands.len();
-                            commands.push(*command);
-                            AppendMenuW(popup, MF_STRING, id, &wide(&text))
+                            AppendMenuW(popup, MF_POPUP, submenu.0 as usize, &wide(title))
                                 .map_err(|error| format!("AppendMenuW: {error}"))?;
                         }
                     }
@@ -81,6 +90,14 @@ impl MenuBar {
                 AppendMenuW(bar, MF_POPUP, popup.0 as usize, &wide(menu.title))
                     .map_err(|error| format!("AppendMenuW: {error}"))?;
             }
+            // The keyboard indicator, empty until a session starts.
+            AppendMenuW(
+                bar,
+                MF_STRING | MF_RIGHTJUSTIFY | MF_GRAYED,
+                STATUS_ID,
+                &wide(" "),
+            )
+            .map_err(|error| format!("AppendMenuW: {error}"))?;
             SetMenu(hwnd, bar).map_err(|error| format!("SetMenu: {error}"))?;
             bar
         };
@@ -99,7 +116,32 @@ impl MenuBar {
             hwnd,
             menu,
             session_active: None,
+            status: String::new(),
         })
+    }
+
+    /// Says who has the keyboard (`""`: no session).
+    pub(super) fn set_keyboard_status(&mut self, status: &str) {
+        if self.status == status {
+            return;
+        }
+        status.clone_into(&mut self.status);
+        let (text, state) = if status.is_empty() {
+            (" ", MF_GRAYED)
+        } else {
+            (status, MF_ENABLED)
+        };
+        // SAFETY: the menu belongs to this window, on its thread.
+        unsafe {
+            let _ = ModifyMenuW(
+                self.menu,
+                u32::try_from(STATUS_ID).unwrap_or(0),
+                MF_BYCOMMAND | MF_STRING | MF_RIGHTJUSTIFY | state,
+                STATUS_ID,
+                &wide(text),
+            );
+            let _ = DrawMenuBar(self.hwnd);
+        }
     }
 
     /// Shows the bar (windowed) or takes it off the window (fullscreen,
@@ -138,6 +180,31 @@ impl MenuBar {
     }
 }
 
+/// Appends one command, with its chord, to `popup`.
+///
+/// # Safety
+///
+/// `popup` is a menu this thread created and still owns.
+unsafe fn append_command(
+    popup: HMENU,
+    command: MenuCommand,
+    commands: &mut Vec<MenuCommand>,
+) -> Result<(), String> {
+    let mut text = command.title(DeckPlatform::Pc).to_owned();
+    if let Some(shortcut) = command.shortcut() {
+        let keys = chord(DeckPlatform::Pc, shortcut);
+        if !keys.is_empty() {
+            text.push('\t');
+            text.push_str(&keys);
+        }
+    }
+    let id = FIRST_ID + commands.len();
+    commands.push(command);
+    // SAFETY: the caller's menu, on its thread.
+    unsafe { AppendMenuW(popup, MF_STRING, id, &wide(&text)) }
+        .map_err(|error| format!("AppendMenuW: {error}"))
+}
+
 /// The commands clicked since the last call.
 pub(super) fn drain() -> Vec<MenuCommand> {
     QUEUE
@@ -157,6 +224,15 @@ unsafe extern "system" fn menu_proc(
     // A menu's WM_COMMAND has 0 in the high word of wParam.
     if message == WM_COMMAND && wparam.0 & 0xffff_0000 == 0 {
         let id = wparam.0 & 0xffff;
+        if id == STATUS_ID
+            && let Some(installed) = INSTALLED.get()
+        {
+            if let Ok(mut queue) = QUEUE.lock() {
+                queue.push(MenuCommand::ToggleKeyboardCapture);
+            }
+            (installed.wake)();
+            return LRESULT(0);
+        }
         if let Some(installed) = INSTALLED.get()
             && let Some(command) = id
                 .checked_sub(FIRST_ID)

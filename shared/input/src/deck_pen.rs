@@ -14,6 +14,7 @@
 use crate::pen_axes::{
     WINDOWS_INK_PRESSURE_RANGE, normalize_logical, tilt_logical_to_degrees, wrap_rotation_degrees,
 };
+use crate::pen_buttons::{DriverClick, PenButtonMap, PenButtonsHeld};
 use crate::{LowLatencyMetadata, PenEvent, PenTool};
 
 /// Where the video is drawn in the window, top-left origin, in the same
@@ -55,7 +56,7 @@ impl ImageRect {
 pub const POINTER_FLAG_INRANGE: u32 = 0x0000_0002;
 /// `POINTER_FLAG_INCONTACT`.
 pub const POINTER_FLAG_INCONTACT: u32 = 0x0000_0004;
-/// `POINTER_FLAG_SECONDBUTTON`: a pen's barrel button.
+/// `POINTER_FLAG_SECONDBUTTON`: a pen's barrel button, in contact.
 pub const POINTER_FLAG_SECONDBUTTON: u32 = 0x0000_0020;
 /// `PEN_FLAG_BARREL`.
 pub const PEN_FLAG_BARREL: u32 = 0x0000_0001;
@@ -116,26 +117,81 @@ pub struct WindowsInkSample {
 /// zeroed leave, as a Mac Deck sends on leaving proximity. The tool is the
 /// eraser while the pen is inverted or erasing, the tip otherwise. Contact
 /// is `POINTER_FLAG_INCONTACT`, or positive pressure.
+///
+/// Barrel buttons go through the session's [`PenButtonMap`]: the Windows Ink
+/// barrel (`PEN_FLAG_BARREL`, or `POINTER_FLAG_SECONDBUTTON` in contact) is
+/// the button the tablet driver set to Right Click, and a right or middle
+/// click the driver performs as a mouse click while the pen is in range
+/// ([`Self::on_driver_click`]; a Wacom side switch set to Middle Click) is
+/// that click on the pen.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowsInkMapper {
     in_proximity: bool,
     eraser: bool,
+    map: PenButtonMap,
+    held: PenButtonsHeld,
+    last: Option<PenEvent>,
 }
 
 impl WindowsInkMapper {
-    /// A mapper with no pen in range.
+    /// A mapper with no pen in range and the default button mapping.
     #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            in_proximity: false,
-            eraser: false,
-        }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The session's button mapping (its settings and its host).
+    pub const fn set_button_map(&mut self, map: PenButtonMap) {
+        self.map = map;
     }
 
     /// Whether a pen is in range.
     #[must_use]
-    pub const fn in_proximity(self) -> bool {
+    pub const fn in_proximity(&self) -> bool {
         self.in_proximity
+    }
+
+    /// Whether the pen in range touches the surface.
+    #[must_use]
+    pub fn touching(&self) -> bool {
+        self.in_proximity && self.last.is_some_and(|event| event.touching)
+    }
+
+    /// Whether the driver's `click` is held on the pen.
+    #[must_use]
+    pub const fn driver_held(&self, click: DriverClick) -> bool {
+        match click {
+            DriverClick::Right => self.held.driver_right,
+            DriverClick::Middle => self.held.driver_middle,
+        }
+    }
+
+    /// A right or middle click the tablet driver performed as a mouse click
+    /// (`WM_RBUTTONDOWN`, `WM_MBUTTONUP`, ...) while the pen is in range: the
+    /// last sample again, with the click on the pen. `None` when no pen is in
+    /// range (the click is the mouse's) or nothing changed.
+    pub fn on_driver_click(
+        &mut self,
+        click: DriverClick,
+        pressed: bool,
+        metadata: LowLatencyMetadata,
+    ) -> Option<PenEvent> {
+        if !self.in_proximity {
+            return None;
+        }
+        let held = match click {
+            DriverClick::Right => &mut self.held.driver_right,
+            DriverClick::Middle => &mut self.held.driver_middle,
+        };
+        if *held == pressed {
+            return None;
+        }
+        *held = pressed;
+        let mut event = self.last?;
+        event.buttons = self.map.wire_buttons(self.held);
+        event.metadata = metadata;
+        self.last = Some(event);
+        Some(event)
     }
 
     /// One sample; `None` when it cannot be placed, or when an out-of-range
@@ -168,7 +224,7 @@ impl WindowsInkMapper {
                 0.0
             }
         };
-        let barrel = sample.pen_flags & PEN_FLAG_BARREL != 0
+        self.held.barrel = sample.pen_flags & PEN_FLAG_BARREL != 0
             || sample.pointer_flags & POINTER_FLAG_SECONDBUTTON != 0;
         let event = PenEvent {
             x,
@@ -184,10 +240,11 @@ impl WindowsInkMapper {
             tool: self.tool(),
             in_proximity: true,
             touching: contact || pressure > 0.0 && has(PEN_MASK_PRESSURE),
-            buttons: u16::from(barrel),
+            buttons: self.map.wire_buttons(self.held),
             metadata,
         };
         event.validate().ok()?;
+        self.last = Some(event);
         Some(event)
     }
 
@@ -198,6 +255,8 @@ impl WindowsInkMapper {
             return None;
         }
         self.in_proximity = false;
+        self.held = PenButtonsHeld::default();
+        self.last = None;
         let event = PenEvent {
             x,
             y,
@@ -221,6 +280,64 @@ impl WindowsInkMapper {
         } else {
             PenTool::Tip
         }
+    }
+}
+
+/// `WM_LBUTTONDOWN` and its neighbours: the mouse messages a tablet driver
+/// sends for a pen button set to a mouse click.
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+#[cfg(test)]
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_LBUTTONDBLCLK: u32 = 0x0203;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_RBUTTONDBLCLK: u32 = 0x0206;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MBUTTONDBLCLK: u32 = 0x0209;
+
+/// Where a mouse message goes while a pen is in range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PenMouseRoute {
+    /// The tablet driver's click on a pen button: the pen's
+    /// ([`WindowsInkMapper::on_driver_click`]).
+    PenClick(DriverClick, bool),
+    /// The mouse's, as without a pen.
+    Mouse,
+    /// Nothing: the pen owns the pointer.
+    Drop,
+}
+
+/// Where a mouse message that arrives while `pen` is in range goes.
+///
+/// The Deck answers every pen `WM_POINTER` message, so Windows promotes none
+/// of them to mouse messages: a click that arrives now is one the tablet
+/// driver performed for a pen button set to a mouse click (Wacom's Right
+/// Click, Middle Click or Left Click), or another mouse's. Right and middle
+/// clicks ride on the pen, so the host sees them from the pen at the pen;
+/// a left click while hovering is the mouse's left button (the pen's own
+/// left click is its tip, so one in contact is dropped); movement stays the
+/// pen's, and a release whose press the pen did not take reaches the mouse.
+#[must_use]
+pub fn route_mouse_while_pen(msg: u32, pen: &WindowsInkMapper) -> PenMouseRoute {
+    let release = |click| {
+        if pen.driver_held(click) {
+            PenMouseRoute::PenClick(click, false)
+        } else {
+            PenMouseRoute::Mouse
+        }
+    };
+    match msg {
+        WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => PenMouseRoute::PenClick(DriverClick::Right, true),
+        WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => PenMouseRoute::PenClick(DriverClick::Middle, true),
+        WM_RBUTTONUP => release(DriverClick::Right),
+        WM_MBUTTONUP => release(DriverClick::Middle),
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK if pen.touching() => PenMouseRoute::Drop,
+        WM_MOUSEMOVE => PenMouseRoute::Drop,
+        // A hovering left click, a left release, the wheel (a Wacom
+        // Pan/Scroll), the side buttons.
+        _ => PenMouseRoute::Mouse,
     }
 }
 
@@ -313,6 +430,8 @@ mod tests {
         assert!(!is_pen_digitizer_collection(0x046D, 0x01, 0x02));
     }
     use super::*;
+    use crate::pen_buttons::{HostPenButtons, PenButtonAction};
+    use arcen_protocol::messages::{PEN_BUTTON_MIDDLE_CLICK, PEN_BUTTON_RIGHT_CLICK};
 
     const IMAGE: ImageRect = ImageRect {
         left: 100.0,
@@ -411,9 +530,158 @@ mod tests {
         assert_eq!(event.tool, PenTool::Eraser);
         raw.pen_flags = PEN_FLAG_BARREL;
         let event = mapper.on_sample(raw, IMAGE, metadata()).expect("placed");
-        assert_eq!((event.tool, event.buttons), (PenTool::Tip, 1));
+        assert_eq!(
+            (event.tool, event.buttons),
+            (PenTool::Tip, PEN_BUTTON_RIGHT_CLICK)
+        );
         let leave = mapper.leave_at(0.0, 0.0, metadata()).expect("leave");
         assert_eq!(leave.tool, PenTool::Tip);
+    }
+
+    /// A fake `WM_POINTER` feed as a Wacom with Windows Ink on produces it:
+    /// hover, the barrel (the side switch set to Right Click) pressed while
+    /// hovering, then a tap with it held (`POINTER_FLAG_SECONDBUTTON`).
+    #[test]
+    fn the_windows_ink_barrel_is_a_right_click_on_every_host() {
+        let mut barrel = sample(IN_RANGE, 0);
+        barrel.pen_flags = PEN_FLAG_BARREL;
+        let mut tap = sample(IN_CONTACT | POINTER_FLAG_SECONDBUTTON, 400);
+        tap.pen_flags = PEN_FLAG_BARREL;
+        let feed = [sample(IN_RANGE, 0), barrel, tap, sample(IN_RANGE, 0)];
+        let run = |host| {
+            let mut mapper = WindowsInkMapper::new();
+            mapper.set_button_map(PenButtonMap {
+                host,
+                ..PenButtonMap::default()
+            });
+            feed.iter()
+                .map(|raw| {
+                    mapper
+                        .on_sample(*raw, IMAGE, metadata())
+                        .expect("placed")
+                        .buttons
+                })
+                .collect::<Vec<_>>()
+        };
+        let right = PEN_BUTTON_RIGHT_CLICK;
+        assert_eq!(run(HostPenButtons::Actions), [0, right, right, 0]);
+        // A Linux Pier from before the meaning right-clicks bit 1.
+        let legacy = PEN_BUTTON_MIDDLE_CLICK;
+        assert_eq!(run(HostPenButtons::LinuxLegacy), [0, legacy, legacy, 0]);
+    }
+
+    #[test]
+    fn the_barrel_follows_the_setting() {
+        let mut mapper = WindowsInkMapper::new();
+        let mut map = PenButtonMap::default();
+        map.settings.barrel = PenButtonAction::MiddleClick;
+        mapper.set_button_map(map);
+        let mut raw = sample(IN_RANGE, 0);
+        raw.pen_flags = PEN_FLAG_BARREL;
+        let event = mapper.on_sample(raw, IMAGE, metadata()).expect("placed");
+        assert_eq!(event.buttons, PEN_BUTTON_MIDDLE_CLICK);
+        map.settings.barrel = PenButtonAction::Off;
+        mapper.set_button_map(map);
+        let event = mapper.on_sample(raw, IMAGE, metadata()).expect("placed");
+        assert_eq!(event.buttons, 0);
+    }
+
+    /// A Wacom side switch set to Middle Click (or Right Click with Windows
+    /// Ink's barrel left alone) arrives as `WM_MBUTTONDOWN`/`WM_RBUTTONDOWN`
+    /// while the pen hovers: it is the pen's click, at the pen.
+    #[test]
+    fn a_click_the_driver_performs_rides_on_the_pen() {
+        let mut mapper = WindowsInkMapper::new();
+        assert_eq!(
+            mapper.on_driver_click(DriverClick::Middle, true, metadata()),
+            None,
+            "no pen in range: the click is the mouse's"
+        );
+        let hover = mapper
+            .on_sample(sample(IN_RANGE, 0), IMAGE, metadata())
+            .expect("placed");
+        let down = mapper
+            .on_driver_click(DriverClick::Middle, true, metadata())
+            .expect("pen click");
+        assert_eq!(down.buttons, PEN_BUTTON_MIDDLE_CLICK);
+        assert_eq!(
+            (down.x, down.y, down.in_proximity),
+            (hover.x, hover.y, true)
+        );
+        assert_eq!(
+            mapper.on_driver_click(DriverClick::Middle, true, metadata()),
+            None,
+            "a repeated press changes nothing"
+        );
+        // Later samples keep it held until the driver releases it.
+        let moved = mapper
+            .on_sample(sample(IN_RANGE, 0), IMAGE, metadata())
+            .expect("placed");
+        assert_eq!(moved.buttons, PEN_BUTTON_MIDDLE_CLICK);
+        let right = mapper
+            .on_driver_click(DriverClick::Right, true, metadata())
+            .expect("pen click");
+        assert_eq!(
+            right.buttons,
+            PEN_BUTTON_MIDDLE_CLICK | PEN_BUTTON_RIGHT_CLICK
+        );
+        let up = mapper
+            .on_driver_click(DriverClick::Middle, false, metadata())
+            .expect("pen release");
+        assert_eq!(up.buttons, PEN_BUTTON_RIGHT_CLICK);
+        // Leaving range releases everything, and nothing stays held after.
+        let leave = mapper.leave_at(0.5, 0.5, metadata()).expect("leave");
+        assert_eq!(leave.buttons, 0);
+        let back = mapper
+            .on_sample(sample(IN_RANGE, 0), IMAGE, metadata())
+            .expect("placed");
+        assert_eq!(back.buttons, 0);
+    }
+
+    #[test]
+    fn mouse_clicks_while_the_pen_hovers_are_the_drivers_pen_buttons() {
+        let mut pen = WindowsInkMapper::new();
+        pen.on_sample(sample(IN_RANGE, 0), IMAGE, metadata());
+        assert_eq!(
+            route_mouse_while_pen(WM_RBUTTONDOWN, &pen),
+            PenMouseRoute::PenClick(DriverClick::Right, true)
+        );
+        assert_eq!(
+            route_mouse_while_pen(WM_MBUTTONDBLCLK, &pen),
+            PenMouseRoute::PenClick(DriverClick::Middle, true)
+        );
+        // A release the pen did not press is the mouse's (pressed before the
+        // pen came into range).
+        assert_eq!(
+            route_mouse_while_pen(WM_RBUTTONUP, &pen),
+            PenMouseRoute::Mouse
+        );
+        pen.on_driver_click(DriverClick::Right, true, metadata());
+        assert_eq!(
+            route_mouse_while_pen(WM_RBUTTONUP, &pen),
+            PenMouseRoute::PenClick(DriverClick::Right, false)
+        );
+        // A side switch set to Left Click: the mouse's left button while
+        // hovering; in contact the tip is the left button already.
+        assert_eq!(
+            route_mouse_while_pen(WM_LBUTTONDOWN, &pen),
+            PenMouseRoute::Mouse
+        );
+        assert_eq!(
+            route_mouse_while_pen(WM_LBUTTONUP, &pen),
+            PenMouseRoute::Mouse
+        );
+        assert_eq!(
+            route_mouse_while_pen(WM_MOUSEMOVE, &pen),
+            PenMouseRoute::Drop
+        );
+        pen.on_sample(sample(IN_CONTACT, 300), IMAGE, metadata());
+        assert_eq!(
+            route_mouse_while_pen(WM_LBUTTONDOWN, &pen),
+            PenMouseRoute::Drop
+        );
+        // The wheel (a Wacom Pan/Scroll) stays the mouse's.
+        assert_eq!(route_mouse_while_pen(0x020A, &pen), PenMouseRoute::Mouse);
     }
 
     #[test]

@@ -531,6 +531,7 @@ mod harness {
             wayland_fidelity_args: Vec::new(),
             // A probe harness: no exact still image.
             refine: None,
+            canvas: None,
             display: None,
             xauthority: None,
             execution: Some(launcher.execution()),
@@ -749,6 +750,7 @@ mod harness {
             desktop: "gnome".into(),
             default_desktop: None,
             deskside: Default::default(),
+            desk_privacy: Default::default(),
             provider: DesktopProvider::Wayland,
             x11_apps: x11,
             audio: Default::default(),

@@ -117,6 +117,9 @@ pub struct EpochRequest {
     /// Exact still image (`refine=on`, ADR 0016): only the wide composition
     /// refines; every other one states why it does not.
     pub refine: Option<arcen_media::refine::CapencRefineArgs>,
+    /// The canvas (`canvas=`, ADR 0028): only the software composition
+    /// serves it.
+    pub canvas: Option<arcen_media::canvas::serve::CanvasCapencArgs>,
 }
 
 /// The wide-composition facts the parent passes from the host's
@@ -362,6 +365,7 @@ impl EpochRequest {
             probe: args.iter().any(|argument| argument == "probe-v1"),
             fidelity: FidelityArgs::from_args(args)?,
             refine: arcen_media::refine::capenc_refine_args(args)?,
+            canvas: arcen_media::canvas::serve::CanvasCapencArgs::from_args(args)?,
         })
     }
 }

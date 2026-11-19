@@ -4,20 +4,24 @@
 //!
 //! The eight-bit sink (Auto, Speed) owns a `B8G8R8A8` swapchain; the ten-bit
 //! sink (Grading, HDR) owns an `R10G10B10A2` (or FP16 scRGB) swapchain and
-//! the Exact still image compositor. Each runs its own presenter thread;
+//! the Exact still image compositor. The eight-bit sink also executes the
+//! canvas (ADR 0028, [`super::canvas`]) and presents it on the same
+//! swapchain. Each runs its own presenter thread;
 //! the one that presents last owns the window's video visual. Neither ever
 //! routes the other's contract (root `AGENTS.md`, streaming pipeline
 //! boundary).
 
+use super::canvas::{D3d11CanvasExecutor, MAX_CANVAS_PX};
 use super::compose::DecodedFrame;
 use super::composition::SharedTree;
 use super::device::Gpu;
 use super::picture::D3d11Picture;
 use super::swapchain::{PresentMode, VideoSwapchain};
-use super::thread::{PresenterEvent, PresenterThread};
+use super::thread::{PresenterEvent, PresenterThread, is_device_lost};
 use arcen_deck_core::present::{
-    LayerColourState, PresentOutcome, PresentableFrame, PresenterFailure, PresenterFailureStage,
-    PresenterPipeline, PresenterTelemetryDelta, VideoPresenterSink,
+    CanvasExecution, CanvasExecutorFacts, CanvasOutcome, CanvasReadback, LayerColourState,
+    PresentOutcome, PresentableFrame, PresenterFailure, PresenterFailureStage, PresenterPipeline,
+    PresenterTelemetryDelta, VideoPresenterSink,
 };
 use arcen_media::BitDepth;
 use arcen_media::video::PresentTiming;
@@ -51,6 +55,8 @@ pub struct D3d11VideoSink {
     timing: PresentTiming,
     /// Which window, for the log ("root", "monitor 2").
     window: String,
+    /// The canvas executor (eight-bit sink only; ADR 0028).
+    canvas: D3d11CanvasExecutor,
 }
 
 const fn failure(stage: PresenterFailureStage, detail: &'static str) -> PresenterFailure {
@@ -73,6 +79,7 @@ impl D3d11VideoSink {
             visible: true,
             timing: PresentTiming::Vsync,
             window: "root".to_owned(),
+            canvas: D3d11CanvasExecutor::new(),
         }
     }
 
@@ -138,8 +145,20 @@ impl D3d11VideoSink {
     }
 
     fn start(&mut self, frame: &DecodedFrame) -> Result<(), PresenterFailure> {
-        let mode = PresentMode::for_contract(frame.contract, false);
         let (width, height) = frame.picture.size();
+        self.start_with(
+            PresentMode::for_contract(frame.contract, false),
+            width,
+            height,
+        )
+    }
+
+    fn start_with(
+        &mut self,
+        mode: PresentMode,
+        width: u32,
+        height: u32,
+    ) -> Result<(), PresenterFailure> {
         let swapchain =
             VideoSwapchain::create(&self.gpu, width, height, mode).map_err(|error| {
                 if error.contains("cannot present") {
@@ -173,6 +192,67 @@ impl D3d11VideoSink {
 
 impl VideoPresenterSink for D3d11VideoSink {
     type NativeFrame = D3d11Picture;
+
+    // The eight-bit sink's D3D11 canvas executor ([`super::canvas`]).
+    const CANVAS_EXECUTOR: Option<CanvasExecutorFacts> = Some(CanvasExecutorFacts {
+        max_canvas_px: MAX_CANVAS_PX,
+    });
+
+    fn execute(&mut self, canvas: &CanvasExecution<'_, '_, D3d11Picture>) -> CanvasOutcome {
+        // The canvas is eight-bit work (ADR 0016 R7): the ten-bit sink never
+        // executes it.
+        if self.pipeline != PresenterPipeline::EightBit {
+            return CanvasOutcome::Unsupported;
+        }
+        if let Some(reason) = self.failure {
+            return CanvasOutcome::Failed(reason);
+        }
+        self.set_timing(canvas.timing);
+        let picture = match self.canvas.execute(&self.gpu, canvas) {
+            Ok(picture) => picture,
+            Err(error) => {
+                let lost = is_device_lost(&error);
+                tracing::warn!(
+                    target: arcen_deck_core::log_target::VIDEO,
+                    window = %self.window,
+                    monitor_id = canvas.work.monitor_id,
+                    fence = canvas.work.fence,
+                    %error,
+                    "canvas execution failed",
+                );
+                if lost {
+                    let reason = failure(PresenterFailureStage::DeviceLost, "device removed");
+                    self.failure = Some(reason);
+                    return CanvasOutcome::Failed(reason);
+                }
+                return CanvasOutcome::Failed(failure(
+                    PresenterFailureStage::Pipeline,
+                    "canvas executor",
+                ));
+            }
+        };
+        if !canvas.present {
+            return CanvasOutcome::Applied;
+        }
+        if self.thread.is_none()
+            && let Err(reason) = self.start_with(PresentMode::Sdr8, picture.size.0, picture.size.1)
+        {
+            self.failure = Some(reason);
+            return CanvasOutcome::Failed(reason);
+        }
+        if !self.visible {
+            return CanvasOutcome::Applied;
+        }
+        let Some(thread) = &self.thread else {
+            return CanvasOutcome::Applied;
+        };
+        thread.handle().submit_canvas(picture, canvas.arrival);
+        CanvasOutcome::Presented
+    }
+
+    fn take_canvas_readback(&mut self) -> Option<CanvasReadback> {
+        self.canvas.take_readback()
+    }
 
     fn pipeline(&self) -> PresenterPipeline {
         self.pipeline
@@ -307,8 +387,10 @@ impl VideoPresenterSink for D3d11VideoSink {
 
     fn teardown(&mut self) {
         // Dropping the thread discards queued frames and clears the video
-        // visual if this pipeline showed it.
+        // visual if this pipeline showed it; the canvases go with it (a new
+        // connection starts with a reset).
         self.thread = None;
+        self.canvas.clear();
         self.failure = None;
     }
 }

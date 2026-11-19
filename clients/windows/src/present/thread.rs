@@ -12,11 +12,16 @@
 //! composition; the decoder and every other window's presenter share the
 //! device's immediate context and must never wait behind it. A still screen
 //! re-presents the last frame when Exact still image tiles changed
-//! ([`PresenterHandle::represent`]). Contract changes (Grading ↔ HDR, a new
+//! ([`PresenterHandle::represent`]). The eight-bit presenter also shows
+//! its canvas (ADR 0028, [`super::canvas`]): the media worker applies each
+//! record on the device's immediate context and hands the canvas over the
+//! same slot; the thread copies it into the back buffer, never a
+//! half-applied record. Contract changes (Grading ↔ HDR, a new
 //! source size) are applied to the swapchain on this thread; the video
 //! visual is pointed at this pipeline's swapchain when it presents.
 
 use super::Result;
+use super::canvas::CanvasPicture;
 use super::compose::{DecodedFrame, FrameComposer};
 use super::composition::SharedTree;
 use super::device::Gpu;
@@ -56,8 +61,33 @@ pub struct PresenterCounters {
     pub latency_samples: AtomicU64,
 }
 
+/// What the presenter shows: a decoded frame, or a canvas.
+#[derive(Clone)]
+enum Presentable {
+    Frame(DecodedFrame),
+    Canvas(CanvasPicture),
+}
+
+impl Presentable {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Frame(frame) => frame.picture.size(),
+            Self::Canvas(canvas) => canvas.size,
+        }
+    }
+
+    fn mode(&self, scrgb_fallback: bool) -> PresentMode {
+        match self {
+            Self::Frame(frame) => PresentMode::for_contract(frame.contract, scrgb_fallback),
+            // Opaque BGRA8 sRGB-coded R′G′B′ (ADR 0028): the eight-bit
+            // swapchain, as Auto.
+            Self::Canvas(_) => PresentMode::Sdr8,
+        }
+    }
+}
+
 struct Pending {
-    frame: DecodedFrame,
+    frame: Presentable,
     arrival: Instant,
 }
 
@@ -253,6 +283,24 @@ const fn timing_code(timing: PresentTiming) -> u8 {
     }
 }
 
+impl PresenterCounters {
+    /// One present: a new frame (its arrival → present latency) or a
+    /// re-present.
+    fn note_present(&self, represent: bool, arrival: Option<Instant>) {
+        let counter = if represent {
+            &self.represented
+        } else {
+            &self.presented
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(arrival) = arrival {
+            let micros = u64::try_from(arrival.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.latency_us_total.fetch_add(micros, Ordering::Relaxed);
+            self.latency_samples.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Shared {
     fn timing(&self) -> PresentTiming {
         match self.timing.load(Ordering::Relaxed) {
@@ -276,6 +324,16 @@ impl PresenterHandle {
 
     /// [`Self::submit`] with the media worker's arrival time (latency).
     pub fn submit_at(&self, frame: DecodedFrame, arrival: Instant) {
+        self.offer(Presentable::Frame(frame), arrival);
+    }
+
+    /// Offers the canvas, applied up to a record received at `arrival`;
+    /// replaces a frame or canvas not yet presented.
+    pub fn submit_canvas(&self, canvas: CanvasPicture, arrival: Instant) {
+        self.offer(Presentable::Canvas(canvas), arrival);
+    }
+
+    fn offer(&self, frame: Presentable, arrival: Instant) {
         self.shared
             .counters
             .received
@@ -340,7 +398,7 @@ impl PresenterHandle {
     }
 }
 
-fn is_device_lost(error: &str) -> bool {
+pub(crate) fn is_device_lost(error: &str) -> bool {
     error.contains("0x887A0005") || error.contains("0x887A0007")
 }
 
@@ -454,7 +512,7 @@ fn wait_for_work(owned: &mut Owned, shared: &Shared) -> bool {
 }
 
 fn run(mut owned: Owned, shared: &Shared) {
-    let mut last: Option<DecodedFrame> = None;
+    let mut last: Option<Presentable> = None;
     loop {
         // Wait for something to show, then for the swapchain to take it, and
         // only then take the newest frame: one that arrived during the wait
@@ -509,6 +567,12 @@ fn run(mut owned: Owned, shared: &Shared) {
         let result = {
             let work = Instant::now();
             let (result, locked) = present_one(&mut owned, shared, &frame);
+            if matches!(result, Ok(false)) {
+                // A canvas between the parts of a record: the record's last
+                // part offers it again.
+                last = Some(frame);
+                continue;
+            }
             let size = (owned.swapchain.width, owned.swapchain.height);
             let phases = owned.phases;
             let pending = owned.composer.take_decode_pending();
@@ -524,26 +588,10 @@ fn run(mut owned: Owned, shared: &Shared) {
             result
         };
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 shared.presented_any.store(true, Ordering::Relaxed);
                 owned.path.after_present(&owned.swapchain, shared.timing());
-                let counter = if represent {
-                    &shared.counters.represented
-                } else {
-                    &shared.counters.presented
-                };
-                counter.fetch_add(1, Ordering::Relaxed);
-                if let Some(arrival) = arrival {
-                    let micros = u64::try_from(arrival.elapsed().as_micros()).unwrap_or(u64::MAX);
-                    shared
-                        .counters
-                        .latency_us_total
-                        .fetch_add(micros, Ordering::Relaxed);
-                    shared
-                        .counters
-                        .latency_samples
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                shared.counters.note_present(represent, arrival);
             }
             Err(error) => {
                 shared.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -568,9 +616,14 @@ fn run(mut owned: Owned, shared: &Shared) {
 /// not: a composed present can block until the next composition (lab: 16
 /// ms per present with two windows), and the decoder and every other
 /// window's presenter must not wait behind it. The device is
-/// multithread-protected, and `Present` is one call. Returns the time spent
-/// waiting for the lock.
-fn present_one(owned: &mut Owned, shared: &Shared, frame: &DecodedFrame) -> (Result<()>, Duration) {
+/// multithread-protected, and `Present` is one call. Returns whether it
+/// presented (a half-applied canvas is not) and the time spent waiting for
+/// the lock.
+fn present_one(
+    owned: &mut Owned,
+    shared: &Shared,
+    frame: &Presentable,
+) -> (Result<bool>, Duration) {
     let context_lock = std::sync::Arc::clone(&owned.gpu.context_lock);
     let asked = Instant::now();
     let context = context_lock
@@ -579,7 +632,8 @@ fn present_one(owned: &mut Owned, shared: &Shared, frame: &DecodedFrame) -> (Res
     let mut locked = asked.elapsed();
     let drawn = draw_one(owned, shared, frame);
     let (first, resized, changed) = match drawn {
-        Ok(facts) => facts,
+        Ok(Some(facts)) => facts,
+        Ok(None) => return (Ok(false), locked),
         Err(error) => {
             owned.composer.abandon_unsubmitted();
             return (Err(error), locked);
@@ -604,10 +658,10 @@ fn present_one(owned: &mut Owned, shared: &Shared, frame: &DecodedFrame) -> (Res
             // since, or torn down and cleared it.
             let mut tree = lock(tree);
             if first || resized || changed || !tree.shows(*owner) {
-                tree.show_swapchain(*owner, &owned.swapchain, frame.picture.size())?;
+                tree.show_swapchain(*owner, &owned.swapchain, frame.size())?;
             }
         }
-        Ok(())
+        Ok(true)
     });
     if finished.is_err() {
         owned.composer.abandon_unsubmitted();
@@ -618,18 +672,22 @@ fn present_one(owned: &mut Owned, shared: &Shared, frame: &DecodedFrame) -> (Res
 }
 
 /// The draw half of [`present_one`], under the context lock: the contract
-/// applied to the swapchain and the frame drawn into its back buffer.
-/// Returns whether this was the first present, a resize, a mode change.
+/// applied to the swapchain and the frame drawn (or the canvas copied)
+/// into its back buffer. Returns whether this was the first present, a
+/// resize, a mode change; `None` (nothing drawn) for a canvas whose record
+/// is still being applied.
 fn draw_one(
     owned: &mut Owned,
     shared: &Shared,
-    frame: &DecodedFrame,
-) -> Result<(bool, bool, bool)> {
-    let mode = PresentMode::for_contract(
-        frame.contract,
-        shared.scrgb_fallback.load(Ordering::Relaxed),
-    );
-    let size = frame.picture.size();
+    frame: &Presentable,
+) -> Result<Option<(bool, bool, bool)>> {
+    if let Presentable::Canvas(canvas) = frame
+        && !canvas.is_whole()
+    {
+        return Ok(None);
+    }
+    let mode = frame.mode(shared.scrgb_fallback.load(Ordering::Relaxed));
+    let size = frame.size();
     let resized = size != (owned.swapchain.width, owned.swapchain.height);
     let changed = mode != owned.swapchain.mode;
     if changed || resized {
@@ -642,14 +700,40 @@ fn draw_one(
     }
     let drawing = Instant::now();
     let back = owned.swapchain.back_buffer()?;
-    let rtv = owned.gpu.rtv(&back)?;
-    owned
-        .composer
-        .draw(&owned.gpu, frame, &rtv, mode.output())?;
-    drop(rtv);
+    match frame {
+        Presentable::Frame(frame) => {
+            let rtv = owned.gpu.rtv(&back)?;
+            owned
+                .composer
+                .draw(&owned.gpu, frame, &rtv, mode.output())?;
+        }
+        Presentable::Canvas(canvas) => {
+            // Same size and format (`Sdr8` is B8G8R8A8_UNORM): a copy.
+            let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: size.0,
+                bottom: size.1,
+                back: 1,
+            };
+            unsafe {
+                owned.gpu.context.CopySubresourceRegion(
+                    &back,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &canvas.texture,
+                    0,
+                    Some(&region),
+                );
+            }
+        }
+    }
     drop(back);
     owned.phases[0] = drawing.elapsed();
-    Ok((first, resized, changed))
+    Ok(Some((first, resized, changed)))
 }
 
 super::opaque_debug!(PresenterHandle, PresenterThread);

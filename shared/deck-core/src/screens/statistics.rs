@@ -482,7 +482,7 @@ pub fn paint_negotiated_truth_panel(
         "Negotiated Truth (server_hello's ServerColorCaps active_* fields)\n\
          {}\n{}\n{}\n{}\n{}\n\
          Intent: {} (requested; no host reports it back)\n\
-         Encode: {} ({})\n\
+         Encode: {} via {}\n\
          Decode: {} ({}) on {}, {}\n\
          {}",
         axis(
@@ -521,7 +521,7 @@ pub fn paint_negotiated_truth_panel(
         ),
         intent,
         hardware_label(truth.encoder_hardware),
-        truth.encoder_backend,
+        arcen_media::video::encoder_backend_display_name(&truth.encoder_backend),
         hardware_label(decode.hardware),
         if decode.backend.is_empty() {
             "no frame decoded yet"

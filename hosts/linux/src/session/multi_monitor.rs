@@ -89,7 +89,7 @@ pub struct MultiMonitorGate {
     /// heads are available to plan against regardless of `advertise_enabled`.
     pub inventory: Option<HeadInventory>,
     /// This host's resolved `video.encoder` policy. `Auto` (the type
-    /// default), `WindowsMediaFoundation` and `SoftwareAv1` withhold the offer
+    /// default), `MediaFoundationHardware` and `SoftwareAv1` withhold the offer
     /// outright ([`build_offer`]); `NativeNvenc` and `SoftwareH264` are otherwise
     /// admitted, with `SoftwareH264` additionally re-checked against the
     /// planned topology's exact geometry at admission time (see
@@ -412,7 +412,7 @@ fn advertised_capability(inventory: &HeadInventory) -> Option<(u8, Vec<RotationM
 /// the carrier gate is not yet open, the operator gate is disabled, no heads
 /// or proven virtual outputs are available, or the resolved encoder
 /// ([`MultiMonitorGate::encoder`]) is not one multi-monitor admission plans
-/// (`Auto`, `WindowsMediaFoundation`, `SoftwareAv1`). Withholding the offer
+/// (`Auto`, `MediaFoundationHardware`, `SoftwareAv1`). Withholding the offer
 /// itself (rather than only rejecting admission later) means an
 /// incompatible-encoder host never advertises a capability it cannot
 /// deliver, so a client never even attempts to request it.
@@ -612,7 +612,7 @@ impl RegionAdmissionPolicy for LinuxRegionAdmission<'_> {
     }
 
     /// Defense-in-depth, run unconditionally after planning: [`build_offer`]
-    /// already withholds the offer for `Auto`/`WindowsMediaFoundation`, so an
+    /// already withholds the offer for `Auto`/`MediaFoundationHardware`, so an
     /// honest client can never even reach this admission path with an
     /// incompatible encoder — but this host's own committed geometry is only
     /// known once `plan_topology` has resolved every monitor's exact applied
@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn offer_is_withheld_when_the_encoder_policy_is_windows_media_foundation() {
         // The Windows-only backend is never valid on this Linux host.
-        let gate = enabled_gate_with_encoder(2, EncoderSelection::WindowsMediaFoundation);
+        let gate = enabled_gate_with_encoder(2, EncoderSelection::MediaFoundationHardware);
         assert!(build_offer(&gate).is_none());
     }
 
@@ -1720,7 +1720,7 @@ mod tests {
 
     #[test]
     fn admit_request_rejects_software_h264_when_a_monitor_would_be_clamped() {
-        // 2560x1600 exceeds OpenH264's 1920x1080 contract (see
+        // 5120x3200 exceeds OpenH264's own 3840x2160 (see
         // `media::multi_capenc`'s own clamp-detection fixtures): this
         // experimental v1 must fail admission closed rather than silently
         // commit a topology one of its pipelines cannot exactly encode.
@@ -1730,7 +1730,7 @@ mod tests {
             "primary",
             1,
             (0, 0),
-            (2560, 1600),
+            (5120, 3200),
             true,
             RotationMsg::Degrees0,
         )]);
@@ -1740,8 +1740,8 @@ mod tests {
             error,
             MultiMonitorDegradeReason::EncoderPolicyRejected(
                 crate::media::multi_capenc::MultiCapencConfigError::SoftwareGeometryWouldClamp {
-                    width: 2560,
-                    height: 1600,
+                    width: 5120,
+                    height: 3200,
                     ..
                 }
             )
@@ -1750,15 +1750,15 @@ mod tests {
 
     #[test]
     fn admit_request_accepts_software_h264_when_geometry_fits_exactly() {
-        // 1920x1080 fits OpenH264's contract with no clamp, so this policy
-        // may exactly honor it: admission must succeed.
+        // 3840x2160 fits OpenH264's own ceiling with no clamp, so this
+        // policy may exactly honor it: admission must succeed.
         let gate = enabled_gate_with_encoder(2, EncoderSelection::SoftwareH264);
         let offer = sample_offer(2);
         let request = sample_request(vec![descriptor(
             "primary",
             1,
             (0, 0),
-            (1920, 1080),
+            (3840, 2160),
             true,
             RotationMsg::Degrees0,
         )]);

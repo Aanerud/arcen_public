@@ -10,20 +10,21 @@
 //!
 //! It writes every [`InputEvent`] and a `PASS`/`FAIL` line per check to
 //! `OUT.txt`, and exits non-zero when a check fails. Lab only; never
-//! shipped.
+//! shipped: build it with `--features dev-tools` (the hook routes the lab's
+//! injected keys only in such a build).
 
-#[cfg(not(windows))]
+#[cfg(not(all(windows, feature = "dev-tools")))]
 fn main() -> std::process::ExitCode {
-    eprintln!("input_lab runs on Windows only");
+    eprintln!("input_lab runs on Windows only, built with --features dev-tools");
     std::process::ExitCode::FAILURE
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dev-tools"))]
 fn main() -> std::process::ExitCode {
     lab::run()
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "dev-tools"))]
 #[allow(unsafe_code, clippy::too_many_lines)]
 mod lab {
     use std::fs::File;
@@ -37,7 +38,8 @@ mod lab {
     };
     use arcen_input::PenTool;
     use arcen_input::deck_pen::ImageRect;
-    use arcen_input::keyboard::{DeckShortcut, KeyboardGrab, PcKeyboardSettings};
+    use arcen_input::keyboard::{DeckShortcut, KeyboardCapturePolicy, PcKeyboardSettings};
+    use arcen_input::pen_buttons::{HostPenButtons, PenButtonMap};
     use arcen_input::text::{HostTextTruth, TypingMode};
     use arcen_protocol::keys::{
         KEY_ALT, KEY_ALTGR, KEY_CONTROL, KEY_META, KEY_SHIFT, MOD_ALT, MOD_CTRL, MOD_KEYPAD,
@@ -91,6 +93,9 @@ mod lab {
     const IME: u32 = WM_APP + 8;
     const IME_SET: u32 = WM_APP + 9;
     const BAR: u32 = WM_APP + 10;
+    /// Pen buttons for a host that predates `pen_button_actions` (a Linux
+    /// Pier: its bits are swapped) with 1, the current layout with 0.
+    const PEN_LEGACY: u32 = WM_APP + 11;
     // imm.h; not in the crate's IME module.
     const IMC_GETCONVERSIONMODE: u32 = 0x0001;
     const IMC_GETOPENSTATUS: u32 = 0x0005;
@@ -380,10 +385,11 @@ mod lab {
                 LRESULT(0)
             }
             BAR => {
-                // The shell shows (1) or hides (0) the connection bar.
+                // The shell pins (1) or closes (0) the connection bar: the
+                // keyboard is this PC's while it is pinned.
                 let shown = wparam.0 == 1;
                 let grabbed = with_input(hwnd, |input| {
-                    input.set_connection_bar(shown);
+                    input.set_keyboard_released(shown);
                     input.grab_active()
                 });
                 LOG.with(|log| {
@@ -396,6 +402,20 @@ mod lab {
             }
             LOCK => {
                 with_input(hwnd, |input| input.set_pointer_lock(wparam.0 == 1));
+                LRESULT(0)
+            }
+            PEN_LEGACY => {
+                let host = if wparam.0 == 1 {
+                    HostPenButtons::LinuxLegacy
+                } else {
+                    HostPenButtons::Actions
+                };
+                with_input(hwnd, |input| {
+                    input.set_pen_buttons(PenButtonMap {
+                        host,
+                        ..PenButtonMap::default()
+                    });
+                });
                 LRESULT(0)
             }
             OTHER_WINDOW => {
@@ -650,8 +670,11 @@ mod lab {
         let Ok(hwnd) = hwnd else {
             return ExitCode::FAILURE;
         };
-        let mut input =
-            WindowInput::new(hwnd, Box::new(Sink(log.clone())), KeyboardGrab::Fullscreen);
+        let mut input = WindowInput::new(
+            hwnd,
+            Box::new(Sink(log.clone())),
+            KeyboardCapturePolicy::Fullscreen,
+        );
         let facts = HostInputFacts {
             platform: HostPlatform::Windows,
             extended_keys: true,
@@ -744,8 +767,9 @@ mod lab {
         send(&[key(0x38, true, false), key(0x03, false, false)]);
         send(&[key(0x03, false, true), key(0x38, true, true)]);
         post(window, LAYOUT, 0);
-        // 3 Without the grab: the Windows key stays local; Ctrl+Win+K is the
-        // Deck's, and Start stays shut.
+        // 3 Without the grab: the Windows key stays local, and Ctrl+Win+K,
+        // no Deck chord any more, is this PC's system chord: nothing of it
+        // reaches the host.
         post(window, MARK, 3);
         send(&[
             key(0x1D, false, false),
@@ -769,10 +793,10 @@ mod lab {
         send(&[key(0x38, true, false), key(0x03, false, false)]);
         send(&[key(0x03, false, true), key(0x38, true, true)]);
         post(window, LAYOUT, 0);
-        // 15 Ctrl+Alt+Home under the grab is the Deck's; the shell shows the
-        // connection bar, which takes the keyboard, so a letter stays with
-        // the Deck; 16 once the bar closes,
-        // the grab is back and the Windows key reaches the host again.
+        // 15 Ctrl+Alt+Home under the grab gives the keyboard to this PC
+        // (the shell pins the connection bar), so a letter stays with the
+        // Deck; 16 once the bar closes, the host has the keyboard and the
+        // grab again and the Windows key reaches it.
         post(window, MARK, 15);
         send(&[
             key(0x1D, false, false),
@@ -790,7 +814,7 @@ mod lab {
         post(window, MARK, 16);
         tap(0x5B, true);
         post(window, FULLSCREEN, 0);
-        // 5 F9 resets; Ctrl+Alt+End is Send Ctrl+Alt+Del.
+        // 5 F9 goes to the host; Ctrl+Alt+End is Send Ctrl+Alt+Del.
         post(window, MARK, 5);
         tap(0x43, false);
         send(&[
@@ -823,6 +847,15 @@ mod lab {
         post(window, OTHER_WINDOW, 0);
         send(&[key(0x2A, false, true)]);
         post(window, BACK, 0);
+        // 17 After that focus bounce the hook routes again: Alt+Tab under
+        // the grab reaches the host (the field fault: Alt+Tab stayed local
+        // once the window had lost focus and come back).
+        std::thread::sleep(Duration::from_millis(300));
+        post(window, FULLSCREEN, 1);
+        post(window, MARK, 17);
+        send(&[key(0x38, false, false), key(0x0F, false, false)]);
+        send(&[key(0x0F, false, true), key(0x38, false, true)]);
+        post(window, FULLSCREEN, 0);
         // 8 Mouse: a move, a click, a notch and a fine wheel step.
         // SAFETY: places the system cursor at the lab window's centre.
         unsafe {
@@ -834,11 +867,31 @@ mod lab {
         send(&[mouse(0, 0, 0, MOUSEEVENTF_LEFTUP)]);
         send(&[mouse(0, 0, 120, MOUSEEVENTF_WHEEL)]);
         send(&[mouse(0, 0, 30, MOUSEEVENTF_WHEEL)]);
-        // 9 Pointer lock: raw relative motion; F9 releases the lock.
+        // 18 Ctrl+Alt+Home gives the keyboard to this PC: a letter stays
+        // here, the click into the picture that gives it back is not sent,
+        // then the Windows key reaches the host again.
+        post(window, FULLSCREEN, 1);
+        post(window, MARK, 18);
+        send(&[
+            key(0x1D, false, false),
+            key(0x38, false, false),
+            key(0x47, true, false),
+        ]);
+        send(&[
+            key(0x47, true, true),
+            key(0x38, false, true),
+            key(0x1D, false, true),
+        ]);
+        tap(0x1E, false);
+        send(&[mouse(0, 0, 0, MOUSEEVENTF_LEFTDOWN)]);
+        send(&[mouse(0, 0, 0, MOUSEEVENTF_LEFTUP)]);
+        tap(0x5B, true);
+        post(window, FULLSCREEN, 0);
+        // 9 Pointer lock: raw relative motion; the menu releases the lock.
         post(window, LOCK, 1);
         post(window, MARK, 9);
         send(&[mouse(10, 5, 0, MOUSEEVENTF_MOVE)]);
-        tap(0x43, false);
+        post(window, LOCK, 0);
         // The cursor's last move is delivered before the pen starts.
         send(&[mouse(1, 0, 0, MOUSEEVENTF_MOVE)]);
         std::thread::sleep(Duration::from_millis(300));
@@ -908,11 +961,115 @@ mod lab {
         std::thread::sleep(Duration::from_millis(500));
         post(window, MARK, 13);
         post(window, IME, 0);
+        std::thread::sleep(Duration::from_millis(300));
+        let buttons = pen_buttons(window, center);
         post(window, DONE, 0);
-        injected
+        injected && buttons
+    }
+
+    /// 20 A tablet driver's pen buttons while the pen hovers: Windows Ink's
+    /// barrel, then the clicks a Wacom side switch set to Middle Click,
+    /// Right Click or Left Click performs as mouse clicks (`SendInput`, as
+    /// its driver does). 21 The barrel again for a Linux Pier that predates
+    /// `pen_button_actions`.
+    fn pen_buttons(window: isize, center: (i32, i32)) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP,
+        };
+        const INRANGE: u32 = 0x2;
+        const UPDATE: u32 = 0x2_0000;
+        const BARREL: u32 = 0x1;
+        let hover = |pen_flags| PenFrame {
+            flags: INRANGE | UPDATE,
+            at: center,
+            pressure: 0,
+            tilt: (0, 0),
+            rotation: 0,
+            pen_flags,
+        };
+        let away = PenFrame {
+            flags: UPDATE,
+            ..hover(0)
+        };
+        SynthPen::new().is_some_and(|mut pen| {
+            post(window, MARK, 20);
+            let mut ok = pen.send(&hover(0));
+            ok &= pen.send(&hover(BARREL));
+            ok &= pen.send(&hover(0));
+            for (down, up) in [
+                (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+                (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+                (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+            ] {
+                send(&[mouse(0, 0, 0, down)]);
+                ok &= pen.send(&hover(0));
+                send(&[mouse(0, 0, 0, up)]);
+                ok &= pen.send(&hover(0));
+            }
+            ok &= pen.send(&away);
+            post(window, PEN_LEGACY, 1);
+            post(window, MARK, 21);
+            ok &= pen.send(&hover(0));
+            ok &= pen.send(&hover(BARREL));
+            ok &= pen.send(&hover(0));
+            ok &= pen.send(&away);
+            post(window, PEN_LEGACY, 0);
+            ok
+        })
     }
 
     // --- Checks ---------------------------------------------------------------
+
+    /// Sections 20 and 21 ([`pen_buttons`]).
+    fn pen_button_checks(log: &Log, report: &mut Report) {
+        use arcen_protocol::messages::{PEN_BUTTON_MIDDLE_CLICK, PEN_BUTTON_RIGHT_CLICK};
+        let pen_buttons = |segment: &[InputEvent]| -> Vec<u16> {
+            let mut seen: Vec<u16> = Vec::new();
+            for event in segment {
+                if let InputEvent::Pen(pen) = event
+                    && seen.last() != Some(&pen.buttons)
+                {
+                    seen.push(pen.buttons);
+                }
+            }
+            seen
+        };
+        let mouse_buttons = |segment: &[InputEvent]| -> Vec<(u8, bool)> {
+            segment
+                .iter()
+                .filter_map(|event| match event {
+                    InputEvent::Button {
+                        button, pressed, ..
+                    } => Some((*button, *pressed)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let s20 = log.segment(20);
+        let (right, middle) = (PEN_BUTTON_RIGHT_CLICK, PEN_BUTTON_MIDDLE_CLICK);
+        // Barrel, then the driver's middle and right clicks, on the pen.
+        let expected = [0, right, 0, middle, 0, right, 0];
+        let seen = pen_buttons(&s20);
+        let mouse = mouse_buttons(&s20);
+        report.check(
+            "pen-barrel-and-driver-clicks-ride-on-the-pen",
+            seen == expected && mouse.iter().all(|(button, _)| *button == 1),
+            &format!("pen buttons {seen:?} (expected {expected:?}) mouse {mouse:?}"),
+        );
+        report.check(
+            "pen-driver-left-click-while-hovering-is-the-mouses",
+            mouse == [(1, true), (1, false)],
+            &format!("mouse {mouse:?}"),
+        );
+        let s21 = log.segment(21);
+        let seen = pen_buttons(&s21);
+        report.check(
+            "pen-barrel-on-a-legacy-linux-pier-is-bit-1",
+            seen == [0, middle, 0],
+            &format!("pen buttons {seen:?} {s21:?}"),
+        );
+    }
 
     struct Report {
         out: File,
@@ -972,9 +1129,12 @@ mod lab {
         );
         let s3 = log.segment(3);
         report.check(
-            "no-grab-windows-local-ctrl-win-k-deck",
-            s3.contains(&InputEvent::Shortcut(DeckShortcut::KeyboardPhysical))
-                && !keys(&s3).iter().any(|(key, ..)| *key == KEY_META),
+            "no-grab-windows-local-ctrl-win-k-to-host",
+            !s3.iter()
+                .any(|event| matches!(event, InputEvent::Shortcut(_)))
+                && !keys(&s3)
+                    .iter()
+                    .any(|(key, ..)| *key == KEY_META || *key == 0x4B),
             &format!("{s3:?}"),
         );
         let s4_events = log.segment(4);
@@ -994,20 +1154,39 @@ mod lab {
         let s15 = keys(&s15_events);
         let s16 = keys(&log.segment(16));
         report.check(
-            "ctrl-alt-home-connection-bar-takes-the-keyboard",
-            s15_events.contains(&InputEvent::Shortcut(DeckShortcut::ShowConnectionBar))
+            "ctrl-alt-home-gives-the-keyboard-to-this-pc",
+            s15_events.contains(&InputEvent::Shortcut(DeckShortcut::ReleaseKeyboard))
                 && !s15.iter().any(|(key, pressed, _)| *pressed && *key == 0x41)
                 && !s15.iter().any(|(key, ..)| *key == 0x0100_0010)
                 && s16.contains(&(KEY_META, true, MOD_META)),
             &format!("{s15_events:?} then {s16:?}"),
         );
+        let s17 = keys(&log.segment(17));
+        report.check(
+            "alt-tab-to-host-after-a-focus-bounce",
+            s17.contains(&(KEY_ALT, true, MOD_ALT)) && s17.contains(&(0x0100_0001, true, MOD_ALT)),
+            &format!("{s17:x?}"),
+        );
+        let s18_events = log.segment(18);
+        let s18 = keys(&s18_events);
+        report.check(
+            "released-keyboard-click-back-consumed",
+            s18_events.contains(&InputEvent::Shortcut(DeckShortcut::ReleaseKeyboard))
+                && !s18.iter().any(|(key, pressed, _)| *pressed && *key == 0x41)
+                && !s18_events
+                    .iter()
+                    .any(|event| matches!(event, InputEvent::Button { .. }))
+                && s18.contains(&(KEY_META, true, MOD_META)),
+            &format!("{s18_events:?}"),
+        );
         let s5 = log.segment(5);
         report.check(
-            "f9-reset-and-ctrl-alt-end",
-            s5.iter()
-                .any(|event| matches!(event, InputEvent::Reset { reason: "panic_f9" }))
+            "f9-to-host-and-ctrl-alt-end",
+            keys(&s5).contains(&(0x0100_0038, true, 0))
                 && s5.contains(&InputEvent::Shortcut(DeckShortcut::SendSecureAttention))
-                && !keys(&s5).iter().any(|(key, ..)| *key == 0x0100_0038),
+                && !s5
+                    .iter()
+                    .any(|event| matches!(event, InputEvent::Reset { .. })),
             &format!("{s5:?}"),
         );
         let s6 = keys(&log.segment(6));
@@ -1048,7 +1227,7 @@ mod lab {
         );
         let s9 = log.segment(9);
         report.check(
-            "pointer-lock-relative-and-f9",
+            "pointer-lock-relative-and-menu-release",
             s9.contains(&InputEvent::PointerRelative { dx: 10, dy: 5 })
                 && s9
                     .iter()
@@ -1143,6 +1322,7 @@ mod lab {
             skipped || (set_preedit && set_text.contains("にほん")),
             &format!("preedit={set_preedit} committed={set_text:?} {s12:?}"),
         );
+        pen_button_checks(log, report);
         report.check(
             "pen-pressure-tilt-rotation-barrel-eraser-leave",
             pen_injected
