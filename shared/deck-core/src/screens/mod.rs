@@ -21,6 +21,7 @@ pub mod connection_test;
 pub mod fidelity;
 pub mod home;
 pub mod host_pointer;
+pub mod keyboard_help;
 pub mod launcher;
 pub mod menu;
 pub mod reconnect;

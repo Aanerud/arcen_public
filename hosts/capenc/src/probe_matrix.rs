@@ -1078,7 +1078,7 @@ mod tests {
                 (
                     "MF",
                     EncoderAttemptOutcome::NotCompiled {
-                        detail: "built without --features mf".to_string(),
+                        detail: "built without --features mf-hw".to_string(),
                     },
                 ),
             ],

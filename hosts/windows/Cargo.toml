@@ -41,7 +41,7 @@ arcen-observability = { workspace = true, features = ["support-bundle"] }
 arcen-outputs.workspace = true
 arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
 arcen-cp-ipc = { path = "cp-ipc" }
-arcen-capenc = { path = "../capenc", features = ["nvenc", "software-h264"] }
+arcen-capenc = { path = "../capenc", features = ["nvenc", "mf-hw", "software-h264"] }
 getrandom.workspace = true
 quinn.workspace = true
 ring = "0.17"

@@ -72,7 +72,6 @@
 # lifecycle glue (a tokio task-local and the Pier's LifecycleEmitter), as
 # hosts/*/src/observability.rs are; its trace moves to shared/ with the emitter seam.
 hosts/capenc/src/annexb.rs 80
-hosts/capenc/src/region_schedule.rs 225
 hosts/capenc/src/wayland/cursor.rs 126
 hosts/capenc/src/wayland/evidence.rs 190
 hosts/capenc/src/wayland/format.rs 64

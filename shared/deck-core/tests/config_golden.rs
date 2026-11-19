@@ -80,7 +80,14 @@ fn every_field_changed() -> ClientSettings {
         hidpi_display_mask: 0b0010,
         tablet_input_enabled: false,
         tablet_mode_requested: TabletModeMsg::DisabledMouseCompat,
+        pen_buttons: arcen_input::pen_buttons::PenButtonSettings {
+            barrel: arcen_input::pen_buttons::PenButtonAction::MiddleClick,
+            lower: arcen_input::pen_buttons::PenButtonAction::Off,
+            upper: arcen_input::pen_buttons::PenButtonAction::RightClick,
+        },
         exact_still_image: false,
+        canvas: false,
+        canvas_cache_mib: 32,
         color_fidelity: ColorFidelitySettings {
             preset: ColorFidelity::GradingReference,
             overrides: ColorFidelityOverrides {
@@ -102,6 +109,7 @@ fn every_field_changed() -> ClientSettings {
             confirm_above: 500,
             chars_per_second: 10,
         },
+        keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Fullscreen,
     }
 }
 
@@ -142,6 +150,11 @@ fn settings_json_golden_for_defaults_every_field_and_a_legacy_file() {
     let loaded = load_client_settings(&repository).unwrap();
     assert_eq!(loaded.security_mode, SecurityMode::High);
     assert!(!loaded.clipboard_enabled);
+    // The keyboard grab's `never` is "this computer keeps its shortcuts".
+    assert_eq!(
+        loaded.keyboard_capture,
+        arcen_input::keyboard::KeyboardCapturePolicy::ThisComputer
+    );
     save_client_settings(&repository, &loaded).unwrap();
     golden(
         "settings.legacy.out.json",

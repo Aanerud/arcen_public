@@ -1316,9 +1316,12 @@ Duplication's accumulated presents and Windows.Graphics.Capture's superseded
 frames as `capture_behind`), and the Xorg XShm loops, software H.264 among
 them, state their pacing (`ticks_due`, `fresh_frames`): deadlines they
 skipped while encoding count at the share of reached deadlines that found new
-content (`arcen_media::video::SourceEvidence`). The software contract's 30 fps
-is OpenH264's ceiling, not a promise, so a CPU that encodes fewer is governed
-the same way; Grading and HDR keep their fixed 30. Grading requests HEVC 4:4:4 10-bit
+content (`arcen_media::video::SourceEvidence`). Every software loop counts
+only pictures Keel found changed (plus frames the source produced while it was
+busy), so a still screen is never read as a slow CPU. The software contract
+follows the Deck display like Auto, up to OpenH264's own 60 fps, and the
+governor steps it down to what the CPU encodes (as low as 5 fps); Grading and
+HDR keep their fixed 30. Grading requests HEVC 4:4:4 10-bit
 BT.709 at 30 fps. HDR requests
 HEVC 4:4:4 10-bit BT.2020/PQ at 30 fps and remains active only when the host
 proves a real HDR desktop source.
@@ -2429,9 +2432,12 @@ NVENC refusing a session because it is already serving its maximum concurrent
 streams, so a host with a working NVIDIA card can still fall back under load.
 
 **The software contract is narrower than hardware.** OpenH264 is H.264
-Baseline, 4:2:0, at most 1920x1200 at 30 fps. A Linux Pier configured for
-H.265 4:4:4 at 60 fps on a larger display will therefore be degraded, not
-refused, and will log exactly what it changed:
+Baseline, 4:2:0, at most 3840x2160 at 60 fps (OpenH264's own limits; Arcen
+sets no smaller size or rate). The frame rate a CPU sustains is found at run
+time: the Pier's governor lowers it to what the encoder keeps up with, and
+each picture is cut into up to four slices encoded on parallel threads. A
+Linux Pier configured for H.265 4:4:4 on a larger display will therefore be
+degraded, not refused, and will log exactly what it changed:
 
 ```json
 "software encode selected and the plan was degraded to fit it",
@@ -2462,7 +2468,7 @@ and the host will warn at startup naming what it will serve. A configured
 `video.qp_map` does not apply to software encode (OpenH264 has no QP-map API);
 the session runs with `qp-map=off` and logs it. On a headless Wayland host the
 same setting, or `auto` on a host whose qualification found no native encoder,
-creates each session's output at a size OpenH264 encodes (at most 1920×1200)
+creates each session's output at a size OpenH264 encodes (at most 3840×2160)
 before the session exists.
 
 No NVIDIA GPU encodes 12-bit at any chroma subsampling, so `video.bit_depth:
@@ -2534,9 +2540,8 @@ These are open findings, listed so an administrator is not surprised by them.
   window. Check for orphaned `Xorg` processes when decommissioning a host.
 - **BUILD-375, partly open** — on a Linux host with *no* usable NVENC, the
   `auto` path arms the session display at the client's requested geometry
-  before the NVENC probe result is known. Clients at or below 1920x1080 fall
+  before the NVENC probe result is known. Clients at or below 3840x2160 fall
   back cleanly; a client asking for more will fail to start a session. Forcing
   `"encoder": "software-h264"` works at any client size. Windows resolves a
   non-NVIDIA output to OpenH264 before display creation, fits the desktop to
-  the shared 1920x1200p30 contract, and degrades the codec to h264/yuv420
-  visibly.
+  OpenH264's own 3840x2160, and degrades the codec to h264/yuv420 visibly.

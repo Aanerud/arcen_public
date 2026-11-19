@@ -19,6 +19,8 @@
 //! - [`cursor`]   — the `CursorUpdate` host cursor image record.
 //! - [`cursor_position`] — the `CursorPosition` host pointer position record.
 //! - [`keys`]     — `key_event` key identifiers and modifier bits.
+//! - [`refine`]   — lossless refinement records (ADR 0016).
+//! - [`canvas`]   — canvas records for damage-first software streaming (ADR 0028).
 //!
 //! Byte-compatibility and any change to the wire is governed by `WIRE.md` in this
 //! crate. See it for the authoritative layout + dated changelog.
@@ -27,6 +29,8 @@
 
 pub mod auth;
 pub mod build_identity;
+mod bytes;
+pub mod canvas;
 pub mod clipboard;
 pub mod cursor;
 pub mod cursor_position;

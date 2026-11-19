@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! One `OpenH264` session for every Linux software encode path.
+//! One `OpenH264` session for every software encode path.
 //!
-//! The Xorg path (MIT-SHM capture) and the Wayland path (`PipeWire` shared
-//! memory) both turn eight-bit BGRA pictures into H.264 4:2:0 under the
-//! shared Software contract. Everything between "here is a BGRA picture and
+//! The Linux Xorg path (MIT-SHM capture), the Linux Wayland path (`PipeWire`
+//! shared memory) and the Windows path (Windows Graphics Capture through a
+//! staging texture) all turn eight-bit BGRA pictures into H.264 4:2:0 under
+//! the shared Software contract. Everything between "here is a BGRA picture and
 //! what changed" and "here is an access unit" lives here, once: the
 //! contract's bitrate bounds, the retained I420 planes, damage-driven
 //! selective conversion, keepalive and keyframe re-encodes of the retained
@@ -18,13 +19,14 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use arcen_keel::{BgraFrame, DamageMap};
+use arcen_keel::BgraFrame;
 
 use super::pipeline::{PipelineId, pipeline_contract};
 use super::{
     ColorTransform, ConversionError, EncodedAccessUnit, FrameLayoutError, I420Frame, I420FrameMut,
-    KeyframePolicy, SoftwareH264Config, SoftwareH264Encoder, SoftwareH264Error,
-    convert_bgra_to_i420, convert_bgra_to_i420_rows,
+    KeyframePolicy, MAX_SOFTWARE_H264_FPS, MAX_SOFTWARE_H264_THREADS, SoftwareH264Config,
+    SoftwareH264Content, SoftwareH264Encoder, SoftwareH264Error, SoftwareH264Threading,
+    StageDamage, convert_bgra_to_i420_rows_parallel,
 };
 use crate::{
     BitDepth, ChromaSubsampling, DirtyRatio, RepresentativeFrameKind, VideoCodec,
@@ -34,18 +36,39 @@ use crate::{
 /// What a software session is opened for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoftwareSessionConfig {
-    /// Coded width (even, at most the Software contract's).
+    /// Coded width (even, within `OpenH264`'s 3840x2160).
     pub width: u32,
-    /// Coded height (even, at most the Software contract's).
+    /// Coded height (even, within `OpenH264`'s 3840x2160).
     pub height: u32,
-    /// Initial frame-rate ceiling, 1 to the Software contract's.
+    /// Initial frame rate, 1 to [`MAX_SOFTWARE_H264_FPS`].
     pub fps: u32,
     /// The coded format: H.264 4:2:0 eight-bit, with the range, matrix,
     /// primaries and transfer the stream states and the conversion applies.
     pub video: VideoConfiguration,
-    /// Encoder worker threads, 1 to 64.
+    /// Encoder worker threads, 1 to 64; `OpenH264` encodes up to
+    /// [`MAX_SOFTWARE_H264_THREADS`] fixed slices in parallel.
     pub threads: u16,
+    /// What the pictures show (`OpenH264`'s usage mode).
+    pub content: SoftwareH264Content,
+    /// How live bitrate requests are held.
+    pub rate: SoftwareRate,
 }
+
+/// How a session holds live bitrate requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SoftwareRate {
+    /// A stream that owns the link: a quarter of the Software contract's
+    /// start bitrate at least, its ceiling at most.
+    #[default]
+    Contract,
+    /// A canvas surface sharing the link: the governor's grant as it is,
+    /// from [`MIN_GRANTED_BPS`] up to the contract's ceiling.
+    Granted,
+}
+
+/// The least bitrate a granted surface is held to: below it `OpenH264`'s
+/// rate control cannot hold a picture of any size.
+pub const MIN_GRANTED_BPS: u64 = 64_000;
 
 impl SoftwareSessionConfig {
     /// A stream of `video` at `width`x`height` and `fps`, with the host's
@@ -58,6 +81,8 @@ impl SoftwareSessionConfig {
             fps,
             video,
             threads: SoftwareH264Session::host_threads(),
+            content: SoftwareH264Content::Screen,
+            rate: SoftwareRate::Contract,
         }
     }
 }
@@ -102,17 +127,6 @@ impl Error for SoftwareSessionError {
     }
 }
 
-/// What changed in a staged picture.
-#[derive(Debug, Clone, Copy)]
-pub enum StageDamage<'a> {
-    /// Rebuild every plane (first picture, keyframe, full damage, or no map).
-    Full,
-    /// Rebuild only the 16x16 block rows the map marks dirty.
-    Rows(DamageMap<'a>),
-    /// Nothing changed; the retained planes stay as they are.
-    Clean,
-}
-
 /// The result of a live rate change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveChange {
@@ -134,7 +148,10 @@ pub struct SoftwareH264Session {
     v: Vec<u8>,
     start_bps: u32,
     ceiling_bps: u32,
+    rate: SoftwareRate,
     max_fps: u32,
+    /// Threads BGRA to I420 conversion is spread over (the encoder's).
+    convert_workers: usize,
 }
 
 /// The Software contract's start and ceiling bitrate for this stream.
@@ -166,7 +183,7 @@ impl SoftwareH264Session {
     ///
     /// [`SoftwareSessionError`] for a format other than H.264 4:2:0
     /// eight-bit, an allocation failure, or a configuration `OpenH264`
-    /// refuses (geometry above 1920x1200, odd dimensions, more than 30 fps).
+    /// refuses (odd dimensions, beyond its 3840x2160 or 60 fps).
     pub fn new(config: SoftwareSessionConfig) -> Result<Self, SoftwareSessionError> {
         let video = config.video;
         if video.codec != VideoCodec::H264
@@ -193,6 +210,7 @@ impl SoftwareH264Session {
             primaries: video.primaries,
             transfer: video.transfer,
             keyframe: KeyframePolicy::SOFTWARE_FALLBACK,
+            content: config.content,
         })
         .map_err(SoftwareSessionError::Encoder)?;
         let width = config.width as usize;
@@ -211,18 +229,27 @@ impl SoftwareH264Session {
             v: zeroed(chroma, "I420 Cr plane")?,
             start_bps,
             ceiling_bps,
-            max_fps: pipeline_contract(PipelineId::Software).max_fps,
+            rate: config.rate,
+            max_fps: MAX_SOFTWARE_H264_FPS,
+            convert_workers: usize::from(config.threads.max(1)),
         })
     }
 
-    /// The worker threads a host offers `OpenH264`: its parallelism, 1 to 64.
+    /// The worker threads a host offers `OpenH264`: its parallelism, held
+    /// to the [`MAX_SOFTWARE_H264_THREADS`] slices `OpenH264` encodes in
+    /// parallel.
     #[must_use]
     pub fn host_threads() -> u16 {
         std::thread::available_parallelism()
-            .map(|count| count.get().min(64))
             .ok()
-            .and_then(|count| u16::try_from(count).ok())
-            .unwrap_or(1)
+            .and_then(|count| u16::try_from(count.get()).ok())
+            .map_or(1, |count| count.clamp(1, MAX_SOFTWARE_H264_THREADS))
+    }
+
+    /// The slices and worker threads `OpenH264` encodes with.
+    #[must_use]
+    pub const fn threading(&self) -> SoftwareH264Threading {
+        self.encoder.threading()
     }
 
     /// Coded width.
@@ -267,20 +294,21 @@ impl SoftwareH264Session {
         source: BgraFrame<'_>,
         damage: StageDamage<'_>,
     ) -> Result<(), SoftwareSessionError> {
-        let transform = self.transform;
-        let mut destination = self.planes_mut()?;
-        match damage {
-            StageDamage::Clean => Ok(()),
-            StageDamage::Full => convert_bgra_to_i420(source, &mut destination, transform)
-                .map_err(SoftwareSessionError::Conversion),
+        let (transform, workers) = (self.transform, self.convert_workers);
+        let height = self.height as usize;
+        let full = 0..height;
+        let dirty: Vec<std::ops::Range<usize>>;
+        let ranges = match damage {
+            StageDamage::Clean => return Ok(()),
+            StageDamage::Full => std::slice::from_ref(&full),
             StageDamage::Rows(map) => {
-                for rows in map.dirty_block_rows() {
-                    convert_bgra_to_i420_rows(source, &mut destination, rows, transform)
-                        .map_err(SoftwareSessionError::Conversion)?;
-                }
-                Ok(())
+                dirty = map.dirty_block_rows().collect();
+                &dirty
             }
-        }
+        };
+        let mut destination = self.planes_mut()?;
+        convert_bgra_to_i420_rows_parallel(source, &mut destination, ranges, transform, workers)
+            .map_err(SoftwareSessionError::Conversion)
     }
 
     /// Writes a representative encoder-admission picture into the retained
@@ -310,12 +338,15 @@ impl SoftwareH264Session {
         }
     }
 
-    /// Fills the retained planes with BT.709 limited-range black (Y 16,
-    /// Cb/Cr 128), the probe's starting picture.
+    /// Fills the retained planes with black in the session's colour
+    /// contract (Y 16 for limited range, 0 for full; Cb/Cr 128): the
+    /// probe's starting picture, and what a host streams before its first
+    /// capture arrives.
     pub fn stage_black(&mut self) {
-        self.y.fill(16);
-        self.u.fill(128);
-        self.v.fill(128);
+        let coded = |code: i32| u8::try_from(code.clamp(0, 255)).unwrap_or(0);
+        self.y.fill(coded(self.transform.luma(0, 0, 0)));
+        self.u.fill(coded(self.transform.cb(0, 0, 0)));
+        self.v.fill(coded(self.transform.cr(0, 0, 0)));
     }
 
     fn planes_mut(&mut self) -> Result<I420FrameMut<'_>, SoftwareSessionError> {
@@ -356,8 +387,8 @@ impl SoftwareH264Session {
             .map_err(SoftwareSessionError::Encoder)
     }
 
-    /// A live frame-rate request, held to `1..=` the Software contract's
-    /// ceiling. `OpenH264` applies it without a recovery point, so no
+    /// A live frame-rate request (the host's governor or the link), held to
+    /// `1..=`[`MAX_SOFTWARE_H264_FPS`]. `OpenH264` applies it without a recovery point, so no
     /// keyframe is forced (a forced IDR here made cadence changes visible as
     /// keyframe pops).
     ///
@@ -375,14 +406,18 @@ impl SoftwareH264Session {
         Ok(LiveChange::Applied(fps))
     }
 
-    /// A live bitrate request, held to a quarter of the contract's start
-    /// bitrate at least and its ceiling at most.
+    /// A live bitrate request, held as the session's [`SoftwareRate`]
+    /// says.
     ///
     /// # Errors
     ///
     /// [`SoftwareSessionError::Encoder`] when `OpenH264` refuses it.
     pub fn reconfigure_bitrate(&mut self, bps: u64) -> Result<LiveChange, SoftwareSessionError> {
-        let bps = bps.clamp(u64::from(self.start_bps / 4), u64::from(self.ceiling_bps));
+        let floor = match self.rate {
+            SoftwareRate::Contract => u64::from(self.start_bps / 4),
+            SoftwareRate::Granted => MIN_GRANTED_BPS,
+        };
+        let bps = bps.clamp(floor, u64::from(self.ceiling_bps).max(floor));
         let bps = u32::try_from(bps).unwrap_or(u32::MAX);
         if bps == self.encoder.config().bitrate_bps {
             return Ok(LiveChange::Unchanged);
@@ -417,6 +452,8 @@ mod tests {
             fps: 30,
             video: VIDEO,
             threads: 1,
+            content: SoftwareH264Content::Screen,
+            rate: SoftwareRate::Contract,
         }
     }
 
@@ -426,9 +463,10 @@ mod tests {
 
     #[test]
     fn only_h264_420_eight_bit_within_the_contract_opens() {
-        assert!(SoftwareH264Session::new(config(1920, 1200)).is_ok());
+        // No size of the contract's own: OpenH264's 3840x2160 bounds it.
+        assert!(SoftwareH264Session::new(config(3840, 2160)).is_ok());
         assert!(matches!(
-            SoftwareH264Session::new(config(1922, 1080)),
+            SoftwareH264Session::new(config(3842, 2160)),
             Err(SoftwareSessionError::Encoder(_))
         ));
         for video in [
@@ -533,6 +571,24 @@ mod tests {
     }
 
     #[test]
+    fn a_granted_session_takes_the_grant_below_the_contracts_floor() {
+        let mut session = SoftwareH264Session::new(SoftwareSessionConfig {
+            rate: SoftwareRate::Granted,
+            ..config(1280, 720)
+        })
+        .expect("session");
+        assert!(u64::from(session.bitrate_bounds().0 / 4) > 300_000);
+        assert_eq!(
+            session.reconfigure_bitrate(300_000).expect("grant"),
+            LiveChange::Applied(300_000)
+        );
+        assert_eq!(
+            session.reconfigure_bitrate(1).expect("floor"),
+            LiveChange::Applied(64_000)
+        );
+    }
+
+    #[test]
     fn live_rates_follow_the_software_contract() {
         let mut session = SoftwareH264Session::new(config(1280, 720)).expect("session");
         let (start, ceiling) = session.bitrate_bounds();
@@ -554,8 +610,10 @@ mod tests {
             LiveChange::Applied(start / 4)
         );
         assert_eq!(
-            session.reconfigure_framerate(120).expect("held to 30"),
-            LiveChange::Unchanged
+            session
+                .reconfigure_framerate(120)
+                .expect("held to OpenH264's 60"),
+            LiveChange::Applied(60)
         );
         assert_eq!(
             session.reconfigure_framerate(0).expect("at least 1"),

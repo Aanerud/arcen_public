@@ -161,6 +161,7 @@ pub const fn macos_key_to_hid_usage(code: u16) -> Option<u8> {
         0x4F => 0x6D, // F18
         0x50 => 0x6E, // F19
         0x5A => 0x6F, // F20
+        0x6E => 0x65, // Menu (PC keyboard Application key)
         0x4A => 0x7F, // Mute
         0x48 => 0x80, // Volume Up
         0x49 => 0x81, // Volume Down
@@ -607,6 +608,9 @@ mod tests {
         assert_eq!(usage(0x41, 0), Some(0x04), "A");
         assert_eq!(usage(0x5A, 0), Some(0x1D), "Z");
         assert_eq!(usage(0x30, 0), Some(0x27), "0");
+        assert_eq!(usage(0x0100_003C, 0), Some(0x68), "F13");
+        assert_eq!(usage(0x0100_0043, 0), Some(0x6F), "F20");
+        assert_eq!(usage(0x0100_0055, 0), Some(0x65), "Menu");
         assert_eq!(usage(0x0100_0004, 0), Some(0x28), "Return");
         assert_eq!(usage(0x0100_0020, MOD_SHIFT), Some(0xE1), "Shift");
         assert_eq!(usage(0x0100_0021, MOD_CTRL), Some(0xE0), "Control");

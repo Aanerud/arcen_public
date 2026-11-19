@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
 
+pub mod console_guard;
 pub mod edges;
 pub mod eis;
 pub mod keymap;
@@ -23,6 +24,7 @@ pub struct InputStats {
     resets: AtomicU64,
     unmapped_keys: AtomicU64,
     unavailable_drops: AtomicU64,
+    console_refused: AtomicU64,
 }
 
 impl InputStats {
@@ -50,6 +52,11 @@ impl InputStats {
     /// Input refused because the session input connection was down.
     pub fn unavailable_drops(&self) -> u64 {
         self.unavailable_drops.load(Ordering::Relaxed)
+    }
+    /// Key presses refused because a text console had the screen
+    /// (`console_guard`).
+    pub fn console_refused(&self) -> u64 {
+        self.console_refused.load(Ordering::Relaxed)
     }
 }
 

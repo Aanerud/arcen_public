@@ -544,8 +544,8 @@ where
 /// facts are never assumed.
 /// The size a display update is served at: refused (`None`) unless the
 /// width is a multiple of four and the height even; on the software encoder
-/// a Wayland output is fitted to OpenH264's limits (aspect kept, width a
-/// multiple of four), while an Xorg MetaMode keeps its 1920x1080 ceiling.
+/// the output (Wayland or an Xorg MetaMode) is fitted to OpenH264's own
+/// 3840x2160 (aspect kept, width a multiple of four).
 /// A `host_converted` (ten-bit Xorg XShm) session is fitted to that path's
 /// pixel budget, aspect kept.
 fn resize_target(
@@ -566,13 +566,12 @@ fn resize_target(
             (fitted.0 > 0 && fitted.1 > 0).then_some(fitted)
         }
         (false, _) => Some((width, height)),
-        (true, true) => {
+        (true, _) => {
             let (fitted_width, fitted_height) =
                 capenc::fit_to_encoder_limits(EncoderRequest::SoftwareH264, width, height);
             let fitted = (fitted_width & !3, fitted_height & !1);
             (fitted.0 > 0 && fitted.1 > 0).then_some(fitted)
         }
-        (true, false) => (width <= 1920 && height <= 1080).then_some((width, height)),
     }
 }
 
@@ -1428,7 +1427,7 @@ fn build_auth_request(
 ///
 /// `cfg.multi_monitor.heads` (duplicate/unrecognized head rejection) and the
 /// `cfg.encoder` vs. `cfg.multi_monitor.advertise_enabled` policy conflict
-/// (`Auto`/`WindowsMediaFoundation` cannot ever back an advertised offer)
+/// (`Auto`/`MediaFoundationHardware` cannot ever back an advertised offer)
 /// are both already validated and rejected at CLI/config-load time (see
 /// `cli::parse`'s end-of-parse `validate-config` checks), so a build
 /// failure here should never happen in practice; it is still handled
@@ -1769,6 +1768,7 @@ fn config_with_initial_video_request_as(
         resolved.apply_initial_video_request(request)?;
     }
     resolved.deck_refine = response.lossless_refine_v1.clone();
+    resolved.deck_canvas = response.canvas_v1.clone();
     Ok(resolved)
 }
 
@@ -1812,6 +1812,60 @@ fn wayland_multi_output_config(
         multi.wayland_multi_output = true;
         config_with_initial_video_request(&multi, response)
     })
+}
+
+/// Whether the Deck asked for Grading or HDR (named, or a colour-fidelity
+/// request the Pier reads as one, as its fallbacks do) and this sign-in
+/// resolved to a 4:2:0 stream instead (a Wayland desktop that proves no
+/// wide composition, or proves it for one output only): a Deck marks every
+/// display full-colour (4:4:4) for those presets, so those marks went with
+/// the preset.
+fn wide_preset_served_narrower(response: &AuthResponse, session_config: &Config) -> bool {
+    let wide = response
+        .initial_video
+        .as_ref()
+        .and_then(|request| arcen_media::video::resolve_client_video_request(request).ok())
+        .is_some_and(|request| {
+            matches!(
+                request.pipeline,
+                Some(arcen_media::video::PipelineId::Grading | arcen_media::video::PipelineId::Hdr)
+            )
+        });
+    wide && session_config.chroma != "yuv444"
+}
+
+/// The planned topology of a Grading or HDR request served as a 4:2:0
+/// stream ([`wide_preset_served_narrower`]): each display the Deck marked
+/// full-colour for the preset takes the host default. Left as they were,
+/// the session was refused for "full-color 4:4:4" or, once the multi-output
+/// fallback had run, the encoder admission planned 4:4:4 on the Auto
+/// capture path and closed the session ("encoder capacity admission
+/// rejected") instead of serving it visibly as Auto.
+fn without_wide_full_color_requirement(
+    outcome: multi_monitor::MultiMonitorOutcome,
+    session_log_id: &CorrelationId,
+) -> multi_monitor::MultiMonitorOutcome {
+    let multi_monitor::MultiMonitorOutcome::Planned { mut plan, carrier } = outcome else {
+        return outcome;
+    };
+    let mut relaxed = 0_usize;
+    for monitor in &mut plan.monitors {
+        if monitor.quality_intent
+            == arcen_protocol::messages::MonitorQualityIntentMsg::FullColorRequired
+        {
+            monitor.quality_intent = arcen_protocol::messages::MonitorQualityIntentMsg::HostDefault;
+            relaxed += 1;
+        }
+    }
+    if relaxed > 0 {
+        info!(
+            target: AUTH,
+            sid = %session_log_id,
+            displays = relaxed,
+            "Grading or HDR is served as a 4:2:0 stream here: the displays marked full-colour for it take the host default"
+        );
+    }
+    multi_monitor::MultiMonitorOutcome::Planned { plan, carrier }
 }
 
 #[derive(Debug)]
@@ -2363,6 +2417,7 @@ where
         desktop: cfg.desktop_session.clone(),
         default_desktop: cfg.default_desktop.clone(),
         deskside: cfg.deskside.clone(),
+        desk_privacy: cfg.desk_privacy,
         provider: cfg.desktop_provider,
         x11_apps: cfg.wayland_x11_apps_enabled(),
         audio: crate::session::agent::AgentAudioArguments {
@@ -2432,7 +2487,10 @@ where
                             == arcen_protocol::messages::MonitorQualityIntentMsg::FullColorRequired
                     })
                     .count();
-                if full_color_required > 0 && session_config.chroma != "yuv444" {
+                if full_color_required > 0
+                    && session_config.chroma != "yuv444"
+                    && !wide_preset_served_narrower(&response, &session_config)
+                {
                     let error = format!(
                         "multi-monitor quality admission failed: {full_color_required} display(s) \
                          require full-color 4:4:4, but this host profile is configured for yuv420"
@@ -2478,6 +2536,11 @@ where
                     return Err(());
                 }
                 None => session_config,
+            };
+            let multi_monitor_outcome = if wide_preset_served_narrower(&response, &session_config) {
+                without_wide_full_color_requirement(multi_monitor_outcome, &session_log_id)
+            } else {
+                multi_monitor_outcome
             };
             // A multi-monitor request served as one stream (not admitted)
             // follows the display that shows it, not its fastest display.
@@ -6237,6 +6300,12 @@ async fn run_attachment(
         deck: cfg.deck_refine.clone(),
         lane: refine_lane_tx,
     });
+    // Canvas (ADR 0028): a single-monitor software capture serves it to a
+    // Deck that offered it; the shared plan decides per spawn.
+    initial_capenc.canvas = cfg.deck_canvas.clone().map(|deck| capenc::CanvasForward {
+        deck,
+        cpu_share: cfg.software_cpu_share,
+    });
     // Committed at admission (`session::multi_monitor::admit_requested_topology`)
     // and persisted onto this session's lease (`session::lifecycle`); fixed
     // for this session's lifetime — a reconnect reuses the exact same plan,
@@ -6895,6 +6964,21 @@ async fn run_attachment(
     );
     if cfg.deck_refine.is_some() {
         hello.lossless_refine = Some(refine_plan.hello_status());
+    }
+    // Canvas (ADR 0028): what the capture was started with, told only to a
+    // Deck that offered it.
+    if cfg.deck_canvas.is_some() {
+        let canvas_plan = match &capenc {
+            CapencHandle::Single(session) => session.canvas_plan().clone(),
+            CapencHandle::Multi(_) => arcen_media::canvas::serve::multi_monitor_off(),
+        };
+        info!(
+            target: MEDIA,
+            state = if canvas_plan.is_on() { "on" } else { "off" },
+            reason = if canvas_plan.is_on() { "" } else { canvas_plan.off_reason() },
+            "canvas plan"
+        );
+        hello.canvas = canvas_plan.status;
     }
     info!(
         target: MEDIA,
@@ -11176,7 +11260,7 @@ fn concrete_encoder_for(plan: ResolvedMediaPlan) -> Option<EncoderRequest> {
         // VideoToolbox is macOS. Both are in the shared vocabulary because
         // another Pier reports them, and neither is a request this one can
         // turn into a concrete encoder.
-        EncoderBackend::WindowsMediaFoundation | EncoderBackend::VideoToolbox => None,
+        EncoderBackend::MediaFoundationHardware | EncoderBackend::VideoToolbox => None,
         EncoderBackend::Rav1e => Some(EncoderRequest::SoftwareAv1),
     }
 }
@@ -11337,19 +11421,35 @@ fn spawn_frame_pump(
                 let refine = std::mem::take(&mut au.refine);
                 let classify_recovery =
                     generation_keyframe.is_some() || queue.requires_generation_recovery();
+                // A canvas record (ADR 0028) is its own wire frame: a reset
+                // is its recovery point, and a dropped frame makes the queue
+                // ask capenc for one (`IDR` starts a new generation).
                 let generation_recovery = classify_recovery
-                    && arcen_media::annexb::video_unit_is_recovery_point(
-                        &au.data,
-                        plan.video.codec,
+                    && if au.canvas {
+                        au.is_keyframe
+                    } else {
+                        arcen_media::annexb::video_unit_is_recovery_point(
+                            &au.data,
+                            plan.video.codec,
+                        )
+                    };
+                let frame = if au.canvas {
+                    let mut record = std::mem::take(&mut au.data);
+                    arcen_media::canvas::serve::stamp_canvas_frame(
+                        &mut record,
+                        wall_ms_u32_at(au.read_at),
                     );
-                let frame = media::build_video_frame(
-                    &plan,
-                    &au,
-                    wall_ms_u32_at(au.read_at),
-                    monitor_id,
-                    topology_generation,
-                    stream_epoch,
-                );
+                    record
+                } else {
+                    media::build_video_frame(
+                        &plan,
+                        &au,
+                        wall_ms_u32_at(au.read_at),
+                        monitor_id,
+                        topology_generation,
+                        stream_epoch,
+                    )
+                };
                 if generation_recovery && generation_keyframe.is_some() {
                     if queue.pin_generation_recovery(frame, refine) {
                         if let Some(ready) = generation_keyframe.take() {
@@ -12058,9 +12158,35 @@ fn handle_control_json(
                 primary.request_refine(command);
             }
         }
+        // Canvas (ADR 0028): flow control and reset requests go to the
+        // capture that serves the canvas, after the shared validation.
+        "canvas_ack" | "canvas_reset_request" => {
+            use arcen_media::capenc_control::CapencControlCommand;
+            let Some(command) =
+                serde_json::from_str::<arcen_protocol::canvas::CanvasControlMsg>(text)
+                    .ok()
+                    .as_ref()
+                    .and_then(CapencControlCommand::from_canvas_control)
+            else {
+                debug!(target: NET, "invalid canvas control message");
+                return;
+            };
+            if let Some(primary) = idr.first() {
+                primary.request_canvas(command);
+            }
+        }
         REQUEST_FULL_FRAME => {
             if let Err(error) = serde_json::from_str::<RequestFullFrameMsg>(text) {
                 debug!(target: NET, %error, "invalid request_full_frame message");
+                return;
+            }
+            if idr.first().is_some_and(IdrRequester::serves_canvas) {
+                // A canvas Deck recovers with `canvas_reset_request`; a
+                // keyframe request would restart the canvas (ADR 0028).
+                debug!(
+                    target: MEDIA,
+                    "request_full_frame ignored: the canvas recovers through canvas_reset_request"
+                );
                 return;
             }
             if full_frame_requests.request(Instant::now()).deliver_now {
@@ -13778,7 +13904,7 @@ mod tests {
             concrete_encoder_for(resized),
             Some(EncoderRequest::SoftwareH264)
         );
-        resized.backend = EncoderBackend::WindowsMediaFoundation;
+        resized.backend = EncoderBackend::MediaFoundationHardware;
         assert_eq!(concrete_encoder_for(resized), None);
     }
 
@@ -14094,6 +14220,95 @@ mod tests {
                 head(3, "third", 3840, false),
             ],
         }
+    }
+
+    #[test]
+    fn only_a_narrowed_wide_preset_sheds_its_full_colour_marks() {
+        use arcen_protocol::messages::StreamPipeline;
+        let ask = |pipeline: Option<StreamPipeline>| {
+            let mut response = AuthResponse::pam("artist", "credential");
+            response.initial_video = Some(arcen_protocol::messages::InitialVideoRequestMsg {
+                quality: QualitySettings {
+                    max_fps: 30,
+                    codec: "h265".to_string(),
+                    chroma: "yuv444".to_string(),
+                    video_selection: arcen_protocol::messages::VideoSelectionIntent::ColorFidelity,
+                    bit_depth: "10".to_string(),
+                    color_range: "full".to_string(),
+                    color_matrix: "bt709".to_string(),
+                    encode_intent: "quality".to_string(),
+                    ..QualitySettings::default()
+                },
+                capabilities: arcen_protocol::messages::ClientVideoCapabilitiesMsg {
+                    h264: true,
+                    h265: true,
+                    yuv444: true,
+                    main10: true,
+                    full_range: true,
+                    ..arcen_protocol::messages::ClientVideoCapabilitiesMsg::default()
+                },
+                pipeline,
+            });
+            response
+        };
+        let served = |chroma: &str| Config {
+            chroma: chroma.to_owned(),
+            ..Config::default()
+        };
+        assert!(wide_preset_served_narrower(
+            &ask(Some(StreamPipeline::Grading)),
+            &served("yuv420")
+        ));
+        // A colour-fidelity request without a pipeline name is Grading to the Pier.
+        assert!(wide_preset_served_narrower(&ask(None), &served("yuv420")));
+        assert!(!wide_preset_served_narrower(
+            &ask(Some(StreamPipeline::Grading)),
+            &served("yuv444")
+        ));
+        assert!(!wide_preset_served_narrower(
+            &AuthResponse::pam("artist", "credential"),
+            &served("yuv420")
+        ));
+    }
+
+    #[test]
+    fn a_wide_preset_served_as_auto_drops_its_full_colour_marks() {
+        use arcen_protocol::messages::{MonitorQualityIntentMsg, MultiMonitorCarrierMsg};
+        let mut plan = three_head_topology_plan();
+        plan.backend = crate::display::topology::LinuxTopologyBackend::VirtualOutputs;
+        plan.monitors[0].quality_intent = MonitorQualityIntentMsg::FullColorRequired;
+        plan.monitors[1].quality_intent = MonitorQualityIntentMsg::FullColorRequired;
+        let outcome = multi_monitor::MultiMonitorOutcome::Planned {
+            plan,
+            carrier: MultiMonitorCarrierMsg::MuxedReliableStream,
+        };
+        let sid = CorrelationId::from_uuid_v4_bytes([7; 16]);
+        let multi_monitor::MultiMonitorOutcome::Planned { plan, carrier } =
+            without_wide_full_color_requirement(outcome, &sid)
+        else {
+            panic!("the planned topology stays planned");
+        };
+        assert_eq!(carrier, MultiMonitorCarrierMsg::MuxedReliableStream);
+        let intents = plan
+            .monitors
+            .iter()
+            .map(|monitor| monitor.quality_intent)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            intents,
+            [
+                MonitorQualityIntentMsg::HostDefault,
+                MonitorQualityIntentMsg::HostDefault,
+                MonitorQualityIntentMsg::BandwidthOptimized,
+            ]
+        );
+        assert_eq!(
+            without_wide_full_color_requirement(
+                multi_monitor::MultiMonitorOutcome::NotRequested,
+                &sid
+            ),
+            multi_monitor::MultiMonitorOutcome::NotRequested
+        );
     }
 
     #[test]
@@ -15982,6 +16197,38 @@ mod tests {
     }
 
     #[test]
+    fn a_canvas_capture_ignores_request_full_frame() {
+        let (idr, mut idr_rx) = crate::media::capenc::test_support::fake_canvas_idr();
+        let (control, _control_rx) = ControlSender::channel(1);
+        let plan = resolved_media_plan();
+        let mut full_frame_requests =
+            arcen_media::video::FullFrameRequestCoalescer::new(FULL_FRAME_IDR_GUARD);
+        let mut input_sequence = InputSequenceTracker::default();
+        let json = serde_json::to_string(&RequestFullFrameMsg::default()).unwrap();
+        let session_health = Mutex::new(arcen_observability::session_health::SessionHealth::new(
+            arcen_telemetry::QosTargets::default(),
+        ));
+        handle_control_json(
+            &json,
+            std::slice::from_ref(&idr),
+            &control,
+            &plan,
+            &CorrelationId::from_uuid_v4_bytes([0; 16]),
+            None,
+            None,
+            &mut full_frame_requests,
+            &mut input_sequence,
+            plan.cursor_mode,
+            &session_health,
+            Instant::now(),
+        );
+        assert!(
+            idr_rx.try_recv().is_err(),
+            "a canvas Deck's keyframe request must not restart the canvas"
+        );
+    }
+
+    #[test]
     fn legacy_single_monitor_typed_request_full_frame_dispatches_existing_idr_path() {
         let (idr, mut idr_rx) = fake_idr();
         let (control, _control_rx) = ControlSender::channel(1);
@@ -17569,33 +17816,41 @@ mod software_resize_tests {
     }
 
     #[test]
-    fn a_software_wayland_resize_is_fitted_and_xorg_keeps_its_ceiling() {
+    fn a_software_resize_is_fitted_to_openh264_on_wayland_and_xorg() {
         // Hardware: served as asked.
         assert_eq!(
             resize_target(2560, 1440, false, true, false),
             Some((2560, 1440))
         );
-        // Software on Wayland: fitted to OpenH264, aspect kept, width % 4.
+        // Software on Wayland: served as asked up to OpenH264's own
+        // 3840x2160, beyond it fitted, aspect kept, width % 4.
         assert_eq!(
             resize_target(2560, 1440, true, true, false),
-            Some((1920, 1080))
+            Some((2560, 1440))
+        );
+        assert_eq!(
+            resize_target(5120, 2880, true, true, false),
+            Some((3840, 2160))
         );
         // The shared resolver keeps the aspect, so this one lands just under.
         assert_eq!(
-            resize_target(2880, 1800, true, true, false),
-            Some((1916, 1198))
+            resize_target(5760, 3600, true, true, false),
+            Some((3452, 2158))
         );
         assert_eq!(
             resize_target(1800, 1130, true, true, false),
             Some((1800, 1130))
         );
-        let (width, height) = resize_target(3024, 1890, true, true, false).unwrap();
-        assert!(width <= 1920 && height <= 1200 && width % 4 == 0 && height % 2 == 0);
-        // Software on Xorg: the MetaMode ceiling, unchanged.
-        assert_eq!(resize_target(2560, 1440, true, false, false), None);
+        let (width, height) = resize_target(6048, 3780, true, true, false).unwrap();
+        assert!(width <= 3840 && height <= 2160 && width % 4 == 0 && height % 2 == 0);
+        // Software on Xorg: the same OpenH264 fit, no ceiling of its own.
         assert_eq!(
-            resize_target(1920, 1080, true, false, false),
-            Some((1920, 1080))
+            resize_target(2560, 1440, true, false, false),
+            Some((2560, 1440))
+        );
+        assert_eq!(
+            resize_target(5120, 2880, true, false, false),
+            Some((3840, 2160))
         );
         // Malformed geometry is refused either way.
         assert_eq!(resize_target(1922, 1080, true, true, false), None);
@@ -17625,16 +17880,16 @@ mod software_resize_tests {
             ..Config::default()
         };
         assert_eq!(
-            wayland_software_refit(&software, &ready(2560, 1600, true)),
-            Some((1920, 1200))
+            wayland_software_refit(&software, &ready(7680, 4320, true)),
+            Some((3840, 2160))
         );
         // Already within the limits, or a fixed (startup-monitor) output.
         assert_eq!(
-            wayland_software_refit(&software, &ready(1800, 1130, true)),
+            wayland_software_refit(&software, &ready(2560, 1600, true)),
             None
         );
         assert_eq!(
-            wayland_software_refit(&software, &ready(2560, 1600, false)),
+            wayland_software_refit(&software, &ready(7680, 4320, false)),
             None
         );
         // A native host keeps its output.
@@ -17643,7 +17898,7 @@ mod software_resize_tests {
             ..Config::default()
         };
         assert_eq!(
-            wayland_software_refit(&native, &ready(2560, 1600, true)),
+            wayland_software_refit(&native, &ready(7680, 4320, true)),
             None
         );
     }

@@ -936,7 +936,7 @@ mod offer_tests {
     const ALL: [EncoderRequest; 5] = [
         EncoderRequest::Auto,
         EncoderRequest::NativeNvenc,
-        EncoderRequest::WindowsMediaFoundation,
+        EncoderRequest::MediaFoundationHardware,
         EncoderRequest::SoftwareH264,
         EncoderRequest::SoftwareAv1,
     ];
@@ -989,7 +989,7 @@ mod offer_tests {
                     );
                     assert_eq!(per_session, Ok(4));
                 }
-                EncoderRequest::WindowsMediaFoundation | EncoderRequest::SoftwareAv1 => {
+                EncoderRequest::MediaFoundationHardware | EncoderRequest::SoftwareAv1 => {
                     assert!(resolved.is_err() && per_session.is_err(), "{request:?}");
                 }
             }

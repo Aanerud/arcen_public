@@ -63,6 +63,7 @@ fn apply(
         form_username: &mut form.username,
         form_displays_mode: &mut form.displays,
         form_keyboard: &mut form.keyboard,
+        app_displays_mode: DisplaysMode::SinglePrimary,
         connection_error: None,
         remember_username: &mut form.remember,
         connection_test: None,
@@ -130,6 +131,54 @@ fn a_saved_connection_is_selected_and_deleting_it_clears_the_selection() {
     assert_eq!(status.as_deref(), Some("Removed Studio"));
     assert!(saved.is_empty());
     assert_eq!(direct.saved_connection_id, None);
+}
+
+#[test]
+fn use_settings_hands_a_connections_displays_choice_back_and_persists() {
+    // The field case: Settings › Displays is Primary display only, the saved
+    // connection keeps Match my layout; its panel's "Use Settings" clears it.
+    let dir = ScratchDir::new("follow-displays");
+    let repository = ClientConfigRepository::at(dir.0.clone());
+    let mut form = Form::default();
+    let mut direct = ConnectionDraft::new(ConnectionKind::DirectMachine);
+    let mut saved = Vec::new();
+    apply(
+        &mut form,
+        &mut direct,
+        &mut saved,
+        &repository,
+        HomeAction::SaveNew {
+            name: "Z8".to_owned(),
+            host: "203.0.113.100".to_owned(),
+            port: "18444".to_owned(),
+            username: String::new(),
+            displays_mode: Some(DisplaysMode::MatchLayout),
+            keyboard: KeyboardSettings::default(),
+        },
+    );
+    assert_eq!(
+        saved[0].settings.displays_mode,
+        Some(DisplaysMode::MatchLayout)
+    );
+    let (effect, status) = apply(
+        &mut form,
+        &mut direct,
+        &mut saved,
+        &repository,
+        HomeAction::FollowAppDisplays(0),
+    );
+    assert!(matches!(effect, HomeEffect::None));
+    assert_eq!(
+        status.as_deref(),
+        Some(
+            "\u{201c}Z8\u{201d} now connects with Settings \u{203a} Displays: Primary display only"
+        )
+    );
+    assert_eq!(saved[0].settings.displays_mode, None);
+    let file = repository.connections_file().expect("connections file");
+    let reloaded =
+        arcen_deck_core::config::parse_saved_connections(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(reloaded.connections[0].settings.displays_mode, None);
 }
 
 #[test]

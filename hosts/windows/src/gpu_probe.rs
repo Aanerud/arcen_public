@@ -48,6 +48,83 @@ pub struct HostCapabilityReport {
     pub recommendation: Option<AdapterRecommendation>,
     pub hypervisor_present: Option<bool>,
     pub firmware_sha256: Option<String>,
+    pub media_foundation_hardware: MediaFoundationHardwareReport,
+}
+
+/// The Media Foundation hardware encoder (Alpha) as diagnose sees it:
+/// registered MFTs only. A session admits one only after a real encode.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MediaFoundationHardwareReport {
+    /// `Media Foundation hardware (Alpha)`.
+    pub label: &'static str,
+    pub compiled: bool,
+    pub encoders: Vec<MediaFoundationEncoderCapability>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MediaFoundationEncoderCapability {
+    pub adapter: String,
+    pub codec: &'static str,
+    pub name: String,
+    pub vendor: String,
+}
+
+impl MediaFoundationHardwareReport {
+    fn probe() -> Self {
+        let label = arcen_media::video::EncoderBackend::MediaFoundationHardware.display_name();
+        let compiled = arcen_capenc::compiled_backend_features().mf_hw;
+        match arcen_capenc::media_foundation_hardware_encoders() {
+            Ok(found) => Self {
+                label,
+                compiled,
+                encoders: found
+                    .into_iter()
+                    .map(|encoder| MediaFoundationEncoderCapability {
+                        adapter: encoder.adapter,
+                        codec: encoder.codec.token(),
+                        name: encoder.name,
+                        vendor: encoder.vendor,
+                    })
+                    .collect(),
+                error: None,
+            },
+            Err(error) => Self {
+                label,
+                compiled,
+                encoders: Vec::new(),
+                error: Some(error),
+            },
+        }
+    }
+
+    fn summary(&self) -> String {
+        let mut output = format!("{}: ", self.label);
+        if let Some(error) = &self.error {
+            output.push_str(&format!("unavailable ({error})\n"));
+        } else if self.encoders.is_empty() {
+            output.push_str("no hardware encoder MFT registered (Auto uses NVENC or OpenH264)\n");
+        } else {
+            output.push_str(
+                "registered; a session admits it only after a proven encode, after NVENC and \
+                 before OpenH264\n",
+            );
+            for encoder in &self.encoders {
+                output.push_str(&format!(
+                    "  {} {} on {} ({})\n",
+                    encoder.codec,
+                    encoder.name,
+                    encoder.adapter,
+                    if encoder.vendor.is_empty() {
+                        "vendor ?"
+                    } else {
+                        &encoder.vendor
+                    }
+                ));
+            }
+        }
+        output
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -101,6 +178,10 @@ pub struct OutputCapability {
     pub edid_manufacture_id: Option<u16>,
     pub edid_product_code_id: Option<u16>,
     pub connector_instance: Option<u32>,
+    /// The device path of the adapter that owns this output's display
+    /// target (desk privacy tells a software-enumerated virtual display from
+    /// a monitor by it).
+    pub target_adapter_path: Option<String>,
     pub deskside_identity_sha256: Option<String>,
     pub deskside_edid_sha256: Option<String>,
     pub deskside_capture_sha256: Option<String>,
@@ -141,6 +222,10 @@ struct CcdTarget {
     edid_manufacture_id: u16,
     edid_product_code_id: u16,
     connector_instance: u32,
+    /// The device path of the adapter that owns the target (for an
+    /// indirect display, its IddCx adapter: `\\?\ROOT#...` when software
+    /// enumerated it, a bus path such as USB for a hardware adapter).
+    target_adapter_path: Option<String>,
 }
 
 impl HostCapabilityReport {
@@ -154,6 +239,7 @@ impl HostCapabilityReport {
                 .as_deref()
                 .unwrap_or("not found")
         );
+        output.push_str(&self.media_foundation_hardware.summary());
         if let Some(error) = self.topology_error.as_deref() {
             output.push_str(&format!("CCD topology: unavailable ({error})\n"));
         }
@@ -226,6 +312,7 @@ pub fn probe() -> Result<HostCapabilityReport, String> {
         recommendation,
         hypervisor_present,
         firmware_sha256,
+        media_foundation_hardware: MediaFoundationHardwareReport::probe(),
     })
 }
 
@@ -379,6 +466,8 @@ fn enumerate_adapters(
                     edid_manufacture_id: ccd_target.map(|target| target.edid_manufacture_id),
                     edid_product_code_id: ccd_target.map(|target| target.edid_product_code_id),
                     connector_instance: ccd_target.map(|target| target.connector_instance),
+                    target_adapter_path: ccd_target
+                        .and_then(|target| target.target_adapter_path.clone()),
                     deskside_identity_sha256: ccd_target
                         .and_then(|target| target.monitor_device_path.as_deref())
                         .map(crate::deskside::normalized_identity_hash),
@@ -625,6 +714,9 @@ fn query_ccd_targets() -> Result<HashMap<String, CcdTarget>, String> {
                 edid_manufacture_id: target.as_ref().map_or(0, |target| target.edidManufactureId),
                 edid_product_code_id: target.as_ref().map_or(0, |target| target.edidProductCodeId),
                 connector_instance: target.as_ref().map_or(0, |target| target.connectorInstance),
+                target_adapter_path: adapter_device_path(path.targetInfo.adapterId)
+                    .ok()
+                    .filter(|value| !value.is_empty()),
             };
             match values.entry(key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1036,6 +1128,7 @@ mod tests {
             edid_manufacture_id: None,
             edid_product_code_id: None,
             connector_instance: None,
+            target_adapter_path: None,
             deskside_identity_sha256: None,
             deskside_edid_sha256: None,
             deskside_capture_sha256: None,

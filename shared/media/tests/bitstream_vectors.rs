@@ -149,6 +149,29 @@ fn openh264_baseline_stream() {
 }
 
 #[test]
+fn openh264_four_slice_stream() {
+    // The software encoder's threaded stream: every picture is four slices
+    // (deblocking off across their edges), and each Deck's picture manager
+    // must take it as one low-latency picture.
+    check_fixture(
+        "openh264-4slice-320x192.264",
+        NalCodec::H264,
+        "profile=66 coded=320x192 visible=320x192 chroma=1 depth=8/8 colour=Some((false, 1, 1, 1))",
+        12,
+    );
+    let stream = std::fs::read(data("openh264-4slice-320x192.264")).unwrap();
+    let mut parser = H264Parser::new(1);
+    for (index, unit) in split_access_units(NalCodec::H264, &stream)
+        .into_iter()
+        .enumerate()
+    {
+        let decoded = parser.decode_access_unit(unit, &|_| false).unwrap();
+        let picture = decoded.picture.unwrap();
+        assert_eq!(picture.slices.len(), 4, "picture {index}");
+    }
+}
+
+#[test]
 fn nvenc_h264_high_stream() {
     check_fixture(
         "nvenc-h264-high-640x360.264",
@@ -275,6 +298,7 @@ fn corrupted_streams_never_panic() {
 fn fixtures() -> Vec<(&'static str, NalCodec)> {
     vec![
         ("openh264-160x96.264", NalCodec::H264),
+        ("openh264-4slice-320x192.264", NalCodec::H264),
         ("nvenc-h264-high-640x360.264", NalCodec::H264),
         ("nvenc-hevc-main-640x360.265", NalCodec::H265),
         ("nvenc-hevc-main10-640x360.265", NalCodec::H265),

@@ -45,8 +45,9 @@ use objc2_app_kit::{NSEvent, NSEventMask, NSEventSubtype, NSEventType};
 use objc2_foundation::{MainThreadMarker, NSProcessInfo};
 
 use super::sample::{
-    BoundedSampleQueue, DispatchAgeStats, DispatchAgeSummary, NativeTabletPoint,
-    NativeTabletProximity, NativeTabletTool, RawTabletSample, TabletButtonMask, TabletMonitorEvent,
+    driver_click_for_event, BoundedSampleQueue, DispatchAgeStats, DispatchAgeSummary,
+    NativeTabletPoint, NativeTabletProximity, NativeTabletTool, RawTabletSample, TabletButtonMask,
+    TabletMonitorEvent,
 };
 
 /// Bounded queue depth. Tablet point events can arrive well over 100 Hz;
@@ -523,6 +524,7 @@ fn decode_event(event: &NSEvent) -> Option<RawTabletSample> {
             tilt_y: event.tilt().y as f32,
             rotation_degrees: event.rotation(),
             buttons: TabletButtonMask::new(truncate_bits(event.buttonMask().0)),
+            driver_click: driver_click_for_event(kind.0, other_button_number(event, kind)),
             device_id: event.deviceID() as u64,
             tool,
             window_number: event.windowNumber(),
@@ -552,6 +554,19 @@ fn decode_event(event: &NSEvent) -> Option<RawTabletSample> {
             device_id: event.deviceID() as u64,
             window_number: event.windowNumber(),
         }))
+    }
+}
+
+/// `-[NSEvent buttonNumber]` of an other-mouse event, `0` for every other
+/// type (the property is defined for mouse button events only).
+fn other_button_number(event: &NSEvent, kind: NSEventType) -> isize {
+    if matches!(
+        kind,
+        NSEventType::OtherMouseDown | NSEventType::OtherMouseUp | NSEventType::OtherMouseDragged
+    ) {
+        event.buttonNumber()
+    } else {
+        0
     }
 }
 

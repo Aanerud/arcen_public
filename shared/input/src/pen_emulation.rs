@@ -49,14 +49,17 @@ pub const MIN_CONTACT_PRESSURE: f32 = 1.0 / 65_535.0;
 /// buttons Linux defines.
 pub const MAX_STYLUS_BARREL_BUTTONS: u8 = 3;
 
-/// Linux input event code of barrel button `index` (`BTN_STYLUS`,
-/// `BTN_STYLUS2`, `BTN_STYLUS3`), the codes the emulated-input button
-/// interface carries; `None` beyond [`MAX_STYLUS_BARREL_BUTTONS`].
+/// Linux input event code of barrel button `index`, the codes the
+/// emulated-input button interface carries; `None` beyond
+/// [`MAX_STYLUS_BARREL_BUTTONS`]. Bit 0 of the wire's buttons is the right
+/// click (`crate::pen_buttons`), which every Linux desktop gives
+/// `BTN_STYLUS2`; bit 1, the middle click, is `BTN_STYLUS`; bit 2
+/// `BTN_STYLUS3`.
 #[must_use]
 pub const fn barrel_button_code(index: u8) -> Option<u32> {
     match index {
-        0 => Some(0x14b),
-        1 => Some(0x14c),
+        0 => Some(0x14c),
+        1 => Some(0x14b),
         2 => Some(0x149),
         _ => None,
     }
@@ -1093,8 +1096,9 @@ mod tests {
 
     #[test]
     fn barrel_buttons_map_to_the_stylus_button_codes() {
-        assert_eq!(barrel_button_code(0), Some(0x14b));
-        assert_eq!(barrel_button_code(1), Some(0x14c));
+        // Right click (bit 0) is BTN_STYLUS2, middle click (bit 1) BTN_STYLUS.
+        assert_eq!(barrel_button_code(0), Some(0x14c));
+        assert_eq!(barrel_button_code(1), Some(0x14b));
         assert_eq!(barrel_button_code(2), Some(0x149));
         assert_eq!(barrel_button_code(3), None);
     }

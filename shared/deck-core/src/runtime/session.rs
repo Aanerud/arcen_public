@@ -484,6 +484,11 @@ pub struct ConnectOptions {
     /// The user's **Exact still image** switch (lossless refinement, ADR
     /// 0016). Off: the Deck does not ask for it and the host sends nothing.
     pub exact_still_image: bool,
+    /// The canvas this connection asks for (ADR 0028): built from the
+    /// sink's canvas executor and the user's switch
+    /// ([`crate::canvas::CanvasRequest::for_sink`]), so a Deck without an
+    /// executor never sends `canvas_v1`.
+    pub canvas: crate::canvas::CanvasRequest,
     /// The refresh each Deck display shows frames at, and the display the
     /// session window is on, read on the UI thread when the connection is
     /// planned ([`crate::connect_plan::deck_display_refresh`]). `monitors`
@@ -517,6 +522,7 @@ impl fmt::Debug for ConnectOptions {
             .field("tablet_input_enabled", &self.tablet_input_enabled)
             .field("tablet_mode_requested", &self.tablet_mode_requested)
             .field("display_refresh", &self.display_refresh)
+            .field("canvas", &self.canvas)
             .field("telemetry", &"<atomic counters>")
             .finish()
     }
@@ -552,6 +558,7 @@ impl ConnectOptions {
             tablet_mode_requested: self.tablet_mode_requested,
             telemetry: Arc::clone(&self.telemetry),
             exact_still_image: self.exact_still_image,
+            canvas: self.canvas.clone(),
             display_refresh: self.display_refresh.clone(),
             services: Arc::clone(&self.services),
         }
@@ -583,6 +590,10 @@ pub enum SessionEvent {
     CursorLaneReset,
     MicrophoneActive(bool),
     MediaReady,
+    /// A connection that asked for the canvas (ADR 0028): every
+    /// [`crate::canvas::ACK_INTERVAL`], so the media worker acknowledges and
+    /// asks for resets without waiting for the next record.
+    CanvasTick,
     PresentationRecoveryRequested,
     ConnectionStatusHint(Option<String>),
     Ended(SessionEnd),
@@ -1753,6 +1764,8 @@ fn spawn_session_with_auth(
     // Exact still image: refinement records are processed only for a
     // connection that asked for them.
     media.refine().set_accepting(options.exact_still_image);
+    // Canvas records are queued only for a connection that asked.
+    media_tx.set_canvas_request(options.canvas.clone());
     let clipboard = ClipboardSession::new();
     let task_clipboard = clipboard.clone();
     let task_cancellation = Arc::clone(&cancellation);
@@ -2164,6 +2177,9 @@ async fn run_session_correlated(
         tokio::time::interval(arcen_media::audio::MICROPHONE_STATS_INTERVAL);
     microphone_stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     microphone_stats_tick.tick().await;
+    let canvas_requested = options.canvas.capability().is_some();
+    let mut canvas_tick = tokio::time::interval(crate::canvas::ACK_INTERVAL);
+    canvas_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_received = tokio::time::Instant::now();
     let mut first_binary_observed = false;
 
@@ -2738,6 +2754,9 @@ async fn run_session_correlated(
                 if finished {
                     outbound = None;
                 }
+            }
+            _ = canvas_tick.tick(), if canvas_requested => {
+                let _ = tx.send(SessionEvent::CanvasTick);
             }
             _ = clipboard_expiry.tick() => {
                 if let Some(reassembler) = clipboard_reassembler.as_mut() {
@@ -3773,6 +3792,7 @@ where
             primary = %format!("{}x{}", response.screen_width, response.screen_height),
             mode = %response.displays_mode,
             exact_still_image = response.lossless_refine_v1.is_some(),
+            canvas = response.canvas_v1.is_some(),
             "reporting client display layout to host",
         );
     }
@@ -4133,6 +4153,9 @@ fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions)
         .exact_still_image
         .then(arcen_media::refine::hub::DeckRefineHub::capability)
         .flatten();
+    // Canvas: only a Deck whose sink executes canvas work, with the switch
+    // on (ADR 0028).
+    response.canvas_v1 = options.canvas.capability().cloned();
     response
 }
 
@@ -4428,6 +4451,8 @@ fn macos_input_capabilities(
         pen_eraser: pen,
         pen_proximity: pen,
         pen_barrel_buttons: pen,
+        // A host capability.
+        pen_button_actions: InputCapabilityAvailability::Unknown,
         // The Deck sends its input method's committed text, and shows what a
         // host reports it could not type.
         text_commit: InputCapabilityAvailability::Available,
@@ -4437,6 +4462,7 @@ fn macos_input_capabilities(
         extended_keys: InputCapabilityAvailability::Available,
         // A host capability.
         meta_pointer_mask: InputCapabilityAvailability::Unknown,
+        pc_keys: arcen_protocol::messages::PcKeysMsg::default(),
     }
 }
 
@@ -5887,6 +5913,36 @@ mod tests {
         assert!(capability.accepts(arcen_protocol::refine::RefineDomain::Rgb));
     }
 
+    /// `canvas_v1` is sent exactly when the request carries it: never for a
+    /// Deck without a canvas executor or with the switch off.
+    #[test]
+    fn the_canvas_capability_follows_the_request() {
+        let mut options = transport_test_options();
+        for request in [
+            crate::canvas::CanvasRequest::Unavailable,
+            crate::canvas::CanvasRequest::Off,
+        ] {
+            options.canvas = request;
+            assert!(
+                auth_response_with_metadata(AuthResponse::none(), &options)
+                    .canvas_v1
+                    .is_none()
+            );
+        }
+        options.canvas = crate::canvas::CanvasRequest::for_executor(
+            Some(crate::present::CanvasExecutorFacts {
+                max_canvas_px: 8_192,
+            }),
+            true,
+            true,
+            crate::canvas::DEFAULT_CACHE_MIB,
+        );
+        let asked = auth_response_with_metadata(AuthResponse::none(), &options);
+        let capability = asked.canvas_v1.clone().expect("requested");
+        assert_eq!(capability.max_canvas_px, 8_192);
+        assert_eq!(capability.max_surfaces_per_monitor, 2);
+    }
+
     /// Grading on a GPU without HEVC Main 4:4:4 10-bit (NVIDIA GRID
     /// V100D-16Q) goes out as Auto: the initial request, its pipeline and
     /// the later quality settings never ask for what the decoder lacks.
@@ -5989,6 +6045,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         }
     }
 
@@ -6143,6 +6200,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let started = Instant::now();
         let error = match open_quic_socket(&options, None, None).await {
@@ -7025,6 +7083,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let mut ws = open_quic_socket(&options, None, None).await.unwrap();
         // `lane_attachment` is consumed by the socket, never seen here.
@@ -7957,6 +8016,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let debug = format!("{options:?}");
         assert!(debug.contains("<redacted>"));
@@ -8119,6 +8179,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let auth = auth_response_with_metadata(AuthResponse::none(), &options);
         let hello =
@@ -8171,6 +8232,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let hello =
             client_hello_with_metadata(&options, &CorrelationId::from_uuid_v4_bytes([0; 16]));
@@ -8528,6 +8590,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         })
         .await
         .unwrap();
@@ -8583,6 +8646,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         });
 
         let event = next_session_event(&mut handle).await;
@@ -8673,6 +8737,7 @@ mod tests {
                 tablet_mode_requested: TabletModeMsg::LocalTermination,
                 telemetry: Arc::new(ClientTelemetry::default()),
                 exact_still_image: false,
+                canvas: crate::canvas::CanvasRequest::Unavailable,
             },
             "03".repeat(32),
         );
@@ -8801,6 +8866,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         });
         let auth_request = next_session_event(&mut handle).await;
         match auth_request {
@@ -8879,6 +8945,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         });
         assert!(matches!(
             next_session_event(&mut handle).await,
@@ -8940,6 +9007,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         })
         .await
         .unwrap_err();
@@ -9008,6 +9076,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
         });
         let _ = next_session_event(&mut handle).await;
         handle

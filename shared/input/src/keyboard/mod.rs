@@ -12,7 +12,10 @@
 //! - [`ShortcutTranslator`] applies one to a stream of physical key edges,
 //!   producing the host key edges and modifier masks to send;
 //! - [`scancode`] maps key identifiers to PC scan codes for a host that
-//!   injects physical keys (Windows).
+//!   injects physical keys (Windows);
+//! - [`host_keys`] holds every Pier's code for the PC keys outside the
+//!   main block and F1–F12 (Insert, Print Screen, Scroll Lock, Pause, Menu,
+//!   F13–F24), what a Pier's hello says of them, and what a Deck reads.
 //!
 //! A PC keyboard (a Windows Deck's) has the same policy in its PC flavour:
 //!
@@ -23,21 +26,39 @@
 //!   edges into the same host key edges, so a shortcut lands on the host
 //!   alike from either Deck;
 //! - [`DeckShortcut`] lists the chords both Decks keep for themselves, and
-//!   [`grab_takes`] what a PC Deck's keyboard grab takes from its system.
+//!   [`grab_takes`] what a PC Deck's keyboard grab takes from its system;
+//! - [`KeyboardCapture`] decides who has the keyboard (the host or this
+//!   computer) and [`KeyboardCapturePolicy`] when the system shortcuts go
+//!   to the host;
+//! - [`SendKey`] is the Send Key menu, [`KeyRemapTable`] a validated remap
+//!   table, and [`PRO_APP_CHORDS`] the chords no Deck chord may take.
 
+mod capture;
 mod deck_shortcuts;
+pub mod host_keys;
 pub mod pc;
 mod pc_input;
+mod pro_app_chords;
 pub mod scancode;
+mod send_keys;
 mod shortcuts;
 pub mod windows;
 
 use arcen_protocol::messages::HostPlatform;
 
+pub use capture::{
+    CaptureChange, ClickRoute, KeyboardCapture, KeyboardCapturePolicy, KeyboardOwner,
+    KeyboardStatus,
+};
 pub use deck_shortcuts::{DeckShortcut, MacChord, PcChord, PcModifierState};
 pub use pc_input::{
-    AltGrKey, HookRoute, HookRouter, KeyboardGrab, MacHostCommandKey, PcKeyAction, PcKeyEvent,
-    PcKeyboardInput, PcKeyboardSettings, SystemChord, grab_takes, resolve_pc_keyboard_policy,
+    AltGrKey, HookRoute, HookRouter, MacHostCommandKey, PcKeyAction, PcKeyEvent, PcKeyboardInput,
+    PcKeyboardSettings, SystemChord, grab_takes, resolve_pc_keyboard_policy,
+};
+pub use pro_app_chords::PRO_APP_CHORDS;
+pub use send_keys::{
+    KEY_INSERT, KEY_SYS_REQ, KeyRemap, KeyRemapTable, MAC_PC_KEYS, RemapError, SendKey,
+    remap_may_send,
 };
 pub use shortcuts::{
     DeckKey, DeckModifiers, HostKeyEdge, ShortcutTranslator, WINDOWS_APP_CONTROL_KEYS,
@@ -137,6 +158,9 @@ pub struct KeyboardPolicy {
     /// opening Start itself (`meta_pointer_mask`); otherwise the translator
     /// taps Control before such a release.
     pub host_masks_meta_release: bool,
+    /// A Mac keyboard's F13, F14 and F15 are Print Screen, Scroll Lock and
+    /// Pause on the host ([`mac_key_on_host`]): a PC host.
+    pub pc_print_keys: bool,
 }
 
 impl KeyboardPolicy {
@@ -148,6 +172,7 @@ impl KeyboardPolicy {
         left_option_altgr: false,
         intl_backslash: false,
         host_masks_meta_release: false,
+        pc_print_keys: false,
     };
 
     /// This policy, for a host that does (or does not) mask a pointer-only
@@ -199,12 +224,66 @@ pub fn resolve_keyboard_policy(
         left_option_altgr: altgr && settings.left_option_altgr,
         intl_backslash: extended_keys,
         host_masks_meta_release: false,
+        pc_print_keys: matches!(platform, HostPlatform::Windows | HostPlatform::Linux),
     }
 }
+
+/// The key a Mac keyboard's key is on the host. A Mac keyboard has no Print
+/// Screen, Scroll Lock or Pause: an Apple extended keyboard has F13, F14 and
+/// F15 in their places, and macOS reports a PC keyboard's Print Screen,
+/// Scroll Lock and Pause as F13, F14 and F15. On a PC host
+/// ([`KeyboardPolicy::pc_print_keys`]) they are those keys again; a Mac host
+/// keeps F13–F15.
+#[must_use]
+pub const fn mac_key_on_host(qt_key: u32, policy: KeyboardPolicy) -> u32 {
+    if !policy.pc_print_keys {
+        return qt_key;
+    }
+    match qt_key {
+        MAC_F13 => pc::KEY_PRINT,
+        MAC_F14 => pc::KEY_SCROLL_LOCK,
+        MAC_F15 => pc::KEY_PAUSE,
+        other => other,
+    }
+}
+
+/// `Qt::Key_F13`.
+const MAC_F13: u32 = pc::KEY_F1 + 12;
+/// `Qt::Key_F14`.
+const MAC_F14: u32 = pc::KEY_F1 + 13;
+/// `Qt::Key_F15`.
+const MAC_F15: u32 = pc::KEY_F1 + 14;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_macs_f13_to_f15_are_print_scroll_lock_and_pause_on_a_pc_host() {
+        for platform in [HostPlatform::Windows, HostPlatform::Linux] {
+            let policy = resolve_keyboard_policy(platform, true, KeyboardSettings::default());
+            assert_eq!(mac_key_on_host(pc::KEY_F1 + 12, policy), pc::KEY_PRINT);
+            assert_eq!(
+                mac_key_on_host(pc::KEY_F1 + 13, policy),
+                pc::KEY_SCROLL_LOCK
+            );
+            assert_eq!(mac_key_on_host(pc::KEY_F1 + 14, policy), pc::KEY_PAUSE);
+            assert_eq!(mac_key_on_host(pc::KEY_F1 + 15, policy), pc::KEY_F1 + 15);
+            assert_eq!(mac_key_on_host(0x41, policy), 0x41);
+        }
+        let windows =
+            resolve_keyboard_policy(HostPlatform::Windows, true, KeyboardSettings::default());
+        for remap in MAC_PC_KEYS {
+            assert_eq!(mac_key_on_host(remap.from, windows), remap.to);
+        }
+        assert!(KeyRemapTable::new(&MAC_PC_KEYS).is_ok());
+        let mac = resolve_keyboard_policy(HostPlatform::MacOs, true, KeyboardSettings::default());
+        assert_eq!(mac_key_on_host(pc::KEY_F1 + 12, mac), pc::KEY_F1 + 12);
+        assert_eq!(
+            mac_key_on_host(pc::KEY_F1 + 12, KeyboardPolicy::LEGACY),
+            pc::KEY_F1 + 12
+        );
+    }
 
     const fn settings(shortcuts: ShortcutPreference, left_option_altgr: bool) -> KeyboardSettings {
         KeyboardSettings {
@@ -223,12 +302,17 @@ mod tests {
         let windows = resolve_keyboard_policy(HostPlatform::Windows, true, automatic);
         assert_eq!(windows.shortcuts, ShortcutMode::WindowsApp);
         assert!(windows.right_option_altgr && !windows.left_option_altgr);
-        for platform in [HostPlatform::Linux, HostPlatform::Unknown] {
-            assert_eq!(
-                resolve_keyboard_policy(platform, false, automatic),
-                KeyboardPolicy::LEGACY
-            );
-        }
+        assert_eq!(
+            resolve_keyboard_policy(HostPlatform::Unknown, false, automatic),
+            KeyboardPolicy::LEGACY
+        );
+        assert_eq!(
+            resolve_keyboard_policy(HostPlatform::Linux, false, automatic),
+            KeyboardPolicy {
+                pc_print_keys: true,
+                ..KeyboardPolicy::LEGACY
+            }
+        );
     }
 
     #[test]

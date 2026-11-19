@@ -2,7 +2,7 @@
   "schema_version": 1,
   "crate": "arcen-keel",
   "owner": "Shared/Architecture",
-  "description": "Damage tracking: which 16x16 blocks changed.",
+  "description": "Content facts per 16x16 block: which changed (full or OS-narrowed hashing), what moved (OS or pixel motion search), how often it changes and its class, how it was last painted, its colour traits, motion regions, measured work cost, and the tile-cache ledger.",
   "validation": ["shared-keel-test", "shared-keel-clippy", "workspace-boundaries"],
   "consumers": [
     {
@@ -105,13 +105,6 @@
           "owner": "Windows Host"
         },
         {
-          "id": "windows-capenc-mf",
-          "entry_points": ["hosts/capenc/src/win_mf.rs"],
-          "build_profiles": ["windows-capenc-mf"],
-          "validation": ["windows-capenc-mf-build"],
-          "owner": "Windows Host"
-        },
-        {
           "id": "linux-wayland-capture-import",
           "entry_points": [
             "hosts/capenc/src/wayland/layout.rs"
@@ -148,6 +141,20 @@
       "package": "arcen-media",
       "dependency_kind": "normal",
       "contracts": ["activity", "cadence", "damage", "external", "grid", "hash"]
+    },
+    {
+      "package": "arcen-deck-windows",
+      "dependency_kind": "dev",
+      "contracts": ["grid", "scenario"],
+      "paths": [
+        {
+          "id": "windows-deck-present-test",
+          "entry_points": ["clients/windows/src/present/canvas/tests.rs"],
+          "build_profiles": ["windows-deck"],
+          "validation": ["windows-deck-test"],
+          "owner": "Windows Client"
+        }
+      ]
     },
     {
       "package": "arcen-pier-macos",

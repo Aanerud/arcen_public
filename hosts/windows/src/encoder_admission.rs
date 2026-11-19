@@ -349,10 +349,12 @@ pub fn plan_encoder_sets(
     let hardware_encode = match template.encoder {
         Some(EncoderRequest::NativeNvenc) => true,
         Some(EncoderRequest::SoftwareH264) => false,
-        // The Windows Pier never parses an MF or AV1 request (`parse_encoder`).
+        // AV1 is never parsed here, and Media Foundation hardware (Alpha) is
+        // single-display only: `prepare_multi_monitor_media` maps it to
+        // OpenH264 before planning.
         Some(
             EncoderRequest::Auto
-            | EncoderRequest::WindowsMediaFoundation
+            | EncoderRequest::MediaFoundationHardware
             | EncoderRequest::SoftwareAv1,
         )
         | None => {
@@ -1105,16 +1107,17 @@ mod tests {
         primary.height = 950;
         primary.mode_width = 1_512;
         primary.mode_height = 950;
+        // Both beyond OpenH264's own 3840x2160 in either orientation.
         let mut landscape = monitor(2, 7, false, "Approved GPU");
-        landscape.width = 2_560;
-        landscape.height = 1_440;
-        landscape.mode_width = 2_560;
-        landscape.mode_height = 1_440;
+        landscape.width = 5_120;
+        landscape.height = 2_880;
+        landscape.mode_width = 5_120;
+        landscape.mode_height = 2_880;
         let mut portrait = monitor(3, 8, false, "Approved GPU");
-        portrait.width = 1_440;
-        portrait.height = 2_560;
-        portrait.mode_width = 2_560;
-        portrait.mode_height = 1_440;
+        portrait.width = 2_880;
+        portrait.height = 5_120;
+        portrait.mode_width = 5_120;
+        portrait.mode_height = 2_880;
         portrait.rotation = Rotation::Degrees270;
         let topology = WindowsTopologyPlan {
             generation: TopologyGeneration::new(10).expect("generation"),

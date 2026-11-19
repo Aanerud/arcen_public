@@ -439,6 +439,33 @@ pub fn coded_fidelity_refusal(
     software::coded_refusal(requested, selection, cause)
 }
 
+/// The message an eight-bit 4:2:0 hardware encoder (the Windows Media
+/// Foundation hardware path, Alpha) refuses a Grading, HDR or colour-fidelity
+/// request with, led by [`FidelityRefusal::GpuFormatUnsupported`], or `None`
+/// when it can serve the request (Auto and Speed, unlike software, are served
+/// as asked). At most 140 bytes, like [`coded_fidelity_refusal`].
+#[must_use]
+pub fn eight_bit_hardware_refusal(
+    requested: Option<PipelineId>,
+    selection: VideoSelectionIntent,
+) -> Option<String> {
+    let what = match requested {
+        Some(PipelineId::Grading) => "Grading",
+        Some(PipelineId::Hdr) => "HDR",
+        Some(PipelineId::Auto | PipelineId::Speed | PipelineId::Software) => return None,
+        None => match selection {
+            VideoSelectionIntent::ColorFidelity => "Colour fidelity",
+            VideoSelectionIntent::AdaptivePerformance | VideoSelectionIntent::Exact => {
+                return None;
+            }
+        },
+    };
+    Some(format!(
+        "{}: {what} refused: this GPU's Media Foundation encoder (Alpha) is 8-bit 4:2:0 only",
+        FidelityRefusal::GpuFormatUnsupported.code()
+    ))
+}
+
 /// Encoder keyframe cadence policy for a served pipeline.
 ///
 /// Recovery is always explicit: a Deck requests `request_full_frame` after
@@ -1783,6 +1810,45 @@ mod tests {
                 "gpu_sessions_in_use: Grading refused: every GPU encoder session is in use"
             )
         );
+    }
+
+    #[test]
+    fn eight_bit_hardware_serves_auto_and_speed_and_refuses_fidelity_with_a_code() {
+        for (requested, selection) in [
+            (
+                Some(PipelineId::Auto),
+                VideoSelectionIntent::AdaptivePerformance,
+            ),
+            (
+                Some(PipelineId::Speed),
+                VideoSelectionIntent::AdaptivePerformance,
+            ),
+            (None, VideoSelectionIntent::AdaptivePerformance),
+            (None, VideoSelectionIntent::Exact),
+        ] {
+            assert_eq!(eight_bit_hardware_refusal(requested, selection), None);
+        }
+        for (requested, selection, what) in [
+            (
+                Some(PipelineId::Grading),
+                VideoSelectionIntent::ColorFidelity,
+                "Grading",
+            ),
+            (
+                Some(PipelineId::Hdr),
+                VideoSelectionIntent::ColorFidelity,
+                "HDR",
+            ),
+            (None, VideoSelectionIntent::ColorFidelity, "Colour fidelity"),
+        ] {
+            let message = eight_bit_hardware_refusal(requested, selection).expect("refused");
+            assert!(message.starts_with("gpu_format_unsupported: "), "{message}");
+            assert!(
+                message.contains(what) && message.contains("(Alpha)"),
+                "{message}"
+            );
+            assert!(message.len() <= 140, "{message}");
+        }
     }
 
     #[test]

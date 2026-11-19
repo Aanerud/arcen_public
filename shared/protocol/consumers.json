@@ -81,13 +81,6 @@
           "owner": "Windows Host"
         },
         {
-          "id": "windows-capenc-mf",
-          "entry_points": ["hosts/capenc/src/lib.rs"],
-          "build_profiles": ["windows-capenc-mf"],
-          "validation": ["windows-capenc-mf-build"],
-          "owner": "Windows Host"
-        },
-        {
           "id": "linux-wayland-auto",
           "entry_points": [
             "hosts/capenc/src/wayland/pipelines/auto.rs",
@@ -115,8 +108,10 @@
       "package": "arcen-deck-core",
       "dependency_kind": "normal",
       "contracts": [
+        "canvas",
         "crate",
         "messages",
+        "refine",
         "wire"
       ]
     },
@@ -261,7 +256,7 @@
     {
       "package": "arcen-media",
       "dependency_kind": "normal",
-      "contracts": ["cursor", "messages", "wire"]
+      "contracts": ["canvas", "cursor", "messages", "refine", "wire"]
     },
     {
       "package": "arcen-observability",
@@ -271,7 +266,7 @@
     {
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
-      "contracts": ["build_identity", "clipboard", "crate", "cursor", "cursor_position", "lanes", "messages", "wire"],
+      "contracts": ["build_identity", "canvas", "clipboard", "crate", "cursor", "cursor_position", "lanes", "messages", "wire"],
       "paths": [
         {
           "id": "linux-wayland-input",
@@ -506,7 +501,7 @@
     {
       "package": "arcen-pier-windows",
       "dependency_kind": "normal",
-      "contracts": ["auth", "build_identity", "clipboard", "crate", "fsm", "messages", "wire"],
+      "contracts": ["auth", "build_identity", "canvas", "clipboard", "crate", "fsm", "messages", "wire"],
       "paths": [
         {
           "id": "windows-auto",

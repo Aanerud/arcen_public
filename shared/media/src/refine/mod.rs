@@ -19,7 +19,8 @@
 //!   in the stream's code values (Linux Xorg depth 30:
 //!   [`source::PackedRgb10Source`]; Windows FP16 scRGB:
 //!   [`scrgb::ScrgbHalfSource`]; planar or biplanar ten-bit Y′CbCr 4:4:4,
-//!   the macOS Pier's `xf44`: [`ycbcr::YCbCr444Source`]).
+//!   the macOS Pier's `xf44`: [`ycbcr::YCbCr444Source`]; eight-bit BGRA,
+//!   the canvas's tiles (ADR 0028): [`source::Bgra8Source`]).
 //! - Deck: [`hub::RefineCompositor`] — paint exact tiles over the presented
 //!   frame and read them back for verification (macOS: the ten-bit Metal
 //!   presenter).

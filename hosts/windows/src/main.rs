@@ -405,10 +405,19 @@ pub struct HostConfig {
     pub timezone_redirection: bool,
     /// `platform.font_smoothing`: grey-scale text for the session's length.
     pub font_smoothing: font_smoothing::FontSmoothingPolicy,
+    /// `platform.media_foundation_hardware` (default on): Auto may serve a
+    /// non-NVIDIA GPU through its Media Foundation hardware encoder (Alpha).
+    pub media_foundation_hardware: bool,
+    /// Codecs this session's Media Foundation hardware admission probe
+    /// proved, best first. Per session, never from config.
+    pub media_foundation_codecs: Vec<arcen_media::VideoCodec>,
     pub reconnect_window_secs: u32,
     pub qos_targets: arcen_telemetry::QosTargets,
     pub debug_diagnostics: bool,
     pub deskside: deskside::DesksideConfig,
+    /// `privacy.desk`: the console desk is kept private while a Deck is
+    /// attached unless the administrator turned it off.
+    pub desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy,
     pub iddcx: config::WindowsIddCxConfig,
     pub multi_monitor: config::WindowsMultiMonitorConfig,
     /// `video.lossless_refinement`: exact still image may be offered.
@@ -416,6 +425,11 @@ pub struct HostConfig {
     /// The Deck's exact-still-image capability from its `AuthResponse`
     /// (absent while its setting is off). Per session, never from config.
     pub deck_refine: Option<arcen_protocol::refine::LosslessRefineCapability>,
+    /// The Deck's canvas offer from its `AuthResponse` (`canvas_v1`, ADR
+    /// 0028). Per session, never from config.
+    pub deck_canvas: Option<arcen_protocol::canvas::CanvasCapability>,
+    /// `video.software.cpu_share`: what the canvas loop may spend.
+    pub software_cpu_share: arcen_media::canvas::CpuShare,
 }
 
 impl HostConfig {
@@ -517,6 +531,9 @@ impl HostConfig {
         active: arcen_media::video::EncoderRequest,
         cause: Option<arcen_media::video::BackendUnavailableReason>,
     ) -> Result<(), String> {
+        if active == arcen_media::video::EncoderRequest::MediaFoundationHardware {
+            return self.apply_media_foundation_hardware_backend();
+        }
         if active != arcen_media::video::EncoderRequest::SoftwareH264 {
             return Ok(());
         }
@@ -538,7 +555,113 @@ impl HostConfig {
                 self.codec_name()
             ));
         }
-        self.codec = VideoCodec::H264;
+        self.serve_eight_bit_420(
+            VideoCodec::H264,
+            arcen_media::video::EncoderBackend::OpenH264,
+        );
+        Ok(())
+    }
+
+    /// Narrows the session to what the Media Foundation hardware encoder
+    /// (Alpha) proved: H.264 or HEVC, 8-bit 4:2:0. Auto and Speed are served
+    /// as asked; Grading, HDR and colour fidelity are refused with
+    /// `gpu_format_unsupported`. The codec is the session's own when the
+    /// admission probe proved it, else H.264, else HEVC for a Deck that
+    /// decodes it.
+    pub(crate) fn apply_media_foundation_hardware_backend(&mut self) -> Result<(), String> {
+        if let Some(refusal) = arcen_media::video::eight_bit_hardware_refusal(
+            self.requested_pipeline,
+            self.video_selection,
+        ) {
+            return Err(refusal);
+        }
+        let current = crate::capenc::media_codec(self.codec);
+        // Before the agent's probe has run nothing is proven yet; H.264 is
+        // what every Deck decodes and the probe always tries.
+        let admitted: &[arcen_media::VideoCodec] = if self.media_foundation_codecs.is_empty() {
+            &[arcen_media::VideoCodec::H264]
+        } else {
+            &self.media_foundation_codecs
+        };
+        let deck_decodes_h265 = self
+            .auth_video_request
+            .as_ref()
+            .and_then(|request| arcen_media::video::resolve_client_video_request(request).ok())
+            .is_some_and(|client| client.capabilities.h265);
+        let codec = if admitted.contains(&current) {
+            current
+        } else if admitted.contains(&arcen_media::VideoCodec::H264) {
+            arcen_media::VideoCodec::H264
+        } else if deck_decodes_h265 && admitted.contains(&arcen_media::VideoCodec::H265) {
+            arcen_media::VideoCodec::H265
+        } else {
+            return Err(format!(
+                "the Media Foundation hardware encoder (Alpha) proved no codec this Deck decodes \
+                 (proved: {})",
+                admitted
+                    .iter()
+                    .map(|codec| codec.token())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        };
+        if self.codec_pinned && codec != current {
+            return Err(format!(
+                "administrator codec pin {} is incompatible with the Media Foundation hardware \
+                 encoder (Alpha)",
+                self.codec_name()
+            ));
+        }
+        if self.variant_pinned
+            && (self.chroma != ChromaSubsampling::Yuv420
+                || self.bit_depth != BitDepth::Eight
+                || self.color_matrix.is_identity())
+        {
+            return Err(
+                "video.variant is incompatible with the Media Foundation hardware encoder (Alpha)"
+                    .to_string(),
+            );
+        }
+        self.serve_eight_bit_420(
+            crate::capenc::protocol_codec(codec),
+            arcen_media::video::EncoderBackend::MediaFoundationHardware,
+        );
+        Ok(())
+    }
+
+    /// The proven codecs this session may actually use: an administrator
+    /// codec pin keeps only itself, and HEVC needs a Deck that decodes it (an
+    /// unknown Deck counts as H.264 only). An empty answer means the Media
+    /// Foundation hardware encoder cannot serve this session, so Auto must not
+    /// choose it.
+    pub(crate) fn media_foundation_servable_codecs(
+        &self,
+        proven: &[arcen_media::VideoCodec],
+    ) -> Vec<arcen_media::VideoCodec> {
+        let pinned = self
+            .codec_pinned
+            .then(|| crate::capenc::media_codec(self.codec));
+        let deck_decodes_h265 = self
+            .auth_video_request
+            .as_ref()
+            .and_then(|request| arcen_media::video::resolve_client_video_request(request).ok())
+            .is_some_and(|client| client.capabilities.h265);
+        proven
+            .iter()
+            .copied()
+            .filter(|codec| pinned.is_none_or(|pinned| pinned == *codec))
+            .filter(|codec| *codec != arcen_media::VideoCodec::H265 || deck_decodes_h265)
+            .collect()
+    }
+
+    /// The eight-bit 4:2:0 contract a software or Media Foundation hardware
+    /// encoder serves, at `backend`'s frame-rate ceiling.
+    fn serve_eight_bit_420(
+        &mut self,
+        codec: VideoCodec,
+        backend: arcen_media::video::EncoderBackend,
+    ) {
+        self.codec = codec;
         self.chroma = ChromaSubsampling::Yuv420;
         self.bit_depth = BitDepth::Eight;
         if self.color_matrix.is_identity() {
@@ -554,14 +677,11 @@ impl HostConfig {
         if requested_bt709 && self.transfer == arcen_media::TransferCharacteristics::Srgb {
             self.transfer = arcen_media::TransferCharacteristics::Bt709;
         }
-        let openh264_fps = arcen_media::video::EncoderBackend::OpenH264
-            .contract()
-            .max_fps;
-        self.fps = self.fps.min(openh264_fps);
+        let max_fps = backend.contract().max_fps;
+        self.fps = self.fps.min(max_fps);
         self.frame_rate = self
             .frame_rate
-            .map(|rate| rate.narrow(openh264_fps, arcen_media::video::FrameRateBasis::Encoder));
-        Ok(())
+            .map(|rate| rate.narrow(max_fps, arcen_media::video::FrameRateBasis::Encoder));
     }
 
     pub(crate) fn exact_pins_allow_software_h264(&self) -> bool {
@@ -1369,9 +1489,10 @@ fn parse_encoder(value: &str) -> Result<arcen_media::video::EncoderRequest, Stri
     match value.to_ascii_lowercase().as_str() {
         "auto" => Ok(arcen_media::video::EncoderRequest::Auto),
         "nvenc" => Ok(arcen_media::video::EncoderRequest::NativeNvenc),
+        "mf-hw" => Ok(arcen_media::video::EncoderRequest::MediaFoundationHardware),
         "software-h264" | "openh264" => Ok(arcen_media::video::EncoderRequest::SoftwareH264),
         other => Err(format!(
-            "unsupported encoder: {other} (want auto|nvenc|software-h264)"
+            "unsupported encoder: {other} (want auto|nvenc|mf-hw|software-h264)"
         )),
     }
 }
@@ -1554,12 +1675,16 @@ where
     let mut local_playback = arcen_session::pier_config::LocalPlayback::default();
     let mut microphone_input_enabled = false;
     let mut lossless_refinement = true;
+    let mut software_cpu_share = arcen_media::canvas::CpuShare::default();
     let mut clipboard_policy = arcen_media::clipboard::ClipboardPolicy::default();
     let mut timezone_redirection = false;
     let mut font_smoothing = font_smoothing::FontSmoothingPolicy::default();
+    let mut media_foundation_hardware = true;
     let mut reconnect_window_secs =
         arcen_session::direct_reconnect::DEFAULT_RECONNECT_WINDOW_SECONDS;
     let mut deskside = deskside::DesksideConfig::default();
+    let mut desk_privacy =
+        arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default();
     let mut iddcx = config::WindowsIddCxConfig::default();
     let mut multi_monitor = config::WindowsMultiMonitorConfig::default();
     let mut output_selector = display::OutputSelector::GlobalIndex(0);
@@ -1569,6 +1694,7 @@ where
     if let Some(loaded) = loaded {
         config_path = Some(loaded.path);
         let file = loaded.value;
+        desk_privacy = file.privacy.desk_policy();
         let resolved = file
             .logging
             .resolved_profile()
@@ -1640,6 +1766,8 @@ where
         }
         // Windows reads HDR state from the OS (Advanced Color); an operator
         // declaration could only contradict it.
+        software_cpu_share =
+            arcen_media::canvas::CpuShare::from_setting(file.video.software_cpu_share_percent());
         if let Some(value) = file.video.desktop_encoding {
             if arcen_media::video::DesktopSignalEncoding::from_token(&value.to_ascii_lowercase())
                 != Some(arcen_media::video::DesktopSignalEncoding::Sdr)
@@ -1709,6 +1837,7 @@ where
         lossless_refinement = arcen_session::pier_config::LosslessRefinementSetting::resolve(
             file.video.lossless_refinement,
         );
+
         if let Some(value) = file.clipboard.direction {
             clipboard_policy.direction = parse_clipboard_direction(&value)?;
         }
@@ -1723,6 +1852,9 @@ where
             )?;
         }
         font_smoothing = file.platform.font_smoothing;
+        if let Some(value) = file.platform.media_foundation_hardware {
+            media_foundation_hardware = value;
+        }
         if let Some(value) = file.platform.first_login_timeout_secs {
             first_login_timeout = validated_first_login_timeout(value)?;
         }
@@ -1754,6 +1886,12 @@ where
         }
         desktop.deskside.validate()?;
         deskside = desktop.deskside.clone();
+        if deskside.enabled && !desk_privacy.enabled {
+            return Err(
+                "platform.desktop.deskside (pinned deskside) contradicts privacy.desk = \"off\""
+                    .to_string(),
+            );
+        }
         if let Some(value) = file.auth.reconnect_window_secs {
             reconnect_window_secs = validated_reconnect_window(value)?;
         }
@@ -2070,14 +2208,19 @@ where
         clipboard_policy,
         timezone_redirection,
         font_smoothing,
+        media_foundation_hardware,
+        media_foundation_codecs: Vec::new(),
         reconnect_window_secs,
         qos_targets,
         debug_diagnostics,
         deskside,
+        desk_privacy,
         iddcx,
         multi_monitor,
         lossless_refinement,
         deck_refine: None,
+        deck_canvas: None,
+        software_cpu_share,
     };
     #[cfg(not(test))]
     resolve_multi_monitor_adapter_at_startup(&mut config)?;
@@ -3149,6 +3292,14 @@ where
     let mut console_display_recovery_tick = tokio::time::interval(Duration::from_secs(5));
     console_display_recovery_tick.tick().await;
     on_started();
+    // Desk privacy is on unless the administrator turned it off
+    // (`privacy.desk`); the effective choice is said once, at start (off at
+    // error level, so every log profile records it).
+    if args.config.desk_privacy.enabled {
+        tracing::info!(target: crate::logging::SESSION, "{}", args.config.desk_privacy.startup_line());
+    } else {
+        tracing::error!(target: crate::logging::SESSION, "{}", args.config.desk_privacy.startup_line());
+    }
     diagnostics::spawn_startup_debug_diagnostics(quic_bind);
     topology_debug.request("startup");
     emit_effective_profile(
@@ -4484,6 +4635,94 @@ mod tests {
     }
 
     #[test]
+    fn media_foundation_hardware_serves_proven_eight_bit_codecs_and_refuses_grading() {
+        let mut auto = unpinned_config();
+        let mut request = initial_video_request(VideoSelectionIntent::Exact);
+        request.quality.codec = "h265".to_string();
+        request.capabilities.h265 = true;
+        request.quality.max_fps = 120;
+        auto.apply_initial_video_request(&request).unwrap();
+        auto.media_foundation_codecs = vec![arcen_media::VideoCodec::H264];
+        auto.apply_software_h264_backend(
+            arcen_media::video::EncoderRequest::MediaFoundationHardware,
+        )
+        .expect("Auto is served on the hardware MFT");
+        assert_eq!(auto.codec, VideoCodec::H264, "only H.264 was proven");
+        assert_eq!(auto.chroma, ChromaSubsampling::Yuv420);
+        assert_eq!(auto.bit_depth, BitDepth::Eight);
+        assert!(
+            auto.fps >= 60,
+            "hardware keeps a hardware frame rate, not the software cap: {}",
+            auto.fps
+        );
+
+        let mut hevc = unpinned_config();
+        hevc.apply_initial_video_request(&request).unwrap();
+        assert_eq!(
+            hevc.codec,
+            VideoCodec::H265,
+            "the Deck asked for HEVC exactly"
+        );
+        hevc.media_foundation_codecs =
+            vec![arcen_media::VideoCodec::H264, arcen_media::VideoCodec::H265];
+        hevc.apply_software_h264_backend(
+            arcen_media::video::EncoderRequest::MediaFoundationHardware,
+        )
+        .unwrap();
+        assert_eq!(
+            hevc.codec,
+            VideoCodec::H265,
+            "a proven codec the Deck asked for stays"
+        );
+
+        let mut grading = unpinned_config();
+        grading
+            .apply_initial_video_request(&grading_request(true))
+            .unwrap();
+        grading.media_foundation_codecs = vec![arcen_media::VideoCodec::H265];
+        let refusal = grading
+            .apply_software_h264_backend(
+                arcen_media::video::EncoderRequest::MediaFoundationHardware,
+            )
+            .expect_err("Grading needs 10-bit 4:4:4");
+        assert!(
+            refusal.starts_with("gpu_format_unsupported: Grading refused"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn media_foundation_evidence_counts_only_codecs_the_session_can_use() {
+        let proven = [arcen_media::VideoCodec::H264, arcen_media::VideoCodec::H265];
+        let hevc_only = [arcen_media::VideoCodec::H265];
+        let mut deck = unpinned_config();
+        let mut request = initial_video_request(VideoSelectionIntent::AdaptivePerformance);
+        request.capabilities.h265 = false;
+        deck.auth_video_request = Some(request.clone());
+        assert_eq!(
+            deck.media_foundation_servable_codecs(&proven),
+            vec![arcen_media::VideoCodec::H264]
+        );
+        assert!(
+            deck.media_foundation_servable_codecs(&hevc_only).is_empty(),
+            "an H.264-only Deck makes a HEVC-only proof no evidence, so Auto keeps OpenH264"
+        );
+        request.capabilities.h265 = true;
+        deck.auth_video_request = Some(request);
+        assert_eq!(
+            deck.media_foundation_servable_codecs(&hevc_only),
+            hevc_only.to_vec()
+        );
+        deck.codec_pinned = true;
+        deck.codec = VideoCodec::H264;
+        assert!(deck.media_foundation_servable_codecs(&hevc_only).is_empty());
+        assert_eq!(
+            deck.media_foundation_servable_codecs(&proven),
+            vec![arcen_media::VideoCodec::H264]
+        );
+    }
+
+    #[test]
     fn speed_pipeline_contract_drives_motion_priority() {
         let mut config = parse_args_from(
             [
@@ -4584,7 +4823,7 @@ mod tests {
                 "--bit-depth",
                 "10",
                 "--fps",
-                "60",
+                "120",
             ]
             .into_iter()
             .map(str::to_string),
@@ -4597,7 +4836,9 @@ mod tests {
         assert_eq!(software.codec, VideoCodec::H264);
         assert_eq!(software.chroma, ChromaSubsampling::Yuv420);
         assert_eq!(software.bit_depth, BitDepth::Eight);
-        assert_eq!(software.fps, 30);
+        // OpenH264's own 60 fps is the only bound; the governor lowers the
+        // rate to what the CPU encodes.
+        assert_eq!(software.fps, 60);
 
         let mut pinned = software;
         pinned.codec = VideoCodec::H265;
@@ -4732,7 +4973,7 @@ mod tests {
                 "--variant",
                 "h264-420-8-limited-bt709",
                 "--fps",
-                "60",
+                "120",
             ]
             .into_iter()
             .map(str::to_string),

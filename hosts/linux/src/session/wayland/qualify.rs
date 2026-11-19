@@ -1849,6 +1849,7 @@ fn qualification_launcher_config(
         desktop: config.desktop_session.clone(),
         default_desktop: None,
         deskside: crate::deskside::LinuxDesksideConfig::default(),
+        desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(),
         provider: DesktopProvider::Wayland,
         audio: crate::session::agent::AgentAudioArguments {
             local_playback: config.local_playback,
@@ -2527,12 +2528,13 @@ async fn qualify_output(
             }
         }
         if run.native_encoder == CapabilityFact::Missing {
-            // The software contract serves at most 30 fps: Speed is always
-            // visibly downgraded here, so no source rate is worth recording.
+            // Speed is always served as Software here (no motion floor; the
+            // governor holds the rate the CPU encodes), so no source rate is
+            // worth recording.
             step(
                 "speed_rate",
                 true,
-                "skipped: software encode serves Speed as Software at up to 30 fps",
+                "skipped: software encode serves Speed as Software at the rate the CPU encodes",
             );
         } else {
             for codec in codecs {
@@ -3193,8 +3195,8 @@ async fn run_with(
         "  Auto:    {}",
         match (wayland.is_ok(), software) {
             (true, true) =>
-                "yes, in software (OpenH264, H.264 4:2:0 at up to 30 fps, outputs \
-                             fitted to 1920x1200)",
+                "yes, in software (OpenH264, H.264 4:2:0 at the rate the CPU encodes, \
+                             up to 60 fps, outputs fitted to 3840x2160)",
             (true, false) => "yes",
             (false, _) => "no",
         }
@@ -3242,7 +3244,7 @@ async fn run_with(
                 decision.map_or_else(
                     || {
                         if software {
-                            "no (served as Software at up to 30 fps: no native encoder)"
+                            "no (served as Software at the rate the CPU encodes: no native encoder)"
                                 .to_owned()
                         } else {
                             format!(

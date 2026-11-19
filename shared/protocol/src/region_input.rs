@@ -220,6 +220,8 @@ pub struct RegionPenEventMsg {
     pub in_proximity: bool,
     #[serde(default)]
     pub touching: bool,
+    /// As [`crate::messages::PenEventMsg::buttons`]: bit 0 right click,
+    /// bit 1 middle click.
     #[serde(default)]
     pub buttons: u16,
     #[serde(flatten)]

@@ -103,8 +103,8 @@ The implementation is split across:
 
 `arcen-media` remains platform-free and free of hidden I/O. Its crate-wide
 unsafe lint is `deny`; the only allowed unsafe exception is the reviewed
-OpenH264 raw `SetOption` bridge in `software_h264.rs`, which exposes safe
-bitrate and frame-rate setters and documents the native-call invariants. The
+OpenH264 raw `SetOption`/`GetOption` bridge in `software_h264.rs`, which
+exposes safe bitrate and frame-rate setters and fixed-slice threading and documents the native-call invariants. The
 safe wrapper does not make the underlying C/C++ codec memory-safe. Platform FFI
 and native resource ownership stay in `arcen-capenc`.
 
@@ -329,7 +329,10 @@ This proves only console capture, conversion, explicit MF initialization, first
 access-unit production, and READY truth on that guest. It does not claim
 unchanged NVIDIA runtime behavior, Deck end-to-end acceptance, sustained
 performance, reconnect/restore, one-hour soak, signing, or distribution
-approval; those listed gates remain open.
+approval; those listed gates remain open. That comparison-only Media Foundation software path was
+removed on 2026-11-19; Windows hosts without NVENC now use the Media
+Foundation *hardware* encoder (Alpha, `backend=media-foundation-hw`) when a
+per-session admission probe proves it, and OpenH264 otherwise.
 
 A later Proxmox CPU-only acceptance pass used SPICE/QXL-compatible display
 hardware and SPICE-backed ICH9 HDA. Windows exposed the display through

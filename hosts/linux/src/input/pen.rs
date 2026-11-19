@@ -58,15 +58,21 @@ pub const BTN_TOOL_PEN: u16 = 0x140;
 pub const BTN_TOOL_RUBBER: u16 = 0x141;
 /// `BTN_TOUCH` (0x14a): tip/eraser touching the surface.
 pub const BTN_TOUCH: u16 = 0x14a;
-/// `BTN_STYLUS` (0x14b): first barrel button.
+/// `BTN_STYLUS` (0x14b): the stylus button every Linux desktop makes a
+/// middle click (X button 2 in xf86-input-libinput and xf86-input-wacom,
+/// GNOME's and KDE's default).
 pub const BTN_STYLUS: u16 = 0x14b;
-/// `BTN_STYLUS2` (0x14c): second barrel button.
+/// `BTN_STYLUS2` (0x14c): the stylus button every Linux desktop makes a
+/// right click (X button 3).
 pub const BTN_STYLUS2: u16 = 0x14c;
 
-/// Bit assigned to the first barrel button in `PenEventMsg::buttons`.
-const BUTTON_STYLUS_BIT: u16 = 0x1;
-/// Bit assigned to the second barrel button in `PenEventMsg::buttons`.
-const BUTTON_STYLUS2_BIT: u16 = 0x2;
+/// `PenEventMsg::buttons` carries what a button does (bit 0 right click,
+/// bit 1 middle click), so the right click is `BTN_STYLUS2`. Before
+/// `pen_button_actions` bit 0 was `BTN_STYLUS`, and a Windows Deck's barrel
+/// button (Windows' right click) middle-clicked here.
+const BUTTON_STYLUS2_BIT: u16 = arcen_protocol::messages::PEN_BUTTON_RIGHT_CLICK;
+/// The middle click: `BTN_STYLUS`.
+const BUTTON_STYLUS_BIT: u16 = arcen_protocol::messages::PEN_BUTTON_MIDDLE_CLICK;
 
 /// Maps a normalized `0.0..=1.0` axis value onto a fixed device-space
 /// integer raster. Shared by the absolute-mouse device and the tablet-tool
@@ -576,15 +582,38 @@ mod tests {
     fn button_edges_are_independently_idempotent() {
         let mut state = PenToolState::default();
         let (edges, next) = plan_pen_edges(state, &sample(PenToolMsg::Tip, true, false, 0b01));
-        assert_eq!(edges, vec![(BTN_TOOL_PEN, true), (BTN_STYLUS, true)]);
+        assert_eq!(edges, vec![(BTN_TOOL_PEN, true), (BTN_STYLUS2, true)]);
         state = next;
 
         let (edges, next) = plan_pen_edges(state, &sample(PenToolMsg::Tip, true, false, 0b11));
-        assert_eq!(edges, vec![(BTN_STYLUS2, true)]);
+        assert_eq!(edges, vec![(BTN_STYLUS, true)]);
         state = next;
 
         let (edges, _) = plan_pen_edges(state, &sample(PenToolMsg::Tip, true, false, 0b11));
         assert!(edges.is_empty());
+    }
+
+    /// The field case: a Windows Deck's barrel button (Windows' right click)
+    /// arrives as bit 0 and must be `BTN_STYLUS2`, which X and every Linux
+    /// desktop make button 3; the middle click is `BTN_STYLUS` (button 2).
+    #[test]
+    fn the_right_click_bit_is_btn_stylus2_and_the_middle_click_btn_stylus() {
+        use arcen_protocol::messages::{PEN_BUTTON_MIDDLE_CLICK, PEN_BUTTON_RIGHT_CLICK};
+        let hover = plan_pen_edges(
+            PenToolState::default(),
+            &sample(PenToolMsg::Tip, true, false, 0),
+        )
+        .1;
+        let (edges, _) = plan_pen_edges(
+            hover,
+            &sample(PenToolMsg::Tip, true, false, PEN_BUTTON_RIGHT_CLICK),
+        );
+        assert_eq!(edges, vec![(BTN_STYLUS2, true)]);
+        let (edges, _) = plan_pen_edges(
+            hover,
+            &sample(PenToolMsg::Tip, true, false, PEN_BUTTON_MIDDLE_CLICK),
+        );
+        assert_eq!(edges, vec![(BTN_STYLUS, true)]);
     }
 
     #[test]

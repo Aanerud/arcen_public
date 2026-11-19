@@ -349,8 +349,19 @@ privacy gaps and local denial of service. SAS/secure desktop, kernel HID,
 pen/tablet, physical hot-plug, sleep/resume, and driver-reset behavior are
 explicit non-claims pending physical lab evidence.
 
-The macOS Pier's desk privacy (`platform.desktop.deskside.enabled`, off by
-default; `hosts/macos/src/desk_privacy.rs`, rules in the shared
+Desk privacy is on by default on every Pier (`privacy.desk`, ADR 0025 §5,
+amended 2026-11-18): an administrator must turn it off explicitly, every
+start logs the choice, and the Deck is told. A Windows Pier that cannot prove
+no desk monitor shows the session, or cannot block the desk's keyboard and
+mouse, refuses the attachment (`console_privacy_unavailable`). The Windows
+Pier detaches the desk's monitors from the desktop (SetDisplayConfig under
+the display lease's recovery journal) and serves the session on a virtual
+display; until the detach, a few seconds after a sign-in, the desk can see
+the session (GAP-050). Desk pens and touch screens on Windows are not
+blocked (GAP-051).
+
+The macOS Pier's desk privacy (`privacy.desk`, on by default; in 0.20.3
+`platform.desktop.deskside.enabled`, off; `hosts/macos/src/desk_privacy.rs`, rules in the shared
 `arcen_session::console_session::desk_privacy`) runs in the signed-in user's
 session helper, never at the login window and never in `serve`. It needs no
 new privilege: the active `CGEventTap` needs the Accessibility grant keyboard

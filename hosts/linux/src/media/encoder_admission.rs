@@ -516,7 +516,7 @@ fn candidate_from_specs(
             EncoderSelection::NativeNvenc => EncoderBackend::NativeNvenc,
             EncoderSelection::SoftwareH264 => EncoderBackend::OpenH264,
             encoder @ (EncoderSelection::Auto
-            | EncoderSelection::WindowsMediaFoundation
+            | EncoderSelection::MediaFoundationHardware
             | EncoderSelection::SoftwareAv1) => {
                 return Err(LinuxEncoderAdmissionError::NonConcreteEncoder {
                     monitor_id: monitor.session_monitor_id.get(),
@@ -632,24 +632,24 @@ mod tests {
         }
     }
 
-    /// The exact committed topology pier-linux.example.internal planned for the Deck's
-    /// `match_layout` request on 2026-08-10: a 3008x1692 primary (above
-    /// OpenH264's 1920x1200 contract) beside a 1800x1168 secondary (inside
+    /// The committed topology pier-linux.example.internal planned for the Deck's
+    /// `match_layout` request on 2026-08-10, its primary doubled to 6016x3384
+    /// (above OpenH264's own 3840x2160) beside a 1800x1168 secondary (inside
     /// it), with neither monitor demanding full color.
     fn oversize_primary_topology() -> LinuxTopologyPlan {
         LinuxTopologyPlan {
             backend: crate::display::topology::LinuxTopologyBackend::DedicatedXorg,
             generation: TopologyGeneration::new(1).expect("generation"),
-            virtual_width: 4_808,
-            virtual_height: 1_962,
+            virtual_width: 7_816,
+            virtual_height: 3_654,
             monitors: vec![
                 sized_monitor(
                     1,
                     "DFP-0",
                     true,
                     MonitorQualityIntentMsg::HostDefault,
-                    3_008,
-                    1_692,
+                    6_016,
+                    3_384,
                 ),
                 sized_monitor(
                     2,
@@ -992,7 +992,7 @@ mod tests {
         ));
     }
 
-    /// Regression: an over-1920x1200 primary must not make the whole
+    /// Regression: an over-3840x2160 primary must not make the whole
     /// multi-monitor session unplannable just because the *most* degraded
     /// candidate (every region on OpenH264) is infeasible for it. Before this
     /// fix, `hardware_counts` always ended at `full_color_required` — `0` when
@@ -1008,7 +1008,7 @@ mod tests {
         assert_eq!(
             plan.candidate_count(),
             2,
-            "only the all-software candidate is infeasible for a 3008x1692 region"
+            "only the all-software candidate is infeasible for a 6016x3384 region"
         );
         assert!(
             plan.primary_specs()
@@ -1064,8 +1064,8 @@ mod tests {
             planned,
             Err(LinuxEncoderAdmissionError::Pipeline(
                 MultiCapencConfigError::SoftwareGeometryWouldClamp {
-                    width: 3_008,
-                    height: 1_692,
+                    width: 6_016,
+                    height: 3_384,
                     ..
                 }
             ))

@@ -113,6 +113,7 @@ mod tests {
             tilt_y: 0.0,
             rotation_degrees: rotation,
             buttons: TabletButtonMask::new(buttons),
+            driver_click: None,
             device_id: 1,
             tool: NativeTabletTool::Pen,
             window_number: 1,

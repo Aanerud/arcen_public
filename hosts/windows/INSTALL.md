@@ -21,10 +21,10 @@ enforces the signature gate on the in-process CP DLL because LogonUI loads it
 directly.
 
 The script builds with `x86_64-pc-windows-msvc`, static CRT linkage, locked
-dependencies, and capenc's `nvenc,software-h264` feature set (the NVENC
-hardware path plus the OpenH264 software fallback for hosts without NVENC,
-e.g. VMware SVGA or QEMU stdvga). The Media Foundation encoder variant
-(`--features mf`) is not part of the Pier.
+dependencies, and capenc's `nvenc,mf-hw,software-h264` feature set (the
+NVENC hardware path, the Media Foundation hardware encoder (Alpha) for other
+GPUs, and the OpenH264 software fallback for hosts without either, e.g.
+VMware SVGA or QEMU stdvga).
 It writes these untracked artifacts to `target\arcen-windows-x64\`:
 
 - `arcen-pier.exe`
@@ -111,17 +111,21 @@ are unsupported; no runtime fallback or fetch occurs.
 
 ### Encoder selection
 
-The Pier's `capenc` subprocess mode ships inside the same executable with two
-encode backends: NVENC (NVIDIA hardware) and source-built OpenH264.
+The Pier's `capenc` subprocess mode ships inside the same executable with three
+encode backends: NVENC (NVIDIA hardware), the Media Foundation hardware encoder
+(**Alpha**: Intel, AMD or any GPU that registers a hardware encoder MFT, admitted
+per session by a proven encode, `platform.media_foundation_hardware` turns it
+off) and source-built OpenH264. Auto tries them in that order.
 The software path is not VMware-specific:
 it is designed for attached Intel, AMD, VMware, and other D3D11 desktop outputs
 when Windows.Graphics.Capture and the inbox H.264 MFT are available. VMware is
 live-tested; Intel/AMD software fallback validation is still pending. It uses
 CPU conversion + encoding; DirectX support alone does not imply hardware video
 encoding. The pier resolves the backend via `video.encoder` in `pier.json` or
-`--encoder <auto|nvenc|software-h264>` on the CLI. `auto` (default) probes the NVIDIA
-encode API on the adapter owning the selected output and falls back to OpenH264 when
-that output is non-NVIDIA or the NVIDIA runtime is absent. A device-bound
+`--encoder <auto|nvenc|mf-hw|software-h264>` on the CLI. `auto` (default) probes the NVIDIA
+encode API on the adapter owning the selected output; when that output is non-NVIDIA or
+the NVIDIA runtime is absent it uses the Media Foundation hardware encoder (Alpha) if the
+session's admission probe proves an encode, and OpenH264 otherwise. A device-bound
 NVENC initialization failure is classified before the software retry; use
 explicit `"software-h264"` for a deliberate CPU comparison. The OpenH264 backend requires
 `"codec": "h264"` and `"chroma": "yuv420"`.

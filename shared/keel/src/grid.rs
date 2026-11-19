@@ -217,6 +217,8 @@ pub enum KeelError {
         actual: usize,
         required: usize,
     },
+    /// Motion search needs [`crate::DamageTracker::retain_row_hashes`].
+    RowHashesNotRetained,
 }
 
 impl fmt::Display for KeelError {
@@ -255,6 +257,9 @@ impl fmt::Display for KeelError {
                 formatter,
                 "external damage map has {actual} bytes, requires {required}"
             ),
+            Self::RowHashesNotRetained => {
+                formatter.write_str("the damage tracker does not retain row hashes")
+            }
         }
     }
 }

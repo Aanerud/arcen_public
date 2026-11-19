@@ -14,6 +14,8 @@
 /// The wire's compact modifier bits, from the one protocol definition.
 pub use arcen_protocol::keys::{MOD_ALT, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT};
 
+use arcen_input::keyboard::host_keys::pc_host_key;
+
 /// Virtual key codes for the modifiers, used to release stuck modifiers.
 pub const MODIFIER_CODES: [u16; 5] = [0x38, 0x3B, 0x3A, 0x37, 0x39];
 
@@ -123,7 +125,11 @@ pub fn qt_key_to_macos(qt_key: u32, modifiers: u32) -> Option<u16> {
         // Caps Lock is the only lock macOS exposes as a key code. Num Lock,
         // Scroll Lock, Print Screen and Pause are deliberately unmapped.
         0x0100_0024 => 0x39,
-        _ => return None,
+        // F13-F20 (`kVK_F13`..`kVK_F20`) and the PC's Menu key as the code
+        // macOS gives a PC keyboard's (`kVK_ContextualMenu`), from the
+        // shared PC-key table. macOS has no code for F21-F24, nor for
+        // Insert, Print Screen, Scroll Lock or Pause: those stay `None`.
+        _ => return pc_host_key(qt_key).and_then(|key| key.macos_key),
     })
 }
 
@@ -186,6 +192,23 @@ mod tests {
         for absent in [0x0100_0025_u32, 0x0100_0026, 0x0100_0009, 0x0100_0008] {
             assert_eq!(qt_key_to_macos(absent, 0), None, "key {absent:#x}");
         }
+    }
+
+    #[test]
+    fn f13_to_f20_and_menu_are_mapped_and_f21_to_f24_are_refused() {
+        // kVK_F13 ... kVK_F20 (HIToolbox `Events.h`).
+        let expected = [0x69, 0x6B, 0x71, 0x6A, 0x40, 0x4F, 0x50, 0x5A];
+        for (index, code) in expected.into_iter().enumerate() {
+            let qt_key = 0x0100_003C + u32::try_from(index).unwrap();
+            assert_eq!(qt_key_to_macos(qt_key, 0), Some(code), "F{}", index + 13);
+        }
+        for qt_key in 0x0100_0044..=0x0100_0047_u32 {
+            assert_eq!(qt_key_to_macos(qt_key, 0), None, "{qt_key:#x}");
+        }
+        // kVK_ContextualMenu.
+        assert_eq!(qt_key_to_macos(0x0100_0055, 0), Some(0x6E));
+        // Insert stays refused: the key in its place on a Mac is Help.
+        assert_eq!(qt_key_to_macos(0x0100_0006, 0), None);
     }
 
     #[test]

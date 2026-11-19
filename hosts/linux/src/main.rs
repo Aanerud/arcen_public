@@ -267,6 +267,14 @@ fn main() -> ExitCode {
     for rule in arcen_pier_linux::usb_bridge::seat::sweep_stale_rules() {
         tracing::info!(target: target::SESSION, rule = %rule, "removed a stale USB bridge seat rule");
     }
+    // Desk privacy is on unless the administrator turned it off
+    // (`privacy.desk`); the effective choice is said once, at start (off at
+    // error level, so every log profile records it).
+    if config.desk_privacy.enabled {
+        tracing::info!(target: target::SESSION, "{}", config.desk_privacy.startup_line());
+    } else {
+        tracing::error!(target: target::SESSION, "{}", config.desk_privacy.startup_line());
+    }
     // Native tablet is the administrator's choice (`usb.native_tablet`),
     // fixed for this Pier's lifetime.
     let native_tablet = arcen_pier_linux::usb_bridge::configure_native_tablet(config.native_tablet);

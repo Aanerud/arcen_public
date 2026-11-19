@@ -13,13 +13,19 @@
 //! Desktop's; Ctrl+Windows+F is Explorer's) and Ctrl+Alt+Enter (other remote
 //! desktop clients', for keyboards without Break), Quit is Alt+F4, and a PC keyboard
 //! adds Ctrl+Alt+End for Ctrl+Alt+Del, which Windows never lets an
-//! application see, and Remote Desktop's Ctrl+Alt+Home for the connection
-//! bar, the keyboard's way out of the keyboard grab. Alt means the left Alt
-//! only: the right one is `AltGr`, which types characters.
+//! application see. Remote Desktop's Ctrl+Alt+Home (Ctrl+Option+Home on a
+//! Mac) gives the keyboard to this computer and back ([`super::capture`]).
+//! Alt means the left Alt only: the right one is `AltGr`, which types
+//! characters.
+//!
+//! Every chord here is a key a host application can never have, so the
+//! list is short: releasing stuck keys, the keyboard modes and Paste as
+//! Keystrokes are menu items without a chord, and F9 reaches the host. A
+//! test holds every chord against [`super::PRO_APP_CHORDS`].
 
 use arcen_protocol::keys::{KEY_Q, KEY_RETURN};
 
-use super::pc::{KEY_END, KEY_F4, KEY_F9, KEY_F12, KEY_HOME, KEY_PAUSE};
+use super::pc::{KEY_END, KEY_F4, KEY_F12, KEY_HOME, KEY_PAUSE};
 
 /// An action a Deck keeps for itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,28 +35,23 @@ pub enum DeckShortcut {
     Quit,
     /// End the session.
     Disconnect,
-    /// Release the pointer lock and every key held on the host, and reset
-    /// its modifiers (F9, whatever else is held). F9 itself never reaches
-    /// the host.
-    PanicReset,
-    /// Type the clipboard's text as keystrokes.
+    /// Type the clipboard's text as keystrokes. A menu item, no chord.
     PasteAsKeystrokes,
-    /// Keyboard mode for this session: physical keys.
+    /// Keyboard mode for this session: physical keys. A menu item, no
+    /// chord.
     KeyboardPhysical,
-    /// Keyboard mode for this session: characters.
+    /// Keyboard mode for this session: characters. A menu item, no chord.
     KeyboardCharacters,
     /// Enter or leave fullscreen.
     ToggleFullscreen,
     /// Send Ctrl+Alt+Del to the host. A PC keyboard's own Ctrl+Alt+Del
     /// never reaches an application, so a PC Deck has a chord for it.
     SendSecureAttention,
-    /// Take the system shortcuts (Windows key, Alt+Tab) for the session, or
-    /// give them back to the Deck's computer. A menu item, no chord.
-    ToggleKeyboardGrab,
-    /// Show the connection bar and give it the keyboard: keys stop reaching
-    /// the host and the keyboard grab lets go until the bar closes. A PC
-    /// keyboard's chord; a Mac's menu bar is always reachable.
-    ShowConnectionBar,
+    /// Give the keyboard to this computer (every key held on the host is
+    /// released, nothing more reaches it, the system shortcuts act locally)
+    /// or back to the host ([`super::KeyboardCapture::toggle`]).
+    /// Ctrl+Alt+Home, Ctrl+Option+Home on a Mac.
+    ReleaseKeyboard,
 }
 
 /// A chord on a Mac keyboard.
@@ -92,16 +93,6 @@ pub struct PcChord {
 }
 
 impl PcChord {
-    const fn control_windows(key: u32) -> Self {
-        Self {
-            control: true,
-            alt: false,
-            shift: false,
-            windows: true,
-            key,
-        }
-    }
-
     const fn control_alt(key: u32) -> Self {
         Self {
             control: true,
@@ -114,7 +105,9 @@ impl PcChord {
 }
 
 impl MacChord {
-    const fn new(control: bool, option: bool, command: bool, key: u32) -> Self {
+    /// Control, Option and Command as given (no Shift) with `key`.
+    #[must_use]
+    pub const fn new(control: bool, option: bool, command: bool, key: u32) -> Self {
         Self {
             control,
             option,
@@ -146,17 +139,15 @@ pub struct PcModifierState {
 
 impl DeckShortcut {
     /// Every action, in menu order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 8] = [
         Self::Quit,
         Self::Disconnect,
-        Self::PanicReset,
         Self::PasteAsKeystrokes,
         Self::KeyboardPhysical,
         Self::KeyboardCharacters,
         Self::ToggleFullscreen,
         Self::SendSecureAttention,
-        Self::ToggleKeyboardGrab,
-        Self::ShowConnectionBar,
+        Self::ReleaseKeyboard,
     ];
 
     /// The menu title, the same on both Decks.
@@ -165,37 +156,33 @@ impl DeckShortcut {
         match self {
             Self::Quit => "Quit Arcen Deck",
             Self::Disconnect => "Disconnect",
-            Self::PanicReset => "Release Pointer Lock and Keys",
             Self::PasteAsKeystrokes => "Paste as Keystrokes",
             Self::KeyboardPhysical => "Keyboard: Physical Keys",
             Self::KeyboardCharacters => "Keyboard: Characters",
             Self::ToggleFullscreen => "Show Fullscreen",
             Self::SendSecureAttention => "Send Ctrl+Alt+Del",
-            Self::ToggleKeyboardGrab => "Keyboard Grab",
-            Self::ShowConnectionBar => "Show Connection Bar",
+            Self::ReleaseKeyboard => "Keyboard: Host or This Computer",
         }
     }
 
-    /// The chord on a Mac keyboard, if it has one. F9 ([`Self::PanicReset`])
-    /// matches with any modifiers held.
+    /// The chord on a Mac keyboard, if it has one.
     #[must_use]
     pub const fn mac_chord(self) -> Option<MacChord> {
         Some(match self {
             Self::Quit => MacChord::new(false, false, true, KEY_Q),
             Self::Disconnect => MacChord::new(true, true, false, KEY_F12),
-            Self::PanicReset => MacChord::new(false, false, false, KEY_F9),
-            Self::PasteAsKeystrokes => MacChord::new(true, true, true, 0x56),
-            Self::KeyboardPhysical => MacChord::new(true, false, true, 0x4B),
-            Self::KeyboardCharacters => MacChord::new(true, false, true, 0x55),
             Self::ToggleFullscreen => MacChord::new(true, false, true, 0x46),
-            Self::SendSecureAttention | Self::ToggleKeyboardGrab | Self::ShowConnectionBar => {
+            Self::ReleaseKeyboard => MacChord::new(true, true, false, KEY_HOME),
+            Self::PasteAsKeystrokes
+            | Self::KeyboardPhysical
+            | Self::KeyboardCharacters
+            | Self::SendSecureAttention => {
                 return None;
             }
         })
     }
 
-    /// The chords on a PC keyboard, the one menus show first. F9
-    /// ([`Self::PanicReset`]) matches with any modifiers held.
+    /// The chords on a PC keyboard, the one menus show first.
     #[must_use]
     pub const fn pc_chords(self) -> &'static [PcChord] {
         const ALT_F4: PcChord = PcChord {
@@ -205,51 +192,42 @@ impl DeckShortcut {
             windows: false,
             key: KEY_F4,
         };
-        const F9: PcChord = PcChord {
-            control: false,
-            alt: false,
-            shift: false,
-            windows: false,
-            key: KEY_F9,
-        };
-        const PASTE: PcChord = PcChord {
-            control: true,
-            alt: true,
-            shift: false,
-            windows: true,
-            key: 0x56,
-        };
         const DISCONNECT: [PcChord; 1] = [PcChord::control_alt(KEY_F12)];
-        const PHYSICAL: [PcChord; 1] = [PcChord::control_windows(0x4B)];
-        const CHARACTERS: [PcChord; 1] = [PcChord::control_windows(0x55)];
         // The main Enter (Return) only: the keypad's Enter is another key.
         const FULLSCREEN: [PcChord; 2] = [
             PcChord::control_alt(KEY_PAUSE),
             PcChord::control_alt(KEY_RETURN),
         ];
         const SECURE_ATTENTION: [PcChord; 1] = [PcChord::control_alt(KEY_END)];
-        const CONNECTION_BAR: [PcChord; 1] = [PcChord::control_alt(KEY_HOME)];
+        const RELEASE_KEYBOARD: [PcChord; 1] = [PcChord::control_alt(KEY_HOME)];
         match self {
             Self::Quit => &[ALT_F4],
             Self::Disconnect => &DISCONNECT,
-            Self::PanicReset => &[F9],
-            Self::PasteAsKeystrokes => &[PASTE],
-            Self::KeyboardPhysical => &PHYSICAL,
-            Self::KeyboardCharacters => &CHARACTERS,
+            Self::PasteAsKeystrokes | Self::KeyboardPhysical | Self::KeyboardCharacters => &[],
             Self::ToggleFullscreen => &FULLSCREEN,
             Self::SendSecureAttention => &SECURE_ATTENTION,
-            Self::ToggleKeyboardGrab => &[],
-            Self::ShowConnectionBar => &CONNECTION_BAR,
+            Self::ReleaseKeyboard => &RELEASE_KEYBOARD,
         }
+    }
+
+    /// Whether the action has a chord on a PC keyboard or a Mac keyboard.
+    #[must_use]
+    pub const fn has_chord(self) -> bool {
+        !self.pc_chords().is_empty() || self.mac_chord().is_some()
+    }
+
+    /// The action a chord pressed on a Mac keyboard is.
+    #[must_use]
+    pub fn for_mac_chord(pressed: MacChord) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|action| action.mac_chord() == Some(pressed))
     }
 
     /// The action a key press on a PC keyboard is, with `held` the modifiers
     /// held at it. `AltGr` held is never a Deck chord: it types characters.
     #[must_use]
     pub fn for_pc_key(qt_key: u32, held: PcModifierState) -> Option<Self> {
-        if qt_key == KEY_F9 {
-            return Some(Self::PanicReset);
-        }
         if held.altgr {
             return None;
         }
@@ -332,20 +310,46 @@ mod tests {
             altgr: true,
             ..PcModifierState::default()
         };
-        assert_eq!(DeckShortcut::for_pc_key(0x4B, altgr), None);
-        assert_eq!(
-            DeckShortcut::for_pc_key(KEY_F9, altgr),
-            Some(DeckShortcut::PanicReset)
-        );
+        assert_eq!(DeckShortcut::for_pc_key(KEY_HOME, altgr), None);
     }
 
     #[test]
-    fn f9_is_the_panic_key_whatever_is_held() {
+    fn f9_and_the_keyboard_mode_and_paste_chords_reach_the_host() {
+        let f9 = super::super::pc::KEY_F9;
         for state in [held(false, false, false), held(true, true, true)] {
+            assert_eq!(DeckShortcut::for_pc_key(f9, state), None);
+        }
+        let control_windows = PcModifierState {
+            control: true,
+            windows: true,
+            ..PcModifierState::default()
+        };
+        for key in [0x4B, 0x55] {
+            assert_eq!(DeckShortcut::for_pc_key(key, control_windows), None);
             assert_eq!(
-                DeckShortcut::for_pc_key(KEY_F9, state),
-                Some(DeckShortcut::PanicReset)
+                DeckShortcut::for_mac_chord(MacChord::new(true, false, true, key)),
+                None
             );
+        }
+        let all = PcModifierState {
+            alt: true,
+            ..control_windows
+        };
+        assert_eq!(DeckShortcut::for_pc_key(0x56, all), None);
+        assert_eq!(
+            DeckShortcut::for_mac_chord(MacChord::new(true, true, true, 0x56)),
+            None
+        );
+        assert_eq!(
+            DeckShortcut::for_mac_chord(MacChord::new(false, false, false, f9)),
+            None
+        );
+        for action in [
+            DeckShortcut::PasteAsKeystrokes,
+            DeckShortcut::KeyboardPhysical,
+            DeckShortcut::KeyboardCharacters,
+        ] {
+            assert!(!action.has_chord(), "{action:?}");
         }
     }
 
@@ -366,7 +370,10 @@ mod tests {
                 "{action:?}"
             );
         }
-        assert!(DeckShortcut::ToggleKeyboardGrab.pc_chords().is_empty());
+        assert_eq!(
+            DeckShortcut::for_mac_chord(MacChord::new(true, true, false, KEY_HOME)),
+            Some(DeckShortcut::ReleaseKeyboard)
+        );
     }
 
     #[test]
@@ -387,12 +394,12 @@ mod tests {
             None
         );
         assert_eq!(DeckShortcut::ToggleFullscreen.pc_chords()[0].key, KEY_PAUSE);
-        // Remote Desktop's Ctrl+Alt+Home shows the connection bar.
+        // Remote Desktop's Ctrl+Alt+Home gives the keyboard to this
+        // computer and back.
         assert_eq!(
             DeckShortcut::for_pc_key(KEY_HOME, control_alt),
-            Some(DeckShortcut::ShowConnectionBar)
+            Some(DeckShortcut::ReleaseKeyboard)
         );
-        assert_eq!(DeckShortcut::ShowConnectionBar.mac_chord(), None);
         // Windows+Escape stays the host's.
         let windows = PcModifierState {
             windows: true,

@@ -137,7 +137,11 @@ pub const FLAME_CRITICAL_CHORDS: &[(u32, u32, &str)] = &[
         MOD_CTRL | MOD_SHIFT | MOD_ALT,
         "Ctrl+Shift+Alt+K -- Flame keyer toggle",
     ),
-    (0x0100_0038, 0, "F9 -- release all modifiers (client panic)"),
+    (
+        0x0100_0038,
+        0,
+        "F9 -- Maya vertex, Resolve insert edit (reaches the host)",
+    ),
     (0x0100_0030, MOD_CTRL, "Ctrl+F1 -- context-help"),
     (0x5D, MOD_CTRL, "Ctrl+] -- brightness up"),
     (0x5B, MOD_CTRL, "Ctrl+[ -- brightness down"),

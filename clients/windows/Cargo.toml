@@ -52,8 +52,11 @@ zeroize.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# present: the GPU end-to-end Exact still image test encodes real tiles.
+# present: the GPU end-to-end Exact still image test encodes real tiles,
+# and the canvas executor's corpus replays the canvas planner over Keel's
+# scenarios (ADR 0028).
 arcen-media = { workspace = true, features = ["refine-zstd-decode", "refine-zstd-encode"] }
+arcen-keel.workspace = true
 
 # Every Win32 feature a stream needs is listed here, grouped by owner, so
 # streams do not edit this manifest in parallel. Ask the owner of this

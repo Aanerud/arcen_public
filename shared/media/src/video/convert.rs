@@ -6,10 +6,22 @@ use std::fmt::{Display, Formatter};
 use std::ops::Range;
 use std::sync::OnceLock;
 
-use arcen_keel::BgraFrame;
+use arcen_keel::{BgraFrame, DamageMap};
 
 use super::frame::{I420FrameMut, I444FrameMut, I444P16FrameMut, Nv12FrameMut};
 use crate::{BitDepth, ColorMatrix, ColorPrimaries, ColorRange, TransferCharacteristics};
+
+/// What changed in a picture being staged into retained planes, from Keel's
+/// damage tracking: every software encode path converts only what it says.
+#[derive(Debug, Clone, Copy)]
+pub enum StageDamage<'a> {
+    /// Rebuild every plane (first picture, keyframe, full damage, or no map).
+    Full,
+    /// Rebuild only the 16x16 block rows the map marks dirty.
+    Rows(DamageMap<'a>),
+    /// Nothing changed; the retained planes stay as they are.
+    Clean,
+}
 
 /// Checked conversion failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -568,6 +580,117 @@ pub fn convert_bgra_to_i420_rows(
         },
         transform,
     )
+}
+
+/// Fewer converted rows than this stay on the calling thread: a thread costs
+/// more than a few block rows of conversion.
+const PARALLEL_MIN_ROWS: usize = 128;
+
+/// Convert the even, full-width row `ranges` of `source` to I420 under
+/// `transform`, spread over up to `workers` threads.
+///
+/// Each worker owns a band of whole 16-row block rows of the destination
+/// and converts the parts of `ranges` inside it, so the result is the same
+/// as [`convert_bgra_to_i420_rows`] over each range. Small jobs (under 128
+/// rows in total) and `workers <= 1` stay on the calling thread. The
+/// conversion allocates no memory.
+///
+/// # Errors
+///
+/// Rejects geometry mismatch and invalid row ranges before converting
+/// anything.
+pub fn convert_bgra_to_i420_rows_parallel(
+    source: BgraFrame<'_>,
+    destination: &mut I420FrameMut<'_>,
+    ranges: &[Range<usize>],
+    transform: ColorTransform,
+    workers: usize,
+) -> Result<(), ConversionError> {
+    let (width, height) = (destination.width, destination.height);
+    for rows in ranges {
+        validate_rows(source, width, height, rows)?;
+    }
+    let total: usize = ranges.iter().map(ExactSizeIterator::len).sum();
+    if workers <= 1 || total < PARALLEL_MIN_ROWS {
+        for rows in ranges {
+            convert_rows(
+                source,
+                width,
+                rows.clone(),
+                destination.y,
+                destination.y_stride,
+                ChromaPlanes::I420 {
+                    u: destination.u,
+                    u_stride: destination.u_stride,
+                    v: destination.v,
+                    v_stride: destination.v_stride,
+                },
+                transform,
+            )?;
+        }
+        return Ok(());
+    }
+    let band_rows = height.div_ceil(workers).next_multiple_of(16);
+    let (y_stride, u_stride, v_stride) = (
+        destination.y_stride,
+        destination.u_stride,
+        destination.v_stride,
+    );
+    let stride = source.stride();
+    let pixels = source.pixels();
+    let y_bands = destination.y.chunks_mut(band_rows * y_stride);
+    let u_bands = destination.u.chunks_mut(band_rows / 2 * u_stride);
+    let v_bands = destination.v.chunks_mut(band_rows / 2 * v_stride);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut local_result = Ok(());
+        for (index, ((y, u), v)) in y_bands.zip(u_bands).zip(v_bands).enumerate() {
+            let start = index * band_rows;
+            if start >= height {
+                break;
+            }
+            let end = (start + band_rows).min(height);
+            let band = BgraFrame::new(&pixels[start * stride..], width, end - start, stride)
+                .map_err(|_| ConversionError::GeometryMismatch);
+            let mut work = move || -> Result<(), ConversionError> {
+                let band = band?;
+                for rows in ranges {
+                    let (from, to) = (rows.start.max(start), rows.end.min(end));
+                    if from < to {
+                        convert_rows(
+                            band,
+                            width,
+                            from - start..to - start,
+                            &mut *y,
+                            y_stride,
+                            ChromaPlanes::I420 {
+                                u: &mut *u,
+                                u_stride,
+                                v: &mut *v,
+                                v_stride,
+                            },
+                            transform,
+                        )?;
+                    }
+                }
+                Ok(())
+            };
+            if end == height {
+                local_result = work();
+            } else {
+                handles.push(scope.spawn(work));
+            }
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or(Err(ConversionError::GeometryMismatch))
+            })
+            .chain(std::iter::once(local_result))
+            .collect::<Result<(), ConversionError>>()
+    })
 }
 
 /// Convert a complete checked BGRA frame to 8-bit planar 4:4:4.
@@ -2031,6 +2154,68 @@ pub fn convert_packed_rgb10_to_bgra8(
 mod tests {
     use super::*;
     use crate::video::{I420FrameMut, I444FrameMut, I444P16FrameMut, Nv12FrameMut};
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn parallel_i420_bands_match_the_serial_conversion() {
+        let (width, height) = (96_usize, 400_usize);
+        let mut state = 0x9e37_79b9_u32;
+        let pixels: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let source = BgraFrame::new(&pixels, width, height, width * 4).expect("frame");
+        let transform = ColorTransform::legacy_bt709_limited();
+        let convert = |ranges: &[Range<usize>], workers: usize| {
+            let (mut y, mut u, mut v) = (
+                vec![7_u8; width * height],
+                vec![7_u8; width * height / 4],
+                vec![7_u8; width * height / 4],
+            );
+            let mut destination = I420FrameMut::new(
+                width as u32,
+                height as u32,
+                &mut y,
+                width,
+                &mut u,
+                width / 2,
+                &mut v,
+                width / 2,
+            )
+            .expect("destination");
+            convert_bgra_to_i420_rows_parallel(
+                source,
+                &mut destination,
+                ranges,
+                transform,
+                workers,
+            )
+            .expect("conversion");
+            (y, u, v)
+        };
+        for ranges in [
+            vec![0..height],
+            vec![0..16, 48..208, 384..400],
+            vec![16..32],
+            vec![],
+        ] {
+            let serial = convert(&ranges, 1);
+            for workers in [2, 3, 4, 7, 64] {
+                assert_eq!(convert(&ranges, workers), serial, "{ranges:?} on {workers}");
+            }
+        }
+        let (mut y, mut u, mut v) = (vec![0; 96 * 400], vec![0; 96 * 100], vec![0; 96 * 100]);
+        let mut destination =
+            I420FrameMut::new(96, 400, &mut y, 96, &mut u, 48, &mut v, 48).expect("destination");
+        assert!(matches!(
+            convert_bgra_to_i420_rows_parallel(source, &mut destination, &[0..401], transform, 4),
+            Err(ConversionError::InvalidRowRange)
+        ));
+    }
 
     #[allow(
         clippy::cast_possible_truncation,

@@ -351,6 +351,11 @@ pub const GOVERNOR_MAX_HOLD_SECS: u32 = 320;
 /// The lowest rate the governor steps an Auto session down to.
 pub const GOVERNOR_MIN_FPS: u32 = 10;
 
+/// The lowest rate the governor steps a Software session down to: a CPU
+/// encoder at a large size may hold only a few pictures a second, and an
+/// even rate it holds beats an uneven one it misses.
+pub const GOVERNOR_SOFTWARE_MIN_FPS: u32 = 5;
+
 /// The share of a rate an encoder must hold for a second to count as
 /// holding it (jitter of a host that holds the rate does not count).
 const HOLD_PERCENT: u32 = 95;
@@ -509,17 +514,18 @@ impl HostRateGovernor {
 
     /// The governor of a session served under `pipeline` at `session_fps`,
     /// or `None` for a fidelity contract (Grading, HDR), whose fixed rate is
-    /// part of what it promises. The software contract's fixed 30 is the
-    /// encoder's ceiling, not a promise: a CPU that encodes 8 is held at an
-    /// even divisor of it like Auto.
+    /// part of what it promises. Software follows the display like Auto and
+    /// steps further down ([`GOVERNOR_SOFTWARE_MIN_FPS`]): its rate is
+    /// whatever the CPU encodes.
     #[must_use]
     pub fn for_pipeline(pipeline: PipelineId, session_fps: u32) -> Option<Self> {
         let policy = pipeline_contract(pipeline).frame_rate;
-        if !policy.follows_display() && pipeline != PipelineId::Software {
+        if !policy.follows_display() {
             return None;
         }
         let floor = match pipeline {
             PipelineId::Speed => policy.floor_fps(),
+            PipelineId::Software => GOVERNOR_SOFTWARE_MIN_FPS,
             _ => GOVERNOR_MIN_FPS,
         };
         Some(Self::new(session_fps, floor))
@@ -843,11 +849,17 @@ mod tests {
         );
         assert!(HostRateGovernor::for_pipeline(PipelineId::Grading, 30).is_none());
         assert!(HostRateGovernor::for_pipeline(PipelineId::Hdr, 30).is_none());
+        // Software steps to what the CPU encodes, below Auto's floor.
         let mut software =
             HostRateGovernor::for_pipeline(PipelineId::Software, 30).expect("software");
         assert_eq!(
             run(&mut software, 3, 8, 30).last().map(|step| step.fps),
-            Some(GOVERNOR_MIN_FPS)
+            Some(7)
+        );
+        let mut slow = HostRateGovernor::for_pipeline(PipelineId::Software, 60).expect("software");
+        assert_eq!(
+            run(&mut slow, 3, 2, 60).last().map(|step| step.fps),
+            Some(GOVERNOR_SOFTWARE_MIN_FPS)
         );
         let mut auto = HostRateGovernor::for_pipeline(PipelineId::Auto, 60).expect("auto");
         assert_eq!(

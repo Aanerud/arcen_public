@@ -186,6 +186,7 @@
       "package": "arcen-deck-windows",
       "dependency_kind": "normal",
       "contracts": [
+        "canvas",
         "clipboard",
         "config",
         "connect_plan",

@@ -81,6 +81,10 @@ pub enum CapencRecordKind {
     RefineLane = 4,
     /// A [`CapencCursorPosition`]. Only with [`CURSOR_POSITION_ARG`].
     CursorPosition = 5,
+    /// A complete canvas record (`arcen_protocol::canvas`, frame type
+    /// `0x0E`, ADR 0028) for the video lane, in order with the others.
+    /// Only with `canvas=` (`crate::canvas::serve::CanvasCapencArgs`).
+    Canvas = 6,
 }
 
 /// Largest refinement record body on either lane.
@@ -96,6 +100,7 @@ impl CapencRecordKind {
             3 => Some(Self::RefineVideo),
             4 => Some(Self::RefineLane),
             5 => Some(Self::CursorPosition),
+            6 => Some(Self::Canvas),
             _ => None,
         }
     }
@@ -108,6 +113,7 @@ impl CapencRecordKind {
             Self::Cursor => MAX_CURSOR_EVENT_BYTES,
             Self::RefineVideo | Self::RefineLane => MAX_REFINE_RECORD_BYTES,
             Self::CursorPosition => CURSOR_POSITION_BYTES,
+            Self::Canvas => arcen_protocol::canvas::MAX_CANVAS_FRAME_BYTES,
         }
     }
 }
@@ -404,13 +410,26 @@ pub enum CapencRoute {
     /// Windows FP16 scRGB NVENC streaming (Grading and HDR): framed-v2 and
     /// lossless refinement.
     WindowsWide,
+    /// The shared software loop on Xorg and Windows
+    /// (`crate::canvas::CanvasEncodeLoop`): framed-v2 and the canvas.
+    Software,
 }
 
 impl CapencRoute {
     /// Whether the route writes framed-v2 records.
     #[must_use]
     pub const fn writes_framed_v2(self) -> bool {
-        matches!(self, Self::XorgWide | Self::Wayland | Self::WindowsWide)
+        matches!(
+            self,
+            Self::XorgWide | Self::Wayland | Self::WindowsWide | Self::Software
+        )
+    }
+
+    /// Whether the route serves a canvas (`canvas=`, ADR 0028): the
+    /// software loop wherever it runs.
+    #[must_use]
+    pub const fn honours_canvas(self) -> bool {
+        matches!(self, Self::Wayland | Self::Software)
     }
 
     /// Whether the route accepts `refine=on` (ADR 0016). A route that
@@ -438,6 +457,21 @@ pub fn check_output_request(args: &[String], route: CapencRoute) -> Result<(), S
         return Err(format!(
             "{} is not honoured by the {route:?} path",
             crate::refine::CAPENC_REFINE_ON
+        ));
+    }
+    let canvas = args
+        .iter()
+        .any(|arg| arg.starts_with(crate::canvas::serve::CAPENC_CANVAS_ARG_PREFIX));
+    if canvas && !route.honours_canvas() {
+        return Err(format!(
+            "{} is not honoured by the {route:?} path",
+            crate::canvas::serve::CAPENC_CANVAS_ARG_PREFIX
+        ));
+    }
+    if canvas && !framed_v2 {
+        return Err(format!(
+            "{} needs {FRAMED_OUTPUT_V2}",
+            crate::canvas::serve::CAPENC_CANVAS_ARG_PREFIX
         ));
     }
     if framed_v2 && !route.writes_framed_v2() {
@@ -516,6 +550,35 @@ mod route_tests {
         ] {
             assert_eq!(check_output_request(&v1, route), Ok(()));
         }
+    }
+
+    #[test]
+    fn only_the_software_loop_serves_a_canvas_and_only_framed_v2() {
+        let canvas = vec![
+            FRAMED_OUTPUT_V2.to_owned(),
+            format!(
+                "{}v1:16384:2:104857600:25600:0:0:0:50",
+                crate::canvas::serve::CAPENC_CANVAS_ARG_PREFIX
+            ),
+        ];
+        for route in [CapencRoute::Software, CapencRoute::Wayland] {
+            assert_eq!(check_output_request(&canvas, route), Ok(()), "{route:?}");
+            assert!(
+                check_output_request(&canvas[1..], route).is_err(),
+                "{route:?}"
+            );
+        }
+        for route in [
+            CapencRoute::XorgWide,
+            CapencRoute::XorgOther,
+            CapencRoute::Windows,
+            CapencRoute::WindowsWide,
+        ] {
+            assert!(check_output_request(&canvas, route).is_err(), "{route:?}");
+        }
+        let record = encode_record(CapencRecordKind::Canvas, &[0x0E, 1, 2]).unwrap();
+        assert_eq!(record_kind(record[4], 3), Ok(CapencRecordKind::Canvas));
+        assert!(record_kind(6, arcen_protocol::canvas::MAX_CANVAS_FRAME_BYTES + 1).is_err());
     }
 }
 

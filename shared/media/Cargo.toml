@@ -26,6 +26,9 @@ software-av1-source = ["dep:rav1e"]
 # (Piers only); the decoder is pure Rust (Decks).
 refine-zstd-encode = ["dep:zstd"]
 refine-zstd-decode = ["dep:ruzstd"]
+# The canvas corpus (`arcen_media::canvas::corpus`) for a Deck's executor
+# tests; never in a product build.
+canvas-corpus = []
 
 [dependencies]
 arcen-keel.workspace = true
@@ -50,8 +53,20 @@ name = "software_h264_vector"
 required-features = ["software-h264-source"]
 
 [[example]]
+name = "software_h264_bench"
+required-features = ["software-h264-source"]
+
+[[example]]
 name = "refine_verify"
 required-features = ["refine-zstd-decode"]
+
+[[example]]
+name = "canvas_verify"
+required-features = ["refine-zstd-decode"]
+
+[[example]]
+name = "canvas_loop_bench"
+required-features = ["refine-zstd-encode", "software-h264-source"]
 
 [lints]
 workspace = true

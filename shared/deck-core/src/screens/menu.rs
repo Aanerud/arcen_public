@@ -5,7 +5,7 @@
 //! the Windows Deck as a window menu bar and, in fullscreen, a connection
 //! bar (PARITY §23 Q-1). Both Decks dispatch the same [`MenuCommand`]s.
 
-use arcen_input::keyboard::DeckShortcut;
+use arcen_input::keyboard::{DeckShortcut, SendKey};
 
 use super::wording::DeckPlatform;
 
@@ -28,12 +28,19 @@ pub enum MenuCommand {
     /// Show/hide the lossless-tile debug view.
     ToggleLosslessTiles,
     Disconnect,
+    /// Release Stuck Keys: every key and button held on the host, and the
+    /// pointer lock (what F9 did before it went to the host).
     ReleaseModifiers,
     /// Send Ctrl+Alt+Del to the host (a PC keyboard's own never reaches an
     /// application).
     SendSecureAttention,
-    /// Take the system shortcuts (Windows key, Alt+Tab) for the session.
-    ToggleKeyboardGrab,
+    /// Give the keyboard to this computer or back to the host
+    /// ([`DeckShortcut::ReleaseKeyboard`]).
+    ToggleKeyboardCapture,
+    /// Connection ▸ Send Key: one key the keyboard lacks.
+    SendKey(SendKey),
+    /// Help ▸ Keyboard Shortcuts: the cheat sheet.
+    KeyboardShortcuts,
     ToggleFullscreen,
     TogglePointerLock,
     ToggleTabletMonitor,
@@ -73,7 +80,9 @@ impl MenuCommand {
             Self::ToggleHealth => "Connection Health",
             Self::ToggleStreamStats => "Stream Statistics",
             Self::ToggleLosslessTiles => "Lossless Tile View",
-            Self::ReleaseModifiers => "Release Modifiers",
+            Self::ReleaseModifiers => "Release Stuck Keys",
+            Self::SendKey(key) => key.title(),
+            Self::KeyboardShortcuts => "Keyboard Shortcuts",
             Self::TogglePointerLock => "Pointer Lock",
             Self::ToggleTabletMonitor => "Tablet Monitor",
             Self::StopTyping => "Stop Typing",
@@ -83,7 +92,7 @@ impl MenuCommand {
             Self::Quit { .. }
             | Self::Disconnect
             | Self::SendSecureAttention
-            | Self::ToggleKeyboardGrab
+            | Self::ToggleKeyboardCapture
             | Self::ToggleFullscreen
             | Self::PasteAsKeystrokes
             | Self::KeyboardPhysical
@@ -98,7 +107,7 @@ impl MenuCommand {
             Self::Quit { .. } => DeckShortcut::Quit,
             Self::Disconnect => DeckShortcut::Disconnect,
             Self::SendSecureAttention => DeckShortcut::SendSecureAttention,
-            Self::ToggleKeyboardGrab => DeckShortcut::ToggleKeyboardGrab,
+            Self::ToggleKeyboardCapture => DeckShortcut::ReleaseKeyboard,
             Self::ToggleFullscreen => DeckShortcut::ToggleFullscreen,
             Self::PasteAsKeystrokes => DeckShortcut::PasteAsKeystrokes,
             Self::KeyboardPhysical => DeckShortcut::KeyboardPhysical,
@@ -120,12 +129,8 @@ impl MenuCommand {
         deck_menus(platform, false)
             .into_iter()
             .flat_map(|menu| menu.entries)
-            .find_map(|entry| match entry {
-                MenuEntry::Command(command) if command.shortcut() == Some(shortcut) => {
-                    Some(command)
-                }
-                _ => None,
-            })
+            .flat_map(MenuEntry::commands)
+            .find(|command| command.shortcut() == Some(shortcut))
     }
 
     /// Whether the command means anything without a session.
@@ -133,16 +138,44 @@ impl MenuCommand {
     pub const fn available_without_session(self) -> bool {
         matches!(
             self,
-            Self::Quit { .. } | Self::About | Self::ToggleColourCheck
+            Self::Quit { .. } | Self::About | Self::ToggleColourCheck | Self::KeyboardShortcuts
         )
     }
 }
+
+/// Connection ▸ Send Key's items, in [`SendKey::ALL`] order.
+pub const SEND_KEY_COMMANDS: [MenuCommand; SendKey::ALL.len()] = {
+    let mut commands = [MenuCommand::ReleaseModifiers; SendKey::ALL.len()];
+    let mut index = 0;
+    while index < commands.len() {
+        commands[index] = MenuCommand::SendKey(SendKey::ALL[index]);
+        index += 1;
+    }
+    commands
+};
 
 /// One line of a menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuEntry {
     Command(MenuCommand),
     Separator,
+    /// A submenu of commands (Send Key).
+    Submenu {
+        title: &'static str,
+        commands: &'static [MenuCommand],
+    },
+}
+
+impl MenuEntry {
+    /// The commands on this line, a submenu's included.
+    #[must_use]
+    pub fn commands(self) -> Vec<MenuCommand> {
+        match self {
+            Self::Command(command) => vec![command],
+            Self::Separator => Vec::new(),
+            Self::Submenu { commands, .. } => commands.to_vec(),
+        }
+    }
 }
 
 /// A top-level menu.
@@ -153,7 +186,7 @@ pub struct Menu {
 }
 
 /// The Deck's menus, after the Mac's application menu (which macOS owns).
-/// A PC Deck adds its keyboard commands and a Help menu (PARITY Q-1).
+/// A PC Deck adds its keyboard commands, Exit and About (PARITY Q-1).
 #[must_use]
 pub fn deck_menus(platform: DeckPlatform, dev_tools: bool) -> Vec<Menu> {
     use MenuCommand as C;
@@ -162,8 +195,12 @@ pub fn deck_menus(platform: DeckPlatform, dev_tools: bool) -> Vec<Menu> {
     let mut connection = vec![Command(C::Disconnect), Command(C::ReleaseModifiers)];
     if pc {
         connection.push(Command(C::SendSecureAttention));
-        connection.push(Command(C::ToggleKeyboardGrab));
+        connection.push(Command(C::ToggleKeyboardCapture));
     }
+    connection.push(MenuEntry::Submenu {
+        title: "Send Key",
+        commands: &SEND_KEY_COMMANDS,
+    });
     connection.extend([
         Separator,
         Command(C::PasteAsKeystrokes),
@@ -209,12 +246,14 @@ pub fn deck_menus(platform: DeckPlatform, dev_tools: bool) -> Vec<Menu> {
             entries: session,
         },
     ];
-    if pc {
-        menus.push(Menu {
-            title: "Help",
-            entries: vec![Command(C::About)],
-        });
-    }
+    menus.push(Menu {
+        title: "Help",
+        entries: if pc {
+            vec![Command(C::About), Command(C::KeyboardShortcuts)]
+        } else {
+            vec![Command(C::KeyboardShortcuts)]
+        },
+    });
     menus
 }
 
@@ -382,24 +421,22 @@ pub fn render_connection_bar(
                                             ui.separator();
                                         }
                                         MenuEntry::Command(command) => {
-                                            let mut button =
-                                                egui::Button::new(command.title(platform));
-                                            if let Some(shortcut) = command.shortcut() {
-                                                let keys =
-                                                    super::wording::chord(platform, shortcut);
-                                                if !keys.is_empty() {
-                                                    button = button.shortcut_text(keys);
+                                            if let Some(command) =
+                                                bar_command(ui, platform, *command, &enabled)
+                                            {
+                                                chosen = Some(command);
+                                            }
+                                        }
+                                        MenuEntry::Submenu { title, commands } => {
+                                            ui.menu_button(*title, |ui| {
+                                                for command in *commands {
+                                                    if let Some(command) = bar_command(
+                                                        ui, platform, *command, &enabled,
+                                                    ) {
+                                                        chosen = Some(command);
+                                                    }
                                                 }
-                                            }
-                                            if ui.add_enabled(enabled(*command), button).clicked() {
-                                                chosen = Some(match command {
-                                                    MenuCommand::Quit { .. } => MenuCommand::Quit {
-                                                        from_keyboard: false,
-                                                    },
-                                                    other => *other,
-                                                });
-                                                ui.close();
-                                            }
+                                            });
                                         }
                                     }
                                 }
@@ -417,6 +454,32 @@ pub fn render_connection_bar(
     }
 }
 
+/// One command button of the connection bar; the command when clicked.
+fn bar_command(
+    ui: &mut egui::Ui,
+    platform: DeckPlatform,
+    command: MenuCommand,
+    enabled: &impl Fn(MenuCommand) -> bool,
+) -> Option<MenuCommand> {
+    let mut button = egui::Button::new(command.title(platform));
+    if let Some(shortcut) = command.shortcut() {
+        let keys = super::wording::chord(platform, shortcut);
+        if !keys.is_empty() {
+            button = button.shortcut_text(keys);
+        }
+    }
+    if !ui.add_enabled(enabled(command), button).clicked() {
+        return None;
+    }
+    ui.close();
+    Some(match command {
+        MenuCommand::Quit { .. } => MenuCommand::Quit {
+            from_keyboard: false,
+        },
+        other => other,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +494,7 @@ mod tests {
                     .map(|entry| match entry {
                         MenuEntry::Command(command) => command.title(platform),
                         MenuEntry::Separator => "-",
+                        MenuEntry::Submenu { title, .. } => title,
                     })
                     .collect();
                 (menu.title, items)
@@ -447,7 +511,8 @@ mod tests {
                     "Connection",
                     vec![
                         "Disconnect",
-                        "Release Modifiers",
+                        "Release Stuck Keys",
+                        "Send Key",
                         "-",
                         "Paste as Keystrokes",
                         "Stop Typing",
@@ -472,6 +537,7 @@ mod tests {
                         "Colour Check…",
                     ]
                 ),
+                ("Help", vec!["Keyboard Shortcuts"]),
             ]
         );
     }
@@ -484,9 +550,10 @@ mod tests {
             pc[0].1,
             vec![
                 "Disconnect",
-                "Release Modifiers",
+                "Release Stuck Keys",
                 "Send Ctrl+Alt+Del",
-                "Keyboard Grab",
+                "Keyboard: Host or This Computer",
+                "Send Key",
                 "-",
                 "Paste as Keystrokes",
                 "Stop Typing",
@@ -497,7 +564,10 @@ mod tests {
                 "Exit",
             ]
         );
-        assert_eq!(pc[3], ("Help", vec!["About Arcen Deck"]));
+        assert_eq!(
+            pc[3],
+            ("Help", vec!["About Arcen Deck", "Keyboard Shortcuts"])
+        );
         for (_, items) in pc {
             assert!(items.iter().all(|title| !title.is_empty()));
         }
@@ -587,12 +657,35 @@ mod tests {
     }
 
     #[test]
+    fn send_key_lists_the_shared_catalogue_on_both_decks() {
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            let connection = deck_menus(platform, false).remove(0);
+            let send_key = connection
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    MenuEntry::Submenu { title, commands } if *title == "Send Key" => {
+                        Some(*commands)
+                    }
+                    _ => None,
+                })
+                .expect("Send Key");
+            let titles: Vec<_> = send_key
+                .iter()
+                .map(|command| command.title(platform))
+                .collect();
+            assert_eq!(titles.len(), 18);
+            assert_eq!(titles[..3], ["Print Screen", "Scroll Lock", "Pause"]);
+            assert_eq!(titles[17], "F24");
+        }
+    }
+
+    #[test]
     fn every_menu_chord_maps_back_to_its_command() {
         for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
             for menu in deck_menus(platform, false) {
-                for entry in menu.entries {
-                    if let MenuEntry::Command(command) = entry
-                        && let Some(shortcut) = command.shortcut()
+                for command in menu.entries.into_iter().flat_map(MenuEntry::commands) {
+                    if let Some(shortcut) = command.shortcut()
                         && shortcut != DeckShortcut::Quit
                     {
                         assert_eq!(MenuCommand::for_shortcut(platform, shortcut), Some(command));

@@ -64,15 +64,13 @@
       "heartbeat_critical_misses": 3
     }
   },
+  "privacy": {
+    "desk": "on"
+  },
   "platform": {
     "input_backend": "auto",
     "multi_monitor": {
       "advertise_enabled": true
-    },
-    "desktop": {
-      "deskside": {
-        "enabled": false
-      }
     }
   }
 }

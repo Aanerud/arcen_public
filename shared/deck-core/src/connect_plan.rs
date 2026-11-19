@@ -812,6 +812,37 @@ pub fn connection_displays_follow_label(connection: &str) -> String {
     format!("Use this setting for \u{201c}{connection}\u{201d}")
 }
 
+/// What a saved connection's panel says it connects with, next to Connect:
+/// the mode, where it comes from and, when the connection's own choice
+/// differs from Settings › Displays, that it wins over it (`true`). A field
+/// report of "Primary display only still gives two displays" was a saved
+/// connection keeping Match my layout, visible only in its editor.
+#[must_use]
+pub fn connection_displays_line(
+    saved: Option<DisplaysMode>,
+    settings: DisplaysMode,
+) -> (String, bool) {
+    match saved {
+        None => (format!("{} (from Settings)", settings.label()), false),
+        Some(mode) if mode == settings => (
+            format!("{} (this connection\u{2019}s own choice)", mode.label()),
+            false,
+        ),
+        Some(mode) => (
+            format!(
+                "{} (this connection\u{2019}s own choice; overrides Settings: {})",
+                mode.label(),
+                settings.label()
+            ),
+            true,
+        ),
+    }
+}
+
+/// The button on a saved connection's panel that hands it back to
+/// Settings › Displays.
+pub const CONNECTION_DISPLAYS_USE_SETTINGS: &str = "Use Settings";
+
 /// A display recovery the user has to choose, recognised from how a
 /// connection ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1048,6 +1079,29 @@ mod tests {
     use super::*;
     use crate::display::metrics::{DisplayMetrics, LogicalRect, SafeAreaInsets};
     use crate::display::topology::build_requested_topology_from;
+
+    #[test]
+    fn a_saved_connections_panel_says_which_displays_choice_it_connects_with() {
+        let (line, overrides) =
+            connection_displays_line(Some(DisplaysMode::MatchLayout), DisplaysMode::SinglePrimary);
+        assert!(overrides);
+        assert_eq!(
+            line,
+            "Match my layout (this connection\u{2019}s own choice; overrides Settings: \
+             Primary display only)"
+        );
+        assert_eq!(
+            connection_displays_line(None, DisplaysMode::SinglePrimary),
+            ("Primary display only (from Settings)".to_owned(), false)
+        );
+        assert!(
+            !connection_displays_line(
+                Some(DisplaysMode::SinglePrimary),
+                DisplaysMode::SinglePrimary
+            )
+            .1
+        );
+    }
 
     #[test]
     fn a_saved_connections_own_displays_choice_wins_and_says_so() {

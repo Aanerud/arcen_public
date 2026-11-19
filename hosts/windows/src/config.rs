@@ -20,6 +20,10 @@ pub struct WindowsPlatformConfig {
     /// `grayscale` replaces ClearType for the length of each session.
     pub font_smoothing: crate::font_smoothing::FontSmoothingPolicy,
     pub multi_monitor: WindowsMultiMonitorConfig,
+    /// `platform.media_foundation_hardware`: whether product Auto may use a
+    /// GPU vendor's Media Foundation hardware encoder (Alpha) after NVENC and
+    /// before OpenH264. Absent means on; `false` keeps such hosts on OpenH264.
+    pub media_foundation_hardware: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]

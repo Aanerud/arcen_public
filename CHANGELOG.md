@@ -53,6 +53,245 @@ works with every 0.17.0 to 0.20.2 Deck and Pier.
   NVIDIA) never tore and is unchanged. No preset tears on the Deck either
   (see Speed above).
 
+### Re-issued 2026-11-19
+
+Every 0.20.3 download (both Decks, the USB component and every Pier) was
+re-issued on 19 November 2026 with these changes.
+
+#### Upgrade note
+
+- **Deck chords moved to the menu.** F9 (release stuck keys) and the
+  keyboard-mode and paste chords Ctrl+Win+K, Ctrl+Win+U and
+  Ctrl+Alt+Win+V (on a Mac ⌃⌘K, ⌃⌘U and ⌃⌥⌘V) are no longer kept by the
+  Deck: they reach the host, where Maya, Resolve and Flame use them. Their
+  actions are **Connection › Release Stuck Keys**, **Keyboard: Physical
+  Keys / Characters** and **Paste as Keystrokes**. Help › Keyboard
+  Shortcuts lists what the Deck still keeps. The Windows Deck's **Keyboard
+  Grab** item is now **Keyboard: Host or This Computer** (Ctrl+Alt+Home).
+
+#### Fixed
+
+- **Pen barrel buttons (Tablet support).** A Windows Deck's Wacom barrel
+  button (Windows Ink: Windows' right click) middle-clicked on a Linux Pier,
+  and a pen button the Wacom driver performs as a mouse click (Middle Click,
+  Right Click, Left Click) was dropped while the pen hovered. `buttons` in
+  `pen_event` now names what a button does (bit 0 right click, bit 1 middle
+  click) on every Pier, which says so with the new `pen_button_actions`
+  capability: Linux presses `BTN_STYLUS2` (button 3) and `BTN_STYLUS`
+  (button 2), Windows the Windows Ink barrel and a mouse middle click, macOS
+  right and other mouse events. Both Decks honour the tablet driver's own
+  clicks while the pen is in range and add Settings › Input › Tablet support
+  pen-button choices (Right click, Middle click, Off: the Windows Ink barrel;
+  a Mac pen's lower and upper side switch). A Deck swaps the two bits for a
+  Linux Pier that predates the capability, so updating the Deck alone fixes
+  it there. A Windows Pier before this change pressed the barrel for the
+  middle click too.
+
+#### Added
+
+- **Who has the keyboard (Windows Deck; shared model).** The host has the
+  keyboard and its system shortcuts (Alt+Tab, Alt+Shift+Tab, the Windows
+  key, Print Screen) while a session window has focus, windowed and
+  fullscreen, as before. **Ctrl+Alt+Home** gives the keyboard to this PC,
+  releasing every key held on the host first, and back; a click into the
+  picture gives it back too and is not sent to the host. The menu bar says
+  who has it ("Keyboard: Z8 (Ctrl+Alt+Home to release)" / "Keyboard: this
+  PC (click to return)"); in fullscreen the connection bar does while this
+  PC has it. **Settings › Input › System shortcuts go to** (the remote
+  computer by default, when fullscreen, or this computer) replaces the
+  unsaved keyboard grab and reads its `always`/`fullscreen`/`never` tokens
+  (`keyboard_capture` in settings.json). The decisions are shared
+  (`arcen_input::keyboard::KeyboardCapture`); the Mac Deck's event tap
+  follows (on a Mac, ⌃⌥Home releases held keys and the pointer lock).
+- **Connection › Send Key** on both Decks: Print Screen, Scroll Lock, Pause,
+  Insert, Ctrl+Alt+Del, Menu and F13–F24, each a press and release after
+  every held key is let go (shared `SendKey`). Key remaps are validated in
+  shared code and can never send a power, sleep or wake key or SysRq
+  (`KeyRemapTable`).
+- **Help › Keyboard Shortcuts** on both Decks, generated from the shared
+  tables, and a Settings line that says where the system shortcuts go.
+
+- Windows Pier: hardware encoding on GPUs without NVENC through the vendor's
+  Media Foundation hardware encoder MFT (Intel Quick Sync, AMD AMF, any vendor
+  that registers one), labelled **Alpha**. Auto now tries NVENC, then this
+  encoder once a per-session admission probe has proven an encode by its SPS
+  (H.264 or HEVC, 8-bit 4:2:0), then OpenH264. Capture stays on the GPU
+  (DDA/WGC, D3D11 video processor to NV12). READY, the hello, the
+  served-pipeline update, Stream Statistics and `diagnose-host` name it
+  "Media Foundation hardware (Alpha)". `platform.media_foundation_hardware:
+  false` turns it off; `video.encoder: "mf-hw"` pins it. Grading and HDR stay
+  refused on it (`gpu_format_unsupported`); multi-monitor sessions use
+  OpenH264.
+- **Every Pier: F13–F24 and the Menu key reach the host, and the hello says
+  which PC keys a Pier takes.** The Linux Pier presses F13–F24 and Menu
+  (`KEY_COMPOSE`) on Xorg and Wayland, and on Xorg makes F13–F24 type the
+  keysyms F13–F24 while a Deck uses them (stock keymaps say `XF86Tools`,
+  `XF86Launch5`…). The Windows Pier injects `VK_F13`…`VK_F24` and
+  `VK_APPS`. The macOS Pier takes F13–F20 and the Menu key as macOS's own
+  PC-keyboard code; a Mac has no F21–F24, Insert, Print Screen, Scroll Lock
+  or Pause. One shared table holds every Pier's code, and the new hello
+  field `pc_keys` lets a Deck grey out Send Key items a host would drop.
+
+#### Removed
+
+- The comparison-only Media Foundation software H.264 path in capenc
+  (`--features mf`).
+
+#### Added (not yet enabled)
+
+- Canvas v1 wire vocabulary for damage-first software streaming (ADR 0028):
+  the `canvas_v1` capability, the per-monitor canvas status in the Pier's
+  hello, the `0x0E` canvas record (reset barrier and fenced frames of fill,
+  copy, tile, cache and surface commands) and the Deck's `canvas_ack` and
+  `canvas_reset_request`, all bounded before allocation. No product sends
+  them yet. The unused partial-frame type `0x02` is removed and reserved.
+- The shared canvas interpreter (`arcen_media::canvas`): one state owner for
+  the Pier's mirror and every Deck, a CPU executor, the canvas digest (the
+  lossless-refinement digest over exact blocks), an eight-bit BGRA
+  refinement source and depth-8 `delta-zstd1` tile packing. A corpus replay
+  proves the Pier's mirror equals an independent replay of the wire bytes
+  for every frame. No product uses it yet.
+- The canvas planner and CPU-budget governor (`arcen_media::canvas`): one
+  monitor's Keel facts (damage, history, traits, verified moves, classes,
+  motion regions) become copies, fills, cache paints, exact tiles, motion
+  surfaces and refinement, through a surface-encoder seam; one budget per
+  Pier (`video.software.cpu_share`, 50 % of the logical cores by default)
+  is shared by every monitor and spent mandatory work first, then exact
+  updates, then surfaces, then refinement. Surfaces degrade rate first,
+  then quality, then size, before text waits, and at most two frames with
+  optional work wait for a Deck's acknowledgement. A simulation on Keel's
+  work meter and corpus replays over Keel's scenarios gate it. No product
+  uses it yet.
+- The Deck's shared canvas (`arcen_deck_core::canvas`): canvas records are
+  admitted per monitor (the hello's state, then region-frame admission),
+  validated by the shared state owner, decoded (tiles, and one H.264
+  decoder per surface, at most two per monitor) and handed to the
+  presenter's new canvas executor before it presents; `canvas_ack` at least
+  four times a second, `canvas_reset_request` after any loss, a 100 MiB
+  cache (16 MiB floor), the canvas digest, a Settings switch (on by
+  default) and a "Screen updates" statistics line.
+- The Windows Deck's canvas executor (ADR 0028): one eight-bit D3D11
+  canvas per monitor on the presenter's device (fills, copies, lossless
+  tiles, the cache, and H.264 surface paints converted by the presenter's
+  own NV12 pass), presented by copying it into the eight-bit swapchain and
+  read back for the canvas digest. Tested against the shared CPU executor:
+  lossless blocks bit-exact, surface blocks within one code, on WARP and
+  GPUs. The Windows Deck asks for canvas in single-window sessions.
+- The macOS Deck's canvas executor: one persistent eight-bit Metal canvas
+  per monitor, written by fills, copies (overlaps staged through a
+  temporary), tiles, cache stores and paints, and surface paints that
+  convert the decoded H.264 picture with the shared colour conversion on
+  the listed blocks only; the Auto/Speed layer presents it. Tested against
+  the shared CPU executor on the planner's corpus: exact on every lossless
+  block, within one code on surface blocks. The macOS Deck asks for canvas
+  on single-window connections (Settings switch, on by default); a
+  multi-monitor connection is served full frames.
+- The Pier side of the canvas (ADR 0028): every Pier's software capture
+  (Linux Xorg and Wayland, Windows) now runs one shared software loop. For a
+  Deck that offers canvas on a single display it sends canvas records under
+  the CPU budget (`video.software.cpu_share`) and says so in its hello; any
+  other Deck gets the same full-frame stream as before, from the same loop.
+  Hardware encoders are unchanged. Canvas video regions follow the bitrate
+  and frame rate the Pier grants them, and a dragged window no longer
+  reopens its encoder on every small change.
+
+#### Fixed
+
+- **Both Decks: a saved connection says which Displays choice it connects
+  with, next to Connect.** A connection saved with its own Displays choice
+  (Match my layout) still opened every monitor with Settings › Displays on
+  Primary display only, and only its editor and Settings said why. Home's
+  panel for the selected connection now has a Displays line: the mode, and
+  "this connection's own choice; overrides Settings: …" when it wins over
+  the setting, with a **Use Settings** button that hands it back.
+- **Windows Deck: release builds route no injected key as a system
+  shortcut.** The input lab's mark (`LAB_KEY_MARK`) exists only in
+  `--features dev-tools` builds.
+- **Windows Deck: the keyboard hook runs on a thread of its own.** The hook
+  that takes Alt+Tab, Alt+Shift+Tab, the Windows key and Print Screen for
+  the session (Keyboard grab, on by default) ran on the window's thread.
+  Windows skips a low-level hook whose thread does not answer within its
+  hook timeout (and, since Windows 7, removes it silently), and that thread
+  is busy drawing; a skipped hook leaves those keys on the Deck's PC (Alt+Tab
+  switches its windows, Print Screen opens its screen capture). The hook now
+  runs on a thread that only pumps messages, still installed only while a
+  session window has focus. The Deck log says when routing starts and
+  stops, with how many keys it took and passed (no key is named). Proof on
+  a Windows Deck with a real keyboard is still pending.
+- **Linux Pier: committed text never presses the SysRq key.** On X11 the
+  Pier types committed text on whatever keys the session's keymap gives
+  the characters, and any X client may change that keymap. A keymap that put
+  a character or a modifier on keycode 107 made the Pier press `KEY_SYSRQ`
+  on its virtual keyboard, which the kernel's SysRq filter reads; with an
+  Alt key remapped as Shift that could start a SysRq action. That key is
+  now never used, as Print Screen already never was.
+- **Linux Pier: a Deck's keys never reach a text console.** The session's
+  virtual keyboard is a kernel keyboard, so with a text console in front
+  (someone at the desk switched to one) a Deck's Ctrl+Alt+Del would have
+  been the console's reboot, Alt+F*n* a console switch and typing input to
+  its login prompt. The Pier now sends key input only while a display server
+  owns the screen, and lets go of held keys when that stops. Every X server
+  the Pier starts also refuses the Ctrl+Alt+Backspace zap (`DontZap`), and
+  committed text no longer borrows F13–F24, which a Deck now presses.
+- **macOS Deck: F13, F14 and F15 are Print Screen, Scroll Lock and Pause on
+  a Windows or Linux host.** A Mac keyboard has no Print Screen or Scroll
+  Lock. An Apple extended keyboard has F13–F15 in their places, and macOS
+  reports a PC keyboard's Print Screen, Scroll Lock and Pause as F13–F15. A
+  Mac host still gets F13–F15.
+- **Grading or HDR with Match my layout on a Wayland Linux Pier no longer
+  fails to start.** A Wayland Pier serves several displays Grading and HDR
+  only once it proves them, so it serves such a session as Auto. The Deck
+  asks for full colour (4:4:4) on every display for those presets, and the
+  Pier kept that requirement for the Auto stream: the connection closed
+  during setup with "encoder capacity admission rejected", or, on a Pier
+  that proves no Grading at all, "display(s) require full-color 4:4:4".
+  The Pier now drops the full-colour requirement together with the preset,
+  and the session starts as Auto on every display, as Stream Statistics
+  already says.
+#### Changed
+
+- **Desk privacy is now on by default on every Pier.** While a Deck is
+  attached to a desktop that the host's own monitors show, those monitors
+  are dark and the keyboard and mouse at the desk are blocked. Nobody can
+  look over your shoulder or type into your session. This applies to the
+  Linux Pier (a joined console, and another product's desktop, whose layout
+  is still never changed), the Windows Pier (the console session) and the
+  macOS Pier (the signed-in user's session). A desk that cannot be made
+  private refuses the session with `console_privacy_unavailable` and the
+  cause; it is never streamed unprotected. The Deck shows "Host screens are
+  blanked for privacy" (or that privacy is off on the host). Leaving still
+  locks the session first, then gives the desk its monitors and input back,
+  restored exactly.
+  **Upgrade note:** this changes the default. To keep the desk live, set
+  `"privacy": {"desk": "off"}` in `pier.json`; every Pier logs the choice
+  at start. On macOS, `platform.desktop.deskside.enabled: false`, which the
+  0.20 package wrote, no longer turns privacy off. A macOS Pier with
+  `input_backend: virtual_hid` refuses signed-in sessions until the input
+  backend is `auto` or `coregraphics`, or privacy is off. A Windows Pier
+  cannot darken a monitor, so it serves the session on a virtual display
+  (or a GPU head with nothing connected) and detaches the desk's monitors
+  from the desktop while the Deck is attached, then puts the desk's own
+  monitor layout back exactly. A Windows desk whose session could only be
+  shown on a monitor at the desk is refused until privacy is turned off.
+  For a few seconds after a sign-in, before the monitors are detached, the
+  desk can still see the session. Pen tablets and touch screens at a
+  Windows desk are not blocked yet.
+- **Software encoding has no fixed size or frame rate any more, and uses
+  more of the CPU.** A Pier without a hardware encoder (Linux and Windows)
+  used to stop at 1920x1200 and 30 fps. It now follows the Deck display up to
+  what OpenH264 itself can encode (3840x2160, 60 fps), and the Pier lowers the
+  frame rate to what its CPU keeps up with. Each picture is cut into up to
+  four slices that are encoded at the same time, and the colour conversion is
+  spread over the same threads, so a multi-core host encodes faster. The
+  software encoder no longer drops pictures to save bits (it froze full-motion
+  video at a few frames a second and paused after every keyframe); it lowers
+  the quality instead, as the hardware encoders do. Unchanged pictures still
+  cost no encode.
+- The Windows Pier's software encoder now runs the same shared session as the
+  Linux Pier, and reports the frames it captured to the frame-rate governor,
+  which it did not before (internal clean-up; Windows software sessions are
+  now governed like Linux ones).
+
 ## [0.20.2] — 2026-11-17
 
 A field release for 0.20.1. A Linux Pier now works beside another

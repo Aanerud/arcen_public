@@ -48,6 +48,9 @@ pub struct HomeViewState<'a> {
     pub form_displays_mode: &'a mut Option<crate::settings::DisplaysMode>,
     /// Working value for the form's Keyboard settings.
     pub form_keyboard: &'a mut arcen_input::keyboard::KeyboardSettings,
+    /// Settings › Displays, which a connection without its own Displays
+    /// choice connects with (the panel says which one wins).
+    pub app_displays_mode: crate::settings::DisplaysMode,
     /// Connection error to show under the Connect button.
     pub connection_error: Option<&'a str>,
     pub remember_username: &'a mut bool,
@@ -94,6 +97,9 @@ pub enum HomeAction {
     },
     /// Cancel the add/edit form.
     CancelForm,
+    /// Hand a saved connection's Displays choice back to Settings ›
+    /// Displays ("Use Settings" on its panel).
+    FollowAppDisplays(usize),
     /// Run the connection test against this address. Sends no credentials.
     TestConnection { host: String, port: String },
     /// A button in the connection test's report.
@@ -342,6 +348,27 @@ pub fn apply_home_action(
             state.form_username.clear();
             state.form_port.clear();
             HomeOutcome::effect(HomeEffect::None)
+        }
+        HomeAction::FollowAppDisplays(index) => {
+            let mut outcome = HomeOutcome::effect(HomeEffect::None);
+            if let Some(original) = state.saved_connections.get(index).cloned() {
+                let mut updated = original.clone();
+                updated.settings.displays_mode = None;
+                match repository.update_connection(&original.id, &original, updated) {
+                    Ok(store) => {
+                        outcome.store = Some(store);
+                        outcome.status = Some(format!(
+                            "\u{201c}{}\u{201d} now connects with Settings \u{203a} Displays: {}",
+                            original.name,
+                            state.app_displays_mode.label()
+                        ));
+                    }
+                    Err(error) => {
+                        outcome.status = Some(format!("Connection was not saved: {error}"));
+                    }
+                }
+            }
+            outcome
         }
     }
 }
@@ -945,6 +972,41 @@ fn detail_connection(
                                     "Off (not encrypted)"
                                 },
                             );
+                            let (displays, overrides) =
+                                crate::connect_plan::connection_displays_line(
+                                    saved.settings.displays_mode,
+                                    state.app_displays_mode,
+                                );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add_sized(
+                                    [72.0, 18.0],
+                                    egui::Label::new(
+                                        egui::RichText::new("DISPLAYS")
+                                            .color(SECTION_COLOR)
+                                            .size(10.0)
+                                            .strong(),
+                                    ),
+                                );
+                                ui.label(egui::RichText::new(displays).size(13.0).color(
+                                    if overrides {
+                                        egui::Color32::from_rgb(0xB0, 0x60, 0x00)
+                                    } else {
+                                        SIDEBAR_TEXT
+                                    },
+                                ));
+                                if overrides
+                                    && ui
+                                        .small_button(
+                                            egui::RichText::new(
+                                                crate::connect_plan::CONNECTION_DISPLAYS_USE_SETTINGS,
+                                            )
+                                            .size(12.0),
+                                        )
+                                        .clicked()
+                                {
+                                    action = Some(HomeAction::FollowAppDisplays(idx));
+                                }
+                            });
                             ui.add_space(18.0);
                             ui.separator();
                             ui.add_space(14.0);
@@ -1876,6 +1938,7 @@ mod tests {
                 form_username: &mut user,
                 form_displays_mode: &mut displays,
                 form_keyboard: &mut keyboard,
+                app_displays_mode: crate::settings::DisplaysMode::SinglePrimary,
                 connection_error: error,
                 remember_username: &mut remember,
                 connection_test: None,
@@ -1933,6 +1996,7 @@ mod tests {
             form_username: &mut user,
             form_displays_mode: &mut displays,
             form_keyboard: &mut keyboard,
+            app_displays_mode: crate::settings::DisplaysMode::SinglePrimary,
             connection_error: Some("the host refused the requested video: selects yuv444"),
             remember_username: &mut remember,
             connection_test: None,

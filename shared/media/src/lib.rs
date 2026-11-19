@@ -18,6 +18,7 @@ pub mod annexb;
 mod applied_topology;
 pub mod audio;
 pub mod bitstream;
+pub mod canvas;
 pub mod capenc_control;
 pub mod capenc_stream;
 pub mod clipboard;
@@ -35,7 +36,6 @@ pub mod refine;
 mod region;
 mod region_activity;
 mod region_frame;
-mod region_schedule;
 pub mod session_plan;
 pub mod stats_overlay;
 pub mod test_pattern;
@@ -84,13 +84,6 @@ pub use region_activity::{
 pub use region_frame::{
     MonitorRoute, RegionFrameAdmissionError, RegionFrameDelivery, RegionFrameRoster,
     RegionFrameRosterError, region_frame_delivery, wire_profile_matches,
-};
-pub use region_schedule::{
-    ForcedKeyframe, MAX_REGION_FRAME_INTERVAL, MAX_REGION_IDLE_REFRESH,
-    MAX_REGION_KEYFRAME_INTERVAL, MIN_REGION_FRAME_INTERVAL, REGION_IDLE_BACKOFF_FACTOR,
-    REGION_IDLE_BACKOFF_STREAK, REGION_SCHEDULE_TELEMETRY_FIELDS, RegionActivityScheduler,
-    RegionSchedulePolicy, RegionSchedulePolicyError, RegionScheduleSignals, RegionScheduleSnapshot,
-    RegionScheduleTelemetry, RegionServiceAction, RegionServiceDecision, RegionServiceReason,
 };
 pub use topology_placement::{
     LayoutSpace, OriginPolicy, PlacedLayout, RegionPlacement, SpacedLayoutRect,

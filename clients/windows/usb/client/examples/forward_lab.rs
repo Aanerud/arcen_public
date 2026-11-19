@@ -249,6 +249,7 @@ mod lab {
             tablet_mode_requested: tablet_mode,
             telemetry: Arc::new(arcen_deck_core::client_telemetry::ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
         })
     }
 

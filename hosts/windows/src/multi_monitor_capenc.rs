@@ -366,6 +366,7 @@ pub fn resolve_pipeline_specs(
                 cursor_mode: template.cursor_mode,
                 session_log_id: template.session_log_id.clone(),
                 refine: None,
+                canvas: None,
             };
             config.qp_map = template.qp_map_for_config(&config);
             Ok(ResolvedMonitorPipeline {
@@ -1275,6 +1276,7 @@ mod tests {
             cursor_mode: CursorMode::Local,
             session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
             refine: None,
+            canvas: None,
         };
         ResolvedMonitorPipeline {
             session_monitor_id: sid(session_monitor_id),

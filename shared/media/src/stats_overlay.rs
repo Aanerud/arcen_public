@@ -27,6 +27,9 @@ pub struct StatsOverlayInputs<'a> {
     pub pipeline: Option<&'a str>,
     /// Exact still image status line (`Exact: …`, scoped wording, ADR 0016 R4).
     pub refine: Option<&'a str>,
+    /// The serving encoder backend's wire token, shown by its display name
+    /// with its maturity label (`Media Foundation hardware (Alpha)`).
+    pub encoder: Option<&'a str>,
 }
 
 /// `SDR` or `HDR` from the transfer: bit depth never implies HDR.
@@ -104,7 +107,7 @@ pub fn stats_overlay_lines(inputs: &StatsOverlayInputs<'_>) -> [String; 3] {
         format!("{:.1} fps", inputs.presented_fps)
     };
     let axes = inputs.axes.copied().unwrap_or_default();
-    let stream = format!(
+    let mut stream = format!(
         "{fps} · {} {} {} · {} · {} · {} primaries",
         codec_label(axes.codec),
         chroma_label(axes.chroma),
@@ -113,6 +116,10 @@ pub fn stats_overlay_lines(inputs: &StatsOverlayInputs<'_>) -> [String; 3] {
         dynamic_range_label(axes.transfer),
         primaries_label(axes.primaries),
     );
+    if let Some(encoder) = inputs.encoder.filter(|token| !token.is_empty()) {
+        stream.push_str(" · ");
+        stream.push_str(&crate::video::encoder_backend_display_name(encoder));
+    }
     let refine = inputs
         .refine
         .unwrap_or("Exact: not offered by this host")
@@ -201,6 +208,7 @@ mod tests {
             axes: Some(&axes),
             pipeline: Some("Grading"),
             refine: None,
+            encoder: None,
         });
         assert!(
             lines[0].starts_with("RTT 23 ms (min 20) · loss "),
@@ -219,5 +227,25 @@ mod tests {
         let unknown = stats_overlay_lines(&StatsOverlayInputs::default());
         assert_eq!(unknown[0], "RTT - · loss - · path not reported");
         assert!(unknown[1].contains("range unknown"));
+    }
+
+    #[test]
+    fn the_serving_encoder_is_named_with_its_maturity_label() {
+        let line = |encoder| {
+            stats_overlay_lines(&StatsOverlayInputs {
+                pipeline: Some("Auto"),
+                encoder,
+                ..StatsOverlayInputs::default()
+            })[1]
+                .clone()
+        };
+        assert!(
+            line(Some("media-foundation-hw")).ends_with(" · Media Foundation hardware (Alpha)"),
+            "{}",
+            line(Some("media-foundation-hw"))
+        );
+        assert!(line(Some("native-nvenc")).ends_with(" · NVIDIA NVENC"));
+        assert!(line(Some("future-encoder")).ends_with(" · future-encoder"));
+        assert!(line(None).ends_with(" primaries"));
     }
 }

@@ -39,28 +39,9 @@ updates before damage state changes, resets in place, and exposes fixed-size
 activity diagnostics for aggregate scheduling. The cadence value is advisory;
 it does not change encoder behavior or frame rates.
 
-`RegionActivityScheduler` is the product adopter of that grid: one scheduler
-per active region, composing `RegionActivityGrid` with Keel's `IdleCadence` so
-no classification or keepalive algorithm is duplicated. Hosts feed it the
-changed-tile summary the capture pipeline already computes for selective
-conversion, so the adopter adds no extra hash pass. It returns a
-`RegionServiceDecision` — serve or skip, keyframe or delta, a stable
-`RegionServiceReason`, and an advisory `recommended_interval` — plus
-fixed-field `RegionScheduleTelemetry`.
-
-Suppression is bounded by construction. `RegionSchedulePolicy` validates
-`frame_interval <= max_idle_refresh <= keyframe_interval`, and startup
-baselines, `ForcedKeyframe` requests (client IDR, recovery, reconfigure),
-keyframe deadlines, input/focus wake, and the max-idle refresh are all
-mandatory reasons that measured activity can never override. Only sustained
-idle backs the cadence off, and never past `deadline_remaining()`, so a static
-region cannot outrun its own refresh. `note_service_failed` restores the
-deadline counters and re-arms a lost keyframe rather than silently downgrading
-it to a delta. Regions hold fully independent state, so one busy region cannot
-starve another; cross-region delivery ordering stays with the existing
-`arcen-outputs` fair roster and is not re-implemented here. Encoder backend,
-codec/chroma, bitrate, and frame-rate policy remain host-authoritative — the
-scheduler only decides whether a region is worth servicing this tick.
+The software loop (`canvas::CanvasEncodeLoop`, below) is the one adopter of
+Keel's damage and idle cadence on every Pier's software path; there is no
+per-region service scheduler beside it.
 
 For multi-monitor sessions, `SessionMonitorId` is a validated nonzero contract
 (`1..=65535`). Wire/frame id `0` remains reserved for legacy single-monitor
@@ -335,7 +316,7 @@ do not send a wire pipeline. Each named file owns one contract:
 - `hdr.rs`: HEVC 4:4:4 10-bit full-range PQ/BT.2020, quality intent,
   conservative start, 500 Mbit/s ceiling, evidence-gated target-relative probe,
   and HDR-scoped queue budgets.
-- `software.rs`: CPU fallback H.264 4:2:0 up to 30 fps. It starts from a CPU-conscious shared bitrate policy (about 4 Mbit/s at 1080p30, scaled by picture shape) and lets the shared live rate controller climb toward an 8 Mbit/s-class ceiling only when the path proves clear. Speed is served visibly as Software/Auto at 30 fps; Grading and HDR are refused on software-only hosts. macOS Pier does not need this fallback because VideoToolbox is always present.
+- `software.rs`: CPU fallback H.264 4:2:0 that follows the Deck display like Auto, at most OpenH264's 3840x2160 and 60 fps, held by the host's frame-rate governor at what the CPU encodes. It starts from a CPU-conscious shared bitrate policy (about 4 Mbit/s at 1080p30, scaled by picture shape) and lets the shared live rate controller climb toward an 8 Mbit/s-class ceiling only when the path proves clear. Speed is served visibly as Software/Auto at the CPU's rate; Grading and HDR are refused on software-only hosts. macOS Pier does not need this fallback because VideoToolbox is always present.
 
 To change one pipeline, edit only its file and update the pinned tests in
 `pipeline/mod.rs`; platform code should keep reading `pipeline_contract`.
@@ -400,14 +381,105 @@ capability, hello, and frame-header truth.
 
 The optional non-default `software-h264-source` feature is the only Arcen
 OpenH264 boundary. `SoftwareH264Encoder` accepts checked borrowed I420, owns
-bounded retained Annex-B output, enforces the reviewed Baseline/1080p30
-contract, and exposes no native pointers. The dependency remains complex unsafe
+bounded retained Annex-B output, enforces Baseline within OpenH264's own
+3840x2160 and 60 fps, cuts each picture into up to four fixed slices encoded on
+OpenH264's worker threads, and exposes no native pointers. The dependency remains complex unsafe
 C/C++; safe Arcen code does not make it memory-safe. The default graph has no
 OpenH264 or native build dependency.
 
 See
 [`../../docs/architecture/media-plan-resolution.md`](../../docs/architecture/media-plan-resolution.md)
 for host policy, source-only dependency, distribution, and physical-lab gates.
+
+## Canvas planner and governor (ADR 0028)
+
+`canvas::{state,pixels,mirror,tile}` is the one interpreter of canvas records
+(the Pier's mirror and every Deck). `canvas::planner` decides what a Software
+Pier sends, from Keel's facts only; `canvas::governor` decides how much of it
+fits. Neither has an OS or codec dependency.
+
+**Planner** (`CanvasPlanner`, one per monitor). Each tick, `observe` runs Keel
+over the captured frame (narrowed hashing when the capture reports damage,
+history, traits, motion search, classes, regions), checks every move hint
+exactly against the mirror and returns the monitor's `MonitorDemand`; `plan`
+spends the monitor's `MonitorGrant` and returns the wire records, already
+applied to the mirror. Rules, first match wins:
+
+1. A block wholly inside a verified move goes in a `Copy`. A move's source
+   never holds lossy blocks (the longest exact band of rows is kept), and the
+   band a copy scrolls through stays exact, so scrolling keeps copying.
+2. A solid block goes in a `Fill` (coalesced into rectangles).
+3. A whole 64 × 64 cell the Deck's cache holds is a `CachePaint`; a whole
+   cell sent exactly is stored (`TileLedger` mirrors the Deck's slots and
+   bytes, evicting first).
+4. A `Motion` block inside a surface goes to that surface; elsewhere it is a
+   tile.
+5. Other changes are exact tiles; a compact many-colour band larger than
+   `image_tile_limit_px` in one tick is one lossy picture of a one-shot
+   surface.
+6. `Settled` lossy blocks are refined to exact tiles with leftover budget.
+7. Motion over 60 % of the monitor for 0.5 s is one whole-monitor surface
+   (today's full-frame stream as a degenerate case).
+
+Surfaces (`SurfaceSet`): a surface opens only with blocks to paint and paints
+its IDR in the same tick; it keeps its rectangle while its motion fits and
+covers more than half of it, moves without an IDR when only the position
+changed, and reopens on any other change or a new scale. The Pier implements
+`SurfaceEncoder` (the shared software H.264 session; a later backend behind
+the same trait).
+
+**Governor** (`CanvasGovernor`, one per session). The budget is
+`tick × logical cores × video.software.cpu_share` (`CpuShare`, 50 % by
+default), kept as credit so a picture due every Nth tick may spend N ticks'
+budget. Spending order: mandatory work (a reset and its repaint, a new
+surface's IDR, damage within 64 px of the latest input, keepalives) always;
+then copies, fills and cache paints; then exact tiles and one-shot pictures,
+oldest first; then surfaces at the governed rate; then refinement on monitors
+without surface work. Across monitors the focused monitor goes first, then
+the one with most motion. Degradation order: the surface rate through the
+session rate's even divisors (`HostRateGovernor`), then surface quality
+(bitrate 75 %, 50 %; minimum QP +4, +8), then surface scale (⅔, ½), and tiles
+spread over more ticks only when exact work alone exceeds the budget.
+Recovery runs in reverse after the shared probing holds. `canvas_ack` flow
+control (`CanvasFlow`): at most two unacknowledged frames per monitor carry
+optional work (surfaces, refinement), and none while the Deck holds more
+unapplied bytes than the link carries in 250 ms; mandatory and exact work
+never wait for an acknowledgement. Costs are `CostModel` predictions over
+Keel's `WorkMeter`, with priors until the meter has measured.
+
+Gates (`canvas/planner_tests.rs`, `canvas/governor.rs`): corpus replays over
+every Keel scenario (mirror digest equals an independent replay of the wire
+bytes every frame; command mix and CPU estimate), a budget simulation on the
+`WorkMeter` cost model (mandatory work never deferred; text p95 latency at
+most one tick under a saturating video; one budget across monitors), and a
+deterministic test for each degradation step.
+
+**The one software loop** (`canvas::CanvasEncodeLoop`). Every Pier's software
+capture (Linux Xorg `XShm`, Linux Wayland `PipeWire`, Windows WGC) is a thin
+adapter: it hands each picture and whatever damage its OS reported to
+`tick` and writes the records that come back; `wants_frame` tells it when a
+picture is owed (damage, waiting work, a keyframe or reset, the keepalive).
+The decision is per Deck and made once, by the shared
+`canvas::serve::plan_canvas`: a Deck that offered `canvas_v1` to a
+single-monitor Software session gets canvas records (planner → governor →
+`SurfaceEncoder` → records, monitor 0 with topology generation and stream
+epoch 0); any other Deck gets the same loop's degenerate path, the whole
+monitor as one surface encoded by the same encoder
+(`LoopEncoder::encode_full`) and sent as ordinary access units, gated by
+Keel's damage and idle cadence. Hardware contracts never reach it. The Pier
+implements the encoder once, `video::SoftwareSurfaces` (one shared
+`SoftwareH264Session` per surface, BT.709 limited range, plus the
+monitor-sized session of the full-frame path), and opens the loop with
+`video::open_software_loop`. The decision travels to `capenc` as one
+argument (`canvas::serve::CanvasCapencArgs`), the records come back as
+framed-v2 `Canvas` records, and the Deck's `canvas_ack` and
+`canvas_reset_request` go to the loop as `CANVAS-ACK`/`CANVAS-RESET` lines
+(`capenc_control`). A Pier that drops a canvas record asks the loop for a
+keyframe, which starts a new generation (reason `recovery`); a reset is the
+queue's and the lane relay's recovery point. The loop logs the mirror's
+digest at every fence that is a multiple of `CANVAS_DIGEST_EVERY_FENCES`;
+`examples/canvas_verify.rs` is a Deck for one capture (the CPU executor,
+acknowledgements, the same digest fences) for lab comparison.
 
 ## Validation
 

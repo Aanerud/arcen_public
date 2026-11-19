@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 use arcen_input::keyboard::pc::{PcKey, PcModifier};
 use arcen_input::keyboard::windows::{AltGrControlFilter, TimedKey, WindowsKeyReader};
 use arcen_input::keyboard::{
-    HostKeyEdge, PcKeyAction, PcKeyEvent, PcKeyboardInput, PcKeyboardSettings, SystemChord,
-    resolve_pc_keyboard_policy,
+    DeckShortcut, HostKeyEdge, PcKeyAction, PcKeyEvent, PcKeyboardInput, PcKeyboardSettings,
+    SendKey, SystemChord, resolve_pc_keyboard_policy,
 };
 use arcen_input::text::{
     DeckTextAction, DeckTextEvent, HostTextTruth, SuppressReason, TextInputPolicy, TypingMode,
@@ -175,6 +175,62 @@ impl Keyboard {
         self.input.tap(qt_key)
     }
 
+    pub(super) fn send_key(&mut self, key: SendKey) -> Vec<HostKeyEdge> {
+        self.input.send_key(key)
+    }
+
+    /// Whether this PC has the keyboard.
+    pub(super) const fn released(&self) -> bool {
+        self.input.released()
+    }
+
+    /// This PC has the keyboard (`true`) or the host again: the releases of
+    /// what the host held. Coming back reads the modifiers still down.
+    pub(super) fn set_released(&mut self, released: bool) -> Vec<HostKeyEdge> {
+        self.reader.clear();
+        self.altgr.clear();
+        self.pass_chars = false;
+        self.down.clear();
+        self.local.clear();
+        if released {
+            let _ = self.text.plan_frame(&[DeckTextEvent::FocusLost]);
+        }
+        let edges = self.input.set_released(released);
+        self.focus_gained();
+        edges
+    }
+
+    /// A key message while this PC has the keyboard: only the escape chord
+    /// is the Deck's (`Some`); every other key goes to the window's own
+    /// path (winit and egui), and nothing reaches the host.
+    pub(super) fn released_key(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+        if !matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
+            return false;
+        }
+        #[allow(clippy::cast_possible_truncation, reason = "the low word is the key")]
+        let vk = wparam.0 as u16;
+        let bits = lparam.0;
+        let (scan, extended) = key_position(
+            vk,
+            u32::try_from((bits >> 16) & 0xFF).unwrap_or(0),
+            bits & (1 << 24) != 0,
+        );
+        let pressed = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let key = self.reader.read(vk, scan, extended, pressed);
+        let repeat = pressed && !self.down.insert(key);
+        if !pressed {
+            self.down.remove(&key);
+        }
+        matches!(
+            self.input.key(PcKeyEvent {
+                key,
+                pressed,
+                repeat,
+            }),
+            PcKeyAction::Shortcut(DeckShortcut::ReleaseKeyboard)
+        )
+    }
+
     /// The window got focus: modifiers already held are recorded (the next
     /// key carries them), and the layout is read again.
     pub(super) fn focus_gained(&mut self) {
@@ -199,7 +255,7 @@ impl Keyboard {
     }
 
     /// Releases everything held on the host and forgets every key (focus
-    /// loss, F9, a session ending).
+    /// loss, Release Stuck Keys, a session ending).
     pub(super) fn release_all(&mut self) -> Vec<HostKeyEdge> {
         self.reader.clear();
         self.altgr.clear();
@@ -441,7 +497,6 @@ impl Keyboard {
                             events.push(InputEvent::Keys(edges));
                         }
                         PcKeyAction::Shortcut(action) => events.push(InputEvent::Shortcut(action)),
-                        PcKeyAction::Reset { reason } => events.push(InputEvent::Reset { reason }),
                         PcKeyAction::Host(_)
                         | PcKeyAction::Local
                         | PcKeyAction::Text

@@ -79,8 +79,8 @@ the headless GNOME stack and a usable render node are present, otherwise a
 refusal naming what to install. A render node of any vendor qualifies: the
 qualification probes for a native encoder (NVENC) first, and a host without
 one (Intel or AMD graphics, a GPU with no encoder) is qualified and served
-with the software encoder (OpenH264, H.264 4:2:0 at up to 30 fps, outputs
-fitted to 1920x1200). The one package the installer may install is `kernel-modules-internal` for
+with the software encoder (OpenH264, H.264 4:2:0 at the rate the CPU encodes,
+outputs fitted to 3840x2160). The one package the installer may install is `kernel-modules-internal` for
 the running kernel, which carries the `vhci-hcd` USB/IP controller Native
 tablet needs. It does so only when Native tablet is enabled (`--native-tablet`,
 or `usb.native_tablet` already `"enabled"` on an upgrade), the host is in the

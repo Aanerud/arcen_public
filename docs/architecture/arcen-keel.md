@@ -140,6 +140,23 @@ of clean blocks, (b) frame-level skip/cadence (shipped), (c) governor decisions.
 map, more leverage. If we ever want true region encoding on CPU, that is the Phase-4
 hybrid-codec decision (§7), not a patch on the MFT.
 
+**Narrowed hashing.** Where the OS reports damage (DDA dirty and move rects,
+WGC dirty regions, PipeWire damage metadata, ScreenCaptureKit dirty rects),
+`DamageTracker::update_within(frame, os_damage)` hashes only the reported
+blocks plus a rotating audit stripe of whole block rows, so hashing cost
+follows the reported damage instead of the frame size (4K typing: 1.83 ms
+full, 83 µs narrowed on the review machine). The result equals a full update
+whenever the report is a superset of the real change; a change the OS never
+reported is found when the stripe reaches it, within `audit_period` narrowed
+updates (default 30). Without a baseline, and whenever the report is
+`DamageMetadataStatus::Unknown`, the adapter performs a full update.
+
+**Move vectors.** `mark_move_rect` keeps each OS move vector (`MoveRect`,
+clipped so source and destination lie in the frame) in a bounded ordered
+list, beside the conservative destination-and-source damage bits, which
+remain the fallback. A move is a hint: a consumer verifies it exactly against
+what the receiver shows before it copies.
+
 **Collision note:** the 64-bit hashes are probabilistic. Tests prove that the
 implementation detects representative pixel changes and excludes pitch padding;
 they cannot prove mathematical collision impossibility. Production does not
@@ -209,6 +226,15 @@ catches scrolling (tracked as zero-offset/offset-tile cache hits). Requires:
   ledger ships after §3–§5.
 - Eviction is ledger-driven (LRU + explicit invalidate), and the ack channel is the
   same feedback path RFI and QUIC loss reports use — one plumbing job, three tenants.
+
+**Implemented (Keel side):** `TileLedger` keys exact tiles by a 128-bit XXH3
+of their shape and pixels (`TileKey::of`), and the Pier assigns the receiver
+slots. On an ordered lane the receiver therefore needs no acknowledgement for
+the ledger to be correct; acknowledgements remain a throttling signal. The
+ledger evicts least recently used entries within a byte budget and a slot
+count and reports each evicted slot so the planner can tell the receiver
+before it reuses one. Scroll is found separately by `MotionEstimator` (§11).
+The wire records stay in `arcen-protocol`.
 
 ## 7. Transport alignment — current QUIC, richer QUIC later
 
@@ -332,3 +358,87 @@ real hosts; unit and offline tests cover the rest.
 5. **Static content:** RGB-exact lossless settle-patches over the H.264 base
    layer, sharing plumbing with the tile cache; an SVT-AV1 base layer is
    evaluated with data before any change of base codec.
+
+## 11. Canvas building blocks
+
+The damage-first canvas pipeline for the Software contract sends each damaged
+region the cheapest exact way it can (a copy, a fill, a cached or lossless
+tile) and only motion through an H.264 surface. Keel supplies the facts, never
+the codec choice or the wire record; the planner in `arcen-media`
+(`arcen_media::canvas::CanvasPlanner`, with the CPU-budget governor
+`CanvasGovernor`; see `shared/media/ARCHITECTURE.md`) maps them.
+
+| Fact | Type | Cost |
+| --- | --- | --- |
+| Which blocks changed, hashing only what the OS reported | `DamageTracker::update_within`, `ActivityGrid::update_within` | O(reported blocks + one stripe) |
+| Which pixels moved where | `ExternalDamage::move_rects`, `PendingExternalDamage::move_rects` | O(moves), at most `MAX_MOVE_RECTS` |
+| How long a block has been still, how often it changes, how it was last painted and whether that paint was lossy | `BlockHistory` (`observe`, `age`, `recent_changes`, `record_paint`, `is_lossy`) | O(changed blocks) |
+| Whether a changed block is one colour, few colours, or has hard edges | `BlockTraitsMap::update`, `BlockTraits` | O(changed blocks), at most 256 pixels each |
+
+| Which band scrolled, and by how much, when the OS reports no moves | `MotionEstimator::estimate` over row hashes kept by `DamageTracker::retain_row_hashes`; `verify_move` | O(changed rows) |
+| What each block is doing: `Static`, `Settled`, `Sparse`, `Motion` or `Moved` | `BlockClassMap::update`, `BlockClass`, `ClassConfig` | O(changed + recently active blocks) |
+| Where motion is, as at most two stable rectangles | `MotionRegions::update`, `MotionRegion` | O(active blocks + 64-px cells) |
+| What each kind of work costs on this host now | `WorkMeter` (`record`, `ms_per_mpx`, `predict`, `affordable_pixels`) | O(1) |
+| Which exact tiles the receiver's cache holds, in which slot | `TileLedger`, `TileKey` | O(1) per lookup or insert |
+
+`BlockHistory` is the one per-block clock; the refinement scheduler's private
+stillness bookkeeping moves onto it when the canvas interpreter lands.
+`PaintKind` names kinds of paint (solid, exact, copied, cached, lossy), not
+codecs.
+
+**Motion search.** XShm, PipeWire SHM and ScreenCaptureKit report no moves,
+yet scrolling is the commonest large damage. With row retention on,
+`DamageTracker` keeps a position-independent hash of every 16-pixel row
+segment for the current and previous frame. For each band of changed block
+rows, `MotionEstimator` votes on a vertical offset from up to 24 distinctive
+row pairs in each of up to 8 block columns, within ±`max_scroll` (512) rows,
+then checks the two best offsets and the previous frame's offset against every
+row of every block column in the band and reports the largest rectangle that
+matches throughout. Only vertical offsets are found from pixels: row segments
+sit on 16-pixel columns, so a horizontal shift changes every segment.
+Horizontal and diagonal moves come from OS move reports (DDA), and a
+pointer-driven drag candidate can be checked with `verify_move` against the
+mirror. Every vector, from the OS or from pixels, is a hint: the planner runs
+`verify_move` (an exact comparison of the moved band against what the receiver
+shows) before it sends a copy.
+
+**Classes.** `Moved` wins for a block that changed and lies wholly inside a
+verified move. A block becomes `Motion` after 5 changes in the last 16
+observations (about 19 a second at 60 Hz: above fast typing under a blinking
+caret, below 24 fps video) and stays `Motion` while it changed at least twice
+in that window. Otherwise a block that changed within the settle time
+(300 ms) is `Sparse`; after it, it is `Settled` when its last paint was lossy
+or missing, else `Static`. A paint recorded without damage takes effect when
+the planner calls `revisit` (or `revisit_all` after `invalidate_paint`). A flap is a block entering or leaving `Motion`.
+
+**Regions.** `Motion` blocks are counted in 64-pixel cells; cells up to one
+empty cell apart join one cluster, clusters with fewer than 16 `Motion` blocks
+(a caret, a clock) are dropped, and the rest merge by least added area down to
+two. A region grows on the frame its cluster grows, shrinks only after the
+smaller shape has held for 30 updates, and closes after 30 updates without
+motion. Regions are 64-pixel aligned and clipped to the frame; region ids are
+stable for a region's life.
+
+**Work meter.** The governor's budget arithmetic needs measured costs, not
+constants. `WorkMeter` keeps an exponentially weighted average (weight 1/8)
+of milliseconds per megapixel for hashing, classification, conversion, exact
+tiles, lossy surfaces and composition. Jobs under 64 Ki pixels accumulate
+before they count, so timer noise on a single tile does not swing the
+average. The governor policy itself stays in `arcen-media`.
+
+**Corpus gates** (`shared/keel/tests/`): scroll vectors are found on at least 95% of
+reachable scroll frames (100% measured) of the `Scroll` and `DocumentScroll` corpora (text
+scrolling inside a viewport at 3 to 64 rows a frame, both directions, with
+pauses) at five frame sizes, through both full and narrowed hashing, and every
+vector reported on any corpus scenario passes `verify_move` against the
+previous frame. On the `Editor` corpus (eight characters a second under a
+blinking caret) no block enters `Motion` in ten seconds and no region opens;
+full-frame video becomes one region that never resizes. The synthetic `Typing`
+scenario, a 12-row band moving 16 rows every frame, is a sweep, not typing,
+and does become motion.
+
+Criterion on the review machine (Apple M4 Pro, release, 3840x2160): a full
+hash costs 1.35 ms plain and 1.8 to 2.4 ms with row retention; motion search
+on a whole-viewport scroll 1.45 to 1.8 ms; classes and regions on full-frame
+video 0.2 ms; a tile ledger insert at a full 100 MB budget 13 ns; a 64x64
+tile key 0.6 µs. These are machine-local, not cross-host promises.

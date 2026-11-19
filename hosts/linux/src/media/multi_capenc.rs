@@ -275,7 +275,7 @@ pub(crate) fn validate_uniform_exact_encoder_policy(
 ) -> Result<(), MultiCapencConfigError> {
     match encoder {
         EncoderSelection::Auto
-        | EncoderSelection::WindowsMediaFoundation
+        | EncoderSelection::MediaFoundationHardware
         | EncoderSelection::SoftwareAv1 => Err(MultiCapencConfigError::AutoEncoderNotPermitted),
         EncoderSelection::NativeNvenc => Ok(()),
         EncoderSelection::SoftwareH264 => {
@@ -474,6 +474,7 @@ pub fn build_pipeline_specs(
                         // `Config::wayland_multi_output`).
                         wayland_fidelity_args: Vec::new(),
                         refine: None,
+                        canvas: None,
                         display: display.clone(),
                         xauthority: xauthority.clone(),
                         execution: execution.clone(),
@@ -496,6 +497,7 @@ pub fn build_pipeline_specs(
                     // `Config::wayland_multi_output`).
                     wayland_fidelity_args: Vec::new(),
                     refine: None,
+                    canvas: None,
                     display,
                     xauthority,
                     execution,
@@ -1021,6 +1023,7 @@ mod tests {
             gpu_import_verified: false,
             wayland_fidelity_args: Vec::new(),
             refine: None,
+            canvas: None,
             display: None,
             xauthority: None,
             execution: None,
@@ -1418,7 +1421,7 @@ mod tests {
         assert_eq!(
             build_pipeline_specs(
                 &plan,
-                &template_with_encoder(EncoderSelection::WindowsMediaFoundation)
+                &template_with_encoder(EncoderSelection::MediaFoundationHardware)
             )
             .unwrap_err(),
             MultiCapencConfigError::AutoEncoderNotPermitted
@@ -1427,29 +1430,29 @@ mod tests {
 
     #[test]
     fn build_pipeline_specs_rejects_software_h264_when_a_monitor_would_be_clamped() {
-        // 2560x1600 exceeds OpenH264's 1920x1080 contract and would be
+        // 5120x3200 exceeds OpenH264's own 3840x2160 and would be
         // silently, aspect-preservingly scaled down — the exact scenario
         // issue #3 must fail closed on. The exact fitted values come from
         // `capenc::fit_to_encoder_limits`'s own scaling, not a naive clamp.
-        let plan = two_head_plan_sized(2560, 1600);
+        let plan = two_head_plan_sized(5120, 3200);
         let error = build_pipeline_specs(
             &plan,
             &template_with_encoder(EncoderSelection::SoftwareH264),
         )
         .unwrap_err();
         let (fitted_width, fitted_height) =
-            capenc::fit_to_encoder_limits(EncoderSelection::SoftwareH264, 2560, 1600);
+            capenc::fit_to_encoder_limits(EncoderSelection::SoftwareH264, 5120, 3200);
         assert_ne!(
             (fitted_width, fitted_height),
-            (2560, 1600),
+            (5120, 3200),
             "fixture must actually exercise a real clamp"
         );
         assert_eq!(
             error,
             MultiCapencConfigError::SoftwareGeometryWouldClamp {
                 session_monitor_id: sid(1),
-                width: 2560,
-                height: 1600,
+                width: 5120,
+                height: 3200,
                 fitted_width,
                 fitted_height,
             }
@@ -1459,9 +1462,9 @@ mod tests {
     #[test]
     fn build_pipeline_specs_accepts_software_h264_when_every_monitor_geometry_is_exactly_within_limits(
     ) {
-        // 1920x1080 is exactly OpenH264's contract ceiling: no clamp occurs,
-        // so an explicit software-h264 pin must be accepted.
-        let plan = two_head_plan_sized(1920, 1080);
+        // 3840x2160 is exactly OpenH264's own ceiling: no clamp occurs, so
+        // an explicit software-h264 pin must be accepted.
+        let plan = two_head_plan_sized(3840, 2160);
         let specs = build_pipeline_specs(
             &plan,
             &template_with_encoder(EncoderSelection::SoftwareH264),

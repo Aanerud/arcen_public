@@ -101,6 +101,9 @@ pub struct AdvertisedCapabilities {
     pub text_input: bool,
     /// Whether Native tablet is offered (ADR 0022), or why not.
     pub native_tablet: Result<(), String>,
+    /// What the desk shows while this Deck is attached, as the hello tells
+    /// it (`SessionPolicy::desk_privacy_status`).
+    pub desk_privacy: Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
 }
 
 /// Encoder claims established before the listener accepts a session.
@@ -154,7 +157,7 @@ pub struct SessionPolicy {
     pub lossless_refinement: bool,
     /// `video.fps`: the administrator's frame-rate ceiling, when configured.
     pub fps_ceiling: Option<u32>,
-    /// `platform.desktop.deskside.enabled`: keep the desk private while a
+    /// `privacy.desk` (on unless turned off): keep the desk private while a
     /// Deck is attached to a signed-in user's session (`desk_privacy`).
     pub desk_privacy: bool,
 }
@@ -186,8 +189,27 @@ impl SessionPolicy {
                 config.video.lossless_refinement,
             ),
             fps_ceiling: config.video.fps,
-            desk_privacy: config.platform.desktop.deskside.enabled,
+            desk_privacy: config.privacy.desk_policy().enabled,
         })
+    }
+
+    /// What the hello tells the Deck about the desk: blanked for a signed-in
+    /// user's session the Pier makes private before anything is shown (or
+    /// refuses), `off` when the administrator turned it off; nothing at the
+    /// login window (nobody's desktop is shown) nor in `serve`.
+    #[must_use]
+    pub fn desk_privacy_status(
+        &self,
+    ) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+        use arcen_session::console_session::desk_privacy::{DeskExposure, DeskPrivacyPolicy};
+        if self.login_window || self.serving_uid.is_none() {
+            return None;
+        }
+        let policy = DeskPrivacyPolicy {
+            enabled: self.desk_privacy,
+            source: arcen_session::console_session::desk_privacy::DeskPrivacySource::Config,
+        };
+        Some(policy.plan(DeskExposure::PhysicalDesk).status())
     }
 }
 
@@ -205,7 +227,7 @@ impl Default for SessionPolicy {
             login_window: false,
             lossless_refinement: true,
             fps_ceiling: None,
-            desk_privacy: false,
+            desk_privacy: true,
         }
     }
 }
@@ -697,6 +719,7 @@ pub fn advertise_with_config(
             crate::bridged_tablet::refresh_probe();
             crate::bridged_tablet::availability(policy.login_window)
         },
+        desk_privacy: policy.desk_privacy_status(),
     })
 }
 
@@ -1103,6 +1126,8 @@ pub fn server_hello_json_for_multi(
             pen_eraser: tablet_surface,
             pen_proximity: tablet_surface,
             pen_barrel_buttons: available,
+            // Bit 0 right click, bit 1 middle (`input::barrel_button`).
+            pen_button_actions: available,
             // Committed text is typed as Unicode key events, which carry any
             // character whatever this Mac's layout, so both or neither.
             text_commit: if capabilities.text_input {
@@ -1119,6 +1144,12 @@ pub fn server_hello_json_for_multi(
             // key as before.
             extended_keys: InputCapabilityAvailability::Unavailable,
             meta_pointer_mask: InputCapabilityAvailability::Unavailable,
+            // F13-F20 and the PC Menu key (kVK_ContextualMenu); a Mac has
+            // no Insert, Print Screen, Scroll Lock, Pause or F21-F24
+            // (input/keymap.rs, the shared PC-key table).
+            pc_keys: arcen_input::keyboard::host_keys::advertised_pc_keys(
+                arcen_protocol::messages::HostPlatform::MacOs,
+            ),
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: available,
@@ -1144,6 +1175,10 @@ pub fn server_hello_json_for_multi(
         // dialled.
         negotiated_transport: Some(arcen_transport::CAPABILITY_TRANSPORT_QUIC.to_owned()),
         lossless_refine,
+        canvas: None,
+        desk_privacy: capabilities
+            .desk_privacy
+            .map(|status| status.token().to_owned()),
     }
     .with_build_identity(crate::build_identity());
 
@@ -2709,6 +2744,7 @@ mod tests {
             multi_monitor_v1: None,
             text_input: false,
             native_tablet: Err(crate::bridged_tablet::NOT_BUILT.to_owned()),
+            desk_privacy: None,
         }
     }
 

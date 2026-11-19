@@ -1,6 +1,6 @@
 # ADR 0025: Arcen joins the user's session
 
-**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement). Product-wide; the Linux Pier is its main
+**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`). Product-wide; the Linux Pier is its main
 part. Builds on [ADR 0005](0005-direct-transport-resume-authority.md)
 (resume), [ADR 0008](0008-virtual-display-for-windows-hosts.md) and
 [ADR 0014](0014-quic-lanes-and-capture-contracts.md); changes the Linux
@@ -377,6 +377,85 @@ and unlocked, end it at once.
   hand-back and is taken again (and proved, or the returning Deck is
   refused) before a resumed Deck is shown anything.
 
+*Amended 2026-11-18 (after 0.20.3): desk privacy is the default on every Pier.*
+Nobody should be able to look over the shoulder of someone working through
+Arcen. One shared policy decides it for every Pier
+(`arcen_session::console_session::desk_privacy::DeskPrivacyPolicy`, the
+common configuration key `privacy.desk`):
+
+- **On unless turned off.** `privacy.desk` absent or `"on"`: while a Deck is
+  attached to a desktop the desk's own monitors show
+  (`DeskExposure::PhysicalDesk`: a joined console, another product's desktop
+  in guest mode, an Arcen login session, the macOS console owner's Aqua
+  session, the Windows console session), the desk's monitors are dark and
+  its keyboard and mouse blocked. `"off"` keeps the desk live; it is an
+  explicit administrator choice, logged at every Pier start
+  (`DeskPrivacyPolicy::startup_line`, a warning when off). A desktop no desk
+  monitor shows (a headless Wayland desktop) has nothing to protect
+  (`DeskExposure::NotShown`).
+- **Fail closed and visible.** A desk that cannot be made private refuses
+  the attachment with the shared `console_privacy_unavailable` code (and the
+  cause, `DeskPrivacyRefusal::deck_reason`), never streams it unprotected.
+- **The Deck is told.** The hello carries `desk_privacy` (`blanked`, `off`,
+  `not_shown`); every Deck shows one line from the shared
+  `arcen_deck_core::session_truth::desk_privacy_note`: "Host screens are
+  blanked for privacy", or that desk privacy is turned off on the host.
+- **Restored exactly; order unchanged.** Detach, a Deck that disappears and
+  a Pier or launcher that dies are handled as before (§4, `DETACH_STEPS`,
+  the journals, the lock guard): lock first, then monitors, sound, input.
+  With `"off"` the hand-back still locks first, and a session that will not
+  lock is made private again (Linux `ConsolePrivacy::show_desk` ends at the
+  hand-back).
+- **How each OS makes the desk dark is earned (PD-027).** Linux zeroes every
+  CRTC's RandR gamma ramp (journalled, restored byte for byte, also on
+  another product's desktop, whose layout is never changed) and grabs the
+  seat's evdev devices. macOS zeroes each display's transfer table and runs
+  an event tap that passes only the Pier's own events. Windows cannot show
+  a black ramp (GDI's `SetDeviceGammaRamp` silently refuses ramps that would
+  make the screen unreadable, such as all black, per its documentation), so
+  the Windows Pier **detaches the desk's monitors** instead:
+  1. The session is served on a display no monitor at the desk shows: a
+     virtual display on the same GPU (an indirect display whose adapter
+     software enumerated, `\\?\ROOT#…`, and whose EDID names a virtual
+     display driver that shows its display nowhere: the Pier's own `ARN`,
+     or the GeForce guide's Virtual Display Driver `MTT`; screen extenders
+     that show the desktop on a tablet at the desk are not trusted) is
+     chosen over a configured desk monitor
+     (`deskside::virtual_output_instead_of`), or the NVIDIA head the Pier
+     provisions with nothing physically connected.
+  2. Once the display lease holds, every other output is detached from the
+     desktop with `SetDisplayConfig` (`DisplayLease::detach_desk_monitors`),
+     a mutation under the lease's armed recovery journal
+     (`C:\ProgramData\Arcen\runtime\display-recovery.json`), exactly as an
+     exact-isolated single display always was.
+  3. It proves that no lit output has a monitor physically connected behind
+     it (`deskside::prove_desk_dark`, shared `desk_outputs_dark`; NVAPI must
+     have enumerated the GPU's displays, or the output counts as unknown; a
+     virtual GPU in a guest drives no desk monitor) and repeats the whole
+     proof on every health tick.
+  4. The desk's keyboard and mouse are blocked by low-level hooks that pass
+     only Arcen's marked input (proved live by the keyboard canary; the
+     mouse hook is installed but not proved live, GAP-051).
+
+  Restore: the lease's restore puts back the exact saved topology when the
+  Deck leaves (outputs first, then the lock, `DETACH_STEPS_OUTPUTS_FIRST`);
+  if the session agent dies, its out-of-process watchdog
+  (`display::spawn_display_recovery_watchdog`, `WATCHDOG_RESTORE`) replays
+  the journal and the broker locks after it (`hand_back_session`,
+  `await_display_restore`); if the service dies, the journal is replayed by
+  the next session's acquire or by `console_recovery` at service start and
+  on the next console change (`arcen-pier restore-display --console` as
+  LocalSystem on the console's input desktop). A desk is refused only where
+  detaching fails (`desk_detach_failed`, rolled back) or a monitor at the
+  desk would still show the session (`desk_monitor_lit`, `desk_monitor_unknown`:
+  no virtual display and the NVIDIA head is a desk monitor, or another
+  vendor's GPU NVAPI cannot describe), and the agent locks the session
+  before the desk's input comes back. Open (GAP-050): between a sign-in
+  that unlocks or moves the session to the console and the detach (the
+  agent's start and display lease, a few seconds) the desk's monitors show
+  the session; on an agent crash the restored monitors show it unlocked
+  until the broker's lock.
+
 ### 6. Displays and layout
 
 *Amended 2026-11-17: per-monitor streams and the Deck's layout replace
@@ -714,12 +793,14 @@ records its log tail and keeps its logs.
 | Remote-first creates the OS's real session | Yes: Credential Provider logon; Winlogon creates the console session the desk later sees (`windows_session.rs:1430-1446`, `first_login.rs:24`) | Yes, interactively: the login window is streamed and the user signs in there; cold boot with FileVault is not served (open, README) |
 | Another account at the console | Refused, typed with the shared codes (`console_other_user`; `console_other_user_other_product` naming the session's WinStation listener and protocol when another remote-desktop service is attached; `windows_session::console_refusal`, `docs/architecture/windows-console-policy.md`) | Refused at once, led by the shared `console_other_user` code and naming the account at the console (`console::other_user_refusal`; `console.rs` tests `a_different_account_at_the_screen_is_refused_at_once_not_waited_out`) |
 | Disconnect locks, never ends | Yes (amended 2026-11-18): a Deck that leaves for good gets the session locked (`LockWorkStation` as the user in that session, then disconnected from the console if it would not lock), outputs first (`DETACH_STEPS_OUTPUTS_FIRST`, PD-033), speakers last; a same-account takeover and a changed session are not locked (shared `Departure`). **Gap** GAP-044: while held for a resume the session stays unlocked | Yes (amended 2026-11-18): a signed-in user's session is locked as its Deck leaves (the system's Lock Screen, `SACLockScreenImmediate` found with `dlsym`, proved from `CGSessionCopyCurrentDictionary`), then its displays and sound are given back (`DETACH_STEPS`); a console another account took over is left alone (shared `Departure`). The macOS Pier has no resume hold, so every departure is final. Joining a locked session does not unlock it: the Deck signs in at the streamed lock screen (no public unlock after a password check) |
-| Desk private while attached | Optional deskside policy, off by default (`hosts/windows/src/deskside.rs:38-48`) | Optional, off by default (amended 2026-11-18, `platform.desktop.deskside.enabled`): every display but the Pier's virtual ones dark through an all-zero transfer table, read back; an active HID event tap passes only the Pier's own events (`hosts/macos/src/desk_privacy.rs`, shared `console_session::desk_privacy`); handed back in `DETACH_STEPS` order; dies with the process, after which the agent's lock guard darkens the displays again and locks the session (`hosts/macos/src/lock_guard.rs`, shared `console_session::owner_death`; GAP-048 closed 2026-11-18) |
+| Desk private while attached | Yes, by default (amended 2026-11-18, `privacy.desk`, §5): served on a virtual display or a head with nothing connected, the desk's monitors detached from the desktop (`DisplayLease::detach_desk_monitors`) and proved dark (`hosts/windows/src/deskside.rs` `prove_desk_dark`), the desk's keyboard and mouse blocked by low-level hooks; the pinned `platform.desktop.deskside` remains for bare-metal pinning. Desk pens and touch screens are not blocked (GAP-051) | Yes, by default (amended 2026-11-18, `privacy.desk`; before, `platform.desktop.deskside.enabled`, off): every display but the Pier's virtual ones dark through an all-zero transfer table, read back; an active HID event tap passes only the Pier's own events (`hosts/macos/src/desk_privacy.rs`, shared `console_session::desk_privacy`); handed back in `DETACH_STEPS` order; dies with the process, after which the agent's lock guard darkens the displays again and locks the session (`hosts/macos/src/lock_guard.rs`, shared `console_session::owner_death`; GAP-048 closed 2026-11-18) |
 | No leftovers | Display journal and console recovery (`hosts/windows/src/console_recovery.rs:1-20`); window repatriation caveat (PD-032) | Virtual displays live in a child process and die with it (`hosts/macos/src/virtual_display.rs:58`, `:125`) |
 
 Follow-ups (not in this change): `windows-lock-on-detach` (landed
 2026-11-18, except the held-for-resume case, GAP-044),
-`windows-deskside-default`, `macos-lock-on-detach` (landed 2026-11-18),
+`windows-deskside-default` (landed 2026-11-18 with desk privacy on by
+default on every Pier, §5; GAP-049 closed, GAP-050 and GAP-051 open),
+`macos-lock-on-detach` (landed 2026-11-18),
 `macos-deskside` (landed 2026-11-18, opt-in like Windows; its lab proof
 that capture reads before the transfer table is
 `arcen-pier-macos probe-desk-privacy --blank 2 --capture`). Each should adopt `console_session::DETACH_STEPS` and
@@ -730,7 +811,7 @@ against the principle are ledger gaps GAP-042 (Linux: Wayland consoles are
 refused), GAP-044 (Windows: a session held for resume stays unlocked),
 GAP-047 (Windows service that dies while attached: nothing locks the session
 afterwards) and GAP-049 (Windows: the desk's input stays live unless deskside
-is enabled). Closed the same day: GAP-046 (a Linux console's windows go back
+is enabled; closed later on 2026-11-18 by desk privacy on by default, §5). Closed the same day: GAP-046 (a Linux console's windows go back
 after the Deck's layout, `console_windows`) and GAP-048 (a macOS agent that
 dies is followed by its lock guard, and a restarted agent locks first,
 `console_session::owner_death`).

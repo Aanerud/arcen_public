@@ -216,18 +216,11 @@ target_os = "any"
 package = "arcen-iddcx-provider"
 
 [build_profile.windows-capenc]
-description = "capenc as the Windows Pier links it: WGC/DDA capture, NVENC and OpenH264"
+description = "capenc as the Windows Pier links it: WGC/DDA capture, NVENC, Media Foundation hardware (Alpha) and OpenH264"
 target_os = "windows"
 rust_target = "x86_64-pc-windows-msvc"
 package = "arcen-capenc"
-features = ["nvenc", "software-h264"]
-
-[build_profile.windows-capenc-mf]
-description = "capenc Media Foundation encoder variant (not enabled by the Windows Pier)"
-target_os = "windows"
-rust_target = "x86_64-pc-windows-msvc"
-package = "arcen-capenc"
-features = ["mf"]
+features = ["nvenc", "mf-hw", "software-h264"]
 
 [build_profile.windows-pier-installer]
 description = "Windows installer embedding arcen-pier.exe and the credential provider DLL"
@@ -839,17 +832,10 @@ template = "cargo-test"
 owner = "Windows Host"
 
 [validation.windows-capenc-test]
-description = "capenc tests on Windows with NVENC and OpenH264 compiled in"
+description = "capenc tests on Windows with NVENC, Media Foundation hardware (Alpha) and OpenH264 compiled in"
 kind = "unit"
 build_profile = "windows-capenc"
 template = "cargo-test"
-owner = "Windows Host"
-
-[validation.windows-capenc-mf-build]
-description = "capenc builds with the Media Foundation encoder variant"
-kind = "build"
-build_profile = "windows-capenc-mf"
-template = "cargo-build"
 owner = "Windows Host"
 
 [validation.windows-pier-native-tablet-lab]
@@ -896,6 +882,13 @@ owner = "Windows Host"
 
 [validation.windows-software-h264-lab]
 description = "OpenH264 software path on a Windows host without NVENC"
+kind = "hardware"
+build_profile = "windows-pier"
+template = "recorded"
+owner = "Windows Host"
+
+[validation.windows-media-foundation-hardware-lab]
+description = "Media Foundation hardware (Alpha): admission proof (SPS) and a Deck session through a vendor hardware encoder MFT, plus the OpenH264 fall-through with ARCEN_LAB_MF_HW_ENUM=none"
 kind = "hardware"
 build_profile = "windows-pier"
 template = "recorded"

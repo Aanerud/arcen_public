@@ -9,7 +9,7 @@
 //! for a UI pass.
 //!
 //! Everything this module decides is shared: the PC keyboard policy, the
-//! Deck's chords and the keyboard grab's routing
+//! Deck's chords, who has the keyboard and the hook's routing
 //! (`arcen_input::keyboard`), committed text (`arcen_input::text`), pen
 //! axes (`arcen_input::deck_pen`) and the wheel (`arcen_input::deck_wheel`).
 //! What is here only reads Windows and acts on what comes back.
@@ -32,7 +32,10 @@ use arcen_deck_core::input::overlay_pointer::{
     HeldBy, OverlayPointerRegions, PointerMessage, PointerRoute, over_ui, route_pointer,
 };
 use arcen_input::deck_pen::ImageRect;
-use arcen_input::keyboard::{HostKeyEdge, KeyboardGrab, PcKeyboardSettings};
+use arcen_input::keyboard::{
+    CaptureChange, ClickRoute, DeckShortcut, HostKeyEdge, KeyboardCapture, KeyboardCapturePolicy,
+    KeyboardOwner, KeyboardStatus, PcKeyboardSettings, SendKey,
+};
 use arcen_input::text::{HostTextTruth, TypingMode};
 use arcen_input::touchpad::TouchpadOutput;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -41,13 +44,14 @@ pub use arcen_input::deck_events::{
     DeckInputEvent as InputEvent, DeckInputSink as InputSink, HostInputFacts, LedCursor,
 };
 pub use cursor::HostCursorImage;
+#[cfg(feature = "dev-tools")]
 pub use hook::LAB_KEY_MARK;
 pub use subclass::{attach, detach, with_input};
 
 /// The session window's input: one per window, owned by its subclass.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "independent window facts: active, focused, fullscreen, bridged pen"
+    reason = "independent window facts: active, focused, bridged pen"
 )]
 pub struct WindowInput {
     hwnd: HWND,
@@ -63,11 +67,12 @@ pub struct WindowInput {
     image: Option<ImageRect>,
     active: bool,
     focused: bool,
-    fullscreen: bool,
-    grab: KeyboardGrab,
-    grab_toggle: Option<bool>,
-    /// The connection bar has the keyboard (Ctrl+Alt+Home).
-    connection_bar: bool,
+    /// Who has the keyboard (shared): the host, or this PC after
+    /// Ctrl+Alt+Home until the chord again or a click into the picture.
+    capture: KeyboardCapture,
+    /// Buttons whose press gave the keyboard back to the host (bit per
+    /// left, middle, right): neither it nor its release reaches the host.
+    consumed_buttons: u8,
     /// Where the Deck's own UI takes the pointer over the session (the
     /// fullscreen connection bar), published by the shell every pass.
     overlay: OverlayPointerRegions,
@@ -101,7 +106,7 @@ impl WindowInput {
     /// Input for `hwnd`, sending to `sink`. Inactive until
     /// [`Self::set_session`] says a session is on screen.
     #[must_use]
-    pub fn new(hwnd: HWND, sink: Box<dyn InputSink>, grab: KeyboardGrab) -> Self {
+    pub fn new(hwnd: HWND, sink: Box<dyn InputSink>, policy: KeyboardCapturePolicy) -> Self {
         Self {
             hwnd,
             sink,
@@ -114,10 +119,8 @@ impl WindowInput {
             image: None,
             active: false,
             focused: false,
-            fullscreen: false,
-            grab,
-            grab_toggle: None,
-            connection_bar: false,
+            capture: KeyboardCapture::new(policy),
+            consumed_buttons: 0,
             overlay: OverlayPointerRegions::default(),
             ui_pointer: false,
             ui_buttons: 0,
@@ -137,6 +140,7 @@ impl WindowInput {
             unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == self.hwnd;
         if focused != self.focused {
             self.focused = focused;
+            self.capture.set_focused(focused);
             if focused {
                 self.keyboard.focus_gained();
             } else {
@@ -153,6 +157,9 @@ impl WindowInput {
             let edges = self.keyboard.set_host(facts, settings);
             self.send_keys(edges);
             self.mouse.set_precise_scroll(facts.precise_scroll);
+            if !self.active {
+                self.capture.set_session(true);
+            }
             self.active = true;
             if self.touchpad.is_none() {
                 self.touchpad = touchpad::Touchpad::new(self.hwnd)
@@ -172,10 +179,17 @@ impl WindowInput {
             self.led.reset();
             self.sink.led_cursor(None);
             self.active = false;
-            self.grab_toggle = None;
-            self.connection_bar = false;
+            self.capture.set_session(false);
+            self.consumed_buttons = 0;
+            let _ = self.keyboard.set_released(false);
         }
         self.apply_grab();
+    }
+
+    /// The session's pen-button mapping (its host's layout, this Deck's
+    /// pen settings).
+    pub fn set_pen_buttons(&mut self, map: arcen_input::pen_buttons::PenButtonMap) {
+        self.pen.set_button_map(map);
     }
 
     /// Where the video is drawn in the client area, in client pixels.
@@ -200,54 +214,77 @@ impl WindowInput {
         self.apply_input_method();
     }
 
-    /// The window entered or left fullscreen (the default grab follows it).
+    /// The window entered or left fullscreen (the policy may follow it).
     pub fn set_fullscreen(&mut self, fullscreen: bool) {
-        self.fullscreen = fullscreen;
+        self.capture.set_fullscreen(fullscreen);
         self.apply_grab();
     }
 
-    /// The Keyboard Grab menu item: turns the grab the other way for this
-    /// session.
-    pub fn toggle_grab(&mut self) {
-        self.grab_toggle = Some(!self.grab_active());
+    /// Settings changed when the system shortcuts go to the host.
+    pub fn set_capture_policy(&mut self, policy: KeyboardCapturePolicy) {
+        self.capture.set_policy(policy);
         self.apply_grab();
+    }
+
+    /// Ctrl+Alt+Home or the menu item: the keyboard goes to this PC (every
+    /// key held on the host is released first) or back to the host.
+    pub fn toggle_keyboard(&mut self) {
+        let change = self.capture.toggle();
+        self.keyboard_changed(change);
+    }
+
+    /// The keyboard goes to this PC (`true`: the fullscreen connection bar
+    /// was pinned) or back to the host (the bar closed with Esc or a
+    /// command).
+    pub fn set_keyboard_released(&mut self, released: bool) {
+        let change = if released {
+            self.capture.release()
+        } else {
+            self.capture.recapture()
+        };
+        self.keyboard_changed(change);
+    }
+
+    /// Whether this PC has the keyboard (the host gets no key).
+    #[must_use]
+    pub fn keyboard_released(&self) -> bool {
+        self.capture.owner() == KeyboardOwner::ThisComputer
+    }
+
+    /// What the indicator says.
+    #[must_use]
+    pub fn keyboard_status(&self) -> KeyboardStatus {
+        self.capture.status()
     }
 
     /// Whether the session takes the system shortcuts now.
     #[must_use]
     pub fn grab_active(&self) -> bool {
-        self.active
-            && !self.connection_bar
-            && self
-                .grab
-                .active(self.focused, self.fullscreen, self.grab_toggle)
+        self.active && self.capture.takes_system_shortcuts()
     }
 
-    /// The connection bar took the keyboard or gave it back: the shell calls
-    /// this when it shows the bar for [`arcen_input::keyboard::DeckShortcut::ShowConnectionBar`]
-    /// (Ctrl+Alt+Home) and when it hides it. While the bar has it, keys
-    /// reach the Deck, not the host, and the keyboard grab lets go; a click
-    /// into the picture gives the keyboard back too.
-    pub fn set_connection_bar(&mut self, shown: bool) {
-        if shown == self.connection_bar {
-            return;
-        }
-        self.connection_bar = shown;
-        if shown {
+    fn keyboard_changed(&mut self, change: CaptureChange) {
+        let released = change.owner == KeyboardOwner::ThisComputer;
+        if change.release_host_keys {
             self.end_composition();
-            // The chord's own Control and Alt went down on the host.
-            let edges = self.keyboard.release_all();
+        }
+        if released != self.keyboard.released() {
+            let edges = self.keyboard.set_released(released);
             self.send_keys(edges);
-        } else {
-            self.keyboard.focus_gained();
+            if released && self.mouse.unlock() {
+                // The pointer is this PC's too.
+                self.sink.input(InputEvent::PointerLockReleased {
+                    reason: "keyboard_released",
+                });
+            }
+            tracing::info!(
+                target: arcen_deck_core::log_target::INPUT,
+                released,
+                "keyboard: {}",
+                if released { "this PC" } else { "the host" }
+            );
         }
         self.apply_grab();
-    }
-
-    /// Whether the connection bar has the keyboard.
-    #[must_use]
-    pub const fn connection_bar(&self) -> bool {
-        self.connection_bar
     }
 
     /// Where the Deck's own UI takes the pointer over the session now
@@ -365,6 +402,16 @@ impl WindowInput {
         self.send_keys(edges);
     }
 
+    /// Connection ▸ Send Key: one key, after everything held on the host is
+    /// released (whoever has the keyboard: the menu was chosen on purpose).
+    pub fn send_key(&mut self, key: SendKey) {
+        if !self.active {
+            return;
+        }
+        let edges = self.keyboard.send_key(key);
+        self.send_keys(edges);
+    }
+
     /// Sends a tapped Alt+F4 to the host (Quit was not held long enough).
     pub fn tap_on_host(&mut self, qt_key: u32) {
         let edges = self.keyboard.tap(qt_key);
@@ -378,10 +425,16 @@ impl WindowInput {
         self.keyboard.holds_deck_key(qt_key)
     }
 
-    /// Releases every key and button held on the host (Release Modifiers).
+    /// Release Stuck Keys: every key and button held on the host, a pen in
+    /// range and the pointer lock, and the host resets its modifiers (what
+    /// F9 did before it went to the host).
     pub fn release_modifiers(&mut self) {
-        let edges = self.keyboard.release_all();
-        self.send_keys(edges);
+        if !self.active {
+            return;
+        }
+        let reason = "release_stuck_keys";
+        self.release_all(reason);
+        self.sink.input(InputEvent::Reset { reason });
     }
 
     /// One window message; `Some` when it was handled and must not reach
@@ -393,12 +446,14 @@ impl WindowInput {
         match msg {
             WM_SETFOCUS => {
                 self.focused = true;
+                self.capture.set_focused(true);
                 self.keyboard.focus_gained();
                 self.apply_grab();
                 return None;
             }
             WM_KILLFOCUS => {
                 self.focused = false;
+                self.capture.set_focused(false);
                 self.release_all("focus_out");
                 self.apply_grab();
                 return None;
@@ -417,10 +472,18 @@ impl WindowInput {
         if !self.active {
             return None;
         }
-        if msg == hook::WM_HOOK_KEY && !self.focused {
+        if msg == hook::WM_HOOK_KEY && (!self.focused || self.keyboard_released()) {
             // Taken by the hook while the window was in front, posted, and
-            // only now handled after focus left (whose release went first):
-            // a press sent now would stay held on the host.
+            // only now handled after focus left (whose release went first)
+            // or the keyboard went to this PC: a press sent now would stay
+            // held on the host.
+            return Some(LRESULT(0));
+        }
+        if self.keyboard_released() && self.keyboard.released_key(msg, wparam, lparam) {
+            // Ctrl+Alt+Home again: the keyboard goes back to the host.
+            self.toggle_keyboard();
+            self.sink
+                .input(InputEvent::Shortcut(DeckShortcut::ReleaseKeyboard));
             return Some(LRESULT(0));
         }
         if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) {
@@ -428,7 +491,7 @@ impl WindowInput {
             // this input saw (a text field in the connection bar).
             self.apply_input_method();
         }
-        if !self.connection_bar
+        if !self.keyboard_released()
             && let Some(result) = self.handle_keyboard(msg, wparam, lparam)
         {
             return Some(result);
@@ -445,12 +508,12 @@ impl WindowInput {
     fn handle_keyboard(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         let outcome = self.keyboard.handle(self.hwnd, msg, wparam, lparam)?;
         for action in outcome.events {
-            if let InputEvent::Reset { reason } = action {
-                self.release_all(reason);
-                self.sink.input(InputEvent::Reset { reason });
-            } else {
-                self.sink.input(action);
+            if action == InputEvent::Shortcut(DeckShortcut::ReleaseKeyboard) {
+                // At once, not on the next UI pass: no further key may
+                // reach the host.
+                self.toggle_keyboard();
             }
+            self.sink.input(action);
         }
         // Reading the queue may have delivered a focus change this window
         // could not take while busy (a nested PeekMessage).
@@ -513,8 +576,20 @@ impl WindowInput {
             WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
             WM_RBUTTONDOWN, WM_RBUTTONUP,
         };
-        // A release always reaches the button its press went to.
+        // A release always reaches the button its press went to; the
+        // release of a click that gave the keyboard back goes nowhere,
+        // wherever the pointer is now.
         let release = matches!(msg, WM_LBUTTONUP | WM_MBUTTONUP | WM_RBUTTONUP);
+        if let Some((bit, false)) = ui_button(msg)
+            && self.consumed_buttons & bit != 0
+        {
+            self.consumed_buttons &= !bit;
+            if self.consumed_buttons == 0 {
+                // SAFETY: gives up the capture the consumed press took.
+                let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture() };
+            }
+            return Some(LRESULT(0));
+        }
         let image = match self.image {
             Some(image) => image,
             None if release => ImageRect {
@@ -546,12 +621,22 @@ impl WindowInput {
                 return None;
             }
         }
-        if self.connection_bar
+        if let Some((bit, true)) = ui_button(msg)
             && matches!(msg, WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_RBUTTONDOWN)
             && mouse::Mouse::over(self.hwnd, image)
+            && self.capture.click_in_picture() == ClickRoute::Consume
         {
-            // A click into the picture gives the keyboard back to the host.
-            self.set_connection_bar(false);
+            // A click into the picture gives the keyboard back to the host
+            // and is not sent: it must not paint or press anything.
+            self.consumed_buttons |= bit;
+            // SAFETY: the window's own handle on its thread: its release
+            // comes here even outside the window.
+            let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(self.hwnd) };
+            self.keyboard_changed(CaptureChange {
+                owner: KeyboardOwner::Host,
+                release_host_keys: false,
+            });
+            return Some(LRESULT(0));
         }
         self.send_mouse(msg, wparam, lparam, image)
     }
@@ -564,13 +649,16 @@ impl WindowInput {
         lparam: LPARAM,
         image: ImageRect,
     ) -> Option<LRESULT> {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEFIRST, WM_MOUSEWHEEL, WM_RBUTTONUP,
-        };
-        let release = matches!(msg, WM_LBUTTONUP | WM_MBUTTONUP | WM_RBUTTONUP);
-        if self.pen.in_proximity() && !release && (WM_MOUSEFIRST..WM_MOUSEWHEEL).contains(&msg) {
-            // The pen owns the pointer while it is in range.
-            return Some(LRESULT(0));
+        use windows::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDBLCLK, WM_MOUSEFIRST};
+        if (WM_MOUSEFIRST..=WM_MBUTTONDBLCLK).contains(&msg) {
+            // While the pen is in range it owns the pointer, and a click its
+            // tablet driver performs for a pen button is the pen's.
+            let sink = &self.sink;
+            if let Some(result) = self.pen.mouse_message(msg, self.epoch, |event| {
+                sink.input(InputEvent::Pen(event));
+            }) {
+                return Some(result);
+            }
         }
         let sink = &self.sink;
         let led = &mut self.led;
@@ -614,7 +702,9 @@ impl WindowInput {
             _ => return None,
         };
         let (x, y) = mouse::Mouse::message_point(self.hwnd, msg, lparam)?;
-        let held = if self.mouse.buttons_held() {
+        // A click the pen took from its tablet driver is the host's too:
+        // its release must reach the pen over the Deck's own UI.
+        let held = if self.mouse.buttons_held() || self.pen.holds_driver_click() {
             Some(HeldBy::Host)
         } else if self.ui_buttons != 0 {
             Some(HeldBy::Ui)
@@ -649,6 +739,7 @@ impl WindowInput {
         let sink = &self.sink;
         self.mouse.release_buttons(|event| sink.input(event));
         self.ui_buttons = 0;
+        self.consumed_buttons = 0;
         if let Some(event) = self.pen.leave(self.epoch) {
             self.sink.input(InputEvent::Pen(event));
         }
@@ -667,10 +758,10 @@ impl WindowInput {
         let grabbed = self.grab_active();
         let edges = self.keyboard.set_grab(grabbed);
         self.send_keys(edges);
-        if self.active && self.focused && !self.connection_bar {
+        if self.active && self.focused && !self.keyboard_released() {
             hook::install(self.hwnd, grabbed, self.keyboard.held_keys());
         } else {
-            hook::uninstall();
+            hook::uninstall(self.hwnd);
         }
         self.apply_input_method();
     }
@@ -688,7 +779,7 @@ impl WindowInput {
             HIMC, IACE_CHILDREN, IACE_DEFAULT, ImmAssociateContextEx, ImmGetContext,
             ImmReleaseContext,
         };
-        let owns = self.active && !self.connection_bar;
+        let owns = self.active && !self.keyboard_released();
         if !owns && !self.owns_input_method {
             return;
         }

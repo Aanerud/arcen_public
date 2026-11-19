@@ -151,6 +151,9 @@ pub struct LauncherConfig {
     /// `platform.session.default_desktop` for console sign-ins.
     pub default_desktop: Option<arcen_session::console_session::account_desktop::DesktopId>,
     pub deskside: crate::deskside::LinuxDesksideConfig,
+    /// `privacy.desk`: a joined console's desk is private while a Deck is
+    /// attached unless the administrator turned it off.
+    pub desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy,
     /// Desktop provider the privileged launcher creates.
     pub provider: arcen_session::desktop_provider::DesktopProvider,
     /// Whether a Wayland desktop runs the compositor's Xwayland for X11
@@ -247,6 +250,11 @@ struct OpenRequest {
     /// (`platform.session.mode = console`, ADR 0025).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     console: bool,
+    /// The administrator turned desk privacy off (`privacy.desk = "off"`):
+    /// a joined console's desk is given its monitors and input once the
+    /// session is joined, and again after each resume. Absent is private.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    desk_live: bool,
 }
 
 /// A served Deck display's facts, carried to the privileged launcher.
@@ -556,6 +564,7 @@ impl OpenRequest {
             wayland_native_seat: false,
             x11_desktop_depth: None,
             console: false,
+            desk_live: false,
         }
     }
 
@@ -858,6 +867,7 @@ pub struct AuthenticatedLauncher {
     session_log_id: Arc<Mutex<CorrelationId>>,
     timezone: Option<IanaTimeZone>,
     deskside: crate::deskside::LinuxDesksideConfig,
+    desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy,
     multi_monitor_plan: Option<MultiHeadPlanMsg>,
     session_display: Option<SessionDisplayMsg>,
     stream_cursor: Option<super::wayland::StreamCursorMode>,
@@ -1110,6 +1120,7 @@ impl AuthenticatedLauncher {
                 session_log_id,
                 timezone: None,
                 deskside: config.deskside.clone(),
+                desk_privacy: config.desk_privacy,
                 multi_monitor_plan: None,
                 session_display: None,
                 stream_cursor: None,
@@ -1258,6 +1269,7 @@ impl AuthenticatedLauncher {
             None,
         );
         request.console = true;
+        request.desk_live = !self.desk_privacy.enabled;
         self.console_open_sent = true;
         let mut request_json = serde_json::to_vec(&request).map_err(|_| LauncherError::Protocol)?;
         request_json.push(b'\n');
@@ -3235,6 +3247,12 @@ async fn run_console(
     if let Err(error) = unlock_logind_session_id(&session_id).await {
         tracing::warn!(target: target::SESSION, %error, "the joined console session could not be unlocked; the Deck sees its lock screen");
     }
+    // The sign-in was private (nobody at the desk could take the session as
+    // it opened); an administrator who turned desk privacy off gets the desk
+    // back for the attachment.
+    if open.desk_live {
+        privacy.show_desk();
+    }
     let vtnr = console::session_fact(&session_id)
         .await
         .map_or(0, |fact| fact.vtnr);
@@ -3329,7 +3347,8 @@ async fn run_console(
         display = %session_display.display,
         origin = origin.token(),
         signed_in,
-        "the console session is joined and private"
+        desk_private = !open.desk_live,
+        "the console session is joined"
     );
 
     // Installed once: a stop that arrives while a command or a hand-back is
@@ -3428,6 +3447,9 @@ async fn run_console(
                                 break;
                             }
                             Ok(()) => {
+                                if open.desk_live {
+                                    privacy.show_desk();
+                                }
                                 let _ = write_response(&LauncherResponse::error("attached"));
                             }
                             Err(refusal) => {
@@ -4311,6 +4333,7 @@ impl arcen_outputs::OutputProvider for DedicatedXorgProvider<'_> {
             XorgSeat::Dedicated => with_session_input_isolation(&config_text, self.x_display)?,
             XorgSeat::Console { .. } => with_console_input(&config_text),
         };
+        let config_text = with_dont_zap(&config_text);
         // A multi-head plan already sized its own `Virtual`.
         // A single head's `Virtual` is raised to the served display if the
         // template's is smaller, never lowered: later resizes and larger
@@ -5111,6 +5134,35 @@ fn with_session_input_isolation(config: &str, x_display: &str) -> Result<String,
     rendered.push('\n');
     rendered.push_str(&xorg_session_bridge_class(display));
     Ok(rendered)
+}
+
+/// The X server never terminates on its zap chord (`Terminate_Server`,
+/// Ctrl+Alt+Backspace under the `terminate:ctrl_alt_bksp` XKB option): a
+/// Deck's keys, or a layout a session loads, must not end the desktop.
+/// `DontZap` is set inside the template's first `ServerFlags` section (one
+/// is added when it has none), replacing any `DontZap` the template sets.
+#[cfg(any(target_os = "linux", test))]
+fn with_dont_zap(config: &str) -> String {
+    const DONT_ZAP: &str = "    Option         \"DontZap\" \"true\"";
+    let mut out: Vec<&str> = Vec::with_capacity(config.lines().count() + 4);
+    let mut placed = false;
+    for line in config.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() == Some(&"Option") && words.get(1) == Some(&"\"DontZap\"") {
+            continue;
+        }
+        out.push(line);
+        if !placed && words == ["Section", "\"ServerFlags\""] {
+            out.push(DONT_ZAP);
+            placed = true;
+        }
+    }
+    if !placed {
+        out.extend(["Section \"ServerFlags\"", DONT_ZAP, "EndSection"]);
+    }
+    let mut rendered = out.join("\n");
+    rendered.push('\n');
+    rendered
 }
 
 #[cfg(target_os = "linux")]
@@ -6941,6 +6993,33 @@ EndSection
         ] {
             assert!(with_session_input_isolation(poisoned, ":58").is_err());
         }
+    }
+
+    #[test]
+    fn every_arcen_x_server_refuses_the_zap_chord() {
+        const TEMPLATE: &str = include_str!("../../../../packaging/linux/arcen-xorg.conf");
+        let rendered = with_dont_zap(&with_session_input_isolation(TEMPLATE, ":58").unwrap());
+        assert_eq!(rendered.matches("\"DontZap\"").count(), 1);
+        assert_eq!(rendered.matches("Section \"ServerFlags\"").count(), 1);
+        let flags = rendered.find("Section \"ServerFlags\"").unwrap();
+        let zap = rendered
+            .find("Option         \"DontZap\" \"true\"")
+            .unwrap();
+        let end = flags + rendered[flags..].find("EndSection").unwrap();
+        assert!(flags < zap && zap < end);
+        // The template's own flags stay.
+        assert!(rendered[flags..end].contains("\"DontVTSwitch\" \"true\""));
+        // A template that allows zapping is overruled; one without flags
+        // gets a section of its own.
+        let allowing = "Section \"ServerFlags\"\n    Option \"DontZap\" \"false\"\nEndSection\n";
+        let fixed = with_dont_zap(allowing);
+        assert!(!fixed.contains("\"false\""));
+        assert!(fixed.contains("\"DontZap\" \"true\""));
+        let bare = with_dont_zap("Section \"Device\"\nEndSection\n");
+        assert!(bare.ends_with(
+            "Section \"ServerFlags\"\n    Option         \"DontZap\" \"true\"\nEndSection\n"
+        ));
+        assert_eq!(with_dont_zap(&rendered), rendered);
     }
 
     #[test]

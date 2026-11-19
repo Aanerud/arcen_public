@@ -31,18 +31,51 @@ pub enum EncoderRequest {
     #[default]
     Auto,
     NativeNvenc,
-    WindowsMediaFoundation,
+    /// A Windows GPU vendor's Media Foundation hardware encoder (Alpha).
+    MediaFoundationHardware,
     SoftwareH264,
     SoftwareAv1,
 }
 
+/// What a Pier has proven about its hardware encoders before it resolves
+/// [`EncoderRequest::Auto`].
+///
+/// Each field is evidence, not configuration: NVENC needs an NVIDIA adapter
+/// owning the output *and* the encode runtime; a Media Foundation hardware
+/// encoder needs the operator to leave it enabled *and* an admission probe
+/// that encoded a real picture whose parameter sets say what was asked
+/// ([`crate::video::prove_encoded_access_unit`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoEncoderEvidence {
+    pub adapter_is_nvidia: bool,
+    pub nvenc_runtime: bool,
+    pub media_foundation_hardware_admitted: bool,
+}
+
+impl AutoEncoderEvidence {
+    /// Whether direct NVENC is the first choice for this output.
+    #[must_use]
+    pub const fn nvenc(self) -> bool {
+        self.adapter_is_nvidia && self.nvenc_runtime
+    }
+}
+
 impl EncoderRequest {
+    /// The order product Auto tries encoders in: the vendor's direct encoder,
+    /// then the vendor-neutral Media Foundation hardware encoder, then
+    /// software. Anything a host cannot prove is skipped, never guessed.
+    pub const AUTO_ORDER: [Self; 3] = [
+        Self::NativeNvenc,
+        Self::MediaFoundationHardware,
+        Self::SoftwareH264,
+    ];
+
     #[must_use]
     pub const fn as_arg(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::NativeNvenc => "nvenc",
-            Self::WindowsMediaFoundation => "mf",
+            Self::MediaFoundationHardware => "mf-hw",
             Self::SoftwareH264 => "software-h264",
             Self::SoftwareAv1 => "software-av1",
         }
@@ -52,14 +85,44 @@ impl EncoderRequest {
     /// the advertised hello and the concrete child agree: direct NVENC only
     /// for an output whose adapter is NVIDIA with the encode runtime present,
     /// the `OpenH264` software path otherwise. A concrete request passes
-    /// through unchanged.
+    /// through unchanged. A Pier that can also offer a Media Foundation
+    /// hardware encoder uses [`Self::resolve_auto_ranked`].
     #[must_use]
     pub const fn resolve_auto(self, adapter_is_nvidia: bool, nvenc_runtime: bool) -> Self {
+        self.resolve_auto_ranked(AutoEncoderEvidence {
+            adapter_is_nvidia,
+            nvenc_runtime,
+            media_foundation_hardware_admitted: false,
+        })
+    }
+
+    /// Resolves `Auto` along [`Self::AUTO_ORDER`]: the first encoder the
+    /// evidence proves wins, and software is always the last rung.
+    #[must_use]
+    pub const fn resolve_auto_ranked(self, evidence: AutoEncoderEvidence) -> Self {
         match self {
-            Self::Auto if adapter_is_nvidia && nvenc_runtime => Self::NativeNvenc,
+            Self::Auto if evidence.nvenc() => Self::NativeNvenc,
+            Self::Auto if evidence.media_foundation_hardware_admitted => {
+                Self::MediaFoundationHardware
+            }
             Self::Auto => Self::SoftwareH264,
             concrete => concrete,
         }
+    }
+
+    /// Whether resolving `Auto` with this evidence still needs a Media
+    /// Foundation hardware admission probe to decide: only when NVENC is not
+    /// the answer and the operator has not disabled the Alpha encoder.
+    #[must_use]
+    pub const fn auto_needs_media_foundation_probe(
+        self,
+        adapter_is_nvidia: bool,
+        nvenc_runtime: bool,
+        media_foundation_hardware_enabled: bool,
+    ) -> bool {
+        matches!(self, Self::Auto)
+            && !(adapter_is_nvidia && nvenc_runtime)
+            && media_foundation_hardware_enabled
     }
 
     #[must_use]
@@ -69,8 +132,8 @@ impl EncoderRequest {
                 (self, backend),
                 (Self::NativeNvenc, EncoderBackend::NativeNvenc)
                     | (
-                        Self::WindowsMediaFoundation,
-                        EncoderBackend::WindowsMediaFoundation
+                        Self::MediaFoundationHardware,
+                        EncoderBackend::MediaFoundationHardware
                     )
                     | (Self::SoftwareH264, EncoderBackend::OpenH264)
                     | (Self::SoftwareAv1, EncoderBackend::Rav1e)
@@ -82,7 +145,9 @@ impl EncoderRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderBackend {
     NativeNvenc,
-    WindowsMediaFoundation,
+    /// A GPU vendor's hardware encoder MFT (Intel Quick Sync, AMD AMF, or any
+    /// vendor that registers one), driven through Media Foundation. Alpha.
+    MediaFoundationHardware,
     VideoToolbox,
     OpenH264,
     /// Pure-Rust AV1 software encoder. The only backend with a 12-bit path.
@@ -125,6 +190,37 @@ impl AcceleratorClass {
             _ => None,
         }
     }
+}
+
+/// How far an encoder backend has been qualified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendMaturity {
+    /// Qualified on the hardware Arcen supports it on.
+    Supported,
+    /// Built and admitted per host, but not yet qualified on every vendor's
+    /// hardware. Shown as "(Alpha)" wherever the backend is named.
+    Alpha,
+}
+
+impl BackendMaturity {
+    /// Stable token, for logs and diagnostics.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Alpha => "alpha",
+        }
+    }
+}
+
+/// The name a person reads for a backend wire token: the backend's
+/// [`EncoderBackend::display_name`] when this build knows the token, the token
+/// itself otherwise (a newer host's backend is shown, never hidden).
+#[must_use]
+pub fn encoder_backend_display_name(token: &str) -> std::borrow::Cow<'_, str> {
+    EncoderBackend::from_token(token).map_or(std::borrow::Cow::Borrowed(token), |backend| {
+        std::borrow::Cow::Borrowed(backend.display_name())
+    })
 }
 
 /// Which capture path actually delivered the desktop image to the encoder.
@@ -234,7 +330,7 @@ impl EncoderBackend {
     pub fn from_token(value: &str) -> Option<Self> {
         match value {
             "native-nvenc" => Some(Self::NativeNvenc),
-            "media-foundation-sw-h264" => Some(Self::WindowsMediaFoundation),
+            "media-foundation-hw" => Some(Self::MediaFoundationHardware),
             "videotoolbox" => Some(Self::VideoToolbox),
             "openh264-sw-h264" => Some(Self::OpenH264),
             "rav1e-sw-av1" => Some(Self::Rav1e),
@@ -246,7 +342,7 @@ impl EncoderBackend {
     pub const fn ready_token(self) -> &'static str {
         match self {
             Self::NativeNvenc => "native-nvenc",
-            Self::WindowsMediaFoundation => "media-foundation-sw-h264",
+            Self::MediaFoundationHardware => "media-foundation-hw",
             Self::VideoToolbox => "videotoolbox",
             Self::OpenH264 => "openh264-sw-h264",
             Self::Rav1e => "rav1e-sw-av1",
@@ -260,10 +356,37 @@ impl EncoderBackend {
     #[must_use]
     pub const fn accelerator_class(self) -> AcceleratorClass {
         match self {
-            Self::NativeNvenc | Self::VideoToolbox => AcceleratorClass::Hardware,
-            Self::WindowsMediaFoundation | Self::OpenH264 | Self::Rav1e => {
-                AcceleratorClass::Software
+            Self::NativeNvenc | Self::MediaFoundationHardware | Self::VideoToolbox => {
+                AcceleratorClass::Hardware
             }
+            Self::OpenH264 | Self::Rav1e => AcceleratorClass::Software,
+        }
+    }
+
+    /// How far this backend has been qualified. Every place that names the
+    /// backend to a person (Deck Stats, Pier diagnose, logs, docs) shows the
+    /// label, so an Alpha path is never presented as a supported one.
+    #[must_use]
+    pub const fn maturity(self) -> BackendMaturity {
+        match self {
+            Self::MediaFoundationHardware => BackendMaturity::Alpha,
+            Self::NativeNvenc | Self::VideoToolbox | Self::OpenH264 | Self::Rav1e => {
+                BackendMaturity::Supported
+            }
+        }
+    }
+
+    /// The name a person reads, maturity label included, such as
+    /// `Media Foundation hardware (Alpha)`. The wire keeps
+    /// [`Self::ready_token`].
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::NativeNvenc => "NVIDIA NVENC",
+            Self::MediaFoundationHardware => "Media Foundation hardware (Alpha)",
+            Self::VideoToolbox => "VideoToolbox",
+            Self::OpenH264 => "OpenH264 software",
+            Self::Rav1e => "rav1e software AV1",
         }
     }
 
@@ -339,17 +462,21 @@ impl EncoderBackend {
                 max_fps: 240,
                 cursor_in_video: true,
             },
-            // Inbox Media Foundation software H.264: 4:2:0 8-bit only. It can
-            // at least signal range correctly via MF_MT_VIDEO_NOMINAL_RANGE.
-            Self::WindowsMediaFoundation => BackendLimits {
-                codecs: CodecSet::from_slice(&[VideoCodec::H264]),
+            // A vendor's Media Foundation hardware encoder MFT: H.264 and
+            // HEVC Main, 4:2:0 8-bit (NV12 input), which every Intel and AMD
+            // encoder MFT accepts. 4:4:4 and 10-bit are not claimed: no
+            // vendor documents them through Media Foundation, so Grading and
+            // HDR stay refused. A host's admission probe narrows the codecs
+            // to the ones that produced a proven parameter set.
+            Self::MediaFoundationHardware => BackendLimits {
+                codecs: CodecSet::from_slice(&[VideoCodec::H264, VideoCodec::H265]),
                 chroma: ChromaSet::from_slice(&[ChromaSubsampling::Yuv420]),
                 bit_depths: BitDepthSet::from_slice(&[BitDepth::Eight]),
                 ranges: ColorRangeSet::from_slice(&[ColorRange::Limited, ColorRange::Full]),
                 identity_matrix: false,
                 max_width: 4096,
                 max_height: 4096,
-                max_fps: 60,
+                max_fps: 120,
                 cursor_in_video: false,
             },
             Self::VideoToolbox => BackendLimits {
@@ -367,17 +494,20 @@ impl EncoderBackend {
                 cursor_in_video: false,
             },
             // The portable OpenH264 contract: H.264 Baseline, 4:2:0, 8-bit,
-            // at most 1920x1200 at 30 fps, cursor composited by the client.
-            // Baseline cannot carry 4:4:4 or any depth above eight.
+            // cursor composited by the client. Baseline cannot carry 4:4:4 or
+            // any depth above eight. The geometry and rate are OpenH264's own
+            // ceilings (3840x2160, `MAX_FRAME_RATE` 60), not an Arcen budget:
+            // the host's frame-rate governor holds a session at what its CPU
+            // encodes.
             Self::OpenH264 => BackendLimits {
                 codecs: CodecSet::from_slice(&[VideoCodec::H264]),
                 chroma: ChromaSet::from_slice(&[ChromaSubsampling::Yuv420]),
                 bit_depths: BitDepthSet::from_slice(&[BitDepth::Eight]),
                 ranges: ColorRangeSet::from_slice(&[ColorRange::Limited, ColorRange::Full]),
                 identity_matrix: false,
-                max_width: 1920,
-                max_height: 1200,
-                max_fps: 30,
+                max_width: 3840,
+                max_height: 2160,
+                max_fps: 60,
                 cursor_in_video: false,
             },
             // rav1e: pure-Rust AV1. The only backend Arcen has with a genuine
@@ -1266,14 +1396,8 @@ pub fn parse_ready_v1(
     if take(&mut fields, "version")? != READY_VERSION {
         return Err(ReadyProtocolError::UnsupportedVersion);
     }
-    let backend = match take(&mut fields, "backend")? {
-        "native-nvenc" => EncoderBackend::NativeNvenc,
-        "media-foundation-sw-h264" => EncoderBackend::WindowsMediaFoundation,
-        "videotoolbox" => EncoderBackend::VideoToolbox,
-        "openh264-sw-h264" => EncoderBackend::OpenH264,
-        "rav1e-sw-av1" => EncoderBackend::Rav1e,
-        _ => return Err(ReadyProtocolError::UnsupportedBackend),
-    };
+    let backend = EncoderBackend::from_token(take(&mut fields, "backend")?)
+        .ok_or(ReadyProtocolError::UnsupportedBackend)?;
     if !expectation.allowed_backends.contains(&backend) {
         return Err(ReadyProtocolError::BackendNotAllowed);
     }
@@ -1606,13 +1730,8 @@ pub fn parse_unavailable_v1(
     if take_unavailable_field(&mut fields, "version")? != "1" {
         return Err(UnavailableProtocolError::UnsupportedVersion);
     }
-    let backend = match take_unavailable_field(&mut fields, "backend")? {
-        "native-nvenc" => EncoderBackend::NativeNvenc,
-        "media-foundation-sw-h264" => EncoderBackend::WindowsMediaFoundation,
-        "videotoolbox" => EncoderBackend::VideoToolbox,
-        "openh264-sw-h264" => EncoderBackend::OpenH264,
-        _ => return Err(UnavailableProtocolError::UnsupportedBackend),
-    };
+    let backend = EncoderBackend::from_token(take_unavailable_field(&mut fields, "backend")?)
+        .ok_or(UnavailableProtocolError::UnsupportedBackend)?;
     let reason = match take_unavailable_field(&mut fields, "code")? {
         "not_built" => BackendUnavailableReason::NotBuilt,
         "runtime_missing" => BackendUnavailableReason::RuntimeMissing,
@@ -1648,7 +1767,7 @@ mod tests {
         }
         for concrete in [
             EncoderRequest::NativeNvenc,
-            EncoderRequest::WindowsMediaFoundation,
+            EncoderRequest::MediaFoundationHardware,
             EncoderRequest::SoftwareH264,
             EncoderRequest::SoftwareAv1,
         ] {
@@ -1656,6 +1775,61 @@ mod tests {
                 assert_eq!(concrete.resolve_auto(nvidia, runtime), concrete);
             }
         }
+    }
+
+    #[test]
+    fn ranked_auto_prefers_nvenc_then_media_foundation_hardware_then_software() {
+        let evidence = |nvidia, runtime, mf| AutoEncoderEvidence {
+            adapter_is_nvidia: nvidia,
+            nvenc_runtime: runtime,
+            media_foundation_hardware_admitted: mf,
+        };
+        // NVENC keeps first place even when the NVIDIA driver also registers
+        // a hardware encoder MFT.
+        assert_eq!(
+            EncoderRequest::Auto.resolve_auto_ranked(evidence(true, true, true)),
+            EncoderRequest::NativeNvenc
+        );
+        // Intel/AMD: an admitted MFT wins over software.
+        assert_eq!(
+            EncoderRequest::Auto.resolve_auto_ranked(evidence(false, false, true)),
+            EncoderRequest::MediaFoundationHardware
+        );
+        // NVIDIA without its runtime falls to the MFT before software.
+        assert_eq!(
+            EncoderRequest::Auto.resolve_auto_ranked(evidence(true, false, true)),
+            EncoderRequest::MediaFoundationHardware
+        );
+        // VMware SVGA and any GPU with no proven MFT: software, cleanly.
+        assert_eq!(
+            EncoderRequest::Auto.resolve_auto_ranked(evidence(false, false, false)),
+            EncoderRequest::SoftwareH264
+        );
+        assert_eq!(
+            EncoderRequest::MediaFoundationHardware
+                .resolve_auto_ranked(evidence(true, true, false)),
+            EncoderRequest::MediaFoundationHardware
+        );
+        assert_eq!(
+            EncoderRequest::AUTO_ORDER.last(),
+            Some(&EncoderRequest::SoftwareH264)
+        );
+    }
+
+    #[test]
+    fn media_foundation_probe_runs_only_when_auto_could_pick_it() {
+        let probe = EncoderRequest::auto_needs_media_foundation_probe;
+        assert!(probe(EncoderRequest::Auto, false, false, true));
+        assert!(probe(EncoderRequest::Auto, true, false, true));
+        assert!(!probe(EncoderRequest::Auto, true, true, true));
+        assert!(!probe(EncoderRequest::Auto, false, false, false));
+        assert!(!probe(EncoderRequest::SoftwareH264, false, false, true));
+        assert!(!probe(
+            EncoderRequest::MediaFoundationHardware,
+            false,
+            false,
+            true
+        ));
     }
 
     /// The NVENC contract must not advertise 4:2:2 while the vendored bindings
@@ -1755,11 +1929,7 @@ mod tests {
         // The substring heuristic this replaces tested for "native". It agrees
         // with the declared class for today's backends, which is exactly why
         // the bug was invisible.
-        for backend in [
-            EncoderBackend::NativeNvenc,
-            EncoderBackend::WindowsMediaFoundation,
-            EncoderBackend::OpenH264,
-        ] {
+        for backend in [EncoderBackend::NativeNvenc, EncoderBackend::OpenH264] {
             let guessed = if backend.ready_token().contains("native") {
                 AcceleratorClass::Hardware
             } else {
@@ -1780,6 +1950,40 @@ mod tests {
             EncoderBackend::OpenH264.accelerator_class(),
             AcceleratorClass::Software
         );
+    }
+
+    #[test]
+    fn media_foundation_hardware_is_hardware_and_labelled_alpha_everywhere() {
+        // Its token has no "native" in it: exactly the backend the old name
+        // heuristic would have called software.
+        let backend = EncoderBackend::MediaFoundationHardware;
+        assert_eq!(backend.accelerator_class(), AcceleratorClass::Hardware);
+        assert_eq!(backend.maturity(), BackendMaturity::Alpha);
+        assert_eq!(backend.display_name(), "Media Foundation hardware (Alpha)");
+        assert_eq!(
+            encoder_backend_display_name(backend.ready_token()),
+            "Media Foundation hardware (Alpha)"
+        );
+        assert_eq!(
+            EncoderBackend::from_token("media-foundation-hw"),
+            Some(backend)
+        );
+        // A token this build does not know is shown as it came.
+        assert_eq!(encoder_backend_display_name("amf-h264"), "amf-h264");
+        for supported in [
+            EncoderBackend::NativeNvenc,
+            EncoderBackend::VideoToolbox,
+            EncoderBackend::OpenH264,
+            EncoderBackend::Rav1e,
+        ] {
+            assert_eq!(supported.maturity(), BackendMaturity::Supported);
+            assert!(!supported.display_name().contains("Alpha"));
+        }
+        let limits = backend.contract();
+        assert!(limits.supports(VideoCodec::H264) && limits.supports(VideoCodec::H265));
+        assert!(!limits.supports(VideoCodec::Av1));
+        assert!(!limits.supports_chroma(ChromaSubsampling::Yuv444));
+        assert!(!limits.supports_bit_depth(BitDepth::Ten));
     }
 
     #[test]
@@ -2052,7 +2256,7 @@ mod tests {
                 availability: unavailable,
             },
             BackendCandidate {
-                backend: EncoderBackend::WindowsMediaFoundation,
+                backend: EncoderBackend::MediaFoundationHardware,
                 availability: BackendAvailability::Available(SOFTWARE_LIMITS),
             },
         ];
@@ -2060,7 +2264,7 @@ mod tests {
             resolve_media_plan(REQUEST, &windows)
                 .expect("Windows fallback")
                 .backend,
-            EncoderBackend::WindowsMediaFoundation
+            EncoderBackend::MediaFoundationHardware
         );
 
         let linux = [
@@ -2112,7 +2316,7 @@ mod tests {
                         availability: BackendAvailability::Available(SOFTWARE_LIMITS),
                     },
                     BackendCandidate {
-                        backend: EncoderBackend::WindowsMediaFoundation,
+                        backend: EncoderBackend::MediaFoundationHardware,
                         availability: BackendAvailability::Available(SOFTWARE_LIMITS),
                     },
                 ]
@@ -2389,13 +2593,13 @@ mod tests {
             .is_err()
         );
         assert!(parse_ready_v1(&line.replace("width=1920", "width=1919"), wildcard).is_err());
-        assert!(parse_ready_v1(&line.replace("width=1920", "width=1922"), wildcard).is_err());
+        assert!(parse_ready_v1(&line.replace("width=1920", "width=3842"), wildcard).is_err());
 
         let windows_auto = ReadyExpectation {
             request: REQUEST,
             allowed_backends: &[
                 EncoderBackend::NativeNvenc,
-                EncoderBackend::WindowsMediaFoundation,
+                EncoderBackend::MediaFoundationHardware,
             ],
             session_log_id: Some(sid),
         };
@@ -2403,10 +2607,7 @@ mod tests {
             parse_ready_v1(&line, windows_auto),
             Err(ReadyProtocolError::BackendNotAllowed)
         );
-        let mf_line = line.replace(
-            "backend=openh264-sw-h264",
-            "backend=media-foundation-sw-h264",
-        );
+        let mf_line = line.replace("backend=openh264-sw-h264", "backend=media-foundation-hw");
         assert!(parse_ready_v1(&mf_line, windows_auto).is_ok());
 
         let linux_auto = ReadyExpectation {

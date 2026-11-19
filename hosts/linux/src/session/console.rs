@@ -1277,13 +1277,42 @@ pub(crate) struct ConsolePrivacy {
     audio: Option<super::agent::ConsoleAudioControl>,
     /// The agent holds the lease now.
     audio_held: bool,
+    /// The administrator turned desk privacy off (`privacy.desk = "off"`):
+    /// the joined session's desk has its monitors and input while the Deck
+    /// is attached ([`Self::show_desk`]). Anything that makes the desk
+    /// private again (a hand-back, a resume, a failure) ends it.
+    desk_live: bool,
 }
 
 impl ConsolePrivacy {
+    /// For an administrator who turned desk privacy off: once the session
+    /// is joined (and after each resume), the desk gets its monitors (their
+    /// own ramps, exactly as journalled) and input back. The session stays
+    /// "armed" so the Deck's departure still locks it before anything else
+    /// (`DETACH_STEPS`); a session that will not lock is made private again.
+    pub(crate) fn show_desk(&mut self) {
+        if let Some(outputs) = self.outputs.as_ref() {
+            restore_gamma(&outputs.connection, &outputs.journal.gamma);
+        }
+        self.input.release();
+        self.desk_live = true;
+        tracing::warn!(
+            target: target::SESSION,
+            "desk privacy is off (privacy.desk): the desk's monitors and input stay live while the Deck is attached"
+        );
+    }
+
+    /// Ends [`Self::show_desk`]: the next [`Self::enforce`] blanks the
+    /// monitors and disables the desk's input again.
+    fn end_live_desk(&mut self) {
+        self.desk_live = false;
+    }
+
     /// Disables the desk's input (before a remote-first sign-in, so nobody
     /// at the desk can use the session the login screen is about to
     /// start).
     pub(crate) fn disable_input(&mut self) -> Result<(), ConsoleRefusal> {
+        self.desk_live = false;
         self.input.grab_new().map(drop).map_err(|error| {
             tracing::error!(target: target::SESSION, %error, "the desk's input could not be disabled");
             ConsoleRefusal::PrivacyUnavailable
@@ -1311,6 +1340,7 @@ impl ConsolePrivacy {
         display: &SessionDisplay,
         session_id: &str,
     ) -> Result<(), ConsoleRefusal> {
+        self.desk_live = false;
         if let Some(outputs) = self.outputs.as_mut() {
             // Already blank: prove it again (a VT switch, a monitor that
             // came back).
@@ -1331,6 +1361,9 @@ impl ConsolePrivacy {
     /// Keeps it private: a monitor turned on, a colour daemon that reset a
     /// ramp, a keyboard plugged in.
     pub(crate) fn enforce(&mut self) {
+        if self.desk_live {
+            return;
+        }
         if let Some(outputs) = self.outputs.as_mut() {
             match outputs.enforce() {
                 Ok(0) => {}
@@ -1912,6 +1945,10 @@ async fn secure_keeping_private(privacy: &mut ConsolePrivacy, session_id: &str) 
 /// ([`secure_session`]): if it is not, the desk stays private and `false`
 /// is returned so the caller tries again.
 pub(crate) async fn hand_back(privacy: &mut ConsolePrivacy, session_id: &str) -> bool {
+    // A desk shown while attached (privacy.desk = "off") is made private
+    // while the session locks, as any other: a session that will not lock
+    // is never left open at the desk.
+    privacy.end_live_desk();
     for step in model::DETACH_STEPS {
         match step {
             model::DetachStep::LockSession => {

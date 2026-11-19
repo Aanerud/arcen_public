@@ -30,7 +30,7 @@ The fixed v1 media shape is:
 `opusic-c`, `opusic-sys`, or `cmake`. The enabled adapter uses safe
 `opusic-c` APIs with caller-owned reusable input, output, and conversion
 buffers. Arcen's shared audio code remains safe Rust; the only shared-media
-unsafe exception is the reviewed OpenH264 raw `SetOption` bridge.
+unsafe exception is the reviewed OpenH264 raw `SetOption`/`GetOption` bridge.
 
 ## Protocol-v3 compatibility and audio-v1 selection
 

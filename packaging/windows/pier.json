@@ -63,6 +63,9 @@
       "heartbeat_critical_misses": 3
     }
   },
+  "privacy": {
+    "desk": "on"
+  },
   "platform": {
     "desktop": {
       "output_index": 0,
@@ -87,6 +90,7 @@
     "logging": {
       "rotate_mb": 32
     },
-    "first_login_timeout_secs": 300
+    "first_login_timeout_secs": 300,
+    "media_foundation_hardware": true
   }
 }

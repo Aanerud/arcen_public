@@ -12,13 +12,12 @@ use crate::log;
 use std::time::Instant;
 
 use windows::core::Interface;
-#[cfg(feature = "mf")]
-use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Foundation::{E_ACCESSDENIED, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC,
 };
 #[cfg(feature = "nvenc")]
 use windows::Win32::Graphics::Direct3D11::{
@@ -352,17 +351,21 @@ pub(crate) unsafe fn resolve_output(
 /// `DuplicateOutput`), and enough resolved identity (`adapter_name`,
 /// `adapter_index`, `vendor_id`) for callers to log which physical output
 /// and adapter this child actually bound.
-struct FoundOutputDevice {
+pub(crate) struct FoundOutputDevice {
     output1: IDXGIOutput1,
-    device: ID3D11Device,
-    context: ID3D11DeviceContext,
+    pub(crate) device: ID3D11Device,
+    pub(crate) context: ID3D11DeviceContext,
     monitor: HMONITOR,
-    adapter_index: u32,
-    vendor_id: u32,
-    adapter_name: String,
+    pub(crate) adapter_index: u32,
+    pub(crate) vendor_id: u32,
+    pub(crate) adapter_name: String,
 }
 
-struct Capture {
+/// D3D11 creation flags of every capture device that serves NVENC or capture
+/// only. The Media Foundation hardware path adds video support.
+pub(crate) const CAPTURE_DEVICE_FLAGS: D3D11_CREATE_DEVICE_FLAG = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
+pub(crate) struct Capture {
     _device: ID3D11Device,
     _context: ID3D11DeviceContext,
     output1: IDXGIOutput1,
@@ -396,8 +399,11 @@ impl Capture {
     /// exact output — either by `global_output_index` (0 = primary, the
     /// legacy/standalone shape) or by an explicit adapter/output/device
     /// binding resolved fresh via [`resolve_output`].
-    unsafe fn new(selector: &OutputSelector<'_>) -> windows::core::Result<Self> {
-        let found = Self::find_output_device(selector)?;
+    unsafe fn new(
+        selector: &OutputSelector<'_>,
+        device_flags: D3D11_CREATE_DEVICE_FLAG,
+    ) -> windows::core::Result<Self> {
+        let found = Self::find_output_device(selector, device_flags)?;
         let (dupl, width, height) = Self::duplicate(&found.output1, &found.device)?;
         log(&format!(
             "bound {} -> adapter {} ({:?})",
@@ -420,8 +426,12 @@ impl Capture {
         })
     }
 
-    unsafe fn find_output_device(
+    /// `device_flags` are the D3D11 creation flags: [`CAPTURE_DEVICE_FLAGS`]
+    /// for every NVENC and capture-only path, plus video support where a
+    /// Media Foundation encoder shares the device.
+    pub(crate) unsafe fn find_output_device(
         selector: &OutputSelector<'_>,
+        device_flags: D3D11_CREATE_DEVICE_FLAG,
     ) -> windows::core::Result<FoundOutputDevice> {
         let resolved = resolve_output(selector)?;
         let output1: IDXGIOutput1 = resolved.output.cast()?;
@@ -431,7 +441,7 @@ impl Capture {
             &resolved.adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             None,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            device_flags,
             None,
             D3D11_SDK_VERSION,
             Some(&mut device),
@@ -749,7 +759,7 @@ impl Capture {
 /// (lowest latency on bare metal); WGC is the fallback that works on headless
 /// NVIDIA vGPU / RDP consoles where DD delivers no frames.
 #[cfg(feature = "nvenc")]
-enum Source {
+pub(crate) enum Source {
     Dda {
         capture: Capture,
         primed: Option<ID3D11Texture2D>,
@@ -776,7 +786,7 @@ impl Source {
         }
     }
 
-    fn capture_backend(&self) -> arcen_media::video::CaptureBackend {
+    pub(crate) fn capture_backend(&self) -> arcen_media::video::CaptureBackend {
         match self {
             Source::Dda { .. } => arcen_media::video::CaptureBackend::DesktopDuplication,
             Source::Wgc(_) => arcen_media::video::CaptureBackend::WindowsGraphicsCapture,
@@ -795,26 +805,26 @@ impl Source {
 
     /// Pointer updates Desktop Duplication reported since the last call.
     /// WGC reports none: it is configured to leave the pointer out.
-    fn take_pointer_updates(&mut self) -> u64 {
+    pub(crate) fn take_pointer_updates(&mut self) -> u64 {
         match self {
             Source::Dda { capture, .. } => std::mem::take(&mut capture.pointer_updates),
             Source::Wgc(_) => 0,
         }
     }
 
-    fn device(&self) -> &ID3D11Device {
+    pub(crate) fn device(&self) -> &ID3D11Device {
         match self {
             Source::Dda { capture, .. } => capture.device(),
             Source::Wgc(w) => w.device(),
         }
     }
-    fn context(&self) -> &ID3D11DeviceContext {
+    pub(crate) fn context(&self) -> &ID3D11DeviceContext {
         match self {
             Source::Dda { capture, .. } => capture.context(),
             Source::Wgc(w) => w.context(),
         }
     }
-    fn take_raw_frames_superseded(&mut self) -> u64 {
+    pub(crate) fn take_raw_frames_superseded(&mut self) -> u64 {
         match self {
             Source::Dda { .. } => 0,
             Source::Wgc(w) => w.take_raw_frames_superseded(),
@@ -823,25 +833,25 @@ impl Source {
     /// Desktop Duplication presents the loop was away for (see
     /// `Capture::frames_behind`); Windows.Graphics.Capture counts its own as
     /// superseded frames.
-    fn take_frames_behind(&mut self) -> u64 {
+    pub(crate) fn take_frames_behind(&mut self) -> u64 {
         match self {
             Source::Dda { capture, .. } => std::mem::take(&mut capture.frames_behind),
             Source::Wgc(_) => 0,
         }
     }
-    fn width(&self) -> u32 {
+    pub(crate) fn width(&self) -> u32 {
         match self {
             Source::Dda { capture, .. } => capture.width,
             Source::Wgc(w) => w.width,
         }
     }
-    fn height(&self) -> u32 {
+    pub(crate) fn height(&self) -> u32 {
         match self {
             Source::Dda { capture, .. } => capture.height,
             Source::Wgc(w) => w.height,
         }
     }
-    unsafe fn acquire_into(
+    pub(crate) unsafe fn acquire_into(
         &mut self,
         timeout_ms: u32,
         dbg: &mut (u64, u64, u64),
@@ -1023,13 +1033,14 @@ fn wgc_requirement(
 /// desktop arrives as 8-bit BGRA no matter what bit depth the stream is
 /// signalled as. `hdr_required` is stricter: it additionally proves that the
 /// selected output is actually compositing PQ/BT.2020 before capture starts.
-unsafe fn select_source(
+pub(crate) unsafe fn select_source(
     selector: &OutputSelector<'_>,
     force_wgc: bool,
     force_dda: bool,
     cursor_mode: crate::CursorCaptureMode,
     wide_capture: bool,
     hdr_required: bool,
+    device_flags: D3D11_CREATE_DEVICE_FLAG,
 ) -> Source {
     if force_dda && wide_capture {
         log("ERROR: Desktop Duplication cannot serve an FP16 wide capture");
@@ -1041,9 +1052,15 @@ unsafe fn select_source(
     }
     if let Some(reason) = wgc_requirement(force_wgc, cursor_mode, wide_capture) {
         log(reason);
-        return build_wgc(selector, cursor_mode, wide_capture, hdr_required);
+        return build_wgc(
+            selector,
+            cursor_mode,
+            wide_capture,
+            hdr_required,
+            device_flags,
+        );
     }
-    let mut capture = Capture::new(selector);
+    let mut capture = Capture::new(selector, device_flags);
     if matches!(&capture, Err(error) if error.code() == E_ACCESSDENIED) {
         // Duplication is refused while the secure desktop is showing, and
         // right after a sign-in that is usually only for a moment. Settling
@@ -1057,7 +1074,7 @@ unsafe fn select_source(
         let waited = Instant::now();
         while waited.elapsed() < SECURE_DESKTOP_WAIT {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            capture = Capture::new(selector);
+            capture = Capture::new(selector, device_flags);
             if !matches!(&capture, Err(error) if error.code() == E_ACCESSDENIED) {
                 break;
             }
@@ -1138,7 +1155,13 @@ unsafe fn select_source(
                 dbg.0, black_probe_frames, dbg.1, dbg.2
             ));
             drop(cap);
-            build_wgc(selector, cursor_mode, wide_capture, hdr_required)
+            build_wgc(
+                selector,
+                cursor_mode,
+                wide_capture,
+                hdr_required,
+                device_flags,
+            )
         }
         Err(e) => {
             log(&format!("DXGI init failed ({e:?}) — falling back to WGC"));
@@ -1151,7 +1174,13 @@ unsafe fn select_source(
                     input_desktop_state()
                 ));
             }
-            build_wgc(selector, cursor_mode, wide_capture, hdr_required)
+            build_wgc(
+                selector,
+                cursor_mode,
+                wide_capture,
+                hdr_required,
+                device_flags,
+            )
         }
     }
 }
@@ -1278,8 +1307,9 @@ unsafe fn build_wgc(
     cursor_mode: crate::CursorCaptureMode,
     wide_capture: bool,
     hdr_required: bool,
+    device_flags: D3D11_CREATE_DEVICE_FLAG,
 ) -> Source {
-    let found = match Capture::find_output_device(selector) {
+    let found = match Capture::find_output_device(selector, device_flags) {
         Ok(found) => found,
         Err(e) => {
             log(&format!("WGC device init failed: {e:?}"));
@@ -2239,7 +2269,7 @@ unsafe fn first_adapter_description() -> Option<String> {
 unsafe fn create_encode_device(
     selector: &OutputSelector<'_>,
 ) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
-    let found = Capture::find_output_device(selector)?;
+    let found = Capture::find_output_device(selector, CAPTURE_DEVICE_FLAGS)?;
     if found.vendor_id != 0x10de {
         return Err(windows::core::Error::new(
             E_ACCESSDENIED,
@@ -3311,61 +3341,22 @@ unsafe fn encode_pattern_frame(
 #[cfg(feature = "nvenc")]
 const ROUNDTRIP_MAX_ATTEMPTS: u32 = 8;
 
-/// The Media Foundation SW H.264 MFT's real trial for one row, with the `mf`
-/// feature compiled in. The MFT is self-contained (no D3D11 device needed —
-/// see `mf_encoder.rs`'s module doc), so this needs no headless device at
-/// all; `mf_encoder::validate_mf_color` (called first, inside
-/// `Encoder::new`) reports every colour rejection as `E_INVALIDARG`, which is
-/// how this tells "MF cannot do this format" apart from a genuine COM/MFT
-/// failure.
-#[cfg(feature = "mf")]
+/// The Media Foundation hardware encoder's (Alpha) real trial for one row:
+/// an encode on the first output's adapter, proven by the stream's own SPS.
+#[cfg(feature = "mf-hw")]
 fn mf_attempt_for_row(
     row: arcen_media::video::VideoVariant,
 ) -> crate::probe_matrix::EncoderAttemptOutcome {
-    use crate::probe_matrix::EncoderAttemptOutcome;
-
-    if row.video.codec != arcen_media::VideoCodec::H264 {
-        return EncoderAttemptOutcome::Unsupported {
-            detail: "the Media Foundation SW H.264 MFT in this build only ever encodes H.264"
-                .to_string(),
-        };
-    }
-    let color = variant_color(row);
-    let cfg = crate::mf_encoder::Config {
-        width: PROBE_WIDTH,
-        height: PROBE_HEIGHT,
-        fps: 30,
-        bitrate_kbps: 5000,
-        gop_frames: 60,
-        profile: crate::mf_encoder::H264Profile::Main,
-        color,
-    };
-    match crate::mf_encoder::Encoder::new(&cfg) {
-        Ok(_encoder) => EncoderAttemptOutcome::Ok {
-            sustained_fps: None,
-            bitrate_mbps: None,
-            note: "MF SW H.264 MFT initialised (no burst measured for this backend -- NVENC's \
-                   burst already measures fps/bitrate for this row)"
-                .to_string(),
-        },
-        Err(error) => {
-            let detail = format!("{error:?}");
-            if error.code() == E_INVALIDARG {
-                EncoderAttemptOutcome::Unsupported { detail }
-            } else {
-                EncoderAttemptOutcome::Failed { detail }
-            }
-        }
-    }
+    crate::win_mf_hw::probe_matrix_attempt(row, variant_color(row), PROBE_WIDTH, PROBE_HEIGHT)
 }
 
-/// Without the `mf` feature there is no Media Foundation encoder to trial.
-#[cfg(not(feature = "mf"))]
+/// Without the `mf-hw` feature there is no Media Foundation encoder to trial.
+#[cfg(not(feature = "mf-hw"))]
 fn mf_attempt_for_row(
     _row: arcen_media::video::VideoVariant,
 ) -> crate::probe_matrix::EncoderAttemptOutcome {
     crate::probe_matrix::EncoderAttemptOutcome::NotCompiled {
-        detail: "capenc was built without --features mf".to_string(),
+        detail: "capenc was built without --features mf-hw".to_string(),
     }
 }
 
@@ -3451,7 +3442,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
         selector.describe()
     ));
     // `bitrate=<kbps>` overrides the default software-encoder CBR bitrate.
-    #[cfg(any(feature = "mf", feature = "software-h264"))]
+    #[cfg(feature = "software-h264")]
     let bitrate_kbps: u32 = args
         .iter()
         .find_map(|a| a.strip_prefix("bitrate="))
@@ -3459,7 +3450,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
         .unwrap_or(0);
 
     // argv[2] = codec ("h264" | "h265").
-    #[cfg(any(feature = "nvenc", feature = "mf", feature = "software-h264"))]
+    #[cfg(any(feature = "nvenc", feature = "software-h264"))]
     let codec = args.get(2).cloned().unwrap_or_else(|| "h264".to_string());
     #[cfg(feature = "nvenc")]
     let fps_arg = args.get(3).filter(|value| value.as_str() != "selftest");
@@ -3467,16 +3458,16 @@ pub fn run_with_args(args: Vec<String>) -> ! {
     let fps = fps_arg
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(60);
-    // For software H.264, the same argv[3] fps position applies; default to 30
-    // fps since SW H.264 encoding of a full desktop at 60 fps on a 2-vCPU VM
-    // is not realistic.
-    #[cfg(any(feature = "mf", feature = "software-h264"))]
+    // For software H.264, the same argv[3] fps position applies; without one
+    // it starts at 30 fps (the Pier always passes its served rate, and its
+    // frame-rate governor lowers it to what the CPU encodes).
+    #[cfg(feature = "software-h264")]
     let software_fps: u32 = args
         .get(3)
         .filter(|value| value.as_str() != "selftest")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(30);
-    #[cfg(any(feature = "nvenc", feature = "mf", feature = "software-h264"))]
+    #[cfg(any(feature = "nvenc", feature = "software-h264"))]
     let yuv444 = args.iter().any(|value| value == "yuv444");
     // The single resolved colour contract for this run: an explicit
     // `variant=<id>` wins over the legacy `yuv444` token, and it is this one
@@ -3484,7 +3475,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
     // must reach both the encoder init below and `resolved_media_plan`'s
     // READY line, or the two can silently disagree about what was actually
     // requested. See `crate::requested_color`.
-    #[cfg(any(feature = "nvenc", feature = "mf", feature = "software-h264"))]
+    #[cfg(any(feature = "nvenc", feature = "software-h264"))]
     let color = match crate::requested_color(&args, yuv444) {
         Ok(color) => color,
         Err(error) => {
@@ -3542,10 +3533,10 @@ pub fn run_with_args(args: Vec<String>) -> ! {
         .unwrap_or((3840u32, 2160u32));
 
     log(&format!(
-        "capenc: encoder-select={} (compiled: nvenc={} mf={} software-h264={})",
+        "capenc: encoder-select={} (compiled: nvenc={} mf-hw={} software-h264={})",
         encoder_choice,
         cfg!(feature = "nvenc"),
-        cfg!(feature = "mf"),
+        cfg!(feature = "mf-hw"),
         cfg!(feature = "software-h264"),
     ));
     // Echo the argument vector as received. Positional arguments plus a
@@ -3573,7 +3564,17 @@ pub fn run_with_args(args: Vec<String>) -> ! {
     #[cfg(not(feature = "nvenc"))]
     let wide_live = false;
     if !wide_live {
-        crate::refuse_unsupported_output(&args, arcen_media::capenc_stream::CapencRoute::Windows);
+        // The shared software loop writes framed-v2 and serves the canvas
+        // (ADR 0028) when it is asked for by name; every other path refuses
+        // both before capture.
+        crate::refuse_unsupported_output(
+            &args,
+            if encoder_choice == "software-h264" {
+                arcen_media::capenc_stream::CapencRoute::Software
+            } else {
+                arcen_media::capenc_stream::CapencRoute::Windows
+            },
+        );
     }
 
     // Portable OpenH264 is both the explicit software backend and the product
@@ -3587,11 +3588,20 @@ pub fn run_with_args(args: Vec<String>) -> ! {
             log("OpenH264 software encoding requires h264 + yuv420 8-bit");
             std::process::exit(2);
         }
+        let canvas = match arcen_media::canvas::serve::CanvasCapencArgs::from_args(&args) {
+            Ok(canvas) => canvas,
+            Err(error) => {
+                log(&format!("ERROR: {error}"));
+                std::process::exit(2);
+            }
+        };
         let options = crate::win_mf::OpenH264RunOpts {
             output_index,
             fps: software_fps,
             bitrate_kbps,
             framed,
+            framed_v2,
+            canvas,
             adapter_hint: adapter_hint.clone(),
             adapter_output_index,
             device_name: device_name.clone(),
@@ -3602,35 +3612,6 @@ pub fn run_with_args(args: Vec<String>) -> ! {
             std::process::exit(crate::win_mf::run_openh264_admission_probe(options, probe));
         }
         crate::win_mf::run_openh264(options);
-    }
-
-    // ---- Explicit MF request short-circuits before touching NVENC state. ----
-    #[cfg(feature = "mf")]
-    if encoder_choice == "mf" {
-        if !codec.eq_ignore_ascii_case("h264")
-            || color.chroma != arcen_media::ChromaSubsampling::Yuv420
-            || color.bit_depth != arcen_media::BitDepth::Eight
-        {
-            log("MF software encoding requires h264 + yuv420 8-bit");
-            std::process::exit(2);
-        }
-        let options = crate::win_mf::MfRunOpts {
-            output_index,
-            fps: software_fps,
-            bitrate_kbps,
-            profile: crate::mf_encoder::H264Profile::Main,
-            keyframe_policy: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
-            framed,
-            adapter_hint: adapter_hint.clone(),
-            adapter_output_index,
-            device_name: device_name.clone(),
-            cursor_mode,
-            color,
-        };
-        if let Some(probe) = admission_probe.as_ref() {
-            std::process::exit(crate::win_mf::run_admission_probe(options, probe));
-        }
-        crate::win_mf::run(options);
     }
 
     // Keep the (virtual) display AWAKE. On a headless VM/vGPU host Windows
@@ -3644,6 +3625,71 @@ pub fn run_with_args(args: Vec<String>) -> ! {
         SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
     }
     log("display keep-awake armed (ES_DISPLAY_REQUIRED|ES_CONTINUOUS)");
+
+    // Media Foundation hardware (Alpha): a vendor's hardware encoder MFT.
+    // The Pier selects it (after NVENC, before OpenH264) only once its
+    // admission probe, `mf-hw-admit=WxH`, has proven an encode.
+    #[cfg(feature = "mf-hw")]
+    if encoder_choice == "mf-hw" {
+        let Some(codec) = arcen_media::VideoCodec::from_token(&codec.to_ascii_lowercase()) else {
+            log(&format!(
+                "Media Foundation hardware: unknown codec {codec:?}"
+            ));
+            std::process::exit(2);
+        };
+        if let Some(admit) = args.iter().find_map(|arg| arg.strip_prefix("mf-hw-admit=")) {
+            let Some((width, height)) = admit
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                .filter(|(w, h)| {
+                    *w >= 16 && *h >= 16 && w.is_multiple_of(2) && h.is_multiple_of(2)
+                })
+            else {
+                log(&format!("invalid mf-hw-admit geometry {admit:?}"));
+                std::process::exit(2);
+            };
+            let codecs = match args
+                .iter()
+                .find_map(|arg| arg.strip_prefix("mf-hw-codecs="))
+            {
+                Some(list) => {
+                    let parsed: Option<Vec<_>> = list
+                        .split(',')
+                        .map(arcen_media::VideoCodec::from_token)
+                        .collect();
+                    let Some(parsed) = parsed.filter(|codecs| !codecs.is_empty()) else {
+                        log(&format!("invalid mf-hw-codecs {list:?}"));
+                        std::process::exit(2);
+                    };
+                    parsed
+                }
+                None => vec![codec],
+            };
+            std::process::exit(crate::win_mf_hw::run_admission(
+                &crate::win_mf_hw::AdmitOpts {
+                    selector: &selector,
+                    codecs,
+                    width,
+                    height,
+                    fps,
+                    color,
+                },
+            ));
+        }
+        std::process::exit(crate::win_mf_hw::run(&crate::win_mf_hw::RunOpts {
+            selector: &selector,
+            codec,
+            fps,
+            color,
+            cursor_mode,
+            framed,
+            force_wgc: args.iter().any(|a| a == "wgc"),
+            force_dda: args.iter().any(|a| a == "ddapi"),
+            intent,
+            priority,
+            max_bitrate_bps,
+        }));
+    }
 
     #[cfg(feature = "nvenc")]
     if let Some(options) = admission_probe.as_ref() {
@@ -3701,22 +3747,23 @@ pub fn run_with_args(args: Vec<String>) -> ! {
             // Explicit `nvenc` fails closed at every rung; `auto` degrades to
             // the software fallback instead of exiting, because auto's whole job is
             // to keep the session alive on whatever the adapter can do.
-            let selected_vendor = match unsafe { Capture::find_output_device(&selector) } {
-                Ok(found) => {
-                    log(&format!(
-                        "selected capture target: {} -> adapter {} ({:?}) vendor=0x{:04x}",
-                        selector.describe(),
-                        found.adapter_index,
-                        found.adapter_name,
+            let selected_vendor =
+                match unsafe { Capture::find_output_device(&selector, CAPTURE_DEVICE_FLAGS) } {
+                    Ok(found) => {
+                        log(&format!(
+                            "selected capture target: {} -> adapter {} ({:?}) vendor=0x{:04x}",
+                            selector.describe(),
+                            found.adapter_index,
+                            found.adapter_name,
+                            found.vendor_id
+                        ));
                         found.vendor_id
-                    ));
-                    found.vendor_id
-                }
-                Err(error) => {
-                    log(&format!("selected output adapter probe failed: {error:?}"));
-                    std::process::exit(2);
-                }
-            };
+                    }
+                    Err(error) => {
+                        log(&format!("selected output adapter probe failed: {error:?}"));
+                        std::process::exit(2);
+                    }
+                };
             let can_try_nvenc = selected_vendor == 0x10de;
             if can_try_nvenc {
                 let force_wgc = args.iter().any(|a| a == "wgc");
@@ -3743,6 +3790,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                         cursor_mode,
                         wide_capture,
                         hdr_required,
+                        CAPTURE_DEVICE_FLAGS,
                     )
                 };
                 match unsafe {
@@ -3854,6 +3902,8 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                     fps: software_fps,
                     bitrate_kbps,
                     framed,
+                    framed_v2: false,
+                    canvas: None,
                     adapter_hint: adapter_hint.clone(),
                     adapter_output_index,
                     device_name: device_name.clone(),
@@ -3861,24 +3911,7 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                     color,
                 });
             }
-            #[cfg(all(not(feature = "software-h264"), feature = "mf"))]
-            {
-                log("falling back to Media Foundation SW H.264 encoder");
-                crate::win_mf::run(crate::win_mf::MfRunOpts {
-                    output_index,
-                    fps: software_fps,
-                    bitrate_kbps,
-                    profile: crate::mf_encoder::H264Profile::Main,
-                    keyframe_policy: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
-                    framed,
-                    adapter_hint: adapter_hint.clone(),
-                    adapter_output_index,
-                    device_name: device_name.clone(),
-                    cursor_mode,
-                    color,
-                });
-            }
-            #[cfg(not(any(feature = "software-h264", feature = "mf")))]
+            #[cfg(not(feature = "software-h264"))]
             {
                 log("no compatible fallback compiled — exiting");
                 std::process::exit(6);
@@ -3911,6 +3944,8 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                 fps: software_fps,
                 bitrate_kbps,
                 framed,
+                framed_v2: false,
+                canvas: None,
                 adapter_hint,
                 adapter_output_index,
                 device_name,
@@ -3918,40 +3953,18 @@ pub fn run_with_args(args: Vec<String>) -> ! {
                 color,
             });
         }
-        #[cfg(all(not(feature = "software-h264"), feature = "mf"))]
+        #[cfg(not(feature = "software-h264"))]
         {
-            if encoder_choice == "nvenc" {
-                log("NVENC requested but this capenc build has no NVENC backend");
-                std::process::exit(6);
-            }
-            if encoder_choice != "auto" && encoder_choice != "mf" {
-                log(&format!("unknown encoder selection: {encoder_choice:?}"));
+            // A build with no encoder only measures capture: an encoder
+            // request (the removed Media Foundation software path's `mf`
+            // among them) or an admission probe would otherwise wait forever.
+            if encoder_choice != "auto" || admission_probe.is_some() {
+                log(&format!(
+                    "this capenc build has no encoder for {encoder_choice:?} or admission probes"
+                ));
                 std::process::exit(2);
             }
-            if !codec.eq_ignore_ascii_case("h264")
-                || color.chroma != arcen_media::ChromaSubsampling::Yuv420
-                || color.bit_depth != arcen_media::BitDepth::Eight
-            {
-                log("MF software encoding requires h264 + yuv420 8-bit");
-                std::process::exit(2);
-            }
-            crate::win_mf::run(crate::win_mf::MfRunOpts {
-                output_index,
-                fps: software_fps,
-                bitrate_kbps,
-                profile: crate::mf_encoder::H264Profile::Main,
-                keyframe_policy: arcen_media::video::KeyframePolicy::SOFTWARE_FALLBACK,
-                framed,
-                adapter_hint,
-                adapter_output_index,
-                device_name,
-                cursor_mode,
-                color,
-            });
-        }
-        #[cfg(not(any(feature = "software-h264", feature = "mf")))]
-        {
-            let cap = match unsafe { Capture::new(&selector) } {
+            let cap = match unsafe { Capture::new(&selector, CAPTURE_DEVICE_FLAGS) } {
                 Ok(c) => c,
                 Err(e) => {
                     log(&format!("init failed: {e:?} (session 0 cannot capture)"));

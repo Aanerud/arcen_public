@@ -1048,7 +1048,6 @@ async fn run_correlated_broker(
         );
     }
     let refine_grant = refine_lane_grant(&cfg, &response);
-
     // Existing active-session attach is unchanged. Only when no SID-matching
     // session exists (or a matching one is locked) do we hand the credential to
     // the Credential Provider for a remote first-login / unlock.
@@ -2288,10 +2287,107 @@ where
     // output. On an NVIDIA output the first child keeps `Auto`, but typed
     // pre-READY NVENC unavailability is handled here so the display can be
     // retargeted before an explicit OpenH264 child becomes authoritative.
+    let adapter_is_nvidia = resolved_output.vendor_id == 0x10de;
+    // Lab only: `ARCEN_LAB_MF_HW=prefer` in the signed-in user's environment
+    // makes Auto pass over NVENC, so an NVIDIA lab host walks the Media
+    // Foundation hardware rung (and, with `ARCEN_LAB_MF_HW_ENUM=none`, its
+    // OpenH264 fall-through) exactly as an Intel or AMD host would.
+    let lab_skip_nvenc =
+        lab_prefers_media_foundation(std::env::var("ARCEN_LAB_MF_HW").ok().as_deref());
+    if lab_skip_nvenc {
+        tracing::warn!(
+            target: SESSION,
+            "ARCEN_LAB_MF_HW=prefer: Auto passes over NVENC for this session (lab switch)"
+        );
+    }
+    let nvenc_runtime = nvenc_runtime_present() && !lab_skip_nvenc;
+    let probe_media_foundation = config.encoder.auto_needs_media_foundation_probe(
+        adapter_is_nvidia,
+        nvenc_runtime,
+        config.media_foundation_hardware,
+    ) || config.encoder
+        == arcen_media::video::EncoderRequest::MediaFoundationHardware;
+    if probe_media_foundation {
+        // Probe at the size the session would run at on this encoder.
+        let probe_size = DisplaySize {
+            width: start.auth_response.screen_width,
+            height: start.auth_response.screen_height,
+        };
+        let probe_size = backend_fitted_display_size(
+            probe_size,
+            EncoderBackend::MediaFoundationHardware,
+            arcen_media::VideoCodec::H264,
+        )
+        .unwrap_or(probe_size);
+        let admission = crate::capenc::media_foundation_hardware_admission(
+            &expected_session_log_id,
+            &resolved_output.adapter_name,
+            resolved_output.adapter_output_index,
+            probe_size.width,
+            probe_size.height,
+            config.fps,
+        )
+        .await;
+        // Only what this session can use counts as evidence: a proven HEVC
+        // alone does not serve an H.264-only Deck or an H.264 pin.
+        config.media_foundation_codecs =
+            config.media_foundation_servable_codecs(&admission.codecs());
+        tracing::info!(
+            target: SESSION,
+            backend = EncoderBackend::MediaFoundationHardware.display_name(),
+            maturity = EncoderBackend::MediaFoundationHardware.maturity().token(),
+            adapter = %resolved_output.adapter_name,
+            probe_size = %probe_size,
+            proven = %admission
+                .codecs()
+                .iter()
+                .map(|codec| codec.token())
+                .collect::<Vec<_>>()
+                .join(","),
+            admitted = %config
+                .media_foundation_codecs
+                .iter()
+                .map(|codec| codec.token())
+                .collect::<Vec<_>>()
+                .join(","),
+            encoder_mft = admission
+                .proven
+                .first()
+                .map_or("none", |proof| proof.encoder_name.as_str()),
+            profile_idc = admission.proven.first().map(|proof| proof.profile_idc),
+            detail = %admission.detail,
+            "Media Foundation hardware encoder admission"
+        );
+        if config.encoder == arcen_media::video::EncoderRequest::MediaFoundationHardware
+            && config.media_foundation_codecs.is_empty()
+        {
+            let error = format!(
+                "video.encoder pins {} but its admission probe proved no encode on {}: {}",
+                EncoderBackend::MediaFoundationHardware.display_name(),
+                resolved_output.adapter_name,
+                admission.detail
+            );
+            send_agent_failure(&mut ws, &error).await;
+            return Err(error);
+        }
+    } else if config.encoder == arcen_media::video::EncoderRequest::Auto
+        && !config.media_foundation_hardware
+        && !(adapter_is_nvidia && nvenc_runtime)
+    {
+        tracing::info!(
+            target: SESSION,
+            "Media Foundation hardware (Alpha) is disabled by platform.media_foundation_hardware"
+        );
+    }
     let display_encoder = if config.encoder == arcen_media::video::EncoderRequest::Auto {
-        let resolved = config
-            .encoder
-            .resolve_auto(resolved_output.vendor_id == 0x10de, nvenc_runtime_present());
+        let resolved =
+            config
+                .encoder
+                .resolve_auto_ranked(arcen_media::video::AutoEncoderEvidence {
+                    adapter_is_nvidia,
+                    nvenc_runtime,
+                    media_foundation_hardware_admitted: !config.media_foundation_codecs.is_empty(),
+                });
         if resolved == arcen_media::video::EncoderRequest::SoftwareH264 {
             if config.codec != VideoCodec::H264 || config.chroma != ChromaSubsampling::Yuv420 {
                 tracing::warn!(
@@ -2339,6 +2435,7 @@ where
         initial_applied_reopen_generation,
         initial_qos_targets,
         emitter,
+        adapter_is_nvidia,
     )
     .await
 }
@@ -2629,6 +2726,7 @@ async fn run_authenticated_agent<S>(
     initial_applied_reopen_generation: u64,
     initial_qos_targets: arcen_telemetry::QosTargets,
     emitter: LifecycleEmitter,
+    display_adapter_is_nvidia: bool,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2672,6 +2770,7 @@ where
     // Exact still image (ADR 0016): the Deck asks at authentication, only
     // while its setting is on; the shared plan decides per capture.
     cfg.deck_refine = response.lossless_refine_v1.clone();
+    cfg.deck_canvas = response.canvas_v1.clone();
     let authoritative_timezone = response.timezone.clone();
     let authoritative_cursor = response.cursor_preference;
     let authoritative_cursor_images = response.cursor_image_v1;
@@ -2918,6 +3017,28 @@ where
         };
         cfg.output_index = primary.global_index;
     }
+    if display_encoder == arcen_media::video::EncoderRequest::MediaFoundationHardware {
+        let fitted = match backend_fitted_display_size(
+            request.size,
+            EncoderBackend::MediaFoundationHardware,
+            crate::capenc::media_codec(cfg.codec),
+        ) {
+            Ok(fitted) => fitted,
+            Err(error) => {
+                send_agent_failure(&mut ws, &error).await;
+                return Err(error);
+            }
+        };
+        if fitted != request.size {
+            tracing::info!(
+                target: DISPLAY,
+                client_requested = %request.size,
+                media_foundation_display = %fitted,
+                "negotiated a desktop within the Media Foundation hardware (Alpha) contract"
+            );
+            request.size = fitted;
+        }
+    }
     if display_encoder == arcen_media::video::EncoderRequest::SoftwareH264 {
         let fitted = match openh264_fitted_display_size(request.size) {
             Ok(fitted) => fitted,
@@ -2977,9 +3098,42 @@ where
             request.refresh_hz = refresh_hz;
         }
     }
+    // Desk privacy by default (ADR 0025 §5): on the console's own desk the
+    // session is served on a display no monitor at the desk shows, and every
+    // other monitor is detached from the desktop while the Deck is attached
+    // (Windows cannot darken one). Pinned deskside, when configured, does its
+    // own isolation.
+    let desk_dark_required = !cfg.deskside.enabled
+        && cfg
+            .desk_privacy
+            .plan(crate::deskside::desk_exposure(&windows_session))
+            == arcen_session::console_session::desk_privacy::DeskPrivacyPlan::Protect;
+    if desk_dark_required && multi_monitor_committed.is_none() {
+        let configured = cfg.output_selector.clone();
+        if let Some(virtual_output) = tokio::task::spawn_blocking(move || {
+            crate::deskside::virtual_output_instead_of(&configured)
+        })
+        .await
+        .ok()
+        .flatten()
+        {
+            tracing::info!(
+                target: SESSION,
+                sid = %session_log_id,
+                configured = ?cfg.output_selector,
+                serving = ?virtual_output,
+                "desk privacy: the configured display is a monitor at the desk; the session is served on a virtual display"
+            );
+            cfg.output_selector = virtual_output;
+        }
+    }
     // Per-encoder mirroring policy: direct NVENC recreates the client display
     // exactly (isolated primary or refuse); the software/paravirtualized path
     // keeps the negotiated ladder because it cannot promise exactness.
+    // The exact NVAPI display path belongs to the NVIDIA adapter, not to the
+    // encoder: a hardware encoder MFT on an NVIDIA output (no NVENC runtime,
+    // or the lab switch) recreates the client display exactly too.
+    let exact_nvidia_display = exact_nvidia_display(display_encoder, display_adapter_is_nvidia);
     let mut policy = if multi_monitor_committed.is_some() {
         crate::display::DisplayPolicy::Negotiated
     } else {
@@ -2987,10 +3141,13 @@ where
             arcen_media::video::EncoderRequest::NativeNvenc => {
                 crate::display::DisplayPolicy::ExactIsolated
             }
-            // `parse_encoder` admits no MF or AV1 request on this Pier; were
-            // one to arrive it is not direct NVENC, so it negotiates too.
+            arcen_media::video::EncoderRequest::MediaFoundationHardware if exact_nvidia_display => {
+                crate::display::DisplayPolicy::ExactIsolated
+            }
+            // Software, AV1 and Media Foundation hardware on any other GPU
+            // cannot promise exactness, so they negotiate.
             arcen_media::video::EncoderRequest::SoftwareH264
-            | arcen_media::video::EncoderRequest::WindowsMediaFoundation
+            | arcen_media::video::EncoderRequest::MediaFoundationHardware
             | arcen_media::video::EncoderRequest::SoftwareAv1 => {
                 crate::display::DisplayPolicy::Negotiated
             }
@@ -3006,9 +3163,7 @@ where
             }
         }
     };
-    if multi_monitor_committed.is_none()
-        && display_encoder == arcen_media::video::EncoderRequest::NativeNvenc
-    {
+    if multi_monitor_committed.is_none() && exact_nvidia_display {
         let adapter = match &cfg.output_selector {
             crate::display::OutputSelector::Adapter { name, .. } => name.clone(),
             crate::display::OutputSelector::GlobalIndex(_) => {
@@ -3187,6 +3342,42 @@ where
         deskside_hooks = Some(hooks);
         deskside_protection = Some(protection);
     }
+    // Desk privacy by default (ADR 0025 §5): on the console's own desk the
+    // desk's keyboard and mouse are blocked (the low-level hooks pass only
+    // Arcen's marked input) before anything is shown, and once the display
+    // lease is held no monitor at the desk may show the desktop (Windows
+    // cannot darken one). Pinned deskside, when configured, already did both.
+    if desk_dark_required {
+        use arcen_session::console_session::desk_privacy::DeskPrivacyRefusal;
+        let hooks = match tokio::task::spawn_blocking(
+            crate::deskside::InputHookGuard::install_keyboard_proved,
+        )
+        .await
+        {
+            Ok(Ok(hooks)) => Some(hooks),
+            Ok(Err(error)) => {
+                tracing::error!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the desk's input could not be blocked");
+                None
+            }
+            Err(error) => {
+                tracing::error!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the input hook task failed");
+                None
+            }
+        };
+        let Some(hooks) = hooks else {
+            let error = DeskPrivacyRefusal::InputBlockUnavailable.deck_reason();
+            send_agent_failure(&mut ws, &error).await;
+            return Err(error);
+        };
+        // Proved live once the display lease holds (below), by the keyboard
+        // canary (`deskside::HookProof`).
+        tracing::info!(
+            target: SESSION,
+            sid = %session_log_id,
+            "desk privacy: the desk's keyboard and mouse are blocked while the Deck is attached"
+        );
+        deskside_hooks = Some(hooks);
+    }
     // A console display Windows powered off for idle makes DWM compose a few
     // frames a second until something wakes it; capenc's keep-awake only holds
     // it on afterwards. Wake it before the display lease, after any deskside
@@ -3351,6 +3542,85 @@ where
                     send_agent_failure(&mut ws, &error).await;
                     return Err(error);
                 }
+            }
+        }
+    }
+    if desk_dark_required {
+        // A multi-monitor session lights the Deck's displays only; the proof
+        // below refuses any desk monitor it left lit.
+        let detached = display
+            .single_mut()
+            .map_or(Ok(false), DisplayLease::detach_desk_monitors);
+        match detached {
+            Ok(true) => tracing::info!(
+                target: SESSION,
+                sid = %session_log_id,
+                "desk privacy: the desk's monitors are detached from the desktop while the Deck is attached"
+            ),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the desk's monitors could not be detached");
+                let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
+                lock_then_release_desk(&mut deskside_hooks, &session_log_id);
+                let error = arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskDetachFailed
+                    .deck_reason();
+                send_agent_failure(&mut ws, &error).await;
+                return Err(error);
+            }
+        }
+        let proof = deskside_hooks
+            .as_ref()
+            .map(crate::deskside::InputHookGuard::proof);
+        let live = match proof {
+            Some(proof) => tokio::task::spawn_blocking(move || {
+                let mut outcome = proof.probe();
+                for _ in 1..3 {
+                    if outcome.is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    outcome = proof.probe();
+                }
+                outcome
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("hook proof task failed: {error}"))),
+            None => Err("no input hooks".to_string()),
+        };
+        if let Err(error) = live {
+            tracing::error!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the input hooks did not prove live");
+            let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
+            lock_then_release_desk(&mut deskside_hooks, &session_log_id);
+            let error = arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::InputBlockUnavailable
+                .deck_reason();
+            send_agent_failure(&mut ws, &error).await;
+            return Err(error);
+        }
+        match tokio::task::spawn_blocking(crate::deskside::prove_desk_dark).await {
+            Ok(Ok(proof)) => {
+                tracing::info!(
+                    target: SESSION,
+                    sid = %session_log_id,
+                    "desk privacy: no monitor at the desk shows the desktop"
+                );
+                crate::deskside::hold_dark_desk(Some(proof));
+            }
+            outcome => {
+                let refusal = match outcome {
+                    Ok(Err(refusal)) => refusal,
+                    _ => arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskMonitorUnknown,
+                };
+                tracing::error!(
+                    target: SESSION,
+                    sid = %session_log_id,
+                    reason = refusal.token(),
+                    "desk privacy: a monitor at the desk would show the session; refused (privacy.desk = \"off\" allows it)"
+                );
+                let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
+                lock_then_release_desk(&mut deskside_hooks, &session_log_id);
+                let error = refusal.deck_reason();
+                send_agent_failure(&mut ws, &error).await;
+                return Err(error);
             }
         }
     }
@@ -3549,6 +3819,18 @@ where
             .deck_refine
             .is_some()
             .then(|| refine_plan.hello_status());
+        // Canvas (ADR 0028): what the capture was started with, told only
+        // to a Deck that offered it.
+        let canvas_status = cfg.deck_canvas.as_ref().and_then(|_| {
+            let canvas_plan = prepared_media.video.canvas_plan();
+            tracing::info!(
+                target: SESSION,
+                state = if canvas_plan.is_on() { "on" } else { "off" },
+                reason = if canvas_plan.is_on() { "" } else { canvas_plan.off_reason() },
+                "canvas plan"
+            );
+            canvas_plan.status
+        });
         let preferences = run_attachment_handshake(
             &mut ws,
             &cfg,
@@ -3568,6 +3850,7 @@ where
             active_transport,
             multi_monitor_capability.as_ref(),
             refine_status,
+            canvas_status,
         )
         .await;
         let preferences = match preferences {
@@ -3700,6 +3983,7 @@ where
         };
         let _ = protection.apply(display_event);
     }
+    crate::deskside::hold_dark_desk(None);
     let input_restore = if let Some(hooks) = deskside_hooks.as_mut() {
         hooks.shutdown()
     } else {
@@ -3814,6 +4098,7 @@ async fn run_attachment_handshake<S>(
     active_transport: &'static str,
     multi_monitor_capability: Option<&ServerMultiMonitorMsg>,
     refine_status: Option<arcen_protocol::refine::LosslessRefineStatusMsg>,
+    canvas_status: Option<arcen_protocol::canvas::CanvasStatusMsg>,
 ) -> Result<AttachmentPreferences, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -3857,6 +4142,7 @@ where
     hello.negotiated_transport = Some(active_transport.to_string());
     // Exact still image: the shared plan's truth, for a Deck that asked.
     hello.lossless_refine = refine_status;
+    hello.canvas = canvas_status;
     if let Some(capability) = multi_monitor_capability {
         hello = hello
             .with_multi_monitor_v1(capability)
@@ -4727,22 +5013,46 @@ fn finite_nonnegative(value: f32, name: &str) -> Result<f32, String> {
 }
 
 fn openh264_fitted_display_size(size: DisplaySize) -> Result<DisplaySize, String> {
+    backend_fitted_display_size(
+        size,
+        EncoderBackend::OpenH264,
+        arcen_media::VideoCodec::H264,
+    )
+}
+
+/// The largest even desktop within `backend`'s contract for `codec`.
+fn backend_fitted_display_size(
+    size: DisplaySize,
+    backend: EncoderBackend,
+    codec: arcen_media::VideoCodec,
+) -> Result<DisplaySize, String> {
     let request = arcen_media::video::MediaRequest {
-        encoder: arcen_media::video::EncoderRequest::SoftwareH264,
-        video: arcen_media::VideoConfiguration::legacy_h264(),
+        encoder: match backend {
+            EncoderBackend::MediaFoundationHardware => {
+                arcen_media::video::EncoderRequest::MediaFoundationHardware
+            }
+            _ => arcen_media::video::EncoderRequest::SoftwareH264,
+        },
+        video: arcen_media::VideoConfiguration {
+            codec,
+            ..arcen_media::VideoConfiguration::legacy_h264()
+        },
         width: size.width & !1,
         height: size.height & !1,
-        fps: 30,
+        fps: EncoderBackend::OpenH264.contract().max_fps,
         cursor_mode: CursorMode::Local,
     };
     let candidate = arcen_media::video::BackendCandidate {
-        backend: EncoderBackend::OpenH264,
-        availability: arcen_media::video::BackendAvailability::Available(
-            EncoderBackend::OpenH264.contract(),
-        ),
+        backend,
+        availability: arcen_media::video::BackendAvailability::Available(backend.contract()),
     };
     let (plan, _) = arcen_media::video::resolve_media_plan_degrading(request, &[candidate])
-        .map_err(|error| format!("fit display to OpenH264 contract: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "fit display to the {} contract: {error}",
+                backend.display_name()
+            )
+        })?;
     DisplaySize::validate(plan.width, plan.height)
 }
 
@@ -4751,7 +5061,7 @@ fn ensure_openh264_applied_size(applied: DisplaySize) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "display settled at {applied}, outside the OpenH264 limit of 1920x1200p30 \
+            "display settled at {applied}, outside OpenH264's own 3840x2160 \
              with even 4:2:0 dimensions"
         ))
     }
@@ -4771,14 +5081,38 @@ fn openh264_fallback_retarget_size(
     openh264_fitted_display_size(requested).map(Some)
 }
 
+/// Whether a single-display session takes the exact NVIDIA (NVAPI headless)
+/// display path: direct NVENC, or the Media Foundation hardware encoder on an
+/// NVIDIA adapter.
+fn exact_nvidia_display(
+    display_encoder: arcen_media::video::EncoderRequest,
+    adapter_is_nvidia: bool,
+) -> bool {
+    display_encoder == arcen_media::video::EncoderRequest::NativeNvenc
+        || (adapter_is_nvidia
+            && display_encoder == arcen_media::video::EncoderRequest::MediaFoundationHardware)
+}
+
+/// Whether the lab switch `ARCEN_LAB_MF_HW` asks Auto to pass over NVENC.
+fn lab_prefers_media_foundation(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim().eq_ignore_ascii_case("prefer"))
+}
+
 fn capenc_encoder_for_attempt(
     configured: arcen_media::video::EncoderRequest,
     active: arcen_media::video::EncoderRequest,
 ) -> arcen_media::video::EncoderRequest {
+    // NVENC keeps `auto`, so capenc reports a typed NVENC failure the Pier
+    // turns into the OpenH264 fallback; the Media Foundation hardware encoder
+    // and OpenH264 are named exactly, because Auto chose them with evidence.
     if configured == arcen_media::video::EncoderRequest::Auto
-        && active == arcen_media::video::EncoderRequest::SoftwareH264
+        && matches!(
+            active,
+            arcen_media::video::EncoderRequest::SoftwareH264
+                | arcen_media::video::EncoderRequest::MediaFoundationHardware
+        )
     {
-        arcen_media::video::EncoderRequest::SoftwareH264
+        active
     } else {
         configured
     }
@@ -4922,11 +5256,12 @@ fn resize_encoder_for(
     match media_plan.backend {
         EncoderBackend::NativeNvenc => Some(arcen_media::video::EncoderRequest::NativeNvenc),
         EncoderBackend::OpenH264 => Some(arcen_media::video::EncoderRequest::SoftwareH264),
+        EncoderBackend::MediaFoundationHardware => {
+            Some(arcen_media::video::EncoderRequest::MediaFoundationHardware)
+        }
         // VideoToolbox is macOS and cannot be opened here; it is in the shared
         // vocabulary because another Pier reports it.
-        EncoderBackend::WindowsMediaFoundation
-        | EncoderBackend::Rav1e
-        | EncoderBackend::VideoToolbox => None,
+        EncoderBackend::Rav1e | EncoderBackend::VideoToolbox => None,
     }
 }
 
@@ -5277,6 +5612,7 @@ fn served_pipeline_message(
             .is_none()
             .then_some("Windows encoder acceleration is unknown".to_string()),
     )
+    .with_encoder(served_encoder_backend_label(primary, aggregate))
 }
 
 fn qp_map_policy_for_capenc(
@@ -5284,7 +5620,12 @@ fn qp_map_policy_for_capenc(
     capenc: &CapencConfig,
 ) -> arcen_media::video::QpMapPolicy {
     let encoder = capenc.encoder.unwrap_or(cfg.encoder);
-    if encoder == arcen_media::video::EncoderRequest::SoftwareH264 {
+    // Only NVENC takes a QP map; the hardware MFT path has no delta-QP input.
+    if matches!(
+        encoder,
+        arcen_media::video::EncoderRequest::SoftwareH264
+            | arcen_media::video::EncoderRequest::MediaFoundationHardware
+    ) {
         return arcen_media::video::QpMapPolicy::Off;
     }
     let video = arcen_media::VideoConfiguration {
@@ -5517,6 +5858,9 @@ fn build_server_hello_with_aggregate(
             pen_eraser: pen_capability,
             pen_proximity: pen_capability,
             pen_barrel_buttons: pen_capability,
+            // Bit 0 the Windows Ink barrel (right click), bit 1 a middle
+            // click (input.rs `pen_ink_flags`, `PenInjector::middle_click`).
+            pen_button_actions: pen_capability,
             // Committed text is typed by key where the foreground layout
             // provably has the character, else as Unicode packets, so any
             // character is typeable (input.rs `text_commit`).
@@ -5527,6 +5871,11 @@ fn build_server_hello_with_aggregate(
             // A Windows key used only with the pointer is masked on release
             // (input.rs `MetaReleaseMask`), so it never opens Start.
             meta_pointer_mask: InputCapabilityAvailability::Available,
+            // Insert, Print, Scroll Lock, Pause, Menu (VK_APPS) and
+            // F13-F24 (VK_F13..VK_F24), from the shared PC-key table.
+            pc_keys: arcen_input::keyboard::host_keys::advertised_pc_keys(
+                arcen_protocol::messages::HostPlatform::Windows,
+            ),
         },
         tablet_mode_capabilities: TabletModeCapabilitiesMsg {
             local_termination: pen_capability,
@@ -5562,6 +5911,20 @@ fn build_server_hello_with_aggregate(
         ]),
         negotiated_transport: None, // set from the active socket before transmission
         lossless_refine: None,
+        canvas: None,
+        // A desk that could not be made private refused the attachment
+        // before this hello (pinned deskside, or desk privacy's default).
+        desk_privacy: Some(
+            if cfg.deskside.enabled {
+                arcen_session::console_session::desk_privacy::DeskPrivacyStatus::Blanked
+            } else {
+                cfg.desk_privacy
+                    .plan(crate::deskside::desk_exposure(windows_session))
+                    .status()
+            }
+            .token()
+            .to_owned(),
+        ),
         // This host takes wheel notches only, and always serves a signed-in
         // desktop: never a login window that sign-in replaces.
         precise_scroll_v1: true,
@@ -6229,6 +6592,22 @@ impl PreparedVideo {
         }
     }
 
+    /// The canvas plan of this attachment (ADR 0028): what the capture was
+    /// started with. Several displays get no canvas yet.
+    fn canvas_plan(&self) -> arcen_media::canvas::serve::CanvasServePlan {
+        match self {
+            Self::Single(pipeline) => pipeline.capenc.canvas_plan().clone(),
+            _ => arcen_media::canvas::serve::multi_monitor_off(),
+        }
+    }
+
+    /// A Deck canvas control for the capture that serves the canvas.
+    fn request_canvas(&self, command: arcen_media::capenc_control::CapencControlCommand) {
+        for pipeline in self.pipelines() {
+            pipeline.capenc.request_canvas(command);
+        }
+    }
+
     fn request_keyframe(&self, monitor_id: u16, reason: &'static str) -> bool {
         self.pipelines()
             .iter()
@@ -6449,7 +6828,15 @@ async fn prepare_attachment_media(
         config.qp_map = qp_map_policy_for_capenc(cfg, &config);
         let qp_map = config.qp_map;
         match Capenc::spawn(config).await {
-            Ok((capenc, frames, plan)) => {
+            Ok((capenc, frames, mut plan)) => {
+                // Advertise only the codecs the admission probe proved.
+                if plan.backend == EncoderBackend::MediaFoundationHardware
+                    && !attempt_cfg.media_foundation_codecs.is_empty()
+                {
+                    plan.codecs = plan.codecs.intersection(arcen_media::CodecSet::from_slice(
+                        &attempt_cfg.media_foundation_codecs,
+                    ));
+                }
                 capenc.request_keyframe("display_mode_settled_capture_restart");
                 return Ok((
                     PreparedAttachmentMedia {
@@ -6539,6 +6926,53 @@ async fn prepare_attachment_media(
                 }
                 display_encoder = arcen_media::video::EncoderRequest::SoftwareH264;
             }
+            Err(CapencStartError::Unavailable(notice))
+                if cfg.encoder == arcen_media::video::EncoderRequest::Auto
+                    && display_encoder
+                        == arcen_media::video::EncoderRequest::MediaFoundationHardware
+                    && notice.backend == EncoderBackend::MediaFoundationHardware =>
+            {
+                // The admission probe proved a synthetic encode, but the live
+                // capture could not be served (a vendor MFT that refuses this
+                // desktop's size, a device lost since): Auto's next rung.
+                drop(injector);
+                drop(pen);
+                tracing::warn!(
+                    target: CAPENC,
+                    event = "media_encoder_fallback",
+                    sid = %session_log_id,
+                    requested_backend = "mf-hw",
+                    selected_backend = "openh264",
+                    reason = ?notice.reason,
+                    "Media Foundation hardware (Alpha) unavailable for this capture; video encoder fallback selected"
+                );
+                attempt_cfg
+                    .apply_software_h264_backend_after(
+                        arcen_media::video::EncoderRequest::SoftwareH264,
+                        Some(notice.reason),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "Media Foundation hardware is unavailable and OpenH264 cannot \
+                             preserve the exact administrator video pin: {error}"
+                        )
+                    })?;
+                if let Some(fitted) = openh264_fallback_retarget_size(
+                    display.report().applied,
+                    display.report().requested,
+                    allow_geometry_retarget,
+                )
+                .map_err(|error| {
+                    format!(
+                        "capenc Media Foundation hardware unavailable ({:?}); {error}",
+                        notice.reason
+                    )
+                })? {
+                    display.retarget_exact(fitted)?;
+                    ensure_openh264_applied_size(display.report().applied)?;
+                }
+                display_encoder = arcen_media::video::EncoderRequest::SoftwareH264;
+            }
             Err(CapencStartError::Unavailable(notice)) => {
                 // A pinned NVENC (or a codec ladder that ran out) reported a
                 // typed cause; a fidelity request names it.
@@ -6585,6 +7019,20 @@ async fn prepare_multi_monitor_media(
     // so a software session's template is pinned here rather than trusting a
     // configured codec/chroma that a late NVENC fallback may have outlived.
     // Any 4:4:4 client intent is still refused by `plan_encoder_sets`.
+    // Media Foundation hardware (Alpha) serves single-display sessions; a
+    // multi-monitor session on such a host runs every display on OpenH264
+    // until per-monitor MFT sessions are qualified.
+    let display_encoder =
+        if display_encoder == arcen_media::video::EncoderRequest::MediaFoundationHardware {
+            tracing::info!(
+                target: SESSION,
+                "multi-monitor: Media Foundation hardware (Alpha) serves single-display \
+                 sessions only; every display uses OpenH264"
+            );
+            arcen_media::video::EncoderRequest::SoftwareH264
+        } else {
+            display_encoder
+        };
     let (codec, chroma) = match display_encoder {
         arcen_media::video::EncoderRequest::NativeNvenc => (cfg.codec, cfg.chroma),
         arcen_media::video::EncoderRequest::SoftwareH264 => {
@@ -6596,7 +7044,7 @@ async fn prepare_multi_monitor_media(
                     .to_string(),
             );
         }
-        unsupported @ (arcen_media::video::EncoderRequest::WindowsMediaFoundation
+        unsupported @ (arcen_media::video::EncoderRequest::MediaFoundationHardware
         | arcen_media::video::EncoderRequest::SoftwareAv1) => {
             return Err(format!(
                 "multi-monitor cannot use the {} encoder on this Pier",
@@ -7022,6 +7470,28 @@ fn validate_held_output(
     Ok(resolved_output)
 }
 
+/// A desk privacy refusal after the desk's input was blocked: the session
+/// is locked before the desk gets its keyboard and mouse back (the display
+/// was restored first: Windows refuses display changes once it is locked),
+/// so the desk is never handed an unlocked session; the broker's hand-back
+/// then finds it secured.
+fn lock_then_release_desk(
+    hooks: &mut Option<crate::deskside::InputHookGuard>,
+    session_log_id: &CorrelationId,
+) {
+    if let Err(error) = crate::windows_session::lock_workstation() {
+        tracing::error!(
+            target: SESSION,
+            sid = %session_log_id,
+            %error,
+            "desk privacy: the refused session could not be locked before the desk's input came back"
+        );
+    }
+    if let Some(hooks) = hooks.as_mut() {
+        let _ = hooks.shutdown();
+    }
+}
+
 async fn verify_deskside_supervision(
     cfg: &HostConfig,
     hook_proof: Option<&crate::deskside::HookProof>,
@@ -7043,6 +7513,12 @@ async fn verify_deskside_supervision(
         .await
         .map_err(|error| format!("deskside topology task failed: {error}"))?
         .map_err(|error| format!("deskside protected topology changed: {error}"))?;
+    }
+    if let Some(proof) = crate::deskside::held_dark_desk() {
+        tokio::task::spawn_blocking(move || crate::deskside::verify_desk_dark(&proof))
+            .await
+            .map_err(|error| format!("desk privacy topology task failed: {error}"))?
+            .map_err(|refusal| refusal.deck_reason())?;
     }
     Ok(())
 }
@@ -9424,6 +9900,15 @@ fn start_capture_after_display<I, C, F>(
             operator_enabled: cfg.lossless_refinement,
             deck: cfg.deck_refine.clone(),
         }),
+        // Canvas (ADR 0028): the single-display software capture serves it
+        // to a Deck that offered it; the shared plan decides.
+        canvas: cfg
+            .deck_canvas
+            .clone()
+            .map(|deck| crate::capenc::CanvasForward {
+                deck,
+                cpu_share: cfg.software_cpu_share,
+            }),
     };
     capenc_config.qp_map = qp_map_policy_for_capenc(cfg, &capenc_config);
     let (capture, frames) = spawn_capture(capenc_config)
@@ -10038,6 +10523,13 @@ fn frame_message(
     topology_generation: u64,
     stream_epoch: u64,
 ) -> Vec<u8> {
+    // A canvas record (ADR 0028) is its own wire frame, stamped with the
+    // wire clock as a video header is.
+    if frame.canvas {
+        let mut record = frame.data.clone();
+        arcen_media::canvas::serve::stamp_canvas_frame(&mut record, frame.timestamp_ms);
+        return record;
+    }
     // Frame type, colour translation and header layout live in
     // `arcen_media::video`, beside the same decisions the other Piers make.
     // Three hosts wrote this out separately against one decoder that has to
@@ -10450,14 +10942,36 @@ async fn handle_inbound(
         }
         REQUEST_FULL_FRAME => {
             if serde_json::from_str::<RequestFullFrameMsg>(text).is_ok() {
-                tracing::info!(target: CAPENC, "client requested IDR");
-                video.request_keyframe_all("client_request_full_frame");
+                if video.canvas_plan().is_on() {
+                    // A canvas Deck recovers with `canvas_reset_request`; a
+                    // keyframe request would restart the canvas (ADR 0028).
+                    tracing::debug!(
+                        target: CAPENC,
+                        "request_full_frame ignored: the canvas recovers through canvas_reset_request"
+                    );
+                } else {
+                    tracing::info!(target: CAPENC, "client requested IDR");
+                    video.request_keyframe_all("client_request_full_frame");
+                }
             }
         }
         // Exact still image (ADR 0016): the Deck asks to start a new
         // generation, or turns refinement off/on for its (only) monitor.
         // The broker's lane relay sends the same messages when the refine
         // lane overflows or ends.
+        // Canvas (ADR 0028): flow control and reset requests go to the
+        // capture that serves the canvas, after the shared validation.
+        "canvas_ack" | "canvas_reset_request" => {
+            use arcen_media::capenc_control::CapencControlCommand;
+            match serde_json::from_str::<arcen_protocol::canvas::CanvasControlMsg>(text)
+                .ok()
+                .as_ref()
+                .and_then(CapencControlCommand::from_canvas_control)
+            {
+                Some(command) => video.request_canvas(command),
+                None => tracing::debug!(target: CAPENC, "invalid canvas control message"),
+            }
+        }
         "refine_reset" | "refine_control" => {
             use arcen_media::capenc_control::CapencControlCommand;
             use arcen_protocol::refine::RefineControlMsg;
@@ -12850,14 +13364,20 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
+            media_foundation_codecs: Vec::new(),
             reconnect_window_secs: 30,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
+            ),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
             lossless_refinement: true,
             deck_refine: None,
+            deck_canvas: None,
+            software_cpu_share: arcen_media::canvas::CpuShare::default(),
         };
         let start = AgentStart::new(
             "peer".to_string(),
@@ -13382,6 +13902,7 @@ mod tests {
             keyframe: true,
             timestamp_ms: 0x0102_0304,
             refine: None,
+            canvas: false,
         };
         let media_plan = test_media_plan(
             arcen_media::video::EncoderBackend::NativeNvenc,
@@ -13403,6 +13924,7 @@ mod tests {
             keyframe: true,
             timestamp_ms: 0x0102_0304,
             refine: None,
+            canvas: false,
         };
         let media_plan = test_media_plan(
             arcen_media::video::EncoderBackend::NativeNvenc,
@@ -13427,6 +13949,7 @@ mod tests {
             keyframe: false,
             timestamp_ms: 0x0102_0304,
             refine: None,
+            canvas: false,
         };
         let mut media_plan = test_media_plan(
             arcen_media::video::EncoderBackend::NativeNvenc,
@@ -13727,13 +14250,24 @@ mod tests {
         );
         assert_eq!(
             openh264_fitted_display_size(DisplaySize {
-                width: 3840,
-                height: 2160,
+                width: 2560,
+                height: 1440,
             })
             .unwrap(),
             DisplaySize {
-                width: 1920,
-                height: 1080,
+                width: 2560,
+                height: 1440,
+            }
+        );
+        assert_eq!(
+            openh264_fitted_display_size(DisplaySize {
+                width: 5120,
+                height: 2880,
+            })
+            .unwrap(),
+            DisplaySize {
+                width: 3840,
+                height: 2160,
             }
         );
     }
@@ -13741,35 +14275,35 @@ mod tests {
     #[test]
     fn openh264_refuses_an_oversize_applied_display_before_server_hello() {
         assert!(ensure_openh264_applied_size(DisplaySize {
-            width: 1920,
-            height: 1080,
+            width: 3840,
+            height: 2160,
         })
         .is_ok());
         let error = ensure_openh264_applied_size(DisplaySize {
-            width: 2560,
-            height: 1440,
+            width: 5120,
+            height: 2880,
         })
         .unwrap_err();
         assert!(error.contains("OpenH264"));
-        assert!(error.contains("2560x1440"));
+        assert!(error.contains("5120x2880"));
     }
 
     #[test]
     fn windows_auto_nvenc_failure_retargets_before_openh264_capture() {
         let requested = DisplaySize {
-            width: 2560,
-            height: 1440,
+            width: 5120,
+            height: 2880,
         };
         assert_eq!(
             openh264_fallback_retarget_size(requested, requested, true).unwrap(),
             Some(DisplaySize {
-                width: 1920,
-                height: 1080,
+                width: 3840,
+                height: 2160,
             })
         );
         let fitted = DisplaySize {
-            width: 1920,
-            height: 1080,
+            width: 3840,
+            height: 2160,
         };
         assert_eq!(
             openh264_fallback_retarget_size(fitted, requested, false).unwrap(),
@@ -13789,6 +14323,31 @@ mod tests {
             ),
             arcen_media::video::EncoderRequest::SoftwareH264
         );
+        // Auto that chose Media Foundation hardware names it to capenc, so
+        // the child never re-runs NVENC on a non-NVIDIA adapter.
+        assert_eq!(
+            capenc_encoder_for_attempt(
+                arcen_media::video::EncoderRequest::Auto,
+                arcen_media::video::EncoderRequest::MediaFoundationHardware,
+            ),
+            arcen_media::video::EncoderRequest::MediaFoundationHardware
+        );
+        assert!(exact_nvidia_display(
+            arcen_media::video::EncoderRequest::MediaFoundationHardware,
+            true
+        ));
+        assert!(!exact_nvidia_display(
+            arcen_media::video::EncoderRequest::MediaFoundationHardware,
+            false
+        ));
+        assert!(!exact_nvidia_display(
+            arcen_media::video::EncoderRequest::SoftwareH264,
+            true
+        ));
+        assert!(lab_prefers_media_foundation(Some("prefer")));
+        assert!(lab_prefers_media_foundation(Some(" PREFER ")));
+        assert!(!lab_prefers_media_foundation(Some("1")));
+        assert!(!lab_prefers_media_foundation(None));
         assert!(
             openh264_fallback_retarget_size(requested, requested, false).is_err(),
             "reconnect must not hide a second display modeset"
@@ -13830,14 +14389,20 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
+            media_foundation_codecs: Vec::new(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
+            ),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
             lossless_refinement: true,
             deck_refine: None,
+            deck_canvas: None,
+            software_cpu_share: arcen_media::canvas::CpuShare::default(),
         };
         assert_eq!(next_adaptive_nvenc_codec(&config), Some(VideoCodec::H265));
         config.codec = VideoCodec::H265;
@@ -14056,14 +14621,20 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
+            media_foundation_codecs: Vec::new(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
+            ),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
             lossless_refinement: true,
             deck_refine: None,
+            deck_canvas: None,
+            software_cpu_share: arcen_media::canvas::CpuShare::default(),
         };
 
         assert!(
@@ -14128,14 +14699,20 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
+            media_foundation_codecs: Vec::new(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
+            ),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
             lossless_refinement: true,
             deck_refine: None,
+            deck_canvas: None,
+            software_cpu_share: arcen_media::canvas::CpuShare::default(),
         };
         let report = DisplayReport {
             requested: DisplaySize {
@@ -14938,14 +15515,20 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
+            media_foundation_codecs: Vec::new(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
+            ),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
             lossless_refinement: true,
             deck_refine: None,
+            deck_canvas: None,
+            software_cpu_share: arcen_media::canvas::CpuShare::default(),
         };
         let report = DisplayReport {
             requested: DisplaySize {
@@ -15100,6 +15683,7 @@ mod tests {
                 cursor_mode: CursorMode::Local,
                 session_log_id: CorrelationId::from_uuid_v4_bytes([0; 16]),
                 refine: None,
+                canvas: None,
             })
             .await
             .unwrap();
@@ -15180,14 +15764,20 @@ mod tests {
             clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
             timezone_redirection: false,
             font_smoothing: Default::default(),
+            media_foundation_hardware: true,
+            media_foundation_codecs: Vec::new(),
             reconnect_window_secs: 0,
             qos_targets: arcen_telemetry::QosTargets::default(),
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
+            ),
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
             lossless_refinement: true,
             deck_refine: None,
+            deck_canvas: None,
+            software_cpu_share: arcen_media::canvas::CpuShare::default(),
         };
         let report = DisplayReport {
             requested: DisplaySize {
@@ -16724,7 +17314,7 @@ fn test_media_plan(
 ) -> ResolvedMediaPlan {
     let software = matches!(
         backend,
-        arcen_media::video::EncoderBackend::WindowsMediaFoundation
+        arcen_media::video::EncoderBackend::MediaFoundationHardware
             | arcen_media::video::EncoderBackend::OpenH264
     );
     ResolvedMediaPlan {

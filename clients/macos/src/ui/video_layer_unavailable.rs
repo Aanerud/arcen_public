@@ -27,14 +27,29 @@ pub struct DedicatedLayerFrame {
     pub refine: Option<RefineFrameTag>,
 }
 
+/// What the eight-bit layer shows; off macOS only an (uninhabited)
+/// picture, since there is no canvas executor.
+#[derive(Debug, Clone)]
+pub enum EightBitLayerSource {
+    Picture(NativePixelBuffer),
+}
+
 /// An eight-bit frame for the Metal layer; uninhabited off macOS too.
 #[derive(Debug, Clone)]
 pub struct DedicatedEightBitLayerFrame {
-    pub pixel_buffer: NativePixelBuffer,
+    pub source: EightBitLayerSource,
     pub contract: VideoColorContract,
     pub arrival_host_time: Duration,
     pub source_fps: Option<u32>,
     pub timing: arcen_media::video::PresentTiming,
+}
+
+impl DedicatedEightBitLayerFrame {
+    pub(crate) fn pixel_buffer(&self) -> Option<&NativePixelBuffer> {
+        match &self.source {
+            EightBitLayerSource::Picture(picture) => Some(picture),
+        }
+    }
 }
 
 /// Monotonic time since the first call; the Metal path uses the host clock.
@@ -118,8 +133,12 @@ impl DedicatedEightBitVideoPresenter {
         &mut self,
         frame: &DedicatedEightBitLayerFrame,
     ) -> DedicatedEightBitPresentationStatus {
-        match frame.pixel_buffer {}
+        match frame.source {
+            EightBitLayerSource::Picture(ref picture) => match *picture {},
+        }
     }
+
+    pub(crate) fn release_canvas(&mut self) {}
 
     pub(crate) fn set_surface_visible(&mut self, _visible: bool) {}
 

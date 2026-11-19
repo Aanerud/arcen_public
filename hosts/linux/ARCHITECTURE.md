@@ -328,11 +328,52 @@ virtual input boundary*).
 The keyboard is also an ordinary kernel keyboard, so the kernel's SysRq filter
 reads it whatever owns the screen. PrintScreen is therefore sent as
 `KEY_PRINT` (210, X keycode 218, keysym `Print`) and never as `KEY_SYSRQ`
-(`input/keymap.rs::kernel_safe_key`). The dedicated Xorg keeps `vt1` in
+(`input/keymap.rs::kernel_safe_key`); the committed-text path never types
+on or holds keycode 107 either, whatever an X client maps there. The dedicated Xorg keeps `vt1` in
 keyboard-off mode with `DontVTSwitch`/`-novtswitch`, so while it owns the
 screen the kernel acts on no other combination (no Ctrl+Alt+Del, no
 Alt+F*n* or Ctrl+Alt+F*n* console switch) except a secure-attention key if the
 console keymap binds one.
+
+That holds only while a display server owns the foreground virtual
+terminal. The kernel's console keyboard handler hands every keyboard's keys
+to the foreground terminal, so with a text console in front (someone at the
+desk switched to one, or the joined console's X server is not in front) a
+Deck's Ctrl+Alt+Del would be the console keymap's `Boot` (systemd's
+`ctrl-alt-del.target`, a reboot), Alt+F*n* would switch consoles, and typing
+would reach that console's login prompt. `input/console_guard.rs` reads the
+foreground terminal's keyboard mode (`KDGKBMODE` on `/dev/tty0`) before every
+key message and committed text (a release too: it carries the modifier and
+lock state the Pier presses from). Key input goes through only in
+keyboard-off mode (`K_OFF`, which Xorg and logind set for a display server) or on a host
+without virtual terminals; otherwise it is refused, the held keys are let
+go once, and the Pier logs the change both ways.
+
+Every X server the Pier starts has `Option "DontZap" "true"` in its
+`ServerFlags` (`session/launcher.rs::with_dont_zap`, replacing any value the
+template sets), so Ctrl+Alt+Backspace cannot end the desktop even under a
+layout with `terminate:ctrl_alt_bksp`. A joined console's X server is the
+user's own and keeps its own setting.
+
+### Keys outside the main block
+
+Insert, Print Screen, Scroll Lock, Pause, Menu and F13–F24 come from the
+shared table `arcen_input::keyboard::host_keys` (`input/keymap.rs`): Menu is
+`KEY_COMPOSE` (127, keysym `Menu`) and F13–F24 are `KEY_F13`…`KEY_F24`
+(183–194), on Xorg and Wayland alike, and the hello advertises them
+(`pc_keys`). Stock keymaps give F13–F24 other keysyms (`XF86Tools`,
+`XF86Launch5`…`9`, `XF86AudioMicMute`, `XF86Touchpad*`, or none), so on an
+Xorg session the committed-text connection gives keycodes 191–202 their own
+keysyms (`F13` … `F24`) at attach, again after the session reloads its
+layout and before each press, and gives them their symbols back when the
+attachment ends (`input/x11_text.rs::pin_function_keys`). It is done ahead
+of the first press because a desktop grabs keys by keycode and moves its
+grabs only once it has read the new mapping: changed at its own press, F13
+reached GNOME's `XF86Tools` grab and F20 its mic-mute grab (measured on the
+lab's GNOME 40). On a joined console the desk's own F13–F24 type F13–F24
+too while a Deck is attached. A Wayland session uses the
+compositor's keymap; xkeyboard-config 2.43 and later offer
+`fkeys:basic_13-24` for F13–F24 keysyms there.
 
 ## Committed text on Xorg (0.18.0)
 
@@ -346,8 +387,10 @@ active group:
 - **By key** when the active group has the character at the base, Shift,
   `AltGr` or Shift+`AltGr` level (the last two only with an
   `ISO_Level3_Shift` key) and no key is held.
-- **By a borrowed key** otherwise: one of F13–F24 or two Japanese keys,
-  only while the server maps nothing to them, is mapped to the character's
+- **By a borrowed key** otherwise: one of the Japanese, Korean or Yen keys
+  or a few rare keys the stock keymap leaves empty (`KEY_MACRO`,
+  `KEY_SETUP`, `KEY_EDIT`…), never F13–F24 or Menu, only while the server
+  maps nothing to them, is mapped to the character's
   keysym at both levels for as long as it is needed and given back after two
   idle seconds. Keys the kernel or logind act on (power, sleep, `SysRq`) are
   never borrowed.

@@ -373,3 +373,58 @@ fragment float4 fs_convert_refined_ycbcr(
     }
     return convert_codes(in, plane0, plane1, u);
 }
+
+// ---------------------------------------------------------------------------
+// The eight-bit canvas (ADR 0028; `canvas_metal.rs`). Every pass renders
+// into the persistent `BGRA8Unorm` canvas with the full-canvas viewport and
+// a scissor rectangle per operation, so `in.position.xy` is the canvas
+// pixel's centre. A unorm8 store of `code / 255.0` is the code exactly.
+// ---------------------------------------------------------------------------
+
+// A fill's opaque colour, `code / 255.0` per channel.
+fragment float4 fs_canvas_fill(constant float4& colour [[buffer(0)]]) {
+    return colour;
+}
+
+// Where a surface picture lands: `dest` on the canvas, `picture` its size.
+struct CanvasPaint {
+    uint dest_x;
+    uint dest_y;
+    uint dest_width;
+    uint dest_height;
+    uint picture_width;
+    uint picture_height;
+};
+
+// A surface paint: the canvas pixel takes the picture's nearest sample
+// (`(x - dest_x) * picture_width / dest_width`, integer division, as the
+// CPU executor `CanvasPixels` scales), converted exactly as `fs_convert`
+// converts that picture pixel at the picture's own size.
+fragment float4 fs_canvas_surface(
+    VsOut in [[stage_in]],
+    texture2d<float, access::sample> plane0 [[texture(0)]],
+    texture2d<float, access::read> plane1 [[texture(1)]],
+    constant VideoUniform& u [[buffer(0)]],
+    constant CanvasPaint& paint [[buffer(1)]]
+) {
+    uint2 canvas = uint2(in.position.xy);
+    uint source_x = (canvas.x - paint.dest_x) * paint.picture_width / paint.dest_width;
+    uint source_y = (canvas.y - paint.dest_y) * paint.picture_height / paint.dest_height;
+    VsOut source = in;
+    source.uv = (float2(source_x, source_y) + 0.5)
+        / float2(paint.picture_width, paint.picture_height);
+    return convert_codes(source, plane0, plane1, u);
+}
+
+// Presents the canvas: the drawable is the canvas's size, one texel each
+// (a drawable of another size, mid-resize, never reads past the canvas).
+fragment float4 fs_canvas_present(
+    VsOut in [[stage_in]],
+    texture2d<float, access::read> canvas [[texture(0)]]
+) {
+    uint2 at = uint2(in.position.xy);
+    if (at.x >= canvas.get_width() || at.y >= canvas.get_height()) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    return float4(canvas.read(at).rgb, 1.0);
+}

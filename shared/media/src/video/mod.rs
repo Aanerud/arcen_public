@@ -15,6 +15,7 @@ pub mod compositor_fidelity;
 mod convert;
 mod desktop_depth;
 mod desktop_encoding;
+mod encoder_proof;
 mod fps_limiter;
 mod frame;
 mod frame_queue;
@@ -35,9 +36,9 @@ mod software_av1;
 #[allow(unsafe_code)]
 mod software_h264;
 #[cfg(feature = "software-h264-source")]
-mod software_loop;
-#[cfg(feature = "software-h264-source")]
 mod software_session;
+#[cfg(feature = "software-h264-source")]
+mod software_surfaces;
 mod variant;
 mod wire_frame;
 
@@ -77,11 +78,12 @@ pub use capture_surface::{
 pub use convert::{
     BT2020_TO_BT709, ColorTransform, ConversionError, FrameRegion, PQ_PEAK_NITS, PackedRgb10Layout,
     Rgb10Signal, SCRGB_CONVERSION_TEST_VECTORS, SCRGB_REFERENCE_WHITE_NITS,
-    ScrgbConversionTestVector, ScrgbPqTransform, ScrgbSdrTransform, WIDE_INPUT_MAX,
-    convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_bgra_to_i444,
-    convert_bgra_to_i444_p16, convert_bgra_to_i444_p16_rows, convert_bgra_to_i444_rows,
-    convert_bgra_to_nv12, convert_bgra_to_nv12_rows, convert_packed_rgb10_region_to_i444_p16,
-    convert_packed_rgb10_to_bgra8, convert_packed_rgb10_to_i444_p16, convert_packed_rgb10_to_p010,
+    ScrgbConversionTestVector, ScrgbPqTransform, ScrgbSdrTransform, StageDamage, WIDE_INPUT_MAX,
+    convert_bgra_to_i420, convert_bgra_to_i420_rows, convert_bgra_to_i420_rows_parallel,
+    convert_bgra_to_i444, convert_bgra_to_i444_p16, convert_bgra_to_i444_p16_rows,
+    convert_bgra_to_i444_rows, convert_bgra_to_nv12, convert_bgra_to_nv12_rows,
+    convert_packed_rgb10_region_to_i444_p16, convert_packed_rgb10_to_bgra8,
+    convert_packed_rgb10_to_i444_p16, convert_packed_rgb10_to_p010,
     convert_rgba_f16_pq_to_packed_rgb10, convert_scrgb_to_pq_i444_p16,
     convert_scrgb_to_sdr_i444_p16, half_to_f32, linear_nits_to_pq_signal, linear_to_bt709,
     linear_to_srgb, pq_bt2020_to_scrgb, pq_signal_to_linear_nits, scrgb_component_to_pq_code,
@@ -94,6 +96,10 @@ pub(crate) use desktop_encoding::fidelity_sdr_transfer;
 pub use desktop_encoding::{
     DesktopPlan, DesktopPlanError, DesktopSignalEncoding, conversion_for_output,
     resolve_desktop_plan, sdr_desktop_transfer, serve_sdr_desktop,
+};
+pub use encoder_proof::{
+    EncoderProofError, HardwareEncoderAdmission, MAX_ENCODER_NAME_CHARS, admitted_profile,
+    prove_encoded_access_unit, sequence_format,
 };
 pub use fps_limiter::{FrameRateLimiter, FrameRateVerdict, FrameRateWindow, classify_frame_rate};
 pub use frame::{
@@ -110,9 +116,9 @@ pub use frame_queue::{
 pub use frame_rate::{
     DISPLAY_REFRESH_FALLBACK_HZ, FrameRateBasis, FrameRatePolicy, FrameRateRequest,
     GOVERNOR_FIRST_HOLD_SECS, GOVERNOR_MAX_HOLD_SECS, GOVERNOR_MIN_FPS, GOVERNOR_SHORT_WINDOWS,
-    GOVERNOR_WINDOWS, GovernorReason, GovernorStep, HostRateGovernor, MAX_SESSION_FPS,
-    SerialPacing, SessionFrameRate, SourceEvidence, UNQUALIFIED_COPY_FPS, monitor_frame_rate,
-    resolve_session_frame_rate, served_stream_rate,
+    GOVERNOR_SOFTWARE_MIN_FPS, GOVERNOR_WINDOWS, GovernorReason, GovernorStep, HostRateGovernor,
+    MAX_SESSION_FPS, SerialPacing, SessionFrameRate, SourceEvidence, UNQUALIFIED_COPY_FPS,
+    monitor_frame_rate, resolve_session_frame_rate, served_stream_rate,
 };
 pub use host_converted_capture::{
     HOST_CONVERTED_CAPTURE_MAX_EDGE, HOST_CONVERTED_CAPTURE_MAX_PIXELS, fit_host_converted_capture,
@@ -129,23 +135,24 @@ pub use pipeline::{
     PipelineQpMapDefault, PresentTiming, QueuePolicy, RawFrameOverflowDisposition,
     RawFrameOverflowPolicy, ServedPipelineContext, SoftwareFallbackDecision,
     aggregate_encoder_backend, aggregate_plan_encoder_backend, clamp_live_bitrate_target,
-    coded_fidelity_refusal, operational_bitrate_bounds, operational_encode_intent,
-    operational_encoder_bitrate_bounds, operational_keyframe_policy, operational_motion_priority,
-    operational_pipeline, operational_present_timing, operational_rate_control_policy,
-    pipeline_codec_ladder, pipeline_contract, pipeline_for_epoch, pipeline_for_request,
-    proven_path_ceiling_bps, resolve_request_pipeline, served_pipeline,
+    coded_fidelity_refusal, eight_bit_hardware_refusal, operational_bitrate_bounds,
+    operational_encode_intent, operational_encoder_bitrate_bounds, operational_keyframe_policy,
+    operational_motion_priority, operational_pipeline, operational_present_timing,
+    operational_rate_control_policy, pipeline_codec_ladder, pipeline_contract, pipeline_for_epoch,
+    pipeline_for_request, proven_path_ceiling_bps, resolve_request_pipeline, served_pipeline,
     served_pipeline_wants_display_hdr, session_wants_display_hdr, software_fallback_decision,
     software_fallback_decision_after_hardware,
 };
 pub use plan::{
-    AcceleratorClass, BackendAvailability, BackendCandidate, BackendLimits,
-    BackendUnavailableNotice, BackendUnavailableReason, CaptureBackend, ConversionBackend,
-    EncoderBackend, EncoderRequest, MediaPlanError, MediaRequest, NVENC_H264_MAX_DIMENSION,
-    PlanDegradation, ReadyExpectation, ReadyProtocolError, ResolvedMediaPlan,
-    UnavailableProtocolError, codec_dimension_ceiling, codec_fits_dimensions, format_ready_v1,
-    format_ready_v1_with_capture, format_ready_v1_with_capture_and_conversion,
-    format_unavailable_v1, parse_ready_capture, parse_ready_conversion, parse_ready_v1,
-    parse_unavailable_v1, resolve_media_plan, resolve_media_plan_degrading,
+    AcceleratorClass, AutoEncoderEvidence, BackendAvailability, BackendCandidate, BackendLimits,
+    BackendMaturity, BackendUnavailableNotice, BackendUnavailableReason, CaptureBackend,
+    ConversionBackend, EncoderBackend, EncoderRequest, MediaPlanError, MediaRequest,
+    NVENC_H264_MAX_DIMENSION, PlanDegradation, ReadyExpectation, ReadyProtocolError,
+    ResolvedMediaPlan, UnavailableProtocolError, codec_dimension_ceiling, codec_fits_dimensions,
+    encoder_backend_display_name, format_ready_v1, format_ready_v1_with_capture,
+    format_ready_v1_with_capture_and_conversion, format_unavailable_v1, parse_ready_capture,
+    parse_ready_conversion, parse_ready_v1, parse_unavailable_v1, resolve_media_plan,
+    resolve_media_plan_degrading,
 };
 pub use policy::{
     ClientColorRequest, ColorCeiling, ColorMatrixCapabilities, ColorPolicy, HostInitialVideoError,
@@ -169,16 +176,19 @@ pub use software_av1::{
 };
 #[cfg(feature = "software-h264-source")]
 pub use software_h264::{
-    EncodedAccessUnit, EncodedFrameKind, MAX_SOFTWARE_H264_ACCESS_UNIT_BYTES, SoftwareH264Config,
-    SoftwareH264Encoder, SoftwareH264Error, SoftwareH264Stats,
+    EncodedAccessUnit, EncodedFrameKind, MAX_SOFTWARE_H264_ACCESS_UNIT_BYTES,
+    MAX_SOFTWARE_H264_FPS, MAX_SOFTWARE_H264_THREADS, SoftwareH264Config, SoftwareH264Content,
+    SoftwareH264Encoder, SoftwareH264Error, SoftwareH264Stats, SoftwareH264Threading,
 };
-#[cfg(feature = "software-h264-source")]
-pub use software_loop::{LoopStats, SoftwareEncodeLoop, StagedPicture};
 #[cfg(feature = "software-h264-source")]
 pub use software_session::{
-    LiveChange, SoftwareH264Session, SoftwareSessionConfig, SoftwareSessionError, StageDamage,
-    software_bitrate_bounds,
+    LiveChange, MIN_GRANTED_BPS, SoftwareH264Session, SoftwareRate, SoftwareSessionConfig,
+    SoftwareSessionError, software_bitrate_bounds,
 };
+#[cfg(all(feature = "software-h264-source", feature = "refine-zstd-encode"))]
+pub use software_surfaces::{SoftwareLoop, open_software_loop};
+#[cfg(feature = "software-h264-source")]
+pub use software_surfaces::{SoftwareLoopConfig, SoftwareSurfaces};
 pub use variant::{PROBE_MATRIX, VariantIdError, VideoVariant};
 pub use wire_frame::{
     FramedVideoCodec, VideoWireProfile, VideoWireRoute, video_frame_message, video_header,

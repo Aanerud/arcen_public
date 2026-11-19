@@ -261,6 +261,43 @@ pub fn extract_packed_rgb10(
     TileCodes::new(rect.width, rect.height, samples)
 }
 
+/// Copies `rect` out of an eight-bit BGRA frame (`stride` bytes per row)
+/// into planar R′G′B′ codes, each 8-bit sample widened to a `u16` code
+/// without scaling (an 8-bit code stays an 8-bit code). Alpha is dropped.
+///
+/// # Errors
+///
+/// [`TileError::Geometry`] or [`TileError::Source`].
+pub fn extract_bgra8(
+    src: &[u8],
+    stride: usize,
+    grid: RefineGrid,
+    rect: TileRect,
+) -> Result<TileCodes, TileError> {
+    grid.check(rect)?;
+    let needed = stride
+        .checked_mul(grid.height as usize)
+        .ok_or(TileError::Source)?;
+    if stride < grid.width as usize * 4 || src.len() < needed {
+        return Err(TileError::Source);
+    }
+    let pixels = rect.pixels();
+    let mut samples = vec![0_u16; pixels * 3];
+    let (r_plane, g_and_b) = samples.split_at_mut(pixels);
+    let (g_plane, b_plane) = g_and_b.split_at_mut(pixels);
+    let mut out = 0;
+    for row in rect.y..rect.y + rect.height {
+        let row_start = row as usize * stride + rect.x as usize * 4;
+        for bgra in src[row_start..row_start + rect.width as usize * 4].chunks_exact(4) {
+            b_plane[out] = u16::from(bgra[0]);
+            g_plane[out] = u16::from(bgra[1]);
+            r_plane[out] = u16::from(bgra[2]);
+            out += 1;
+        }
+    }
+    TileCodes::new(rect.width, rect.height, samples)
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

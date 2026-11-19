@@ -869,6 +869,7 @@ mod lab {
             tablet_mode_requested: arcen_protocol::messages::TabletModeMsg::DisabledMouseCompat,
             telemetry: Arc::new(arcen_deck_core::client_telemetry::ClientTelemetry::default()),
             exact_still_image: false,
+            canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
             services: dyn_services,
         };
         let mut auth = Some(AuthSubmission { username, password });

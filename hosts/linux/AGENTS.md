@@ -14,7 +14,10 @@ single-platform `--workspace` build. Platform behavior requires Linux
 integration coverage.
 
 Building requires `libpam0g-dev` and `libpulse-dev`. NVENC capture requires an
-NVIDIA GPU and driver on the build/test host.
+NVIDIA GPU and driver on the build/test host. The software encoder also needs
+`nasm` on the build host: without it OpenH264 silently builds without its
+assembly and encodes three to four times slower. Run
+`scripts/verify-openh264-assembly.sh target/release` on every release build.
 
 ## Capture pipeline boundaries
 
@@ -92,7 +95,17 @@ NVIDIA GPU and driver on the build/test host.
   `usb_bridge::seat::x11_isolation` proves every running X server keeps it
   out, and never tell a user to sign out for it.
 - Never emit `KEY_SYSRQ` from a kernel virtual keyboard
-  (`input/keymap.rs::kernel_safe_key`).
+  (`input/keymap.rs::kernel_safe_key`), the committed-text path included
+  (`input/x11_text.rs::CoreKeymap::evdev` never yields it, whatever the
+  session's keymap puts at keycode 107).
+- Never send key input (presses, or releases, which carry modifier and lock state) to the uinput keyboard while the foreground virtual
+  terminal reads kernel keyboards (`input/console_guard.rs`: only `K_OFF`
+  or no VTs admit keys); a text console in front would take a Deck's
+  Ctrl+Alt+Del as a reboot. Every Arcen X server keeps `DontZap`
+  (`session/launcher.rs::with_dont_zap`).
+- Keys outside the main block come from the shared
+  `arcen_input::keyboard::host_keys` table; F13–F24 and Menu are pressed as
+  keys and never borrowed for committed text (`BORROWABLE_EVDEV`).
 - The Xorg session's layout reaches a Deck that types committed text as a
   `host_keymap` notice (source `x11_core_keymap`), as on Wayland: the
   committed-text connection (`input/x11_text.rs`) reads the core keyboard
@@ -292,7 +305,8 @@ NVIDIA GPU and driver on the build/test host.
   offered wide format (Mutter's shm screencast paints eight-bit).
 - A Wayland host without a usable NVENC still streams: `encoder=software-h264`
   runs capenc's separate `linux-wayland-software` composition (shared memory
-  only, the shared `SoftwareH264Session` and Keel-gated loop, no CUDA).
+  only, the shared software loop `arcen_media::canvas::CanvasEncodeLoop`
+  with `PipeWire`'s damage regions, no CUDA).
   Selection never requires NVIDIA, only a render node a session can open;
   the qualification probes the native encoder and records
   `facts.encoder.native`, and a host without one sizes each session's

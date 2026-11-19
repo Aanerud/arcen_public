@@ -8,7 +8,7 @@
 //! copy and returns what the user asked for ([`SettingsAction`]). The shell
 //! compares, persists and applies, exactly once per pass.
 
-use arcen_input::keyboard::DeckShortcut;
+use arcen_input::pen_buttons::{PenButtonAction, PenButtonSettings};
 use arcen_input::text::paste::PasteSettings;
 use arcen_input::text::{OptionKeyPreference, TypingMode};
 use arcen_protocol::messages::{ClientMonitor, ClipboardPolicyMsg, CursorMode, TabletModeMsg};
@@ -61,6 +61,11 @@ pub const EXACT_STILL_IMAGE_DESCRIPTION: &str = "When the picture stops moving, 
 exact pixels, losslessly, and the Deck checks them. Grading and HDR only, when the host offers \
 it; uses spare bandwidth only while the picture is still. Applies from the next connection.";
 
+/// What the Canvas screen updates switch does (ADR 0028).
+pub const CANVAS_DESCRIPTION: &str = "With a host that encodes in software, this Deck keeps the \
+picture and the host sends only what changed: moved areas as copies, text and controls as exact \
+tiles, and video only where things move. Applies from the next connection.";
+
 /// Why HDR cannot be chosen. On Windows the usual cause is "Use HDR" being
 /// off for the display (PARITY Q-13).
 #[must_use]
@@ -102,7 +107,10 @@ pub struct SettingsValues {
     pub clipboard_enabled: bool,
     pub microphone_enabled: bool,
     pub tablet_mode_requested: TabletModeMsg,
+    pub pen_buttons: PenButtonSettings,
     pub exact_still_image: bool,
+    pub canvas: bool,
+    pub keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
 }
 
 impl SettingsValues {
@@ -131,7 +139,10 @@ impl SettingsValues {
             clipboard_enabled: settings.clipboard_enabled,
             microphone_enabled: settings.microphone_enabled,
             tablet_mode_requested: settings.tablet_mode_requested,
+            pen_buttons: settings.pen_buttons,
             exact_still_image: settings.exact_still_image,
+            canvas: settings.canvas,
+            keyboard_capture: settings.keyboard_capture,
         }
     }
 
@@ -164,7 +175,10 @@ impl SettingsValues {
         settings.microphone_enabled = self.microphone_enabled;
         settings.tablet_mode_requested = self.tablet_mode_requested;
         settings.tablet_input_enabled = tablet_input_enabled;
+        settings.pen_buttons = self.pen_buttons;
         settings.exact_still_image = self.exact_still_image;
+        settings.canvas = self.canvas;
+        settings.keyboard_capture = self.keyboard_capture;
         changed
     }
 }
@@ -378,6 +392,10 @@ pub struct SettingsFacts<'a> {
     /// The selected saved connection's own Displays choice, which wins over
     /// Settings › Displays for it: its name and the mode.
     pub connection_displays: Option<(String, DisplaysMode)>,
+    /// Whether this Deck can hold a canvas (its presenter has a canvas
+    /// executor, `crate::canvas::CanvasRequest::for_sink`): the Canvas
+    /// screen updates switch is shown only then.
+    pub canvas_available: bool,
 }
 
 /// What the user asked for on the Settings screen, besides editing values.
@@ -516,7 +534,10 @@ pub fn render_settings(
         mut clipboard_enabled,
         mut microphone_enabled,
         mut tablet_mode_requested,
+        mut pen_buttons,
         mut exact_still_image,
+        mut canvas,
+        mut keyboard_capture,
     } = values.clone();
     let initial_streaming_preset = StreamingPreset::from_settings(performance, color_fidelity);
     let mut streaming_preset = initial_streaming_preset;
@@ -725,6 +746,14 @@ pub fn render_settings(
                             egui::RichText::new(EXACT_STILL_IMAGE_DESCRIPTION)
                                 .color(egui::Color32::DARK_GRAY),
                         );
+                        if facts.canvas_available {
+                            ui.add_space(12.0);
+                            ui.checkbox(&mut canvas, "Canvas screen updates");
+                            ui.label(
+                                egui::RichText::new(CANVAS_DESCRIPTION)
+                                    .color(egui::Color32::DARK_GRAY),
+                            );
+                        }
                         ui.add_space(12.0);
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Colour check…").clicked() {
@@ -1137,6 +1166,35 @@ pub fn render_settings(
                              into the captured video. This can feel less responsive and depends \
                              on the capture backend including the cursor.",
                         );
+                        if platform == DeckPlatform::Pc {
+                            ui.add_space(24.0);
+                            ui.label(
+                                egui::RichText::new("System shortcuts go to")
+                                    .color(egui::Color32::BLACK)
+                                    .size(19.0),
+                            );
+                            ui.add_space(10.0);
+                            for policy in arcen_input::keyboard::KeyboardCapturePolicy::ALL {
+                                settings_radio(
+                                    ui,
+                                    &mut keyboard_capture,
+                                    policy,
+                                    (policy == arcen_input::keyboard::KeyboardCapturePolicy::Host)
+                                        .then_some("(Recommended)"),
+                                    super::keyboard_help::capture_policy_label(policy),
+                                    &super::keyboard_help::capture_policy_help(policy, platform),
+                                );
+                            }
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Help ▸ Keyboard Shortcuts lists every key Arcen Deck keeps \
+                                     and the keys Connection ▸ Send Key sends.",
+                                )
+                                .color(egui::Color32::DARK_GRAY)
+                                .size(12.0),
+                            );
+                        }
                         ui.add_space(24.0);
                         ui.label(
                             egui::RichText::new("Typing")
@@ -1235,13 +1293,11 @@ pub fn render_settings(
                             }
                             ui.add_space(10.0);
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "The Connection menu's Keyboard: Characters ({}) switches a session \
-                                     to characters and Physical Keys ({}) back; a saved \
-                                     connection can start in either.",
-                                    super::wording::chord(platform, DeckShortcut::KeyboardCharacters),
-                                    super::wording::chord(platform, DeckShortcut::KeyboardPhysical),
-                                ))
+                                egui::RichText::new(
+                                    "The Connection menu's Keyboard: Characters switches a session \
+                                     to characters and Physical Keys back; a saved connection can \
+                                     start in either.",
+                                )
                                 .color(egui::Color32::DARK_GRAY)
                                 .size(12.0),
                             );
@@ -1255,10 +1311,9 @@ pub fn render_settings(
                         ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new(format!(
-                                "The Connection menu's Paste as Keystrokes ({}) types {} \
-                                 clipboard text into the remote computer, for sign-in screens \
-                                 and consoles that clipboard sharing cannot reach. Esc stops it.",
-                                super::wording::chord(platform, DeckShortcut::PasteAsKeystrokes),
+                                "The Connection menu's Paste as Keystrokes types {} clipboard \
+                                 text into the remote computer, for sign-in screens and consoles \
+                                 that clipboard sharing cannot reach. Esc stops it.",
                                 platform.this_machines(),
                             ))
                             .color(egui::Color32::DARK_GRAY)
@@ -1338,6 +1393,9 @@ pub fn render_settings(
                             tablet_mode_label(TabletModeMsg::LocalTermination),
                             &tablet_mode_description(TabletModeMsg::LocalTermination, platform),
                         );
+                        if tablet_mode_requested == TabletModeMsg::LocalTermination {
+                            pen_button_rows(ui, platform, &mut pen_buttons);
+                        }
                         // The helper control sits on the option's own row and
                         // states where the helper stands, because that is the
                         // one prerequisite the user can act on from here. It
@@ -1816,9 +1874,64 @@ pub fn render_settings(
         clipboard_enabled,
         microphone_enabled,
         tablet_mode_requested,
+        pen_buttons,
         exact_still_image,
+        canvas,
+        keyboard_capture,
     };
     actions
+}
+
+/// The pen-button rows under Tablet support: the buttons this Deck's
+/// operating system reports (Windows Ink's one barrel button, or a Mac pen's
+/// lower and upper side switch), and what each clicks on the host.
+fn pen_button_rows(ui: &mut egui::Ui, platform: DeckPlatform, buttons: &mut PenButtonSettings) {
+    let rows: Vec<(&str, &str, &mut PenButtonAction)> = match platform {
+        DeckPlatform::Pc => vec![("pen_barrel_button", "Pen button", &mut buttons.barrel)],
+        DeckPlatform::Mac => vec![
+            ("pen_lower_button", "Lower pen button", &mut buttons.lower),
+            ("pen_upper_button", "Upper pen button", &mut buttons.upper),
+        ],
+    };
+    for (id, label, action) in rows {
+        ui.horizontal(|ui| {
+            ui.add_space(28.0);
+            ui.label(label);
+            egui::ComboBox::from_id_salt(id)
+                .selected_text(action.label())
+                .show_ui(ui, |ui| {
+                    for choice in PenButtonAction::ALL {
+                        ui.selectable_value(&mut *action, choice, choice.label());
+                    }
+                });
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(28.0);
+        ui.label(
+            egui::RichText::new(pen_button_note(platform))
+                .color(egui::Color32::GRAY)
+                .size(11.0),
+        );
+    });
+    ui.add_space(8.0);
+}
+
+/// The note under the pen-button rows.
+#[must_use]
+pub const fn pen_button_note(platform: DeckPlatform) -> &'static str {
+    match platform {
+        DeckPlatform::Pc => {
+            "Windows Ink reports one pen button: the one your tablet's settings set to Right \
+             Click. A pen button your tablet's settings set to a mouse click (Middle Click, \
+             Right Click or Left Click) clicks that on the host."
+        }
+        DeckPlatform::Mac => {
+            "A pen button your tablet's settings set to a mouse click (Right Click, Middle \
+             Click) clicks that on the host; these choices apply to a button it leaves to the \
+             application."
+        }
+    }
 }
 
 /// The few phrases that name the machine, its operating system or its keys.
@@ -1892,22 +2005,24 @@ mod words {
 mod tests {
     use super::*;
 
+    use arcen_input::keyboard::DeckShortcut;
+
     #[test]
     fn the_mac_spells_its_chords_as_its_menus_do() {
         let mac = |shortcut| super::super::wording::chord(DeckPlatform::Mac, shortcut);
-        assert_eq!(mac(DeckShortcut::KeyboardCharacters), "Control-Command-U");
-        assert_eq!(mac(DeckShortcut::KeyboardPhysical), "Control-Command-K");
-        assert_eq!(
-            mac(DeckShortcut::PasteAsKeystrokes),
-            "Control-Option-Command-V"
-        );
+        assert_eq!(mac(DeckShortcut::ReleaseKeyboard), "Control-Option-Home");
+        assert_eq!(mac(DeckShortcut::Disconnect), "Control-Option-F12");
+        // Menu items without a chord.
+        assert_eq!(mac(DeckShortcut::KeyboardCharacters), "");
+        assert_eq!(mac(DeckShortcut::PasteAsKeystrokes), "");
     }
 
     #[test]
     fn the_pc_transliterates_and_keeps_its_own_fullscreen_and_quit() {
         let pc = |shortcut| super::super::wording::chord(DeckPlatform::Pc, shortcut);
-        assert_eq!(pc(DeckShortcut::KeyboardCharacters), "Ctrl+Win+U");
-        assert_eq!(pc(DeckShortcut::PasteAsKeystrokes), "Ctrl+Alt+Win+V");
+        assert_eq!(pc(DeckShortcut::KeyboardCharacters), "");
+        assert_eq!(pc(DeckShortcut::PasteAsKeystrokes), "");
+        assert_eq!(pc(DeckShortcut::ReleaseKeyboard), "Ctrl+Alt+Home");
         assert_eq!(pc(DeckShortcut::Disconnect), "Ctrl+Alt+F12");
         assert_eq!(pc(DeckShortcut::ToggleFullscreen), "Ctrl+Alt+Break");
         assert_eq!(pc(DeckShortcut::Quit), "Alt+F4");
@@ -2095,7 +2210,10 @@ mod tests {
             clipboard_enabled: true,
             microphone_enabled: false,
             tablet_mode_requested: TabletModeMsg::LocalTermination,
+            pen_buttons: PenButtonSettings::default(),
             exact_still_image: true,
+            canvas: true,
+            keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Host,
         }
     }
 
@@ -2111,6 +2229,7 @@ mod tests {
 
         values.tablet_mode_requested = TabletModeMsg::DisabledMouseCompat;
         values.exact_still_image = !saved.exact_still_image;
+        values.canvas = !saved.canvas;
         assert!(values.apply_to(&mut written));
         assert_eq!(
             written.tablet_mode_requested,
@@ -2155,6 +2274,7 @@ mod tests {
                 decode: Some(report.clone()),
                 support_bundle: None,
                 connection_displays: None,
+                canvas_available: false,
             };
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 assert!(render_settings(ui, &mut values, &facts).is_empty());
@@ -2196,6 +2316,7 @@ mod tests {
                         ..super::super::support_bundle::SupportBundleView::default()
                     }),
                     connection_displays: Some(("Studio".to_owned(), DisplaysMode::MatchLayout)),
+                    canvas_available: false,
                 };
                 let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                     assert!(render_settings(ui, &mut values, &facts).is_empty());

@@ -12,7 +12,13 @@ maintenance command as LocalSystem when the protected
 follow reparse points, or delete a failed journal before topology ownership is
 adjudicated. Hooks are process-owned and disappear with the authenticated agent.
 
-On macOS (`platform.desktop.deskside.enabled`) there is nothing to
+Desk privacy is on by default on every Pier (`privacy.desk`). On Windows its
+default form needs no recovery of its own: the desk's keyboard and mouse
+hooks end with the session agent, and the display lease and its journal are
+the ordinary display recovery. On Linux a joined console's blanking is the
+console privacy journal (`/run/arcen/console-privacy.json`, ADR 0025 §4).
+
+On macOS (`privacy.desk`, formerly `platform.desktop.deskside.enabled`) there is nothing to
 recover by hand: the desk's input filter and dark displays belong to the
 signed-in user's session helper, and the window server removes the filter and
 restores the displays' colour tables when that process exits. If a desk stays

@@ -2063,7 +2063,7 @@ facts:
   A software host asks capenc for `encoder=software-h264` directly
   (`Config::session_encoder`); elsewhere the usual ladder runs (NVENC, other
   NVENC codecs, then OpenH264), and its software step follows the stream's
-  cursor truth and refuses, by name, an output larger than 1920x1200 that
+  cursor truth and refuses, by name, an output larger than 3840x2160 that
   can no longer be fitted (see [Software encode](#software-encode-linux-wayland-software)). The
   Pier waits for `ADMISSION` and `READY`; the hello's `active_pipeline`
   comes from the admitted plan, so a Speed request served as Auto is
@@ -3248,8 +3248,10 @@ separate `linux-wayland-software` composition; see
 Code: `hosts/capenc/src/wayland/pipelines/software.rs` (the composition)
 and `software_runner.rs` (the epoch); the shared pieces are
 `arcen_media::video::SoftwareH264Session` (the one OpenH264 session the Xorg
-MIT-SHM path also runs on), `SoftwareEncodeLoop` (Keel-gated encoding of
-delivered pictures) and the Software contract
+MIT-SHM path also runs on), `arcen_media::canvas::CanvasEncodeLoop` (the one
+software loop of every Pier, ADR 0028: Keel-gated full frames, or the canvas
+for a Deck that offers `canvas_v1`; PipeWire's damage regions narrow Keel's
+hash) and the Software contract
 (`arcen_media::video::pipeline` `software`). Registered as the product path
 `linux-wayland-software`.
 
@@ -3268,10 +3270,11 @@ streams a Wayland desktop:
   `route=shm-cpu-convert`, `conversion_backend=cpu`).
 - **Admission.** The requested contract's own shared admission given
   OpenH264, which applies the shared software rule: Auto is served as
-  Software (H.264 4:2:0 eight-bit limited BT.709, up to 30 fps), Speed is
+  Software (H.264 4:2:0 eight-bit limited BT.709, at the rate the CPU
+  encodes, at most 60 fps), Speed is
   visibly downgraded to it (`reason=software_fallback`), Grading and HDR
   never reach it (the Pier serves them as Auto on Wayland), and a stream
-  larger than OpenH264's 1920x1200 is refused by name
+  larger than OpenH264's own 3840x2160 is refused by name
   (`encoder_geometry_exceeded`). An embedded (compositor-drawn) cursor is
   carried as `cursor=host` (`BackendLimits::with_source_cursor`: the
   pixels already hold it); a metadata stream keeps the Deck's cursor.
@@ -3300,7 +3303,7 @@ software directly and creates each session's output fitted to OpenH264's
 limits (see [Serving a Deck](#serving-a-deck)). On a native host
 whose NVENC fails at spawn, the ladder falls to software when the output
 fits, and otherwise closes with `the Wayland session's output is larger
-than the software encoder's 1920x1200 and no hardware encoder is
+than the software encoder's 3840x2160 and no hardware encoder is
 available`. Vendor-neutral hardware encode (VA-API, Vulkan Video) is not
 implemented yet; it is listed under
 [Where help is wanted](../project.md#where-help-is-wanted).

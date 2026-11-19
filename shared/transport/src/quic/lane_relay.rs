@@ -553,6 +553,13 @@ impl PierLaneRelay {
                 {
                     self.route_refine_video(bytes)
                 }
+                // Canvas records (ADR 0028) change Deck state that later
+                // records build on: a reset is their recovery point, so
+                // once one is dropped its monitor passes nothing until the
+                // next reset, which the agent's keyframe request starts.
+                Some(LaneRole::Video) if bytes.first() == Some(&(FrameType::Canvas as u8)) => {
+                    self.route_canvas(bytes)
+                }
                 Some(LaneRole::Video) => self.route_video(bytes),
                 Some(LaneRole::AudioOutput) => self.route_audio(bytes),
                 Some(LaneRole::BulkAux) => self.route_bulk(&SessionRecord::Binary(bytes)),
@@ -573,6 +580,28 @@ impl PierLaneRelay {
             self.release_video();
             return RelayRoute::Dropped(LaneRole::Video);
         };
+        self.queue_video(frame, header.monitor_id, header.is_keyframe())
+    }
+
+    /// A canvas record: queued like video, its reset as the keyframe. A
+    /// record without a canvas prefix is dropped without breaking a chain.
+    fn route_canvas(&mut self, record: Vec<u8>) -> RelayRoute {
+        use arcen_protocol::canvas::{
+            CANVAS_PREFIX_BYTES, CANVAS_RECORD_VERSION, CanvasRecordKind,
+        };
+        let kind = (record.len() >= CANVAS_PREFIX_BYTES && record[1] == CANVAS_RECORD_VERSION)
+            .then(|| CanvasRecordKind::from_wire(record[2]))
+            .flatten();
+        let Some(kind) = kind else {
+            bump(&self.counters.video_dropped);
+            self.release_video();
+            return RelayRoute::Dropped(LaneRole::Video);
+        };
+        let monitor = u16::from_be_bytes([record[4], record[5]]);
+        self.queue_video(record, monitor, kind == CanvasRecordKind::Reset)
+    }
+
+    fn queue_video(&mut self, frame: Vec<u8>, monitor_id: u16, keyframe: bool) -> RelayRoute {
         // Every frame the agent sends takes a sequence number, sent or not:
         // the fences that preceded a dropped frame go with the next one.
         let seq = self.refine.as_mut().map(|refine| {
@@ -580,8 +609,7 @@ impl PierLaneRelay {
             refine.next_seq = refine.next_seq.wrapping_add(1);
             seq
         });
-        let keyframe = header.is_keyframe();
-        if !self.resync.admits(header.monitor_id, keyframe) {
+        if !self.resync.admits(monitor_id, keyframe) {
             bump(&self.counters.video_dropped);
             self.release_video();
             self.request_keyframe_if_due();
@@ -609,7 +637,7 @@ impl PierLaneRelay {
         } else {
             bump(&self.counters.video_dropped);
             self.release_video();
-            self.break_video_chain(header.monitor_id);
+            self.break_video_chain(monitor_id);
             RelayRoute::Dropped(LaneRole::Video)
         }
     }
@@ -1387,6 +1415,31 @@ mod tests {
                 super::LaneRelayEvent::Ended(super::LaneTerminal::ConnectionLost(None))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_canvas_record_without_a_canvas_prefix_breaks_no_chain() {
+        let mut relay = stopped_relay();
+        let mut record = vec![arcen_protocol::wire::FrameType::Canvas as u8, 9, 2, 0];
+        record.resize(64, 1);
+        assert_eq!(
+            relay.route_to_deck(super::SessionRecord::Binary(record)),
+            super::RelayRoute::Dropped(super::LaneRole::Video)
+        );
+        assert!(!relay.resync.is_waiting());
+        assert!(relay.owed.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_canvas_record_holds_its_monitor_until_the_next_reset() {
+        let mut resync = VideoResync::default();
+        // The relay treats a canvas reset as the keyframe of its monitor.
+        let start = Instant::now();
+        assert!(resync.admits(0, true));
+        assert!(resync.broke(0, start));
+        assert!(!resync.admits(0, false), "frames of the broken generation");
+        assert!(resync.admits(0, true), "the reset");
+        assert!(resync.admits(0, false));
     }
 
     #[test]

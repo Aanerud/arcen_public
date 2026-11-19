@@ -13,22 +13,22 @@
 //! The trait assumes neither ten bits nor RGB: [`RefineSource::depth`] and
 //! [`RefineSource::domain`] travel in every tile header and in the digest.
 //!
-//! # Adding an eight-bit source (slice 2)
+//! # Eight-bit sources
 //!
-//! An Auto capture that already lives in CPU memory as 8-bit RGB — Windows
-//! DDA/WGC BGRA8, a Linux GPU readback of eligible blocks — implements this
-//! trait with `depth() == 8`, `domain() == RefineDomain::Rgb`, and an
-//! `extract` that widens each 8-bit sample into a `u16` code (no scaling: an
-//! 8-bit code stays an 8-bit code). The plan rule that refuses
-//! [`super::RefineOffReason::EightBit`] becomes a per-contract decision, and
-//! the Deck's eight-bit presenter implements
-//! [`super::hub::RefineCompositor`]. No record, digest or scheduler change
-//! is needed. `NvFBC` and every other GPU-only capture stays
+//! [`Bgra8Source`] is the eight-bit source: a CPU-resident BGRA8 capture
+//! (Windows DDA/WGC, Xorg `XShm` at depth 24, a Wayland or macOS read-back)
+//! with `depth() == 8` and `domain() == RefineDomain::Rgb`, each sample
+//! widened into a `u16` code without scaling. The canvas pipeline
+//! (`crate::canvas`, ADR 0028) packs its lossless tiles from it. The refine
+//! lane's plan still refuses [`super::RefineOffReason::EightBit`]; `NvFBC`
+//! and every other GPU-only capture stays
 //! [`super::RefineSourceKind::GpuOnly`] and is never refined.
 
 use super::BLOCK;
 use super::RefineSourceKind;
-use super::tile::{RefineGrid, TileCodes, TileError, TileRect, extract_packed_rgb10};
+use super::tile::{
+    RefineGrid, TileCodes, TileError, TileRect, extract_bgra8, extract_packed_rgb10,
+};
 use crate::video::{PackedRgb10Layout, Rgb10Signal};
 use arcen_protocol::refine::RefineDomain;
 
@@ -259,6 +259,60 @@ impl RefineSource for PackedRgb10Source {
     }
 }
 
+/// An eight-bit BGRA source (ADR 0028): the desktop's own sRGB-coded
+/// values, alpha ignored.
+#[derive(Debug, Clone)]
+pub struct Bgra8Source {
+    mirror: SourceMirror,
+}
+
+impl Bgra8Source {
+    /// A source of `grid` pixels.
+    #[must_use]
+    pub fn new(grid: RefineGrid) -> Self {
+        Self {
+            mirror: SourceMirror::new(grid),
+        }
+    }
+
+    /// The exact copy of the source (BGRA8, `grid.width × 4` bytes a row).
+    #[must_use]
+    pub const fn mirror(&self) -> &SourceMirror {
+        &self.mirror
+    }
+}
+
+impl RefineSource for Bgra8Source {
+    fn grid(&self) -> RefineGrid {
+        self.mirror.grid
+    }
+
+    fn depth(&self) -> u8 {
+        8
+    }
+
+    fn domain(&self) -> RefineDomain {
+        RefineDomain::Rgb
+    }
+
+    fn observe(&mut self, src: &[u8], stride: usize, rect: TileRect) -> Vec<usize> {
+        self.mirror.observe_rect(src, stride, rect)
+    }
+
+    fn ready(&self) -> bool {
+        self.mirror.is_valid()
+    }
+
+    fn extract(&self, rect: TileRect) -> Result<TileCodes, TileError> {
+        extract_bgra8(
+            self.mirror.bytes(),
+            self.mirror.stride(),
+            self.mirror.grid,
+            rect,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +424,66 @@ mod tests {
                 .collect();
             assert_eq!(extracted(&source), want, "{signal:?}");
         }
+    }
+
+    #[test]
+    fn eight_bit_tiles_are_the_bgra_codes_widened() {
+        let grid = RefineGrid {
+            width: 20,
+            height: 18,
+        };
+        let frame: Vec<u8> = (0..20 * 18 * 4)
+            .map(|at| u8::try_from(at * 37 % 251).unwrap_or(0))
+            .collect();
+        let mut source = Bgra8Source::new(grid);
+        assert_eq!(source.depth(), 8);
+        assert_eq!(source.kind(), RefineSourceKind::CpuRgb);
+        assert!(!source.ready());
+        assert_eq!(
+            source.observe(
+                &frame,
+                80,
+                TileRect {
+                    x: 0,
+                    y: 0,
+                    width: 20,
+                    height: 18
+                }
+            ),
+            vec![0, 1, 2, 3]
+        );
+        assert!(source.ready());
+        let edge = TileRect {
+            x: 16,
+            y: 16,
+            width: 4,
+            height: 2,
+        };
+        let codes = source.extract(edge).expect("tile");
+        for y in 0..2 {
+            for x in 0..4 {
+                let at = ((16 + y) * 20 + 16 + x) as usize * 4;
+                assert_eq!(codes.at(0, x, y), u16::from(frame[at + 2]));
+                assert_eq!(codes.at(1, x, y), u16::from(frame[at + 1]));
+                assert_eq!(codes.at(2, x, y), u16::from(frame[at]));
+            }
+        }
+        // Depth 8 round-trips through the residual transform unchanged.
+        let bytes = super::super::tile::encode_residuals(&codes, 8).expect("residuals");
+        // Every high-byte plane is zero at depth 8.
+        let pixels = 8;
+        for plane in 0..3 {
+            let high = &bytes[plane * pixels * 2 + pixels..(plane + 1) * pixels * 2];
+            assert!(high.iter().all(|byte| *byte == 0));
+        }
+        assert_eq!(
+            super::super::tile::decode_residuals(&bytes, 4, 2, 8).expect("decode"),
+            codes
+        );
+        assert_eq!(
+            source.extract(TileRect { x: 8, ..edge }),
+            Err(TileError::Geometry)
+        );
     }
 
     #[test]

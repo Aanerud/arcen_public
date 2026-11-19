@@ -71,7 +71,7 @@ The `arcen-deck-core` purity proof is the same script with
 There is no single-platform `--workspace` build. `arcen-protocol`,
 `arcen-input`, and `arcen-transport` retain crate-level `unsafe_code = "forbid"`;
 `arcen-media` is crate-wide `unsafe_code = "deny"` with a single reviewed
-OpenH264 raw `SetOption` exception in `software_h264.rs`. Shared manifests must
+OpenH264 raw `SetOption`/`GetOption` exception in `software_h264.rs`. Shared manifests must
 not reference `hosts/`, `clients/`, or `packaging/`.
 
 Shared code behaves the same on every OS. An OS-conditional `cfg` in shared
@@ -134,6 +134,8 @@ facts, time zone), `decode::VideoDecoderBackend` + `VideoDecoderFactory`
 (native picture as an associated type; HEVC RExt 4:4:4 10-bit, P010/Y410;
 frame-exact pictures for Exact still image fences) and
 `present::VideoPresenterSink` (eight-bit and ten-bit dedicated presenters,
+the canvas executor `execute` with `CANVAS_EXECUTOR`, ADR 0028: a sink that
+states none never makes its Deck advertise `canvas_v1`,
 `RefineCompositor` obligations on `present::RefineFrameTag`).
 
 - The default feature is std, serde/serde_json, zeroize, getrandom,

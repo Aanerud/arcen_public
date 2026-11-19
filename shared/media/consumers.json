@@ -2,7 +2,7 @@
   "schema_version": 1,
   "crate": "arcen-media",
   "owner": "Shared/Architecture",
-  "description": "Codec negotiation, preset contracts, colour, conversion, rate control, clipboard and audio rules.",
+  "description": "Codec negotiation, preset contracts, colour, conversion, rate control, lossless refinement, the canvas interpreter (ADR 0028), clipboard and audio rules.",
   "validation": [
     "shared-media-test",
     "shared-media-clippy",
@@ -17,6 +17,7 @@
       "dependency_kind": "normal",
       "contracts": [
         "annexb",
+        "canvas",
         "capenc_control",
         "capenc_stream",
         "crate",
@@ -26,7 +27,6 @@
         "multi_monitor",
         "region",
         "region_activity",
-        "region_schedule",
         "test_pattern",
         "video",
         "video::bitrate",
@@ -56,6 +56,7 @@
           "software-av1-source"
         ],
         "software-h264": [
+          "refine-zstd-encode",
           "software-h264-source"
         ]
       },
@@ -200,6 +201,7 @@
           "entry_points": [
             "hosts/capenc/src/win_mf.rs",
             "hosts/capenc/src/win.rs",
+            "hosts/capenc/src/admission_probe.rs",
             "hosts/capenc/src/lib.rs"
           ],
           "build_profiles": ["windows-capenc"],
@@ -207,14 +209,16 @@
           "owner": "Windows Host"
         },
         {
-          "id": "windows-capenc-mf",
+          "id": "windows-media-foundation-hardware",
           "entry_points": [
-            "hosts/capenc/src/win_mf.rs",
+            "hosts/capenc/src/win_mf_hw.rs",
             "hosts/capenc/src/mf_encoder.rs",
-            "hosts/capenc/src/lib.rs"
+            "hosts/capenc/src/win.rs",
+            "hosts/windows/src/capenc.rs",
+            "hosts/windows/src/main.rs"
           ],
-          "build_profiles": ["windows-capenc-mf"],
-          "validation": ["windows-capenc-mf-build"],
+          "build_profiles": ["windows-capenc", "windows-pier"],
+          "validation": ["windows-capenc-test", "windows-media-foundation-hardware-lab"],
           "owner": "Windows Host"
         },
         {
@@ -312,6 +316,7 @@
       "dependency_kind": "normal",
       "contracts": [
         "audio",
+        "canvas",
         "crate",
         "display_color",
         "refine",
@@ -340,6 +345,7 @@
         "audio::microphone",
         "audio::opus",
         "audio::playout",
+        "canvas",
         "clipboard",
         "clipboard::image",
         "colour_check",
@@ -516,6 +522,32 @@
           "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
           "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
           "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-canvas",
+          "entry_points": [
+            "clients/macos/src/ui/canvas_metal.rs",
+            "clients/macos/src/ui/video_metal_layer.rs",
+            "clients/macos/src/ui/media_worker.rs"
+          ],
+          "build_profiles": ["macos-deck-apple-silicon", "macos-deck-intel"],
+          "validation": ["macos-deck-test-apple-silicon", "macos-deck-build-intel"],
+          "owner": "macOS Client"
+        }
+      ]
+    },
+    {
+      "package": "arcen-deck-macos",
+      "dependency_kind": "dev",
+      "contracts": ["canvas::corpus"],
+      "features": ["canvas-corpus"],
+      "paths": [
+        {
+          "id": "macos-deck-canvas-executor-test",
+          "entry_points": ["clients/macos/src/ui/canvas_metal.rs"],
+          "build_profiles": ["macos-deck-apple-silicon"],
+          "validation": ["macos-deck-test-apple-silicon"],
+          "owner": "macOS Client"
         }
       ]
     },
@@ -537,6 +569,7 @@
         "audio",
         "audio::microphone",
         "audio::opus",
+        "canvas",
         "capenc_control",
         "capenc_stream",
         "clipboard",
@@ -1003,6 +1036,7 @@
         "audio",
         "audio::microphone",
         "audio::opus",
+        "canvas",
         "capenc_control",
         "clipboard",
         "clipboard::image",
@@ -1238,7 +1272,7 @@
     {
       "package": "arcen-deck-windows",
       "dependency_kind": "normal",
-      "contracts": ["annexb", "audio", "audio::capture_normalizer", "audio::playback_queue", "bitstream", "clipboard", "clipboard::image", "crate", "display_color", "refine", "refine::compositor", "refine::hub", "video", "video::present"],
+      "contracts": ["annexb", "audio", "audio::capture_normalizer", "audio::playback_queue", "bitstream", "canvas", "clipboard", "clipboard::image", "crate", "display_color", "refine", "refine::compositor", "refine::hub", "video", "video::present"],
       "features": ["refine-zstd-decode"],
       "production_uses": [
         {
@@ -1274,12 +1308,12 @@
     {
       "package": "arcen-deck-windows",
       "dependency_kind": "dev",
-      "contracts": ["refine::pier", "refine::zstd_encode"],
+      "contracts": ["canvas::planner", "canvas::tile", "refine::pier", "refine::zstd_encode"],
       "features": ["refine-zstd-decode", "refine-zstd-encode"],
       "paths": [
         {
           "id": "windows-deck-present-test",
-          "entry_points": ["clients/windows/src/present/hub_e2e.rs"],
+          "entry_points": ["clients/windows/src/present/hub_e2e.rs", "clients/windows/src/present/canvas/tests.rs"],
           "build_profiles": ["windows-deck"],
           "validation": ["windows-deck-test"],
           "owner": "Windows Client"
@@ -1291,6 +1325,7 @@
       "dependency_kind": "source",
       "contracts": ["crate"],
       "includes": [
+        "shared/media/tests/data/bitstream/openh264-4slice-320x192.264",
         "shared/media/tests/data/bitstream/nvenc-h264-high-640x360.264",
         "shared/media/tests/data/bitstream/nvenc-hevc-main-640x360.265",
         "shared/media/tests/data/bitstream/nvenc-hevc-main10-640x360.265",

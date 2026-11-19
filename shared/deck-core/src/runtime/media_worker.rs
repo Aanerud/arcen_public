@@ -59,8 +59,8 @@ use crate::runtime::frame_queue::{
 };
 use crate::runtime::monitor_router::{MonitorFrameRouter, MonitorRoute, RouteError, RouteOutcome};
 use crate::runtime::session::{
-    DisconnectReason, FullFrameRequestGate, SessionAuthentication, SessionCommandSender,
-    SessionEnd, SessionEvent, TerminalDisconnect,
+    DisconnectReason, FullFrameRequestGate, SessionAuthentication, SessionCommand,
+    SessionCommandSender, SessionEnd, SessionEvent, TerminalDisconnect,
 };
 use crate::runtime::tls::CertInfo;
 use arcen_media::{PresentationWindow, TransferCharacteristics, classify_presentation_window};
@@ -537,6 +537,14 @@ pub struct SharedMediaState<M: MediaPlatform> {
     /// committed multi-monitor session wait here until frames captured with
     /// them on the other monitors are ready too, within a bound.
     pub frame_sync: crate::runtime::frame_sync::FrameSync<M::NativeFrame>,
+    /// The canvas (ADR 0028) as the Stream Statistics show it.
+    pub canvas: crate::canvas::CanvasStats,
+    /// The eight-bit presenters that execute the canvas of a monitor other
+    /// than the root window's (each secondary window registers its own).
+    /// The root monitor's canvas is executed by
+    /// `eight_bit_video_presenter`.
+    pub canvas_presenters:
+        BTreeMap<arcen_media::SessionMonitorId, Arc<Mutex<M::EightBitPresenter>>>,
 }
 
 impl<M: MediaPlatform> std::fmt::Debug for SharedMediaState<M> {
@@ -651,6 +659,8 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             monitor_presentation_targets: Default::default(),
             routed_primary_dedicated_eight_bit: false,
             frame_sync: Default::default(),
+            canvas: Default::default(),
+            canvas_presenters: BTreeMap::new(),
         }
     }
 }
@@ -730,6 +740,14 @@ impl<M: MediaPlatform> SharedMediaState<M> {
                 timing: present_timing_for_state(self),
             },
         ))
+    }
+
+    /// The Stream Statistics line for the canvas: how the screen is updated,
+    /// or why full frames arrive. `None` on a Deck that cannot hold a
+    /// canvas.
+    #[must_use]
+    pub fn canvas_status_line(&self) -> Option<String> {
+        self.canvas.line()
     }
 
     /// The state of a new connection attempt: nothing decoded, and
@@ -821,6 +839,10 @@ pub fn spawn_media_worker<M, F>(
             let mut session_color = SessionColor::default();
             let mut decode_latency_policy = arcen_media::video::DecodeLatencyPolicy::default();
             let mut decode_lag = crate::runtime::decode_lag::DecodeLagGuard::default();
+            // The canvas (ADR 0028): what this connection asked for, until
+            // the hello says what the host serves.
+            let mut canvas = crate::canvas::DeckCanvas::<M::Decoder>::new(&media.canvas_request());
+            shared.lock().expect("media state poisoned").canvas = canvas.stats();
             tracing::info!(target: crate::log_target::VIDEO, "media worker started");
 
             loop {
@@ -957,6 +979,19 @@ pub fn spawn_media_worker<M, F>(
                         );
                         decoder.set_session_color(session_color);
                         decoder.set_decode_latency_policy(decode_latency_policy);
+                        canvas = crate::canvas::DeckCanvas::new(&media.canvas_request());
+                        canvas.set_session_color(session_color);
+                        canvas.set_decode_latency_policy(decode_latency_policy);
+                        {
+                            let mut state = shared.lock().expect("media state poisoned");
+                            canvas.on_hello(
+                                state
+                                    .server_hello
+                                    .as_ref()
+                                    .and_then(|hello| hello.canvas.as_ref()),
+                            );
+                            state.canvas = canvas.stats();
+                        }
                         if let Some(router) = secondary_router.as_mut() {
                             router.set_session_color(session_color);
                             router.set_decode_latency_policy(decode_latency_policy);
@@ -1107,6 +1142,8 @@ pub fn spawn_media_worker<M, F>(
                             &decoders,
                         );
                         let mut batch = media.take_batch();
+                        let canvas_records = std::mem::take(&mut batch.canvas);
+                        let canvas_lost = std::mem::take(&mut batch.canvas_lost_monitor_ids);
                         skip_video_if_behind(&shared, &media, &mut decode_lag, &mut batch);
                         handle_media_batch(
                             &shared,
@@ -1119,11 +1156,36 @@ pub fn spawn_media_worker<M, F>(
                             &telemetry,
                             repaint,
                         );
+                        handle_canvas_batch(
+                            &shared,
+                            &mut canvas,
+                            &decoders,
+                            &media,
+                            &commands,
+                            canvas_records,
+                            &canvas_lost,
+                            repaint,
+                        );
                         maybe_heartbeat(&shared, &mut last_heartbeat, &mut monitor_rate_snapshots);
                         maybe_report_timeline(&shared, &telemetry);
                         // No wake here: a decoded frame wakes the UI where it
                         // is published, and waking for every batch woke it
                         // ~50 times a second for audio alone.
+                    }
+                    SessionEvent::CanvasTick => {
+                        let now = Instant::now();
+                        if canvas.next_due(now).is_some_and(|due| due <= now) {
+                            handle_canvas_batch(
+                                &shared,
+                                &mut canvas,
+                                &decoders,
+                                &media,
+                                &commands,
+                                Vec::new(),
+                                &[],
+                                repaint,
+                            );
+                        }
                     }
                     SessionEvent::PresentationRecoveryRequested => {
                         request_presentation_recovery(&shared, &commands, &mut full_frame_requests);
@@ -1615,6 +1677,188 @@ fn maybe_commit_secondary_router<M, F>(
             );
         }
     }
+}
+
+/// The eight-bit presenter that executes `monitor_id`'s canvas: a
+/// secondary window's registered presenter, else the root presenter for the
+/// root monitor (0 in a single-monitor session; the committed root, else the
+/// roster's first monitor, in a multi-monitor one).
+fn canvas_presenter_for<M: MediaPlatform>(
+    state: &SharedMediaState<M>,
+    monitor_id: u16,
+) -> Option<Arc<Mutex<M::EightBitPresenter>>> {
+    if let Ok(id) = arcen_media::SessionMonitorId::new(monitor_id)
+        && let Some(presenter) = state.canvas_presenters.get(&id)
+    {
+        return Some(Arc::clone(presenter));
+    }
+    let root = match state.multi_monitor_decode_roster.as_ref() {
+        None => 0,
+        Some((_, roster)) => state
+            .multi_monitor_root_monitor_id
+            .or_else(|| roster.plans().first().map(|plan| plan.session_monitor_id))
+            .map_or(0, arcen_media::SessionMonitorId::get),
+    };
+    (monitor_id == root)
+        .then(|| state.eight_bit_video_presenter.clone())
+        .flatten()
+}
+
+/// Applies one batch's canvas records (ADR 0028) in lane order, each
+/// executed by its monitor's eight-bit presenter before that presenter shows
+/// the canvas, then sends what flow control and recovery owe the Pier
+/// (`canvas_ack`, `canvas_reset_request`) and publishes the statistics.
+///
+/// Never holds the media state's lock and a presenter's at the same time.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the worker's canvas, decoders, inbox and command channel"
+)]
+fn handle_canvas_batch<M, F>(
+    shared: &Arc<Mutex<SharedMediaState<M>>>,
+    canvas: &mut crate::canvas::DeckCanvas<M::Decoder>,
+    decoders: &F,
+    media: &IncomingMediaReceiver,
+    commands: &SessionCommandSender,
+    records: Vec<(u16, Vec<u8>)>,
+    lost: &[u16],
+    repaint: &dyn RepaintRequester,
+) where
+    M: MediaPlatform,
+    F: VideoDecoderFactory<Decoder = M::Decoder>,
+{
+    if !canvas.is_on() {
+        if !records.is_empty() {
+            tracing::debug!(
+                target: crate::log_target::VIDEO,
+                records = records.len(),
+                "canvas records arrived while canvas is off; dropped",
+            );
+        }
+        return;
+    }
+    for monitor_id in lost {
+        canvas.records_lost(*monitor_id);
+    }
+    let now = Instant::now();
+    let (timing, roster, presenters, root) = {
+        let state = shared.lock().expect("media state poisoned");
+        let roster = if canvas.has_roster() {
+            None
+        } else {
+            state
+                .multi_monitor_decode_roster
+                .as_ref()
+                .and_then(|(generation, roster)| {
+                    arcen_media::RegionFrameRoster::from_media_roster(*generation, roster).ok()
+                })
+        };
+        // Every monitor that may apply a record or owe the Pier a message.
+        let mut monitors: Vec<u16> = records.iter().map(|(monitor, _)| *monitor).collect();
+        monitors.extend_from_slice(lost);
+        monitors.extend(canvas.monitor_ids());
+        monitors.sort_unstable();
+        monitors.dedup();
+        let presenters: BTreeMap<u16, Arc<Mutex<M::EightBitPresenter>>> = monitors
+            .into_iter()
+            .filter_map(|monitor| canvas_presenter_for(&state, monitor).map(|p| (monitor, p)))
+            .collect();
+        (
+            present_timing_for_state(&state),
+            roster,
+            presenters,
+            state.eight_bit_video_presenter.clone(),
+        )
+    };
+    if roster.is_some() {
+        canvas.set_roster(roster);
+    }
+    let make = || decoders.create();
+    let mut tiles = arcen_media::canvas::pixels::ZstdTileDecoder;
+    let mut root_presented = false;
+    let mut root_canvas = None;
+    for (monitor_id, bytes) in records {
+        let presenter = presenters.get(&monitor_id);
+        let mut guard = presenter.map(|presenter| presenter.lock().expect("presenter poisoned"));
+        let mut env = crate::canvas::CanvasEnv {
+            now,
+            decoders: &make,
+            tiles: &mut tiles,
+            sink: guard.as_deref_mut(),
+            timing,
+        };
+        let applied = canvas.apply(&bytes, &mut env);
+        if let Some(sink) = guard.as_deref_mut() {
+            while let Some(readback) = sink.take_canvas_readback() {
+                let _ = canvas.on_readback(&readback);
+            }
+        }
+        drop(guard);
+        let is_root = matches!(
+            (presenter, root.as_ref()),
+            (Some(presenter), Some(root)) if Arc::ptr_eq(presenter, root)
+        );
+        if is_root
+            && matches!(
+                applied,
+                crate::canvas::CanvasApplied::Presented | crate::canvas::CanvasApplied::Applied
+            )
+        {
+            root_canvas = canvas.size(monitor_id);
+        }
+        root_presented |= is_root && applied == crate::canvas::CanvasApplied::Presented;
+    }
+    let messages = canvas.take_control_messages(
+        now,
+        |monitor_id| presenters.contains_key(&monitor_id),
+        |monitor_id| media.canvas_queued_bytes(monitor_id),
+    );
+    for message in messages {
+        match serde_json::to_value(&message) {
+            Ok(value) => {
+                let _ = commands.send(SessionCommand::Json(value));
+            }
+            Err(error) => tracing::warn!(
+                target: crate::log_target::VIDEO,
+                %error,
+                "canvas control message did not serialise",
+            ),
+        }
+    }
+    {
+        let mut state = shared.lock().expect("media state poisoned");
+        state.canvas = canvas.stats();
+        if root_presented {
+            state.eight_bit_layer_has_picture = true;
+        }
+        if let Some((width, height)) = root_canvas {
+            publish_canvas_metadata(&mut state, width, height);
+        }
+    }
+    if root_presented || root_canvas.is_some() {
+        repaint.request_repaint();
+    }
+}
+
+/// Tells the UI the root canvas's size, as a decoded frame's metadata does:
+/// the window lays out, maps the pointer and attaches the eight-bit layer
+/// from it, which presents the canvas (ADR 0028).
+fn publish_canvas_metadata<M: MediaPlatform>(
+    state: &mut SharedMediaState<M>,
+    width: u32,
+    height: u32,
+) {
+    let (width, height) = (width as usize, height as usize);
+    state.last_native_frame_size = Some([width, height]);
+    state.latest_native_frame_metadata = Some(NativePresentationMetadata {
+        width,
+        height,
+        timestamp_ms: 0,
+        pixel_format: "canvas BGRA8".to_owned(),
+        backend: "canvas",
+        // The surfaces' coding; the canvas itself is eight-bit sRGB R′G′B′.
+        video: arcen_media::VideoConfiguration::legacy_h264(),
+    });
 }
 
 /// An interactive contract whose decoder fell behind the stream skips the
@@ -3221,10 +3465,33 @@ mod tests {
         async_status: Option<PresentOutcome>,
         on_glass: bool,
         torn_down: bool,
+        /// `(monitor, generation, fence)` of every canvas record executed.
+        canvas: Vec<(u16, u32, u64)>,
     }
 
     impl VideoPresenterSink for TestPresenter {
         type NativeFrame = TestPicture;
+
+        const CANVAS_EXECUTOR: Option<crate::present::CanvasExecutorFacts> =
+            Some(crate::present::CanvasExecutorFacts {
+                max_canvas_px: 16_384,
+            });
+
+        fn execute(
+            &mut self,
+            canvas: &crate::present::CanvasExecution<'_, '_, TestPicture>,
+        ) -> crate::present::CanvasOutcome {
+            self.canvas.push((
+                canvas.work.monitor_id,
+                canvas.work.generation.get(),
+                canvas.work.fence,
+            ));
+            if self.visible && canvas.present {
+                crate::present::CanvasOutcome::Presented
+            } else {
+                crate::present::CanvasOutcome::Applied
+            }
+        }
 
         fn pipeline(&self) -> PresenterPipeline {
             PresenterPipeline::TenBit
@@ -5142,5 +5409,272 @@ mod tests {
         assert_eq!(mailbox.dropped(), 2);
         assert_eq!(mailbox.take(), Some(3));
         assert_eq!(mailbox.take(), None);
+    }
+
+    struct TestFactory;
+
+    impl VideoDecoderFactory for TestFactory {
+        type Decoder = TestDecoder;
+
+        fn create(&self) -> TestDecoder {
+            TestDecoder::default()
+        }
+    }
+
+    mod canvas {
+        use super::*;
+        use crate::canvas::{CanvasRequest, DEFAULT_CACHE_MIB, DeckCanvas};
+        use arcen_protocol::canvas::{
+            CanvasCommand, CanvasControlMsg, CanvasFrame, CanvasMonitorStatusMsg,
+            CanvasPixelFormat, CanvasRect, CanvasReset, CanvasResetReason, CanvasScope,
+            CanvasStateMsg, CanvasStatusMsg, canvas_block_count,
+        };
+
+        fn request() -> CanvasRequest {
+            CanvasRequest::for_executor(
+                TestPresenter::CANVAS_EXECUTOR,
+                true,
+                true,
+                DEFAULT_CACHE_MIB,
+            )
+        }
+
+        fn status(monitors: &[u16]) -> CanvasStatusMsg {
+            CanvasStatusMsg {
+                state: CanvasStateMsg::On,
+                reason: None,
+                tile_codec: Some("delta-zstd1".to_owned()),
+                cache_bytes: None,
+                cache_slots: None,
+                max_surfaces_per_monitor: None,
+                monitors: monitors
+                    .iter()
+                    .map(|monitor_id| CanvasMonitorStatusMsg {
+                        monitor_id: *monitor_id,
+                        state: CanvasStateMsg::On,
+                        reason: None,
+                    })
+                    .collect(),
+            }
+        }
+
+        fn scope(monitor_id: u16, topology_generation: u64) -> CanvasScope {
+            CanvasScope {
+                monitor_id,
+                topology_generation,
+                stream_epoch: u64::from(topology_generation != 0),
+                generation: std::num::NonZeroU32::new(1).expect("nonzero"),
+            }
+        }
+
+        fn records(scope: CanvasScope) -> [Vec<u8>; 2] {
+            [
+                CanvasReset {
+                    scope,
+                    reason: CanvasResetReason::Start,
+                    format: CanvasPixelFormat::Bgra8,
+                    width: 64,
+                    height: 32,
+                }
+                .encode()
+                .expect("reset"),
+                CanvasFrame {
+                    scope,
+                    fence: 1,
+                    timestamp_ms: 5,
+                    block_count: canvas_block_count(64, 32),
+                    commands: vec![CanvasCommand::Fill {
+                        rect: CanvasRect {
+                            x: 0,
+                            y: 0,
+                            width: 64,
+                            height: 32,
+                        },
+                        rgb: [1, 2, 3],
+                    }],
+                }
+                .encode()
+                .expect("frame"),
+            ]
+        }
+
+        fn sent(receiver: &mut mpsc::UnboundedReceiver<SessionCommand>) -> Vec<CanvasControlMsg> {
+            let mut messages = Vec::new();
+            while let Ok(command) = receiver.try_recv() {
+                if let SessionCommand::Json(value) = command {
+                    messages.push(serde_json::from_value(value).expect("a canvas message"));
+                }
+            }
+            messages
+        }
+
+        /// The root window's presenter executes the single monitor's canvas
+        /// records in lane order, before it presents, and the Pier hears a
+        /// `canvas_ack` for the newest presented fence.
+        #[test]
+        fn canvas_records_reach_the_root_presenter_in_order_and_are_acknowledged() {
+            let (tx, rx) = crate::runtime::frame_queue::incoming_media_inbox();
+            tx.set_canvas_request(request());
+            let root = Arc::new(Mutex::new(TestPresenter {
+                visible: true,
+                ..TestPresenter::default()
+            }));
+            let shared = Arc::new(Mutex::new(SharedMediaState {
+                eight_bit_video_presenter: Some(Arc::clone(&root)),
+                ..SharedMediaState::default()
+            }));
+            let mut canvas = DeckCanvas::<TestDecoder>::new(&rx.canvas_request());
+            canvas.on_hello(Some(&status(&[0])));
+            let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+            let commands = SessionCommandSender::for_test(commands_tx);
+            for record in records(scope(0, 0)) {
+                assert!(tx.enqueue_bytes(&record).expect("queued").accepted);
+            }
+            let mut batch = rx.take_batch();
+            handle_canvas_batch(
+                &shared,
+                &mut canvas,
+                &TestFactory,
+                &rx,
+                &commands,
+                std::mem::take(&mut batch.canvas),
+                &batch.canvas_lost_monitor_ids,
+                &NoRepaint,
+            );
+            assert_eq!(
+                root.lock().expect("presenter").canvas,
+                [(0, 1, 0), (0, 1, 1)]
+            );
+            assert_eq!(
+                sent(&mut commands_rx),
+                [CanvasControlMsg::CanvasAck {
+                    monitor_id: 0,
+                    generation: 1,
+                    fence: 1,
+                    unprocessed_bytes: 0,
+                    decode_ms_p95: 0,
+                }]
+            );
+            let state = shared.lock().expect("state");
+            assert!(state.eight_bit_layer_has_picture);
+            assert_eq!(
+                state.canvas_status_line().as_deref(),
+                Some("Screen updates: canvas (tiles 100%, surface 0%, copy 0%)")
+            );
+            let metadata = state
+                .latest_native_frame_metadata
+                .as_ref()
+                .expect("the UI learns the canvas size");
+            assert_eq!((metadata.width, metadata.height), (64, 32));
+        }
+
+        /// In a multi-monitor session each monitor's canvas goes to its own
+        /// window's presenter; a monitor whose window has no presenter yet
+        /// loses its canvas and asks for a reset once one is registered,
+        /// without waiting for another record.
+        #[test]
+        fn each_monitor_canvas_goes_to_its_own_presenter() {
+            let plan = |id: u16| {
+                arcen_media::RegionMediaPlan::new(
+                    arcen_media::SessionMonitorId::new(id).expect("nonzero"),
+                    arcen_media::MediaStreamEpoch::new(1).expect("nonzero epoch"),
+                    arcen_media::video::EncoderBackend::OpenH264,
+                    arcen_media::VideoConfiguration::legacy_h264(),
+                    64,
+                    32,
+                    30,
+                    arcen_media::BitrateBudgetKbps::nominal_for_geometry(64, 32, 30),
+                )
+                .expect("valid region plan")
+            };
+            let roster =
+                arcen_media::RegionMediaRoster::new(vec![plan(1), plan(2)]).expect("roster");
+            let generation = arcen_media::TopologyGeneration::new(3).expect("nonzero");
+            let (tx, rx) = crate::runtime::frame_queue::incoming_media_inbox();
+            tx.set_canvas_request(request());
+            let root = Arc::new(Mutex::new(TestPresenter {
+                visible: true,
+                ..TestPresenter::default()
+            }));
+            let shared = Arc::new(Mutex::new(SharedMediaState {
+                eight_bit_video_presenter: Some(Arc::clone(&root)),
+                multi_monitor_decode_roster: Some((generation, roster)),
+                ..SharedMediaState::default()
+            }));
+            let mut canvas = DeckCanvas::<TestDecoder>::new(&rx.canvas_request());
+            canvas.on_hello(Some(&status(&[1, 2])));
+            let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+            let commands = SessionCommandSender::for_test(commands_tx);
+            let mut run = |records: Vec<Vec<u8>>| {
+                for record in records {
+                    assert!(tx.enqueue_bytes(&record).expect("queued").accepted);
+                }
+                let mut batch = rx.take_batch();
+                handle_canvas_batch(
+                    &shared,
+                    &mut canvas,
+                    &TestFactory,
+                    &rx,
+                    &commands,
+                    std::mem::take(&mut batch.canvas),
+                    &batch.canvas_lost_monitor_ids,
+                    &NoRepaint,
+                );
+            };
+            let [reset_1, frame_1] = records(scope(1, 3));
+            let [reset_2, _] = records(scope(2, 3));
+            run(vec![reset_1, reset_2.clone(), frame_1]);
+            assert_eq!(
+                root.lock().expect("root").canvas,
+                [(1, 1, 0), (1, 1, 1)],
+                "the roster's first monitor is the root window's"
+            );
+            let messages = sent(&mut commands_rx);
+            assert_eq!(
+                messages.len(),
+                1,
+                "monitor 2 has no presenter: {messages:?}"
+            );
+            assert!(
+                shared
+                    .lock()
+                    .expect("state")
+                    .latest_native_frame_metadata
+                    .take()
+                    .is_some(),
+                "the root canvas's size reaches the UI"
+            );
+
+            let secondary = Arc::new(Mutex::new(TestPresenter::default()));
+            shared.lock().expect("state").canvas_presenters.insert(
+                arcen_media::SessionMonitorId::new(2).expect("nonzero"),
+                Arc::clone(&secondary),
+            );
+            // No record needed: the next pass (a batch or a canvas tick)
+            // asks for the reset now that a presenter exists.
+            run(Vec::new());
+            assert_eq!(
+                sent(&mut commands_rx),
+                [CanvasControlMsg::CanvasResetRequest {
+                    monitor_id: 2,
+                    generation: 0,
+                    reason: "no_presenter".to_owned(),
+                }]
+            );
+            run(vec![reset_2]);
+            assert_eq!(
+                secondary.lock().expect("secondary").canvas,
+                [(2, 1, 0)],
+                "hidden, the reset is applied without being shown"
+            );
+            assert!(
+                shared
+                    .lock()
+                    .expect("state")
+                    .latest_native_frame_metadata
+                    .is_none(),
+                "a secondary window's canvas does not resize the root window"
+            );
+        }
     }
 }
