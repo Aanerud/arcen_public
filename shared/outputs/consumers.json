@@ -213,6 +213,7 @@
         "atomic_start",
         "display_lease",
         "edid",
+        "edid_provisioning",
         "fairness",
         "provider",
         "provider::capability",

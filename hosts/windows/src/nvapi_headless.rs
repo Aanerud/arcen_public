@@ -29,6 +29,7 @@ use crate::nvapi::AdapterLuid;
 #[cfg(windows)]
 use crate::nvapi::DisplayMapping;
 use crate::nvapi_inventory::{DisplayIdEntry, GpuEntry, NvapiInventoryReport};
+use arcen_outputs::edid_provisioning::EdidProvisioning;
 
 const JOURNAL_VERSION: u32 = 1;
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
@@ -393,7 +394,7 @@ fn activation_matches(
 /// leaving a journal behind that no later session can restore. So the class is
 /// checked first, while the host is still only being inspected.
 fn require_edid_provisioning_class(adapter_name: &str, gpu: &GpuEntry) -> Result<(), String> {
-    if gpu.quadro == Some(true) {
+    if gpu_edid_provisioning(adapter_name, gpu).permits_writes() {
         Ok(())
     } else {
         Err(format!(
@@ -403,24 +404,141 @@ fn require_edid_provisioning_class(adapter_name: &str, gpu: &GpuEntry) -> Result
     }
 }
 
-fn matching_gpu<'a>(
-    report: &'a NvapiInventoryReport,
+fn gpu_edid_provisioning(adapter_name: &str, gpu: &GpuEntry) -> EdidProvisioning {
+    EdidProvisioning::from_professional_class(
+        gpu.full_name.as_deref().unwrap_or(adapter_name),
+        gpu.quadro,
+    )
+}
+
+/// The EDID provisioning class of the NVIDIA GPU named `adapter_name`.
+pub(crate) fn adapter_edid_provisioning(
+    report: &NvapiInventoryReport,
     adapter_name: &str,
-) -> Result<&'a GpuEntry, String> {
+) -> Result<EdidProvisioning, String> {
+    matching_gpu(report, adapter_name).map(|gpu| gpu_edid_provisioning(adapter_name, gpu))
+}
+
+/// Whether the display transaction may use NVAPI's exact backend, which
+/// writes the display's EDID, on an output of the GPU at `adapter_luid`.
+///
+/// `Err` is the limitation the session reports: a GPU that is not proved a
+/// Quadro, RTX Pro or GRID (a GeForce, a class NVAPI did not report, an
+/// inventory that could not be read) is served through Windows' own modes.
+pub(crate) fn exact_edid_backend_permitted(
+    inventory: Result<&NvapiInventoryReport, &str>,
+    adapter_luid: AdapterLuid,
+) -> Result<(), String> {
+    let provisioning = match inventory {
+        Ok(report) => {
+            let mut matches = report
+                .gpus
+                .iter()
+                .filter(|gpu| gpu.adapter_luid == Some(adapter_luid));
+            match (matches.next(), matches.next()) {
+                (Some(gpu), None) => gpu_edid_provisioning("NVIDIA GPU", gpu),
+                _ => EdidProvisioning::ClassUnknown {
+                    gpu: "NVIDIA GPU".to_string(),
+                },
+            }
+        }
+        Err(error) => EdidProvisioning::ClassUnknown {
+            gpu: format!("NVIDIA GPU ({error})"),
+        },
+    };
+    provisioning.limitation().map_or(Ok(()), Err)
+}
+
+/// The monitors of a multi-display plan that take NVAPI's synthesized
+/// timing, each on a GPU proved to permit its EDID write. A fixed-mode
+/// monitor is left out: CCD sets it at a mode it offers.
+///
+/// # Errors
+///
+/// A monitor that needs a synthesized timing on a GPU not proved a Quadro,
+/// RTX Pro or GRID.
+pub(crate) fn monitors_needing_synthesized_timing<'a>(
+    plan: &'a arcen_outputs::windows_topology::WindowsTopologyPlan,
+    inventory: Result<&NvapiInventoryReport, &str>,
+) -> Result<Vec<&'a arcen_outputs::windows_topology::WindowsMonitorPlan>, String> {
+    let timed = plan
+        .monitors
+        .iter()
+        .filter(|monitor| monitor.custom_timing)
+        .collect::<Vec<_>>();
+    for monitor in &timed {
+        exact_edid_backend_permitted(inventory, monitor.adapter_luid).map_err(|limitation| {
+            format!(
+                "{} needs a mode it does not offer: {limitation}",
+                monitor.device_name
+            )
+        })?;
+    }
+    Ok(timed)
+}
+
+/// Why a session cannot start on a host whose NVIDIA GPUs have no display
+/// attached and may not have one created (a GeForce without a monitor or a
+/// dummy plug), or `None` when that is not the host's situation.
+pub(crate) fn displayless_gpu_refusal(report: &NvapiInventoryReport) -> Option<String> {
+    use arcen_outputs::edid_provisioning::{decide, ExactDisplayRequirement, ProvisioningDecision};
+    let first = report.gpus.first()?;
+    let displayless = report.gpus.iter().all(|gpu| {
+        !gpu_edid_provisioning("NVIDIA GPU", gpu).permits_writes()
+            && !gpu.displays.iter().any(|display| display.flags.connected)
+    });
+    if !displayless {
+        return None;
+    }
+    match decide(
+        &gpu_edid_provisioning("NVIDIA GPU", first),
+        ExactDisplayRequirement::Preferred,
+        false,
+    ) {
+        ProvisioningDecision::Refuse(message) => Some(message),
+        ProvisioningDecision::Provision | ProvisioningDecision::ServeAttachedModes(_) => None,
+    }
+}
+
+fn gpu_named(gpu: &GpuEntry, adapter_name: &str) -> bool {
     fn without_nvidia_prefix(value: &str) -> &str {
         value
             .get(..7)
             .filter(|prefix| prefix.eq_ignore_ascii_case("NVIDIA "))
             .map_or(value, |_| &value[7..])
     }
+    gpu.full_name.as_deref().is_some_and(|name| {
+        name.eq_ignore_ascii_case(adapter_name)
+            || without_nvidia_prefix(name).eq_ignore_ascii_case(without_nvidia_prefix(adapter_name))
+    })
+}
 
-    let mut matches = report.gpus.iter().filter(|gpu| {
-        gpu.full_name.as_deref().is_some_and(|name| {
-            name.eq_ignore_ascii_case(adapter_name)
-                || without_nvidia_prefix(name)
-                    .eq_ignore_ascii_case(without_nvidia_prefix(adapter_name))
-        })
-    });
+/// Whether an output of the NVIDIA adapter named `adapter_name` may be given
+/// an EDID Arcen synthesizes, so a request must be fitted to that EDID's
+/// limits. Errs toward fitting: only when every GPU of that name is proved
+/// not to permit EDID writes is the answer no (several identical GPUs, or a
+/// name NVAPI does not report, may still reach NVAPI's exact backend).
+pub(crate) fn adapter_may_synthesize_edid(
+    report: &NvapiInventoryReport,
+    adapter_name: &str,
+) -> bool {
+    let mut named = report
+        .gpus
+        .iter()
+        .filter(|gpu| gpu_named(gpu, adapter_name))
+        .peekable();
+    named.peek().is_none()
+        || named.any(|gpu| gpu_edid_provisioning(adapter_name, gpu).permits_writes())
+}
+
+fn matching_gpu<'a>(
+    report: &'a NvapiInventoryReport,
+    adapter_name: &str,
+) -> Result<&'a GpuEntry, String> {
+    let mut matches = report
+        .gpus
+        .iter()
+        .filter(|gpu| gpu_named(gpu, adapter_name));
     let Some(gpu) = matches.next() else {
         return Err(format!("NVAPI inventory has no GPU named {adapter_name:?}"));
     };
@@ -1729,6 +1847,194 @@ mod tests {
 
         let grid = gpu(Vec::new());
         assert!(require_edid_provisioning_class("NVIDIA GRID RTX6000-8Q", &grid).is_ok());
+    }
+
+    /// A GeForce RTX 5090 with one DisplayPort dummy plug: a connected,
+    /// active head with the plug's own EDID, nothing Arcen wrote (Asus-007).
+    fn geforce_with_a_dongle() -> NvapiInventoryReport {
+        let mut dongle = display(0x8006_1086, 0x200, true);
+        dongle.connector_type = 6;
+        dongle.flags.physically_connected = true;
+        dongle.edid.manufacturer = Some("DPA".to_string());
+        dongle.edid.written_by_arcen = false;
+        let mut geforce = gpu(vec![dongle]);
+        geforce.full_name = Some("NVIDIA GeForce RTX 5090".to_string());
+        geforce.quadro = Some(false);
+        geforce.virtualization_mode = Some(1);
+        geforce.virtualization_mode_name = Some("none".to_string());
+        inventory(geforce, 0x8006_1086)
+    }
+
+    #[test]
+    #[ignore = "reads this host's NVIDIA GPUs through NVAPI (read-only)"]
+    fn this_hosts_gpu_class_decides_the_edid_backend() {
+        let report = crate::nvapi_inventory::inventory().expect("NVAPI inventory");
+        assert!(!report.gpus.is_empty(), "no NVIDIA GPU");
+        for gpu in &report.gpus {
+            let luid = gpu.adapter_luid.expect("adapter LUID");
+            let decision = exact_edid_backend_permitted(Ok(&report), luid);
+            eprintln!(
+                "gpu {:?} quadro={:?} edid backend: {decision:?}",
+                gpu.full_name, gpu.quadro
+            );
+            assert_eq!(decision.is_ok(), gpu.quadro == Some(true));
+        }
+    }
+
+    #[test]
+    fn a_geforce_without_any_display_is_told_to_attach_one() {
+        let mut headless = geforce_with_a_dongle();
+        assert_eq!(
+            displayless_gpu_refusal(&headless),
+            None,
+            "the dongle is a display"
+        );
+        headless.gpus[0].displays.clear();
+        let refusal = displayless_gpu_refusal(&headless).expect("no display to serve");
+        assert!(refusal.contains("GeForce RTX 5090"), "{refusal}");
+        assert!(refusal.contains("dummy plug"), "{refusal}");
+        assert_eq!(
+            displayless_gpu_refusal(&inventory(gpu(Vec::new()), 0)),
+            None
+        );
+    }
+
+    fn planned_monitor(
+        id: u16,
+        adapter_luid: AdapterLuid,
+        custom_timing: bool,
+    ) -> arcen_outputs::windows_topology::WindowsMonitorPlan {
+        use arcen_media::{LogicalPoint, LogicalRect, LogicalSize, Rotation, Scale120};
+        arcen_outputs::windows_topology::WindowsMonitorPlan {
+            session_monitor_id: arcen_media::SessionMonitorId::new(id).expect("monitor id"),
+            client_display_id: format!("deck-{id}"),
+            adapter_luid,
+            target_id: u32::from(id),
+            adapter_output_index: 0,
+            adapter_name: format!("adapter-{id}"),
+            global_index: u32::from(id),
+            device_name: format!(r"\\.\DISPLAY{id}"),
+            x: 0,
+            y: 0,
+            width: 1_920,
+            height: 1_080,
+            mode_width: 1_920,
+            mode_height: 1_080,
+            logical_rect: LogicalRect::new(
+                LogicalPoint::from_pixels(0, 0).expect("origin"),
+                LogicalSize::from_pixels(1_920, 1_080).expect("size"),
+            )
+            .expect("rect"),
+            scale: Scale120::new(120).expect("scale"),
+            ui_scale: arcen_outputs::WindowsUiScale::from_percent(
+                100,
+                arcen_outputs::ScaleBasis::Unknown,
+            ),
+            refresh_hz: 60,
+            rotation: Rotation::Degrees0,
+            primary: id == 1,
+            custom_timing,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn hdr_is_fitted_to_the_synthesized_edid_unless_every_named_gpu_refuses_it() {
+        let geforce = geforce_with_a_dongle();
+        assert!(!adapter_may_synthesize_edid(
+            &geforce,
+            "NVIDIA GeForce RTX 5090"
+        ));
+        // Two identical professional GPUs: the name is ambiguous, but either
+        // one takes the synthesized EDID.
+        let mut twins = inventory(gpu(Vec::new()), 0);
+        let mut twin = twins.gpus[0].clone();
+        twin.adapter_luid = Some(AdapterLuid {
+            low_part: 2,
+            high_part: 0,
+        });
+        twins.gpus.push(twin);
+        assert!(adapter_may_synthesize_edid(
+            &twins,
+            "NVIDIA GRID RTX6000-8Q"
+        ));
+        assert!(adapter_may_synthesize_edid(
+            &geforce,
+            "an adapter NVAPI does not name"
+        ));
+    }
+
+    #[test]
+    fn a_fixed_mode_geforce_monitor_beside_a_quadro_is_left_to_ccd() {
+        let mut report = geforce_with_a_dongle();
+        let geforce_luid = report.gpus[0].adapter_luid.expect("luid");
+        let quadro_luid = AdapterLuid {
+            low_part: 2,
+            high_part: 0,
+        };
+        let mut quadro = gpu(Vec::new());
+        quadro.adapter_luid = Some(quadro_luid);
+        quadro.full_name = Some("NVIDIA RTX A6000".to_string());
+        report.gpus.push(quadro);
+        let plan = arcen_outputs::windows_topology::WindowsTopologyPlan {
+            generation: arcen_media::TopologyGeneration::new(1).expect("generation"),
+            desktop_x: 0,
+            desktop_y: 0,
+            desktop_width: 3_840,
+            desktop_height: 1_080,
+            monitors: vec![
+                planned_monitor(1, quadro_luid, true),
+                planned_monitor(2, geforce_luid, false),
+            ],
+            requires_custom_timing: true,
+        };
+        let timed = monitors_needing_synthesized_timing(&plan, Ok(&report))
+            .expect("the GeForce monitor needs no EDID write");
+        assert_eq!(
+            timed
+                .iter()
+                .map(|monitor| monitor.client_display_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deck-1"]
+        );
+
+        let mut geforce_timed = plan.clone();
+        geforce_timed.monitors[1].custom_timing = true;
+        let error = monitors_needing_synthesized_timing(&geforce_timed, Ok(&report))
+            .expect_err("a GeForce never takes a synthesized timing");
+        assert!(error.contains("GeForce RTX 5090"), "{error}");
+    }
+
+    #[test]
+    fn a_geforce_with_a_dongle_never_reaches_the_edid_backend() {
+        let report = geforce_with_a_dongle();
+        let luid = report.gpus[0].adapter_luid.expect("luid");
+        let limitation = exact_edid_backend_permitted(Ok(&report), luid)
+            .expect_err("a GeForce must be served without SetEDID");
+        assert_eq!(
+            limitation,
+            "exact display needs a Quadro, RTX Pro or GRID GPU; this host has a GeForce RTX 5090"
+        );
+        assert!(
+            !adapter_edid_provisioning(&report, "NVIDIA GeForce RTX 5090")
+                .expect("named")
+                .permits_writes()
+        );
+
+        let mut unknown = report.clone();
+        unknown.gpus[0].quadro = None;
+        assert!(exact_edid_backend_permitted(Ok(&unknown), luid).is_err());
+        assert!(exact_edid_backend_permitted(Err("NVAPI not loaded"), luid)
+            .expect_err("an unread inventory is not a professional GPU")
+            .contains("could not be read"));
+        let other_luid = AdapterLuid {
+            low_part: 99,
+            high_part: 0,
+        };
+        assert!(exact_edid_backend_permitted(Ok(&report), other_luid).is_err());
+
+        let professional = inventory(gpu(Vec::new()), 0);
+        assert!(exact_edid_backend_permitted(Ok(&professional), luid).is_ok());
     }
 
     fn gpu(displays: Vec<DisplayIdEntry>) -> GpuEntry {

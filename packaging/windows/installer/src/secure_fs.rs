@@ -37,11 +37,13 @@ use std::path::{Component, Path, PathBuf};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, LUID, LocalFree,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SHARING_VIOLATION, ERROR_SUCCESS, HANDLE,
+    INVALID_HANDLE_VALUE, LUID, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
     ACL, AdjustTokenPrivileges, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
@@ -54,8 +56,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
     FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW, READ_CONTROL,
-    VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
+    FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW, QueryDosDeviceW,
+    READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -217,7 +219,20 @@ impl Pinned {
             .share_mode(share)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
-            .map_err(|error| format!("open {}: {error}", path.display()))?;
+            .map_err(|error| {
+                // Never advise deleting it: it may be the installer's own
+                // folder, with the key and the configuration in it, or one
+                // that is Windows' own or shared.
+                if held_open(share, &error) {
+                    format!(
+                        "{} is open in another program that may rename or delete it; close it \
+                         and run again",
+                        path.display()
+                    )
+                } else {
+                    format!("open {}: {error}", path.display())
+                }
+            })?;
         let attributes = object
             .metadata()
             .map_err(|error| format!("inspect {}: {error}", path.display()))?
@@ -275,6 +290,90 @@ impl Pinned {
             .map_err(|error| format!("read the owner of {}: {error}", self.path.display()))
     }
 
+    /// The owner and DACL, as SDDL, read from the handle.
+    pub(crate) fn sddl(&self) -> Result<String, String> {
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: the handle is open for READ_CONTROL; the descriptor is
+        // freed by `_descriptor` after it is converted.
+        let status = unsafe {
+            GetSecurityInfo(
+                self.object.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &raw mut descriptor,
+            )
+        };
+        let _descriptor = LocalMemory(descriptor);
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "read the ACL of {}: {}",
+                self.path.display(),
+                win32_error(status)
+            ));
+        }
+        let mut text: *mut u16 = null_mut();
+        let mut length = 0_u32;
+        // SAFETY: `descriptor` is valid; the string is LocalAlloc memory
+        // freed by `_text`, `length` units long with its terminator.
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &raw mut text,
+                &raw mut length,
+            )
+        };
+        if converted == 0 || text.is_null() {
+            return Err(format!(
+                "read the ACL of {}: {}",
+                self.path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        let _text = LocalMemory(text.cast());
+        // SAFETY: the conversion wrote `length` units to `text`.
+        let units =
+            unsafe { std::slice::from_raw_parts(text, usize::try_from(length).unwrap_or(0)) };
+        Ok(String::from_utf16_lossy(units)
+            .trim_end_matches('\0')
+            .to_owned())
+    }
+
+    /// Refuses the object unless it is still a plain folder (not a link or
+    /// junction) at the path it was opened by.
+    pub(crate) fn require_plain_folder(&self) -> Result<(), String> {
+        let attributes = self
+            .object
+            .metadata()
+            .map_err(|error| format!("inspect {}: {error}", self.path.display()))?
+            .file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "{} is a reparse point (a link or junction); the installer does not follow \
+                 one, since it could lead to a share",
+                self.path.display()
+            ));
+        }
+        let actual = final_path(&self.object)?;
+        if crate::acl::is_network_path(&actual.display().to_string()) {
+            return Err(format!("{} is on a network share", self.path.display()));
+        }
+        if !same_path(&actual, &self.path) {
+            return Err(format!(
+                "{} opened as {}; refusing a redirected or short-name (8.3) path: give the \
+                 full long path",
+                self.path.display(),
+                actual.display()
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuses an object that does not belong to SYSTEM or Administrators:
     /// whoever owns it can change its ACL whatever the installer sets, and
     /// may still hold a handle opened while it was theirs.
@@ -285,7 +384,9 @@ impl Pinned {
         } else {
             Err(format!(
                 "{} is owned by {owner}, not SYSTEM or Administrators, so its owner could read \
-                 or replace the Pier's key; delete it and run again",
+                 or replace what the installer puts there. Leave it as it is (it may be a \
+                 system or shared folder) and choose a location owned by SYSTEM or \
+                 Administrators",
                 self.path.display()
             ))
         }
@@ -365,6 +466,491 @@ fn sid_string(sid: PSID) -> Result<String, io::Error> {
     // SAFETY: `length` units were just read from the same buffer.
     let units = unsafe { std::slice::from_raw_parts(text, length) };
     Ok(String::from_utf16_lossy(units))
+}
+
+/// Whether an open that did not share deletion failed because another
+/// handle may rename or delete the object.
+fn held_open(share: u32, error: &io::Error) -> bool {
+    share & FILE_SHARE_DELETE == 0
+        && error.raw_os_error() == i32::try_from(ERROR_SHARING_VIOLATION).ok()
+}
+
+/// The device a drive letter (`C:`) names, read from the object manager
+/// (`QueryDosDeviceW`) without opening anything on the drive.
+fn drive_device(letter: &str) -> Option<String> {
+    let name = wide(OsStr::new(letter));
+    let mut target = vec![0_u16; 1024];
+    let capacity = u32::try_from(target.len()).unwrap_or(0);
+    // SAFETY: `name` is NUL-terminated and `target` holds `capacity` units.
+    let written = unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), capacity) };
+    let written = usize::try_from(written)
+        .ok()
+        .filter(|written| *written > 0)?;
+    // The first of the NUL-separated targets is the current one.
+    let first = target[..written].split(|unit| *unit == 0).next()?;
+    Some(String::from_utf16_lossy(first))
+}
+
+/// The volume root (`C:\`) of `dir`, or a refusal: `dir` must name a
+/// local disk volume by its drive letter. Not a UNC or device path, nor a
+/// drive letter that names a share, a redirector or a `subst` mapping
+/// (judged from the drive's device name, before anything on the drive is
+/// opened). Nothing is opened here: the walk ([`walk_to`]) opens the
+/// folders, from this root down, without following a link.
+fn local_volume_root(option: &str, dir: &Path) -> Result<PathBuf, String> {
+    let refused = || {
+        format!(
+            "refusing {option} {}: it is on a network share, or not on a local drive \
+             letter. The Pier service runs as SYSTEM and the sign-in screen loads its DLL \
+             from the install folder, so both folders must be on a local drive",
+            dir.display()
+        )
+    };
+    // As typed and as made absolute: an NT path (`\\??\\UNC\\...`) only
+    // shows as typed.
+    if crate::acl::is_network_path(&dir.to_string_lossy()) {
+        return Err(refused());
+    }
+    let absolute = lexical(dir)?;
+    let text = absolute.display().to_string();
+    if crate::acl::is_network_path(&text) {
+        return Err(refused());
+    }
+    let drive = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let letter = drive
+        .get(..2)
+        .filter(|letter| letter.as_bytes()[0].is_ascii_alphabetic() && letter.as_bytes()[1] == b':')
+        .ok_or_else(refused)?;
+    // A local disk volume only: a mapped share (`\Device\LanmanRedirector`,
+    // `\Device\Mup`), WebDAV, a remote desktop's drive, or a `subst`
+    // mapping (`\??\...`, which may lead anywhere) is refused here.
+    if !drive_device(letter).is_some_and(|device| device.starts_with(r"\Device\Harddisk")) {
+        return Err(refused());
+    }
+    Ok(PathBuf::from(format!(r"{letter}\")))
+}
+
+/// Refuses `dir` unless it names a local disk volume by its drive letter
+/// ([`local_volume_root`]). Opens nothing: the folders are opened and
+/// judged by the walk that holds them ([`walk_to`]).
+pub(crate) fn refuse_network_location(option: &str, dir: &Path) -> Result<(), String> {
+    local_volume_root(option, dir).map(drop)
+}
+
+/// Why a folder of a walk could not be opened.
+enum ChildOpen {
+    /// It does not exist.
+    Missing,
+    /// Another handle may rename or delete it.
+    Held,
+    /// Anything else, as a message.
+    Failed(String),
+}
+
+/// Opens, or with `create` creates, the folder `name` in the folder held
+/// by `parent`, relative to that handle (`NtCreateFile` with
+/// `RootDirectory`): no path is looked up again, so nothing above it can be
+/// swapped for a link in between. A link or junction is opened itself,
+/// never followed (`FILE_OPEN_REPARSE_POINT`). Deletion is not shared, so
+/// while the handle is held nobody can rename it. `create` carries the
+/// security descriptor a new folder gets in the creating call, or `None`
+/// for its parent's inherited ACL.
+fn open_child(
+    parent: &File,
+    name: &OsStr,
+    access: u32,
+    share: u32,
+    create: Option<Option<&Descriptor>>,
+) -> Result<File, ChildOpen> {
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, STATUS_OBJECT_NAME_COLLISION,
+        STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SHARING_VIOLATION, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let units: Vec<u16> = name.encode_wide().collect();
+    if units.is_empty()
+        || units
+            .iter()
+            .any(|unit| *unit == u16::from(b'\\') || *unit == u16::from(b'/'))
+    {
+        return Err(ChildOpen::Failed(format!(
+            "{} is not a single folder name",
+            name.to_string_lossy()
+        )));
+    }
+    let bytes = u16::try_from(units.len() * 2)
+        .map_err(|_| ChildOpen::Failed("folder name too long".to_owned()))?;
+    let object_name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: units.as_ptr().cast_mut(),
+    };
+    let descriptor = create.flatten().map_or(std::ptr::null(), |descriptor| {
+        descriptor.0.0.cast_const().cast()
+    });
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: u32::try_from(std::mem::size_of::<OBJECT_ATTRIBUTES>()).unwrap_or(0),
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &raw const object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: descriptor,
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let options = FILE_DIRECTORY_FILE
+        | FILE_OPEN_REPARSE_POINT
+        | FILE_OPEN_FOR_BACKUP_INTENT
+        | FILE_SYNCHRONOUS_IO_NONALERT;
+    let open = |disposition| {
+        let mut handle: HANDLE = null_mut();
+        // SAFETY: an all-zero IO_STATUS_BLOCK is its documented initial
+        // state.
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `attributes`, the name and the descriptor it points to
+        // outlive the call; `handle` and `status_block` are written.
+        let status = unsafe {
+            NtCreateFile(
+                &raw mut handle,
+                access | SYNCHRONIZE,
+                &raw const attributes,
+                &raw mut status_block,
+                std::ptr::null(),
+                0,
+                share,
+                disposition,
+                options,
+                std::ptr::null(),
+                0,
+            )
+        };
+        (status, handle)
+    };
+    let (mut status, mut handle) = open(if create.is_some() {
+        FILE_CREATE
+    } else {
+        FILE_OPEN
+    });
+    if create.is_some() && status == STATUS_OBJECT_NAME_COLLISION {
+        // Made by someone else in between: opened, and judged, like any other.
+        (status, handle) = open(FILE_OPEN);
+    }
+    match status {
+        // SAFETY: a handle NtCreateFile just opened, owned from here on.
+        0.. => Ok(unsafe { File::from_raw_handle(handle) }),
+        STATUS_OBJECT_NAME_NOT_FOUND => Err(ChildOpen::Missing),
+        STATUS_SHARING_VIOLATION => Err(ChildOpen::Held),
+        _ => {
+            // SAFETY: a plain conversion of a status code.
+            let error = unsafe { RtlNtStatusToDosError(status) };
+            Err(ChildOpen::Failed(win32_error(error).to_string()))
+        }
+    }
+}
+
+/// Whose the folders above a walked directory are.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Above<'a> {
+    /// The installer's: a missing one is made with `sddl` from the start
+    /// (an inherited ACL is the system drive's "Authenticated Users:
+    /// Modify"), and one a non-administrator could replace is refused,
+    /// `instead` naming the way out.
+    Installer { sddl: &'a str, instead: &'a str },
+    /// An operator's own (`--tls-only`): a missing one inherits its
+    /// parent's ACL, none is refused for its permissions, and the first a
+    /// non-administrator could replace is named in a warning.
+    Operator,
+}
+
+/// Walks from `dir`'s local volume root ([`local_volume_root`]) to its
+/// parent, one folder at a time, each opened, or made when `create`,
+/// relative to its parent's handle ([`open_child`]): no link is followed
+/// and no path is looked up twice, so nothing can be swapped in between.
+/// Every folder must be a plain directory whose final path is the one it
+/// was named by; each is held without sharing deletion in the returned
+/// [`ChainHold`] until the caller drops it. For [`Above::Installer`] each
+/// is also judged ([`crate::acl::ancestor_hazard`]) and a replaceable one
+/// refused: never to be fixed in place (a handle opened while it was may
+/// keep the right to change its permissions) nor deleted (it may be
+/// Windows' own or shared); the message names it and the right and asks
+/// for a separate protected location. For [`Above::Operator`] the first
+/// replaceable one is returned as a warning. Without `create`, the walk
+/// stops at the first missing folder.
+pub(crate) fn walk_to(
+    option: &str,
+    dir: &Path,
+    above: Above<'_>,
+    create: bool,
+) -> Result<(ChainHold, Option<String>), String> {
+    let root = local_volume_root(option, dir)?;
+    let absolute = lexical(dir)?;
+    let installer = matches!(above, Above::Installer { .. });
+    let instead = match above {
+        Above::Installer { instead, .. } => instead,
+        Above::Operator => "",
+    };
+    let refused = |reason: String| {
+        if installer {
+            format!(
+                "refusing to install into {}: {reason}. Install into a separate location whose \
+                 folders only SYSTEM and Administrators can change, {instead}",
+                dir.display()
+            )
+        } else {
+            format!("refusing {option} {}: {reason}", dir.display())
+        }
+    };
+    let held = |path: &Path| {
+        format!(
+            "{} is open in another program that may rename or delete it; close it and run \
+             again",
+            path.display()
+        )
+    };
+    let leave_it = "leave it as it is: it may be a system or shared folder, and a program \
+                    that opened it while it was replaceable can keep that right after its \
+                    permissions are fixed";
+    let descriptor = match above {
+        Above::Installer { sddl, .. } => Some(Descriptor::owned_by_administrators(sddl)?),
+        Above::Operator => None,
+    };
+    let below_root = absolute
+        .strip_prefix(&root)
+        .or_else(|_| absolute.strip_prefix(format!(r"\\?\{}", root.display())))
+        .map_err(|_| {
+            refused(format!(
+                "{} is not below {}",
+                absolute.display(),
+                root.display()
+            ))
+        })?;
+    let mut names = Vec::new();
+    for component in below_root.components() {
+        match component {
+            Component::Normal(name) => names.push(name.to_os_string()),
+            _ => {
+                return Err(refused(format!(
+                    "{} has a component that is not a name",
+                    dir.display()
+                )));
+            }
+        }
+    }
+    // The folders above `dir`; `dir` itself is the caller's ([`ChainHold::open_own`]).
+    if names.pop().is_none() {
+        return Err(refused(format!("{} is a volume root", dir.display())));
+    }
+    enable_repair_privileges();
+    let access = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL;
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    let root_handle = OpenOptions::new()
+        .access_mode(access)
+        .share_mode(share)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&root)
+        .map_err(|error| {
+            if held_open(share, &error) {
+                refused(held(&root))
+            } else {
+                refused(format!("open {}: {error}", root.display()))
+            }
+        })?;
+    let mut hold = ChainHold::default();
+    let mut warning = None;
+    let mut folder = Pinned {
+        object: root_handle,
+        path: root,
+    };
+    let mut rest = names.into_iter();
+    loop {
+        folder.require_plain_folder().map_err(refused)?;
+        let shown = folder.path.display().to_string();
+        match crate::acl::ancestor_hazard(&shown, &folder.sddl()?) {
+            Ok(()) => {}
+            Err(hazard @ crate::acl::Hazard::Replaceable { .. }) if installer => {
+                return Err(refused(format!("{hazard}; {leave_it}")));
+            }
+            Err(hazard) if installer => return Err(refused(hazard.to_string())),
+            Err(hazard) => {
+                warning.get_or_insert_with(|| hazard.to_string());
+            }
+        }
+        let Some(name) = rest.next() else {
+            hold.push(folder, installer);
+            return Ok((hold, warning));
+        };
+        let path = folder.path.join(&name);
+        let child = match open_child(&folder.object, &name, access, share, None) {
+            Ok(child) => child,
+            Err(ChildOpen::Missing) if create => {
+                match open_child(
+                    &folder.object,
+                    &name,
+                    access,
+                    share,
+                    Some(descriptor.as_ref()),
+                ) {
+                    Ok(child) => child,
+                    Err(ChildOpen::Held) => return Err(refused(held(&path))),
+                    Err(ChildOpen::Missing) => {
+                        return Err(refused(format!("{} vanished while made", path.display())));
+                    }
+                    Err(ChildOpen::Failed(error)) => {
+                        return Err(refused(format!("create {}: {error}", path.display())));
+                    }
+                }
+            }
+            Err(ChildOpen::Missing) => {
+                hold.push(folder, installer);
+                return Ok((hold, warning));
+            }
+            Err(ChildOpen::Held) => return Err(refused(held(&path))),
+            Err(ChildOpen::Failed(error)) => {
+                return Err(refused(format!("open {}: {error}", path.display())));
+            }
+        };
+        hold.push(folder, installer);
+        folder = Pinned {
+            object: child,
+            path,
+        };
+    }
+}
+
+/// The first existing folder above `dir` that a non-administrator could
+/// replace, as a message; `None` when there is none. Nothing is created or
+/// changed, and no link is followed ([`walk_to`]).
+pub(crate) fn ancestor_warning(dir: &Path) -> Option<String> {
+    match walk_to("--programdata", dir, Above::Operator, false) {
+        Ok((_, warning)) => warning,
+        Err(error) => Some(error),
+    }
+}
+
+/// The folders from a volume root to an install directory, and the
+/// directory itself, held open without sharing deletion from when the walk
+/// ([`walk_to`]) opened them until the installer has written and registered
+/// what goes in them: nobody can rename one meanwhile. [`Self::recheck`]
+/// judges them again through the same handles before each payload is
+/// written.
+#[derive(Debug, Default)]
+pub(crate) struct ChainHold {
+    /// From the root down; `true` for a folder above an installer's
+    /// directory, judged again at every recheck, `false` for one above an
+    /// operator's own, only kept a plain folder.
+    folders: Vec<(Pinned, bool)>,
+    /// The install directory and the class its ACL must have.
+    own: Option<(Pinned, crate::acl::AclClass)>,
+}
+
+impl ChainHold {
+    fn push(&mut self, folder: Pinned, judged: bool) {
+        self.folders.push((folder, judged));
+    }
+
+    /// Opens, or makes with the DACL of `class` from the start, the
+    /// directory `dir` in the last folder of the walk, relative to its
+    /// handle, never following a link; refuses one that another account
+    /// owns; applies the class's ACL through the handle; and holds it.
+    pub(crate) fn open_own(
+        &mut self,
+        dir: &Path,
+        class: crate::acl::AclClass,
+    ) -> Result<(), String> {
+        let (parent, _) = self
+            .folders
+            .last()
+            .ok_or_else(|| format!("{} has no folder above it to open it from", dir.display()))?;
+        let name = dir
+            .file_name()
+            .ok_or_else(|| format!("{} has no folder name", dir.display()))?;
+        let path = parent.path.join(name);
+        if !same_path(&path, &lexical(dir)?) {
+            return Err(format!(
+                "{} is not in {}, the folder the walk ended at",
+                dir.display(),
+                parent.path.display()
+            ));
+        }
+        let held = |path: &Path| {
+            format!(
+                "{} is open in another program that may rename or delete it; close it and run \
+                 again",
+                path.display()
+            )
+        };
+        let access =
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        let object = match open_child(&parent.object, name, access, share, None) {
+            Ok(object) => object,
+            Err(ChildOpen::Missing) => {
+                let descriptor = Descriptor::owned_by_administrators(class.sddl())?;
+                match open_child(&parent.object, name, access, share, Some(Some(&descriptor))) {
+                    Ok(object) => object,
+                    Err(ChildOpen::Held) => return Err(held(&path)),
+                    Err(ChildOpen::Missing) => {
+                        return Err(format!("{} vanished while made", path.display()));
+                    }
+                    Err(ChildOpen::Failed(error)) => {
+                        return Err(format!("create {}: {error}", path.display()));
+                    }
+                }
+            }
+            Err(ChildOpen::Held) => return Err(held(&path)),
+            Err(ChildOpen::Failed(error)) => {
+                return Err(format!("open {}: {error}", path.display()));
+            }
+        };
+        let directory = Pinned { object, path };
+        directory.require_plain_folder()?;
+        directory.require_trusted_owner()?;
+        directory.set_security(class.sddl())?;
+        self.own = Some((directory, class));
+        Ok(())
+    }
+
+    /// Where each held folder really is, from the root down.
+    #[cfg(test)]
+    pub(crate) fn held_paths(&self) -> Vec<PathBuf> {
+        self.folders
+            .iter()
+            .map(|(folder, _)| &folder.object)
+            .chain(self.own.as_ref().map(|(directory, _)| &directory.object))
+            .filter_map(|object| final_path(object).ok())
+            .collect()
+    }
+
+    /// Judges every held folder again, as it is now: still a plain folder
+    /// at its path, a folder above an installer's directory still one no
+    /// non-administrator could replace, and the install directory still
+    /// owned by SYSTEM or Administrators with exactly its class's ACL.
+    pub(crate) fn recheck(&self) -> Result<(), String> {
+        for (folder, judged) in &self.folders {
+            folder.require_plain_folder()?;
+            if *judged {
+                crate::acl::ancestor_hazard(&folder.path.display().to_string(), &folder.sddl()?)
+                    .map_err(|hazard| {
+                        format!("{hazard}, since the installer checked it; nothing more is written")
+                    })?;
+            }
+        }
+        if let Some((directory, class)) = &self.own {
+            directory.require_plain_folder()?;
+            directory.require_trusted_owner()?;
+            crate::acl::assert_acl_sddl(
+                &directory.path.display().to_string(),
+                &directory.sddl()?,
+                *class,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Creates the directory `path` owned by Administrators with the DACL of
@@ -497,6 +1083,30 @@ pub(crate) fn verify_in_directory(file: &File, canonical_directory: &Path) -> Re
             canonical_directory.display()
         ))
     }
+}
+
+/// Reads the text file `path`, opened without following a final link and
+/// only once its final path is proven to be in `canonical_directory`.
+pub(crate) fn read_in_directory(path: &Path, canonical_directory: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let attributes = file
+        .metadata()
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?
+        .file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("refusing reparse point {}", path.display()));
+    }
+    verify_in_directory(&file, canonical_directory)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(text)
 }
 
 /// Writes `bytes` to the new file `path`, created with the DACL of `sddl`,

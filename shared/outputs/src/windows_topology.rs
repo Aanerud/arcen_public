@@ -666,6 +666,11 @@ pub struct WindowsMonitorPlan {
     pub refresh_hz: u32,
     pub rotation: Rotation,
     pub primary: bool,
+    /// Whether this monitor's output is driven through the NVAPI
+    /// synthesized-timing path ([`OutputModeCapability::CustomTimingCapable`]).
+    /// A fixed-mode output in the same plan is set through CCD at one of its
+    /// own modes, whatever the other monitors need.
+    pub custom_timing: bool,
     /// Deck display colour contract for the physical output this monitor is
     /// mapped onto, when the Deck reported one.
     pub color: Option<arcen_media::display_color::DisplayColor>,
@@ -690,7 +695,8 @@ pub struct WindowsTopologyPlan {
     /// Applied monitors, in requested-roster order (not output-assignment
     /// order).
     pub monitors: Vec<WindowsMonitorPlan>,
-    /// Whether applying this plan needs the NVAPI synthesized-timing path.
+    /// Whether applying this plan needs the NVAPI synthesized-timing path for
+    /// any monitor (see [`WindowsMonitorPlan::custom_timing`] for which).
     ///
     /// True when any assigned output is [`OutputModeCapability::CustomTimingCapable`],
     /// i.e. it was planned at a mode it does not itself enumerate. Outputs
@@ -925,6 +931,7 @@ pub fn plan_current_topology(
             refresh_hz: output.current_refresh_hz.max(1),
             rotation: ccd_mode.target_rotation,
             primary: monitor.primary,
+            custom_timing: output.mode_capability.requires_custom_timing(),
             color: monitor
                 .color
                 .as_ref()
@@ -1144,6 +1151,7 @@ pub fn plan_topology(
             refresh_hz,
             rotation: ccd_mode.target_rotation,
             primary: applied_monitor.monitor().primary,
+            custom_timing: output.mode_capability.requires_custom_timing(),
             color: applied_monitor
                 .monitor()
                 .color
@@ -2970,6 +2978,15 @@ mod tests {
         .expect("requested topology");
         let plan = plan_topology(&requested, generation(), &inventory).expect("plans");
         assert!(plan.requires_custom_timing);
+        // Each monitor says which path it needs: a professional NVIDIA output
+        // beside a fixed-mode one (a GeForce) does not drag the latter onto
+        // NVAPI.
+        let custom = plan
+            .monitors
+            .iter()
+            .map(|monitor| (monitor.client_display_id.as_str(), monitor.custom_timing))
+            .collect::<Vec<_>>();
+        assert_eq!(custom, vec![("a", true), ("b", false)]);
     }
 
     /// The no-mutation current-topology planner reports the same requirement

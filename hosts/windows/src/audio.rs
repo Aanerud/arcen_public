@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 #[cfg(windows)]
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use arcen_media::audio::resample::PcmResampler;
+use arcen_media::audio::AudioFrameSpec;
 
 use crate::latest::LatestQueue;
 use crate::logging::AUDIO;
@@ -29,7 +31,9 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioPacket {
-    pub pcm_s16le: Vec<u8>,
+    /// One audio-v1 packet, held by value so the capture loop hands it over
+    /// without allocating.
+    pub pcm_s16le: [u8; CHUNK_BYTES],
     pub timestamp_ms: u32,
 }
 
@@ -350,16 +354,46 @@ impl MixFormat {
     }
 }
 
+/// Mix frames adapted and converted at a time, so every scratch buffer the
+/// capture loop uses is allocated once and bounded.
+const CONVERT_CHUNK_FRAMES: usize = 1_024;
+
+/// Turns WASAPI buffers into audio-v1 packets without allocating.
+///
+/// Format adaptation (sample format, channel layout) is this adapter's: it
+/// is what the mix format says. The rate conversion is the shared
+/// `arcen_media` resampler every Pier uses.
 struct AudioPipeline {
     converter: StereoConverter,
-    chunk_samples: VecDeque<i16>,
+    resampler: PcmResampler,
+    /// Stereo float frames at the mix rate, at most `CONVERT_CHUNK_FRAMES`.
+    stereo: Vec<f32>,
+    /// The resampler's output for one chunk, sized for the lowest mix rate.
+    resampled: Vec<f32>,
+    /// The packet being filled, handed over by value: no allocation per
+    /// packet either.
+    chunk: [u8; CHUNK_BYTES],
+    chunk_len: usize,
 }
 
 impl AudioPipeline {
     fn new(format: MixFormat) -> Result<Self, String> {
+        let format = format.validate()?;
+        let resampler = PcmResampler::new(format.sample_rate, AudioFrameSpec::V1)
+            .ok_or_else(|| format!("no resampler from {} Hz to audio-v1", format.sample_rate))?;
+        let resampled = PcmResampler::max_output_samples_for(
+            MIN_MIX_SAMPLE_RATE,
+            AudioFrameSpec::V1,
+            CONVERT_CHUNK_FRAMES * CHANNELS,
+        )
+        .ok_or_else(|| "audio-v1 has no resampler bound".to_string())?;
         Ok(Self {
-            converter: StereoConverter::new(format.validate()?),
-            chunk_samples: VecDeque::with_capacity(CHUNK_FRAMES * CHANNELS * 2),
+            converter: StereoConverter::new(format),
+            resampler,
+            stereo: Vec::with_capacity(CONVERT_CHUNK_FRAMES * CHANNELS),
+            resampled: Vec::with_capacity(resampled),
+            chunk: [0; CHUNK_BYTES],
+            chunk_len: 0,
         })
     }
 
@@ -371,12 +405,29 @@ impl AudioPipeline {
         clock: &mut AudioClock,
         emit: &mut dyn FnMut(AudioPacket),
     ) -> Result<u64, String> {
-        let converted = self.converter.convert(data, frames)?;
-        self.chunk_samples.extend(converted);
-        Ok(self.emit_chunks(now_ms, clock, emit))
+        let block_align = self.converter.format.block_align;
+        let expected = frames
+            .checked_mul(block_align)
+            .ok_or_else(|| "WASAPI packet size overflow".to_string())?;
+        if expected > MAX_PACKET_BYTES {
+            return Err("WASAPI packet exceeds safety limit".to_string());
+        }
+        if data.len() < expected {
+            return Err(format!(
+                "short WASAPI packet: got {} bytes, expected {expected}",
+                data.len()
+            ));
+        }
+        let mut gap_total_ms = 0;
+        for piece in data[..expected].chunks(CONVERT_CHUNK_FRAMES * block_align) {
+            self.stereo.clear();
+            self.converter.convert_into(piece, &mut self.stereo)?;
+            gap_total_ms += self.convert_and_emit(now_ms, clock, emit)?;
+        }
+        Ok(gap_total_ms)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     fn push_silence(
         &mut self,
         frames: usize,
@@ -390,19 +441,76 @@ impl AudioPipeline {
         if bytes > MAX_PACKET_BYTES {
             return Err("silent WASAPI packet exceeds safety limit".to_string());
         }
-        let silence = vec![0u8; bytes];
-        self.push(&silence, frames, now_ms, clock, emit)
+        let mut gap_total_ms = 0;
+        let mut remaining = frames;
+        while remaining > 0 {
+            let piece = remaining.min(CONVERT_CHUNK_FRAMES);
+            self.stereo.clear();
+            self.stereo.resize(piece * CHANNELS, 0.0);
+            gap_total_ms += self.convert_and_emit(now_ms, clock, emit)?;
+            remaining -= piece;
+        }
+        Ok(gap_total_ms)
     }
 
-    fn emit_chunks(
+    /// Converts `stereo` to audio-v1's rate and emits every completed packet.
+    fn convert_and_emit(
+        &mut self,
+        now_ms: u64,
+        clock: &mut AudioClock,
+        emit: &mut dyn FnMut(AudioPacket),
+    ) -> Result<u64, String> {
+        self.resampled.clear();
+        self.resampler
+            .process(&self.stereo, &mut self.resampled)
+            .map_err(|error| format!("resample WASAPI audio: {error}"))?;
+        Ok(self.emit_resampled(now_ms, clock, emit))
+    }
+
+    /// Ends this capture without losing audio: the frames the resampler
+    /// holds back and the partial packet are real sound, so they go out,
+    /// the last packet completed with silence. Called when the device
+    /// changes or the capture stops; a restart builds a new pipeline.
+    fn finish(
+        &mut self,
+        now_ms: u64,
+        clock: &mut AudioClock,
+        emit: &mut dyn FnMut(AudioPacket),
+    ) -> Result<u64, String> {
+        self.resampled.clear();
+        self.resampler
+            .flush(&mut self.resampled)
+            .map_err(|error| format!("flush WASAPI audio: {error}"))?;
+        let mut gap_total_ms = self.emit_resampled(now_ms, clock, emit);
+        if self.chunk_len > 0 {
+            self.chunk[self.chunk_len..].fill(0);
+            self.chunk_len = 0;
+            let (timestamp_ms, gap_ms) = clock.next_chunk(now_ms);
+            gap_total_ms += gap_ms;
+            emit(AudioPacket {
+                pcm_s16le: self.chunk,
+                timestamp_ms,
+            });
+        }
+        Ok(gap_total_ms)
+    }
+
+    /// Frames `resampled` into packets and emits every completed one.
+    fn emit_resampled(
         &mut self,
         now_ms: u64,
         clock: &mut AudioClock,
         emit: &mut dyn FnMut(AudioPacket),
     ) -> u64 {
-        let chunk_samples = CHUNK_FRAMES * CHANNELS;
         let mut gap_total_ms = 0;
-        while self.chunk_samples.len() >= chunk_samples {
+        for &sample in &self.resampled {
+            let bytes = float_to_i16(sample).to_le_bytes();
+            self.chunk[self.chunk_len..self.chunk_len + 2].copy_from_slice(&bytes);
+            self.chunk_len += 2;
+            if self.chunk_len < CHUNK_BYTES {
+                continue;
+            }
+            self.chunk_len = 0;
             let (timestamp_ms, gap_ms) = clock.next_chunk(now_ms);
             gap_total_ms += gap_ms;
             if gap_ms > 0 {
@@ -412,12 +520,8 @@ impl AudioPipeline {
                     "audio timestamp gap after capture interruption"
                 );
             }
-            let mut pcm = Vec::with_capacity(CHUNK_BYTES);
-            for sample in self.chunk_samples.drain(..chunk_samples) {
-                pcm.extend_from_slice(&sample.to_le_bytes());
-            }
             emit(AudioPacket {
-                pcm_s16le: pcm,
+                pcm_s16le: self.chunk,
                 timestamp_ms,
             });
         }
@@ -425,11 +529,11 @@ impl AudioPipeline {
     }
 }
 
+/// Adapts the mix format to stereo: decodes each sample and downmixes the
+/// channel layout. Rates are the shared resampler's.
 struct StereoConverter {
     format: MixFormat,
     downmix_weights: Vec<[f64; CHANNELS]>,
-    pending: VecDeque<[i16; CHANNELS]>,
-    phase: u64,
 }
 
 impl StereoConverter {
@@ -437,61 +541,27 @@ impl StereoConverter {
         Self {
             format,
             downmix_weights: downmix_weights(format.channels, format.channel_mask),
-            pending: VecDeque::new(),
-            phase: 0,
         }
     }
 
-    fn convert(&mut self, data: &[u8], frames: usize) -> Result<Vec<i16>, String> {
-        let expected = frames
-            .checked_mul(self.format.block_align)
-            .ok_or_else(|| "WASAPI packet size overflow".to_string())?;
-        if expected > MAX_PACKET_BYTES {
-            return Err("WASAPI packet exceeds safety limit".to_string());
+    /// Appends `data`'s frames to `stereo` as interleaved float stereo.
+    /// `stereo` must have room for them; it is never grown here.
+    fn convert_into(&self, data: &[u8], stereo: &mut Vec<f32>) -> Result<(), String> {
+        let frames = data.len() / self.format.block_align;
+        if stereo.capacity() - stereo.len() < frames * CHANNELS {
+            return Err("WASAPI conversion buffer too small".to_string());
         }
-        if data.len() < expected {
-            return Err(format!(
-                "short WASAPI packet: got {} bytes, expected {expected}",
-                data.len()
-            ));
-        }
-
-        let mut stereo = Vec::with_capacity(frames);
-        for frame in data[..expected].chunks_exact(self.format.block_align) {
+        for frame in data.chunks_exact(self.format.block_align) {
             let mut mixed = [0.0; CHANNELS];
             for (channel, weights) in self.downmix_weights.iter().enumerate() {
                 let sample = f64::from(decode_sample(frame, channel, self.format.sample_format)?);
                 mixed[0] += sample * weights[0];
                 mixed[1] += sample * weights[1];
             }
-            stereo.push([clamp_i16(mixed[0]), clamp_i16(mixed[1])]);
+            stereo.push(f32::from(clamp_i16(mixed[0])) / 32_768.0);
+            stereo.push(f32::from(clamp_i16(mixed[1])) / 32_768.0);
         }
-
-        if self.format.sample_rate == SAMPLE_RATE {
-            return Ok(stereo.into_iter().flatten().collect());
-        }
-
-        self.pending.extend(stereo);
-        let mut out = Vec::new();
-        loop {
-            let index = (self.phase / u64::from(SAMPLE_RATE)) as usize;
-            let Some(second_index) = index.checked_add(1) else {
-                break;
-            };
-            if second_index >= self.pending.len() {
-                break;
-            }
-            let first = self.pending[index];
-            let second = self.pending[second_index];
-            let fraction = (self.phase % u64::from(SAMPLE_RATE)) as f64 / SAMPLE_RATE as f64;
-            out.push(interpolate(first[0], second[0], fraction));
-            out.push(interpolate(first[1], second[1], fraction));
-            self.phase += u64::from(self.format.sample_rate);
-        }
-        let consume = ((self.phase / u64::from(SAMPLE_RATE)) as usize).min(self.pending.len());
-        self.pending.drain(..consume);
-        self.phase -= consume as u64 * u64::from(SAMPLE_RATE);
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -661,13 +731,6 @@ fn float_to_i16(value: f32) -> i16 {
     }
 }
 
-fn interpolate(first: i16, second: i16, fraction: f64) -> i16 {
-    let value = f64::from(first) + (f64::from(second) - f64::from(first)) * fraction;
-    value
-        .round()
-        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
-}
-
 #[derive(Debug, Default)]
 struct AudioClock {
     next_ms: Option<u64>,
@@ -819,86 +882,98 @@ mod platform {
             "WASAPI loopback started"
         );
 
-        while !stop.is_requested() {
-            if endpoint_check.elapsed() >= ENDPOINT_POLL {
-                let current = default_render_endpoint(&enumerator)
-                    .and_then(|endpoint| endpoint_id(&endpoint))?;
-                if current != active_endpoint_id {
-                    return Err(format!(
+        let result = (|| -> Result<(), String> {
+            while !stop.is_requested() {
+                if endpoint_check.elapsed() >= ENDPOINT_POLL {
+                    let current = default_render_endpoint(&enumerator)
+                        .and_then(|endpoint| endpoint_id(&endpoint))?;
+                    if current != active_endpoint_id {
+                        return Err(format!(
                         "default render endpoint changed from {active_endpoint_id} to {current}"
                     ));
+                    }
+                    endpoint_check = Instant::now();
                 }
-                endpoint_check = Instant::now();
-            }
-            let packet_frames = unsafe {
-                // SAFETY: `capture` is valid while `_started` keeps the audio client running.
-                capture.GetNextPacketSize()
-            }
-            .map_err(wasapi_error("query next audio packet"))?;
-            if packet_frames == 0 {
-                if !idle_reported && last_packet.elapsed() >= IDLE_AFTER {
-                    telemetry.idle_periods.fetch_add(1, Ordering::Relaxed);
-                    idle_reported = true;
-                    tracing::debug!(target: AUDIO, "WASAPI loopback idle: no rendered audio for 100 ms");
+                let packet_frames = unsafe {
+                    // SAFETY: `capture` is valid while `_started` keeps the audio client running.
+                    capture.GetNextPacketSize()
                 }
-                if stop.wait_timeout(IDLE_POLL) {
-                    break;
+                .map_err(wasapi_error("query next audio packet"))?;
+                if packet_frames == 0 {
+                    if !idle_reported && last_packet.elapsed() >= IDLE_AFTER {
+                        telemetry.idle_periods.fetch_add(1, Ordering::Relaxed);
+                        idle_reported = true;
+                        tracing::debug!(target: AUDIO, "WASAPI loopback idle: no rendered audio for 100 ms");
+                    }
+                    if stop.wait_timeout(IDLE_POLL) {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            let mut data = std::ptr::null_mut();
-            let mut frames = 0u32;
-            let mut flags = 0u32;
-            unsafe {
-                // SAFETY: All output pointers are valid for writes and remain in scope through
-                // ReleaseBuffer. The returned data is read only before releasing it.
-                capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)
-            }
-            .map_err(wasapi_error("read audio packet"))?;
-            let buffer = CaptureBuffer::new(&capture, frames);
-            let frame_count = frames as usize;
-            if frame_count == 0 || frame_count > max_buffer_frames {
-                return Err(format!(
+                let mut data = std::ptr::null_mut();
+                let mut frames = 0u32;
+                let mut flags = 0u32;
+                unsafe {
+                    // SAFETY: All output pointers are valid for writes and remain in scope through
+                    // ReleaseBuffer. The returned data is read only before releasing it.
+                    capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)
+                }
+                .map_err(wasapi_error("read audio packet"))?;
+                let buffer = CaptureBuffer::new(&capture, frames);
+                let frame_count = frames as usize;
+                if frame_count == 0 || frame_count > max_buffer_frames {
+                    return Err(format!(
                     "invalid WASAPI packet frame count: {frame_count} (buffer {max_buffer_frames})"
                 ));
-            }
-            let timestamp = now_ms();
-            if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
-                telemetry.discontinuities.fetch_add(1, Ordering::Relaxed);
-                telemetry.underruns.fetch_add(1, Ordering::Relaxed);
-            }
-            if flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 {
-                telemetry.discontinuities.fetch_add(1, Ordering::Relaxed);
-            }
-            if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                telemetry
-                    .silent_frames
-                    .fetch_add(u64::from(frames), Ordering::Relaxed);
-                let gap = pipeline.push_silence(frame_count, timestamp, clock, emit)?;
-                telemetry.timestamp_gap_ms.fetch_add(gap, Ordering::Relaxed);
-            } else {
-                let bytes = frame_count
-                    .checked_mul(format.block_align)
-                    .ok_or_else(|| "WASAPI buffer size overflow".to_string())?;
-                if bytes > super::MAX_PACKET_BYTES {
-                    return Err("WASAPI buffer exceeds safety limit".to_string());
                 }
-                let data = NonNull::new(data)
-                    .ok_or_else(|| "WASAPI returned a null non-silent buffer".to_string())?;
-                let slice = unsafe {
-                    // SAFETY: GetBuffer guarantees `frames * block_align` readable bytes until
-                    // ReleaseBuffer, `data` is non-null, and the checked length is bounded.
-                    std::slice::from_raw_parts(data.as_ptr(), bytes)
-                };
-                let gap = pipeline.push(slice, frame_count, timestamp, clock, emit)?;
+                let timestamp = now_ms();
+                if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 {
+                    telemetry.discontinuities.fetch_add(1, Ordering::Relaxed);
+                    telemetry.underruns.fetch_add(1, Ordering::Relaxed);
+                }
+                if flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 {
+                    telemetry.discontinuities.fetch_add(1, Ordering::Relaxed);
+                }
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                    telemetry
+                        .silent_frames
+                        .fetch_add(u64::from(frames), Ordering::Relaxed);
+                    let gap = pipeline.push_silence(frame_count, timestamp, clock, emit)?;
+                    telemetry.timestamp_gap_ms.fetch_add(gap, Ordering::Relaxed);
+                } else {
+                    let bytes = frame_count
+                        .checked_mul(format.block_align)
+                        .ok_or_else(|| "WASAPI buffer size overflow".to_string())?;
+                    if bytes > super::MAX_PACKET_BYTES {
+                        return Err("WASAPI buffer exceeds safety limit".to_string());
+                    }
+                    let data = NonNull::new(data)
+                        .ok_or_else(|| "WASAPI returned a null non-silent buffer".to_string())?;
+                    let slice = unsafe {
+                        // SAFETY: GetBuffer guarantees `frames * block_align` readable bytes until
+                        // ReleaseBuffer, `data` is non-null, and the checked length is bounded.
+                        std::slice::from_raw_parts(data.as_ptr(), bytes)
+                    };
+                    let gap = pipeline.push(slice, frame_count, timestamp, clock, emit)?;
+                    telemetry.timestamp_gap_ms.fetch_add(gap, Ordering::Relaxed);
+                }
+                buffer.release()?;
+                last_packet = Instant::now();
+                idle_reported = false;
+            }
+            Ok(())
+        })();
+        // A device change or loss ends this capture here: send what the
+        // filter and the partial packet hold before the restart builds a
+        // new pipeline, rather than dropping up to 24 ms of sound.
+        match pipeline.finish(now_ms(), clock, emit) {
+            Ok(gap) => {
                 telemetry.timestamp_gap_ms.fetch_add(gap, Ordering::Relaxed);
             }
-            buffer.release()?;
-            last_packet = Instant::now();
-            idle_reported = false;
+            Err(error) => tracing::warn!(target: AUDIO, %error, "WASAPI flush failed"),
         }
-        Ok(())
+        result
     }
 
     fn default_render_endpoint(enumerator: &IMMDeviceEnumerator) -> Result<IMMDevice, String> {
@@ -1114,6 +1189,109 @@ mod platform {
             }
         }
     }
+
+    /// The default render endpoint's shared-mode mix format.
+    #[cfg(test)]
+    fn default_mix_format() -> Result<(String, MixFormat), String> {
+        let _com = ComApartment::initialize()?;
+        let enumerator: IMMDeviceEnumerator = unsafe {
+            // SAFETY: COM is initialized on this thread; the CLSID/IID pair is
+            // supplied by the windows crate.
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        }
+        .map_err(|error| format!("create MMDeviceEnumerator: {error}"))?;
+        let device = default_render_endpoint(&enumerator)?;
+        let id = endpoint_id(&device)?;
+        let client: IAudioClient = unsafe {
+            // SAFETY: `device` is a live IMMDevice from this apartment.
+            device.Activate(CLSCTX_ALL, None)
+        }
+        .map_err(|error| format!("activate IAudioClient: {error}"))?;
+        let mix = CoTaskMem::new(
+            unsafe {
+                // SAFETY: GetMixFormat returns CoTaskMem-owned memory, freed by the guard.
+                client.GetMixFormat()
+            }
+            .map_err(|error| format!("get WASAPI mix format: {error}"))?,
+        )?;
+        Ok((id, parse_mix_format(mix.as_ptr())?))
+    }
+
+    #[cfg(test)]
+    mod hardware {
+        use super::*;
+        use crate::audio::{AudioTelemetry, StopSignal};
+        use std::sync::Arc;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_LOOP};
+
+        /// Hardware qualification: run with `--ignored` on a Windows host.
+        ///
+        /// Captures this machine's default render endpoint for three seconds
+        /// through the real WASAPI loop and the shared resampler while a
+        /// system sound plays, and reports the mix format and what arrived.
+        /// It changes no device setting.
+        #[test]
+        #[ignore = "plays a sound and captures the default render endpoint"]
+        fn wasapi_loopback_captures_through_the_shared_resampler() {
+            let (endpoint, mix) = default_mix_format().expect("a default render endpoint");
+            eprintln!(
+                "default render endpoint {endpoint}: {} Hz, {} channels, {:?}",
+                mix.sample_rate, mix.channels, mix.sample_format
+            );
+            let stop = Arc::new(StopSignal::default());
+            let timer = {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(3));
+                    stop.request();
+                })
+            };
+            let playing = unsafe {
+                // SAFETY: a NUL-terminated literal path; SND_ASYNC returns at once.
+                PlaySoundW(
+                    w!("C:\\Windows\\Media\\Windows Background.wav"),
+                    HMODULE::default(),
+                    SND_FILENAME | SND_ASYNC | SND_LOOP,
+                )
+            }
+            .as_bool();
+            let telemetry = AudioTelemetry::default();
+            let mut clock = AudioClock::default();
+            let (mut packets, mut peak) = (0usize, 0i32);
+            let result = WasapiRunner.run_once(
+                &stop,
+                &mut clock,
+                &mut |packet: AudioPacket| {
+                    packets += 1;
+                    for pair in packet.pcm_s16le.chunks_exact(2) {
+                        peak = peak.max(i32::from(i16::from_le_bytes([pair[0], pair[1]])).abs());
+                    }
+                },
+                &telemetry,
+            );
+            unsafe {
+                // SAFETY: a null sound stops whatever this process is playing.
+                let _ = PlaySoundW(PCWSTR::null(), HMODULE::default(), SND_ASYNC);
+            }
+            timer.join().expect("timer thread");
+            let snapshot = telemetry.snapshot();
+            eprintln!(
+                "capture: {result:?}, sound playing {playing}, {packets} packets (audio-v1, 20 ms), \
+                 peak {peak}, silent frames {}, discontinuities {}",
+                snapshot.silent_frames, snapshot.discontinuities
+            );
+            result.expect("the WASAPI loop ran without error");
+            if playing {
+                assert!(
+                    packets > 50,
+                    "3 s of sound should be about 150 packets, got {packets}"
+                );
+                assert!(peak > 0, "the sound must arrive, not silence");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1166,27 +1344,53 @@ mod tests {
             .is_err());
     }
 
+    /// Every frame `pipeline` emits for `data`, and what it holds back.
+    fn run_pipeline(pipeline: &mut AudioPipeline, data: &[u8], frames: usize) -> Vec<i16> {
+        let mut clock = AudioClock::default();
+        let mut samples = Vec::new();
+        pipeline
+            .push(data, frames, 1_000, &mut clock, &mut |packet| {
+                samples.extend(
+                    packet
+                        .pcm_s16le
+                        .chunks_exact(2)
+                        .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+                );
+            })
+            .unwrap();
+        samples.extend(
+            pipeline.chunk[..pipeline.chunk_len]
+                .chunks_exact(2)
+                .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+        );
+        samples
+    }
+
     #[test]
     fn duplicates_mono_and_resamples_44k1_to_48k() {
         let mono: Vec<u8> = (0..4_410i16)
             .flat_map(|sample| sample.to_le_bytes())
             .collect();
-        let mut converter = StereoConverter::new(
-            format(
-                44_100,
-                1,
-                SampleFormat::SignedPcm {
-                    container_bytes: 2,
-                    valid_bits: 16,
-                },
-                2,
-            )
-            .validate()
-            .unwrap(),
+        let mix = format(
+            44_100,
+            1,
+            SampleFormat::SignedPcm {
+                container_bytes: 2,
+                valid_bits: 16,
+            },
+            2,
         );
-        let converted = converter.convert(&mono, 4_410).unwrap();
+        let mut pipeline = AudioPipeline::new(mix).unwrap();
+        let latency = pipeline.resampler.latency_frames();
+        let converted = run_pipeline(&mut pipeline, &mono, 4_410);
+        // 0.1 s at 44.1 kHz is 4800 frames at 48 kHz; the last
+        // `latency_frames` of input are still in the filter.
         let output_frames = converted.len() / CHANNELS;
-        assert!((4_798..=4_800).contains(&output_frames));
+        let expected = (4_410 - latency) * 48_000 / 44_100;
+        assert!(
+            output_frames.abs_diff(expected) <= 1,
+            "{output_frames} frames, expected {expected}"
+        );
         assert!(converted.chunks_exact(2).all(|frame| frame[0] == frame[1]));
     }
 
@@ -1200,19 +1404,37 @@ mod tests {
                 valid_bits: 16,
             },
             2,
-        )
-        .validate()
-        .unwrap();
-        let input: Vec<u8> = (0..960i16).flat_map(i16::to_le_bytes).collect();
-        let mut contiguous = StereoConverter::new(mix);
-        let expected = contiguous.convert(&input, 960).unwrap();
+        );
+        let input: Vec<u8> = (0..9_600i32)
+            .map(|frame| ((frame % 400) * 50 - 10_000) as i16)
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        let mut contiguous = AudioPipeline::new(mix).unwrap();
+        let expected = run_pipeline(&mut contiguous, &input, 9_600);
 
-        let mut fragmented = StereoConverter::new(mix);
+        let mut fragmented = AudioPipeline::new(mix).unwrap();
+        let mut clock = AudioClock::default();
         let mut actual = Vec::new();
-        for frame in input.chunks_exact(2) {
-            actual.extend(fragmented.convert(frame, 1).unwrap());
+        for frame in input.chunks_exact(2 * 37) {
+            fragmented
+                .push(frame, 37, 1_000, &mut clock, &mut |packet| {
+                    actual.extend(
+                        packet
+                            .pcm_s16le
+                            .chunks_exact(2)
+                            .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+                    );
+                })
+                .unwrap();
         }
+        let rest = input.len() / (2 * 37) * (2 * 37);
+        actual.extend(run_pipeline(
+            &mut fragmented,
+            &input[rest..],
+            (input.len() - rest) / 2,
+        ));
 
+        assert!(expected.len() > CHUNK_FRAMES * CHANNELS * 4);
         assert_eq!(actual, expected);
     }
 
@@ -1257,12 +1479,13 @@ mod tests {
             | SPEAKER_LOW_FREQUENCY
             | SPEAKER_BACK_LEFT
             | SPEAKER_BACK_RIGHT;
-        let mut converter = StereoConverter::new(mix.validate().unwrap());
+        let converter = StereoConverter::new(mix.validate().unwrap());
         let samples = [0i16, 0, 10_000, 0, 2_000, -2_000];
         let input: Vec<u8> = samples.into_iter().flat_map(i16::to_le_bytes).collect();
 
-        let converted = converter.convert(&input, 1).unwrap();
-        assert_eq!(converted, vec![8_485, 5_657]);
+        let mut converted = Vec::with_capacity(CHANNELS);
+        converter.convert_into(&input, &mut converted).unwrap();
+        assert_eq!(converted, vec![8_485.0 / 32_768.0, 5_657.0 / 32_768.0]);
     }
 
     #[test]
@@ -1325,6 +1548,263 @@ mod tests {
         stop.request();
         assert!(join.join().unwrap());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Interleaved float stereo bytes of a sine, as a float mix format
+    /// delivers it: left carries the tone, right its inverse.
+    fn float_stereo_sine(rate: u32, frequency: f64, frames: usize, amplitude: f64) -> Vec<u8> {
+        (0..frames)
+            .flat_map(|frame| {
+                let value = (std::f64::consts::TAU * frequency * frame as f64 / f64::from(rate))
+                    .sin()
+                    * amplitude;
+                let mut bytes = [0u8; 8];
+                bytes[..4].copy_from_slice(&(value as f32).to_le_bytes());
+                bytes[4..].copy_from_slice(&(-value as f32).to_le_bytes());
+                bytes
+            })
+            .collect()
+    }
+
+    /// Runs `bytes` of a float stereo mix through the pipeline in 10 ms
+    /// WASAPI-sized buffers and returns the left channel of every packet.
+    fn capture_left(rate: u32, bytes: &[u8]) -> Vec<f64> {
+        let mut pipeline = AudioPipeline::new(format(rate, 2, SampleFormat::Float32, 8)).unwrap();
+        let mut clock = AudioClock::default();
+        let mut left = Vec::new();
+        let buffer_frames = rate as usize / 100;
+        for buffer in bytes.chunks(buffer_frames * 8) {
+            pipeline
+                .push(buffer, buffer.len() / 8, 1_000, &mut clock, &mut |packet| {
+                    left.extend(packet.pcm_s16le.chunks_exact(4).map(|frame| {
+                        f64::from(i16::from_le_bytes([frame[0], frame[1]])) / 32_768.0
+                    }));
+                })
+                .unwrap();
+        }
+        left
+    }
+
+    /// The level of a sine at `frequency` in `samples` at 48 kHz, fitted by
+    /// least squares over the middle half (away from start-up).
+    fn level_at(samples: &[f64], frequency: f64) -> f64 {
+        let skip = samples.len() / 4;
+        let body = &samples[skip..samples.len() - skip];
+        let (mut sin_sum, mut cos_sum) = (0.0, 0.0);
+        for (index, value) in body.iter().enumerate() {
+            let angle =
+                std::f64::consts::TAU * frequency * (index + skip) as f64 / f64::from(SAMPLE_RATE);
+            sin_sum += value * angle.sin();
+            cos_sum += value * angle.cos();
+        }
+        let count = body.len() as f64;
+        (2.0 * sin_sum / count).hypot(2.0 * cos_sum / count)
+    }
+
+    fn decibels_below(level: f64, reference: f64) -> f64 {
+        20.0 * (level / reference).log10()
+    }
+
+    #[test]
+    fn a_24_khz_mix_keeps_its_image_80_db_below_the_tone() {
+        // A 7 kHz tone mixed at 24 kHz mirrors to 17 kHz at 48 kHz. The
+        // former linear interpolation left that image 14 dB down.
+        let left = capture_left(24_000, &float_stereo_sine(24_000, 7_000.0, 24_000, 0.5));
+        let tone = decibels_below(level_at(&left, 7_000.0), 0.5);
+        let image = decibels_below(level_at(&left, 17_000.0), 0.5);
+        eprintln!("24 kHz mix, 7 kHz tone: tone {tone:.2} dB, image at 17 kHz {image:.1} dB");
+        assert!(tone.abs() < 0.1, "the tone came out at {tone:.2} dB");
+        assert!(image <= -80.0, "the image is only {image:.1} dB down");
+    }
+
+    #[test]
+    fn a_96_khz_mix_does_not_alias_into_the_wire_band() {
+        // 30 kHz is above audio-v1's Nyquist frequency. The former linear
+        // interpolation passed it through as an 18 kHz alias at full level.
+        let left = capture_left(96_000, &float_stereo_sine(96_000, 30_000.0, 48_000, 0.5));
+        let alias = decibels_below(level_at(&left, 18_000.0), 0.5);
+        eprintln!("96 kHz mix, 30 kHz tone: alias at 18 kHz {alias:.1} dB");
+        // 16-bit packets put the floor near -100 dB; the filter itself
+        // leaves about -128 dB.
+        assert!(alias <= -90.0, "the alias is only {alias:.1} dB down");
+    }
+
+    #[test]
+    fn ending_a_capture_sends_what_the_filter_and_partial_packet_hold() {
+        // 4000 frames at 44.1 kHz are 4354 frames at 48 kHz: four whole
+        // packets and 514 frames, some still inside the filter. Ending the
+        // capture (a device change) must send them, not drop them.
+        let mut pipeline = AudioPipeline::new(format(44_100, 2, SampleFormat::Float32, 8)).unwrap();
+        let mut clock = AudioClock::default();
+        let level: Vec<u8> = (0..4_000)
+            .flat_map(|_| {
+                let mut frame = [0u8; 8];
+                frame[..4].copy_from_slice(&0.5f32.to_le_bytes());
+                frame[4..].copy_from_slice(&0.5f32.to_le_bytes());
+                frame
+            })
+            .collect();
+        let mut packets = Vec::new();
+        pipeline
+            .push(&level, 4_000, 1_000, &mut clock, &mut |packet| {
+                packets.push(packet)
+            })
+            .unwrap();
+        assert_eq!(packets.len(), 4, "four whole packets before the end");
+        pipeline
+            .finish(1_000, &mut clock, &mut |packet| packets.push(packet))
+            .unwrap();
+        assert_eq!(packets.len(), 5, "the partial packet goes out at the end");
+        let samples: Vec<i16> = packets
+            .iter()
+            .flat_map(|packet| {
+                packet
+                    .pcm_s16le
+                    .chunks_exact(2)
+                    .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            })
+            .collect();
+        let sound = samples.iter().take_while(|&&sample| sample != 0).count() / CHANNELS;
+        assert_eq!(sound, 4_354, "every frame of input, then silence");
+        assert!(samples[..sound * CHANNELS]
+            .iter()
+            .all(|&sample| (sample - 16_384).abs() <= 2));
+        assert!(samples[sound * CHANNELS..]
+            .iter()
+            .all(|&sample| sample == 0));
+        let timestamps: Vec<u32> = packets.iter().map(|packet| packet.timestamp_ms).collect();
+        assert_eq!(timestamps, [1_000, 1_020, 1_040, 1_060, 1_080]);
+    }
+
+    #[test]
+    fn conversion_delay_stays_within_a_quarter_of_a_packet() {
+        // audio-v1 packets are 20 ms and the Deck plays 60 ms behind
+        // (docs/architecture/audio-compression.md). Rate conversion may add at
+        // most 5 ms: the last frame of each packet must leave within 5 ms of
+        // the input that covers it, at every rate WASAPI may mix at.
+        for rate in [
+            8_000, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400,
+            192_000, 384_000,
+        ] {
+            let mut pipeline =
+                AudioPipeline::new(format(rate, 2, SampleFormat::Float32, 8)).unwrap();
+            let mut clock = AudioClock::default();
+            let frame = [0u8; 8];
+            let mut worst_ms = 0.0f64;
+            let mut packets = 0usize;
+            let mut pushed = 0usize;
+            while packets < 5 {
+                let before = packets;
+                pushed += 1;
+                pipeline
+                    .push(&frame, 1, 1_000, &mut clock, &mut |_| packets += 1)
+                    .unwrap();
+                if packets > before {
+                    // Input frames that cover every output frame emitted so far.
+                    let covering =
+                        (packets * CHUNK_FRAMES) as f64 * f64::from(rate) / f64::from(SAMPLE_RATE);
+                    let late = (pushed as f64 - covering).max(0.0) / f64::from(rate) * 1_000.0;
+                    worst_ms = worst_ms.max(late);
+                }
+            }
+            eprintln!("{rate} Hz mix: conversion delay {worst_ms:.2} ms");
+            assert!(worst_ms <= 5.0, "{rate} Hz: {worst_ms:.2} ms");
+        }
+    }
+
+    mod allocation {
+        use super::super::*;
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        struct CountingAllocator;
+
+        thread_local! {
+            static COUNTING: Cell<bool> = const { Cell::new(false) };
+            static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        // SAFETY: every operation is forwarded unchanged to `System`; the
+        // wrapper only counts this thread's allocations while asked to.
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                record();
+                // SAFETY: the caller's layout contract is forwarded unchanged.
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                record();
+                // SAFETY: as for `alloc`.
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                // SAFETY: the pointer and layout come from this allocator.
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                record();
+                // SAFETY: the caller's pointer, layout and size are forwarded.
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: CountingAllocator = CountingAllocator;
+
+        fn record() {
+            COUNTING.with(|counting| {
+                if counting.get() {
+                    ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                }
+            });
+        }
+
+        fn count_allocations(run: impl FnOnce()) -> usize {
+            ALLOCATIONS.with(|count| count.set(0));
+            COUNTING.with(|counting| counting.set(true));
+            run();
+            COUNTING.with(|counting| counting.set(false));
+            ALLOCATIONS.with(Cell::get)
+        }
+
+        #[test]
+        fn steady_capture_allocates_nothing_per_buffer_or_packet() {
+            // Everything the capture loop does with a WASAPI buffer: format
+            // adaptation, rate conversion, framing and the packet handed to
+            // the session queue. Measured at a converted rate and at 48 kHz,
+            // with sound and with silence, after one buffer of warm-up.
+            for rate in [44_100u32, 48_000, 24_000] {
+                let mut pipeline =
+                    AudioPipeline::new(super::format(rate, 2, SampleFormat::Float32, 8)).unwrap();
+                let queue = LatestQueue::new(QUEUE_CAPACITY);
+                let mut clock = AudioClock::default();
+                let frames = rate as usize / 100;
+                let sound = super::float_stereo_sine(rate, 440.0, frames, 0.5);
+                let mut emit = |packet: AudioPacket| {
+                    let _ = queue.push(packet);
+                };
+                pipeline
+                    .push(&sound, frames, 1_000, &mut clock, &mut emit)
+                    .unwrap();
+                let allocations = count_allocations(|| {
+                    for _ in 0..50 {
+                        pipeline
+                            .push(&sound, frames, 1_000, &mut clock, &mut emit)
+                            .unwrap();
+                        pipeline
+                            .push_silence(frames, 1_000, &mut clock, &mut emit)
+                            .unwrap();
+                    }
+                });
+                assert_eq!(
+                    allocations, 0,
+                    "{rate} Hz: 1 s of capture allocated {allocations} times"
+                );
+            }
+        }
     }
 
     #[test]

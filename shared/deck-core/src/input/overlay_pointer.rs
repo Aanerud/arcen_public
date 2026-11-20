@@ -8,9 +8,13 @@
 //! over the video, so the Deck's own controls appear only on demand: the
 //! connection bar drops down when the pointer reaches the top edge above it
 //! (the *reveal* strip), and while it is open the pointer over it (or, with
-//! one of its menus open, anywhere) belongs to the Deck. A platform adapter
-//! publishes these regions in window pixels once per UI pass and asks
-//! [`route_pointer`] for every pointer message.
+//! one of its menus open, anywhere) belongs to the Deck. A modal window of
+//! the Deck (Help ▸ About, Help ▸ Keyboard Shortcuts) takes the whole
+//! window, windowed or fullscreen, and the keyboard with it, until it
+//! closes: its OK button and Esc are the Deck's, never the host's. A
+//! platform adapter publishes these regions in window pixels once per UI
+//! pass and asks [`route_pointer`] for every pointer message and
+//! [`keys_to_host`] before it sends a key.
 
 use arcen_input::deck_pen::ImageRect;
 
@@ -25,6 +29,24 @@ pub struct OverlayPointerRegions {
     pub owned: Option<ImageRect>,
     /// The Deck's UI has the whole window (a menu of the bar is open).
     pub whole_window: bool,
+    /// A modal window of the Deck is open: the UI has the whole window's
+    /// pointer and the keyboard; the host gets neither until it closes.
+    pub modal: bool,
+}
+
+impl OverlayPointerRegions {
+    /// What a session's other windows (Match My Layout's secondary
+    /// windows) take from these: a modal window holds every session
+    /// window, the connection bar only the root window it is drawn in.
+    #[must_use]
+    pub const fn for_secondary(self) -> Self {
+        Self {
+            reveal: None,
+            owned: None,
+            whole_window: false,
+            modal: self.modal,
+        }
+    }
 }
 
 /// The kind of pointer message to route.
@@ -79,7 +101,19 @@ fn contains(rect: Option<ImageRect>, x: f64, y: f64) -> bool {
 /// as `ui_had_pointer`.
 #[must_use]
 pub fn over_ui(regions: OverlayPointerRegions, x: f64, y: f64) -> bool {
-    regions.whole_window || contains(regions.owned, x, y) || contains(regions.reveal, x, y)
+    owns_window(regions) || contains(regions.owned, x, y) || contains(regions.reveal, x, y)
+}
+
+/// Whether the host may receive keys now: not while a modal window of the
+/// Deck is open (its Esc and Enter close it). Held keys are released when
+/// it opens, as on a focus loss.
+#[must_use]
+pub const fn keys_to_host(regions: OverlayPointerRegions) -> bool {
+    !regions.modal
+}
+
+const fn owns_window(regions: OverlayPointerRegions) -> bool {
+    regions.whole_window || regions.modal
 }
 
 /// Routes one pointer `message` at window point (`x`, `y`).
@@ -103,7 +137,7 @@ pub fn route_pointer(
         Some(HeldBy::Ui) => return PointerRoute::UI,
         None => {}
     }
-    if regions.whole_window || contains(regions.owned, x, y) {
+    if owns_window(regions) || contains(regions.owned, x, y) {
         return PointerRoute::UI;
     }
     if message == PointerMessage::Move && (ui_had_pointer || contains(regions.reveal, x, y)) {
@@ -134,6 +168,7 @@ mod tests {
         }),
         owned: None,
         whole_window: false,
+        modal: false,
     };
 
     #[test]
@@ -227,5 +262,82 @@ mod tests {
                 PointerRoute::HOST
             );
         }
+    }
+
+    #[test]
+    fn a_modal_window_owns_the_pointer_and_keyboard_windowed_or_fullscreen() {
+        // Help ▸ About over a windowed session: no bar, no strip, and the
+        // click on its OK button (anywhere in the window) is the UI's.
+        let windowed = OverlayPointerRegions {
+            modal: true,
+            ..OverlayPointerRegions::default()
+        };
+        for regions in [
+            windowed,
+            OverlayPointerRegions {
+                modal: true,
+                ..REVEAL
+            },
+        ] {
+            for message in [
+                PointerMessage::Move,
+                PointerMessage::Press,
+                PointerMessage::Release,
+                PointerMessage::Wheel,
+            ] {
+                assert_eq!(
+                    route_pointer(regions, message, 960.0, 600.0, None, false),
+                    PointerRoute::UI,
+                    "{message:?}"
+                );
+            }
+            assert!(over_ui(regions, 960.0, 600.0));
+            assert!(!keys_to_host(regions));
+        }
+        // Closed: the picture and the keys are the host's again.
+        assert_eq!(
+            route_pointer(
+                OverlayPointerRegions::default(),
+                PointerMessage::Press,
+                960.0,
+                600.0,
+                None,
+                false
+            ),
+            PointerRoute::HOST
+        );
+        assert!(keys_to_host(REVEAL));
+    }
+
+    #[test]
+    fn a_secondary_window_shares_a_modal_window_but_never_the_bar() {
+        let bar_menu = OverlayPointerRegions {
+            owned: Some(rect(700.0, 0.0, 400.0, 30.0)),
+            whole_window: true,
+            ..REVEAL
+        };
+        let secondary = bar_menu.for_secondary();
+        assert_eq!(secondary, OverlayPointerRegions::default());
+        assert_eq!(
+            route_pointer(secondary, PointerMessage::Press, 750.0, 20.0, None, false),
+            PointerRoute::HOST
+        );
+        let help = OverlayPointerRegions {
+            modal: true,
+            ..bar_menu
+        }
+        .for_secondary();
+        assert_eq!(
+            help,
+            OverlayPointerRegions {
+                modal: true,
+                ..OverlayPointerRegions::default()
+            }
+        );
+        assert_eq!(
+            route_pointer(help, PointerMessage::Press, 750.0, 600.0, None, false),
+            PointerRoute::UI
+        );
+        assert!(!keys_to_host(help));
     }
 }

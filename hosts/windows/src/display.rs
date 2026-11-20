@@ -199,6 +199,29 @@ pub fn enumerate_outputs() -> Result<Vec<ResolvedOutput>, String> {
     Ok(Vec::new())
 }
 
+/// Whether the session display on `selector` may be given an EDID Arcen
+/// synthesizes (NVAPI's exact backend), so its limits apply to the request.
+/// Only an NVIDIA output whose GPU is proved not to permit EDID writes (a
+/// GeForce) is served at its own modes without them; when that cannot be
+/// read the answer is yes, because fitting is the safe direction.
+#[cfg(windows)]
+pub fn edid_synthesis_permitted(selector: &OutputSelector, adapter_is_nvidia: bool) -> bool {
+    if !adapter_is_nvidia {
+        return false;
+    }
+    let Ok(output) = resolve_output_selector(selector) else {
+        return true;
+    };
+    crate::nvapi_inventory::inventory().map_or(true, |report| {
+        crate::nvapi_headless::adapter_may_synthesize_edid(&report, &output.adapter_name)
+    })
+}
+
+#[cfg(not(windows))]
+pub fn edid_synthesis_permitted(_selector: &OutputSelector, _adapter_is_nvidia: bool) -> bool {
+    false
+}
+
 /// NVIDIA's PCI vendor id. NVENC lives only on these adapters.
 pub const NVIDIA_VENDOR_ID: u32 = 0x10de;
 
@@ -769,6 +792,53 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
                 reason = %exact_failure,
                 "exact client display mode rejected; testing safe driver fallback"
             );
+            // The nearest mode the display offers may be the one it runs:
+            // setting it again would change nothing, and arming a restore of
+            // it would replay the whole topology at teardown.
+            if original.is_settled_at(fallback)
+                && !transaction
+                    .backend
+                    .requires_contract_refresh(&target, fallback)
+                    .unwrap_or(true)
+            {
+                let current = match transaction.backend.current(&target) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        // Nothing was changed, or every change was rolled
+                        // back and verified: there is nothing to restore.
+                        transaction.disarm_after_rollback()?;
+                        transaction.snapshot = None;
+                        transaction.record_restore_success();
+                        return Err(format!(
+                            "read the display before serving its current mode: {error}"
+                        ));
+                    }
+                };
+                if current == original && current.is_settled_at(fallback) {
+                    transaction.disarm_after_rollback()?;
+                    transaction.snapshot = None;
+                    transaction.record_restore_success();
+                    transaction.report = report(
+                        requested,
+                        original,
+                        current,
+                        false,
+                        false,
+                        "unchanged-current-mode-fallback",
+                        "none",
+                        &target,
+                    );
+                    tracing::warn!(
+                        target: DISPLAY,
+                        requested = %requested,
+                        current = %current.size,
+                        refresh_hz = current.refresh_hz,
+                        rejected = ?rejected,
+                        "the nearest mode the display offers is the one it runs; serving it unchanged"
+                    );
+                    return Ok(transaction);
+                }
+            }
             if let Err(error) = transaction.backend.test_mode(&target, fallback) {
                 rejected.push(format!("test {fallback}: {error}"));
                 continue;
@@ -818,7 +888,16 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
             rejected.push(mismatch);
         }
 
-        let current = transaction.backend.current(&target)?;
+        let current = match transaction.backend.current(&target) {
+            Ok(current) => current,
+            Err(error) => {
+                // Every candidate was refused or rolled back and verified.
+                transaction.disarm_after_rollback()?;
+                transaction.snapshot = None;
+                transaction.record_restore_success();
+                return Err(error);
+            }
+        };
         if current == original
             && current.is_settled_at(original.size)
             && DisplaySize::validate(current.size.width, current.size.height).is_ok()
@@ -1179,6 +1258,80 @@ fn isolation_mismatch(state: ModeState, requested: DisplaySize) -> String {
     )
 }
 
+/// Whether a session may give a display the Deck's Windows UI scale step,
+/// decided by the class of the GPU that drives it. A Quadro, RTX Pro or GRID
+/// output behaves as in 0.20.5. A GeForce, or a GPU whose class is not
+/// proved (any other adapter, an unreadable inventory), never has its
+/// Windows scale changed; the Deck is told the scale Windows shows
+/// (`effective_display_scale`).
+const fn ui_scale_change_permitted(professional_gpu: bool) -> bool {
+    professional_gpu
+}
+
+/// Whether Windows Advanced Color (HDR) is prepared before the mode is set.
+///
+/// NVAPI's exact backend writes an HDR EDID, so it prepares HDR first and
+/// the mode set keeps it. An attached display set at one of its own modes is
+/// proved after the mode settles: a wait or proof on the old mode says
+/// nothing about the new one.
+const fn advanced_color_before_mode_apply(nvapi_exact_apply: bool) -> bool {
+    nvapi_exact_apply
+}
+
+/// Publishes what Windows reads back as each attached monitor's refresh.
+/// A synthesized monitor keeps its planned timing (NVAPI sets it exactly);
+/// an attached one is published at its measured refresh, never the plan's,
+/// and at 0 when that is unknown ([`resolved_refresh_hz`]).
+///
+/// # Errors
+///
+/// An attached monitor whose refresh cannot be read.
+fn publish_measured_refresh(
+    plan: &mut arcen_outputs::windows_topology::WindowsTopologyPlan,
+    synthesized: impl Fn(&arcen_outputs::windows_topology::WindowsMonitorPlan) -> bool,
+    mut measured: impl FnMut(
+        &arcen_outputs::windows_topology::WindowsMonitorPlan,
+    ) -> Result<u32, String>,
+) -> Result<(), String> {
+    for monitor in &mut plan.monitors {
+        if synthesized(monitor) {
+            continue;
+        }
+        let hz = measured(monitor)?;
+        if hz != monitor.refresh_hz {
+            tracing::warn!(
+                target: DISPLAY,
+                device = %monitor.device_name,
+                planned_refresh_hz = monitor.refresh_hz,
+                measured_refresh_hz = hz,
+                "attached display runs at another refresh than planned; publishing the measured one"
+            );
+            monitor.refresh_hz = hz;
+        }
+    }
+    Ok(())
+}
+
+/// The refresh a display runs at, in hertz, or 0 when it is unknown.
+///
+/// A DEVMODE `dmDisplayFrequency` of 0 or 1 means the hardware's default
+/// rate, not a rate (Microsoft's DEVMODE documentation), so the active CCD
+/// target's refresh rational is used instead. When that is unavailable too
+/// the refresh is unknown, and an unknown refresh is never a capture or
+/// encoder cap.
+fn resolved_refresh_hz(devmode_hz: u32, target_refresh: Option<(u32, u32)>) -> u32 {
+    if devmode_hz > 1 {
+        return devmode_hz;
+    }
+    match target_refresh {
+        Some((numerator, denominator)) if denominator > 0 => {
+            let hz = (u64::from(numerator) + u64::from(denominator) / 2) / u64::from(denominator);
+            u32::try_from(hz).ok().filter(|hz| *hz > 1).unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
 fn restore_mismatch(restored: ModeState, original: ModeState) -> String {
     format!(
         "restore settled at {} @ {}Hz output {} rect {:?} instead of original \
@@ -1208,13 +1361,19 @@ impl DisplayTransaction<NativeBackend> {
     /// the EDID-derived recommendation entirely, so the guarded Windows
     /// device-info path applies the Settings-equivalent step and fails
     /// closed if it cannot be verified.
+    ///
+    /// Only a display on a GPU proved professional is given the step
+    /// ([`ui_scale_change_permitted`]); any other keeps the desk's and the
+    /// Deck is told what Windows shows.
     fn serve_ui_scale(&mut self, ui_scale: arcen_outputs::WindowsUiScale) -> Result<(), String> {
         #[cfg(windows)]
         {
             let device_name = self.report.device_name.clone();
             let rect = self.report.desktop_rect;
             let mut ui_scale = ui_scale;
-            if self.target.vendor_id == 0x10de {
+            if self.target.vendor_id == 0x10de
+                && ui_scale_change_permitted(self.backend.professional_gpu())
+            {
                 match windows_backend::apply_single_display_scale(&device_name, rect, ui_scale) {
                     Ok(served) => ui_scale = served,
                     Err(error) => {
@@ -1898,6 +2057,9 @@ pub enum HeadlessProvisionError {
     /// Refused before the recovery journal was written; nothing on the host
     /// changed.
     NotApplicable(String),
+    /// Refused before the recovery journal was written because the GPU may
+    /// not have an EDID written (a GeForce); nothing on the host changed.
+    EdidNotPermitted(arcen_outputs::edid_provisioning::EdidProvisioning),
     /// Failed while, or after, changing the host's displays.
     Failed(String),
 }
@@ -1906,6 +2068,11 @@ impl std::fmt::Display for HeadlessProvisionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotApplicable(reason) | Self::Failed(reason) => formatter.write_str(reason),
+            Self::EdidNotPermitted(provisioning) => formatter.write_str(
+                &provisioning
+                    .limitation()
+                    .unwrap_or_else(|| "EDID provisioning is permitted".to_string()),
+            ),
         }
     }
 }
@@ -2292,6 +2459,8 @@ struct NativeBackend {
     nvapi_snapshot: Option<crate::nvapi::ExactModeSnapshot>,
     nvapi_active: Option<crate::nvapi::ActiveExactMode>,
     nvapi_failed: bool,
+    /// Why NVAPI's exact backend is not used on this GPU (a GeForce).
+    edid_limitation: Option<String>,
     pending_nvapi: bool,
     pending_vmware: bool,
     advanced_color_prepared: bool,
@@ -2309,6 +2478,13 @@ struct NativeBackend {
 
 #[cfg(windows)]
 impl NativeBackend {
+    /// Whether the session display's GPU was proved a Quadro, RTX Pro or
+    /// GRID when `snapshot` read its class (an NVIDIA GPU that is not has
+    /// `edid_limitation`).
+    fn professional_gpu(&self) -> bool {
+        self.edid_limitation.is_none()
+    }
+
     fn new(
         request: DisplayRequest,
         session_log_id: arcen_telemetry::CorrelationId,
@@ -2321,6 +2497,7 @@ impl NativeBackend {
             nvapi_snapshot: None,
             nvapi_active: None,
             nvapi_failed: false,
+            edid_limitation: None,
             pending_nvapi: false,
             pending_vmware: false,
             advanced_color_prepared: false,
@@ -2640,8 +2817,8 @@ mod windows_backend {
     use windows::Win32::Graphics::Gdi::{
         ChangeDisplaySettingsExW, EnumDisplaySettingsExW, MonitorFromPoint, CDS_FULLSCREEN,
         CDS_TEST, CDS_TYPE, DEVMODEW, DEVMODE_FIELD_FLAGS, DISP_CHANGE, DISP_CHANGE_SUCCESSFUL,
-        DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_FLAGS,
-        ENUM_DISPLAY_SETTINGS_MODE, MONITOR_DEFAULTTONEAREST,
+        DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION, ENUM_CURRENT_SETTINGS,
+        ENUM_DISPLAY_SETTINGS_FLAGS, ENUM_DISPLAY_SETTINGS_MODE, MONITOR_DEFAULTTONEAREST,
     };
     use windows::Win32::Security::{
         CheckTokenMembership, CreateWellKnownSid, WinBuiltinAdministratorsSid, PSID,
@@ -2874,11 +3051,15 @@ mod windows_backend {
             .ok_or_else(|| "safe recovery path index is outside the topology".to_string())?;
         let selected_device = source_gdi_name(selected_path)?;
         let selected_mode = current_devmode(&selected_device)?;
+        // From the topology this journal saves, never a second live query:
+        // a rate that changes in between would not match the restored one.
+        let selected_refresh_hz =
+            journalled_refresh_hz(selected_mode.dmDisplayFrequency, selected_path);
         let journal = crate::recovery::DisplayRecoveryJournal::new(
             selected_device,
             selected_mode.dmPelsWidth,
             selected_mode.dmPelsHeight,
-            selected_mode.dmDisplayFrequency.max(1),
+            selected_refresh_hz,
             as_bytes(&original.paths),
             as_bytes(&original.modes),
             value_bytes(&selected_mode),
@@ -2908,9 +3089,17 @@ mod windows_backend {
         contracts: &[crate::nvapi_headless::HeadlessDisplayContract],
         session_log_id: &arcen_telemetry::CorrelationId,
     ) -> Result<Option<HeadlessOutputPreparation>, super::HeadlessProvisionError> {
-        use super::HeadlessProvisionError::{Failed, NotApplicable};
-        // Inventory and mapping only read the host. A display NVAPI does not
-        // drive is refused here, before anything changes.
+        use super::HeadlessProvisionError::{EdidNotPermitted, Failed, NotApplicable};
+        // Inventory and mapping only read the host. A GPU that may not have
+        // an EDID written, or a display NVAPI does not drive, is refused
+        // here, before anything changes.
+        let inventory = crate::nvapi_inventory::inventory().map_err(NotApplicable)?;
+        let provisioning =
+            crate::nvapi_headless::adapter_edid_provisioning(&inventory, adapter_name)
+                .map_err(NotApplicable)?;
+        if !provisioning.permits_writes() {
+            return Err(EdidNotPermitted(provisioning));
+        }
         let prepared = crate::nvapi_headless::prepare_provisioning(adapter_name, contracts)
             .map_err(NotApplicable)?;
         if prepared.is_empty() {
@@ -3102,6 +3291,10 @@ mod windows_backend {
         }
 
         fn verify_blocking(binding: &mut PhysicalOutputBinding) -> Result<(), String> {
+            wait_for_multi_display_plan(binding.plan(), MODE_SETTLE_TIMEOUT)?;
+            binding.settle_attached_refresh()?;
+            // A per-device mode set may let Windows lay the desktop out
+            // again: the layout is proved once more after it.
             wait_for_multi_display_plan(binding.plan(), MODE_SETTLE_TIMEOUT)?;
             binding.apply_requested_dpi_scales()?;
             let effective_scale_reports = effective_scale_reports(binding.plan());
@@ -3404,6 +3597,19 @@ mod windows_backend {
                 );
                 return Ok(());
             }
+            // Only the monitors whose outputs take a synthesized timing go
+            // through NVAPI, and with it an EDID write that NVIDIA permits
+            // only on Quadro, RTX Pro and GRID GPUs; a fixed-mode monitor in
+            // the same plan (a GeForce beside a Quadro) is set by the CCD
+            // `apply` below at a mode it offers.
+            let inventory = crate::nvapi_inventory::inventory();
+            let timed = crate::nvapi_headless::monitors_needing_synthesized_timing(
+                plan,
+                inventory.as_ref().map_err(String::as_str),
+            )?;
+            if timed.is_empty() {
+                return Ok(());
+            }
             let mut driver =
                 nvapi::Nvapi::load().map_err(|error| format!("load NVAPI: {error}"))?;
             // Bind every boot-local Windows target to its stable NVAPI display
@@ -3411,8 +3617,7 @@ mod windows_backend {
             // head can renumber later \\.\DISPLAY names, so resolving and
             // mutating one monitor at a time can accidentally bind two planned
             // monitors to the same NVIDIA head.
-            let snapshots = plan
-                .monitors
+            let snapshots = timed
                 .iter()
                 .map(|monitor| {
                     nvapi::snapshot(
@@ -3428,7 +3633,7 @@ mod windows_backend {
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            for (monitor, snapshot) in plan.monitors.iter().zip(snapshots) {
+            for (monitor, snapshot) in timed.iter().copied().zip(snapshots) {
                 let snapshot = match nvapi::retarget_snapshot(
                     &mut driver,
                     &snapshot,
@@ -3790,13 +3995,52 @@ mod windows_backend {
             }
         }
 
-        /// Gives every monitor its Windows UI scale step and records the
-        /// step served (Windows may offer a monitor fewer steps) in the
-        /// applied plan, which the session's scale report reads.
+        /// Sets every attached monitor to the refresh of the enumerated mode
+        /// it was planned at (CCD sets only its size and position), reads
+        /// it back, and publishes only what Windows reports.
+        fn settle_attached_refresh(&mut self) -> Result<(), String> {
+            let mut plan = self.plan().clone();
+            super::publish_measured_refresh(
+                &mut plan,
+                |monitor| monitor.custom_timing,
+                apply_attached_refresh,
+            )?;
+            self.evidence.set_applied_plan(plan);
+            Ok(())
+        }
+
+        /// Gives every monitor on a GPU proved professional its Windows UI
+        /// scale step, as 0.20.5 did, and records the step served (Windows
+        /// may offer a monitor fewer steps) in the applied plan, which the
+        /// session's scale report reads. A monitor on any other GPU keeps the
+        /// desk's step ([`super::ui_scale_change_permitted`]); the report says
+        /// what Windows shows on it.
         fn apply_requested_dpi_scales(&mut self) -> Result<(), String> {
+            let inventory = crate::nvapi_inventory::inventory();
+            self.apply_requested_dpi_scales_where(|monitor| {
+                crate::nvapi_headless::exact_edid_backend_permitted(
+                    inventory.as_ref().map_err(String::as_str),
+                    monitor.adapter_luid,
+                )
+                .is_ok()
+            })
+        }
+
+        fn apply_requested_dpi_scales_where(
+            &mut self,
+            professional_gpu: impl Fn(&arcen_outputs::windows_topology::WindowsMonitorPlan) -> bool,
+        ) -> Result<(), String> {
             let mut plan = self.plan().clone();
             let mut applied = Vec::new();
-            for monitor in &mut plan.monitors {
+            let permitted = plan
+                .monitors
+                .iter()
+                .map(|monitor| super::ui_scale_change_permitted(professional_gpu(monitor)))
+                .collect::<Vec<_>>();
+            for (monitor, permitted) in plan.monitors.iter_mut().zip(permitted) {
+                if !permitted {
+                    continue;
+                }
                 match apply_monitor_dpi_scale(monitor) {
                     Ok((scale, served)) => {
                         applied.extend(scale);
@@ -3942,6 +4186,7 @@ mod windows_backend {
                     refresh_hz: 60,
                     rotation: arcen_media::Rotation::Degrees0,
                     primary: true,
+                    custom_timing: false,
                     color: None,
                 }],
                 requires_custom_timing: false,
@@ -3999,6 +4244,166 @@ mod windows_backend {
                 binding.nvapi_driver.is_none(),
                 "commit must not synthesize driver cleanup side effects"
             );
+        }
+
+        fn attached_binding(
+            plan: arcen_outputs::windows_topology::WindowsTopologyPlan,
+        ) -> PhysicalOutputBinding {
+            let report = empty_multi_display_report(&plan).expect("report");
+            PhysicalOutputBinding {
+                evidence: crate::output_provider::WindowsOutputEvidence::new(report, plan),
+                original: TopologySnapshot {
+                    paths: Vec::new(),
+                    modes: Vec::new(),
+                },
+                working: TopologySnapshot {
+                    paths: Vec::new(),
+                    modes: Vec::new(),
+                },
+                original_stable: crate::recovery::StableTopologySnapshot { paths: Vec::new() },
+                journal_path: std::env::temp_dir().join("arcen-attached-binding-unused.json"),
+                recovery_armed: true,
+                nvapi_driver: None,
+                nvapi_modes: Vec::new(),
+                headless_entries: Vec::new(),
+                applied_dpi_scales: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn a_monitor_on_a_gpu_not_proved_professional_never_gets_the_decks_ui_scale() {
+            // The class decides, not the monitor: a retained head beside a
+            // headless recovery entry, with a custom timing, is still left at
+            // the desk's step when its GPU is not proved a Quadro, RTX Pro or
+            // GRID. Nothing is applied and nothing is held for a restore.
+            let mut plan = test_plan();
+            plan.monitors[0].custom_timing = true;
+            plan.monitors[0].ui_scale = arcen_outputs::WindowsUiScale::from_percent(
+                200,
+                arcen_outputs::ScaleBasis::Unknown,
+            );
+            let mut binding = attached_binding(plan);
+            binding
+                .headless_entries
+                .push(crate::nvapi_headless::HeadlessEdidRecovery {
+                    display_id: 0x8001_0001,
+                    output_id: 1,
+                    adapter_luid: crate::nvapi::AdapterLuid::default(),
+                    original_edid: None,
+                    intended_edid_sha256: "0".repeat(64),
+                });
+            binding
+                .apply_requested_dpi_scales_where(|_| false)
+                .expect("a GeForce monitor is left alone");
+            assert!(binding.applied_dpi_scales.is_empty());
+            assert_eq!(binding.plan().monitors[0].ui_scale.step_percent, 200);
+            // In production the class comes from NVAPI by the adapter LUID;
+            // one no GPU reports is not proved professional either.
+            binding
+                .apply_requested_dpi_scales()
+                .expect("an unknown class is left alone");
+            assert!(binding.applied_dpi_scales.is_empty());
+        }
+
+        #[test]
+        fn a_journal_with_a_hardware_default_refresh_matches_the_resolved_readback() {
+            // A 0.20.5 journal on a display at the hardware default stored
+            // DEVMODE's raw 1; the readback is now resolved (60 Hz).
+            let mut saved = DISPLAYCONFIG_PATH_INFO::default();
+            saved.targetInfo.refreshRate.Numerator = 60_000;
+            saved.targetInfo.refreshRate.Denominator = 1_000;
+            let legacy = crate::recovery::DisplayRecoveryJournal::new(
+                r"\\.\DISPLAY1".to_string(),
+                1920,
+                1080,
+                1,
+                &[],
+                &[],
+                &[],
+                None,
+            );
+            assert_eq!(journal_expected_refresh_hz(&legacy, &[saved]), Some(60));
+            // No saved target rate: the refresh is not checked, geometry and
+            // topology still are.
+            assert_eq!(journal_expected_refresh_hz(&legacy, &[]), None);
+            // A journal written now stores the resolved rate, which wins.
+            let current = crate::recovery::DisplayRecoveryJournal::new(
+                r"\\.\DISPLAY1".to_string(),
+                1920,
+                1080,
+                144,
+                &[],
+                &[],
+                &[],
+                None,
+            );
+            assert_eq!(journal_expected_refresh_hz(&current, &[saved]), Some(144));
+        }
+
+        #[test]
+        fn a_journal_records_the_refresh_of_the_topology_it_saves() {
+            // The saved topology runs at 60 Hz; by the time anything read the
+            // live topology again it ran at 120. The journal must expect
+            // what restoring the saved topology gives back: 60.
+            let mut saved = DISPLAYCONFIG_PATH_INFO::default();
+            saved.targetInfo.refreshRate.Numerator = 60;
+            saved.targetInfo.refreshRate.Denominator = 1;
+            let recorded = journalled_refresh_hz(1, &saved);
+            assert_eq!(recorded, 60);
+            let journal = crate::recovery::DisplayRecoveryJournal::new(
+                r"\\.\DISPLAY1".to_string(),
+                1920,
+                1080,
+                recorded,
+                &[],
+                &[],
+                &[],
+                None,
+            );
+            assert_eq!(journal_expected_refresh_hz(&journal, &[saved]), Some(60));
+            // DEVMODE's own rate, when it states one, is kept.
+            assert_eq!(journalled_refresh_hz(144, &saved), 144);
+        }
+
+        #[test]
+        fn an_attached_monitor_is_published_at_its_measured_refresh() {
+            let mut plan = test_plan();
+            let mut timed = plan.monitors[0].clone();
+            timed.session_monitor_id = arcen_media::SessionMonitorId::new(2).expect("id");
+            timed.target_id = 2;
+            timed.custom_timing = true;
+            timed.refresh_hz = 120;
+            plan.monitors.push(timed);
+            super::super::publish_measured_refresh(
+                &mut plan,
+                |monitor| monitor.custom_timing,
+                |monitor| {
+                    assert!(
+                        !monitor.custom_timing,
+                        "a synthesized timing is not re-read"
+                    );
+                    Ok(30)
+                },
+            )
+            .expect("published");
+            // Planned at 60, the dummy plug runs at 30: the Deck is told 30.
+            assert_eq!(plan.monitors[0].refresh_hz, 30);
+            assert_eq!(plan.monitors[1].refresh_hz, 120);
+            assert!(super::super::publish_measured_refresh(
+                &mut plan,
+                |_| false,
+                |_| Err("unreadable".to_string()),
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn hdr_on_an_attached_display_is_proved_after_its_mode() {
+            // NVAPI's exact backend prepares HDR with its EDID before the
+            // mode; an attached display set through Windows' own modes leaves
+            // HDR to the session's Advanced Color gate on the settled mode.
+            assert!(super::super::advanced_color_before_mode_apply(true));
+            assert!(!super::super::advanced_color_before_mode_apply(false));
         }
     }
 
@@ -4789,7 +5194,32 @@ mod windows_backend {
             let topology = query_active_topology()?;
             let mode = current_devmode(&target.device_name)?;
             let original = mode_state(&mut self.dxgi, target, &mode)?;
-            let nvapi = if target.vendor_id == 0x10de {
+            // NVAPI's exact backend writes the display's EDID, which NVIDIA
+            // permits only on Quadro, RTX Pro and GRID GPUs. Any other GPU (a
+            // GeForce, with a monitor or a dummy plug) is served through
+            // Windows' own modes for that display and never reaches SetEDID.
+            let edid_backend = if target.vendor_id == 0x10de {
+                let inventory = crate::nvapi_inventory::inventory();
+                crate::nvapi_headless::exact_edid_backend_permitted(
+                    inventory.as_ref().map_err(String::as_str),
+                    target.adapter_luid,
+                )
+            } else {
+                Ok(())
+            };
+            if let Err(limitation) = &edid_backend {
+                tracing::warn!(
+                    target: DISPLAY,
+                    device = %target.device_name,
+                    %limitation,
+                    "NVAPI exact backend not used; serving the modes this display offers"
+                );
+                self.edid_limitation = Some(limitation.clone());
+            }
+            let nvapi = if target.vendor_id == 0x10de && edid_backend.is_err() {
+                self.nvapi_failed = true;
+                None
+            } else if target.vendor_id == 0x10de {
                 match nvapi::Nvapi::load().and_then(|mut driver| {
                     let snapshot = nvapi::snapshot(
                         &mut driver,
@@ -5042,7 +5472,12 @@ mod windows_backend {
                 return Ok(());
             }
             self.pending_nvapi = false;
-            change_mode(&target.device_name, size, CDS_TEST)
+            change_mode(&target.device_name, size, CDS_TEST).map_err(|error| {
+                match &self.edid_limitation {
+                    Some(limitation) => format!("{error} ({limitation})"),
+                    None => error,
+                }
+            })
         }
 
         fn needs_bound_mode_preparation(&self, target: &DisplayTarget, _size: DisplaySize) -> bool {
@@ -5076,7 +5511,9 @@ mod windows_backend {
             target: &DisplayTarget,
             _size: DisplaySize,
         ) -> Result<(), String> {
-            self.prepare_advanced_color_before_exact_mode(target)?;
+            if super::advanced_color_before_mode_apply(self.pending_nvapi) {
+                self.prepare_advanced_color_before_exact_mode(target)?;
+            }
             Ok(())
         }
 
@@ -5219,6 +5656,9 @@ mod windows_backend {
                 return wait_for_mode(&mut self.dxgi, target, size, MODE_SETTLE_TIMEOUT);
             }
             change_mode(&target.device_name, size, CDS_FULLSCREEN)?;
+            // HDR prepared for an NVAPI attempt that failed was proved on
+            // the old mode; the session proves it again on this one.
+            self.advanced_color_prepared = false;
             self.dxgi.invalidate();
             wait_for_mode(&mut self.dxgi, target, size, MODE_SETTLE_TIMEOUT)
         }
@@ -6690,6 +7130,21 @@ mod windows_backend {
         }
     }
 
+    /// The refresh of `mode` on `device_name`, resolved through the active
+    /// CCD target when DEVMODE reports the hardware default (0 if unknown).
+    fn devmode_refresh_hz(device_name: &str, mode: &DEVMODEW) -> u32 {
+        let target_refresh = (mode.dmDisplayFrequency <= 1)
+            .then(|| active_source_path(device_name).ok())
+            .flatten()
+            .map(|path| {
+                (
+                    path.targetInfo.refreshRate.Numerator,
+                    path.targetInfo.refreshRate.Denominator,
+                )
+            });
+        super::resolved_refresh_hz(mode.dmDisplayFrequency, target_refresh)
+    }
+
     fn current_devmode(device_name: &str) -> Result<DEVMODEW, String> {
         let device = wide(device_name);
         let mut mode = DEVMODEW {
@@ -6743,6 +7198,99 @@ mod windows_backend {
             .into_iter()
             .map(|(width, height)| DisplaySize { width, height })
             .collect())
+    }
+
+    /// Sets an attached monitor's refresh to the planned one when Windows
+    /// enumerates that mode for it (a CCD apply leaves the refresh as it
+    /// was), then returns the refresh Windows reports.
+    fn apply_attached_refresh(
+        monitor: &arcen_outputs::windows_topology::WindowsMonitorPlan,
+    ) -> Result<u32, String> {
+        let (_, device_name) = active_target_path(monitor.adapter_luid, monitor.target_id)?;
+        let measured = |device_name: &str| -> Result<u32, String> {
+            Ok(devmode_refresh_hz(
+                device_name,
+                &current_devmode(device_name)?,
+            ))
+        };
+        let current = measured(&device_name)?;
+        // A planned refresh of 0 or 1 is the hardware default read from
+        // DEVMODE: there is no rate to set.
+        if monitor.refresh_hz <= 1
+            || current == monitor.refresh_hz
+            || !offers_mode(&device_name, monitor)
+        {
+            return Ok(current);
+        }
+        // The current mode carries the monitor's position; only the refresh
+        // changes, so the layout CCD just applied is passed back as it is.
+        let mut mode = current_devmode(&device_name)?;
+        mode.dmFields = DEVMODE_FIELD_FLAGS(
+            DM_POSITION.0 | DM_PELSWIDTH.0 | DM_PELSHEIGHT.0 | DM_DISPLAYFREQUENCY.0,
+        );
+        mode.dmDisplayFrequency = monitor.refresh_hz;
+        let device = wide(&device_name);
+        // SAFETY: the device string is null-terminated and mode is the
+        // complete DEVMODEW Windows returned for it, refresh changed.
+        let result = unsafe {
+            ChangeDisplaySettingsExW(
+                PCWSTR(device.as_ptr()),
+                Some(&mode),
+                HWND::default(),
+                CDS_TYPE(0),
+                None,
+            )
+        };
+        if result != DISP_CHANGE_SUCCESSFUL {
+            tracing::warn!(
+                target: DISPLAY,
+                device = %device_name,
+                refresh_hz = monitor.refresh_hz,
+                result = display_change_name(result),
+                "attached display refused the planned refresh"
+            );
+            return measured(&device_name);
+        }
+        let deadline = Instant::now() + MODE_SETTLE_TIMEOUT;
+        loop {
+            let now = measured(&device_name)?;
+            if now == monitor.refresh_hz || Instant::now() >= deadline {
+                return Ok(now);
+            }
+            std::thread::sleep(MODE_SETTLE_POLL);
+        }
+    }
+
+    fn offers_mode(
+        device_name: &str,
+        monitor: &arcen_outputs::windows_topology::WindowsMonitorPlan,
+    ) -> bool {
+        let device = wide(device_name);
+        for index in 0..MAX_ENUMERATED_MODES {
+            let mut mode = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..DEVMODEW::default()
+            };
+            // SAFETY: the device string is null-terminated and mode is writable.
+            let found = unsafe {
+                EnumDisplaySettingsExW(
+                    PCWSTR(device.as_ptr()),
+                    ENUM_DISPLAY_SETTINGS_MODE(index),
+                    &mut mode,
+                    ENUM_DISPLAY_SETTINGS_FLAGS(0),
+                )
+            };
+            if !found.as_bool() {
+                return false;
+            }
+            if mode.dmPelsWidth == monitor.width
+                && mode.dmPelsHeight == monitor.height
+                && mode.dmDisplayFrequency == monitor.refresh_hz
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn change_mode(device_name: &str, size: DisplaySize, flags: CDS_TYPE) -> Result<(), String> {
@@ -6805,7 +7353,7 @@ mod windows_backend {
                 width: mode.dmPelsWidth,
                 height: mode.dmPelsHeight,
             },
-            refresh_hz: mode.dmDisplayFrequency,
+            refresh_hz: devmode_refresh_hz(&target.device_name, mode),
             output_index: output.output_index,
             desktop_rect: output.desktop_rect,
             active_outputs,
@@ -7868,6 +8416,36 @@ mod windows_backend {
         )
     }
 
+    /// The refresh a restored display must read back to match `journal`.
+    /// The readback is resolved ([`super::resolved_refresh_hz`]); a journal
+    /// written with DEVMODE's raw 0 or 1 (every 0.20.5 journal on a display
+    /// at the hardware default) is resolved from its saved CCD target, and
+    /// is otherwise not checked: geometry and topology still are.
+    fn target_refresh(path: &DISPLAYCONFIG_PATH_INFO) -> (u32, u32) {
+        (
+            path.targetInfo.refreshRate.Numerator,
+            path.targetInfo.refreshRate.Denominator,
+        )
+    }
+
+    /// The refresh a new journal records for its selected output: DEVMODE's
+    /// rate, or for the hardware default (0 or 1) the rate of `saved`, the
+    /// CCD path in the topology the journal saves.
+    pub(super) fn journalled_refresh_hz(devmode_hz: u32, saved: &DISPLAYCONFIG_PATH_INFO) -> u32 {
+        super::resolved_refresh_hz(devmode_hz, Some(target_refresh(saved)))
+    }
+
+    pub(super) fn journal_expected_refresh_hz(
+        journal: &crate::recovery::DisplayRecoveryJournal,
+        paths: &[DISPLAYCONFIG_PATH_INFO],
+    ) -> Option<u32> {
+        let saved_target = paths.get(journal.selected_path_index).map(target_refresh);
+        match super::resolved_refresh_hz(journal.original_refresh_hz, saved_target) {
+            0 => None,
+            hz => Some(hz),
+        }
+    }
+
     pub(super) fn restore_from_path(path: &std::path::Path) -> Result<RestoreOutcome, String> {
         let journal = crate::recovery::read(path)?;
         if journal.is_advanced_color_only() {
@@ -8307,10 +8885,11 @@ mod windows_backend {
                     width: journal.original_width,
                     height: journal.original_height,
                 };
+                let expected_refresh = journal_expected_refresh_hz(&journal, &paths);
                 match wait_for_mode(&mut dxgi, &target, expected, MODE_SETTLE_TIMEOUT) {
                     Ok(restored)
                         if restored.size == expected
-                            && restored.refresh_hz == journal.original_refresh_hz =>
+                            && expected_refresh.is_none_or(|hz| restored.refresh_hz == hz) =>
                     {
                         if restored.active_outputs != paths.len() as u32 {
                             errors.push(format!(
@@ -8322,8 +8901,8 @@ mod windows_backend {
                         }
                     }
                     Ok(restored) => errors.push(format!(
-                        "standalone restore settled at {} @ {}Hz, expected {} @ {}Hz",
-                        restored.size, restored.refresh_hz, expected, journal.original_refresh_hz
+                        "standalone restore settled at {} @ {}Hz, expected {} @ {:?}Hz",
+                        restored.size, restored.refresh_hz, expected, expected_refresh
                     )),
                     Err(error) => errors.push(error),
                 }
@@ -8947,6 +9526,7 @@ mod tests {
             refresh_hz: 30,
             rotation: arcen_media::Rotation::Degrees0,
             primary: true,
+            custom_timing: false,
             color: Some(color),
         };
 
@@ -10471,6 +11051,8 @@ mod tests {
         bound_mode_preparation_needed: bool,
         bound_mode_preparations: VecDeque<Result<bool, String>>,
         topology_restores: VecDeque<Result<(), String>>,
+        /// Readbacks of `current`, in order (`Ok` = the current mode).
+        current_results: VecDeque<Result<(), String>>,
     }
 
     impl FakeBackend {
@@ -10495,6 +11077,7 @@ mod tests {
                 bound_mode_preparation_needed: false,
                 bound_mode_preparations: VecDeque::new(),
                 topology_restores: VecDeque::new(),
+                current_results: VecDeque::new(),
             }
         }
 
@@ -10527,7 +11110,10 @@ mod tests {
 
         fn current(&mut self, _target: &DisplayTarget) -> Result<ModeState, String> {
             self.record(Call::Current);
-            Ok(self.current)
+            match self.current_results.pop_front() {
+                Some(Err(error)) => Err(error),
+                _ => Ok(self.current),
+            }
         }
 
         fn supported_sizes(&mut self, _target: &DisplayTarget) -> Result<Vec<DisplaySize>, String> {
@@ -11482,6 +12068,67 @@ mod tests {
             &lock_restore_state(&restore_state).state,
             RestoreState::Failed { error, .. } if error.contains("attempt 3/3")
         ));
+    }
+
+    #[test]
+    fn a_fallback_to_the_mode_already_running_changes_and_arms_nothing() {
+        // A GeForce dummy plug at 1920x1080 cannot show 1800x1168; the nearest
+        // mode it offers is the one it runs.
+        let mut backend = FakeBackend::new(size(1920, 1080));
+        backend.tests.push_back(Err("exact BADMODE".to_string()));
+        let calls = Arc::clone(&backend.calls);
+
+        let transaction =
+            DisplayTransaction::acquire(backend, 0, size(1800, 1168)).expect("served unchanged");
+
+        assert_eq!(transaction.report.applied, size(1920, 1080));
+        assert!(!transaction.report.changed);
+        assert_eq!(
+            transaction.report.backend,
+            "unchanged-current-mode-fallback"
+        );
+        assert!(
+            transaction.snapshot.is_none(),
+            "nothing to restore at teardown"
+        );
+        drop(transaction);
+        let calls = calls.lock().unwrap();
+        assert!(!calls.contains(&Call::Arm));
+        assert!(!calls.iter().any(|call| matches!(call, Call::Apply(_))));
+        assert!(!calls.contains(&Call::Restore));
+    }
+
+    #[test]
+    fn a_failed_fallback_readback_restores_nothing_it_never_changed() {
+        // The exact mode is refused before anything changes, and the display
+        // disappears (hot-plug) when it is read back for the fallback.
+        let mut backend = FakeBackend::new(size(1920, 1080));
+        backend.tests.push_back(Err("exact BADMODE".to_string()));
+        backend.current_results = VecDeque::from([Ok(()), Err("display removed".to_string())]);
+        let calls = Arc::clone(&backend.calls);
+
+        let error = match DisplayTransaction::acquire(backend, 0, size(1800, 1168)) {
+            Ok(_) => panic!("the readback failure is reported"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("display removed"), "{error}");
+        let calls = calls.lock().unwrap();
+        assert!(!calls.contains(&Call::Arm));
+        assert!(!calls.iter().any(|call| matches!(call, Call::Apply(_))));
+        assert!(!calls.contains(&Call::Restore));
+    }
+
+    #[test]
+    fn a_hardware_default_refresh_is_resolved_or_unknown_never_one_hertz() {
+        assert_eq!(resolved_refresh_hz(60, Some((30, 1))), 60);
+        // dmDisplayFrequency 1: the hardware default; the CCD target says 59.94.
+        assert_eq!(resolved_refresh_hz(1, Some((59_940, 1_000))), 60);
+        assert_eq!(resolved_refresh_hz(0, Some((144, 1))), 144);
+        // Nothing usable: unknown, which is never a cap.
+        assert_eq!(resolved_refresh_hz(1, None), 0);
+        assert_eq!(resolved_refresh_hz(0, Some((0, 0))), 0);
+        assert_eq!(resolved_refresh_hz(1, Some((1, 1))), 0);
     }
 
     #[test]

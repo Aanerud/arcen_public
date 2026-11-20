@@ -61,6 +61,12 @@ pub(super) struct Keyboard {
     typing: TypingMode,
     layout_has_altgr: bool,
     grabbed: bool,
+    /// Virtual-Keys a modal window of the Deck took and still holds (the Esc
+    /// or Enter that closed it): a drained message of theirs is not the
+    /// host's, and a drained release is handed back
+    /// ([`Self::take_modal_released`]).
+    modal_held: Vec<u16>,
+    modal_released: Vec<u16>,
 }
 
 impl Default for Keyboard {
@@ -72,6 +78,8 @@ impl Default for Keyboard {
             text: TextInputPolicy::default(),
             down: BTreeSet::new(),
             local: BTreeSet::new(),
+            modal_held: Vec::new(),
+            modal_released: Vec::new(),
             pass_chars: false,
             settings: PcKeyboardSettings::default(),
             facts: None,
@@ -204,7 +212,7 @@ impl Keyboard {
             let _ = self.text.plan_frame(&[DeckTextEvent::FocusLost]);
         }
         let edges = self.input.set_released(released);
-        self.focus_gained();
+        self.focus_gained(false);
         edges
     }
 
@@ -240,8 +248,10 @@ impl Keyboard {
     }
 
     /// The window got focus: modifiers already held are recorded (the next
-    /// key carries them), and the layout is read again.
-    pub(super) fn focus_gained(&mut self) {
+    /// key carries them), and the layout is read again. `deck_alt`: Alt is
+    /// held for a Deck chord the host never saw (Alt+F4 under a Help
+    /// window), so it is not one of them: its release is the Deck's too.
+    pub(super) fn focus_gained(&mut self, deck_alt: bool) {
         const SIDES: [(i32, PcModifier); 8] = [
             (0xA0, PcModifier::LeftShift),
             (0xA1, PcModifier::RightShift),
@@ -256,7 +266,10 @@ impl Keyboard {
         let held = SIDES
             .into_iter()
             .filter(|(vk, _)| unsafe { GetKeyState(*vk) } < 0)
-            .map(|(_, modifier)| modifier);
+            .map(|(_, modifier)| modifier)
+            .filter(|modifier| {
+                !deck_alt || !matches!(modifier, PcModifier::LeftAlt | PcModifier::RightAlt)
+            });
         self.input.seed_modifiers(held);
         self.layout_has_altgr = layout_has_altgr();
         self.configure_text();
@@ -434,6 +447,17 @@ impl Keyboard {
 
     /// Processes the key messages queued no later than `time` (a hook key's
     /// time), translating each as the message loop would.
+    /// The keys a modal window holds now (`WindowInput::modal_key`).
+    pub(super) fn set_modal_held(&mut self, held: &[u16]) {
+        self.modal_held.clear();
+        self.modal_held.extend_from_slice(held);
+    }
+
+    /// The releases of modal-held keys a drain took since the last call.
+    pub(super) fn take_modal_released(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.modal_released)
+    }
+
     fn drain_keys_before(&mut self, hwnd: HWND, time: u32, events: &mut Vec<InputEvent>) {
         loop {
             let mut msg = MSG::default();
@@ -448,6 +472,30 @@ impl Keyboard {
             // Message times wrap after 49.7 days; compare by difference.
             if !found || !key_message || time.wrapping_sub(msg.time) > u32::MAX / 2 {
                 return;
+            }
+            #[allow(clippy::cast_possible_truncation, reason = "the low word is the key")]
+            let vk = msg.wParam.0 as u16;
+            let fresh =
+                matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) && msg.lParam.0 & (1 << 30) == 0;
+            if let Some(index) = self.modal_held.iter().position(|held| *held == vk) {
+                if fresh {
+                    // Let go outside the Deck: a new press, the host's below.
+                    self.modal_held.swap_remove(index);
+                    self.modal_released.push(vk);
+                } else {
+                    // A repeat or the release of a key a modal window took:
+                    // the Deck's, without its characters, as on the window's
+                    // path.
+                    // SAFETY: removes the message just peeked.
+                    let _ = unsafe {
+                        PeekMessageW(&raw mut msg, hwnd, msg.message, msg.message, PM_REMOVE)
+                    };
+                    if matches!(msg.message, WM_KEYUP | WM_SYSKEYUP) {
+                        self.modal_held.swap_remove(index);
+                        self.modal_released.push(vk);
+                    }
+                    continue;
+                }
             }
             // SAFETY: removes the message just peeked and queues its
             // characters, as TranslateMessage in the loop would have.

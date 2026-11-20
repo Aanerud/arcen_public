@@ -1037,6 +1037,7 @@
         "audio",
         "audio::microphone",
         "audio::opus",
+        "audio::resample",
         "canvas",
         "capenc_control",
         "clipboard",

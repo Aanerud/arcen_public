@@ -15,6 +15,7 @@ use arcen_deck_core::connect_plan::{
     apply_streaming_settings, keep_profile_decodable, profile_video,
 };
 use arcen_deck_core::connection_draft::ConnectionDraft;
+use arcen_deck_core::input::overlay_pointer::OverlayPointerRegions;
 use arcen_deck_core::input::{SessionInput, host_input_facts};
 use arcen_deck_core::multi_window::activation::{
     MULTI_WINDOW_ENTER_TIMEOUT, MultiWindowSessionState, begin_multi_window_entry,
@@ -97,6 +98,8 @@ pub(super) enum LocalInput {
     Preedit(Option<String>),
     /// A Deck chord: the shell applies its menu command.
     Shortcut(DeckShortcut),
+    /// Esc or Enter in a session window under a Help window: it closes.
+    DismissModal,
     /// The keyboard ended pointer lock (Esc held, focus lost).
     PointerLockReleased,
 }
@@ -114,6 +117,7 @@ impl DeckInputSink for LocalSink {
             DeckInputEvent::Shortcut(shortcut) => LocalInput::Shortcut(shortcut),
             DeckInputEvent::PointerLockReleased { .. } => LocalInput::PointerLockReleased,
             DeckInputEvent::Preedit(text) => LocalInput::Preedit(text),
+            DeckInputEvent::DismissModal => LocalInput::DismissModal,
             _ => return,
         };
         self.news
@@ -183,6 +187,10 @@ pub(super) struct Connection {
     /// The window whose input this session has, and where the picture is
     /// in it.
     input_window: Option<(HWND, Option<ImageRect>, (u32, u32))>,
+    /// Where the Deck's own UI takes the session windows' input now
+    /// (`Launcher::publish_local_ui`), kept for a secondary window attached
+    /// later.
+    local_ui: OverlayPointerRegions,
     /// The host's input facts, once the input is attached.
     host_facts: Option<arcen_input::deck_events::HostInputFacts>,
     /// What the pen's barrel buttons click on this host (from its hello and
@@ -360,6 +368,7 @@ impl Connection {
             shown_cursor: DeckCursor::Default,
             pointer_texture: None,
             input_window: None,
+            local_ui: OverlayPointerRegions::default(),
             host_facts: None,
             pen_buttons: arcen_input::pen_buttons::PenButtonMap::default(),
             streaming: false,
@@ -848,6 +857,8 @@ impl Connection {
             input.set_fullscreen(true);
             input.set_host_cursor_shown(Some(self.shown_cursor.clone()), false);
         });
+        // Opened while a Help window is: held by it from the start.
+        publish_local_ui(None, [hwnd], self.local_ui);
         multi.inputs.push((hwnd, monitor));
         Ok(())
     }
@@ -1266,6 +1277,34 @@ impl Connection {
         }
     }
 
+    /// Where the Deck's own UI takes the session windows' input
+    /// (`arcen_deck_core::input::overlay_pointer`): the connection bar in
+    /// the root window only, a modal Help window in every one.
+    pub(super) fn set_local_ui(&mut self, regions: OverlayPointerRegions) {
+        self.local_ui = regions;
+        let secondaries = self
+            .multi
+            .iter()
+            .flat_map(|multi| multi.inputs.iter().map(|(hwnd, _)| *hwnd));
+        publish_local_ui(
+            self.input_window.map(|(hwnd, ..)| hwnd),
+            secondaries,
+            regions,
+        );
+    }
+
+    /// Whether any session window's input holds a key it took for a Deck
+    /// chord (Alt+F4 held in a secondary window as well as the root one).
+    pub(super) fn holds_deck_key(&self, qt_key: u32) -> bool {
+        self.with_window_input(|input| input.holds_deck_key(qt_key)) == Some(true)
+            || self.multi.as_ref().is_some_and(|multi| {
+                multi.inputs.iter().any(|(hwnd, _)| {
+                    crate::input::with_input(*hwnd, |input| input.holds_deck_key(qt_key))
+                        == Some(true)
+                })
+            })
+    }
+
     pub(super) fn with_window_input<T>(
         &self,
         apply: impl FnOnce(&mut WindowInput) -> T,
@@ -1296,5 +1335,182 @@ impl Drop for Connection {
     /// and its window procedure restored.
     fn drop(&mut self) {
         self.release_input();
+    }
+}
+
+/// Publishes the Deck UI's regions to a session's windows: all of them to
+/// the root window (`primary`), what a secondary window shares
+/// (`OverlayPointerRegions::for_secondary`) to each secondary one.
+fn publish_local_ui(
+    primary: Option<HWND>,
+    secondaries: impl IntoIterator<Item = HWND>,
+    regions: OverlayPointerRegions,
+) {
+    if let Some(hwnd) = primary {
+        crate::input::with_input(hwnd, |input| input.set_overlay_pointer(regions));
+    }
+    for hwnd in secondaries {
+        crate::input::with_input(hwnd, |input| {
+            input.set_overlay_pointer(regions.for_secondary());
+        });
+    }
+}
+
+#[cfg(test)]
+mod local_ui_tests {
+    use std::sync::{Arc, Mutex};
+
+    use arcen_deck_core::input::overlay_pointer::OverlayPointerRegions;
+    use arcen_input::deck_pen::ImageRect;
+    use arcen_input::keyboard::{KeyboardCapturePolicy, PcKeyboardSettings};
+    use arcen_protocol::messages::HostPlatform;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        WS_POPUP,
+    };
+    use windows::core::w;
+
+    use super::publish_local_ui;
+    use crate::input::{HostInputFacts, InputEvent, InputSink, WindowInput, attach, with_input};
+
+    #[derive(Clone, Default)]
+    struct Sent(Arc<Mutex<Vec<InputEvent>>>);
+
+    impl InputSink for Sent {
+        fn input(&self, event: InputEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// A hidden session window with its input attached, as the root window
+    /// and each Match My Layout secondary window have one.
+    fn session_window(sent: &Sent) -> HWND {
+        // SAFETY: a plain hidden popup of the system's static class, on this
+        // thread, destroyed by the test.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("local ui test"),
+                WS_POPUP,
+                0,
+                0,
+                400,
+                300,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("a test window");
+        let mut input = WindowInput::new(hwnd, Box::new(sent.clone()), KeyboardCapturePolicy::Host);
+        let facts = HostInputFacts {
+            platform: HostPlatform::Windows,
+            extended_keys: true,
+            precise_scroll: true,
+            text_commit: true,
+            unicode_text: true,
+        };
+        input.set_session(Some((facts, PcKeyboardSettings::default())));
+        input.set_image_rect(Some(ImageRect {
+            left: 0.0,
+            top: 0.0,
+            width: 400.0,
+            height: 300.0,
+        }));
+        attach(hwnd, input).expect("input attached");
+        hwnd
+    }
+
+    /// Whether a click at (200, 20) and the letter A reach the host.
+    fn host_gets(hwnd: HWND, sent: &Sent) -> (bool, bool) {
+        let _ = std::mem::take(&mut *sent.0.lock().unwrap());
+        let click = with_input(hwnd, |input| {
+            input.handle(WM_LBUTTONDOWN, WPARAM(1), LPARAM((20 << 16) | 200))
+        })
+        .flatten()
+        .is_some();
+        let clicked = std::mem::take(&mut *sent.0.lock().unwrap())
+            .iter()
+            .any(|event| matches!(event, InputEvent::Button { pressed: true, .. }));
+        let _ = with_input(hwnd, |input| {
+            input.handle(WM_KEYDOWN, WPARAM(0x41), LPARAM(0x001E_0001))
+        });
+        let typed = std::mem::take(&mut *sent.0.lock().unwrap())
+            .iter()
+            .any(|event| matches!(event, InputEvent::Keys(_)));
+        let _ = with_input(hwnd, |input| input.release_modifiers());
+        (click && clicked, typed)
+    }
+
+    #[test]
+    fn a_help_window_holds_every_session_window_and_the_bar_only_the_root() {
+        let (root_sent, secondary_sent, late_sent) =
+            (Sent::default(), Sent::default(), Sent::default());
+        let root = session_window(&root_sent);
+        let secondary = session_window(&secondary_sent);
+        // The fullscreen bar's menu is open over the root window: the root's
+        // pointer is the UI's, a secondary window's click still the host's.
+        let bar_menu = OverlayPointerRegions {
+            owned: Some(ImageRect {
+                left: 0.0,
+                top: 0.0,
+                width: 400.0,
+                height: 30.0,
+            }),
+            whole_window: true,
+            ..OverlayPointerRegions::default()
+        };
+        publish_local_ui(Some(root), [secondary], bar_menu);
+        assert!(!host_gets(root, &root_sent).0);
+        assert!(host_gets(secondary, &secondary_sent).0);
+        // Help ▸ About is open: no session window's click or key reaches
+        // the host, nor one of a secondary window opened meanwhile.
+        let help = OverlayPointerRegions {
+            modal: true,
+            ..OverlayPointerRegions::default()
+        };
+        publish_local_ui(Some(root), [secondary], help);
+        let late = session_window(&late_sent);
+        publish_local_ui(None, [late], help);
+        for (hwnd, sent) in [
+            (root, &root_sent),
+            (secondary, &secondary_sent),
+            (late, &late_sent),
+        ] {
+            assert_eq!(host_gets(hwnd, sent), (false, false));
+        }
+        // Esc in a secondary window (the one with the keyboard) closes Help.
+        let _ = std::mem::take(&mut *secondary_sent.0.lock().unwrap());
+        let _ = with_input(secondary, |input| {
+            input.handle(WM_KEYDOWN, WPARAM(0x1B), LPARAM(0x0001_0001))
+        });
+        assert_eq!(
+            std::mem::take(&mut *secondary_sent.0.lock().unwrap()),
+            vec![InputEvent::DismissModal]
+        );
+        let _ = with_input(secondary, |input| {
+            input.handle(WM_KEYUP, WPARAM(0x1B), LPARAM(0xC001_0001_u32 as isize))
+        });
+        // Closed: the host has them all again.
+        publish_local_ui(
+            Some(root),
+            [secondary, late],
+            OverlayPointerRegions::default(),
+        );
+        for (hwnd, sent) in [
+            (root, &root_sent),
+            (secondary, &secondary_sent),
+            (late, &late_sent),
+        ] {
+            assert!(host_gets(hwnd, sent).0);
+        }
+        for hwnd in [root, secondary, late] {
+            // SAFETY: the windows created above, on this thread (their
+            // input detaches on WM_NCDESTROY).
+            let _ = unsafe { DestroyWindow(hwnd) };
+        }
     }
 }

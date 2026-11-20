@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-usb-helper"
-version = "0.20.5"
+version = "0.20.6"
 edition = "2021"
 publish = false
 license.workspace = true

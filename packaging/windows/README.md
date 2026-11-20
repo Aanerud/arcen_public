@@ -31,6 +31,49 @@ These are runtime-selected paths inside the same signed-in session agent and
 capenc binary, not optional components. Rebuild the Pier before rebuilding the
 embedding installer.
 
+## Install folders (`install-arcen-pier.exe`)
+
+`arcen-pier.exe` runs as a SYSTEM service from `--prefix` (default
+`C:\Program Files\Arcen\Pier`), and LogonUI loads the credential provider
+from there as SYSTEM. Every folder above `--prefix` and `--programdata`
+must therefore be one that only SYSTEM and Administrators can change.
+The installer makes each missing one administrator-only when it creates it.
+It refuses an existing one that another account owns, that a
+non-administrator may rename, delete, re-permission or take ownership of,
+or that another process holds open with the right to rename it
+(`installer/src/acl.rs` `ancestor_hazard`, `installer/src/secure_fs.rs`
+`secure_ancestors`). A volume root's `DELETE` right is ignored, since a
+root cannot be renamed (a share's root is an ordinary folder on its server,
+so it gets no such exemption). The folders stay held open until the
+payloads are written and registered, and are judged again before each
+write. The recheck compares what each trustee may do to the folder, its
+child folders and its child files with the class, not only the set of
+trustees. A refused folder above the install
+folder is never deleted or fixed in place on the installer's word: it may
+be Windows' own or shared, and a handle opened earlier can keep the right
+to change its permissions. The message names the folder and the right, and
+asks for a separate location whose folders only SYSTEM and Administrators
+can change. The install folder itself, when it already exists and belongs
+to SYSTEM or Administrators, is corrected in place as before.
+
+`--prefix` and `--programdata` must be on a local drive letter: a UNC path
+(`\\server\share\...`, `\\?\UNC\...`) or a drive letter mapped to a
+share is refused, since a SYSTEM service and a DLL that LogonUI loads must
+not come from a network share. The check never contacts a share: the
+drive letter's device is read from the object manager (`QueryDosDeviceW`;
+only a local disk volume passes, so `subst` is refused too), and each
+existing folder from the drive's root is opened without following a link,
+a link or junction being refused. Each folder is opened, or made, relative
+to the handle of the one above it, so no path is looked up twice, and all
+of them stay held from that walk through the prefix clean-up and the
+install.
+
+The one exception is `--tls-only` with an operator's own `--programdata`,
+for example `new-host-cert.ps1 -OutputRoot D:\certs\tls`. That folder and
+those above it are the operator's, and are never changed or refused. Keep
+them administrator-only: the installer prints a warning naming the first
+one a non-administrator could replace.
+
 ## Native codec/static-runtime boundary
 
 `hosts\windows\build.cmd` is the active source-build entry point. It requires an

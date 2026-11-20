@@ -45,6 +45,10 @@
 //!   state (SDR, WCG or HDR composition and the user's HDR toggle) admits
 //!   capture, which HDR toggle to change, and what to restore. The Pier
 //!   keeps only the `DisplayConfig` calls that read and set it.
+//! - [`edid_provisioning`]: whether a GPU may have a display's EDID
+//!   written to recreate the Deck's exact display, and what a session gets
+//!   when it may not (the attached display's own modes, reported, or a
+//!   refusal before any change).
 //! - [`xorg_gpu`]: which PCI GPU a dedicated NVIDIA Xorg `Device` section
 //!   names (`BusID`), decided from host-reported PCI facts, so a template
 //!   never carries one machine's GPU address to another.
@@ -74,6 +78,7 @@ pub mod atomic_start;
 pub mod console_layout;
 pub mod display_lease;
 pub mod edid;
+pub mod edid_provisioning;
 pub mod fairness;
 pub mod nvidia_heads;
 pub mod provider;

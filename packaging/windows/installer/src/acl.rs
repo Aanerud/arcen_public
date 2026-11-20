@@ -230,16 +230,383 @@ pub(crate) fn assert_acl_sddl(path: &str, sddl: &str, acl_class: AclClass) -> Re
         ));
     }
     let expected = acl_class.expected_sids();
-    if dacl.sids == expected {
-        Ok(())
-    } else {
-        Err(format!(
+    if dacl.sids != expected {
+        return Err(format!(
             "ACL verification failed for {path}: expected {} trustees {:?}, got {:?} (SDDL {sddl})",
             acl_class.label(),
             expected,
             dacl.sids
+        ));
+    }
+    // The right trustees are not enough: what each one may do, to the
+    // folder itself and to what inherits from it, must be the class's, or a
+    // grant widened in place (read and execute made full control) would
+    // pass.
+    let actual = dacl_meaning(sddl).map_err(|e| format!("{e} for {path} (SDDL {sddl})"))?;
+    let intended = dacl_meaning(acl_class.sddl())?;
+    if actual == intended {
+        Ok(())
+    } else {
+        Err(format!(
+            "ACL verification failed for {path}: it does not grant exactly what a {} does \
+             (expected {intended:?}, got {actual:?}; SDDL {sddl})",
+            acl_class.label()
         ))
     }
+}
+
+/// Where a DACL grants or denies rights: the object itself, or what its
+/// child folders (`CI`) and files (`OI`) inherit, either all the way down
+/// or one level only (`NP`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Reach {
+    Itself,
+    Folders { one_level: bool },
+    Files { one_level: bool },
+}
+
+/// What a DACL means, for comparison: for each entry type, trustee, reach
+/// and whether it was inherited, the rights given, generic rights mapped as
+/// Windows maps them for files and folders. Windows stores an inheritable
+/// grant made with generic rights as an inherit-only generic entry plus an
+/// entry for the object with the mapped rights; both mean the same.
+pub(crate) type DaclMeaning = std::collections::BTreeMap<(String, String, Reach, bool), u32>;
+
+/// `mask` with its generic rights replaced by the file rights they map to.
+const fn file_rights(mask: u32) -> u32 {
+    let mut rights = mask & 0x0FFF_FFFF;
+    if mask & 0x1000_0000 != 0 {
+        rights |= 0x001F_01FF;
+    }
+    if mask & 0x8000_0000 != 0 {
+        rights |= 0x0012_0089;
+    }
+    if mask & 0x4000_0000 != 0 {
+        rights |= 0x0012_0116;
+    }
+    if mask & 0x2000_0000 != 0 {
+        rights |= 0x0012_00A9;
+    }
+    rights
+}
+
+/// The [`DaclMeaning`] of the DACL of `sddl`. An entry that cannot be read
+/// exactly (unknown rights, a condition, an object type) is an error.
+pub(crate) fn dacl_meaning(sddl: &str) -> Result<DaclMeaning, String> {
+    if sddl.contains('"') || sddl.contains('@') {
+        return Err("DACL has a conditional entry".to_string());
+    }
+    let dacl =
+        sddl_section(sddl, 'D').ok_or_else(|| "security descriptor has no DACL".to_string())?;
+    let flags: String = dacl.chars().take_while(|c| *c != '(').collect();
+    let mut rest = &dacl[flags.len()..];
+    let mut meaning = DaclMeaning::new();
+    while let Some(open) = rest.find('(') {
+        let close = rest[open..]
+            .find(')')
+            .map(|close| open + close)
+            .ok_or_else(|| "DACL has an unterminated access control entry".to_string())?;
+        let fields: Vec<&str> = rest[open + 1..close].split(';').collect();
+        rest = &rest[close + 1..];
+        let [kind, ace_flags, rights, object, inherited_object, trustee] = fields.as_slice() else {
+            return Err("DACL entry is not a plain entry".to_string());
+        };
+        if !object.is_empty() || !inherited_object.is_empty() || !matches!(*kind, "A" | "D") {
+            return Err(format!("DACL entry of type {kind} with an object type"));
+        }
+        let rights = file_rights(
+            sddl_rights(rights).ok_or_else(|| format!("DACL entry with rights {rights}"))?,
+        );
+        let mut flag = std::collections::BTreeSet::new();
+        for code in ace_flags.as_bytes().chunks(2) {
+            let code = std::str::from_utf8(code).map_err(|_| "DACL entry flags".to_string())?;
+            if !matches!(code, "OI" | "CI" | "NP" | "IO" | "ID") {
+                return Err(format!("DACL entry with flag {code}"));
+            }
+            flag.insert(code);
+        }
+        let one_level = flag.contains("NP");
+        let mut reaches = Vec::new();
+        if !flag.contains("IO") {
+            reaches.push(Reach::Itself);
+        }
+        if flag.contains("CI") {
+            reaches.push(Reach::Folders { one_level });
+        }
+        if flag.contains("OI") {
+            reaches.push(Reach::Files { one_level });
+        }
+        for reach in reaches {
+            *meaning
+                .entry((
+                    (*kind).to_owned(),
+                    canonical_sid(trustee),
+                    reach,
+                    flag.contains("ID"),
+                ))
+                .or_insert(0) |= rights;
+        }
+    }
+    meaning.retain(|_, rights| *rights != 0);
+    Ok(meaning)
+}
+
+/// `TrustedInstaller`, which owns `C:\` and `C:\Program Files`.
+pub(crate) const SID_TRUSTED_INSTALLER: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// Who may own, and hold any right on, a folder above an install directory.
+const CHAIN_TRUSTEES: [&str; 3] = [SID_SYSTEM, SID_ADMINISTRATORS, SID_TRUSTED_INSTALLER];
+
+/// `DELETE`: renames or deletes the object itself.
+const DELETE: u32 = 0x0001_0000;
+
+/// Rights on a folder above an install directory that let their holder
+/// replace it, or a folder in it, with one of their own: what each lets
+/// them do, for the message.
+const REPLACING_RIGHTS: [(u32, &str); 5] = [
+    (0x1000_0000, "take full control of"),
+    (DELETE, "rename or delete"),
+    (0x0004_0000, "change the permissions of"),
+    (0x0008_0000, "take ownership of"),
+    (0x0000_0040, "rename or delete the folders in"),
+];
+
+/// The access mask of an SDDL rights field: a hexadecimal number or
+/// two-letter codes. `None` for a code this does not know, which the
+/// caller treats as every right.
+fn sddl_rights(field: &str) -> Option<u32> {
+    let field = field.trim();
+    if let Some(hex) = field
+        .strip_prefix("0x")
+        .or_else(|| field.strip_prefix("0X"))
+    {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    if field.len() % 2 != 0 || !field.is_ascii() {
+        return None;
+    }
+    let mut mask = 0_u32;
+    for index in (0..field.len()).step_by(2) {
+        mask |= match &field[index..index + 2] {
+            "GA" => 0x1000_0000,
+            "GR" => 0x8000_0000,
+            "GW" => 0x4000_0000,
+            "GX" => 0x2000_0000,
+            "RC" => 0x0002_0000,
+            "SD" => 0x0001_0000,
+            "WD" => 0x0004_0000,
+            "WO" => 0x0008_0000,
+            "CC" => 0x0000_0001,
+            "DC" => 0x0000_0002,
+            "LC" => 0x0000_0004,
+            "SW" => 0x0000_0008,
+            "RP" => 0x0000_0010,
+            "WP" => 0x0000_0020,
+            "DT" => 0x0000_0040,
+            "LO" => 0x0000_0080,
+            "CR" => 0x0000_0100,
+            "FA" => 0x001F_01FF,
+            "FR" => 0x0012_0089,
+            "FW" => 0x0012_0116,
+            "FX" => 0x0012_00A9,
+            _ => return None,
+        };
+    }
+    Some(mask)
+}
+
+/// The text of the SDDL section `marker` (`O`, `G`, `D` or `S`), found at
+/// parenthesis depth zero, up to the next section.
+fn sddl_section(sddl: &str, marker: char) -> Option<&str> {
+    let bytes = sddl.as_bytes();
+    let mut depth = 0_usize;
+    let mut start = None;
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'O' | b'G' | b'D' | b'S' if depth == 0 && bytes.get(index + 1) == Some(&b':') => {
+                if let Some(start) = start {
+                    return Some(&sddl[start..index]);
+                }
+                if byte == marker as u8 {
+                    start = Some(index + 2);
+                }
+            }
+            _ => {}
+        }
+    }
+    start.map(|start| &sddl[start..])
+}
+
+/// Why a folder above an install directory is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Hazard {
+    /// `account` could have replaced the folder: it `how`. Access is
+    /// checked when a handle is opened, so a handle opened while this was
+    /// so keeps the right after the ACL is fixed in place: the folder is
+    /// deleted and made again instead.
+    Replaceable {
+        path: String,
+        account: String,
+        how: String,
+    },
+    /// Who may replace the folder cannot be judged.
+    Unreadable { path: String, what: String },
+}
+
+impl std::fmt::Display for Hazard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replaceable { path, account, how } => {
+                write!(f, "{path} has been replaceable by {account}, who {how}")
+            }
+            Self::Unreadable { path, what } => {
+                write!(f, "cannot judge who may replace {path}: {what}")
+            }
+        }
+    }
+}
+
+/// Whether `path` is a drive's root (`X:\\`, `\\\\?\\X:\\`), which can never
+/// be renamed or deleted. A share's root (`\\\\server\\share`) is not one:
+/// it is an ordinary folder on its server. Read from the text, the same
+/// on every host.
+pub(crate) fn is_volume_root(path: &str) -> bool {
+    let path = path.trim_end_matches('\\');
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let bytes = path.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// Whether `path` names a network location (`\\\\server\\share\\...`,
+/// `\\\\?\\UNC\\...`, `//server/share`): anything that does not begin with a
+/// drive letter, as is or verbatim. A drive letter mapped to a share is
+/// found by the caller from the drive itself.
+pub(crate) fn is_network_path(path: &str) -> bool {
+    let verbatim_disk = |rest: &str| {
+        let bytes = rest.as_bytes();
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    };
+    // A device path (`\\.\Z:\`) reaches whatever the device name is
+    // mapped to, a share included: refused outright.
+    if path.starts_with(r"\\.\") {
+        return true;
+    }
+    // An NT path (`\??\UNC\server\share`, `\??\Z:\`) is no Win32 path at
+    // all: made absolute it would read as a folder on the current drive.
+    if path.starts_with(r"\??\") || path.starts_with("/??/") {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        return !verbatim_disk(rest);
+    }
+    path.starts_with(r"\\") || path.starts_with("//")
+}
+
+/// Judges an existing folder above an install directory (`sddl`, its
+/// owner and DACL). It is replaceable when its owner is not SYSTEM,
+/// Administrators or `TrustedInstaller`, or when its DACL lets anyone else
+/// rename or delete it, change its permissions or owner, or rename or
+/// delete the folders in it: any of them could put a folder of their own
+/// where the installer's is, and the service would run what they placed
+/// there. A volume root ([`is_volume_root`]) cannot be renamed or deleted,
+/// so `DELETE` on it is harmless. Creating new folders in it is harmless
+/// too: the installer's own already exist and are checked themselves.
+/// Denying entries are ignored, so a denial never passes a folder. An
+/// entry it cannot read refuses the folder.
+///
+/// # Errors
+///
+/// The [`Hazard`].
+pub(crate) fn ancestor_hazard(path: &str, sddl: &str) -> Result<(), Hazard> {
+    let unreadable = |what: &str| Hazard::Unreadable {
+        path: path.to_owned(),
+        what: format!("{what} (SDDL {sddl})"),
+    };
+    let replaceable = |account: &str, how: String| Hazard::Replaceable {
+        path: path.to_owned(),
+        account: account.to_owned(),
+        how,
+    };
+    // A string literal or an attribute name (only in a conditional entry)
+    // could hold a lone parenthesis, which would hide the entries after it
+    // from the depth counting below; without them, SDDL's parentheses are
+    // balanced. Refused before anything is parsed, whatever the encoding.
+    if sddl.contains('"') {
+        return Err(unreadable("a conditional entry with a string literal"));
+    }
+    if sddl.contains('@') {
+        return Err(unreadable("a conditional entry with an attribute"));
+    }
+    let owner = sddl_section(sddl, 'O')
+        .map(canonical_sid)
+        .ok_or_else(|| unreadable("no owner"))?;
+    if !CHAIN_TRUSTEES.contains(&owner.as_str()) {
+        return Err(replaceable(
+            &owner,
+            "owns it (an owner can always change its permissions)".to_owned(),
+        ));
+    }
+    let dacl = sddl_section(sddl, 'D').ok_or_else(|| unreadable("no DACL"))?;
+    let flags: String = dacl.chars().take_while(|c| *c != '(').collect();
+    if flags.contains("NO_ACCESS_CONTROL") {
+        return Err(replaceable(
+            "everyone",
+            "may do anything to it (it has no access control)".to_owned(),
+        ));
+    }
+    let root = is_volume_root(path);
+    let mut rest = &dacl[flags.len()..];
+    while let Some(open) = rest.find('(') {
+        let mut depth = 0_usize;
+        let mut close = None;
+        for (index, character) in rest[open..].char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.ok_or_else(|| unreadable("an unterminated entry"))?;
+        let fields: Vec<&str> = rest[open + 1..close].splitn(7, ';').collect();
+        rest = &rest[close + 1..];
+        let [kind, ace_flags, rights, _, _, trustee, ..] = fields.as_slice() else {
+            return Err(unreadable("an entry without a trustee"));
+        };
+        let conditional = match kind.trim() {
+            "A" | "OA" => false,
+            "XA" | "ZA" => true,
+            "D" | "OD" | "XD" => continue,
+            other => return Err(unreadable(&format!("an entry of type {other}"))),
+        };
+        let inherit_only = ace_flags.as_bytes().chunks(2).any(|flag| flag == b"IO");
+        let trustee = canonical_sid(trustee);
+        if inherit_only || CHAIN_TRUSTEES.contains(&trustee.as_str()) {
+            continue;
+        }
+        if conditional {
+            return Err(unreadable(&format!("a conditional entry for {trustee}")));
+        }
+        let mask = sddl_rights(rights).unwrap_or(u32::MAX);
+        let what: Vec<&str> = REPLACING_RIGHTS
+            .iter()
+            .filter(|(right, _)| mask & right != 0)
+            .filter(|(right, _)| !(root && *right == DELETE))
+            .map(|(_, what)| *what)
+            .collect();
+        if !what.is_empty() {
+            return Err(replaceable(&trustee, format!("may {} it", what.join(", "))));
+        }
+    }
+    Ok(())
 }
 
 /// Trustees present in `sddl` that `acl_class` does not allow.
@@ -277,6 +644,164 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Read from a Windows 11 lab host (`Get-Acl`, 2026-11-20).
+    const SYSTEM_DRIVE: &str = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464\
+        G:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:PAI(A;;LC;;;AU)\
+        (A;OICIIO;SDGXGWGR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)\
+        (A;;0x1000a1;;;S-1-15-3-65536-1888954469-739942743-1668119174-2468466756-4239452838-1296943325-355587736-700089176)";
+    const PROGRAM_FILES: &str = "O:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464\
+        G:S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464D:PAI(A;OICIIO;GA;;;CO)\
+        (A;OICIIO;GA;;;SY)(A;;0x1301bf;;;SY)(A;OICIIO;GA;;;BA)(A;;0x1301bf;;;BA)(A;OICIIO;GXGR;;;BU)\
+        (A;;0x1200a9;;;BU)(A;CIIO;GA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)\
+        (A;;FA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)(A;;0x1200a9;;;AC)\
+        (A;OICIIO;GXGR;;;AC)(A;;0x1200a9;;;S-1-15-2-2)(A;OICIIO;GXGR;;;S-1-15-2-2)";
+    const PROGRAM_DATA: &str = "O:SYG:SYD:PAI(A;OICIIO;GA;;;CO)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)\
+        (A;OICI;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)";
+
+    #[test]
+    fn a_data_volume_root_is_never_refused_for_what_cannot_happen_to_a_root() {
+        // A secondary NTFS volume's root: users may Modify it, delete
+        // included, but a root can never be renamed or deleted.
+        let root = "O:BAG:SYD:AI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;AU)(A;OICI;0x1200a9;;;BU)";
+        ancestor_hazard(r"D:\", root).expect("a root cannot be renamed");
+        // What can still be done to a root is still refused.
+        for rights in ["WD", "WO", "DT", "GA"] {
+            let sddl = format!("O:BAG:SYD:AI(A;OICI;FA;;;BA)(A;;{rights};;;AU)");
+            assert!(ancestor_hazard(r"D:\", &sddl).is_err(), "{rights}");
+        }
+        // Below the root, the same Modify lets them rename the folder.
+        assert!(ancestor_hazard(r"D:\certs", root).is_err());
+        for path in [r"D:\", "D:", r"\\?\D:\"] {
+            assert!(is_volume_root(path), "{path}");
+        }
+        // A share's root is an ordinary folder on its server (`C:\Tools`
+        // shared as `\\localhost\tools`): DELETE there renames it.
+        for path in [
+            r"D:\certs",
+            r"\\server\share\",
+            r"\\?\UNC\server\share",
+            r"\\server\share\certs",
+            r"\\?\D:\certs",
+            r"\\server",
+            "",
+        ] {
+            assert!(!is_volume_root(path), "{path}");
+        }
+        assert!(ancestor_hazard(r"\\localhost\tools", root).is_err());
+        assert!(ancestor_hazard(r"\\?\UNC\localhost\tools\", root).is_err());
+        for path in [
+            r"\\server\share\Arcen",
+            r"\\?\UNC\server\share\Arcen",
+            "//server/share/Arcen",
+            r"\\localhost\C$\Arcen",
+            r"\\?\Volume{0}\Arcen",
+            r"\\?\GLOBALROOT\Device\Mup\server\share",
+            // A device path: `Z:` may be a mapped drive.
+            r"\\.\Z:\Arcen",
+            r"\\.\C:\Arcen",
+            // NT paths, which `GetFullPathNameW` would put on the current drive.
+            r"\??\UNC\server\share\Arcen",
+            r"\??\C:\Arcen",
+        ] {
+            assert!(is_network_path(path), "{path}");
+        }
+        for path in [r"C:\Arcen", r"\\?\C:\Arcen", r"D:\"] {
+            assert!(!is_network_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_default_install_folders_are_ones_no_user_can_replace() {
+        for (path, sddl) in [
+            (r"C:\", SYSTEM_DRIVE),
+            (r"C:\Program Files", PROGRAM_FILES),
+            (r"C:\ProgramData", PROGRAM_DATA),
+        ] {
+            ancestor_hazard(path, sddl).unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+        // What the installer makes for a missing folder above a prefix.
+        ancestor_hazard(r"C:\Tools", AclClass::PublicDirectory.sddl()).expect("created folder");
+    }
+
+    #[test]
+    fn a_folder_a_user_can_replace_is_named_with_who_and_how() {
+        // `C:\Tools`, made under the drive root: it inherits Modify.
+        let tools = "O:BAG:S-1-5-21-1-2-3-513D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)\
+                     (A;OICIID;0x1301bf;;;AU)";
+        let error = ancestor_hazard(r"C:\Tools", tools)
+            .expect_err("Modify includes delete")
+            .to_string();
+        assert!(
+            error.contains(
+                r"C:\Tools has been replaceable by S-1-5-11, who may rename or delete it"
+            ),
+            "{error}"
+        );
+        for (sddl, what) in [
+            (
+                "O:BAD:PAI(A;;FA;;;BA)(A;;WD;;;BU)",
+                "change the permissions of",
+            ),
+            ("O:BAD:PAI(A;;FA;;;BA)(A;;WO;;;WD)", "take ownership of"),
+            (
+                "O:BAD:PAI(A;;FA;;;BA)(A;;DT;;;AU)",
+                "rename or delete the folders in",
+            ),
+            (
+                "O:BAD:PAI(A;;FA;;;BA)(A;;GA;;;S-1-5-21-1-2-3-1001)",
+                "take full control of",
+            ),
+            ("O:BAD:PAI(A;;FA;;;BA)(A;;0x10000;;;AU)", "rename or delete"),
+        ] {
+            let error = ancestor_hazard("X", sddl).expect_err(sddl).to_string();
+            assert!(error.contains(what), "{sddl}: {error}");
+        }
+        let owned = ancestor_hazard("X", "O:BUD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+            .expect_err("a user owns it")
+            .to_string();
+        assert!(
+            owned.contains("replaceable by S-1-5-32-545, who owns it"),
+            "{owned}"
+        );
+        assert!(ancestor_hazard("X", "O:BAD:NO_ACCESS_CONTROL").is_err());
+        // What cannot be read is refused, never passed.
+        assert!(ancestor_hazard("X", "O:BAD:PAI(A;;FA;;;BA)(A;;QQ;;;AU)").is_err());
+        assert!(ancestor_hazard("X", "O:BAD:PAI(ML;;NW;;;LW)").is_err());
+        assert!(ancestor_hazard("X", "D:PAI(A;;FA;;;BA)").is_err());
+        // A conditional entry for anyone else is never judged passable,
+        // and a string literal cannot hide an entry behind a parenthesis.
+        assert!(
+            ancestor_hazard(
+                "X",
+                "O:BAD:PAI(A;;FA;;;BA)(XA;;FR;;;AU;(Member_of {SID(BA)}))"
+            )
+            .is_err()
+        );
+        assert!(ancestor_hazard("X", "O:BAD:PAI(A;;FA;;;BA)(XD;;FR;;;AU;(@User.x == 1))").is_err());
+        let hidden = "O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;BA)(XA;;FR;;;AU;(@User.x == \"(\"))\
+                      (A;;SD;;;AU)(XA;;FR;;;AU;(@User.y == \")\"))";
+        let error = ancestor_hazard("X", hidden)
+            .expect_err("a hidden entry is never passed")
+            .to_string();
+        assert!(error.contains("string literal"), "{error}");
+    }
+
+    #[test]
+    fn creating_folders_inheriting_and_denials_never_make_a_folder_replaceable() {
+        for sddl in [
+            // Users may add folders to it: theirs, never the installer's.
+            "O:BAD:PAI(A;;FA;;;BA)(A;;LCDC;;;AU)(A;;0x116;;;BU)",
+            // What only children inherit does not apply to the folder.
+            "O:BAD:PAI(A;;FA;;;BA)(A;OICIIO;GA;;;AU)(A;OICIIO;GA;;;CO)",
+            // A denial is ignored either way.
+            "O:BAD:PAI(A;;FA;;;BA)(D;;SD;;;AU)",
+            // Read and execute, generic write without delete.
+            "O:BAD:PAI(A;;FA;;;BA)(A;;FRFX;;;BU)(A;;GW;;;BU)",
+        ] {
+            ancestor_hazard("X", sddl).unwrap_or_else(|error| panic!("{sddl}: {error}"));
+        }
     }
 
     const PATH: &str = r"C:\ProgramData\Arcen\tls\host.key";
@@ -491,6 +1016,55 @@ mod tests {
             )
             .is_err(),
             "host.key must never grant Authenticated Users"
+        );
+    }
+
+    #[test]
+    fn a_widened_grant_to_an_allowed_trustee_fails() {
+        // Same trustees as the class, but Authenticated Users' read and
+        // execute widened to full control, or made to reach only children.
+        for dacl in [
+            "(A;OICI;FA;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+            "(A;OICI;0x1301bf;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+            "(A;OICIIO;FA;;;AU)(A;OICI;0x1200a9;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+            "(A;CI;0x1200a9;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+        ] {
+            assert!(
+                assert_acl_sddl(
+                    r"C:\Program Files\Arcen\Pier",
+                    &sddl(dacl),
+                    AclClass::PublicDirectory
+                )
+                .is_err(),
+                "{dacl}"
+            );
+        }
+        // The installed forms, generic rights as Windows renders them: as
+        // given, mapped, or split into an inherit-only generic entry and a
+        // mapped entry for the folder itself.
+        assert!(
+            assert_acl_sddl(
+                r"C:\Program Files\Arcen\Pier",
+                &sddl("(A;OICIIO;GXGR;;;AU)(A;;0x1200a9;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+                AclClass::PublicDirectory
+            )
+            .is_ok()
+        );
+        assert!(
+            assert_acl_sddl(
+                r"C:\Program Files\Arcen\Pier",
+                &sddl("(A;OICI;0x1200a9;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+                AclClass::PublicDirectory
+            )
+            .is_ok()
+        );
+        assert!(
+            assert_acl_sddl(
+                r"C:\Program Files\Arcen\Pier",
+                &sddl("(A;OICI;GRGX;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
+                AclClass::PublicDirectory
+            )
+            .is_ok()
         );
     }
 

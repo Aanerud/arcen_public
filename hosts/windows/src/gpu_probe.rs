@@ -761,6 +761,14 @@ pub fn physical_output_inventory(
     if let Some(error) = report.topology_error {
         return Err(format!("CCD topology probe failed: {error}"));
     }
+    // A custom timing comes with an EDID write, which NVIDIA permits only on
+    // Quadro, RTX Pro and GRID GPUs: any other NVIDIA GPU (a GeForce) is
+    // planned at the modes its outputs offer, as every other vendor's is.
+    let nvidia_inventory = report
+        .adapters
+        .iter()
+        .any(|adapter| adapter.vendor_id == 0x10de)
+        .then(crate::nvapi_inventory::inventory);
     let mut outputs = Vec::new();
     for adapter in report.adapters {
         if adapter.d3d11_feature_level.is_none()
@@ -801,7 +809,15 @@ pub fn physical_output_inventory(
                     refresh_hz: mode.refresh_hz.max(1),
                 })
                 .collect::<Vec<_>>();
-            let mode_capability = if adapter.vendor_id == 0x10de {
+            let custom_timing = adapter.vendor_id == 0x10de
+                && nvidia_inventory.as_ref().is_some_and(|inventory| {
+                    crate::nvapi_headless::exact_edid_backend_permitted(
+                        inventory.as_ref().map_err(String::as_str),
+                        adapter_luid,
+                    )
+                    .is_ok()
+                });
+            let mode_capability = if custom_timing {
                 OutputModeCapability::CustomTimingCapable {
                     min_width: 320,
                     max_width: 8_192,

@@ -28,8 +28,13 @@ time = "=0.3.45"
 # Creates the TLS directories and staged key files with their protected DACL
 # in the creating call, reads directory owners and checks final paths.
 windows-sys = { workspace = true, features = [
+    # NtCreateFile relative to a held folder's handle: the walk from a volume
+    # root to an install directory never looks a path up twice.
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_System_IO",
     "Win32_System_Threading",
 ] }
 
