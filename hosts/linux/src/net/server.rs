@@ -5608,7 +5608,11 @@ async fn run_resumable_session(
             lease.disconnect();
             return;
         }
-        if !resumable_transport_loss(end.reason) {
+        // A joined Wayland session is never held for a resume: its lock
+        // closes the sharing (`wayland_attach::AFTER_DECK_LEFT`); the
+        // returning Deck signs in again and joins the same session.
+        let joined_wayland = lease.metadata.console && lease.metadata.wayland.is_some();
+        if !resumable_transport_loss(end.reason) || joined_wayland {
             let event = if end.reason == SessionEndReason::ClientClosed {
                 ReconnectEvent::ExplicitDisconnect
             } else {
@@ -5647,7 +5651,7 @@ async fn run_resumable_session(
         );
         let mut console_hold = if lease.metadata.console {
             Some(
-                arcen_session::console_session::detached_hold::DetachedHold::new(
+                arcen_session::console_session::detached_hold::DetachedHold::from_read(
                     &lease.metadata.session_id,
                     lease.metadata.console_guest,
                     &crate::session::console::read_sessions().await,
@@ -5947,7 +5951,7 @@ async fn run_resumable_session(
                             None
                         };
                         let sessions = crate::session::console::read_sessions().await;
-                        if let Some(end) = hold.observe(&sessions, client.is_some()) {
+                        if let Some(end) = hold.observe_read(&sessions, client.is_some()) {
                             tracing::warn!(
                                 target: SESSION,
                                 reason_class = end.token(),
@@ -6850,6 +6854,31 @@ async fn run_attachment(
                 }
             }
         };
+    // A joined console's X server takes every device on its seat, and so
+    // would any other X server there: each typed device is admitted only
+    // while it is proved to reach the joined desktop alone
+    // (`net::joined_input`). An essential one that is not refuses the
+    // attachment before anything is injected; an unproved pen is released
+    // before the hello could claim it.
+    let mut input_controller = input_controller;
+    let joined_input_plan = match (input_controller.as_mut(), current_metadata.as_ref()) {
+        (Some(input @ PierInput::Uinput(_)), Some(metadata)) if metadata.console => {
+            match super::joined_input::admit(input, metadata).await {
+                Ok(plan) => Some(plan),
+                Err(reason) => {
+                    send_critical_control(
+                        &mut sink,
+                        close_with_reason(&reason),
+                        "joined_input_refused_close",
+                    )
+                    .await;
+                    capenc.shutdown().await;
+                    return AttachmentEnd::terminal(SessionEndReason::InputLost);
+                }
+            }
+        }
+        _ => None,
+    };
     // Runtime-established truth only, probed/created above before this
     // `ServerHello` is built: `false` whenever the tablet-tool uinput device
     // was not actually created, including when the input backend is off.
@@ -7888,6 +7917,31 @@ async fn run_attachment(
         && usb_hard_session.is_ok()
         && usb_hard_authorization.is_ok()
         && crate::usb_bridge::runtime_available();
+    // A joined console takes Native tablet the host-decoded way instead
+    // (`net::joined_pen`): the Pier reads the pen and posts it through the
+    // typed pen device built above, once that device is proved to reach the
+    // joined desktop's X server alone. The raw bridge stays refused there.
+    let joined_pen_offer = match current_metadata.as_ref() {
+        Some(metadata)
+            if super::joined_pen::applies(
+                crate::usb_bridge::session_seat(Some(metadata)),
+                client_hello.tablet_mode_requested,
+            ) =>
+        {
+            Some(
+                super::joined_pen::offer(
+                    input_controller.as_mut(),
+                    metadata,
+                    client_hello.usb_hard_device.as_ref(),
+                )
+                .await,
+            )
+        }
+        _ => None,
+    };
+    let joined_pen_available = joined_pen_offer
+        .as_ref()
+        .is_some_and(super::joined_pen::JoinedPenOffer::admitted);
     info!(
         target: NET,
         requested = ?client_hello.tablet_mode_requested,
@@ -7901,6 +7955,8 @@ async fn run_attachment(
         tablet_refusal = usb_hard_authorization.as_ref().err().map(String::as_str),
         session_refusal = usb_hard_session.err().map(|denial| denial.reason()),
         usb_hard_available,
+        joined_pen_available,
+        joined_pen_refusal = joined_pen_offer.as_ref().and_then(|offer| offer.refusal.as_deref()),
         "Hard USB negotiation inputs"
     );
     let host_tablet_capabilities = TabletModeCapabilitiesMsg {
@@ -7909,7 +7965,7 @@ async fn run_attachment(
         } else {
             InputCapabilityAvailability::Unavailable
         },
-        usb_tablet_bridge: if usb_hard_available {
+        usb_tablet_bridge: if usb_hard_available || joined_pen_available {
             InputCapabilityAvailability::Available
         } else {
             InputCapabilityAvailability::Unavailable
@@ -7935,10 +7991,12 @@ async fn run_attachment(
         }
     }
     // A refused session says why, whatever else is missing: no backend or
-    // device can make Hard USB reach a seatless session.
+    // device can make Hard USB reach a seatless session. A joined console's
+    // reason is its host-decoded route's, below.
     if let Err(denial) = usb_hard_session {
         if client_hello.tablet_mode_requested == TabletModeMsg::UsbTabletBridge
             && !tablet_mode_result.accepted
+            && joined_pen_offer.is_none()
         {
             tablet_mode_result.reason =
                 TabletModeReason::try_from(denial.reason().to_owned()).unwrap_or_default();
@@ -7965,6 +8023,23 @@ async fn run_attachment(
     ) {
         tablet_mode_result.reason = reason;
     }
+    // The joined console's route: active with what the pen brings, or
+    // refused with why; mouse compatibility otherwise.
+    let joined_pen_plan = match joined_pen_offer {
+        Some(offer) => {
+            let (result, plan) = super::joined_pen::settle(
+                tablet_mode_result,
+                offer,
+                input_controller.as_ref().map_or(
+                    crate::session::handshake::PenCapabilityTruth::UNAVAILABLE,
+                    PierInput::pen_capabilities,
+                ),
+            );
+            tablet_mode_result = result;
+            plan
+        }
+        None => None,
+    };
     // Lab (Hard USB). Every attachment gets its own bridge, which ends with
     // the attachment. A native-seat Wayland desktop's bridge is on its own
     // seat, and Mutter adds the tablet through logind. A dedicated Xorg
@@ -8001,6 +8076,7 @@ async fn run_attachment(
     #[cfg(feature = "native-tablet")]
     let mut usb_bridge = if tablet_mode_result.accepted
         && tablet_mode_result.active == TabletModeMsg::UsbTabletBridge
+        && joined_pen_plan.is_none()
     {
         let tablet = usb_hard_authorization
             .as_ref()
@@ -8048,11 +8124,12 @@ async fn run_attachment(
     // tablet, so it is destroyed here — before the bridge attaches the real
     // one, which keeps the two out of each other's way by construction.
     //
-    // Rebound rather than declared `mut` at its own binding: the controller is
-    // built long before the requested tablet mode is known, and mutability is
-    // wanted only for this one decision.
-    let mut input_controller = input_controller;
-    if tablet_mode_result.accepted && tablet_mode_result.active == TabletModeMsg::UsbTabletBridge {
+    // The host-decoded route keeps the typed pen device: it is the tablet the
+    // pen it reads is posted through.
+    if tablet_mode_result.accepted
+        && tablet_mode_result.active == TabletModeMsg::UsbTabletBridge
+        && joined_pen_plan.is_none()
+    {
         if let Some(controller) = input_controller.as_mut() {
             if controller.release_tablet_device() {
                 info!(
@@ -8086,8 +8163,23 @@ async fn run_attachment(
         accepted = tablet_mode_result.accepted,
         reason = tablet_mode_result.reason.as_str(),
         pen_unavailable = ?pen_unavailable,
+        native_tablet_route = joined_pen_plan.as_ref().map(|_| "host_decoded"),
         "tablet mode result"
     );
+    // The joined console's Native tablet starts with the dispatcher, which
+    // owns the bulk lane's USB frames.
+    let joined_pen_start = joined_pen_plan.map(|plan| {
+        (
+            plan,
+            tablet_mode_result.clone(),
+            joined_input_plan
+                .as_ref()
+                .map(super::joined_input::JoinedInputPlan::gate),
+        )
+    });
+    // What the Deck was told, for a joined console whose pen is withdrawn
+    // later (`net::joined_input`).
+    let tablet_mode_settled = tablet_mode_result.clone();
     let tablet_mode_result =
         serde_json::to_string(&tablet_mode_result).expect("TabletModeResultMsg must serialize");
     if !send_critical_control(
@@ -8166,6 +8258,13 @@ async fn run_attachment(
         CapencHandle::Multi(_) => primary_idr
             .clone()
             .expect("multi-monitor primary idr captured at spawn"),
+    };
+    // Where input was applied, for the canvas's input priority (ADR 0028).
+    let canvas_input = match &capenc {
+        CapencHandle::Single(session) => {
+            lane_workers::CanvasInputForward::new(session.canvas_plan(), idr.clone())
+        }
+        CapencHandle::Multi(_) => None,
     };
     let bitrate = match &capenc {
         CapencHandle::Single(session) => session.bitrate(),
@@ -8729,7 +8828,6 @@ async fn run_attachment(
         spawn_linux_transport_telemetry(session_log_id.clone(), microphone_generation);
     // Text results and the session's layout go to a Deck that advertised
     // committed text, on its input lane.
-    let mut input_controller = input_controller;
     let text_notices = if supports_text_commit_v1(client_hello.input_capabilities) {
         input_controller
             .as_mut()
@@ -8738,6 +8836,10 @@ async fn run_attachment(
         None
     };
     let input_controller = Arc::new(Mutex::new(input_controller));
+    // A joined console's devices stay admitted only while they are proved
+    // to reach its desktop alone; the watch ends with the attachment.
+    let mut joined_input_watch = joined_input_plan
+        .map(|plan| super::joined_input::watch(plan, Arc::clone(&input_controller)));
 
     // 3c. Lane readers for the lanes the Deck opens: input/cursor (injection
     // and the host cursor shape), microphone, and bulk (forwarded to the
@@ -8753,6 +8855,7 @@ async fn run_attachment(
                 cursor_feed,
                 text_notices,
                 input_slot,
+                canvas_input,
             )
             .instrument(tracing::Span::current()),
         ),
@@ -8816,6 +8919,8 @@ async fn run_attachment(
     let disp_microphone_summary_reported = Arc::clone(&microphone_transport_summary_reported);
     let disp_microphone_telemetry = microphone_transport_telemetry.clone();
     let disp_usb_bridge = usb_bridge.take();
+    let disp_joined_pen = joined_pen_start;
+    let disp_input = Arc::clone(&input_controller);
     let disp_usb_verdict = usb_verdict.take();
     // SEC-raw-hid. Mutual, explicit negotiation for the quarantined
     // experimental raw-HID passthrough: this host must have its own runtime
@@ -8878,7 +8983,30 @@ async fn run_attachment(
             let mut usb_verdict = disp_usb_verdict;
             let mut bulk_unavailable_rx = bulk_unavailable_rx;
             let usb_out = usb_out_tx;
+            // Native tablet on a joined console (`net::joined_pen`): the pen
+            // read here, posted through the session's typed pen device.
+            let mut joined_pen: Option<super::joined_pen::JoinedNativePen> = None;
+            let mut joined_pen_poll =
+                tokio::time::interval(arcen_input::bridged_pen::BRIDGED_PEN_POLL);
+            joined_pen_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut joined_pen_recheck = tokio::time::interval(super::joined_pen::RECHECK);
+            joined_pen_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            joined_pen_recheck.tick().await;
+            let mut joined_pen_failed = false;
+            let mut joined_pen_check: Option<super::joined_pen::RecheckTask> = None;
+            if let Some((plan, result, gate)) = disp_joined_pen {
+                let (mut pen, output) = super::joined_pen::JoinedNativePen::start(plan, &result);
+                if let Some(gate) = gate {
+                    pen.follow_gate(gate);
+                }
+                joined_pen = Some(pen);
+                joined_pen_failed =
+                    deliver_joined_pen(output, &usb_out, &disp_ctrl, &disp_input).await.is_err();
+            }
             let reason = loop {
+                if joined_pen_failed {
+                    break SessionEndReason::WriterEnded;
+                }
                 tokio::select! {
                     _ = clipboard_expiry.tick() => {
                         if let Some(reassembler) = deck_reassembler.as_mut() {
@@ -9056,9 +9184,60 @@ async fn run_attachment(
                             }
                         }
                     }
+                    _ = joined_pen_poll.tick(),
+                        if joined_pen.as_ref().is_some_and(super::joined_pen::JoinedNativePen::needs_poll) =>
+                    {
+                        let output = joined_pen
+                            .as_mut()
+                            .map(super::joined_pen::JoinedNativePen::poll)
+                            .unwrap_or_default();
+                        joined_pen_failed =
+                            deliver_joined_pen(output, &usb_out, &disp_ctrl, &disp_input).await.is_err();
+                    }
+                    // The proof is repeated off the dispatcher: the scan
+                    // never holds up a pen completion.
+                    _ = joined_pen_recheck.tick(),
+                        if joined_pen_check.is_none()
+                            && joined_pen.as_ref().is_some_and(super::joined_pen::JoinedNativePen::is_active) =>
+                    {
+                        joined_pen_check = joined_pen
+                            .as_ref()
+                            .and_then(super::joined_pen::JoinedNativePen::start_recheck);
+                    }
+                    proof = async {
+                        match joined_pen_check.as_mut() {
+                            Some(check) => check.await,
+                            None => std::future::pending().await,
+                        }
+                    }, if joined_pen_check.is_some() => {
+                        joined_pen_check = None;
+                        let output = joined_pen
+                            .as_mut()
+                            .and_then(|pen| pen.finish_recheck(proof));
+                        if let Some(output) = output {
+                            joined_pen_failed =
+                                deliver_joined_pen(output, &usb_out, &disp_ctrl, &disp_input).await.is_err();
+                        }
+                    }
                     Some(()) = bulk_unavailable_rx.recv() => {
                         // Clipboard and Hard USB are off for the session; the
                         // session itself goes on.
+                        if let Some(pen) = joined_pen
+                            .as_mut()
+                            .filter(|pen| pen.is_active())
+                        {
+                            warn!(
+                                target: NET,
+                                "bulk lane unavailable; Native tablet stopped for this session"
+                            );
+                            let mut output = pen.end_lifting(
+                                "the bulk stream is unavailable; mouse compatibility remains active",
+                            );
+                            // Nothing more reaches the Deck's tablet.
+                            output.frames.clear();
+                            joined_pen_failed =
+                                deliver_joined_pen(output, &usb_out, &disp_ctrl, &disp_input).await.is_err();
+                        }
                         if let Some(bridge) = usb_bridge.take() {
                             warn!(
                                 target: NET,
@@ -9317,6 +9496,23 @@ async fn run_attachment(
                                     debug!(target: NET, device_id, "uhid device removed");
                                 }
                             }
+                            Some(FrameType::UsbBridgeUrbComplete) if joined_pen.is_some() => {
+                                let output = match joined_pen.as_mut() {
+                                    Some(pen) if pen.takes(&bytes) => pen.on_deck_frame(&bytes),
+                                    // Completions still in flight when Native
+                                    // tablet ended.
+                                    _ => {
+                                        trace!(target: NET, "USB completion after Native tablet ended; ignored");
+                                        continue;
+                                    }
+                                };
+                                if deliver_joined_pen(output, &usb_out, &disp_ctrl, &disp_input)
+                                    .await
+                                    .is_err()
+                                {
+                                    break SessionEndReason::WriterEnded;
+                                }
+                            }
                             Some(FrameType::UsbBridgeUrbComplete) => {
                                 let Some(bridge) = usb_bridge.as_mut() else {
                                     break SessionEndReason::ProtocolError;
@@ -9358,6 +9554,12 @@ async fn run_attachment(
             };
             if let Some(bridge) = usb_bridge.take() {
                 bridge.shutdown().await;
+            }
+            if let Some(check) = joined_pen_check.take() {
+                check.abort();
+            }
+            if let Some(pen) = joined_pen.as_mut() {
+                pen.shutdown();
             }
             if !disp_microphone_summary_reported.swap(true, Ordering::AcqRel) {
                 disp_microphone_telemetry.try_snapshot(
@@ -9979,15 +10181,22 @@ async fn run_attachment(
     let console_joined = session_lease
         .filter(|lease| lease.metadata.console)
         .map(|lease| lease.metadata.session_id.clone());
-    let foreign_before: Vec<String> = match (&console_joined, console_guest) {
-        (Some(joined), false) => arcen_session::console_session::other_product_desktops(
-            &crate::session::console::read_sessions().await,
-            joined,
-        )
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
-        _ => Vec::new(),
+    // The other products' desktops already there; `None` until logind
+    // answers completely (an unreadable look is no baseline: the first
+    // complete one becomes it, so nothing already there is taken for new).
+    let foreign_baseline = |sessions: &[arcen_session::console_session::ConsoleSessionFact],
+                            joined: &str| {
+        arcen_session::console_session::other_product_desktops(sessions, joined)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<String>>()
+    };
+    let mut foreign_before: Option<Vec<String>> = match (&console_joined, console_guest) {
+        (Some(joined), false) => crate::session::console::read_sessions()
+            .await
+            .ok()
+            .map(|sessions| foreign_baseline(&sessions, joined)),
+        _ => Some(Vec::new()),
     };
     let mut guest_check = tokio::time::interval(Duration::from_secs(2));
     guest_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -10006,12 +10215,16 @@ async fn run_attachment(
                     );
                     ConsoleRefusal::InUseOtherProduct
                 } else {
-                    let sessions = crate::session::console::read_sessions().await;
-                    if !other_product_started(
-                        &sessions,
-                        console_joined.as_deref().unwrap_or(""),
-                        &foreign_before,
-                    ) {
+                    // An unreadable logind concludes nothing.
+                    let Ok(sessions) = crate::session::console::read_sessions().await else {
+                        continue;
+                    };
+                    let joined = console_joined.as_deref().unwrap_or("");
+                    let Some(before) = foreign_before.as_deref() else {
+                        foreign_before = Some(foreign_baseline(&sessions, joined));
+                        continue;
+                    };
+                    if !other_product_started(&sessions, joined, before) {
                         continue;
                     }
                     error!(
@@ -10028,6 +10241,42 @@ async fn run_attachment(
                     let _ = ctrl_tx.barrier().await;
                 }
                 break SessionEndReason::ConsoleTakenOver;
+            }
+            event = async {
+                match joined_input_watch.as_mut() {
+                    Some(watch) => watch.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match event {
+                    super::joined_input::JoinedInputEvent::PenWithdrawn(gap) => {
+                        // Tablet support stops and the pen works as a
+                        // mouse; Native tablet ends through its own
+                        // attachment.
+                        if let Some(result) =
+                            arcen_input::joined_input::pen_withdrawn_result(&tablet_mode_settled, &gap)
+                        {
+                            if let Ok(json) = serde_json::to_string(&result) {
+                                ctrl_tx.send_best_effort(
+                                    Message::Text(json),
+                                    arcen_protocol::messages::TABLET_MODE_RESULT,
+                                );
+                            }
+                        }
+                    }
+                    super::joined_input::JoinedInputEvent::End(reason) => {
+                        // Fail safe: nothing reached another session; the
+                        // desktop is handed back as on any detach.
+                        warn!(target: INPUT, %reason, "joined console input could not be kept to the desktop; ending the attachment");
+                        if ctrl_tx
+                            .send_required(close_with_reason(&reason), "joined_input_lost_close")
+                            .await
+                        {
+                            let _ = ctrl_tx.barrier().await;
+                        }
+                        break SessionEndReason::InputLost;
+                    }
+                }
             }
             loss = wait_for_input_loss(&mut input_status) => {
                 // Input that can no longer reach the session would leave the
@@ -11209,6 +11458,47 @@ fn resolve_linux_tablet_mode_result(
     }
 }
 
+/// Posts what a joined console's Native tablet step read through the
+/// session's typed pen device, then sends its USB frames and any ending
+/// notice to the Deck, in order.
+///
+/// # Errors
+///
+/// When the USB writer is gone (the attachment is ending).
+async fn deliver_joined_pen(
+    output: arcen_input::bridged_pen::NativeTabletOutput,
+    usb_out: &mpsc::Sender<Vec<u8>>,
+    ctrl: &ControlSender,
+    input: &Mutex<Option<PierInput>>,
+) -> Result<(), ()> {
+    super::joined_pen::log_output(&output);
+    if !output.pens.is_empty() {
+        let mut input = lock_recover(input);
+        match input.as_mut() {
+            Some(input) => {
+                for pen in &output.pens {
+                    if let Err(error) = input.pen_event(pen) {
+                        debug!(target: INPUT, %error, "Native tablet pen event not posted");
+                    }
+                }
+            }
+            None => {
+                debug!(target: INPUT, "Native tablet pen events dropped: input backend disabled")
+            }
+        }
+    }
+    for frame in output.frames {
+        usb_out.send(frame).await.map_err(|_| ())?;
+    }
+    if let Some(notice) = output.notice {
+        ctrl.send_best_effort(
+            Message::Text(notice),
+            arcen_protocol::messages::TABLET_MODE_RESULT,
+        );
+    }
+    Ok(())
+}
+
 /// The tablet-mode result telling the Deck that Native tablet (requested as
 /// the USB bridge) is not, or no longer, active: mouse compatibility with the
 /// reason, and `reconnect_required`, which the Deck's consistency check
@@ -11457,10 +11747,18 @@ fn spawn_frame_pump(
                         }
                     }
                 } else {
-                    if !au.is_keyframe {
-                        queue.wait_for_room(crate::session::client::ROOM_WAIT).await;
-                    }
-                    queue.enqueue_classified(frame, au.is_keyframe, generation_recovery, refine);
+                    // The shared backpressure rule per record: a canvas
+                    // frame waits for the writer however long the path
+                    // stalls (a drop would cost a new canvas generation);
+                    // an access unit at most `ROOM_WAIT`.
+                    queue
+                        .enqueue_with_backpressure(
+                            arcen_media::video::OutboundVideoRecord::new(au.canvas, au.is_keyframe),
+                            frame,
+                            generation_recovery,
+                            refine,
+                        )
+                        .await;
                 }
             }
             debug!(target: MEDIA, "frame pump ended (capenc frames closed)");
@@ -12126,7 +12424,7 @@ fn handle_control_json(
     if arcen_protocol::lanes::lane_for_message_type(msg_type)
         == arcen_protocol::lanes::LaneRole::InputCursor
     {
-        handle_input_json(text, input, input_sequence);
+        handle_input_json(text, input, input_sequence, &mut None);
         return;
     }
 
@@ -12396,10 +12694,15 @@ fn x11_pointer_layout(
     )
 }
 
+/// Applies one input message. `applied_at` receives the normalised
+/// position of a pointer or pen event the backend applied (absolute
+/// moves, buttons with their position, pen samples): where the canvas's
+/// encode loop keeps the neighbourhood mandatory (ADR 0028 §11).
 fn handle_input_json(
     text: &str,
     input: Option<&mut PierInput>,
     input_sequence: &mut InputSequenceTracker,
+    applied_at: &mut Option<(f64, f64)>,
 ) {
     let value: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -12543,11 +12846,10 @@ fn handle_input_json(
                 return;
             };
             match parse_sequenced_input::<MouseMoveMsg>(text, input_sequence) {
-                Ok(message) => {
-                    if let Err(error) = input.mouse_move(&message) {
-                        report_injection_error(&error, "mouse move injection failed");
-                    }
-                }
+                Ok(message) => match input.mouse_move(&message) {
+                    Ok(()) => *applied_at = Some((message.x, message.y)),
+                    Err(error) => report_injection_error(&error, "mouse move injection failed"),
+                },
                 Err(error) => debug!(target: INPUT, %error, "invalid mouse_move"),
             }
         }
@@ -12569,11 +12871,16 @@ fn handle_input_json(
                 return;
             };
             match parse_sequenced_input::<MouseButtonMsg>(text, input_sequence) {
-                Ok(message) => {
-                    if let Err(error) = input.mouse_button(&message) {
-                        report_injection_error(&error, "mouse button injection failed");
+                Ok(message) => match input.mouse_button(&message) {
+                    Ok(()) => {
+                        if message.motion_mode
+                            == arcen_protocol::messages::PointerMotionMode::Absolute
+                        {
+                            *applied_at = Some((message.x, message.y));
+                        }
                     }
-                }
+                    Err(error) => report_injection_error(&error, "mouse button injection failed"),
+                },
                 Err(error) => debug!(target: INPUT, %error, "invalid mouse_button"),
             }
         }
@@ -12633,11 +12940,17 @@ fn handle_input_json(
                         "pen_event received"
                     );
                     match input.pen_event(&message) {
-                        Ok(()) => {}
+                        Ok(()) => *applied_at = Some((message.x, message.y)),
                         Err(InputError::PenUnavailable) => {
                             trace!(
                                 target: INPUT,
                                 "pen_event ignored: tablet backend unavailable on this session"
+                            );
+                        }
+                        Err(InputError::NotConfined) => {
+                            trace!(
+                                target: INPUT,
+                                "pen_event dropped: the pen is not proved to reach this desktop alone"
                             );
                         }
                         Err(error) => warn!(target: INPUT, %error, "pen injection failed"),
@@ -12679,7 +12992,8 @@ fn report_injection_error(error: &InputError, what: &'static str) {
     match error {
         InputError::InjectorLost
         | InputError::InjectorReconnecting
-        | InputError::TextUnavailable => {
+        | InputError::TextUnavailable
+        | InputError::NotConfined => {
             trace!(target: INPUT, %error, what, "input not delivered");
         }
         _ => warn!(target: INPUT, %error, "{what}"),

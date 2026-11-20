@@ -6617,6 +6617,15 @@ impl PreparedVideo {
         }
     }
 
+    /// The agent applied pointer or pen input at normalised `(x, y)`: the
+    /// canvas's input priority (ADR 0028 §11). A single display only, the
+    /// one a canvas serves.
+    fn note_canvas_input(&self, x: f64, y: f64) {
+        if let Self::Single(pipeline) = self {
+            pipeline.capenc.note_canvas_input(x, y);
+        }
+    }
+
     /// A Deck canvas control for the capture that serves the canvas.
     fn request_canvas(&self, command: arcen_media::capenc_control::CapencControlCommand) {
         for pipeline in self.pipelines() {
@@ -6675,11 +6684,14 @@ struct RoutedFrameIngress {
 
 impl RoutedFrameIngress {
     /// Routes every pipeline's frames to the attachment loop. A delta frame
-    /// first waits (at most `VIDEO_ROOM_WAIT`) for room in its monitor's
-    /// outbound queue, which refuses room once its oldest frames are older
-    /// than the shared backlog budget: like the Linux frame pump, the router
-    /// then stops taking frames, the engine stalls on its pipe, and its next
-    /// capture is the current screen. Keyframes never wait.
+    /// first waits for room in its monitor's outbound queue (the shared
+    /// `OutboundVideoRecord::room_wait`: an access unit at most
+    /// `VIDEO_ROOM_WAIT`, a canvas frame until there is room), which refuses
+    /// room once its oldest frames are older than the shared backlog budget
+    /// or hold its byte budget: like the Linux frame pump, the router then
+    /// stops taking frames, the engine stalls on its pipe, and its next
+    /// capture is the current screen (a canvas merges the damage it held).
+    /// Keyframes and canvas resets never wait.
     fn start(video: &PreparedVideo, outbound: &Arc<OutboundVideoMux>) -> Self {
         let pipelines = video.pipelines();
         let (sender, receiver) = mpsc::channel(pipelines.len().max(1));
@@ -6716,9 +6728,15 @@ impl RoutedFrameIngress {
                         let _ = sender.send(RoutedFrameEvent::Closed(monitor_id)).await;
                         break;
                     };
-                    if !frame.keyframe && !crate::latest::video_backlog_legacy() {
+                    if !crate::latest::video_backlog_legacy() {
                         outbound
-                            .wait_for_room(monitor_id, arcen_media::video::VIDEO_ROOM_WAIT)
+                            .wait_for_record_room(
+                                monitor_id,
+                                arcen_media::video::OutboundVideoRecord::new(
+                                    frame.canvas,
+                                    frame.keyframe,
+                                ),
+                            )
                             .await;
                     }
                     let (ack, acknowledged) = oneshot::channel();
@@ -7334,6 +7352,7 @@ async fn prepare_resized_attachment_media(
         || plan.height != display_report.applied.height
         || !resize_contract_matches(current_plan, &plan)
     {
+        frames.close();
         capenc.shutdown().await;
         return Err("replacement capenc changed geometry or the active media contract".to_string());
     }
@@ -8590,9 +8609,13 @@ where
                             let single = video_pipelines
                                 .single_mut()
                                 .expect("multi-monitor resize rejected above");
-                            single.capenc.shutdown().await;
+                            // Closed first, as at teardown: a canvas reader
+                            // waits for room until the queue closes, and a
+                            // reader that stopped reading would leave capenc
+                            // blocked on its pipe, deaf to STOP.
                             single.frames.close();
                             single.frames.clear();
+                            single.capenc.shutdown().await;
                             dropped_frames =
                                 dropped_frames.saturating_add(video.clear() as u64);
                             writer_audio_barrier(&control_tx).await?;
@@ -10040,18 +10063,33 @@ impl OutboundVideoMux {
     /// queue, unless `ARCEN_VIDEO_BACKLOG=legacy`.
     fn apply_backlog_budget(&self, monitor_id: u16, contract_fps: u32) {
         if let Some(queue) = self.roster.get(monitor_id) {
+            let legacy = crate::latest::video_backlog_legacy();
             queue.set_backlog_budget(
-                (!crate::latest::video_backlog_legacy())
-                    .then(|| arcen_media::video::video_backlog_budget(contract_fps)),
+                (!legacy).then(|| arcen_media::video::video_backlog_budget(contract_fps)),
             );
+            queue.set_byte_budget((!legacy).then_some(arcen_media::video::CANVAS_QUEUE_BYTES));
         }
     }
 
     /// Waits, for at most `max_wait`, until one monitor's queue would take an
     /// ordinary frame without exceeding its capacity or backlog budget.
+    #[cfg(test)]
     async fn wait_for_room(&self, monitor_id: u16, max_wait: Duration) -> bool {
         match self.roster.get(monitor_id) {
             Some(queue) => queue.wait_for_room(Some(max_wait)).await,
+            None => false,
+        }
+    }
+
+    /// Waits for room in one monitor's queue as the shared backpressure
+    /// rule asks for `record` (`OutboundVideoRecord::room_wait`).
+    async fn wait_for_record_room(
+        &self,
+        monitor_id: u16,
+        record: arcen_media::video::OutboundVideoRecord,
+    ) -> bool {
+        match self.roster.get(monitor_id) {
+            Some(queue) => queue.wait_for_record_room(record).await,
             None => false,
         }
     }
@@ -10075,7 +10113,8 @@ impl OutboundVideoMux {
         let Some(queue) = self.roster.get(monitor_id) else {
             return VideoPushResult::Closed(frame);
         };
-        let result = queue.push(frame, keyframe);
+        let bytes = frame.message.len() as u64;
+        let result = queue.push_sized(frame, keyframe, bytes);
         if matches!(&result, VideoPushResult::Enqueued { .. }) {
             self.notify.notify_one();
         }
@@ -10757,6 +10796,7 @@ async fn handle_inbound(
                 log_legacy_pointer_rejected(message_type);
             } else if let Some(message) = parse_input::<MouseMoveMsg>(text, sequence_tracker) {
                 injector.move_abs(&message);
+                video.note_canvas_input(message.x, message.y);
                 action.input_type = Some("mouse_move");
             }
         }
@@ -10774,7 +10814,9 @@ async fn handle_inbound(
             if region_input.is_some() {
                 log_legacy_pointer_rejected(message_type);
             } else if let Some(message) = parse_input::<MouseButtonMsg>(text, sequence_tracker) {
-                injector.button(&message);
+                if injector.button(&message) {
+                    video.note_canvas_input(message.x, message.y);
+                }
                 action.input_type = Some("mouse_button");
             }
         }
@@ -10921,6 +10963,7 @@ async fn handle_inbound(
                 match pen.as_mut() {
                     Some(pen) => {
                         pen.dispatch(&message);
+                        video.note_canvas_input(message.x, message.y);
                         action.input_type = Some(PEN_EVENT);
                     }
                     None => tracing::debug!(

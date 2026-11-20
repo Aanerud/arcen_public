@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-deck-macos"
-version = "0.20.4"
+version = "0.20.5"
 edition = "2021"
 rust-version = "1.89"
 description = "Arcen Deck — the macOS QUIC client (egui + VideoToolbox)."
@@ -121,6 +121,11 @@ objc2-core-video = { version = "0.3.2", default-features = false, features = ["s
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVAudioBuffer", "AVAudioEngine", "AVAudioFormat", "AVAudioIONode", "AVAudioNode", "AVAudioTime", "AVAudioTypes"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
 videotoolbox = "0.18.1"
+
+# The root event loop is driven directly (`ui::pass_pacing`), so `winit` is a
+# direct dependency wherever the Deck library compiles: macOS, and Windows for
+# the `macos-deck-windows-typecheck` validation. eframe already links it there.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 
 [dev-dependencies]

@@ -22,6 +22,8 @@ use crate::session::identity::{
 };
 
 const READY_TIMEOUT: Duration = Duration::from_secs(12);
+/// The longest ready message an agent may send.
+const MAX_AGENT_READY_BYTES: usize = 16 * 1024;
 /// A headless compositor, its stack and the first `ScreenCast` stream take
 /// longer to prove than an X client's start; the agent bounds its own start
 /// below this.
@@ -77,6 +79,8 @@ pub enum AgentError {
     ReadyTimeout,
     #[error("session-agent readiness message is invalid")]
     InvalidReady,
+    #[error("session-agent readiness message is longer than {MAX_AGENT_READY_BYTES} bytes")]
+    ReadyTooLong,
     #[error("the configured compositor prefix may not be used: {0}")]
     CompositorPrefix(String),
     #[error("session-agent exited before readiness")]
@@ -105,6 +109,43 @@ pub enum AgentError {
     LocalPlaybackRefused(arcen_session::local_playback::LocalPlaybackRefusal),
 }
 
+/// Reads an agent's ready message: one line of at most
+/// [`MAX_AGENT_READY_BYTES`], within `within`. A longer line is refused
+/// without reading the rest of it; what follows the line stays in
+/// `reader` for the control link.
+async fn read_ready_line<R>(reader: &mut R, within: Duration) -> Result<String, AgentError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let read = async {
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                break;
+            }
+            let (part, consumed, ended) = match available.iter().position(|&byte| byte == b'\n') {
+                Some(newline) => (&available[..newline], newline + 1, true),
+                None => (available, available.len(), false),
+            };
+            if line.len() + part.len() > MAX_AGENT_READY_BYTES {
+                return Err(AgentError::ReadyTooLong);
+            }
+            line.extend_from_slice(part);
+            reader.consume(consumed);
+            if ended {
+                return Ok(Some(line));
+            }
+        }
+        Ok((!line.is_empty()).then_some(line))
+    };
+    let line = tokio::time::timeout(within, read)
+        .await
+        .map_err(|_| AgentError::ReadyTimeout)??
+        .ok_or(AgentError::ExitedBeforeReady)?;
+    String::from_utf8(line).map_err(|_| AgentError::InvalidReady)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentDispatch {
     Desktop,
@@ -130,6 +171,9 @@ pub struct AgentReady {
     /// How the session's audio is served and the local-playback evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<SessionAudioReady>,
+    /// What a joined Wayland session proved (S4b); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined: Option<super::wayland::JoinedReady>,
 }
 
 /// A session's audio, as its agent established it.
@@ -413,6 +457,54 @@ impl SessionAgent {
         Ok(agent)
     }
 
+    /// Spawns the console agent of a joined Wayland session (S4b): the
+    /// console agent's audio, and the session's own monitors and input,
+    /// served as the account on its own user bus against the compositor
+    /// `compositor_pid` the launcher proved. Its ready message must carry a
+    /// consistent joined session and what it proved.
+    #[allow(clippy::too_many_arguments)] // The launcher's open context.
+    pub async fn spawn_wayland_join(
+        binary: &Path,
+        identity: &UserIdentity,
+        environment: &SessionEnvironment,
+        desktop: &str,
+        session_log_id: &CorrelationId,
+        audio: &AgentAudioArguments,
+        compositor_pid: u32,
+        cursor_mode: super::wayland::StreamCursorMode,
+        ready_within: Duration,
+    ) -> Result<Self, AgentError> {
+        let mut arguments = vec![
+            super::wayland::AGENT_WAYLAND_JOIN_FLAG.to_owned(),
+            super::wayland::AGENT_JOIN_COMPOSITOR_FLAG.to_owned(),
+            compositor_pid.to_string(),
+            super::wayland::AGENT_CURSOR_MODE_FLAG.to_owned(),
+            cursor_mode.token().to_owned(),
+        ];
+        arguments.extend(audio.to_arguments());
+        let agent = Self::spawn_with(
+            binary,
+            identity,
+            environment,
+            desktop,
+            session_log_id,
+            &arguments,
+            WAYLAND_READY_TIMEOUT.min(ready_within),
+            AgentStdin::Control,
+        )
+        .await?;
+        let consistent = agent.ready.joined.as_ref().is_some_and(|joined| {
+            joined.compositor_pid == compositor_pid
+                && agent.ready.wayland.as_ref().is_some_and(|wayland| {
+                    wayland.is_consistent_joined(identity.uid) && wayland.cursor_mode == cursor_mode
+                })
+        });
+        if !consistent {
+            return Err(AgentError::InvalidReady);
+        }
+        Ok(agent)
+    }
+
     /// Spawns the agent for a headless Wayland desktop that must create
     /// `runtime_dir` and exactly `outputs` (the first is primary), placed as
     /// given, with the compositor's Xwayland when `x11`, and waits for its
@@ -578,11 +670,8 @@ impl SessionAgent {
         let stdout = child.stdout.take().ok_or(AgentError::InvalidReady)?;
         let stderr = child.stderr.take().ok_or(AgentError::InvalidReady)?;
         let stderr_task = tokio::spawn(read_agent_stderr(stderr));
-        let mut lines = BufReader::new(stdout).lines();
-        let line = tokio::time::timeout(ready_timeout, lines.next_line())
-            .await
-            .map_err(|_| AgentError::ReadyTimeout)??
-            .ok_or(AgentError::ExitedBeforeReady)?;
+        let mut stdout = BufReader::new(stdout);
+        let line = read_ready_line(&mut stdout, ready_timeout).await?;
         if let Ok(refusal) = serde_json::from_str::<AgentRefusal>(&line) {
             tracing::warn!(
                 target: target::SESSION,
@@ -619,7 +708,7 @@ impl SessionAgent {
         );
         let audio_control = control_stdin.map(|stdin| ConsoleAudioControl {
             stdin,
-            answers: crate::bounded_io::BoundedLineReader::new(lines.into_inner()),
+            answers: crate::bounded_io::BoundedLineReader::new(stdout),
             lost: false,
             release_timeout: CONSOLE_AUDIO_RELEASE_TIMEOUT,
             hold_timeout: CONSOLE_AUDIO_HOLD_TIMEOUT,
@@ -819,6 +908,12 @@ pub async fn run_user_agent(args: &[String]) -> Result<(), AgentError> {
         {
             return run_wayland_agent(args).await;
         }
+        if args
+            .iter()
+            .any(|argument| argument == super::wayland::AGENT_WAYLAND_JOIN_FLAG)
+        {
+            return run_wayland_join_agent(args, uid.as_raw()).await;
+        }
         let username = required_environment("USER")?;
         let display = required_environment("DISPLAY")?;
         let session_id = required_environment("XDG_SESSION_ID")?;
@@ -838,9 +933,11 @@ pub async fn run_user_agent(args: &[String]) -> Result<(), AgentError> {
                     desktop: advertised_desktop,
                     wayland: None,
                     audio: None,
+                    joined: None,
                 },
                 &audio_arguments,
                 &session_log_id,
+                None,
             )
             .await;
         }
@@ -911,6 +1008,7 @@ pub async fn run_user_agent(args: &[String]) -> Result<(), AgentError> {
             desktop: advertised_desktop,
             wayland: None,
             audio: Some(audio.ready()),
+            joined: None,
         };
         println!(
             "{}",
@@ -955,6 +1053,7 @@ async fn run_console_agent(
     mut ready: AgentReady,
     audio_arguments: &AgentAudioArguments,
     session_log_id: &str,
+    join: Option<JoinRequest>,
 ) -> Result<(), AgentError> {
     use std::io::Write;
     let mut audio = X11SessionAudio::establish(audio_arguments, session_log_id).await;
@@ -964,6 +1063,22 @@ async fn run_console_agent(
         return Err(refusal_error(report));
     }
     ready.audio = Some(audio.ready());
+    // A joined Wayland session: its own monitors recorded and its input
+    // served, as the account, on its own user bus.
+    let joined = match join {
+        Some(request) => match join_session(&request, &ready.username).await {
+            Ok(joined) => {
+                ready.wayland = Some(joined_ready(&joined));
+                ready.joined = Some(joined_proof(&joined));
+                Some(joined)
+            }
+            Err(error) => {
+                audio.release().await;
+                return Err(error);
+            }
+        },
+        None => None,
+    };
     println!(
         "{}",
         serde_json::to_string(&ready).map_err(|_| AgentError::InvalidReady)?
@@ -978,6 +1093,7 @@ async fn run_console_agent(
     loop {
         tokio::select! {
             () = &mut shutdown => break,
+            () = serve_joined(joined.as_ref()) => break,
             () = audio.watch(), if held => break,
             line = next_console_command(commands.as_mut()) => {
                 let Some(line) = line else { break };
@@ -1021,8 +1137,123 @@ async fn run_console_agent(
             }
         }
     }
+    if let Some(joined) = joined {
+        stop_joined(joined).await;
+    }
     audio.release().await;
     Ok(())
+}
+
+/// What the launcher asked a joined Wayland session's agent to join.
+struct JoinRequest {
+    compositor_pid: u32,
+    uid: u32,
+    cursor_mode: super::wayland::StreamCursorMode,
+}
+
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+type JoinedSession = super::wayland::join::JoinedSession;
+/// No joined session without the Wayland adapter.
+#[cfg(not(all(target_os = "linux", feature = "wayland-provider")))]
+enum JoinedSession {}
+
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+async fn join_session(request: &JoinRequest, username: &str) -> Result<JoinedSession, AgentError> {
+    super::wayland::join::JoinedSession::start(
+        request.compositor_pid,
+        request.uid,
+        username,
+        request.cursor_mode,
+    )
+    .await
+    .map_err(|error| AgentError::Wayland(error.to_string()))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "wayland-provider")))]
+async fn join_session(
+    _request: &JoinRequest,
+    _username: &str,
+) -> Result<JoinedSession, AgentError> {
+    Err(AgentError::UnsupportedDesktop)
+}
+
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+fn joined_ready(joined: &JoinedSession) -> super::wayland::WaylandAgentReady {
+    joined.ready().clone()
+}
+
+#[cfg(not(all(target_os = "linux", feature = "wayland-provider")))]
+fn joined_ready(joined: &JoinedSession) -> super::wayland::WaylandAgentReady {
+    match *joined {}
+}
+
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+fn joined_proof(joined: &JoinedSession) -> super::wayland::JoinedReady {
+    joined.joined().clone()
+}
+
+#[cfg(not(all(target_os = "linux", feature = "wayland-provider")))]
+fn joined_proof(joined: &JoinedSession) -> super::wayland::JoinedReady {
+    match *joined {}
+}
+
+/// Serves a joined session until its sharing closes; never without one.
+async fn serve_joined(joined: Option<&JoinedSession>) {
+    match joined {
+        #[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+        Some(joined) => joined.serve().await,
+        #[cfg(not(all(target_os = "linux", feature = "wayland-provider")))]
+        Some(joined) => match *joined {},
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+async fn stop_joined(joined: JoinedSession) {
+    joined.stop().await;
+}
+
+#[cfg(not(all(target_os = "linux", feature = "wayland-provider")))]
+async fn stop_joined(joined: JoinedSession) {
+    match joined {}
+}
+
+/// The console agent of a joined Wayland session (S4b): the console
+/// agent's audio and command loop, with the session's own monitors and
+/// input served beside them.
+#[cfg(target_os = "linux")]
+async fn run_wayland_join_agent(args: &[String], uid: u32) -> Result<(), AgentError> {
+    let compositor_pid = argument_value(args, super::wayland::AGENT_JOIN_COMPOSITOR_FLAG)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 1)
+        .ok_or(AgentError::InvalidReady)?;
+    let cursor_mode = argument_value(args, super::wayland::AGENT_CURSOR_MODE_FLAG)
+        .and_then(|value| super::wayland::StreamCursorMode::from_token(&value))
+        .unwrap_or_default();
+    let audio_arguments = AgentAudioArguments::from_arguments(args)?;
+    let session_log_id = argument_value(args, "--session-log-id").unwrap_or_default();
+    run_console_agent(
+        AgentReady {
+            pid: std::process::id(),
+            uid,
+            username: required_environment("USER")?,
+            display: String::new(),
+            session_id: required_environment("XDG_SESSION_ID")?,
+            session_type: required_environment("XDG_SESSION_TYPE")?,
+            desktop: required_environment("XDG_SESSION_DESKTOP")?,
+            wayland: None,
+            audio: None,
+            joined: None,
+        },
+        &audio_arguments,
+        &session_log_id,
+        Some(JoinRequest {
+            compositor_pid,
+            uid,
+            cursor_mode,
+        }),
+    )
+    .await
 }
 
 /// The launcher's commands on standard input, read without a blocking
@@ -1683,6 +1914,109 @@ pub fn agent_main(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_agents_ready_message_is_read_bounded_in_size_and_time() {
+        let mut ready = BufReader::new(std::io::Cursor::new(b"{\"pid\":1}\nreleased\n".to_vec()));
+        assert_eq!(
+            read_ready_line(&mut ready, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            "{\"pid\":1}"
+        );
+        // What follows the ready line stays for the control link.
+        let mut rest = String::new();
+        ready.read_line(&mut rest).await.unwrap();
+        assert_eq!(rest, "released\n");
+        // A line longer than the bound is refused, terminated or not,
+        // without reading the rest of it.
+        for terminated in [false, true] {
+            let mut flood = vec![b'{'; MAX_AGENT_READY_BYTES * 64];
+            if terminated {
+                flood.push(b'\n');
+            }
+            let mut flood = BufReader::new(std::io::Cursor::new(flood));
+            assert!(matches!(
+                read_ready_line(&mut flood, Duration::from_secs(1)).await,
+                Err(AgentError::ReadyTooLong)
+            ));
+            assert!(flood.get_ref().position() <= (MAX_AGENT_READY_BYTES * 2) as u64);
+        }
+        // A pipe that never answers is cut off at the deadline.
+        let (_writer, silent) = tokio::io::duplex(64);
+        let mut silent = BufReader::new(silent);
+        assert!(matches!(
+            read_ready_line(&mut silent, Duration::from_millis(50)).await,
+            Err(AgentError::ReadyTimeout)
+        ));
+        let mut ended = BufReader::new(std::io::Cursor::new(Vec::new()));
+        assert!(matches!(
+            read_ready_line(&mut ended, Duration::from_secs(1)).await,
+            Err(AgentError::ExitedBeforeReady)
+        ));
+    }
+
+    #[test]
+    fn the_largest_ready_message_an_agent_sends_fits_the_bound() {
+        use super::super::wayland::{ReadyOutput, ReadyStream, WaylandAgentReady};
+        let monitors = 16;
+        let ready = AgentReady {
+            pid: u32::MAX,
+            uid: u32::MAX,
+            username: "a".repeat(32),
+            display: String::new(),
+            session_id: "c".repeat(16),
+            session_type: "wayland".into(),
+            desktop: "gnome".into(),
+            wayland: Some(WaylandAgentReady {
+                compositor: "gnome-shell".into(),
+                runtime_dir: PathBuf::from(format!("/run/user/{}", u32::MAX)),
+                wayland_display: "w".repeat(64),
+                outputs: (0..monitors)
+                    .map(|index| ReadyOutput {
+                        connector: format!("Virtual-remote-monitor-{index:02}"),
+                        width: 7680,
+                        height: 4320,
+                        refresh_hz: 240,
+                    })
+                    .collect(),
+                streams: (0..monitors)
+                    .map(|index| ReadyStream {
+                        connector: format!("Virtual-remote-monitor-{index:02}"),
+                        node_id: u32::MAX,
+                        width: 7680,
+                        height: 4320,
+                        x: i32::MIN,
+                        y: i32::MIN,
+                    })
+                    .collect(),
+                input_device_types: u32::MAX,
+                input_socket: PathBuf::from(format!("/run/user/{}/arcen-input.sock", u32::MAX)),
+                generation: u64::MAX,
+                compositor_render_node: Some(PathBuf::from("/dev/dri/renderD128")),
+                compositor_gpu_pci: Some("0000:00:10.0".into()),
+                compositor_gpu_vendor: Some(u16::MAX),
+                output_mode: arcen_session::wayland_outputs::VirtualOutputMode::StartupMonitors,
+                output_socket: Some(PathBuf::from(format!(
+                    "/run/user/{}/arcen-output.sock",
+                    u32::MAX
+                ))),
+                x11: None,
+                cursor_mode: Default::default(),
+                clipboard: None,
+            }),
+            audio: None,
+            joined: Some(super::super::wayland::JoinedReady {
+                compositor_pid: u32::MAX,
+                capture: true,
+                input: true,
+                lock: true,
+                at_desk: true,
+            }),
+        };
+        let bytes = serde_json::to_vec(&ready).unwrap().len();
+        assert!(bytes * 2 <= MAX_AGENT_READY_BYTES, "{bytes} bytes");
+    }
 
     #[tokio::test]
     async fn a_console_agent_gives_the_desk_its_sound_back_and_takes_it_again() {

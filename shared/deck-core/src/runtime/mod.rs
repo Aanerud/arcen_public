@@ -11,6 +11,7 @@
 //! runtime halves of the seams: [`MicrophoneQueue`].
 
 pub mod audio_lane;
+pub mod audio_output;
 pub mod audio_player;
 pub mod audio_worker;
 pub mod clipboard_controller;

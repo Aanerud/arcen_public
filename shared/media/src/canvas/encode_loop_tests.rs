@@ -315,6 +315,174 @@ fn recovery_and_a_deck_reset_request_start_new_generations() {
     assert!(!encode.set_frame_rate(30));
 }
 
+/// A mandatory reset under an optional backlog: a Deck that acknowledges
+/// nothing leaves the loop with its optional window full, yet its reset
+/// request is answered at the next tick, first, and the new generation
+/// replays to the Pier's mirror.
+#[test]
+fn a_reset_request_is_served_at_once_under_an_optional_backlog() {
+    let start = Instant::now();
+    let mut encode = CanvasEncodeLoop::new(
+        config(canvas_mode()),
+        StubEncoder::default(),
+        Box::new(ResidualTilePacker),
+        start,
+    )
+    .unwrap();
+    let scenario = Scenario::new(WIDTH as usize, HEIGHT as usize, ScenarioKind::Video, 7);
+    let mut replay = Replay::new();
+    let mut pixels = Vec::new();
+    let mut step = 0_u32;
+    while encode.encoder().surface_pictures < 3 {
+        assert!(step < 120, "the video scenario paints surfaces");
+        scenario.render(u64::from(step), &mut pixels);
+        replay.apply(
+            &encode
+                .tick(frame(&pixels), None, start + TICK * step)
+                .unwrap(),
+        );
+        step += 1;
+    }
+    // Never acknowledged: the optional window stays full.
+    for _ in 0..10 {
+        scenario.render(u64::from(step), &mut pixels);
+        replay.apply(
+            &encode
+                .tick(frame(&pixels), None, start + TICK * step)
+                .unwrap(),
+        );
+        step += 1;
+    }
+    let painted = encode.encoder().surface_pictures;
+    assert!(painted <= 3, "optional work waits for acknowledgements");
+    encode.on_control(&CanvasControlMsg::CanvasResetRequest {
+        monitor_id: 0,
+        generation: 1,
+        reason: "decode".to_owned(),
+    });
+    let now = start + TICK * step;
+    assert!(encode.wants_frame(now, false));
+    let tick = encode.tick(frame(&pixels), None, now).unwrap();
+    assert!(tick.records[0].is_recovery_point(), "the reset goes first");
+    replay.apply(&tick);
+    assert_eq!(
+        replay.resets,
+        [CanvasResetReason::Start, CanvasResetReason::ResetRequest]
+    );
+    assert_eq!(
+        encode.mirror_digest().map(|(_, digest)| digest),
+        replay.mirror.digest()
+    );
+}
+
+/// Input-neighbourhood priority through the whole plumbing: where the Pier
+/// applied input becomes a `CANVAS-INPUT` line (`CanvasInputFeed`), crosses
+/// capenc's control parser and reaches the loop, whose planner paints the
+/// typed text there in the tick it changes even when the CPU budget defers
+/// the rest. The same session without that input defers some of it, and a
+/// line for another monitor or topology generation changes nothing.
+#[test]
+fn input_the_pier_applied_is_painted_first_under_a_starved_budget() {
+    use crate::canvas::serve::{CanvasInputFeed, CanvasServePlan};
+    use crate::capenc_control::CapencControlCommand;
+    use arcen_keel::PixelRect;
+    let starved = LoopMode::Canvas(CanvasLoopTerms {
+        terms: terms(),
+        monitor_id: 0,
+        topology_generation: 0,
+        stream_epoch: 0,
+        cpu_share: CpuShare::from_percent(1).unwrap(),
+        logical_cores: 1,
+    });
+    let plan = CanvasServePlan {
+        status: None,
+        terms: Some(terms()),
+    };
+    // `forward`: Some(lines are rewritten by this) or None (no input).
+    let run = |forward: Option<fn(CapencControlCommand) -> CapencControlCommand>| -> u32 {
+        let start = Instant::now();
+        let mut encode = CanvasEncodeLoop::new(
+            config(starved),
+            StubEncoder::default(),
+            Box::new(ResidualTilePacker),
+            start,
+        )
+        .unwrap();
+        let mut feed = CanvasInputFeed::for_plan(&plan).unwrap();
+        let editor = Scenario::new(WIDTH as usize, HEIGHT as usize, ScenarioKind::Editor, 9);
+        let mut pixels = Vec::new();
+        let mut rects: Vec<PixelRect> = Vec::new();
+        let mut waiting_at_input = 0;
+        for tick in 0..120_u64 {
+            let now = start + TICK * u32::try_from(tick).unwrap();
+            editor.render(tick, &mut pixels);
+            editor.damage_rects(tick.saturating_sub(1), tick, &mut rects);
+            let typed = rects.last().copied();
+            if let (Some(rect), Some(forward)) = (typed, forward) {
+                let x = (rect.x + rect.width / 2) as f64 / f64::from(WIDTH);
+                let y = (rect.y + rect.height / 2) as f64 / f64::from(HEIGHT);
+                if let Some(command) = feed.applied(x, y, now) {
+                    // The line capenc reads, parsed as its control thread does.
+                    let line = forward(command).as_line();
+                    if let Ok(CapencControlCommand::CanvasInput {
+                        monitor_id,
+                        topology_generation,
+                        x,
+                        y,
+                    }) = line.parse()
+                    {
+                        encode.note_input(monitor_id, topology_generation, x, y, now);
+                    }
+                }
+            }
+            encode.tick(frame(&pixels), None, now).unwrap();
+            if tick == 0 {
+                continue;
+            }
+            if let Some(rect) = typed {
+                let center = (
+                    u32::try_from(rect.x + rect.width / 2).unwrap(),
+                    u32::try_from(rect.y + rect.height / 2).unwrap(),
+                );
+                waiting_at_input += u32::from(encode.is_pending_at(center.0, center.1));
+            }
+        }
+        waiting_at_input
+    };
+    assert_eq!(
+        run(Some(|command| command)),
+        0,
+        "the input neighbourhood waits"
+    );
+    assert!(run(None) > 0, "without input the budget defers the typing");
+    let other_monitor = run(Some(|command| match command {
+        CapencControlCommand::CanvasInput {
+            topology_generation,
+            x,
+            y,
+            ..
+        } => CapencControlCommand::CanvasInput {
+            monitor_id: 3,
+            topology_generation,
+            x,
+            y,
+        },
+        other => other,
+    }));
+    let stale_generation = run(Some(|command| match command {
+        CapencControlCommand::CanvasInput {
+            monitor_id, x, y, ..
+        } => CapencControlCommand::CanvasInput {
+            monitor_id,
+            topology_generation: 7,
+            x,
+            y,
+        },
+        other => other,
+    }));
+    assert!(other_monitor > 0 && stale_generation > 0);
+}
+
 #[test]
 fn an_older_deck_gets_full_frames_from_the_same_loop_gated_by_keel() {
     let start = Instant::now();

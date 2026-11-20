@@ -259,6 +259,8 @@ cargo clippy --locked -p arcen-deck-core -p arcen-identity -p arcen-input \
   -p arcen-usb-bridge -- -D warnings
 cargo test --locked -p arcen-media --features software-h264-source
 cargo test --locked -p arcen-transport --features quic
+cargo test --locked -p arcen-transport --features issuer
+cargo clippy --locked -p arcen-transport --features issuer -- -D warnings
 cargo test --locked -p arcen-deck-core --features runtime,egui,wgpu-presenter
 cargo clippy --locked -p arcen-deck-core --features runtime,egui,wgpu-presenter \
   -- -D warnings

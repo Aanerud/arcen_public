@@ -60,8 +60,8 @@ use super::{InputError, InputStats};
 use crate::logging::target;
 use crate::session::wayland::text::{SessionKeymap, TextOutcome};
 use crate::session::wayland::{
-    is_private_runtime_dir, AxisSource, InputBackendKind, InputCommand, InputReply, InputRequest,
-    InputSessionFacts, ReadyStream, WaylandAgentReady, SUPERSEDED_REASON,
+    AxisSource, InputBackendKind, InputCommand, InputReply, InputRequest, InputSessionFacts,
+    ReadyStream, WaylandAgentReady, SUPERSEDED_REASON,
 };
 
 /// Commands waiting for the session; beyond this the queue collapses into
@@ -229,10 +229,10 @@ impl WaylandInputTarget {
         session_id: &str,
         agent_pid: u32,
     ) -> Result<Self, WaylandInputError> {
-        if !ready.is_consistent() {
+        if !ready.is_consistent() && !ready.is_consistent_joined(uid) {
             return Err(WaylandInputError::Inconsistent);
         }
-        if !is_private_runtime_dir(&ready.runtime_dir, uid, session_id) {
+        if !ready.serves_session(uid, session_id) {
             return Err(WaylandInputError::RuntimeDir);
         }
         Ok(Self {

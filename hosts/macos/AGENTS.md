@@ -215,6 +215,36 @@ Do not infer audio from a tap that constructed: on a machine with capture
 denied, a tap creates, reports a valid format, honours a mute request and then
 delivers nothing. Read `audio_observed` from `probe-audio`.
 
+Do not infer the capture rate from the tap either. The IO proc runs on the
+aggregate device, which is clocked by the default output device and resamples
+the tap to it. Measured with AirPods in call mode as the output: the tap
+reported 48 kHz stereo, the aggregate's nominal rate was 24 kHz, and the IO
+proc delivered 480 frames every 20 ms, which audio-v1 framed as 48 kHz. The
+recorder reads the aggregate's `kAudioDevicePropertyNominalSampleRate` and
+resamples that clock to 48 kHz with the shared
+`arcen_media::audio::resample::PcmResampler` on the drain thread, never in the
+IO proc. It re-reads the clock every 100 ms with a range check that builds
+nothing (`PcmResampler::accepts`), and builds a filter only when the rate
+actually changes (`follow_clock`): the old rate's held-back frames are
+flushed first and the new rate starts from its first frame, so a change
+loses no audio and does not fade in. Within the filter's reach of the join
+(about 1.3 ms) the outputs that needed input past it are made from the last
+frame held. Audio drained in the up to 100 ms before a change is noticed is
+converted at the old ratio. A clock outside 8-384 kHz is refused at start and
+discarded during capture (`clock_mismatches`).
+
+The resampler's latency is `latency_frames` input frames: 32 when upsampling
+(4 ms at 8 kHz, 1.3 ms at 24 kHz); when downsampling, widened to
+32 × source / 48000 (64 at 96 kHz, 256 at 384 kHz), about 32 output frames or
+0.67 ms; none at 48 kHz.
+
+A tap-only aggregate (no sub-device, no clock device) also ran at 48 kHz with
+the headset in call mode, and 10/10 lifecycle cycles, mute readback and a
+10-second rate held. It is not the shipped topology. Device switches and a Mac
+with no output device could not be qualified without changing a workstation's
+audio settings, and it would still need a resampler for a tap that reports
+another rate.
+
 Two more, both from package installs on the lab Mac:
 
 * **A Core Audio connection opened while Core Audio restarts can go stale.**
@@ -383,7 +413,13 @@ concurrent runs fail with timeouts that look like permission faults.
 `new-host-cert` takes the same flags as the Linux host — `--directory`,
 `--dns`, `--renew`, `--new-key`, `--adopt-legacy` — because the decision it
 makes comes from `arcen_transport::cert_provisioning` and must not differ by
-platform. The adapter only reports what is on disk and carries out the plan.
+platform. The adapter only reports what is on disk and carries out the plan:
+what to issue (profile, kept names, kept SEC1 or PKCS #8 key) is
+`arcen_transport::cert_issuance`, and the publish order and its journal are
+`cert_transaction::PublicationPlan`; never add certificate parameters or a
+transaction order here. A running service or `serve` reloads its material on
+`SIGHUP` (`tls_material::spawn_watch`) through the shared
+`HostTlsMaterial::reload`, and emits the shared certificate events.
 
 Four things this has already caught, none of which a unit test would have:
 keyframe detection that read every H.264 frame as a keyframe because the NAL

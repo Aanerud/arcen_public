@@ -64,11 +64,15 @@ unstable snapshots, untrusted owners, and oversized material; requires key mode
 `0600` and certificate mode `0644` or stricter. Temporary key bytes are
 zeroized.
 
-The SMB helpers are separate privileged tools. They issue P-256/SHA-256,
-`serverAuth`/`digitalSignature`, 825-day certificates with explicit hostname,
-FQDN, and non-loopback IP SANs. They publish protected files transactionally.
-Linux OpenSSL is a helper prerequisite only; the service neither links to nor
-invokes it.
+The SMB helpers are front ends for the platform's one implementation:
+`arcen-new-host-cert` runs `arcen-pier new-host-cert`, and `new-host-cert.ps1`
+runs `install-arcen-pier.exe --tls-only`. The profile
+(`arcen_transport::cert_issuance`: P-256/SHA-256, `CN=Arcen Pier`,
+`serverAuth`/`digitalSignature`, 825 days, explicit hostname, FQDN and
+non-loopback IP SANs) and the journalled replacement with its crash recovery
+(`arcen_transport::cert_publication`) are shared by every Pier, installer and
+helper; each platform supplies only its file operations. No tool needs
+OpenSSL.
 
 Same-key renewal preserves SPKI and therefore a new Deck session accepts the
 renewed certificate after the operator has trusted that SPKI in the current

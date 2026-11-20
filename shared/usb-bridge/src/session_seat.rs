@@ -73,8 +73,19 @@ pub enum HardUsbSessionDenial {
     /// keys on a node), which on `seat0` would reach the machine's console.
     X11KeyboardInterface,
     /// The session is the desktop on the machine's own monitors; see
-    /// [`HardUsbSessionSeat::JoinedConsole`].
+    /// [`HardUsbSessionSeat::JoinedConsole`]. Refuses the host-driver route
+    /// only: such a desktop takes the host-decoded one
+    /// ([`crate::joined_pen`]).
     JoinedConsole,
+    /// A joined console without the Pier's typed pen device, which the
+    /// host-decoded route posts the pen through.
+    JoinedConsoleNoPenDevice,
+    /// A joined console whose typed pen device another display server or
+    /// process also has open ([`crate::JoinedPenRefusal::NotConfined`]).
+    JoinedConsolePenNotConfined,
+    /// A joined console whose display server has not admitted the typed pen
+    /// device, could not be identified, or is not in front of its seat.
+    JoinedConsolePenNotReady,
 }
 
 impl HardUsbSessionDenial {
@@ -119,6 +130,21 @@ impl HardUsbSessionDenial {
                 "Native tablet is not available on the desktop of this machine's own \
                  monitors: Arcen did not start its display server, so a bridged tablet \
                  could not be kept to your session. Use Tablet support."
+            }
+            Self::JoinedConsoleNoPenDevice => {
+                "Native tablet is not available on this desktop: the host could not create \
+                 Arcen's pen device (uinput), which brings the pen into a desktop Arcen did \
+                 not start. The pen works as a mouse."
+            }
+            Self::JoinedConsolePenNotConfined => {
+                "Native tablet is not available on this desktop now: another display server \
+                 or program on the host (such as a login screen) also has Arcen's pen device \
+                 open, so the pen could not be kept to your session."
+            }
+            Self::JoinedConsolePenNotReady => {
+                "Native tablet is not available on this desktop now: its display server did \
+                 not take Arcen's pen device, or the desktop is not the one on the host's \
+                 monitors. Reconnect to try again."
             }
         }
     }
@@ -172,6 +198,15 @@ mod tests {
         assert!(reason.contains("physical seat"));
         let console = admit_hard_usb_session(HardUsbSessionSeat::ConsoleSeat).unwrap_err();
         assert!(console.reason().contains("login screen"));
+        for denial in [
+            HardUsbSessionDenial::JoinedConsoleNoPenDevice,
+            HardUsbSessionDenial::JoinedConsolePenNotConfined,
+            HardUsbSessionDenial::JoinedConsolePenNotReady,
+        ] {
+            assert!(denial.reason().len() <= 240, "{denial:?}");
+            assert!(!denial.reason().contains("Sign out"), "{denial:?}");
+            assert!(denial.reason().contains("this desktop"), "{denial:?}");
+        }
         for denial in [
             denial,
             console,

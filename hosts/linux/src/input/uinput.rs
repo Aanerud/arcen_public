@@ -29,16 +29,75 @@ use super::pen::{self, PenToolState};
 use super::region_adapter::{RegionInputAdapter, XorgAxisPoint};
 use super::{InputError, InputStats};
 
+/// One uinput device whose input a joined console admits only while it is
+/// proved to reach the joined desktop alone (`joined_devices::JoinedInputGate`);
+/// every other session has no gate.
+struct GatedDevice {
+    device: VirtualDevice,
+    role: VirtualInputRole,
+    gate: Option<Arc<super::joined_devices::JoinedInputGate>>,
+}
+
+impl GatedDevice {
+    const fn new(device: VirtualDevice, role: VirtualInputRole) -> Self {
+        Self {
+            device,
+            role,
+            gate: None,
+        }
+    }
+
+    /// Nothing is written, not even a release, while the gate is shut.
+    fn admit(&self) -> Result<(), InputError> {
+        match self.gate.as_ref() {
+            Some(gate) if !gate.admits(self.role) => {
+                gate.count_drop();
+                Err(InputError::NotConfined)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn emit(&mut self, events: &[InputEvent]) -> Result<(), InputError> {
+        self.admit()?;
+        self.device.emit(events)?;
+        Ok(())
+    }
+
+    fn device_mut(&mut self) -> Result<&mut VirtualDevice, InputError> {
+        self.admit()?;
+        Ok(&mut self.device)
+    }
+
+    /// Whether this device is confined to a joined console.
+    const fn confined(&self) -> bool {
+        self.gate.is_some()
+    }
+}
+
+/// Whether `code` with `held` keys is a virtual-terminal switch an X server
+/// performs itself (Ctrl+Alt+F1..F12, `XF86Switch_VT_n`): on a joined
+/// console it would put another session in front, and that session's display
+/// server would read the devices before the next check.
+fn switches_terminal(held: &HashSet<u16>, code: u16) -> bool {
+    const CTRL: [u16; 2] = [29, 97];
+    const ALT: [u16; 2] = [56, 100];
+    let function_key = (59..=68).contains(&code) || code == 87 || code == 88;
+    function_key
+        && CTRL.iter().any(|key| held.contains(key))
+        && ALT.iter().any(|key| held.contains(key))
+}
+
 pub struct InputController {
-    absolute_device: VirtualDevice,
-    relative_device: VirtualDevice,
+    absolute_device: GatedDevice,
+    relative_device: GatedDevice,
     // Separate virtual tablet-tool device: Xorg/libinput classify a device by
     // its full capability set, and merging tablet ABS_PRESSURE/BTN_TOOL_PEN
     // capabilities onto the existing absolute-mouse device would make that
     // device advertise (and get treated as) a tablet everywhere the plain
     // mouse pointer is expected. `None` when the probe/create attempt in
     // `new` failed; mouse/keyboard stay fully usable in that case.
-    tablet_device: Option<VirtualDevice>,
+    tablet_device: Option<GatedDevice>,
     width: u32,
     height: u32,
     region_input: Option<RegionInputAdapter>,
@@ -199,9 +258,10 @@ impl InputController {
         let stats = Arc::new(InputStats::default());
         Ok((
             Self {
-                absolute_device,
-                relative_device,
-                tablet_device,
+                absolute_device: GatedDevice::new(absolute_device, VirtualInputRole::Absolute),
+                relative_device: GatedDevice::new(relative_device, VirtualInputRole::Relative),
+                tablet_device: tablet_device
+                    .map(|device| GatedDevice::new(device, VirtualInputRole::TabletPen)),
                 width,
                 height,
                 region_input,
@@ -229,6 +289,9 @@ impl InputController {
     }
 
     pub fn key_event(&mut self, message: &KeyEventMsg) -> Result<(), InputError> {
+        // A joined console's keyboard that is not proved confined takes
+        // nothing, and its held keys stay as the device has them.
+        self.absolute_device.admit()?;
         // A release message too: its modifier bits and lock states can
         // press Control, Shift or a lock key.
         if !self.admit_keys()? {
@@ -248,12 +311,18 @@ impl InputController {
                 }
             }
         }
-        let edges = plan_key_edges(
-            &mut self.held_keys,
-            code,
-            message.pressed,
-            message.modifiers,
-        );
+        // Held keys change only once the device has the edges, so a later
+        // release covers exactly what it holds.
+        let mut held = self.held_keys.clone();
+        let edges = plan_key_edges(&mut held, code, message.pressed, message.modifiers);
+        if message.pressed && self.absolute_device.confined() && switches_terminal(&held, code) {
+            tracing::warn!(
+                target: "input",
+                code,
+                "a terminal switch (Ctrl+Alt+F-key) is not passed to a joined console"
+            );
+            return Ok(());
+        }
         if !edges.is_empty() {
             let events: Vec<InputEvent> = edges
                 .into_iter()
@@ -264,6 +333,7 @@ impl InputController {
                 .collect();
             self.absolute_device.emit(&events)?;
         }
+        self.held_keys = held;
         self.stats.key_events.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -278,7 +348,9 @@ impl InputController {
             return Ok(true);
         }
         self.stats.console_refused.fetch_add(1, Ordering::Relaxed);
-        if !was_refusing {
+        // Once when refusing starts, and again while keys a refused release
+        // left held remain.
+        if !was_refusing || !self.held_keys.is_empty() {
             self.reset_keyboard_held()?;
         }
         Ok(false)
@@ -682,7 +754,9 @@ impl InputController {
                 .pen_proximity_timeout
                 .needs_prelude(self.pen_state.tool.is_some(), in_proximity)
             {
-                let _ = super::seat_pen::emit_proximity_prelude(tablet_device, axes.x, axes.y);
+                if let Ok(device) = tablet_device.device_mut() {
+                    let _ = super::seat_pen::emit_proximity_prelude(device, axes.x, axes.y);
+                }
             }
             let mut tab_events: Vec<InputEvent> = edges
                 .iter()
@@ -733,6 +807,43 @@ impl InputController {
         Ok(())
     }
 
+    /// The kernel nodes of the tablet-tool device (`eventN`, and `mouseN`
+    /// when `mousedev` took it); `None` without the device.
+    pub fn tablet_nodes(
+        &mut self,
+    ) -> Option<std::io::Result<Vec<super::joined_devices::DeviceNode>>> {
+        self.device_nodes(VirtualInputRole::TabletPen)
+    }
+
+    /// The kernel nodes of the device for `role`; `None` when it does not
+    /// exist (only the tablet-tool device can be missing).
+    pub fn device_nodes(
+        &mut self,
+        role: VirtualInputRole,
+    ) -> Option<std::io::Result<Vec<super::joined_devices::DeviceNode>>> {
+        let device = match role {
+            VirtualInputRole::Absolute => &mut self.absolute_device,
+            VirtualInputRole::Relative => &mut self.relative_device,
+            VirtualInputRole::TabletPen => self.tablet_device.as_mut()?,
+        };
+        Some(
+            device
+                .device
+                .get_syspath()
+                .and_then(|syspath| super::joined_devices::device_nodes(&syspath)),
+        )
+    }
+
+    /// Admits every device's input only through `gate` from now on (a
+    /// joined console; see `joined_devices::JoinedInputGate`).
+    pub fn confine(&mut self, gate: &Arc<super::joined_devices::JoinedInputGate>) {
+        self.absolute_device.gate = Some(Arc::clone(gate));
+        self.relative_device.gate = Some(Arc::clone(gate));
+        if let Some(device) = self.tablet_device.as_mut() {
+            device.gate = Some(Arc::clone(gate));
+        }
+    }
+
     /// Whether a real tablet-tool device can deliver the advertised pen axes.
     /// Mouse compatibility without that device does not establish pen support.
     #[must_use]
@@ -773,6 +884,8 @@ impl InputController {
                 error = %error,
                 "failed to release held pen state before destroying the virtual tablet device"
             );
+            // Destroying the device releases what it held to its readers.
+            self.pen_state = PenToolState::default();
         }
         // Dropping `VirtualDevice` closes its `/dev/uinput` file descriptor,
         // and that close is what destroys the kernel device and makes udev and
@@ -837,6 +950,9 @@ impl InputController {
         if self.x11_text.is_none() || message.validate().is_err() {
             return Err(InputError::TextUnavailable);
         }
+        // Refused before typing starts: a shut gate is not an X server that
+        // went away, so committed text stays available.
+        self.absolute_device.admit()?;
         if !self.admit_keys()? {
             return Ok(());
         }
@@ -845,12 +961,42 @@ impl InputController {
         };
         let keys_held = !self.held_keys.is_empty();
         let device = &mut self.absolute_device;
-        let mut emit = |(code, pressed): super::x11_text::KeyEdge| {
-            device
-                .emit(&[InputEvent::new(EventType::KEY.0, code, i32::from(pressed))])
-                .map_err(|error| error.to_string())
+        // Keys this commit pressed and has not let go yet, and whether the
+        // gate refused an edge: a joined console's terminal can leave the
+        // front while a long commit is typed.
+        let mut down: HashSet<u16> = HashSet::new();
+        let mut refused = false;
+        let mut caps_presses = 0_u32;
+        let mut emit = |(code, pressed): super::x11_text::KeyEdge| match device
+            .emit(&[InputEvent::new(EventType::KEY.0, code, i32::from(pressed))])
+        {
+            Ok(()) => {
+                if pressed {
+                    down.insert(code);
+                    caps_presses += u32::from(code == LOCK_CODES[0]);
+                } else {
+                    down.remove(&code);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                refused |= matches!(error, InputError::NotConfined);
+                Err(error.to_string())
+            }
         };
-        let report = match text.type_text(&message.text, keys_held, &mut emit) {
+        let typed = text.type_text(&message.text, keys_held, &mut emit);
+        if typed.is_err() && refused {
+            // Not an X server that went away: committed text stays, and the
+            // keys left down are released with the rest once input resumes.
+            // A Caps Lock the commit turned off and could not turn on again
+            // is known as off, so the next key event's lock states set it.
+            self.held_keys.extend(down);
+            if caps_presses % 2 == 1 {
+                self.lock_state[0] = !self.lock_state[0];
+            }
+            return Err(InputError::NotConfined);
+        }
+        let report = match typed {
             Ok(report) => report,
             Err(error) => {
                 tracing::warn!(target: "input", %error, "committed text not typed: X server");
@@ -941,8 +1087,17 @@ impl InputController {
 
 impl Drop for InputController {
     fn drop(&mut self) {
-        if let Err(error) = self.reset_held() {
-            tracing::error!(error = %error, "failed to release held uinput state during teardown");
+        match self.reset_held() {
+            Ok(()) => {}
+            // A joined console's devices that are not proved confined get
+            // nothing, not even releases; destroying them releases all.
+            Err(InputError::NotConfined) => tracing::debug!(
+                target: "input",
+                "held uinput state not released through devices that are not proved confined"
+            ),
+            Err(error) => {
+                tracing::error!(error = %error, "failed to release held uinput state during teardown");
+            }
         }
     }
 }
@@ -1083,6 +1238,24 @@ fn relative_motion_events(dx: i32, dy: i32) -> [InputEvent; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_ctrl_alt_function_keys_switch_terminals() {
+        let held = |keys: &[u16]| keys.iter().copied().collect::<HashSet<u16>>();
+        assert!(switches_terminal(&held(&[29, 56]), 59), "Ctrl+Alt+F1");
+        assert!(
+            switches_terminal(&held(&[97, 100]), 88),
+            "right Ctrl+AltGr+F12"
+        );
+        assert!(
+            switches_terminal(&held(&[29, 56, 42]), 63),
+            "with Shift too"
+        );
+        assert!(!switches_terminal(&held(&[29]), 59), "Ctrl+F1");
+        assert!(!switches_terminal(&held(&[56]), 59), "Alt+F1");
+        assert!(!switches_terminal(&held(&[29, 56]), 30), "Ctrl+Alt+A");
+        assert!(!switches_terminal(&held(&[29, 56]), 69), "Ctrl+Alt+NumLock");
+    }
 
     #[test]
     #[ignore = "requires /dev/uinput; creates isolated virtual devices without injecting input"]

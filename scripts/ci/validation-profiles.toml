@@ -146,6 +146,12 @@ target_os = "any"
 package = "arcen-transport"
 features = ["quic"]
 
+[build_profile.shared-transport-issuer]
+description = "arcen-transport with the shared certificate issuer (rcgen)"
+target_os = "any"
+package = "arcen-transport"
+features = ["issuer"]
+
 [build_profile.shared-usb-bridge]
 description = "arcen-usb-bridge, default features"
 target_os = "any"
@@ -522,6 +528,13 @@ owner = "Shared/Architecture"
 description = "arcen-transport tests with the QUIC adapter (localhost, priority audio, monitor streams)"
 kind = "unit"
 build_profile = "shared-transport-quic"
+template = "cargo-test"
+owner = "Shared/Architecture"
+
+[validation.shared-transport-issuer-test]
+description = "arcen-transport tests with the shared certificate issuer (SEC1 and PKCS #8 renewal, profile verification)"
+kind = "unit"
+build_profile = "shared-transport-issuer"
 template = "cargo-test"
 owner = "Shared/Architecture"
 

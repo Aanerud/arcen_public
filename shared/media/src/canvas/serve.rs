@@ -307,9 +307,139 @@ impl CanvasCapencArgs {
     }
 }
 
+/// Movement, in 1/65536ths of the picture's width or height, after which a
+/// Pier forwards the applied input position again: 1/256 of a side, about
+/// one canvas block on a 4K monitor and half a block at 1080p.
+pub const INPUT_MOVE: u16 = 256;
+
+/// How often a Pier forwards input that stays in place (a click or a held
+/// drag on one spot), half the planner's input window, so the neighbourhood
+/// stays mandatory while the user acts there.
+pub const INPUT_REFRESH: std::time::Duration = std::time::Duration::from_millis(125);
+
+/// The Pier's half of canvas input priority (ADR 0028 §11): turns where the
+/// Pier applied pointer or pen input into `CANVAS-INPUT` lines for the
+/// encode loop, whose planner never defers that neighbourhood.
+///
+/// It is fed only after the Pier authorised and applied an event, with the
+/// event's normalised position (the fraction the injection used); it holds
+/// one position, not a queue, carries no input content, and forwards a
+/// position only when it moved [`INPUT_MOVE`] or the last one is
+/// [`INPUT_REFRESH`] old, so redundant samples cost no traffic. Positions
+/// travel as 1/65536ths of the picture: the loop, which knows its size,
+/// turns them into pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasInputFeed {
+    monitor_id: u16,
+    topology_generation: u64,
+    last: Option<(u16, u16, std::time::Instant)>,
+}
+
+impl CanvasInputFeed {
+    /// The feed for a capture's canvas, `None` when the plan serves none.
+    /// A single-monitor canvas is monitor 0 of topology generation 0.
+    #[must_use]
+    pub fn for_plan(plan: &CanvasServePlan) -> Option<Self> {
+        plan.is_on().then_some(Self {
+            monitor_id: 0,
+            topology_generation: 0,
+            last: None,
+        })
+    }
+
+    /// The Pier applied input at normalised `(x, y)` (0 to 1 across the
+    /// picture) at `now`. Returns the line to send, if one is due. A
+    /// position that is not finite yields nothing; one outside the picture
+    /// is clamped to its edge.
+    #[must_use]
+    pub fn applied(
+        &mut self,
+        x: f64,
+        y: f64,
+        now: std::time::Instant,
+    ) -> Option<crate::capenc_control::CapencControlCommand> {
+        let fixed = |fraction: f64| -> Option<u16> {
+            if !fraction.is_finite() {
+                return None;
+            }
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped to 0..=65535 before the cast"
+            )]
+            let at = (fraction.clamp(0.0, 1.0) * 65_536.0).min(65_535.0) as u16;
+            Some(at)
+        };
+        let (x, y) = (fixed(x)?, fixed(y)?);
+        if let Some((last_x, last_y, at)) = self.last {
+            let moved = last_x.abs_diff(x).max(last_y.abs_diff(y)) >= INPUT_MOVE;
+            if !moved && now.saturating_duration_since(at) < INPUT_REFRESH {
+                return None;
+            }
+        }
+        self.last = Some((x, y, now));
+        Some(crate::capenc_control::CapencControlCommand::CanvasInput {
+            monitor_id: self.monitor_id,
+            topology_generation: self.topology_generation,
+            x,
+            y,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Pier forwards where it applied input only to a capture that
+    /// serves a canvas, once per [`INPUT_MOVE`] of movement or per refresh
+    /// while the input stays in place, in 1/65536ths of the picture, as
+    /// monitor 0 of topology generation 0; a position that is not a number
+    /// is dropped.
+    #[test]
+    fn applied_input_is_forwarded_once_per_move_or_refresh() {
+        use crate::capenc_control::CapencControlCommand;
+        let start = std::time::Instant::now();
+        assert_eq!(CanvasInputFeed::for_plan(&multi_monitor_off()), None);
+        let on = CanvasServePlan {
+            status: None,
+            terms: Some(CanvasTerms {
+                max_canvas_px: 16_384,
+                max_surfaces_per_monitor: 2,
+                cache_bytes: 1 << 20,
+                cache_slots: 256,
+            }),
+        };
+        let mut feed = CanvasInputFeed::for_plan(&on).expect("a canvas");
+        let line = |x, y| CapencControlCommand::CanvasInput {
+            monitor_id: 0,
+            topology_generation: 0,
+            x,
+            y,
+        };
+        assert_eq!(feed.applied(0.5, 0.25, start), Some(line(32_768, 16_384)));
+        // Redundant samples: less than INPUT_MOVE away, within the refresh.
+        for step in 1..10 {
+            let now = start + std::time::Duration::from_millis(step * 10);
+            assert_eq!(feed.applied(0.5 + 0.001, 0.25, now), None);
+        }
+        assert_eq!(
+            feed.applied(0.505, 0.25, start + INPUT_REFRESH / 2),
+            Some(line(33_095, 16_384)),
+            "moved"
+        );
+        assert_eq!(
+            feed.applied(0.505, 0.25, start + INPUT_REFRESH * 2),
+            Some(line(33_095, 16_384)),
+            "still acting there"
+        );
+        assert_eq!(
+            feed.applied(1.5, -1.0, start + INPUT_REFRESH * 4),
+            Some(line(65_535, 0)),
+            "clamped to the picture"
+        );
+        assert_eq!(feed.applied(f64::NAN, 0.5, start), None);
+    }
 
     fn offer() -> CanvasCapability {
         CanvasCapability {

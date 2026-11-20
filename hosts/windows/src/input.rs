@@ -1013,7 +1013,9 @@ mod windows_impl {
         }
 
         /// Atomic move-then-button as a single SendInput array.
-        pub fn button(&mut self, msg: &MouseButtonMsg) {
+        /// Emits one button edge, moving to its position first when it
+        /// carries one. Returns whether that position was applied.
+        pub fn button(&mut self, msg: &MouseButtonMsg) -> bool {
             if msg.pressed {
                 self.meta_mask.pointer();
             }
@@ -1027,7 +1029,7 @@ mod windows_impl {
                     sequence = msg.sequence,
                     "duplicate mouse edge dropped"
                 );
-                return;
+                return false;
             }
             let flag = match (button, msg.pressed) {
                 (1, true) => MOUSEEVENTF_LEFTDOWN,
@@ -1038,7 +1040,7 @@ mod windows_impl {
                 (3, false) => MOUSEEVENTF_RIGHTUP,
                 _ => {
                     tracing::debug!(target: INPUT, button, "unknown mouse button — dropped");
-                    return;
+                    return false;
                 }
             };
             if msg.pressed {
@@ -1073,6 +1075,7 @@ mod windows_impl {
             } else {
                 Self::send(&[edge]);
             }
+            position.is_some()
         }
 
         /// Atomic region move-then-button. The shared state machine has
@@ -1981,7 +1984,9 @@ impl Injector {
     pub fn move_abs(&self, msg: &MouseMoveMsg) {}
     pub fn move_region(&self, mapped: MappedRegionPoint, sequence: u64) {}
     pub fn move_relative(&self, msg: &MouseMoveRelativeMsg) {}
-    pub fn button(&mut self, msg: &MouseButtonMsg) {}
+    pub fn button(&mut self, msg: &MouseButtonMsg) -> bool {
+        false
+    }
     pub fn button_region(&mut self, mapped: MappedRegionButton, sequence: u64) {}
     pub fn scroll(&self, msg: &MouseScrollMsg) {}
     pub fn scroll_region(&self, mapped: MappedRegionScroll, sequence: u64) {}

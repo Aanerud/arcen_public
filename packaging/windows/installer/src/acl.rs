@@ -11,6 +11,9 @@
 ///
 /// Installed service paths accept only SYSTEM or Administrators as owner, so
 /// this is load-bearing rather than cosmetic.
+// The installer applies these by handle; the icacls form remains the manual
+// procedure in hosts/windows/INSTALL.md and is kept in step by the tests.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) const OWNER_SID: &str = "*S-1-5-32-544";
 
 /// Well-known SIDs, never display names.
@@ -60,6 +63,7 @@ impl AclClass {
 
     /// icacls `/grant:r` arguments, addressed by SID so they are identical on
     /// every display language.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) const fn grants(self) -> &'static [&'static str] {
         match self {
             Self::PublicDirectory => &[
@@ -85,6 +89,7 @@ impl AclClass {
     /// binary installer used BUILTIN\Users for public paths while the earlier
     /// manual install used Authenticated Users, so moving between those paths
     /// otherwise leaves both ACEs behind and makes strict verification fail.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) const fn revoked_grants(self) -> &'static [&'static str] {
         match self {
             Self::SecretDirectory | Self::SecretFile => &["*S-1-5-32-545", "*S-1-5-11"],
@@ -107,6 +112,14 @@ impl AclClass {
             sids.insert(SID_AUTHENTICATED_USERS.to_string());
         }
         sids
+    }
+
+    /// Whether the class is for a directory.
+    pub(crate) const fn is_directory(self) -> bool {
+        matches!(
+            self,
+            Self::PublicDirectory | Self::SecretDirectory | Self::AgentWritableDirectory
+        )
     }
 
     pub(crate) const fn label(self) -> &'static str {
@@ -234,6 +247,7 @@ pub(crate) fn assert_acl_sddl(path: &str, sddl: &str, acl_class: AclClass) -> Re
 /// # Errors
 ///
 /// Returns a message when the DACL cannot be parsed.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn unexpected_trustees(sddl: &str, acl_class: AclClass) -> Result<Vec<String>, String> {
     let dacl = parse_dacl(sddl)?;
     let expected = acl_class.expected_sids();

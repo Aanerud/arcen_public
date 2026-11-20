@@ -13,7 +13,11 @@
 //! the session window as [`WM_HOOK_KEY`] and never reaches the system; a
 //! release always goes where its press went. Windows+L and Ctrl+Alt+Del
 //! cannot be taken, by design of Windows. While this PC has the keyboard
-//! the hook is not installed at all.
+//! the hook is not installed at all. A press the hooks installed before
+//! this one block (a Windows Pier's desk privacy, when this Deck runs
+//! inside a Pier's session) is not taken either: it goes nowhere. Only the
+//! release of a press the session already has still reaches it, so no key
+//! stays down on the host ([`HookRouter::blocked_below`]).
 //!
 //! The hook runs on a thread of its own that only pumps messages, so it
 //! always answers within Windows' hook timeout however busy the window's
@@ -94,6 +98,9 @@ struct HookCounts {
     taken: u64,
     /// Passed on to the system by the routing.
     passed: u64,
+    /// Taken for the session, but blocked by a hook installed before this
+    /// one: dropped, unless the release of a press the session has.
+    blocked: u64,
 }
 
 /// The routing the hook thread reads, set by the session window's thread.
@@ -234,6 +241,7 @@ pub(super) fn uninstall(hwnd: HWND) {
         events = counts.events,
         taken = counts.taken,
         passed = counts.passed,
+        blocked = counts.blocked,
         elsewhere = counts.elsewhere,
         injected = counts.injected,
         "keyboard hook: routing stopped"
@@ -273,26 +281,45 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // SAFETY: for HC_ACTION, lParam points at the event's
         // KBDLLHOOKSTRUCT for the duration of the call.
         let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-        if take(event) {
-            return LRESULT(1);
+        if let Some(taken) = take(event) {
+            // The hooks installed before this one see the key first. One
+            // of them may block the keyboard (a Windows Pier keeping its
+            // desk private while this Deck runs in its session, a kiosk
+            // lock): the Deck is never a way around it, so a press the
+            // rest of the chain blocks goes nowhere. The shared router
+            // still lets the release of a press the session has through.
+            // SAFETY: passes the event on unchanged.
+            let below = unsafe { CallNextHookEx(None, code, wparam, lparam) };
+            if below.0 == 0 || blocked_below(&taken) {
+                deliver(&taken);
+            }
+            return if below.0 == 0 { LRESULT(1) } else { below };
         }
     }
     // SAFETY: passes the event on unchanged.
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// Whether the hook takes this event (and has posted it to the window).
-fn take(event: &KBDLLHOOKSTRUCT) -> bool {
+/// A key the session takes, to post to its window.
+struct Taken {
+    hwnd: isize,
+    key: PcKey,
+    pressed: bool,
+    route: HookRoute,
+    packed: usize,
+    scan: isize,
+}
+
+/// Whether the hook takes this event for the session window.
+fn take(event: &KBDLLHOOKSTRUCT) -> Option<Taken> {
     let flags = event.flags.0;
     let mut slot = state();
-    let Some(state) = slot.as_mut() else {
-        return false;
-    };
+    let state = slot.as_mut()?;
     state.counts.events += 1;
     if flags & LLKHF_INJECTED != 0 && !lab_marked(event.dwExtraInfo) {
         // The mask key, and anything another program types.
         state.counts.injected += 1;
-        return false;
+        return None;
     }
     let pressed = flags & LLKHF_UP == 0;
     #[allow(clippy::cast_possible_truncation, reason = "Virtual-Keys are one byte")]
@@ -307,19 +334,14 @@ fn take(event: &KBDLLHOOKSTRUCT) -> bool {
     let foreground = unsafe { GetForegroundWindow() }.0 as isize;
     if pressed && foreground != state.hwnd {
         state.counts.elsewhere += 1;
-        return false;
+        return None;
     }
     let route = state.router.route(key, pressed, state.grabbed);
     if route == HookRoute::System {
         state.counts.passed += 1;
-        return false;
+        return None;
     }
     state.counts.taken += 1;
-    let hwnd = HWND(state.hwnd as *mut core::ffi::c_void);
-    drop(slot);
-    if route == HookRoute::SessionMaskingWindowsKey {
-        inject_mask_key();
-    }
     let packed = usize::from(vk) | ((flags as usize & 0xFF) << 16);
     let packed_scan = (u64::from(event.time) << 32) | u64::from(event.scanCode);
     #[allow(
@@ -327,9 +349,36 @@ fn take(event: &KBDLLHOOKSTRUCT) -> bool {
         reason = "x64 only: isize is 64 bits"
     )]
     let scan = packed_scan.cast_signed() as isize;
+    Some(Taken {
+        hwnd: state.hwnd,
+        key,
+        pressed,
+        route,
+        packed,
+        scan,
+    })
+}
+
+/// A taken key the rest of the hook chain blocked: whether the session
+/// still gets it (the release of a press it has).
+fn blocked_below(taken: &Taken) -> bool {
+    let mut slot = state();
+    let Some(state) = slot.as_mut().filter(|state| state.hwnd == taken.hwnd) else {
+        return false;
+    };
+    state.counts.blocked += 1;
+    state.router.blocked_below(taken.key, taken.pressed)
+}
+
+/// Posts a taken key to the session window.
+fn deliver(taken: &Taken) {
+    if taken.route == HookRoute::SessionMaskingWindowsKey {
+        inject_mask_key();
+    }
+    let hwnd = HWND(taken.hwnd as *mut core::ffi::c_void);
     // SAFETY: posting to the session window; a failure loses the key,
     // which the window's focus loss then releases.
-    unsafe { PostMessageW(hwnd, WM_HOOK_KEY, WPARAM(packed), LPARAM(scan)) }.is_ok()
+    let _ = unsafe { PostMessageW(hwnd, WM_HOOK_KEY, WPARAM(taken.packed), LPARAM(taken.scan)) };
 }
 
 #[cfg(test)]
@@ -354,5 +403,227 @@ mod tests {
         assert!(take_if_routing_for(&mut slot, 1).is_some());
         assert!(slot.is_none());
         assert!(take_if_routing_for(&mut slot, 1).is_none());
+    }
+
+    /// A Windows Pier keeping its desk private while this Deck runs in its
+    /// session: its keyboard hook, installed first, blocks every key the
+    /// desk types. The Deck's hook, newer and so called first, must not
+    /// take such a key for its own session. Typed keys are stood in for by
+    /// the input lab's marked keys (`dev-tools`), which the Deck routes as
+    /// typed and a real Pier's hook blocks too. Run from a
+    /// signed-in console: `arcen_deck_windows-*.exe --ignored --exact
+    /// input::hook::tests::a_key_a_hook_below_blocks_is_not_taken`.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    #[ignore = "needs an interactive session (foreground window, low-level hooks)"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one live scenario: the blocking hook, the window, the key"
+    )]
+    fn a_key_a_hook_below_blocks_is_not_taken() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_EXTENDEDKEY;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
+            PM_REMOVE, RegisterClassW, SetForegroundWindow, TranslateMessage, WINDOW_EX_STYLE,
+            WM_QUIT, WNDCLASSW, WS_POPUP, WS_VISIBLE,
+        };
+        use windows::core::w;
+
+        static BLOCKING: AtomicBool = AtomicBool::new(false);
+        static BLOCKED: AtomicUsize = AtomicUsize::new(0);
+        static PIER_THREAD: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "system" fn pier(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            if code == i32::try_from(HC_ACTION).unwrap_or(0) {
+                // SAFETY: for HC_ACTION, lParam points at the event.
+                let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+                if event.dwExtraInfo == LAB_KEY_MARK && BLOCKING.load(Ordering::SeqCst) {
+                    BLOCKED.fetch_add(1, Ordering::SeqCst);
+                    return LRESULT(1);
+                }
+            }
+            // SAFETY: passes the event on unchanged.
+            unsafe { CallNextHookEx(None, code, wparam, lparam) }
+        }
+
+        unsafe extern "system" fn window_proc(
+            hwnd: HWND,
+            message: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            // SAFETY: the default procedure.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+
+        fn send(vk: u16, flags: KEYBD_EVENT_FLAGS, extra: usize) {
+            let input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(vk),
+                        dwFlags: flags,
+                        dwExtraInfo: extra,
+                        ..KEYBDINPUT::default()
+                    },
+                },
+            };
+            // SAFETY: one well-formed keyboard input.
+            let _ = unsafe {
+                SendInput(
+                    &[input],
+                    i32::try_from(std::mem::size_of::<INPUT>()).unwrap_or(0),
+                )
+            };
+        }
+
+        /// Pumps the window's thread; how many keys the hook posted to it.
+        fn pump(duration: Duration) -> usize {
+            let mut posted = 0;
+            let until = Instant::now() + duration;
+            let mut msg = MSG::default();
+            while Instant::now() < until {
+                // SAFETY: this thread's queue; a valid out-parameter.
+                while unsafe { PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    if msg.message == WM_HOOK_KEY {
+                        posted += 1;
+                    }
+                    // SAFETY: a message just removed from this thread's queue.
+                    unsafe {
+                        let _ = TranslateMessage(&raw const msg);
+                        DispatchMessageW(&raw const msg);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            posted
+        }
+
+        // The "Pier": a blocking hook installed before the Deck's.
+        let pier_thread = std::thread::spawn(|| {
+            let mut msg = MSG::default();
+            // SAFETY: creates this thread's queue; a valid out-parameter.
+            let _ = unsafe { PeekMessageW(&raw mut msg, None, 0, 0, PM_NOREMOVE) };
+            // SAFETY: a hook procedure of this module on this pumping thread.
+            let handle = unsafe {
+                GetModuleHandleW(None)
+                    .and_then(|module| SetWindowsHookExW(WH_KEYBOARD_LL, Some(pier), module, 0))
+            };
+            // SAFETY: no arguments.
+            PIER_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+            let Ok(handle) = handle else {
+                return;
+            };
+            // SAFETY: this thread's own queue.
+            while unsafe { GetMessageW(&raw mut msg, None, 0, 0) }.0 > 0 {}
+            // SAFETY: the hook this thread installed.
+            let _ = unsafe { UnhookWindowsHookEx(handle) };
+        });
+        while PIER_THREAD.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // SAFETY: a class and a popup window of this module, on this thread.
+        let hwnd = unsafe {
+            let instance = GetModuleHandleW(None).unwrap_or_default();
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: w!("ArcenHookChainTest"),
+                ..WNDCLASSW::default()
+            };
+            let _ = RegisterClassW(&raw const class);
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("ArcenHookChainTest"),
+                w!("Arcen hook chain test"),
+                WS_POPUP | WS_VISIBLE,
+                100,
+                100,
+                640,
+                360,
+                None,
+                None,
+                instance,
+                None,
+            )
+        };
+        let Ok(hwnd) = hwnd else {
+            panic!("could not create the test window");
+        };
+        // Test set-up only: an Alt tap lets this process take the
+        // foreground (nothing here reads raw keyboard input).
+        send(0x12, KEYBD_EVENT_FLAGS::default(), 0);
+        send(0x12, KEYEVENTF_KEYUP, 0);
+        // SAFETY: this thread's window.
+        let _ = unsafe { SetForegroundWindow(hwnd) };
+        pump(Duration::from_millis(300));
+        // SAFETY: no arguments.
+        let in_front = unsafe { GetForegroundWindow() } == hwnd;
+
+        install(hwnd, true, Vec::new());
+        pump(Duration::from_millis(300));
+
+        // Print Screen, which the grab takes for the session; the "Pier"
+        // blocks it.
+        BLOCKING.store(true, Ordering::SeqCst);
+        send(0x2C, KEYEVENTF_EXTENDEDKEY, LAB_KEY_MARK);
+        send(0x2C, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, LAB_KEY_MARK);
+        let posted = pump(Duration::from_millis(300));
+        let counts = state().as_ref().map(|state| state.counts);
+        let blocked = BLOCKED.load(Ordering::SeqCst);
+
+        // The block begins while the session holds the key: its release
+        // still reaches the session, so the host does not keep it down.
+        BLOCKING.store(false, Ordering::SeqCst);
+        send(0x2C, KEYEVENTF_EXTENDEDKEY, LAB_KEY_MARK);
+        let held_press = pump(Duration::from_millis(300));
+        BLOCKING.store(true, Ordering::SeqCst);
+        send(0x2C, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, LAB_KEY_MARK);
+        let held_release = pump(Duration::from_millis(300));
+        BLOCKING.store(false, Ordering::SeqCst);
+        let late_counts = state().as_ref().map(|state| state.counts);
+
+        uninstall(hwnd);
+        // SAFETY: this thread's window; a thread message without pointers.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            let _ = PostThreadMessageW(
+                PIER_THREAD.load(Ordering::SeqCst),
+                WM_QUIT,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        let _ = pier_thread.join();
+
+        assert!(in_front, "the test window did not come to the front");
+        let counts = counts.unwrap_or_default();
+        // The blocked press is taken and dropped; its release then goes
+        // down the chain with it.
+        assert_eq!(
+            (counts.taken, counts.passed),
+            (1, 1),
+            "the grab did not take Print Screen: {counts:?}"
+        );
+        assert_eq!(
+            blocked, 2,
+            "the blocking hook did not see both edges: {counts:?}"
+        );
+        assert_eq!(
+            posted, 0,
+            "the Deck took keys a hook below it blocked: {counts:?}"
+        );
+        assert_eq!(counts.blocked, 1, "{counts:?}");
+        let late_counts = late_counts.unwrap_or_default();
+        assert_eq!(held_press, 1, "the unblocked press: {late_counts:?}");
+        assert_eq!(
+            held_release, 1,
+            "the release of a press the session has was dropped: {late_counts:?}"
+        );
+        assert_eq!(late_counts.blocked, 2, "{late_counts:?}");
     }
 }

@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-pier-linux-installer"
-version = "0.20.4"
+version = "0.20.5"
 edition.workspace = true
 rust-version.workspace = true
 description = "Single-file Linux installer for Arcen Pier."
@@ -19,6 +19,8 @@ path = "src/main.rs"
 arcen-outputs.workspace = true
 arcen-session.workspace = true
 arcen-usb-bridge.workspace = true
-arcen-transport = { workspace = true, default-features = false }
+# `issuer`: the shared certificate issuer.
+arcen-transport = { workspace = true, default-features = false, features = ["issuer"] }
 rustix.workspace = true
 serde_json.workspace = true
+zeroize.workspace = true

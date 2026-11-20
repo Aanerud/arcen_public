@@ -112,8 +112,14 @@ authenticates the password with the Pier's PAM service and runs the account
 checks (`pam_authenticate`, `pam_acct_mgmt`), but opens **no PAM session**:
 the session already exists, or GDM creates it.
 
-It reads every logind session (`loginctl show-session`) and
-`console_session::decide` answers:
+It reads every logind session (`loginctl list-sessions`, then
+`loginctl show-session` for each) and `console_session::decide` answers.
+The read must be complete (`console_session::logind_read`, amended
+2026-11-20): a list that fails, times out or is not a session list, a
+listed session logind will not describe while it still lists it, or a
+description that names another session or user than the list, is
+"unknown", never "nobody", and refuses `console_sessions_unreadable`.
+Only a complete read proves that the account has no session.
 
 | Console | Decision |
 | --- | --- |
@@ -122,9 +128,11 @@ It reads every logind session (`loginctl show-session`) and
 | Another account's session is active on `seat0` | Refuse `console_other_user` |
 | Another account's session the display manager did not start (another remote-desktop product) exists on `seat0`, active or not | Refuse `console_other_user_other_product` |
 | Only the login screen (an X11 greeter on `seat0`, active or idle) | Remote-first sign-in through it (§3) |
-| The session, or the login screen's next session, is Wayland | Refuse `console_wayland_session` (§9) |
+| The account's own session is Wayland | Identify it and prove its compositor read-only (`console_session::wayland_join`), then join it (§9, S4b); a Pier built without the Wayland adapter refuses `console_wayland_session` |
+| The login screen's next session is Wayland | Refuse `console_wayland_session` (§9) |
 | Nothing graphical on `seat0`, and the host has no display manager | Start the account's real login session (§10), then join it |
 | Nothing graphical on `seat0`, and the display manager's login screen is not running | Refuse `console_no_session` |
+| logind's sessions could not be read completely | Refuse `console_sessions_unreadable`: nothing is joined and no session is started |
 
 An Arcen dedicated desktop (logind `TTY=arcen`) is never a console. Any
 other session on `seat0` is, whatever its PAM remote host says. A session
@@ -310,6 +318,7 @@ SSSD would not weigh the login screen's service as interactive.
 | A resume finds the console changed | The console is decided afresh just before anything is touched (`console_session::decide_reattach`, `console::reattach`): only the held session of the same account, still the one the decision attaches, is joined; anything else refuses without touching the desk. The launcher answers the broker's `attach` with `attached` or the typed refusal, and the broker waits for that answer (25 s bound) before it streams: the returning Deck is shown the code (`console_session_changed` when the account's session is no longer the one it joined), never a capture error |
 | Same user signs in again | Joins the same session |
 | The user logs out (at the desk is impossible while attached; from the Deck) | The attachment ends |
+| logind does not answer about the joined session (`loginctl` fails or is slow) | Not a logout: the launcher keeps the attachment and looks again. It ends only when logind no longer has the session (its state file is gone too) or describes it as no longer the account's console desktop. After `UNANSWERED_LOOKS_BEFORE_HAND_BACK` (5) unanswered looks in a row, about 10 to 25 s, ownership is unproven: the attachment ends and the console is handed back as when the Deck leaves (locked, or kept private while it cannot be locked); the session is never ended (`console_session::session_watch`, amended 2026-11-20) |
 | The Pier or its launcher dies | The kernel releases the input grabs; the monitors stay blank; the Pier locks the session, then restores the monitors, from its journal (`/run/arcen/console-privacy.json`, directory kept by the tmpfiles rule) when the launcher is cleaned up and at service start |
 | A refusal after the login screen started, or logind brought forward, the session | The session is handed back locked before the refusal |
 | The session will not lock (no lock screen, lock disabled) | GDM is asked for a login screen on a new VT (`CreateTransientDisplay`) so the session goes to the background; failing that, the desk stays blank and its input disabled while the launcher retries. From the first failed hand-back the session's X server is also told to ignore the desk's devices (XInput `Device Enabled` 0, journalled): an `EVIOCGRAB` ends with the launcher, the X server's state does not. A launcher that is stopped or killed therefore leaves the desk blank and unusable; the Pier retries every 10 s (`console::guard_unsecured_console`, also re-blanking a monitor that came back and disabling a newly plugged device) and gives the desk its monitors and devices back only once the session is locked, behind a login screen, or gone. One Pier-wide gate keeps a retry and a console launcher apart. *Amended 2026-11-18:* a display manager's session is "behind a login screen" only for the desk's picture: the login screen is put in front, but the session stays private (blank, the desk's devices disabled in its X server) until it locks, because a key chord switches to its terminal (`console_session::unlocked_hand_back` returns `KeepPrivate` for it in the background), for at most a minute (`UNLOCKED_GRACE`, counted from the first failed lock in `/run/arcen/console-unlocked.json`): a session whose lock screen is turned off by policy never locks, and its owner signing in at the login screen must get it back. Another product's session in the background is given back as before |
@@ -538,7 +547,7 @@ The Deck shows the code first, then the reason; the Pier logs the code as
 The codes and what an administrator does about them are in
 [error codes](../operations/error-codes.md#linux-sign-in-refusals):
 `console_other_user`, `console_other_user_other_product`,
-`console_wayland_session`, `console_no_session`,
+`console_wayland_session`, `console_no_session`, `console_sessions_unreadable`,
 `console_sign_in_unavailable`, `console_sign_in_failed`,
 `console_session_unreachable`, `console_privacy_unavailable`. A sign-in of
 another account while a joined console waits for its Deck's resume gets the
@@ -663,6 +672,131 @@ per the same document). That is work package `console-wayland`. The GNOME 49
 lab host has no working GDM login screen on its vGPU (no KMS connector), so
 it is proved on hardware with a display.
 
+Amended 2026-11-20 (S4a, the target and ownership contract): the account's
+own Wayland console session is no longer an anonymous refusal. The console
+decision names it (`ConsoleDecision::JoinWayland`, a `WaylandTarget` with
+logind's id, owner, leader, lock and origin), and the Linux adapter
+(`hosts/linux/src/session/console_wayland.rs`) proves its compositor
+read-only before refusing: the session's `XDG_RUNTIME_DIR` must be logind's
+`/run/user/<uid>`, a directory only the account owns; its `bus` socket must
+be the account's, and the kernel's peer credentials must say the account
+serves it; one connection must own `org.gnome.Mutter.DisplayConfig`,
+`ScreenCast` and `RemoteDesktop`, and the process the bus names must be,
+by `/proc`, the account's, in the account's slice and this session's
+compositor (its scope, its `XDG_SESSION_ID`, or the account's display
+session); the names must not move while they are read; and logind must
+still describe the same session (owner and leader) afterwards. A user bus
+does not accept root, so the Pier asks it through `busctl` running as the
+account, with no groups and an empty environment, only after the kernel
+has proven the socket. Nothing is started and no Mutter method is called.
+`wayland_join::prove_compositor` and `decide_join` hold every rule; while
+the Pier has no join adapter the outcome is
+`WaylandJoin::AdapterUnavailable`, which keeps the visible
+`console_wayland_session` refusal and logs the proof. A Pier that creates
+its own Wayland desktops creates one only when logind proved the account
+holds no session at the workstation (`decide_before_creating_read`,
+`creating_step`, amended 2026-11-20): the account's own Wayland
+session is identified and proven the same way and joined (S4b, below), its
+X11 session refused `console_session_unreachable`,
+and an unreadable logind `console_sessions_unreadable`. Another account's
+session, a login screen, SSH and background sessions, Arcen's own
+desktops (`TTY=arcen`, seatless or on their own seat) and a session on
+another seat are not the account's workstation session and do not stop
+it. A reconnect to the account's own Arcen desktop creates nothing and is
+not refused; one whose layout would need a new desktop keeps the existing
+one rather than tear it down for a refused creation.
+
+Amended 2026-11-20 (S4b, the join): a proven Wayland session is joined,
+on an Xorg host's console path and on a host that creates its own Wayland
+desktops alike (`wayland_join::creating_step` gives `JoinConsole`; the
+sign-in then goes through the console launcher). The decisions are shared
+(`console_session::wayland_attach`); the Linux side only gathers facts and
+acts (`hosts/linux/src/session/wayland/join.rs`, `launcher.rs`
+`run_wayland_join`):
+
+- The console agent runs as the account, on the session's own user bus
+  (`/run/user/<uid>/bus`): it starts no bus, no compositor and no
+  PipeWire. Before it uses the bus it checks again, from inside, that one
+  connection serves every Mutter name and that the bus reports that
+  connection as the proven compositor process of this account. Upstream
+  Mutter 49.4 and 50.0 accept `ScreenCast` and `RemoteDesktop` sessions
+  from any client of the session bus and tie each session to the caller
+  that created it (`meta-dbus-session-manager.c`; `RecordMonitor` and
+  the input notifications check the creator); no allow-list applies.
+- It records the session's own enabled monitors with `RecordMonitor` on a
+  `ScreenCast` session paired with a `RemoteDesktop` session, at the size,
+  place and scale the session runs them (`joined_outputs`); nothing of
+  the session's monitors is changed. Input and the clipboard go through
+  the same RemoteDesktop machinery as Arcen's own desktops; the pen stays
+  absent.
+- The Deck is served only when capture, input and lock are all proved on
+  the running session (`decide_serve`): every monitor announced a stream,
+  the input target accepted keyboard, pointer and an absolute motion, and
+  the compositor's connection is GNOME Shell's (which locks on logind's
+  request) with locking allowed by the account's settings. Otherwise the
+  sign-in is refused `console_session_unreachable`.
+- Desk privacy is judged before anything is brought forward: a session
+  shown on a monitor at the desk, or whose monitors cannot be read, is
+  refused `console_privacy_unavailable` while desk privacy is required,
+  before it is activated or unlocked (`wayland_attach::monitors_at_desk`).
+  A Wayland compositor's monitors cannot be blanked from outside without
+  changing its state, and Mutter stops painting a monitor it powers down.
+  A headless session's own virtual monitors show nothing at a desk. The
+  desk's input is then disabled at the kernel. A monitor enabled, disabled
+  or reconfigured during the attachment ends it (the recorded set and the
+  privacy judgement were made for the old one); the session continues.
+  The agent judges each change as Mutter signals it
+  (`DisplayConfig.MonitorsChanged`, not a periodic check;
+  `wayland_attach::monitor_change_step`): when the session now shows, or
+  may show, on a monitor at the desk, the agent locks it through logind
+  at once, as the account, before the attachment winds down, and the
+  hand-back locks and checks again. Mutter often closes the sharing
+  first (a recorded monitor that moves or loses its place closes its
+  stream before `MonitorsChanged` is emitted), so the monitors are judged
+  again whatever ended the attachment. Mutter reports a change only after
+  it has applied it, so a monitor plugged in at the desk can show the
+  session from Mutter's first frame on it until GNOME Shell's lock shield
+  covers it: one signal delivery (`MonitorsChanged` or the sharing's
+  `Closed`), one `GetCurrentState` and one `LockSession` call on
+  already-open buses, then the shield. No
+  compositor interface announces a monitor before it is shown, and
+  blanking it from outside would change the user's session; the vGPU lab
+  has no connector, so this window is not measured on hardware.
+- A join is journalled (`/run/arcen/console-wayland-join.json`) before the
+  desk's input is taken, so a Pier that dies mid-attachment locks the
+  session when it starts again (the desk's input, held by the process
+  that died, is already back). A sign-in the
+  Pier switched to joining is served only that session: it never falls
+  back to another console route, and never replaces the account's Arcen
+  desktop.
+- GNOME Shell closes screen sharing and refuses new sharing sessions
+  while the session is locked (`js/ui/sessionMode.js`, Mutter's remote
+  access controller). A locked session is therefore unlocked through
+  logind after the account's password was proven, as an X11 session
+  behind its login screen is brought forward, and refused if it stays
+  locked. When the Deck leaves, the session is locked, the desk gets its
+  input and sound back, and the attachment ends: it is not held for a
+  resume (the lock closes the sharing), and the returning Deck signs in
+  again and joins the same session. The session is never ended.
+- Still refused, with evidence: a Wayland login screen. GDM 47 (RHEL 10)
+  has no supported route for a third-party product to complete a sign-in
+  into, or hand over to, a session through its Wayland greeter: it moves a
+  remote id on reauthentication only for GDM's own remote displays
+  (`gdm-manager.c`), and `CreateUserDisplay` exists from GDM 50 only.
+
+Lab proof (2026-11-20, Rocky 10.2, GNOME Shell and Mutter 49.4, PipeWire
+1.4.11): a task-owned account's GNOME Wayland session on `seat0` (a PAM
+`login` session on virtual terminal 8 running `gnome-shell --headless` on
+its own systemd user bus; the vGPU has no display connector and GDM shows
+no login screen, so the physical-monitor and greeter paths are not
+exercised there) was joined from a Mac Deck: capture showed the session's
+own application, typed text reached it, disconnect locked the session with
+its applications and compositor unchanged, a locked session was unlocked
+and joined again, and a second Deck (another account, and the same one)
+was refused while the first was attached. Persistent per-user Wayland
+sessions (S4c), the resume hold and a desk with physical monitors remain
+GAP-042.
+
 ### 10. Hosts without a display manager: a real login session
 
 **Decision (amended 2026-11-17).** A host without a display manager
@@ -761,14 +895,16 @@ The dedicated path is fixed where it stays:
 - Before it starts an X server, any user's console session on `seat0` on
   any VT holds the seat (`x11_seat::x11_seat_holder`): refused
   `seat_occupied`, or `seat_occupied_other_product` when the display
-  manager did not start it.
+  manager did not start it. A console logind cannot describe completely
+  is refused `console_sessions_unreadable`, never taken for a free one.
 - The X server's readiness is bounded (12 s) so a hung server fails inside
   the broker's open timeout; its log tail is recorded at error level and its
   `Xorg.log` and `xorg.conf` are kept in `<runtime_root>/last-failed/`.
 
 **The headless Wayland provider** (ADR 0015, `linux-wayland-provider.md`,
 hosts without an Xorg server such as Enterprise Linux 10) still creates
-one desktop per sign-in: it lives in the Pier's registry for the reconnect
+one desktop per sign-in for an account with no session at the workstation
+(never beside one, §9): it lives in the Pier's registry for the reconnect
 window (`auth.reconnect_window_secs`) and an explicit disconnect ends it.
 Making it persistent per user is tracked as `wayland-persistent-session`:
 the same model applies (the user's GNOME session started through

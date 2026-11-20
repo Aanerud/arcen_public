@@ -6,12 +6,12 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::atomic::AtomicU64;
 
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
 
 use super::*;
+use crate::test_keys::{openssl_sec1_key, sec1_label};
 use crate::tls::{ClockError, RingCipherSuite, TlsVersionFloor};
 
 const NOW: u64 = 1_800_000_000;
@@ -531,6 +531,78 @@ fn startup_reports_active_or_expiring() {
 }
 
 #[test]
+fn a_malformed_expired_or_half_written_replacement_keeps_the_last_good_material() {
+    let clock = Arc::new(TestClock::new(NOW));
+    let (certificate, key) = issued("host.example");
+    let material = HostTlsMaterial::load(
+        &file_system_with(certificate.clone(), key.clone(), false),
+        source(vec!["host.example".to_string()]),
+        clock,
+        "arcen-pier",
+    )
+    .expect("material");
+    let last_good = material.metadata().expect("metadata").cert_sha256;
+
+    let mut expired_params = CertificateParams::new(vec!["host.example".to_owned()]).expect("p");
+    expired_params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    expired_params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    expired_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key_pair = KeyPair::from_pem(std::str::from_utf8(&key).expect("pem")).expect("key");
+    let expired = expired_params
+        .self_signed(&key_pair)
+        .expect("expired")
+        .pem()
+        .into_bytes();
+    let half = certificate[..certificate.len() / 2].to_vec();
+    let (new_certificate, _) = issued("host.example");
+
+    for (label, replacement_certificate, replacement_key, reason) in [
+        (
+            "malformed",
+            b"not a certificate".to_vec(),
+            key.clone(),
+            "pem_invalid",
+        ),
+        ("expired", expired, key.clone(), "certificate_rejected"),
+        ("half-written certificate", half, key.clone(), "pem_invalid"),
+        (
+            "certificate replaced, key not yet",
+            new_certificate,
+            key.clone(),
+            "certificate_rejected",
+        ),
+        ("empty key", certificate.clone(), Vec::new(), "pem_invalid"),
+    ] {
+        let failed = material.reload(&file_system_with(
+            replacement_certificate,
+            replacement_key,
+            false,
+        ));
+        assert!(failed.result.is_err(), "{label} must be refused");
+        assert_eq!(
+            failed
+                .events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![arcen_telemetry::LifecycleEventKind::TlsCertificateReloadFailed],
+            "{label}"
+        );
+        assert!(
+            format!("{:?}", failed.events[0].fields).contains(reason),
+            "{label}: {:?}",
+            failed.events[0].fields
+        );
+        assert_eq!(
+            material.metadata().expect("metadata").cert_sha256,
+            last_good,
+            "{label}: the last good certificate keeps serving"
+        );
+        assert!(material.resolver().resolve_current().is_some(), "{label}");
+    }
+}
+
+#[test]
 fn reload_keeps_the_last_good_material_and_expiry_refuses_new_handshakes() {
     let clock = Arc::new(TestClock::new(NOW));
     let material = HostTlsMaterial::load(
@@ -591,84 +663,6 @@ fn reload_keeps_the_last_good_material_and_expiry_refuses_new_handshakes() {
 }
 
 // --- Material deployed Piers hold today ------------------------------------
-
-/// DER length octets.
-fn der_length(length: usize) -> Vec<u8> {
-    if length < 0x80 {
-        return vec![u8::try_from(length).expect("short length")];
-    }
-    let bytes = length.to_be_bytes();
-    let first = bytes.iter().position(|byte| *byte != 0).expect("non-zero");
-    let mut encoded = vec![0x80 | u8::try_from(bytes.len() - first).expect("length of length")];
-    encoded.extend_from_slice(&bytes[first..]);
-    encoded
-}
-
-/// One DER element: tag, contents, and the input after it.
-fn der_element(input: &[u8]) -> (u8, &[u8], &[u8]) {
-    let tag = input[0];
-    let (length, header) = if input[1] < 0x80 {
-        (usize::from(input[1]), 2)
-    } else {
-        let count = usize::from(input[1] & 0x7f);
-        let length = input[2..2 + count]
-            .iter()
-            .fold(0_usize, |length, byte| (length << 8) | usize::from(*byte));
-        (length, 2 + count)
-    };
-    (
-        tag,
-        &input[header..header + length],
-        &input[header + length..],
-    )
-}
-
-fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
-    let mut encoded = vec![tag];
-    encoded.extend(der_length(contents.len()));
-    encoded.extend_from_slice(contents);
-    encoded
-}
-
-fn pem(label: &str, der: &[u8]) -> Vec<u8> {
-    let encoded = crate::cert_marker::base64_encode(der);
-    let mut text = format!("-----BEGIN {label}-----\n");
-    for line in encoded.as_bytes().chunks(64) {
-        text.push_str(std::str::from_utf8(line).expect("base64"));
-        text.push('\n');
-    }
-    let _ = writeln!(text, "-----END {label}-----");
-    text.into_bytes()
-}
-
-/// The private-key label `openssl ecparam -genkey -noout` writes. Built at
-/// run time because the publication hygiene gate refuses the literal header;
-/// no key is stored in the repository.
-fn sec1_label() -> String {
-    ["EC", "PRIVATE", "KEY"].join(" ")
-}
-
-/// A P-256 key in the SEC1 form `openssl ecparam -name prime256v1 -genkey
-/// -noout` writes (RFC 5915 `ECPrivateKey` with the curve in `[0]` and the
-/// public key in `[1]`), converted from a fresh PKCS #8 key.
-fn openssl_sec1_key(key: &KeyPair) -> Vec<u8> {
-    let pkcs8 = key.serialize_der();
-    let (_, info, _) = der_element(&pkcs8);
-    let (_, _, rest) = der_element(info); // version
-    let (_, _, rest) = der_element(rest); // algorithm
-    let (_, inner, _) = der_element(rest); // privateKey OCTET STRING
-    let (_, ec_private_key, _) = der_element(inner);
-    let (_, version, rest) = der_element(ec_private_key);
-    let (_, private, rest) = der_element(rest);
-    let (public_tag, public, _) = der_element(rest);
-    assert_eq!(public_tag, 0xa1, "ring writes the public key in [1]");
-    let prime256v1 = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
-    let mut body = der(0x02, version);
-    body.extend(der(0x04, private));
-    body.extend(der(0xa0, &prime256v1));
-    body.extend(der(0xa1, public));
-    pem(&sec1_label(), &der(0x30, &body))
-}
 
 /// The certificate profile `new-host-cert.sh` and the Linux Pier's
 /// `new-host-cert` issue through `openssl req -x509`.

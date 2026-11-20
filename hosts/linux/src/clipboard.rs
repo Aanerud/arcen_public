@@ -890,7 +890,7 @@ pub async fn connect_wayland_clipboard(
     session: &SessionMetadata,
     negotiation: ClipboardNegotiation,
 ) -> Result<WebSocketStream<ClipboardAgentIo>, String> {
-    use crate::session::wayland::{is_private_runtime_dir, socket_proof};
+    use crate::session::wayland::socket_proof;
     let ready = session
         .wayland
         .as_ref()
@@ -899,9 +899,7 @@ pub async fn connect_wayland_clipboard(
         .clipboard
         .as_ref()
         .ok_or_else(|| "the session agent proved no compositor clipboard".to_string())?;
-    if !ready.is_consistent()
-        || !is_private_runtime_dir(&ready.runtime_dir, session.uid, &session.session_id)
-    {
+    if !ready.serves_session(session.uid, &session.session_id) {
         return Err("clipboard socket is not in the session's runtime directory".to_string());
     }
     tokio::time::timeout(IPC_READY_TIMEOUT, async {

@@ -737,6 +737,7 @@ async fn serve(
                 x11,
             }),
             audio: Some(audio.ready()),
+            joined: None,
         };
         emit_ready(&ready)?;
         tracing::info!(
@@ -825,7 +826,7 @@ const CLIPBOARD_PROOF_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// its socket. `None` (logged once) when the compositor offers no usable
 /// clipboard: the session goes on, and the Pier advertises the clipboard
 /// disabled for it.
-async fn prove_clipboard(
+pub(super) async fn prove_clipboard(
     connection: &zbus::Connection,
     runtime_dir: &std::path::Path,
     uid: u32,

@@ -34,6 +34,7 @@ mod hid_host;
 mod hid_publish;
 mod host_pen;
 mod host_pen_bridge;
+pub mod joined_pen;
 mod kernel_package;
 mod ledger;
 mod native_component;
@@ -108,6 +109,7 @@ pub use host_pen_bridge::{
     HOST_PEN_BACKLOG, HOST_PEN_TOKENS, HostPenBridge, HostPenBridgeOutput, HostPenMode,
     HostPenNote, NoPenInterface, read_pen_mode,
 };
+pub use joined_pen::{JoinedPenRefusal, NativeTabletRoute, native_tablet_route};
 pub use kernel_package::{
     VhciHcdFacts, el_point_release, kernel_arch, kernel_modules_internal_command,
     kernel_modules_internal_package, missing_vhci_hcd_reason, os_release_is_rhel_family,

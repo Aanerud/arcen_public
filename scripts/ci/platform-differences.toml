@@ -155,10 +155,11 @@ decision = "AGENTS.md"
 id = "PD-010"
 area = "input injection"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
-difference = "How pointer, keyboard and pen input is injected."
-earned_by = "Linux: uinput devices, or libei (ei_stylus) where the Wayland compositor owns input. Windows: SendInput and Windows Ink synthetic pointers (CreateSyntheticPointerDevice, PT_PEN). macOS: CGEventPost and IOHIDUserDevice."
+difference = "How pointer, keyboard and pen input is injected. On a joined Linux console each uinput device is admitted only while the shared proof holds that it reaches the joined X server alone (arcen_input::joined_input: JoinedInputGuard, fail safe); Windows and macOS need no such proof."
+earned_by = "Linux: uinput devices, or libei (ei_stylus) where the Wayland compositor owns input; a uinput device is offered to every reader on its seat, and a joined console's X server is not one Arcen configures to ignore other sessions' devices. Windows: SendInput and Windows Ink synthetic pointers (CreateSyntheticPointerDevice, PT_PEN), delivered to the caller's own session. macOS: CGEventPost and IOHIDUserDevice."
 code = [
   { path = "hosts/linux/src/input/uinput.rs", symbol = "VirtualDeviceBuilder" },
+  { path = "hosts/linux/src/net/joined_input.rs", symbol = "JoinedInputGuard" },
   { path = "hosts/linux/src/input/eis.rs" },
   { path = "hosts/windows/src/input.rs", symbol = "CreateSyntheticPointerDevice" },
   { path = "hosts/macos/src/input/mod.rs", symbol = "CGEventPost" },
@@ -264,21 +265,27 @@ id = "PD-018"
 area = "file security"
 products = ["hosts/windows", "clients/macos", "clients/windows", "shared/deck-core", "shared/observability"]
 difference = "Private-file checks and creation modes."
-earned_by = "POSIX mode bits, owner and O_NOFOLLOW on Unix; security descriptors, owners and reparse points on Windows, where files inherit an ACL instead of taking a mode. A file without a name while open (a sealed support bundle's plaintext) is unlink-while-open on Unix and FILE_FLAG_DELETE_ON_CLOSE on Windows, which cannot unlink an open file; FILE_FLAG_OPEN_REPARSE_POINT opens a reparse point instead of following it."
+earned_by = "POSIX mode bits, owner and O_NOFOLLOW on Unix; security descriptors, owners and reparse points on Windows, where files inherit an ACL instead of taking a mode. A file without a name while open (a sealed support bundle's plaintext) is unlink-while-open on Unix and FILE_FLAG_DELETE_ON_CLOSE on Windows, which cannot unlink an open file; FILE_FLAG_OPEN_REPARSE_POINT opens a reparse point instead of following it. A support-bundle source path is walked folder by folder: on Unix with openat(O_NOFOLLOW) relative to the folder before (rustix), following only a link whose owner and folder (uid, mode bits) show nobody else could have made it, and opening the file O_NONBLOCK so a FIFO cannot block; Win32 has no open relative to a handle and no owner/mode facts for a reparse point, so every folder is opened by path with FILE_FLAG_OPEN_REPARSE_POINT, any reparse point is refused, and each handle's GetFinalPathNameByHandleW location must sit inside the one before. Identity is fstat device and inode on Unix; on Windows the 64-bit volume serial and 128-bit FILE_ID_128 from GetFileInformationByHandleEx(FileIdInfo) (the 64-bit index only where FileIdInfo is unsupported), with GetVolumeInformationByHandleW's FILE_SUPPORTS_OPEN_BY_FILE_ID and FileRemoteProtocolInfo saying whether the volume can prove it (std exposes none of these on stable). The decisions (link_is_trusted, check_source, verify_same_source) are shared."
 code = [
   { path = "clients/windows/src/platform/password_file.rs", symbol = "OWNER_SECURITY_INFORMATION" },
   { path = "hosts/windows/src/tls.rs", symbol = "FILE_ATTRIBUTE_REPARSE_POINT" },
   { path = "clients/macos/secure-dir/src/lib.rs" },
   { path = "shared/deck-core/src/config.rs", symbol = "PermissionsExt" },
   { path = "shared/observability/src/support_bundle.rs", symbol = "FILE_ATTRIBUTE_REPARSE_POINT" },
-  { path = "shared/observability/src/support_bundle.rs", symbol = "FILE_FLAG_OPEN_REPARSE_POINT" },
   { path = "shared/observability/src/support_bundle/seal.rs", symbol = "FILE_FLAG_DELETE_ON_CLOSE" },
+  { path = "shared/observability/src/support_bundle/native_identity/unix.rs", symbol = "NOFOLLOW" },
+  { path = "shared/observability/src/support_bundle/native_identity/windows.rs", symbol = "FILE_FLAG_OPEN_REPARSE_POINT" },
+  { path = "shared/observability/src/support_bundle/native_identity/windows.rs", symbol = "GetFinalPathNameByHandleW" },
+  { path = "shared/observability/src/support_bundle/native_identity/windows.rs", symbol = "FileIdInfo" },
+  { path = "shared/observability/src/support_bundle/native_identity/windows.rs", symbol = "FILE_SUPPORTS_OPEN_BY_FILE_ID" },
+  { path = "shared/observability/src/support_bundle/source.rs", symbol = "verify_same_source" },
+  { path = "shared/observability/src/support_bundle/source.rs", symbol = "link_is_trusted" },
 ]
 cfg_sites = [
   { path = "shared/deck-core/src/config.rs", function = "atomic_write_json_with_hook", count = 1 },
   { path = "shared/observability/src/support_bundle.rs", function = "create_private_new", count = 2 },
   { path = "shared/observability/src/support_bundle.rs", function = "is_unsafe_source", count = 1 },
-  { path = "shared/observability/src/support_bundle.rs", function = "open_without_following", count = 1 },
+  { path = "shared/observability/src/support_bundle/native_identity.rs", function = "<module>", count = 6 },
   { path = "shared/observability/src/support_bundle/seal.rs", function = "create_unnamed_private", count = 3 },
 ]
 
@@ -324,7 +331,7 @@ area = "Deck audio"
 products = ["clients/windows"]
 difference = "Playback adapts to the output device's mix format."
 earned_by = "WASAPI shared mode plays only the device mix format; the adaptation itself is the shared DeviceFormatAdapter."
-code = [{ path = "clients/windows/src/audio/output.rs", symbol = "DeviceFormatAdapter" }]
+code = [{ path = "clients/windows/src/audio/output.rs", symbol = "renderer(config.sample_rate.0, config.channels)" }]
 
 [[difference]]
 id = "PD-023"
@@ -504,6 +511,34 @@ code = [
 ]
 decision = "docs/architecture/pen-tablet-input.md"
 
+[[difference]]
+id = "PD-037"
+area = "TLS material"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "What asks a running Pier to reload its TLS material: SIGHUP on Linux (systemctl reload arcen-pier) and macOS (launchctl kill HUP system/pier.arcen.tech.service), service control 202 on Windows (sc.exe control ArcenPier 202). The reload, its checks and its events are shared (HostTlsMaterial::reload, status_events)."
+earned_by = "A Windows service receives no POSIX signals; the Service Control Manager delivers user-defined control codes (128-255) to its handler instead. systemd and launchd deliver signals."
+code = [
+  { path = "hosts/linux/src/service_signals.rs", symbol = "hangup" },
+  { path = "hosts/macos/src/tls_material.rs", symbol = "hangup" },
+  { path = "hosts/windows/src/service.rs", symbol = "SERVICE_CONTROL_RELOAD_TLS" },
+  { path = "shared/transport/src/host_material.rs", symbol = "fn reload" },
+]
+
+[[difference]]
+id = "PD-038"
+area = "Native tablet route"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "How a Pier brings a Deck's bridged tablet into the desktop. The route decision, the pen readers, the attachment, what a read pen claims and the Deck's wording are shared (arcen_usb_bridge::joined_pen::native_tablet_route, host_pen_bridge, arcen_input::bridged_pen). Linux publishes the tablet to its kernel through vhci-hcd for a dedicated Xorg desktop or a desktop on its own Arcen seat (the host driver route), and on a joined console reads the pen itself and posts it through its typed uinput pen (HidPublishPolicy::Nothing) once that device is proved to reach the joined X server alone. Windows always reads the pen itself (HidPublishPolicy::Nothing, Windows Ink). macOS reads the pen itself and publishes only pen and vendor interfaces (HidPublishPolicy::PenAndVendorOnly)."
+earned_by = "Linux has an in-tree virtual USB host controller (vhci-hcd) and per-device udev/Xorg routing, but a joined console's X server is not one Arcen starts, so a raw bridged device cannot be confined to it (it ignores the arcen_bridge tag and has no per-desktop class); its typed uinput device is offered to every reader on seat0, so its readers are proved from /proc and logind's seat record. Windows has no virtual USB host controller or HID device without a kernel driver (ADR 0017). An IOHIDUserDevice on macOS is system-wide (ADR 0022)."
+code = [
+  { path = "hosts/linux/src/net/joined_pen.rs", symbol = "HidPublishPolicy::Nothing" },
+  { path = "hosts/linux/src/input/joined_devices.rs", symbol = "listening_x_sockets" },
+  { path = "hosts/linux/src/usb_bridge/mod.rs", symbol = "attach_x11_desktop" },
+  { path = "hosts/windows/src/session.rs", symbol = "NATIVE_TABLET_POLICY" },
+  { path = "hosts/macos/src/bridged_tablet.rs", symbol = "PUBLISH_POLICY" },
+]
+decision = "docs/architecture/pen-tablet-input.md"
+
 # --- Open gaps (unearned) -------------------------------------------------------
 
 [[gap]]
@@ -630,15 +665,6 @@ owner = "Windows Client"
 code = [{ path = "clients/macos/src/ui/connection_test.rs", symbol = "ConnectionTest" }]
 
 [[gap]]
-id = "GAP-026"
-area = "Deck audio"
-products = ["clients/macos"]
-difference = "The macOS Deck plays 48 kHz stereo on the device it opened and does not follow default-device changes; the Windows Deck follows them."
-why_open = "Both use cpal and Core Audio changes its default device too; the format adaptation alone is earned (PD-022)."
-owner = "macOS Client"
-code = [{ path = "clients/macos/src/pipeline/audio.rs" }, { path = "clients/windows/src/audio/output.rs" }]
-
-[[gap]]
 id = "GAP-027"
 area = "Deck present"
 products = ["clients/macos", "clients/windows"]
@@ -646,6 +672,18 @@ difference = "Video fit rounding: the macOS Deck snaps to physical pixels, the W
 why_open = "Two local policies for pointer-accurate letterboxing."
 owner = "Shared/Architecture"
 code = [{ path = "clients/macos/src/ui/app.rs" }, { path = "clients/windows/src/present/composition.rs" }]
+
+[[gap]]
+id = "GAP-055"
+area = "audio"
+products = ["hosts/windows"]
+difference = "The Windows Pier brings its WASAPI mix rate to 48 kHz with its own linear interpolator (StereoConverter); the macOS Pier resamples its capture clock with the shared arcen_media::audio::resample::PcmResampler."
+why_open = "Not an OS limit: rate conversion is portable. Measured: linear interpolation leaves the 17 kHz image of a 7 kHz tone at 24 kHz 14 dB down and passes a 30 kHz tone at 96 kHz through as an 18 kHz alias at full level; the shared windowed-sinc resampler keeps both below -84 dB. Moving needs a Windows build and qualification."
+owner = "Windows Host"
+code = [
+  { path = "hosts/windows/src/audio.rs", symbol = "StereoConverter" },
+  { path = "shared/media/src/audio/resample.rs", symbol = "PcmResampler" },
+]
 
 [[gap]]
 id = "GAP-054"
@@ -695,44 +733,6 @@ code = [{ path = "packaging/windows/pier.json", symbol = "rotate_mb" }]
 config = ["hosts/linux:platform.logging.*", "hosts/windows:platform.logging.*"]
 
 [[gap]]
-id = "GAP-037"
-area = "file security"
-products = ["clients/windows", "hosts/windows", "shared/observability"]
-difference = "The support-bundle collector checks that a source file did not change between inspection and open only on Unix (device and inode)."
-why_open = "Windows has file identities (GetFileInformationByHandle volume serial and file index); std does not expose them on stable, so the check needs a Windows adaptor."
-owner = "Shared/Architecture"
-code = [{ path = "shared/observability/src/support_bundle.rs", symbol = "Replaced" }]
-cfg_sites = [
-  { path = "shared/observability/src/support_bundle.rs", function = "open_source", count = 1 },
-]
-
-[[gap]]
-id = "GAP-038"
-area = "TLS material"
-products = ["hosts/linux", "hosts/windows", "hosts/macos", "packaging"]
-difference = "Certificates are issued three ways: the openssl CLI (Linux Pier new-host-cert, Linux installer, new-host-cert.sh; SEC1 keys, CN \"Arcen Pier\", CA:FALSE, digitalSignature), rcgen in the macOS Pier (no key usage, no backdate) and rcgen in the Windows installer (digitalSignature, five-minute backdate); the journalled publish and recovery is written twice (macOS Pier, Linux installer)."
-why_open = "Portable: the decision, file names, inspection and pin files are already shared (cert_provisioning, cert_store). One shared issuer needs to renew over the SEC1 keys deployed Linux Piers hold, which rcgen with ring cannot read; a SEC1-to-PKCS #8 wrap (tested in host_material) is the route."
-owner = "Shared/Architecture"
-code = [
-  { path = "hosts/linux/src/host_cert.rs", symbol = "ecparam" },
-  { path = "hosts/macos/src/host_cert.rs", symbol = "self_signed" },
-  { path = "packaging/windows/installer/src/main.rs", symbol = "certificate_params" },
-  { path = "packaging/linux/installer/src/main.rs", symbol = "recover_interrupted" },
-]
-
-[[gap]]
-id = "GAP-039"
-area = "TLS material"
-products = ["hosts/macos"]
-difference = "The macOS Pier reads its TLS material once at start: no reload and no certificate lifecycle events (active, expiring, expired, reloaded); Linux reloads on SIGHUP and Windows on its reload request, both emitting the shared events."
-why_open = "Not implemented yet; HostTlsMaterial::reload and startup_event/status_events are shared and need only a trigger and an emitter."
-owner = "macOS Host"
-code = [
-  { path = "hosts/macos/src/tls_material.rs", symbol = "HostTlsMaterial::load" },
-  { path = "shared/transport/src/host_material.rs", symbol = "fn reload" },
-]
-
-[[gap]]
 id = "GAP-040"
 area = "support bundle"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
@@ -780,10 +780,14 @@ code = [
 id = "GAP-042"
 area = "session model"
 products = ["hosts/linux"]
-difference = "The Linux Pier joins X11 console sessions only; a GNOME Wayland console session or login screen is refused `console_wayland_session` (ADR 0025 section 9)."
-why_open = "Not implemented yet. Upstream has the route (Mutter ScreenCast and RemoteDesktop on the user's session bus, as GNOME Remote Desktop's desktop sharing uses; the greeter hook exists in GNOME Shell 40 and 49); Arcen's side (session-bus discovery, RecordMonitor capture of physical monitors, input through the session's RemoteDesktop session, the lock screen) is work package console-wayland."
+difference = "The Linux Pier joins the account's own GNOME Wayland console session (shared `console_session::wayland_join` and `wayland_attach`, Linux `session/wayland/join.rs`): its compositor proven, its own monitors recorded as they run, input and clipboard through its own RemoteDesktop session, served only when capture, input and lock are proved, locked when the Deck leaves. Unlike an X11 console it is not held for a resume (GNOME closes sharing on lock), a session shown on a monitor at the desk is refused while desk privacy is on (`desk_privacy`: a Wayland desk cannot be blanked without changing the compositor), and a Wayland login screen is still refused `console_wayland_session` (ADR 0025 section 9)."
+why_open = "Not implemented yet. Done: S4a (the target and ownership contract), S4c-2 (no desktop beside an account's session), S4b (the join, proved on a task-owned GNOME 49 session without a display connector). Missing: desk privacy for physical monitors without changing the compositor; a remote-first sign-in through a Wayland login screen (GDM 47 has no third-party route; GDM 50 adds CreateUserDisplay); the resume hold across a lock; S4c, persistent per-user Wayland sessions; and native proof on a host with a display connector and GDM's login screen."
 owner = "Linux Host"
-code = [{ path = "shared/session/src/console_session/mod.rs", symbol = "WaylandSession" }]
+code = [
+  { path = "shared/session/src/console_session/wayland_attach.rs", symbol = "desk_privacy" },
+  { path = "shared/session/src/console_session/wayland_attach.rs", symbol = "AFTER_DECK_LEFT" },
+  { path = "hosts/linux/src/session/wayland/join.rs", symbol = "JoinedSession" },
+]
 
 [[gap]]
 id = "GAP-043"
@@ -824,6 +828,12 @@ status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos"
 id = "shared_tls_material"
 description = "Loads TLS material through arcen_transport::host_material"
 proof = 'host_material::'
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
+
+[[capability]]
+id = "tls_material_reload"
+description = "Reloads TLS material while serving, keeping the last good material on a refused replacement, and emits the shared certificate lifecycle events (active, expiring, reloaded, reload failed, expired)"
+proof = 'material\.reload\('
 status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
 
 [[capability]]
@@ -892,6 +902,12 @@ status = { "clients/macos" = "present", "clients/windows" = "present" }
 id = "deck_follow_login_window"
 description = "Follows the host's sign-in screen into its desktop"
 proof = 'HandoverSchedule'
+status = { "clients/macos" = "present", "clients/windows" = "present" }
+
+[[capability]]
+id = "deck_audio_follows_default_output"
+description = "Host audio follows the system's default output device (shared lifecycle, GAP-026 closed)"
+proof = 'FollowedOutput<'
 status = { "clients/macos" = "present", "clients/windows" = "present" }
 
 [[capability]]
@@ -975,8 +991,7 @@ id = "local-tls-material"
 pattern = '\bfn\s+(?:parse_material|load_validated|certificate_fields|emit_reload_failed|build_quic_server_config|marker_matches|legacy_arcen_evidence|write_pins)\b|\bstruct\s+(?:TlsFileSource|FileSnapshot|TlsPaths)\b|\benum\s+TlsLoadError\b|"sha256 Fingerprint='
 paths = ["hosts", "packaging"]
 shared = "arcen_transport::{host_material, cert_store, quic::pier_server_config}"
-gap = "GAP-038"
-known = ["packaging/linux/installer/src/main.rs"]
+known = []
 
 [[local_copy]]
 id = "local-annexb-scan"

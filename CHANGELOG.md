@@ -6,6 +6,216 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.5] — 2026-11-20
+
+A Linux Pier joins your own GNOME Wayland session and keeps a joined
+desktop's keyboard, pointer and pen to that desktop; Native tablet works on
+joined Xorg desktops; a Windows Deck inside a Windows Pier's session no
+longer makes that Pier end the session; a macOS Pier keeps host audio at the
+right speed on any output rate; the Mac Deck's audio follows the default
+output; certificate renewal is one journalled transaction on every Pier; and
+Canvas no longer restarts near a screen edge. 0.20.5 speaks protocol v5 and
+works with every 0.17.0 to 0.20.4 Deck and Pier.
+
+### Fixed
+
+- Canvas screen updates no longer restart every minute or so while text
+  scrolls near the bottom or right edge of a screen whose size is not a
+  multiple of 16 pixels, such as 1920 × 1080. A moving picture region
+  that started against that edge was moved off it with a size only valid
+  there; the Pier refused its own update and sent the whole screen again
+  (2 to 4 times in 150 seconds on an X11 Pier). Such a region now stays
+  against the edge or reopens on the block grid. Pictures stay exact.
+- Replacing a Pier certificate can no longer leave a mismatched certificate
+  and key behind. On Linux (`arcen-pier new-host-cert` and
+  `arcen-new-host-cert`) and in the Windows installer, a run that is
+  interrupted part-way is now finished or undone by the next run, so the Pier
+  always has the whole old pair or the whole new one, as the Linux installer
+  and the Mac already did. A second run while one is busy stops with "another
+  host-certificate transaction is active" and changes nothing. Renewing never
+  rewrites the key, so paired Decks keep trusting the host.
+- The Windows installer (and `new-host-cert.ps1`) no longer lets another
+  account on the machine get at the Pier's private key while it is written.
+  It refuses a TLS or Arcen folder that is a junction or link, or that
+  belongs to an account other than SYSTEM or Administrators (delete it and
+  run again), creates its folders and the new key already readable only by
+  SYSTEM and Administrators, and sets permissions on the folder itself
+  rather than on wherever a link points.
+- A Linux Pier joined to the desktop on a workstation's own monitors now
+  types, points and draws into that desktop only. Its virtual keyboard,
+  mouse and pen are offered to every display server on the machine, so a
+  login screen or another account's desktop could also have read them. Each
+  is now used only while the Pier proves that the joined desktop's display
+  server is the only one reading it, checked every two seconds and whenever
+  another session comes to the front. If the check fails, input stops at once
+  and nothing is sent elsewhere. When it passes again within five seconds,
+  held keys and buttons are let go and input resumes; otherwise the Deck is
+  disconnected with the reason and the workstation is locked as on any
+  disconnect. A pen that fails the check stops for the rest of the
+  connection, and the Deck is told it now works as a mouse. Ctrl+Alt+F1 to
+  F12 from the Deck no longer switch the workstation to another session.
+  System services that read every input device, such as `acpid`, `thd`,
+  `gpm` or `brltty`, do not count against the check and are logged. Another
+  login session, a login screen, another display server, another account's
+  program or an input remapper that resends to every session (`keyd`,
+  `input-remapper`) does, and the Deck's reason names the program, its
+  process and what the administrator should do. Proven with the Pier's own
+  virtual devices on a lab workstation; not yet tested with a physical
+  tablet.
+- A Linux Pier on a host without a display manager no longer starts a new
+  login session when it cannot read who is signed in. If `loginctl` fails,
+  times out or gives an incomplete answer, the sign-in is now refused with
+  `console_sessions_unreadable` instead of being treated as "nobody is
+  signed in", so an account that already has a session never gets a second
+  one. Sign in again once logind answers.
+- A Linux Pier no longer ends a Deck's attachment to the user's own
+  workstation session when a single check with logind fails or is slow.
+  It ends the attachment only when the session is really gone, for example
+  after the user logs out. If logind stops answering for about 10 to 25
+  seconds, the Pier ends the attachment and hands the workstation back
+  locked, as when the Deck disconnects. If it cannot be locked yet, its
+  screens stay blank and its keyboard and mouse disabled until logind
+  answers again. The user's session keeps running.
+- A Linux Pier that creates its own Wayland desktops (a host without an
+  Xorg server) no longer creates one for an account that already has a
+  session at the workstation. If your own GNOME Wayland session is there,
+  Arcen joins it (see Added); if it is an X11 session, the sign-in is
+  refused with `console_session_unreachable`;
+  and if the Pier cannot read who is signed in, with
+  `console_sessions_unreadable`. An account with no session at the
+  workstation still gets its desktop as before.
+- A macOS Pier now picks up a renewed or replaced certificate without a
+  restart: send it `SIGHUP` (`sudo launchctl kill HUP
+  system/pier.arcen.tech.service`). A replacement that is malformed, expired,
+  half-written or does not match its key is refused, and the Pier keeps
+  serving the certificate it had. The Pier also reports its certificate as
+  active, expiring, reloaded, refused or expired, as the Linux and Windows
+  Piers do.
+- A macOS Pier no longer sends host audio at the wrong speed when the Mac's
+  output device runs at another rate than 48 kHz, for example Bluetooth
+  headphones in call mode (16 or 24 kHz). Capture runs on the output
+  device's clock, not the 48 kHz the audio tap reports, so 24 kHz sound
+  reached the Deck at twice the speed with half of it missing. The Pier now
+  reads that clock and converts it to 48 kHz (next entry).
+- A macOS Pier keeps host audio on an output device running at any rate
+  from 8 to 384 kHz (Bluetooth headphones in call mode, a 44.1 kHz DAC), and
+  follows the device when it changes rate during a session, as a headset
+  does when an app opens its microphone, without losing audio at the
+  change. The conversion is a new shared windowed-sinc resampler in
+  `arcen-media`; it adds 32 frames of the device's rate when upsampling
+  (1.3 ms at 24 kHz, 4 ms at 8 kHz) and 0.7 ms when downsampling, and
+  nothing at 48 kHz. Outside that range the session carries on without host
+  audio and says why. `probe-audio` reports the clock it captured from
+  (`clock_rate_hz`). The Windows Pier still uses its own resampler; it moves
+  to the shared one in a later release.
+- Renewing a Pier certificate keeps every name the old one covered. A renewal
+  on a Mac, by the Windows installer or with the Linux Pier's
+  `new-host-cert` used to drop any address or name it was not given again,
+  so a Deck that connected by that address stopped connecting.
+- Renewing over a key written by `openssl` (the format every Linux Pier and
+  most operator tooling use) now works on a Mac and in the Windows
+  installer. The key file is left exactly as it was, so paired Decks keep
+  trusting the host.
+- Certificates made on a Mac or by the Windows installer now match the ones
+  Linux makes (`CN=Arcen Pier`, not a CA, signing only, valid from five
+  minutes before issue), and each renewal gets its own serial number instead
+  of repeating the last one.
+- An interrupted certificate replacement on a Mac is put back together at
+  the next run: the Pier ends up with the old certificate or the new one,
+  never half of each.
+- Two certificate runs on a Mac at the same time no longer interfere: the
+  second one stops with "another host-certificate transaction is active" and
+  changes nothing, as on Linux.
+- A support bundle on a Windows Pier or Deck now refuses a source file that
+  was replaced between being checked and being opened, as on Linux and
+  macOS. The file opened must be the one checked (same volume and file
+  number, read from the open file itself); otherwise the bundle's manifest
+  records it as changed during read and leaves it out.
+- Support bundles on every Pier and Deck now read a source only through
+  folders that are really where its path says. A folder link someone else
+  could have planted, or any Windows junction or folder reparse point, is
+  refused (`source_path_linked`); a link the system or the collecting
+  account made in a folder only it can write (macOS `/var`) is still
+  followed. A FIFO put where a source was no longer hangs the bundle; it is
+  refused at once as an unsafe file type. A source with a second name (a
+  hard link) is refused (`source_hard_linked`). On Windows a source is
+  identified by its 128-bit file ID, so ReFS files whose 64-bit indexes
+  collide are told apart (a volume with only 64-bit indexes is noted as
+  `source_identity_index_only`), and a source on a network or other volume
+  that cannot prove which file was opened is refused as
+  `source_identity_unverifiable` instead of being reported as changed.
+- **macOS Deck: host audio now follows your Mac's sound output** (GAP-026
+  closed). Picking another output, unplugging headphones or a USB device, or
+  a failed audio stream used to leave the sound on the old device, or
+  silent, until you reconnected. The Deck now moves to the new default
+  output by itself (it checks twice a second), waits progressively longer
+  between attempts when a device keeps failing, never plays on two devices
+  at once, and never starts playing again after you disconnect. The Windows
+  Deck follows its default device the same way, now through the same shared
+  code. Stream Statistics shows when audio output is rebuilding and why.
+  Proven by switching the default output; physically unplugging and
+  replugging headphones or a USB device is not yet qualified.
+- A Windows Deck running inside a Windows Pier's session no longer makes
+  that Pier end and lock the session a second or two after the Deck's
+  window comes to the front (for example when it goes fullscreen). The
+  Deck registered for raw keyboard input, which makes Windows skip every
+  low-level keyboard hook while the Deck's window is in front: the Pier's
+  desk-privacy check then failed, so the Pier, correctly, ended the session.
+  The same rule had switched off the Deck's own keyboard hook while its
+  window was in front, so the Windows key, Alt+Tab and Print Screen stayed
+  on the Deck's PC; they now go to the host again. A shortcut that another
+  program's keyboard hook on the Deck's PC blocks (a Windows Pier's desk
+  privacy, a kiosk lock, a hotkey tool) is no longer sent to the host:
+  the Deck is never a way around such a hook. Proven with injected keys;
+  not yet typed on a physical keyboard.
+
+### Added
+
+- A Linux Pier now joins your own GNOME session on Wayland at the
+  workstation instead of refusing it: your own monitors and applications,
+  nothing of the session changed. A locked session is unlocked once your
+  password is accepted, and the session is locked again when the Deck
+  leaves; it is never ended. A Deck that disconnects signs in again rather
+  than resuming. While desk privacy is on, a session shown on a monitor at
+  the desk is still refused (`console_privacy_unavailable`), because a
+  Wayland desk cannot be blanked; a Wayland login screen with nobody signed
+  in is still refused (`console_wayland_session`). Proven on a lab
+  workstation without monitors or a login screen; not yet proven natively
+  with the GDM login screen, a remote-first sign-in, a physical monitor
+  plugged in during a session, or alongside the console (Xorg) mode.
+- Native tablet now works on a Linux desktop Arcen joins (the account's own
+  Xorg session at the workstation, or another remote-desktop product's).
+  The Pier reads the pen from the tablet itself and brings it in through its
+  own pen device, which it first proves only that desktop's display server
+  reads; no USB device is published on the host. The Deck is told exactly
+  what reaches the desktop (pressure, tilt, eraser, hover, barrel buttons as
+  the tablet reports them; never pad buttons or touch), and when the route
+  is refused it says why and the pen stays a mouse. The raw USB bridge stays
+  refused on such desktops. Not yet tested with a physical tablet.
+
+### Changed
+
+- The certificate helpers no longer have their own copies.
+  `arcen-new-host-cert` now runs `arcen-pier new-host-cert` and needs neither
+  OpenSSL nor `flock`. On Windows, `new-host-cert.ps1` now runs the new
+  `install-arcen-pier.exe --tls-only`, which also takes `--renew`. Every
+  certificate they make is the one the installers make (`CN=Arcen Pier`,
+  valid from five minutes before issue), and a new Linux key is PKCS #8.
+  Without `--directory`, `arcen-new-host-cert` now uses the Pier's
+  `/etc/arcen`, or `ARCEN_TLS_DIRECTORY`, instead of `/etc/arcen/tls`. On
+  Windows, the shared `host.cert-sha256`, `host.spki-sha256` and
+  `host.generated-by-arcen` replace the earlier helper's `.txt` files, which
+  are removed. `install-arcen-pier.exe --tls-only` restricts only the `tls`
+  directory it is given, not the folder above it, unless that is
+  `%ProgramData%\Arcen`. The helper no longer looks for the installer in a
+  folder relative to itself; name a build elsewhere with `-Installer`. If
+  an earlier `new-host-cert.ps1` run was interrupted, the installer now
+  stops with a message instead of making a new key.
+- A Linux Pier now identifies the account's own GNOME Wayland session at the
+  workstation and checks, read-only, that its compositor belongs to that
+  session and account; the Pier's log names the session and the result of
+  the check (GAP-042).
+
 ## [0.20.4] — 2026-11-20
 
 One keyboard switch on both Decks, with a chord you can choose; slow, fine
@@ -3983,7 +4193,8 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.4...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.5...HEAD
+[0.20.5]: https://github.com/Aanerud/arcen_public/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/Aanerud/arcen_public/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/Aanerud/arcen_public/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/Aanerud/arcen_public/compare/v0.20.1...v0.20.2

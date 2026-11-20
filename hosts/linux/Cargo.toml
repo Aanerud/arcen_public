@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-pier-linux"
-version = "0.20.4"
+version = "0.20.5"
 edition = "2021"
 description = "Arcen Pier (Linux) — native Rust QUIC control plane, PAM auth, session/display management, and capenc supervision."
 publish.workspace = true
@@ -83,7 +83,8 @@ arcen-session.workspace = true
 arcen-telemetry.workspace = true
 arcen-observability = { workspace = true, features = ["support-bundle"] }
 arcen-outputs.workspace = true
-arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
+# `issuer`: the shared certificate issuer behind `new-host-cert`.
+arcen-transport = { workspace = true, default-features = false, features = ["issuer", "quic"] }
 arcen-usb-bridge.workspace = true
 bytes.workspace = true
 quinn.workspace = true

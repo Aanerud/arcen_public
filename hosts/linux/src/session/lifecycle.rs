@@ -158,6 +158,58 @@ fn reconnect_must_replace_desktop(topology_matches: bool) -> bool {
     !topology_matches
 }
 
+/// Before a Wayland-creating launcher creates a desktop: the refusal, or
+/// `None` to go on, having switched `pending` to join the account's own
+/// proven Wayland session when it holds one (S4b).
+async fn before_creating(
+    pending: &mut AuthenticatedLauncher,
+) -> Option<arcen_session::console_session::ConsoleNotice> {
+    use super::console_wayland::BeforeCreatingOutcome;
+    match super::console_wayland::before_creating(pending.identity.uid, pending.identity.gid).await
+    {
+        BeforeCreatingOutcome::Create => None,
+        BeforeCreatingOutcome::JoinConsole => {
+            pending.join_wayland_console();
+            None
+        }
+        BeforeCreatingOutcome::Refuse(notice) => Some(notice),
+    }
+}
+
+/// The console pre-check's answer for the account's own identified Wayland
+/// session: none when the shared decision joins it (locked or not), so
+/// the console launcher reaches its join (S4b, `run_wayland_join`); the
+/// refusal when it is refused or this Pier has no adapter.
+fn wayland_console_refusal(
+    join: &arcen_session::console_session::wayland_join::WaylandJoin,
+) -> Option<arcen_session::console_session::ConsoleRefusal> {
+    join.refusal()
+}
+
+/// What a reconnect does with the account's own desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaceStep {
+    /// The desktop serves the requested layout: reattach it.
+    Reattach,
+    /// Tear it down and create one for the requested layout.
+    Replace,
+    /// Replacing it would create a desktop, which is refused (ADR 0025,
+    /// `wayland_join::creating_step`): the desktop the account
+    /// already has is kept, never torn down for nothing, and the sign-in
+    /// is refused.
+    KeepAndRefuse,
+}
+
+fn reconnect_replacement(topology_matches: bool, creation_refused: bool) -> ReplaceStep {
+    if !reconnect_must_replace_desktop(topology_matches) {
+        ReplaceStep::Reattach
+    } else if creation_refused {
+        ReplaceStep::KeepAndRefuse
+    } else {
+        ReplaceStep::Replace
+    }
+}
+
 /// Whether a disconnected persistent desktop has exceeded the operator
 /// configured idle lifetime and should be torn down before serving a new
 /// connection.
@@ -399,14 +451,25 @@ impl SessionRegistry {
         // too: while the Deck was away another account may have taken the
         // workstation (ADR 0025).
         if pending.joins_console() {
+            use arcen_session::console_session::{decide_on_read, ConsoleDecision};
+            // An unreadable logind refuses here: it never reads as "nobody
+            // is signed in", which would let the launcher start a second
+            // login session for an account that may hold one.
             let sessions = super::console::read_sessions().await;
-            if let arcen_session::console_session::ConsoleDecision::Refuse(refusal) =
-                arcen_session::console_session::decide_on(
-                    &sessions,
-                    pending.identity.uid,
-                    super::login_session::console_host(),
-                )
-            {
+            let refusal = match decide_on_read(
+                &sessions,
+                pending.identity.uid,
+                super::login_session::console_host(),
+            ) {
+                ConsoleDecision::Refuse(refusal) => Some(refusal),
+                ConsoleDecision::JoinWayland(target) => wayland_console_refusal(
+                    &super::console_wayland::identify(&target, pending.identity.gid).await,
+                ),
+                ConsoleDecision::Attach { .. }
+                | ConsoleDecision::SignInThroughGreeter { .. }
+                | ConsoleDecision::StartLoginSession { .. } => None,
+            };
+            if let Some(refusal) = refusal {
                 tracing::warn!(
                     target: crate::logging::target::SESSION,
                     username = %pending.identity.username,
@@ -418,6 +481,28 @@ impl SessionRegistry {
                 )));
             }
         }
+        // A Pier that creates its own Wayland desktops never builds one for
+        // an account that holds a session at the workstation, nor when
+        // logind cannot say whether it does (ADR 0025). Asked before any
+        // desktop is torn down for a replacement; a reconnect to the
+        // account's own Arcen desktop creates nothing and is not refused.
+        // The account's own proven Wayland session is joined instead (S4b).
+        let creation_refusal = if pending.creates_wayland_desktop() {
+            before_creating(&mut pending).await
+        } else {
+            None
+        };
+        // A sign-in switched to join the account's Wayland session creates
+        // no desktop: a replacement would tear the account's Arcen desktop
+        // down for nothing, so it is kept and the sign-in refused.
+        let replacement_refusal = creation_refusal.clone().or_else(|| {
+            pending
+                .joins_wayland_console()
+                .then(|| arcen_session::console_session::ConsoleRefusal::SessionChanged.into())
+        });
+        // A teardown or a wait before the creation: the answer is asked
+        // again just before the desktop is created.
+        let mut waited = false;
         let mut pending = Some(pending);
         loop {
             let decision = {
@@ -514,6 +599,7 @@ impl SessionRegistry {
                                         existing.multi_monitor_ever_usable =
                                             MultiMonitorEverUsable::new();
                                     }
+                                    let previous_outputs = existing.requested_outputs.clone();
                                     if existing.launcher.wayland.is_some() {
                                         existing.requested_outputs = pending
                                             .as_ref()
@@ -524,8 +610,22 @@ impl SessionRegistry {
                                     // authoritative. A disconnected desktop
                                     // with a different frozen topology is
                                     // replaced rather than silently reattached.
-                                    if reconnect_must_replace_desktop(topology_matches || in_place)
-                                    {
+                                    let step = reconnect_replacement(
+                                        topology_matches || in_place,
+                                        replacement_refusal.is_some(),
+                                    );
+                                    if step == ReplaceStep::KeepAndRefuse {
+                                        existing.requested_outputs = previous_outputs;
+                                        tracing::warn!(
+                                            target: crate::logging::target::SESSION,
+                                            username = %existing.launcher.identity.username,
+                                            reason_class = replacement_refusal
+                                                .as_ref()
+                                                .map_or("", |notice| notice.token()),
+                                            "the account's desktop cannot serve the requested layout, and a new one may not be created; the desktop is kept and the sign-in refused"
+                                        );
+                                        ExistingDecision::Busy(replacement_refusal.clone())
+                                    } else if step == ReplaceStep::Replace {
                                         guard.draining = true;
                                         ExistingDecision::Replace(Box::new(
                                             guard.session.take().expect("existing session"),
@@ -583,6 +683,7 @@ impl SessionRegistry {
 
             match decision {
                 ExistingDecision::Dead(session) => {
+                    waited = true;
                     tracing::warn!(
                         target: crate::logging::target::SESSION,
                         username = %session.launcher.identity.username,
@@ -594,6 +695,7 @@ impl SessionRegistry {
                     wait_for_cleanup_completion(completion).await;
                 }
                 ExistingDecision::Replace(session) => {
+                    waited = true;
                     tracing::warn!(
                         target: crate::logging::target::SESSION,
                         username = %session.launcher.identity.username,
@@ -605,6 +707,7 @@ impl SessionRegistry {
                     wait_for_cleanup_completion(completion).await;
                 }
                 ExistingDecision::IdleExpired(session, disconnected_for, configured_limit) => {
+                    waited = true;
                     tracing::info!(
                         target: crate::logging::target::SESSION,
                         username = %session.launcher.identity.username,
@@ -618,6 +721,7 @@ impl SessionRegistry {
                     wait_for_cleanup_completion(completion).await;
                 }
                 ExistingDecision::Draining => {
+                    waited = true;
                     self.wait_for_cleanup().await;
                 }
                 ExistingDecision::Reconnect(reconnect) => {
@@ -669,6 +773,17 @@ impl SessionRegistry {
         }
 
         let mut pending = pending.take().expect("pending launcher");
+        if pending.creates_wayland_desktop() {
+            let refusal = if waited {
+                before_creating(&mut pending).await
+            } else {
+                creation_refusal
+            };
+            if let Some(notice) = refusal {
+                pending.discard().await;
+                return Err(LifecycleError::Launcher(LauncherError::Console(notice)));
+            }
+        }
         // A joined console session keeps the user's own time zone.
         let mut timezone = if pending.joins_console() {
             None
@@ -1525,6 +1640,43 @@ impl Drop for SessionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_console_pier_lets_a_joinable_wayland_session_through_to_the_join() {
+        use arcen_session::console_session::wayland_join::{CompositorProof, WaylandJoin};
+        use arcen_session::console_session::ConsoleRefusal;
+        // A Pier with the adapter: the console launcher's JoinWayland arm
+        // joins the session, locked or not; the pre-check refuses nothing.
+        let join = WaylandJoin::Join {
+            session: "19662".into(),
+            activate: false,
+            compositor: 1350556,
+        };
+        assert_eq!(wayland_console_refusal(&join), None);
+        let locked = WaylandJoin::HandleLock {
+            session: "19662".into(),
+            activate: true,
+            compositor: 1350556,
+        };
+        assert_eq!(wayland_console_refusal(&locked), None);
+        // Without the adapter, or with the session refused, it still refuses.
+        let unavailable = WaylandJoin::AdapterUnavailable {
+            session: "19662".into(),
+            proof: CompositorProof::Verified { pid: 1350556 },
+            locked: false,
+        };
+        assert_eq!(
+            wayland_console_refusal(&unavailable),
+            Some(WaylandJoin::REFUSAL_WITHOUT_ADAPTER)
+        );
+        assert_eq!(
+            wayland_console_refusal(&WaylandJoin::Refuse {
+                refusal: ConsoleRefusal::SessionUnreachable,
+                proof: CompositorProof::Verified { pid: 1350556 },
+            }),
+            Some(ConsoleRefusal::SessionUnreachable)
+        );
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A desktop's committed topology is frozen for its lifetime, so a
@@ -1542,6 +1694,17 @@ mod tests {
 
         // Exact topology matches always reattach, regardless of permission.
         assert!(!reconnect_must_replace_desktop(true));
+    }
+
+    #[test]
+    fn a_refused_creation_keeps_the_desktop_a_replacement_would_tear_down() {
+        assert_eq!(reconnect_replacement(true, false), ReplaceStep::Reattach);
+        assert_eq!(reconnect_replacement(true, true), ReplaceStep::Reattach);
+        assert_eq!(reconnect_replacement(false, false), ReplaceStep::Replace);
+        assert_eq!(
+            reconnect_replacement(false, true),
+            ReplaceStep::KeepAndRefuse
+        );
     }
 
     /// A disconnected desktop's idle-lifetime policy is opt-in hygiene, not

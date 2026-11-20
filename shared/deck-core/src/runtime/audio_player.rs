@@ -33,27 +33,16 @@ pub const INTERLEAVED_FRAME_SAMPLES: usize = 1_920;
 const PCM_FRAME_BYTES: usize = INTERLEAVED_FRAME_SAMPLES * BYTES_PER_SAMPLE;
 const DECODER_FAILURE_THRESHOLD: u8 = 3;
 
-/// The playback queue's state, for the stream statistics.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PlaybackSnapshot {
-    /// Audio waiting to play.
-    pub queued_ms: usize,
-    /// Times the queue ran dry while playing.
-    pub underruns: u64,
-    /// Latency trims.
-    pub trim_events: u64,
-    /// Samples removed by those trims.
-    pub trimmed_samples: u64,
-    /// Building the reserve before playing.
-    pub prebuffering: bool,
-    /// Rebuilding the reserve after an underrun.
-    pub recovering: bool,
-}
+/// The playback queue's state, for the stream statistics (the shared
+/// queue's own reading).
+pub use arcen_media::audio::playback_queue::PlaybackSnapshot;
 
 /// The platform's audio output: the default output device at 48 kHz
 /// stereo, playing from its own playback queue (interleaved signed 16-bit
 /// samples in, the device's format out). Opened on the audio worker's
-/// thread when the first frame plays.
+/// thread when the first frame plays. Both Decks implement it with
+/// [`crate::runtime::audio_output::FollowedOutput`], which follows the
+/// system's default device.
 pub trait AudioOutputDevice: Sized {
     /// Opens and starts the default output.
     ///
@@ -80,6 +69,12 @@ pub trait AudioOutputDevice: Sized {
 
     /// The queue's state now.
     fn snapshot(&self) -> PlaybackSnapshot;
+
+    /// The output device's lifecycle for Stream Statistics (rebuilding,
+    /// moved to another device), or nothing while it plays untroubled.
+    fn device_note(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Plays the host's audio stream through a platform [`AudioOutputDevice`].
@@ -391,7 +386,7 @@ impl<O: AudioOutputDevice> PcmAudioPlayer<O> {
             decode_failures: self.decode_failures,
             concealed_frames: self.concealed_frames,
             queue_phase,
-            note,
+            note: combine_notes(note, output.device_note()),
         }
     }
 
@@ -497,6 +492,56 @@ mod tests {
     }
 
     type PcmAudioPlayer = super::PcmAudioPlayer<NoDevice>;
+
+    /// A device whose output is being rebuilt.
+    struct RebuildingDevice;
+
+    impl AudioOutputDevice for RebuildingDevice {
+        fn open() -> Result<Self, String> {
+            Ok(Self)
+        }
+
+        fn backend(&self) -> &'static str {
+            "test-rebuilding"
+        }
+
+        fn push_s16le(&self, payload: &[u8]) -> usize {
+            payload.len()
+        }
+
+        fn push_samples(&self, samples: &[i16]) -> usize {
+            samples.len() * 2
+        }
+
+        fn reset(&self) {}
+
+        fn snapshot(&self) -> PlaybackSnapshot {
+            PlaybackSnapshot::default()
+        }
+
+        fn device_note(&self) -> Option<String> {
+            Some("audio output rebuilding (stream_error, attempt 2)".to_owned())
+        }
+    }
+
+    #[test]
+    fn the_output_device_state_reaches_the_feed_note() {
+        let mut player = super::PcmAudioPlayer::<RebuildingDevice>::new();
+        let status = player.feed(
+            AudioHeader {
+                codec: AudioCodec::Pcm,
+                timestamp_ms: 0,
+            },
+            &[0, 0, 0, 0],
+        );
+        assert_eq!(status.backend, "test-rebuilding");
+        assert_eq!(status.accepted_bytes, 4);
+        let note = status.note.expect("the device's state");
+        assert!(
+            note.contains("rebuilding (stream_error, attempt 2)"),
+            "{note}"
+        );
+    }
 
     #[test]
     fn a_lane_player_drops_audio_until_the_stream_result_arrives() {

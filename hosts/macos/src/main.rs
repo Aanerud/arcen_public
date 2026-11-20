@@ -771,9 +771,17 @@ fn run_service(command: &str, arguments: &[String]) -> ExitCode {
 /// Returns a message naming the command that fixes it, because a missing
 /// certificate is the most common first-run failure and an operator should not
 /// have to guess.
-fn load_server_config(directory: &std::path::Path) -> Result<quinn::ServerConfig, String> {
+fn load_server_config(
+    directory: &std::path::Path,
+) -> Result<
+    (
+        quinn::ServerConfig,
+        std::sync::Arc<arcen_pier_macos::tls_material::TlsLifecycle>,
+    ),
+    String,
+> {
     let paths = arcen_pier_macos::host_cert::MaterialPaths::in_directory(directory);
-    arcen_pier_macos::net::server_config(&paths.certificate, &paths.key).map_err(|error| {
+    arcen_pier_macos::net::served_material(&paths.certificate, &paths.key).map_err(|error| {
         format!(
             "serve: {error}\nRun `arcen-pier-macos new-host-cert --directory {}` first.",
             directory.display()
@@ -1356,8 +1364,8 @@ fn run_serve(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         arcen_pier_macos::bridged_tablet::set_injector_program(program);
     }
 
-    let config = match load_server_config(&directory) {
-        Ok(config) => config,
+    let (config, tls) = match load_server_config(&directory) {
+        Ok(loaded) => loaded,
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::FAILURE;
@@ -1384,6 +1392,7 @@ fn run_serve(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
     };
     runtime.block_on(serve_loop(
         config,
+        tls,
         host,
         port,
         once,
@@ -1434,8 +1443,8 @@ fn run_daemon(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         Err(code) => return code,
     };
     let (host, port) = listen_address(&host_setup.file_config, options.port);
-    let config = match load_server_config(&options.directory) {
-        Ok(config) => config,
+    let (config, tls) = match load_server_config(&options.directory) {
+        Ok(loaded) => loaded,
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::FAILURE;
@@ -1461,6 +1470,7 @@ fn run_daemon(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         );
     runtime.block_on(daemon_loop(
         config,
+        tls,
         host,
         port,
         host_setup.telemetry,
@@ -1471,6 +1481,7 @@ fn run_daemon(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
 
 async fn daemon_loop(
     config: quinn::ServerConfig,
+    tls: std::sync::Arc<arcen_pier_macos::tls_material::TlsLifecycle>,
     host: String,
     port: u16,
     telemetry: arcen_pier_macos::observability::HostTelemetry,
@@ -1539,6 +1550,7 @@ async fn daemon_loop(
             "service start",
         );
     }
+    watch_tls(tls, &telemetry);
     println!(
         "{}",
         arcen_pier_macos::startup_build_line(&arcen_pier_macos::build_identity())
@@ -1555,6 +1567,22 @@ async fn daemon_loop(
     }
 
     serve_decks(&listener, &registry, refine_allowed).await
+}
+
+/// Reports the served certificate and starts its lifecycle: `SIGHUP`
+/// reloads it, and expiring and expired are reported as they happen, the
+/// same events the Linux and Windows Piers emit.
+fn watch_tls(
+    tls: std::sync::Arc<arcen_pier_macos::tls_material::TlsLifecycle>,
+    telemetry: &arcen_pier_macos::observability::HostTelemetry,
+) {
+    arcen_pier_macos::tls_material::emit(telemetry, tls.startup_events());
+    let sink_telemetry = telemetry.clone();
+    if let Err(error) = arcen_pier_macos::tls_material::spawn_watch(tls, move |events| {
+        arcen_pier_macos::tls_material::emit(&sink_telemetry, events);
+    }) {
+        eprintln!("tls: no SIGHUP reload ({error}); restart the service to load new material");
+    }
 }
 
 /// Admits Decks side by side and relays each to its desktop agent; returns
@@ -3675,6 +3703,7 @@ fn advertise_host_audio() {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve_loop(
     config: quinn::ServerConfig,
+    tls: std::sync::Arc<arcen_pier_macos::tls_material::TlsLifecycle>,
     host: String,
     port: u16,
     once: bool,
@@ -3732,6 +3761,7 @@ async fn serve_loop(
             "service start",
         );
     }
+    watch_tls(tls, &telemetry);
     println!(
         "{}",
         arcen_pier_macos::startup_build_line(&arcen_pier_macos::build_identity())

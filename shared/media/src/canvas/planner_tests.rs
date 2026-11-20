@@ -800,3 +800,47 @@ fn a_reset_after_a_scroll_repaints_the_copied_blocks_exactly() {
     pier.step(&[(&after, None)]);
     pier.step(&[(&after, None)]);
 }
+
+#[test]
+fn a_surface_against_a_partial_block_edge_follows_climbing_motion_on_the_grid() {
+    // 360 rows end half way through a block row (as 1080 does). Busy,
+    // changing content opens a region surface against the bottom edge,
+    // whose height is then not whole blocks, and climbs the screen the
+    // way a terminal's scrolling text does. Moving that surface off the
+    // edge left a destination the canvas refuses (`alignment`), so the
+    // planner's own mirror refused the paint and the canvas restarted
+    // (2-4 times per 150 s on an X11 lab at 1920 × 1080).
+    let (width, height) = (640_u32, 360_u32);
+    let mut pier = Pier::generous(vec![Monitor::new(1, width, height)]);
+    let mut pixels = vec![0_u8; (width * height * 4) as usize];
+    let mut mix = CommandMix::default();
+    let mut against_edge = false;
+    for tick in 0..240_u32 {
+        let top = 220_u32.saturating_sub(tick.saturating_sub(30) * 2).max(16);
+        for y in 0..height {
+            for x in 0..width {
+                let at = ((y * width + x) * 4) as usize;
+                let busy = (64..448).contains(&x) && (top..top + 140).contains(&y);
+                let value = if busy {
+                    (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503) ^ tick.wrapping_mul(97))
+                        >> 9
+                } else {
+                    0x0030_5070
+                };
+                pixels[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                pixels[at + 3] = 255;
+            }
+        }
+        mix.add(pier.step(&[(&pixels, None)]).remove(0).mix);
+        against_edge |= pier.monitors[0]
+            .planner
+            .surfaces()
+            .slots()
+            .any(|slot| slot.dest.y + slot.dest.height == height && slot.dest.height % 16 != 0);
+    }
+    assert!(
+        against_edge,
+        "a surface opened against the partial edge: {mix:?}"
+    );
+    assert!(mix.surface_paint > 0, "{mix:?}");
+}

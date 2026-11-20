@@ -64,7 +64,7 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.20.4"
+version = "0.20.5"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -73,19 +73,19 @@ authors = ["TUTTIFRUTTI AS"]
 repository = "https://github.com/Aanerud/arcen_public"
 
 [workspace.dependencies]
-arcen-deck-core = { path = "shared/deck-core", version = "=0.20.4" }
-arcen-identity = { path = "shared/identity", version = "=0.20.4" }
-arcen-input = { path = "shared/input", version = "=0.20.4" }
-arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.20.4" }
-arcen-keel = { path = "shared/keel", version = "=0.20.4" }
-arcen-media = { path = "shared/media", version = "=0.20.4" }
-arcen-observability = { path = "shared/observability", version = "=0.20.4" }
-arcen-outputs = { path = "shared/outputs", version = "=0.20.4" }
-arcen-protocol = { path = "shared/protocol", version = "=0.20.4", default-features = false }
-arcen-session = { path = "shared/session", version = "=0.20.4" }
-arcen-telemetry = { path = "shared/telemetry", version = "=0.20.4" }
-arcen-transport = { path = "shared/transport", version = "=0.20.4", default-features = false }
-arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.20.4" }
+arcen-deck-core = { path = "shared/deck-core", version = "=0.20.5" }
+arcen-identity = { path = "shared/identity", version = "=0.20.5" }
+arcen-input = { path = "shared/input", version = "=0.20.5" }
+arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.20.5" }
+arcen-keel = { path = "shared/keel", version = "=0.20.5" }
+arcen-media = { path = "shared/media", version = "=0.20.5" }
+arcen-observability = { path = "shared/observability", version = "=0.20.5" }
+arcen-outputs = { path = "shared/outputs", version = "=0.20.5" }
+arcen-protocol = { path = "shared/protocol", version = "=0.20.5", default-features = false }
+arcen-session = { path = "shared/session", version = "=0.20.5" }
+arcen-telemetry = { path = "shared/telemetry", version = "=0.20.5" }
+arcen-transport = { path = "shared/transport", version = "=0.20.5", default-features = false }
+arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.20.5" }
 bytes = "1.10.1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["pkcs8", "rand_core", "std"] }
 ed25519 = { version = "=2.2.3", default-features = false, features = ["pkcs8", "std"] }
@@ -112,6 +112,12 @@ sha2 = "0.10.9"
 subtle = "=2.6.1"
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.16", features = ["rt"] }
+# Safe Win32 file-identity reads for the support-bundle collector; already
+# shipped in Windows artefacts (legal/THIRD_PARTY_NOTICES.md).
+winapi-util = "=0.1.11"
+# The support-bundle collector's Windows file-identity facts (FileIdInfo,
+# volume flags, final paths); already locked through winapi-util.
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 x509-parser = { version = "=0.18.1", features = ["verify"] }
 zeroize = "1.8.2"
 zip = { version = "=7.3.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

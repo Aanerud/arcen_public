@@ -49,6 +49,22 @@ const MAX_ADDRESSES: usize = 4;
 /// How long a connected test waits for path MTU discovery, when it is on.
 const MTU_SEARCH_WAIT: Duration = Duration::from_millis(1_500);
 
+/// How long each waited-on step may take.
+#[derive(Debug, Clone, Copy)]
+struct Budgets {
+    resolve: Duration,
+    handshake: Duration,
+    greeting: Duration,
+}
+
+impl Budgets {
+    const PRODUCTION: Self = Self {
+        resolve: RESOLVE_TIMEOUT,
+        handshake: HANDSHAKE_TIMEOUT,
+        greeting: GREETING_TIMEOUT,
+    };
+}
+
 /// Where an expected pin came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinOrigin {
@@ -96,11 +112,23 @@ pub fn deck_label() -> String {
 
 /// Runs every step and assesses the result.
 pub async fn run(request: DiagnoseRequest) -> DiagnosticReport {
-    let observations = observe(&request).await;
+    let addresses = system_addresses(&request.target.host, request.target.port);
+    let observations = observe(&request, Budgets::PRODUCTION, addresses).await;
+    report(&request, &observations)
+}
+
+/// The system resolver's answer for `host`.
+async fn system_addresses(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    tokio::net::lookup_host((host, port))
+        .await
+        .map(Iterator::collect)
+}
+
+fn report(request: &DiagnoseRequest, observations: &Observations) -> DiagnosticReport {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    let report = assess(&observations, now, QosTargets::default());
+    let report = assess(observations, now, QosTargets::default());
     tracing::info!(
         target: crate::logging::target::TRANSPORT,
         endpoint = %request.target.display(),
@@ -115,7 +143,13 @@ pub async fn run(request: DiagnoseRequest) -> DiagnosticReport {
     report
 }
 
-async fn observe(request: &DiagnoseRequest) -> Observations {
+/// Runs every step against `addresses`, the resolver's answer for the
+/// request's host.
+async fn observe(
+    request: &DiagnoseRequest,
+    budgets: Budgets,
+    addresses: impl std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+) -> Observations {
     let target = request.target.clone();
     let expected_identity = match request.pin {
         None => ExpectedIdentity::Unknown,
@@ -145,15 +179,10 @@ async fn observe(request: &DiagnoseRequest) -> Observations {
     };
 
     let started = Instant::now();
-    let addresses = match timeout(
-        RESOLVE_TIMEOUT,
-        tokio::net::lookup_host((request.target.host.as_str(), request.target.port)),
-    )
-    .await
-    {
+    let addresses = match timeout(budgets.resolve, addresses).await {
         Err(_) => {
             observations.resolution = ResolutionObservation::TimedOut {
-                waited_ms: millis(RESOLVE_TIMEOUT),
+                waited_ms: millis(budgets.resolve),
             };
             return observations;
         }
@@ -202,7 +231,7 @@ async fn observe(request: &DiagnoseRequest) -> Observations {
             });
             continue;
         }
-        let dial = dial(address, request).await;
+        let dial = dial(address, request, budgets.handshake).await;
         if let Some(capture) = dial.capture {
             observations.certificate = Some(presented(capture));
         }
@@ -215,7 +244,7 @@ async fn observe(request: &DiagnoseRequest) -> Observations {
             .attempts
             .push(AddressAttempt { address, outcome });
         if let Some(mut socket) = dial.socket {
-            observations.greeting = Some(read_greeting(&mut socket).await);
+            observations.greeting = Some(read_greeting(&mut socket, budgets.greeting).await);
             if MtuDiscovery::from_env() == MtuDiscovery::On {
                 // Discovery probes one size per round trip after the
                 // handshake; give the search a moment to finish.
@@ -288,7 +317,7 @@ struct Dial {
     socket: Option<DeckLaneSocket>,
 }
 
-async fn dial(address: SocketAddr, request: &DiagnoseRequest) -> Dial {
+async fn dial(address: SocketAddr, request: &DiagnoseRequest, budget: Duration) -> Dial {
     let failed = |detail: String| Dial {
         outcome: HandshakeOutcome::Failed { detail },
         capture: None,
@@ -321,7 +350,7 @@ async fn dial(address: SocketAddr, request: &DiagnoseRequest) -> Dial {
     };
     let started = Instant::now();
     let result = timeout(
-        HANDSHAKE_TIMEOUT,
+        budget,
         connect_session_lanes(
             DirectQuicDialParams {
                 endpoint: endpoint.clone(),
@@ -340,7 +369,7 @@ async fn dial(address: SocketAddr, request: &DiagnoseRequest) -> Dial {
     let (outcome, socket) = match result {
         Err(_) => (
             HandshakeOutcome::TimedOut {
-                waited_ms: millis(HANDSHAKE_TIMEOUT),
+                waited_ms: millis(budget),
             },
             None,
         ),
@@ -394,12 +423,12 @@ fn io_outcome(error: &std::io::Error, message: &str) -> HandshakeOutcome {
     }
 }
 
-async fn read_greeting(socket: &mut DeckLaneSocket) -> GreetingObservation {
-    let first = match recv_json(socket, GREETING_TIMEOUT).await {
+async fn read_greeting(socket: &mut DeckLaneSocket, budget: Duration) -> GreetingObservation {
+    let first = match recv_json(socket, budget).await {
         Ok(first) => first,
         Err(ConnectSmokeError::Timeout) => {
             return GreetingObservation::TimedOut {
-                waited_ms: millis(GREETING_TIMEOUT),
+                waited_ms: millis(budget),
             };
         }
         Err(ConnectSmokeError::ClosedByHost(reason)) => {
@@ -455,6 +484,29 @@ mod tests {
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
+    /// The production budgets are for real networks. On loopback the steps'
+    /// outcome must not depend on how busy the machine is: only a stall of
+    /// tens of seconds, a real fault, may change a finding.
+    const LOOPBACK: Budgets = Budgets {
+        resolve: Duration::from_secs(30),
+        handshake: Duration::from_secs(30),
+        greeting: Duration::from_secs(30),
+    };
+
+    /// Tests `localhost:{port}` (the name the fake Pier's certificate
+    /// carries) with the name already resolved to the fake Pier's address:
+    /// the system resolver can take longer than [`RESOLVE_TIMEOUT`] on a busy
+    /// machine, and resolving is not what these tests are about.
+    async fn run_on_loopback(port: u16, pin: Option<(TlsPin, PinOrigin)>) -> DiagnosticReport {
+        let request = DiagnoseRequest {
+            target: DiagnosticTarget::parse(&format!("localhost:{port}")).unwrap(),
+            pin,
+        };
+        let resolved = std::future::ready(Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]));
+        let observations = observe(&request, LOOPBACK, resolved).await;
+        report(&request, &observations)
+    }
+
     /// A Pier that grants the attachment, sends `greeting` and reports the
     /// first record the Deck sends afterwards (`None` when it only closes).
     async fn fake_pier(
@@ -490,7 +542,7 @@ mod tests {
             let (lanes, control) = arcen_transport::quic::accept_session_lanes(
                 connection,
                 LaneRuntimeConfig::new(arcen_protocol::lanes::LaneEndpoint::Pier),
-                Duration::from_secs(5),
+                LOOPBACK.handshake,
             )
             .await
             .ok()?;
@@ -499,16 +551,12 @@ mod tests {
                 .send(arcen_protocol::lanes::SessionRecord::Text(greeting.into()))
                 .await
                 .ok()?;
-            match timeout(Duration::from_secs(5), socket.next()).await {
+            match timeout(LOOPBACK.greeting, socket.next()).await {
                 Ok(Some(Ok(record))) => Some(record),
                 _ => None,
             }
         });
         (port, certificate_der, task)
-    }
-
-    fn localhost(port: u16) -> DiagnosticTarget {
-        DiagnosticTarget::parse(&format!("localhost:{port}")).unwrap()
     }
 
     #[tokio::test]
@@ -521,11 +569,7 @@ mod tests {
             arcen_transport::tls::PinKind::CertificateSha256,
             crate::transport::tls::fingerprint_sha256(certificate.as_ref()),
         );
-        let report = run(DiagnoseRequest {
-            target: localhost(port),
-            pin: Some((pin, PinOrigin::Supplied)),
-        })
-        .await;
+        let report = run_on_loopback(port, Some((pin, PinOrigin::Supplied))).await;
         let findings: Vec<_> = report.steps.iter().map(|step| step.finding).collect();
         assert_eq!(
             &findings[..4],
@@ -549,16 +593,16 @@ mod tests {
     #[tokio::test]
     async fn a_changed_identity_stops_at_the_certificate() {
         let (port, _certificate, _pier) = fake_pier(r#"{"type":"auth_request"}"#).await;
-        let report = run(DiagnoseRequest {
-            target: localhost(port),
-            pin: Some((
+        let report = run_on_loopback(
+            port,
+            Some((
                 TlsPin::new(
                     arcen_transport::tls::PinKind::SubjectPublicKeyInfoSha256,
                     [7; 32],
                 ),
                 PinOrigin::Remembered,
             )),
-        })
+        )
         .await;
         assert_eq!(report.steps[1].finding, Finding::UdpHandshakeCompleted);
         assert_eq!(report.steps[2].finding, Finding::CertMismatch);
@@ -569,11 +613,7 @@ mod tests {
     #[tokio::test]
     async fn a_first_connection_reads_the_greeting_without_trusting_the_pier() {
         let (port, _certificate, _pier) = fake_pier(r#"{"type":"quality_settings"}"#).await;
-        let report = run(DiagnoseRequest {
-            target: localhost(port),
-            pin: None,
-        })
-        .await;
+        let report = run_on_loopback(port, None).await;
         assert_eq!(report.steps[2].finding, Finding::CertFirstUse);
         assert_eq!(report.steps[3].finding, Finding::GreetingUnexpected);
     }

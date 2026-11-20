@@ -42,10 +42,16 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+mod native_identity;
 pub mod seal;
+mod source;
 pub mod summary;
 
 pub use seal::{BundleSealer, SealedArchive, write_sealed_archive};
+pub use source::{
+    ContainerFacts, FileIdentity, IdentityScheme, LinkFacts, OpenedSource, Owner, SourceFacts,
+    SourceKind, VolumeFacts, check_source, link_is_trusted, open_source, verify_same_source,
+};
 pub use summary::{
     ArchiveFingerprint, PreflightRefusal, PublicSummary, SummaryDetails, SummaryFact, SummaryValue,
     fingerprint, fingerprint_file,
@@ -146,11 +152,23 @@ impl From<SupportBundleError> for String {
 pub enum SourceOpenError {
     /// The file could not be inspected or opened.
     Io(std::io::Error),
-    /// Not a regular file: a link, a directory, a device, or (Windows) any
-    /// reparse point.
+    /// Not a regular file: a link, a directory, a FIFO, a socket, a device,
+    /// or (Windows) any reparse point.
     UnsafeType,
+    /// A folder on the way to the source was a link the collector does not
+    /// trust ([`link_is_trusted`]) or a reparse point, or the opened file
+    /// was not in the folder its path names.
+    PathLinked,
+    /// The source has more than one name (a hard link).
+    HardLinked,
     /// The file that was opened is not the one that was inspected.
     Replaced,
+    /// The file system reported no file number, so nothing proves the
+    /// opened file is the inspected one ([`verify_same_source`]).
+    IdentityUnproven,
+    /// The source's volume cannot prove file identity: a network volume, or
+    /// one without stable file IDs ([`VolumeFacts`]).
+    IdentityUnstable,
 }
 
 impl SourceOpenError {
@@ -160,7 +178,13 @@ impl SourceOpenError {
         match self {
             Self::Io(error) => io_notice(error),
             Self::UnsafeType => (NoticeKind::Invalid, NoticeCode::UnsafeFileType),
+            Self::PathLinked => (NoticeKind::Invalid, NoticeCode::SourcePathLinked),
+            Self::HardLinked => (NoticeKind::Invalid, NoticeCode::SourceHardLinked),
             Self::Replaced => (NoticeKind::Invalid, NoticeCode::SourceChangedDuringRead),
+            Self::IdentityUnproven | Self::IdentityUnstable => (
+                NoticeKind::Unavailable,
+                NoticeCode::SourceIdentityUnverifiable,
+            ),
         }
     }
 }
@@ -195,51 +219,6 @@ pub fn is_unsafe_source(metadata: &Metadata) -> bool {
         }
     }
     false
-}
-
-/// Opens a source without following a link at its last component, and
-/// checks that the opened file is a regular file and — where the platform
-/// exposes file identities through `std` (Unix device and inode) — the one
-/// that was inspected; on Windows a reparse point is opened, not followed,
-/// and refused. Returns the file and its metadata as opened.
-///
-/// # Errors
-///
-/// The source is missing, unreadable, not a regular file, or was replaced
-/// between inspection and opening.
-pub fn open_source(path: &Path) -> Result<(File, Metadata), SourceOpenError> {
-    let inspected = std::fs::symlink_metadata(path).map_err(SourceOpenError::Io)?;
-    if is_unsafe_source(&inspected) {
-        return Err(SourceOpenError::UnsafeType);
-    }
-    let file = open_without_following(path).map_err(SourceOpenError::Io)?;
-    let opened = file.metadata().map_err(SourceOpenError::Io)?;
-    if is_unsafe_source(&opened) {
-        return Err(SourceOpenError::UnsafeType);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if (opened.dev(), opened.ino()) != (inspected.dev(), inspected.ino()) {
-            return Err(SourceOpenError::Replaced);
-        }
-    }
-    Ok((file, opened))
-}
-
-/// Opens `path` for reading. On Windows a reparse point that replaced the
-/// file after it was inspected is opened itself, not followed, so the
-/// opened handle's metadata shows it and [`is_unsafe_source`] refuses it.
-fn open_without_following(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    options.open(path)
 }
 
 /// One log file a product offers for export, newest first in the list it
@@ -487,7 +466,9 @@ impl<W: Write + Seek> Collector<W> {
     }
 
     /// Opens a source for `archive_path`, recording a notice instead when
-    /// it cannot be read safely.
+    /// it cannot be read safely, and an advisory when it was opened but its
+    /// identity was weaker than a 128-bit file ID
+    /// ([`OpenedSource::advisory`]).
     ///
     /// # Errors
     ///
@@ -498,7 +479,12 @@ impl<W: Write + Seek> Collector<W> {
         archive_path: &str,
     ) -> Result<Option<(File, Metadata)>, SupportBundleError> {
         match open_source(file_path) {
-            Ok(opened) => Ok(Some(opened)),
+            Ok(opened) => {
+                if let Some((kind, code)) = opened.advisory() {
+                    self.notice(archive_path, kind, code)?;
+                }
+                Ok(Some((opened.file, opened.metadata)))
+            }
             Err(error) => {
                 self.source_notice(archive_path, &error)?;
                 Ok(None)

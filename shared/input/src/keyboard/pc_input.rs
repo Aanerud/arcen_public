@@ -277,12 +277,17 @@ pub enum HookRoute {
 /// on). A key whose press the system saw (it was down when routing began,
 /// or was passed on, like Windows+L) has its release passed on too, so
 /// Windows never keeps a key down on the Deck's computer.
+///
+/// The hooks installed before the Deck's see a taken key first; one that
+/// blocks it ([`HookRouter::blocked_below`]) keeps it from the session.
 #[derive(Debug, Clone, Default)]
 pub struct HookRouter {
     system_keys: BTreeSet<PcKey>,
     session_keys: BTreeSet<PcKey>,
     held: BTreeSet<PcModifier>,
     switch: KeyboardSwitchChord,
+    /// The press the last [`HookRouter::route`] newly gave the session.
+    fresh: Option<PcKey>,
 }
 
 impl HookRouter {
@@ -308,6 +313,7 @@ impl HookRouter {
 
     /// Where this edge goes, with the grab on or off.
     pub fn route(&mut self, key: PcKey, pressed: bool, grabbed: bool) -> HookRoute {
+        self.fresh = None;
         let before = self.modifiers();
         if let PcKey::Modifier(modifier) = key {
             if pressed {
@@ -346,6 +352,7 @@ impl HookRouter {
             return HookRoute::System;
         }
         self.session_keys.insert(key);
+        self.fresh = Some(key);
         let system_windows = self
             .system_keys
             .contains(&PcKey::Modifier(PcModifier::LeftWindows))
@@ -359,12 +366,32 @@ impl HookRouter {
         }
     }
 
+    /// A hook installed before the Deck's blocked the edge
+    /// [`route`](Self::route) just gave the session (a Windows Pier keeping
+    /// its desk private while the Deck runs in its session, a kiosk lock);
+    /// whether the session still gets it.
+    ///
+    /// The Deck is never a way around such a hook: a press it blocked is
+    /// not the session's, and that key's release follows it down the chain.
+    /// A repeat it blocked is dropped. A release still goes to the session,
+    /// whose press the host holds, so no key stays down there.
+    pub fn blocked_below(&mut self, key: PcKey, pressed: bool) -> bool {
+        if !pressed {
+            return true;
+        }
+        if self.fresh.take() == Some(key) {
+            self.session_keys.remove(&key);
+        }
+        false
+    }
+
     /// Routing ends (focus lost): the keys the system still holds are its
     /// own.
     pub fn end(&mut self) {
         self.system_keys.clear();
         self.session_keys.clear();
         self.held.clear();
+        self.fresh = None;
     }
 
     fn modifiers(&self) -> PcModifierState {
@@ -1480,6 +1507,37 @@ mod tests {
             router.route(PcKey::Lock(LockKey::Num), false, true),
             HookRoute::System
         );
+    }
+
+    #[test]
+    fn a_key_a_hook_below_blocks_is_not_the_sessions() {
+        let mut router = HookRouter::default();
+        router.begin([]);
+        let windows = modifier(PcModifier::LeftWindows);
+        // Blocked below: the press is dropped and its release follows it
+        // down the chain, so nothing reaches the session.
+        assert_eq!(router.route(windows, true, true), HookRoute::Session);
+        assert!(!router.blocked_below(windows, true));
+        assert_eq!(router.route(windows, false, true), HookRoute::System);
+        // Blocked again on a repeat: still nothing for the session.
+        assert_eq!(router.route(windows, true, true), HookRoute::Session);
+        assert!(!router.blocked_below(windows, true));
+        assert_eq!(router.route(windows, true, true), HookRoute::Session);
+        assert!(!router.blocked_below(windows, true));
+        assert_eq!(router.route(windows, false, true), HookRoute::System);
+        // The block begins while the session holds the key: a blocked
+        // repeat is dropped, but the release still reaches the session, so
+        // the host does not keep the key down.
+        let tab = position(0x0100_0001);
+        router.route(modifier(PcModifier::LeftAlt), true, true);
+        assert_eq!(router.route(tab, true, true), HookRoute::Session);
+        assert_eq!(router.route(tab, true, true), HookRoute::Session);
+        assert!(!router.blocked_below(tab, true));
+        assert_eq!(router.route(tab, false, true), HookRoute::Session);
+        assert!(router.blocked_below(tab, false));
+        // The key is free again: its next press is the session's.
+        assert_eq!(router.route(tab, true, true), HookRoute::Session);
+        assert_eq!(router.route(tab, false, true), HookRoute::Session);
     }
 
     #[test]

@@ -795,6 +795,7 @@ its pen points (ADR 0023). Each piece has one home:
 | Desktop isolation (Linux) | `arcen-usb-bridge` `bridge_seat` | The per-port udev rule, the Xorg ignore and per-desktop classes, `PressureRecalibration` off |
 | Pen readers (macOS and Windows Piers) | `arcen-usb-bridge` `generic_pen` (`GenericPenLayout`, `GenericPenReader`), `wacom_intuos_pen` (`IntuosPenReader`, `HOST_DECODED_INTUOS_MODELS`), `host_pen::host_pen_route` | Any tablet's pen by its own report descriptor; a dedicated reader only where it adds features (a vendor packet format) |
 | Host-read attachment (macOS and Windows Piers) | `arcen-usb-bridge` `host_pen_bridge::HostPenBridge`; `arcen-input` `bridged_pen` (`authorize`, `tablet_result`, `NativeTabletAttachment`, `BridgedPenSession`, `host_pen_event`, `HostPenPointer`) | One attachment for a Pier that reads the pen itself: enumeration over the URB bridge, the pen interface polled for the Pier (published or not; `HidPublishPolicy::Nothing` publishes no device), the Intuos mode switch and its restore, the proximity release on the end, wire frames, the same `PenEventMsg` a Deck sends in Tablet support, and the host pointer the pen moves |
+| Route on a joined desktop (Linux) | `arcen-usb-bridge` `joined_pen` (`native_tablet_route`, `JoinedPenRefusal`); `arcen-input` `joined_input` (`prove_joined_device_confinement`, `JoinedInputGuard`) and `bridged_pen` (`host_decoded_capabilities`, `host_decoded_notice`, `host_decoded_tablet_result`) | A desktop Arcen did not start (a joined console, ADR 0025) never takes the raw bridge; it takes the host-decoded route: the Pier reads the pen (`HidPublishPolicy::Nothing`) and posts it through its own typed pen device, only while that device is proved to reach the joined desktop's display server alone (its event node held by that server, no node held by another login session, another display server, another account's process or an input bridge, the session in front; system services such as `acpid` or `gpm` may read: `classify_reader`); the Deck is told exactly what is decoded and carried |
 | Lab emulation | `arcen-usb-bridge` `wacom_intuos5` | An emulated Intuos5 with scripted strokes, for tests and lab proofs |
 
 Platform adapters only read devices and publish: the Linux Pier's
@@ -802,7 +803,9 @@ Platform adapters only read devices and publish: the Linux Pier's
 X11 and Wayland alike), the macOS Pier's `hosts/macos/src/bridged_tablet.rs`
 (its device-owner child and console watch), the Windows Pier's
 `negotiate_native_tablet` / `send_native_tablet_output` in
-`hosts/windows/src/session.rs` (Windows Ink injection), and the Deck's `clients/macos/src/ui/sharp_cursor.rs`. **Extend the shared
+`hosts/windows/src/session.rs` (Windows Ink injection), the Linux Pier's
+joined-console route `hosts/linux/src/net/joined_pen.rs` with its facts
+reader `hosts/linux/src/input/joined_devices.rs`, and the Deck's `clients/macos/src/ui/sharp_cursor.rs`. **Extend the shared
 modules above; do not add another pen-position, mapping or admission
 mechanism.** A new Pier adds an adapter that produces `PenSample`s; a
 tablet model on a macOS Pier needs nothing when its descriptor states its

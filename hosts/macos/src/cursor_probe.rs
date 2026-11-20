@@ -26,6 +26,9 @@
 use std::time::Duration;
 
 use arcen_protocol::messages::CursorShapeKind;
+use objc2::rc::Retained;
+use objc2::runtime::Sel;
+use objc2::{ClassType as _, msg_send, sel};
 // `currentSystemCursor` and some of the resize cursors carry deprecation
 // warnings. Apple's replacement advice for the first is to composite the
 // cursor into the capture with `SCStreamConfiguration.showsCursor`, which is a
@@ -35,14 +38,18 @@ use arcen_protocol::messages::CursorShapeKind;
 // gated. Deprecated here means superseded for the common case, not removed.
 #[allow(deprecated)]
 use objc2_app_kit::NSCursor;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSCursorFrameResizeDirections,
+    NSCursorFrameResizePosition, NSImage,
+};
 
 /// Connects this process to the window server, without appearing anywhere.
 ///
 /// [`NSCursor`]'s standard-cursor accessors return NULL until an `NSApplication`
-/// exists, and the bindings turn that NULL into a panic. Measured on the lab
-/// Mac: a session logged `cannot read the desktop cursor shape` because every
-/// accessor came back NULL, even running as a proper Aqua `LaunchAgent`.
+/// exists, and the generated bindings would turn that NULL into a panic, which
+/// is why `ShapeCatalogue` reads them through `class_cursor`. Measured on
+/// the lab Mac: a session logged `cannot read the desktop cursor shape` because
+/// every accessor came back NULL, even running as a proper Aqua `LaunchAgent`.
 ///
 /// The activation policy is what makes this safe for a background agent.
 /// `Prohibited` is the programmatic equivalent of `LSUIElement`: no Dock icon,
@@ -104,104 +111,51 @@ struct ShapeCatalogue {
 impl ShapeCatalogue {
     #[allow(deprecated)]
     fn capture() -> Option<Self> {
-        // Probed before anything else is touched. Without a connection to the
-        // window server the standard-cursor accessors return NULL, and the
-        // bindings turn a NULL from a non-nullable return into a panic rather
-        // than a `None`. `currentSystemCursor` is the one accessor declared
-        // nullable, so it is the only safe way to ask whether the rest will
-        // answer at all — a process with no Aqua session, or a test binary
+        // Asked first: a process with no Aqua session, or a test binary
         // without AppKit, has no cursor to watch and should say so.
         NSCursor::currentSystemCursor()?;
-        // Caught rather than trusted. The standard-cursor accessors are
-        // declared non-nullable and the bindings turn a NULL from one into a
-        // panic, and they do return NULL in a process that has not brought up
-        // AppKit. This host must not bring up AppKit: it runs as a background
-        // agent with no Dock presence, and an NSApplication would give it one.
-        // So the accessors are called defensively, and a host that cannot name
-        // the shapes reports none rather than taking the session down with it.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(Self::capture_standard))
-            .ok()
-            .flatten()
+        // The standard cursors do come back NULL in a process that has not
+        // brought up AppKit, and this host must not bring it up: it runs as a
+        // background agent with no Dock presence, and an NSApplication would
+        // give it one. A host that cannot name the shapes reports none rather
+        // than panicking.
+        Self::from_images(standard_cursors().into_iter().map(|(cursor, kind)| {
+            let image = match cursor {
+                StandardCursor::Absent => StandardCursor::Absent,
+                StandardCursor::Null => StandardCursor::Null,
+                StandardCursor::Read(cursor) => match cursor_image(&cursor) {
+                    // A cursor without an image is as unreadable as no cursor.
+                    None => StandardCursor::Null,
+                    Some(image) => {
+                        tiff_bytes(&image).map_or(StandardCursor::Absent, StandardCursor::Read)
+                    }
+                },
+            };
+            (image, kind)
+        }))
     }
 
-    /// Reads the standard cursors. May panic if `AppKit` is unavailable; see
-    /// [`ShapeCatalogue::capture`], which is the only caller and guards it.
-    #[allow(deprecated)]
-    fn capture_standard() -> Option<Self> {
-        // SAFETY: these are AppKit's standard cursor singletons. Reading them
-        // allocates nothing the caller owns beyond the returned retained
-        // reference, which `Retained` releases.
-        use objc2_app_kit::{NSCursorFrameResizeDirections, NSCursorFrameResizePosition};
-
-        // Window frames resize from any edge on modern macOS, and the cursors
-        // for that come from `frameResizeCursorFromPosition:inDirections:`
-        // rather than from the old resize singletons. Leaving them out is what
-        // made a corner drag show a plain arrow while the side edges worked:
-        // measured as 86 distinct cursor images against 59 that could be named.
-        let frame = |position: NSCursorFrameResizePosition, kind: CursorShapeKind| {
-            (
-                NSCursor::frameResizeCursorFromPosition_inDirections(
-                    position,
-                    NSCursorFrameResizeDirections::All,
-                ),
-                kind,
-            )
-        };
-        let standard: Vec<(objc2::rc::Retained<NSCursor>, CursorShapeKind)> = vec![
-            (NSCursor::arrowCursor(), CursorShapeKind::Default),
-            (NSCursor::IBeamCursor(), CursorShapeKind::Text),
-            (NSCursor::pointingHandCursor(), CursorShapeKind::Pointer),
-            (NSCursor::crosshairCursor(), CursorShapeKind::Crosshair),
-            (NSCursor::openHandCursor(), CursorShapeKind::Grab),
-            (NSCursor::closedHandCursor(), CursorShapeKind::Grabbing),
-            (
-                NSCursor::operationNotAllowedCursor(),
-                CursorShapeKind::NotAllowed,
-            ),
-            (NSCursor::zoomInCursor(), CursorShapeKind::ZoomIn),
-            (NSCursor::zoomOutCursor(), CursorShapeKind::ZoomOut),
-            // Edges in both spellings. Both are in circulation: the singletons
-            // still appear inside views, the frame cursors on window chrome.
-            (NSCursor::resizeUpDownCursor(), CursorShapeKind::ResizeNs),
-            (NSCursor::resizeLeftRightCursor(), CursorShapeKind::ResizeEw),
-            (NSCursor::rowResizeCursor(), CursorShapeKind::ResizeNs),
-            (NSCursor::columnResizeCursor(), CursorShapeKind::ResizeEw),
-            frame(NSCursorFrameResizePosition::Top, CursorShapeKind::ResizeNs),
-            frame(
-                NSCursorFrameResizePosition::Bottom,
-                CursorShapeKind::ResizeNs,
-            ),
-            frame(NSCursorFrameResizePosition::Left, CursorShapeKind::ResizeEw),
-            frame(
-                NSCursorFrameResizePosition::Right,
-                CursorShapeKind::ResizeEw,
-            ),
-            // The corners, which is what "I did not get the size" was about.
-            frame(
-                NSCursorFrameResizePosition::TopLeft,
-                CursorShapeKind::ResizeNwse,
-            ),
-            frame(
-                NSCursorFrameResizePosition::BottomRight,
-                CursorShapeKind::ResizeNwse,
-            ),
-            frame(
-                NSCursorFrameResizePosition::TopRight,
-                CursorShapeKind::ResizeNesw,
-            ),
-            frame(
-                NSCursorFrameResizePosition::BottomLeft,
-                CursorShapeKind::ResizeNesw,
-            ),
-        ];
-        let mut known = Vec::with_capacity(standard.len());
-        for (cursor, kind) in standard {
-            if let Some(bytes) = image_bytes(&cursor) {
-                // First spelling wins: several cursors share an image, and the
-                // earlier entry is the one whose name reads better in a log.
-                if !known.iter().any(|(seen, _)| seen == &bytes) {
-                    known.push((bytes, kind));
-                }
+    /// Builds the catalogue from the standard cursors' images, in naming
+    /// order.
+    fn from_images(
+        images: impl IntoIterator<Item = (StandardCursor<Vec<u8>>, CursorShapeKind)>,
+    ) -> Option<Self> {
+        let mut known: Vec<(Vec<u8>, CursorShapeKind)> = Vec::new();
+        for (image, kind) in images {
+            let bytes = match image {
+                StandardCursor::Absent => continue,
+                // NULL from an accessor this macOS has means the process has
+                // no cursor resources, and nothing else it reads can be
+                // trusted to name a shape. Measured in a test binary: the
+                // arrow and the I-beam NULL, and the pointing hand, open hand
+                // and closed hand one shared placeholder image.
+                StandardCursor::Null => return None,
+                StandardCursor::Read(bytes) => bytes,
+            };
+            // First spelling wins: several cursors share an image, and the
+            // earlier entry is the one whose name reads better in a log.
+            if !known.iter().any(|(seen, _)| seen == &bytes) {
+                known.push((bytes, kind));
             }
         }
         // A catalogue that recognises only the arrow would report every cursor
@@ -230,12 +184,145 @@ impl ShapeCatalogue {
     }
 }
 
+/// One standard cursor, as this process could read it.
+#[derive(Debug, PartialEq, Eq)]
+enum StandardCursor<T> {
+    /// Left out: the running macOS predates it (the zoom, column and
+    /// window-frame cursors arrived in macOS 15, and this Pier supports 14.2),
+    /// or its image has no TIFF form to compare.
+    Absent,
+    /// `AppKit` has the accessor and answered NULL.
+    Null,
+    Read(T),
+}
+
+/// The standard cursors, in naming order.
+fn standard_cursors() -> Vec<(StandardCursor<Retained<NSCursor>>, CursorShapeKind)> {
+    let named = [
+        (sel!(arrowCursor), CursorShapeKind::Default),
+        (sel!(IBeamCursor), CursorShapeKind::Text),
+        (sel!(pointingHandCursor), CursorShapeKind::Pointer),
+        (sel!(crosshairCursor), CursorShapeKind::Crosshair),
+        (sel!(openHandCursor), CursorShapeKind::Grab),
+        (sel!(closedHandCursor), CursorShapeKind::Grabbing),
+        (sel!(operationNotAllowedCursor), CursorShapeKind::NotAllowed),
+        (sel!(zoomInCursor), CursorShapeKind::ZoomIn),
+        (sel!(zoomOutCursor), CursorShapeKind::ZoomOut),
+        // Edges in both spellings. Both are in circulation: the singletons
+        // still appear inside views, the frame cursors on window chrome.
+        (sel!(resizeUpDownCursor), CursorShapeKind::ResizeNs),
+        (sel!(resizeLeftRightCursor), CursorShapeKind::ResizeEw),
+        (sel!(rowResizeCursor), CursorShapeKind::ResizeNs),
+        (sel!(columnResizeCursor), CursorShapeKind::ResizeEw),
+    ];
+    // Window frames resize from any edge on modern macOS, and the cursors for
+    // that come from `frameResizeCursorFromPosition:inDirections:` rather than
+    // from the old resize singletons. Leaving them out is what made a corner
+    // drag show a plain arrow while the side edges worked: measured as 86
+    // distinct cursor images against 59 that could be named.
+    let frames = [
+        (NSCursorFrameResizePosition::Top, CursorShapeKind::ResizeNs),
+        (
+            NSCursorFrameResizePosition::Bottom,
+            CursorShapeKind::ResizeNs,
+        ),
+        (NSCursorFrameResizePosition::Left, CursorShapeKind::ResizeEw),
+        (
+            NSCursorFrameResizePosition::Right,
+            CursorShapeKind::ResizeEw,
+        ),
+        // The corners, which is what "I did not get the size" was about.
+        (
+            NSCursorFrameResizePosition::TopLeft,
+            CursorShapeKind::ResizeNwse,
+        ),
+        (
+            NSCursorFrameResizePosition::BottomRight,
+            CursorShapeKind::ResizeNwse,
+        ),
+        (
+            NSCursorFrameResizePosition::TopRight,
+            CursorShapeKind::ResizeNesw,
+        ),
+        (
+            NSCursorFrameResizePosition::BottomLeft,
+            CursorShapeKind::ResizeNesw,
+        ),
+    ];
+    named
+        .into_iter()
+        .map(|(selector, kind)| (class_cursor(selector), kind))
+        .chain(
+            frames
+                .into_iter()
+                .map(|(position, kind)| (frame_resize_cursor(position), kind)),
+        )
+        .collect()
+}
+
+/// Whether `NSCursor` itself answers `selector` on this macOS.
+fn cursor_class_responds_to(selector: Sel) -> bool {
+    NSCursor::class().metaclass().responds_to(selector)
+}
+
+/// Reads one of `NSCursor`'s argument-less class cursors.
+///
+/// Not through the generated bindings, which declare these accessors
+/// non-null and panic on the NULL that `AppKit` returns in a process without an
+/// `NSApplication` (every test binary, measured: `+[NSCursor arrowCursor]`).
+/// And an accessor newer than the running macOS is an unrecognised selector:
+/// an Objective-C exception, which Rust cannot catch. So the class is asked
+/// first.
+#[allow(unsafe_code)]
+fn class_cursor(selector: Sel) -> StandardCursor<Retained<NSCursor>> {
+    if !cursor_class_responds_to(selector) {
+        return StandardCursor::Absent;
+    }
+    // SAFETY: `NSCursor` responds to `selector`, a class method that takes no
+    // arguments and returns an `NSCursor` or nil; `performSelector:` returns
+    // that object unretained, and `Retained` takes its own reference.
+    let cursor: Option<Retained<NSCursor>> =
+        unsafe { msg_send![NSCursor::class(), performSelector: selector] };
+    cursor.map_or(StandardCursor::Null, StandardCursor::Read)
+}
+
+/// Reads a window-frame resize cursor; see [`class_cursor`].
+#[allow(unsafe_code)]
+fn frame_resize_cursor(
+    position: NSCursorFrameResizePosition,
+) -> StandardCursor<Retained<NSCursor>> {
+    if !cursor_class_responds_to(sel!(frameResizeCursorFromPosition:inDirections:)) {
+        return StandardCursor::Absent;
+    }
+    // SAFETY: `NSCursor` responds to the selector, which takes a frame
+    // position and a direction mask and returns an `NSCursor` or nil.
+    let cursor: Option<Retained<NSCursor>> = unsafe {
+        msg_send![
+            NSCursor::class(),
+            frameResizeCursorFromPosition: position,
+            inDirections: NSCursorFrameResizeDirections::All
+        ]
+    };
+    cursor.map_or(StandardCursor::Null, StandardCursor::Read)
+}
+
 /// Returns the bytes of a cursor's image, for comparison only.
 fn image_bytes(cursor: &NSCursor) -> Option<Vec<u8>> {
-    // SAFETY: every NSCursor has an image; TIFF representation is a plain
-    // serialisation of it and borrows nothing from the caller.
-    let data = cursor.image().TIFFRepresentation()?;
-    Some(data.to_vec())
+    cursor_image(cursor).and_then(|image| tiff_bytes(&image))
+}
+
+/// A cursor's image, read nullable for the same reason as `class_cursor`: the
+/// binding for `image` is non-null, and the watcher calls this on its own
+/// thread, where a panic would end the watch without a word.
+#[allow(unsafe_code)]
+fn cursor_image(cursor: &NSCursor) -> Option<Retained<NSImage>> {
+    // SAFETY: `image` takes no arguments and returns an `NSImage` or nil.
+    unsafe { msg_send![cursor, image] }
+}
+
+/// An image's TIFF serialisation, which borrows nothing from the image.
+fn tiff_bytes(image: &NSImage) -> Option<Vec<u8>> {
+    Some(image.TIFFRepresentation()?.to_vec())
 }
 
 /// Where the probe's sweep should put the pointer on a given step.
@@ -441,8 +528,73 @@ impl Drop for CursorWatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShapeCatalogue, sweep_point};
+    use super::{
+        ShapeCatalogue, StandardCursor, class_cursor, image_bytes, standard_cursors, sweep_point,
+    };
     use arcen_protocol::messages::CursorShapeKind;
+
+    #[test]
+    fn reading_the_standard_cursors_in_a_process_without_appkit_does_not_panic() {
+        // A test binary has no NSApplication, and AppKit answers NULL for
+        // `+[NSCursor arrowCursor]` here (measured). Read the way a session
+        // reads them, with nothing to catch a panic.
+        for (cursor, _) in standard_cursors() {
+            if let StandardCursor::Read(cursor) = cursor {
+                let _ = image_bytes(&cursor);
+            }
+        }
+        let _ = ShapeCatalogue::capture();
+    }
+
+    #[test]
+    fn a_cursor_this_macos_does_not_have_reads_as_none() {
+        // Sent without asking first, this is an Objective-C exception.
+        assert!(matches!(
+            class_cursor(objc2::sel!(arcenCursorNoMacOSHas)),
+            StandardCursor::Absent
+        ));
+    }
+
+    #[test]
+    fn a_cursor_this_macos_does_not_have_is_left_out_of_the_catalogue() {
+        let catalogue = ShapeCatalogue::from_images([
+            (StandardCursor::Read(vec![1]), CursorShapeKind::Text),
+            (StandardCursor::Absent, CursorShapeKind::ZoomIn),
+            (StandardCursor::Read(vec![2]), CursorShapeKind::Crosshair),
+            (StandardCursor::Read(vec![1]), CursorShapeKind::Grab),
+        ]);
+        assert_eq!(
+            catalogue.map(|catalogue| catalogue.known),
+            Some(vec![
+                (vec![1], CursorShapeKind::Text),
+                (vec![2], CursorShapeKind::Crosshair),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_standard_cursor_answered_as_null_means_no_catalogue() {
+        assert!(
+            ShapeCatalogue::from_images([
+                (StandardCursor::Null, CursorShapeKind::Default),
+                (StandardCursor::Read(vec![1]), CursorShapeKind::Text),
+                (StandardCursor::Read(vec![2]), CursorShapeKind::Pointer),
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_catalogue_that_can_name_one_shape_is_none() {
+        assert!(
+            ShapeCatalogue::from_images([
+                (StandardCursor::Read(vec![1]), CursorShapeKind::Default),
+                (StandardCursor::Absent, CursorShapeKind::ZoomIn),
+                (StandardCursor::Read(vec![1]), CursorShapeKind::Pointer),
+            ])
+            .is_none()
+        );
+    }
 
     #[test]
     fn the_standard_cursors_are_distinguishable_from_each_other() {

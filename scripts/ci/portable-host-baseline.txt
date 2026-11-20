@@ -71,6 +71,17 @@
 # hosts/linux/src/net/setup_watch.rs is the Linux Pier's connection-scoped
 # lifecycle glue (a tokio task-local and the Pier's LifecycleEmitter), as
 # hosts/*/src/observability.rs are; its trace moves to shared/ with the emitter seam.
+# hosts/linux/src/net/joined_pen.rs is the Linux Pier's glue for Native tablet on a
+# joined console: it feeds the Linux facts (input/joined_devices.rs: /proc, sysfs,
+# logind's seat record) to the shared decisions (arcen_usb_bridge::joined_pen,
+# arcen_input::bridged_pen::host_decoded_tablet_result) and runs the shared
+# NativeTabletAttachment on the dispatcher, as hosts/windows/src/session.rs does for its
+# Windows Ink pen. It holds no policy of its own.
+# hosts/linux/src/net/joined_input.rs is the same kind of glue for a joined console's
+# keyboard, pointers and typed pen: it feeds input/joined_devices.rs's Linux facts to the
+# shared arcen_input::joined_input proof and JoinedInputGuard, mirrors the guard into the
+# uinput devices' gate and releases held input through the session's injector. It holds
+# no policy of its own.
 hosts/capenc/src/annexb.rs 80
 hosts/capenc/src/wayland/cursor.rs 126
 hosts/capenc/src/wayland/evidence.rs 190
@@ -95,6 +106,8 @@ hosts/linux/src/input/region_adapter.rs 221
 hosts/linux/src/media/annexb.rs 124
 hosts/linux/src/media/mod.rs 57
 hosts/linux/src/media/wayland_cursor.rs 83
+hosts/linux/src/net/joined_input.rs 226
+hosts/linux/src/net/joined_pen.rs 293
 hosts/linux/src/net/setup_watch.rs 83
 hosts/linux/src/observability.rs 520
 hosts/linux/src/session/audio.rs 209

@@ -15,7 +15,14 @@ adjudicated. Hooks are process-owned and disappear with the authenticated agent.
 Desk privacy is on by default on every Pier (`privacy.desk`). On Windows its
 default form needs no recovery of its own: the desk's keyboard and mouse
 hooks end with the session agent, and the display lease and its journal are
-the ordinary display recovery. On Linux a joined console's blanking is the
+the ordinary display recovery. The Windows agent proves its keyboard hook
+every two seconds with an injected canary key. Windows calls no low-level
+keyboard hook while a program in the session that reads raw keyboard
+input, and whose own low-level keyboard hook is the newest, has its window
+in front, so the hook cannot keep the desk's keyboard out then. The canary misses and
+the Pier ends and locks the session (`deskside hook canary deadline
+expired` in the agent log). The Windows Deck no longer does this (after
+0.20.4); another such program in the session still ends it. On Linux a joined console's blanking is the
 console privacy journal (`/run/arcen/console-privacy.json`, ADR 0025 §4).
 
 On macOS (`privacy.desk`, formerly `platform.desktop.deskside.enabled`) there is nothing to

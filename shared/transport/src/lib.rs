@@ -13,8 +13,10 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod cert_issuance;
 pub mod cert_marker;
 pub mod cert_provisioning;
+pub mod cert_publication;
 pub mod cert_store;
 pub mod cert_transaction;
 pub mod host_material;
@@ -24,6 +26,8 @@ pub mod path_signal;
 #[cfg(feature = "quic")]
 pub mod quic;
 pub mod refine_meter;
+#[cfg(test)]
+mod test_keys;
 pub mod tls;
 
 #[cfg(feature = "quic")]

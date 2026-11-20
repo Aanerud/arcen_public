@@ -25,9 +25,14 @@ pub mod foreign_service;
 pub mod greeter_token;
 pub mod login_screen;
 pub mod login_session;
+pub mod logind_read;
 pub mod owner_death;
+pub mod session_watch;
+pub mod wayland_attach;
+pub mod wayland_join;
 
 pub use foreign_service::{ConsoleNotice, ForeignService, other_product_holder};
+pub use logind_read::{SessionRead, SessionsUnreadable};
 
 /// How a Linux Pier serves a sign-in (`platform.session.mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -135,6 +140,9 @@ pub struct ConsoleSessionFact {
     pub locked: bool,
     /// The process that opened the session (logind `Leader=`; 0 unknown).
     pub leader: u32,
+    /// logind's `Desktop=` (`gnome`…; empty when the display manager did
+    /// not name one). Evidence for logs, never a decision.
+    pub desktop: String,
 }
 
 impl ConsoleSessionFact {
@@ -165,6 +173,7 @@ impl ConsoleSessionFact {
                 "Service" => value.clone_into(&mut fact.service),
                 "LockedHint" => fact.locked = value == "yes",
                 "Leader" => fact.leader = value.parse().unwrap_or(0),
+                "Desktop" => value.clone_into(&mut fact.desktop),
                 _ => {}
             }
         }
@@ -218,6 +227,12 @@ pub enum ConsoleDecision {
         activate: bool,
         origin: ConsoleOrigin,
     },
+    /// Join this session of the authenticated user, which runs GNOME on
+    /// Wayland: the Pier proves its compositor read-only and asks
+    /// [`wayland_join::decide_join`]. A Pier without the Wayland console
+    /// adapter refuses visibly (`console_wayland_session`), with the
+    /// evidence in its log (GAP-042).
+    JoinWayland(wayland_join::WaylandTarget),
     /// Nobody holds the console and the login screen is showing: complete
     /// the sign-in through it, so the display manager creates (or, when the
     /// user already has a session it started, resumes) the session.
@@ -289,12 +304,13 @@ pub fn decide(sessions: &[ConsoleSessionFact], uid: u32) -> ConsoleDecision {
 
 /// Decides what a sign-in of `uid` does, from every logind session.
 ///
-/// The user's own console desktop is joined; one held by another account
-/// (actively, or outside the display manager in any state) refuses;
-/// a Wayland desktop refuses until Arcen joins Wayland sessions; with only
-/// the login screen showing the sign-in goes through it; with nothing on
-/// the console seat there is nothing to join and the sign-in is refused
-/// rather than given a private desktop.
+/// The user's own console desktop is joined (an X11 one preferred; a
+/// Wayland one is the [`ConsoleDecision::JoinWayland`] target); one held by
+/// another account (actively, or outside the display manager in any state)
+/// refuses; with only the login screen showing the sign-in goes through it
+/// (a Wayland login screen refuses until Arcen signs in through one); with
+/// nothing on the console seat there is nothing to join and the sign-in is
+/// refused rather than given a private desktop.
 ///
 /// With nothing on the console seat, a host without a display manager gets
 /// Arcen's own login session for the account; one with a display manager
@@ -349,6 +365,20 @@ pub fn decide_on(sessions: &[ConsoleSessionFact], uid: u32, host: ConsoleHost) -
     }
 }
 
+/// [`decide_on`] from a read of logind's sessions: a read that is not
+/// complete ([`SessionsUnreadable`]) refuses
+/// ([`ConsoleRefusal::SessionsUnreadable`]). It is never "nobody holds the
+/// console": on a host without a display manager that would start a
+/// second login session for an account that may already hold one. Only a
+/// complete read proves that the account has no session.
+#[must_use]
+pub fn decide_on_read(read: &SessionRead, uid: u32, host: ConsoleHost) -> ConsoleDecision {
+    match read {
+        Ok(sessions) => decide_on(sessions, uid, host),
+        Err(_) => ConsoleDecision::Refuse(ConsoleRefusal::SessionsUnreadable),
+    }
+}
+
 /// What a returning Deck of `uid` may do with the console session `held`
 /// its attachment joined: `Ok(activate)` when the console still attaches
 /// exactly that session of the same account (`activate` brings it forward
@@ -373,9 +403,30 @@ pub fn decide_reattach(
             session, activate, ..
         } if owned && session == held => Ok(activate),
         ConsoleDecision::Refuse(refusal) => Err(refusal),
+        // A held attachment is an X11 one until the Wayland console adapter
+        // exists: the account's Wayland session is refused as at sign-in.
+        ConsoleDecision::JoinWayland(_) => Err(ConsoleRefusal::WaylandSession),
         ConsoleDecision::Attach { .. }
         | ConsoleDecision::SignInThroughGreeter { .. }
         | ConsoleDecision::StartLoginSession { .. } => Err(ConsoleRefusal::SessionChanged),
+    }
+}
+
+/// [`decide_reattach`] from a read of logind's sessions.
+///
+/// # Errors
+///
+/// [`ConsoleRefusal::SessionsUnreadable`] when the read is not complete,
+/// otherwise as [`decide_reattach`].
+pub fn decide_reattach_read(
+    read: &SessionRead,
+    uid: u32,
+    held: &str,
+    host: ConsoleHost,
+) -> Result<bool, ConsoleRefusal> {
+    match read {
+        Ok(sessions) => decide_reattach(sessions, uid, held, host),
+        Err(_) => Err(ConsoleRefusal::SessionsUnreadable),
     }
 }
 
@@ -434,7 +485,7 @@ pub fn settle_sign_in(
 
 fn attach(session: &ConsoleSessionFact, activate: bool) -> ConsoleDecision {
     if session.is_wayland() {
-        return ConsoleDecision::Refuse(ConsoleRefusal::WaylandSession);
+        return ConsoleDecision::JoinWayland(wayland_join::WaylandTarget::of(session, activate));
     }
     ConsoleDecision::Attach {
         session: session.id.clone(),
@@ -455,12 +506,18 @@ pub enum ConsoleRefusal {
     /// X server, or `startx`), active or in the background.
     OtherUserOtherProduct,
     /// The session (or the login screen's next session) is GNOME on
-    /// Wayland; Arcen joins X11 console sessions.
+    /// Wayland, and this Pier cannot join it yet: the account's own
+    /// session is identified ([`wayland_join::WaylandJoin::AdapterUnavailable`],
+    /// its evidence in the Pier's log) but not joined (GAP-042).
     WaylandSession,
     /// Nobody is signed in and no login screen runs on the console: there
     /// is no session to join and none can be created through the display
     /// manager.
     NoConsoleSession,
+    /// logind's sessions could not be read completely (it did not answer,
+    /// or not about every session, or contradicted itself): who is signed
+    /// in is unknown, so nothing is joined and no session is started.
+    SessionsUnreadable,
     /// The login screen cannot complete a remote sign-in on this host: the
     /// installer's sign-in components are missing or another service owns
     /// the login screen's credential channel.
@@ -495,11 +552,12 @@ pub enum ConsoleRefusal {
 
 impl ConsoleRefusal {
     /// Every refusal (the error-code reference checks each has a row).
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::OtherUser,
         Self::OtherUserOtherProduct,
         Self::WaylandSession,
         Self::NoConsoleSession,
+        Self::SessionsUnreadable,
         Self::SignInUnavailable,
         Self::SignInFailed,
         Self::SessionUnreachable,
@@ -528,6 +586,7 @@ impl ConsoleRefusal {
             Self::OtherUserOtherProduct => "console_other_user_other_product",
             Self::WaylandSession => "console_wayland_session",
             Self::NoConsoleSession => "console_no_session",
+            Self::SessionsUnreadable => "console_sessions_unreadable",
             Self::SignInUnavailable => "console_sign_in_unavailable",
             Self::SignInFailed => "console_sign_in_failed",
             Self::SessionUnreachable => "console_session_unreachable",
@@ -555,6 +614,9 @@ impl ConsoleRefusal {
             }
             Self::NoConsoleSession => {
                 "console_no_session: nobody is signed in and the workstation's login screen is not running."
+            }
+            Self::SessionsUnreadable => {
+                "console_sessions_unreadable: the workstation could not say who is signed in; no session was joined or started."
             }
             Self::SignInUnavailable => {
                 "console_sign_in_unavailable: this workstation's login screen cannot take a remote sign-in."
@@ -1069,6 +1131,7 @@ mod tests {
             service: "gdm-password".to_owned(),
             locked: false,
             leader: 0,
+            desktop: String::new(),
         }
     }
 
@@ -1330,10 +1393,20 @@ mod tests {
     }
 
     #[test]
-    fn wayland_desktops_and_wayland_login_screens_are_refused_visibly() {
-        assert_eq!(
+    fn wayland_desktops_are_targets_and_wayland_login_screens_are_refused_visibly() {
+        assert!(matches!(
             decide(&[session("7", TIM, "user", "wayland", true)], TIM),
-            ConsoleDecision::Refuse(ConsoleRefusal::WaylandSession)
+            ConsoleDecision::JoinWayland(target) if target.session == "7" && !target.activate
+        ));
+        assert_eq!(
+            decide_reattach(
+                &[session("7", TIM, "user", "wayland", true)],
+                TIM,
+                "7",
+                ConsoleHost::default()
+            ),
+            Err(ConsoleRefusal::WaylandSession),
+            "a held attachment is never a Wayland one until the adapter exists"
         );
         let mut wayland_greeter = greeter(true);
         wayland_greeter.session_type = "wayland".into();
@@ -1390,11 +1463,12 @@ mod tests {
     fn loginctl_properties_parse_and_an_unnamed_or_ownerless_session_is_no_fact() {
         let fact = ConsoleSessionFact::from_properties(
             "Id=23025\nUser=2311\nName=lca\nSeat=seat0\nVTNr=7\nClass=user\nType=x11\n\
-             State=active\nActive=yes\nRemote=no\nService=gdm-ovirtcred\nLockedHint=yes\nDisplay=\nLeader=4242\n",
+             State=active\nActive=yes\nRemote=no\nService=gdm-ovirtcred\nLockedHint=yes\nDisplay=\nLeader=4242\nDesktop=gnome\n",
         )
         .expect("fact");
         assert_eq!(fact.uid, 2311);
         assert_eq!(fact.leader, 4242);
+        assert_eq!(fact.desktop, "gnome");
         assert!(fact.active && fact.locked && fact.is_console_desktop());
         assert_eq!(fact.origin(), ConsoleOrigin::DisplayManager);
         assert_eq!(ConsoleSessionFact::from_properties("User=1\n"), None);

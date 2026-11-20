@@ -43,9 +43,18 @@ pub enum CapencControlCommand {
     /// Canvas: a Deck's `canvas_reset_request`; the loop answers with a
     /// reset (reason `reset request`).
     CanvasReset { monitor_id: u16, generation: u32 },
-    /// Canvas: local input at monitor pixel `(x, y)`; its neighbourhood is
-    /// never deferred.
-    CanvasInput { x: u32, y: u32 },
+    /// Canvas: input the Pier applied at `(x, y)` of monitor `monitor_id`
+    /// in topology generation `topology_generation`, in 1/65536ths of the
+    /// picture's width and height (the loop knows its own size; the Pier
+    /// may not); its neighbourhood is never deferred. A loop serving
+    /// another monitor or generation ignores it. Built by
+    /// [`crate::canvas::serve::CanvasInputFeed`]; carries no input content.
+    CanvasInput {
+        monitor_id: u16,
+        topology_generation: u64,
+        x: u16,
+        y: u16,
+    },
 }
 
 impl CapencControlCommand {
@@ -76,7 +85,12 @@ impl CapencControlCommand {
                 monitor_id,
                 generation,
             } => format!("CANVAS-RESET {monitor_id} {generation}"),
-            Self::CanvasInput { x, y } => format!("CANVAS-INPUT {x} {y}"),
+            Self::CanvasInput {
+                monitor_id,
+                topology_generation,
+                x,
+                y,
+            } => format!("CANVAS-INPUT {monitor_id} {topology_generation} {x} {y}"),
         }
     }
 
@@ -242,9 +256,11 @@ impl FromStr for CapencControlCommand {
                     monitor_id: narrow16(*monitor)?,
                     generation: narrow32(*generation)?,
                 }),
-                ("CANVAS-INPUT", [x, y]) => Ok(Self::CanvasInput {
-                    x: narrow32(*x)?,
-                    y: narrow32(*y)?,
+                ("CANVAS-INPUT", [monitor, topology_generation, x, y]) => Ok(Self::CanvasInput {
+                    monitor_id: narrow16(*monitor)?,
+                    topology_generation: *topology_generation,
+                    x: narrow16(*x)?,
+                    y: narrow16(*y)?,
                 }),
                 _ => Err(invalid()),
             };
@@ -301,9 +317,97 @@ impl FromStr for CapencControlCommand {
     }
 }
 
+/// Canvas control lines a capenc keeps between two encode-loop ticks: at
+/// most this many acknowledgements and reset requests.
+pub const MAX_CANVAS_CONTROLS: usize = 256;
+
+/// Canvas control lines waiting for the encode loop (ADR 0028): the Deck's
+/// acknowledgements and reset requests in arrival order, bounded at
+/// [`MAX_CANVAS_CONTROLS`], and only the newest input position, so input
+/// can never grow the inbox or push out a reset request. When full, the
+/// oldest acknowledgement goes first (a later one supersedes it); a reset
+/// request goes only when nothing but reset requests is left (each asks for
+/// the same thing).
+#[derive(Debug, Default)]
+pub struct CanvasControlInbox {
+    ordered: std::collections::VecDeque<CapencControlCommand>,
+    input: Option<CapencControlCommand>,
+}
+
+impl CanvasControlInbox {
+    /// Keeps one canvas line; any other command is ignored.
+    pub fn push(&mut self, command: CapencControlCommand) {
+        match command {
+            CapencControlCommand::CanvasInput { .. } => self.input = Some(command),
+            CapencControlCommand::CanvasAck { .. } | CapencControlCommand::CanvasReset { .. } => {
+                if self.ordered.len() >= MAX_CANVAS_CONTROLS {
+                    let ack = self.ordered.iter().position(|queued| {
+                        matches!(queued, CapencControlCommand::CanvasAck { .. })
+                    });
+                    self.ordered.remove(ack.unwrap_or(0));
+                }
+                self.ordered.push_back(command);
+            }
+            _ => {}
+        }
+    }
+
+    /// Everything kept since the last call: the ordered lines, then the
+    /// newest input position.
+    pub fn take(&mut self) -> Vec<CapencControlCommand> {
+        let mut taken: Vec<_> = self.ordered.drain(..).collect();
+        taken.extend(self.input.take());
+        taken
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flood of input positions while the loop is busy keeps one, the
+    /// newest, and never pushes a reset request out; a full inbox gives up
+    /// acknowledgements first.
+    #[test]
+    fn input_never_displaces_a_reset_request() {
+        let mut inbox = CanvasControlInbox::default();
+        let reset = CapencControlCommand::CanvasReset {
+            monitor_id: 0,
+            generation: 4,
+        };
+        inbox.push(reset);
+        for x in 0..10_000_u16 {
+            inbox.push(CapencControlCommand::CanvasInput {
+                monitor_id: 0,
+                topology_generation: 0,
+                x,
+                y: 7,
+            });
+        }
+        for fence in 0..(MAX_CANVAS_CONTROLS as u64 * 2) {
+            inbox.push(CapencControlCommand::CanvasAck {
+                monitor_id: 0,
+                generation: 4,
+                fence,
+                unprocessed_bytes: 0,
+                decode_ms_p95: 0,
+            });
+        }
+        let taken = inbox.take();
+        assert_eq!(taken.len(), MAX_CANVAS_CONTROLS + 1);
+        assert_eq!(taken[0], reset, "the reset request survived");
+        assert_eq!(
+            taken.last(),
+            Some(&CapencControlCommand::CanvasInput {
+                monitor_id: 0,
+                topology_generation: 0,
+                x: 9_999,
+                y: 7,
+            }),
+            "only the newest input position"
+        );
+        assert!(inbox.take().is_empty());
+    }
 
     #[test]
     fn canvas_lines_round_trip_and_bad_ones_are_refused() {
@@ -320,7 +424,12 @@ mod tests {
                 monitor_id: 1,
                 generation: 2,
             },
-            CapencControlCommand::CanvasInput { x: 10, y: 2159 },
+            CapencControlCommand::CanvasInput {
+                monitor_id: 0,
+                topology_generation: 0,
+                x: 10,
+                y: 65_535,
+            },
         ] {
             assert_eq!(command.as_line().parse(), Ok(command));
         }
@@ -330,6 +439,8 @@ mod tests {
             "CANVAS-RESET 1",
             "CANVAS-RESET 1 x",
             "CANVAS-INPUT 1 2 3",
+            "CANVAS-INPUT 10 20",
+            "CANVAS-INPUT 0 0 65536 1",
         ] {
             assert!(bad.parse::<CapencControlCommand>().is_err(), "{bad}");
         }

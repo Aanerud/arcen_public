@@ -224,20 +224,10 @@ pub(crate) struct ControlState {
     refine_enable: AtomicU32,
     /// The latest `REFINE-RATE`, packed by [`pack_refine_rate`]; 0 = none.
     refine_rate: AtomicU64,
-    /// Canvas control lines (ADR 0028) in arrival order, bounded: the
-    /// oldest acknowledgements go first when the loop falls behind.
-    canvas: std::sync::Mutex<
-        std::collections::VecDeque<arcen_media::capenc_control::CapencControlCommand>,
-    >,
+    /// Canvas control lines (ADR 0028), bounded by the shared inbox: the
+    /// Deck's in arrival order, input positions newest only.
+    canvas: std::sync::Mutex<arcen_media::capenc_control::CanvasControlInbox>,
 }
-
-/// Canvas control lines kept for the loop.
-#[cfg(any(
-    test,
-    windows,
-    all(target_os = "linux", any(feature = "nvenc", feature = "software-h264"))
-))]
-const MAX_CANVAS_CONTROLS: usize = 256;
 
 /// Packs a `REFINE-RATE` into one non-zero word: the hold flag in bit 0,
 /// the rate above it (saturated far beyond any link).
@@ -271,19 +261,17 @@ impl ControlState {
             refine_reset: AtomicBool::new(false),
             refine_enable: AtomicU32::new(0),
             refine_rate: AtomicU64::new(0),
-            canvas: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            canvas: std::sync::Mutex::new(
+                arcen_media::capenc_control::CanvasControlInbox::default(),
+            ),
         }
     }
 
     fn push_canvas(&self, command: arcen_media::capenc_control::CapencControlCommand) {
-        let mut queue = self
-            .canvas
+        self.canvas
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if queue.len() >= MAX_CANVAS_CONTROLS {
-            queue.pop_front();
-        }
-        queue.push_back(command);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(command);
     }
 
     /// Takes the canvas control lines that arrived since the last call.
@@ -294,11 +282,10 @@ impl ControlState {
     pub(crate) fn take_canvas_controls(
         &self,
     ) -> Vec<arcen_media::capenc_control::CapencControlCommand> {
-        let mut queue = self
-            .canvas
+        self.canvas
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.drain(..).collect()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Consumes a pending `REFINE-RATE`: `(bps, hold)`.

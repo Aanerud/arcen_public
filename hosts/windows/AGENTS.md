@@ -53,7 +53,8 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   reset, one extra frame per quiet second), so a slow path
   holds frames in its per-monitor shared queues under
   `video_backlog_budget`, and the frame router and the capenc reader wait for
-  room instead of dropping. Never let frames pile up in the relay again, and
+  room instead of dropping (the shared `OutboundVideoRecord::room_wait`: a
+  canvas frame until there is room, ADR 0028 §7). Never let frames pile up in the relay again, and
   never block the agent socket for video: audio, cursor and control share it.
   The agent's environment is the signed-in user's (`CreateEnvironmentBlock`
   without inheritance): a service setting the agent must honour, such as

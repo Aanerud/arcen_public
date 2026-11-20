@@ -62,13 +62,13 @@ arcen-protocol = { path = "../../shared/protocol", default-features = false }
 arcen-session.workspace = true
 arcen-telemetry.workspace = true
 arcen-usb-bridge.workspace = true
-arcen-transport = { workspace = true, default-features = false, features = ["quic"] }
+# `issuer`: the shared certificate issuer behind `new-host-cert`.
+arcen-transport = { workspace = true, default-features = false, features = ["issuer", "quic"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom.workspace = true
 mach2.workspace = true
 libc = "0.2"
 quinn.workspace = true
-rcgen = "=0.14.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
@@ -79,7 +79,6 @@ sha2.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror = "1"
-time = { version = "0.3", default-features = false, features = ["std"] }
 x509-parser.workspace = true
 zip.workspace = true
 zeroize.workspace = true
@@ -106,6 +105,7 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
 videotoolbox = { version = "0.18.1", features = ["async"] }
 
 [dev-dependencies]
+rcgen = "=0.14.8"
 rustls-pemfile = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 

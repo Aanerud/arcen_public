@@ -725,12 +725,48 @@ impl PointerReporting {
 /// host cursor written back on the same lane. Topology barriers are
 /// explicit in every region message (its generation), never inferred from
 /// arrival order relative to the control lane.
+/// Tells the canvas's encode loop where input was applied (ADR 0028 §11):
+/// the shared feed, which keeps one position and forwards it only when it
+/// moved or is due again, and the capture's control mailbox. Only input the
+/// backend applied reaches it, and only its position.
+pub(super) struct CanvasInputForward {
+    feed: arcen_media::canvas::serve::CanvasInputFeed,
+    capture: IdrRequester,
+}
+
+impl CanvasInputForward {
+    /// For a capture whose plan serves a canvas; `None` otherwise.
+    pub(super) fn new(
+        plan: &arcen_media::canvas::serve::CanvasServePlan,
+        capture: IdrRequester,
+    ) -> Option<Self> {
+        Some(Self {
+            feed: arcen_media::canvas::serve::CanvasInputFeed::for_plan(plan)?,
+            capture,
+        })
+    }
+
+    /// The backend applied input at normalised `at`. Sends nothing once
+    /// the capture stopped serving the canvas (a restart without it).
+    fn applied(&mut self, at: (f64, f64)) {
+        if !self.capture.serves_canvas() {
+            return;
+        }
+        if let Some(command) = self.feed.applied(at.0, at.1, Instant::now()) {
+            // Latest wins, beside the control mailbox: input never queues
+            // and never takes a reset request's place.
+            self.capture.request_canvas_input(command);
+        }
+    }
+}
+
 pub(super) async fn input_lane_worker(
     lanes: LaneConnection,
     input: Arc<Mutex<Option<PierInput>>>,
     cursor_feed: Option<CursorFeed>,
     mut text_notices: Option<mpsc::Receiver<String>>,
     slot: LaneSenderSlot,
+    mut canvas_input: Option<CanvasInputForward>,
 ) -> SessionEndReason {
     let mut reader = PeerLaneReader::new(&lanes, LaneRole::InputCursor);
     let mut sequence = arcen_input::InputSequenceTracker::default();
@@ -803,8 +839,19 @@ pub(super) async fn input_lane_worker(
                         if let Some(pointer) = pointer.as_mut() {
                             pointer.note_input(&text);
                         }
-                        let mut controller = lock_recover(&input);
-                        super::handle_input_json(&text, controller.as_mut(), &mut sequence);
+                        let mut applied_at = None;
+                        {
+                            let mut controller = lock_recover(&input);
+                            super::handle_input_json(
+                                &text,
+                                controller.as_mut(),
+                                &mut sequence,
+                                &mut applied_at,
+                            );
+                        }
+                        if let (Some(at), Some(canvas)) = (applied_at, canvas_input.as_mut()) {
+                            canvas.applied(at);
+                        }
                     }
                     Ok(SessionRecord::Ping(_) | SessionRecord::Pong(_)) => {}
                     Ok(_) => {
@@ -1509,6 +1556,7 @@ mod tests {
             }),
             None,
             input_slot,
+            None,
         ));
         let mut deck_input = SessionLane::split(
             tokio::time::timeout(STEP, pair.deck.open_lane(LaneRole::InputCursor))
@@ -1580,6 +1628,141 @@ mod tests {
         assert!(!input_worker.is_finished());
         running.writers.abort();
         input_worker.abort();
+    }
+
+    /// Input priority plumbing (ADR 0028 §11): where the backend applied
+    /// input reaches the canvas capture as one `CANVAS-INPUT` line per move
+    /// or refresh, redundant samples cost nothing, only the newest line
+    /// waits, and none of it takes a place in the control mailbox that
+    /// canvas reset requests, keyframe and rate lines share.
+    #[test]
+    fn applied_input_reaches_the_canvas_capture_newest_only_beside_the_mailbox() {
+        use crate::media::capenc::test_support::{fake_canvas_idr_with_control, take_canvas_input};
+        use arcen_media::capenc_control::CapencControlCommand;
+        let plan = arcen_media::canvas::serve::CanvasServePlan {
+            status: None,
+            terms: Some(arcen_protocol::canvas::CanvasTerms {
+                max_canvas_px: 16_384,
+                max_surfaces_per_monitor: 2,
+                cache_bytes: 1 << 20,
+                cache_slots: 256,
+            }),
+        };
+        let (capture, mut control, slot) = fake_canvas_idr_with_control(4);
+        assert!(CanvasInputForward::new(
+            &arcen_media::canvas::serve::multi_monitor_off(),
+            capture.clone()
+        )
+        .is_none());
+        let reset = CapencControlCommand::CanvasReset {
+            monitor_id: 0,
+            generation: 3,
+        };
+        assert!(capture.request_canvas(reset));
+        let mut forward = CanvasInputForward::new(&plan, capture.clone()).expect("a canvas");
+        let line = |x, y| CapencControlCommand::CanvasInput {
+            monitor_id: 0,
+            topology_generation: 0,
+            x,
+            y,
+        };
+        forward.applied((0.25, 0.5));
+        assert_eq!(take_canvas_input(&slot), Some(line(16_384, 32_768)));
+        for _ in 0..50 {
+            forward.applied((0.25, 0.5));
+        }
+        assert_eq!(take_canvas_input(&slot), None, "redundant samples");
+        for x in 1..=200 {
+            forward.applied((0.25 + f64::from(x) * 0.005, 0.5));
+        }
+        assert_eq!(
+            take_canvas_input(&slot),
+            Some(line(65_535, 32_768)),
+            "only the newest waits"
+        );
+        assert!(capture.request_canvas(reset), "the mailbox still has room");
+        let mut mailbox = Vec::new();
+        while let Ok(command) = control.try_recv() {
+            mailbox.push(command);
+        }
+        assert_eq!(mailbox.len(), 2, "only the two reset requests");
+    }
+
+    /// Audio progress under canvas video pressure: while the Deck reads no
+    /// video and the canvas frame pump waits for room (it never drops a
+    /// canvas record for a slow path), the audio lane keeps flowing and the
+    /// waiting producer asks for no new generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audio_flows_while_a_canvas_producer_waits_for_the_video_lane() {
+        let pair = pair().await;
+        let mut running = start_writers(&pair);
+        // A canvas generation the Deck never reads, queued the way the pump
+        // queues it, until the lane and then the queue are full.
+        let mut full = false;
+        for index in 0..64_u8 {
+            let record = if index == 0 {
+                arcen_media::video::OutboundVideoRecord::CanvasReset
+            } else {
+                arcen_media::video::OutboundVideoRecord::CanvasFrame
+            };
+            let queued = running.video.enqueue_with_backpressure(
+                record,
+                vec![FrameType::Canvas as u8, index].repeat(256 * 1024),
+                index == 0,
+                Vec::new(),
+            );
+            if tokio::time::timeout(Duration::from_millis(500), queued)
+                .await
+                .is_err()
+            {
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "the video lane and queue back up");
+        let backed_up = Instant::now() + Duration::from_secs(10);
+        while pair.pier.status().role(LaneRole::Video).queued_records == 0
+            && Instant::now() < backed_up
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pair.pier.status().role(LaneRole::Video).queued_records > 0);
+        let producer = {
+            let video = Arc::clone(&running.video);
+            tokio::spawn(async move {
+                video
+                    .enqueue_with_backpressure(
+                        arcen_media::video::OutboundVideoRecord::CanvasFrame,
+                        vec![FrameType::Canvas as u8, 0xCA],
+                        false,
+                        Vec::new(),
+                    )
+                    .await
+            })
+        };
+        let mut deck_audio = PeerLaneReader::new(&pair.deck, LaneRole::AudioOutput);
+        let mut worst_audio = Duration::ZERO;
+        // Longer than the access-unit room wait, so a canvas producer that
+        // gave up would have dropped by now.
+        for sequence in 0..40_u32 {
+            let sent = Instant::now();
+            running.audio.enqueue(audio_packet(sequence));
+            let frame = next_frame(&mut deck_audio).await;
+            worst_audio = worst_audio.max(sent.elapsed());
+            assert_eq!(frame[0], FrameType::Audio as u8);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(worst_audio < Duration::from_millis(250), "{worst_audio:?}");
+        assert!(!producer.is_finished(), "the canvas producer still waits");
+        assert!(running.idr_rx.try_recv().is_err(), "no new generation");
+        assert!(!running.writers.is_finished());
+        running.video.close_and_clear();
+        let queued = tokio::time::timeout(STEP, producer)
+            .await
+            .expect("teardown releases the producer")
+            .unwrap();
+        assert!(!queued);
+        running.writers.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1789,6 +1972,7 @@ mod tests {
             None,
             None,
             LaneSenderSlot::new(LaneRole::InputCursor),
+            None,
         ));
         let deck_input = SessionLane::split(
             tokio::time::timeout(STEP, pair.deck.open_lane(LaneRole::InputCursor))
@@ -1878,6 +2062,7 @@ mod tests {
             None,
             Some(notices_rx),
             LaneSenderSlot::new(LaneRole::InputCursor),
+            None,
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mut deck_input = SessionLane::split(
@@ -1912,6 +2097,7 @@ mod tests {
             None,
             None,
             LaneSenderSlot::new(LaneRole::InputCursor),
+            None,
         ));
         let deck_input = SessionLane::split(
             tokio::time::timeout(STEP, pair.deck.open_lane(LaneRole::InputCursor))
@@ -2000,6 +2186,7 @@ mod tests {
                 }),
                 None,
                 input_slot,
+                None,
             ));
             let mut deck_input = SessionLane::split(
                 tokio::time::timeout(STEP, pair.deck.open_lane(LaneRole::InputCursor))
@@ -2122,6 +2309,7 @@ mod tests {
             }),
             None,
             LaneSenderSlot::new(LaneRole::InputCursor),
+            None,
         ));
         let mut deck_input = SessionLane::split(
             tokio::time::timeout(STEP, pair.deck.open_lane(LaneRole::InputCursor))

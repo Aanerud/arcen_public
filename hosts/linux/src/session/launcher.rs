@@ -891,6 +891,9 @@ pub struct AuthenticatedLauncher {
     provider: arcen_session::desktop_provider::DesktopProvider,
     audio: AgentAudioArguments,
     desktop_mode: arcen_session::console_session::DesktopMode,
+    /// A host that creates its own Wayland desktops found the account's own
+    /// proven Wayland session: this sign-in joins it instead (S4b).
+    joins_wayland_console: bool,
 }
 
 impl AuthenticatedLauncher {
@@ -1137,6 +1140,7 @@ impl AuthenticatedLauncher {
                 provider: config.provider,
                 audio: config.audio.clone(),
                 desktop_mode: config.desktop_mode,
+                joins_wayland_console: false,
             }),
             "rejected" => Err(LauncherError::Rejected),
             status => arcen_session::console_session::ConsoleNotice::from_status(status, None)
@@ -1239,8 +1243,27 @@ impl AuthenticatedLauncher {
     /// `platform.session.mode = console` on an Xorg host. A headless Wayland
     /// provider keeps creating its own desktops.
     pub(crate) fn joins_console(&self) -> bool {
-        self.desktop_mode == arcen_session::console_session::DesktopMode::Console
-            && self.provider == arcen_session::desktop_provider::DesktopProvider::Xorg
+        self.joins_wayland_console
+            || (self.desktop_mode == arcen_session::console_session::DesktopMode::Console
+                && self.provider == arcen_session::desktop_provider::DesktopProvider::Xorg)
+    }
+
+    /// Whether this sign-in is served by a Wayland desktop of the Pier's
+    /// own (the headless or native-seat provider).
+    pub(crate) fn creates_wayland_desktop(&self) -> bool {
+        !self.joins_wayland_console
+            && self.provider == arcen_session::desktop_provider::DesktopProvider::Wayland
+    }
+
+    /// This sign-in joins the account's own proven Wayland session as a
+    /// console session, on a host that would otherwise create a desktop.
+    pub(crate) fn join_wayland_console(&mut self) {
+        self.joins_wayland_console = true;
+    }
+
+    /// Whether [`Self::join_wayland_console`] switched this sign-in.
+    pub(crate) const fn joins_wayland_console(&self) -> bool {
+        self.joins_wayland_console
     }
 
     /// Joins the user's console session through the privileged launcher:
@@ -1270,6 +1293,9 @@ impl AuthenticatedLauncher {
         );
         request.console = true;
         request.desk_live = !self.desk_privacy.enabled;
+        // A joined Wayland session's streams report the cursor as the
+        // Deck asked.
+        request.stream_cursor = self.stream_cursor;
         self.console_open_sent = true;
         let mut request_json = serde_json::to_vec(&request).map_err(|_| LauncherError::Protocol)?;
         request_json.push(b'\n');
@@ -1280,38 +1306,67 @@ impl AuthenticatedLauncher {
             CONSOLE_OPEN_TIMEOUT,
         )
         .await?;
+        // A joined Wayland session (S4b) answers with its own monitors'
+        // streams in the account's runtime directory, and nothing else.
+        let joined_wayland = response
+            .wayland
+            .as_ref()
+            .filter(|wayland| wayland.is_consistent_joined(self.identity.uid));
+        // A sign-in switched to join the account's Wayland session is
+        // served only that session.
+        if response.status == "ready" && self.joins_wayland_console && joined_wayland.is_none() {
+            return Err(LauncherError::Console(
+                arcen_session::console_session::ConsoleRefusal::SessionChanged.into(),
+            ));
+        }
         if response.status != "ready"
             || response.username != self.identity.username
             || response.uid != self.identity.uid
-            || response.wayland.is_some()
+            || (response.wayland.is_some() && joined_wayland.is_none())
         {
             return Err(open_response_error(
                 response.status.as_str(),
                 response.console_service.clone(),
             ));
         }
-        let environment = SessionEnvironment::build(
-            &self.identity,
-            &response.display,
-            (!response.xauthority.is_empty()).then_some(response.xauthority.as_str()),
-            &response.desktop,
-            None,
-            vec![
-                ("XDG_SESSION_ID".into(), response.session_id.clone()),
-                (
-                    "XDG_SEAT".into(),
-                    arcen_session::console_session::CONSOLE_SEAT.into(),
-                ),
-                (
-                    "ARCEN_SESSION_LOG_ID".into(),
-                    self.session_log_id
-                        .lock()
-                        .expect("session log id lock")
-                        .to_string(),
-                ),
-            ],
-        )
-        .with_session_audio(response.audio.as_ref());
+        let pam_environment = vec![
+            ("XDG_SESSION_ID".into(), response.session_id.clone()),
+            (
+                "XDG_SEAT".into(),
+                arcen_session::console_session::CONSOLE_SEAT.into(),
+            ),
+            (
+                "ARCEN_SESSION_LOG_ID".into(),
+                self.session_log_id
+                    .lock()
+                    .expect("session log id lock")
+                    .to_string(),
+            ),
+        ];
+        let environment = match joined_wayland {
+            Some(wayland) => {
+                let handoff = wayland
+                    .primary_handoff()
+                    .map_err(|_| LauncherError::Protocol)?;
+                SessionEnvironment::build_wayland(
+                    &self.identity,
+                    &response.desktop,
+                    None,
+                    pam_environment,
+                )
+                .with_wayland_session(wayland, &handoff)
+                .with_session_audio(response.audio.as_ref())
+            }
+            None => SessionEnvironment::build(
+                &self.identity,
+                &response.display,
+                (!response.xauthority.is_empty()).then_some(response.xauthority.as_str()),
+                &response.desktop,
+                None,
+                pam_environment,
+            )
+            .with_session_audio(response.audio.as_ref()),
+        };
         let depth = response
             .x11_root_depth
             .and_then(arcen_media::video::DesktopDepth::from_x11_depth)
@@ -1337,8 +1392,8 @@ impl AuthenticatedLauncher {
         Ok(SessionLauncher {
             identity: self.identity.clone(),
             environment,
-            x11_desktop_depth: Some(depth),
-            wayland: None,
+            x11_desktop_depth: joined_wayland.is_none().then_some(depth),
+            wayland: joined_wayland.cloned(),
             audio: response.audio,
             agent_pid: response.agent_pid,
             child: self.child.take().ok_or(LauncherError::Protocol)?,
@@ -2567,7 +2622,9 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     let open = parse_open_request(&command)?;
     let x11_desktop_depth = open.x11_desktop_depth()?;
     let mut commands = commands.lines();
-    if open.console && !wayland {
+    // A launcher of a host that creates Wayland desktops joins too: the
+    // account's own Wayland session (S4b).
+    if open.console {
         // No PAM session: the session already exists (or the login screen
         // creates it). PAM proved the password and the account above.
         drop(context);
@@ -2591,6 +2648,7 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
             &mut commands,
             &launch,
             console_keyring_password,
+            wayland,
         )
         .await;
     }
@@ -2630,9 +2688,22 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     // runs its own Xorg on VT 7): the second X server hangs, or takes the
     // console away.
     if !wayland {
-        if let Some((holder, origin)) =
-            arcen_session::x11_seat::x11_seat_holder(&super::console::read_sessions().await)
-        {
+        // A console nobody can see is never taken for a free one.
+        let sessions = match super::console::read_sessions().await {
+            Ok(sessions) => sessions,
+            Err(unreadable) => {
+                tracing::warn!(
+                    target: target::SESSION,
+                    logind = unreadable.token(),
+                    "logind's sessions could not be read; a dedicated desktop is not started beside a console it cannot see"
+                );
+                let notice: arcen_session::console_session::ConsoleNotice =
+                    arcen_session::console_session::ConsoleRefusal::SessionsUnreadable.into();
+                write_response(&LauncherResponse::console_refusal(&notice))?;
+                return Err(LauncherError::Console(notice));
+            }
+        };
+        if let Some((holder, origin)) = arcen_session::x11_seat::x11_seat_holder(&sessions) {
             tracing::warn!(
                 target: target::SESSION,
                 holder_session = %holder.id,
@@ -2963,6 +3034,10 @@ async fn run_console(
     launch: &super::login_session::LoginLaunch,
     // Only a sign-in that starts the session uses it.
     mut keyring_password: Option<Zeroizing<Vec<u8>>>,
+    // A launcher of a host that creates Wayland desktops: only the
+    // account's own Wayland session is joined (S4b); it never takes an X11
+    // console, a login screen or a login session of its own.
+    wayland_join_only: bool,
 ) -> Result<(), LauncherError> {
     use super::console;
     use arcen_session::console_session::{self as model, ConsoleDecision, ConsoleRefusal};
@@ -2984,13 +3059,29 @@ async fn run_console(
     let ready_by = tokio::time::Instant::now() + CONSOLE_OPEN_TIMEOUT - CONSOLE_READY_MARGIN;
     let sessions = console::read_sessions().await;
     let host = super::login_session::console_host();
-    let decision = model::decide_on(&sessions, identity.uid, host);
+    // Only a complete read of logind's sessions proves the account has
+    // none; an unreadable one refuses rather than start a second session.
+    let decision = model::decide_on_read(&sessions, identity.uid, host);
     tracing::info!(
         target: target::SESSION,
         decision = ?decision,
-        sessions = sessions.len(),
+        sessions = sessions.as_ref().map_or(0, Vec::len),
+        logind = sessions.as_ref().err().map_or("read", |unreadable| unreadable.token()),
         "console session decision"
     );
+    if wayland_join_only
+        && !matches!(
+            decision,
+            ConsoleDecision::JoinWayland(_) | ConsoleDecision::Refuse(_)
+        )
+    {
+        tracing::error!(
+            target: target::SESSION,
+            decision = ?decision,
+            "the account's Wayland session is no longer the console session this sign-in was to join"
+        );
+        return Err(refuse(ConsoleRefusal::SessionChanged.into()));
+    }
     let mut privacy = console::ConsolePrivacy::default();
     let mut signed_in_through: Option<String> = None;
     // What `platform.session.default_desktop` did for a sign-in that
@@ -3100,6 +3191,40 @@ async fn run_console(
                     return Err(refuse(refusal.into()));
                 }
             }
+        }
+        // The account's own Wayland session: identified and its compositor
+        // proven read-only, then refused visibly until this Pier can join
+        // one (GAP-042).
+        // The account's own Wayland session: identified and its compositor
+        // proven read-only, then joined (S4b) when this Pier has the
+        // adapter, refused visibly otherwise (GAP-042).
+        ConsoleDecision::JoinWayland(target) => {
+            let join = super::console_wayland::identify(&target, identity.gid).await;
+            if model::wayland_attach::lock_step(&join).is_none() {
+                let refusal = join
+                    .refusal()
+                    .unwrap_or(model::wayland_join::WaylandJoin::REFUSAL_WITHOUT_ADAPTER);
+                return Err(refuse(console::notice_for(
+                    refusal,
+                    &sessions,
+                    identity.uid,
+                )));
+            }
+            return run_wayland_join(
+                WaylandJoinContext {
+                    identity,
+                    open,
+                    agent_binary,
+                    desktop,
+                    session_log_id,
+                    ready_by,
+                },
+                commands,
+                &target,
+                &join,
+                &refuse,
+            )
+            .await;
         }
         ConsoleDecision::Refuse(refusal) => {
             return Err(refuse(console::notice_for(
@@ -3358,6 +3483,9 @@ async fn run_console(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ticks: u32 = 0;
     let mut attached = true;
+    // A look logind does not answer is not a logout; enough of them in a
+    // row hand the console back (locked), never end the session.
+    let mut watch = model::session_watch::SessionWatch::new(identity.uid);
     loop {
         tokio::select! {
             line = commands.next_line() => {
@@ -3482,16 +3610,26 @@ async fn run_console(
                     }
                 }
                 if ticks & 1 == 0 {
-                    let alive = console::session_fact(&session_id)
-                        .await
-                        .is_some_and(|fact| fact.uid == identity.uid && fact.is_console_desktop());
-                    if !alive {
-                        tracing::info!(
-                            target: target::SESSION,
-                            session_id = %session_id,
-                            "the console session ended (the user logged out)"
-                        );
-                        break;
+                    match console::watch_joined(&mut watch, &session_id).await {
+                        model::session_watch::WatchStep::Hold => {}
+                        model::session_watch::WatchStep::Ended => {
+                            tracing::info!(
+                                target: target::SESSION,
+                                session_id = %session_id,
+                                "the console session ended (the user logged out)"
+                            );
+                            break;
+                        }
+                        step @ model::session_watch::WatchStep::HandBack => {
+                            tracing::warn!(
+                                target: target::SESSION,
+                                session_id = %session_id,
+                                reason_class = step.token(),
+                                unanswered = watch.unanswered(),
+                                "logind has not answered about the joined console session; the attachment ends and the console is handed back locked (the session is not ended)"
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -3520,6 +3658,286 @@ async fn run_console(
     }
     agent.shutdown().await;
     Ok(())
+}
+
+/// What a joined Wayland session's launcher works with.
+#[cfg(target_os = "linux")]
+struct WaylandJoinContext<'a> {
+    identity: &'a UserIdentity,
+    open: &'a OpenRequest,
+    agent_binary: &'a Path,
+    desktop: &'a str,
+    session_log_id: &'a CorrelationId,
+    /// When the Pier stops waiting for the ready answer.
+    ready_by: tokio::time::Instant,
+}
+
+/// Joins the account's own proven Wayland session (ADR 0025 §9, S4b) and
+/// holds it while the Deck is attached.
+///
+/// The desk's input is disabled first; a session waiting behind another is
+/// brought forward and a locked one unlocked (GNOME shares nothing of a
+/// locked session; the account's password was just proven). The session
+/// agent then joins the session as the account
+/// (`session/wayland/join.rs`); the Deck is served only when the shared
+/// decisions accept what it proved (`wayland_attach::{desk_privacy,
+/// decide_serve}`). When the Deck leaves, or anything fails after the
+/// session was touched, the session is handed back locked and the
+/// attachment ends; the session is never ended.
+#[cfg(target_os = "linux")]
+async fn run_wayland_join(
+    context: WaylandJoinContext<'_>,
+    commands: &mut Lines<LauncherCommands>,
+    target: &arcen_session::console_session::wayland_join::WaylandTarget,
+    join: &arcen_session::console_session::wayland_join::WaylandJoin,
+    refuse: &dyn Fn(arcen_session::console_session::ConsoleNotice) -> LauncherError,
+) -> Result<(), LauncherError> {
+    use super::console;
+    use arcen_session::console_session::wayland_attach::{self, LockStep};
+    use arcen_session::console_session::wayland_join::WaylandJoin;
+    use arcen_session::console_session::{self as model, ConsoleRefusal};
+
+    let WaylandJoinContext {
+        identity,
+        open,
+        agent_binary,
+        desktop,
+        session_log_id,
+        ready_by,
+    } = context;
+    let session_id = target.session.clone();
+    let (step, compositor_pid) = match (wayland_attach::lock_step(join), join) {
+        (
+            Some(step),
+            WaylandJoin::Join { compositor, .. } | WaylandJoin::HandleLock { compositor, .. },
+        ) => (step, *compositor),
+        _ => return Err(refuse(ConsoleRefusal::SessionUnreachable.into())),
+    };
+    // Desk privacy is decided before anything of the session is brought
+    // forward or unlocked: a session that shows on a monitor at the desk is
+    // never put on it for a join that would be refused.
+    if !open.desk_live {
+        let shown = super::console_wayland::desk_shows_session(target, identity.gid).await;
+        if let Err(refusal) = wayland_attach::desk_privacy(shown.unwrap_or(true), !open.desk_live) {
+            tracing::error!(
+                target: target::SESSION,
+                session_id = %session_id,
+                read = shown.is_some(),
+                "the joined Wayland session shows on a monitor at the desk (or its monitors could not be read), and desk privacy is required: a Wayland desk cannot be blanked without changing the user's compositor, so nothing of the session is shown"
+            );
+            return Err(refuse(refusal.into()));
+        }
+    }
+    // Journalled before anything of the session is touched: a Pier that
+    // loses this launcher locks the session (`console::recover_console`).
+    if let Err(error) = console::journal_wayland_join(&session_id) {
+        tracing::error!(target: target::SESSION, session_id = %session_id, %error, "the joined Wayland session could not be journalled; it is not touched");
+        return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
+    }
+    let mut privacy = console::ConsolePrivacy::default();
+    // Nobody at the desk may use the session while it is shown remotely.
+    if let Err(refusal) = privacy.disable_input() {
+        console::forget_wayland_join();
+        return Err(refuse(refusal.into()));
+    }
+    if target.activate {
+        privacy.mark_brought_forward();
+        if !console::activate_session(&session_id).await {
+            tracing::error!(target: target::SESSION, session_id = %session_id, "the joined Wayland session could not be brought forward");
+            leave_unserved(&mut privacy, &session_id).await;
+            return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
+        }
+    }
+    if step == LockStep::UnlockFirst {
+        privacy.mark_brought_forward();
+        let unlocked = unlock_logind_session_id(&session_id).await.is_ok();
+        if let Err(refusal) = wayland_attach::after_unlock(!unlocked) {
+            tracing::error!(
+                target: target::SESSION,
+                session_id = %session_id,
+                "the joined Wayland session did not unlock; the sign-in is refused"
+            );
+            leave_unserved(&mut privacy, &session_id).await;
+            return Err(refuse(refusal.into()));
+        }
+    }
+    let display = console::session_environ(&session_id, identity.uid, "WAYLAND_DISPLAY")
+        .unwrap_or_else(|| super::wayland::WAYLAND_DISPLAY_NAME.to_owned());
+    let environment = SessionEnvironment::build_wayland(
+        identity,
+        desktop,
+        None,
+        [
+            ("XDG_SESSION_ID".to_owned(), session_id.clone()),
+            ("XDG_SEAT".to_owned(), model::CONSOLE_SEAT.to_owned()),
+        ],
+    )
+    .with_wayland_display(&display)
+    .with_locale(&super::locale::session_locale(&identity.username));
+    if let Err(error) = environment.validate_runtime(identity) {
+        tracing::error!(target: target::SESSION, session_id = %session_id, %error, "the joined Wayland session's runtime directory or user bus is not the account's");
+        leave_unserved(&mut privacy, &session_id).await;
+        return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
+    }
+    let mut agent = match SessionAgent::spawn_wayland_join(
+        agent_binary,
+        identity,
+        &environment,
+        desktop,
+        session_log_id,
+        &open.audio(),
+        compositor_pid,
+        open.stream_cursor.unwrap_or_default(),
+        ready_by.saturating_duration_since(tokio::time::Instant::now()),
+    )
+    .await
+    {
+        Ok(agent) => agent,
+        Err(error) => {
+            tracing::error!(target: target::SESSION, session_id = %session_id, %error, "the joined Wayland session's agent did not join it");
+            leave_unserved(&mut privacy, &session_id).await;
+            if matches!(error, AgentError::LocalPlaybackRefused(_)) {
+                write_response(&LauncherResponse::error("local_playback_refused"))?;
+                return Err(LauncherError::LocalPlaybackRefused);
+            }
+            return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
+        }
+    };
+    let joined = agent.ready.joined.clone();
+    let served = joined.as_ref().map_or(
+        Err((
+            ConsoleRefusal::SessionUnreachable,
+            wayland_attach::RouteGap::Capture,
+        )),
+        |joined| wayland_attach::decide_serve(joined.proof()),
+    );
+    let private = joined.as_ref().map_or(Ok(()), |joined| {
+        wayland_attach::desk_privacy(joined.at_desk, !open.desk_live).inspect_err(|_| {
+            tracing::error!(target: target::SESSION, session_id = %session_id, "the joined Wayland session shows on a monitor at the desk, and desk privacy is required: a Wayland desk cannot be blanked without changing the user's compositor, so the Deck is not served");
+        })
+    });
+    if let Err(refusal) = served
+        .map_err(|(refusal, gap)| {
+            tracing::error!(target: target::SESSION, session_id = %session_id, gap = gap.token(), "the joined Wayland session's route is not proved; the Deck is not served");
+            refusal
+        })
+        .and(private)
+    {
+        agent.shutdown().await;
+        leave_unserved(&mut privacy, &session_id).await;
+        return Err(refuse(refusal.into()));
+    }
+    // The desk's sound goes back with the desk when the Deck leaves.
+    privacy.hold_audio_with(agent.take_audio_control());
+    let mut ready = LauncherResponse::ready(identity, &environment, &agent.ready, None, None);
+    ready.console_origin = Some(target.origin.token().to_owned());
+    ready.console_desktop = Some(target.desktop.clone()).filter(|desktop| !desktop.is_empty());
+    if let Err(error) = write_response(&ready) {
+        agent.shutdown().await;
+        leave_unserved(&mut privacy, &session_id).await;
+        return Err(error);
+    }
+    if open.desk_live {
+        privacy.show_desk();
+    }
+    tracing::info!(
+        target: target::SESSION,
+        session_id = %session_id,
+        compositor_pid,
+        unlocked = step == LockStep::UnlockFirst,
+        desk_private = !open.desk_live,
+        "the account's Wayland session is joined"
+    );
+    let mut stop = StopSignals::install()?;
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks: u32 = 0;
+    let mut watch = model::session_watch::SessionWatch::new(identity.uid);
+    loop {
+        tokio::select! {
+            line = commands.next_line() => {
+                let command = match line {
+                    Ok(Some(line)) => serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|value| value.get("command").and_then(|c| c.as_str()).map(str::to_owned)),
+                    _ => None,
+                };
+                match command.as_deref() {
+                    // The Deck left: the session is locked and the
+                    // attachment ends (`wayland_attach::AFTER_DECK_LEFT`).
+                    Some("detach") | None => break,
+                    // A joined Wayland session is never held for a resume.
+                    Some("attach") => {
+                        let _ = write_response(&LauncherResponse::console_refusal(
+                            &ConsoleRefusal::SessionChanged.into(),
+                        ));
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+            () = stop.recv() => break,
+            _ = agent.wait_for_exit() => {
+                tracing::info!(target: target::SESSION, session_id = %session_id, "the joined Wayland session's sharing ended (locked or its compositor gone); the attachment ends");
+                break;
+            }
+            _ = tick.tick() => {
+                ticks = ticks.wrapping_add(1);
+                privacy.enforce();
+                if ticks & 1 == 0 {
+                    match console::watch_joined(&mut watch, &session_id).await {
+                        model::session_watch::WatchStep::Hold => {}
+                        model::session_watch::WatchStep::Ended => {
+                            tracing::info!(target: target::SESSION, session_id = %session_id, "the console session ended (the user logged out)");
+                            break;
+                        }
+                        step @ model::session_watch::WatchStep::HandBack => {
+                            tracing::warn!(target: target::SESSION, session_id = %session_id, reason_class = step.token(), unanswered = watch.unanswered(), "logind has not answered about the joined Wayland session; it is handed back locked (the session is not ended)");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The session is locked (GNOME ends the sharing sessions), then the
+    // desk gets its input and its sound back through the agent, which ends
+    // last.
+    if !give_back_joined(&mut privacy, &session_id).await {
+        keep_private_until_secured(&mut privacy, None, &session_id, &mut stop).await;
+        if console::session_fact(&session_id)
+            .await
+            .is_some_and(|fact| fact.locked)
+        {
+            console::forget_wayland_join();
+        }
+    }
+    agent.shutdown_gracefully().await;
+    Ok(())
+}
+
+/// Leaves a joined Wayland session the Deck was never served: one this
+/// launcher brought forward or unlocked is handed back locked; one the desk
+/// was already using is left as it was (only the desk's input comes back).
+#[cfg(target_os = "linux")]
+async fn leave_unserved(privacy: &mut super::console::ConsolePrivacy, session_id: &str) {
+    if privacy.is_brought_forward() {
+        let _ = give_back_joined(privacy, session_id).await;
+    } else {
+        privacy.release_input();
+        super::console::forget_wayland_join();
+    }
+}
+
+/// Hands a joined Wayland session back (locked first) and forgets its
+/// journal once that is done.
+#[cfg(target_os = "linux")]
+async fn give_back_joined(privacy: &mut super::console::ConsolePrivacy, session_id: &str) -> bool {
+    let given_back = super::console::hand_back(privacy, session_id).await;
+    if given_back {
+        super::console::forget_wayland_join();
+    }
+    given_back
 }
 
 /// Hands the console back before the launcher leaves, when it must

@@ -357,6 +357,25 @@ fn test_clipboard() -> Option<arcen_media::clipboard::ClipboardNegotiation> {
     )
 }
 
+/// Whether a binary session message travels on the video lane, the only lane
+/// a Deck hands to its decoder.
+///
+/// [`LaneClient`] merges every lane into one stream. A session that negotiated
+/// clipboard ([`test_clipboard`]) forwards the host's pasteboard on the bulk
+/// lane, so whenever anything on the machine running the test copies, a
+/// clipboard chunk arrives between two pictures. A Deck never mistakes one for
+/// the other: it reads video from the video lane and dispatches by frame type.
+/// A binary message that names no frame type is a fault, not something to skip.
+fn on_video_lane(bytes: &[u8]) -> bool {
+    match arcen_protocol::lanes::lane_for_binary_message(bytes) {
+        Some(lane) => lane == arcen_protocol::lanes::LaneRole::Video,
+        None => panic!(
+            "every binary session message names its frame type, not {:02x?}",
+            bytes.first()
+        ),
+    }
+}
+
 #[tokio::test]
 async fn a_client_connects_over_quic_and_completes_the_handshake() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -520,6 +539,7 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
     let mut received = 0_u64;
     let mut keyframes = 0_u64;
     let mut payload_bytes = 0_usize;
+    let mut other_lanes = 0_u64;
     let mut full_frame_requested = false;
     while received < WANTED {
         let message = tokio::time::timeout(Duration::from_secs(20), client.next())
@@ -530,6 +550,10 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
         let Message::Binary(bytes) = message else {
             continue;
         };
+        if !on_video_lane(&bytes) {
+            other_lanes += 1;
+            continue;
+        }
         let header = arcen_protocol::wire::decode_video_header(&bytes)
             .expect("every frame must carry a header the Deck can decode");
         assert_eq!(
@@ -582,8 +606,8 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
     assert!(payload_bytes > 0);
     println!(
         "e2e: {received} frames, {keyframes} keyframe(s), {payload_bytes} payload bytes, \
-         {:.1} fps sent, {:.2} ms mean, {:.2} ms worst | stages: capture-wait {:.2} ms, \
-         encode {:.2} ms, send {:.2} ms",
+         {other_lanes} message(s) on other lanes, {:.1} fps sent, {:.2} ms mean, \
+         {:.2} ms worst | stages: capture-wait {:.2} ms, encode {:.2} ms, send {:.2} ms",
         stats.sent_fps,
         stats.mean_frame_ms,
         stats.max_frame_ms,
@@ -671,6 +695,9 @@ async fn a_grading_stream_for_an_srgb_deck_says_srgb_in_its_sps() {
         let Message::Binary(bytes) = message else {
             continue;
         };
+        if !on_video_lane(&bytes) {
+            continue;
+        }
         let header = arcen_protocol::wire::decode_video_header(&bytes).expect("a video header");
         if header.is_keyframe() {
             truth = Some(
@@ -1392,7 +1419,7 @@ async fn a_streamed_session_records_what_it_measured() {
     let mut received = 0_u64;
     while received < WANTED {
         match tokio::time::timeout(Duration::from_secs(20), client.next()).await {
-            Ok(Some(Ok(Message::Binary(_)))) => received += 1,
+            Ok(Some(Ok(Message::Binary(bytes)))) if on_video_lane(&bytes) => received += 1,
             Ok(Some(Ok(_))) => {}
             _ => break,
         }
@@ -1920,7 +1947,8 @@ async fn host_audio_reaches_the_client_when_capture_is_available() {
                 Some(byte) if byte == arcen_protocol::wire::FrameType::Audio as u8 => {
                     audio_frames += 1;
                 }
-                _ => video_frames += 1,
+                _ if on_video_lane(&bytes) => video_frames += 1,
+                _ => {}
             },
             Ok(Some(Ok(_))) => {}
             Ok(Some(Err(_)) | None) => break,
@@ -2131,7 +2159,7 @@ async fn a_thirty_fps_session_delivers_near_thirty_fps() {
             .expect("a frame arrives in time")
             .expect("a frame")
             .expect("a valid frame");
-        if matches!(message, Message::Binary(_)) {
+        if matches!(&message, Message::Binary(bytes) if on_video_lane(bytes)) {
             first_frame_at.get_or_insert_with(std::time::Instant::now);
             received += 1;
         }
@@ -2346,6 +2374,9 @@ async fn a_still_desktop_sends_almost_nothing() {
             break;
         };
         if let Message::Binary(payload) = message {
+            if !on_video_lane(&payload) {
+                continue;
+            }
             if started.is_none() {
                 started = Some(tokio::time::Instant::now());
                 continue;
@@ -2528,7 +2559,7 @@ async fn a_still_screen_stays_healthy_for_a_minute() {
                     health.push((started.elapsed().as_secs_f64(), stats));
                 }
             }
-            Ok(Some(Ok(Message::Binary(_)))) => video += 1,
+            Ok(Some(Ok(Message::Binary(bytes)))) if on_video_lane(&bytes) => video += 1,
             _ => {}
         }
     }

@@ -252,10 +252,12 @@ Step "WiX $WixVersion at $Wix"
 $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) { $python = Get-Command py -ErrorAction SilentlyContinue }
 if (-not $python) { throw "Python 3 is required to check the third-party notices" }
-Step "third-party notices are current (scripts\generate-third-party-notices.py --check)"
+# The full notices check needs a POSIX host and is the macOS release gate;
+# a Windows build checks the Windows artefacts' part of the file exactly.
+Step "third-party notices are current for Windows (scripts\generate-third-party-notices.py --check --host-only)"
 $env:RUSTUP_TOOLCHAIN = $Toolchain
 Push-Location $Repo
-try { Invoke-Checked $python.Source @("scripts\generate-third-party-notices.py", "--check") } finally { Pop-Location }
+try { Invoke-Checked $python.Source @("scripts\generate-third-party-notices.py", "--check", "--host-only") } finally { Pop-Location }
 Remove-Item env:RUSTUP_TOOLCHAIN
 if (Test-Path (Join-Path $Repo "scripts\verify-opusic-source.ps1")) {
     Invoke-Checked "powershell.exe" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File",

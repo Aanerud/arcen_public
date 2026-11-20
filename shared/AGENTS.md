@@ -28,7 +28,9 @@ the same test and strict-Clippy gates for `arcen-deck-core` with
 `--features runtime,egui,wgpu-presenter`,
 the `arcen-media/software-h264-source` test and strict-Clippy gates on Rust
 1.89+ with C++ and NASM,
-`cargo test --locked -p arcen-transport --features quic`, and the CI
+`cargo test --locked -p arcen-transport --features quic`, the test and
+strict-Clippy gates for `arcen-transport --features issuer` (the shared
+certificate issuer), and the CI
 `cargo tree --locked -p arcen-transport -e normal` proof that the default graph
 contains no `quinn`, `tokio`, `tokio-util`, or `bytes` package line.
 CI likewise proves the default `arcen-media` graph excludes OpenH264 and its
@@ -71,7 +73,11 @@ The `arcen-deck-core` purity proof is the same script with
 There is no single-platform `--workspace` build. `arcen-protocol`,
 `arcen-input`, and `arcen-transport` retain crate-level `unsafe_code = "forbid"`;
 `arcen-media` is crate-wide `unsafe_code = "deny"` with a single reviewed
-OpenH264 raw `SetOption`/`GetOption` exception in `software_h264.rs`. Shared manifests must
+OpenH264 raw `SetOption`/`GetOption` exception in `software_h264.rs`;
+`arcen-observability` is crate-wide `unsafe_code = "deny"` with a single
+reviewed exception, the Windows support-bundle file-identity adapter
+(`support_bundle/native_identity/windows.rs`: read-only `FileIdInfo`,
+volume-flag, remote-protocol and final-path queries). Shared manifests must
 not reference `hosts/`, `clients/`, or `packaging/`.
 
 Shared code behaves the same on every OS. An OS-conditional `cfg` in shared
@@ -99,6 +105,9 @@ of affected consumers before changing shared behavior.
 | Reading any tablet's pen (macOS and Windows Piers): generic reader, dedicated readers, the choice | `generic_pen::{GenericPenLayout, GenericPenReader}`, `wacom_intuos_pen::{IntuosPenReader, HOST_DECODED_INTUOS_MODELS}`, `host_pen::host_pen_route` | `arcen-usb-bridge` |
 | One attachment on a Pier that reads the pen itself: USB host driver, reader, Intuos mode switch and restore, proximity release (`HidPublishPolicy::Nothing` for a Pier that publishes no device) | `host_pen_bridge::HostPenBridge` | `arcen-usb-bridge` |
 | The same as wire frames and pen events, authorization, the Deck's tablet-mode wording, the host pointer the pen moves | `bridged_pen::{authorize, tablet_result, NativeTabletAttachment, BridgedPenSession, host_pen_event, HostPenPointer}` | `arcen-input` |
+| Which Native tablet route a session takes (host driver or host decoded) | `joined_pen::{native_tablet_route, JoinedPenRefusal}` | `arcen-usb-bridge` |
+| The proof that a joined desktop's typed input devices (keyboard, pointers, pen) reach it alone, and what a session does when it lapses | `joined_input::{prove_joined_device_confinement, classify_reader, JoinedDeviceFacts, JoinedInputGuard}` | `arcen-input` |
+| What a host-decoded pen claims (decoded within carried) and the Deck's wording | `bridged_pen::{host_decoded_capabilities, host_decoded_notice, host_decoded_tablet_result}` | `arcen-input` |
 | The bridge engine | `exporter` (Deck), `hid_host` (macOS and Windows Piers) | `arcen-usb-bridge` |
 | The Deck's USB component status and its wording | `native_component::{NativeUsbComponentState, NativeComponentFacts}` | `arcen-usb-bridge` |
 | Framing between a Deck and its USB component (macOS helper, Windows service) | `component_ipc` | `arcen-usb-bridge` |

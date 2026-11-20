@@ -157,6 +157,24 @@ per presented frame and at least every 250 ms while frames arrive. It is
 used to throttle optional work only (at most two unacknowledged frames per
 monitor carry optional work), never for cache or canvas correctness. A
 throttled frame loses nothing: Keel's pending damage merges into the next.
+An acknowledgement of another generation, or of a fence the generation has
+not sent (an earlier loop's generation of the same number, after a capture
+restarted for a new size), is stale and changes nothing.
+
+The Pier's own send queues apply backpressure, not loss
+(`arcen_media::video::OutboundVideoRecord::room_wait`): a canvas frame's
+producer waits for room however long the path stalls, because a dropped
+record costs a new generation (a full repaint, larger than whatever a short
+stall held back) while waiting loses nothing; capenc then stalls on its
+pipe and the loop merges the damage it could not send. A queue holds at
+most its record bound and `CANVAS_QUEUE_BYTES` (one record of the largest
+size). A reset never waits: it supersedes what its generation queued. Only
+a closed queue (teardown, which releases a waiting producer at once), the
+Windows Pier's legacy queue (`ARCEN_VIDEO_BACKLOG=legacy`, whose reader
+and router do not wait at all, as before this rule) or the Windows relay's
+own backlog drops a record, and that genuine loss starts a new generation.
+The Linux Pier's legacy queue only drops the backlog budget: a canvas frame
+there still waits for the record and byte bounds.
 
 ### 8. Amendment to ADR 0016 (§2 Auto, R7)
 
@@ -208,8 +226,16 @@ canvas does not grant the refine lane.
   without a presenter or a discarded queue loses the monitor's canvas: later
   records wait for a reset, and `canvas_reset_request` (the state owner's
   refusal token as the reason) is sent once a presenter exists, at most
-  every 2 s. A presenter without an executor that receives canvas work
-  stops canvas for the connection without asking for resets.
+  every 2 s. A hidden or not yet attached sink is not a failure: it
+  applies the work and shows the canvas when it can. A sink that cannot
+  show a canvas for the rest of the connection stops canvas without asking
+  for resets (each would be a full repaint): a presenter without an
+  executor, a sink that failed to apply two resets in a row
+  (`SINK_FAILED_RESETS`), or an eight-bit presenter that fell back (a
+  canvas has no keyframe to ask for). Stream Statistics then say why and
+  that turning Canvas screen updates off and reconnecting gives full
+  frames; switching such a connection to full frames by itself is not
+  implemented yet.
 - **Flow control.** `canvas_ack` with the newest applied fence after each
   batch that presented a frame, and at least every 250 ms while records
   arrive; `unprocessed_bytes` is what the inbox holds for the monitor and
@@ -223,7 +249,14 @@ canvas does not grant the refine lane.
   compares it with the Pier mirror's digest. The protocol has no record that
   carries a Pier digest to the Deck yet.
 - **Statistics.** "Screen updates: canvas (tiles x%, surface y%, copy z%)"
-  over the last 5 to 10 s, or why full frames arrive.
+  over the last 5 to 10 s, or why full frames arrive. Canvas records feed
+  the received side of Stream Statistics as video packets do (the wire
+  line, the receive rate and a frame's wire-clock delay); none counts as a
+  decoded or presented frame.
+- **No keyframe requests.** A connection whose hello turns the canvas on
+  never sends `request_full_frame` for its first picture or after it: its
+  first picture is the reset, and its recovery is `canvas_reset_request`.
+  The root picture waits for a "keyframe" only while its canvas is lost.
 - **Executors.** Windows Deck (`clients/windows/src/present/canvas.rs`): one
   `B8G8R8A8_UNORM` texture per monitor on the eight-bit presenter's D3D11
   device; fills and surface block spans are instanced rectangles,
@@ -314,10 +347,21 @@ loops each path had.
   tick. A reopen with nothing to paint keeps the surface it would replace.
 - **Plumbing.** One `capenc` argument (`canvas=v1:…`), framed-v2 `Canvas`
   records back, `CANVAS-ACK`/`CANVAS-RESET`/`CANVAS-INPUT` control lines in.
+  `CANVAS-INPUT <monitor> <topology_generation> <x> <y>` comes from the
+  pointer and pen input the Pier authorised and applied (absolute moves,
+  buttons with their position, pen samples), with the event's position in
+  1/65536ths of the picture: the shared `canvas::serve::CanvasInputFeed`
+  keeps one position and forwards it only when it moved 1/256 of a side or
+  is 125 ms old, and capenc keeps only the newest
+  (`capenc_control::CanvasControlInbox`), so input never queues and never
+  displaces a reset request. It carries no input content. The loop ignores
+  a line for another monitor or topology generation.
   A Pier stamps each frame with its wire clock. Its send queue and the
   Windows lane relay treat a reset as the recovery point: a dropped record
   holds its monitor until the next reset, which the keyframe request starts
-  (reason `recovery`), so no generation is ever relayed with a gap.
+  (reason `recovery`), so no generation is ever relayed with a gap. A slow
+  path never drops one (§7): the Linux frame pump and the Windows capenc
+  reader and frame router wait for room.
 - **Evidence.** The loop logs its mirror digest at every fence that is a
   multiple of 30 (`canvas mirror digest …`); `examples/canvas_verify.rs`
   is a Deck for one capture that applies the records with the CPU executor,
