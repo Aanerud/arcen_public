@@ -87,21 +87,32 @@ working virtual tablet. 0.20.4 speaks protocol v5 and works with every
   one a professional application uses. Stored in settings.json as
   `keyboard_switch` (`"Ctrl+Alt+Home"`); the Help sheet, menus and indicator
   name the chosen chord.
+- **Who has the keyboard (Mac Deck).** The Mac Deck uses the same shared
+  model: **⌃⌥Home** (Fn+⌃⌥← on a laptop) gives the keyboard to this Mac,
+  releasing every key held on the host first, and back; a click into the
+  picture gives it back and is not sent; **Connection › Keyboard: Host or
+  This Computer** does the same; the menu bar says who has it ("Keyboard: Z8
+  (Control-Option-Home to release)" / "Keyboard: this Mac (click to
+  return)"). While this Mac has the keyboard nothing typed reaches the host
+  and ⌘H hides the Deck again.
+- **⌘Tab, ⌘Space and Mission Control to the host (Mac Deck, opt-in).**
+  **Settings › Input › Send ⌘Tab, ⌘Space and Mission Control to the remote
+  computer** (off by default) takes ⌘Tab, ⇧⌘Tab, ⌘\`, ⌘Space, ⌃↑, ⌃↓, the
+  screenshot keys and ⌥⌘D for the host while it has the keyboard and a
+  session window is in front, through an event tap that needs the
+  Accessibility permission (the switch's **Allow in Accessibility…** button
+  asks, and the Deck offers it once in context, below). With it on, ⌃← and
+  ⌃→ follow the keyboard switch too; ⌥⌘Esc, ⌃⌘Q and every key
+  under Secure Event Input stay on the Mac. ⌘Tab is the host's app switcher:
+  Alt+Tab on a Windows or Linux host, ⌘Tab on a Mac host. The decision is
+  shared (`arcen_input::keyboard::MacTapRouter`); settings.json key
+  `capture_mac_system_shortcuts`.
 - **⌘Tab asked in context (Mac Deck).** The first time ⌘Tab takes you out
   of a session in Remote without the event tap, the Deck asks once: "Send
   ⌘Tab to the remote? macOS needs the Accessibility permission." **Allow**
   turns on the ⌘Tab switch and asks macOS; **Not now** is remembered
   (`mac_system_shortcut_offer_answered`) and the Deck stays quiet. The switch
   stays in Settings › Input. Without the permission nothing changes.
-
-#### Upgrade note
-
-- **The Mac's separate ⌃←/⌃→ setting is gone.** "Send ⌃← and ⌃→ (Spaces) to
-  the remote computer too" (`mac_spaces_to_host`) folded into the keyboard
-  switch: with the ⌘Tab switch on, ⌃← and ⌃→ go to the remote computer in
-  Remote and switch this Mac's Spaces in Local. The old key is ignored and
-  dropped from settings.json at the next save. To switch Spaces during a
-  session, press the keyboard switch first.
 
 ## [0.20.3] — 2026-11-18
 
@@ -199,26 +210,6 @@ re-issued on 19 November 2026 with these changes.
   unsaved keyboard grab and reads its `always`/`fullscreen`/`never` tokens
   (`keyboard_capture` in settings.json). The decisions are shared
   (`arcen_input::keyboard::KeyboardCapture`).
-- **Who has the keyboard (Mac Deck).** The Mac Deck uses the same shared
-  model: **⌃⌥Home** (Fn+⌃⌥← on a laptop) gives the keyboard to this Mac,
-  releasing every key held on the host first, and back; a click into the
-  picture gives it back and is not sent; **Connection › Keyboard: Host or
-  This Computer** does the same; the menu bar says who has it ("Keyboard: Z8
-  (Control-Option-Home to release)" / "Keyboard: this Mac (click to
-  return)"). While this Mac has the keyboard nothing typed reaches the host
-  and ⌘H hides the Deck again.
-- **⌘Tab, ⌘Space and Mission Control to the host (Mac Deck, opt-in).**
-  **Settings › Input › Send ⌘Tab, ⌘Space and Mission Control to the remote
-  computer** (off by default) takes ⌘Tab, ⇧⌘Tab, ⌘\`, ⌘Space, ⌃↑, ⌃↓, the
-  screenshot keys and ⌥⌘D for the host while it has the keyboard and a
-  session window is in front, through an event tap that needs the
-  Accessibility permission (the switch's **Allow in Accessibility…** button
-  asks; the Deck never asks by itself). ⌃← and ⌃→ keep switching this Mac's
-  Spaces unless a second switch sends them too; ⌥⌘Esc, ⌃⌘Q and every key
-  under Secure Event Input stay on the Mac. ⌘Tab is the host's app switcher:
-  Alt+Tab on a Windows or Linux host, ⌘Tab on a Mac host. The decision is
-  shared (`arcen_input::keyboard::MacTapRouter`); settings.json keys
-  `capture_mac_system_shortcuts` and `mac_spaces_to_host`.
 - **Connection › Send Key** on both Decks: Print Screen, Scroll Lock, Pause,
   Insert, Ctrl+Alt+Del, Menu and F13–F24, each a press and release after
   every held key is let go (shared `SendKey`). Key remaps are validated in
