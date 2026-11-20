@@ -160,6 +160,16 @@ impl SessionEnvironment {
         self.exec_context.as_ref()
     }
 
+    /// The joined Wayland session's own display socket (S4b): a plain name
+    /// in the account's runtime directory, as the session's processes have
+    /// it.
+    #[must_use]
+    pub fn with_wayland_display(mut self, name: &str) -> Self {
+        self.values
+            .insert("WAYLAND_DISPLAY".into(), name.to_owned());
+        self
+    }
+
     /// Gives the desktop its locale (see [`super::locale`]). A value PAM
     /// already provided is kept.
     #[must_use]

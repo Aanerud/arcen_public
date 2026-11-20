@@ -62,6 +62,13 @@
           "native-tablet"
         ]
       },
+      "production_uses": [
+        {
+          "id": "audio-follows-default-output",
+          "symbol": "FollowedOutput",
+          "reason": "The Deck plays host audio through the shared default-output lifecycle (runtime::audio_output, GAP-026 closed): it moves to the new default on a change or a stream error, backs off, never plays two streams at once and never plays after close; the platform adapter only opens streams."
+        }
+      ],
       "paths": [
         {
           "id": "macos-deck-session",
@@ -230,6 +237,11 @@
           "id": "fullscreen-bar-pointer-routing",
           "symbol": "route_pointer",
           "reason": "The session window lets the Deck's UI see the pointer at the top-edge strip and on the open bar through the shared routing rule."
+        },
+        {
+          "id": "audio-follows-default-output",
+          "symbol": "FollowedOutput",
+          "reason": "The Deck plays host audio through the shared default-output lifecycle (runtime::audio_output, GAP-026 closed): it moves to the new default on a change or a stream error, backs off, never plays two streams at once and never plays after close; the platform adapter only opens streams."
         }
       ],
       "paths": [

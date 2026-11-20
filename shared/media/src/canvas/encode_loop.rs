@@ -297,6 +297,7 @@ struct Canvas {
     planner: CanvasPlanner,
     governor: CanvasGovernor,
     monitor_id: u16,
+    topology_generation: u64,
     last_sent: Option<Instant>,
     keepalive: Duration,
 }
@@ -387,6 +388,7 @@ impl<E: LoopEncoder> CanvasEncodeLoop<E> {
                     planner,
                     governor,
                     monitor_id: canvas.monitor_id,
+                    topology_generation: canvas.topology_generation,
                     last_sent: None,
                     keepalive: config.keepalive,
                 }))
@@ -477,12 +479,30 @@ impl<E: LoopEncoder> CanvasEncodeLoop<E> {
         }
     }
 
-    /// Local input acted at `(x, y)` (monitor pixels): its neighbourhood
-    /// is never deferred.
-    pub fn note_input(&mut self, x: u32, y: u32, now: Instant) {
-        if let Inner::Canvas(canvas) = &mut self.inner {
+    /// Input the Pier applied at `(x, y)`, in 1/65536ths of the picture's
+    /// width and height, of monitor `monitor_id` in topology generation
+    /// `topology_generation`: its neighbourhood is never deferred. Input for
+    /// another monitor or generation (a stale line from before a topology
+    /// change) changes nothing.
+    pub fn note_input(
+        &mut self,
+        monitor_id: u16,
+        topology_generation: u64,
+        x: u16,
+        y: u16,
+        now: Instant,
+    ) {
+        if let Inner::Canvas(canvas) = &mut self.inner
+            && monitor_id == canvas.monitor_id
+            && topology_generation == canvas.topology_generation
+        {
+            let pixel = |at: u16, size: u32| {
+                u32::try_from((u64::from(at) * u64::from(size)) >> 16).unwrap_or(u32::MAX)
+            };
             let at = now.saturating_duration_since(self.started);
-            canvas.planner.note_input(x, y, at);
+            canvas
+                .planner
+                .note_input(pixel(x, self.width), pixel(y, self.height), at);
             canvas.planner.set_focus(true);
         }
     }
@@ -506,6 +526,19 @@ impl<E: LoopEncoder> CanvasEncodeLoop<E> {
                 true
             }
             Inner::Canvas(_) => false,
+        }
+    }
+
+    /// Whether the block at `(x, y)` changed and still waits to be painted
+    /// (canvas only).
+    #[cfg(test)]
+    pub(crate) fn is_pending_at(&self, x: u32, y: u32) -> bool {
+        match &self.inner {
+            Inner::Canvas(canvas) => {
+                let block = (y / 16) * self.width.div_ceil(16) + x / 16;
+                canvas.planner.is_pending(block)
+            }
+            Inner::Full(_) => false,
         }
     }
 

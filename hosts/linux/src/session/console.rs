@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use arcen_session::console_session::{
-    self as model, greeter_token, ConsoleNotice, ConsoleRefusal, ConsoleSessionFact,
-    ForeignService, InputDeviceFact,
+    self as model, greeter_token, logind_read, ConsoleNotice, ConsoleRefusal, ConsoleSessionFact,
+    ForeignService, InputDeviceFact, SessionRead, SessionsUnreadable,
 };
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -31,12 +31,16 @@ const BUSCTL: &str = "/usr/bin/busctl";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 /// What a console decision reads of every logind session.
 const SESSION_PROPERTIES: &str =
-    "Id,User,Name,Seat,VTNr,TTY,Class,Type,State,Active,Remote,Service,LockedHint,Leader";
+    "Id,User,Name,Seat,VTNr,TTY,Class,Type,State,Active,Remote,Service,LockedHint,Leader,Desktop";
 const MAX_ENVIRON_BYTES: u64 = 256 * 1024;
 const MAX_XAUTHORITY_BYTES: u64 = 64 * 1024;
 /// Where the launcher records what it changed on the console, so a Pier
 /// that lost its launcher can still hand the console back.
 pub(crate) const PRIVACY_JOURNAL: &str = "/run/arcen/console-privacy.json";
+/// Where the launcher of a joined Wayland session records the session it
+/// may bring forward or unlock (S4b), so a Pier that lost its launcher
+/// locks it.
+pub(crate) const WAYLAND_JOIN_JOURNAL: &str = "/run/arcen/console-wayland-join.json";
 /// How long a remote-first sign-in may take from token to a running
 /// session of the user.
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -81,51 +85,122 @@ fn safe_session_id(session_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-async fn bounded_output(mut command: Command) -> Option<std::process::Output> {
+async fn bounded_output(command: Command) -> Option<std::process::Output> {
+    bounded_output_within(command, COMMAND_TIMEOUT).await
+}
+
+async fn bounded_output_within(
+    mut command: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
     command
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null());
-    match tokio::time::timeout(COMMAND_TIMEOUT, command.output()).await {
+    match tokio::time::timeout(timeout, command.output()).await {
         Ok(Ok(output)) if output.status.success() => Some(output),
         _ => None,
     }
 }
 
-/// Every logind session, as facts. A session logind cannot describe is
-/// left out; an unreadable session list is an empty one.
-pub(crate) async fn read_sessions() -> Vec<ConsoleSessionFact> {
-    let mut list = Command::new(LOGINCTL);
-    list.args(["list-sessions", "--no-legend", "--no-pager"]);
-    let Some(output) = bounded_output(list).await else {
-        return Vec::new();
-    };
-    let ids: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|id| safe_session_id(id))
-        .map(str::to_owned)
-        .collect();
-    let mut facts = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(fact) = session_fact(&id).await {
-            facts.push(fact);
-        }
-    }
-    facts
+/// Every logind session, as facts, or why logind's answer cannot be used
+/// (`console_session::logind_read`). An unreadable answer is never an
+/// empty list: only a complete read proves that nobody holds a session.
+pub(crate) async fn read_sessions() -> SessionRead {
+    read_sessions_from(&[LOGINCTL], COMMAND_TIMEOUT).await
 }
 
-pub(crate) async fn session_fact(session_id: &str) -> Option<ConsoleSessionFact> {
+/// `loginctl` is the program and any arguments that come before its own
+/// (a test runs a script through `/bin/sh`).
+async fn read_sessions_from(loginctl: &[&str], timeout: Duration) -> SessionRead {
+    let read = async {
+        let listed = list_sessions(loginctl, timeout).await?;
+        let mut described = Vec::with_capacity(listed.len());
+        for session in &listed {
+            described.push(describe_session(loginctl, timeout, &session.id).await);
+        }
+        // A session that could not be described may have ended meanwhile:
+        // only logind's next list can say so.
+        let relisted = if described.iter().any(Option::is_none) {
+            Some(list_sessions(loginctl, timeout).await?)
+        } else {
+            None
+        };
+        logind_read::assemble(&listed, &described, relisted.as_deref())
+    }
+    .await;
+    if let Err(unreadable) = &read {
+        tracing::debug!(
+            target: target::SESSION,
+            logind = unreadable.token(),
+            "logind's sessions could not be read; nothing is decided from them"
+        );
+    }
+    read
+}
+
+async fn list_sessions(
+    loginctl: &[&str],
+    timeout: Duration,
+) -> Result<Vec<logind_read::ListedSession>, SessionsUnreadable> {
+    let mut list = loginctl_command(loginctl);
+    list.args(["list-sessions", "--no-legend", "--no-pager"]);
+    let output = bounded_output_within(list, timeout)
+        .await
+        .ok_or(SessionsUnreadable::ListFailed)?;
+    let text = String::from_utf8(output.stdout).map_err(|_| SessionsUnreadable::ListGarbled)?;
+    logind_read::parse_session_list(&text)
+}
+
+fn loginctl_command(loginctl: &[&str]) -> Command {
+    let (program, before) = loginctl.split_first().unwrap_or((&LOGINCTL, &[]));
+    let mut command = Command::new(program);
+    command.args(before);
+    command
+}
+
+/// What `loginctl show-session` prints for `session_id`, or `None` when
+/// it failed, timed out or printed something that is not text.
+async fn describe_session(
+    loginctl: &[&str],
+    timeout: Duration,
+    session_id: &str,
+) -> Option<String> {
     if !safe_session_id(session_id) {
         return None;
     }
-    let mut show = Command::new(LOGINCTL);
+    let mut show = loginctl_command(loginctl);
     show.args(["show-session", session_id]);
     for property in SESSION_PROPERTIES.split(',') {
         show.args(["-p", property]);
     }
-    let output = bounded_output(show).await?;
-    ConsoleSessionFact::from_properties(&String::from_utf8_lossy(&output.stdout))
+    let output = bounded_output_within(show, timeout).await?;
+    String::from_utf8(output.stdout).ok()
 }
+
+pub(crate) async fn session_fact(session_id: &str) -> Option<ConsoleSessionFact> {
+    session_fact_from(&SYSTEM_LOGIND, session_id).await
+}
+
+async fn session_fact_from(logind: &Logind<'_>, session_id: &str) -> Option<ConsoleSessionFact> {
+    let description = describe_session(logind.loginctl, logind.timeout, session_id).await?;
+    ConsoleSessionFact::from_properties(&description).filter(|fact| fact.id == session_id)
+}
+
+/// Where the adapter asks logind (a test stands in its own `loginctl` and
+/// state directory).
+struct Logind<'a> {
+    /// The program and any arguments before `loginctl`'s own.
+    loginctl: &'a [&'a str],
+    /// The directory where logind keeps a state file for every session.
+    sessions_dir: &'a str,
+    timeout: Duration,
+}
+
+const SYSTEM_LOGIND: Logind<'static> = Logind {
+    loginctl: &[LOGINCTL],
+    sessions_dir: LOGIND_SESSIONS,
+    timeout: COMMAND_TIMEOUT,
+};
 
 /// The system service a cgroup path (`/proc/<pid>/cgroup`) puts a process
 /// in: the first `<name>.service` below `system.slice`, or `None` (a user
@@ -217,11 +292,19 @@ pub(crate) fn foreign_service(fact: &ConsoleSessionFact) -> ForeignService {
 /// The notice for `refusal` of a sign-in of `uid`: when another
 /// remote-desktop service holds the workstation, it names that service as
 /// the host reports it, and logs what it found.
-pub(crate) fn notice_for(
-    refusal: ConsoleRefusal,
-    sessions: &[ConsoleSessionFact],
-    uid: u32,
-) -> ConsoleNotice {
+pub(crate) fn notice_for(refusal: ConsoleRefusal, read: &SessionRead, uid: u32) -> ConsoleNotice {
+    let sessions = match read {
+        Ok(sessions) => sessions,
+        Err(unreadable) => {
+            tracing::warn!(
+                target: target::SESSION,
+                reason_class = refusal.token(),
+                logind = unreadable.token(),
+                "logind's sessions could not be read; the sign-in is refused, never taken for nobody signed in"
+            );
+            return refusal.into();
+        }
+    };
     if refusal != ConsoleRefusal::OtherUserOtherProduct {
         return refusal.into();
     }
@@ -299,9 +382,15 @@ fn session_processes(session_id: &str, uid: u32) -> Vec<SessionProcess> {
 /// `XDG_SESSION_DESKTOP` as the user's processes in the session's scope
 /// have it (GDM 40 does not give logind the session's desktop).
 pub(crate) fn session_environ_desktop(session_id: &str, uid: u32) -> Option<String> {
+    session_environ(session_id, uid, "XDG_SESSION_DESKTOP")
+}
+
+/// `key` as the first of the user's processes in the session's own scope
+/// that has it sees it.
+pub(crate) fn session_environ(session_id: &str, uid: u32, key: &str) -> Option<String> {
     session_processes(session_id, uid)
         .iter()
-        .find_map(|process| environ_value(process.pid, "XDG_SESSION_DESKTOP"))
+        .find_map(|process| environ_value(process.pid, key))
 }
 
 fn environ_value(pid: u32, key: &str) -> Option<String> {
@@ -1741,37 +1830,80 @@ const LOGIND_SESSIONS: &str = "/run/systemd/sessions";
 /// only when its state file is gone too (a failed or slow `loginctl` proves
 /// nothing).
 pub(crate) async fn session_state(session_id: &str) -> SessionState {
-    if let Some(fact) = session_fact(session_id).await {
-        let display_alive = if fact.origin() == model::ConsoleOrigin::Arcen {
-            session_display_alive(session_id).await
-        } else {
-            true
-        };
+    session_state_from(&SYSTEM_LOGIND, session_id).await
+}
+
+async fn session_state_from(logind: &Logind<'_>, session_id: &str) -> SessionState {
+    match session_presence_from(logind, session_id).await {
+        SessionState::Known { fact, .. } if fact.origin() == model::ConsoleOrigin::Arcen => {
+            let display_alive = session_display_alive(logind, session_id).await;
+            SessionState::Known {
+                fact,
+                display_alive,
+            }
+        }
+        state => state,
+    }
+}
+
+/// [`session_state`] without asking whether the session's X server
+/// answers (`display_alive` is then `true`: not ruled out): one
+/// `loginctl` call, and a look at logind's state file only when that call
+/// gave no answer.
+async fn session_presence_from(logind: &Logind<'_>, session_id: &str) -> SessionState {
+    if let Some(fact) = session_fact_from(logind, session_id).await {
         return SessionState::Known {
             fact: Box::new(fact),
-            display_alive,
+            display_alive: true,
         };
     }
     if !safe_session_id(session_id) {
         return SessionState::Failed;
     }
-    match std::fs::symlink_metadata(Path::new(LOGIND_SESSIONS).join(session_id)) {
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                && Path::new(LOGIND_SESSIONS).is_dir() =>
-        {
+    let sessions_dir = Path::new(logind.sessions_dir);
+    match std::fs::symlink_metadata(sessions_dir.join(session_id)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && sessions_dir.is_dir() => {
             SessionState::Unknown
         }
         _ => SessionState::Failed,
     }
 }
 
+/// One look at the session a launcher joined, for its watch
+/// (`console_session::session_watch`): a look logind did not answer is
+/// told apart from a session it no longer has.
+pub(crate) async fn watch_joined(
+    watch: &mut model::session_watch::SessionWatch,
+    session_id: &str,
+) -> model::session_watch::WatchStep {
+    watch_joined_from(&SYSTEM_LOGIND, watch, session_id).await
+}
+
+async fn watch_joined_from(
+    logind: &Logind<'_>,
+    watch: &mut model::session_watch::SessionWatch,
+    session_id: &str,
+) -> model::session_watch::WatchStep {
+    // The watch never consults the display: one `loginctl` call per look.
+    let state = session_presence_from(logind, session_id).await;
+    let step = watch.observe(state.lookup());
+    if matches!(state, SessionState::Failed) {
+        tracing::debug!(
+            target: target::SESSION,
+            session_id,
+            unanswered = watch.unanswered(),
+            "logind did not answer about the joined console session"
+        );
+    }
+    step
+}
+
 /// Whether the X server of `session_id` (logind `Display=`) still accepts
 /// connections; `true` whenever that cannot be ruled out.
-async fn session_display_alive(session_id: &str) -> bool {
-    let mut show = Command::new(LOGINCTL);
+async fn session_display_alive(logind: &Logind<'_>, session_id: &str) -> bool {
+    let mut show = loginctl_command(logind.loginctl);
     show.args(["show-session", session_id, "-p", "Display", "--value"]);
-    let Some(output) = bounded_output(show).await else {
+    let Some(output) = bounded_output_within(show, logind.timeout).await else {
         return true;
     };
     let display = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -2012,7 +2144,62 @@ static RECOVERY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Callers hold [`RECOVERY`].
 async fn recover(retry: bool) -> bool {
-    recover_with(&mut LiveRecovery, retry).await
+    let joined = recover_wayland_join().await;
+    recover_with(&mut LiveRecovery, retry).await && joined
+}
+
+/// The joined Wayland session a launcher journalled before it touched it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WaylandJoinJournal {
+    session_id: String,
+}
+
+/// Records, before anything of it is touched, the joined Wayland session
+/// this launcher may bring forward or unlock.
+///
+/// # Errors
+///
+/// When the journal cannot be written: the session is then not touched.
+pub(crate) fn journal_wayland_join(session_id: &str) -> Result<(), String> {
+    let text = serde_json::to_vec(&WaylandJoinJournal {
+        session_id: session_id.to_owned(),
+    })
+    .map_err(|error| error.to_string())?;
+    write_root_journal(Path::new(WAYLAND_JOIN_JOURNAL), &text)
+}
+
+/// Forgets the journal once the session is handed back (locked).
+pub(crate) fn forget_wayland_join() {
+    let _ = std::fs::remove_file(WAYLAND_JOIN_JOURNAL);
+}
+
+/// Locks a joined Wayland session whose launcher did not hand it back
+/// (or puts it behind the login screen); the journal stays, and
+/// [`guard_unsecured_console`] retries, while it cannot be secured.
+/// Returns whether nothing is left to recover.
+async fn recover_wayland_join() -> bool {
+    let Some(journal) = read_root_journal(Path::new(WAYLAND_JOIN_JOURNAL))
+        .and_then(|text| serde_json::from_slice::<WaylandJoinJournal>(&text).ok())
+    else {
+        return true;
+    };
+    let done = match session_state(&journal.session_id).await {
+        SessionState::Unknown => true,
+        SessionState::Known { fact, .. } if fact.state == "closing" => true,
+        // Locked, or else put behind the login screen, as a hand-back is.
+        SessionState::Known { .. } => secure_session(&journal.session_id).await,
+        SessionState::Failed => false,
+    };
+    tracing::warn!(
+        target: target::SESSION,
+        session_id = %journal.session_id,
+        locked = done,
+        "a joined Wayland session's launcher did not hand it back; it is locked"
+    );
+    if done {
+        forget_wayland_join();
+    }
+    done
 }
 
 /// What recovering a console left by a launcher that did not hand it back
@@ -2321,7 +2508,9 @@ pub(crate) async fn guard_unsecured_console() {
     let mut ticks: u32 = 0;
     loop {
         tick.tick().await;
-        if PrivacyJournal::read().is_none() {
+        // A joined Wayland session a dead launcher left unlocked is
+        // retried here too, until it is secured.
+        if PrivacyJournal::read().is_none() && !Path::new(WAYLAND_JOIN_JOURNAL).exists() {
             ticks = 0;
             continue;
         }
@@ -2361,7 +2550,10 @@ pub(crate) async fn guard_login_screen() {
         let Ok(gate) = std::sync::Arc::clone(&CONSOLE_GATE).try_lock_owned() else {
             continue;
         };
-        let sessions = read_sessions().await;
+        // Nothing is brought anywhere on a console logind cannot describe.
+        let Ok(sessions) = read_sessions().await else {
+            continue;
+        };
         let mut without_shell = Vec::new();
         for greeter in sessions.iter().filter(|fact| fact.is_console_greeter()) {
             if session_processes(&greeter.id, greeter.uid).is_empty() {
@@ -2598,10 +2790,14 @@ pub(crate) async fn ready_login_screen(greeter_session: &str) -> Result<String, 
     let mut greeter = greeter_session.to_owned();
     let mut brought = 0_u32;
     loop {
-        let sessions = read_sessions().await;
+        let read = read_sessions().await;
         let processes = login_screen_processes(&greeter).await.unwrap_or_default();
         let shell_running = !shell_pids(&processes).is_empty();
-        match model::login_screen::step(&sessions, &greeter, shell_running) {
+        // An unreadable logind proves nothing about the login screen: wait.
+        let step = read.as_ref().map_or(LoginScreenStep::Wait, |sessions| {
+            model::login_screen::step(sessions, &greeter, shell_running)
+        });
+        match step {
             LoginScreenStep::Ready => {
                 if brought > 0 {
                     tracing::info!(
@@ -2624,7 +2820,7 @@ pub(crate) async fn ready_login_screen(greeter_session: &str) -> Result<String, 
                 );
             }
             LoginScreenStep::Gone => {
-                if let Some(next) = sessions.iter().find(|fact| fact.is_console_greeter()) {
+                if let Some(next) = read.iter().flatten().find(|fact| fact.is_console_greeter()) {
                     next.id.clone_into(&mut greeter);
                     continue;
                 }
@@ -2828,7 +3024,12 @@ pub(crate) async fn sign_in_through_greeter(
                 "the login screen had not taken the sign-in token; it is given again"
             );
         }
-        let sessions = read_sessions().await;
+        // An unreadable logind shows no session yet: asked again on the next
+        // poll, until the sign-in's deadline.
+        let Ok(sessions) = read_sessions().await else {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        };
         if let Some(session) = sessions
             .iter()
             .find(|session| session.uid == uid && session.is_console_desktop() && session.active)
@@ -2877,6 +3078,7 @@ pub(crate) async fn sign_in_through_greeter(
             if let Some(session) = read_sessions()
                 .await
                 .into_iter()
+                .flatten()
                 .find(|session| session.uid == uid && session.is_console_desktop())
             {
                 let locked = secure_session(&session.id).await;
@@ -2911,17 +3113,25 @@ pub(crate) async fn settle_signed_in_session(
     let mut active_since: Option<tokio::time::Instant> = None;
     let mut brought_forward = 0_u32;
     loop {
-        let sessions = read_sessions().await;
+        let read = read_sessions().await;
         let now = tokio::time::Instant::now();
-        let mine_active = sessions
+        // An unreadable logind proves neither that the session is in front
+        // nor that the login screen finished: nothing settles on it.
+        let mine_active = read
             .iter()
+            .flatten()
             .any(|fact| fact.id == session && fact.active);
         active_since = if mine_active {
             active_since.or(Some(now))
         } else {
             None
         };
-        match model::settle_sign_in(&sessions, uid, greeter_session) {
+        let settlement = read
+            .as_ref()
+            .map_or(model::SignInSettlement::Pending, |sessions| {
+                model::settle_sign_in(sessions, uid, greeter_session)
+            });
+        match settlement {
             model::SignInSettlement::Settled(id) if id == session => {
                 let since = *settled_since.get_or_insert(now);
                 if now.duration_since(since) >= SIGN_IN_SETTLE {
@@ -2978,7 +3188,7 @@ pub(crate) async fn settle_signed_in_session(
 /// What a returning Deck's attachment does to the console, as steps a
 /// test can stand in for.
 pub(crate) trait ConsoleDesk {
-    async fn sessions(&mut self) -> Vec<ConsoleSessionFact>;
+    async fn sessions(&mut self) -> SessionRead;
     fn disable_input(&mut self) -> Result<(), ConsoleRefusal>;
     async fn activate(&mut self, session_id: &str) -> bool;
     /// Blanks the desk's monitors only.
@@ -3008,7 +3218,7 @@ pub(crate) async fn reattach<D: ConsoleDesk>(
     host: model::ConsoleHost,
 ) -> Result<(), ConsoleRefusal> {
     let sessions = desk.sessions().await;
-    let activate = match model::decide_reattach(&sessions, uid, session_id, host) {
+    let activate = match model::decide_reattach_read(&sessions, uid, session_id, host) {
         Ok(activate) => activate,
         Err(refusal) => {
             tracing::warn!(
@@ -3077,7 +3287,7 @@ pub(crate) struct LiveDesk<'a> {
 }
 
 impl ConsoleDesk for LiveDesk<'_> {
-    async fn sessions(&mut self) -> Vec<ConsoleSessionFact> {
+    async fn sessions(&mut self) -> SessionRead {
         read_sessions().await
     }
 
@@ -3349,6 +3559,8 @@ mod tests {
     #[derive(Default)]
     struct FakeDesk {
         sessions: Vec<ConsoleSessionFact>,
+        /// logind did not answer (`sessions` is then ignored).
+        unreadable: Option<SessionsUnreadable>,
         input_fails: bool,
         activate_fails: bool,
         arm_fails: bool,
@@ -3356,9 +3568,10 @@ mod tests {
     }
 
     impl ConsoleDesk for FakeDesk {
-        async fn sessions(&mut self) -> Vec<ConsoleSessionFact> {
+        async fn sessions(&mut self) -> SessionRead {
             self.calls.push("sessions");
-            self.sessions.clone()
+            self.unreadable
+                .map_or_else(|| Ok(self.sessions.clone()), Err)
         }
         fn disable_input(&mut self) -> Result<(), ConsoleRefusal> {
             self.calls.push("disable_input");
@@ -3499,6 +3712,17 @@ mod tests {
             ..FakeDesk::default()
         };
         assert_eq!(run(&mut desk), Err(ConsoleRefusal::SessionChanged));
+        assert_eq!(desk.calls, ["sessions"]);
+    }
+
+    #[test]
+    fn a_console_logind_cannot_describe_is_not_touched_for_a_returning_deck() {
+        let mut desk = FakeDesk {
+            sessions: vec![greeter(), held(false)],
+            unreadable: Some(SessionsUnreadable::ListFailed),
+            ..FakeDesk::default()
+        };
+        assert_eq!(run(&mut desk), Err(ConsoleRefusal::SessionsUnreadable));
         assert_eq!(desk.calls, ["sessions"]);
     }
 
@@ -3737,5 +3961,287 @@ mod tests {
         };
         assert!(user_space_input_holders(&root, &unreadable).is_none());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A stand-in `loginctl` in a directory of its own: `list` (or
+    /// `list.N` for the N-th list, from 0) is what `list-sessions` prints,
+    /// `show.<id>` what `show-session <id>` prints (no file: it fails as
+    /// logind does for a session it does not know), `list.fail` makes the
+    /// list fail and `list.hang` makes it hang.
+    struct FakeLoginctl {
+        dir: PathBuf,
+    }
+
+    impl FakeLoginctl {
+        const SCRIPT: &'static str = r#"#!/bin/sh
+dir=$(dirname "$0")
+case "$1" in
+  list-sessions)
+    n=$(cat "$dir/lists" 2>/dev/null || echo 0)
+    echo $((n + 1)) > "$dir/lists"
+    [ -f "$dir/list.fail" ] && { echo "Failed to connect to bus" >&2; exit 1; }
+    [ -f "$dir/list.hang" ] && exec sleep 30
+    if [ -f "$dir/list.$n" ]; then cat "$dir/list.$n"; else cat "$dir/list"; fi ;;
+  show-session)
+    echo "$*" >> "$dir/calls"
+    [ -f "$dir/show.hang" ] && exec sleep 30
+    [ -f "$dir/show.$2" ] || { echo "Failed to get session: No session '$2' known." >&2; exit 1; }
+    cat "$dir/show.$2" ;;
+  *) exit 2 ;;
+esac
+"#;
+
+        /// The script is run through `/bin/sh`, never executed itself: a
+        /// file just written can be busy (`ETXTBSY`) while another test
+        /// thread forks.
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("arcen-fake-loginctl-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("sessions")).unwrap();
+            let script = dir.join("loginctl");
+            std::fs::write(&script, Self::SCRIPT).unwrap();
+            Self { dir }
+        }
+
+        fn file(self, name: &str, contents: impl AsRef<[u8]>) -> Self {
+            std::fs::write(self.dir.join(name), contents).unwrap();
+            self
+        }
+
+        fn show(self, id: &str, properties: &str) -> Self {
+            self.file(&format!("show.{id}"), properties)
+        }
+
+        /// Writes (`Some`) or removes (`None`) one of the stand-in's files
+        /// between two looks.
+        fn set(&self, name: &str, contents: Option<&str>) {
+            let path = self.dir.join(name);
+            match contents {
+                Some(contents) => std::fs::write(path, contents).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        /// One look of a launcher's watch at session `id`; logind's state
+        /// files are `sessions/<id>`.
+        async fn watch(
+            &self,
+            watch: &mut model::session_watch::SessionWatch,
+            id: &str,
+        ) -> model::session_watch::WatchStep {
+            let loginctl = self.dir.join("loginctl");
+            let sessions = self.dir.join("sessions");
+            let logind = Logind {
+                loginctl: &["/bin/sh", loginctl.to_str().unwrap()],
+                sessions_dir: sessions.to_str().unwrap(),
+                timeout: Duration::from_millis(1500),
+            };
+            watch_joined_from(&logind, watch, id).await
+        }
+
+        async fn read(&self) -> SessionRead {
+            let loginctl = self.dir.join("loginctl");
+            read_sessions_from(
+                &["/bin/sh", loginctl.to_str().unwrap()],
+                Duration::from_millis(1500),
+            )
+            .await
+        }
+
+        /// The console decision for `uid` on a host without a display
+        /// manager, where "nobody holds the console" starts a login session.
+        async fn decide(&self, uid: u32) -> model::ConsoleDecision {
+            model::decide_on_read(
+                &self.read().await,
+                uid,
+                model::ConsoleHost {
+                    display_manager: false,
+                },
+            )
+        }
+    }
+
+    impl Drop for FakeLoginctl {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const ACCOUNT: u32 = 1001;
+    const ACCOUNT_X11: &str = "Id=2\nUser=1001\nName=tim\nSeat=seat0\nVTNr=7\nTTY=tty7\nClass=user\nType=x11\nState=online\nActive=no\nRemote=no\nService=arcen-login\nLockedHint=yes\nLeader=4242\n";
+    const ROOT_SSH: &str = "Id=5\nUser=0\nName=root\nSeat=\nVTNr=0\nTTY=pts/0\nClass=user\nType=tty\nState=active\nActive=no\nRemote=yes\nService=sshd\nLockedHint=no\nLeader=900\n";
+    const UNREADABLE: model::ConsoleDecision =
+        model::ConsoleDecision::Refuse(ConsoleRefusal::SessionsUnreadable);
+
+    #[tokio::test]
+    async fn a_failing_loginctl_refuses_and_never_starts_a_second_session() {
+        let logind = FakeLoginctl::new("fails").file("list.fail", "");
+        assert_eq!(logind.read().await, Err(SessionsUnreadable::ListFailed));
+        assert_eq!(logind.decide(ACCOUNT).await, UNREADABLE);
+        // No loginctl at all.
+        let missing = read_sessions_from(&["/nonexistent/arcen/loginctl"], COMMAND_TIMEOUT).await;
+        assert_eq!(missing, Err(SessionsUnreadable::ListFailed));
+    }
+
+    #[tokio::test]
+    async fn a_loginctl_that_hangs_refuses_within_its_bound() {
+        let logind = FakeLoginctl::new("hangs").file("list.hang", "");
+        let started = std::time::Instant::now();
+        assert_eq!(logind.decide(ACCOUNT).await, UNREADABLE);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_garbled_loginctl_answer_refuses() {
+        for (name, list) in [
+            (
+                "bus",
+                &b"Failed to connect to bus: No such file or directory\n"[..],
+            ),
+            ("words", b"No sessions.\n"),
+            ("binary", b"2 1001 tim\n\xff\xfe\n"),
+        ] {
+            let logind = FakeLoginctl::new(name).file("list", list);
+            assert_eq!(
+                logind.read().await,
+                Err(SessionsUnreadable::ListGarbled),
+                "{name}"
+            );
+            assert_eq!(logind.decide(ACCOUNT).await, UNREADABLE, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_logind_lists_but_will_not_describe_refuses() {
+        // The account's own session is listed; its description fails and it
+        // is still listed when asked again.
+        let logind = FakeLoginctl::new("undescribed")
+            .file("list", "2 1001 tim seat0 tty7\n5 0 root - pts/0\n")
+            .show("5", ROOT_SSH);
+        assert_eq!(
+            logind.read().await,
+            Err(SessionsUnreadable::SessionUndescribed)
+        );
+        assert_eq!(logind.decide(ACCOUNT).await, UNREADABLE);
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ended_between_the_two_lists_is_gone() {
+        let logind = FakeLoginctl::new("ended")
+            .file("list.0", "2 1001 tim seat0 tty7\n5 0 root - pts/0\n")
+            .file("list", "5 0 root - pts/0\n")
+            .show("5", ROOT_SSH);
+        let read = logind.read().await.expect("complete");
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].id, "5");
+    }
+
+    #[tokio::test]
+    async fn a_description_that_contradicts_the_list_refuses() {
+        // Session 2 is listed for the account but described as root's.
+        let logind = FakeLoginctl::new("contradicts")
+            .file("list", "2 1001 tim seat0 tty7\n")
+            .show("2", &ACCOUNT_X11.replace("User=1001", "User=0"));
+        assert_eq!(logind.read().await, Err(SessionsUnreadable::Contradictory));
+        assert_eq!(logind.decide(ACCOUNT).await, UNREADABLE);
+        let garbage = FakeLoginctl::new("garbage-show")
+            .file("list", "2 1001 tim seat0 tty7\n")
+            .show("2", "<html>not a session</html>\n");
+        assert_eq!(garbage.read().await, Err(SessionsUnreadable::Contradictory));
+    }
+
+    #[tokio::test]
+    async fn only_a_complete_read_proves_the_account_has_no_session() {
+        // logind answered: nobody, or only root's SSH session.
+        let nobody = FakeLoginctl::new("nobody").file("list", "");
+        assert_eq!(nobody.read().await, Ok(Vec::new()));
+        assert_eq!(
+            nobody.decide(ACCOUNT).await,
+            model::ConsoleDecision::StartLoginSession { vt: 7 }
+        );
+        let ssh_only = FakeLoginctl::new("ssh-only")
+            .file("list", "     5    0 root        pts/0\n")
+            .show("5", ROOT_SSH);
+        assert_eq!(
+            ssh_only.decide(ACCOUNT).await,
+            model::ConsoleDecision::StartLoginSession { vt: 7 }
+        );
+        // Read completely, the account's own session is joined.
+        let held = FakeLoginctl::new("held")
+            .file("list", "2 1001 tim seat0 tty7\n5 0 root - pts/0\n")
+            .show("2", ACCOUNT_X11)
+            .show("5", ROOT_SSH);
+        assert!(matches!(
+            held.decide(ACCOUNT).await,
+            model::ConsoleDecision::Attach { ref session, activate: true, .. } if session == "2"
+        ));
+    }
+
+    /// The account's GDM X11 session a launcher joined.
+    const JOINED: &str = "Id=7\nUser=1001\nName=tim\nSeat=seat0\nVTNr=2\nTTY=tty2\nClass=user\nType=x11\nState=active\nActive=yes\nRemote=no\nService=gdm-password\nLockedHint=no\nLeader=4242\n";
+
+    #[tokio::test]
+    async fn one_unanswered_look_keeps_a_joined_session() {
+        use model::session_watch::{SessionWatch, WatchStep};
+        let logind = FakeLoginctl::new("watch-transient").show("7", JOINED);
+        logind.set("sessions/7", Some(""));
+        let mut watch = SessionWatch::new(ACCOUNT);
+        assert_eq!(logind.watch(&mut watch, "7").await, WatchStep::Hold);
+        // One `show-session` fails while logind still keeps the session.
+        logind.set("show.7", None);
+        assert_eq!(logind.watch(&mut watch, "7").await, WatchStep::Hold);
+        logind.set("show.7", Some(JOINED));
+        assert_eq!(logind.watch(&mut watch, "7").await, WatchStep::Hold);
+        // One that takes longer than its bound.
+        logind.set("show.hang", Some(""));
+        assert_eq!(logind.watch(&mut watch, "7").await, WatchStep::Hold);
+    }
+
+    #[tokio::test]
+    async fn a_logout_ends_the_joined_attachment() {
+        use model::session_watch::{SessionWatch, WatchStep};
+        // logind no longer describes it, and its state file is gone.
+        let logind = FakeLoginctl::new("watch-logout");
+        let mut watch = SessionWatch::new(ACCOUNT);
+        assert_eq!(logind.watch(&mut watch, "7").await, WatchStep::Ended);
+        // logind still describes it, closing.
+        let closing = FakeLoginctl::new("watch-closing")
+            .show("7", &JOINED.replace("State=active", "State=closing"));
+        closing.set("sessions/7", Some(""));
+        let mut watch = SessionWatch::new(ACCOUNT);
+        assert_eq!(closing.watch(&mut watch, "7").await, WatchStep::Ended);
+    }
+
+    #[tokio::test]
+    async fn a_logind_that_stays_silent_hands_the_console_back() {
+        use model::session_watch::{SessionWatch, WatchStep, UNANSWERED_LOOKS_BEFORE_HAND_BACK};
+        let logind = FakeLoginctl::new("watch-silent");
+        logind.set("sessions/7", Some(""));
+        let mut watch = SessionWatch::new(ACCOUNT);
+        for look in 1..UNANSWERED_LOOKS_BEFORE_HAND_BACK {
+            assert_eq!(
+                logind.watch(&mut watch, "7").await,
+                WatchStep::Hold,
+                "look {look}"
+            );
+        }
+        assert_eq!(logind.watch(&mut watch, "7").await, WatchStep::HandBack);
+    }
+
+    #[tokio::test]
+    async fn a_look_at_the_joined_session_asks_logind_once() {
+        use model::session_watch::{SessionWatch, WatchStep};
+        // Arcen's own login session: `session_state` also asks for its
+        // display; the watch does not.
+        let logind = FakeLoginctl::new("watch-once")
+            .show("7", &JOINED.replace("gdm-password", "arcen-login"));
+        logind.set("sessions/7", Some(""));
+        let mut watch = SessionWatch::new(ACCOUNT);
+        assert_eq!(logind.watch(&mut watch, "7").await, WatchStep::Hold);
+        let calls = std::fs::read_to_string(logind.dir.join("calls")).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
     }
 }

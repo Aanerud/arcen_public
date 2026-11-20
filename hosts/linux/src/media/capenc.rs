@@ -877,6 +877,33 @@ pub struct IdrRequester {
     idr_tx: std::sync::Arc<std::sync::RwLock<mpsc::UnboundedSender<()>>>,
     control_tx: std::sync::Arc<std::sync::RwLock<mpsc::Sender<StdinCmd>>>,
     canvas: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    canvas_input: std::sync::Arc<std::sync::RwLock<std::sync::Arc<CanvasInputSlot>>>,
+}
+
+/// The newest `CANVAS-INPUT` line waiting for capenc's stdin (ADR 0028
+/// §11): one line, a newer one replaces it, and it never takes a place in
+/// the control mailbox that keyframe, rate and canvas reset lines share.
+#[derive(Debug, Default)]
+pub(crate) struct CanvasInputSlot {
+    line: std::sync::Mutex<Option<arcen_media::capenc_control::CapencControlCommand>>,
+    ready: tokio::sync::Notify,
+}
+
+impl CanvasInputSlot {
+    fn put(&self, command: arcen_media::capenc_control::CapencControlCommand) {
+        *self
+            .line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(command);
+        self.ready.notify_one();
+    }
+
+    fn take(&self) -> Option<arcen_media::capenc_control::CapencControlCommand> {
+        self.line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 #[derive(Clone)]
@@ -889,12 +916,24 @@ impl IdrRequester {
         idr_tx: mpsc::UnboundedSender<()>,
         control_tx: mpsc::Sender<StdinCmd>,
         canvas: bool,
+        canvas_input: std::sync::Arc<CanvasInputSlot>,
     ) -> Self {
         Self {
             idr_tx: std::sync::Arc::new(std::sync::RwLock::new(idr_tx)),
             control_tx: std::sync::Arc::new(std::sync::RwLock::new(control_tx)),
             canvas: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(canvas)),
+            canvas_input: std::sync::Arc::new(std::sync::RwLock::new(canvas_input)),
         }
+    }
+
+    /// Where input was applied, for the canvas's input priority: replaces
+    /// any input line still waiting for capenc's stdin. Never blocks and
+    /// never displaces a control line.
+    pub fn request_canvas_input(&self, command: arcen_media::capenc_control::CapencControlCommand) {
+        self.canvas_input
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .put(command);
     }
 
     /// The capture serves the canvas (ADR 0028): the Deck recovers with
@@ -960,6 +999,11 @@ impl IdrRequester {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *control_tx = session.stdin_tx.clone();
+        *self
+            .canvas_input
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            std::sync::Arc::clone(&session.canvas_input);
         self.canvas.store(
             session.canvas_plan().is_on(),
             std::sync::atomic::Ordering::Relaxed,
@@ -1027,6 +1071,7 @@ pub struct CapencSession {
     child: Child,
     idr_tx: mpsc::UnboundedSender<()>,
     stdin_tx: mpsc::Sender<StdinCmd>,
+    canvas_input: std::sync::Arc<CanvasInputSlot>,
 }
 
 impl CapencSession {
@@ -1764,6 +1809,7 @@ async fn spawn_one(
     // means an IDR is already queued, so dropping extras is correct).
     let (stdin_tx, stdin_rx) = mpsc::channel::<StdinCmd>(4);
     let (idr_tx, idr_rx) = mpsc::unbounded_channel();
+    let canvas_input = std::sync::Arc::new(CanvasInputSlot::default());
 
     let helper_span = tracing::info_span!(
         target: target::CAPENC,
@@ -1808,7 +1854,15 @@ async fn spawn_one(
             );
         }
     }
-    tokio::spawn(write_stdin(stdin, idr_rx, stdin_rx).instrument(helper_span.clone()));
+    tokio::spawn(
+        write_stdin(
+            stdin,
+            idr_rx,
+            stdin_rx,
+            std::sync::Arc::clone(&canvas_input),
+        )
+        .instrument(helper_span.clone()),
+    );
     let (stats_tx, stats) = tokio::sync::watch::channel(None);
     let content = ContentWindowCell::default();
     tokio::spawn(
@@ -1843,10 +1897,16 @@ async fn spawn_one(
                 stats,
                 content,
             }),
-            idr: IdrRequester::new(idr_tx.clone(), stdin_tx.clone(), canvas_on),
+            idr: IdrRequester::new(
+                idr_tx.clone(),
+                stdin_tx.clone(),
+                canvas_on,
+                std::sync::Arc::clone(&canvas_input),
+            ),
             child,
             idr_tx,
             stdin_tx,
+            canvas_input,
         },
         plan,
     ))
@@ -2204,9 +2264,23 @@ async fn write_stdin(
     mut stdin: tokio::process::ChildStdin,
     mut idr_rx: mpsc::UnboundedReceiver<()>,
     mut rx: mpsc::Receiver<StdinCmd>,
+    canvas_input: std::sync::Arc<CanvasInputSlot>,
 ) {
     loop {
         tokio::select! {
+            () = canvas_input.ready.notified() => {
+                let Some(command) = canvas_input.take() else {
+                    continue;
+                };
+                if let Err(e) = stdin
+                    .write_all(command.as_wire_line().as_bytes())
+                    .await
+                    .and(stdin.flush().await)
+                {
+                    tracing::warn!(target: target::CAPENC, error = %e, "capenc canvas input write failed");
+                    break;
+                }
+            }
             idr = idr_rx.recv() => {
                 if idr.is_none() {
                     if rx.is_closed() {
@@ -2499,14 +2573,46 @@ pub(crate) mod test_support {
     pub(crate) fn fake_idr() -> (IdrRequester, mpsc::UnboundedReceiver<()>) {
         let (idr_tx, idr_rx) = mpsc::unbounded_channel();
         let (control_tx, _control_rx) = mpsc::channel::<StdinCmd>(8);
-        (IdrRequester::new(idr_tx, control_tx, false), idr_rx)
+        (
+            IdrRequester::new(idr_tx, control_tx, false, std::sync::Arc::default()),
+            idr_rx,
+        )
+    }
+
+    /// [`fake_canvas_idr`] that keeps the control lines the capture would
+    /// read on its stdin.
+    pub(crate) fn fake_canvas_idr_with_control(
+        capacity: usize,
+    ) -> (
+        IdrRequester,
+        mpsc::Receiver<StdinCmd>,
+        std::sync::Arc<super::CanvasInputSlot>,
+    ) {
+        let (idr_tx, _idr_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::channel::<StdinCmd>(capacity);
+        let slot = std::sync::Arc::new(super::CanvasInputSlot::default());
+        (
+            IdrRequester::new(idr_tx, control_tx, true, std::sync::Arc::clone(&slot)),
+            control_rx,
+            slot,
+        )
+    }
+
+    /// The input line waiting in a slot, as capenc's stdin writer takes it.
+    pub(crate) fn take_canvas_input(
+        slot: &super::CanvasInputSlot,
+    ) -> Option<arcen_media::capenc_control::CapencControlCommand> {
+        slot.take()
     }
 
     /// [`fake_idr`] for a capture that serves the canvas.
     pub(crate) fn fake_canvas_idr() -> (IdrRequester, mpsc::UnboundedReceiver<()>) {
         let (idr_tx, idr_rx) = mpsc::unbounded_channel();
         let (control_tx, _control_rx) = mpsc::channel::<StdinCmd>(8);
-        (IdrRequester::new(idr_tx, control_tx, true), idr_rx)
+        (
+            IdrRequester::new(idr_tx, control_tx, true, std::sync::Arc::default()),
+            idr_rx,
+        )
     }
 
     pub(crate) fn fake_bitrate(idr: &IdrRequester) -> BitrateRequester {
@@ -3963,7 +4069,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let (idr_tx, idr_rx) = mpsc::unbounded_channel();
         drop(idr_tx);
-        tokio::spawn(write_stdin(stdin, idr_rx, rx));
+        tokio::spawn(write_stdin(stdin, idr_rx, rx, std::sync::Arc::default()));
         (child, tx)
     }
 

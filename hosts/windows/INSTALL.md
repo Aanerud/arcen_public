@@ -76,15 +76,20 @@ PowerShell 7+):
 .\hosts\windows\scripts\new-host-cert.ps1
 ```
 
-With no arguments the helper generates only when both files are absent. A
-complete pair is retained and its pins are printed; a partial pair or
-unmarked administrator-provided PEM is never overwritten. It creates an
-ECDSA P-256/SHA-256 certificate with server-auth EKU and SANs for the hostname,
-FQDN, and non-loopback host IP addresses, valid for 825 days. It writes
-`%ProgramData%\Arcen\tls\host.crt`, PKCS#8 `host.key`,
-`host.fingerprint.txt`, and `host.spki-sha256.txt` with
-SYSTEM/Administrators-only ACLs through a recoverable same-directory
-transaction.
+The helper runs `install-arcen-pier.exe --tls-only` (pass `-Installer` when
+it is neither beside the script nor in Program Files), the same code the installer runs, and installs nothing else.
+With no arguments material is created only when both files are absent, kept
+while current and renewed over its key when due; its pins are printed. A
+partial pair or unmarked administrator-provided PEM is never overwritten. It
+creates an ECDSA P-256/SHA-256 certificate, `CN=Arcen Pier`, with server-auth
+EKU and SANs for the hostname, FQDN, and non-loopback host IP addresses, valid
+for 825 days. It writes `%ProgramData%\Arcen\tls\host.crt`, PKCS#8
+`host.key`, `host.cert-sha256`, `host.spki-sha256` and the ownership marker
+`host.generated-by-arcen` with SYSTEM/Administrators-only ACLs through the
+shared journalled transaction, which the next run recovers if it was
+interrupted. The earlier helper's `host.fingerprint.txt`,
+`host.spki-sha256.txt` and `host.generated-by-arcen.txt` are removed once the
+shared files are written; `-Subject` is accepted and ignored.
 
 Renew a helper-managed certificate without changing its SPKI pin:
 

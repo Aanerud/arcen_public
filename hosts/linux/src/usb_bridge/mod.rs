@@ -190,6 +190,24 @@ pub fn runtime_unavailable_reason() -> Option<String> {
     }
 }
 
+/// Why a joined console cannot take Native tablet's host-decoded route
+/// (`arcen_usb_bridge::joined_pen`) on this Pier: the build lacks Native
+/// tablet, or the administrator has not enabled it. The route needs no
+/// virtual host controller: the Pier reads the pen and posts it through its
+/// own typed pen device.
+#[must_use]
+pub fn host_decoded_unavailable_reason() -> Option<String> {
+    #[cfg(feature = "native-tablet")]
+    {
+        native_tablet_policy().disabled_reason().map(str::to_owned)
+    }
+
+    #[cfg(not(feature = "native-tablet"))]
+    {
+        Some(NOT_BUILT.to_owned())
+    }
+}
+
 /// A build without the Native tablet importer (`native-tablet` feature).
 #[cfg_attr(feature = "native-tablet", allow(dead_code))]
 const NOT_BUILT: &str = "this Pier build does not contain Native tablet";

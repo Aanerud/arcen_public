@@ -82,8 +82,11 @@ pub fn build_server_hello(
     pen: PenCapabilityTruth,
     region_input_available: bool,
 ) -> ServerHelloMsg {
-    let usb_hard_offered = crate::usb_bridge::runtime_available()
-        && crate::usb_bridge::session_admission(session).is_ok();
+    // The raw bridge where the session can take it; on a joined console,
+    // the host-decoded route through the session's own pen device.
+    let usb_hard_offered = (crate::usb_bridge::runtime_available()
+        && crate::usb_bridge::session_admission(session).is_ok())
+        || crate::net::joined_pen::offered(session, pen);
     ServerHelloMsg {
         msg_type: SERVER_HELLO.to_string(),
         server_name: "Arcen Host (Rust, Linux)".to_string(),

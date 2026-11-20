@@ -2,7 +2,9 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! OS-independent observability runtime for Arcen's canonical telemetry contracts.
 
-#![forbid(unsafe_code)]
+// Denied crate-wide; the one reviewed exception is the Windows support-bundle
+// file-identity adapter (`support_bundle/native_identity/windows.rs`).
+#![deny(unsafe_code)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod runtime;

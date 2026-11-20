@@ -473,7 +473,16 @@ pub fn parse_material(
     if certificates.is_empty() {
         return Err(HostTlsError::EmptyCertificateChain);
     }
+    Ok((certificates, parse_private_key(private_key_pem)?))
+}
 
+/// Parses exactly one private key: PKCS #8, SEC1 (`openssl ecparam`) or
+/// PKCS #1.
+///
+/// # Errors
+///
+/// Returns the PEM failure: an unexpected block, no key or more than one key.
+pub fn parse_private_key(private_key_pem: &[u8]) -> Result<PrivateKeyDer<'static>, HostTlsError> {
     let mut private_key = None;
     for item in pem_items(private_key_pem) {
         let key = match item.map_err(|()| HostTlsError::MalformedPrivateKeyPem)? {
@@ -486,10 +495,7 @@ pub fn parse_material(
             return Err(HostTlsError::MultiplePrivateKeys);
         }
     }
-    Ok((
-        certificates,
-        private_key.ok_or(HostTlsError::MissingPrivateKey)?,
-    ))
+    private_key.ok_or(HostTlsError::MissingPrivateKey)
 }
 
 /// Reads, parses and validates the material `source` names.

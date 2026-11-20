@@ -13,6 +13,10 @@ repository.workspace = true
 
 [features]
 default = []
+# The shared certificate issuer (`cert_issuance::issue`): rcgen over ring,
+# which rustls already builds. Off by default so a Deck or a program that
+# only validates certificates links no issuer.
+issuer = ["dep:rcgen", "dep:time"]
 quic = [
     "dep:arcen-observability",
     "dep:bytes",
@@ -37,9 +41,12 @@ quinn = { workspace = true, optional = true }
 # congestion::Controller trait takes quinn_proto::RttEstimator, which quinn
 # does not re-export (see quic/loss_guard.rs).
 quinn-proto = { version = "=0.11.16", default-features = false, optional = true }
+rcgen = { version = "=0.14.8", optional = true }
 rustls.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+# rcgen's validity window is a time::OffsetDateTime; the version rcgen builds.
+time = { version = "0.3.45", default-features = false, features = ["std"], optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 x509-parser.workspace = true
@@ -47,6 +54,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 rcgen = "=0.14.8"
+time = { version = "0.3.45", default-features = false, features = ["std"] }
 serde_json.workspace = true
 # Adds `tokio::time::pause`/`#[tokio::test(start_paused = true)]` for test
 # code only (dev-dependencies are never linked into a non-test build of

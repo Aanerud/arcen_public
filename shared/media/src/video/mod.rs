@@ -107,11 +107,12 @@ pub use frame::{
     Nv12FrameMut,
 };
 pub use frame_queue::{
-    FrameClassification, FullFrameRequestCoalescer, FullFrameRequestDecision, KeyframeRequestRetry,
-    MIN_VIDEO_BACKLOG_FRAMES, PinGenerationRecovery, RELAYED_VIDEO_FRAMES_IN_FLIGHT,
-    RELAYED_VIDEO_RESYNC, RelayedVideoWindow, RoomState, SharedVideoQueue, VIDEO_BACKLOG_ENV,
-    VIDEO_ROOM_WAIT, VideoQueuePush, VideoQueueWaitStats, VideoWrite, VideoWriteMeter,
-    video_backlog_budget, video_backlog_budget_from_env, video_backlog_is_legacy_from_env,
+    CANVAS_QUEUE_BYTES, FrameClassification, FullFrameRequestCoalescer, FullFrameRequestDecision,
+    KeyframeRequestRetry, MIN_VIDEO_BACKLOG_FRAMES, OutboundVideoRecord, PinGenerationRecovery,
+    RELAYED_VIDEO_FRAMES_IN_FLIGHT, RELAYED_VIDEO_RESYNC, RelayedVideoWindow, RoomState, RoomWait,
+    SharedVideoQueue, VIDEO_BACKLOG_ENV, VIDEO_ROOM_WAIT, VideoQueuePush, VideoQueueWaitStats,
+    VideoWrite, VideoWriteMeter, video_backlog_budget, video_backlog_budget_from_env,
+    video_backlog_is_legacy_from_env,
 };
 pub use frame_rate::{
     DISPLAY_REFRESH_FALLBACK_HZ, FrameRateBasis, FrameRatePolicy, FrameRateRequest,

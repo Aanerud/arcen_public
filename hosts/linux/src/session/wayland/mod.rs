@@ -70,6 +70,8 @@ pub mod eis_text;
 pub mod facts;
 pub mod input;
 #[cfg(all(target_os = "linux", feature = "wayland-provider"))]
+pub mod join;
+#[cfg(all(target_os = "linux", feature = "wayland-provider"))]
 pub mod keyring;
 #[cfg(all(target_os = "linux", feature = "wayland-provider"))]
 pub mod mutter;
@@ -115,6 +117,10 @@ pub const FIRST_LOGIN_SETUP_FLAG: &str = "--first-login-setup";
 
 /// Agent flag selecting the headless Wayland desktop.
 pub const AGENT_WAYLAND_FLAG: &str = "--wayland-headless";
+/// Console agent flag: join the account's own Wayland session (S4b).
+pub const AGENT_WAYLAND_JOIN_FLAG: &str = "--wayland-join";
+/// Console agent flag naming the compositor process the launcher proved.
+pub const AGENT_JOIN_COMPOSITOR_FLAG: &str = "--join-compositor-pid";
 /// Agent flag naming the private runtime directory it must create.
 pub const AGENT_RUNTIME_DIR_FLAG: &str = "--wayland-runtime-dir";
 /// Agent flag naming one virtual output, `WIDTHxHEIGHT@HZ`.
@@ -1626,6 +1632,34 @@ pub struct WaylandAgentReady {
     pub clipboard: Option<WaylandClipboardReady>,
 }
 
+/// What the joined session proved, reported beside its ready message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JoinedReady {
+    /// The compositor the agent found serving Mutter's names.
+    pub compositor_pid: u32,
+    /// Every recorded monitor announced a `PipeWire` stream.
+    pub capture: bool,
+    /// The input target was accepted (keyboard, pointer, absolute motion).
+    pub input: bool,
+    /// The compositor's connection is GNOME Shell's, which locks the
+    /// session when logind asks, and the account's settings allow locking.
+    pub lock: bool,
+    /// A recorded monitor is shown at the desk.
+    pub at_desk: bool,
+}
+
+impl JoinedReady {
+    /// The route proof the shared decision reads.
+    #[must_use]
+    pub const fn proof(&self) -> arcen_session::console_session::wayland_attach::JoinRouteProof {
+        arcen_session::console_session::wayland_attach::JoinRouteProof {
+            capture: self.capture,
+            input: self.input,
+            lock: self.lock,
+        }
+    }
+}
+
 /// A compositor clipboard the session agent proved and serves on
 /// [`CLIPBOARD_SOCKET_NAME`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1676,6 +1710,48 @@ impl WaylandAgentReady {
                         && output.height == stream.height
                         && stream.node_id != 0
                 })
+    }
+
+    /// Whether this message's sockets belong to `session_id` of `uid`: a
+    /// desktop Arcen created, in its private runtime directory, or a joined
+    /// session (S4b), in the account's own.
+    #[must_use]
+    pub fn serves_session(&self, uid: u32, session_id: &str) -> bool {
+        (self.is_consistent() && is_private_runtime_dir(&self.runtime_dir, uid, session_id))
+            || self.is_consistent_joined(uid)
+    }
+
+    /// Whether the ready message of a joined session of `uid` is one the
+    /// launcher may hand on: the account's own runtime directory, its
+    /// sockets there, the session's own monitors recorded as they run (one
+    /// stream each, a fixed set), nothing of Arcen's own compositor.
+    #[must_use]
+    pub fn is_consistent_joined(&self, uid: u32) -> bool {
+        let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+        let display_ok = !self.wayland_display.is_empty()
+            && self.wayland_display.len() <= 64
+            && self
+                .wayland_display
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+        self.runtime_dir == runtime_dir
+            && display_ok
+            && self.input_socket == runtime_dir.join(INPUT_SOCKET_NAME)
+            && self
+                .clipboard
+                .as_ref()
+                .is_none_or(|clipboard| clipboard.socket == runtime_dir.join(CLIPBOARD_SOCKET_NAME))
+            && self.output_socket.is_none()
+            && self.output_mode == VirtualOutputMode::StartupMonitors
+            && self.x11.is_none()
+            && !self.outputs.is_empty()
+            && self.outputs.len() == self.streams.len()
+            && self.generation == INITIAL_OUTPUT_GENERATION
+            && self
+                .outputs
+                .iter()
+                .zip(&self.streams)
+                .all(|(output, stream)| output.connector == stream.connector && stream.node_id != 0)
     }
 
     /// This session after an output reconfiguration the agent reported:
@@ -2803,6 +2879,54 @@ mod tests {
             cursor_mode: Default::default(),
             clipboard: None,
         }
+    }
+
+    /// A joined session's ready message (S4b): the account's own runtime
+    /// directory and display, its sockets there.
+    fn joined_ready() -> WaylandAgentReady {
+        let runtime_dir = PathBuf::from("/run/user/1000");
+        WaylandAgentReady {
+            input_socket: runtime_dir.join(INPUT_SOCKET_NAME),
+            clipboard: Some(WaylandClipboardReady {
+                socket: runtime_dir.join(CLIPBOARD_SOCKET_NAME),
+                interface: "org.gnome.Mutter.RemoteDesktop.Session".into(),
+                dedicated_session: true,
+            }),
+            runtime_dir,
+            wayland_display: "wayland-1".into(),
+            ..ready()
+        }
+    }
+
+    #[test]
+    fn a_joined_session_is_served_only_from_the_accounts_own_runtime_directory() {
+        let joined = joined_ready();
+        assert!(joined.is_consistent_joined(1000));
+        assert!(joined.serves_session(1000, "19662"));
+        // Another account's runtime directory, or a session whose sockets
+        // are elsewhere, is never served.
+        assert!(!joined.serves_session(1001, "19662"));
+        let mut elsewhere = joined_ready();
+        elsewhere.input_socket = PathBuf::from("/tmp/arcen-input.sock");
+        assert!(!elsewhere.serves_session(1000, "19662"));
+        let mut clipboard_elsewhere = joined_ready();
+        clipboard_elsewhere.clipboard.as_mut().unwrap().socket =
+            PathBuf::from("/run/user/1001/arcen-clipboard.sock");
+        assert!(!clipboard_elsewhere.serves_session(1000, "19662"));
+        // A joined session's monitors are never reconfigured, and it has no
+        // Xwayland of Arcen's own.
+        let mut reconfigurable = joined_ready();
+        reconfigurable.output_socket = Some(PathBuf::from("/run/user/1000/arcen-output.sock"));
+        assert!(!reconfigurable.serves_session(1000, "19662"));
+        let mut bad_display = joined_ready();
+        bad_display.wayland_display = "../wayland-0".into();
+        assert!(!bad_display.serves_session(1000, "19662"));
+        let mut no_stream = joined_ready();
+        no_stream.streams.clear();
+        assert!(!no_stream.serves_session(1000, "19662"));
+        // A desktop Arcen created is still served from its private directory.
+        assert!(ready().serves_session(1000, "c7"));
+        assert!(!ready().is_consistent_joined(1000));
     }
 
     #[test]

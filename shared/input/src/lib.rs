@@ -20,6 +20,7 @@ mod gestures;
 pub mod hid_digitizer;
 pub mod hid_reports;
 pub mod host_pointer;
+pub mod joined_input;
 pub mod keyboard;
 mod lane_outbox;
 mod negotiation;

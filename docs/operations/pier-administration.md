@@ -269,11 +269,13 @@ session.
 | The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it as a guest: its screens are streamed as they are and never changed (below); the other product is never stopped or reconfigured |
 | The same, while that product's own client is connected | refused, `console_in_use_other_product`: one remote-desktop product at a time |
 | Another account is signed in (or holds the console through another product) | refused, `console_other_user` or `console_other_user_other_product` |
-| GNOME on Wayland | refused, `console_wayland_session`: set `WaylandEnable=false` in `/etc/gdm/custom.conf` and restart GDM while nobody is signed in |
+| The account is signed in to GNOME on Wayland | joins that session: its own monitors and applications, nothing of it changed; locked when the Deck leaves. Refused `console_privacy_unavailable` while desk privacy is on and the session shows on a monitor at the desk (a Wayland desk cannot be blanked); a disconnected Deck signs in again rather than resuming |
+| GDM's login screen is Wayland, nobody signed in | refused, `console_wayland_session`: set `WaylandEnable=false` in `/etc/gdm/custom.conf` and restart GDM while nobody is signed in |
 | No display manager on the host, nobody signed in | starts the account's real login session (below), then joins it |
 | The account's session that Arcen started | joins it (same desktop, same applications) |
 | Another account's session that Arcen started | refused, `console_other_user` (one account at a time without a display manager) |
 | A display manager is configured but its login screen is not running | refused, `console_no_session` |
+| logind's sessions cannot be read (`loginctl` fails, times out, or answers incompletely) | refused, `console_sessions_unreadable`: whether the account already has a session is unknown, so Arcen neither joins nor starts one |
 | `display-manager.service` points at another remote-desktop product's unit, and that unit is stopped | nothing will show a login screen: served like a host without a display manager (Arcen's real login session) |
 
 While a Deck is attached the workstation is private: its monitors are
@@ -1748,6 +1750,11 @@ sudo systemctl reload arcen-pier
 
 ```powershell
 sc.exe control ArcenPier 202
+```
+
+```sh
+# macOS Pier (preview)
+sudo launchctl kill HUP system/pier.arcen.tech.service
 ```
 
 A failed reload keeps the last good certificate while it remains valid. Once the active certificate expires, new TLS handshakes are refused. Existing QUIC sessions keep the already negotiated key. There is no plaintext or WSS fallback. On Deck, a certificate trust or name mismatch appears as a connection failure or trust prompt depending on the macOS trust path and Deck security mode.

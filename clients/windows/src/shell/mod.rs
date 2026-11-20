@@ -40,7 +40,9 @@ use arcen_deck_core::ui_pacing::PassPacer;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::event_loop::{
+    ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopBuilder, EventLoopProxy,
+};
 use winit::platform::windows::{MonitorHandleExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId};
@@ -146,7 +148,7 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     // Sessions spawn their tasks from the UI thread, as on the Mac.
     let _runtime = runtime.enter();
-    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+    let event_loop = match build_event_loop(&mut EventLoop::<UserEvent>::with_user_event()) {
         Ok(event_loop) => event_loop,
         Err(error) => {
             eprintln!("arcen-deck: cannot create the window's event loop: {error}");
@@ -241,6 +243,25 @@ fn display_of(window: &Window) -> Option<u32> {
 /// A monitor's roster id: `\\.\DISPLAY3` is 3.
 fn display_number(monitor: &winit::monitor::MonitorHandle) -> Option<u32> {
     crate::display::gdi_display_number(&monitor.native_id())
+}
+
+/// The shell's event loop, registered for no raw input.
+///
+/// winit registers every event loop for raw keyboard and mouse input (its
+/// device events). Windows calls no `WH_KEYBOARD_LL` hook, this Deck's or
+/// any other program's, while the newest hook belongs to a process
+/// registered for raw keyboard input whose window is in front: the Deck's
+/// own keyboard hook then took nothing, and a Windows Pier keeping its desk
+/// private while this Deck ran in its session lost its hook canary and,
+/// rightly, ended and locked the session. The Deck reads keys from its
+/// window procedure and its hook, and raw mouse motion only while the
+/// pointer is locked (`input::mouse`); it uses no device event.
+fn build_event_loop(
+    builder: &mut EventLoopBuilder<UserEvent>,
+) -> Result<EventLoop<UserEvent>, winit::error::EventLoopError> {
+    let event_loop = builder.build()?;
+    event_loop.listen_device_events(DeviceEvents::Never);
+    Ok(event_loop)
 }
 
 fn hwnd_of(window: &Window) -> Result<windows::Win32::Foundation::HWND, String> {
@@ -645,5 +666,47 @@ impl ApplicationHandler<UserEvent> for Shell {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::UI::Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE};
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+
+    use super::{EventLoop, UserEvent, build_event_loop};
+
+    /// The process's raw input registrations (usage page, usage).
+    fn registered_raw_input() -> Vec<(u16, u16)> {
+        let size = u32::try_from(std::mem::size_of::<RAWINPUTDEVICE>()).unwrap_or(0);
+        let mut count = 0_u32;
+        // SAFETY: a size query: no buffer, a valid count out-parameter.
+        let _ = unsafe { GetRegisteredRawInputDevices(None, &raw mut count, size) };
+        let mut devices = vec![RAWINPUTDEVICE::default(); count as usize];
+        if count > 0 {
+            // SAFETY: a buffer of `count` elements and its length.
+            let read = unsafe {
+                GetRegisteredRawInputDevices(Some(devices.as_mut_ptr()), &raw mut count, size)
+            };
+            devices.truncate(usize::try_from(read).unwrap_or(0).min(devices.len()));
+        }
+        devices
+            .iter()
+            .map(|device| (device.usUsagePage, device.usUsage))
+            .collect()
+    }
+
+    #[test]
+    fn the_event_loop_leaves_the_process_without_raw_keyboard_input() -> Result<(), String> {
+        let mut builder = EventLoop::<UserEvent>::with_user_event();
+        builder.with_any_thread(true);
+        let event_loop = build_event_loop(&mut builder).map_err(|error| error.to_string())?;
+        let registered = registered_raw_input();
+        drop(event_loop);
+        assert!(
+            !registered.contains(&(0x01, 0x06)),
+            "raw keyboard input registered: {registered:?}"
+        );
+        Ok(())
     }
 }

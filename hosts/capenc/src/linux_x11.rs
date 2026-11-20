@@ -1658,7 +1658,12 @@ fn run_inner(args: Vec<String>) -> i32 {
         }
         for command in control.take_canvas_controls() {
             match command {
-                CapencControlCommand::CanvasInput { x, y } => encode.note_input(x, y, now),
+                CapencControlCommand::CanvasInput {
+                    monitor_id,
+                    topology_generation,
+                    x,
+                    y,
+                } => encode.note_input(monitor_id, topology_generation, x, y, now),
                 command => {
                     if let Some(message) = command.canvas_control() {
                         encode.on_control(&message);

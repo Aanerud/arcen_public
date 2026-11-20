@@ -4,7 +4,7 @@
 //! [`SoftwareH264Session`] per canvas surface, and one at the monitor's
 //! size for a Deck that receives full frames (ADR 0028).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arcen_keel::BgraFrame;
 
@@ -373,7 +373,7 @@ pub fn open_software_loop(config: SoftwareLoopConfig) -> Result<SoftwareLoop, St
         },
         encoder,
         Box::new(packer),
-        Instant::now(),
+        std::time::Instant::now(),
     )
     .map_err(|error| format!("software loop: {error}"))?;
     Ok(SoftwareLoop {

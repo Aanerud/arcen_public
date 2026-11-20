@@ -325,6 +325,19 @@ pub enum NoticeCode {
     /// The bundle was asked for crash reports, but this product does not
     /// collect them yet.
     CrashReportsNotCollected,
+    /// A folder on the way to the source was a link or reparse point the
+    /// collector does not trust, or the opened file was not where its path
+    /// says.
+    SourcePathLinked,
+    /// The source has more than one name (a hard link), so it may be
+    /// another file's contents under an allowed name.
+    SourceHardLinked,
+    /// The source's volume cannot prove which file was opened (a network
+    /// volume, no stable file IDs, or no file number).
+    SourceIdentityUnverifiable,
+    /// The source was opened and read, but its volume gave only a 64-bit
+    /// file index, not a 128-bit file ID.
+    SourceIdentityIndexOnly,
 }
 
 /// One typed omission/degradation notice.

@@ -7,6 +7,7 @@
     "shared-transport-test",
     "shared-transport-clippy",
     "shared-transport-quic-test",
+    "shared-transport-issuer-test",
     "shared-transport-tree-purity",
     "workspace-boundaries"
   ],
@@ -73,8 +74,12 @@
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
       "contracts": [
+        "cert_issuance",
         "cert_marker",
         "cert_provisioning",
+        "cert_publication",
+        "cert_store",
+        "cert_transaction",
         "crate",
         "lanes",
         "path_signal",
@@ -84,7 +89,7 @@
         "quic::session_lanes",
         "tls"
       ],
-      "features": ["quic"],
+      "features": ["issuer", "quic"],
       "production_uses": [
         {
           "id": "lane-session",
@@ -145,7 +150,14 @@
     {
       "package": "arcen-pier-linux-installer",
       "dependency_kind": "normal",
-      "contracts": ["cert_marker", "cert_provisioning", "cert_transaction"],
+      "contracts": [
+        "cert_issuance",
+        "cert_marker",
+        "cert_provisioning",
+        "cert_publication",
+        "cert_transaction"
+      ],
+      "features": ["issuer"],
       "paths": [
         {
           "id": "linux-installer",
@@ -160,10 +172,13 @@
       "package": "arcen-pier-macos",
       "dependency_kind": "normal",
       "contracts": [
+        "cert_issuance",
         "cert_marker",
         "cert_provisioning",
+        "cert_publication",
         "cert_transaction",
         "crate",
+        "host_material",
         "path_signal",
         "quic",
         "quic::config",
@@ -172,7 +187,7 @@
         "quic::lane_runtime",
         "quic::session_lanes"
       ],
-      "features": ["quic"],
+      "features": ["issuer", "quic"],
       "production_uses": [
         {
           "id": "lane-session",
@@ -340,7 +355,14 @@
     {
       "package": "arcen-pier-windows-installer",
       "dependency_kind": "normal",
-      "contracts": ["cert_marker", "cert_provisioning"],
+      "contracts": [
+        "cert_issuance",
+        "cert_marker",
+        "cert_provisioning",
+        "cert_publication",
+        "cert_transaction"
+      ],
+      "features": ["issuer"],
       "paths": [
         {
           "id": "windows-installer",

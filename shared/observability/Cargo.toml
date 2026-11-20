@@ -15,8 +15,11 @@ repository.workspace = true
 default = []
 # The support-bundle collector every Pier and Deck writes with: the ZIP
 # writer and SHA-256 hashing. Off by default so a program that only logs
-# does not build an archive writer.
-support-bundle = ["dep:sha2", "dep:zip"]
+# does not build an archive writer. The source walk reads OS facts through
+# rustix (openat/fstatat without following links) on Unix, and through
+# winapi-util and windows-sys (file IDs, volume flags, final paths) on
+# Windows.
+support-bundle = ["dep:sha2", "dep:zip", "dep:rustix", "dep:winapi-util", "dep:windows-sys"]
 
 [dependencies]
 arcen-protocol.workspace = true
@@ -26,6 +29,13 @@ sha2 = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zip = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = { workspace = true, optional = true }
+windows-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 sha2.workspace = true

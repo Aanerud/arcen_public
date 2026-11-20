@@ -4,7 +4,7 @@
 use super::*;
 use arcen_protocol::messages::UsbHidReportDescriptorMsg;
 use arcen_usb_bridge::descriptor_fixtures::{
-    GENERIC_PEN_FIXTURES, HUION_STYLE_PEN, XP_PEN_STYLE_COMPOSITE,
+    GAOMON_STYLE_PEN, GENERIC_PEN_FIXTURES, HUION_STYLE_PEN, XP_PEN_STYLE_COMPOSITE,
 };
 use arcen_usb_bridge::{
     EmulatedUsbFunction, GENERIC_PEN_IN, GenericPenState, GenericPenTablet, INTUOS5_PEN_IN,
@@ -218,6 +218,126 @@ fn the_deck_is_told_exactly_why_and_what_it_will_get() {
     };
     assert_eq!(
         tablet_result(typed.clone(), &Err("x".to_owned()), None, NOTICES),
+        typed
+    );
+}
+
+/// A pen read on the host claims only what its reader decodes and the
+/// host's pen device carries: a generic pen without tilt or eraser fields
+/// gets neither, a model reader gets its full set, and no host pen device
+/// means no pen at all.
+#[test]
+fn a_host_decoded_pen_claims_only_what_is_decoded_and_carried() {
+    use crate::pen_emulation::PenCapabilityTruth;
+    let available = CapabilityAvailability::Available;
+    let unavailable = CapabilityAvailability::Unavailable;
+    let linux = PenCapabilityTruth::LINUX_UINPUT_TABLET;
+    let gaomon = authorize(
+        Some(&generic(0x256c, GAOMON_STYLE_PEN)),
+        HidPublishPolicy::Nothing,
+        false,
+    )
+    .unwrap();
+    let truth = host_decoded_capabilities(&gaomon, linux);
+    assert_eq!(truth.pen, available);
+    assert_eq!(truth.pressure, available);
+    assert_eq!(truth.tilt, unavailable, "no tilt field is declared");
+    assert_eq!(truth.eraser, unavailable, "no eraser or invert field");
+    assert_eq!(truth.proximity, available, "In Range is declared");
+    assert_eq!(truth.barrel_buttons, available);
+    assert_eq!(truth.rotation, unavailable);
+    assert_eq!(
+        pen_feature_words(truth),
+        ["pressure", "hover", "barrel buttons"]
+    );
+    let notice = host_decoded_notice(&gaomon, truth, "Linux Pier");
+    assert!(notice.contains("from its HID reports"), "{notice}");
+    assert!(
+        notice.contains("pressure, hover and barrel buttons."),
+        "{notice}"
+    );
+    assert!(
+        !notice.contains("tilt") && !notice.contains("eraser"),
+        "{notice}"
+    );
+    assert!(notice.contains("Pad buttons, touch"), "{notice}");
+    let intuos = authorize(Some(&intuos5()), HidPublishPolicy::Nothing, false).unwrap();
+    let truth = host_decoded_capabilities(&intuos, linux);
+    assert_eq!(
+        pen_feature_words(truth),
+        ["pressure", "tilt", "eraser", "hover", "barrel buttons"],
+        "the device carries no rotation"
+    );
+    let notice = host_decoded_notice(&intuos, truth, "Linux Pier");
+    assert!(notice.contains("with its model's reader"), "{notice}");
+    assert!(notice.len() <= MAX_TABLET_MODE_REASON_BYTES);
+    // Every axis a host could carry still fits the wire's reason bound.
+    let every = PenCapabilityTruth {
+        rotation: available,
+        ..linux
+    };
+    let huion = authorize(
+        Some(&generic(0x256c, HUION_STYLE_PEN)),
+        HidPublishPolicy::Nothing,
+        false,
+    )
+    .unwrap();
+    assert!(host_decoded_notice(&huion, every, "Linux Pier").len() <= MAX_TABLET_MODE_REASON_BYTES);
+    assert_eq!(
+        host_decoded_capabilities(&intuos, PenCapabilityTruth::UNAVAILABLE),
+        PenCapabilityTruth::UNAVAILABLE
+    );
+    assert!(
+        host_decoded_notice(&intuos, PenCapabilityTruth::UNAVAILABLE, "Linux Pier")
+            .contains("position and tip only")
+    );
+}
+
+/// A joined desktop's host-decoded result: an unknown model is refused with
+/// mouse compatibility and its reason, an accepted pen says what it gets.
+#[test]
+fn a_host_decoded_result_refuses_an_unknown_model_and_names_what_an_accepted_pen_gets() {
+    use crate::pen_emulation::PenCapabilityTruth;
+    let device = PenCapabilityTruth::LINUX_UINPUT_TABLET;
+    let unknown = UsbHardDeviceMsg {
+        product_id: 0x0001,
+        ..intuos5()
+    };
+    let refused = authorize(Some(&unknown), HidPublishPolicy::Nothing, false);
+    let result =
+        host_decoded_tablet_result(requested_native(true), Some(&refused), device, "Linux Pier");
+    assert!(!result.accepted && result.reconnect_required);
+    assert_eq!(result.active, TabletModeMsg::DisabledMouseCompat);
+    let reason = String::from(result.reason);
+    assert!(
+        reason.contains("refused") && reason.contains("vendor format"),
+        "{reason}"
+    );
+    let gaomon = authorize(
+        Some(&generic(0x256c, GAOMON_STYLE_PEN)),
+        HidPublishPolicy::Nothing,
+        false,
+    );
+    let result =
+        host_decoded_tablet_result(requested_native(true), Some(&gaomon), device, "Linux Pier");
+    assert!(result.accepted && !result.reconnect_required);
+    assert_eq!(result.active, TabletModeMsg::UsbTabletBridge);
+    let reason = String::from(result.reason);
+    assert!(
+        reason.starts_with("Native tablet is active: this Linux Pier"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("pressure, hover and barrel buttons."),
+        "{reason}"
+    );
+    // Another requested mode is untouched.
+    let typed = TabletModeResultMsg {
+        requested: TabletModeMsg::LocalTermination,
+        ..TabletModeResultMsg::default()
+    };
+    assert_eq!(
+        host_decoded_tablet_result(typed.clone(), None, device, "Linux Pier"),
         typed
     );
 }

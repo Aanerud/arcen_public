@@ -250,6 +250,35 @@ pub struct Capenc {
     refine_control: mpsc::UnboundedSender<arcen_media::capenc_control::CapencControlCommand>,
     /// The canvas plan this capenc was started with (ADR 0028).
     canvas_plan: arcen_media::canvas::serve::CanvasServePlan,
+    /// Where the session applied input, for the canvas's input priority:
+    /// the shared feed (`None` without a canvas) and one latest-wins line.
+    canvas_input: std::sync::Mutex<Option<arcen_media::canvas::serve::CanvasInputFeed>>,
+    canvas_input_line: Arc<CanvasInputSlot>,
+}
+
+/// The newest `CANVAS-INPUT` line waiting for capenc's stdin: one line, a
+/// newer one replaces it, so input never queues behind a slow pipe.
+#[derive(Debug, Default)]
+struct CanvasInputSlot {
+    line: std::sync::Mutex<Option<arcen_media::capenc_control::CapencControlCommand>>,
+    ready: tokio::sync::Notify,
+}
+
+impl CanvasInputSlot {
+    fn put(&self, command: arcen_media::capenc_control::CapencControlCommand) {
+        *self
+            .line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(command);
+        self.ready.notify_one();
+    }
+
+    fn take(&self) -> Option<arcen_media::capenc_control::CapencControlCommand> {
+        self.line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -820,6 +849,7 @@ impl Capenc {
         }));
         let (stdin_tx, stdin_rx) = mpsc::channel(1);
         let (refine_tx, refine_rx) = mpsc::unbounded_channel();
+        let canvas_input_line = Arc::new(CanvasInputSlot::default());
         let (idr_tx, idr_rx) = mpsc::unbounded_channel();
         let idr = IdrRequester::new(idr_tx);
         let pipeline_telemetry = Arc::new(PipelineTelemetry::default());
@@ -871,7 +901,14 @@ impl Capenc {
             retry_pending_idr(frames.clone(), idr.clone()).instrument(helper_span.clone()),
         );
         tokio::spawn(
-            write_stdin(stdin, idr_rx, stdin_rx, refine_rx).instrument(helper_span.clone()),
+            write_stdin(
+                stdin,
+                idr_rx,
+                stdin_rx,
+                refine_rx,
+                Arc::clone(&canvas_input_line),
+            )
+            .instrument(helper_span.clone()),
         );
         tokio::spawn(
             forward_stderr(stderr_lines, Arc::clone(&pipeline_telemetry)).instrument(helper_span),
@@ -886,6 +923,10 @@ impl Capenc {
                 refine_plan,
                 refine_lane,
                 refine_control: refine_tx,
+                canvas_input: std::sync::Mutex::new(
+                    arcen_media::canvas::serve::CanvasInputFeed::for_plan(&canvas_plan),
+                ),
+                canvas_input_line,
                 canvas_plan,
             },
             frames,
@@ -1230,6 +1271,23 @@ impl Capenc {
     pub fn request_canvas(&self, command: arcen_media::capenc_control::CapencControlCommand) {
         if self.canvas_plan.is_on() {
             let _ = self.refine_control.send(command);
+        }
+    }
+
+    /// The session applied pointer or pen input at normalised `(x, y)`:
+    /// the canvas's encode loop keeps that neighbourhood mandatory (ADR
+    /// 0028 §11). Only a position due under the shared feed's rule becomes
+    /// a line, and it replaces any line still waiting; nothing without a
+    /// canvas.
+    pub fn note_canvas_input(&self, x: f64, y: f64) {
+        let command = self
+            .canvas_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|feed| feed.applied(x, y, std::time::Instant::now()));
+        if let Some(command) = command {
+            self.canvas_input_line.put(command);
         }
     }
 
@@ -1652,9 +1710,14 @@ async fn read_framed_v2_inner<R>(
                     refine: None,
                     canvas: true,
                 };
-                if !reset && !crate::latest::video_backlog_legacy() {
+                // A canvas frame waits for the consumer however long the
+                // path stalls: dropping one would cost a new generation
+                // (ADR 0028 §11). A reset never waits.
+                if !crate::latest::video_backlog_legacy() {
                     frames
-                        .wait_for_room(Some(arcen_media::video::VIDEO_ROOM_WAIT))
+                        .wait_for_record_room(arcen_media::video::OutboundVideoRecord::new(
+                            true, reset,
+                        ))
                         .await;
                 }
                 if !enqueue_encoded_frame(&frames, &idr, frame) {
@@ -1764,10 +1827,28 @@ async fn write_stdin(
     mut idr_requests: mpsc::UnboundedReceiver<&'static str>,
     mut commands: mpsc::Receiver<StdinCommand>,
     mut refine: mpsc::UnboundedReceiver<arcen_media::capenc_control::CapencControlCommand>,
+    canvas_input: Arc<CanvasInputSlot>,
 ) {
     let mut refine_open = true;
     loop {
         tokio::select! {
+            () = canvas_input.ready.notified() => {
+                let Some(command) = canvas_input.take() else {
+                    continue;
+                };
+                let line = command.as_wire_line();
+                let write = async {
+                    stdin.write_all(line.as_bytes()).await?;
+                    stdin.flush().await
+                };
+                if tokio::time::timeout(CAPENC_WRITE_TIMEOUT, write)
+                    .await
+                    .map_or(true, |written| written.is_err())
+                {
+                    tracing::warn!(target: CAPENC, "capenc canvas input write failed");
+                    return;
+                }
+            }
             command = refine.recv(), if refine_open => {
                 let Some(command) = command else {
                     refine_open = false;
@@ -3012,6 +3093,109 @@ mod tests {
         assert_eq!(third.refine.expect("tagged").take(), vec![vec![0x0A, 2]]);
     }
 
+    /// Input positions never queue for capenc's stdin: one line waits, and
+    /// a newer one replaces it.
+    #[test]
+    fn a_canvas_input_line_waits_one_deep_and_the_newest_wins() {
+        use arcen_media::capenc_control::CapencControlCommand;
+        let slot = CanvasInputSlot::default();
+        let line = |x| CapencControlCommand::CanvasInput {
+            monitor_id: 0,
+            topology_generation: 0,
+            x,
+            y: 1,
+        };
+        for x in 0..100 {
+            slot.put(line(x));
+        }
+        assert_eq!(slot.take(), Some(line(99)));
+        assert_eq!(slot.take(), None);
+    }
+
+    /// A canvas reset and two frames of its generation, as capenc writes
+    /// them.
+    fn canvas_generation() -> [Vec<u8>; 3] {
+        use arcen_protocol::canvas::{
+            canvas_block_count, CanvasCommand, CanvasFrame, CanvasPixelFormat, CanvasRect,
+            CanvasReset, CanvasResetReason, CanvasScope,
+        };
+        let scope = CanvasScope {
+            monitor_id: 0,
+            topology_generation: 0,
+            stream_epoch: 0,
+            generation: std::num::NonZeroU32::new(1).unwrap(),
+        };
+        let frame = |fence: u64| {
+            CanvasFrame {
+                scope,
+                fence,
+                timestamp_ms: 0,
+                block_count: canvas_block_count(64, 32),
+                commands: vec![CanvasCommand::Fill {
+                    rect: CanvasRect {
+                        x: 0,
+                        y: 0,
+                        width: 64,
+                        height: 32,
+                    },
+                    rgb: [1, 2, 3],
+                }],
+            }
+            .encode()
+            .unwrap()
+        };
+        [
+            CanvasReset {
+                scope,
+                reason: CanvasResetReason::Start,
+                format: CanvasPixelFormat::Bgra8,
+                width: 64,
+                height: 32,
+            }
+            .encode()
+            .unwrap(),
+            frame(1),
+            frame(2),
+        ]
+    }
+
+    /// A canvas frame behind a stalled consumer waits in the reader past
+    /// `VIDEO_ROOM_WAIT` for as long as the path stalls, then goes out in
+    /// order: no drop, so no `IDR` and no new canvas generation (ADR 0028
+    /// §11). The reset never waits.
+    #[tokio::test]
+    async fn a_canvas_frame_waits_for_a_stalled_consumer_without_a_new_generation() {
+        use arcen_media::capenc_stream::{encode_record, CapencRecordKind};
+        let (mut writer, reader) = tokio::io::duplex(1 << 16);
+        let frames = Arc::new(VideoQueue::new(1));
+        let (tx, mut idr_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(read_framed_v2(
+            reader,
+            VideoCodec::H264,
+            frames.clone(),
+            IdrRequester::new(tx),
+            None,
+        ));
+        let records = canvas_generation();
+        for record in &records {
+            writer
+                .write_all(&encode_record(CapencRecordKind::Canvas, record).unwrap())
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(arcen_media::video::VIDEO_ROOM_WAIT + Duration::from_millis(300)).await;
+        assert_eq!(frames.len(), 1, "the frames wait in the reader");
+        assert!(idr_rx.try_recv().is_err(), "nothing was dropped");
+        for record in &records {
+            let frame = frames.pop().await.expect("in order");
+            assert!(frame.canvas);
+            assert_eq!(&frame.data, record);
+        }
+        assert!(idr_rx.try_recv().is_err(), "no new generation");
+        drop(writer);
+        task.await.unwrap();
+    }
+
     async fn spawn_shutdown_fixture(script: &str) -> (Child, mpsc::Sender<StdinCommand>) {
         let mut child = Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", script])
@@ -3025,7 +3209,13 @@ mod tests {
         drop(idr_tx);
         let (tx, rx) = mpsc::channel(1);
         let (_refine_tx, refine_rx) = mpsc::unbounded_channel();
-        tokio::spawn(write_stdin(stdin, idr_rx, rx, refine_rx));
+        tokio::spawn(write_stdin(
+            stdin,
+            idr_rx,
+            rx,
+            refine_rx,
+            Arc::new(CanvasInputSlot::default()),
+        ));
         (child, tx)
     }
 

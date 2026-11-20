@@ -100,9 +100,11 @@
       "dependency_kind": "normal",
       "contracts": [
         "crate",
+        "bridged_pen",
         "compositor_pressure",
         "cursor",
         "host_pointer",
+        "joined_input",
         "pen_axes",
         "pen_emulation",
         "region",
@@ -152,6 +154,29 @@
           "entry_points": ["hosts/linux/src/net/server.rs"],
           "build_profiles": ["linux-pier"],
           "validation": ["linux-pier-test"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-native-tablet-joined",
+          "entry_points": [
+            "hosts/linux/src/net/joined_pen.rs",
+            "hosts/linux/src/input/joined_devices.rs",
+            "hosts/linux/src/net/server.rs"
+          ],
+          "build_profiles": ["linux-pier-native-tablet"],
+          "validation": ["linux-pier-native-tablet-test", "linux-usb-lab"],
+          "owner": "Linux Host"
+        },
+        {
+          "id": "linux-joined-input",
+          "entry_points": [
+            "hosts/linux/src/net/joined_input.rs",
+            "hosts/linux/src/input/joined_devices.rs",
+            "hosts/linux/src/input/uinput.rs",
+            "hosts/linux/src/net/server.rs"
+          ],
+          "build_profiles": ["linux-pier"],
+          "validation": ["linux-pier-test", "linux-av-input-lab"],
           "owner": "Linux Host"
         }
       ]

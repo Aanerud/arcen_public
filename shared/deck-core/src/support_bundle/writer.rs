@@ -521,6 +521,20 @@ impl<W: Write + Seek> Bundle<W> {
         self.collector.notice(source, kind, code)
     }
 
+    /// Opens a source for `entry` through the shared safe open
+    /// ([`Collector::open_source`]), which records its notice when it
+    /// cannot be read and its advisory when its identity was weak.
+    fn open_entry(
+        &mut self,
+        entry: &str,
+        path: &Path,
+    ) -> Result<Option<(File, u64)>, SupportBundleError> {
+        Ok(self
+            .collector
+            .open_source(path, entry)?
+            .map(|(file, opened)| (file, opened.len())))
+    }
+
     /// Adds one entry, or an omission notice when the total cap would be
     /// passed.
     fn add(
@@ -642,9 +656,8 @@ impl<W: Write + Seek> Bundle<W> {
         if *budget == 0 {
             return self.notice(&entry, NoticeKind::Truncated, NoticeCode::LogPayloadLimit);
         }
-        let (mut file, size) = match open_regular(&directory.join(name)) {
-            Ok(opened) => opened,
-            Err((kind, code)) => return self.notice(&entry, kind, code),
+        let Some((mut file, size)) = self.open_entry(&entry, &directory.join(name))? else {
+            return Ok(());
         };
         // The newest records matter most: read the tail of a long day.
         let input_limit = LIMITS
@@ -730,12 +743,8 @@ impl<W: Write + Seek> Bundle<W> {
                 self.notice(&entry, NoticeKind::Unavailable, NoticeCode::SourceNotFound)?;
                 continue;
             };
-            let (file, size) = match open_regular(&directory.join(name)) {
-                Ok(opened) => opened,
-                Err((kind, code)) => {
-                    self.notice(&entry, kind, code)?;
-                    continue;
-                }
+            let Some((file, size)) = self.open_entry(&entry, &directory.join(name))? else {
+                continue;
             };
             if size > LIMITS.max_document_bytes {
                 self.notice(&entry, NoticeKind::Truncated, NoticeCode::SourceTooLarge)?;
@@ -919,12 +928,8 @@ impl<W: Write + Seek> Bundle<W> {
             let name = self.crash_entry_name(&source.path, &used);
             used.push(name.clone());
             let entry = format!("crash/{name}");
-            let (file, size) = match open_regular(&source.path) {
-                Ok(opened) => opened,
-                Err((kind, code)) => {
-                    self.notice(&entry, kind, code)?;
-                    continue;
-                }
+            let Some((file, size)) = self.open_entry(&entry, &source.path)? else {
+                continue;
             };
             if size > MAX_CRASH_REPORT_BYTES {
                 self.notice(&entry, NoticeKind::Truncated, NoticeCode::SourceTooLarge)?;
@@ -1087,18 +1092,18 @@ fn is_log_file_name(name: &str) -> bool {
 }
 
 /// Opens a regular file through the shared collector's safe open
-/// ([`open_source`]), with its notice when it cannot be read.
-fn open_regular(path: &Path) -> Result<(File, u64), (NoticeKind, NoticeCode)> {
+/// ([`open_source`]), for a fact read outside the archive.
+fn open_regular(path: &Path) -> Option<(File, u64)> {
     open_source(path)
-        .map(|(file, opened)| (file, opened.len()))
-        .map_err(|error| error.notice())
+        .ok()
+        .map(|opened| (opened.file, opened.metadata.len()))
 }
 
 /// The last selected saved connection's host and port, from
 /// `connections.json` in `config_dir`, for the network probe.
 #[must_use]
 pub fn last_selected_target(config_dir: &Path) -> Option<(String, u16)> {
-    let (file, size) = open_regular(&config_dir.join("connections.json")).ok()?;
+    let (file, size) = open_regular(&config_dir.join("connections.json"))?;
     if size > LIMITS.max_document_bytes {
         return None;
     }
@@ -1136,7 +1141,7 @@ pub fn bundle_target(
 /// runs at), for a bundle made from the command line.
 #[must_use]
 pub fn saved_log_level(config_dir: &Path) -> Option<LogLevel> {
-    let (file, size) = open_regular(&config_dir.join("settings.json")).ok()?;
+    let (file, size) = open_regular(&config_dir.join("settings.json"))?;
     if size > LIMITS.max_document_bytes {
         return None;
     }

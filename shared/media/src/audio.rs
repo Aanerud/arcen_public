@@ -10,6 +10,7 @@ mod microphone;
 mod opus;
 pub mod playback_queue;
 pub mod playout;
+pub mod resample;
 use arcen_protocol::messages::{
     AUDIO_PROTOCOL_VERSION, AudioBitrateTierMsg, AudioOutputCapabilitiesMsg, AudioStreamConfigMsg,
     AudioStreamReason, AudioStreamResultMsg,

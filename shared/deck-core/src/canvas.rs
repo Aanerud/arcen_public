@@ -70,6 +70,11 @@ pub const DIGEST_INTERVAL: Duration = Duration::from_secs(10);
 pub const DECODE_WINDOW: Duration = Duration::from_secs(1);
 /// The statistics' tile/surface/copy shares cover two windows of this.
 pub const STATS_WINDOW: Duration = Duration::from_secs(5);
+/// Resets in a row the sink must fail to apply before the Deck holds it
+/// permanently unable to show a canvas: a fresh canvas that cannot be
+/// created twice will not be created by a third reset, and every reset is
+/// a full repaint on the link.
+pub const SINK_FAILED_RESETS: u8 = 2;
 
 const MIB: u64 = 1024 * 1024;
 /// Bytes a decoded tile holds per pixel until the sink runs (three `u16`
@@ -173,6 +178,77 @@ pub fn record_is_reset(bytes: &[u8]) -> bool {
     bytes.len() >= CANVAS_PREFIX_BYTES
         && bytes.first() == Some(&(FrameType::Canvas as u8))
         && bytes[2] == arcen_protocol::canvas::CanvasRecordKind::Reset.wire()
+}
+
+/// What one canvas record says about itself on the wire, read from its
+/// prefix as it arrives: the Stream Statistics' received side (what came,
+/// how late), never whether it was applied or shown, which only
+/// [`DeckCanvas::apply`] and the sink know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanvasWireRecord {
+    /// Monitor.
+    pub monitor_id: u16,
+    /// Canvas generation.
+    pub generation: u32,
+    /// A reset (the generation's barrier) rather than a frame.
+    pub reset: bool,
+    /// A frame's fence; 0 for a reset.
+    pub fence: u64,
+    /// A frame's capture time on the wire clock; a reset carries none.
+    pub timestamp_ms: Option<u32>,
+    /// Record bytes.
+    pub bytes: usize,
+}
+
+impl CanvasWireRecord {
+    /// Reads a record's prefix (and a frame's fence and timestamp); `None`
+    /// for bytes too short to be a canvas record of a known kind.
+    #[must_use]
+    pub fn read(bytes: &[u8]) -> Option<Self> {
+        use arcen_protocol::canvas::{CANVAS_FRAME_FIXED_BYTES, CanvasRecordKind};
+        let monitor_id = record_monitor(bytes)?;
+        let generation = u32::from_be_bytes(bytes[22..26].try_into().ok()?);
+        match CanvasRecordKind::from_wire(bytes[2])? {
+            CanvasRecordKind::Reset => Some(Self {
+                monitor_id,
+                generation,
+                reset: true,
+                fence: 0,
+                timestamp_ms: None,
+                bytes: bytes.len(),
+            }),
+            CanvasRecordKind::Frame if bytes.len() >= CANVAS_FRAME_FIXED_BYTES => Some(Self {
+                monitor_id,
+                generation,
+                reset: false,
+                fence: u64::from_be_bytes(bytes[26..34].try_into().ok()?),
+                timestamp_ms: Some(u32::from_be_bytes(bytes[34..38].try_into().ok()?)),
+                bytes: bytes.len(),
+            }),
+            CanvasRecordKind::Frame => None,
+        }
+    }
+
+    /// The wire line of Stream Statistics ("Canvas frame monitor=0
+    /// generation=3 fence=120 ts=… payload=… bytes").
+    #[must_use]
+    pub fn summary(&self) -> String {
+        if self.reset {
+            format!(
+                "Canvas reset monitor={} generation={} payload={} bytes",
+                self.monitor_id, self.generation, self.bytes
+            )
+        } else {
+            format!(
+                "Canvas frame monitor={} generation={} fence={} ts={} payload={} bytes",
+                self.monitor_id,
+                self.generation,
+                self.fence,
+                self.timestamp_ms.unwrap_or(0),
+                self.bytes
+            )
+        }
+    }
 }
 
 /// Why a record was not admitted. Admission never breaks a canvas: a record
@@ -313,7 +389,11 @@ pub struct CanvasStats {
     /// Worst monitor's 95th-percentile surface decode time over the last
     /// [`DECODE_WINDOW`], in milliseconds.
     pub decode_ms_p95: u32,
-    /// Why canvas work was refused by this Deck's sink, if it was.
+    /// Why this Deck's sink cannot show a canvas for the rest of the
+    /// connection, if it cannot: it has no executor, it failed to create a
+    /// fresh canvas [`SINK_FAILED_RESETS`] times, or its presenter fell
+    /// back. A hidden or not yet attached sink is not this: it applies the
+    /// work and shows it when it can.
     pub sink_refused: Option<String>,
     /// The newest digest.
     pub last_digest: Option<CanvasDigestReport>,
@@ -362,7 +442,8 @@ impl CanvasStats {
         }
         if let Some(reason) = &self.sink_refused {
             return Some(format!(
-                "Screen updates: canvas refused by this Deck ({reason})"
+                "Screen updates: stopped: this Deck cannot show the canvas ({reason}); \
+                 turn Canvas screen updates off and reconnect for full frames"
             ));
         }
         Some(match &self.session {
@@ -447,11 +528,14 @@ struct MonitorCanvas<D> {
     decode_ms: VecDeque<(Instant, f64)>,
     last_digest_request: Option<Instant>,
     pending_digest: Option<(u32, u64, CanvasState)>,
+    /// Resets in a row the sink failed to apply.
+    failed_resets: u8,
 }
 
 impl<D> MonitorCanvas<D> {
     fn new(monitor_id: u16, terms: CanvasTerms) -> Self {
         Self {
+            failed_resets: 0,
             state: CanvasState::new(monitor_id, terms),
             surfaces: (0..terms.max_surfaces_per_monitor)
                 .map(|_| SurfaceSlot::Closed)
@@ -886,6 +970,7 @@ impl<D: VideoDecoderBackend> DeckCanvas<D> {
         match outcome {
             CanvasOutcome::Presented | CanvasOutcome::Applied => {
                 if is_reset {
+                    monitor.failed_resets = 0;
                     monitor.lost = None;
                     monitor.last_reset_request = None;
                     monitor.pending_digest = None;
@@ -925,6 +1010,14 @@ impl<D: VideoDecoderBackend> DeckCanvas<D> {
                 CanvasApplied::SinkRefused
             }
             CanvasOutcome::Failed(failure) => {
+                monitor.lose("executor_failed");
+                if is_reset {
+                    monitor.failed_resets = monitor.failed_resets.saturating_add(1);
+                }
+                if monitor.failed_resets >= SINK_FAILED_RESETS {
+                    self.refuse_sink(scope.monitor_id, failure.detail);
+                    return CanvasApplied::SinkRefused;
+                }
                 tracing::warn!(
                     target: crate::log_target::VIDEO,
                     monitor_id = scope.monitor_id,
@@ -932,10 +1025,38 @@ impl<D: VideoDecoderBackend> DeckCanvas<D> {
                     detail = failure.detail,
                     "canvas executor failed; asking the host for a reset",
                 );
-                monitor.lose("executor_failed");
                 CanvasApplied::Lost("executor_failed")
             }
         }
+    }
+
+    /// The sink cannot show a canvas for the rest of the connection (its
+    /// presenter fell back, or it cannot create one): every canvas stops,
+    /// no reset is asked for again, and the statistics say why and how to
+    /// get full frames. A hidden or not yet attached sink never comes here.
+    pub fn sink_unavailable(&mut self, reason: &str) {
+        if !self.is_on() || self.sink_refused {
+            return;
+        }
+        let monitors: Vec<u16> = self.monitors.keys().copied().collect();
+        for monitor_id in &monitors {
+            if let Some(monitor) = self.monitors.get_mut(monitor_id) {
+                monitor.lose("sink_unavailable");
+            }
+        }
+        self.refuse_sink(monitors.first().copied().unwrap_or(0), reason);
+    }
+
+    fn refuse_sink(&mut self, monitor_id: u16, reason: &str) {
+        self.sink_refused = true;
+        self.stats.sink_refused = Some(reason.to_owned());
+        tracing::error!(
+            target: crate::log_target::VIDEO,
+            monitor_id,
+            reason,
+            "this Deck cannot show the canvas; canvas records are ignored for this \
+             connection and no reset is asked for",
+        );
     }
 
     /// Takes a canvas the sink read back and computes its digest against the

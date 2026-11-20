@@ -13,6 +13,8 @@ pub(crate) mod console;
 #[cfg(target_os = "linux")]
 pub(crate) mod console_layout;
 #[cfg(target_os = "linux")]
+pub(crate) mod console_wayland;
+#[cfg(target_os = "linux")]
 pub(crate) mod console_windows;
 pub mod handshake;
 pub mod identity;

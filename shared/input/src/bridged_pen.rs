@@ -21,6 +21,8 @@
 //! screen, hands frames to the Deck's bulk lane, injects the events, and
 //! nothing more.
 
+use crate::CapabilityAvailability;
+use crate::pen_emulation::PenCapabilityTruth;
 use crate::tablet_pointer::{AxisRange, PenMapping, PenPointerLead, PenSample, PenTool};
 use arcen_protocol::messages::{
     MAX_TABLET_MODE_REASON_BYTES, PenEventMsg, PenToolMsg, TabletModeMsg, TabletModeReason,
@@ -33,8 +35,8 @@ use arcen_protocol::{
 use arcen_usb_bridge::{
     AttachmentGeneration, BridgedHidDevice, HidPublishPolicy, HidReportFailure, HidReportRequest,
     HostPenBridge, HostPenBridgeOutput, HostPenNote, HostPenRoute, HostPenSample,
-    InterfaceReportDescriptor, NoPenInterface, PenTabletProfile, PublishRefusal, UrbId,
-    UsbDeviceId,
+    InterfaceReportDescriptor, NoPenInterface, PenReportLayout, PenTabletProfile, PublishRefusal,
+    UrbId, UsbDeviceId,
 };
 use std::time::{Duration, Instant};
 
@@ -176,6 +178,142 @@ pub fn tablet_result(
             });
         }
         _ => {}
+    }
+    result
+}
+
+/// What a pen read on the host brings to the desktop, axis by axis: what the
+/// reader decodes from this tablet's reports, within what the host's pen
+/// device (`device`, its own capability truth) carries. A generic reader
+/// decodes only the fields the pen interface's descriptor declares; pad
+/// buttons, touch and strips are never read, so they are never claimed.
+#[must_use]
+pub fn host_decoded_capabilities(
+    tablet: &AuthorizedTablet,
+    device: PenCapabilityTruth,
+) -> PenCapabilityTruth {
+    let availability = |present: bool| {
+        if present {
+            CapabilityAvailability::Available
+        } else {
+            CapabilityAvailability::Unavailable
+        }
+    };
+    let decoded = match &tablet.host_pen {
+        // The dedicated readers decode pressure, tilt, both side switches,
+        // the eraser end and hover; the models they know report no barrel
+        // rotation.
+        HostPenRoute::Dedicated(_) => PenCapabilityTruth {
+            pen: CapabilityAvailability::Available,
+            pressure: CapabilityAvailability::Available,
+            tilt: CapabilityAvailability::Available,
+            rotation: CapabilityAvailability::Unavailable,
+            eraser: CapabilityAvailability::Available,
+            proximity: CapabilityAvailability::Available,
+            barrel_buttons: CapabilityAvailability::Available,
+        },
+        HostPenRoute::Generic { layout, .. } => {
+            let any = |field: fn(&PenReportLayout) -> bool| {
+                availability(layout.reports.iter().any(field))
+            };
+            PenCapabilityTruth {
+                pen: CapabilityAvailability::Available,
+                pressure: any(|report| report.pressure.is_some()),
+                tilt: any(|report| report.tilt_x.is_some() || report.tilt_y.is_some()),
+                rotation: any(|report| report.twist.is_some()),
+                eraser: any(|report| report.eraser.is_some() || report.invert.is_some()),
+                proximity: any(|report| report.in_range.is_some()),
+                barrel_buttons: any(|report| {
+                    report.barrel.is_some() || report.secondary_barrel.is_some()
+                }),
+            }
+        }
+    };
+    if device.pen != CapabilityAvailability::Available {
+        return PenCapabilityTruth::UNAVAILABLE;
+    }
+    let both = |decoded: CapabilityAvailability, carried: CapabilityAvailability| {
+        availability(
+            decoded == CapabilityAvailability::Available
+                && carried == CapabilityAvailability::Available,
+        )
+    };
+    PenCapabilityTruth {
+        pen: CapabilityAvailability::Available,
+        pressure: both(decoded.pressure, device.pressure),
+        tilt: both(decoded.tilt, device.tilt),
+        rotation: both(decoded.rotation, device.rotation),
+        eraser: both(decoded.eraser, device.eraser),
+        proximity: both(decoded.proximity, device.proximity),
+        barrel_buttons: both(decoded.barrel_buttons, device.barrel_buttons),
+    }
+}
+
+/// The pen features `capabilities` delivers, in words, in a fixed order.
+#[must_use]
+pub fn pen_feature_words(capabilities: PenCapabilityTruth) -> Vec<&'static str> {
+    [
+        (capabilities.pressure, "pressure"),
+        (capabilities.tilt, "tilt"),
+        (capabilities.rotation, "barrel rotation"),
+        (capabilities.eraser, "eraser"),
+        (capabilities.proximity, "hover"),
+        (capabilities.barrel_buttons, "barrel buttons"),
+    ]
+    .into_iter()
+    .filter(|(availability, _)| *availability == CapabilityAvailability::Available)
+    .map(|(_, word)| word)
+    .collect()
+}
+
+/// What a host that reads the pen itself tells a Deck it accepted: how the
+/// pen is read and exactly what reaches the desktop (`capabilities`, from
+/// [`host_decoded_capabilities`]). `host` names the host ("Linux Pier").
+#[must_use]
+pub fn host_decoded_notice(
+    tablet: &AuthorizedTablet,
+    capabilities: PenCapabilityTruth,
+    host: &str,
+) -> String {
+    let reader = match tablet.host_pen {
+        HostPenRoute::Dedicated(_) => "with its model's reader",
+        HostPenRoute::Generic { .. } => "from its HID reports",
+    };
+    let features = pen_feature_words(capabilities);
+    let features = match features.split_last() {
+        None => "position and tip only".to_owned(),
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    };
+    format!(
+        "Native tablet is active: this {host} reads the pen {reader} and gives your desktop \
+         {features}. Pad buttons, touch and the maker's driver settings are not used."
+    )
+}
+
+/// The tablet-mode result for a Native tablet request on a host whose
+/// host-decoded route was admitted (the Linux Pier on a joined console,
+/// `arcen_usb_bridge::joined_pen`): a refused device keeps mouse
+/// compatibility and says why; an accepted one says how the pen is read and
+/// exactly what reaches the desktop ([`host_decoded_notice`] over
+/// [`host_decoded_capabilities`] with the host's pen device, `device`).
+#[must_use]
+pub fn host_decoded_tablet_result(
+    result: TabletModeResultMsg,
+    authorization: Option<&Result<AuthorizedTablet, String>>,
+    device: PenCapabilityTruth,
+    host: &str,
+) -> TabletModeResultMsg {
+    let notices = HostPenNotices {
+        dedicated: "",
+        generic: "",
+    };
+    let mut result = tablet_result(result, &Ok(()), authorization, notices);
+    if result.accepted && result.active == TabletModeMsg::UsbTabletBridge {
+        if let Some(Ok(tablet)) = authorization {
+            let capabilities = host_decoded_capabilities(tablet, device);
+            result.reason = tablet_reason(&host_decoded_notice(tablet, capabilities, host));
+        }
     }
     result
 }

@@ -121,6 +121,17 @@ the moment Windows delivers them, before winit and egui see the message;
 the UI pass only publishes routing. Keep pointer events in order at their
 own positions, and release held keys on focus loss.
 
+The Deck process never registers for raw keyboard input: the event loop
+turns winit's device events off (`shell::build_event_loop`), and only the
+pointer lock registers raw mouse input. Windows calls no `WH_KEYBOARD_LL`
+hook at all while the newest hook belongs to a process registered for raw
+keyboard input whose window is in front. That switched off the Deck's own
+keyboard hook, and the hook a Windows Pier uses for desk privacy, so a
+Windows Deck run inside a Pier's session ended it. A key the hook takes
+goes down the rest of the hook chain first: a press a hook below blocks
+(desk privacy, a kiosk lock, a hotkey tool) goes nowhere, and only the release of a press the session already has
+still reaches it (shared `HookRouter::blocked_below`).
+
 The session window's UI passes begin at most once per refresh of its
 display (shared `arcen_deck_core::ui_pacing::PassPacer`, as on the Mac):
 egui asks for two more passes after every input pass, and a held pass runs

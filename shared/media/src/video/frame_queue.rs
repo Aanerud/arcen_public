@@ -297,14 +297,16 @@ struct QueuedVideo<T> {
     item: T,
     enqueued_at: Instant,
     keyframe: bool,
+    bytes: u64,
 }
 
 impl<T> QueuedVideo<T> {
-    const fn new(item: T, enqueued_at: Instant, keyframe: bool) -> Self {
+    const fn new(item: T, enqueued_at: Instant, keyframe: bool, bytes: u64) -> Self {
         Self {
             item,
             enqueued_at,
             keyframe,
+            bytes,
         }
     }
 }
@@ -355,6 +357,87 @@ pub fn video_backlog_is_legacy_from_env() -> bool {
 /// lets the queue's drop-and-keyframe recovery take over: past this the link
 /// is not slow but gone.
 pub const VIDEO_ROOM_WAIT: Duration = Duration::from_millis(500);
+
+/// Bytes a send queue holding canvas records (ADR 0028) keeps before it
+/// refuses room: one record of the largest size. With the record bound
+/// (the queue's capacity) it caps what a slow path makes the Pier hold.
+pub const CANVAS_QUEUE_BYTES: u64 = arcen_protocol::canvas::MAX_CANVAS_FRAME_BYTES as u64;
+
+/// What one outbound video record is, for its producer's backpressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundVideoRecord {
+    /// An encoded access unit; a keyframe (`recovery_point`) supersedes
+    /// what queued before it.
+    AccessUnit {
+        /// A keyframe or other recovery point.
+        recovery_point: bool,
+    },
+    /// A canvas frame: ordered state the Deck builds on, never superseded.
+    CanvasFrame,
+    /// A canvas reset: the generation's barrier, which supersedes every
+    /// record queued before it.
+    CanvasReset,
+}
+
+/// How a producer waits for room before it hands a record over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoomWait {
+    /// Never: the record is a recovery point and supersedes the queue.
+    Never,
+    /// At most this long; then the queue's own rule (drop and recover) takes
+    /// over.
+    UpTo(Duration),
+    /// Until there is room or the queue closes.
+    UntilRoomOrClosed,
+}
+
+impl RoomWait {
+    /// The wait as an optional bound: `None` waits until room or close.
+    /// Only meaningful for a wait other than [`Self::Never`].
+    #[must_use]
+    pub const fn max_wait(self) -> Option<Duration> {
+        match self {
+            Self::Never => Some(Duration::ZERO),
+            Self::UpTo(wait) => Some(wait),
+            Self::UntilRoomOrClosed => None,
+        }
+    }
+}
+
+impl OutboundVideoRecord {
+    /// The record a capenc canvas record (`reset` from its prefix) or access
+    /// unit is.
+    #[must_use]
+    pub const fn new(canvas: bool, recovery_point: bool) -> Self {
+        match (canvas, recovery_point) {
+            (true, true) => Self::CanvasReset,
+            (true, false) => Self::CanvasFrame,
+            (false, recovery_point) => Self::AccessUnit { recovery_point },
+        }
+    }
+
+    /// How its producer waits for room. An access unit waits at most
+    /// [`VIDEO_ROOM_WAIT`]: past it the link is gone and dropping the
+    /// prediction chain for a keyframe is the recovery. A canvas frame
+    /// waits until there is room or the queue closes: dropping one costs a
+    /// new generation (a full repaint, larger than everything a short stall
+    /// held back) and waiting loses nothing, because the encode loop merges
+    /// the damage it could not send into its next frame. A recovery point
+    /// never waits.
+    #[must_use]
+    pub const fn room_wait(self) -> RoomWait {
+        match self {
+            Self::AccessUnit {
+                recovery_point: true,
+            }
+            | Self::CanvasReset => RoomWait::Never,
+            Self::AccessUnit {
+                recovery_point: false,
+            } => RoomWait::UpTo(VIDEO_ROOM_WAIT),
+            Self::CanvasFrame => RoomWait::UntilRoomOrClosed,
+        }
+    }
+}
 
 /// Encoded frames a split Pier's desktop agent may have handed to its
 /// network relay that the relay has not yet released into the video lane.
@@ -514,6 +597,7 @@ pub struct SharedVideoQueue<T> {
     wait_max: Duration,
     wait_frames: u64,
     backlog_budget: Option<Duration>,
+    byte_budget: Option<u64>,
 }
 
 impl<T> SharedVideoQueue<T> {
@@ -547,6 +631,7 @@ impl<T> SharedVideoQueue<T> {
             wait_max: Duration::ZERO,
             wait_frames: 0,
             backlog_budget: None,
+            byte_budget: None,
         }
     }
 
@@ -557,12 +642,33 @@ impl<T> SharedVideoQueue<T> {
         self.backlog_budget = budget;
     }
 
+    /// Bounds the bytes queued records may hold before
+    /// [`Self::room_state_at`] reports [`RoomState::Full`] (see
+    /// [`CANVAS_QUEUE_BYTES`]); one record of any size is always taken.
+    /// `None` keeps the record bound alone. Only sizes given to
+    /// [`Self::push_sized`] count.
+    pub fn set_byte_budget(&mut self, budget: Option<u64>) {
+        self.byte_budget = budget;
+    }
+
     /// Enqueues one AU or suppresses it according to the shared policy.
-    #[allow(clippy::too_many_lines)]
     pub fn push(
         &mut self,
         item: T,
         classification: FrameClassification,
+        now: Instant,
+    ) -> VideoQueuePush<T> {
+        self.push_sized(item, classification, 0, now)
+    }
+
+    /// [`Self::push`] for a record of `bytes` bytes, counted against the
+    /// byte budget while it waits.
+    #[allow(clippy::too_many_lines)]
+    pub fn push_sized(
+        &mut self,
+        item: T,
+        classification: FrameClassification,
+        bytes: u64,
         now: Instant,
     ) -> VideoQueuePush<T> {
         if self.closed {
@@ -571,7 +677,8 @@ impl<T> SharedVideoQueue<T> {
         let keyframe = classification.keyframe || classification.recovery_point;
         if self.generation_chain && self.require_generation_recovery {
             if classification.recovery_point && self.deque.len() < self.capacity {
-                self.deque.push_back(QueuedVideo::new(item, now, keyframe));
+                self.deque
+                    .push_back(QueuedVideo::new(item, now, keyframe, bytes));
                 self.require_generation_recovery = false;
                 self.awaiting_keyframe = false;
                 self.keyframe_request_pending = false;
@@ -595,7 +702,8 @@ impl<T> SharedVideoQueue<T> {
                 .capacity
                 .saturating_sub(usize::from(self.generation_recovery.is_some()));
             if self.deque.len() < generation_capacity {
-                self.deque.push_back(QueuedVideo::new(item, now, keyframe));
+                self.deque
+                    .push_back(QueuedVideo::new(item, now, keyframe, bytes));
                 VideoQueuePush::Enqueued { cleared: 0 }
             } else {
                 let count = self.deque.len() + 1;
@@ -620,7 +728,8 @@ impl<T> SharedVideoQueue<T> {
             }
         } else if self.protected_front {
             if self.deque.len() < self.capacity {
-                self.deque.push_back(QueuedVideo::new(item, now, keyframe));
+                self.deque
+                    .push_back(QueuedVideo::new(item, now, keyframe, bytes));
                 VideoQueuePush::Enqueued { cleared: 0 }
             } else {
                 let pinned = self.deque.pop_front();
@@ -634,7 +743,8 @@ impl<T> SharedVideoQueue<T> {
                 self.awaiting_keyframe = !classification.recovery_point;
                 self.keyframe_request_pending = !classification.recovery_point;
                 if classification.recovery_point {
-                    self.deque.push_back(QueuedVideo::new(item, now, keyframe));
+                    self.deque
+                        .push_back(QueuedVideo::new(item, now, keyframe, bytes));
                     self.drops_since_keyframe = 0;
                     self.keyframe_request_pending = false;
                     self.last_keyframe_request_at = None;
@@ -653,7 +763,8 @@ impl<T> SharedVideoQueue<T> {
         } else if classification.keyframe {
             let cleared = self.deque.len();
             self.deque.clear();
-            self.deque.push_back(QueuedVideo::new(item, now, keyframe));
+            self.deque
+                .push_back(QueuedVideo::new(item, now, keyframe, bytes));
             self.awaiting_keyframe = false;
             self.keyframe_request_pending = false;
             self.drops_since_keyframe = 0;
@@ -669,7 +780,8 @@ impl<T> SharedVideoQueue<T> {
                 idr_request,
             }
         } else if self.deque.len() < self.capacity {
-            self.deque.push_back(QueuedVideo::new(item, now, keyframe));
+            self.deque
+                .push_back(QueuedVideo::new(item, now, keyframe, bytes));
             VideoQueuePush::Enqueued { cleared: 0 }
         } else {
             let count = self.deque.len() + 1;
@@ -699,7 +811,7 @@ impl<T> SharedVideoQueue<T> {
         }
         let dropped = self.deque.len();
         self.deque.clear();
-        self.generation_recovery = Some(QueuedVideo::new(item, now, true));
+        self.generation_recovery = Some(QueuedVideo::new(item, now, true, 0));
         self.generation_chain = true;
         self.require_generation_recovery = true;
         self.awaiting_keyframe = true;
@@ -781,9 +893,10 @@ impl<T> SharedVideoQueue<T> {
         self.room_state_at(Instant::now())
     }
 
-    /// [`Self::room_state`] at a caller-injected time: full at capacity, or,
-    /// with a backlog budget, once at least [`MIN_VIDEO_BACKLOG_FRAMES`] wait
-    /// and the oldest has waited the whole budget.
+    /// [`Self::room_state`] at a caller-injected time: full at capacity,
+    /// with a byte budget once the queued records hold it, or, with a
+    /// backlog budget, once at least [`MIN_VIDEO_BACKLOG_FRAMES`] wait and
+    /// the oldest has waited the whole budget.
     #[must_use]
     pub fn room_state_at(&self, now: Instant) -> RoomState {
         let ordinary = !self.closed
@@ -795,6 +908,12 @@ impl<T> SharedVideoQueue<T> {
             return RoomState::NotOrdinary;
         }
         if self.deque.len() >= self.capacity {
+            return RoomState::Full;
+        }
+        if self
+            .byte_budget
+            .is_some_and(|budget| !self.deque.is_empty() && self.queued_bytes() >= budget)
+        {
             return RoomState::Full;
         }
         let over_budget = self.backlog_budget.is_some_and(|budget| {
@@ -875,6 +994,13 @@ impl<T> SharedVideoQueue<T> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.deque.is_empty()
+    }
+
+    /// Bytes the visible queued records hold (as given to
+    /// [`Self::push_sized`]).
+    #[must_use]
+    pub fn queued_bytes(&self) -> u64 {
+        self.deque.iter().map(|queued| queued.bytes).sum()
     }
 
     /// Whether non-recovery P-frames are currently suppressed.
@@ -1522,5 +1648,209 @@ mod tests {
         window.note_sent_at(later);
         assert!(!window.admits(later), "back to one frame in flight");
         assert_eq!(window.outstanding(), 1);
+    }
+
+    /// A producer that follows [`OutboundVideoRecord::room_wait`] against a
+    /// consumer that stalls for `stall` and then takes one record a tick:
+    /// what reached the writer, what the queue dropped, the keyframe (new
+    /// generation) requests, and the most the queue ever held.
+    struct SlowPath {
+        sent: Vec<u32>,
+        dropped: u64,
+        idr_requests: u32,
+        most_records: usize,
+        most_bytes: u64,
+    }
+
+    fn slow_path(record: OutboundVideoRecord, records: u32, stall: Duration) -> SlowPath {
+        const TICK: Duration = Duration::from_millis(16);
+        const BYTES: u64 = 4 * 1024 * 1024;
+        let start = Instant::now();
+        let mut queue = SharedVideoQueue::new(8, Duration::from_secs(1));
+        queue.set_backlog_budget(Some(video_backlog_budget(60)));
+        queue.set_byte_budget(Some(CANVAS_QUEUE_BYTES));
+        let mut path = SlowPath {
+            sent: Vec::new(),
+            dropped: 0,
+            idr_requests: 0,
+            most_records: 0,
+            most_bytes: 0,
+        };
+        let mut next = 0_u32;
+        let mut waiting_since: Option<Instant> = None;
+        for step in 0..2_000_u32 {
+            let now = start + TICK * step;
+            if next < records {
+                let full = queue.room_state_at(now) == RoomState::Full;
+                let push = match record.room_wait() {
+                    RoomWait::Never => true,
+                    _ if !full => true,
+                    RoomWait::UpTo(wait) => {
+                        now.saturating_duration_since(*waiting_since.get_or_insert(now)) >= wait
+                    }
+                    RoomWait::UntilRoomOrClosed => false,
+                };
+                if push {
+                    waiting_since = None;
+                    let classification = match record {
+                        OutboundVideoRecord::AccessUnit { recovery_point } => {
+                            FrameClassification::keyframe_is_recovery(recovery_point)
+                        }
+                        OutboundVideoRecord::CanvasFrame => FrameClassification::new(false, false),
+                        OutboundVideoRecord::CanvasReset => FrameClassification::new(true, true),
+                    };
+                    let pushed = queue.push_sized(next, classification, BYTES, now);
+                    path.idr_requests += u32::from(pushed.idr_request());
+                    next += 1;
+                }
+            }
+            path.most_records = path.most_records.max(queue.len());
+            path.most_bytes = path.most_bytes.max(queue.queued_bytes());
+            if now.saturating_duration_since(start) >= stall {
+                if let Some(item) = queue.pop_front() {
+                    path.sent.push(item);
+                }
+            }
+            if next == records && queue.is_empty() {
+                break;
+            }
+        }
+        path.dropped = queue.frames_dropped();
+        path
+    }
+
+    /// A bounded slow consumer: a canvas path that stalls for six seconds
+    /// holds its producer back instead of dropping a record, so no new
+    /// canvas generation (a full repaint) is started, every record arrives
+    /// in order, and the queue never holds more than its record and byte
+    /// bounds. An access unit keeps its own rule: past the room wait the
+    /// link is gone and the prediction chain restarts at a keyframe.
+    #[test]
+    fn a_slow_consumer_holds_canvas_frames_back_without_a_drop_or_a_new_generation() {
+        let canvas = slow_path(OutboundVideoRecord::CanvasFrame, 60, Duration::from_secs(6));
+        assert_eq!(canvas.dropped, 0);
+        assert_eq!(canvas.idr_requests, 0, "no new generation");
+        assert_eq!(
+            canvas.sent,
+            (0..60).collect::<Vec<_>>(),
+            "every record, in order"
+        );
+        assert!(canvas.most_records <= 8);
+        assert!(
+            canvas.most_bytes <= CANVAS_QUEUE_BYTES + 4 * 1024 * 1024,
+            "one record past the byte budget at most: {}",
+            canvas.most_bytes
+        );
+
+        let video = slow_path(
+            OutboundVideoRecord::AccessUnit {
+                recovery_point: false,
+            },
+            60,
+            Duration::from_secs(6),
+        );
+        assert!(video.dropped > 0 && video.idr_requests > 0);
+    }
+
+    /// A mandatory reset under an optional backlog: the barrier never waits
+    /// for room, supersedes the old generation's queued frames (which are
+    /// not loss and ask for nothing), and the queue takes the new
+    /// generation's frames behind it.
+    #[test]
+    fn a_canvas_reset_never_waits_and_supersedes_a_full_queue() {
+        let now = Instant::now();
+        let mut queue = SharedVideoQueue::new(4, Duration::from_secs(1));
+        queue.set_byte_budget(Some(CANVAS_QUEUE_BYTES));
+        for record in 0..4 {
+            assert!(
+                queue
+                    .push_sized(record, FrameClassification::new(false, false), 1024, now)
+                    .enqueued()
+            );
+        }
+        assert_eq!(queue.room_state_at(now), RoomState::Full);
+        assert_eq!(
+            OutboundVideoRecord::new(true, true).room_wait(),
+            RoomWait::Never
+        );
+        assert_eq!(
+            queue.push_sized(9, FrameClassification::new(true, true), 64, now),
+            VideoQueuePush::Enqueued { cleared: 4 }
+        );
+        assert_eq!(queue.frames_dropped(), 0);
+        assert!(!queue.awaiting_keyframe());
+        assert!(
+            queue
+                .push_sized(10, FrameClassification::new(false, false), 64, now)
+                .enqueued()
+        );
+        assert_eq!(queue.pop_front(), Some(9));
+        assert_eq!(queue.pop_front(), Some(10));
+    }
+
+    /// A record that is lost (the queue overflowed past every wait, as a
+    /// legacy queue does) holds the rest of its generation back, asks once
+    /// for recovery, and the next reset starts a new generation that flows.
+    #[test]
+    fn a_lost_canvas_record_holds_its_generation_until_the_next_reset() {
+        let now = Instant::now();
+        let mut queue = SharedVideoQueue::new(2, Duration::from_secs(1));
+        let frame = FrameClassification::new(false, false);
+        assert!(queue.push(1, frame, now).enqueued());
+        assert!(queue.push(2, frame, now).enqueued());
+        let lost = queue.push(3, frame, now);
+        assert!(matches!(
+            lost,
+            VideoQueuePush::Dropped {
+                recovery_started: true,
+                idr_request: true,
+                ..
+            }
+        ));
+        assert!(queue.is_empty(), "the broken generation is never sent");
+        queue.note_keyframe_request_handoff(true, now);
+        let held = queue.push(4, frame, now + Duration::from_millis(100));
+        assert!(!held.enqueued() && !held.idr_request(), "asked once");
+        assert_eq!(
+            queue.push(5, FrameClassification::new(true, true), now),
+            VideoQueuePush::Enqueued { cleared: 0 }
+        );
+        assert!(queue.push(6, frame, now).enqueued());
+        assert_eq!(queue.pop_front(), Some(5));
+        assert_eq!(queue.pop_front(), Some(6));
+    }
+
+    /// The byte budget refuses room once queued records hold it, but a
+    /// single record of any size is always taken.
+    #[test]
+    fn the_byte_budget_refuses_room_but_always_takes_one_record() {
+        let now = Instant::now();
+        let mut queue = SharedVideoQueue::new(8, Duration::from_secs(1));
+        queue.set_byte_budget(Some(100));
+        assert_eq!(queue.room_state_at(now), RoomState::HasRoom);
+        assert!(
+            queue
+                .push_sized(1, FrameClassification::new(false, false), 500, now)
+                .enqueued()
+        );
+        assert_eq!(queue.queued_bytes(), 500);
+        assert_eq!(queue.room_state_at(now), RoomState::Full);
+        assert_eq!(queue.pop_front(), Some(1));
+        assert_eq!(queue.queued_bytes(), 0);
+        assert_eq!(queue.room_state_at(now), RoomState::HasRoom);
+    }
+
+    /// Teardown while a canvas producer waits: closing the queue ends the
+    /// wait (the room is no longer ordinary) and hands the record back.
+    #[test]
+    fn closing_the_queue_releases_a_waiting_canvas_producer() {
+        let now = Instant::now();
+        let mut queue = SharedVideoQueue::new(1, Duration::from_secs(1));
+        let frame = FrameClassification::new(false, false);
+        assert!(queue.push(1, frame, now).enqueued());
+        assert_eq!(queue.room_state_at(now), RoomState::Full);
+        queue.close_and_clear();
+        assert_eq!(queue.room_state_at(now), RoomState::NotOrdinary);
+        assert_eq!(queue.push(2, frame, now), VideoQueuePush::Closed(2));
     }
 }

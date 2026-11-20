@@ -1048,8 +1048,117 @@ fn a_sink_without_an_executor_refuses_and_the_deck_stops_asking() {
     );
     assert_eq!(
         canvas.stats().line().unwrap(),
-        "Screen updates: canvas refused by this Deck (no canvas executor)"
+        "Screen updates: stopped: this Deck cannot show the canvas (no canvas executor); \
+         turn Canvas screen updates off and reconnect for full frames"
     );
+}
+
+/// Permanent sink failure: a sink that cannot create a fresh canvas is not
+/// asked again and again. After [`SINK_FAILED_RESETS`] failed resets the
+/// canvas stops for the connection: no further reset request (each would be
+/// a full repaint on the link), later records are ignored, and the
+/// statistics say why and how to get full frames.
+#[test]
+fn a_sink_that_cannot_create_a_canvas_stops_after_failed_resets() {
+    let mut rig = Rig::new(&[0]);
+    assert_eq!(
+        rig.apply(&reset(scope(0, 1), WIDTH, HEIGHT)),
+        CanvasApplied::Presented
+    );
+    // The device is gone for good.
+    rig.sink.fail = true;
+    assert_eq!(
+        rig.apply(&frame(scope(0, 1), 1, WIDTH, HEIGHT, vec![])),
+        CanvasApplied::Lost("executor_failed")
+    );
+    assert_eq!(reset_requests(&rig.control()).len(), 1);
+    // The Pier's first answer cannot be applied either: asked once more.
+    assert_eq!(
+        rig.apply(&reset(scope(0, 2), WIDTH, HEIGHT)),
+        CanvasApplied::Lost("executor_failed")
+    );
+    rig.advance(RESET_REQUEST_RETRY);
+    assert_eq!(reset_requests(&rig.control()).len(), 1);
+    assert_eq!(
+        rig.apply(&reset(scope(0, 3), WIDTH, HEIGHT)),
+        CanvasApplied::SinkRefused
+    );
+    for _ in 0..3 {
+        rig.advance(RESET_REQUEST_RETRY);
+        assert!(
+            rig.control().is_empty(),
+            "no more resets for a sink that cannot apply them"
+        );
+    }
+    assert_eq!(
+        rig.apply(&reset(scope(0, 4), WIDTH, HEIGHT)),
+        CanvasApplied::SinkRefused
+    );
+    assert_eq!(rig.canvas.next_due(rig.now), None);
+    assert_eq!(
+        rig.canvas.stats().line().unwrap(),
+        "Screen updates: stopped: this Deck cannot show the canvas (test device lost); \
+         turn Canvas screen updates off and reconnect for full frames"
+    );
+}
+
+/// A temporary failure is not permanent: a sink that fails one record and
+/// then applies the Pier's reset keeps its canvas.
+#[test]
+fn one_failed_reset_followed_by_a_good_one_keeps_the_canvas() {
+    let mut rig = Rig::new(&[0]);
+    rig.sink.fail = true;
+    assert_eq!(
+        rig.apply(&reset(scope(0, 1), WIDTH, HEIGHT)),
+        CanvasApplied::Lost("executor_failed")
+    );
+    rig.sink.fail = false;
+    assert_eq!(
+        rig.apply(&reset(scope(0, 2), WIDTH, HEIGHT)),
+        CanvasApplied::Presented
+    );
+    rig.sink.fail = true;
+    assert_eq!(
+        rig.apply(&reset(scope(0, 3), WIDTH, HEIGHT)),
+        CanvasApplied::Lost("executor_failed"),
+        "the count starts again after a reset that applied"
+    );
+    assert_eq!(rig.canvas.stats().sink_refused, None);
+}
+
+/// The first canvas arriving before the layer is attached (or while the
+/// window is hidden) is not a failure: the sink applies it, nothing is
+/// lost or asked for, and the next record is shown once the surface is.
+#[test]
+fn a_canvas_that_arrives_before_its_layer_is_shown_is_kept() {
+    let mut rig = Rig::new(&[0]);
+    rig.sink.hidden = true;
+    assert_eq!(
+        rig.apply(&reset(scope(0, 1), WIDTH, HEIGHT)),
+        CanvasApplied::Applied
+    );
+    assert_eq!(
+        rig.apply(&frame(
+            scope(0, 1),
+            1,
+            WIDTH,
+            HEIGHT,
+            vec![CanvasCommand::Fill {
+                rect: rect(0, 0, 16, 16),
+                rgb: [1, 2, 3],
+            }]
+        )),
+        CanvasApplied::Applied
+    );
+    assert!(!rig.canvas.is_lost(0));
+    rig.advance(ACK_INTERVAL);
+    assert!(reset_requests(&rig.control()).is_empty());
+    rig.sink.hidden = false;
+    assert_eq!(
+        rig.apply(&frame(scope(0, 1), 2, WIDTH, HEIGHT, vec![])),
+        CanvasApplied::Presented
+    );
+    assert_eq!(rig.canvas.stats().resets, 1);
 }
 
 #[test]

@@ -30,14 +30,14 @@ use crate::logging::target;
 /// `KEY_RESERVED`: the evdev code that names no key.
 const KEY_RESERVED: u32 = 0;
 
-const SCREEN_CAST: &str = "org.gnome.Mutter.ScreenCast";
+const SCREEN_CAST: &str = arcen_session::console_session::wayland_join::MUTTER_SCREEN_CAST;
 const SCREEN_CAST_PATH: &str = "/org/gnome/Mutter/ScreenCast";
 const SCREEN_CAST_SESSION: &str = "org.gnome.Mutter.ScreenCast.Session";
 const SCREEN_CAST_STREAM: &str = "org.gnome.Mutter.ScreenCast.Stream";
-const REMOTE_DESKTOP: &str = "org.gnome.Mutter.RemoteDesktop";
+const REMOTE_DESKTOP: &str = arcen_session::console_session::wayland_join::MUTTER_REMOTE_DESKTOP;
 const REMOTE_DESKTOP_PATH: &str = "/org/gnome/Mutter/RemoteDesktop";
 const REMOTE_DESKTOP_SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
-const DISPLAY_CONFIG: &str = "org.gnome.Mutter.DisplayConfig";
+const DISPLAY_CONFIG: &str = arcen_session::console_session::wayland_join::MUTTER_DISPLAY_CONFIG;
 const DISPLAY_CONFIG_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 const VIRTUAL_MONITOR_PRODUCT: &str = "MetaVirtualMonitor";
 /// Product name of a `ScreenCast.RecordVirtual` monitor.
@@ -184,6 +184,9 @@ pub struct DisplayMonitor {
     pub connector: String,
     /// Whether it is a `RecordVirtual` monitor.
     pub remote: bool,
+    /// Whether the compositor made it (a headless session's virtual
+    /// monitor or a `RecordVirtual` one): no monitor at a desk shows it.
+    pub virtual_monitor: bool,
     /// Current mode id, width, height and refresh in millihertz.
     pub current: Option<(String, u32, u32, u32)>,
     /// The UI scales the current mode supports.
@@ -246,6 +249,8 @@ pub async fn display_state(connection: &Connection) -> Result<DisplayState, Mutt
                 DisplayMonitor {
                     connector,
                     remote: product == REMOTE_MONITOR_PRODUCT,
+                    virtual_monitor: product == VIRTUAL_MONITOR_PRODUCT
+                        || product == REMOTE_MONITOR_PRODUCT,
                     current,
                     supported_scales: current_mode.map(|mode| mode.5.clone()).unwrap_or_default(),
                 }

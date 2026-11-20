@@ -144,7 +144,10 @@ mod native {
     #![allow(unsafe_code)]
 
     use super::{AudioError, MuteEvidence, TapFormat};
-    use arcen_media::audio::{AUDIO_V1_SAMPLE_RATE_HZ, AudioFrameSpec, PcmPacketizer};
+    use arcen_media::audio::resample::{MAX_SOURCE_RATE_HZ, MIN_SOURCE_RATE_HZ, PcmResampler};
+    use arcen_media::audio::{
+        AUDIO_V1_CHANNELS, AUDIO_V1_SAMPLE_RATE_HZ, AudioFrameSpec, PcmPacketizer,
+    };
     use arcen_session::pier_config::LocalPlayback;
     use block2::RcBlock;
     use objc2::AnyThread;
@@ -161,15 +164,16 @@ mod native {
         kAudioAggregateDeviceNameKey, kAudioAggregateDeviceSubDeviceListKey,
         kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
         kAudioAggregateDeviceUIDKey, kAudioDevicePropertyBufferFrameSizeRange,
-        kAudioDevicePropertyDeviceUID, kAudioHardwarePropertyDefaultOutputDevice,
-        kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+        kAudioDevicePropertyDeviceUID, kAudioDevicePropertyNominalSampleRate,
+        kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
         kAudioSubDeviceDriftCompensationKey, kAudioSubDeviceUIDKey,
         kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyDescription,
         kAudioTapPropertyFormat, kAudioTapPropertyUID,
     };
     use objc2_core_audio_types::{
-        AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp, AudioValueRange,
+        AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp, AudioTimeStampFlags,
+        AudioValueRange,
     };
     use objc2_core_foundation::{CFDictionary, CFRetained, CFString};
     use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString};
@@ -531,6 +535,12 @@ mod native {
         drain_buffer: Vec<f32>,
         /// Frames them. Owned here, not by the callback, because it allocates.
         packetizer: PcmPacketizer,
+        /// The aggregate's clock, re-read while capture runs.
+        clock: ClockWatch,
+        /// Brings the clock's rate to audio-v1's.
+        resampler: PcmResampler,
+        /// Where one chunk of resampled audio waits to be framed.
+        resampled: Vec<f32>,
         running: bool,
     }
 
@@ -599,6 +609,64 @@ mod native {
         pub contended_buffers: AtomicU64,
         /// Callbacks dropped because the pending queue was full.
         pub dropped_buffers: AtomicU64,
+        /// Drains discarded because the aggregate's clock ran at a rate the
+        /// resampler cannot carry.
+        pub clock_mismatches: AtomicU64,
+        /// The rate capture is being resampled from, in hertz.
+        pub clock_rate_hz: AtomicU64,
+        /// Input samples that could not be resampled.
+        pub unresampled_samples: AtomicU64,
+        /// Times the capture clock changed rate and the resampler followed.
+        pub clock_changes: AtomicU64,
+        /// Frames handed to the resampler, at the capture clock's rate.
+        pub resampled_input_frames: AtomicU64,
+        /// Frames the resampler produced, at audio-v1's rate.
+        pub resampled_output_frames: AtomicU64,
+        /// The device's sample time and host time (as `f64` bits and mach
+        /// ticks) of the first and the latest IO cycle: the device's own
+        /// clock, which a callback delayed or skipped under load does not
+        /// distort. A host time of zero means none yet.
+        pub first_sample_time_bits: AtomicU64,
+        pub first_host_time: AtomicU64,
+        pub last_sample_time_bits: AtomicU64,
+        pub last_host_time: AtomicU64,
+    }
+
+    /// Records an IO cycle's input timestamp. Atomics only: this runs on Core
+    /// Audio's real-time thread.
+    fn note_input_time(counters: &CaptureCounters, stamp: &AudioTimeStamp) {
+        let needed = AudioTimeStampFlags::SampleTimeValid | AudioTimeStampFlags::HostTimeValid;
+        if !stamp.mFlags.contains(needed) || stamp.mHostTime == 0 {
+            return;
+        }
+        let sample_bits = stamp.mSampleTime.to_bits();
+        if counters.first_host_time.load(Ordering::Acquire) == 0 {
+            counters
+                .first_sample_time_bits
+                .store(sample_bits, Ordering::Relaxed);
+            counters
+                .first_host_time
+                .store(stamp.mHostTime, Ordering::Release);
+        }
+        counters
+            .last_sample_time_bits
+            .store(sample_bits, Ordering::Relaxed);
+        counters
+            .last_host_time
+            .store(stamp.mHostTime, Ordering::Release);
+    }
+
+    /// Seconds in `ticks` of the host clock `AudioTimeStamp::mHostTime` uses.
+    pub(super) fn host_ticks_to_seconds(ticks: u64) -> f64 {
+        let mut timebase = mach2::mach_time::mach_timebase_info { numer: 0, denom: 0 };
+        // SAFETY: `timebase` is a live local the call fills in.
+        let status = unsafe { mach2::mach_time::mach_timebase_info(&raw mut timebase) };
+        if status != 0 || timebase.denom == 0 {
+            return 0.0;
+        }
+        #[allow(clippy::cast_precision_loss, reason = "a duration, not a count")]
+        let nanos = ticks as f64 * f64::from(timebase.numer) / f64::from(timebase.denom);
+        nanos / 1e9
     }
 
     /// How many interleaved samples may wait to be framed.
@@ -658,6 +726,22 @@ mod native {
                 Ok(aggregate) => aggregate,
                 Err(source) => return Err(recorder_error(tap, source)),
             };
+            // The tap's format is not the rate the IO proc delivers: the
+            // aggregate runs on the output device's clock and resamples the
+            // tap to it. Measured with AirPods in call mode as the default
+            // output: the tap reported 48 kHz and the IO proc delivered
+            // 24 kHz, the rate the resampler starts from.
+            let clock = match device_nominal_rate(aggregate).and_then(|rate| {
+                require_clock_rate(rate, AudioFrameSpec::V1)?;
+                Ok(rate)
+            }) {
+                Ok(rate) => ClockWatch::new(rate, AudioFrameSpec::V1, std::time::Instant::now()),
+                Err(error) => {
+                    // SAFETY: `aggregate` was created above and not yet destroyed.
+                    unsafe { AudioHardwareDestroyAggregateDevice(aggregate) };
+                    return Err(recorder_error(tap, error));
+                }
+            };
             let callback_capacity = match callback_sample_capacity(aggregate, format) {
                 Ok(capacity) => capacity,
                 Err(error) => {
@@ -666,7 +750,24 @@ mod native {
                     return Err(recorder_error(tap, error));
                 }
             };
+            // `require_clock_rate` accepted this rate, so the resampler exists.
+            let Some(resampler) = clock
+                .carried()
+                .and_then(|rate| PcmResampler::new(rate, AudioFrameSpec::V1))
+            else {
+                // SAFETY: `aggregate` was created above and not yet destroyed.
+                unsafe { AudioHardwareDestroyAggregateDevice(aggregate) };
+                return Err(recorder_error(
+                    tap,
+                    AudioError::UnsupportedFormat {
+                        detail: "no resampler for the capture clock".to_owned(),
+                    },
+                ));
+            };
             let observed = Arc::new(CaptureCounters::default());
+            observed
+                .clock_rate_hz
+                .store(u64::from(resampler.source_rate_hz()), Ordering::Relaxed);
             let counters = Arc::clone(&observed);
 
             // The wire's frame size, not the device's: the shared contract
@@ -692,9 +793,13 @@ mod native {
             let block = RcBlock::new(
                 move |_now: NonNull<AudioTimeStamp>,
                       input: NonNull<AudioBufferList>,
-                      _input_time: NonNull<AudioTimeStamp>,
+                      input_time: NonNull<AudioTimeStamp>,
                       _output: NonNull<AudioBufferList>,
                       _output_time: NonNull<AudioTimeStamp>| {
+                    // SAFETY: Core Audio guarantees `input_time` points at a
+                    // valid timestamp for the duration of this call; it is
+                    // copied, not retained.
+                    note_input_time(&counters, unsafe { input_time.as_ref() });
                     // SAFETY: Core Audio guarantees `input` points at a valid
                     // buffer list for the duration of this call, and this
                     // closure does not retain it. Only reads happen here.
@@ -756,6 +861,9 @@ mod native {
                 pending,
                 drain_buffer,
                 packetizer,
+                clock,
+                resampler,
+                resampled: resample_scratch(),
                 running: true,
             })
         }
@@ -783,13 +891,74 @@ mod native {
             if !drain_pending_samples(&self.pending, &mut self.drain_buffer) {
                 return packets;
             }
-            if self.drain_buffer.is_empty() {
-                return packets;
+            let aggregate = self.aggregate;
+            let was_carried = self.clock.carried();
+            let carried = self.clock.poll(std::time::Instant::now(), || {
+                device_nominal_rate(aggregate).ok()
+            });
+            if carried != was_carried {
+                tracing::info!(
+                    target: "arcen::media",
+                    rate_hz = self.clock.last_rate_hz(),
+                    resampled = carried.is_some(),
+                    "audio capture clock changed"
+                );
             }
-            self.packetizer.push(&self.drain_buffer, &mut packets);
-            self.drain_buffer.clear();
+            let observed = &self.observed;
+            let followed = follow_clock(
+                &mut self.resampler,
+                &mut self.resampled,
+                &mut self.packetizer,
+                carried,
+                &mut packets,
+            );
+            match followed {
+                Followed::Unchanged => {}
+                Followed::Changed {
+                    rate,
+                    flushed_frames,
+                } => {
+                    observed
+                        .resampled_output_frames
+                        .fetch_add(flushed_frames as u64, Ordering::Relaxed);
+                    observed
+                        .clock_rate_hz
+                        .store(u64::from(rate), Ordering::Relaxed);
+                    observed.clock_changes.fetch_add(1, Ordering::Relaxed);
+                }
+                Followed::Discarding { flushed_frames } => {
+                    // Samples from a clock the resampler cannot carry are
+                    // discarded; what the old clock still held went out.
+                    observed
+                        .resampled_output_frames
+                        .fetch_add(flushed_frames as u64, Ordering::Relaxed);
+                    observed.clock_mismatches.fetch_add(1, Ordering::Relaxed);
+                    self.drain_buffer.clear();
+                }
+            }
+            if !self.drain_buffer.is_empty() {
+                let framed = frame_at_clock(
+                    &mut self.resampler,
+                    &mut self.resampled,
+                    &mut self.packetizer,
+                    &self.drain_buffer,
+                    &mut packets,
+                );
+                observed
+                    .resampled_input_frames
+                    .fetch_add(framed.input_frames as u64, Ordering::Relaxed);
+                observed
+                    .resampled_output_frames
+                    .fetch_add(framed.output_frames as u64, Ordering::Relaxed);
+                if framed.dropped_samples > 0 {
+                    observed
+                        .unresampled_samples
+                        .fetch_add(framed.dropped_samples as u64, Ordering::Relaxed);
+                }
+                self.drain_buffer.clear();
+            }
             if !packets.is_empty() {
-                self.observed
+                observed
                     .packets
                     .fetch_add(packets.len() as u64, Ordering::Relaxed);
             }
@@ -857,17 +1026,9 @@ mod native {
                 ),
             });
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let rate = format.sample_rate_hz.round() as u32;
-        if rate != expected.sample_rate_hz {
-            return Err(AudioError::UnsupportedFormat {
-                detail: format!(
-                    "tap delivers {rate} Hz, but audio-v1 is {} Hz and this adapter does \
-                     not resample",
-                    expected.sample_rate_hz
-                ),
-            });
-        }
+        // The tap's rate is not checked: the IO proc delivers at the
+        // aggregate's clock whatever the tap reports, and that clock is
+        // resampled (`require_clock_rate`).
         if format.channels != u32::from(expected.channels) {
             return Err(AudioError::UnsupportedFormat {
                 detail: format!(
@@ -877,6 +1038,244 @@ mod native {
             });
         }
         Ok(())
+    }
+
+    /// The clock rate capture can be resampled from, to the nearest hertz.
+    fn carried_rate(rate_hz: f64, expected: AudioFrameSpec) -> Option<u32> {
+        if !rate_hz.is_finite() || rate_hz <= 0.0 || rate_hz > f64::from(u32::MAX) {
+            return None;
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "finite, positive and below u32::MAX, checked above"
+        )]
+        let rounded = rate_hz.round() as u32;
+        PcmResampler::accepts(rounded, expected).then_some(rounded)
+    }
+
+    /// The aggregate's clock, when the resampler can carry it to `expected`.
+    ///
+    /// The IO proc delivers at the aggregate's rate whatever the tap reports:
+    /// measured with a Bluetooth headset in call mode, the tap said 48 kHz and the IO
+    /// proc delivered 24 kHz. Framing that as audio-v1 unconverted played it
+    /// at twice the speed.
+    pub(super) fn require_clock_rate(
+        clock_rate_hz: f64,
+        expected: AudioFrameSpec,
+    ) -> Result<u32, AudioError> {
+        carried_rate(clock_rate_hz, expected).ok_or_else(|| AudioError::UnsupportedFormat {
+            detail: format!(
+                "the output device clocks capture at {clock_rate_hz:.0} Hz, outside the \
+                 {MIN_SOURCE_RATE_HZ}-{MAX_SOURCE_RATE_HZ} Hz this adapter resamples to audio-v1"
+            ),
+        })
+    }
+
+    /// How often a running capture re-reads its aggregate's clock.
+    const CLOCK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// Watches the aggregate's clock for the life of a capture.
+    ///
+    /// The output device can change rate under a running capture: a
+    /// Bluetooth headset switches to its call mode when any process opens
+    /// its microphone, and the aggregate follows it.
+    #[derive(Debug)]
+    pub(super) struct ClockWatch {
+        expected: AudioFrameSpec,
+        checked_at: std::time::Instant,
+        last_rate_hz: f64,
+        carried: Option<u32>,
+    }
+
+    impl ClockWatch {
+        /// A watch on a clock just read at `rate_hz`.
+        pub(super) fn new(rate_hz: f64, expected: AudioFrameSpec, now: std::time::Instant) -> Self {
+            Self {
+                expected,
+                checked_at: now,
+                last_rate_hz: rate_hz,
+                carried: carried_rate(rate_hz, expected),
+            }
+        }
+
+        /// The rate audio drained at `now` was delivered at, or `None` when
+        /// the resampler cannot carry it.
+        ///
+        /// `read` is called at most once per [`CLOCK_CHECK_INTERVAL`]. A rate
+        /// that cannot be read keeps the previous answer.
+        pub(super) fn poll(
+            &mut self,
+            now: std::time::Instant,
+            read: impl FnOnce() -> Option<f64>,
+        ) -> Option<u32> {
+            if now.saturating_duration_since(self.checked_at) >= CLOCK_CHECK_INTERVAL {
+                self.checked_at = now;
+                if let Some(rate_hz) = read() {
+                    self.last_rate_hz = rate_hz;
+                    self.carried = carried_rate(rate_hz, self.expected);
+                }
+            }
+            self.carried
+        }
+
+        /// The last answer [`Self::poll`] gave.
+        pub(super) const fn carried(&self) -> Option<u32> {
+            self.carried
+        }
+
+        /// The rate last read from the clock.
+        pub(super) const fn last_rate_hz(&self) -> f64 {
+            self.last_rate_hz
+        }
+    }
+
+    /// Input samples resampled at a time: the scratch output is sized for
+    /// this many at the lowest clock the resampler accepts.
+    const RESAMPLE_CHUNK_SAMPLES: usize = 1_024 * AUDIO_V1_CHANNELS as usize;
+
+    /// What one call to [`frame_at_clock`] did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(super) struct Framed {
+        /// Frames converted, at the capture clock's rate.
+        pub input_frames: usize,
+        /// Frames produced, at audio-v1's rate.
+        pub output_frames: usize,
+        /// Samples that could not be converted: a trailing partial frame,
+        /// or a refusal.
+        pub dropped_samples: usize,
+    }
+
+    /// Converts `samples` from the capture clock to audio-v1 and frames them.
+    ///
+    /// `scratch` must have the capacity [`resample_scratch`] gives it; the
+    /// resampler refuses rather than grow it.
+    pub(super) fn frame_at_clock(
+        resampler: &mut PcmResampler,
+        scratch: &mut Vec<f32>,
+        packetizer: &mut PcmPacketizer,
+        samples: &[f32],
+        packets: &mut Vec<Vec<i16>>,
+    ) -> Framed {
+        let channels = usize::from(resampler.target().channels);
+        let whole = samples.len() - samples.len() % channels;
+        let mut framed = Framed {
+            dropped_samples: samples.len() - whole,
+            ..Framed::default()
+        };
+        for chunk in samples[..whole].chunks(RESAMPLE_CHUNK_SAMPLES) {
+            scratch.clear();
+            match resampler.process(chunk, scratch) {
+                Ok(produced) => {
+                    framed.input_frames += chunk.len() / channels;
+                    framed.output_frames += produced / channels;
+                    packetizer.push(scratch, packets);
+                }
+                Err(_) => framed.dropped_samples += chunk.len(),
+            }
+        }
+        scratch.clear();
+        framed
+    }
+
+    /// What [`follow_clock`] did before a drain was framed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Followed {
+        /// The clock is where the resampler already is.
+        Unchanged,
+        /// The resampler moved to `rate`, after flushing what the old rate
+        /// held back.
+        Changed { rate: u32, flushed_frames: usize },
+        /// The clock cannot be carried: drained audio is discarded, after the
+        /// old rate's tail was flushed.
+        Discarding { flushed_frames: usize },
+    }
+
+    /// Moves the resampler to the clock `carried` reports, flushing the old
+    /// rate's held-back frames into `packetizer` so a change loses nothing.
+    ///
+    /// Builds a filter only when the rate actually changes.
+    pub(super) fn follow_clock(
+        resampler: &mut PcmResampler,
+        scratch: &mut Vec<f32>,
+        packetizer: &mut PcmPacketizer,
+        carried: Option<u32>,
+        packets: &mut Vec<Vec<i16>>,
+    ) -> Followed {
+        scratch.clear();
+        let followed = match carried {
+            Some(rate) if rate == resampler.source_rate_hz() => return Followed::Unchanged,
+            Some(rate) => match resampler.change_source_rate(rate, scratch) {
+                Ok(_) => Followed::Changed {
+                    rate,
+                    flushed_frames: 0,
+                },
+                Err(_) => Followed::Discarding { flushed_frames: 0 },
+            },
+            None => {
+                let _ = resampler.flush(scratch);
+                Followed::Discarding { flushed_frames: 0 }
+            }
+        };
+        let flushed = scratch.len() / usize::from(resampler.target().channels);
+        packetizer.push(scratch, packets);
+        scratch.clear();
+        match followed {
+            Followed::Changed { rate, .. } => Followed::Changed {
+                rate,
+                flushed_frames: flushed,
+            },
+            Followed::Discarding { .. } => Followed::Discarding {
+                flushed_frames: flushed,
+            },
+            Followed::Unchanged => Followed::Unchanged,
+        }
+    }
+
+    /// A scratch buffer [`frame_at_clock`] can use at any accepted clock.
+    pub(super) fn resample_scratch() -> Vec<f32> {
+        Vec::with_capacity(
+            PcmResampler::max_output_samples_for(
+                MIN_SOURCE_RATE_HZ,
+                AudioFrameSpec::V1,
+                RESAMPLE_CHUNK_SAMPLES,
+            )
+            .unwrap_or(RESAMPLE_CHUNK_SAMPLES),
+        )
+    }
+
+    /// Reads a device's nominal sample rate.
+    fn device_nominal_rate(device: AudioObjectID) -> Result<f64, AudioError> {
+        let address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        let mut rate = 0.0f64;
+        let mut size = u32::try_from(size_of::<f64>()).unwrap_or(0);
+        // SAFETY: `device` is a live device this process created. The
+        // pointers address live locals and `size` states the exact size of
+        // the one `Float64` the property holds.
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device,
+                NonNull::from(&address),
+                0,
+                std::ptr::null(),
+                NonNull::from(&mut size),
+                NonNull::from(&mut rate).cast(),
+            )
+        };
+        if status != 0 {
+            return Err(AudioError::CaptureFailed {
+                status,
+                detail: format!(
+                    "could not read the capture clock's sample rate: {}",
+                    describe_status(status)
+                ),
+            });
+        }
+        Ok(rate)
     }
 
     fn drain_pending_samples(pending: &Mutex<Vec<f32>>, drain_buffer: &mut Vec<f32>) -> bool {
@@ -1274,6 +1673,13 @@ mod native {
         (status == 0 && device != 0).then_some(device)
     }
 
+    /// The default output device's nominal rate, for tests that must know
+    /// what clock capture will run on.
+    #[cfg(test)]
+    pub(super) fn default_output_rate_hz() -> Option<f64> {
+        device_nominal_rate(default_output_device()?).ok()
+    }
+
     /// Returns the UID of the current default output device.
     ///
     /// The aggregate device needs a real device to take its clock from.
@@ -1634,7 +2040,7 @@ pub struct AudioProbeReport {
 /// capture if only the callback count is recorded, so the peak amplitude is
 /// kept alongside it. That is the difference between capture working and
 /// capture being permitted but empty.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct CaptureObservation {
     /// How long capture ran, in milliseconds.
     pub duration_ms: u64,
@@ -1663,6 +2069,26 @@ pub struct CaptureObservation {
     /// can take a third of a short probe to deliver its first buffer.
     pub steady_frames: u64,
     pub steady_ms: u64,
+    /// Drains discarded because the capture clock ran at a rate the
+    /// resampler cannot carry. Non-zero means the frame counts above mix
+    /// clocks and say little about any one of them.
+    pub clock_mismatches: u64,
+    /// The capture clock audio was last resampled from, in hertz. Frames
+    /// above are counted at this rate; packets carry audio-v1's.
+    pub clock_rate_hz: u64,
+    /// Input samples that could not be resampled.
+    pub unresampled_samples: u64,
+    /// Times the capture clock changed rate during the run.
+    pub clock_changes: u64,
+    /// Frames handed to the resampler, at the capture clock's rate.
+    pub resampled_input_frames: u64,
+    /// Frames the resampler produced, at audio-v1's rate.
+    pub resampled_output_frames: u64,
+    /// The device's rate from its own IO timestamps (sample time over host
+    /// time, first cycle to last), when they span at least 200 ms. Unlike
+    /// frames over wall time, a callback delayed or skipped under load does
+    /// not change it.
+    pub device_rate_hz: Option<f64>,
 }
 
 impl CaptureObservation {
@@ -1765,8 +2191,8 @@ pub fn probe(local_playback: LocalPlayback) -> AudioProbeReport {
 /// advertising audio that nobody can hear.
 #[must_use]
 pub fn probe_for(local_playback: LocalPlayback, duration: std::time::Duration) -> AudioProbeReport {
-    let mut session = match AudioCaptureSession::start(local_playback) {
-        Ok(session) => session,
+    let tap = match SystemAudioTap::create(local_playback) {
+        Ok(tap) => tap,
         Err(error) => {
             return AudioProbeReport {
                 tap_created: false,
@@ -1779,9 +2205,25 @@ pub fn probe_for(local_playback: LocalPlayback, duration: std::time::Duration) -
             };
         }
     };
-
-    let format = session.format().ok();
-    let mute = session.mute_evidence();
+    let format = tap.format().ok();
+    let mute = tap.mute_evidence();
+    // The tap is reported even when the recorder refuses it, so a refusal
+    // (a capture clock this adapter cannot carry, for example) reads as that
+    // rather than as a machine without a tap.
+    let mut session = match AudioCaptureSession::start_with_tap(tap) {
+        Ok(session) => session,
+        Err(AudioRecorderStartupError { mut tap, source }) => {
+            return AudioProbeReport {
+                tap_created: true,
+                format,
+                mute: Some(mute),
+                restored: tap.release().is_ok(),
+                error: Some(source.to_string()),
+                capture: None,
+                usable: false,
+            };
+        }
+    };
 
     let started = std::time::Instant::now();
     let mut flowing: Option<(std::time::Instant, u64)> = None;
@@ -1804,46 +2246,7 @@ pub fn probe_for(local_playback: LocalPlayback, duration: std::time::Duration) -
     let _ = session.drain_packets();
     let elapsed = started.elapsed();
 
-    let counters = session.counters();
-    let frames = counters.frames.load(std::sync::atomic::Ordering::Relaxed);
-    let (steady_frames, steady_ms) = flowing.map_or((0, 0), |(since, at)| {
-        (
-            frames.saturating_sub(at),
-            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
-        )
-    });
-    let observation = CaptureObservation {
-        duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-        callbacks: counters
-            .callbacks
-            .load(std::sync::atomic::Ordering::Relaxed),
-        frames,
-        peak_micro: counters
-            .peak_micro
-            .load(std::sync::atomic::Ordering::Relaxed),
-        audio_observed: counters
-            .peak_micro
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0,
-        packets: counters.packets.load(std::sync::atomic::Ordering::Relaxed),
-        buffers_last: counters
-            .buffers_last
-            .load(std::sync::atomic::Ordering::Relaxed),
-        channels_last: counters
-            .channels_last
-            .load(std::sync::atomic::Ordering::Relaxed),
-        unsupported_layout: counters
-            .unsupported_layout
-            .load(std::sync::atomic::Ordering::Relaxed),
-        contended_buffers: counters
-            .contended_buffers
-            .load(std::sync::atomic::Ordering::Relaxed),
-        dropped_buffers: counters
-            .dropped_buffers
-            .load(std::sync::atomic::Ordering::Relaxed),
-        steady_frames,
-        steady_ms,
-    };
+    let observation = observe(session.counters(), elapsed, flowing);
 
     let restored = session.stop().is_ok();
 
@@ -1860,12 +2263,71 @@ pub fn probe_for(local_playback: LocalPlayback, duration: std::time::Duration) -
         // the mute was honoured, and the machine got its sound back.
         // Packets are required too: callbacks that arrive in a layout this
         // adapter cannot interleave would otherwise read as success while
-        // producing nothing the wire can carry.
+        // producing nothing the wire can carry. So is a clock that stayed
+        // within what the resampler accepts, with no input left unconverted:
+        // audio from any other clock is discarded.
         usable: format.is_some()
             && mute.honoured
             && restored
             && observation.callbacks > 0
-            && observation.packets > 0,
+            && observation.packets > 0
+            && observation.clock_mismatches == 0
+            && observation.unresampled_samples == 0,
+    }
+}
+
+/// The device's rate from its first and latest IO timestamps.
+fn device_rate_hz(counters: &CaptureCounters) -> Option<f64> {
+    use std::sync::atomic::Ordering;
+    let first_host = counters.first_host_time.load(Ordering::Acquire);
+    let last_host = counters.last_host_time.load(Ordering::Acquire);
+    if first_host == 0 || last_host <= first_host {
+        return None;
+    }
+    let seconds = native::host_ticks_to_seconds(last_host - first_host);
+    let samples = f64::from_bits(counters.last_sample_time_bits.load(Ordering::Relaxed))
+        - f64::from_bits(counters.first_sample_time_bits.load(Ordering::Relaxed));
+    (seconds >= 0.2).then(|| samples / seconds)
+}
+
+/// What a capture's counters say once it has run for `elapsed`.
+///
+/// `flowing` is when the first frames arrived and how many had by then.
+fn observe(
+    counters: &CaptureCounters,
+    elapsed: std::time::Duration,
+    flowing: Option<(std::time::Instant, u64)>,
+) -> CaptureObservation {
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+    let frames = load(&counters.frames);
+    let (steady_frames, steady_ms) = flowing.map_or((0, 0), |(since, at)| {
+        (
+            frames.saturating_sub(at),
+            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+    });
+    CaptureObservation {
+        duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        callbacks: load(&counters.callbacks),
+        frames,
+        peak_micro: load(&counters.peak_micro),
+        audio_observed: load(&counters.peak_micro) > 0,
+        packets: load(&counters.packets),
+        buffers_last: load(&counters.buffers_last),
+        channels_last: load(&counters.channels_last),
+        unsupported_layout: load(&counters.unsupported_layout),
+        contended_buffers: load(&counters.contended_buffers),
+        dropped_buffers: load(&counters.dropped_buffers),
+        steady_frames,
+        steady_ms,
+        clock_mismatches: load(&counters.clock_mismatches),
+        clock_rate_hz: load(&counters.clock_rate_hz),
+        unresampled_samples: load(&counters.unresampled_samples),
+        clock_changes: load(&counters.clock_changes),
+        resampled_input_frames: load(&counters.resampled_input_frames),
+        resampled_output_frames: load(&counters.resampled_output_frames),
+        device_rate_hz: device_rate_hz(counters),
     }
 }
 
@@ -1942,20 +2404,208 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn recorder_format_contract_is_not_part_of_a_mute_lease() {
-        let mismatched = TapFormat {
-            sample_rate_hz: 44_100.0,
+        let integer = TapFormat {
+            sample_rate_hz: 48_000.0,
             channels: 2,
+            bits_per_channel: 16,
+            float: false,
+        };
+        let Err(error) =
+            native::require_capture_format(integer, arcen_media::audio::AudioFrameSpec::V1)
+        else {
+            panic!("the recorder still refuses samples it cannot read honestly");
+        };
+        assert!(matches!(error, AudioError::UnsupportedFormat { .. }));
+        assert!(error.to_string().contains("16-bit integer"), "{error}");
+
+        // The tap's rate is not what the IO proc delivers (the aggregate's
+        // clock is), so a 44.1 kHz tap is resampled rather than refused.
+        let cd_rate = TapFormat {
+            sample_rate_hz: 44_100.0,
+            ..integer
+        };
+        let cd_rate = TapFormat {
             bits_per_channel: 32,
             float: true,
+            ..cd_rate
         };
-
-        let error =
-            native::require_capture_format(mismatched, arcen_media::audio::AudioFrameSpec::V1)
-                .expect_err("the recorder still refuses formats it cannot packetize honestly");
-        assert!(matches!(error, AudioError::UnsupportedFormat { .. }));
-        assert!(error.to_string().contains("44100 Hz"));
+        assert!(
+            native::require_capture_format(cd_rate, arcen_media::audio::AudioFrameSpec::V1).is_ok()
+        );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_capture_clock_is_resampled_when_it_can_be_and_refused_when_not() {
+        // A Bluetooth headset in call mode clocks the aggregate at 16 or
+        // 24 kHz while the tap still reports 48 kHz; DACs run at 44.1 kHz.
+        for rate in [16_000.0, 24_000.0, 44_100.0, 48_000.0, 96_000.0, 192_000.0] {
+            assert!(
+                native::require_clock_rate(rate, arcen_media::audio::AudioFrameSpec::V1).is_ok(),
+                "{rate} Hz is resampled to audio-v1"
+            );
+        }
+        for rate in [0.0, 4_000.0, 768_000.0, f64::NAN, f64::INFINITY] {
+            let Err(error) =
+                native::require_clock_rate(rate, arcen_media::audio::AudioFrameSpec::V1)
+            else {
+                panic!("{rate} Hz is outside what the resampler accepts");
+            };
+            assert!(matches!(error, AudioError::UnsupportedFormat { .. }));
+            assert!(error.to_string().contains("clocks capture at"), "{error}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_clock_that_changes_under_capture_is_followed_and_an_uncarried_one_discarded() {
+        let start = std::time::Instant::now();
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        let mut watch =
+            native::ClockWatch::new(48_000.0, arcen_media::audio::AudioFrameSpec::V1, start);
+        assert_eq!(watch.carried(), Some(48_000));
+
+        // Not re-read within the interval: a property read per drain is not
+        // free, and the drain runs on the session's loop.
+        assert_eq!(
+            watch.poll(at(10), || panic!("read inside the check interval")),
+            Some(48_000)
+        );
+        // The headset switched to call mode: resample from its clock.
+        assert_eq!(watch.poll(at(150), || Some(24_000.0)), Some(24_000));
+        // An unreadable clock keeps the last answer rather than guessing.
+        assert_eq!(watch.poll(at(300), || None), Some(24_000));
+        // A clock the resampler cannot carry is discarded, not guessed at.
+        assert_eq!(watch.poll(at(450), || Some(1_000_000.0)), None);
+        assert!((watch.last_rate_hz() - 1_000_000.0).abs() < f64::EPSILON);
+        assert_eq!(watch.poll(at(600), || Some(44_100.0)), Some(44_100));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_24_khz_capture_leaves_as_48_khz_packets() {
+        // Half a second of 24 kHz stereo, as the IO proc delivers it with a
+        // Bluetooth headset in call mode, must become half a second of
+        // audio-v1: 25 packets of 960 frames, less the filter's latency.
+        let spec = arcen_media::audio::AudioFrameSpec::V1;
+        let (Some(mut resampler), Some(mut packetizer)) = (
+            arcen_media::audio::resample::PcmResampler::new(24_000, spec),
+            arcen_media::audio::PcmPacketizer::new(spec),
+        ) else {
+            panic!("24 kHz is resampled and audio-v1 is framed");
+        };
+        let mut scratch = native::resample_scratch();
+        let capacity = scratch.capacity();
+        let samples: Vec<f32> = (0..12_000)
+            .flat_map(|frame| {
+                #[allow(clippy::cast_precision_loss)]
+                let value = (f64::from(frame) * std::f64::consts::TAU * 440.0 / 24_000.0).sin();
+                #[allow(clippy::cast_possible_truncation)]
+                let value = value as f32 * 0.5;
+                [value, value]
+            })
+            .collect();
+        let mut packets = Vec::new();
+        // In uneven pieces, as drains arrive.
+        let (mut input, mut output) = (0, 0);
+        for piece in samples.chunks(2 * 1_111) {
+            let framed = native::frame_at_clock(
+                &mut resampler,
+                &mut scratch,
+                &mut packetizer,
+                piece,
+                &mut packets,
+            );
+            assert_eq!(framed.dropped_samples, 0);
+            input += framed.input_frames;
+            output += framed.output_frames;
+        }
+        assert_eq!(
+            scratch.capacity(),
+            capacity,
+            "the scratch buffer never grows"
+        );
+        assert_eq!(input, 12_000);
+        let frames = packets.len() * 960 + packetizer.pending_samples() / 2;
+        assert_eq!(frames, output);
+        assert_eq!(frames, 24_000 - 2 * resampler.latency_frames());
+        assert_eq!(packets.len(), 24, "{frames} frames");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_clock_change_mid_capture_loses_no_frames_and_keeps_its_level() {
+        // 0.5 s at 24 kHz, the headset leaves call mode for 44.1 kHz for
+        // 0.25 s, then a clock the resampler cannot carry: every frame of
+        // the first two clocks leaves as audio-v1, at an unchanged level.
+        let spec = arcen_media::audio::AudioFrameSpec::V1;
+        let (Some(mut resampler), Some(mut packetizer)) = (
+            arcen_media::audio::resample::PcmResampler::new(24_000, spec),
+            arcen_media::audio::PcmPacketizer::new(spec),
+        ) else {
+            panic!("24 kHz is resampled and audio-v1 is framed");
+        };
+        let mut scratch = native::resample_scratch();
+        let mut packets = Vec::new();
+        let mut output_frames = 0;
+        for (carried, frames) in [
+            (Some(24_000), 12_000usize),
+            (Some(44_100), 11_025),
+            (None, 0),
+        ] {
+            match native::follow_clock(
+                &mut resampler,
+                &mut scratch,
+                &mut packetizer,
+                carried,
+                &mut packets,
+            ) {
+                native::Followed::Unchanged => {}
+                native::Followed::Changed { flushed_frames, .. }
+                | native::Followed::Discarding { flushed_frames } => {
+                    output_frames += flushed_frames;
+                }
+            }
+            let level = vec![0.5f32; 2 * frames];
+            for piece in level.chunks(2 * 480) {
+                let framed = native::frame_at_clock(
+                    &mut resampler,
+                    &mut scratch,
+                    &mut packetizer,
+                    piece,
+                    &mut packets,
+                );
+                assert_eq!(framed.dropped_samples, 0);
+                output_frames += framed.output_frames;
+            }
+        }
+        assert_eq!(
+            output_frames, 36_000,
+            "0.75 s of input is 0.75 s of audio-v1"
+        );
+        assert_eq!(
+            packets.len() * 960 + packetizer.pending_samples() / 2,
+            36_000
+        );
+        let worst = packets
+            .iter()
+            .flatten()
+            .map(|&sample| (i32::from(sample) - 16_383).abs())
+            .max();
+        assert!(
+            worst.is_some_and(|worst| worst <= 2),
+            "level moved by {worst:?} LSB"
+        );
+    }
+
+    /// Hardware: a live process tap on this Mac's default output.
+    ///
+    /// Deterministic on any output device: frames arrive at the output
+    /// device's clock, and packets leave at audio-v1's 48 kHz in real time
+    /// whatever that clock is, as long as the resampler accepts it. It used
+    /// to fail about half the time on a Mac whose Bluetooth headset was in
+    /// call mode, because its 24 kHz clock was framed as 48 kHz and measured
+    /// within a few hertz of the test's lower bound.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_tap_reports_a_real_format_and_gives_the_sound_back() {
@@ -1963,6 +2613,7 @@ mod tests {
         // Runs against real Core Audio. A machine without the entitlement or
         // consent reports that instead, which is evidence rather than a
         // failure of this test.
+        let clock_hz = native::default_output_rate_hz();
         let report = probe_for(
             LocalPlayback::Muted,
             std::time::Duration::from_millis(1_500),
@@ -1994,30 +2645,93 @@ mod tests {
         );
         assert!(mute.honoured);
 
+        let Some(capture) = report.capture else {
+            // The recorder refused the tap. On a granted Mac that is a format
+            // audio-v1 cannot carry (the tap's own, or the output clock's),
+            // and it must say so rather than send audio at the wrong speed.
+            let error = report.error.unwrap_or_default();
+            assert!(
+                error.starts_with("audio format unsupported:"),
+                "the recorder refused for an unexpected reason: {error}"
+            );
+            assert!(
+                !clock_hz.is_some_and(|rate| (8_000.0..=384_000.0).contains(&rate)),
+                "the output device runs at {clock_hz:?} Hz, which the recorder resamples, \
+                 yet capture was refused: {error}"
+            );
+            assert!(!report.usable);
+            eprintln!("capture refused on this output device: {error}");
+            return;
+        };
+
         // A tap that exists but never delivers is the failure this test is
         // really for: it looked like success for as long as only tap creation
         // was checked.
-        let capture = report
-            .capture
-            .expect("capture is exercised, not just arranged");
         assert!(
             capture.callbacks > 0,
             "the IO proc must actually run; a tap without callbacks delivers nothing: {capture:?}",
         );
         assert!(capture.frames > 0, "frames must arrive: {capture:?}");
 
-        // Roughly the tap's own sample rate, measured once audio was flowing.
-        // Over the whole window it read 23.5 kHz from a 48 kHz device on a
-        // busy Mac: the window also holds capture start-up, which is not the
-        // device's clock. Generous bounds, because this is checking that the
-        // clock is real rather than measuring it.
-        let rate = capture
-            .steady_rate_hz()
-            .unwrap_or_else(|| panic!("audio must flow for a measurable time: {capture:?}"));
+        if capture.clock_mismatches > 0 || capture.clock_changes > 0 {
+            // The output device changed rate while the probe ran (another
+            // process opened a headset's microphone). The resampler followed
+            // it or discarded it, and the counts below span two clocks.
+            if capture.clock_mismatches > 0 {
+                assert!(!report.usable, "{capture:?}");
+            }
+            eprintln!("capture clock changed during the probe: {capture:?}");
+            return;
+        }
+
+        // The device's own clock, from its IO timestamps rather than frames
+        // over wall time. Under load Core Audio skips IO cycles (measured:
+        // 93 callbacks in 1.5 s on a 48 kHz clock while other builds ran),
+        // which wall time reads as a slow clock and device time does not.
+        #[allow(clippy::cast_precision_loss, reason = "a sample rate")]
+        let clock = capture.clock_rate_hz as f64;
+        eprintln!("capture ran on a {clock:.0} Hz clock (default output {clock_hz:?} Hz)");
+        let device_hz = capture
+            .device_rate_hz
+            .unwrap_or_else(|| panic!("IO timestamps must span the probe: {capture:?}"));
         assert!(
-            rate > format.sample_rate_hz * 0.5 && rate < format.sample_rate_hz * 1.5,
-            "delivered rate {rate:.0} should resemble the declared {:.0} Hz ({capture:?})",
-            format.sample_rate_hz,
+            (device_hz - clock).abs() < clock * 0.02,
+            "the device ran at {device_hz:.0} Hz by its own timestamps, not the {clock:.0} Hz \
+             capture resamples from ({capture:?})",
+        );
+
+        // Every frame drained left at audio-v1's rate: the resampler's output
+        // is its input scaled by 48 kHz over the clock, less its latency.
+        // Framing a 24 kHz clock as 48 kHz unconverted produced half of this.
+        let latency = u32::try_from(capture.clock_rate_hz)
+            .ok()
+            .and_then(|rate| {
+                arcen_media::audio::resample::PcmResampler::new(
+                    rate,
+                    arcen_media::audio::AudioFrameSpec::V1,
+                )
+            })
+            .map_or(0, |resampler| resampler.latency_frames());
+        #[allow(clippy::cast_precision_loss, reason = "counts of a 1.5 s probe")]
+        let (input, output, latency) = (
+            capture.resampled_input_frames as f64,
+            capture.resampled_output_frames as f64,
+            latency as f64,
+        );
+        let ratio = 48_000.0 / clock;
+        assert!(input > 0.0, "audio must reach the resampler: {capture:?}");
+        assert!(
+            output <= input * ratio + 2.0 && output >= (input - latency) * ratio - 2.0,
+            "{input} frames at {clock:.0} Hz became {output} at 48 kHz ({capture:?})",
+        );
+        // And it left in whole audio-v1 packets.
+        let packet_frames = capture.packets * 960;
+        assert!(
+            packet_frames <= capture.resampled_output_frames
+                && capture.resampled_output_frames < packet_frames + 960,
+            "{} resampled frames left as {} packets ({capture:?})",
+            capture.resampled_output_frames,
+            capture.packets,
         );
         assert!(report.usable);
     }

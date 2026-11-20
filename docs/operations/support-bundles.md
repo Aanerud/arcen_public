@@ -90,6 +90,24 @@ typed manifest notices rather than silent omissions. Collection does not invent
 unsupported diagnostics; in particular, Windows does not claim a read-only
 NVAPI driver query.
 
+Every Pier and Deck opens a source the same way (`arcen_observability`
+`open_source`). The path is walked folder by folder from its root without
+following a link: on Linux and macOS each folder is opened relative to the
+one before it, so a folder cannot be swapped for a link mid-walk, and a link
+is followed only when the system or the collecting account owns it and the
+folder it sits in, and nobody else can write to that folder. On Windows any
+junction, symbolic link or other reparse point on the way is refused, and
+each folder's real location (read back from its handle) must be inside the
+one before. The file must be a regular file (`unsafe_file_type` otherwise; a
+FIFO is opened without blocking and refused), have one name
+(`source_hard_linked`), and be the file that was inspected
+(`source_changed_during_read`). Windows identifies it by its 128-bit file ID
+(`source_identity_index_only`, an advisory, where the volume offers only a
+64-bit index) and refuses a source whose volume cannot prove identity: a
+network volume, or one without stable file IDs
+(`source_identity_unverifiable`). A folder link refused on the way is
+`source_path_linked`.
+
 ## Privacy and handling
 
 Bundles pseudonymize canonical log usernames, hostnames, peer addresses, and

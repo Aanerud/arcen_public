@@ -373,7 +373,12 @@ pub fn run(
         let now = Instant::now();
         for command in control.take_canvas_controls() {
             match command {
-                CapencControlCommand::CanvasInput { x, y } => encoder.note_input(x, y, now),
+                CapencControlCommand::CanvasInput {
+                    monitor_id,
+                    topology_generation,
+                    x,
+                    y,
+                } => encoder.note_input(monitor_id, topology_generation, x, y, now),
                 command => {
                     if let Some(message) = command.canvas_control() {
                         encoder.on_control(&message);

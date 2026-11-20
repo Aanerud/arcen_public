@@ -74,17 +74,19 @@ newly discovered or supplied names, writes the shared ownership marker and pin
 files, and keeps Deck SPKI pins stable. Ambiguous self-signed material or a
 mismatched marker is preserved as operator-managed.
 
-`arcen-new-host-cert` is the reviewed SMB helper. OpenSSL and util-linux
-`flock` are required by this helper only, not by the running service. `flock`
-serializes recovery and publication. With no issuance-mode argument it
-generates only when both files are absent and refuses a partial pair. It issues
-P-256/SHA-256, 825-day, serverAuth/digitalSignature certificates with explicit
-FQDN/DNS and non-loopback IP SANs. Install the helper prerequisite with
-`apt install openssl util-linux` on Debian-family hosts or
-`dnf install openssl util-linux` on RHEL-family hosts. It also writes:
+`arcen-new-host-cert` is the SMB helper. It runs `arcen-pier new-host-cert`
+(the Pier binary beside it, `/opt/arcen/bin/arcen-pier`, or `ARCEN_PIER_BIN`),
+which holds the only implementation; it needs neither OpenSSL nor `flock`.
+With no issuance-mode argument material is created only when both files are
+absent, kept while current and renewed over its key when due; a partial pair
+is refused. It issues the shared profile: P-256/SHA-256, `CN=Arcen Pier`,
+825 days from five minutes before issue, serverAuth/digitalSignature, with the
+given `--dns`/`--ip` names, or else the host's FQDN and non-loopback addresses.
+The directory defaults to `ARCEN_TLS_DIRECTORY`, else `/etc/arcen`. It also
+writes:
 
-- `host.cert-sha256`: OpenSSL's `sha256 Fingerprint=AA:...` whole-certificate
-  fingerprint.
+- `host.cert-sha256`: the `sha256 Fingerprint=AA:...` whole-certificate
+  fingerprint, as OpenSSL prints it.
 - `host.spki-sha256`: one `sha256/<base64>` SPKI fingerprint line.
 - `host.generated-by-arcen`: pair-bound ownership metadata; renewal and rekey
   refuse if the current certificate, key, and marker no longer agree.
@@ -114,11 +116,14 @@ sudo /opt/arcen/bin/arcen-new-host-cert --new-key --directory /etc/arcen
 sudo systemctl reload arcen-pier
 ```
 
-The helper stages, fsyncs, journals, backs up, and atomically renames files in
-the TLS directory; the next invocation recovers an interrupted transaction.
-It rejects symlinks in destinations and transaction artifacts. The installer
-takes the same `.arcen-cert.lock` and uses the same journaled publication set
-when it creates, adopts, renews, or rekeys material. The running Pier never
+The helper stages and checks every file, journals, backs up, and atomically
+renames files in the TLS directory, fsyncing each step; the next invocation
+(of the helper, `arcen-pier new-host-cert` or the installer) recovers an
+interrupted transaction before anything else. It rejects a link anywhere in
+the directory path, in destinations and in transaction artifacts, and a
+directory anyone but its owner can write. The installer takes the same
+`.arcen-cert.lock` and runs the same shared transaction when it creates,
+adopts, renews, or rekeys material. The running Pier never
 issues or rotates certificates. `SIGHUP` independently reloads
 logging and validates/reloads PEM; either reload can succeed while the other
 fails, and invalid material leaves the last good certificate active.

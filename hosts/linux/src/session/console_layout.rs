@@ -634,8 +634,15 @@ pub(crate) struct LiveConsole {
 /// display cannot be opened).
 pub(crate) async fn live_console() -> Result<LiveConsole, String> {
     use arcen_session::console_session::{ConsoleOrigin, ARCEN_TTY, CONSOLE_SEAT};
-    let mut candidates: Vec<_> = super::console::read_sessions()
+    let sessions = super::console::read_sessions()
         .await
+        .map_err(|unreadable| {
+            format!(
+                "logind's sessions could not be read ({})",
+                unreadable.token()
+            )
+        })?;
+    let mut candidates: Vec<_> = sessions
         .into_iter()
         .filter(|fact| {
             fact.seat == CONSOLE_SEAT

@@ -281,17 +281,26 @@ pub const REGION_HEADROOM: u32 = 32;
 
 /// A `width × height` rectangle on the grid, inside `bounds`, that holds
 /// `rect`; `None` when there is none.
+///
+/// The canvas takes a surface destination only on the block grid: whole
+/// blocks, unless a side ends at the canvas's edge. A side that is not
+/// whole blocks opened against that edge and can sit only there; moving
+/// it anywhere else would leave a destination the Deck refuses (and the
+/// planner's own mirror refuses first, which restarts the canvas).
 fn place(width: u32, height: u32, rect: TileRect, bounds: TileRect) -> Option<TileRect> {
     let axis = |start: u32, length: u32, low: u32, high: u32| -> Option<u32> {
-        // Keep the start where it is, else push it back inside the bounds,
-        // on the block grid.
         let latest = high.checked_sub(length)?;
-        let origin = if start + length <= high {
+        let origin = if length % BLOCK != 0 {
+            latest
+        } else if start + length <= high {
+            // Keep the start where it is, else push it back inside the
+            // bounds, on the block grid.
             start
         } else {
             latest & !(BLOCK - 1)
         };
-        (origin >= low && origin <= start && origin + length <= high).then_some(origin)
+        (origin >= low && origin <= start && origin + length <= high && origin % BLOCK == 0)
+            .then_some(origin)
     };
     let x = axis(rect.x, width, bounds.x, bounds.x + bounds.width)?;
     let y = axis(rect.y, height, bounds.y, bounds.y + bounds.height)?;
@@ -575,6 +584,76 @@ mod tests {
             plan(&set, wide).as_slice(),
             [SurfaceChange::Open(slot)] if contains(slot.dest, wide)
         ));
+    }
+
+    /// The canvas state's rule for a surface destination: whole blocks,
+    /// unless a side ends at the canvas's edge.
+    fn on_the_grid(dest: TileRect, bounds: TileRect) -> bool {
+        dest.x % BLOCK == 0
+            && dest.y % BLOCK == 0
+            && (dest.width % BLOCK == 0 || dest.x + dest.width == bounds.x + bounds.width)
+            && (dest.height % BLOCK == 0 || dest.y + dest.height == bounds.y + bounds.height)
+    }
+
+    #[test]
+    fn a_surface_opened_against_a_partial_block_edge_never_moves_off_it() {
+        // 1080 rows end half way through a block row, and a 1512-wide
+        // canvas half way through a block column: a surface that opens
+        // against that edge has a partial-block side, which is valid only
+        // while it ends there.
+        for bounds in [BOUNDS, rect(0, 0, 1512, 950)] {
+            let plan = |set: &SurfaceSet, rect| {
+                set.plan(
+                    &[(SurfaceRole::Region(3), rect)],
+                    SurfaceScale::Full,
+                    bounds,
+                )
+            };
+            let mut set = SurfaceSet::new(2);
+            let near_corner = rect(
+                (bounds.width - 690) & !(BLOCK - 1),
+                (bounds.height - 180) & !(BLOCK - 1),
+                640,
+                160,
+            );
+            let changes = plan(&set, near_corner);
+            let [SurfaceChange::Open(slot)] = changes.as_slice() else {
+                panic!("{changes:?}");
+            };
+            assert!(on_the_grid(slot.dest, bounds), "{:?}", slot.dest);
+            assert_eq!(
+                slot.dest.y + slot.dest.height,
+                bounds.height,
+                "the test opens against the bottom edge"
+            );
+            set.apply(&changes);
+            set.painted(0);
+            // Scrolling text whose motion climbs the screen: every move or
+            // reopen stays on the grid.
+            for step in 1..=24 {
+                let moved = rect(
+                    near_corner.x - step * BLOCK,
+                    near_corner.y - step * BLOCK,
+                    640,
+                    160,
+                );
+                let changes = plan(&set, moved);
+                for change in &changes {
+                    match change {
+                        SurfaceChange::Move { dest, .. } => {
+                            assert!(on_the_grid(*dest, bounds), "move to {dest:?} in {bounds:?}");
+                            assert!(contains(*dest, moved));
+                        }
+                        SurfaceChange::Open(slot) => {
+                            assert!(on_the_grid(slot.dest, bounds), "open {:?}", slot.dest);
+                        }
+                        SurfaceChange::Close(_) => {}
+                    }
+                }
+                set.apply(&changes);
+                set.painted(0);
+            }
+        }
     }
 
     #[test]

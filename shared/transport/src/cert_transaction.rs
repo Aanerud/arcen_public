@@ -31,6 +31,143 @@ pub const MANAGED_FILES: [&str; 5] = [
     "host.generated-by-arcen",
 ];
 
+/// The journal recording an in-flight publication, beside the material.
+pub const JOURNAL_FILE: &str = ".arcen-cert.transaction";
+
+/// The longest run of digits on either side of a transaction id's `-`.
+const MAX_TRANSACTION_ID_PART: usize = 20;
+
+/// A transaction id for the process `process_id` starting at
+/// `epoch_secs`: `<pid>-<seconds>`, the form `new-host-cert.sh` writes.
+#[must_use]
+pub fn transaction_id(process_id: u32, epoch_secs: u64) -> String {
+    format!("{process_id}-{epoch_secs}")
+}
+
+/// Whether `value` is a transaction id: one to twenty ASCII digits, `-`, one
+/// to twenty ASCII digits, and nothing else.
+///
+/// The id becomes part of a backup's file name, so anything that could name
+/// another directory (`/`, `\`, `..`), end a string early (NUL) or grow
+/// without bound is refused rather than joined into a path.
+#[must_use]
+pub fn is_transaction_id(value: &str) -> bool {
+    let part = |digits: &str| {
+        (1..=MAX_TRANSACTION_ID_PART).contains(&digits.len())
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    value
+        .split_once('-')
+        .is_some_and(|(process, seconds)| part(process) && part(seconds))
+}
+
+/// The name of the backup `transaction_id` takes of managed file `name`.
+///
+/// Every adapter, and `new-host-cert.sh`, uses this one spelling: a
+/// recovery run by a different tool than the one that was interrupted must
+/// find the backups. Only ids [`is_transaction_id`] accepts reach here: the
+/// writers make them with [`transaction_id`], and [`TransactionJournal::parse`]
+/// refuses any other.
+#[must_use]
+pub fn backup_file_name(transaction_id: &str, name: &str) -> String {
+    format!(".arcen-cert.backup.{transaction_id}.{name}")
+}
+
+/// One step of publishing replacement material, in the order a host takes
+/// them. The native adapter performs each step with its own file system
+/// calls; the order and the set of files are decided here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationStep {
+    /// Write every replacement to a staging file beside its target and check
+    /// the staged certificate against the staged or kept key. Nothing the
+    /// host serves has changed yet, so a malformed replacement stops here.
+    StageAndVerify,
+    /// Record the journal before any managed file moves, so an interrupted
+    /// run always has a record of what to restore.
+    WriteJournal(TransactionPhase),
+    /// Move or copy one existing managed file aside.
+    BackUp(&'static str),
+    /// Rename one staged file over its target.
+    Publish(&'static str),
+    /// Check the published pair matches before committing; on failure the
+    /// host rolls back from the backups.
+    VerifyPublished,
+    /// Remove the backups taken for this transaction.
+    DiscardBackups,
+    /// Remove the journal: the transaction is over.
+    ClearJournal,
+}
+
+/// The publication of one issue: which managed files change, and the order
+/// of the steps that change them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationPlan {
+    replace_key: bool,
+    existed: [bool; MANAGED_FILES.len()],
+}
+
+impl PublicationPlan {
+    /// A plan that replaces the key only when `replace_key`; `existed` is
+    /// which [`MANAGED_FILES`] are present before it starts.
+    ///
+    /// A renewal keeps the key file exactly as it is: it is neither staged,
+    /// backed up nor published, so its bytes, owner and mode never change.
+    #[must_use]
+    pub const fn new(replace_key: bool, existed: [bool; MANAGED_FILES.len()]) -> Self {
+        Self {
+            replace_key,
+            existed,
+        }
+    }
+
+    /// Whether managed file `name` is published by this plan.
+    #[must_use]
+    pub fn publishes(&self, name: &str) -> bool {
+        MANAGED_FILES.contains(&name) && (self.replace_key || name != MANAGED_FILES[0])
+    }
+
+    /// Whether managed file `name` was present before the plan started.
+    #[must_use]
+    pub fn existed_before(&self, name: &str) -> bool {
+        MANAGED_FILES
+            .iter()
+            .position(|managed| *managed == name)
+            .is_some_and(|index| self.existed[index])
+    }
+
+    /// The journal this plan records in `phase`.
+    #[must_use]
+    pub fn journal(&self, transaction_id: &str, phase: TransactionPhase) -> TransactionJournal {
+        TransactionJournal::new(transaction_id, phase, self.existed)
+    }
+
+    /// Every step, in order.
+    #[must_use]
+    pub fn steps(&self) -> Vec<PublicationStep> {
+        let mut steps = vec![
+            PublicationStep::StageAndVerify,
+            PublicationStep::WriteJournal(TransactionPhase::Prepared),
+        ];
+        for (index, name) in MANAGED_FILES.iter().enumerate() {
+            if self.existed[index] && self.publishes(name) {
+                steps.push(PublicationStep::BackUp(name));
+            }
+        }
+        for name in MANAGED_FILES {
+            if self.publishes(name) {
+                steps.push(PublicationStep::Publish(name));
+            }
+        }
+        steps.extend([
+            PublicationStep::VerifyPublished,
+            PublicationStep::WriteJournal(TransactionPhase::Committed),
+            PublicationStep::DiscardBackups,
+            PublicationStep::ClearJournal,
+        ]);
+        steps
+    }
+}
+
 /// How far a transaction had got before it stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionPhase {
@@ -95,6 +232,9 @@ pub enum FileRecovery {
 pub enum JournalError {
     /// The journal did not name a transaction.
     MissingTransactionId,
+    /// The transaction id is not `<digits>-<digits>`: it could name a path
+    /// outside the certificate directory.
+    InvalidTransactionId,
     /// The journal did not record a phase.
     MissingPhase,
     /// The phase was not one this version understands.
@@ -114,6 +254,7 @@ impl JournalError {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MissingTransactionId => "missing_transaction_id",
+            Self::InvalidTransactionId => "invalid_transaction_id",
             Self::MissingPhase => "missing_phase",
             Self::UnknownPhase => "unknown_phase",
             Self::IncompleteFileRecord => "incomplete_file_record",
@@ -223,6 +364,9 @@ impl TransactionJournal {
         if transaction_id.is_empty() {
             return Err(JournalError::MissingTransactionId);
         }
+        if !is_transaction_id(&transaction_id) {
+            return Err(JournalError::InvalidTransactionId);
+        }
         let phase = phase.ok_or(JournalError::MissingPhase)?;
         let mut resolved = [false; MANAGED_FILES.len()];
         for (index, value) in existed.iter().enumerate() {
@@ -276,7 +420,246 @@ impl TransactionJournal {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+
+    /// A directory in memory, driven through a [`PublicationPlan`] the way
+    /// a host adapter drives its file system, with a crash after any step.
+    struct Directory {
+        files: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl Directory {
+        fn with(names: &[&str], tag: &str) -> Self {
+            Self {
+                files: names
+                    .iter()
+                    .map(|name| ((*name).to_owned(), format!("{tag}:{name}").into_bytes()))
+                    .collect(),
+            }
+        }
+
+        fn staging(name: &str) -> String {
+            format!(".{name}.staging")
+        }
+
+        /// Runs the first `limit` steps of `plan`, then stops as a crash would.
+        fn publish(&mut self, plan: PublicationPlan, id: &str, limit: usize) {
+            for step in plan.steps().into_iter().take(limit) {
+                match step {
+                    PublicationStep::StageAndVerify => {
+                        for name in MANAGED_FILES {
+                            if plan.publishes(name) {
+                                self.files.insert(
+                                    Self::staging(name),
+                                    format!("new:{name}").into_bytes(),
+                                );
+                            }
+                        }
+                    }
+                    PublicationStep::WriteJournal(phase) => {
+                        self.files.insert(
+                            JOURNAL_FILE.to_owned(),
+                            plan.journal(id, phase).render().into_bytes(),
+                        );
+                    }
+                    PublicationStep::BackUp(name) => {
+                        let bytes = self.files.remove(name).expect("backed-up file exists");
+                        self.files.insert(backup_file_name(id, name), bytes);
+                    }
+                    PublicationStep::Publish(name) => {
+                        let bytes = self
+                            .files
+                            .remove(&Self::staging(name))
+                            .expect("staged file exists");
+                        self.files.insert(name.to_owned(), bytes);
+                    }
+                    PublicationStep::VerifyPublished => {}
+                    PublicationStep::DiscardBackups => {
+                        self.files
+                            .retain(|name, _| !name.starts_with(".arcen-cert.backup."));
+                    }
+                    PublicationStep::ClearJournal => {
+                        self.files.remove(JOURNAL_FILE);
+                    }
+                }
+            }
+        }
+
+        /// What every host does at its next start.
+        fn recover(&mut self) {
+            if let Some(text) = self.files.remove(JOURNAL_FILE) {
+                let journal = TransactionJournal::parse(std::str::from_utf8(&text).expect("utf8"))
+                    .expect("journal");
+                for name in MANAGED_FILES {
+                    let backup = backup_file_name(journal.transaction_id(), name);
+                    let decision = journal
+                        .recover_file(
+                            name,
+                            FileBefore {
+                                existed: self.files.contains_key(name),
+                                backup_present: self.files.contains_key(&backup),
+                            },
+                        )
+                        .expect("decision");
+                    match decision {
+                        FileRecovery::RequirePublished | FileRecovery::RequireUntouched => {
+                            assert!(self.files.contains_key(name), "{name} must be present");
+                        }
+                        FileRecovery::RestoreBackup => {
+                            let bytes = self.files.remove(&backup).expect("backup");
+                            self.files.insert(name.to_owned(), bytes);
+                        }
+                        FileRecovery::RemoveFile => {
+                            self.files.remove(name);
+                        }
+                    }
+                    self.files.remove(&backup);
+                }
+            }
+            for name in MANAGED_FILES {
+                self.files.remove(&Self::staging(name));
+            }
+        }
+    }
+
+    #[test]
+    fn a_crash_after_any_step_recovers_to_the_old_or_the_new_material_whole() {
+        for replace_key in [false, true] {
+            for first_install in [false, true] {
+                if first_install && !replace_key {
+                    continue;
+                }
+                let existed = [!first_install; MANAGED_FILES.len()];
+                let plan = PublicationPlan::new(replace_key, existed);
+                let steps = plan.steps();
+                let committed_at = steps
+                    .iter()
+                    .position(|step| {
+                        *step == PublicationStep::WriteJournal(TransactionPhase::Committed)
+                    })
+                    .expect("commit step");
+                let before = if first_install {
+                    Directory::with(&[], "old")
+                } else {
+                    Directory::with(&MANAGED_FILES, "old")
+                };
+                let mut after = Directory::with(&MANAGED_FILES, "new");
+                if !replace_key {
+                    after
+                        .files
+                        .insert("host.key".to_owned(), b"old:host.key".to_vec());
+                }
+                for limit in 0..=steps.len() {
+                    let mut directory = Directory {
+                        files: before.files.clone(),
+                    };
+                    directory.publish(plan, "77-1800000000", limit);
+                    directory.recover();
+                    let expected = if limit > committed_at {
+                        &after
+                    } else {
+                        &before
+                    };
+                    assert_eq!(
+                        directory.files, expected.files,
+                        "replace_key={replace_key} first_install={first_install}: \
+                         crash after {limit} steps"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_renewal_never_touches_the_key_file() {
+        let plan = PublicationPlan::new(false, [true; MANAGED_FILES.len()]);
+        assert!(!plan.publishes("host.key"));
+        assert!(plan.steps().iter().all(|step| !matches!(
+            step,
+            PublicationStep::BackUp("host.key") | PublicationStep::Publish("host.key")
+        )));
+        assert!(plan.publishes("host.crt"));
+    }
+
+    #[test]
+    fn the_journal_is_written_before_anything_moves_and_the_key_moves_first() {
+        let plan = PublicationPlan::new(true, [true; MANAGED_FILES.len()]);
+        let steps = plan.steps();
+        assert_eq!(steps[0], PublicationStep::StageAndVerify);
+        assert_eq!(
+            steps[1],
+            PublicationStep::WriteJournal(TransactionPhase::Prepared)
+        );
+        assert_eq!(steps[2], PublicationStep::BackUp("host.key"));
+        let first_publish = steps
+            .iter()
+            .position(|step| matches!(step, PublicationStep::Publish(_)))
+            .expect("publish");
+        assert_eq!(steps[first_publish], PublicationStep::Publish("host.key"));
+        assert!(
+            steps[..first_publish]
+                .iter()
+                .all(|step| !matches!(step, PublicationStep::Publish(_)))
+        );
+        assert_eq!(steps.last(), Some(&PublicationStep::ClearJournal));
+    }
+
+    #[test]
+    fn a_transaction_id_that_could_name_a_path_is_refused() {
+        use std::fmt::Write as _;
+
+        let journal_with = |id: &str| {
+            let mut text = format!("transaction={id}\nphase=prepared\n");
+            for name in MANAGED_FILES {
+                let _ = writeln!(text, "existed.{name}=1");
+            }
+            TransactionJournal::parse(&text)
+        };
+        let overlong = format!("{}-1", "9".repeat(MAX_TRANSACTION_ID_PART + 1));
+        for hostile in [
+            "1-2/../../etc",
+            "../1-2",
+            "1/2-3",
+            "1-2\\..\\x",
+            "..",
+            "1-..",
+            "1-2\0",
+            "1\u{0}-2",
+            "-1",
+            "1-",
+            "1-2-3",
+            "a-1",
+            "１-2",
+            overlong.as_str(),
+        ] {
+            assert_eq!(
+                journal_with(hostile),
+                Err(JournalError::InvalidTransactionId),
+                "{hostile:?}"
+            );
+        }
+        let longest = format!(
+            "{}-{}",
+            "4".repeat(MAX_TRANSACTION_ID_PART),
+            "2".repeat(MAX_TRANSACTION_ID_PART)
+        );
+        for valid in ["4242-1800000000", "1-0", longest.as_str()] {
+            assert!(journal_with(valid).is_ok(), "{valid}");
+        }
+        assert!(is_transaction_id(&transaction_id(u32::MAX, u64::MAX)));
+    }
+
+    #[test]
+    fn backup_names_match_the_linux_helper() {
+        // `new-host-cert.sh` writes `$TLS_DIRECTORY/.arcen-cert.backup.$transaction.$name`.
+        assert_eq!(
+            backup_file_name("4242-1800000000", "host.key"),
+            ".arcen-cert.backup.4242-1800000000.host.key"
+        );
+        assert_eq!(JOURNAL_FILE, ".arcen-cert.transaction");
+    }
 
     fn journal(phase: TransactionPhase, existed: bool) -> TransactionJournal {
         TransactionJournal::new("4242-1800000000", phase, [existed; MANAGED_FILES.len()])

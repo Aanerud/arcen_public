@@ -276,12 +276,20 @@ pub(crate) async fn start(
             );
             return Err(ConsoleRefusal::SignInFailed);
         }
-        if let Some(session) = super::console::read_sessions().await.into_iter().find(|s| {
-            s.uid == identity.uid
-                && s.is_console_desktop()
-                && s.origin() == model::ConsoleOrigin::Arcen
-                && s.active
-        }) {
+        // Waiting for the session to appear: an unreadable logind proves
+        // nothing either way, and is asked again on the next poll.
+        let started = super::console::read_sessions()
+            .await
+            .ok()
+            .and_then(|sessions| {
+                sessions.into_iter().find(|s| {
+                    s.uid == identity.uid
+                        && s.is_console_desktop()
+                        && s.origin() == model::ConsoleOrigin::Arcen
+                        && s.active
+                })
+            });
+        if let Some(session) = started {
             tracing::info!(
                 target: target::SESSION,
                 session_id = %session.id,

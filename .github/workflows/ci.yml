@@ -105,6 +105,10 @@ jobs:
         run: cargo clippy --locked -p arcen-deck-core -p arcen-identity -p arcen-input -p arcen-media -p arcen-observability -p arcen-outputs -p arcen-protocol -p arcen-session -p arcen-telemetry -p arcen-transport -p arcen-usb-bridge -p arcen-cp-ipc -p arcen-keel -- -D warnings
       - name: Test optional QUIC adapter
         run: cargo test --locked -p arcen-transport --features quic
+      - name: Test and lint the optional certificate issuer
+        run: |
+          cargo test --locked -p arcen-transport --features issuer
+          cargo clippy --locked -p arcen-transport --features issuer -- -D warnings
       - name: Test and lint the Deck core with every feature
         run: |
           cargo test --locked -p arcen-deck-core --features runtime,egui,wgpu-presenter

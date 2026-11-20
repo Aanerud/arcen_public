@@ -64,6 +64,9 @@ assembly and encodes three to four times slower. Run
   would do: the frame pump waits for room (`FrameQueue::wait_for_room`,
   bounded by `ROOM_WAIT`) so capenc slows instead of breaking the prediction
   chain. Drop-and-IDR is only for a link that stays blocked past the bound.
+  A canvas record waits for room however long the path stalls (shared
+  `OutboundVideoRecord::room_wait`, `FrameQueue::enqueue_with_backpressure`):
+  a dropped one costs a new canvas generation.
 - Every session runs on the shared isolated QUIC lanes (ADR 0014,
   `arcen_transport::quic::session_lanes`): one task per role in
   `net/lane_workers.rs`. Audio has its own lane and writer and never falls
@@ -94,6 +97,44 @@ assembly and encodes three to four times slower. Run
   a bridged device by name, VID or a wider tag, never start a bridge before
   `usb_bridge::seat::x11_isolation` proves every running X server keeps it
   out, and never tell a user to sign out for it.
+- A joined console's X server (ADR 0025) is not one Arcen configures, and
+  every X server on `seat0` would add the session's uinput devices. On a
+  joined console each device is admitted only while the shared proof
+  (`arcen_input::joined_input`) holds over the facts `input/joined_devices.rs`
+  reads, through the gate every injection passes (`uinput.rs` `GatedDevice`);
+  `net/joined_input.rs` proves them before the hello (an unproved keyboard or
+  pointer refuses the attachment, an unproved pen is released), again as soon
+  as the watch starts and then every two seconds, and the session's place in
+  front every 250 ms; every injection also checks that the session's own
+  terminal is in front, and a Deck's Ctrl+Alt+F-key (an X server's terminal
+  switch) is not passed on. A lapse shuts the gate at once (nothing is
+  written, not even releases; key state changes only once written); the
+  shared `JoinedInputGuard` decides when held input is released and input
+  resumes, or the attachment ends; a withdrawn pen's device is destroyed.
+  Never inject on a joined console around the gate. Who may read a device
+  is the shared `classify_reader`; Linux reads only the facts (each
+  reader's uid, its login from the root-owned `user-<uid>.slice` and
+  `session-<id>.scope` levels of its cgroup, its namespaces, whether its
+  descriptors were readable). A reader is matched by the device number
+  (`st_rdev`, `statx` with `AT_STATX_DONT_SYNC` through
+  `/proc/<pid>/fd/<n>`) of what it holds, never by path: a bind-mounted,
+  hard-linked or second `mknod` node is the same device, and path text
+  alone (a `/dev/input/…` file in a user's own namespace) never counts. A
+  descriptor is a reader only when its `fdinfo` (read first) and the
+  `statx` describe the same open file (inode and mount) and it is not
+  `O_PATH`; one that disagrees in three reads is an unstable handle (an
+  `O_PATH` handle, which needs no read permission, swapped in a loop),
+  not a reader, so an account that cannot read the node cannot stop the
+  session with it. Below kernel 5.14 (no `ino` in `fdinfo`) such a handle
+  could still stop it (fail closed). Root, the `input` group and `uaccess` ACL
+  holders can still read the devices unseen (`SCM_RIGHTS` in flight,
+  io_uring fixed files, a thread's own descriptor table) and can stop a
+  joined session by holding a node; the proof is against other sessions
+  and display servers, not the host's administrators. System services (`acpid`, `thd`, `gpm`,
+  `brltty`) and the joined session's own processes are allowed and logged
+  once per attachment; another session, a login screen, another display
+  server, another account and a known input bridge are not. Never widen
+  this by process name.
 - Never emit `KEY_SYSRQ` from a kernel virtual keyboard
   (`input/keymap.rs::kernel_safe_key`), the committed-text path included
   (`input/x11_text.rs::CoreKeymap::evdev` never yields it, whatever the
@@ -137,6 +178,19 @@ assembly and encodes three to four times slower. Run
   reports. The desktop's bridge class therefore sets `RawSample` 1
   (`bridge_seat::XORG_BRIDGE_RAW_SAMPLE`); keep it, and keep `Suppress` at
   the driver's default.
+- A joined console (ADR 0025) never takes the raw bridge: its X server is
+  not one Arcen starts. It takes the host-decoded route
+  (`net/joined_pen.rs`): the Pier reads the pen with the shared reader
+  (`HidPublishPolicy::Nothing`) and posts it through the session's typed
+  uinput pen, which is kept, not released. The route is offered only while
+  the shared `joined_pen` proof holds over the facts
+  `input/joined_devices.rs` reads (the joined X server, found by its
+  listening `/tmp/.X11-unix` socket, has the event node open; no node is
+  open in another session, display server, account or input bridge, as
+  `classify_reader` judges it; the session is logind's active one), and the
+  proof is repeated every two seconds; a gap ends Native tablet without
+  another event. Never relabel a joined console as an X11 desktop, edit or
+  restart its X server, or weaken the ignore classes to admit the raw bridge.
 - Prove pen changes with a real tablet or a real browser, not only the
   emulated Intuos5; read `BTN_STYLUS*` before blaming timing ("pen but no
   ink" is usually a held side switch).
@@ -424,7 +478,24 @@ free VT, starts a console-seat X server (`XorgSeat::Console`) and the user's
 X session entry through `Xsession`, and lives until the user logs out. The
 console path joins it like any console session. Never tie its lifetime to
 a connection or to the Pier's process tree, and never authenticate with
-`arcen-login` (its stack denies `auth`).
+`arcen-login` (its stack denies `auth`). Only a complete read of logind's
+sessions proves the account has none (`console::read_sessions` returns a
+shared `console_session::SessionRead`): never turn a `loginctl` failure,
+timeout or partial answer into an empty list; decide with the `*_read`
+decisions, which refuse `console_sessions_unreadable`. Likewise one
+unanswered `show-session` is not a logout: a joined launcher watches its
+session through `console::watch_joined` (shared
+`console_session::session_watch`), never through `session_fact(..).is_none()`.
+
+The account's own GNOME Wayland console session is joined, never
+replaced (ADR 0025 section 9, S4b): the console agent's `--wayland-join`
+mode (`session/wayland/join.rs`) runs as the account on the session's own
+user bus and re-checks the proven compositor before it uses the bus; it
+starts no bus, compositor or PipeWire and never changes the session's
+monitors. Every decision (outputs, desk privacy, the proved route, lock,
+departure) is shared `console_session::wayland_attach`; keep the launcher's
+`run_wayland_join` an adapter. A joined Wayland session is never held for a
+resume.
 
 A seated desktop is local to polkit (it never reads logind's `Remote`), so
 Arcen's rule `05-arcen-remote-session.rules` (shared

@@ -4,7 +4,8 @@
 //!
 //! WASAPI shared-mode render through cpal (the macOS Deck's audio library)
 //! with the shared playout policy (`arcen_media::audio::playback_queue`),
-//! following the default device; and microphone capture behind
+//! following the default device (`arcen_deck_core::runtime::audio_output`);
+//! and microphone capture behind
 //! `arcen_deck_core::DeckServices::start_microphone`. Both device threads
 //! join MMCSS "Pro Audio" on their first callback.
 

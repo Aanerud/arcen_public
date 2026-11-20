@@ -407,6 +407,25 @@
             "linux-console-session-lab"
           ],
           "owner": "Linux Host"
+        },
+        {
+          "id": "linux-console-wayland-target",
+          "entry_points": [
+            "hosts/linux/src/session/console_wayland.rs",
+            "hosts/linux/src/session/lifecycle.rs",
+            "hosts/linux/src/session/launcher.rs",
+            "hosts/linux/src/session/wayland/join.rs",
+            "hosts/linux/src/session/agent.rs"
+          ],
+          "build_profiles": [
+            "linux-pier",
+            "linux-pier-wayland-provider"
+          ],
+          "validation": [
+            "linux-pier-test",
+            "linux-pier-wayland-provider-test"
+          ],
+          "owner": "Linux Host"
         }
       ]
     },

@@ -41,7 +41,7 @@ mod lab {
         CapturedMicrophoneFrame, MicrophoneCancel, MicrophoneCaptureError, MicrophoneFrameSink,
     };
     use arcen_deck_windows::audio::microphone::microphone_privacy;
-    use arcen_deck_windows::audio::output::WindowsAudioOutput;
+    use arcen_deck_windows::audio::output::{WasapiOutput, WindowsAudioOutput};
     use arcen_deck_windows::clipboard::{WindowsClipboard, encode_clipboard_utf16};
     use arcen_deck_windows::platform::WindowsDeckServices;
     use arcen_protocol::messages::ClipboardContentKind;
@@ -417,7 +417,7 @@ mod lab {
             let (peak, _) = loopback_report(&loopback, "listen");
             return i32::from(peak == 0);
         }
-        let output = match WindowsAudioOutput::start() {
+        let output = match WindowsAudioOutput::start(WasapiOutput::default) {
             Ok(output) => output,
             Err(error) => {
                 println!("output=FAIL {error}");
@@ -426,8 +426,8 @@ mod lab {
         };
         println!(
             "output_device={} output_format={} backend={}",
-            output.device_name(),
-            output.device_format(),
+            output.status().device,
+            output.status().format,
             arcen_deck_windows::audio::output::BACKEND
         );
         // 440 Hz at -12 dBFS, fed in 20 ms frames like the audio lane.
@@ -456,7 +456,7 @@ mod lab {
             snapshot.underruns,
             snapshot.trim_events,
             snapshot.phase(),
-            output.device_changes()
+            output.status().rebuilds
         );
         let (peak, rms) = loopback_report(&loopback, "tone");
         drop(output);
@@ -497,7 +497,7 @@ mod lab {
     /// Plays a 440 Hz tone through the Deck output until `stop`.
     fn play_tone_until(stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let Ok(output) = WindowsAudioOutput::start() else {
+            let Ok(output) = WindowsAudioOutput::start(WasapiOutput::default) else {
                 return;
             };
             let started = Instant::now();

@@ -1172,6 +1172,7 @@ mod tests {
                 .map(|(connector, placed)| mutter::DisplayMonitor {
                     connector: connector.clone(),
                     remote: true,
+                    virtual_monitor: true,
                     current: Some((
                         "mode".to_owned(),
                         placed.request.width(),

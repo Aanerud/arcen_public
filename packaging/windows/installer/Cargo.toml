@@ -16,13 +16,26 @@ path = "src/main.rs"
 
 [dependencies]
 arcen-session.workspace = true
-arcen-transport = { workspace = true, default-features = false }
-rcgen = "=0.14.8"
+# `issuer`: the shared certificate issuer every Pier uses.
+arcen-transport = { workspace = true, default-features = false, features = ["issuer"] }
 serde_json.workspace = true
-# Only for the certificate validity window. Already in the graph via rcgen,
-# whose CertificateParams::not_before/not_after are time::OffsetDateTime and
-# which does not re-export the type.
+zeroize.workspace = true
+# The clock the provisioning decision reads. Already in the graph through
+# the shared issuer (rcgen).
 time = "=0.3.45"
+
+[target.'cfg(windows)'.dependencies]
+# Creates the TLS directories and staged key files with their protected DACL
+# in the creating call, reads directory owners and checks final paths.
+windows-sys = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# Builds the certificates earlier installers issued, for adoption tests.
+rcgen = "=0.14.8"
 
 [lints]
 workspace = true

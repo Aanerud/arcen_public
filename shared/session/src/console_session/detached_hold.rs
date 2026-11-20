@@ -18,7 +18,7 @@
 //! product starts a desktop of its own, or the person at the desk unlocks
 //! the session or signs in.
 
-use super::{ConsoleSessionFact, other_product_desktops, other_product_started};
+use super::{ConsoleSessionFact, SessionRead, other_product_desktops, other_product_started};
 
 /// What happens to a desktop when its Deck has left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +126,22 @@ impl DetachedHold {
         }
     }
 
+    /// [`Self::new`] from a read of logind's sessions: an unreadable one is
+    /// no baseline (the first complete look that lists the joined session
+    /// becomes it).
+    #[must_use]
+    pub fn from_read(joined: &str, guest: bool, read: &SessionRead) -> Self {
+        Self {
+            joined: joined.to_owned(),
+            guest,
+            before: read
+                .as_ref()
+                .ok()
+                .and_then(|sessions| Baseline::of(sessions, joined)),
+            given_back: false,
+        }
+    }
+
     /// Whether [`Self::observe`] needs to know if another product's client
     /// is using the desktop (only a guest console's own product counts).
     #[must_use]
@@ -169,6 +185,22 @@ impl DetachedHold {
             .any(|session| !before.in_use.contains(&session.id));
         signed_in_at_desk.then_some(HoldEnd::DeskTookOver)
     }
+
+    /// [`Self::observe`] from a read of logind's sessions: an unreadable
+    /// one concludes nothing from sessions (only a guest console's own
+    /// product's client still ends the hold).
+    pub fn observe_read(
+        &mut self,
+        read: &SessionRead,
+        another_products_client: bool,
+    ) -> Option<HoldEnd> {
+        match read {
+            Ok(sessions) => self.observe(sessions, another_products_client),
+            Err(_) => {
+                (self.guest && another_products_client).then_some(HoldEnd::OtherProductClient)
+            }
+        }
+    }
 }
 
 /// Console desktops other than `joined` in front and unlocked.
@@ -208,6 +240,7 @@ mod tests {
             service: "gdm-password".to_owned(),
             locked,
             leader: 0,
+            desktop: String::new(),
         }
     }
 

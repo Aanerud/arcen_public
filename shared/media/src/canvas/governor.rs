@@ -131,6 +131,7 @@ pub struct CanvasFlow {
     optional: VecDeque<u64>,
     unprocessed_bytes: u64,
     acked_fence: u64,
+    sent_fence: u64,
 }
 
 impl CanvasFlow {
@@ -142,6 +143,7 @@ impl CanvasFlow {
                 ..Self::default()
             };
         }
+        self.sent_fence = self.sent_fence.max(fence);
         if optional && fence > self.acked_fence {
             self.optional.push_back(fence);
         }
@@ -149,9 +151,12 @@ impl CanvasFlow {
 
     /// A `canvas_ack`: frames up to `fence` are presented and the Deck
     /// holds `unprocessed_bytes`. An acknowledgement of another generation
-    /// is ignored.
+    /// is stale and ignored, and so is one of a fence this generation has
+    /// not sent: it belongs to an earlier loop's generation of the same
+    /// number (a capture restarted for a new size starts again at 1), and
+    /// taking it would open the window for every frame up to that fence.
     pub fn ack(&mut self, generation: u32, fence: u64, unprocessed_bytes: u64) {
-        if generation != self.generation {
+        if generation != self.generation || fence > self.sent_fence {
             return;
         }
         self.acked_fence = self.acked_fence.max(fence);
@@ -1086,6 +1091,53 @@ mod tests {
             }),
             Some(1)
         );
+    }
+
+    /// A stale acknowledgement opens no window: one of an older
+    /// generation, or one of a fence this generation has not sent (an
+    /// earlier loop's generation of the same number, after a capture
+    /// restarted for a new size), changes neither the unacknowledged
+    /// frames nor the Deck's unapplied bytes.
+    #[test]
+    fn a_stale_acknowledgement_opens_no_window() {
+        let mut governor = governor();
+        let demand = video(1, 1.0, SurfaceScale::Full, 100);
+        let mut fence = 0_u64;
+        let mut send = |governor: &mut CanvasGovernor| {
+            let (grants, _) = governor.allocate(std::slice::from_ref(&demand));
+            let optional = !grants[0].surfaces.is_empty();
+            fence += 1;
+            governor.complete(&[TickOutcome {
+                monitor_id: 1,
+                generation: 1,
+                fence,
+                carried_optional: optional,
+                measured: Vec::new(),
+            }]);
+            optional
+        };
+        assert!(send(&mut governor));
+        assert!(send(&mut governor));
+        assert!(!send(&mut governor), "the window is full");
+        let ack = |generation, fence, unprocessed_bytes| CanvasControlMsg::CanvasAck {
+            monitor_id: 1,
+            generation,
+            fence,
+            unprocessed_bytes,
+            decode_ms_p95: 3,
+        };
+        for stale in [ack(1, 500, 0), ack(7, 3, 0), ack(0, 3, 0)] {
+            assert_eq!(governor.on_control(&stale), None);
+            assert_eq!(
+                governor.flow(1).map(CanvasFlow::unacked_optional),
+                Some(2),
+                "{stale:?}"
+            );
+            assert!(!send(&mut governor), "{stale:?} opened the window");
+        }
+        // The real acknowledgement of what was sent opens it.
+        assert_eq!(governor.on_control(&ack(1, 2, 0)), None);
+        assert!(send(&mut governor));
     }
 
     #[test]

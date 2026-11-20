@@ -111,6 +111,10 @@ fn main() {
     }
 }
 
+/// Reparse-point, owner and creation-time ACL guards for the TLS paths.
+#[cfg(windows)]
+mod secure_fs;
+
 #[cfg(windows)]
 mod imp {
     use std::ffi::OsStr;
@@ -119,14 +123,18 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    use arcen_transport::cert_issuance::{
+        HostKey, IssuanceProfile, IssuedMaterial, IssuerKey, issue,
+    };
     use arcen_transport::cert_provisioning::{
         MaterialState, ProvisioningAction, ProvisioningRefusal, ProvisioningRequest, plan,
     };
-    use arcen_transport::cert_store::{self, InspectContext, MaterialPaths, PinFiles};
-    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
-    use time::{Duration, OffsetDateTime};
+    use arcen_transport::cert_publication::{self, Publication, PublicationFiles, Slot};
+    use arcen_transport::cert_store::{self, InspectContext, MaterialPaths};
+    use arcen_transport::cert_transaction::{JOURNAL_FILE, transaction_id};
+    use time::OffsetDateTime;
 
-    use crate::acl::{AclClass, OWNER_SID, assert_acl_sddl, unexpected_trustees};
+    use crate::acl::{AclClass, assert_acl_sddl};
     use crate::diagnosis::is_tls_failure;
     use crate::scm_state::{ScmState, parse_state};
     use crate::service_outcome::{ServiceOutcome, finish_install};
@@ -160,9 +168,6 @@ mod imp {
     const SOURCE_OFFER: &str = "Arcen is free software under the GNU AGPL-3.0. It comes with ABSOLUTELY NO WARRANTY. \
          You may redistribute it under the terms of that licence. If you run a modified version \
          that others connect to over a network, you must offer them its corresponding source.";
-    /// Lifetime of a self-signed Pier certificate, in days: the shared
-    /// figure every Pier and `hosts/windows/scripts/new-host-cert.ps1` use.
-    const CERTIFICATE_VALIDITY_DAYS: i64 = cert_store::VALIDITY_DAYS;
     const DEFAULT_CONFIG: &str = include_str!("../../pier.json");
     const EVENTLOG_SOURCE_SCRIPT: &str = include_str!("../../host/eventlog-source.ps1");
     /// Shipped with the binary rather than kept only in the repository, so a
@@ -201,6 +206,11 @@ mod imp {
         /// Take ownership of a certificate an earlier installer left without
         /// an ownership marker, keeping its key so paired Decks still trust it.
         adopt_legacy: bool,
+        /// Reissue the TLS certificate over the existing key now (`--renew`).
+        renew: bool,
+        /// Only provision the TLS material (`--tls-only`): what
+        /// `new-host-cert.ps1` runs, without installing or touching the service.
+        tls_only: bool,
         service_name: String,
         /// Extra names or addresses to place in the generated TLS certificate.
         ///
@@ -215,16 +225,15 @@ mod imp {
         fn parse() -> Result<Self, String> {
             let mut opts = Self {
                 prefix: PathBuf::from(r"C:\Program Files\Arcen\Pier"),
-                programdata: std::env::var_os("ProgramData")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                    .join("Arcen"),
+                programdata: default_programdata(),
                 dry_run: false,
                 uninstall: false,
                 purge: false,
                 version: false,
                 force: false,
                 adopt_legacy: false,
+                renew: false,
+                tls_only: false,
                 service_name: SERVICE_NAME.to_string(),
                 extra_sans: Vec::new(),
             };
@@ -245,6 +254,8 @@ mod imp {
                     "--version" => opts.version = true,
                     "--force" => opts.force = true,
                     "--adopt-legacy" => opts.adopt_legacy = true,
+                    "--renew" => opts.renew = true,
+                    "--tls-only" => opts.tls_only = true,
                     "--verbose" | "-v" => {
                         VERBOSE.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -279,17 +290,22 @@ mod imp {
             if opts.adopt_legacy && opts.uninstall {
                 return Err("--adopt-legacy applies to an install, not --uninstall".to_owned());
             }
+            if opts.renew && opts.force {
+                return Err(
+                    "--renew keeps the existing key and --force replaces it; pass one of them"
+                        .to_owned(),
+                );
+            }
+            if opts.tls_only && opts.uninstall {
+                return Err("--tls-only provisions TLS material; it cannot uninstall".to_owned());
+            }
             Ok(opts)
         }
 
         fn staging(&self) -> bool {
             self.service_name != SERVICE_NAME
                 || self.prefix != PathBuf::from(r"C:\Program Files\Arcen\Pier")
-                || self.programdata
-                    != std::env::var_os("ProgramData")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                        .join("Arcen")
+                || self.programdata != default_programdata()
         }
     }
 
@@ -306,6 +322,8 @@ mod imp {
         }
         if opts.uninstall {
             uninstall(&opts)
+        } else if opts.tls_only {
+            install_tls_only(&opts)
         } else {
             install(&opts)
         }
@@ -315,9 +333,16 @@ mod imp {
         println!(
             "USAGE: install-arcen-pier [--prefix <dir>] [--programdata <dir>] [--dry-run]\n\
              \x20                        [--uninstall] [--purge] [--version]\n\
-             \x20                        [--force | --adopt-legacy] [--verbose]\n\
-             \x20                        [--service-name <name>] [--extra-san <name-or-ip>]\n\
+             \x20                        [--force | --adopt-legacy | --renew] [--tls-only]\n\
+             \x20                        [--verbose] [--service-name <name>]\n\
+             \x20                        [--extra-san <name-or-ip>]\n\
              \n\
+             --tls-only   Only create, keep or renew the TLS material in\n\
+             \x20            <programdata>\\tls; install nothing else and leave the\n\
+             \x20            service alone (what new-host-cert.ps1 runs). Reload a\n\
+             \x20            running Pier after a change: sc.exe control ArcenPier 202\n\
+             --renew      Reissue the TLS certificate over the existing key now. Paired\n\
+             \x20            Decks keep trusting the host.\n\
              --adopt-legacy  Not needed any more: a self-signed key pair an older Arcen\n\
              \x20            install left behind is taken over automatically, keeping the\n\
              \x20            key so paired Decks keep trusting the host. Accepted so\n\
@@ -430,26 +455,14 @@ mod imp {
         // Crash-recovery journals (time zone, display) live here. Nothing
         // created it, so time-zone redirection failed on every session.
         let recovery = opts.programdata.join("recovery");
-        for dir in [
-            &opts.prefix,
-            &opts.programdata,
-            &logs,
-            &sessions,
-            &runtime,
-            &tls,
-            &rollback,
-            &recovery,
-        ] {
-            create_dir(opts, dir)?;
-        }
         // The Arcen root carries a protected DACL with exactly two entries,
         // SYSTEM and Administrators. Sub-directories the session agent must
         // write, such as runtime, carry their own explicit grant and remain
         // reachable because Windows gives Everyone bypass-traverse-checking by
-        // default.
-        apply_secret_dir_acl(opts, &opts.programdata)?;
-        for dir in [&logs, &sessions, &rollback, &recovery] {
-            apply_secret_dir_acl(opts, dir)?;
+        // default. Each is created with its DACL, or accepted only when it
+        // belongs to SYSTEM or Administrators, and never through a link.
+        for dir in [&opts.programdata, &logs, &sessions, &rollback, &recovery] {
+            secure_directory(opts, dir, AclClass::SecretDirectory)?;
         }
         // The install prefix holds arcen-pier.exe and, below,
         // arcen_credential_provider.dll — the DLL registered under
@@ -468,14 +481,12 @@ mod imp {
         // AclClass::PublicDirectory and its helper existed and were unit-tested
         // but were called from nowhere, so the protection was designed and then
         // never applied.
-        apply_public_dir_acl(opts, &opts.prefix)?;
+        secure_directory(opts, &opts.prefix, AclClass::PublicDirectory)?;
         // The per-session agent writes the display-recovery journal here under
         // the user's unelevated token. Treating it as secret made every session
         // fail with "create display recovery journal ...: Access is denied".
-        apply_acl(opts, &runtime, AclClass::AgentWritableDirectory)?;
-        for dir in [&tls] {
-            apply_secret_dir_acl(opts, dir)?;
-        }
+        secure_directory(opts, &runtime, AclClass::AgentWritableDirectory)?;
+        secure_directory(opts, &tls, AclClass::SecretDirectory)?;
         let pier_path = opts.prefix.join("arcen-pier.exe");
         atomic_write(opts, &pier_path, PIER_BYTES, true)?;
         let config = opts.programdata.join("pier.json");
@@ -1156,31 +1167,37 @@ mod imp {
         )
     }
 
-    /// Certificate parameters for a self-signed Pier certificate.
+    /// The certificate (and, for a new key, the key) this install publishes.
     ///
-    /// Separate from `ensure_tls` so the validity window can be asserted
-    /// without touching the filesystem.
-    fn certificate_params(names: Vec<String>) -> Result<CertificateParams, String> {
-        let mut params =
-            CertificateParams::new(names).map_err(|e| format!("create cert params: {e}"))?;
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        // Without an explicit window rcgen applies its own defaults, which are
-        // 1975-01-01 to 4096-01-01. A Pier certificate that never expires is
-        // not cosmetic here: the trust anchor is a user-approved pin with no
-        // revocation channel, so expiry is the only event that would ever force
-        // a Deck to re-verify a host. It also left the whole certificate-expiry
-        // apparatus — CertificateTimePolicy, days_remaining, the
-        // TlsCertificateExpiring lifecycle event and the documented
-        // --tls-expiry-warning-days knob — permanently inert on Windows.
-        //
-        // The five-minute backdate matches the PowerShell helper and absorbs
-        // clock skew between Pier and Deck; the Deck rejects a not-yet-valid
-        // certificate outright.
-        let now = OffsetDateTime::now_utc();
-        params.not_before = now - Duration::minutes(5);
-        params.not_after = now + Duration::days(CERTIFICATE_VALIDITY_DAYS);
-        Ok(params)
+    /// What to issue is shared with every Pier: the profile, the names a
+    /// renewal keeps (every name the existing certificate covers, then
+    /// `names`), and the key. A renewal or adoption reissues over the key on
+    /// disk, SEC1 or PKCS #8, without rewriting it, so every SPKI-pinned Deck
+    /// keeps trusting the host; generating unconditionally would silently
+    /// break them at the moment the host renewed itself. Separate from
+    /// `ensure_tls` so it can be tested without the file system or ACLs.
+    fn issue_tls(
+        action: ProvisioningAction,
+        names: &[String],
+        existing_certificate: Option<&[u8]>,
+        existing_key: Option<&[u8]>,
+        now_epoch_secs: u64,
+    ) -> Result<IssuedMaterial, String> {
+        let profile =
+            IssuanceProfile::for_action(action, names, existing_certificate, now_epoch_secs)
+                .map_err(|error| format!("TLS certificate profile: {error}"))?;
+        if IssuanceProfile::preserves_key(action) {
+            let key = existing_key
+                .ok_or_else(|| "the existing TLS key is missing".to_string())
+                .and_then(|pem| {
+                    HostKey::from_pem(pem)
+                        .map_err(|error| format!("reuse existing TLS key: {error}"))
+                })?;
+            issue(&profile, IssuerKey::Existing(&key))
+        } else {
+            issue(&profile, IssuerKey::Generate)
+        }
+        .map_err(|error| format!("issue TLS certificate: {error}"))
     }
 
     /// Reads the TLS directory into the shared provisioning input.
@@ -1195,7 +1212,10 @@ mod imp {
             &MaterialPaths::in_directory(tls),
             now,
             InspectContext {
-                stale_staging_present: false,
+                stale_staging_present: MaterialPaths::in_directory(tls)
+                    .managed()
+                    .iter()
+                    .any(|path| tls_staging(path).exists()),
                 machine_sans: Some(&machine_sans),
             },
         )
@@ -1207,37 +1227,143 @@ mod imp {
         })
     }
 
-    /// Writes the pin files and ownership marker beside the certificate.
-    /// Pins the certificate just issued. It is taken from memory, not read
-    /// back from `host.crt`, so `--dry-run` (which writes nothing) never
-    /// reads a file it did not write.
-    fn write_pins_and_marker(
-        opts: &Options,
-        tls: &Path,
-        certificate_pem: &[u8],
-    ) -> Result<(), String> {
-        let pins = PinFiles::for_certificate(certificate_pem)?;
-        for (path, contents) in pins.files(&MaterialPaths::in_directory(tls)) {
-            atomic_write(opts, path, contents.as_bytes(), false)?;
+    /// Creates `dir` with the DACL of `class` from the start, or accepts an
+    /// existing one only when it belongs to SYSTEM or Administrators, then
+    /// applies the class's ACL. No component of the path may be a reparse
+    /// point, before or after it is created: an ACL applied through a
+    /// junction would protect someone else's folder, and a key written there
+    /// would be theirs to read.
+    fn secure_directory(opts: &Options, dir: &Path, class: AclClass) -> Result<(), String> {
+        crate::secure_fs::refuse_reparse_chain(dir)?;
+        if opts.dry_run {
+            println!(
+                "dry-run: create or check {} {}",
+                class.label(),
+                dir.display()
+            );
+            return Ok(());
+        }
+        if let Some(parent) = dir.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("create {}: {error}", parent.display()))?;
+            }
+        }
+        crate::secure_fs::create_protected_dir(dir, class.sddl())?;
+        let directory = crate::secure_fs::Pinned::directory(dir)?;
+        directory.require_trusted_owner()?;
+        directory.set_security(class.sddl())?;
+        drop(directory);
+        verify_acl(opts, dir, class)
+    }
+
+    /// Provisions only the TLS material: the restricted `ProgramData` and TLS
+    /// directories, then [`ensure_tls`]. The service is not touched; a
+    /// running Pier serves a change after `sc.exe control ArcenPier 202`.
+    fn install_tls_only(opts: &Options) -> Result<(), String> {
+        let tls = opts.programdata.join("tls");
+        let restricted = tls_only_restricted_dirs(opts);
+        if !restricted.contains(&opts.programdata) {
+            // An operator's own folder above `tls`: made if missing, never
+            // re-permissioned, but still free of links.
+            crate::secure_fs::refuse_reparse_chain(&opts.programdata)?;
+            create_dir(opts, &opts.programdata)?;
+        }
+        for dir in restricted {
+            secure_directory(opts, &dir, AclClass::SecretDirectory)?;
+        }
+        ensure_tls(opts, &tls)?;
+        verify_acl(opts, &tls.join("host.key"), AclClass::SecretFile)?;
+        if !opts.dry_run {
+            let paths = MaterialPaths::in_directory(&tls);
+            for path in [&paths.certificate_pin, &paths.spki_pin] {
+                if let Ok(text) = fs::read_to_string(path) {
+                    println!("{}: {}", path.display(), text.trim_end());
+                }
+            }
+            println!(
+                "Reload a running Pier to serve it: sc.exe control {} 202",
+                opts.service_name
+            );
         }
         Ok(())
+    }
+
+    /// The directories `--tls-only` restricts. The parent of an operator's
+    /// own TLS directory (`new-host-cert.ps1 -OutputRoot D:\certs\tls`) is
+    /// theirs and keeps its ACL; only Arcen's own `ProgramData` root is locked
+    /// down with it.
+    fn tls_only_restricted_dirs(opts: &Options) -> Vec<PathBuf> {
+        let tls = opts.programdata.join("tls");
+        if opts.programdata == default_programdata() {
+            vec![opts.programdata.clone(), tls]
+        } else {
+            vec![tls]
+        }
+    }
+
+    /// The earlier PowerShell helper journalled differently and may have
+    /// moved the pinned pair aside; judging the directory then would make a
+    /// new key. An operator restores it by hand first.
+    fn refuse_legacy_helper_journal(tls: &Path) -> Result<(), String> {
+        let legacy = tls.join(LEGACY_HELPER_JOURNAL);
+        if legacy.exists() {
+            return Err(format!(
+                "{} records an interrupted run of the earlier new-host-cert.ps1; restore \
+                 host.key and host.crt from the .backup files it names, delete it, and \
+                 re-run",
+                legacy.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// `--force` means "replace the key too", which is what lets an operator
+    /// change the names the certificate covers after installation. Without
+    /// it, existing material is kept or renewed, never silently replaced.
+    fn tls_request(opts: &Options) -> ProvisioningRequest {
+        if opts.force {
+            ProvisioningRequest::Rekey
+        } else if opts.adopt_legacy {
+            ProvisioningRequest::AdoptLegacy
+        } else if opts.renew {
+            ProvisioningRequest::Renew
+        } else {
+            ProvisioningRequest::Ensure
+        }
     }
 
     fn ensure_tls(opts: &Options, tls: &Path) -> Result<(), String> {
         let cert = tls.join("host.crt");
         let key = tls.join("host.key");
-        // `--force` means "replace the key too", which is what lets an operator
-        // change the names the certificate covers after installation. Without
-        // it, existing material is kept or renewed, never silently replaced.
-        let request = if opts.force {
-            ProvisioningRequest::Rekey
-        } else if opts.adopt_legacy {
-            ProvisioningRequest::AdoptLegacy
+        crate::secure_fs::refuse_reparse_chain(tls)?;
+        // Held to the end: neither `tls` nor any folder above it can be
+        // renamed or replaced while the key is written into it.
+        let _directory = if opts.dry_run {
+            None
         } else {
-            ProvisioningRequest::Ensure
+            let directory = crate::secure_fs::Pinned::directory(tls)?;
+            directory.require_trusted_owner()?;
+            Some(directory)
         };
+        // One run at a time, from recovery to commit; a dry run reads only.
+        let _lock = if opts.dry_run {
+            None
+        } else {
+            Some(TlsLock::acquire(tls)?)
+        };
+        refuse_legacy_helper_journal(tls)?;
+        if !opts.dry_run {
+            // Finish or undo an interrupted transaction before judging what
+            // is here.
+            if let Some(transaction) = cert_publication::recover(&mut WindowsFiles::new(opts, tls))
+                .map_err(|error| error.to_string())?
+            {
+                println!("recovered interrupted TLS transaction {transaction}");
+            }
+        }
         let state = inspect_tls(tls)?;
-        let decided = plan(request, state).map_err(|refusal| {
+        let decided = plan(tls_request(opts), state).map_err(|refusal| {
             let hint = if refusal == ProvisioningRefusal::ForeignMaterial {
                 format!(
                     "\n  To keep this key so paired Decks still trust the host, re-run with \
@@ -1250,6 +1376,9 @@ mod imp {
             };
             format!("{}: {}{hint}", refusal.as_str(), refusal.guidance())
         })?;
+        if decided.clear_stale_staging && !opts.dry_run {
+            WindowsFiles::new(opts, tls).discard_staging()?;
+        }
 
         match decided.action {
             ProvisioningAction::KeepExisting => {
@@ -1278,55 +1407,326 @@ mod imp {
 
         let mut names = subject_alt_names();
         // Operator-supplied names last, so a duplicate of something discovered
-        // locally does not appear twice; rcgen would emit both.
+        // locally does not appear twice.
         for extra in &opts.extra_sans {
             if !names.iter().any(|existing| existing == extra) {
                 names.push(extra.clone());
             }
         }
-        println!("TLS certificate covers: {}", names.join(", "));
-        let params = certificate_params(names)?;
-
-        // Whether the key survives is the whole difference between renewal and
-        // rekey. Generating unconditionally here would make "reissuing over the
-        // existing key" a lie and silently break every SPKI-pinned Deck at the
-        // moment the host renewed itself — the least convenient moment to
-        // discover it.
-        let preserve_key = matches!(
-            decided.action,
-            ProvisioningAction::RenewPreservingKey | ProvisioningAction::AdoptAndRenew
-        );
-        let keypair = if preserve_key {
-            let existing = std::fs::read_to_string(&key)
-                .map_err(|e| format!("read existing TLS key {}: {e}", key.display()))?;
-            KeyPair::from_pem(&existing)
-                .map_err(|e| format!("reuse existing TLS key {}: {e}", key.display()))?
+        let preserve_key = IssuanceProfile::preserves_key(decided.action);
+        let existing_certificate = std::fs::read(&cert).ok();
+        let existing_key = if preserve_key {
+            Some(
+                std::fs::read(&key)
+                    .map_err(|e| format!("read existing TLS key {}: {e}", key.display()))?,
+            )
         } else {
-            KeyPair::generate().map_err(|e| format!("generate TLS key: {e}"))?
+            None
         };
-        let certificate = params
-            .self_signed(&keypair)
-            .map_err(|e| format!("self-sign TLS cert: {e}"))?;
-        let certificate_pem = certificate.pem();
-        atomic_write(opts, &cert, certificate_pem.as_bytes(), false)?;
-        // Rewriting an unchanged key would churn its ACL and mtime for no
-        // reason, and a failure there would destroy material that was fine.
-        if preserve_key {
-            // A kept key still gets the secret-file ACL: an adopted key from an
-            // older install, or one restored by hand, may carry inherited access.
-            apply_secret_file_acl(opts, &key)?;
-        } else {
-            atomic_write_with_acl(
-                opts,
-                &key,
-                keypair.serialize_pem().as_bytes(),
-                false,
-                AclClass::SecretFile,
-            )?;
+        let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+        let issued = issue_tls(
+            decided.action,
+            &names,
+            existing_certificate.as_deref(),
+            existing_key.as_deref(),
+            now,
+        )?;
+        let covered = arcen_transport::cert_marker::subject_alt_names_from_pem(
+            issued.certificate_pem.as_bytes(),
+        )
+        .unwrap_or_default();
+        println!("TLS certificate covers: {}", covered.join(", "));
+        if opts.dry_run {
+            println!(
+                "dry-run: publish the TLS {} in {}",
+                if issued.new_key_pem.is_some() {
+                    "certificate, key, pins and marker"
+                } else {
+                    "certificate, pins and marker over the existing key"
+                },
+                tls.display()
+            );
+            return Ok(());
         }
-        // The marker is what stops a later run replacing material an operator
-        // installed themselves, and the pins are what they compare against.
-        write_pins_and_marker(opts, tls, certificate_pem.as_bytes())
+        // The key is untouched by a renewal; a kept key still gets the
+        // secret-file ACL, since an adopted key from an older install, or one
+        // restored by hand, may carry inherited access.
+        publish_tls(&mut WindowsFiles::new(opts, tls), &issued, now, usize::MAX)?;
+        apply_secret_file_acl(opts, &key)
+    }
+
+    /// Publishes `issued` through `files` by the shared transaction. `limit`
+    /// stops after that many steps, as a crash would; production passes
+    /// `usize::MAX`.
+    fn publish_tls(
+        files: &mut WindowsFiles<'_>,
+        issued: &IssuedMaterial,
+        now: u64,
+        limit: usize,
+    ) -> Result<(), String> {
+        cert_publication::publish(
+            files,
+            &Publication::from(issued),
+            &transaction_id(std::process::id(), now),
+            limit,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// The lock file every certificate transaction holds, beside the journal.
+    const LOCK_FILE: &str = ".arcen-cert.lock";
+
+    /// The journal the earlier PowerShell helper wrote; the shared
+    /// transaction cannot recover it.
+    const LEGACY_HELPER_JOURNAL: &str = "host-cert.transaction.json";
+
+    /// `%ProgramData%\Arcen`, the installer's own data root.
+    fn default_programdata() -> PathBuf {
+        std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .join("Arcen")
+    }
+
+    /// An exclusive hold on `<tls>\.arcen-cert.lock` for the whole
+    /// transaction: the file is opened without sharing, so a second
+    /// installer or helper run cannot open it until this one ends.
+    struct TlsLock {
+        _file: fs::File,
+    }
+
+    impl TlsLock {
+        fn acquire(tls: &Path) -> Result<Self, String> {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            /// `FILE_FLAG_OPEN_REPARSE_POINT`: open a link itself, not its target.
+            const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            /// `ERROR_SHARING_VIOLATION`.
+            const SHARING_VIOLATION: i32 = 32;
+
+            let path = tls.join(LOCK_FILE);
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .custom_flags(OPEN_REPARSE_POINT)
+                .open(&path)
+                .map_err(|error| {
+                    if error.raw_os_error() == Some(SHARING_VIOLATION) {
+                        "another host-certificate transaction is active".to_owned()
+                    } else {
+                        format!("open {}: {error}", path.display())
+                    }
+                })?;
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(format!("unsafe TLS transaction lock {}", path.display()));
+            }
+            crate::secure_fs::verify_in_directory(&file, &canonical_tls_directory(tls)?)?;
+            Ok(Self { _file: file })
+        }
+    }
+
+    /// `tls` as an absolute path, written as given rather than resolved,
+    /// once no component of it is a link; what every file opened in it is
+    /// checked against.
+    fn canonical_tls_directory(tls: &Path) -> Result<PathBuf, String> {
+        crate::secure_fs::refuse_reparse_chain(tls)?;
+        crate::secure_fs::lexical(tls)
+    }
+
+    /// Where a replacement for `target` is staged.
+    fn tls_staging(target: &Path) -> PathBuf {
+        let name = target
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("material");
+        target.with_file_name(format!(".{name}.staging"))
+    }
+
+    /// The Windows file operations behind the shared transaction. A staged
+    /// file is created with its DACL (SYSTEM and Administrators only for the
+    /// key) in the call that creates it, in the directory it was meant for,
+    /// and a backup is the file itself moved aside: `MoveFileEx` keeps its
+    /// DACL and is atomic.
+    struct WindowsFiles<'a> {
+        opts: &'a Options,
+        paths: MaterialPaths,
+        /// The TLS directory's final path, or why it could not be proven.
+        canonical: Result<PathBuf, String>,
+        /// Apply the final ACL after creation; off only in tests of the
+        /// transaction itself (files are still created protected).
+        protect: bool,
+    }
+
+    impl<'a> WindowsFiles<'a> {
+        fn new(opts: &'a Options, tls: &Path) -> Self {
+            Self {
+                opts,
+                paths: MaterialPaths::in_directory(tls),
+                canonical: canonical_tls_directory(tls),
+                protect: true,
+            }
+        }
+
+        fn path(&self, name: &str) -> Result<PathBuf, String> {
+            arcen_transport::cert_transaction::MANAGED_FILES
+                .iter()
+                .position(|managed| *managed == name)
+                .map(|index| self.paths.managed()[index].clone())
+                .ok_or_else(|| format!("unmanaged file {name}"))
+        }
+
+        fn in_directory(&self, name: &str) -> Result<PathBuf, String> {
+            let path = self.paths.directory.join(name);
+            if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                return Err(format!("refusing reparse point {}", path.display()));
+            }
+            Ok(path)
+        }
+
+        /// Writes the new file `path` with the DACL of `class` from creation.
+        fn write_new(&self, path: &Path, bytes: &[u8], class: AclClass) -> Result<(), String> {
+            let directory = self.canonical.as_ref().map_err(Clone::clone)?;
+            remove_if_present(path)?;
+            crate::secure_fs::write_new_protected(path, bytes, class.sddl(), directory)
+        }
+
+        fn protect(&self, path: &Path, secret: bool) -> Result<(), String> {
+            if !self.protect {
+                return Ok(());
+            }
+            apply_acl(
+                self.opts,
+                path,
+                if secret {
+                    AclClass::SecretFile
+                } else {
+                    AclClass::PublicFile
+                },
+            )
+        }
+    }
+
+    fn is_regular_file(path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    }
+
+    fn remove_if_present(path: &Path) -> Result<(), String> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove {}: {error}", path.display())),
+        }
+    }
+
+    fn read_regular(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+        if !is_regular_file(path) {
+            return Err(format!(
+                "{} is missing or not a regular file",
+                path.display()
+            ));
+        }
+        fs::read(path)
+            .map(zeroize::Zeroizing::new)
+            .map_err(|error| format!("read {}: {error}", path.display()))
+    }
+
+    fn move_file(from: &Path, to: &Path) -> Result<(), String> {
+        fs::rename(from, to)
+            .map_err(|error| format!("move {} to {}: {error}", from.display(), to.display()))
+    }
+
+    impl PublicationFiles for WindowsFiles<'_> {
+        type Error = String;
+
+        fn stage(&mut self, name: &'static str, bytes: &[u8], secret: bool) -> Result<(), String> {
+            let staged = tls_staging(&self.path(name)?);
+            // Never readable by anyone else, even before its ACL is applied.
+            let class = if secret {
+                AclClass::SecretFile
+            } else {
+                AclClass::PublicFile
+            };
+            self.write_new(&staged, bytes, class)?;
+            self.protect(&staged, secret)
+        }
+
+        fn read(
+            &mut self,
+            name: &'static str,
+            slot: Slot,
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+            let path = self.path(name)?;
+            match slot {
+                Slot::Published => read_regular(&path),
+                Slot::Staged => read_regular(&tls_staging(&path)),
+            }
+        }
+
+        fn exists(&mut self, name: &'static str) -> Result<bool, String> {
+            Ok(is_regular_file(&self.path(name)?))
+        }
+
+        fn back_up(&mut self, name: &'static str, backup: &str) -> Result<(), String> {
+            let backup = self.in_directory(backup)?;
+            move_file(&self.path(name)?, &backup)
+        }
+
+        fn backup_exists(&mut self, backup: &str) -> Result<bool, String> {
+            Ok(is_regular_file(&self.in_directory(backup)?))
+        }
+
+        fn publish(&mut self, name: &'static str, secret: bool) -> Result<(), String> {
+            let path = self.path(name)?;
+            move_file(&tls_staging(&path), &path)?;
+            self.protect(&path, secret)
+        }
+
+        fn restore(&mut self, name: &'static str, backup: &str) -> Result<(), String> {
+            let backup = self.in_directory(backup)?;
+            move_file(&backup, &self.path(name)?)
+        }
+
+        fn remove(&mut self, name: &'static str) -> Result<(), String> {
+            remove_if_present(&self.path(name)?)
+        }
+
+        fn remove_backup(&mut self, backup: &str) -> Result<(), String> {
+            remove_if_present(&self.in_directory(backup)?)
+        }
+
+        fn discard_staging(&mut self) -> Result<(), String> {
+            for path in self.paths.managed() {
+                remove_if_present(&tls_staging(path))?;
+            }
+            Ok(())
+        }
+
+        fn write_journal(&mut self, text: &str) -> Result<(), String> {
+            let journal = self.in_directory(JOURNAL_FILE)?;
+            let staged = tls_staging(&journal);
+            self.write_new(&staged, text.as_bytes(), AclClass::SecretFile)?;
+            move_file(&staged, &journal)
+        }
+
+        fn read_journal(&mut self) -> Result<Option<String>, String> {
+            let journal = self.in_directory(JOURNAL_FILE)?;
+            if !is_regular_file(&journal) {
+                return Ok(None);
+            }
+            String::from_utf8(read_regular(&journal)?.to_vec())
+                .map(Some)
+                .map_err(|_| "certificate journal is not text".to_owned())
+        }
+
+        fn remove_journal(&mut self) -> Result<(), String> {
+            remove_if_present(&self.in_directory(JOURNAL_FILE)?)
+        }
     }
 
     /// A directory whose contents users must read and execute but never write.
@@ -1336,18 +1736,16 @@ mod imp {
     /// replaceable by a non-administrator, and a file DACL alone does not
     /// achieve that — `FILE_DELETE_CHILD` on the directory would still allow
     /// delete-and-replace.
-    fn apply_public_dir_acl(opts: &Options, path: &Path) -> Result<(), String> {
-        apply_acl(opts, path, AclClass::PublicDirectory)
-    }
-
-    fn apply_secret_dir_acl(opts: &Options, path: &Path) -> Result<(), String> {
-        apply_acl(opts, path, AclClass::SecretDirectory)
-    }
-
     fn apply_secret_file_acl(opts: &Options, path: &Path) -> Result<(), String> {
         apply_acl(opts, path, AclClass::SecretFile)
     }
 
+    /// Sets the owner (Administrators) and the protected DACL of
+    /// `acl_class` on `path` through a handle to the object itself: never
+    /// a link's target, and only once the object is proven to be at `path`.
+    /// The DACL is replaced whole, so no trustee the class does not grant
+    /// can remain (an Explorer "you don't currently have permission" grant,
+    /// an earlier installer's broad grant).
     fn apply_acl(opts: &Options, path: &Path, acl_class: AclClass) -> Result<(), String> {
         detail!(
             "applying {} SDDL to {}: {}",
@@ -1355,80 +1753,22 @@ mod imp {
             path.display(),
             acl_class.sddl()
         );
-        // `/inheritance:r` and `/grant:r` go in one invocation on purpose.
-        // Issued separately, the first strips every inherited ACE and leaves an
-        // empty DACL that nobody can read, and the second restores access. Any
-        // interruption between them — a killed process, a failing icacls, a
-        // reboot — leaves the file permanently unreadable. Combining them means
-        // the file is never observable without a DACL.
-        // Ownership first, and by SID for the same localization reason as the
-        // grants. Installed service paths require the owner to be SYSTEM or
-        // Administrators; a directory this installer created is otherwise owned
-        // by whoever ran it, so the service installs cleanly and then refuses
-        // to start with `directory_chain_invalid`.
-        //
-        // `hosts/windows/INSTALL.md` has always done this. The binary did not,
-        // which is the third place these two install paths had drifted apart.
-        run_or_print(
-            opts,
-            Command::new("icacls")
-                .arg(path)
-                .args(["/setowner", OWNER_SID]),
-        )?;
-        let mut reset = Command::new("icacls");
-        reset.arg(path).arg("/inheritance:r").arg("/grant:r");
-        for grant in acl_class.grants() {
-            reset.arg(grant);
-        }
-        run_or_print(opts, &mut reset)?;
-        let revoked = acl_class.revoked_grants();
-        if !revoked.is_empty() {
-            // `/grant:r` replaces only ACEs for trustees named above. Remove
-            // stale broad trustees after the required grants are in place, so
-            // upgrades remain readable throughout and converge on one exact
-            // ACL. This repairs paths that moved between the original manual
-            // AU grant and the first binary installer's BU grant.
-            let mut remove = Command::new("icacls");
-            remove.arg(path).arg("/remove:g");
-            for trustee in revoked {
-                remove.arg(trustee);
-            }
-            run_or_print(opts, &mut remove)?;
-        }
-        remove_unexpected_trustees(opts, path, acl_class)?;
-        verify_acl(opts, path, acl_class)
-    }
-
-    /// Removes every trustee the class does not allow.
-    ///
-    /// `/grant:r` only replaces the trustees it names. Opening a protected
-    /// folder in Explorer and accepting "You don't currently have permission"
-    /// adds the signed-in user with full control, and the installer then
-    /// refused to run until someone repaired the ACL by hand.
-    fn remove_unexpected_trustees(
-        opts: &Options,
-        path: &Path,
-        acl_class: AclClass,
-    ) -> Result<(), String> {
         if opts.dry_run {
+            println!(
+                "dry-run: apply the {} ACL to {}",
+                acl_class.label(),
+                path.display()
+            );
             return Ok(());
         }
-        let sddl = read_sddl(path)?;
-        let extra = unexpected_trustees(&sddl, acl_class)?;
-        if extra.is_empty() {
-            return Ok(());
-        }
-        println!(
-            "removing access this installer does not grant from {}: {}",
-            path.display(),
-            extra.join(", ")
-        );
-        let mut remove = Command::new("icacls");
-        remove.arg(path).arg("/remove");
-        for sid in &extra {
-            remove.arg(format!("*{sid}"));
-        }
-        run_or_print(opts, &mut remove)
+        let object = if acl_class.is_directory() {
+            crate::secure_fs::Pinned::directory(path)?
+        } else {
+            crate::secure_fs::Pinned::file(path)?
+        };
+        object.set_security(acl_class.sddl())?;
+        drop(object);
+        verify_acl(opts, path, acl_class)
     }
 
     fn verify_acl(opts: &Options, path: &Path, acl_class: AclClass) -> Result<(), String> {
@@ -1879,8 +2219,11 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use arcen_transport::cert_provisioning::MaterialOwnership;
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
 
         use super::*;
+
+        const NOW: u64 = 1_800_000_000;
 
         #[test]
         fn the_installer_ships_the_whole_licence_set() {
@@ -1924,6 +2267,8 @@ mod imp {
                 version: false,
                 force: false,
                 adopt_legacy: false,
+                renew: false,
+                tls_only: false,
                 service_name: SERVICE_NAME.to_string(),
                 extra_sans: Vec::new(),
             };
@@ -1980,6 +2325,8 @@ mod imp {
                 version: false,
                 force: false,
                 adopt_legacy: false,
+                renew: false,
+                tls_only: false,
                 service_name: SERVICE_NAME.to_string(),
                 extra_sans: Vec::new(),
             };
@@ -2017,6 +2364,8 @@ mod imp {
                 version: false,
                 force: false,
                 adopt_legacy: false,
+                renew: false,
+                tls_only: false,
                 service_name: SERVICE_NAME.to_string(),
                 extra_sans: Vec::new(),
             };
@@ -2064,6 +2413,8 @@ mod imp {
                 version: false,
                 force: false,
                 adopt_legacy: false,
+                renew: false,
+                tls_only: false,
                 service_name: SERVICE_NAME.to_string(),
                 extra_sans: Vec::new(),
             };
@@ -2112,6 +2463,8 @@ mod imp {
                 version: false,
                 force: false,
                 adopt_legacy: false,
+                renew: false,
+                tls_only: false,
                 service_name: "invalid\0service".to_string(),
                 extra_sans: Vec::new(),
             };
@@ -2163,8 +2516,15 @@ mod imp {
             ));
             let tls = root.join("tls");
             fs::create_dir_all(&tls).expect("create tls dir");
+            // What earlier installers issued: rcgen's default subject,
+            // digitalSignature, serverAuth, an 825-day window.
             let key = KeyPair::generate().expect("key");
-            let params = certificate_params(subject_alt_names()).expect("params");
+            let mut params = CertificateParams::new(subject_alt_names()).expect("params");
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            let now = OffsetDateTime::now_utc();
+            params.not_before = now - time::Duration::minutes(5);
+            params.not_after = now + time::Duration::days(cert_store::VALIDITY_DAYS);
             let certificate = params.self_signed(&key).expect("cert");
             fs::write(tls.join("host.crt"), certificate.pem()).expect("write cert");
             fs::write(tls.join("host.key"), key.serialize_pem()).expect("write key");
@@ -2199,49 +2559,530 @@ mod imp {
             );
         }
 
+        /// The SEC1 file `openssl ecparam -genkey -noout` writes for a ring
+        /// PKCS #8 P-256 key: the same key, as operator tooling holds it.
+        fn sec1_from_ring_pkcs8(pkcs8_pem: &str) -> String {
+            fn element(input: &[u8]) -> (&[u8], &[u8]) {
+                let (length, header) = if input[1] < 0x80 {
+                    (usize::from(input[1]), 2)
+                } else {
+                    let count = usize::from(input[1] & 0x7f);
+                    let length = input[2..2 + count]
+                        .iter()
+                        .fold(0_usize, |length, byte| (length << 8) | usize::from(*byte));
+                    (length, 2 + count)
+                };
+                (&input[header..header + length], &input[header + length..])
+            }
+            fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
+                let mut encoded = vec![tag, u8::try_from(contents.len()).expect("short")];
+                encoded.extend_from_slice(contents);
+                encoded
+            }
+            let body: String = pkcs8_pem
+                .lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect();
+            let pkcs8 = arcen_transport::cert_marker::base64_decode(&body).expect("base64");
+            let (info, _) = element(&pkcs8);
+            let (_, rest) = element(info);
+            let (_, rest) = element(rest);
+            let (inner, _) = element(rest);
+            let (ec_private_key, _) = element(inner);
+            let (version, rest) = element(ec_private_key);
+            let (private, rest) = element(rest);
+            let (public, _) = element(rest);
+            let prime256v1 = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+            let mut sequence = der(0x02, version);
+            sequence.extend(der(0x04, private));
+            sequence.extend(der(0xa0, &prime256v1));
+            sequence.extend(der(0xa1, public));
+            let label = ["EC", "PRIVATE", "KEY"].join(" ");
+            let encoded = arcen_transport::cert_marker::base64_encode(&der(0x30, &sequence));
+            let lines: Vec<&str> = encoded
+                .as_bytes()
+                .chunks(64)
+                .map(|line| std::str::from_utf8(line).expect("base64"))
+                .collect();
+            format!(
+                "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+                lines.join("\n")
+            )
+        }
+
         #[test]
-        fn generated_certificates_expire() {
+        fn generated_certificates_are_the_shared_profile_and_expire() {
             // rcgen's defaults are 1975-01-01 to 4096-01-01. Shipping those
             // produced a Pier certificate that never expired, and because the
             // trust anchor is a user-approved pin with no revocation channel,
             // nothing else would ever have forced re-verification.
-            let params =
-                certificate_params(vec!["pier.example.internal".to_string()]).expect("params");
-            let now = OffsetDateTime::now_utc();
+            let issued = issue_tls(
+                ProvisioningAction::CreateNew,
+                &["pier.example.internal".to_string()],
+                None,
+                None,
+                NOW,
+            )
+            .expect("issued");
+            let key = HostKey::from_pem(issued.new_key_pem.as_ref().expect("key").as_bytes())
+                .expect("key");
+            let profile =
+                IssuanceProfile::new(&["pier.example.internal".to_string()], NOW).expect("p");
+            // CN=Arcen Pier, critical CA:FALSE and digitalSignature (the
+            // Deck's leaf policy rejects a key usage without it), serverAuth.
+            profile
+                .verify_issued(issued.certificate_pem.as_bytes(), key.spki_sha256())
+                .expect("shared profile");
+            let validity =
+                arcen_transport::cert_marker::validity_from_pem(issued.certificate_pem.as_bytes())
+                    .expect("validity");
+            assert_eq!(validity.not_before, profile.not_before_epoch_secs());
+            assert_eq!(
+                validity.not_after - validity.not_before,
+                cert_store::VALIDITY_DAYS * 86_400 + 300
+            );
+        }
 
-            assert!(
-                params.not_before <= now,
-                "certificate must already be valid, got {}",
-                params.not_before
-            );
-            assert!(
-                params.not_before > now - Duration::hours(1),
-                "backdate is for clock skew, not history, got {}",
-                params.not_before
-            );
+        fn tls_test_root(name: &str) -> PathBuf {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let root = std::env::temp_dir().join(format!(
+                "arcen-windows-installer-tls-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(root.join("tls")).expect("tls dir");
+            root
+        }
 
-            let lifetime = params.not_after - params.not_before;
+        fn tls_options(root: &Path) -> Options {
+            Options {
+                prefix: root.join("prefix"),
+                programdata: root.to_path_buf(),
+                dry_run: false,
+                uninstall: false,
+                purge: false,
+                version: false,
+                force: false,
+                adopt_legacy: false,
+                renew: false,
+                tls_only: false,
+                service_name: SERVICE_NAME.to_string(),
+                extra_sans: Vec::new(),
+            }
+        }
+
+        fn unprotected<'a>(opts: &'a Options, tls: &Path) -> WindowsFiles<'a> {
+            let mut files = WindowsFiles::new(opts, tls);
+            files.protect = false;
+            files
+        }
+
+        /// Every file in the TLS directory but the lock and inert staging.
+        fn tls_snapshot(tls: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+            fs::read_dir(tls)
+                .expect("read tls")
+                .map(|entry| entry.expect("entry"))
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name != LOCK_FILE && !name.ends_with(".staging")
+                })
+                .map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        fs::read(entry.path()).expect("read"),
+                    )
+                })
+                .collect()
+        }
+
+        /// An owned pair in `tls`, as an earlier install left it.
+        fn deploy_pair(opts: &Options, tls: &Path) {
+            let issued = issue_tls(
+                ProvisioningAction::CreateNew,
+                &["pier.example.internal".to_string()],
+                None,
+                None,
+                NOW,
+            )
+            .expect("issued");
+            publish_tls(&mut unprotected(opts, tls), &issued, NOW, usize::MAX).expect("deploy");
+        }
+
+        #[test]
+        fn a_crash_at_any_step_recovers_to_the_old_or_the_new_pair_whole() {
+            for rekey in [false, true] {
+                let mut saw = (false, false);
+                for limit in 0..=16 {
+                    let root = tls_test_root(&format!("crash-{rekey}-{limit}"));
+                    let tls = root.join("tls");
+                    let opts = tls_options(&root);
+                    deploy_pair(&opts, &tls);
+                    let before = tls_snapshot(&tls);
+                    let existing = fs::read(tls.join("host.crt")).expect("cert");
+                    let key = fs::read(tls.join("host.key")).expect("key");
+                    let issued = if rekey {
+                        issue_tls(
+                            ProvisioningAction::ReplaceKeyAndCertificate,
+                            &["pier.example.internal".to_string()],
+                            Some(&existing),
+                            None,
+                            NOW + 60,
+                        )
+                    } else {
+                        issue_tls(
+                            ProvisioningAction::RenewPreservingKey,
+                            &[],
+                            Some(&existing),
+                            Some(&key),
+                            NOW + 60,
+                        )
+                    }
+                    .expect("issued");
+                    publish_tls(&mut unprotected(&opts, &tls), &issued, NOW + 60, limit)
+                        .expect("stopped run");
+                    // The next run recovers first.
+                    cert_publication::recover(&mut unprotected(&opts, &tls)).expect("recovery");
+                    let after = tls_snapshot(&tls);
+                    let _ = fs::remove_dir_all(&root);
+                    if after == before {
+                        saw.0 = true;
+                    } else {
+                        assert_eq!(
+                            after.get("host.crt").map(Vec::as_slice),
+                            Some(issued.certificate_pem.as_bytes()),
+                            "rekey={rekey}: crash after {limit} steps left a mix"
+                        );
+                        assert_eq!(after.len(), 5, "{:?}", after.keys());
+                        if !rekey {
+                            assert_eq!(after.get("host.key"), before.get("host.key"));
+                        }
+                        saw.1 = true;
+                    }
+                }
+                assert!(saw.0 && saw.1, "rekey={rekey}");
+            }
+        }
+
+        #[test]
+        fn a_second_concurrent_run_refuses_and_changes_nothing() {
+            let root = tls_test_root("locked");
+            let tls = root.join("tls");
+            let opts = tls_options(&root);
+            deploy_pair(&opts, &tls);
+            let before = tls_snapshot(&tls);
+            let held = TlsLock::acquire(&tls).expect("first run's lock");
+            let error = ensure_tls(&opts, &tls).expect_err("busy");
             assert!(
-                lifetime <= Duration::days(CERTIFICATE_VALIDITY_DAYS + 1),
-                "certificate outlives the 825-day policy: {lifetime}"
+                error.contains("another host-certificate transaction is active"),
+                "{error}"
             );
+            assert_eq!(tls_snapshot(&tls), before);
+            drop(held);
+            assert!(TlsLock::acquire(&tls).is_ok());
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        /// Plants what a run leaves when it dies after moving the old files
+        /// aside: a prepared journal, two backups, a half-published
+        /// certificate.
+        fn plant_interrupted_transaction(tls: &Path) {
+            let id = "4242-1800000000";
+            fs::write(
+                tls.join(".arcen-cert.transaction"),
+                arcen_transport::cert_transaction::TransactionJournal::new(
+                    id,
+                    arcen_transport::cert_transaction::TransactionPhase::Prepared,
+                    [true; 5],
+                )
+                .render(),
+            )
+            .expect("journal");
+            for name in ["host.crt", "host.cert-sha256"] {
+                fs::rename(
+                    tls.join(name),
+                    tls.join(arcen_transport::cert_transaction::backup_file_name(
+                        id, name,
+                    )),
+                )
+                .expect("back up");
+            }
+            fs::write(tls.join("host.crt"), b"half written").expect("half");
+        }
+
+        #[test]
+        fn tls_only_restricts_an_operator_directory_but_not_its_parent() {
+            let custom = tls_options(Path::new(r"D:\certs"));
+            assert_eq!(
+                tls_only_restricted_dirs(&custom),
+                vec![PathBuf::from(r"D:\certs\tls")]
+            );
+            let mut own = custom;
+            own.programdata = default_programdata();
+            assert_eq!(
+                tls_only_restricted_dirs(&own),
+                vec![own.programdata.clone(), own.programdata.join("tls")]
+            );
+        }
+
+        fn run_ok(command: &mut Command) {
+            let output = command.output().expect("start");
             assert!(
-                lifetime >= Duration::days(CERTIFICATE_VALIDITY_DAYS - 1),
-                "certificate is shorter than the 825-day policy: {lifetime}"
+                output.status.success(),
+                "{command:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn junction(link: &Path, target: &Path) {
+            run_ok(
+                Command::new("cmd")
+                    .arg("/C")
+                    .arg("mklink")
+                    .arg("/J")
+                    .arg(link)
+                    .arg(target),
             );
         }
 
         #[test]
-        fn generated_certificates_are_server_auth_leaves() {
-            let params =
-                certificate_params(vec!["pier.example.internal".to_string()]).expect("params");
-            assert_eq!(
-                params.extended_key_usages,
-                vec![ExtendedKeyUsagePurpose::ServerAuth]
+        fn a_planted_junction_for_the_tls_directory_is_refused() {
+            // A user made `tls` a junction to a folder they own, so the ACL
+            // and the key would land there.
+            let root = tls_test_root("junction");
+            fs::remove_dir(root.join("tls")).expect("remove tls");
+            let theirs = root.join("theirs");
+            fs::create_dir(&theirs).expect("their folder");
+            let before = read_sddl(&theirs).expect("their ACL");
+            junction(&root.join("tls"), &theirs);
+            let outcome = install_tls_only(&tls_options(&root));
+            let planted: Vec<_> = fs::read_dir(&theirs)
+                .expect("read their folder")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect();
+            let after = read_sddl(&theirs).expect("their ACL");
+            let _ = fs::remove_dir(root.join("tls"));
+            let _ = fs::remove_dir_all(&root);
+            let error = outcome.expect_err("a junction is refused");
+            assert!(error.contains("reparse point"), "{error}");
+            assert!(
+                planted.is_empty(),
+                "written through the junction: {planted:?}"
             );
-            // The Deck's leaf policy rejects a certificate whose key usage is
-            // present but omits digitalSignature, so this is load-bearing.
-            assert_eq!(params.key_usages, vec![KeyUsagePurpose::DigitalSignature]);
+            assert_eq!(after, before, "their folder's ACL was changed");
+        }
+
+        #[test]
+        fn a_tls_directory_owned_by_another_account_is_refused() {
+            // Whoever owns the folder can change its ACL afterwards.
+            let root = tls_test_root("foreign-owner");
+            let tls = root.join("tls");
+            run_ok(
+                Command::new("icacls")
+                    .arg(&tls)
+                    .args(["/setowner", "*S-1-5-32-545"]),
+            );
+            let outcome = install_tls_only(&tls_options(&root));
+            let key_written = tls.join("host.key").exists();
+            let _ = fs::remove_dir_all(&root);
+            let error = outcome.expect_err("a foreign-owned folder is refused");
+            assert!(error.contains("is owned by S-1-5-32-545"), "{error}");
+            assert!(!key_written);
+        }
+
+        #[test]
+        fn a_staged_key_has_its_protected_dacl_from_creation() {
+            // The folder hands Everyone read access to what is created in it;
+            // the ACL step after creation is off, so only the creating call
+            // can have protected the key.
+            let root = tls_test_root("staged-dacl");
+            let tls = root.join("tls");
+            run_ok(
+                Command::new("icacls")
+                    .arg(&tls)
+                    .args(["/grant", "*S-1-1-0:(OI)(CI)(R)"]),
+            );
+            let opts = tls_options(&root);
+            let mut files = unprotected(&opts, &tls);
+            files
+                .stage("host.key", b"test key bytes", true)
+                .expect("staged");
+            let staged = tls.join(".host.key.staging");
+            let sddl = read_sddl(&staged).expect("staged ACL");
+            let _ = fs::remove_dir_all(&root);
+            assert_acl_sddl(&staged.to_string_lossy(), &sddl, AclClass::SecretFile)
+                .expect("SYSTEM and Administrators only, protected, from creation");
+        }
+
+        #[test]
+        fn a_key_left_with_an_empty_dacl_is_still_repaired() {
+            // What an interrupted earlier run can leave: a file nobody is
+            // granted anything on. Its ACL is still set, as icacls did.
+            let root = tls_test_root("empty-dacl");
+            let key = root.join("tls").join("host.key");
+            fs::write(&key, b"key").expect("key");
+            run_ok(Command::new("icacls").arg(&key).arg("/inheritance:r"));
+            let outcome = apply_acl(&tls_options(&root), &key, AclClass::SecretFile);
+            let readable = fs::read(&key).is_ok();
+            let _ = fs::remove_dir_all(&root);
+            outcome.expect("repaired");
+            assert!(readable);
+        }
+
+        #[test]
+        fn a_junction_swapped_in_after_the_check_does_not_receive_the_key() {
+            let root = tls_test_root("swap");
+            let tls = root.join("tls");
+            let opts = tls_options(&root);
+            let mut files = unprotected(&opts, &tls);
+            // Swapped once the directory has been checked.
+            let theirs = root.join("theirs");
+            fs::create_dir(&theirs).expect("their folder");
+            fs::rename(&tls, root.join("tls-moved")).expect("move tls");
+            junction(&tls, &theirs);
+            let outcome = files.stage("host.key", b"test key bytes", true);
+            let planted: Vec<_> = fs::read_dir(&theirs)
+                .expect("read their folder")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect();
+            let _ = fs::remove_dir(&tls);
+            let _ = fs::remove_dir_all(&root);
+            let error = outcome.expect_err("a redirected stage is refused");
+            assert!(error.contains("redirected"), "{error}");
+            assert!(
+                planted.is_empty(),
+                "staged through the junction: {planted:?}"
+            );
+        }
+
+        #[test]
+        fn the_earlier_helpers_interrupted_run_is_refused_not_replaced() {
+            // Its run died with the pinned pair moved aside: nothing in
+            // place, so deciding now would make a new key.
+            let root = tls_test_root("legacy-journal");
+            let tls = root.join("tls");
+            fs::write(tls.join(LEGACY_HELPER_JOURNAL), b"{}").expect("journal");
+            fs::write(tls.join(".host.key.0123.backup"), b"pinned key").expect("backup");
+            let error = ensure_tls(&tls_options(&root), &tls).expect_err("refused");
+            assert!(error.contains("host-cert.transaction.json"), "{error}");
+            assert!(!tls.join("host.key").exists());
+            assert!(!tls.join("host.crt").exists());
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn the_installer_recovers_an_interrupted_transaction_before_it_decides() {
+            // Through the installer itself (elevated: it applies ACLs).
+            let root = tls_test_root("installer-recovers");
+            let tls = root.join("tls");
+            let opts = tls_options(&root);
+            // Current and covering this machine, so the installer keeps it.
+            let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).expect("now");
+            let issued = issue_tls(
+                ProvisioningAction::CreateNew,
+                &subject_alt_names(),
+                None,
+                None,
+                now,
+            )
+            .expect("issued");
+            publish_tls(&mut unprotected(&opts, &tls), &issued, now, usize::MAX).expect("deploy");
+            let before = tls_snapshot(&tls);
+            plant_interrupted_transaction(&tls);
+            ensure_tls(&opts, &tls).expect("recovers, then keeps the current pair");
+            assert_eq!(tls_snapshot(&tls), before);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn an_interrupted_transaction_is_recovered_before_the_install_decides() {
+            // What a run leaves when it dies after moving the old files aside:
+            // a prepared journal, the backups, a half-published certificate.
+            // The next install puts the old pair back before deciding anything.
+            let root = tls_test_root("interrupted");
+            let tls = root.join("tls");
+            let opts = tls_options(&root);
+            deploy_pair(&opts, &tls);
+            let before = tls_snapshot(&tls);
+            let id = "4242-1800000000";
+            fs::write(
+                tls.join(".arcen-cert.transaction"),
+                arcen_transport::cert_transaction::TransactionJournal::new(
+                    id,
+                    arcen_transport::cert_transaction::TransactionPhase::Prepared,
+                    [true; 5],
+                )
+                .render(),
+            )
+            .expect("journal");
+            for name in ["host.crt", "host.cert-sha256"] {
+                fs::rename(
+                    tls.join(name),
+                    tls.join(arcen_transport::cert_transaction::backup_file_name(
+                        id, name,
+                    )),
+                )
+                .expect("back up");
+            }
+            fs::write(tls.join("host.crt"), b"half written").expect("half");
+
+            cert_publication::recover(&mut unprotected(&opts, &tls)).expect("recovery");
+            assert_eq!(tls_snapshot(&tls), before);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn renewal_over_a_sec1_key_keeps_the_key_its_pin_and_every_name() {
+            // rcgen over ring reads only PKCS #8: before the shared issuer,
+            // reissuing over a key written by openssl failed with "reuse
+            // existing TLS key", and a renewal dropped any name discovery no
+            // longer found.
+            let first = issue_tls(
+                ProvisioningAction::CreateNew,
+                &[
+                    "pier.example.internal".to_string(),
+                    "203.0.113.7".to_string(),
+                ],
+                None,
+                None,
+                NOW,
+            )
+            .expect("first");
+            let sec1 = sec1_from_ring_pkcs8(first.new_key_pem.as_ref().expect("key"));
+            for action in [
+                ProvisioningAction::RenewPreservingKey,
+                ProvisioningAction::AdoptAndRenew,
+            ] {
+                let renewed = issue_tls(
+                    action,
+                    &["pier.example.internal".to_string()],
+                    Some(first.certificate_pem.as_bytes()),
+                    Some(sec1.as_bytes()),
+                    NOW + 86_400,
+                )
+                .expect("renewal over SEC1");
+                assert!(
+                    renewed.new_key_pem.is_none(),
+                    "{action:?} keeps the key file"
+                );
+                assert_eq!(
+                    arcen_transport::cert_marker::pins_from_pem(renewed.certificate_pem.as_bytes())
+                        .expect("pins")
+                        .spki,
+                    arcen_transport::cert_marker::pins_from_pem(first.certificate_pem.as_bytes())
+                        .expect("pins")
+                        .spki,
+                    "{action:?} keeps the SPKI pin"
+                );
+                assert!(arcen_transport::cert_marker::subject_alt_names_match_pem(
+                    renewed.certificate_pem.as_bytes(),
+                    &[
+                        "DNS:pier.example.internal".to_string(),
+                        "IP:203.0.113.7".to_string()
+                    ]
+                ));
+            }
         }
 
         #[test]

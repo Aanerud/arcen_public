@@ -875,6 +875,7 @@
         "audio",
         "audio::microphone",
         "audio::opus",
+        "audio::resample",
         "clipboard",
         "clipboard::image",
         "clipboard::latest",

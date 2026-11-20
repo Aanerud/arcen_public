@@ -12,18 +12,15 @@ use arcen_session::install_provider::{InstallPlan, plan_install_provider, summar
 use arcen_session::wayland_qualification::{
     QUALIFY_TEMPORARY_USER, QUALIFY_TEMPORARY_USER_GECOS, QualificationTarget, RECORD_PATH,
 };
+use arcen_transport::cert_issuance::{HostKey, IssuanceProfile, IssuerKey, issue};
 use arcen_transport::cert_marker;
 use arcen_transport::cert_provisioning::{
     MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningRefusal, ProvisioningRequest,
     plan,
 };
-use arcen_transport::cert_store::{
-    self, CERTIFICATE_FILE, CERTIFICATE_PIN_FILE, InspectContext, KEY_FILE, MARKER_FILE,
-    MaterialPaths, PinFiles, SPKI_PIN_FILE,
-};
-use arcen_transport::cert_transaction::{
-    FileBefore, FileRecovery, MANAGED_FILES, TransactionJournal, TransactionPhase,
-};
+use arcen_transport::cert_publication::{self, Publication, PublicationFiles, Slot};
+use arcen_transport::cert_store::{self, InspectContext, MaterialPaths};
+use arcen_transport::cert_transaction::{JOURNAL_FILE, MANAGED_FILES, transaction_id};
 
 /// Canonical location of the corresponding source.
 ///
@@ -100,7 +97,6 @@ const PIER_SYMLINK: &str = "/usr/local/bin/arcen-pier";
 /// build from the one systemd runs.
 const LEGACY_PIER_DIR: &str = "/usr/local/libexec/arcen";
 const LEGACY_PIER_PATH: &str = "/usr/local/libexec/arcen/arcen-pier";
-const JOURNAL_FILE: &str = ".arcen-cert.transaction";
 const LOCK_FILE: &str = ".arcen-cert.lock";
 
 const SERVICE_TEMPLATE: &str = include_str!("../../arcen-pier.service");
@@ -2766,58 +2762,19 @@ fn subject_alt_name_entries(extra: &[String]) -> Vec<String> {
     entries
 }
 
-fn merge_san_entry(entries: &mut Vec<String>, entry: String) {
-    if !entries
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(&entry))
-    {
-        entries.push(entry);
-    }
-}
-
 /// Paths to the managed TLS material.
-#[derive(Debug)]
-struct TlsPaths {
-    certificate: PathBuf,
-    key: PathBuf,
-    marker: PathBuf,
-    certificate_pin: PathBuf,
-    spki_pin: PathBuf,
+/// The managed TLS material under the install prefix: the shared layout.
+fn tls_paths(options: &Options) -> MaterialPaths {
+    MaterialPaths::in_directory(&map_path(&options.prefix, "/etc/arcen"))
 }
 
-impl TlsPaths {
-    fn from_options(options: &Options) -> Self {
-        let directory = map_path(&options.prefix, "/etc/arcen");
-        Self {
-            certificate: directory.join(CERTIFICATE_FILE),
-            key: directory.join(KEY_FILE),
-            marker: directory.join(MARKER_FILE),
-            certificate_pin: directory.join(CERTIFICATE_PIN_FILE),
-            spki_pin: directory.join(SPKI_PIN_FILE),
-        }
-    }
-
-    fn directory(&self) -> &Path {
-        self.certificate.parent().unwrap_or(&self.certificate)
-    }
-
-    fn managed(&self) -> [&Path; MANAGED_FILES.len()] {
-        [
-            &self.key,
-            &self.certificate,
-            &self.certificate_pin,
-            &self.spki_pin,
-            &self.marker,
-        ]
-    }
-
-    fn staging_for(path: &Path) -> PathBuf {
-        let name = path.file_name().map_or_else(
-            || "material".to_owned(),
-            |name| name.to_string_lossy().into_owned(),
-        );
-        path.with_file_name(format!(".{name}.installing.{}", std::process::id()))
-    }
+/// Where a file is written before it is renamed into place.
+fn installing_path(path: &Path) -> PathBuf {
+    let name = path.file_name().map_or_else(
+        || "material".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    path.with_file_name(format!(".{name}.installing.{}", std::process::id()))
 }
 
 struct TlsDirectoryLock {
@@ -2825,15 +2782,26 @@ struct TlsDirectoryLock {
 }
 
 impl TlsDirectoryLock {
-    fn acquire(paths: &TlsPaths) -> Result<Self, String> {
-        let path = paths.directory().join(LOCK_FILE);
+    fn acquire(paths: &MaterialPaths) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let path = paths.directory.as_path().join(LOCK_FILE);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC)
+                    .bits()
+                    .cast_signed(),
+            )
             .open(&path)
             .map_err(|error| format!("open {}: {error}", path.display()))?;
+        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+            return Err(format!("unsafe TLS transaction lock {}", path.display()));
+        }
         chmod(&path, 0o600)?;
         rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .map_err(|error| format!("another host-certificate transaction is active: {error}"))?;
@@ -2847,139 +2815,171 @@ impl Drop for TlsDirectoryLock {
     }
 }
 
-#[derive(Debug)]
-struct CertTransaction {
-    id: String,
-    journal: PathBuf,
-    backups: Vec<(PathBuf, PathBuf)>,
-    existed: [bool; MANAGED_FILES.len()],
+/// Where the installer stages a replacement for `target`.
+fn tls_staging(target: &Path) -> PathBuf {
+    let name = target.file_name().map_or_else(
+        || "material".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    target.with_file_name(format!(".{name}.staging"))
 }
 
-impl CertTransaction {
-    fn begin(paths: &TlsPaths) -> Result<Self, String> {
-        let id = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_secs())
-        );
-        let journal = paths.directory().join(JOURNAL_FILE);
-        let mut existed = [false; MANAGED_FILES.len()];
-        for (index, path) in paths.managed().into_iter().enumerate() {
-            existed[index] = path.is_file();
-        }
-        write_atomic_path(
-            &journal,
-            TransactionJournal::new(id.clone(), TransactionPhase::Prepared, existed)
-                .render()
-                .as_bytes(),
-            0o600,
-        )?;
-        fsync_path(&journal)?;
-        fsync_directory(paths.directory())?;
+/// The installer's file operations behind the shared transaction
+/// ([`cert_publication`]): files created with their final mode, synced with
+/// their directory, and a backup made by moving the file aside (a rename is
+/// atomic, so a backup is never seen incomplete).
+struct InstallerFiles<'a> {
+    paths: &'a MaterialPaths,
+}
 
-        let mut transaction = Self {
-            id,
-            journal,
-            backups: Vec::new(),
-            existed,
-        };
-        for (index, path) in paths.managed().into_iter().enumerate() {
-            if existed[index] {
-                let backup = paths.directory().join(format!(
-                    ".arcen-cert.backup.{}.{}",
-                    transaction.id, MANAGED_FILES[index]
-                ));
-                if let Err(error) = backup_rename(index, path, &backup) {
-                    return match transaction.roll_back(paths) {
-                        Ok(()) => Err(format!("back up {}: {error}", path.display())),
-                        Err(rollback) => Err(format!(
-                            "back up {}: {error}; rollback incomplete: {rollback}",
-                            path.display()
-                        )),
-                    };
-                }
-                transaction
-                    .backups
-                    .push((path.to_path_buf(), backup.clone()));
-                if let Err(error) = fsync_backup(index, &backup)
-                    .and_then(|()| fsync_backup_directory(index, paths.directory()))
-                {
-                    return match transaction.roll_back(paths) {
-                        Ok(()) => Err(error),
-                        Err(rollback) => Err(format!("{error}; rollback incomplete: {rollback}")),
-                    };
-                }
-            }
-        }
-        if let Err(error) = fsync_directory(paths.directory()) {
-            return match transaction.roll_back(paths) {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(format!("{error}; rollback incomplete: {rollback}")),
-            };
-        }
-        Ok(transaction)
+impl InstallerFiles<'_> {
+    fn path(&self, name: &str) -> Result<&Path, String> {
+        MANAGED_FILES
+            .iter()
+            .position(|managed| *managed == name)
+            .map(|index| self.paths.managed()[index].as_path())
+            .ok_or_else(|| format!("unmanaged file {name}"))
     }
 
-    fn commit(self, paths: &TlsPaths) -> Result<(), String> {
-        let mut existed = [true; MANAGED_FILES.len()];
-        for (index, path) in paths.managed().into_iter().enumerate() {
-            existed[index] = path.is_file();
+    fn in_directory(&self, name: &str) -> Result<PathBuf, String> {
+        let path = self.paths.directory.as_path().join(name);
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(format!("refusing symbolic link {}", path.display()));
         }
-        write_atomic_path(
-            &self.journal,
-            TransactionJournal::new(self.id, TransactionPhase::Committed, existed)
-                .render()
-                .as_bytes(),
-            0o600,
-        )?;
-        fsync_path(&self.journal)?;
-        fsync_directory(paths.directory())?;
-        for (_, backup) in &self.backups {
-            fs::remove_file(backup)
-                .map_err(|error| format!("remove backup {}: {error}", backup.display()))?;
-        }
-        fs::remove_file(&self.journal)
-            .map_err(|error| format!("clear {}: {error}", self.journal.display()))?;
-        fsync_directory(paths.directory())
+        Ok(path)
     }
 
-    fn roll_back(self, paths: &TlsPaths) -> Result<(), String> {
-        let mut failures = Vec::new();
-        for (final_path, backup) in &self.backups {
-            let _ = fs::remove_file(final_path);
-            if let Err(error) = fs::rename(backup, final_path) {
-                failures.push(format!("restore {}: {error}", final_path.display()));
-            } else if let Err(error) = fsync_path(final_path) {
-                failures.push(error);
-            }
+    fn index(name: &str) -> usize {
+        MANAGED_FILES
+            .iter()
+            .position(|managed| *managed == name)
+            .unwrap_or(0)
+    }
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+fn remove_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => fsync_directory(path.parent().unwrap_or(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove {}: {error}", path.display())),
+    }
+}
+
+fn read_no_follow(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC)
+                .bits()
+                .cast_signed(),
+        )
+        .open(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(bytes)
+}
+
+/// Renames and syncs the file and its directory.
+fn rename_synced(from: &Path, to: &Path) -> Result<(), String> {
+    fs::rename(from, to)
+        .map_err(|error| format!("rename {} to {}: {error}", from.display(), to.display()))?;
+    fsync_path(to)?;
+    fsync_directory(to.parent().unwrap_or(to))
+}
+
+impl PublicationFiles for InstallerFiles<'_> {
+    type Error = String;
+
+    fn stage(&mut self, name: &'static str, bytes: &[u8], secret: bool) -> Result<(), String> {
+        let staged = tls_staging(self.path(name)?);
+        remove_if_present(&staged)?;
+        write_file_path(&staged, bytes, if secret { 0o600 } else { 0o644 })
+    }
+
+    fn read(
+        &mut self,
+        name: &'static str,
+        slot: Slot,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+        let path = self.path(name)?;
+        match slot {
+            Slot::Published => read_no_follow(path),
+            Slot::Staged => read_no_follow(&tls_staging(path)),
         }
-        for path in paths.managed() {
-            let index = paths
-                .managed()
-                .iter()
-                .position(|managed| *managed == path)
-                .unwrap_or(0);
-            if !self.backups.iter().any(|(backed_up, _)| backed_up == path)
-                && !self.existed[index]
-                && let Err(error) = fs::remove_file(path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                failures.push(format!("remove {}: {error}", path.display()));
-            }
+    }
+
+    fn exists(&mut self, name: &'static str) -> Result<bool, String> {
+        Ok(is_regular_file(self.path(name)?))
+    }
+
+    fn back_up(&mut self, name: &'static str, backup: &str) -> Result<(), String> {
+        let index = Self::index(name);
+        let source = self.path(name)?.to_path_buf();
+        let backup = self.in_directory(backup)?;
+        backup_rename(index, &source, &backup)?;
+        fsync_backup(index, &backup)?;
+        fsync_backup_directory(index, self.paths.directory.as_path())
+    }
+
+    fn backup_exists(&mut self, backup: &str) -> Result<bool, String> {
+        Ok(is_regular_file(&self.in_directory(backup)?))
+    }
+
+    fn publish(&mut self, name: &'static str, secret: bool) -> Result<(), String> {
+        let path = self.path(name)?.to_path_buf();
+        rename_synced(&tls_staging(&path), &path)?;
+        chmod(&path, if secret { 0o600 } else { 0o644 })
+    }
+
+    fn restore(&mut self, name: &'static str, backup: &str) -> Result<(), String> {
+        let backup = self.in_directory(backup)?;
+        rename_synced(&backup, self.path(name)?)
+    }
+
+    fn remove(&mut self, name: &'static str) -> Result<(), String> {
+        remove_if_present(self.path(name)?)
+    }
+
+    fn remove_backup(&mut self, backup: &str) -> Result<(), String> {
+        remove_if_present(&self.in_directory(backup)?)
+    }
+
+    fn discard_staging(&mut self) -> Result<(), String> {
+        for path in self.paths.managed() {
+            remove_if_present(&tls_staging(path))?;
         }
-        if let Err(error) = fsync_directory(paths.directory()) {
-            failures.push(error);
+        Ok(())
+    }
+
+    fn write_journal(&mut self, text: &str) -> Result<(), String> {
+        let journal = self.in_directory(JOURNAL_FILE)?;
+        let staged = tls_staging(&journal);
+        remove_if_present(&staged)?;
+        write_file_path(&staged, text.as_bytes(), 0o600)?;
+        rename_synced(&staged, &journal)
+    }
+
+    fn read_journal(&mut self) -> Result<Option<String>, String> {
+        let journal = self.in_directory(JOURNAL_FILE)?;
+        if !is_regular_file(&journal) {
+            return Ok(None);
         }
-        if failures.is_empty() {
-            fs::remove_file(&self.journal)
-                .map_err(|error| format!("clear {}: {error}", self.journal.display()))?;
-            fsync_directory(paths.directory())?;
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }
+        String::from_utf8(read_no_follow(&journal)?.to_vec())
+            .map(Some)
+            .map_err(|_| "certificate journal is not text".to_owned())
+    }
+
+    fn remove_journal(&mut self) -> Result<(), String> {
+        remove_if_present(&self.in_directory(JOURNAL_FILE)?)
     }
 }
 
@@ -3014,29 +3014,27 @@ enum TestBackupOp {
 }
 
 #[cfg(test)]
-fn test_backup_failure_slot() -> &'static std::sync::Mutex<Option<(TestBackupOp, usize)>> {
-    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<(TestBackupOp, usize)>>> =
-        std::sync::OnceLock::new();
-    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+thread_local! {
+    /// Per test thread, so a failure one test injects never reaches another
+    /// test running beside it.
+    static TEST_BACKUP_FAILURE: std::cell::Cell<Option<(TestBackupOp, usize)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
 fn set_test_backup_failure(failure: Option<(TestBackupOp, usize)>) {
-    *test_backup_failure_slot()
-        .lock()
-        .expect("test backup failure lock") = failure;
+    TEST_BACKUP_FAILURE.with(|slot| slot.set(failure));
 }
 
 #[cfg(test)]
 fn maybe_inject_backup_failure(op: TestBackupOp, index: usize) -> Result<(), String> {
-    let mut guard = test_backup_failure_slot()
-        .lock()
-        .expect("test backup failure lock");
-    if *guard == Some((op, index)) {
-        *guard = None;
-        return Err(format!("injected {op:?} failure at backup {index}"));
-    }
-    Ok(())
+    TEST_BACKUP_FAILURE.with(|slot| {
+        if slot.get() == Some((op, index)) {
+            slot.set(None);
+            return Err(format!("injected {op:?} failure at backup {index}"));
+        }
+        Ok(())
+    })
 }
 
 #[cfg(not(test))]
@@ -3044,75 +3042,39 @@ fn maybe_inject_backup_failure(_op: TestBackupOp, _index: usize) -> Result<(), S
     Ok(())
 }
 
-fn recover_interrupted(paths: &TlsPaths) -> Result<(), String> {
-    let journal_path = paths.directory().join(JOURNAL_FILE);
-    if !journal_path.is_file() {
-        return Ok(());
-    }
-    let text = fs::read_to_string(&journal_path)
-        .map_err(|error| format!("read {}: {error}", journal_path.display()))?;
-    let journal = TransactionJournal::parse(&text)
-        .map_err(|error| format!("unreadable certificate transaction journal: {error}"))?;
-    for (index, path) in paths.managed().into_iter().enumerate() {
-        let name = MANAGED_FILES[index];
-        let backup = paths.directory().join(format!(
-            ".arcen-cert.backup.{}.{name}",
-            journal.transaction_id()
-        ));
-        let decision = journal
-            .recover_file(
-                name,
-                FileBefore {
-                    existed: path.is_file(),
-                    backup_present: backup.is_file(),
-                },
-            )
-            .map_err(|error| format!("journal decision for {name}: {error}"))?;
-        match decision {
-            FileRecovery::RequirePublished | FileRecovery::RequireUntouched => {
-                if !path.is_file() {
-                    return Err(format!(
-                        "interrupted certificate transaction cannot restore {name}"
-                    ));
-                }
-            }
-            FileRecovery::RestoreBackup => {
-                let _ = fs::remove_file(path);
-                fs::rename(&backup, path)
-                    .map_err(|error| format!("restore {}: {error}", path.display()))?;
-            }
-            FileRecovery::RemoveFile => {
-                let _ = fs::remove_file(path);
-            }
-        }
-        let _ = fs::remove_file(&backup);
-    }
-    for path in paths.managed() {
-        let _ = fs::remove_file(TlsPaths::staging_for(path));
-    }
-    fs::remove_file(&journal_path)
-        .map_err(|error| format!("clear {}: {error}", journal_path.display()))?;
-    fsync_directory(paths.directory())
+/// Finishes or undoes an interrupted transaction (the installer's, the
+/// Pier's `new-host-cert` or the earlier helper's) by the shared journal.
+fn recover_interrupted(paths: &MaterialPaths) -> Result<(), String> {
+    cert_publication::recover(&mut InstallerFiles { paths })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Reads the TLS directory into the shared provisioning input.
-fn inspect_tls(paths: &TlsPaths) -> Result<MaterialState, String> {
+fn inspect_tls(paths: &MaterialPaths) -> Result<MaterialState, String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(u64::MAX, |duration| duration.as_secs());
     cert_store::inspect(
-        &MaterialPaths::in_directory(paths.directory()),
+        &MaterialPaths::in_directory(&paths.directory),
         now,
-        InspectContext::default(),
+        InspectContext {
+            stale_staging_present: paths
+                .managed()
+                .iter()
+                .any(|path| tls_staging(path).exists()),
+            machine_sans: None,
+        },
     )
     .map_err(|error| format!("read {}: {error}", paths.certificate.display()))
 }
 
 /// Writes the pin files and ownership marker beside the active certificate.
-fn write_pins_and_marker(paths: &TlsPaths) -> Result<(), String> {
+#[cfg(test)]
+fn write_pins_and_marker(paths: &MaterialPaths) -> Result<(), String> {
     let bytes = std::fs::read(&paths.certificate)
         .map_err(|error| format!("read {}: {error}", paths.certificate.display()))?;
-    let pins = PinFiles::for_certificate(&bytes)?;
+    let pins = cert_store::PinFiles::for_certificate(&bytes)?;
     write_atomic_path(
         &paths.certificate_pin,
         pins.certificate_pin.as_bytes(),
@@ -3123,7 +3085,7 @@ fn write_pins_and_marker(paths: &TlsPaths) -> Result<(), String> {
 }
 
 fn write_atomic_path(target: &Path, content: &[u8], mode: u32) -> Result<(), String> {
-    let staged = TlsPaths::staging_for(target);
+    let staged = installing_path(target);
     {
         let mut file = OpenOptions::new()
             .write(true)
@@ -3146,16 +3108,33 @@ fn write_atomic_path(target: &Path, content: &[u8], mode: u32) -> Result<(), Str
 }
 
 fn write_file_path(path: &Path, content: &[u8], mode: u32) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| format!("create {}: {error}", path.display()))?;
-    chmod(path, mode)?;
+    let mut file = create_exclusive(path, mode)?;
     file.write_all(content)
         .map_err(|error| format!("write {}: {error}", path.display()))?;
     file.sync_all()
         .map_err(|error| format!("sync {}: {error}", path.display()))
+}
+
+/// Creates `path` (never through a link) with `mode` from the first byte, so
+/// a secret is never readable by anyone else, even before it is written.
+fn create_exclusive(path: &Path, mode: u32) -> Result<fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(
+            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC)
+                .bits()
+                .cast_signed(),
+        )
+        .open(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    // The umask may have narrowed `mode`; set it exactly, on the open file.
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("chmod {}: {error}", path.display()))?;
+    Ok(file)
 }
 
 fn fsync_path(path: &Path) -> Result<(), String> {
@@ -3172,116 +3151,31 @@ fn fsync_directory(path: &Path) -> Result<(), String> {
 
 fn issue_certificate(
     options: &Options,
-    paths: &TlsPaths,
+    paths: &MaterialPaths,
     reuse_key: bool,
-    san_entries: &[String],
+    profile: &IssuanceProfile,
 ) -> Result<(), String> {
     if options.dry_run {
         return Ok(());
     }
-    let staged_key = TlsPaths::staging_for(&paths.key);
-    let staged_cert = TlsPaths::staging_for(&paths.certificate);
-    let staged_cert_pin = TlsPaths::staging_for(&paths.certificate_pin);
-    let staged_spki_pin = TlsPaths::staging_for(&paths.spki_pin);
-    let staged_marker = TlsPaths::staging_for(&paths.marker);
-    for path in [
-        &staged_key,
-        &staged_cert,
-        &staged_cert_pin,
-        &staged_spki_pin,
-        &staged_marker,
-    ] {
-        let _ = fs::remove_file(path);
-    }
-    let key_for_cert = if reuse_key {
-        fs::copy(&paths.key, &staged_key)
-            .map_err(|error| format!("stage existing TLS key {}: {error}", paths.key.display()))?;
-        chmod(&staged_key, 0o600)?;
-        staged_key.clone()
+    let issued = if reuse_key {
+        let key = HostKey::from_pem(&read_no_follow(&paths.key)?)
+            .map_err(|error| format!("existing TLS key: {error}"))?;
+        issue(profile, IssuerKey::Existing(&key))
     } else {
-        let status = Command::new("openssl")
-            .args([
-                "ecparam",
-                "-name",
-                "prime256v1",
-                "-genkey",
-                "-noout",
-                "-out",
-            ])
-            .arg(&staged_key)
-            .status()
-            .map_err(|error| format!("start openssl key generation: {error}"))?;
-        if !status.success() {
-            let _ = fs::remove_file(&staged_key);
-            return Err("openssl key generation failed".to_string());
-        }
-        chmod(&staged_key, 0o600)?;
-        staged_key.clone()
-    };
-
-    let san = format!("subjectAltName={}", san_entries.join(","));
-    let status = Command::new("openssl")
-        .args(["req", "-x509", "-new", "-sha256", "-days"])
-        .arg(cert_store::VALIDITY_DAYS.to_string())
-        .arg("-key")
-        .arg(&key_for_cert)
-        .arg("-out")
-        .arg(&staged_cert)
-        .args(["-subj", "/CN=Arcen Pier"])
-        .args(["-addext", "basicConstraints=critical,CA:FALSE"])
-        .args(["-addext", "keyUsage=critical,digitalSignature"])
-        .args(["-addext", "extendedKeyUsage=serverAuth"])
-        .args(["-addext", &san])
-        .status()
-        .map_err(|error| format!("start openssl certificate generation: {error}"))?;
-    if !status.success() {
-        let _ = fs::remove_file(&staged_key);
-        let _ = fs::remove_file(&staged_cert);
-        return Err("openssl certificate generation failed".to_string());
+        issue(profile, IssuerKey::Generate)
     }
-
-    chmod(&staged_cert, 0o644)?;
-    fsync_path(&staged_key)?;
-    fsync_path(&staged_cert)?;
-    verify_key_matches_certificate(&staged_cert, &key_for_cert)?;
-    verify_certificate_covers(&staged_cert, san_entries)?;
-    let staged_cert_bytes = fs::read(&staged_cert)
-        .map_err(|error| format!("read {}: {error}", staged_cert.display()))?;
-    let pins = PinFiles::for_certificate(&staged_cert_bytes)?;
-    write_file_path(&staged_cert_pin, pins.certificate_pin.as_bytes(), 0o644)?;
-    write_file_path(&staged_spki_pin, pins.spki_pin.as_bytes(), 0o644)?;
-    write_file_path(&staged_marker, pins.marker.as_bytes(), 0o644)?;
-
-    let transaction = CertTransaction::begin(paths)?;
-    let publish = (|| {
-        fs::rename(&staged_key, &paths.key)
-            .map_err(|error| format!("install {}: {error}", paths.key.display()))?;
-        chmod(&paths.key, 0o600)?;
-        fs::rename(&staged_cert, &paths.certificate)
-            .map_err(|error| format!("install {}: {error}", paths.certificate.display()))?;
-        fs::rename(&staged_cert_pin, &paths.certificate_pin)
-            .map_err(|error| format!("install {}: {error}", paths.certificate_pin.display()))?;
-        fs::rename(&staged_spki_pin, &paths.spki_pin)
-            .map_err(|error| format!("install {}: {error}", paths.spki_pin.display()))?;
-        fs::rename(&staged_marker, &paths.marker)
-            .map_err(|error| format!("install {}: {error}", paths.marker.display()))?;
-        chmod(&paths.certificate, 0o644)?;
-        chmod(&paths.certificate_pin, 0o644)?;
-        chmod(&paths.spki_pin, 0o644)?;
-        chmod(&paths.marker, 0o644)?;
-        for path in paths.managed() {
-            fsync_path(path)?;
-        }
-        fsync_directory(paths.directory())?;
-        verify_key_matches_certificate(&paths.certificate, &paths.key)
-    })();
-    match publish {
-        Ok(()) => transaction.commit(paths),
-        Err(error) => match transaction.roll_back(paths) {
-            Ok(()) => Err(error),
-            Err(rollback) => Err(format!("{error}; rollback incomplete: {rollback}")),
-        },
-    }
+    .map_err(|error| format!("issue TLS certificate: {error}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    cert_publication::publish(
+        &mut InstallerFiles { paths },
+        &Publication::from(&issued),
+        &transaction_id(std::process::id(), now),
+        usize::MAX,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn openssl_stdout(args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
@@ -3317,58 +3211,29 @@ fn openssl_stdout(args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, String
     }
 }
 
-fn verify_key_matches_certificate(certificate: &Path, key: &Path) -> Result<(), String> {
-    let cert_pub = openssl_stdout(
-        &[
-            "x509",
-            "-in",
-            certificate
-                .to_str()
-                .ok_or_else(|| "certificate path".to_string())?,
-            "-pubkey",
-            "-noout",
-        ],
-        None,
-    )?;
-    let cert_der = openssl_stdout(&["pkey", "-pubin", "-outform", "DER"], Some(&cert_pub))?;
-    let key_der = openssl_stdout(
-        &[
-            "pkey",
-            "-in",
-            key.to_str().ok_or_else(|| "key path".to_string())?,
-            "-pubout",
-            "-outform",
-            "DER",
-        ],
-        None,
-    )?;
-    if cert_der == key_der {
-        Ok(())
-    } else {
-        Err("generated certificate and key do not match".to_string())
-    }
-}
-
-fn verify_certificate_covers(certificate: &Path, required: &[String]) -> Result<(), String> {
-    let cert = fs::read(certificate)
-        .map_err(|error| format!("read {}: {error}", certificate.display()))?;
-    let covered = cert_marker::subject_alt_names_from_pem(&cert)
-        .ok_or_else(|| "generated certificate has no readable DNS/IP SANs".to_string())?;
-    for required in required {
-        if !covered
-            .iter()
-            .any(|covered| covered.eq_ignore_ascii_case(required))
-        {
-            return Err(format!(
-                "generated certificate does not cover required SAN {required}"
-            ));
-        }
-    }
-    Ok(())
+/// The certificate to issue for `action`; see
+/// [`IssuanceProfile::for_action`]. A renewal keeps every name the existing
+/// certificate covers and adds this host's and the operator's.
+fn issuance_profile(
+    action: ProvisioningAction,
+    options: &Options,
+    existing_certificate: Option<&[u8]>,
+) -> Result<IssuanceProfile, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .as_secs();
+    IssuanceProfile::for_action(
+        action,
+        &subject_alt_name_entries(&options.extra_sans),
+        existing_certificate,
+        now,
+    )
+    .map_err(|error| format!("TLS certificate profile: {error}"))
 }
 
 fn ensure_cert(options: &Options) -> Result<(), String> {
-    let paths = TlsPaths::from_options(options);
+    let paths = tls_paths(options);
     let _lock = if options.dry_run {
         None
     } else {
@@ -3407,7 +3272,7 @@ fn ensure_cert(options: &Options) -> Result<(), String> {
             };
             println!(
                 "keeping existing TLS certificate and key in {} ({reason})",
-                paths.directory().display()
+                paths.directory.as_path().display()
             );
             if !options.dry_run {
                 chmod(&paths.key, 0o600)?;
@@ -3421,10 +3286,10 @@ fn ensure_cert(options: &Options) -> Result<(), String> {
                 } else {
                     ""
                 },
-                paths.directory().display()
+                paths.directory.as_path().display()
             );
-            let san_entries = subject_alt_name_entries(&options.extra_sans);
-            issue_certificate(options, &paths, false, &san_entries)?;
+            let profile = issuance_profile(decided.action, options, None)?;
+            issue_certificate(options, &paths, false, &profile)?;
         }
         ProvisioningAction::RenewPreservingKey | ProvisioningAction::AdoptAndRenew => {
             println!(
@@ -3434,18 +3299,14 @@ fn ensure_cert(options: &Options) -> Result<(), String> {
                 } else {
                     ""
                 },
-                paths.directory().display()
+                paths.directory.as_path().display()
             );
-            let mut san_entries = subject_alt_name_entries(&options.extra_sans);
-            if let Some(existing) = existing_certificate_bytes
-                .as_deref()
-                .and_then(cert_marker::subject_alt_names_from_pem)
-            {
-                for entry in existing {
-                    merge_san_entry(&mut san_entries, entry);
-                }
-            }
-            issue_certificate(options, &paths, true, &san_entries)?;
+            let profile = issuance_profile(
+                decided.action,
+                options,
+                existing_certificate_bytes.as_deref(),
+            )?;
+            issue_certificate(options, &paths, true, &profile)?;
         }
         ProvisioningAction::ReplaceKeyAndCertificate => {
             if decided.invalidates_pins {
@@ -3456,11 +3317,11 @@ fn ensure_cert(options: &Options) -> Result<(), String> {
                     } else {
                         "--force: "
                     },
-                    paths.directory().display()
+                    paths.directory.as_path().display()
                 );
             }
-            let san_entries = subject_alt_name_entries(&options.extra_sans);
-            issue_certificate(options, &paths, false, &san_entries)?;
+            let profile = issuance_profile(decided.action, options, None)?;
+            issue_certificate(options, &paths, false, &profile)?;
         }
     }
     Ok(())
@@ -4488,7 +4349,7 @@ mod tests {
             console_outputs: None,
             extra_sans: Vec::new(),
         };
-        let state = inspect_tls(&TlsPaths::from_options(&options)).expect("inspect");
+        let state = inspect_tls(&tls_paths(&options)).expect("inspect");
 
         assert_eq!(state.ownership, Some(MaterialOwnership::Foreign));
         assert!(
@@ -4527,7 +4388,7 @@ mod tests {
             console_outputs: None,
             extra_sans: Vec::new(),
         };
-        let state = inspect_tls(&TlsPaths::from_options(&options)).expect("inspect");
+        let state = inspect_tls(&tls_paths(&options)).expect("inspect");
 
         assert_eq!(state.ownership, Some(MaterialOwnership::Foreign));
         assert!(
@@ -4630,6 +4491,76 @@ mod tests {
         fs::remove_dir_all(prefix).expect("remove test directory");
     }
 
+    fn tls_test_options(prefix: &Path, force: bool) -> Options {
+        Options {
+            prefix: prefix.to_path_buf(),
+            dry_run: false,
+            uninstall: false,
+            purge: false,
+            force,
+            no_service: true,
+            restart: false,
+            check: false,
+            qualify_outputs: Vec::new(),
+            disable_gdm: false,
+            restore_gdm: false,
+            no_native_tablet_modules: false,
+            native_tablet: None,
+            console_outputs: None,
+            extra_sans: Vec::new(),
+        }
+    }
+
+    /// Every file in the TLS directory but the lock and inert staging.
+    fn tls_snapshot(directory: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        fs::read_dir(directory)
+            .expect("read tls directory")
+            .map(|entry| entry.expect("entry"))
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name != LOCK_FILE && !name.ends_with(".staging")
+            })
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).expect("read"),
+                )
+            })
+            .collect()
+    }
+
+    /// An owned, current pair as earlier installers wrote it (`openssl`,
+    /// SEC1 key) with its pins and marker.
+    fn owned_openssl_pair(prefix: &Path) -> MaterialPaths {
+        let directory = prefix.join("etc/arcen");
+        fs::create_dir_all(&directory).expect("create tls directory");
+        generate_self_signed_pair(&directory);
+        let paths = tls_paths(&tls_test_options(prefix, false));
+        write_pins_and_marker(&paths).expect("write marker");
+        paths
+    }
+
+    #[test]
+    fn a_staged_secret_is_owner_only_from_creation_and_never_follows_a_link() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let prefix = test_prefix("create-exclusive");
+        fs::create_dir_all(&prefix).expect("create prefix");
+        let staged = prefix.join(".host.key.staging");
+        let file = create_exclusive(&staged, 0o600).expect("create");
+        // Before a byte is written, nobody else can open it.
+        assert_eq!(file.metadata().expect("metadata").mode() & 0o777, 0o600);
+        drop(file);
+
+        let victim = prefix.join("victim");
+        fs::write(&victim, b"keep").expect("victim");
+        let link = prefix.join(".link.staging");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+        assert!(write_file_path(&link, b"secret", 0o600).is_err());
+        assert_eq!(fs::read(&victim).expect("victim"), b"keep");
+        let _ = fs::remove_dir_all(&prefix);
+    }
+
     #[test]
     fn backup_preparation_failures_restore_only_files_that_moved() {
         for op in [
@@ -4637,66 +4568,120 @@ mod tests {
             TestBackupOp::FileFsync,
             TestBackupOp::DirFsync,
         ] {
+            // Backups are taken of the files a rekey publishes: all five.
             for index in 0..MANAGED_FILES.len() {
                 let prefix = test_prefix(&format!("backup-failure-{op:?}-{index}"));
-                let directory = prefix.join("etc/arcen");
-                fs::create_dir_all(&directory).expect("create tls directory");
-                let options = Options {
-                    prefix: prefix.clone(),
-                    dry_run: false,
-                    uninstall: false,
-                    purge: false,
-                    force: false,
-                    no_service: true,
-                    restart: false,
-                    check: false,
-                    qualify_outputs: Vec::new(),
-                    disable_gdm: false,
-                    restore_gdm: false,
-                    no_native_tablet_modules: false,
-                    native_tablet: None,
-                    console_outputs: None,
-                    extra_sans: Vec::new(),
-                };
-                let paths = TlsPaths::from_options(&options);
-                for (file_index, path) in paths.managed().into_iter().enumerate() {
-                    fs::write(path, format!("original-{file_index}")).expect("write original");
-                }
+                let paths = owned_openssl_pair(&prefix);
+                let directory = paths.directory.as_path().to_path_buf();
+                let before = tls_snapshot(&directory);
 
                 set_test_backup_failure(Some((op, index)));
-                let error = CertTransaction::begin(&paths).expect_err("injected failure");
-
-                assert!(
-                    error.contains("injected") || error.contains("back up"),
-                    "{error}"
-                );
-                for (file_index, path) in paths.managed().into_iter().enumerate() {
-                    assert_eq!(
-                        fs::read_to_string(path).expect("read restored"),
-                        format!("original-{file_index}"),
-                        "{} should retain its original bytes",
-                        path.display()
-                    );
-                    let backups: Vec<_> = fs::read_dir(&directory)
-                        .expect("read tls directory")
-                        .filter_map(Result::ok)
-                        .filter(|entry| {
-                            entry
-                                .file_name()
-                                .to_string_lossy()
-                                .contains(&format!(".{}", MANAGED_FILES[file_index]))
-                        })
-                        .collect();
-                    assert!(backups.is_empty(), "backup was left for {}", path.display());
-                }
-                assert!(
-                    !directory.join(JOURNAL_FILE).exists(),
-                    "complete rollback should clear the journal"
-                );
+                let error =
+                    ensure_cert(&tls_test_options(&prefix, true)).expect_err("injected failure");
                 set_test_backup_failure(None);
+
+                assert!(error.contains("injected"), "{error}");
+                assert_eq!(
+                    tls_snapshot(&directory),
+                    before,
+                    "{op:?} at backup {index}: originals restored, no backup or journal left"
+                );
                 fs::remove_dir_all(prefix).expect("remove test directory");
             }
         }
+    }
+
+    #[test]
+    fn a_crash_at_any_step_recovers_to_the_old_or_the_new_pair_whole() {
+        for force in [false, true] {
+            let mut saw = (false, false);
+            for limit in 0..=16 {
+                let prefix = test_prefix(&format!("crash-{force}-{limit}"));
+                let paths = owned_openssl_pair(&prefix);
+                let directory = paths.directory.as_path().to_path_buf();
+                let before = tls_snapshot(&directory);
+                let existing = fs::read(&paths.certificate).expect("certificate");
+                let action = if force {
+                    ProvisioningAction::ReplaceKeyAndCertificate
+                } else {
+                    ProvisioningAction::RenewPreservingKey
+                };
+                let profile = IssuanceProfile::for_action(
+                    action,
+                    &["DNS:pier.example.internal".to_owned()],
+                    Some(&existing),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("clock")
+                        .as_secs(),
+                )
+                .expect("profile");
+                let issued = if force {
+                    issue(&profile, IssuerKey::Generate)
+                } else {
+                    let key = HostKey::from_pem(&fs::read(&paths.key).expect("key")).expect("key");
+                    issue(&profile, IssuerKey::Existing(&key))
+                }
+                .expect("issued");
+                cert_publication::publish(
+                    &mut InstallerFiles { paths: &paths },
+                    &Publication::from(&issued),
+                    "77-1800000000",
+                    limit,
+                )
+                .expect("stopped run");
+                // The next install recovers first; the material is owned and
+                // current either way, so it is then kept.
+                ensure_cert(&tls_test_options(&prefix, false)).expect("next install");
+                let after = tls_snapshot(&directory);
+                if after == before {
+                    saw.0 = true;
+                } else {
+                    assert_eq!(
+                        after.get("host.crt").map(Vec::as_slice),
+                        Some(issued.certificate_pem.as_bytes()),
+                        "force={force}: crash after {limit} steps left a mix"
+                    );
+                    assert_eq!(after.len(), MANAGED_FILES.len(), "{:?}", after.keys());
+                    if !force {
+                        assert_eq!(after.get("host.key"), before.get("host.key"));
+                    }
+                    saw.1 = true;
+                }
+                fs::remove_dir_all(prefix).expect("remove test directory");
+            }
+            assert!(saw.0 && saw.1, "force={force}");
+        }
+    }
+
+    #[test]
+    fn renewal_over_the_deployed_sec1_key_keeps_the_key_and_its_pin() {
+        let prefix = test_prefix("renew-sec1");
+        let paths = owned_openssl_pair(&prefix);
+        let key_before = fs::read(&paths.key).expect("key");
+        let spki_before = fs::read(&paths.spki_pin).expect("spki pin");
+        // Force a renewal: the shared plan renews an owned pair that is due.
+        let existing = fs::read(&paths.certificate).expect("certificate");
+        issue_certificate(
+            &tls_test_options(&prefix, false),
+            &paths,
+            true,
+            &IssuanceProfile::for_action(
+                ProvisioningAction::RenewPreservingKey,
+                &[],
+                Some(&existing),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_secs(),
+            )
+            .expect("profile"),
+        )
+        .expect("renewal");
+        assert_eq!(fs::read(&paths.key).expect("key"), key_before);
+        assert_eq!(fs::read(&paths.spki_pin).expect("spki pin"), spki_before);
+        assert_ne!(fs::read(&paths.certificate).expect("cert"), existing);
+        fs::remove_dir_all(prefix).expect("remove test directory");
     }
 
     #[test]
@@ -4752,10 +4737,11 @@ mod tests {
             console_outputs: None,
             extra_sans: Vec::new(),
         };
-        let paths = TlsPaths::from_options(&options);
+        let paths = tls_paths(&options);
 
         write_pins_and_marker(&paths).expect("write marker");
-        let marker = fs::read_to_string(directory.join(MARKER_FILE)).expect("read marker");
+        let marker =
+            fs::read_to_string(directory.join(cert_store::MARKER_FILE)).expect("read marker");
 
         assert!(
             marker.contains("version=3\ncertificate="),
@@ -4763,7 +4749,7 @@ mod tests {
         );
         assert!(
             cert_store::marker_matches(
-                &MaterialPaths::in_directory(paths.directory()),
+                &MaterialPaths::in_directory(&paths.directory),
                 &fs::read(directory.join("host.crt")).expect("read cert")
             ),
             "marker must match the active certificate pins"

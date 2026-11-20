@@ -1039,8 +1039,12 @@ pub fn spawn_media_worker<M, F>(
                             router.set_session_color(session_color);
                             router.set_decode_latency_policy(decode_latency_policy);
                         }
-                        full_frame_requests.request();
-                        let _ = full_frame_requests.send_due(&commands);
+                        request_first_picture(
+                            canvas.is_on(),
+                            &mut full_frame_requests,
+                            &mut pending_ingress_idr,
+                            &commands,
+                        );
                         repaint.request_repaint();
                     }
                     SessionEvent::Json(value) => {
@@ -1231,7 +1235,13 @@ pub fn spawn_media_worker<M, F>(
                         }
                     }
                     SessionEvent::PresentationRecoveryRequested => {
-                        request_presentation_recovery(&shared, &commands, &mut full_frame_requests);
+                        if !canvas_presentation_recovery(&shared, &mut canvas) {
+                            request_presentation_recovery(
+                                &shared,
+                                &commands,
+                                &mut full_frame_requests,
+                            );
+                        }
                         repaint.request_repaint();
                     }
                     SessionEvent::ConnectionStatusHint(hint) => {
@@ -1759,16 +1769,59 @@ fn canvas_presenter_for<M: MediaPlatform>(
     {
         return Some(Arc::clone(presenter));
     }
-    let root = match state.multi_monitor_decode_roster.as_ref() {
+    (monitor_id == canvas_root_monitor(state))
+        .then(|| state.eight_bit_video_presenter.clone())
+        .flatten()
+}
+
+/// The monitor the root window shows: 0 in a single-monitor session; the
+/// committed root, else the roster's first monitor, in a multi-monitor one.
+fn canvas_root_monitor<M: MediaPlatform>(state: &SharedMediaState<M>) -> u16 {
+    match state.multi_monitor_decode_roster.as_ref() {
         None => 0,
         Some((_, roster)) => state
             .multi_monitor_root_monitor_id
             .or_else(|| roster.plans().first().map(|plan| plan.session_monitor_id))
             .map_or(0, arcen_media::SessionMonitorId::get),
-    };
-    (monitor_id == root)
-        .then(|| state.eight_bit_video_presenter.clone())
-        .flatten()
+    }
+}
+
+/// Feeds the canvas records of a batch into the Stream Statistics' received
+/// side, as video packets feed it: the wire line, the receive times and,
+/// for frames, the wire-clock delay. Nothing here counts as decoded or
+/// presented; a record is shown only when its sink says so.
+fn note_canvas_wire_records<M: MediaPlatform>(
+    state: &mut SharedMediaState<M>,
+    records: &[(u16, Vec<u8>)],
+    now: Instant,
+) {
+    for (_, bytes) in records {
+        let Some(record) = crate::canvas::CanvasWireRecord::read(bytes) else {
+            continue;
+        };
+        push_instant_sample(&mut state.video_packet_times, now);
+        if let Some(timestamp_ms) = record.timestamp_ms {
+            let clock_age = wire_clock_age_ms(timestamp_ms);
+            let delay = state.wire_delay_estimator.observe(clock_age);
+            state.last_wire_clock_age_ms = Some(clock_age);
+            state.last_wire_delay_ms = Some(delay);
+            push_ms_sample(
+                &mut state.video_wire_clock_age_samples,
+                f64::from(clock_age),
+            );
+            push_ms_sample(&mut state.video_wire_delay_samples, f64::from(delay));
+            if let Ok(monitor_id) = arcen_media::SessionMonitorId::new(record.monitor_id) {
+                push_ms_sample(
+                    state
+                        .monitor_wire_delay_samples
+                        .entry(monitor_id)
+                        .or_default(),
+                    f64::from(delay),
+                );
+            }
+        }
+        state.last_wire_video_summary = record.summary();
+    }
 }
 
 /// Applies one batch's canvas records (ADR 0028) in lane order, each
@@ -1808,8 +1861,9 @@ fn handle_canvas_batch<M, F>(
         canvas.records_lost(*monitor_id);
     }
     let now = Instant::now();
-    let (timing, roster, presenters, root) = {
-        let state = shared.lock().expect("media state poisoned");
+    let (timing, roster, presenters, root, root_monitor) = {
+        let mut state = shared.lock().expect("media state poisoned");
+        note_canvas_wire_records(&mut state, &records, now);
         let roster = if canvas.has_roster() {
             None
         } else {
@@ -1835,6 +1889,7 @@ fn handle_canvas_batch<M, F>(
             roster,
             presenters,
             state.eight_bit_video_presenter.clone(),
+            canvas_root_monitor(&state),
         )
     };
     if roster.is_some() {
@@ -1900,6 +1955,11 @@ fn handle_canvas_batch<M, F>(
         }
         if let Some((width, height)) = root_canvas {
             publish_canvas_metadata(&mut state, width, height);
+        }
+        // The canvas's keyframe is its reset: the root picture waits for
+        // one only while its canvas is lost, never for a full frame.
+        if canvas.position(root_monitor).is_some() || canvas.is_lost(root_monitor) {
+            state.waiting_for_keyframe = canvas.is_lost(root_monitor);
         }
     }
     if root_presented || root_canvas.is_some() {
@@ -2936,6 +2996,53 @@ fn clear_native_layer_history<M: MediaPlatform>(state: &mut SharedMediaState<M>)
     state.layer_present_ms_samples.clear();
     state.eight_bit_layer_has_picture = false;
     state.ten_bit_layer_has_picture = false;
+}
+
+/// A presenter asked for recovery on a canvas connection, which has no
+/// keyframe to ask for (`request_full_frame` is ignored by a canvas Pier,
+/// so the picture would stop silently). When the eight-bit presenter that
+/// shows the canvas fell back, the canvas cannot be shown for this
+/// connection: it stops, asks for no more resets, and the statistics say
+/// why and how to get full frames. Any other presenter's recovery leaves a
+/// canvas alone. Returns `false` for a full-frame connection, whose caller
+/// asks for a keyframe as before.
+fn canvas_presentation_recovery<M: MediaPlatform>(
+    shared: &Mutex<SharedMediaState<M>>,
+    canvas: &mut crate::canvas::DeckCanvas<M::Decoder>,
+) -> bool {
+    if !canvas.is_on() {
+        return false;
+    }
+    let mut state = shared.lock().expect("media state poisoned");
+    if state.eight_bit_layer_disabled {
+        let reason = outcome_of(state.eight_bit_presentation_status)
+            .fallback_reason()
+            .map_or("the presenter fell back", |failure| failure.detail);
+        canvas.sink_unavailable(reason);
+        state.canvas = canvas.stats();
+    }
+    true
+}
+
+/// What a hello owes the Pier for the first picture. A full-frame stream
+/// asks for a keyframe and keeps asking until one decodes. A canvas
+/// connection (ADR 0028 §5) asks for nothing: its first picture is the
+/// Pier's reset, its recovery is `canvas_reset_request`, and no keyframe
+/// ever arrives to end an ordinary request, which would otherwise repeat
+/// every [`FullFrameRequestGate`] interval for the whole session.
+fn request_first_picture(
+    canvas_on: bool,
+    full_frame_requests: &mut FullFrameRequestGate,
+    pending_ingress_idr: &mut bool,
+    commands: &SessionCommandSender,
+) {
+    if canvas_on {
+        full_frame_requests.cancel_pending();
+        *pending_ingress_idr = false;
+    } else {
+        full_frame_requests.request();
+        let _ = full_frame_requests.send_due(commands);
+    }
 }
 
 fn request_presentation_recovery<M: MediaPlatform>(
@@ -5822,6 +5929,296 @@ mod tests {
                     .latest_native_frame_metadata
                     .is_none(),
                 "a secondary window's canvas does not resize the root window"
+            );
+        }
+
+        fn run_batch(
+            shared: &Arc<Mutex<SharedMediaState>>,
+            canvas: &mut DeckCanvas<TestDecoder>,
+            tx: &crate::runtime::frame_queue::IncomingMediaSender,
+            rx: &IncomingMediaReceiver,
+            commands: &SessionCommandSender,
+            records: Vec<Vec<u8>>,
+        ) {
+            for record in records {
+                assert!(tx.enqueue_bytes(&record).expect("queued").accepted);
+            }
+            let mut batch = rx.take_batch();
+            handle_canvas_batch(
+                shared,
+                canvas,
+                &TestFactory,
+                rx,
+                commands,
+                std::mem::take(&mut batch.canvas),
+                &batch.canvas_lost_monitor_ids,
+                &NoRepaint,
+            );
+        }
+
+        /// A visible canvas is a stream on the wire: its records feed the
+        /// received side of Stream Statistics (the wire line, the receive
+        /// times, a frame's wire-clock delay) so it never reads "No wire
+        /// frames yet", and nothing counts a tile or a reset as a decoded
+        /// or presented video frame.
+        #[test]
+        fn canvas_records_feed_the_wire_statistics_but_no_frame_counts() {
+            let (tx, rx) = crate::runtime::frame_queue::incoming_media_inbox();
+            tx.set_canvas_request(request());
+            let root = Arc::new(Mutex::new(TestPresenter {
+                visible: true,
+                ..TestPresenter::default()
+            }));
+            let shared = Arc::new(Mutex::new(SharedMediaState {
+                eight_bit_video_presenter: Some(Arc::clone(&root)),
+                ..SharedMediaState::default()
+            }));
+            let mut canvas = DeckCanvas::<TestDecoder>::new(&rx.canvas_request());
+            canvas.on_hello(Some(&status(&[0])));
+            let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+            let commands = SessionCommandSender::for_test(commands_tx);
+            let records = records(scope(0, 0));
+            let frame_bytes = records[1].len();
+            run_batch(&shared, &mut canvas, &tx, &rx, &commands, records.to_vec());
+
+            let state = shared.lock().expect("state");
+            assert_eq!(
+                state.last_wire_video_summary,
+                format!(
+                    "Canvas frame monitor=0 generation=1 fence=1 ts=5 payload={frame_bytes} bytes"
+                )
+            );
+            assert_eq!(state.video_packet_times.len(), 2, "both records arrived");
+            assert!(
+                state.last_wire_clock_age_ms.is_some() && state.last_wire_delay_ms.is_some(),
+                "a frame's wire clock feeds the stream delay"
+            );
+            assert_eq!(
+                state.video_wire_delay_samples.len(),
+                1,
+                "a reset has no clock"
+            );
+            assert_eq!(state.video_frames_seen, 0);
+            assert_eq!(state.video_frames_decoded, 0);
+            assert!(state.monitor_presented_frames.is_empty());
+        }
+
+        /// The canvas's keyframe is its reset: a resumed connection waits
+        /// for a picture until its first reset applies, and again only
+        /// while its canvas is lost.
+        #[test]
+        fn a_canvas_reset_ends_the_keyframe_wait_and_a_lost_canvas_starts_it() {
+            let (tx, rx) = crate::runtime::frame_queue::incoming_media_inbox();
+            tx.set_canvas_request(request());
+            let root = Arc::new(Mutex::new(TestPresenter {
+                visible: true,
+                ..TestPresenter::default()
+            }));
+            let shared = Arc::new(Mutex::new(SharedMediaState {
+                eight_bit_video_presenter: Some(Arc::clone(&root)),
+                ..SharedMediaState::fresh(2, true)
+            }));
+            let mut canvas = DeckCanvas::<TestDecoder>::new(&rx.canvas_request());
+            canvas.on_hello(Some(&status(&[0])));
+            let (commands_tx, _commands_rx) = mpsc::unbounded_channel();
+            let commands = SessionCommandSender::for_test(commands_tx);
+            let [reset, frame] = records(scope(0, 0));
+            run_batch(&shared, &mut canvas, &tx, &rx, &commands, vec![reset]);
+            assert!(!shared.lock().expect("state").waiting_for_keyframe);
+
+            // A refused record (a fence that does not increase) loses it.
+            run_batch(
+                &shared,
+                &mut canvas,
+                &tx,
+                &rx,
+                &commands,
+                vec![frame.clone(), frame],
+            );
+            assert!(canvas.is_lost(0));
+            assert!(shared.lock().expect("state").waiting_for_keyframe);
+        }
+
+        /// Permanent sink failure through the presenter: when the eight-bit
+        /// presenter that shows the canvas falls back, a canvas connection
+        /// does not ask for a keyframe (a canvas Pier ignores it and the
+        /// picture would stop silently, waiting for one forever): the canvas
+        /// stops for the connection and Stream Statistics say why. Another
+        /// presenter's recovery leaves the canvas alone, and a full-frame
+        /// connection still asks for its keyframe.
+        #[test]
+        fn a_fallen_back_presenter_stops_the_canvas_visibly() {
+            let (tx, rx) = crate::runtime::frame_queue::incoming_media_inbox();
+            tx.set_canvas_request(request());
+            let shared = Mutex::new(SharedMediaState {
+                eight_bit_presentation_status: PresentOutcome::Presented,
+                ..SharedMediaState::default()
+            });
+            let mut canvas = DeckCanvas::<TestDecoder>::new(&rx.canvas_request());
+            canvas.on_hello(Some(&status(&[0])));
+
+            // The ten-bit presenter's recovery is not the canvas's.
+            assert!(canvas_presentation_recovery(&shared, &mut canvas));
+            assert_eq!(canvas.stats().sink_refused, None);
+            assert!(!shared.lock().expect("state").waiting_for_keyframe);
+
+            {
+                let mut state = shared.lock().expect("state");
+                state.eight_bit_layer_disabled = true;
+                state.eight_bit_presentation_status = PresentOutcome::Fallback(NO_SURFACE);
+            }
+            assert!(canvas_presentation_recovery(&shared, &mut canvas));
+            let state = shared.lock().expect("state");
+            assert_eq!(
+                state.canvas_status_line().as_deref(),
+                Some(
+                    "Screen updates: stopped: this Deck cannot show the canvas \
+                     (no video surface attached); turn Canvas screen updates off and \
+                     reconnect for full frames"
+                )
+            );
+            assert!(!state.waiting_for_keyframe, "no keyframe wait on a canvas");
+            drop(state);
+            assert_eq!(canvas.next_due(Instant::now()), None, "no reset churn");
+
+            let mut full_frames = DeckCanvas::<TestDecoder>::new(&rx.canvas_request());
+            full_frames.on_hello(None);
+            assert!(!canvas_presentation_recovery(&shared, &mut full_frames));
+        }
+
+        struct SilentAudio;
+
+        impl crate::runtime::audio_worker::AudioPlayback for SilentAudio {
+            fn set_stream_result(
+                &mut self,
+                _result: &arcen_protocol::messages::AudioStreamResultMsg,
+            ) {
+            }
+
+            fn feed(
+                &mut self,
+                _header: arcen_protocol::AudioHeader,
+                _payload: &[u8],
+            ) -> crate::runtime::audio_worker::AudioFeedStatus {
+                crate::runtime::audio_worker::AudioFeedStatus {
+                    backend: "silent",
+                    accepted_bytes: 0,
+                    queued_ms: 0,
+                    playback_underruns: 0,
+                    buffer_trim_events: 0,
+                    buffer_trimmed_samples: 0,
+                    feed_gap_ms: 0,
+                    max_feed_gap_ms: 0,
+                    decode_failures: 0,
+                    concealed_frames: 0,
+                    queue_phase: "playing",
+                    note: None,
+                }
+            }
+        }
+
+        fn hello(canvas: Option<CanvasStatusMsg>) -> arcen_protocol::messages::ServerHelloMsg {
+            let mut hello: arcen_protocol::messages::ServerHelloMsg =
+                serde_json::from_value(serde_json::json!({
+                    "type": "server_hello",
+                    "screen_width": 64,
+                    "screen_height": 32,
+                }))
+                .expect("minimal server_hello parses");
+            hello.canvas = canvas;
+            hello
+        }
+
+        /// The whole worker over a healthy, idle canvas connection: the
+        /// hello, the first reset and frame, then a still screen with only
+        /// the session's canvas ticks. It never sends an ordinary
+        /// `request_full_frame` (a canvas never answers one with a keyframe,
+        /// so it would repeat every 750 ms for the session), while a
+        /// full-frame connection still asks once for its first keyframe.
+        #[test]
+        fn a_healthy_idle_canvas_session_never_asks_for_a_full_frame() {
+            let run = |canvas_status: Option<CanvasStatusMsg>| -> Vec<serde_json::Value> {
+                let (tx, rx) = crate::runtime::frame_queue::incoming_media_inbox();
+                tx.set_canvas_request(request());
+                let root = Arc::new(Mutex::new(TestPresenter {
+                    visible: true,
+                    ..TestPresenter::default()
+                }));
+                let shared = Arc::new(Mutex::new(SharedMediaState {
+                    eight_bit_video_presenter: Some(Arc::clone(&root)),
+                    ..SharedMediaState::default()
+                }));
+                let (events_tx, events_rx) = mpsc::unbounded_channel();
+                let (commands_tx, mut commands_rx) = mpsc::unbounded_channel();
+                let canvas_on = canvas_status.is_some();
+                spawn_media_worker(
+                    events_rx,
+                    rx,
+                    SessionCommandSender::for_test(commands_tx),
+                    Arc::clone(&shared),
+                    Arc::new(NoRepaint),
+                    Arc::new(ClientTelemetry::default()),
+                    TestFactory,
+                    || {
+                        Box::new(SilentAudio)
+                            as Box<dyn crate::runtime::audio_worker::AudioPlayback>
+                    },
+                );
+                events_tx
+                    .send(SessionEvent::ServerHello(hello(canvas_status)))
+                    .expect("worker alive");
+                if canvas_on {
+                    for record in records(scope(0, 0)) {
+                        assert!(tx.enqueue_bytes(&record).expect("queued").accepted);
+                    }
+                    events_tx
+                        .send(SessionEvent::MediaReady)
+                        .expect("worker alive");
+                }
+                // A still screen: nothing but the session's canvas ticks,
+                // for twice the full-frame retry interval.
+                for _ in 0..8 {
+                    std::thread::sleep(Duration::from_millis(250));
+                    events_tx
+                        .send(SessionEvent::CanvasTick)
+                        .expect("worker alive");
+                }
+                drop(events_tx);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !shared.lock().expect("state").closed {
+                    assert!(Instant::now() < deadline, "the worker ends with its events");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if canvas_on {
+                    assert_eq!(
+                        root.lock().expect("presenter").canvas,
+                        [(0, 1, 0), (0, 1, 1)]
+                    );
+                }
+                let mut sent = Vec::new();
+                while let Ok(command) = commands_rx.try_recv() {
+                    if let SessionCommand::Json(value) = command {
+                        sent.push(value);
+                    }
+                }
+                sent
+            };
+            let full_frame = |value: &serde_json::Value| value["type"] == "request_full_frame";
+
+            let canvas = run(Some(status(&[0])));
+            assert!(
+                !canvas.iter().any(full_frame),
+                "a canvas connection asked for full frames: {canvas:?}"
+            );
+            assert!(
+                canvas.iter().any(|value| value["type"] == "canvas_ack"),
+                "the canvas is still acknowledged: {canvas:?}"
+            );
+
+            let legacy = run(None);
+            assert!(
+                legacy.iter().any(full_frame),
+                "a full-frame connection asks for its first keyframe: {legacy:?}"
             );
         }
     }

@@ -261,12 +261,34 @@ pub fn server_config(
     certificate_path: &Path,
     key_path: &Path,
 ) -> Result<quinn::ServerConfig, ServeError> {
-    let material = crate::tls_material::load(certificate_path, key_path)
+    served_material(certificate_path, key_path).map(|(config, _)| config)
+}
+
+/// Builds the QUIC server configuration over reloadable material, and
+/// returns the material too: a reload through it is what the endpoint's
+/// next handshake serves.
+///
+/// # Errors
+///
+/// As [`server_config`].
+pub fn served_material(
+    certificate_path: &Path,
+    key_path: &Path,
+) -> Result<
+    (
+        quinn::ServerConfig,
+        std::sync::Arc<crate::tls_material::TlsLifecycle>,
+    ),
+    ServeError,
+> {
+    let lifecycle = crate::tls_material::TlsLifecycle::load(certificate_path, key_path)
         .map_err(|error| ServeError::Material(error.to_string()))?;
-    let tls = material
+    let tls = lifecycle
+        .material()
         .server_config()
         .map_err(|error| ServeError::Tls(error.to_string()))?;
-    arcen_transport::quic::pier_server_config(tls).map_err(ServeError::Tls)
+    let config = arcen_transport::quic::pier_server_config(tls).map_err(ServeError::Tls)?;
+    Ok((config, std::sync::Arc::new(lifecycle)))
 }
 
 /// How long a peer has to establish TLS, open its stream, and send a preface.

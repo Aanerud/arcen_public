@@ -189,12 +189,43 @@ impl<T> VideoQueue<T> {
         }
     }
 
+    /// Waits for room as the shared backpressure rule asks for this record
+    /// ([`arcen_media::video::OutboundVideoRecord::room_wait`]): an access
+    /// unit at most `VIDEO_ROOM_WAIT`, a canvas frame until the consumer
+    /// makes room or the queue closes, a recovery point not at all.
+    pub async fn wait_for_record_room(
+        &self,
+        record: arcen_media::video::OutboundVideoRecord,
+    ) -> bool {
+        match record.room_wait() {
+            arcen_media::video::RoomWait::Never => true,
+            wait => self.wait_for_room(wait.max_wait()).await,
+        }
+    }
+
+    /// Bounds the bytes queued frames may hold before
+    /// [`Self::wait_for_room`] holds the producer back (only sizes given to
+    /// [`Self::push_sized`] count).
+    pub fn set_byte_budget(&self, budget: Option<u64>) {
+        self.state
+            .lock()
+            .expect("video queue lock poisoned")
+            .set_byte_budget(budget);
+    }
+
     pub fn push(&self, item: T, keyframe: bool) -> VideoPushResult<T> {
+        self.push_sized(item, keyframe, 0)
+    }
+
+    /// [`Self::push`] for a frame of `bytes` bytes, counted against the
+    /// byte budget while it waits.
+    pub fn push_sized(&self, item: T, keyframe: bool, bytes: u64) -> VideoPushResult<T> {
         let result = {
             let mut state = self.state.lock().expect("video queue lock poisoned");
-            state.push(
+            state.push_sized(
                 item,
                 arcen_media::video::FrameClassification::keyframe_is_recovery(keyframe),
+                bytes,
                 std::time::Instant::now(),
             )
         };

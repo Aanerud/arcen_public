@@ -80,6 +80,10 @@ pub enum InputError {
     /// the same [`InputController`] when only the pen backend is unavailable.
     #[error("pen/tablet uinput device is unavailable")]
     PenUnavailable,
+    /// A joined console's device is not proved to reach the joined desktop
+    /// alone (`arcen_input::joined_input`): nothing was injected.
+    #[error("session input is not proved to reach this desktop alone")]
+    NotConfined,
     /// A pointer coordinate was not finite.
     #[error("invalid pointer coordinate")]
     InvalidCoordinate,
@@ -236,6 +240,36 @@ impl PierInput {
                 arcen_input::pen_emulation::PenCapabilityTruth::UNAVAILABLE
             }
             Self::Wayland(injector) => injector.pen_capabilities(),
+        }
+    }
+
+    /// The kernel nodes of the uinput tablet-tool device, for the joined
+    /// desktop's confinement proof (`joined_devices`); `None` without that
+    /// device or on a Wayland session.
+    pub fn tablet_nodes(&mut self) -> Option<std::io::Result<Vec<joined_devices::DeviceNode>>> {
+        match self {
+            Self::Uinput(controller) => controller.tablet_nodes(),
+            Self::Wayland(_) => None,
+        }
+    }
+
+    /// The kernel nodes of the uinput device for `role`; `None` without it
+    /// or on a Wayland session.
+    pub fn device_nodes(
+        &mut self,
+        role: arcen_input::virtual_device::VirtualInputRole,
+    ) -> Option<std::io::Result<Vec<joined_devices::DeviceNode>>> {
+        match self {
+            Self::Uinput(controller) => controller.device_nodes(role),
+            Self::Wayland(_) => None,
+        }
+    }
+
+    /// Admits a uinput session's input only through `gate` from now on (a
+    /// joined console, `joined_devices::JoinedInputGate`).
+    pub fn confine(&mut self, gate: &std::sync::Arc<joined_devices::JoinedInputGate>) {
+        if let Self::Uinput(controller) = self {
+            controller.confine(gate);
         }
     }
 
@@ -423,6 +457,7 @@ pub fn choose_input_backend(
     }
 }
 
+pub mod joined_devices;
 #[cfg(target_os = "linux")]
 pub mod seat_pen;
 #[cfg(target_os = "linux")]
@@ -732,6 +767,18 @@ impl InputController {
     pub const fn release_tablet_device(&mut self) -> bool {
         false
     }
+    pub const fn tablet_nodes(
+        &mut self,
+    ) -> Option<std::io::Result<Vec<joined_devices::DeviceNode>>> {
+        None
+    }
+    pub const fn device_nodes(
+        &mut self,
+        _role: arcen_input::virtual_device::VirtualInputRole,
+    ) -> Option<std::io::Result<Vec<joined_devices::DeviceNode>>> {
+        None
+    }
+    pub fn confine(&mut self, _gate: &std::sync::Arc<joined_devices::JoinedInputGate>) {}
     pub const fn region_input_available(&self) -> bool {
         false
     }

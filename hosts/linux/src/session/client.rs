@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use arcen_media::refine::carry::RefineVideoCarry;
 use arcen_media::video::{
-    FrameClassification, RoomState, SharedVideoQueue, VideoQueuePush, VideoQueueWaitStats,
+    FrameClassification, OutboundVideoRecord, RoomState, RoomWait, SharedVideoQueue,
+    VideoQueuePush, VideoQueueWaitStats,
 };
 use tokio::sync::Notify;
 
@@ -35,7 +36,10 @@ pub const CAPACITY: usize = 8;
 /// hiccups overflowed it: each loss meant an IDR, whose size caused the next
 /// loss (27 IDRs in 50 s, 800 ms p50 frame age). Past this bound the link is
 /// not hiccupping but gone, and drop-and-IDR recovery takes over as before.
-pub const ROOM_WAIT: Duration = Duration::from_millis(500);
+/// A canvas record waits longer (the shared
+/// [`OutboundVideoRecord::room_wait`]): until the writer makes room or the
+/// queue closes, because dropping one costs a new canvas generation.
+pub const ROOM_WAIT: Duration = arcen_media::video::VIDEO_ROOM_WAIT;
 
 /// At most one IDR request per second while a drop streak persists
 /// (`KEYFRAME_REQUEST_MIN_INTERVAL_S = 1.0`).
@@ -74,14 +78,16 @@ pub struct FrameQueue {
 
 impl FrameQueue {
     pub fn new(idr: IdrRequester) -> Self {
+        let mut queue = SharedVideoQueue::new(
+            CAPACITY,
+            arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Auto)
+                .queue
+                .encoded_overflow
+                .keyframe_request_min_interval,
+        );
+        queue.set_byte_budget(Some(arcen_media::video::CANVAS_QUEUE_BYTES));
         Self {
-            inner: Mutex::new(SharedVideoQueue::new(
-                CAPACITY,
-                arcen_media::video::pipeline_contract(arcen_media::video::PipelineId::Auto)
-                    .queue
-                    .encoded_overflow
-                    .keyframe_request_min_interval,
-            )),
+            inner: Mutex::new(queue),
             refine: Mutex::new(RefineLedger::default()),
             notify: Notify::new(),
             room: Notify::new(),
@@ -152,11 +158,13 @@ impl FrameQueue {
         let outcome = {
             // The ledger stays locked until the frame is queued, so a
             // writer never takes records filed for a frame not yet queued.
+            let bytes = data.len() as u64;
             let (frame, _ledger) = self.sequence(data, refine);
             let mut inner = self.inner.lock().unwrap();
-            inner.push(
+            inner.push_sized(
                 frame,
                 FrameClassification::new(is_keyframe, is_recovery_point),
+                bytes,
                 now,
             )
         };
@@ -286,11 +294,12 @@ impl FrameQueue {
     }
 
     /// Waits until an ordinary enqueue would not overflow, for at most
-    /// `max_wait` (see [`ROOM_WAIT`]). Returns immediately when the queue is
-    /// paused, recovering or closed: those states have their own rules.
-    /// Returns whether there is room.
-    pub async fn wait_for_room(&self, max_wait: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + max_wait;
+    /// `max_wait` (see [`ROOM_WAIT`]; `None` until the writer makes room or
+    /// the queue closes). Returns immediately when the queue is paused,
+    /// recovering or closed: those states have their own rules. Returns
+    /// whether there is room.
+    pub async fn wait_for_room(&self, max_wait: Option<Duration>) -> bool {
+        let deadline = max_wait.map(|wait| tokio::time::Instant::now() + wait);
         loop {
             let room = self.room.notified();
             match self.inner.lock().unwrap().room_state() {
@@ -298,10 +307,46 @@ impl FrameQueue {
                 RoomState::HasRoom => return true,
                 RoomState::Full => {}
             }
-            if tokio::time::timeout_at(deadline, room).await.is_err() {
-                return false;
+            match deadline {
+                Some(deadline) => {
+                    if tokio::time::timeout_at(deadline, room).await.is_err() {
+                        return false;
+                    }
+                }
+                None => room.await,
             }
         }
+    }
+
+    /// Queues one record from the frame pump after the shared backpressure
+    /// rule for its kind ([`OutboundVideoRecord::room_wait`]): an access
+    /// unit waits at most [`ROOM_WAIT`], a canvas frame until the writer
+    /// makes room or the queue closes, a recovery point never. Returns
+    /// what [`Self::enqueue_classified`] returns.
+    pub(crate) async fn enqueue_with_backpressure(
+        &self,
+        record: OutboundVideoRecord,
+        data: Vec<u8>,
+        is_recovery_point: bool,
+        refine: Vec<Vec<u8>>,
+    ) -> bool {
+        let is_keyframe = matches!(
+            record,
+            OutboundVideoRecord::CanvasReset
+                | OutboundVideoRecord::AccessUnit {
+                    recovery_point: true
+                }
+        );
+        match record.room_wait() {
+            RoomWait::Never => {}
+            RoomWait::UpTo(wait) => {
+                self.wait_for_room(Some(wait)).await;
+            }
+            RoomWait::UntilRoomOrClosed => {
+                self.wait_for_room(None).await;
+            }
+        }
+        self.enqueue_classified(data, is_keyframe, is_recovery_point, refine)
     }
 
     /// Close the queue and wake the writer so it can exit.
@@ -456,7 +501,7 @@ mod tests {
             })
         };
         assert!(
-            q.wait_for_room(Duration::from_secs(2)).await,
+            q.wait_for_room(Some(Duration::from_secs(2))).await,
             "the writer made room"
         );
         assert!(
@@ -472,6 +517,71 @@ mod tests {
         );
     }
 
+    /// A canvas frame behind a slow writer waits past the access-unit
+    /// bound for as long as the path stalls, then goes out in order: no
+    /// drop, so no `IDR` and no new canvas generation (ADR 0028 §11).
+    #[tokio::test]
+    async fn a_canvas_frame_waits_for_a_slow_writer_without_a_new_generation() {
+        let (idr, mut rx) = fake_idr();
+        let q = std::sync::Arc::new(FrameQueue::new(idr));
+        for i in 0..CAPACITY {
+            assert!(q.enqueue(vec![i as u8], false));
+        }
+        let producer = {
+            let q = std::sync::Arc::clone(&q);
+            tokio::spawn(async move {
+                q.enqueue_with_backpressure(
+                    OutboundVideoRecord::CanvasFrame,
+                    vec![0xCA],
+                    false,
+                    Vec::new(),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(ROOM_WAIT + Duration::from_millis(250)).await;
+        assert!(!producer.is_finished(), "still waiting past ROOM_WAIT");
+        assert_eq!(q.frames_dropped(), 0);
+        for i in 0..CAPACITY {
+            assert_eq!(q.dequeue().await, Some(vec![i as u8]));
+        }
+        assert!(producer.await.unwrap(), "queued without a drop");
+        assert_eq!(q.dequeue().await, Some(vec![0xCA]));
+        assert_eq!(q.frames_dropped(), 0);
+        assert!(rx.try_recv().is_err(), "no IDR: the generation goes on");
+    }
+
+    /// Teardown while a canvas producer is blocked: closing the queue
+    /// releases it at once, and it asks for nothing.
+    #[tokio::test]
+    async fn closing_the_queue_releases_a_blocked_canvas_producer() {
+        let (idr, mut rx) = fake_idr();
+        let q = std::sync::Arc::new(FrameQueue::new(idr));
+        for i in 0..CAPACITY {
+            assert!(q.enqueue(vec![i as u8], false));
+        }
+        let producer = {
+            let q = std::sync::Arc::clone(&q);
+            tokio::spawn(async move {
+                q.enqueue_with_backpressure(
+                    OutboundVideoRecord::CanvasFrame,
+                    vec![0xCA],
+                    false,
+                    Vec::new(),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        q.close_and_clear();
+        let queued = tokio::time::timeout(Duration::from_secs(1), producer)
+            .await
+            .expect("released at once")
+            .unwrap();
+        assert!(!queued);
+        assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn a_writer_that_never_drains_bounds_the_wait() {
         let (idr, _rx) = fake_idr();
@@ -480,11 +590,11 @@ mod tests {
             assert!(q.enqueue(vec![i as u8], false));
         }
         let started = tokio::time::Instant::now();
-        assert!(!q.wait_for_room(Duration::from_millis(60)).await);
+        assert!(!q.wait_for_room(Some(Duration::from_millis(60))).await);
         assert!(started.elapsed() >= Duration::from_millis(60));
         q.close();
         assert!(
-            !q.wait_for_room(Duration::from_secs(5)).await,
+            !q.wait_for_room(Some(Duration::from_secs(5))).await,
             "closed returns at once"
         );
     }
@@ -500,7 +610,7 @@ mod tests {
             let q = std::sync::Arc::clone(&q);
             tokio::spawn(async move {
                 let started = tokio::time::Instant::now();
-                let has_room = q.wait_for_room(Duration::from_secs(5)).await;
+                let has_room = q.wait_for_room(Some(Duration::from_secs(5))).await;
                 (has_room, started.elapsed())
             })
         };
