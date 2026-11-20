@@ -137,6 +137,11 @@ mod platform {
                 push_menu_command(MenuCommand::KeyboardCharacters);
             }
 
+            #[unsafe(method(arcenToggleKeyboardCapture:))]
+            fn toggle_keyboard_capture(&self, _sender: *mut AnyObject) {
+                push_menu_command(MenuCommand::ToggleKeyboardCapture);
+            }
+
             #[unsafe(method(arcenSendKey:))]
             fn send_key(&self, sender: *mut AnyObject) {
                 // The item's tag is its index in the shared Send Key list.
@@ -219,6 +224,28 @@ mod platform {
         /// while a session is on screen, with the key each normally carries.
         static HOST_SHORTCUT_ITEMS: std::cell::RefCell<Vec<(Retained<NSMenuItem>, &'static str)>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// The menu bar's keyboard indicator: its item and its menu.
+        static KEYBOARD_STATUS: std::cell::RefCell<Option<(Retained<NSMenuItem>, Retained<NSMenu>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Shows who has the keyboard in the menu bar (the shared wording), or
+    /// hides the indicator when `line` is empty (no session). Main thread
+    /// only; a no-op elsewhere.
+    pub fn set_keyboard_status(line: &str) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        KEYBOARD_STATUS.with(|status| {
+            if let Some((item, menu)) = status.borrow().as_ref() {
+                item.setTitle(&ns(line));
+                menu.setTitle(&ns(line));
+                item.setHidden(line.is_empty());
+            }
+        });
     }
 
     thread_local! {
@@ -394,6 +421,16 @@ mod platform {
             sel!(arcenReleaseModifiers:),
             None,
         ));
+        // No key equivalent: Control-Option-Home reaches the window, which
+        // gives the keyboard to this Mac and back (a menu equivalent would
+        // fire before the window could release the held keys in order).
+        connection_menu.addItem(&action_item(
+            mtm,
+            &menu_target,
+            title(MenuCommand::ToggleKeyboardCapture),
+            sel!(arcenToggleKeyboardCapture:),
+            None,
+        ));
         // Connection ▸ Send Key: the shared list (tag = its index).
         let send_key_menu = make_menu(mtm, "Send Key");
         for (index, key) in arcen_input::keyboard::SendKey::ALL.iter().enumerate() {
@@ -528,6 +565,24 @@ mod platform {
         ));
         add_submenu(mtm, &menubar, "Session", &session_menu);
 
+        // The keyboard indicator: "Keyboard: <host> (Control-Option-Home to
+        // release)" while the host has it, hidden outside a session.
+        let keyboard_menu = make_menu(mtm, "");
+        keyboard_menu.addItem(&action_item(
+            mtm,
+            &menu_target,
+            title(MenuCommand::ToggleKeyboardCapture),
+            sel!(arcenToggleKeyboardCapture:),
+            None,
+        ));
+        let keyboard_item = NSMenuItem::new(mtm);
+        keyboard_item.setSubmenu(Some(&keyboard_menu));
+        keyboard_item.setHidden(true);
+        menubar.addItem(&keyboard_item);
+        KEYBOARD_STATUS.with(|status| {
+            *status.borrow_mut() = Some((keyboard_item, keyboard_menu));
+        });
+
         let help_menu = make_menu(mtm, "Help");
         help_menu.addItem(&action_item(
             mtm,
@@ -639,6 +694,7 @@ mod platform {
         false
     }
     pub fn set_keyboard_state(_characters: bool, _typing: bool) {}
+    pub fn set_keyboard_status(_line: &str) {}
 }
 
 pub fn install() {
@@ -663,6 +719,11 @@ pub fn modifiers_held() -> bool {
 /// See `platform::set_keyboard_state`.
 pub fn set_keyboard_state(characters: bool, typing: bool) {
     platform::set_keyboard_state(characters, typing);
+}
+
+/// See `platform::set_keyboard_status`.
+pub fn set_keyboard_status(line: &str) {
+    platform::set_keyboard_status(line);
 }
 
 /// See `platform::forward_app_shortcuts_to_host`.

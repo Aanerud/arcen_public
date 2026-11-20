@@ -232,13 +232,10 @@ impl Mouse {
             return;
         }
         // A host without precise scroll: a pixel is a 120th of a notch, as
-        // the macOS Deck gathers a trackpad for such a host.
-        for (axis, value) in [(WheelAxis::Vertical, dy), (WheelAxis::Horizontal, dx)] {
-            #[allow(clippy::cast_possible_truncation, reason = "rounded, one gesture step")]
-            let delta = value.round() as i32;
-            if let Some(scroll) = self.wheel.wheel(axis, delta) {
-                emit(InputEvent::Scroll { scroll, x, y });
-            }
+        // the macOS Deck gathers a trackpad for such a host. A step of less
+        // than a pixel is kept, not rounded away.
+        if let Some(scroll) = self.wheel.travel_xy(dx, dy) {
+            emit(InputEvent::Scroll { scroll, x, y });
         }
     }
 

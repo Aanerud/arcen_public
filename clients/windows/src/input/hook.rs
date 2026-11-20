@@ -23,7 +23,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use arcen_input::keyboard::pc::PcKey;
 use arcen_input::keyboard::windows::WindowsKeyReader;
-use arcen_input::keyboard::{HookRoute, HookRouter};
+use arcen_input::keyboard::{HookRoute, HookRouter, KeyboardSwitchChord};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -98,6 +98,8 @@ struct HookCounts {
 
 /// The routing the hook thread reads, set by the session window's thread.
 static STATE: Mutex<Option<HookState>> = Mutex::new(None);
+/// The keyboard switch's chord (Settings ▸ Input ▸ Keyboard switch).
+static SWITCH: Mutex<KeyboardSwitchChord> = Mutex::new(KeyboardSwitchChord::DEFAULT);
 /// The hook thread's id, once it runs (`None` if it could not start).
 static THREAD: OnceLock<Option<u32>> = OnceLock::new();
 /// Posted to the hook thread: install the hook (`WM_HOOK_ON`) or remove
@@ -189,6 +191,7 @@ pub(super) fn install(hwnd: HWND, grabbed: bool, held: Vec<PcKey>) {
         drop(slot);
     } else {
         let mut router = HookRouter::default();
+        router.set_switch_chord(*SWITCH.lock().unwrap_or_else(PoisonError::into_inner));
         router.begin(held);
         *slot = Some(HookState {
             hwnd,
@@ -206,6 +209,14 @@ pub(super) fn install(hwnd: HWND, grabbed: bool, held: Vec<PcKey>) {
         "keyboard hook: routing for the session window, grab {}",
         if grabbed { "on" } else { "off" }
     );
+}
+
+/// The keyboard switch's chord the hook keeps for the Deck.
+pub(super) fn set_switch_chord(switch: KeyboardSwitchChord) {
+    *SWITCH.lock().unwrap_or_else(PoisonError::into_inner) = switch;
+    if let Some(state) = state().as_mut() {
+        state.router.set_switch_chord(switch);
+    }
 }
 
 /// Removes the hook when `hwnd` is the window it routes for (that window

@@ -216,15 +216,23 @@ struct MonitorRateSnapshot {
     frames_presented: u64,
     frames_rejected: u64,
     frames_superseded_by_refresh: u64,
+    /// [`SharedMediaState::monitor_presentation_epoch`] the presented count
+    /// belongs to: a count from another epoch is no baseline.
+    presentation_epoch: u64,
 }
 
 impl MonitorRateSnapshot {
-    fn from_counts(counters: &MonitorMediaCounters, frames_presented: u64) -> Self {
+    fn from_counts(
+        counters: &MonitorMediaCounters,
+        frames_presented: u64,
+        presentation_epoch: u64,
+    ) -> Self {
         Self {
             frames_received: counters.frames_received,
             frames_presented,
             frames_rejected: counters.frames_rejected,
             frames_superseded_by_refresh: counters.frames_superseded_by_refresh,
+            presentation_epoch,
         }
     }
 }
@@ -311,7 +319,12 @@ fn monitor_stream_window(
     current: MonitorRateSnapshot,
     display_refresh_hz: u32,
 ) -> MonitorWindowRates {
-    let previous = previous.unwrap_or_default();
+    let mut previous = previous.unwrap_or_default();
+    if previous.presentation_epoch != current.presentation_epoch {
+        // The presented counts restarted (a new multi-window commit); the
+        // monitor's media counters did not.
+        previous.frames_presented = 0;
+    }
     let report = classify_presentation_window(PresentationWindow {
         frames_received: current
             .frames_received
@@ -523,9 +536,17 @@ pub struct SharedMediaState<M: MediaPlatform> {
     pub decoder_behind: crate::runtime::decode_lag::DecoderBehind,
     /// Recent offset-free video wire-delay samples by negotiated monitor.
     pub monitor_wire_delay_samples: BTreeMap<arcen_media::SessionMonitorId, VecDeque<f64>>,
-    /// Cumulative UI presentations by monitor. Decode/receive counters are
-    /// worker-owned, but presentation happens on the UI thread.
+    /// New decoded frames each window put up for display, by monitor, in
+    /// the current presentation epoch: written once per frame through
+    /// [`Self::note_monitor_presented`] by whichever window shows the
+    /// monitor, root included, and never for a re-present of a frame
+    /// already shown. A submission count, not a measurement of the glass.
+    /// Decode/receive counters are worker-owned, but presentation happens on
+    /// the UI thread.
     pub monitor_presented_frames: BTreeMap<arcen_media::SessionMonitorId, u64>,
+    /// Bumped by [`Self::reset_monitor_presentation`], so the per-monitor
+    /// statistics never difference counts of two epochs.
+    pub monitor_presentation_epoch: u64,
     /// The local Deck display each negotiated monitor is presented on.
     pub monitor_presentation_targets:
         BTreeMap<arcen_media::SessionMonitorId, MonitorPresentationTarget>,
@@ -656,6 +677,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             decoder_behind: Default::default(),
             monitor_wire_delay_samples: Default::default(),
             monitor_presented_frames: Default::default(),
+            monitor_presentation_epoch: Default::default(),
             monitor_presentation_targets: Default::default(),
             routed_primary_dedicated_eight_bit: false,
             frame_sync: Default::default(),
@@ -707,6 +729,27 @@ impl<M: MediaPlatform> SharedMediaState<M> {
                 )
             })
             .collect();
+    }
+
+    /// Counts `frames` new decoded frames a window put up for `monitor`
+    /// (the per-monitor statistics). Every window of a multi-window
+    /// session, the root window included, reports through this once per
+    /// frame; a re-present of a frame already shown is not a new frame.
+    pub fn note_monitor_presented(&mut self, monitor: arcen_media::SessionMonitorId, frames: u64) {
+        if frames == 0 {
+            return;
+        }
+        let presented = self.monitor_presented_frames.entry(monitor).or_default();
+        *presented = presented.saturating_add(frames);
+    }
+
+    /// Ends the presentation epoch of a multi-window layout (teardown): the
+    /// presented counts and display targets go, and the next counts start a
+    /// new epoch.
+    pub fn reset_monitor_presentation(&mut self) {
+        self.monitor_presented_frames.clear();
+        self.monitor_presentation_targets.clear();
+        self.monitor_presentation_epoch = self.monitor_presentation_epoch.wrapping_add(1);
     }
 
     /// A secondary monitor's decoded frame as its own window's dedicated
@@ -1565,18 +1608,13 @@ fn maybe_heartbeat<M: MediaPlatform>(
     // starved -- the exact gap that left the pier-windows.example.internal stutter
     // undiagnosable from client telemetry alone.
     for (monitor_id, counters) in &state.monitor_media {
-        let presented = state
-            .monitor_presented_frames
-            .get(monitor_id)
-            .copied()
-            .unwrap_or_default();
-        let current = MonitorRateSnapshot::from_counts(counters, presented);
         let target = state.monitor_presentation_targets.get(monitor_id);
-        let rates = monitor_stream_window(
+        let (current, rates) = monitor_window_from_state(
+            &state,
+            *monitor_id,
+            counters,
             elapsed,
             monitor_rate_snapshots.get(monitor_id).copied(),
-            current,
-            target.map_or(0, |target| target.display_refresh_hz),
         );
         monitor_rate_snapshots.insert(*monitor_id, current);
         let video_delay = state
@@ -1613,6 +1651,35 @@ fn maybe_heartbeat<M: MediaPlatform>(
         );
     }
     monitor_rate_snapshots.retain(|monitor_id, _| state.monitor_media.contains_key(monitor_id));
+}
+
+/// One monitor's statistics window from the shared state: its media
+/// counters and the frames its window put up, against the previous
+/// heartbeat's snapshot.
+fn monitor_window_from_state<M: MediaPlatform>(
+    state: &SharedMediaState<M>,
+    monitor_id: arcen_media::SessionMonitorId,
+    counters: &MonitorMediaCounters,
+    elapsed: Duration,
+    previous: Option<MonitorRateSnapshot>,
+) -> (MonitorRateSnapshot, MonitorWindowRates) {
+    let presented = state
+        .monitor_presented_frames
+        .get(&monitor_id)
+        .copied()
+        .unwrap_or_default();
+    let current =
+        MonitorRateSnapshot::from_counts(counters, presented, state.monitor_presentation_epoch);
+    let rates = monitor_stream_window(
+        elapsed,
+        previous,
+        current,
+        state
+            .monitor_presentation_targets
+            .get(&monitor_id)
+            .map_or(0, |target| target.display_refresh_hz),
+    );
+    (current, rates)
 }
 
 /// One-way arm: builds the additive per-monitor `secondary_router` the
@@ -3619,12 +3686,14 @@ mod tests {
             frames_presented: 90,
             frames_rejected: 7,
             frames_superseded_by_refresh: 0,
+            presentation_epoch: 0,
         };
         let current = MonitorRateSnapshot {
             frames_received: 250,
             frames_presented: 140,
             frames_rejected: 12,
             frames_superseded_by_refresh: 0,
+            presentation_epoch: 0,
         };
 
         let rates = monitor_stream_window(Duration::from_secs(5), Some(previous), current, 0);
@@ -3634,6 +3703,83 @@ mod tests {
         assert_eq!(rates.frames_dropped, 100);
         assert_eq!(rates.frames_superseded_by_refresh, 0);
         assert_eq!(rates.frames_dropped_before_presentation, 100);
+    }
+
+    /// The root window of a multi-window session reports its frames through
+    /// the same shared writer as every other window, whatever monitor it
+    /// shows: here monitor 3 (not the roster's first) with a secondary on 2.
+    #[test]
+    fn the_root_monitor_feeds_the_per_monitor_statistics_once_per_frame() {
+        let root = arcen_media::SessionMonitorId::new(3).expect("nonzero");
+        let secondary = arcen_media::SessionMonitorId::new(2).expect("nonzero");
+        let mut state = SharedMediaState::default();
+        for monitor in [root, secondary] {
+            state.monitor_media.insert(
+                monitor,
+                MonitorMediaCounters {
+                    frames_received: 150,
+                    frames_decoded: 150,
+                    ..MonitorMediaCounters::default()
+                },
+            );
+        }
+        // Thirty passes of five frames each, as each window reports them.
+        for _ in 0..30 {
+            state.note_monitor_presented(root, 5);
+            state.note_monitor_presented(secondary, 5);
+        }
+        state.note_monitor_presented(root, 0);
+
+        assert_eq!(state.monitor_presented_frames.get(&root), Some(&150));
+        assert_eq!(state.monitor_presented_frames.get(&secondary), Some(&150));
+        for monitor in [root, secondary] {
+            let counters = state.monitor_media[&monitor];
+            let (_, rates) =
+                monitor_window_from_state(&state, monitor, &counters, Duration::from_secs(5), None);
+            assert!((rates.fps_presented - 30.0).abs() < f64::EPSILON);
+            assert_eq!(rates.frames_dropped_before_presentation, 0);
+        }
+    }
+
+    /// A new multi-window epoch restarts the presented counts while the
+    /// monitors' media counters run on: the first window after it counts
+    /// from zero, not "nothing presented" against the old total.
+    #[test]
+    fn a_new_presentation_epoch_restarts_the_presented_baseline() {
+        let root = arcen_media::SessionMonitorId::new(3).expect("nonzero");
+        let mut state = SharedMediaState::default();
+        state.monitor_media.insert(
+            root,
+            MonitorMediaCounters {
+                frames_received: 300,
+                ..MonitorMediaCounters::default()
+            },
+        );
+        state.note_monitor_presented(root, 300);
+        let counters = state.monitor_media[&root];
+        let (before, _) =
+            monitor_window_from_state(&state, root, &counters, Duration::from_secs(5), None);
+
+        state.reset_monitor_presentation();
+        assert!(state.monitor_presented_frames.is_empty());
+        state
+            .monitor_media
+            .get_mut(&root)
+            .expect("root counters")
+            .frames_received = 450;
+        state.note_monitor_presented(root, 150);
+        let counters = state.monitor_media[&root];
+        let (_, rates) = monitor_window_from_state(
+            &state,
+            root,
+            &counters,
+            Duration::from_secs(5),
+            Some(before),
+        );
+
+        assert!((rates.fps_received - 30.0).abs() < f64::EPSILON);
+        assert!((rates.fps_presented - 30.0).abs() < f64::EPSILON);
+        assert_eq!(rates.frames_dropped_before_presentation, 0);
     }
 
     #[test]
@@ -3668,6 +3814,7 @@ mod tests {
             frames_presented: 25,
             frames_rejected: 3,
             frames_superseded_by_refresh: 0,
+            presentation_epoch: 0,
         };
 
         let rates = monitor_stream_window(Duration::ZERO, None, current, 60);
@@ -3686,6 +3833,7 @@ mod tests {
             frames_presented: 300,
             frames_rejected: 0,
             frames_superseded_by_refresh: 0,
+            presentation_epoch: 0,
         };
 
         let rates = monitor_stream_window(Duration::from_secs(5), None, current, 30);

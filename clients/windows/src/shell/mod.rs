@@ -352,6 +352,8 @@ impl DeckWindow {
         self.menu_bar.set_session_active(self.launcher.in_session());
         self.menu_bar
             .set_keyboard_status(&self.launcher.keyboard_status_line());
+        self.menu_bar
+            .set_switch_chord(self.launcher.keyboard_switch());
         self.backdrop.set_fill(if self.launcher.in_session() {
             egui::Color32::BLACK
         } else {

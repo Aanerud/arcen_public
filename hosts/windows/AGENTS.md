@@ -112,6 +112,17 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   shared `Departure::locks_session`: never on a same-account takeover
   (`OwnerCommand::TakenOver`, displaced incumbent) or a changed session.
   Keep every relay exit setting its `Departure`.
+- A broker that dies while attached (ADR 0025 §4, shared
+  `console_session::owner_death`): `owner_guard::OwnerGuard` is armed for
+  every attachment and released only after `hand_back_session`. It starts
+  `arcen-pier session-guard` (LocalSystem, session 0, outside the agent's
+  job, a pipe only the broker writes), which on a closed pipe waits for the
+  display watchdog and then locks the exact session (WTS id, logon id, SID);
+  and it writes `recovery\deck-attachment.record` (session, logon, a boot id
+  from a volatile key under the service's registry key, SID), which a
+  starting broker locks first (`recover_at_start`, before the speakers and
+  displays). Never lock a session a record or guard does not name exactly,
+  and never release a guard before the hand-back.
 - `audio.local_playback` is the broker's endpoint-mute lease
   (`local_playback.rs`, shared `local_playback::endpoint_*`): every active
   render endpoint muted (loopback still carries the mix), journalled in

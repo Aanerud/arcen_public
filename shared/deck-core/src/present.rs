@@ -196,8 +196,12 @@ pub struct PresenterTelemetryDelta {
     pub slot_waits: u64,
     /// Frames handed to the presenter.
     pub frames_received: u64,
-    /// Frames submitted to the GPU.
+    /// Presents submitted to the GPU, re-presents included.
     pub frames_submitted: u64,
+    /// The part of `frames_submitted` that showed a frame already shown
+    /// again ([`VideoPresenterSink::represent_last`]); 0 from a presenter
+    /// that does not tell them apart.
+    pub frames_represented: u64,
     /// Frames confirmed on screen.
     pub frames_confirmed: u64,
     /// Frames the compositor (Core Animation, DWM) reported dropped.
@@ -240,6 +244,17 @@ pub struct PresenterTelemetryDelta {
     pub confirmed_presented_at: Vec<Instant>,
     /// The output's refresh period.
     pub refresh_period_us: Option<u64>,
+}
+
+impl PresenterTelemetryDelta {
+    /// New decoded frames submitted to the GPU: submissions less
+    /// re-presents. A submission, not a confirmation that it reached the
+    /// glass.
+    #[must_use]
+    pub const fn new_frames_submitted(&self) -> u64 {
+        self.frames_submitted
+            .saturating_sub(self.frames_represented)
+    }
 }
 
 /// The output colour state a ten-bit presenter applied, for the stream

@@ -1002,6 +1002,21 @@ pub(crate) fn still_unlocked_session_of(session_id: u32, expected_sid: &str) -> 
     platform::still_unlocked_session_of(session_id, expected_sid)
 }
 
+/// Who a WTS session belongs to: the account and its logon. A session id
+/// comes back for later logons; the logon id (the token's
+/// `AuthenticationId`) does not, within one boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionOwner {
+    pub(crate) sid: String,
+    pub(crate) logon_id: u64,
+}
+
+/// The owner of `session_id` now: `None` when the session is gone or has no
+/// signed-in user.
+pub(crate) fn session_owner(session_id: u32) -> Result<Option<SessionOwner>, String> {
+    platform::session_owner(session_id)
+}
+
 /// `arcen-pier lock-session`, started by the broker in the user's session:
 /// locks the workstation (`LockWorkStation` must run on the session's
 /// interactive desktop).
@@ -1150,6 +1165,9 @@ pub(crate) use platform::{
 };
 
 #[cfg(windows)]
+pub(crate) use platform::{inherited_handle_list, quote_windows_argument};
+
+#[cfg(windows)]
 mod platform {
     use std::ffi::c_void;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
@@ -1251,8 +1269,8 @@ mod platform {
         }
     }
 
-    struct AttributeList {
-        raw: LPPROC_THREAD_ATTRIBUTE_LIST,
+    pub(crate) struct AttributeList {
+        pub(crate) raw: LPPROC_THREAD_ATTRIBUTE_LIST,
         _storage: Vec<usize>,
         // UpdateProcThreadAttribute stores the POINTER to the handle array, not
         // a copy; the kernel reads it at CreateProcess* time, so the array must
@@ -2238,7 +2256,7 @@ mod platform {
         unsafe { std::fs::File::from_raw_handle(raw) }
     }
 
-    fn inherited_handle_list(handles: Vec<HANDLE>) -> Result<AttributeList, String> {
+    pub(crate) fn inherited_handle_list(handles: Vec<HANDLE>) -> Result<AttributeList, String> {
         let handles: Box<[HANDLE]> = handles.into_boxed_slice();
         let mut bytes = 0usize;
         // SAFETY: documented sizing call writes the required allocation size.
@@ -2309,7 +2327,7 @@ mod platform {
         value.encode_utf16().chain([0]).collect()
     }
 
-    fn quote_windows_argument(argument: &str) -> String {
+    pub(crate) fn quote_windows_argument(argument: &str) -> String {
         if !argument
             .chars()
             .any(|character| character.is_whitespace() || character == '"')
@@ -2459,6 +2477,47 @@ mod platform {
         let token = own(token);
         crate::auth::token_string_sid(raw(&token))
             .is_ok_and(|sid| sid.eq_ignore_ascii_case(expected_sid))
+    }
+
+    pub fn session_owner(session_id: u32) -> Result<Option<super::SessionOwner>, String> {
+        let Some(candidate) = enumerate_sessions()?
+            .into_iter()
+            .find(|candidate| candidate.id == session_id)
+        else {
+            return Ok(None);
+        };
+        if candidate.user.is_empty() {
+            return Ok(None);
+        }
+        owner_of(session_id).map(Some)
+    }
+
+    fn owner_of(session_id: u32) -> Result<super::SessionOwner, String> {
+        use windows::Win32::Security::{TokenStatistics, TOKEN_STATISTICS};
+        let mut token = HANDLE::default();
+        // SAFETY: token is a valid out-param; WTS validates the session id.
+        unsafe { WTSQueryUserToken(session_id, &mut token) }
+            .map_err(|error| format!("WTSQueryUserToken({session_id}): {error}"))?;
+        let token = own(token);
+        let sid = crate::auth::token_string_sid(raw(&token))?;
+        let mut statistics = TOKEN_STATISTICS::default();
+        let mut written = 0u32;
+        // SAFETY: the buffer is a live TOKEN_STATISTICS of the size passed.
+        unsafe {
+            GetTokenInformation(
+                raw(&token),
+                TokenStatistics,
+                Some((&raw mut statistics).cast()),
+                std::mem::size_of::<TOKEN_STATISTICS>() as u32,
+                &mut written,
+            )
+        }
+        .map_err(|error| format!("GetTokenInformation({session_id}, statistics): {error}"))?;
+        let logon = statistics.AuthenticationId;
+        Ok(super::SessionOwner {
+            sid,
+            logon_id: (u64::from(logon.HighPart as u32) << 32) | u64::from(logon.LowPart),
+        })
     }
 
     /// Starts `arcen-pier lock-session` as the session's user on its
@@ -2790,6 +2849,10 @@ mod platform {
 
     pub fn still_unlocked_session_of(_session_id: u32, _expected_sid: &str) -> bool {
         false
+    }
+
+    pub fn session_owner(_session_id: u32) -> Result<Option<super::SessionOwner>, String> {
+        Err("Windows WTS sessions are unavailable on this platform".to_string())
     }
 }
 

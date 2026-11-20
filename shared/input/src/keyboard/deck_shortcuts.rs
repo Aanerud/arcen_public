@@ -25,6 +25,7 @@
 
 use arcen_protocol::keys::{KEY_Q, KEY_RETURN};
 
+use super::KeyboardSwitchChord;
 use super::pc::{KEY_END, KEY_F4, KEY_F12, KEY_HOME, KEY_PAUSE};
 
 /// An action a Deck keeps for itself.
@@ -216,29 +217,56 @@ impl DeckShortcut {
         !self.pc_chords().is_empty() || self.mac_chord().is_some()
     }
 
-    /// The action a chord pressed on a Mac keyboard is.
+    /// The action a chord pressed on a Mac keyboard is, with the default
+    /// keyboard switch.
     #[must_use]
     pub fn for_mac_chord(pressed: MacChord) -> Option<Self> {
+        Self::for_mac_chord_with(pressed, KeyboardSwitchChord::DEFAULT)
+    }
+
+    /// The action a chord pressed on a Mac keyboard is, with `switch` the
+    /// keyboard switch's chord ([`Self::ReleaseKeyboard`]).
+    #[must_use]
+    pub fn for_mac_chord_with(pressed: MacChord, switch: KeyboardSwitchChord) -> Option<Self> {
+        if switch.matches_mac(pressed) {
+            return Some(Self::ReleaseKeyboard);
+        }
         Self::ALL
             .into_iter()
-            .find(|action| action.mac_chord() == Some(pressed))
+            .find(|action| *action != Self::ReleaseKeyboard && action.mac_chord() == Some(pressed))
     }
 
     /// The action a key press on a PC keyboard is, with `held` the modifiers
-    /// held at it. `AltGr` held is never a Deck chord: it types characters.
+    /// held at it and the default keyboard switch. `AltGr` held is never a
+    /// Deck chord: it types characters.
     #[must_use]
     pub fn for_pc_key(qt_key: u32, held: PcModifierState) -> Option<Self> {
+        Self::for_pc_key_with(qt_key, held, KeyboardSwitchChord::DEFAULT)
+    }
+
+    /// The action a key press on a PC keyboard is, with `switch` the
+    /// keyboard switch's chord ([`Self::ReleaseKeyboard`]).
+    #[must_use]
+    pub fn for_pc_key_with(
+        qt_key: u32,
+        held: PcModifierState,
+        switch: KeyboardSwitchChord,
+    ) -> Option<Self> {
         if held.altgr {
             return None;
         }
+        if switch.matches_pc(qt_key, held) {
+            return Some(Self::ReleaseKeyboard);
+        }
         Self::ALL.into_iter().find(|action| {
-            action.pc_chords().iter().any(|chord| {
-                chord.key == qt_key
-                    && chord.control == held.control
-                    && chord.alt == held.alt
-                    && chord.shift == held.shift
-                    && chord.windows == held.windows
-            })
+            *action != Self::ReleaseKeyboard
+                && action.pc_chords().iter().any(|chord| {
+                    chord.key == qt_key
+                        && chord.control == held.control
+                        && chord.alt == held.alt
+                        && chord.shift == held.shift
+                        && chord.windows == held.windows
+                })
         })
     }
 }
@@ -374,6 +402,47 @@ mod tests {
             DeckShortcut::for_mac_chord(MacChord::new(true, true, false, KEY_HOME)),
             Some(DeckShortcut::ReleaseKeyboard)
         );
+    }
+
+    #[test]
+    fn the_keyboard_switch_follows_the_chosen_chord_on_both_keyboards() {
+        let switch = KeyboardSwitchChord::CONTROL_ALT_SHIFT_Z;
+        let held = PcModifierState {
+            control: true,
+            alt: true,
+            shift: true,
+            ..PcModifierState::default()
+        };
+        assert_eq!(
+            DeckShortcut::for_pc_key_with(0x5A, held, switch),
+            Some(DeckShortcut::ReleaseKeyboard)
+        );
+        // The default chord is an ordinary key again.
+        assert_eq!(
+            DeckShortcut::for_pc_key_with(KEY_HOME, held_ctrl_alt(), switch),
+            None
+        );
+        // Other Deck chords stay.
+        assert_eq!(
+            DeckShortcut::for_pc_key_with(KEY_END, held_ctrl_alt(), switch),
+            Some(DeckShortcut::SendSecureAttention)
+        );
+        let mac = MacChord {
+            shift: true,
+            ..MacChord::new(true, true, false, 0x5A)
+        };
+        assert_eq!(
+            DeckShortcut::for_mac_chord_with(mac, switch),
+            Some(DeckShortcut::ReleaseKeyboard)
+        );
+        assert_eq!(
+            DeckShortcut::for_mac_chord_with(MacChord::new(true, true, false, KEY_HOME), switch),
+            None
+        );
+    }
+
+    const fn held_ctrl_alt() -> PcModifierState {
+        held(true, true, false)
     }
 
     #[test]

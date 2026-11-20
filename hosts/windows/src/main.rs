@@ -150,6 +150,7 @@ mod nvapi_headless;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod nvapi_inventory;
 mod output_provider;
+mod owner_guard;
 #[cfg(windows)]
 mod paths;
 #[cfg(not(windows))]
@@ -831,6 +832,9 @@ enum MaintenanceCommand {
     Capenc,
     /// Started by the broker in a departing Deck's session: lock it.
     LockSession,
+    /// Started by the broker for each attachment: lock the session if the
+    /// broker dies before handing it back.
+    SessionGuard(owner_guard::GuardArguments),
     RestoreDisplay {
         journal: Option<std::path::PathBuf>,
         console: bool,
@@ -931,6 +935,9 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
             }
             Ok(Some(MaintenanceCommand::LockSession))
         }
+        owner_guard::SUBCOMMAND => Ok(Some(MaintenanceCommand::SessionGuard(
+            owner_guard::parse_arguments(&mut arguments)?,
+        ))),
         "restore-display" => {
             let mut journal = None;
             let mut console = false;
@@ -2910,6 +2917,7 @@ fn main() {
                 MaintenanceCommand::MigrateDisplayJournal { journal } => {
                     display::migrate_legacy_journal(journal, &emitter)
                 }
+                MaintenanceCommand::SessionGuard(arguments) => owner_guard::run(arguments),
                 MaintenanceCommand::RestoreTimezone { journal } => {
                     timezone::restore_from_journal(journal)
                 }
@@ -3285,13 +3293,18 @@ where
     let mut tls_health_interval = tokio::time::interval(Duration::from_secs(60));
     tls_health_interval.tick().await;
     let topology_debug = WtsTopologyDebugWorker::default();
+    // Running before the recovery below: locking a session may take a
+    // while, and nothing is served until the loop starts.
+    on_started();
+    // A Deck's session left attached by a broker that died is locked before
+    // the desk gets its speakers or displays back (ADR 0025, GAP-047).
+    let _ = tokio::task::spawn_blocking(owner_guard::recover_at_start).await;
     let _ = tokio::task::spawn_blocking(local_playback::recover_left_over).await;
     let mut console_display_recovery =
         console_recovery::ConsoleDisplayRecovery::new(recovery::default_path());
     console_display_recovery.request(arcen_outputs::display_lease::DisplayLeaseEvent::PierStarted);
     let mut console_display_recovery_tick = tokio::time::interval(Duration::from_secs(5));
     console_display_recovery_tick.tick().await;
-    on_started();
     // Desk privacy is on unless the administrator turned it off
     // (`privacy.desk`); the effective choice is said once, at start (off at
     // error level, so every log profile records it).

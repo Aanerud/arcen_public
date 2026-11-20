@@ -32,7 +32,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use super::backdrop::Backdrop;
 use super::launcher::Launcher;
-use super::session::{ROOT_WINDOW, WindowObservation};
+use super::session::{Connection, ROOT_WINDOW, WindowObservation};
 use super::{display_number, display_of, hwnd_of};
 use crate::present::composition::{CompositionTree, SharedTree};
 use crate::present::{AdapterChoice, D3d11VideoSink, Gpu};
@@ -330,19 +330,28 @@ impl Secondaries {
             else {
                 continue;
             };
-            let outcome = match pipeline {
+            let _ = match pipeline {
                 PresenterPipeline::EightBit => window.eight_bit.present(frame),
                 PresenterPipeline::TenBit => window.ten_bit.present(frame),
             };
-            if outcome.is_presented() {
-                connection.note_secondary_presented(*monitor, 1);
-            }
         }
+        self.report_new_frames(connection);
         for (hwnd, monitor) in attach {
             launcher.attach_secondary_input(hwnd, monitor);
         }
         if !frames.is_empty() {
             ctx.request_repaint();
+        }
+    }
+
+    /// What each window's presenter thread put up since the last pass, as
+    /// the root window counts its own: a frame handed over and then
+    /// replaced before its present, or a re-present, is no new frame.
+    fn report_new_frames(&self, connection: &Connection) {
+        for window in &self.windows {
+            let new_frames = window.eight_bit.take_telemetry().new_frames_submitted()
+                + window.ten_bit.take_telemetry().new_frames_submitted();
+            connection.note_secondary_presented(window.monitor, new_frames);
         }
     }
 

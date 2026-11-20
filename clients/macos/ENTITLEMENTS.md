@@ -90,7 +90,25 @@ are separate Apple mechanisms. An app can need one, both, or neither for a given
   `com.apple.security.network.client` is an App-Sandbox-only entitlement and is deliberately
   **not** in `Deck.entitlements`.
 
-None of the three keys above is authorized by the provisioning profile either, so leaving
+- **Accessibility** (System Settings → Privacy & Security → Accessibility) is *only*
+  TCC, and optional. The Deck's system-shortcut event tap
+  (`clients/macos/src/ui/system_shortcut_tap.rs`: an active `CGEventTap` at the session
+  level that takes ⌘Tab, ⌘Space and Mission Control for the host) needs it. It is off
+  by default (Settings › Input › "Send ⌘Tab, ⌘Space and Mission Control to the remote
+  computer"); the Deck checks `AXIsProcessTrusted()` and never creates the tap without
+  the grant, and it asks for the grant (`AXIsProcessTrustedWithOptions` with the
+  prompt option) only when the user clicks **Allow in Accessibility…** next to that
+  switch, or **Allow** in the one-time question the Deck shows the first time ⌘Tab
+  leaves a session without the tap ("Send ⌘Tab to the remote? macOS needs the
+  Accessibility permission.", Allow / Not now; Not now is remembered and the Deck
+  never asks again). No entitlement and no Info.plist usage string exists for it: the system's own
+  prompt names the app. The tap exists only while the host has the keyboard and a
+  session window is key, reads only key-down/key-up events (key code, autorepeat flag,
+  modifier flags), lets every event go while Secure Event Input is on or when the event
+  is aimed at another process, and logs no key identity. Turning it on by default is a
+  Release/Security decision (ledger `GAP-052`).
+
+None of the three entitlement keys above is authorized by the provisioning profile either, so leaving
 them out also lets the provisioning-profile entitlement-superset validator
 in `packaging/macos/validate_release_inputs.py` pass against the profile.
 

@@ -409,13 +409,15 @@ impl Connection {
         }
         if confirmed > 0 || submitted > 0 {
             self.last_frame_at = Some(now);
-            if let Some(root) = self.multi_window_root_monitor() {
-                // Presents handed to the presenter, as each further window
-                // counts its own: a frame is submitted in one pass and
-                // confirmed in a later one, so counting either per pass
-                // would count it twice.
-                self.note_monitor_presents(root, submitted);
-            }
+        }
+        if let Some(root) = self.multi_window_root_monitor() {
+            // New frames the root presenter submitted, as each further
+            // window counts its own: a frame is submitted in one pass and
+            // confirmed in a later one, so counting both would count it
+            // twice, and a re-present is no new frame.
+            let new_frames =
+                pass.eight_bit.new_frames_submitted() + pass.ten_bit.new_frames_submitted();
+            self.note_presented(root, new_frames);
         }
         for window in [&mut self.presented, &mut self.submitted] {
             while window
@@ -748,21 +750,25 @@ impl Connection {
             .collect()
     }
 
-    /// Counts frames a secondary window presented (per-display statistics).
+    /// Counts new frames a secondary window's presenters submitted: the
+    /// per-display statistics and the session's presented frames (the
+    /// decoded count covers every monitor).
     pub(super) fn note_secondary_presented(&self, monitor: SessionMonitorId, frames: u64) {
-        *self
-            .media
-            .shared()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .monitor_presented_frames
-            .entry(monitor)
-            .or_default() += frames;
         self.media.record_secondary_presented(frames);
-        self.note_monitor_presents(monitor, frames);
+        self.note_presented(monitor, frames);
     }
 
-    fn note_monitor_presents(&self, monitor: SessionMonitorId, frames: u64) {
+    /// One window's new frames for `monitor`, once: the shared per-monitor
+    /// count the media worker logs and the local history Stream
+    /// Statistics shows.
+    fn note_presented(&self, monitor: SessionMonitorId, frames: u64) {
+        if frames > 0 {
+            self.media
+                .shared()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .note_monitor_presented(monitor, frames);
+        }
         let now = std::time::Instant::now();
         let mut presents = self
             .monitor_presents
@@ -1249,6 +1255,17 @@ impl Connection {
     }
 
     /// Applies `apply` to the window's input, if this session has it.
+    /// The keyboard switch's chord, for the session window and every
+    /// secondary window.
+    pub(super) fn set_switch_chord(&self, switch: arcen_input::keyboard::KeyboardSwitchChord) {
+        let _ = self.with_window_input(|input| input.set_switch_chord(switch));
+        if let Some(multi) = &self.multi {
+            for (secondary, _) in &multi.inputs {
+                crate::input::with_input(*secondary, |input| input.set_switch_chord(switch));
+            }
+        }
+    }
+
     pub(super) fn with_window_input<T>(
         &self,
         apply: impl FnOnce(&mut WindowInput) -> T,

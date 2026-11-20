@@ -979,6 +979,28 @@ pub fn load_client_settings(
     {
         settings.keyboard_capture = policy;
     }
+    if let Some(on) = value
+        .get("capture_mac_system_shortcuts")
+        .and_then(serde_json::Value::as_bool)
+    {
+        settings.capture_mac_system_shortcuts = on;
+    }
+    // `mac_spaces_to_host` (⌃← and ⌃→ to the host, 0.20.x previews) is not
+    // read: those keys follow the keyboard switch like every other system
+    // shortcut, and the next save drops the key.
+    if let Some(on) = value
+        .get("mac_system_shortcut_offer_answered")
+        .and_then(serde_json::Value::as_bool)
+    {
+        settings.mac_system_shortcut_offer_answered = on;
+    }
+    if let Some(chord) = value
+        .get("keyboard_switch")
+        .and_then(serde_json::Value::as_str)
+        .and_then(arcen_input::keyboard::KeyboardSwitchChord::parse)
+    {
+        settings.keyboard_switch = chord.or_default();
+    }
     // `option_keys` knows Automatic; older builds wrote only
     // `option_key_mode`, their default included (see `from_settings`).
     settings.option_key_mode = arcen_input::text::OptionKeyPreference::from_settings(
@@ -1059,6 +1081,19 @@ pub fn save_client_settings(
     value.insert(
         "keyboard_capture".to_string(),
         settings.keyboard_capture.token().into(),
+    );
+    value.insert(
+        "capture_mac_system_shortcuts".to_string(),
+        settings.capture_mac_system_shortcuts.into(),
+    );
+    value.remove("mac_spaces_to_host");
+    value.insert(
+        "mac_system_shortcut_offer_answered".to_string(),
+        settings.mac_system_shortcut_offer_answered.into(),
+    );
+    value.insert(
+        "keyboard_switch".to_string(),
+        settings.keyboard_switch.pc_text().into(),
     );
     value.insert(
         "option_keys".to_string(),

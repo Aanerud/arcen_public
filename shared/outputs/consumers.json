@@ -218,6 +218,7 @@
         "provider::capability",
         "provider::error",
         "provider::transaction",
+        "windows_advanced_colour",
         "windows_multi_monitor",
         "windows_topology"
       ],

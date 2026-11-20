@@ -226,7 +226,14 @@ impl WindowInput {
         self.apply_grab();
     }
 
-    /// Ctrl+Alt+Home or the menu item: the keyboard goes to this PC (every
+    /// The keyboard switch's chord (Settings ▸ Input ▸ Keyboard switch), for
+    /// this window's keys and the keyboard hook.
+    pub fn set_switch_chord(&mut self, switch: arcen_input::keyboard::KeyboardSwitchChord) {
+        self.keyboard.set_switch_chord(switch);
+        hook::set_switch_chord(switch);
+    }
+
+    /// The keyboard switch or the menu item: the keyboard goes to this PC (every
     /// key held on the host is released first) or back to the host.
     pub fn toggle_keyboard(&mut self) {
         let change = self.capture.toggle();

@@ -154,6 +154,14 @@ impl Keyboard {
         self.configure_text();
     }
 
+    /// The keyboard switch's chord.
+    pub(super) const fn set_switch_chord(
+        &mut self,
+        switch: arcen_input::keyboard::KeyboardSwitchChord,
+    ) {
+        self.input.set_switch_chord(switch);
+    }
+
     pub(super) fn set_grab(&mut self, grabbed: bool) -> Vec<HostKeyEdge> {
         self.grabbed = grabbed;
         self.input.set_grab(grabbed)

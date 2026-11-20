@@ -30,6 +30,10 @@ use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 
 use crate::logging::DISPLAY;
 use crate::recovery::AdvancedColorRecoveryEntry;
+use arcen_outputs::windows_advanced_colour::{
+    hdr_toggle, restore_toggle, setup_poll, AdmittedAs, ColourReading, CompositionMode, SetupPoll,
+    TargetObservation,
+};
 
 const WINDOWS_11_FIRST_BUILD: u32 = 22_000;
 
@@ -48,7 +52,6 @@ const FLAG_WCG_SUPPORTED: u32 = 1 << 6;
 const FLAG_WCG_USER_ENABLED: u32 = 1 << 7;
 
 const COLOR_MODE_SDR: i32 = 0;
-const COLOR_MODE_WCG: i32 = 1;
 const COLOR_MODE_HDR: i32 = 2;
 
 // Hardware measurement on the GRID host showed Windows taking up to roughly
@@ -144,6 +147,16 @@ impl AdvancedColorTarget {
 }
 
 impl AdvancedColorState {
+    fn reading(&self) -> ColourReading {
+        ColourReading {
+            hdr_supported: self.hdr_supported,
+            hdr_user_enabled: self.hdr_user_enabled,
+            advanced_color_active: self.advanced_color_active,
+            wcg_user_enabled: self.wcg_user_enabled,
+            mode: CompositionMode::from_raw(self.active_colour_mode),
+        }
+    }
+
     fn recovery_target(&self, original_hdr_enabled: bool) -> AdvancedColorRecoveryEntry {
         AdvancedColorRecoveryEntry {
             adapter_device_path: self.adapter_device_path.clone(),
@@ -172,15 +185,6 @@ fn windows_11_or_later() -> Result<bool, String> {
         ));
     }
     Ok(version.dwMajorVersion >= 10 && version.dwBuildNumber >= WINDOWS_11_FIRST_BUILD)
-}
-
-fn mode_name(mode: i32) -> &'static str {
-    match mode {
-        COLOR_MODE_SDR => "sdr",
-        COLOR_MODE_WCG => "wcg",
-        COLOR_MODE_HDR => "hdr",
-        _ => "unknown",
-    }
 }
 
 fn query_distinct_hdr(
@@ -487,65 +491,11 @@ fn set_hdr_enabled(state: &AdvancedColorState, enabled: bool) -> bool {
     unsafe { DisplayConfigSetDeviceInfo(&request.header) == 0 }
 }
 
-fn is_genuinely_hdr(state: &AdvancedColorState) -> bool {
-    state.hdr_supported && state.advanced_color_active && state.active_colour_mode == COLOR_MODE_HDR
-}
-
-fn is_sdr(state: &AdvancedColorState) -> bool {
-    !state.advanced_color_active && state.active_colour_mode == COLOR_MODE_SDR
-}
-
-fn user_hdr_enabled(state: &AdvancedColorState) -> bool {
-    state.hdr_user_enabled
-}
-
 fn is_requested_target(
     state: &AdvancedColorState,
     required_targets: &[AdvancedColorTarget],
 ) -> bool {
     required_targets.iter().any(|target| target.matches(state))
-}
-
-fn all_required_targets_in_mode(
-    required_targets: &[AdvancedColorTarget],
-    states: &[AdvancedColorState],
-    desired_hdr: bool,
-) -> bool {
-    required_targets.iter().all(|target| {
-        states
-            .iter()
-            .any(|state| target.matches(state) && target_satisfies_desired(state, desired_hdr))
-    })
-}
-
-fn target_satisfies_desired(state: &AdvancedColorState, desired_hdr: bool) -> bool {
-    user_hdr_enabled(state) == desired_hdr
-        && if desired_hdr {
-            is_genuinely_hdr(state)
-        } else {
-            is_sdr(state)
-        }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HdrChangeDecision {
-    Change { from_hdr: bool, to_hdr: bool },
-    NoChange,
-}
-
-fn change_decision(state: &AdvancedColorState, desired_hdr: bool) -> HdrChangeDecision {
-    if !state.hdr_supported {
-        return HdrChangeDecision::NoChange;
-    }
-    let current_hdr = user_hdr_enabled(state);
-    if current_hdr == desired_hdr {
-        HdrChangeDecision::NoChange
-    } else {
-        HdrChangeDecision::Change {
-            from_hdr: current_hdr,
-            to_hdr: desired_hdr,
-        }
-    }
 }
 
 fn state_summary(states: &[AdvancedColorState]) -> String {
@@ -565,7 +515,7 @@ fn state_summary(states: &[AdvancedColorState]) -> String {
                 state.hdr_user_enabled,
                 state.wcg_supported,
                 state.wcg_user_enabled,
-                mode_name(state.active_colour_mode),
+                CompositionMode::from_raw(state.active_colour_mode).name(),
                 state.bits_per_colour_channel
             )
         })
@@ -660,9 +610,9 @@ fn recovery_entries_for_states(
 ) -> Vec<AdvancedColorRecoveryEntry> {
     states
         .iter()
-        .filter_map(|state| match change_decision(state, desired_hdr) {
-            HdrChangeDecision::Change { from_hdr, .. } => Some(state.recovery_target(from_hdr)),
-            HdrChangeDecision::NoChange => None,
+        .filter_map(|state| {
+            hdr_toggle(state.reading(), desired_hdr)
+                .map(|(from_hdr, _)| state.recovery_target(from_hdr))
         })
         .collect()
 }
@@ -695,73 +645,87 @@ fn set_required_targets(
     entries: &mut Vec<AdvancedColorRecoveryEntry>,
     session_log_id: &arcen_telemetry::CorrelationId,
 ) -> Result<(), String> {
-    if required_targets.is_empty() {
-        return Err("Advanced Color session requires at least one display target".to_string());
-    }
     let started = std::time::Instant::now();
     let deadline = crate::session::AGENT_SETUP.wait_deadline(started, ENGAGE_TIMEOUT);
     let mut last_summary = String::new();
     let mut changed_targets = 0_usize;
+    let mut arcen_toggled = vec![false; required_targets.len()];
     loop {
-        let states = match query_targets(required_targets) {
-            Ok(states) => states,
-            Err(error) if !desired_hdr => {
+        let (matched, observations) = match query_targets(required_targets) {
+            Ok(states) => {
+                let summary = state_summary(&states);
+                if summary != last_summary {
+                    tracing::debug!(
+                        target: DISPLAY,
+                        required_targets = required_targets.len(),
+                        desired = if desired_hdr { "hdr" } else { "sdr" },
+                        state = summary,
+                        "advanced colour state verification"
+                    );
+                    last_summary = summary;
+                }
+                let matched = required_targets
+                    .iter()
+                    .map(|target| states.iter().find(|state| target.matches(state)).cloned())
+                    .collect::<Vec<_>>();
+                let observations = matched
+                    .iter()
+                    .zip(&arcen_toggled)
+                    .map(|(state, &arcen_toggled)| {
+                        state.as_ref().map(|state| TargetObservation {
+                            reading: state.reading(),
+                            arcen_toggled,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (matched, Ok(observations))
+            }
+            Err(error) => (Vec::new(), Err(error)),
+        };
+        let toggles = match setup_poll(desired_hdr, observations.as_deref().map_err(String::as_str))
+        {
+            SetupPoll::Admitted(admitted) => {
+                if !desired_hdr && changed_targets != 0 {
+                    tracing::info!(
+                        target: DISPLAY,
+                        changed_targets,
+                        "Windows HDR disabled on required display(s) before SDR capture"
+                    );
+                }
+                let wcg_targets = admitted
+                    .iter()
+                    .filter(|how| **how == AdmittedAs::WcgWithoutHdr)
+                    .count();
+                if wcg_targets != 0 {
+                    tracing::info!(
+                        target: DISPLAY,
+                        wcg_targets,
+                        state = %last_summary,
+                        "SDR capture admitted on wide-colour-gamut display(s) without HDR; \
+                         no Windows HDR change is needed or possible"
+                    );
+                }
+                return Ok(());
+            }
+            SetupPoll::ContinueUnverified(reason) => {
                 tracing::warn!(
                     target: DISPLAY,
-                    %error,
-                    "continuing SDR session after failing to query Windows HDR state"
+                    %reason,
+                    "continuing SDR session without verifying Windows HDR state"
                 );
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            SetupPoll::Refuse(reason) => return Err(reason),
+            SetupPoll::Pending { toggles } => toggles,
         };
-        let missing_targets = required_targets
-            .iter()
-            .filter(|target| !states.iter().any(|state| target.matches(state)))
-            .count();
-        if missing_targets != 0 && desired_hdr {
-            return Err(format!(
-                "Advanced Color setup could not find {missing_targets} required display target(s)"
-            ));
-        }
-        if missing_targets != 0 {
-            tracing::warn!(
-                target: DISPLAY,
-                missing_targets,
-                "continuing SDR session after failing to resolve every Windows HDR target"
-            );
-            return Ok(());
-        }
-        let summary = state_summary(&states);
-        if summary != last_summary {
-            tracing::debug!(
-                target: DISPLAY,
-                required_targets = required_targets.len(),
-                desired = if desired_hdr { "hdr" } else { "sdr" },
-                state = summary,
-                "advanced colour state verification"
-            );
-            last_summary = summary;
-        }
-        if all_required_targets_in_mode(required_targets, &states, desired_hdr) {
-            if !desired_hdr && changed_targets != 0 {
-                tracing::info!(
-                    target: DISPLAY,
-                    changed_targets,
-                    "Windows HDR disabled on required display(s) before SDR capture"
-                );
-            }
-            return Ok(());
-        }
-        for state in &states {
-            let HdrChangeDecision::Change { from_hdr, to_hdr } =
-                change_decision(state, desired_hdr)
-            else {
+        for (index, from_hdr, to_hdr) in toggles {
+            let Some(state) = matched.get(index).and_then(Option::as_ref) else {
                 continue;
             };
             ensure_recovery_entry(entries, state, from_hdr, session_log_id)?;
             let accepted = set_hdr_enabled(state, to_hdr);
             changed_targets += usize::from(accepted);
+            arcen_toggled[index] |= accepted;
             tracing::info!(
                 target: DISPLAY,
                 target_id = state.target,
@@ -864,10 +828,9 @@ pub(crate) fn restore_entries(
                 continue;
             }
         };
-        let before = user_hdr_enabled(&state);
-        if before == entry.original_hdr_enabled {
+        let Some((before, _)) = restore_toggle(state.reading(), entry.original_hdr_enabled) else {
             continue;
-        }
+        };
         let accepted = set_hdr_enabled(&state, entry.original_hdr_enabled);
         tracing::info!(
             target: DISPLAY,
@@ -947,6 +910,17 @@ fn clear_recovery_entries() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arcen_outputs::windows_advanced_colour::{target_step, TargetStep};
+
+    const COLOR_MODE_WCG: i32 = 1;
+
+    fn is_genuinely_hdr(state: &AdvancedColorState) -> bool {
+        state.reading().is_genuinely_hdr()
+    }
+
+    fn change_decision(state: &AdvancedColorState, desired_hdr: bool) -> Option<(bool, bool)> {
+        hdr_toggle(state.reading(), desired_hdr)
+    }
 
     #[test]
     fn the_hdr_wait_is_the_shared_setup_budget_not_longer_than_the_broker() {
@@ -1084,7 +1058,24 @@ mod tests {
         );
         let states = [requested_sdr.clone(), unrelated_hdr.clone()];
 
-        assert!(!all_required_targets_in_mode(&required, &states, true));
+        let observations = required
+            .iter()
+            .map(|target| {
+                states
+                    .iter()
+                    .find(|state| target.matches(state))
+                    .map(|state| TargetObservation {
+                        reading: state.reading(),
+                        arcen_toggled: false,
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            setup_poll(true, Ok(&observations)),
+            SetupPoll::Pending {
+                toggles: vec![(0, false, true)]
+            }
+        );
         assert!(is_requested_target(&requested_sdr, &required));
         assert!(!is_requested_target(&unrelated_hdr, &required));
     }
@@ -1092,13 +1083,7 @@ mod tests {
     #[test]
     fn hdr_session_from_sdr_records_restore_to_sdr() {
         let sdr = state(ColorStateApi::DistinctHdr, true, false, COLOR_MODE_SDR, 10);
-        assert_eq!(
-            change_decision(&sdr, true),
-            HdrChangeDecision::Change {
-                from_hdr: false,
-                to_hdr: true
-            }
-        );
+        assert_eq!(change_decision(&sdr, true), Some((false, true)));
         let entries = recovery_entries_for_states(&[sdr], true);
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].original_hdr_enabled);
@@ -1107,13 +1092,7 @@ mod tests {
     #[test]
     fn sdr_session_from_hdr_records_restore_to_hdr() {
         let hdr = state(ColorStateApi::DistinctHdr, true, true, COLOR_MODE_HDR, 10);
-        assert_eq!(
-            change_decision(&hdr, false),
-            HdrChangeDecision::Change {
-                from_hdr: true,
-                to_hdr: false
-            }
-        );
+        assert_eq!(change_decision(&hdr, false), Some((true, false)));
         let entries = recovery_entries_for_states(&[hdr], false);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].original_hdr_enabled);
@@ -1122,14 +1101,14 @@ mod tests {
     #[test]
     fn sdr_session_on_sdr_display_does_not_change_hdr_state() {
         let sdr = state(ColorStateApi::DistinctHdr, true, false, COLOR_MODE_SDR, 10);
-        assert_eq!(change_decision(&sdr, false), HdrChangeDecision::NoChange);
+        assert_eq!(change_decision(&sdr, false), None);
         assert!(recovery_entries_for_states(&[sdr], false).is_empty());
     }
 
     #[test]
     fn hdr_session_on_hdr_display_does_not_record_restore() {
         let hdr = state(ColorStateApi::DistinctHdr, true, true, COLOR_MODE_HDR, 10);
-        assert_eq!(change_decision(&hdr, true), HdrChangeDecision::NoChange);
+        assert_eq!(change_decision(&hdr, true), None);
         assert!(recovery_entries_for_states(&[hdr], true).is_empty());
     }
 
@@ -1140,18 +1119,34 @@ mod tests {
         inactive_but_enabled.hdr_user_enabled = true;
         assert_eq!(
             change_decision(&inactive_but_enabled, false),
-            HdrChangeDecision::Change {
-                from_hdr: true,
-                to_hdr: false
-            }
+            Some((true, false))
         );
         let entries = recovery_entries_for_states(&[inactive_but_enabled.clone()], false);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].original_hdr_enabled);
         assert!(
-            !target_satisfies_desired(&inactive_but_enabled, false),
+            !matches!(
+                target_step(inactive_but_enabled.reading(), false, false),
+                TargetStep::Admitted(_)
+            ),
             "SDR capture readiness must not ignore an enabled user HDR toggle"
         );
+    }
+
+    #[test]
+    fn windows_11_wcg_report_admits_sdr_capture_and_journals_nothing() {
+        let mut wcg = state(ColorStateApi::DistinctHdr, false, true, COLOR_MODE_WCG, 10);
+        wcg.wcg_supported = true;
+        wcg.wcg_user_enabled = true;
+        wcg.hdr_user_enabled = false;
+        assert_eq!(wcg.reading().mode, CompositionMode::Wcg);
+        assert_eq!(
+            target_step(wcg.reading(), false, false),
+            TargetStep::Admitted(AdmittedAs::WcgWithoutHdr)
+        );
+        assert_eq!(target_step(wcg.reading(), true, false), TargetStep::Wait);
+        assert_eq!(change_decision(&wcg, false), None);
+        assert!(recovery_entries_for_states(&[wcg], false).is_empty());
     }
 
     #[test]

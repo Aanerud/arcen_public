@@ -901,6 +901,17 @@ Windows 11 uses `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2` and
 `DISPLAYCONFIG_SET_HDR_STATE`; the legacy Advanced Color bit is insufficient
 because it can describe WCG. Windows 10 keeps the older API.
 
+An SDR session changes only the user's HDR toggle, so it is admitted when that
+toggle is off and the target composes SDR, or composes WCG (for
+example Auto Color Management): no HDR operation leaves WCG, and waiting for
+SDR there only spent the setup budget. Straight after Arcen switched HDR off,
+WCG counts only when the user's own WCG choice is on; otherwise it may be a
+step on the way to SDR. An HDR toggle left on keeps an SDR session waiting
+even where Windows does not offer HDR yet, because support can appear late
+and HDR would then compose the session with nothing journalled to restore.
+WCG never satisfies an HDR session. The rules are
+shared `arcen_outputs::windows_advanced_colour`, tested on every OS.
+
 HDR queries and mutations are scoped to the exact `(adapter,target)` identities
 resolved from the final display lease. Another active HDR monitor cannot
 satisfy this session's gate and is never toggled on its behalf.

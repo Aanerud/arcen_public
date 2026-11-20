@@ -6,16 +6,48 @@
 //! (`arcen_input::keyboard::{DeckShortcut, SendKey, KeyboardCapturePolicy}`),
 //! so the help can never drift from what the keyboard does.
 
-use arcen_input::keyboard::{DeckShortcut, KeyboardCapturePolicy, KeyboardStatus, SendKey};
+use arcen_input::keyboard::{
+    DeckShortcut, KeyboardCapturePolicy, KeyboardOwner, KeyboardStatus, KeyboardSwitchChord,
+    KeyboardSwitchPreset, SendKey, SwitchChordCheck,
+};
 
 use super::wording::{DeckPlatform, chord};
+
+/// The keyboard switch's chord as this Deck spells it: "Ctrl+Alt+Home" on a
+/// PC, "Control-Option-Home" on a Mac.
+#[must_use]
+pub fn switch_chord_text(platform: DeckPlatform, switch: KeyboardSwitchChord) -> String {
+    match platform {
+        DeckPlatform::Mac => switch.mac_text(),
+        DeckPlatform::Pc => switch.pc_text(),
+    }
+}
+
+/// A Deck shortcut's chord, with the keyboard switch's chosen one.
+#[must_use]
+pub fn shortcut_chord_text(
+    platform: DeckPlatform,
+    shortcut: DeckShortcut,
+    switch: KeyboardSwitchChord,
+) -> String {
+    if shortcut == DeckShortcut::ReleaseKeyboard {
+        switch_chord_text(platform, switch)
+    } else {
+        chord(platform, shortcut)
+    }
+}
 
 /// The indicator: "Keyboard: Z8 (Ctrl+Alt+Home to release)" while the host
 /// has it, "Keyboard: this PC (click to return)" while this computer does;
 /// empty outside a session.
 #[must_use]
-pub fn keyboard_status_line(status: KeyboardStatus, host: &str, platform: DeckPlatform) -> String {
-    let escape = chord(platform, DeckShortcut::ReleaseKeyboard);
+pub fn keyboard_status_line(
+    status: KeyboardStatus,
+    host: &str,
+    platform: DeckPlatform,
+    switch: KeyboardSwitchChord,
+) -> String {
+    let escape = switch_chord_text(platform, switch);
     match status {
         KeyboardStatus::NoSession => String::new(),
         KeyboardStatus::Host {
@@ -33,6 +65,184 @@ pub fn keyboard_status_line(status: KeyboardStatus, host: &str, platform: DeckPl
     }
 }
 
+/// The macOS Deck's switch for its event tap (Settings ▸ Input).
+pub const MAC_SYSTEM_SHORTCUTS_LABEL: &str =
+    "Send ⌘Tab, ⌘Space and Mission Control to the remote computer";
+
+/// What the switch does and what it needs.
+pub const MAC_SYSTEM_SHORTCUTS_HELP: &str = "macOS acts on these before any window sees them. To send them, Arcen Deck watches the \
+     keyboard while a session window is in front and the remote computer has the keyboard, \
+     which needs the Accessibility permission (System Settings ▸ Privacy & Security ▸ \
+     Accessibility). It takes only ⌘Tab, ⌘`, ⌘Space, ⌃↑, ⌃↓, ⌃←, ⌃→, the screenshot keys \
+     (⇧⌘3, 4, 5) and ⌥⌘D, and only while the keyboard switch says Remote; ⌥⌘Esc, ⌃⌘Q and \
+     every key while a password field asks for secure input stay on this Mac. Off, these \
+     chords act on this Mac as before.";
+
+/// The one-time question when ⌘Tab is pressed in a session without the
+/// permission.
+pub const MAC_SHORTCUT_OFFER_TITLE: &str = "Send ⌘Tab to the remote?";
+
+/// Its explanation.
+pub const MAC_SHORTCUT_OFFER_TEXT: &str = "macOS needs the Accessibility permission. You can \
+     change this later in Settings ▸ Input.";
+
+/// Settings ▸ Input ▸ Keyboard switch: what the switch is.
+#[must_use]
+pub fn keyboard_switch_help(platform: DeckPlatform, switch: KeyboardSwitchChord) -> String {
+    let keys = switch_chord_text(platform, switch);
+    let machine = platform.this_machine();
+    let shortcuts = match platform {
+        DeckPlatform::Pc => "Alt+Tab, the Windows key and Print Screen",
+        DeckPlatform::Mac => "⌘Tab, ⌘Space, Mission Control and ⌃←/⌃→",
+    };
+    format!(
+        "{keys} flips the keyboard between the remote computer (Remote) and {machine} (Local). \
+         In Remote, every key and {shortcuts} go to the remote computer; in Local, they all \
+         stay on {machine}. Clicking the picture also returns to Remote."
+    )
+}
+
+/// The Settings label of a switch preset.
+#[must_use]
+pub fn keyboard_switch_preset_label(
+    platform: DeckPlatform,
+    preset: KeyboardSwitchPreset,
+) -> String {
+    preset.chord().map_or_else(
+        || "Custom chord".to_owned(),
+        |chord| switch_chord_text(platform, chord),
+    )
+}
+
+/// What Settings says of a typed chord: `Ok(None)` fine, `Ok(Some(..))` a
+/// warning (it works), `Err(..)` why it cannot be used.
+///
+/// # Errors
+///
+/// The chord cannot be read, or cannot be the keyboard switch.
+pub fn keyboard_switch_verdict(
+    text: &str,
+) -> Result<(KeyboardSwitchChord, Option<String>), String> {
+    let Some(chord) = KeyboardSwitchChord::parse(text) else {
+        return Err(arcen_input::keyboard::SwitchChordRejection::Unreadable
+            .message()
+            .to_owned());
+    };
+    match chord.check() {
+        SwitchChordCheck::Ok => Ok((chord, None)),
+        SwitchChordCheck::ProAppCollision(description) => Ok((
+            chord,
+            Some(format!(
+                "Works, but the remote computer loses this chord ({}).",
+                description.replace(" -- ", ": ")
+            )),
+        )),
+        SwitchChordCheck::Rejected(rejection) => Err(rejection.message().to_owned()),
+    }
+}
+
+/// The short notice every flip of the switch shows: "Keyboard: Remote —
+/// Alt+Tab goes to Z8", or "Keyboard: This computer". `system_shortcuts`:
+/// the system shortcuts go to the remote computer now (on a Mac, only with
+/// the ⌘Tab switch on and allowed).
+#[must_use]
+pub fn keyboard_switch_toast(
+    owner: KeyboardOwner,
+    host: &str,
+    platform: DeckPlatform,
+    system_shortcuts: bool,
+) -> String {
+    match owner {
+        KeyboardOwner::ThisComputer => "Keyboard: This computer".to_owned(),
+        KeyboardOwner::Host if system_shortcuts => {
+            let switcher = match platform {
+                DeckPlatform::Pc => "Alt+Tab",
+                DeckPlatform::Mac => "⌘Tab",
+            };
+            format!("Keyboard: Remote — {switcher} goes to {host}")
+        }
+        KeyboardOwner::Host => format!("Keyboard: Remote — keys go to {host}"),
+    }
+}
+
+/// How long the notice stays, in seconds.
+pub const KEYBOARD_TOAST_SECONDS: f64 = 2.5;
+
+/// The notice on screen, from when it was shown (egui time).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyboardToast {
+    /// What it says.
+    pub text: String,
+    /// `egui::InputState::time` when it was shown.
+    pub shown_at: f64,
+}
+
+impl KeyboardToast {
+    /// A notice shown now.
+    #[must_use]
+    pub fn new(ctx: &egui::Context, text: String) -> Self {
+        Self {
+            text,
+            shown_at: ctx.input(|input| input.time),
+        }
+    }
+}
+
+/// Paints the notice at the top of the window until it is due to go, then
+/// clears it. Drawn over the picture for its few seconds only.
+pub fn render_keyboard_toast(ctx: &egui::Context, toast: &mut Option<KeyboardToast>) {
+    let Some(shown) = toast.as_ref() else {
+        return;
+    };
+    let left = KEYBOARD_TOAST_SECONDS - (ctx.input(|input| input.time) - shown.shown_at);
+    if left <= 0.0 {
+        *toast = None;
+        return;
+    }
+    egui::Area::new(egui::Id::new("arcen-keyboard-toast"))
+        .order(egui::Order::Tooltip)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 24.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_black_alpha(210))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::symmetric(14, 8))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(&shown.text)
+                            .color(egui::Color32::WHITE)
+                            .size(15.0),
+                    );
+                });
+        });
+    ctx.request_repaint_after(std::time::Duration::from_secs_f64(left.max(0.05)));
+}
+
+/// The one-time ⌘Tab question (macOS Deck): `Some(true)` Allow,
+/// `Some(false)` Not now, `None` not answered yet.
+#[must_use]
+pub fn render_mac_shortcut_offer(ctx: &egui::Context) -> Option<bool> {
+    let mut answer = None;
+    egui::Window::new(MAC_SHORTCUT_OFFER_TITLE)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label(MAC_SHORTCUT_OFFER_TEXT);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Allow").clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Not now").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+    answer
+}
+
 /// A Settings choice's label.
 #[must_use]
 pub const fn capture_policy_label(policy: KeyboardCapturePolicy) -> &'static str {
@@ -45,12 +255,16 @@ pub const fn capture_policy_label(policy: KeyboardCapturePolicy) -> &'static str
 
 /// The line under the Settings choice: what goes where, and the way out.
 #[must_use]
-pub fn capture_policy_help(policy: KeyboardCapturePolicy, platform: DeckPlatform) -> String {
+pub fn capture_policy_help(
+    policy: KeyboardCapturePolicy,
+    platform: DeckPlatform,
+    switch: KeyboardSwitchChord,
+) -> String {
     let shortcuts = match platform {
         DeckPlatform::Pc => "Alt+Tab, Alt+Shift+Tab, the Windows key and Print Screen",
-        DeckPlatform::Mac => "⌘Tab, ⌘Space and Mission Control",
+        DeckPlatform::Mac => "⌘Tab, ⌘Space and Mission Control (with the switch below on)",
     };
-    let escape = chord(platform, DeckShortcut::ReleaseKeyboard);
+    let escape = switch_chord_text(platform, switch);
     let machine = platform.this_machine();
     match policy {
         KeyboardCapturePolicy::Host => format!(
@@ -84,6 +298,7 @@ pub struct ShortcutRow {
 pub fn keyboard_shortcut_sheet(
     platform: DeckPlatform,
     capture: bool,
+    switch: KeyboardSwitchChord,
 ) -> Vec<(&'static str, Vec<ShortcutRow>)> {
     let row = |keys: String, action: &str| ShortcutRow {
         keys,
@@ -94,7 +309,7 @@ pub fn keyboard_shortcut_sheet(
         if !capture && shortcut == DeckShortcut::ReleaseKeyboard {
             continue;
         }
-        let keys = chord(platform, shortcut);
+        let keys = shortcut_chord_text(platform, shortcut, switch);
         if keys.is_empty() {
             continue;
         }
@@ -104,8 +319,9 @@ pub fn keyboard_shortcut_sheet(
                 DeckPlatform::Pc => "Hold to exit Arcen Deck (a tap goes to the remote computer)",
             },
             DeckShortcut::ReleaseKeyboard => {
-                "Keyboard to this computer and back (keys held on the remote computer are \
-                 released)"
+                "The keyboard switch: Remote (every key and the system shortcuts go to the \
+                 remote computer) or Local (they all stay on this computer); keys held on the \
+                 remote computer are released. Change it in Settings ▸ Input"
             }
             other => other.title(),
         };
@@ -162,6 +378,15 @@ pub fn keyboard_shortcut_sheet(
                     "Fn+F1 … F12".to_owned(),
                     "F1–F12 to the remote computer (or use F1, F2, etc. as standard function keys)",
                 ),
+                row(
+                    "⌘Tab, ⌘Space, ⌃↑, ⌃←, ⌃→".to_owned(),
+                    "To the remote computer in Remote, with Settings ▸ Input ▸ Send ⌘Tab, \
+                     ⌘Space and Mission Control on (needs Accessibility); on this Mac in Local",
+                ),
+                row(
+                    "⌥⌘Esc, ⌃⌘Q".to_owned(),
+                    "Force Quit and Lock Screen, always on this Mac",
+                ),
             ],
         ));
     }
@@ -174,6 +399,7 @@ pub fn render_keyboard_shortcuts(
     ctx: &egui::Context,
     platform: DeckPlatform,
     capture: bool,
+    switch: KeyboardSwitchChord,
     open: &mut bool,
 ) {
     if !*open {
@@ -185,7 +411,7 @@ pub fn render_keyboard_shortcuts(
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
-            for (title, rows) in keyboard_shortcut_sheet(platform, capture) {
+            for (title, rows) in keyboard_shortcut_sheet(platform, capture, switch) {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(title).strong());
                 egui::Grid::new(title)
@@ -214,12 +440,18 @@ mod tests {
                     system_shortcuts: true
                 },
                 "Z8",
-                DeckPlatform::Pc
+                DeckPlatform::Pc,
+                KeyboardSwitchChord::DEFAULT
             ),
             "Keyboard: Z8 (Ctrl+Alt+Home to release)"
         );
         assert_eq!(
-            keyboard_status_line(KeyboardStatus::ThisComputer, "Z8", DeckPlatform::Pc),
+            keyboard_status_line(
+                KeyboardStatus::ThisComputer,
+                "Z8",
+                DeckPlatform::Pc,
+                KeyboardSwitchChord::DEFAULT
+            ),
             "Keyboard: this PC (click to return)"
         );
         assert_eq!(
@@ -228,16 +460,25 @@ mod tests {
                     system_shortcuts: true
                 },
                 "Z8",
-                DeckPlatform::Mac
+                DeckPlatform::Mac,
+                KeyboardSwitchChord::DEFAULT
             ),
             "Keyboard: Z8 (Control-Option-Home to release)"
         );
-        assert!(keyboard_status_line(KeyboardStatus::NoSession, "Z8", DeckPlatform::Pc).is_empty());
+        assert!(
+            keyboard_status_line(
+                KeyboardStatus::NoSession,
+                "Z8",
+                DeckPlatform::Pc,
+                KeyboardSwitchChord::DEFAULT
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn the_cheat_sheet_comes_from_the_shared_tables() {
-        let sheet = keyboard_shortcut_sheet(DeckPlatform::Pc, true);
+        let sheet = keyboard_shortcut_sheet(DeckPlatform::Pc, true, KeyboardSwitchChord::DEFAULT);
         let all: Vec<_> = sheet.iter().flat_map(|(_, rows)| rows.iter()).collect();
         assert!(all.iter().any(|row| row.keys == "Ctrl+Alt+Home"));
         assert!(all.iter().any(|row| row.keys == "Ctrl+Alt+End"));
@@ -245,19 +486,107 @@ mod tests {
         assert!(!all.iter().any(|row| row.keys.contains("F9")));
         assert!(!all.iter().any(|row| row.keys.contains("Win+K")));
         assert!(all.iter().any(|row| row.keys.ends_with("Print Screen")));
-        // A Deck that cannot release its keyboard yet does not offer it.
-        let mac = keyboard_shortcut_sheet(DeckPlatform::Mac, false);
+        // A Deck that cannot release its keyboard does not offer it.
+        let mac = keyboard_shortcut_sheet(DeckPlatform::Mac, false, KeyboardSwitchChord::DEFAULT);
         let mac: Vec<_> = mac.iter().flat_map(|(_, rows)| rows.iter()).collect();
         assert!(!mac.iter().any(|row| row.keys.contains("Home")));
         assert!(!mac.iter().any(|row| row.keys == "Click the picture"));
         assert!(mac.iter().any(|row| row.keys == "F13, F14, F15"));
+        // The Mac Deck does: its chord, the click, and where its system
+        // chords go.
+        let mac = keyboard_shortcut_sheet(DeckPlatform::Mac, true, KeyboardSwitchChord::DEFAULT);
+        let mac: Vec<_> = mac.iter().flat_map(|(_, rows)| rows.iter()).collect();
+        assert!(mac.iter().any(|row| row.keys == "Control-Option-Home"));
+        assert!(mac.iter().any(|row| row.keys == "Click the picture"));
+        assert!(mac.iter().any(|row| row.keys.starts_with("⌘Tab")));
+        assert!(mac.iter().any(|row| row.keys.contains("⌃←")));
     }
 
     #[test]
     fn every_policy_has_a_label_and_names_the_way_out() {
         for policy in KeyboardCapturePolicy::ALL {
             assert!(!capture_policy_label(policy).is_empty());
-            assert!(capture_policy_help(policy, DeckPlatform::Pc).contains("Ctrl+Alt+Home"));
+            assert!(
+                capture_policy_help(policy, DeckPlatform::Pc, KeyboardSwitchChord::DEFAULT)
+                    .contains("Ctrl+Alt+Home")
+            );
         }
+    }
+
+    #[test]
+    fn a_chosen_chord_shows_everywhere_the_switch_is_named() {
+        let switch = KeyboardSwitchChord::ALT_F1;
+        let sheet = keyboard_shortcut_sheet(DeckPlatform::Pc, true, switch);
+        let all: Vec<_> = sheet.iter().flat_map(|(_, rows)| rows.iter()).collect();
+        assert!(all.iter().any(|row| row.keys == "Alt+F1"));
+        assert!(!all.iter().any(|row| row.keys == "Ctrl+Alt+Home"));
+        assert_eq!(
+            keyboard_status_line(
+                KeyboardStatus::Host {
+                    system_shortcuts: true
+                },
+                "Z8",
+                DeckPlatform::Mac,
+                switch
+            ),
+            "Keyboard: Z8 (Option-F1 to release)"
+        );
+        assert!(keyboard_switch_help(DeckPlatform::Pc, switch).starts_with("Alt+F1 flips"));
+        assert!(
+            capture_policy_help(KeyboardCapturePolicy::Host, DeckPlatform::Pc, switch)
+                .contains("Alt+F1")
+        );
+    }
+
+    #[test]
+    fn every_flip_says_where_the_keyboard_went() {
+        assert_eq!(
+            keyboard_switch_toast(KeyboardOwner::Host, "Z8", DeckPlatform::Pc, true),
+            "Keyboard: Remote — Alt+Tab goes to Z8"
+        );
+        assert_eq!(
+            keyboard_switch_toast(KeyboardOwner::Host, "Z8", DeckPlatform::Mac, true),
+            "Keyboard: Remote — ⌘Tab goes to Z8"
+        );
+        assert_eq!(
+            keyboard_switch_toast(KeyboardOwner::Host, "Z8", DeckPlatform::Mac, false),
+            "Keyboard: Remote — keys go to Z8"
+        );
+        assert_eq!(
+            keyboard_switch_toast(KeyboardOwner::ThisComputer, "Z8", DeckPlatform::Pc, true),
+            "Keyboard: This computer"
+        );
+    }
+
+    #[test]
+    fn a_typed_chord_is_checked_in_shared_code() {
+        assert_eq!(
+            keyboard_switch_verdict("ctrl+alt+shift+z")
+                .map(|(chord, warning)| (chord, warning.is_none())),
+            Ok((KeyboardSwitchChord::CONTROL_ALT_SHIFT_Z, true))
+        );
+        assert!(keyboard_switch_verdict("Win+L").is_err());
+        assert!(keyboard_switch_verdict("Ctrl+Alt+Del").is_err());
+        assert!(keyboard_switch_verdict("q").is_err());
+        assert!(keyboard_switch_verdict("nonsense").is_err());
+        let (_, warning) = keyboard_switch_verdict("Ctrl+Alt+Shift+P").unwrap();
+        assert!(warning.unwrap().contains("Flame"));
+        assert_eq!(
+            keyboard_switch_preset_label(DeckPlatform::Mac, KeyboardSwitchPreset::ControlAltHome),
+            "Control-Option-Home"
+        );
+    }
+
+    #[test]
+    fn the_toast_goes_away_by_itself() {
+        let ctx = egui::Context::default();
+        let mut toast = Some(KeyboardToast {
+            text: "Keyboard: This computer".to_owned(),
+            shown_at: -10.0,
+        });
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            render_keyboard_toast(ui.ctx(), &mut toast);
+        });
+        assert!(toast.is_none());
     }
 }

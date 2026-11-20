@@ -33,6 +33,7 @@ use std::sync::atomic::Ordering;
 struct Baseline {
     received: u64,
     presented: u64,
+    represented: u64,
     confirmed: u64,
     unconfirmed: u64,
     replaced: u64,
@@ -338,9 +339,11 @@ impl VideoPresenterSink for D3d11VideoSink {
         };
         let handle = thread.handle();
         let c = handle.counters();
+        let represented = c.represented.load(Ordering::Relaxed);
         let now = Baseline {
             received: c.received.load(Ordering::Relaxed),
-            presented: c.presented.load(Ordering::Relaxed) + c.represented.load(Ordering::Relaxed),
+            presented: c.presented.load(Ordering::Relaxed) + represented,
+            represented,
             confirmed: c.confirmed.load(Ordering::Relaxed),
             unconfirmed: c.unconfirmed.load(Ordering::Relaxed),
             replaced: c.replaced_before_present.load(Ordering::Relaxed),
@@ -359,6 +362,7 @@ impl VideoPresenterSink for D3d11VideoSink {
         PresenterTelemetryDelta {
             frames_received: now.received - before.received,
             frames_submitted: now.presented - before.presented,
+            frames_represented: now.represented - before.represented,
             frames_confirmed: now.confirmed - before.confirmed,
             presented_time_unconfirmed: now.unconfirmed - before.unconfirmed,
             dropped_stale: now.replaced - before.replaced,

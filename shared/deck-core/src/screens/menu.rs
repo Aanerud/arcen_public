@@ -195,8 +195,8 @@ pub fn deck_menus(platform: DeckPlatform, dev_tools: bool) -> Vec<Menu> {
     let mut connection = vec![Command(C::Disconnect), Command(C::ReleaseModifiers)];
     if pc {
         connection.push(Command(C::SendSecureAttention));
-        connection.push(Command(C::ToggleKeyboardCapture));
     }
+    connection.push(Command(C::ToggleKeyboardCapture));
     connection.push(MenuEntry::Submenu {
         title: "Send Key",
         commands: &SEND_KEY_COMMANDS,
@@ -463,7 +463,11 @@ fn bar_command(
 ) -> Option<MenuCommand> {
     let mut button = egui::Button::new(command.title(platform));
     if let Some(shortcut) = command.shortcut() {
-        let keys = super::wording::chord(platform, shortcut);
+        let keys = super::keyboard_help::shortcut_chord_text(
+            platform,
+            shortcut,
+            super::wording::keyboard_switch(ui.ctx()),
+        );
         if !keys.is_empty() {
             button = button.shortcut_text(keys);
         }
@@ -512,6 +516,7 @@ mod tests {
                     vec![
                         "Disconnect",
                         "Release Stuck Keys",
+                        "Keyboard: Host or This Computer",
                         "Send Key",
                         "-",
                         "Paste as Keystrokes",

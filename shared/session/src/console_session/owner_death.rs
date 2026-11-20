@@ -28,10 +28,19 @@
 //!   record that cannot be read is treated as this session's, so the check
 //!   fails closed.
 //!
+//!   A service that runs outside its users' sessions decides with
+//!   [`service_startup_recovery`] instead: it compares the record with every
+//!   login session alive now, and locks only the one it names exactly. A
+//!   record it cannot read names no session, so it locks none: locking
+//!   whoever holds the console now could lock an account the record never
+//!   named.
+//!
 //! The Linux Pier's service runs outside the session and keeps a root
 //! journal of the console it made private (`recover_console`). The macOS
-//! Pier's per-user agent uses both mechanisms. The Windows Pier's broker is
-//! GAP-047.
+//! Pier's per-user agent uses both mechanisms in its own session. The
+//! Windows Pier's broker uses both from session 0: its guard is a `LocalSystem`
+//! process outside the broker, and the record names the WTS session and its
+//! logon, the boot, and the account's SID.
 
 use super::Departure;
 
@@ -85,6 +94,42 @@ pub fn guard_end(received: &[u8]) -> GuardEnd {
 const RECORD_HEADER: &str = "arcen-attachment 1";
 /// The longest token (login session, boot) a record holds.
 const MAX_TOKEN: usize = 64;
+/// The longest Windows SID a record holds: `S-1-` and fifteen 32-bit
+/// sub-authorities fit in 184 bytes.
+const MAX_SID: usize = 184;
+
+/// The account a recorded login session belongs to, as its platform names
+/// accounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordAccount {
+    /// A POSIX user id (Linux, macOS).
+    Uid(u32),
+    /// A Windows security identifier in its string form (`S-1-5-21-…`).
+    Sid(String),
+}
+
+impl RecordAccount {
+    /// A SID account, or `None` unless `sid` is `S-` followed by at least
+    /// two dash-separated decimal components, at most 184 bytes.
+    #[must_use]
+    pub fn sid(sid: &str) -> Option<Self> {
+        sid_valid(sid).then(|| Self::Sid(sid.to_owned()))
+    }
+
+    fn to_line(&self) -> String {
+        match self {
+            Self::Uid(uid) => format!("uid {uid}"),
+            Self::Sid(sid) => format!("sid {sid}"),
+        }
+    }
+
+    fn parse_line(line: &str) -> Option<Self> {
+        if let Some(uid) = line.strip_prefix("uid ") {
+            return u32::try_from(parse_decimal(uid)?).ok().map(Self::Uid);
+        }
+        Self::sid(line.strip_prefix("sid ")?)
+    }
+}
 
 /// A Deck attached to a login session, as recorded for the next Pier
 /// process that starts in it.
@@ -100,18 +145,29 @@ pub struct AttachmentRecord {
     /// The same characters and length as `login_session`.
     pub boot: String,
     /// The account the session belongs to.
-    pub uid: u32,
+    pub account: RecordAccount,
 }
 
 impl AttachmentRecord {
-    /// A record, or `None` when the login-session or boot token is not a
-    /// short identifier.
+    /// A record of a POSIX account's session, or `None` when the
+    /// login-session or boot token is not a short identifier.
     #[must_use]
     pub fn new(login_session: &str, boot: &str, uid: u32) -> Option<Self> {
-        (token_valid(login_session) && token_valid(boot)).then(|| Self {
+        Self::for_account(login_session, boot, RecordAccount::Uid(uid))
+    }
+
+    /// A record of `account`'s session, or `None` when the login-session or
+    /// boot token is not a short identifier or the SID is malformed.
+    #[must_use]
+    pub fn for_account(login_session: &str, boot: &str, account: RecordAccount) -> Option<Self> {
+        let account_valid = match &account {
+            RecordAccount::Uid(_) => true,
+            RecordAccount::Sid(sid) => sid_valid(sid),
+        };
+        (token_valid(login_session) && token_valid(boot) && account_valid).then(|| Self {
             login_session: login_session.to_owned(),
             boot: boot.to_owned(),
-            uid,
+            account,
         })
     }
 
@@ -119,8 +175,10 @@ impl AttachmentRecord {
     #[must_use]
     pub fn to_text(&self) -> String {
         format!(
-            "{RECORD_HEADER}\nlogin_session {}\nboot {}\nuid {}\n",
-            self.login_session, self.boot, self.uid
+            "{RECORD_HEADER}\nlogin_session {}\nboot {}\n{}\n",
+            self.login_session,
+            self.boot,
+            self.account.to_line()
         )
     }
 
@@ -134,12 +192,23 @@ impl AttachmentRecord {
         }
         let login_session = lines.next()?.strip_prefix("login_session ")?;
         let boot = lines.next()?.strip_prefix("boot ")?;
-        let uid = u32::try_from(parse_decimal(lines.next()?.strip_prefix("uid ")?)?).ok()?;
+        let account = RecordAccount::parse_line(lines.next()?)?;
         if lines.next().is_some() {
             return None;
         }
-        Self::new(login_session, boot, uid)
+        Self::for_account(login_session, boot, account)
     }
+}
+
+fn sid_valid(sid: &str) -> bool {
+    let Some(components) = sid.strip_prefix("S-") else {
+        return false;
+    };
+    sid.len() <= MAX_SID
+        && components.split('-').count() >= 2
+        && components
+            .split('-')
+            .all(|part| (1..=10).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn token_valid(token: &str) -> bool {
@@ -194,6 +263,59 @@ pub fn startup_recovery(stored: Option<&str>, current: &AttachmentRecord) -> Sta
         None => StartupRecovery::LockFirst,
         Some(record) if record == *current => StartupRecovery::LockFirst,
         Some(_) => StartupRecovery::Stale,
+    }
+}
+
+/// What a service that runs outside its users' sessions does with the
+/// attachment record it finds at start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceStartupRecovery {
+    /// No record: nothing was attached.
+    Nothing,
+    /// The login session the record names is alive, in this boot, with the
+    /// same account: lock it before giving the desk anything back, then
+    /// remove the record.
+    LockFirst(AttachmentRecord),
+    /// No login session alive now is the one the record names (it ended, or
+    /// its id now belongs to another logon, account or boot): remove it
+    /// without locking anyone.
+    Stale,
+    /// The record cannot be read, so it names no session: lock nobody, and
+    /// keep it aside for the operator.
+    Unreadable,
+}
+
+impl ServiceStartupRecovery {
+    /// Why the Deck's attachment ended, when a session must be locked.
+    #[must_use]
+    pub const fn departure(&self) -> Option<Departure> {
+        match self {
+            Self::LockFirst(_) => Some(Departure::AgentFailed),
+            Self::Nothing | Self::Stale | Self::Unreadable => None,
+        }
+    }
+}
+
+/// Decides what a service starting outside its users' sessions does with
+/// the stored record `stored` (`None`: no record), given every login session
+/// `alive` now, each described as a record would describe it (this boot, its
+/// logon, its account). Only an exact match is locked: a login session id
+/// reused by another logon, account or boot is not the recorded one.
+#[must_use]
+pub fn service_startup_recovery(
+    stored: Option<&str>,
+    alive: &[AttachmentRecord],
+) -> ServiceStartupRecovery {
+    let Some(text) = stored else {
+        return ServiceStartupRecovery::Nothing;
+    };
+    let Some(record) = AttachmentRecord::parse(text) else {
+        return ServiceStartupRecovery::Unreadable;
+    };
+    if alive.contains(&record) {
+        ServiceStartupRecovery::LockFirst(record)
+    } else {
+        ServiceStartupRecovery::Stale
     }
 }
 
@@ -453,11 +575,11 @@ mod tests {
     fn a_record_of_another_session_boot_or_account_is_stale() {
         let record = current();
         for other in [
-            AttachmentRecord::new("100009", &record.boot, record.uid),
+            AttachmentRecord::new("100009", &record.boot, 501),
             AttachmentRecord::new(
                 &record.login_session,
                 "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0",
-                record.uid,
+                501,
             ),
             AttachmentRecord::new(&record.login_session, &record.boot, 502),
         ] {
@@ -468,5 +590,101 @@ mod tests {
             );
         }
         assert_eq!(StartupRecovery::Stale.departure(), None);
+    }
+
+    const SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
+
+    fn windows_session(login_session: &str, boot: &str, sid: &str) -> AttachmentRecord {
+        AttachmentRecord::for_account(login_session, boot, RecordAccount::sid(sid).expect("sid"))
+            .expect("record")
+    }
+
+    #[test]
+    fn a_windows_record_names_the_account_by_sid_and_parses_strictly() {
+        let record = windows_session("wts2-logon-00000000000a1b2c", BOOT, SID);
+        let text = record.to_text();
+        assert!(text.ends_with(&format!("\nsid {SID}\n")), "{text}");
+        assert_eq!(AttachmentRecord::parse(&text), Some(record.clone()));
+        // A POSIX record still reads as before.
+        assert_eq!(
+            AttachmentRecord::parse(
+                "arcen-attachment 1\nlogin_session 100008\nboot 6D1F4A52-0C2B-4E43-9E0A-5B8A1C3D2E10\nuid 501\n"
+            ),
+            Some(current())
+        );
+        for bad in [
+            "S-1",
+            "S-",
+            "s-1-5-18",
+            "S-1-5-x",
+            "S-1--5",
+            "S-1-5-21-12345678901",
+            "1-5-21",
+            "S-1-5 18",
+        ] {
+            assert_eq!(RecordAccount::sid(bad), None, "{bad:?}");
+            let text = record.to_text().replace(SID, bad);
+            assert_eq!(AttachmentRecord::parse(&text), None, "{bad:?}");
+        }
+        let longest = format!("S-1{}", "-4294967295".repeat(17));
+        assert!(longest.len() > MAX_SID);
+        assert_eq!(RecordAccount::sid(&longest), None);
+        assert!(RecordAccount::sid("S-1-5-18").is_some());
+        assert!(
+            AttachmentRecord::for_account("1", BOOT, RecordAccount::Sid("bogus".to_owned()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_service_locks_only_the_live_session_a_record_names_exactly() {
+        let record = windows_session("wts2-logon-00000000000a1b2c", BOOT, SID);
+        let text = record.to_text();
+        let another_user =
+            windows_session("wts3-logon-00000000000b0001", BOOT, "S-1-5-21-1-2-3-1002");
+        assert_eq!(
+            service_startup_recovery(None, std::slice::from_ref(&record)),
+            ServiceStartupRecovery::Nothing
+        );
+        let recovery =
+            service_startup_recovery(Some(&text), &[another_user.clone(), record.clone()]);
+        assert_eq!(recovery, ServiceStartupRecovery::LockFirst(record.clone()));
+        assert_eq!(recovery.departure(), Some(Departure::AgentFailed));
+        assert!(recovery.departure().is_some_and(Departure::locks_session));
+
+        // The session ended, or its id came back for another logon of the
+        // same account, another account, or another boot: nobody is locked.
+        for alive in [
+            vec![],
+            vec![another_user.clone()],
+            vec![windows_session("wts2-logon-00000000000a1b2d", BOOT, SID)],
+            vec![windows_session(
+                "wts2-logon-00000000000a1b2c",
+                BOOT,
+                "S-1-5-21-1004336348-1177238915-682003330-1002",
+            )],
+            vec![windows_session(
+                "wts2-logon-00000000000a1b2c",
+                "0F1E2D3C4B5A69788796A5B4C3D2E1F0",
+                SID,
+            )],
+        ] {
+            let recovery = service_startup_recovery(Some(&text), &alive);
+            assert_eq!(recovery, ServiceStartupRecovery::Stale, "{alive:?}");
+            assert_eq!(recovery.departure(), None);
+        }
+
+        // A record that cannot be read names nobody: locking whoever holds
+        // the console could lock an account it never named.
+        for unreadable in ["", "garbage", &text[..text.len() - 1]] {
+            let recovery =
+                service_startup_recovery(Some(unreadable), &[record.clone(), another_user.clone()]);
+            assert_eq!(
+                recovery,
+                ServiceStartupRecovery::Unreadable,
+                "{unreadable:?}"
+            );
+            assert_eq!(recovery.departure(), None);
+        }
     }
 }

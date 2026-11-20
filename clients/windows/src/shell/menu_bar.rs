@@ -43,6 +43,8 @@ pub(super) struct MenuBar {
     session_active: Option<bool>,
     /// The keyboard indicator's text now.
     status: String,
+    /// The keyboard switch's chord the keyboard item shows.
+    switch: arcen_input::keyboard::KeyboardSwitchChord,
 }
 
 fn wide(text: &str) -> HSTRING {
@@ -117,7 +119,42 @@ impl MenuBar {
             menu,
             session_active: None,
             status: String::new(),
+            switch: arcen_input::keyboard::KeyboardSwitchChord::DEFAULT,
         })
+    }
+
+    /// Shows the keyboard switch's chord beside its item (Settings ▸ Input
+    /// ▸ Keyboard switch).
+    pub(super) fn set_switch_chord(&mut self, switch: arcen_input::keyboard::KeyboardSwitchChord) {
+        if self.switch == switch {
+            return;
+        }
+        self.switch = switch;
+        let Some(index) = INSTALLED.get().and_then(|installed| {
+            installed
+                .commands
+                .iter()
+                .position(|command| *command == MenuCommand::ToggleKeyboardCapture)
+        }) else {
+            return;
+        };
+        let text = format!(
+            "{}\t{}",
+            MenuCommand::ToggleKeyboardCapture.title(DeckPlatform::Pc),
+            switch.pc_text()
+        );
+        let id = FIRST_ID + index;
+        // SAFETY: the menu belongs to this window, on its thread; the item
+        // is found by its command id in any submenu.
+        unsafe {
+            let _ = ModifyMenuW(
+                self.menu,
+                u32::try_from(id).unwrap_or(0),
+                MF_BYCOMMAND | MF_STRING,
+                id,
+                &wide(&text),
+            );
+        }
     }
 
     /// Says who has the keyboard (`""`: no session).

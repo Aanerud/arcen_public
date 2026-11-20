@@ -5,8 +5,8 @@
 use std::collections::BTreeSet;
 
 use arcen_protocol::keys::{
-    KEY_ALT, KEY_ALTGR, KEY_CONTROL, KEY_META, KEY_SHIFT, MOD_ALT, MOD_CTRL, MOD_KEYPAD, MOD_META,
-    MOD_SHIFT,
+    KEY_ALT, KEY_ALTGR, KEY_CONTROL, KEY_META, KEY_SHIFT, KEY_TAB, MOD_ALT, MOD_CTRL, MOD_KEYPAD,
+    MOD_META, MOD_SHIFT,
 };
 
 use super::{KeyboardPolicy, ShortcutMode};
@@ -94,6 +94,11 @@ const HOST_MODIFIERS: [(u32, u32); 5] = [
 /// [`WINDOWS_APP_CONTROL_KEYS`] is sent with Control (Command+C is Ctrl+C,
 /// never Win+Ctrl+C), any other key with the Windows key, and Command let
 /// go of alone is a tap of the Windows key (it opens Start).
+///
+/// ⌘Tab is the host's app switcher on every host: a Mac host gets ⌘Tab as
+/// it is, and on a Windows or Linux host Command becomes Alt from the Tab
+/// until Command is let go of (Alt+Tab, Alt+Shift+Tab), never Win+Tab
+/// (Task View) or Ctrl+Tab (the next tab).
 #[derive(Debug, Clone, Default)]
 pub struct ShortcutTranslator {
     policy: KeyboardPolicy,
@@ -108,6 +113,9 @@ pub struct ShortcutTranslator {
     /// Command became the Windows key for pointer input only: no key has
     /// been pressed with it, so its release alone would open Start.
     meta_for_pointer_only: bool,
+    /// Command is Alt until it is let go of: ⌘Tab opened the host's app
+    /// switcher.
+    app_switcher: bool,
 }
 
 impl ShortcutTranslator {
@@ -212,6 +220,20 @@ impl ShortcutTranslator {
     /// Releases every host key held, other keys before modifiers, and
     /// forgets the physical state (the next event's modifiers restore it). A
     /// Command held back is dropped, not tapped.
+    /// [`Self::release_all`] for the keyboard switch: when Alt is all the
+    /// host holds of a modifier chord (a switch such as Alt+F1, whose key
+    /// never reached the host), a Control tap comes first, so the host never
+    /// sees Alt pressed and let go alone (Windows would open the menu bar).
+    pub fn release_all_for_switch(&mut self) -> Vec<HostKeyEdge> {
+        let mut out = Vec::new();
+        if self.host_modifiers.contains(&KEY_ALT) && !self.host_modifiers.contains(&KEY_CONTROL) {
+            self.press_modifier(KEY_CONTROL, &mut out);
+            self.release_modifier(KEY_CONTROL, &mut out);
+        }
+        out.extend(self.release_all());
+        out
+    }
+
     pub fn release_all(&mut self) -> Vec<HostKeyEdge> {
         let mut out = Vec::new();
         for (qt_key, keypad) in std::mem::take(&mut self.host_keys) {
@@ -225,6 +247,7 @@ impl ShortcutTranslator {
         self.mask_windows_key_release(&mut out);
         self.physical = DeckModifiers::default();
         self.command = None;
+        self.app_switcher = false;
         self.under_command.clear();
         self.reconcile(&mut out);
         out
@@ -269,6 +292,9 @@ impl ShortcutTranslator {
                     return;
                 }
                 self.physical.command = pressed;
+                if !pressed {
+                    self.app_switcher = false;
+                }
                 if !windows_app {
                     self.reconcile(out);
                     return;
@@ -316,7 +342,33 @@ impl ShortcutTranslator {
         if self.host_keys.contains(&host_key) {
             return;
         }
-        if self.policy.shortcuts == ShortcutMode::WindowsApp && self.physical.command {
+        if qt_key == KEY_TAB
+            && !keypad
+            && self.physical.command
+            && !self.app_switcher
+            && self.policy.shortcuts != ShortcutMode::CommandIsMeta
+        {
+            // ⌘Tab: the keys a resolved Command holds end first, then
+            // Command is Alt for the rest of its hold.
+            for held in std::mem::take(&mut self.under_command) {
+                if self.host_keys.remove(&held) {
+                    out.push(HostKeyEdge {
+                        qt_key: held.0,
+                        pressed: false,
+                        modifiers: self.host_mask() | keypad_bit(held.1),
+                    });
+                }
+            }
+            self.app_switcher = true;
+            if self.command.is_some() {
+                self.command = Some(CommandState::Pending { used: true });
+            }
+            self.meta_for_pointer_only = false;
+        }
+        if self.policy.shortcuts == ShortcutMode::WindowsApp
+            && self.physical.command
+            && !self.app_switcher
+        {
             let wanted = if !keypad && WINDOWS_APP_CONTROL_KEYS.contains(&qt_key) {
                 CommandState::Control
             } else {
@@ -401,7 +453,8 @@ impl ShortcutTranslator {
         let physical = self.physical;
         let (left, right) = option_sides(physical.option);
         let policy = self.policy;
-        let command = physical.command;
+        let switcher = physical.command && self.app_switcher;
+        let command = physical.command && !switcher;
         let (control, meta) = match policy.shortcuts {
             ShortcutMode::CommandIsMeta => (physical.control, command),
             ShortcutMode::CommandIsControl => (physical.control || command, false),
@@ -411,7 +464,9 @@ impl ShortcutTranslator {
                 command && self.command == Some(CommandState::Meta),
             ),
         };
-        let alt = (left && !policy.left_option_altgr) || (right && !policy.right_option_altgr);
+        let alt = switcher
+            || (left && !policy.left_option_altgr)
+            || (right && !policy.right_option_altgr);
         let altgr = (left && policy.left_option_altgr) || (right && policy.right_option_altgr);
         [
             (KEY_CONTROL, control),
@@ -947,6 +1002,96 @@ mod tests {
         assert_eq!(
             mac.press(DeckKey::Command),
             vec![(KEY_META, true, MOD_META)]
+        );
+    }
+
+    #[test]
+    fn command_tab_is_the_hosts_app_switcher_on_every_host() {
+        // Windows: Alt+Tab, Alt+Shift+Tab, and no Windows key (no Task
+        // View, no Start).
+        let mut keyboard = Keyboard::new(windows(KeyboardSettings::default()));
+        assert!(keyboard.press(DeckKey::Command).is_empty());
+        assert_eq!(
+            keyboard.tap(KEY_TAB),
+            vec![
+                (KEY_ALT, true, MOD_ALT),
+                (KEY_TAB, true, MOD_ALT),
+                (KEY_TAB, false, MOD_ALT),
+            ]
+        );
+        keyboard.press(DeckKey::Shift);
+        assert_eq!(
+            keyboard.tap(KEY_TAB),
+            vec![
+                (KEY_TAB, true, MOD_ALT | MOD_SHIFT),
+                (KEY_TAB, false, MOD_ALT | MOD_SHIFT),
+            ]
+        );
+        keyboard.release(DeckKey::Shift);
+        assert_eq!(
+            keyboard.release(DeckKey::Command),
+            vec![(KEY_ALT, false, 0)]
+        );
+        assert!(keyboard.translator.is_idle());
+        // The next Command is the Windows key again.
+        keyboard.press(DeckKey::Command);
+        assert_eq!(
+            keyboard.tap(KEY_E),
+            vec![
+                (KEY_META, true, MOD_META),
+                (KEY_E, true, MOD_META),
+                (KEY_E, false, MOD_META),
+            ]
+        );
+
+        // Linux: Command was Control; from the Tab it is Alt.
+        let mut linux = Keyboard::new(ShortcutTranslator::new(KeyboardPolicy::LEGACY));
+        linux.press(DeckKey::Command);
+        assert_eq!(
+            linux.tap(KEY_TAB),
+            vec![
+                (KEY_CONTROL, false, 0),
+                (KEY_ALT, true, MOD_ALT),
+                (KEY_TAB, true, MOD_ALT),
+                (KEY_TAB, false, MOD_ALT),
+            ]
+        );
+        assert_eq!(linux.release(DeckKey::Command), vec![(KEY_ALT, false, 0)]);
+
+        // A Mac host: Command+Tab as it is.
+        let mut mac = Keyboard::new(ShortcutTranslator::new(resolve_keyboard_policy(
+            HostPlatform::MacOs,
+            true,
+            KeyboardSettings::default(),
+        )));
+        mac.press(DeckKey::Command);
+        assert_eq!(
+            mac.tap(KEY_TAB),
+            vec![(KEY_TAB, true, MOD_META), (KEY_TAB, false, MOD_META)]
+        );
+    }
+
+    #[test]
+    fn command_tab_after_a_windows_shortcut_ends_it_without_opening_start() {
+        let mut keyboard = Keyboard::new(windows(KeyboardSettings::default()));
+        keyboard.press(DeckKey::Command);
+        keyboard.press(DeckKey::Other(KEY_E));
+        // E still held when Tab comes: E is let go of, the Windows key goes
+        // up only after Alt is down.
+        assert_eq!(
+            keyboard.press(DeckKey::Other(KEY_TAB)),
+            vec![
+                (KEY_E, false, MOD_META),
+                (KEY_ALT, true, MOD_ALT | MOD_META),
+                (KEY_META, false, MOD_ALT),
+                (KEY_TAB, true, MOD_ALT),
+            ]
+        );
+        keyboard.release(DeckKey::Other(KEY_E));
+        keyboard.release(DeckKey::Other(KEY_TAB));
+        assert_eq!(
+            keyboard.release(DeckKey::Command),
+            vec![(KEY_ALT, false, 0)]
         );
     }
 

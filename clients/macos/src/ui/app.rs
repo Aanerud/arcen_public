@@ -46,7 +46,7 @@ use crate::ui::session_truth::{ActiveContract, ExactnessReadout, NegotiatedTruth
 use crate::ui::theme;
 use crate::ui::video_metal_layer::{
     DedicatedEightBitPresentationStatus, DedicatedEightBitVideoPresenter, DedicatedLayerFrame,
-    DedicatedPresentationStatus, DedicatedVideoPresenter,
+    DedicatedPresentationStatus, DedicatedPresentations, DedicatedVideoPresenter,
 };
 use crate::ui::video_render::RemoteVideoFrame;
 #[cfg(test)]
@@ -90,6 +90,7 @@ use arcen_deck_core::screens::statistics::{
 };
 use arcen_deck_core::screens::widgets::{back_button, labelled_line_edit};
 use arcen_input::deck_pen::ImageRect;
+use arcen_input::deck_wheel::{WheelAccumulator, WheelAxis};
 #[cfg(test)]
 use arcen_input::PenTool;
 use arcen_input::{FractionalMotionAccumulator, RegionInputWireMessage};
@@ -1254,8 +1255,6 @@ pub struct ArcenApp {
     dedicated_eight_bit_presentation: DedicatedEightBitPresentationStatus,
     dedicated_eight_bit_layer_has_picture: bool,
     remote_frame_size: Option<[usize; 2]>,
-    /// The host injects point-unit, phased scrolling (`precise_scroll_v1`).
-    host_precise_scroll: bool,
     /// The host injects native gesture-v1 messages.
     host_gestures_v1: bool,
     /// Everything this session's `server_hello` says is actually happening,
@@ -1429,21 +1428,22 @@ pub struct ArcenApp {
     last_keyboard_timestamp_ns: u64,
     last_input_sent_type: String,
     last_input_sent_at: Option<Instant>,
-    /// Root viewport's own accumulated sub-tick scroll delta -- see
-    /// `accumulate_scroll_ticks`'s doc for why this must stay entirely
-    /// separate from every secondary viewport's own accumulator
-    /// (`secondary_scroll_accum`), never a single value shared across
-    /// owners.
-    root_scroll_accum: egui::Vec2,
-    /// Per-secondary-monitor accumulated sub-tick scroll delta, keyed by
-    /// the negotiated `SessionMonitorId` that owns it. A scroll gesture
-    /// crossing from root to a secondary, or from one secondary to
-    /// another, never leaks a partial "sub-tick" remainder into the new
-    /// owner's own tick count, since each owner's entry lives independently
-    /// here. Cleared on multi-window teardown (`close_multi_window_session`)
-    /// so a stale monitor id from a prior committed roster never lingers
-    /// into a later one.
-    secondary_scroll_accum: BTreeMap<arcen_media::SessionMonitorId, egui::Vec2>,
+    /// Root viewport's own wheel: the shared accumulator
+    /// (`arcen_input::deck_wheel`), built for whether the host took precise
+    /// scroll (`precise_scroll_v1`). Its partial notch is root's alone,
+    /// never shared with a secondary viewport's (`secondary_wheels`).
+    /// Replaced on every (re)attach and hello, cleared on focus loss and
+    /// multi-window teardown (the module's remainder policy).
+    root_wheel: WheelAccumulator,
+    /// Each secondary monitor's own wheel, keyed by the negotiated
+    /// `SessionMonitorId` that owns it, so a scroll crossing from root to a
+    /// secondary, or between secondaries, never carries a partial notch
+    /// into the new owner's count. Always gathers whole notches: secondary
+    /// viewports do not yet send precise scroll (GAP-054). Cleared on
+    /// multi-window teardown (`close_multi_window_session`), so a stale
+    /// monitor id from a prior committed roster never lingers into a later
+    /// one, and on focus loss.
+    secondary_wheels: BTreeMap<arcen_media::SessionMonitorId, WheelAccumulator>,
     /// Newest decoded frame retained per secondary monitor so a viewport
     /// that binds/resizes after decode can replay the current desktop even
     /// when Keel sends no new damage.
@@ -1506,8 +1506,8 @@ pub struct ArcenApp {
     /// Per-secondary-monitor fractional relative-motion accumulator, keyed
     /// by the negotiated `SessionMonitorId` that owns `secondary_pointer_lock`
     /// -- entirely separate from root's own `relative_motion` above, for the
-    /// exact same reason `secondary_scroll_accum` is kept separate from
-    /// `root_scroll_accum`: switching lock ownership between viewports must
+    /// exact same reason `secondary_wheels` is kept separate from
+    /// `root_wheel`: switching lock ownership between viewports must
     /// never leak a fractional remainder across them. Cleared on
     /// acquire/release and on multi-window teardown.
     secondary_relative_motion: BTreeMap<arcen_media::SessionMonitorId, FractionalMotionAccumulator>,
@@ -1608,6 +1608,10 @@ pub struct ArcenApp {
     /// `presentedTime`. See
     /// [`arcen_media::presentation::presented_frames_for_health`].
     dedicated_presented_time_reported: bool,
+    /// Confirmed and unconfirmed presents taken since the last
+    /// "dedicated presenter telemetry" line (taken every UI pass, logged
+    /// once a second).
+    dedicated_presentations_logged: (u64, u64),
     /// Presentation samples keyed by the monitor whose surface actually
     /// refreshed. `presented_frame_times` above only ever samples the root
     /// window, so on a multi-monitor session it reports the primary's rate
@@ -1865,9 +1869,36 @@ pub struct ArcenApp {
     encode_intent: arcen_media::EncodeIntent,
     /// Mirrors `ClientSettings::typing_mode`.
     typing_mode: arcen_input::text::TypingMode,
-    /// Mirrors `ClientSettings::keyboard_capture` (kept and saved; the Mac
-    /// acts on it with the event tap, K4).
+    /// Mirrors `ClientSettings::keyboard_capture`: when the system shortcuts
+    /// go to the host (with the event tap).
     keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
+    /// Mirrors `ClientSettings::capture_mac_system_shortcuts`.
+    capture_mac_system_shortcuts: bool,
+    /// Mirrors `ClientSettings::mac_system_shortcut_offer_answered`.
+    mac_system_shortcut_offer_answered: bool,
+    /// ⌘Tab took this Mac out of a session without the event tap: ask once,
+    /// when a session window has the focus again.
+    mac_system_shortcut_offer_pending: bool,
+    /// Mirrors `ClientSettings::keyboard_switch`.
+    keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord,
+    /// The keyboard switch's notice after a flip, while it shows.
+    keyboard_toast: Option<arcen_deck_core::screens::keyboard_help::KeyboardToast>,
+    /// A flip's notice, shown from the next pass.
+    keyboard_toast_text: Option<String>,
+    /// Who has the keyboard during a session (shared
+    /// `arcen_input::keyboard::KeyboardCapture`): Control-Option-Home and
+    /// a click into the picture move it.
+    keyboard_owner: arcen_input::keyboard::KeyboardCapture,
+    /// A session was on screen at the last capture sync.
+    keyboard_owner_session: bool,
+    /// Mouse buttons whose press into the picture gave the keyboard back to
+    /// the host: their releases are not sent either (bit = egui button).
+    consumed_picture_buttons: u8,
+    /// The event tap for ⌘Tab, ⌘Space and Mission Control (created on the
+    /// first pass; installed only while wanted).
+    system_shortcut_tap: Option<crate::ui::system_shortcut_tap::SystemShortcutTap>,
+    /// The keyboard indicator the menu bar shows.
+    keyboard_status_shown: String,
     /// Help ▸ Keyboard Shortcuts is open.
     keyboard_shortcuts_open: bool,
     /// Mirrors `ClientSettings::option_key_mode`.
@@ -2236,7 +2267,6 @@ impl ArcenApp {
             dedicated_eight_bit_presentation: DedicatedEightBitPresentationStatus::Inactive,
             dedicated_eight_bit_layer_has_picture: false,
             remote_frame_size: None,
-            host_precise_scroll: false,
             host_gestures_v1: false,
             negotiated_truth: None,
             requested_video_variant: None,
@@ -2310,8 +2340,8 @@ impl ArcenApp {
             last_keyboard_timestamp_ns: 0,
             last_input_sent_type: String::new(),
             last_input_sent_at: None,
-            root_scroll_accum: egui::Vec2::ZERO,
-            secondary_scroll_accum: BTreeMap::new(),
+            root_wheel: WheelAccumulator::new(false),
+            secondary_wheels: BTreeMap::new(),
             secondary_retained_frames: BTreeMap::new(),
             secondary_full_frame_refresh_needed: BTreeSet::new(),
             secondary_full_frame_refresh_sent: BTreeSet::new(),
@@ -2361,6 +2391,7 @@ impl ArcenApp {
             presented_frame_times: VecDeque::new(),
             presented_frame_times_estimated: VecDeque::new(),
             dedicated_presented_time_reported: false,
+            dedicated_presentations_logged: (0, 0),
             monitor_presented_frame_times: BTreeMap::new(),
             multi_window_timing: MultiWindowTimingTelemetry::default(),
             last_ui_wake_media_ready: 0,
@@ -2491,6 +2522,17 @@ impl ArcenApp {
             encode_intent: settings.encode_intent,
             typing_mode: settings.typing_mode,
             keyboard_capture: settings.keyboard_capture,
+            capture_mac_system_shortcuts: settings.capture_mac_system_shortcuts,
+            mac_system_shortcut_offer_answered: settings.mac_system_shortcut_offer_answered,
+            mac_system_shortcut_offer_pending: false,
+            keyboard_switch: settings.keyboard_switch,
+            keyboard_toast: None,
+            keyboard_toast_text: None,
+            keyboard_owner: arcen_input::keyboard::KeyboardCapture::new(settings.keyboard_capture),
+            keyboard_owner_session: false,
+            consumed_picture_buttons: 0,
+            system_shortcut_tap: None,
+            keyboard_status_shown: String::new(),
             keyboard_shortcuts_open: false,
             option_key_mode: settings.option_key_mode,
             paste_keys: {
@@ -2569,6 +2611,19 @@ impl eframe::App for ArcenApp {
         if root_pass && raw_input.viewport().close_requested() {
             crate::ui::pass_pacing::note_root_close_requested();
         }
+        let picture = if root_pass {
+            self.root_pointer_gate.as_ref().map(|gate| PictureArea {
+                image: gate.image_rect.intersect(gate.rect),
+                overlays: gate.overlays.clone(),
+            })
+        } else {
+            self.secondary_picture_rect(raw_input.viewport_id)
+                .map(|image| PictureArea {
+                    image,
+                    overlays: Vec::new(),
+                })
+        };
+        self.filter_keyboard_capture_input(raw_input, picture);
         if root_pass {
             self.root_pointer_forwarded = self.forward_root_pointer_events(ctx, raw_input);
         } else {
@@ -2635,6 +2690,7 @@ impl eframe::App for ArcenApp {
             && self.keyboard.update_focus(false)
         {
             self.release_remote_keys("focus_out");
+            self.forget_partial_notches();
         }
         if !matches!(self.screen, AppScreen::InSession)
             || !raw_input.focused
@@ -2750,6 +2806,7 @@ impl eframe::App for ArcenApp {
         for command in macos_menu::drain_menu_commands() {
             self.handle_menu_command(command, ctx);
         }
+        self.sync_keyboard_capture(ctx);
         self.drive_paste_keys(ctx);
         // A remote desktop on screen owns Cmd+Q and Cmd+H: they are for the
         // application the person is using on the host, not for this one.
@@ -2760,6 +2817,8 @@ impl eframe::App for ArcenApp {
                 | AppScreen::Resuming(_)
                 | AppScreen::SigningIn
         );
+        // While this Mac has the keyboard, Cmd+H hides the Deck again.
+        let forward_shortcuts = forward_shortcuts && !self.keyboard_released();
         if forward_shortcuts != self.app_shortcuts_forwarded {
             macos_menu::forward_app_shortcuts_to_host(forward_shortcuts);
             self.app_shortcuts_forwarded = forward_shortcuts;
@@ -2779,6 +2838,7 @@ impl eframe::App for ArcenApp {
         self.drain_pending_root_restore(ctx);
         self.drive_multi_window(ctx);
         self.publish_root_viewport_visibility(ctx);
+        self.take_dedicated_presentations();
         self.maybe_log_telemetry();
     }
 
@@ -3092,9 +3152,20 @@ impl eframe::App for ArcenApp {
         arcen_deck_core::screens::keyboard_help::render_keyboard_shortcuts(
             ui.ctx(),
             arcen_deck_core::screens::wording::DeckPlatform::Mac,
-            false,
+            true,
+            self.keyboard_switch,
             &mut self.keyboard_shortcuts_open,
         );
+        if let Some(text) = self.keyboard_toast_text.take() {
+            self.keyboard_toast = Some(
+                arcen_deck_core::screens::keyboard_help::KeyboardToast::new(ui.ctx(), text),
+            );
+        }
+        arcen_deck_core::screens::keyboard_help::render_keyboard_toast(
+            ui.ctx(),
+            &mut self.keyboard_toast,
+        );
+        self.mac_system_shortcut_offer(ui.ctx());
         // A pass that drew no video (another screen, a closed session)
         // gives the system cursor back.
         if !self.lead_cursor_wanted && self.lead_cursor.is_hidden() {
@@ -3376,7 +3447,7 @@ impl ArcenApp {
                 )
             });
             self.display_follow_polled = None;
-            self.host_precise_scroll = hello.precise_scroll_v1;
+            self.root_wheel = WheelAccumulator::new(hello.precise_scroll_v1);
             self.host_gestures_v1 = arcen_protocol::messages::supports_gestures_v1(
                 hello.input_protocol_version,
                 hello.input_capabilities,
@@ -4127,7 +4198,6 @@ impl ArcenApp {
         self.host_supports_display_update = false;
         self.display_follow = None;
         self.display_follow_polled = None;
-        self.host_precise_scroll = false;
         self.host_gestures_v1 = false;
         self.text_input.reset();
         self.display_fit.reset();
@@ -4154,13 +4224,14 @@ impl ArcenApp {
         self.remote_pointer_buttons = [false; 3];
         self.relative_motion.clear();
         // Item 3 (enablement audit): a fresh attach or a reconnect/resume
-        // must never inherit a leftover sub-tick scroll remainder from a
-        // prior connection generation. `secondary_scroll_accum` is already
-        // cleared by `close_multi_window_session` just above; root's own
-        // accumulator has no other reset point, so it is zeroed here,
-        // exactly at this single "session (re)attach" chokepoint every
-        // fresh connect and every resume/reconnect both funnel through.
-        self.root_scroll_accum = egui::Vec2::ZERO;
+        // must never inherit a leftover partial notch from a prior
+        // connection generation. `secondary_wheels` is already cleared by
+        // `close_multi_window_session` just above; root's own wheel is
+        // replaced here, exactly at this single "session (re)attach"
+        // chokepoint every fresh connect and every resume/reconnect both
+        // funnel through, and again by the new hello with its precise
+        // scroll answer.
+        self.root_wheel = WheelAccumulator::new(false);
         self.media = Some(shared);
         self.session_hello_handled = false;
         self.video_frames_seen = 0;
@@ -4266,7 +4337,7 @@ impl ArcenApp {
         self.secondary_paced_frames.clear();
         self.secondary_refresh_superseded_pending.clear();
         self.secondary_tablet_targets.clear();
-        self.secondary_scroll_accum.clear();
+        self.secondary_wheels.clear();
         self.secondary_retained_frames.clear();
         self.secondary_full_frame_refresh_needed.clear();
         self.secondary_full_frame_refresh_sent.clear();
@@ -4285,17 +4356,18 @@ impl ArcenApp {
         self.secondary_last_known_local_fraction.clear();
         self.secondary_pointer_contained.clear();
         if let Some(media) = &self.media {
-            let mut state = media.lock().expect("media state poisoned");
-            state.monitor_presented_frames.clear();
-            state.monitor_presentation_targets.clear();
+            media
+                .lock()
+                .expect("media state poisoned")
+                .reset_monitor_presentation();
         }
-        // Item 3 (enablement audit): teardown must reset root's own
-        // scroll accumulator too, not just every secondary's -- a stale
-        // sub-tick remainder from the session that just ended must never
-        // leak into whatever comes next (a later commit reusing the same
-        // negotiated ids, or root's own plain single-monitor scrolling
-        // once no multi-window session remains at all).
-        self.root_scroll_accum = egui::Vec2::ZERO;
+        // Item 3 (enablement audit): teardown must clear root's own wheel
+        // too, not just every secondary's -- a stale partial notch from the
+        // session that just ended must never leak into whatever comes next
+        // (a later commit reusing the same negotiated ids, or root's own
+        // plain single-monitor scrolling once no multi-window session
+        // remains at all).
+        self.root_wheel.clear();
         self.pen.borrow_mut().last_region_viewport = None;
         self.active_secondary_keyboard_focus = None;
         self.active_keyboard_viewport = None;
@@ -5050,12 +5122,12 @@ impl ArcenApp {
     /// resolved through this viewport's own region id and the shared
     /// [`arcen_input::RegionInputEmitter`] its pointer moves/buttons already
     /// use -- never root's region, and never a second affine desktop
-    /// mapping. Accumulates sub-tick remainder in
-    /// this monitor's own entry in `self.secondary_scroll_accum` (via
-    /// `accumulate_scroll_ticks`), never root's own `root_scroll_accum` or
-    /// another monitor's entry -- see that field's own doc for why a single
-    /// shared accumulator previously let a scroll gesture's leftover
-    /// sub-tick remainder leak across viewports.
+    /// mapping. Gathers whole notches in this monitor's own entry in
+    /// `self.secondary_wheels` (the shared `arcen_input::deck_wheel`
+    /// accumulator), never root's own `root_wheel` or another monitor's
+    /// entry -- see that field's own doc for why a single shared
+    /// accumulator previously let a scroll gesture's leftover partial notch
+    /// leak across viewports.
     ///
     /// Suppressed by the same `secondary_pointer_dispatch_suppressed_by_other_owner`
     /// check `dispatch_secondary_pointer` uses -- scroll continues to be
@@ -5081,16 +5153,16 @@ impl ArcenApp {
         ) {
             return;
         }
-        let accum = self
-            .secondary_scroll_accum
-            .get(&monitor_id)
-            .copied()
-            .unwrap_or(egui::Vec2::ZERO);
-        let (dx, dy, remainder) = accumulate_scroll_ticks(accum, scroll);
-        self.secondary_scroll_accum.insert(monitor_id, remainder);
-        if dx == 0 && dy == 0 {
+        let (travel_x, travel_y) = deck_wheel_travel(scroll);
+        let Some((dx, dy)) = self
+            .secondary_wheels
+            .entry(monitor_id)
+            .or_insert_with(|| WheelAccumulator::new(false))
+            .travel_xy(travel_x, travel_y)
+            .and_then(|scroll| scroll.whole_lines())
+        else {
             return;
-        }
+        };
         if !self.ensure_region_runtime_for_validated(validated) {
             return;
         }
@@ -5252,6 +5324,27 @@ impl ArcenApp {
             }
         }
         true
+    }
+
+    /// Where a committed secondary window draws its picture, if known.
+    fn secondary_picture_rect(&self, viewport_id: egui::ViewportId) -> Option<egui::Rect> {
+        let MultiWindowSessionState::Active {
+            attempt,
+            committed: true,
+            ..
+        } = &self.multi_window
+        else {
+            return None;
+        };
+        let monitor_id = attempt
+            .plan()
+            .assignments()
+            .iter()
+            .find(|assignment| assignment.window == viewport_id)
+            .map(|assignment| assignment.session_monitor_id)?;
+        let state = self.secondary_deferred_viewports.get(&monitor_id)?;
+        let state = state.lock().ok()?;
+        state.image_rect
     }
 
     fn forward_secondary_pointer_events(
@@ -5945,12 +6038,10 @@ impl ArcenApp {
                         telemetry.record_frames_presented(1);
                     }
                     if let Some(media) = &callback_media {
-                        *media
+                        media
                             .lock()
                             .expect("media state poisoned")
-                            .monitor_presented_frames
-                            .entry(monitor_id)
-                            .or_default() += 1;
+                            .note_monitor_presented(monitor_id, 1);
                     }
                 }
                 state.texture = texture.clone();
@@ -6738,11 +6829,9 @@ impl ArcenApp {
             // commands and its About window are not on the Mac's menu bar.
             #[cfg(not(feature = "dev-tools"))]
             MenuCommand::CycleTestPattern => {}
-            // Giving the keyboard to this Mac and back needs the event tap
-            // (K4); a Mac's Ctrl+Alt+Del is Send Key ▸ Ctrl+Alt+Del.
-            MenuCommand::About
-            | MenuCommand::SendSecureAttention
-            | MenuCommand::ToggleKeyboardCapture => {}
+            MenuCommand::ToggleKeyboardCapture => self.toggle_keyboard_owner("menu"),
+            // A Mac's Ctrl+Alt+Del is Send Key ▸ Ctrl+Alt+Del.
+            MenuCommand::About | MenuCommand::SendSecureAttention => {}
         }
     }
 
@@ -8609,6 +8698,9 @@ impl ArcenApp {
             }),
             canvas_available: canvas_request(true, self.canvas_cache_mib)
                 != arcen_deck_core::canvas::CanvasRequest::Unavailable,
+            system_shortcut_permission: Some(
+                crate::ui::system_shortcut_tap::accessibility_allowed(),
+            ),
         };
         let mut values = SettingsValues {
             tab: self.settings_tab,
@@ -8633,6 +8725,8 @@ impl ArcenApp {
             exact_still_image: self.exact_still_image,
             canvas: self.canvas,
             keyboard_capture: self.keyboard_capture,
+            capture_mac_system_shortcuts: self.capture_mac_system_shortcuts,
+            keyboard_switch: self.keyboard_switch,
         };
         let actions = render_settings(ui, &mut values, &facts);
         let SettingsValues {
@@ -8657,7 +8751,9 @@ impl ArcenApp {
             pen_buttons,
             exact_still_image,
             canvas,
-            keyboard_capture: _,
+            keyboard_capture,
+            capture_mac_system_shortcuts,
+            keyboard_switch,
         } = values;
         let mut close = actions.contains(&SettingsAction::Close);
         let show_in_folder = actions.contains(&SettingsAction::ShowLogFolder);
@@ -8691,6 +8787,9 @@ impl ArcenApp {
                     }
                 }
             }
+        }
+        if actions.contains(&SettingsAction::AllowSystemShortcutPermission) {
+            crate::ui::system_shortcut_tap::request_accessibility();
         }
         if actions.contains(&SettingsAction::NativeTabletComponent) {
             let ctx = ui.ctx().clone();
@@ -8729,6 +8828,9 @@ impl ArcenApp {
             || microphone_enabled != self.microphone_enabled
             || exact_still_image != self.exact_still_image
             || canvas != self.canvas
+            || keyboard_capture != self.keyboard_capture
+            || capture_mac_system_shortcuts != self.capture_mac_system_shortcuts
+            || keyboard_switch != self.keyboard_switch
             || pen_buttons != self.pen_buttons
             || tablet_mode_requested != self.tablet_mode_requested;
         self.settings_tab = tab;
@@ -8759,6 +8861,14 @@ impl ArcenApp {
         self.microphone_enabled = microphone_enabled;
         self.exact_still_image = exact_still_image;
         self.canvas = canvas;
+        self.keyboard_capture = keyboard_capture;
+        self.keyboard_owner.set_policy(keyboard_capture);
+        self.capture_mac_system_shortcuts = capture_mac_system_shortcuts;
+        if keyboard_switch != self.keyboard_switch {
+            self.keyboard_switch = keyboard_switch;
+            self.keyboard.set_switch_chord(keyboard_switch);
+            self.keyboard.clear_escape_home();
+        }
         if pen_buttons != self.pen_buttons {
             self.pen_buttons = pen_buttons;
             self.pen.borrow_mut().set_button_settings(pen_buttons);
@@ -9076,6 +9186,9 @@ impl ArcenApp {
                 option_key_mode: self.option_key_mode,
                 paste: self.paste_keys.settings(),
                 keyboard_capture: self.keyboard_capture,
+                capture_mac_system_shortcuts: self.capture_mac_system_shortcuts,
+                mac_system_shortcut_offer_answered: self.mac_system_shortcut_offer_answered,
+                keyboard_switch: self.keyboard_switch,
             },
         )
     }
@@ -10053,8 +10166,8 @@ impl ArcenApp {
                 smooth_y = smooth_scroll.y,
                 hovered = response.hovered(),
                 pointer_lock = self.pointer_lock,
-                accum_x = self.root_scroll_accum.x,
-                accum_y = self.root_scroll_accum.y,
+                remainder_x = self.root_wheel.remainder(WheelAxis::Horizontal),
+                remainder_y = self.root_wheel.remainder(WheelAxis::Vertical),
                 "scroll input"
             );
         }
@@ -10063,26 +10176,13 @@ impl ArcenApp {
         // elastic edges. The notch path below quantised a trackpad to 120-point
         // ticks and dropped its phase, which is why scrolling felt like a
         // wheel, and a gentle drag could produce nothing at all.
-        let precise = self.host_precise_scroll;
-        if precise {
-            if response.hovered() || self.pointer_lock {
-                if let Some(pos) = pointer_pos.or(self.last_pointer_view_pos) {
-                    self.send_wheel_events_precisely(image_rect, pos, &wheel_events);
-                }
-            }
-            self.root_scroll_accum = egui::Vec2::ZERO;
-        } else if response.hovered() || self.pointer_lock {
-            let scroll = smooth_scroll;
-            if scroll != egui::Vec2::ZERO {
-                let (dx, dy, remainder) = accumulate_scroll_ticks(self.root_scroll_accum, scroll);
-                self.root_scroll_accum = remainder;
-                if dx != 0 || dy != 0 {
-                    if let Some(pos) = pointer_pos.or(self.last_pointer_view_pos) {
-                        self.send_mouse_scroll(image_rect, pos, dx, dy);
-                    }
-                }
-            }
-        }
+        self.dispatch_root_scroll(
+            image_rect,
+            pointer_pos.or(self.last_pointer_view_pos),
+            response.hovered() || self.pointer_lock,
+            smooth_scroll,
+            &wheel_events,
+        );
         // Gestures are independent of how scrolling is carried; every current
         // host takes precise scroll, so gating them on the notch path meant
         // they were never sent.
@@ -10640,6 +10740,59 @@ impl ArcenApp {
         }
     }
 
+    /// Every UI pass: what the dedicated presenters put on glass since the
+    /// last pass, for session health and the per-monitor statistics. Taken
+    /// here rather than with the once-a-second log, so a frame counts in
+    /// the health window it was presented in: counted only when logged, five
+    /// seconds held four or five seconds of presents against five of decoded
+    /// frames, and steady sessions alternated between "unpresented" alarms
+    /// and surpluses.
+    fn take_dedicated_presentations(&mut self) {
+        if !matches!(self.screen, AppScreen::InSession) {
+            return;
+        }
+        let ten_bit = self
+            .dedicated_video_presenter
+            .lock()
+            .expect("10-bit presenter poisoned")
+            .take_presentations();
+        let eight_bit = self
+            .dedicated_eight_bit_video_presenter
+            .lock()
+            .expect("8-bit presenter poisoned")
+            .take_presentations();
+        self.note_dedicated_presentations(ten_bit);
+        self.note_dedicated_presentations(eight_bit);
+    }
+
+    fn note_dedicated_presentations(&mut self, presentations: DedicatedPresentations) {
+        let DedicatedPresentations {
+            frames_confirmed,
+            presented_time_unconfirmed,
+            confirmed_presented_at,
+        } = presentations;
+        if frames_confirmed == 0 && presented_time_unconfirmed == 0 {
+            return;
+        }
+        for confirmed_at in confirmed_presented_at {
+            Self::push_instant_sample(&mut self.presented_frame_times, confirmed_at);
+            if let Some(root_monitor_id) = self.committed_root_monitor_id() {
+                self.record_monitor_presentation(root_monitor_id, confirmed_at);
+            }
+        }
+        self.dedicated_presented_time_reported |= frames_confirmed > 0;
+        if let Some(telemetry) = &self.session_telemetry {
+            telemetry.record_presenter_frames(
+                frames_confirmed,
+                presented_time_unconfirmed,
+                self.dedicated_presented_time_reported,
+            );
+        }
+        let logged = &mut self.dedicated_presentations_logged;
+        logged.0 = logged.0.saturating_add(frames_confirmed);
+        logged.1 = logged.1.saturating_add(presented_time_unconfirmed);
+    }
+
     fn drain_dedicated_presenter_telemetry(&mut self) {
         let ten_bit = {
             let presenter = self
@@ -10694,10 +10847,6 @@ impl ArcenApp {
             .0
             .frames_submitted
             .saturating_add(eight_bit.0.frames_submitted);
-        let confirmed = ten_bit
-            .0
-            .frames_confirmed
-            .saturating_add(eight_bit.0.frames_confirmed);
         if submitted > 0 {
             for submitted_at in ten_bit
                 .0
@@ -10709,36 +10858,20 @@ impl ArcenApp {
                 Self::push_instant_sample(&mut self.presented_frame_times_estimated, submitted_at);
             }
         }
-        if confirmed > 0 {
-            for confirmed_at in ten_bit
-                .0
-                .confirmed_presented_at
-                .iter()
-                .chain(eight_bit.0.confirmed_presented_at.iter())
-                .copied()
-            {
-                Self::push_instant_sample(&mut self.presented_frame_times, confirmed_at);
-                if let Some(root_monitor_id) = self.committed_root_monitor_id() {
-                    self.record_monitor_presentation(root_monitor_id, confirmed_at);
-                }
-            }
+        // Presentations a pass has not taken yet (this drain's own race).
+        for delta in [&ten_bit.0, &eight_bit.0] {
+            self.note_dedicated_presentations(DedicatedPresentations {
+                frames_confirmed: delta.frames_confirmed,
+                presented_time_unconfirmed: delta.presented_time_unconfirmed,
+                confirmed_presented_at: delta.confirmed_presented_at.clone(),
+            });
         }
+        let (confirmed, presented_time_unconfirmed) =
+            std::mem::take(&mut self.dedicated_presentations_logged);
         let metal_dropped = ten_bit
             .0
             .metal_dropped
             .saturating_add(eight_bit.0.metal_dropped);
-        let presented_time_unconfirmed = ten_bit
-            .0
-            .presented_time_unconfirmed
-            .saturating_add(eight_bit.0.presented_time_unconfirmed);
-        self.dedicated_presented_time_reported |= confirmed > 0;
-        if let Some(telemetry) = &self.session_telemetry {
-            telemetry.record_presenter_frames(
-                confirmed,
-                presented_time_unconfirmed,
-                self.dedicated_presented_time_reported,
-            );
-        }
         let overflow = ten_bit
             .0
             .dropped_overflow
@@ -11709,11 +11842,10 @@ impl ArcenApp {
             now,
         );
         if let Some(media) = &self.media {
-            let mut state = media.lock().expect("media state poisoned");
-            *state
-                .monitor_presented_frames
-                .entry(monitor_id)
-                .or_default() += 1;
+            media
+                .lock()
+                .expect("media state poisoned")
+                .note_monitor_presented(monitor_id, 1);
         }
     }
 
@@ -11805,6 +11937,15 @@ impl ArcenApp {
         self.last_input_sent_at = Some(Instant::now());
     }
 
+    /// Every window's partial notch is forgotten when focus leaves the
+    /// Deck: travel gathered before belongs to a scroll that has ended.
+    fn forget_partial_notches(&mut self) {
+        self.root_wheel.clear();
+        for wheel in self.secondary_wheels.values_mut() {
+            wheel.clear();
+        }
+    }
+
     fn update_viewer_keyboard_focus(&mut self, focused: bool) {
         self.keyboard.begin_frame();
         let lost_focus = self.keyboard.update_focus(focused);
@@ -11816,8 +11957,10 @@ impl ArcenApp {
             "keyboard focus sample",
         );
         if lost_focus {
+            self.note_command_tab_without_tap();
             self.release_pointer_lock("focus_out");
             self.release_remote_keys("focus_out");
+            self.forget_partial_notches();
         }
     }
 
@@ -12253,6 +12396,13 @@ impl ArcenApp {
     /// longer physically held, so a person still holding it for the next
     /// shortcut keeps it held on the host too.
     fn send_command_q_to_host(&mut self) {
+        if self.keyboard_released() {
+            tracing::info!(
+                target: crate::logging::target::INPUT,
+                "Cmd+Q tapped while this Mac has the keyboard; not sent"
+            );
+            return;
+        }
         let edges = self
             .keyboard
             .tap_with_command(arcen_protocol::keys::KEY_Q, macos_menu::command_held());
@@ -12405,7 +12555,11 @@ impl ArcenApp {
                     self.process_keyboard_event(&event);
                 }
                 crate::ui::text_input::RoutedInput::Text(text) => {
-                    self.send_text_commit(text);
+                    // This Mac has the keyboard: nothing typed reaches the
+                    // host.
+                    if !self.keyboard_released() {
+                        self.send_text_commit(text);
+                    }
                 }
             }
         }
@@ -12441,19 +12595,29 @@ impl ArcenApp {
     }
 
     fn process_keyboard_event(&mut self, event: &egui::Event) {
-        let escape_chord = matches!(
-            event,
-            egui::Event::Key {
-                key: egui::Key::Home,
-                pressed: true,
-                repeat: false,
-                modifiers,
-                ..
-            } if modifiers.ctrl && modifiers.alt && !modifiers.shift && !modifiers.mac_cmd
-        );
+        let native = self
+            .native_key_metadata
+            .front()
+            .copied()
+            .filter(|metadata| metadata.matches(event));
+        if native.is_some() {
+            self.native_key_metadata.pop_front();
+        }
+        self.process_keyboard_event_with_native(event, native);
+    }
+
+    /// One key event with the native facts AppKit gave for it, if any (the
+    /// event tap's keys bring their own).
+    fn process_keyboard_event_with_native(
+        &mut self,
+        event: &egui::Event,
+        native: Option<crate::ui::keyboard::NativeKeyMetadata>,
+    ) {
+        let escape_chord =
+            crate::ui::keyboard::is_switch_chord(event, native, self.keyboard_switch);
         if escape_chord {
-            // Control-Option-Home (the Deck's escape chord; F9 reaches the
-            // host).
+            // The keyboard switch (Control-Option-Home by default; F9
+            // reaches the host).
             // Panic-release must clear whichever viewport actually owns a
             // pointer lock. If a secondary owns it, release exactly that
             // owner via the same path `drive_multi_window` uses -- root's
@@ -12467,13 +12631,13 @@ impl ArcenApp {
                 self.release_pointer_lock("release_keyboard");
             }
         }
-        let native = self
-            .native_key_metadata
-            .front()
-            .copied()
-            .filter(|metadata| metadata.matches(event));
-        if native.is_some() {
-            self.native_key_metadata.pop_front();
+        if self.keyboard_released() {
+            // This Mac has the keyboard: no key reaches the host, and only
+            // Control-Option-Home gives it back.
+            if escape_chord {
+                self.toggle_keyboard_owner("chord");
+            }
+            return;
         }
         // The physical key, for the keyboard's own state if the input
         // method swallows its release.
@@ -12544,7 +12708,13 @@ impl ArcenApp {
                     reason,
                     "local keyboard reset requested",
                 );
-                self.release_remote_keys(reason);
+                if reason == "release_keyboard" && self.keyboard_owner_session {
+                    // Control-Option-Home: the keyboard goes to this Mac,
+                    // every key held on the host released first.
+                    self.toggle_keyboard_owner("chord");
+                } else {
+                    self.release_remote_keys(reason);
+                }
             }
             KeyboardAction::Suppressed {
                 qt_key,
@@ -12566,6 +12736,239 @@ impl ArcenApp {
                 );
             }
             KeyboardAction::Ignored => {}
+        }
+    }
+
+    /// Whether this Mac has the keyboard during a session (nothing typed
+    /// reaches the host).
+    fn keyboard_released(&self) -> bool {
+        self.keyboard_owner_session
+            && self.keyboard_owner.owner() == arcen_input::keyboard::KeyboardOwner::ThisComputer
+    }
+
+    /// Control-Option-Home or Connection ▸ Keyboard: Host or This Computer:
+    /// the keyboard goes to this Mac (every key held on the host is released
+    /// first) or back to the host.
+    fn toggle_keyboard_owner(&mut self, reason: &'static str) {
+        let change = self.keyboard_owner.toggle();
+        self.keyboard_owner_changed(change, reason);
+    }
+
+    fn keyboard_owner_changed(
+        &mut self,
+        change: arcen_input::keyboard::CaptureChange,
+        reason: &'static str,
+    ) {
+        if change.release_host_keys {
+            self.release_remote_keys("release_keyboard");
+        }
+        if change.owner == arcen_input::keyboard::KeyboardOwner::Host {
+            self.keyboard.clear_escape_home();
+        }
+        tracing::info!(
+            target: crate::logging::target::INPUT,
+            owner = ?change.owner,
+            reason,
+            "keyboard owner changed"
+        );
+        // No chord may be taken for the host from here on.
+        self.sync_system_shortcut_tap();
+        self.show_keyboard_toast(change.owner);
+    }
+
+    /// The short notice every flip of the keyboard switch gives.
+    fn show_keyboard_toast(&mut self, owner: arcen_input::keyboard::KeyboardOwner) {
+        let system_shortcuts = self
+            .system_shortcut_tap
+            .as_ref()
+            .is_some_and(|tap| tap.state().takes_shortcuts());
+        let host = self
+            .active_connection
+            .as_ref()
+            .map_or("the remote computer", ConnectionDraft::display_name);
+        let text = arcen_deck_core::screens::keyboard_help::keyboard_switch_toast(
+            owner,
+            host,
+            arcen_deck_core::screens::wording::DeckPlatform::Mac,
+            system_shortcuts,
+        );
+        self.keyboard_toast_text = Some(text);
+    }
+
+    /// A session window lost the focus while ⌘ was held, the remote
+    /// computer had the keyboard and no event tap took ⌘Tab: macOS switched
+    /// apps. The first time, the Deck offers to send ⌘Tab to the remote
+    /// computer (it needs Accessibility); "Not now" is remembered.
+    fn note_command_tab_without_tap(&mut self) {
+        let tap_takes = self
+            .system_shortcut_tap
+            .as_ref()
+            .is_some_and(|tap| tap.state().takes_shortcuts());
+        if !self.mac_system_shortcut_offer_answered
+            && self.keyboard_owner_session
+            && !self.keyboard_released()
+            && self
+                .keyboard_owner
+                .policy()
+                .takes_system_shortcuts(self.fullscreen)
+            && !tap_takes
+            && self.keyboard.command_held()
+        {
+            self.mac_system_shortcut_offer_pending = true;
+            tracing::info!(
+                target: crate::logging::target::INPUT,
+                "command-tab left the session without the event tap; offering it once"
+            );
+        }
+    }
+
+    /// The one-time question, while a session window has the focus again.
+    fn mac_system_shortcut_offer(&mut self, ctx: &egui::Context) {
+        if !self.mac_system_shortcut_offer_pending
+            || self.mac_system_shortcut_offer_answered
+            || !self.keyboard_owner_session
+            || !self.keyboard.focused()
+        {
+            return;
+        }
+        let Some(allow) = arcen_deck_core::screens::keyboard_help::render_mac_shortcut_offer(ctx)
+        else {
+            return;
+        };
+        self.mac_system_shortcut_offer_pending = false;
+        self.mac_system_shortcut_offer_answered = true;
+        if allow {
+            self.capture_mac_system_shortcuts = true;
+            if !crate::ui::system_shortcut_tap::accessibility_allowed() {
+                crate::ui::system_shortcut_tap::request_accessibility();
+            }
+            self.sync_system_shortcut_tap();
+        }
+        tracing::info!(
+            target: crate::logging::target::INPUT,
+            allow,
+            "command-tab offer answered"
+        );
+        if let Err(error) = self.persist_settings() {
+            tracing::warn!(%error, "settings were not saved after the command-tab offer");
+        }
+    }
+
+    /// The session's keyboard facts into the shared capture, the event tap
+    /// on or off, and the indicator. Once per pass, from `logic`.
+    fn sync_keyboard_capture(&mut self, ctx: &egui::Context) {
+        let session = matches!(self.screen, AppScreen::InSession);
+        if session != self.keyboard_owner_session {
+            self.keyboard_owner.set_session(session);
+            self.keyboard_owner_session = session;
+            self.consumed_picture_buttons = 0;
+            self.keyboard.clear_escape_home();
+        }
+        self.keyboard_owner.set_policy(self.keyboard_capture);
+        arcen_deck_core::screens::wording::set_keyboard_switch(ctx, self.keyboard_switch);
+        self.keyboard.set_switch_chord(self.keyboard_switch);
+        self.keyboard_owner.set_focused(self.keyboard.focused());
+        self.keyboard_owner.set_fullscreen(self.fullscreen);
+        if self.system_shortcut_tap.is_none() {
+            let wake = ctx.clone();
+            self.system_shortcut_tap =
+                Some(crate::ui::system_shortcut_tap::SystemShortcutTap::new(
+                    move || wake.request_repaint(),
+                ));
+        }
+        self.sync_system_shortcut_tap();
+        let line = self.keyboard_status_line();
+        if line != self.keyboard_status_shown {
+            macos_menu::set_keyboard_status(&line);
+            self.keyboard_status_shown = line;
+        }
+    }
+
+    /// Installs the event tap while the switch is on, the host has the
+    /// keyboard, the policy takes the system shortcuts and a session window
+    /// has the keyboard focus; removes it otherwise.
+    fn sync_system_shortcut_tap(&mut self) {
+        let wanted = self.capture_mac_system_shortcuts
+            && self.keyboard_owner_session
+            && self.keyboard_owner.takes_system_shortcuts();
+        if let Some(tap) = self.system_shortcut_tap.as_mut() {
+            tap.update(wanted);
+        }
+    }
+
+    /// What the indicator says (the menu bar): who has the keyboard, and
+    /// whether the system shortcuts go to the host now (only through the
+    /// event tap).
+    fn keyboard_status_line(&self) -> String {
+        use arcen_input::keyboard::KeyboardStatus;
+        let status = match self.keyboard_owner.status() {
+            KeyboardStatus::Host { .. } if self.keyboard_owner_session => KeyboardStatus::Host {
+                system_shortcuts: self
+                    .system_shortcut_tap
+                    .as_ref()
+                    .is_some_and(|tap| tap.state().takes_shortcuts()),
+            },
+            other => other,
+        };
+        let host = self
+            .active_connection
+            .as_ref()
+            .map_or("the remote computer", ConnectionDraft::display_name);
+        arcen_deck_core::screens::keyboard_help::keyboard_status_line(
+            status,
+            host,
+            arcen_deck_core::screens::wording::DeckPlatform::Mac,
+            self.keyboard_switch,
+        )
+    }
+
+    /// Keys the event tap took for the host, sent through the usual keyboard
+    /// path before this pass's own events (each carries the modifiers held
+    /// at it, so a modifier pressed just before is pressed from that, and a
+    /// modifier let go of just after is released after it); and a click
+    /// into the picture while this Mac has the keyboard: it gives the
+    /// keyboard back and is not sent (nor is its release).
+    ///
+    /// The tap wakes the root window, so its pass takes the keys whichever
+    /// session window has the keyboard focus.
+    fn filter_keyboard_capture_input(
+        &mut self,
+        raw_input: &mut egui::RawInput,
+        picture: Option<PictureArea>,
+    ) {
+        let tapped = self
+            .system_shortcut_tap
+            .as_ref()
+            .map(crate::ui::system_shortcut_tap::SystemShortcutTap::drain)
+            .unwrap_or_default();
+        if self.keyboard_owner.keys_to_host() {
+            for key in tapped {
+                if let Some(event) = crate::ui::system_shortcut_tap::tapped_key_event(key) {
+                    let native = crate::ui::system_shortcut_tap::tapped_key_native(key, &event);
+                    self.process_keyboard_event_with_native(&event, native);
+                }
+            }
+        }
+        // Otherwise taken before the keyboard left the host or the window
+        // lost focus: every host key was released then.
+        if !self.keyboard_owner_session {
+            return;
+        }
+        let (events, recaptured) = consume_picture_clicks(
+            &mut self.keyboard_owner,
+            &mut self.consumed_picture_buttons,
+            std::mem::take(&mut raw_input.events),
+            picture.as_ref(),
+        );
+        raw_input.events = events;
+        if recaptured {
+            self.keyboard_owner_changed(
+                arcen_input::keyboard::CaptureChange {
+                    owner: arcen_input::keyboard::KeyboardOwner::Host,
+                    release_host_keys: false,
+                },
+                "click",
+            );
         }
     }
 
@@ -12615,10 +13018,14 @@ impl ArcenApp {
 
     fn release_remote_keys(&mut self, reason: &'static str) {
         self.text_input.focus_lost();
-        let edges = self.keyboard.release_all();
+        let edges = if reason == "release_keyboard" {
+            self.keyboard.release_all_for_switch()
+        } else {
+            self.keyboard.release_all()
+        };
         let released = edges.len();
         for edge in edges {
-            let (sent, sequence) = self.send_key_event(edge.qt_key, false, edge.modifiers);
+            let (sent, sequence) = self.send_key_event(edge.qt_key, edge.pressed, edge.modifiers);
             self.keyboard.record_delivery(sent);
             tracing::debug!(
                 target: crate::logging::target::INPUT,
@@ -12964,10 +13371,40 @@ impl ArcenApp {
         }
     }
 
+    /// One root pass's scroll, while the pointer is over the picture or
+    /// locked to it.
+    fn dispatch_root_scroll(
+        &mut self,
+        image_rect: egui::Rect,
+        pos: Option<egui::Pos2>,
+        over_picture: bool,
+        smooth_scroll: egui::Vec2,
+        wheel_events: &[(egui::MouseWheelUnit, egui::Vec2, egui::TouchPhase)],
+    ) {
+        if !over_picture {
+            return;
+        }
+        if self.root_wheel.precise_host() {
+            if let Some(pos) = pos {
+                self.send_wheel_events_precisely(image_rect, pos, wheel_events);
+            }
+            return;
+        }
+        let (dx, dy) = deck_wheel_travel(smooth_scroll);
+        let Some(scroll) = self.root_wheel.travel_xy(dx, dy) else {
+            return;
+        };
+        if let (Some(pos), Some((dx, dy))) = (pos, scroll.whole_lines()) {
+            self.send_mouse_scroll(image_rect, pos, dx, dy);
+        }
+    }
+
     /// Sends one frame's wheel events to a host that takes precise scroll.
     ///
     /// Point events keep their fractional travel and phase. Line events — a
-    /// physical wheel — are sent as whole notches, exactly as before.
+    /// physical wheel — go as whole lines through the shared accumulator
+    /// (`WheelAccumulator::notches`), which keeps a smooth wheel's fraction
+    /// of a line until it completes one instead of truncating it away.
     fn send_wheel_events_precisely(
         &mut self,
         rect: egui::Rect,
@@ -12991,11 +13428,8 @@ impl ArcenApp {
                             arcen_protocol::messages::ScrollPhaseMsg::Cancelled
                         }
                     };
-                    // The same signs as the notch path: x as delivered, y
-                    // inverted.
-                    let dx = f64::from(delta.x) * scale;
-                    let dy = -f64::from(delta.y) * scale;
-                    self.send_precise_scroll(rect, pos, dx, dy, phase);
+                    let (dx, dy) = deck_wheel_travel(delta);
+                    self.send_precise_scroll(rect, pos, dx * scale, dy * scale, phase);
                 }
                 egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
                     let lines = if unit == egui::MouseWheelUnit::Page {
@@ -13003,10 +13437,15 @@ impl ArcenApp {
                     } else {
                         delta
                     };
-                    let accum = self.root_scroll_accum + egui::vec2(lines.x, -lines.y);
-                    let (dx, dy) = (accum.x.trunc() as i32, accum.y.trunc() as i32);
-                    self.root_scroll_accum = accum - egui::vec2(dx as f32, dy as f32);
-                    if dx != 0 || dy != 0 {
+                    // Whole lines on every host; the fraction waits in
+                    // root's wheel until it completes one.
+                    let (dx, dy) = deck_wheel_travel(lines);
+                    let notch = f64::from(arcen_input::deck_wheel::WHEEL_DELTA);
+                    if let Some((dx, dy)) = self
+                        .root_wheel
+                        .notches_xy(dx * notch, dy * notch)
+                        .and_then(|scroll| scroll.whole_lines())
+                    {
                         self.send_mouse_scroll(rect, pos, dx, dy);
                     }
                 }
@@ -13497,28 +13936,12 @@ impl ArcenApp {
     }
 }
 
-/// Accumulates a raw per-frame scroll delta on top of `accum`, returning the
-/// discrete whole-notch `(dx, dy)` ticks ready to send this frame (`(0, 0)`
-/// if the accumulated delta has not yet reached a full 120-unit notch) and
-/// the new sub-tick remainder the caller must store back in its own,
-/// entirely separate accumulator.
-///
-/// Pulled out as a single pure helper so root's own scroll dispatch
-/// (`ArcenApp::viewer_input_surface`) and every secondary viewport's own
-/// dispatch (`ArcenApp::dispatch_secondary_scroll`) share one bucketing rule
-/// while each still keeps its own, independent accumulator
-/// (`ArcenApp::root_scroll_accum`/`ArcenApp::secondary_scroll_accum`) --
-/// this function never reads or writes any shared state itself, so there is
-/// no way for one owner's leftover sub-tick remainder to leak into
-/// another's tick count.
+/// egui's scroll delta in `arcen_input::deck_wheel`'s sign: x as egui
+/// delivers it, y negated. This is the macOS Deck's one sign conversion;
+/// the notch, smooth-wheel and trackpad paths all go through it.
 #[must_use]
-fn accumulate_scroll_ticks(accum: egui::Vec2, delta: egui::Vec2) -> (i32, i32, egui::Vec2) {
-    let mut accum = accum + delta;
-    let dx = (accum.x / 120.0).trunc() as i32;
-    let dy = (-accum.y / 120.0).trunc() as i32;
-    accum.x -= dx as f32 * 120.0;
-    accum.y += dy as f32 * 120.0;
-    (dx, dy, accum)
+fn deck_wheel_travel(delta: egui::Vec2) -> (f64, f64) {
+    (f64::from(delta.x), -f64::from(delta.y))
 }
 
 /// Resolves this frame's secondary keyboard-focus *winner* from the raw
@@ -14736,6 +15159,64 @@ fn connection_identity_with_live_monitors(
         live_topology,
         safe_area_policy,
     )
+}
+
+/// A press over `picture` while this Mac has the keyboard gives it back to
+/// the host (shared `KeyboardCapture::click_in_picture`) and is removed, and
+/// so is that button's release, whenever it comes. Returns the events left
+/// and whether the keyboard went back. Without a known picture nothing is
+/// consumed.
+/// Where a window shows the picture, and the Deck's own areas over it.
+#[derive(Debug, Clone)]
+struct PictureArea {
+    image: egui::Rect,
+    overlays: Vec<egui::Rect>,
+}
+
+impl PictureArea {
+    fn contains(&self, pos: egui::Pos2) -> bool {
+        self.image.contains(pos) && !self.overlays.iter().any(|rect| rect.contains(pos))
+    }
+}
+
+fn consume_picture_clicks(
+    capture: &mut arcen_input::keyboard::KeyboardCapture,
+    consumed: &mut u8,
+    events: Vec<egui::Event>,
+    picture: Option<&PictureArea>,
+) -> (Vec<egui::Event>, bool) {
+    let bit = |button: egui::PointerButton| 1u8 << (button as u8);
+    let mut recaptured = false;
+    let kept = events
+        .into_iter()
+        .filter(|event| {
+            let egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if !*pressed {
+                if *consumed & bit(*button) != 0 {
+                    *consumed &= !bit(*button);
+                    return false;
+                }
+                return true;
+            }
+            if picture.is_some_and(|area| area.contains(*pos))
+                && capture.click_in_picture() == arcen_input::keyboard::ClickRoute::Consume
+            {
+                *consumed |= bit(*button);
+                recaptured = true;
+                return false;
+            }
+            true
+        })
+        .collect();
+    (kept, recaptured)
 }
 
 fn display_name_for_draft(draft: &ConnectionDraft) -> &str {
@@ -17788,6 +18269,239 @@ mod tests {
         assert!(!app.pointer_lock);
         assert_eq!(app.relative_motion.residual(), (0.0, 0.0));
         assert_eq!(app.remote_pointer_buttons, [false; 3]);
+    }
+
+    /// An app in a focused session, as `sync_keyboard_capture` leaves it.
+    fn app_with_captured_keyboard() -> (ArcenApp, mpsc::UnboundedReceiver<SessionCommand>) {
+        let (mut app, receiver) = app_with_command_channel();
+        app.keyboard_owner.set_session(true);
+        app.keyboard_owner.set_focused(true);
+        app.keyboard_owner_session = true;
+        (app, receiver)
+    }
+
+    #[test]
+    fn the_escape_chord_gives_the_keyboard_to_this_mac_and_back() {
+        use arcen_input::keyboard::KeyboardOwner;
+        let (mut app, mut receiver) = app_with_captured_keyboard();
+        seed_non_modifier_and_modifier(&mut app, &mut receiver);
+
+        app.process_keyboard_event(&key_event(egui::Key::Home, true, control_option()));
+        assert_releases_before_reset(&mut receiver, "release_keyboard");
+        assert_eq!(app.keyboard_owner.owner(), KeyboardOwner::ThisComputer);
+        assert!(app.keyboard_released());
+        assert!(app.keyboard_status_line().starts_with("Keyboard: this Mac"));
+
+        // Nothing typed reaches the host: keys, the Home release, text.
+        app.process_keyboard_event(&key_event(egui::Key::Home, false, control_option()));
+        app.process_keyboard_event(&key_event(egui::Key::B, true, egui::Modifiers::NONE));
+        app.process_keyboard_event(&key_event(egui::Key::B, false, egui::Modifiers::NONE));
+        app.dispatch_routed_keyboard_events(&[egui::Event::Text("b".to_owned())]);
+        assert!(receiver.try_recv().is_err());
+
+        // The chord again: back to the host, nothing released twice, and
+        // the next Home is a plain key.
+        app.process_keyboard_event(&key_event(egui::Key::Home, true, control_option()));
+        app.process_keyboard_event(&key_event(egui::Key::Home, false, control_option()));
+        assert_eq!(app.keyboard_owner.owner(), KeyboardOwner::Host);
+        assert!(receiver.try_recv().is_err());
+        app.process_keyboard_event(&key_event(egui::Key::Home, true, egui::Modifiers::NONE));
+        let home = receive_json(&mut receiver);
+        assert_eq!(home["type"], "key_event");
+        assert_eq!(home["pressed"], true);
+    }
+
+    #[test]
+    fn a_chosen_switch_chord_flips_the_keyboard_and_every_flip_says_so() {
+        use arcen_input::keyboard::{KeyboardOwner, KeyboardSwitchChord};
+        let (mut app, mut receiver) = app_with_captured_keyboard();
+        app.keyboard_switch = KeyboardSwitchChord::ALT_F1;
+        app.keyboard.set_switch_chord(KeyboardSwitchChord::ALT_F1);
+        // The default chord is a plain key now.
+        app.process_keyboard_event(&key_event(egui::Key::Home, true, control_option()));
+        assert_eq!(app.keyboard_owner.owner(), KeyboardOwner::Host);
+        app.process_keyboard_event(&key_event(egui::Key::Home, false, control_option()));
+        while receiver.try_recv().is_ok() {}
+        assert!(app.keyboard_status_line().contains("Option-F1"));
+        let option = egui::Modifiers {
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        app.process_keyboard_event(&key_event(egui::Key::F1, true, option));
+        assert_eq!(app.keyboard_owner.owner(), KeyboardOwner::ThisComputer);
+        assert_eq!(
+            app.keyboard_toast_text.as_deref(),
+            Some("Keyboard: This computer")
+        );
+        app.process_keyboard_event(&key_event(egui::Key::F1, false, option));
+        app.process_keyboard_event(&key_event(egui::Key::F1, true, option));
+        assert_eq!(app.keyboard_owner.owner(), KeyboardOwner::Host);
+        assert!(app
+            .keyboard_toast_text
+            .as_deref()
+            .is_some_and(|text| text.starts_with("Keyboard: Remote")));
+    }
+
+    #[test]
+    fn command_tab_without_the_tap_offers_it_once() {
+        let (mut app, _receiver) = app_with_captured_keyboard();
+        app.capture_mac_system_shortcuts = false;
+        app.keyboard.update_focus(true);
+        // ⌘ is down (it reached the host), then macOS switches apps.
+        app.keyboard
+            .held_keys_insert_for_test(crate::protocol::keymap::QT_KEY_META);
+        app.update_viewer_keyboard_focus(false);
+        assert!(app.mac_system_shortcut_offer_pending);
+        // "Not now" is remembered: a later ⌘Tab asks nothing.
+        app.mac_system_shortcut_offer_pending = false;
+        app.mac_system_shortcut_offer_answered = true;
+        app.keyboard.update_focus(true);
+        app.keyboard
+            .held_keys_insert_for_test(crate::protocol::keymap::QT_KEY_META);
+        app.update_viewer_keyboard_focus(false);
+        assert!(!app.mac_system_shortcut_offer_pending);
+    }
+
+    #[test]
+    fn connection_keyboard_menu_item_toggles_the_owner() {
+        use arcen_input::keyboard::KeyboardOwner;
+        let (mut app, mut receiver) = app_with_captured_keyboard();
+        let ctx = egui::Context::default();
+        app.handle_menu_command(macos_menu::MenuCommand::ToggleKeyboardCapture, &ctx);
+        assert_eq!(app.keyboard_owner.owner(), KeyboardOwner::ThisComputer);
+        assert_eq!(receive_json(&mut receiver)["type"], "key_reset_modifiers");
+        app.handle_menu_command(macos_menu::MenuCommand::ToggleKeyboardCapture, &ctx);
+        assert_eq!(app.keyboard_owner.owner(), KeyboardOwner::Host);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_click_into_the_picture_takes_the_keyboard_back_and_is_never_sent() {
+        use arcen_input::keyboard::{KeyboardCapture, KeyboardCapturePolicy};
+        let press = |pos: egui::Pos2, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let picture = PictureArea {
+            image: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0)),
+            overlays: vec![egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(10.0, 10.0),
+            )],
+        };
+        let mut capture = KeyboardCapture::new(KeyboardCapturePolicy::Host);
+        capture.set_session(true);
+        capture.set_focused(true);
+        let mut consumed = 0;
+        // While the host has the keyboard a click is the host's.
+        let inside = egui::pos2(50.0, 50.0);
+        let (kept, back) = consume_picture_clicks(
+            &mut capture,
+            &mut consumed,
+            vec![press(inside, egui::PointerButton::Primary, true)],
+            Some(&picture),
+        );
+        assert_eq!(kept.len(), 1);
+        assert!(!back);
+        let _ = capture.release();
+        // Over the Deck's own overlay, or outside the picture: kept.
+        for pos in [egui::pos2(5.0, 5.0), egui::pos2(150.0, 50.0)] {
+            let (kept, back) = consume_picture_clicks(
+                &mut capture,
+                &mut consumed,
+                vec![press(pos, egui::PointerButton::Primary, true)],
+                Some(&picture),
+            );
+            assert_eq!(kept.len(), 1);
+            assert!(!back);
+        }
+        // Into the picture: consumed with its move kept, the keyboard back.
+        let moved = egui::Event::PointerMoved(inside);
+        let (kept, back) = consume_picture_clicks(
+            &mut capture,
+            &mut consumed,
+            vec![
+                moved.clone(),
+                press(inside, egui::PointerButton::Secondary, true),
+            ],
+            Some(&picture),
+        );
+        assert_eq!(kept, vec![moved]);
+        assert!(back);
+        assert_eq!(capture.owner(), arcen_input::keyboard::KeyboardOwner::Host);
+        // Its release, in a later pass, is consumed too; the next click is
+        // the host's.
+        let (kept, _) = consume_picture_clicks(
+            &mut capture,
+            &mut consumed,
+            vec![
+                press(inside, egui::PointerButton::Secondary, false),
+                press(inside, egui::PointerButton::Primary, true),
+            ],
+            Some(&picture),
+        );
+        assert_eq!(
+            kept,
+            vec![press(inside, egui::PointerButton::Primary, true)]
+        );
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn tapped_system_chords_reach_the_host_in_order_unless_this_mac_has_the_keyboard() {
+        let (mut app, mut receiver) = app_with_captured_keyboard();
+        let tap = crate::ui::system_shortcut_tap::SystemShortcutTap::new(|| {});
+        let tab = |pressed| crate::ui::system_shortcut_tap::TappedKey {
+            key_code: arcen_input::keyboard::MAC_KEY_TAB,
+            pressed,
+            repeat: false,
+            flags: arcen_input::keyboard::MacTapModifiers::CG_COMMAND,
+        };
+        tap.queue_for_test(tab(true));
+        tap.queue_for_test(tab(false));
+        app.system_shortcut_tap = Some(tap);
+        // The pass that takes them also carries the Command release, which
+        // must come after them.
+        let mut raw = egui::RawInput {
+            focused: true,
+            events: vec![key_event(egui::Key::A, false, egui::Modifiers::NONE)],
+            ..egui::RawInput::default()
+        };
+        app.filter_keyboard_capture_input(&mut raw, None);
+        assert_eq!(raw.events.len(), 1, "the pass's own events stay for the UI");
+        let mut sent = Vec::new();
+        while let Ok(SessionCommand::Json(json)) = receiver.try_recv() {
+            if json["type"] == "key_event" {
+                sent.push((
+                    json["scan_code"].as_u64().unwrap(),
+                    json["pressed"].as_bool().unwrap(),
+                ));
+            }
+        }
+        let tab_key = u64::from(arcen_protocol::keys::KEY_TAB);
+        assert!(sent.contains(&(tab_key, true)), "{sent:?}");
+        assert!(sent.contains(&(tab_key, false)), "{sent:?}");
+        assert!(
+            sent.iter().position(|edge| *edge == (tab_key, true))
+                < sent.iter().position(|edge| *edge == (tab_key, false))
+        );
+
+        // This Mac has the keyboard: a key the tap took just before is
+        // dropped.
+        app.toggle_keyboard_owner("test");
+        while receiver.try_recv().is_ok() {}
+        app.system_shortcut_tap
+            .as_ref()
+            .expect("tap")
+            .queue_for_test(tab(true));
+        let mut raw = egui::RawInput {
+            focused: true,
+            ..egui::RawInput::default()
+        };
+        app.filter_keyboard_capture_input(&mut raw, None);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -24669,6 +25383,9 @@ mod tests {
                     chars_per_second: 10,
                 },
                 keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Fullscreen,
+                capture_mac_system_shortcuts: true,
+                mac_system_shortcut_offer_answered: true,
+                keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord::ALT_F1,
             },
         )
         .unwrap();
@@ -28870,6 +29587,127 @@ mod tests {
         assert!(app.last_pointer_norm.is_none());
     }
 
+    /// Every root scroll the host was sent, as `(unit, delta_x, delta_y)`.
+    fn drain_root_scrolls(
+        receiver: &mut mpsc::UnboundedReceiver<SessionCommand>,
+    ) -> Vec<(String, i64, i64)> {
+        let mut scrolls = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            let SessionCommand::Json(value) = command else {
+                continue;
+            };
+            if value["type"] == "region_pointer_scroll" {
+                scrolls.push((
+                    value["unit"].as_str().unwrap_or("line").to_owned(),
+                    value["delta_x"].as_i64().expect("delta_x"),
+                    value["delta_y"].as_i64().expect("delta_y"),
+                ));
+            }
+        }
+        scrolls
+    }
+
+    #[test]
+    fn a_smooth_wheel_s_fractions_of_a_line_add_up_to_whole_lines_on_a_precise_host() {
+        // A Mac wheel with smooth scrolling reports fractions of a line. They
+        // were truncated per event and the rest dropped at the end of every
+        // pass, so a slow wheel did nothing at all. They add up to whole
+        // lines on every host: a Pier reads `Point` as its own pixels (the
+        // macOS Pier) or 120ths, never as a wheel's lines.
+        let (mut app, mut receiver) = app_with_command_channel();
+        assert!(app.ensure_region_runtime_for_validated(&two_monitor_validated_topology()));
+        app.root_wheel = WheelAccumulator::new(true);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 540.0));
+        let pos = Some(egui::pos2(480.0, 270.0));
+        let wheel = |x: f32, y: f32| {
+            [(
+                egui::MouseWheelUnit::Line,
+                egui::vec2(x, y),
+                egui::TouchPhase::Move,
+            )]
+        };
+        // A quarter line four times is exactly one line (y negated, as the
+        // Mac's notch path always did) and no `Point` travel.
+        for _ in 0..4 {
+            app.dispatch_root_scroll(rect, pos, true, egui::Vec2::ZERO, &wheel(0.0, 0.25));
+        }
+        assert_eq!(
+            drain_root_scrolls(&mut receiver),
+            vec![("line".to_owned(), 0, -120)]
+        );
+        // 2.3 lines: two now, the 0.3 kept until it completes a line.
+        app.dispatch_root_scroll(rect, pos, true, egui::Vec2::ZERO, &wheel(0.0, 2.3));
+        assert_eq!(
+            drain_root_scrolls(&mut receiver),
+            vec![("line".to_owned(), 0, -240)]
+        );
+        assert!((app.root_wheel.remainder(WheelAxis::Vertical) + 36.0).abs() < 1e-3);
+        app.dispatch_root_scroll(rect, pos, true, egui::Vec2::ZERO, &wheel(0.0, 0.7));
+        assert_eq!(
+            drain_root_scrolls(&mut receiver),
+            vec![("line".to_owned(), 0, -120)]
+        );
+        // Whole lines on both axes go as one scroll.
+        app.dispatch_root_scroll(rect, pos, true, egui::Vec2::ZERO, &wheel(-1.0, 2.0));
+        assert_eq!(
+            drain_root_scrolls(&mut receiver),
+            vec![("line".to_owned(), -120, -240)]
+        );
+        // A trackpad's own travel is untouched: host pixels, 120 logical
+        // units each.
+        let pad = [(
+            egui::MouseWheelUnit::Point,
+            egui::vec2(0.0, 3.0),
+            egui::TouchPhase::Move,
+        )];
+        app.dispatch_root_scroll(rect, pos, true, egui::Vec2::ZERO, &pad);
+        assert_eq!(
+            drain_root_scrolls(&mut receiver),
+            vec![("point".to_owned(), 0, -360)]
+        );
+    }
+
+    #[test]
+    fn a_trackpad_s_fine_travel_is_conserved_for_a_notch_host() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        assert!(app.ensure_region_runtime_for_validated(&two_monitor_validated_topology()));
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 540.0));
+        let pos = Some(egui::pos2(480.0, 270.0));
+        // 0.1 points a pass: 1,200 passes are exactly one notch.
+        for _ in 0..1_200 {
+            app.dispatch_root_scroll(rect, pos, true, egui::vec2(0.0, -0.1), &[]);
+        }
+        assert_eq!(
+            drain_root_scrolls(&mut receiver),
+            vec![("line".to_owned(), 0, 120)]
+        );
+        // Off the picture nothing is gathered.
+        app.dispatch_root_scroll(rect, pos, false, egui::vec2(0.0, -119.0), &[]);
+        app.dispatch_root_scroll(rect, pos, true, egui::vec2(0.0, -2.0), &[]);
+        assert!(drain_root_scrolls(&mut receiver).is_empty());
+    }
+
+    #[test]
+    fn losing_focus_forgets_every_window_s_partial_notch() {
+        let (mut app, mut receiver) = app_with_command_channel();
+        assert!(app.ensure_region_runtime_for_validated(&two_monitor_validated_topology()));
+        let validated = two_monitor_validated_topology();
+        let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 540.0));
+        let pos = Some(egui::pos2(480.0, 270.0));
+        app.dispatch_root_scroll(rect, pos, true, egui::vec2(0.0, 100.0), &[]);
+        app.dispatch_secondary_scroll(&validated, monitor_id, (0.5, 0.5), egui::vec2(0.0, 100.0));
+
+        app.update_viewer_keyboard_focus(false);
+        app.update_viewer_keyboard_focus(true);
+        while receiver.try_recv().is_ok() {}
+
+        // 100 + 30 would have crossed a notch in either window.
+        app.dispatch_root_scroll(rect, pos, true, egui::vec2(0.0, 30.0), &[]);
+        app.dispatch_secondary_scroll(&validated, monitor_id, (0.5, 0.5), egui::vec2(0.0, 30.0));
+        assert!(drain_root_scrolls(&mut receiver).is_empty());
+    }
+
     #[test]
     fn dispatch_secondary_scroll_accumulates_sub_tick_deltas_and_forwards_whole_ticks() {
         let (mut app, mut receiver) = app_with_command_channel();
@@ -28956,8 +29794,8 @@ mod tests {
     #[test]
     fn scroll_accumulation_never_leaks_a_sub_tick_remainder_from_root_to_a_secondary_viewport() {
         // Final gate audit finding #3: root's own scroll accumulator
-        // (`root_scroll_accum`) and a secondary's own accumulator
-        // (`secondary_scroll_accum`) must be entirely separate storage, so
+        // (`root_wheel`) and a secondary's own accumulator
+        // (`secondary_wheels`) must be entirely separate storage, so
         // a scroll gesture crossing from root to a secondary never lets a
         // leftover root sub-tick remainder push the secondary across a
         // tick boundary it would not otherwise have crossed on its own.
@@ -28967,7 +29805,7 @@ mod tests {
 
         // Root already holds a large leftover sub-tick remainder from
         // earlier root-focused scrolling (just under one tick).
-        app.root_scroll_accum = egui::vec2(0.0, 119.0);
+        let _ = app.root_wheel.travel(WheelAxis::Vertical, -119.0);
 
         // Focus now switches to the secondary; its own delta alone (50
         // units) must not inherit root's leftover remainder -- 119 + 50 =
@@ -28981,13 +29819,15 @@ mod tests {
              sub-tick remainder",
         );
         assert_eq!(
-            app.root_scroll_accum,
-            egui::vec2(0.0, 119.0),
+            app.root_wheel.remainder(WheelAxis::Vertical),
+            -119.0,
             "root's own accumulator must be untouched by a secondary's own dispatch",
         );
         assert_eq!(
-            app.secondary_scroll_accum.get(&monitor_id).copied(),
-            Some(egui::vec2(0.0, 50.0)),
+            app.secondary_wheels
+                .get(&monitor_id)
+                .map(|wheel| wheel.remainder(WheelAxis::Vertical)),
+            Some(-50.0),
             "the secondary's own accumulator must hold only its own delta",
         );
     }
@@ -29067,12 +29907,16 @@ mod tests {
         // separate slots, not merely "didn't happen to cross a tick yet"
         // by coincidence.
         assert_eq!(
-            app.secondary_scroll_accum.get(&monitor_a).copied(),
-            Some(egui::vec2(0.0, 119.0)),
+            app.secondary_wheels
+                .get(&monitor_a)
+                .map(|wheel| wheel.remainder(WheelAxis::Vertical)),
+            Some(-119.0),
         );
         assert_eq!(
-            app.secondary_scroll_accum.get(&monitor_b).copied(),
-            Some(egui::vec2(0.0, 50.0)),
+            app.secondary_wheels
+                .get(&monitor_b)
+                .map(|wheel| wheel.remainder(WheelAxis::Vertical)),
+            Some(-50.0),
         );
     }
 
@@ -29084,29 +29928,30 @@ mod tests {
         // negotiated `SessionMonitorId` for a physically different
         // monitor).
         let mut app = ArcenApp::default();
-        app.secondary_scroll_accum.insert(
+        let mut wheel = WheelAccumulator::new(false);
+        let _ = wheel.travel(WheelAxis::Vertical, -90.0);
+        app.secondary_wheels.insert(
             arcen_media::SessionMonitorId::new(2).expect("valid id"),
-            egui::vec2(0.0, 90.0),
+            wheel,
         );
 
         app.close_multi_window_session();
 
         assert!(
-            app.secondary_scroll_accum.is_empty(),
+            app.secondary_wheels.is_empty(),
             "a torn-down multi-window session must clear every secondary's own scroll \
              accumulator",
         );
     }
 
     #[test]
-    fn close_multi_window_session_resets_root_scroll_accum_and_every_secondary_pointer_lock_state()
-    {
+    fn close_multi_window_session_resets_root_wheel_and_every_secondary_pointer_lock_state() {
         // Item 3 (enablement audit): teardown must reset root's own
         // scroll accumulator too, plus any lingering secondary pointer
         // lock ownership/relative-motion accumulator state -- none of it
         // may survive into whatever comes next.
         let mut app = ArcenApp::default();
-        app.root_scroll_accum = egui::vec2(0.0, 77.0);
+        let _ = app.root_wheel.travel(WheelAxis::Vertical, -77.0);
         let monitor_id = arcen_media::SessionMonitorId::new(2).expect("valid id");
         app.secondary_pointer_lock = Some(monitor_id);
         app.secondary_relative_motion
@@ -29115,8 +29960,8 @@ mod tests {
         app.close_multi_window_session();
 
         assert_eq!(
-            app.root_scroll_accum,
-            egui::Vec2::ZERO,
+            app.root_wheel.remainder(WheelAxis::Vertical),
+            0.0,
             "root's own scroll accumulator must never leak a sub-tick remainder past teardown",
         );
         assert!(
@@ -29130,24 +29975,30 @@ mod tests {
     }
 
     #[test]
-    fn install_session_handle_resets_root_scroll_accum_on_launch_reconnect_and_new_attach() {
+    fn install_session_handle_resets_root_wheel_on_launch_reconnect_and_new_attach() {
         // Item 3 (enablement audit): `install_session_handle` is the
         // single chokepoint every fresh connect ("launch") and every
         // resume ("reconnect/new attach") both funnel through -- a
         // leftover scroll remainder from whatever came before must never
         // survive into the freshly (re)installed session.
         let mut app = ArcenApp::default();
-        app.root_scroll_accum = egui::vec2(0.0, 42.0);
+        let _ = app.root_wheel.travel(WheelAxis::Vertical, -42.0);
         let handle = test_session_handle();
         let ctx = egui::Context::default();
 
         app.install_session_handle(handle, false, &ctx);
 
         assert_eq!(
-            app.root_scroll_accum,
-            egui::Vec2::ZERO,
+            app.root_wheel.remainder(WheelAxis::Vertical),
+            0.0,
             "a fresh session attach must reset root's own scroll accumulator",
         );
+
+        // The previous host's precise scroll does not outlive it either:
+        // only the new hello says what this host takes.
+        app.root_wheel = WheelAccumulator::new(true);
+        app.install_session_handle(test_session_handle(), false, &ctx);
+        assert!(!app.root_wheel.precise_host());
     }
 
     #[test]

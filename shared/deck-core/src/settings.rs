@@ -773,6 +773,18 @@ pub struct ClientSettings {
     /// (`arcen_input::keyboard::KeyboardCapturePolicy`; the host whenever a
     /// session window has focus by default).
     pub keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
+    /// A macOS Deck takes ⌘Tab, ⌘Space and Mission Control for the host
+    /// with an event tap (`arcen_input::keyboard::MacTapRouter`), which
+    /// needs the Accessibility permission. Off by default.
+    pub capture_mac_system_shortcuts: bool,
+    /// The macOS Deck asked once, in context, whether to send ⌘Tab to the
+    /// remote computer (Allow or Not now); it never asks again.
+    pub mac_system_shortcut_offer_answered: bool,
+    /// The keyboard switch's chord (Ctrl+Alt+Home, Ctrl+Option+Home on a
+    /// Mac, by default): it flips the keyboard between the remote computer
+    /// and this computer. Checked when read
+    /// (`arcen_input::keyboard::KeyboardSwitchChord::check`).
+    pub keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord,
 }
 
 pub const SAVED_CONNECTIONS_VERSION: u32 = 2;
@@ -835,6 +847,9 @@ impl Default for ClientSettings {
             option_key_mode: arcen_input::text::OptionKeyPreference::default(),
             paste: arcen_input::text::PasteSettings::default(),
             keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::default(),
+            capture_mac_system_shortcuts: false,
+            mac_system_shortcut_offer_answered: false,
+            keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord::DEFAULT,
         }
     }
 }

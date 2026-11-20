@@ -53,7 +53,10 @@ use arcen_deck_core::screens::connecting::{
     render_displays_unsupported, render_topology_conflict,
 };
 use arcen_deck_core::screens::home::{HomeEffect, HomeViewState, apply_home_action, render_home};
-use arcen_deck_core::screens::keyboard_help::{keyboard_status_line, render_keyboard_shortcuts};
+use arcen_deck_core::screens::keyboard_help::{
+    KeyboardToast, keyboard_status_line, keyboard_switch_toast, render_keyboard_shortcuts,
+    render_keyboard_toast,
+};
 use arcen_deck_core::screens::launcher::{LauncherAction, render_launcher_top_bar};
 use arcen_deck_core::screens::menu::{
     MenuCommand, QuitHoldStep, connection_bar_reveal_zone, paint_quit_hold_notice, quit_hold_step,
@@ -224,6 +227,11 @@ pub(super) struct Launcher {
     preedit: Option<String>,
     /// The latest typing notice and when it was given.
     notice: Option<(std::time::Instant, String)>,
+    /// The keyboard switch's notice after a flip, while it shows.
+    keyboard_toast: Option<KeyboardToast>,
+    /// Who had the keyboard at the last pass (`None` outside a session), so
+    /// every flip (chord, menu, click into the picture) gets its notice.
+    shown_keyboard_owner: Option<arcen_input::keyboard::KeyboardStatus>,
     /// Since when Alt+F4 has been held in a session.
     quit_hold: Option<std::time::Instant>,
     /// A held Alt+F4 asked the Deck to exit.
@@ -379,6 +387,8 @@ impl Launcher {
             session_keyboard_mode: None,
             preedit: None,
             notice: None,
+            keyboard_toast: None,
+            shown_keyboard_owner: None,
             quit_hold: None,
             exit_requested: false,
             reconnect: None,
@@ -652,6 +662,7 @@ impl Launcher {
         if show_connection_bar {
             self.keyboard_owner_changed();
         }
+        self.watch_keyboard_switch(&ui.ctx().clone());
         self.drive_quit_hold(&ui.ctx().clone());
         let available = ui.available_size();
         let in_session = matches!(self.screen, Screen::InSession) || self.recovering();
@@ -732,7 +743,13 @@ impl Launcher {
         {
             self.about_open = false;
         }
-        render_keyboard_shortcuts(ctx, DeckPlatform::Pc, true, &mut self.shortcuts_open);
+        render_keyboard_shortcuts(
+            ctx,
+            DeckPlatform::Pc,
+            true,
+            self.settings.keyboard_switch,
+            &mut self.shortcuts_open,
+        );
     }
 
     /// Settings changed: what takes effect at once does, and they are saved.
@@ -750,11 +767,62 @@ impl Launcher {
     /// (Ctrl+Alt+Home to release)"); empty outside a session.
     pub(super) fn keyboard_status_line(&self) -> String {
         self.window_input_value(WindowInput::keyboard_status)
-            .map(|status| keyboard_status_line(status, &self.session_title, DeckPlatform::Pc))
+            .map(|status| {
+                keyboard_status_line(
+                    status,
+                    &self.session_title,
+                    DeckPlatform::Pc,
+                    self.settings.keyboard_switch,
+                )
+            })
             .unwrap_or_default()
     }
 
-    /// The keyboard went to this PC or back: say so, and in fullscreen pin
+    /// The keyboard switch's chord (Settings ▸ Input ▸ Keyboard switch).
+    pub(super) const fn keyboard_switch(&self) -> arcen_input::keyboard::KeyboardSwitchChord {
+        self.settings.keyboard_switch
+    }
+
+    /// The keyboard switch's chord to every session window and the menus,
+    /// and a notice whenever the keyboard changed hands since the last pass.
+    fn watch_keyboard_switch(&mut self, ctx: &egui::Context) {
+        use arcen_input::keyboard::{KeyboardOwner, KeyboardStatus};
+        let switch = self.settings.keyboard_switch;
+        arcen_deck_core::screens::wording::set_keyboard_switch(ctx, switch);
+        if let Some(connection) = &self.connection {
+            connection.set_switch_chord(switch);
+        }
+        let status = self
+            .window_input_value(WindowInput::keyboard_status)
+            .filter(|status| *status != KeyboardStatus::NoSession);
+        let owner = |status: KeyboardStatus| match status {
+            KeyboardStatus::ThisComputer => KeyboardOwner::ThisComputer,
+            _ => KeyboardOwner::Host,
+        };
+        if let (Some(before), Some(now)) = (self.shown_keyboard_owner, status)
+            && owner(before) != owner(now)
+        {
+            let system_shortcuts = matches!(
+                now,
+                KeyboardStatus::Host {
+                    system_shortcuts: true
+                }
+            );
+            self.keyboard_toast = Some(KeyboardToast::new(
+                ctx,
+                keyboard_switch_toast(
+                    owner(now),
+                    &self.session_title,
+                    DeckPlatform::Pc,
+                    system_shortcuts,
+                ),
+            ));
+        }
+        self.shown_keyboard_owner = status;
+        render_keyboard_toast(ctx, &mut self.keyboard_toast);
+    }
+
+    /// The keyboard went to this PC or back: in fullscreen pin
     /// the connection bar while this PC has it (the bar is then the
     /// indicator; fullscreen draws nothing over the video otherwise).
     fn keyboard_owner_changed(&mut self) {
@@ -763,10 +831,6 @@ impl Launcher {
             self.pin_bar();
         } else if self.bar_pinned {
             self.bar_pinned = false;
-        }
-        let line = self.keyboard_status_line();
-        if !line.is_empty() {
-            self.notify(line);
         }
     }
 
@@ -2244,6 +2308,7 @@ impl Launcher {
                 crate::media::WindowSink,
             >(true, self.settings.canvas_cache_mib)
                 != arcen_deck_core::canvas::CanvasRequest::Unavailable,
+            system_shortcut_permission: None,
         };
         let mut values = SettingsValues::from_client_settings(&self.settings, self.settings_tab);
         let actions = render_settings(ui, &mut values, &facts);
@@ -2298,7 +2363,8 @@ impl Launcher {
                     self.native_tablet
                         .clicked(Arc::clone(&self.services), move || ctx.request_repaint());
                 }
-                SettingsAction::OpenColourCheck => {}
+                SettingsAction::OpenColourCheck | SettingsAction::AllowSystemShortcutPermission => {
+                }
                 SettingsAction::SupportBundle(action) => {
                     let ctx = ui.ctx().clone();
                     let wake_ctx = ctx.clone();
