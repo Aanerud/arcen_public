@@ -65,6 +65,62 @@ give the virtual display a 60 Hz mode in `vdd_settings.xml`.
   for it to close, then names the desktop in the session log:
   `DXGI Desktop Duplication refused; input desktop: …`.
 
+## A GeForce with a monitor or a dummy plug
+
+From the release after 0.20.5 the Pier also serves a GeForce's own display:
+a monitor, or an HDMI or DisplayPort dummy plug, which Windows treats as a
+monitor with the plug's own EDID. It reads the card's class before it
+changes anything and never asks a GeForce to write an EDID. It sets the mode
+of that display nearest to the Deck's size, from the modes the display
+offers, through Windows' own display settings. When the Deck's size is not
+one of them, the Deck says so, for example *Host could not set 1800x1168; it
+is serving 1920x1080* and *exact display needs a Quadro, RTX Pro or GRID GPU;
+this host has a GeForce RTX 5090, so it serves the modes its attached display
+offers*. A GeForce with no display at all is refused with a message that asks
+for a monitor, a dummy plug or a virtual display driver.
+
+The Pier does not change the Windows display scale of that display: the desk
+keeps its own, and when it is not the Deck's Remote UI scale the Deck shows
+the scale Windows uses, so it can be set in Windows Display settings. An HDR
+session first sets the display's own mode nearest to the Deck's size, then
+turns HDR on for that display, and is served as HDR only when Windows shows
+HDR there. The Deck is told the refresh the display runs at.
+
+Desk privacy (`privacy.desk`, on by default) serves a session only on a
+display no monitor at the desk shows. Windows reports a dummy plug as a
+physically connected monitor, so on a PC whose only display is a dummy plug
+the session is refused `console_privacy_unavailable: desk_monitor_lit`. On
+such a PC, where no one at the desk can see the screen, set
+`"privacy": {"desk": "off"}` in `C:\ProgramData\Arcen\pier.json` and restart
+the `ArcenPier` service; or install the virtual display driver above and
+keep desk privacy on, and the Pier serves the virtual display and detaches
+the plug while a Deck is attached.
+
+Pinned deskside protection (`platform.desktop.deskside.enabled`) requires
+the Deck's exact display, which a GeForce cannot provide: such a host is
+refused before anything changes, with a message naming the card.
+
+### Earlier releases (0.20.4 and 0.20.5)
+
+These releases asked a GeForce's monitor or dummy plug to take an EDID.
+NVIDIA refused (`NvAPI_GPU_SetEDID returned NVAPI status -104
+(NVAPI_NOT_SUPPORTED)`), the session failed with *exact display apply
+failed … rollback also failed*, and the display recovery journal it left
+could not be restored. Nothing was written to the display: NVIDIA refused
+the write. On those releases the next session sets the journal aside as
+`display-recovery.unrestorable.<time>.json` and fails the same way, unless
+the session is served on a display NVIDIA does not drive, the virtual
+display driver above (keep desk privacy on so the Pier chooses it). After
+upgrading:
+
+1. Connect once from the Deck. A journal still pending from such a session
+   is restored on its own; the session log says `this GPU refuses EDID
+   writes, so the attempted write changed nothing`.
+2. Leave the files
+   `C:\ProgramData\Arcen\runtime\display-recovery.unrestorable.*.json` as
+   they are. They are records of the failed sessions, set aside so that they
+   block nothing.
+
 ## If the picture is black
 
 Set `logging.level` to `3` in `C:\ProgramData\Arcen\pier.json`, run

@@ -2233,6 +2233,15 @@ where
                     output
                 }
                 Err(recovery_error) => {
+                    if let Some(refusal) = crate::nvapi_inventory::inventory()
+                        .ok()
+                        .as_ref()
+                        .and_then(crate::nvapi_headless::displayless_gpu_refusal)
+                    {
+                        let error = format!("{refusal} ({initial_error})");
+                        send_agent_failure(&mut ws, &error).await;
+                        return Err(error);
+                    }
                     let error = format!(
                         "{initial_error}; automatic display recovery before output selection \
                          did not restore the configured output: {recovery_error}. If the host \
@@ -2984,7 +2993,7 @@ where
     } else {
         None
     };
-    let plan = match session_display_plan(&response) {
+    let mut plan = match session_display_plan(&response) {
         Ok(plan) => plan,
         Err(error) => {
             send_agent_failure(&mut ws, &error).await;
@@ -3078,7 +3087,22 @@ where
         // refresh from the Deck's own, not from this size's.
         request.deck_refresh_hz = request.refresh_hz;
         request.hdr_stream_fps = hdr_stream_fps(cfg.fps);
-        let refresh_hz = or_report!(ws, request.refresh_for(request.size));
+        let selector = cfg.output_selector.clone();
+        let synthesizes_edid = tokio::task::spawn_blocking(move || {
+            crate::display::edid_synthesis_permitted(&selector, display_adapter_is_nvidia)
+        })
+        .await
+        .unwrap_or(true);
+        if !synthesizes_edid {
+            tracing::info!(
+                target: DISPLAY,
+                size = %request.size,
+                refresh_hz = request.refresh_hz,
+                "HDR is served on the attached display's own mode: no EDID is synthesized for \
+                 it, so its limits do not apply; HDR is proved on that output"
+            );
+        }
+        let refresh_hz = or_report!(ws, hdr_display_refresh(&request, synthesizes_edid));
         if refresh_hz != request.refresh_hz {
             tracing::info!(
                 target: DISPLAY,
@@ -3251,6 +3275,29 @@ where
                      for example); serving the existing display at the nearest mode instead"
                 );
                 policy = crate::display::DisplayPolicy::Negotiated;
+            }
+            SingleDisplayReconciliation::WithoutProvisioning(provisioning) => {
+                use arcen_outputs::edid_provisioning::ProvisioningDecision;
+                match without_provisioning_decision(&provisioning, cfg.deskside.enabled) {
+                    ProvisioningDecision::ServeAttachedModes(limit) => {
+                        tracing::warn!(
+                            target: SESSION,
+                            adapter = %adapter,
+                            reason = limit.reason,
+                            explanation = %limit.explanation,
+                            "serving the existing display at the nearest mode instead"
+                        );
+                        policy = crate::display::DisplayPolicy::Negotiated;
+                        plan.exact_display_limit = Some(limit);
+                    }
+                    ProvisioningDecision::Provision => {
+                        policy = crate::display::DisplayPolicy::Negotiated;
+                    }
+                    ProvisioningDecision::Refuse(error) => {
+                        send_agent_failure(&mut ws, &error).await;
+                        return Err(error);
+                    }
+                }
             }
             SingleDisplayReconciliation::Refuse(error) => {
                 send_agent_failure(&mut ws, &error).await;
@@ -4844,6 +4891,10 @@ enum SingleDisplayReconciliation<L> {
     /// NVIDIA does not drive this display, and nothing was changed: serve the
     /// display the host already has.
     UseExistingDisplay(String),
+    /// The GPU may not have an EDID written (a GeForce), and nothing was
+    /// changed: the shared rule decides between the display's own modes and
+    /// a refusal.
+    WithoutProvisioning(arcen_outputs::edid_provisioning::EdidProvisioning),
     /// The host's displays were being changed when it failed.
     Refuse(String),
 }
@@ -4861,12 +4912,47 @@ fn single_display_reconciliation<L>(
         Err(crate::display::HeadlessProvisionError::NotApplicable(reason)) => {
             SingleDisplayReconciliation::UseExistingDisplay(reason)
         }
+        Err(crate::display::HeadlessProvisionError::EdidNotPermitted(provisioning)) => {
+            SingleDisplayReconciliation::WithoutProvisioning(provisioning)
+        }
         Err(crate::display::HeadlessProvisionError::Failed(error)) => {
             SingleDisplayReconciliation::Refuse(format!(
                 "reconcile NVIDIA headless display: {error}"
             ))
         }
     }
+}
+
+/// The display refresh an HDR session's display is set to. Arcen's
+/// synthesized HDR10 EDID carries CVT timings over a 550 MHz link, so a
+/// display that will be given one is sized to it; an attached display served
+/// at its own modes (a GPU that may not have an EDID written) is not, and
+/// HDR is then proved on that output by the Advanced Color gate.
+fn hdr_display_refresh(request: &DisplayRequest, synthesizes_edid: bool) -> Result<u32, String> {
+    if synthesizes_edid {
+        request.refresh_for(request.size)
+    } else {
+        Ok(request.refresh_hz)
+    }
+}
+
+/// What a single-display session does on a GPU that may not have an EDID
+/// written. The session already resolved an attached output on it (a
+/// monitor or a dummy plug), so its own modes can be served; pinned deskside
+/// protection requires the exact display.
+fn without_provisioning_decision(
+    provisioning: &arcen_outputs::edid_provisioning::EdidProvisioning,
+    deskside_enabled: bool,
+) -> arcen_outputs::edid_provisioning::ProvisioningDecision {
+    use arcen_outputs::edid_provisioning::ExactDisplayRequirement;
+    let requirement = if deskside_enabled {
+        ExactDisplayRequirement::Required {
+            by: "pinned deskside protection (platform.desktop.deskside.enabled)",
+        }
+    } else {
+        ExactDisplayRequirement::Preferred
+    };
+    arcen_outputs::edid_provisioning::decide(provisioning, requirement, true)
 }
 
 async fn send_agent_failure<S>(ws: &mut WebSocketStream<S>, error: &str)
@@ -4921,6 +5007,9 @@ struct MonitorPlan {
 struct SessionDisplayPlan {
     monitors: Vec<MonitorPlan>,
     degradation: Option<DisplayPlanDegradation>,
+    /// Why this session is served without the Deck's exact display (a
+    /// GPU that may not have an EDID written).
+    exact_display_limit: Option<arcen_outputs::edid_provisioning::ExactDisplayLimit>,
 }
 
 #[derive(Debug)]
@@ -4983,6 +5072,7 @@ fn session_display_plan(response: &AuthResponse) -> Result<SessionDisplayPlan, S
                 name: "Primary Display".to_string(),
             }],
             degradation,
+            exact_display_limit: None,
         });
     };
     if monitor.width_px != request.size.width || monitor.height_px != request.size.height {
@@ -5017,6 +5107,7 @@ fn session_display_plan(response: &AuthResponse) -> Result<SessionDisplayPlan, S
             name: monitor.name.clone(),
         }],
         degradation,
+        exact_display_limit: None,
     })
 }
 
@@ -5206,8 +5297,20 @@ fn windows_display_update_supported(display: &DisplayReport) -> bool {
     windows_display_update_availability(display).supported
 }
 
-fn display_resize_capability(display: &DisplayReport) -> serde_json::Value {
+fn display_resize_capability(
+    display: &DisplayReport,
+    exact_limit: Option<&arcen_outputs::edid_provisioning::ExactDisplayLimit>,
+) -> serde_json::Value {
     let resize = windows_display_update_availability(display);
+    if let Some(limit) = exact_limit.filter(|_| !resize.supported) {
+        return serde_json::json!({
+            "available": false,
+            "reason": limit.reason,
+            "explanation": limit.explanation,
+            "mechanism": "none",
+            "scope": "none",
+        });
+    }
     let (mechanism, scope) = if resize.supported {
         ("nvapi_custom_timing", "arbitrary_custom_timing")
     } else {
@@ -5747,8 +5850,12 @@ fn build_server_hello_with_aggregate(
         "device_name": display.device_name,
         "selected_output_index": cfg.output_index,
         "capture_output_index": display.capture_output_index,
-        "resize": display_resize_capability(display),
+        "resize": display_resize_capability(display, plan.exact_display_limit.as_ref()),
         "degradation": display_plan_degradation_capability(plan),
+        "exact_unavailable": plan.exact_display_limit.as_ref().map(|limit| serde_json::json!({
+            "reason": limit.reason,
+            "explanation": limit.explanation,
+        })),
         "desktop_coordinates": {
             "left": rect.left,
             "top": rect.top,
@@ -7148,12 +7255,15 @@ async fn prepare_multi_monitor_media(
                 // Each monitor at its own Deck display's rate, and never
                 // faster than its virtual display refreshes (Desktop
                 // Duplication and WGC deliver once per composition).
-                let rate = cfg
-                    .monitor_frame_rate(&monitor.client_display_id, template_fps)
-                    .narrow(
-                        monitor.refresh_hz.max(1),
+                // An unknown refresh (0) is no cap.
+                let rate = cfg.monitor_frame_rate(&monitor.client_display_id, template_fps);
+                let rate = match monitor.refresh_hz {
+                    0 => rate,
+                    refresh_hz => rate.narrow(
+                        refresh_hz,
                         arcen_media::video::FrameRateBasis::CaptureSource,
-                    );
+                    ),
+                };
                 tracing::info!(
                     target: SESSION,
                     client_display_id = %monitor.client_display_id,
@@ -10661,9 +10771,6 @@ impl AudioWireEncoder {
                 Ok(Some((message, packet.pcm_s16le.len())))
             }
             Some(AudioCodec::Opus) => {
-                if packet.pcm_s16le.len() != crate::audio::CHUNK_BYTES {
-                    return Err(self.codec_failure(stream));
-                }
                 for (sample, bytes) in self.pcm.iter_mut().zip(packet.pcm_s16le.chunks_exact(2)) {
                     *sample = i16::from_le_bytes([bytes[0], bytes[1]]);
                 }
@@ -12671,6 +12778,90 @@ mod tests {
     }
 
     #[test]
+    fn a_geforce_is_served_its_displays_modes_by_default_and_refused_when_exact_is_pinned() {
+        use arcen_outputs::edid_provisioning::{EdidProvisioning, ProvisioningDecision};
+        let geforce =
+            EdidProvisioning::from_professional_class("NVIDIA GeForce RTX 5090", Some(false));
+        let outcome = single_display_reconciliation::<()>(Err(
+            crate::display::HeadlessProvisionError::EdidNotPermitted(geforce.clone()),
+        ));
+        let SingleDisplayReconciliation::WithoutProvisioning(provisioning) = outcome else {
+            panic!("a GeForce is decided without provisioning, not refused as a failure");
+        };
+
+        let ProvisioningDecision::ServeAttachedModes(limit) =
+            without_provisioning_decision(&provisioning, false)
+        else {
+            panic!("the default serves the attached display");
+        };
+        // The dongle offers 1920x1080, not the Deck's 1800x1168.
+        let report = DisplayReport {
+            requested: DisplaySize {
+                width: 1800,
+                height: 1168,
+            },
+            applied: DisplaySize {
+                width: 1920,
+                height: 1080,
+            },
+            original: DisplaySize {
+                width: 1920,
+                height: 1080,
+            },
+            original_refresh_hz: 60,
+            applied_refresh_hz: 60,
+            exact: false,
+            changed: false,
+            retarget_capable: false,
+            backend: "unchanged-current-mode-fallback",
+            restore_backend: "none",
+            device_name: r"\\.\DISPLAY1".to_string(),
+            capture_output_index: 0,
+            desktop_rect: crate::display::DesktopRect {
+                left: 0,
+                top: 0,
+                width: 1920,
+                height: 1080,
+            },
+            effective_scale_reports: Vec::new(),
+        };
+        let resize = display_resize_capability(&report, Some(&limit));
+        assert_eq!(resize["reason"], "exact_display_needs_professional_gpu");
+        assert_eq!(resize["explanation"], limit.explanation.as_str());
+
+        let ProvisioningDecision::Refuse(error) =
+            without_provisioning_decision(&provisioning, true)
+        else {
+            panic!("pinned deskside requires the exact display");
+        };
+        assert!(
+            error.starts_with(
+                "exact display needs a Quadro, RTX Pro or GRID GPU; this host has a GeForce RTX 5090"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("nothing on the host was changed"));
+    }
+
+    #[test]
+    fn an_hdr_request_beyond_the_synthesized_edid_is_tried_on_the_attached_display() {
+        let mut request = DisplayRequest::new(5_120, 2_880).expect("5K request");
+        request.hdr10 = true;
+        request.refresh_hz = 60;
+        request.deck_refresh_hz = 60;
+        request.hdr_stream_fps = 30;
+        assert!(
+            hdr_display_refresh(&request, true).is_err(),
+            "Arcen's own HDR10 EDID cannot describe 5120x2880"
+        );
+        assert_eq!(
+            hdr_display_refresh(&request, false),
+            Ok(60),
+            "the attached display's own mode is negotiated instead"
+        );
+    }
+
+    #[test]
     fn a_failure_while_changing_displays_still_refuses_the_session() {
         let outcome = single_display_reconciliation::<()>(Err(
             crate::display::HeadlessProvisionError::Failed("EDID write failed".to_string()),
@@ -13941,7 +14132,7 @@ mod tests {
             self.active.fetch_add(1, Ordering::SeqCst);
             queue
                 .push(AudioPacket {
-                    pcm_s16le: vec![0; crate::audio::CHUNK_BYTES],
+                    pcm_s16le: [0; crate::audio::CHUNK_BYTES],
                     timestamp_ms: 1,
                 })
                 .expect("test audio queue must be open");
@@ -14835,6 +15026,7 @@ mod tests {
                 name: "Built-in Display".to_string(),
             }],
             degradation: None,
+            exact_display_limit: None,
         };
         let native_media = test_media_plan(
             arcen_media::video::EncoderBackend::NativeNvenc,
@@ -15475,7 +15667,7 @@ mod tests {
         };
         assert!(windows_display_update_supported(&capable));
         assert_eq!(
-            display_resize_capability(&capable),
+            display_resize_capability(&capable, None),
             serde_json::json!({
                 "available": true,
                 "reason": "available",
@@ -15491,7 +15683,7 @@ mod tests {
             ..capable.clone()
         };
         assert_eq!(
-            display_resize_capability(&cds_exact),
+            display_resize_capability(&cds_exact, None),
             serde_json::json!({
                 "available": false,
                 "reason": "display_backend_cannot_retarget",
@@ -16373,7 +16565,7 @@ mod tests {
         let audio = Arc::new(LatestQueue::new(1));
         audio
             .push(AudioPacket {
-                pcm_s16le: vec![0; crate::audio::CHUNK_BYTES],
+                pcm_s16le: [0; crate::audio::CHUNK_BYTES],
                 timestamp_ms: 7,
             })
             .unwrap();
@@ -16467,7 +16659,7 @@ mod tests {
         audio_state.activate(Arc::new(AudioTelemetry::default()), stream);
         audio
             .push(AudioPacket {
-                pcm_s16le: vec![0; crate::audio::CHUNK_BYTES],
+                pcm_s16le: [0; crate::audio::CHUNK_BYTES],
                 timestamp_ms: 7,
             })
             .unwrap();
@@ -16589,7 +16781,7 @@ mod tests {
         let audio = Arc::new(LatestQueue::new(1));
         audio
             .push(AudioPacket {
-                pcm_s16le: vec![0; crate::audio::CHUNK_BYTES],
+                pcm_s16le: [0; crate::audio::CHUNK_BYTES],
                 timestamp_ms: 7,
             })
             .unwrap();
@@ -16653,7 +16845,7 @@ mod tests {
         let sent_before_disable_completed = sent.lock().unwrap().len();
         audio
             .push(AudioPacket {
-                pcm_s16le: vec![0; crate::audio::CHUNK_BYTES],
+                pcm_s16le: [0; crate::audio::CHUNK_BYTES],
                 timestamp_ms: 2,
             })
             .unwrap();
@@ -16665,14 +16857,11 @@ mod tests {
 
     #[test]
     fn shared_audio_header_is_exactly_eight_bytes_and_pcm_tagged() {
-        let packet = AudioPacket {
-            pcm_s16le: vec![0x34, 0x12, 0x78, 0x56],
-            timestamp_ms: 0x0102_0304,
-        };
-        let message = audio_message(AudioCodec::Pcm, packet.timestamp_ms, &packet.pcm_s16le);
+        let payload = [0x34, 0x12, 0x78, 0x56];
+        let message = audio_message(AudioCodec::Pcm, 0x0102_0304, &payload);
         assert_eq!(message.len(), arcen_protocol::AUDIO_HEADER_SIZE + 4);
         assert_eq!(&message[..8], &[0x10, 0x01, 0, 0, 1, 2, 3, 4]);
-        assert_eq!(&message[8..], packet.pcm_s16le);
+        assert_eq!(&message[8..], payload);
     }
 
     #[test]
@@ -16682,9 +16871,7 @@ mod tests {
             pcm_available: true,
         };
         let packet = AudioPacket {
-            pcm_s16le: (0..crate::audio::CHUNK_BYTES)
-                .map(|index| (index % 251) as u8)
-                .collect(),
+            pcm_s16le: std::array::from_fn(|index| (index % 251) as u8),
             timestamp_ms: 0x1122_3344,
         };
         let state = AudioSendState::default();
@@ -16741,15 +16928,22 @@ mod tests {
         let peer = policy.capabilities();
         let state = AudioSendState::default();
         state.set_stream(policy.resolve(Some(&peer), true, 128));
-        let malformed = AudioPacket {
-            pcm_s16le: Vec::new(),
+        let packet = AudioPacket {
+            pcm_s16le: [0; crate::audio::CHUNK_BYTES],
             timestamp_ms: 1,
         };
         let mut encoder = AudioWireEncoder::default();
+        encoder
+            .encode(&packet, &state)
+            .expect("configure")
+            .expect("first frame");
+        // An encoder that has failed: packets are a fixed audio-v1 size, so
+        // a short packet can no longer be the way to fail one.
+        encoder.opus = None;
 
         for _ in 0..3 {
             assert!(matches!(
-                encoder.encode(&malformed, &state),
+                encoder.encode(&packet, &state),
                 Err(AudioEncodeFailure::Transient)
             ));
         }
@@ -16761,7 +16955,7 @@ mod tests {
     async fn audio_backpressure_drops_oldest_without_consuming_video_capacity() {
         let audio = LatestQueue::new(2);
         let packet = |timestamp_ms| AudioPacket {
-            pcm_s16le: vec![0; crate::audio::CHUNK_BYTES],
+            pcm_s16le: [0; crate::audio::CHUNK_BYTES],
             timestamp_ms,
         };
         assert!(audio.push(packet(1)).unwrap().is_none());
@@ -16820,7 +17014,7 @@ mod tests {
         ));
         audio
             .push(AudioPacket {
-                pcm_s16le: vec![0; crate::audio::CHUNK_BYTES],
+                pcm_s16le: [0; crate::audio::CHUNK_BYTES],
                 timestamp_ms: 7,
             })
             .unwrap();

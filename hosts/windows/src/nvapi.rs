@@ -18,6 +18,14 @@ const NVAPI_END_ENUMERATION: i32 = -7;
 const NVAPI_INSUFFICIENT_BUFFER: i32 = -174;
 const NVAPI_DATA_NOT_FOUND: i32 = -121;
 const NVAPI_NVIDIA_DEVICE_NOT_FOUND: i32 = -6;
+const NVAPI_NOT_SUPPORTED: i32 = -104;
+
+/// Whether NVAPI refused an EDID write because this GPU does not allow one
+/// at all (a GeForce: `NvAPI_GPU_SetEDID` is for Quadro, RTX Pro and GRID).
+#[must_use]
+pub fn edid_write_not_supported(error: &str) -> bool {
+    error.contains(&format!("NVAPI status {NVAPI_NOT_SUPPORTED} "))
+}
 
 /// Whether a failed NVAPI display lookup means NVIDIA does not drive the
 /// display at all, as opposed to a driver fault.
@@ -1313,19 +1321,18 @@ where
     F: FnMut(CleanupStage) -> Result<(), String>,
     G: FnMut(String) -> Result<(), String>,
 {
-    let edid_write_was_attempted = active.is_some_and(|active| {
-        matches!(
-            active.edid_write_stage,
-            EdidWriteStage::Attempted | EdidWriteStage::Verified
-        )
-    });
+    let edid_write_stage = active.map_or(EdidWriteStage::None, |active| active.edid_write_stage);
+    let edid_write_was_attempted = matches!(
+        edid_write_stage,
+        EdidWriteStage::Attempted | EdidWriteStage::Verified
+    );
     if stage < CleanupStage::TopologyRestored {
         // The injected EDID may be the only reason the temporary mode is
         // valid. Restore the monitor's effective EDID before asking NVAPI to
         // reinstate the original topology. This preparation is deliberately
         // idempotent and uncheckpointed: a crash repeats it from Pending.
         if edid_write_was_attempted {
-            restore_effective_edid(driver, snapshot)?;
+            restore_effective_edid(driver, snapshot, edid_write_stage)?;
         }
         if let Err(error) = driver.set_display_config(&snapshot.original_config) {
             topology_fallback(error)?;
@@ -1366,7 +1373,7 @@ where
 
     if stage < CleanupStage::EdidRestored {
         if edid_write_was_attempted {
-            restore_effective_edid(driver, snapshot)?;
+            restore_effective_edid(driver, snapshot, edid_write_stage)?;
         }
         checkpoint_cleanup_stage(&mut checkpoint, &mut stage, CleanupStage::EdidRestored)?;
     }
@@ -1380,10 +1387,30 @@ where
 fn restore_effective_edid<D: NvapiDriver>(
     driver: &mut D,
     snapshot: &ExactModeSnapshot,
+    write_stage: EdidWriteStage,
 ) -> Result<(), String> {
-    driver
-        .set_edid(snapshot.mapping, &[])
-        .map_err(|error| format!("purge injected EDID: {error}"))?;
+    if let Err(error) = driver.set_edid(snapshot.mapping, &[]) {
+        // A GPU that refuses every EDID write refused the session's write
+        // too, so a write that was only attempted left nothing behind. The
+        // display's own EDID, read back, is the proof; a verified write, or a
+        // display that does not read back its original EDID, still fails.
+        if write_stage != EdidWriteStage::Attempted || !edid_write_not_supported(&error) {
+            return Err(format!("purge injected EDID: {error}"));
+        }
+        verify_effective_edid(driver, snapshot.mapping, snapshot.original_edid.as_deref())
+            .map_err(|verify| {
+                format!(
+                    "purge injected EDID: {error}; the display's own EDID is not back: {verify}"
+                )
+            })?;
+        tracing::info!(
+            display_id = format_args!("0x{:08x}", snapshot.mapping.display_id),
+            %error,
+            "this GPU refuses EDID writes, so the attempted write changed nothing; \
+             the display still reads back its own EDID"
+        );
+        return Ok(());
+    }
     if let Some(original) = snapshot.original_edid.as_deref() {
         let current = driver
             .get_edid(snapshot.mapping)
@@ -2729,6 +2756,8 @@ mod tests {
         pending_custom: Option<CustomDisplay>,
         named_mapping_available: bool,
         edid_writes_effective: bool,
+        /// A GeForce: every `NvAPI_GPU_SetEDID` answers `NVAPI_NOT_SUPPORTED`.
+        edid_writes_refused: bool,
     }
 
     fn custom_display(width: u32, height: u32, refresh_hz: u32) -> CustomDisplay {
@@ -2777,6 +2806,7 @@ mod tests {
                 pending_custom: None,
                 named_mapping_available: true,
                 edid_writes_effective: true,
+                edid_writes_refused: false,
             }
         }
 
@@ -2839,6 +2869,12 @@ mod tests {
 
         fn set_edid(&mut self, _mapping: DisplayMapping, edid: &[u8]) -> Result<(), String> {
             self.record(Call::SetEdid(edid.len()))?;
+            if self.edid_writes_refused {
+                return Err(
+                    "NvAPI_GPU_SetEDID returned NVAPI status -104 (NVAPI_NOT_SUPPORTED)"
+                        .to_string(),
+                );
+            }
             if self.edid_writes_effective {
                 self.current_edid = (!edid.is_empty()).then(|| edid.to_vec());
             }
@@ -4143,6 +4179,85 @@ mod tests {
 
         assert_eq!(driver.current_edid, None);
         assert!(driver.calls.contains(&Call::SetEdid(0)));
+    }
+
+    #[test]
+    fn a_rollback_after_a_geforce_refused_the_edid_write_succeeds() {
+        // Asus-007 (RTX 5090): SetEDID answered NVAPI_NOT_SUPPORTED, and the
+        // rollback's purge failed the same way although nothing was written.
+        let mut driver = MockDriver::new();
+        driver.edid_writes_refused = true;
+        let original = driver.current_edid.clone();
+        let snapshot = snapshot_for(&mut driver);
+        let error = apply_for(&mut driver, &snapshot).unwrap_err();
+        assert!(
+            edid_write_not_supported(&error.message),
+            "{}",
+            error.message
+        );
+        let active = error.active.expect("the attempted write is recorded");
+        assert_eq!(active.edid_write_stage, EdidWriteStage::Attempted);
+
+        let mut stages = Vec::new();
+        restore_exact_staged(
+            &mut driver,
+            &snapshot,
+            Some(&active),
+            CleanupStage::Pending,
+            |stage| {
+                stages.push(stage);
+                Ok(())
+            },
+        )
+        .expect("a purge of an EDID never written is not a failure");
+
+        assert_eq!(stages.last(), Some(&CleanupStage::Complete));
+        assert_eq!(driver.current_edid, original);
+        assert!(driver.calls.contains(&Call::SetConfig(1680, 1050)));
+    }
+
+    #[test]
+    fn a_refused_purge_still_fails_when_arcen_did_change_the_edid() {
+        let mut driver = MockDriver::new();
+        let snapshot = snapshot_for(&mut driver);
+        let active = apply_for(&mut driver, &snapshot).expect("the write is verified");
+        assert_eq!(active.edid_write_stage, EdidWriteStage::Verified);
+        driver.edid_writes_refused = true;
+        let verified = restore_exact(&mut driver, &snapshot, Some(&active)).unwrap_err();
+        assert!(verified.contains("purge injected EDID"), "{verified}");
+
+        // Attempted, refused, and the display does not read back its own EDID.
+        let mut attempted = active;
+        attempted.edid_write_stage = EdidWriteStage::Attempted;
+        let error = restore_exact(&mut driver, &snapshot, Some(&attempted)).unwrap_err();
+        assert!(
+            error.contains("the display's own EDID is not back"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_stale_journal_whose_only_pending_action_is_an_impossible_purge_is_cleared() {
+        // What a 0.20.4/0.20.5 GeForce host left behind: the EDID write was
+        // checkpointed as attempted, NVAPI refused it, and every later
+        // restore failed on the purge.
+        let mut driver = MockDriver::new();
+        let snapshot = snapshot_for(&mut driver);
+        let original = driver.current_edid.clone();
+        driver.edid_writes_refused = true;
+        let mut recovery = recovery_data(r"\\.\DISPLAY6".to_string(), &snapshot, 1800, 1168, 60);
+        recovery.edid_write_stage = EdidWriteStage::Attempted;
+        recovery.intended_edid_sha256 = Some("0".repeat(64));
+
+        let mut stages = Vec::new();
+        restore_recovery_staged(&mut driver, &recovery, |stage| {
+            stages.push(stage);
+            Ok(())
+        })
+        .expect("the journal is restored, not quarantined");
+
+        assert_eq!(stages.last(), Some(&CleanupStage::Complete));
+        assert_eq!(driver.current_edid, original);
     }
 
     #[test]

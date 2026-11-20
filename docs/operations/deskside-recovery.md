@@ -11,6 +11,9 @@ maintenance command as LocalSystem when the protected
 `display-recovery.json` remains. Do not weaken the SYSTEM/Administrators ACL,
 follow reparse points, or delete a failed journal before topology ownership is
 adjudicated. Hooks are process-owned and disappear with the authenticated agent.
+A journal left by a 0.20.4 or 0.20.5 session on a GeForce, whose only failure
+was NVIDIA refusing the EDID purge, needs no manual step after upgrading: see
+[the GeForce guide](windows-geforce-virtual-display.md#earlier-releases-0204-and-0205).
 
 Desk privacy is on by default on every Pier (`privacy.desk`). On Windows its
 default form needs no recovery of its own: the desk's keyboard and mouse

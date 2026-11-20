@@ -130,10 +130,17 @@ install-arcen-pier.exe --tls-only
 
 `--tls-only` restricts the `tls` directory it is given; the folder above it
 keeps its own permissions unless it is the default `%ProgramData%\Arcen`.
+That folder, and those above it, are yours: keep them administrator-only,
+since whoever can rename one could put a key and certificate of their own
+where the Pier reads them. The installer does not change or refuse them,
+but prints a warning naming the first one a non-administrator could
+replace.
 The installer refuses a `tls` or Arcen folder that is a junction or link
 anywhere in its path, or that is owned by an account other than SYSTEM or
-Administrators; delete such a folder and run again (re-owning it is not
-enough, since its previous owner may still hold it open). New folders and
+Administrators. Leave such a folder intact: never delete it or the key
+material in it, and do not re-own it or repair its permissions in place,
+since its previous owner may still hold it open. Choose a protected
+location instead, such as the default `%ProgramData%\Arcen`. New folders and
 the staged key are created readable only by SYSTEM and Administrators. If
 the earlier `new-host-cert.ps1` was interrupted, its
 `host-cert.transaction.json` is still in the directory and both the helper

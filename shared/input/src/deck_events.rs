@@ -36,6 +36,10 @@ pub enum DeckInputEvent {
     Preedit(Option<String>),
     /// A chord the Deck keeps (Disconnect, Paste as Keystrokes, …).
     Shortcut(DeckShortcut),
+    /// Esc or Enter pressed in a session window while a modal window of
+    /// the Deck has the keyboard: the Deck closes the one in front. The key,
+    /// its repeats and its release stay the Deck's.
+    DismissModal,
     /// The pointer moved to a normalized position in the image.
     PointerMove {
         /// `0..=1` across the image.

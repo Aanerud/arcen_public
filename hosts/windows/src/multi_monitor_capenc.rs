@@ -803,6 +803,7 @@ mod tests {
             refresh_hz: 60,
             rotation: Rotation::Degrees0,
             primary,
+            custom_timing: false,
             color: None,
         }
     }
@@ -1526,6 +1527,7 @@ mod tests {
                 refresh_hz: output.current_refresh_hz,
                 rotation: Rotation::Degrees0,
                 primary: index == 0,
+                custom_timing: false,
                 color: None,
             })
             .collect::<Vec<_>>();

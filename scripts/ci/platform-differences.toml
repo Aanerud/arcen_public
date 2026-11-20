@@ -128,7 +128,7 @@ id = "PD-007"
 area = "virtual displays"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
 difference = "How a Pier creates outputs for a Deck's displays."
-earned_by = "Linux: Xorg screens on NVIDIA heads. Windows: the Arcen IddCx driver and NVAPI headless EDIDs (NvAPI_GPU_SetEDID). macOS: CGVirtualDisplay."
+earned_by = "Linux: Xorg screens on NVIDIA heads. Windows: the Arcen IddCx driver and NVAPI headless EDIDs (NvAPI_GPU_SetEDID, which NVIDIA permits only on Quadro, RTX Pro and GRID GPUs: a GeForce answers NVAPI_NOT_SUPPORTED, so the Windows Pier writes no EDID there and serves the attached display at its own modes, decided by the shared arcen_outputs::edid_provisioning). macOS: CGVirtualDisplay."
 code = [
   { path = "hosts/linux/src/session/xorg_multihead.rs" },
   { path = "hosts/windows/src/iddcx.rs", symbol = "IOCTL_APPLY_TOPOLOGY" },
@@ -238,8 +238,8 @@ code = [
 id = "PD-016"
 area = "audio"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
-difference = "Audio capture, playback control and microphone injection, and how the host's own speakers are kept silent (audio.local_playback; the policy, evidence and what to undo are shared, arcen_session::local_playback): a session sink on Linux, a muting process tap on macOS, every render endpoint muted on Windows."
-earned_by = "Linux: PipeWire and PulseAudio (pactl) in the session user's audio server, which can route every stream to a session sink. Windows: WASAPI loopback (IAudioClient), which still carries the mix while a render endpoint is muted (IAudioEndpointVolume::SetMute), and the Arcen virtual audio driver; Windows has no session sink to route to. macOS: Core Audio, ScreenCaptureKit audio and an AudioServerPlugIn driver; a Core Audio process tap can mute what it captures."
+difference = "Audio capture, playback control and microphone injection, and how the host's own speakers are kept silent (audio.local_playback; the policy, evidence and what to undo are shared, arcen_session::local_playback): a session sink on Linux, a muting process tap on macOS, every render endpoint muted on Windows. The Linux session audio server converts its monitor to the 48 kHz stereo audio-v1 the Pier records, so only the macOS and Windows Piers convert a device rate, both with the shared arcen_media::audio::resample::PcmResampler."
+earned_by = "Linux: PipeWire and PulseAudio (pactl) in the session user's audio server, which can route every stream to a session sink and converts a record stream to the sample spec it asks for (audiocap's 48 kHz S16le). Windows: WASAPI loopback (IAudioClient), which still carries the mix while a render endpoint is muted (IAudioEndpointVolume::SetMute), and the Arcen virtual audio driver; Windows has no session sink to route to. macOS: Core Audio, ScreenCaptureKit audio and an AudioServerPlugIn driver; a Core Audio process tap can mute what it captures."
 code = [
   { path = "hosts/linux/src/media/pipewire_bridge.rs", symbol = "PIPEWIRE" },
   { path = "hosts/windows/src/audio.rs", symbol = "IAudioClient" },
@@ -674,18 +674,6 @@ owner = "Shared/Architecture"
 code = [{ path = "clients/macos/src/ui/app.rs" }, { path = "clients/windows/src/present/composition.rs" }]
 
 [[gap]]
-id = "GAP-055"
-area = "audio"
-products = ["hosts/windows"]
-difference = "The Windows Pier brings its WASAPI mix rate to 48 kHz with its own linear interpolator (StereoConverter); the macOS Pier resamples its capture clock with the shared arcen_media::audio::resample::PcmResampler."
-why_open = "Not an OS limit: rate conversion is portable. Measured: linear interpolation leaves the 17 kHz image of a 7 kHz tone at 24 kHz 14 dB down and passes a 30 kHz tone at 96 kHz through as an 18 kHz alias at full level; the shared windowed-sinc resampler keeps both below -84 dB. Moving needs a Windows build and qualification."
-owner = "Windows Host"
-code = [
-  { path = "hosts/windows/src/audio.rs", symbol = "StereoConverter" },
-  { path = "shared/media/src/audio/resample.rs", symbol = "PcmResampler" },
-]
-
-[[gap]]
 id = "GAP-054"
 area = "Deck input"
 products = ["clients/macos"]
@@ -903,6 +891,12 @@ id = "deck_follow_login_window"
 description = "Follows the host's sign-in screen into its desktop"
 proof = 'HandoverSchedule'
 status = { "clients/macos" = "present", "clients/windows" = "present" }
+
+[[capability]]
+id = "pier_audio_any_capture_rate"
+description = "Carries host audio captured at any device rate from 8 to 384 kHz as audio-v1 through the shared resampler (GAP-055 closed)"
+proof = 'PcmResampler::new'
+status = { "hosts/linux" = "PD-016", "hosts/windows" = "present", "hosts/macos" = "present" }
 
 [[capability]]
 id = "deck_audio_follows_default_output"

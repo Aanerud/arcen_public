@@ -299,6 +299,11 @@ mod imp {
             if opts.tls_only && opts.uninstall {
                 return Err("--tls-only provisions TLS material; it cannot uninstall".to_owned());
             }
+            // Judged as typed (an NT path such as `\??\UNC\...` would read
+            // as `C:\??\...` once made absolute), then used only in the
+            // absolute form every later check sees.
+            opts.prefix = checked_location("--prefix", &opts.prefix)?;
+            opts.programdata = checked_location("--programdata", &opts.programdata)?;
             Ok(opts)
         }
 
@@ -307,6 +312,18 @@ mod imp {
                 || self.prefix != PathBuf::from(r"C:\Program Files\Arcen\Pier")
                 || self.programdata != default_programdata()
         }
+    }
+
+    /// `dir` made absolute, or refused when, as typed, it names a network
+    /// or device location ([`crate::acl::is_network_path`]).
+    fn checked_location(option: &str, dir: &Path) -> Result<PathBuf, String> {
+        if crate::acl::is_network_path(&dir.to_string_lossy()) {
+            return Err(format!(
+                "refusing {option} {}: it is on a network share, or not on a local drive letter",
+                dir.display()
+            ));
+        }
+        std::path::absolute(dir).map_err(|error| format!("resolve {}: {error}", dir.display()))
     }
 
     pub(super) fn run() -> Result<(), String> {
@@ -337,10 +354,22 @@ mod imp {
              \x20                        [--verbose] [--service-name <name>]\n\
              \x20                        [--extra-san <name-or-ip>]\n\
              \n\
+             --prefix     Install directory (default C:\\Program Files\\Arcen\\Pier).\n\
+             --programdata  Configuration and TLS directory (default\n\
+             \x20            C:\\ProgramData\\Arcen). For both, every folder above it must\n\
+             \x20            be administrator-only: one a non-administrator owns, or may\n\
+             \x20            rename, delete, re-permission or take ownership of, is\n\
+             \x20            refused (install into a separate location; never delete or\n\
+             \x20            repair it in place), and a missing one is made\n\
+             \x20            administrator-only. Both must be on a local disk, reached\n\
+             \x20            without a link: a network share is refused.\n\
              --tls-only   Only create, keep or renew the TLS material in\n\
              \x20            <programdata>\\tls; install nothing else and leave the\n\
              \x20            service alone (what new-host-cert.ps1 runs). Reload a\n\
              \x20            running Pier after a change: sc.exe control ArcenPier 202\n\
+             \x20            A --programdata of your own and the folders above it are\n\
+             \x20            yours and left as they are; keep them administrator-only\n\
+             \x20            (a warning names one a non-administrator could replace).\n\
              --renew      Reissue the TLS certificate over the existing key now. Paired\n\
              \x20            Decks keep trusting the host.\n\
              --adopt-legacy  Not needed any more: a self-signed key pair an older Arcen\n\
@@ -442,11 +471,12 @@ mod imp {
 
     fn install_files(opts: &Options) -> Result<(), String> {
         // Elevation and argument checks already passed in `windows_main`.
+        crate::secure_fs::refuse_network_location("--prefix", &opts.prefix)?;
+        crate::secure_fs::refuse_network_location("--programdata", &opts.programdata)?;
         let mut transaction = InstallTransaction::new();
         transaction
             .apply(InstallEvent::PreflightPassed)
             .map_err(|error| format!("installer transaction: {error}"))?;
-        remove_set_aside_credential_providers(opts);
         let logs = opts.programdata.join("logs");
         let sessions = logs.join("sessions");
         let runtime = opts.programdata.join("runtime");
@@ -461,8 +491,17 @@ mod imp {
         // reachable because Windows gives Everyone bypass-traverse-checking by
         // default. Each is created with its DACL, or accepted only when it
         // belongs to SYSTEM or Administrators, and never through a link.
+        // Every folder secured here, and those above it, stay held until
+        // the payloads are written and registered, and are judged again
+        // before each is written (`recheck`).
+        let mut held = Vec::new();
         for dir in [&opts.programdata, &logs, &sessions, &rollback, &recovery] {
-            secure_directory(opts, dir, AclClass::SecretDirectory)?;
+            held.push(secure_directory(
+                opts,
+                dir,
+                AclClass::SecretDirectory,
+                Place::Data,
+            )?);
         }
         // The install prefix holds arcen-pier.exe and, below,
         // arcen_credential_provider.dll — the DLL registered under
@@ -481,16 +520,37 @@ mod imp {
         // AclClass::PublicDirectory and its helper existed and were unit-tested
         // but were called from nowhere, so the protection was designed and then
         // never applied.
-        secure_directory(opts, &opts.prefix, AclClass::PublicDirectory)?;
+        held.push(secure_directory(
+            opts,
+            &opts.prefix,
+            AclClass::PublicDirectory,
+            Place::Program,
+        )?);
+        // Only now, with the prefix and every folder above it held, is
+        // anything in it read or removed.
+        remove_set_aside_credential_providers(opts);
         // The per-session agent writes the display-recovery journal here under
         // the user's unelevated token. Treating it as secret made every session
         // fail with "create display recovery journal ...: Access is denied".
-        secure_directory(opts, &runtime, AclClass::AgentWritableDirectory)?;
-        secure_directory(opts, &tls, AclClass::SecretDirectory)?;
+        held.push(secure_directory(
+            opts,
+            &runtime,
+            AclClass::AgentWritableDirectory,
+            Place::Data,
+        )?);
+        held.push(secure_directory(
+            opts,
+            &tls,
+            AclClass::SecretDirectory,
+            Place::Data,
+        )?);
         let pier_path = opts.prefix.join("arcen-pier.exe");
+        recheck(&held)?;
         atomic_write(opts, &pier_path, PIER_BYTES, true)?;
         let config = opts.programdata.join("pier.json");
-        let kept_config = config.exists();
+        // A preview reads nothing below the data directory (see `Payload`).
+        let kept_config = !opts.dry_run && config.exists();
+        recheck(&held)?;
         if kept_config {
             println!("keeping existing config: {}", config.display());
             migrate_existing_config(opts, &config)?;
@@ -501,6 +561,7 @@ mod imp {
             );
         }
         apply_secret_file_acl(opts, &config)?;
+        recheck(&held)?;
         ensure_tls(opts, &tls)?;
         verify_acl(opts, &tls.join("host.key"), AclClass::SecretFile)?;
         if kept_config {
@@ -517,7 +578,9 @@ mod imp {
             // `ensure_tls` was about to perform anyway.
             validate_kept_config(opts, &pier_path, &config)?;
         }
+        recheck(&held)?;
         atomic_write(opts, &opts.prefix.join(CP_DLL), CP_BYTES, true)?;
+        recheck(&held)?;
         atomic_write(
             opts,
             &opts.programdata.join("pier-administration.md"),
@@ -525,9 +588,11 @@ mod imp {
             false,
         )?;
         for (name, text) in LEGAL_FILES {
+            recheck(&held)?;
             atomic_write(opts, &opts.programdata.join(name), text.as_bytes(), false)?;
         }
         let eventlog_script = opts.programdata.join(EVENTLOG_SOURCE_SCRIPT_NAME);
+        recheck(&held)?;
         atomic_write(
             opts,
             &eventlog_script,
@@ -543,6 +608,7 @@ mod imp {
         transaction
             .apply(InstallEvent::PayloadStaged)
             .map_err(|error| format!("installer transaction: {error}"))?;
+        recheck(&held)?;
         register_service(opts, &config)?;
         register_credential_provider(opts)?;
         open_firewall(opts);
@@ -558,7 +624,15 @@ mod imp {
                 opts.programdata.join("pier-administration.md").display()
             );
         }
+        // Held until the payloads are written and registered.
+        drop(held);
         finish_install(transaction, &outcome, &opts.service_name)
+    }
+
+    /// Judges every held folder again before something is written into one.
+    fn recheck(held: &[crate::secure_fs::ChainHold]) -> Result<(), String> {
+        held.iter()
+            .try_for_each(crate::secure_fs::ChainHold::recheck)
     }
 
     /// Proves the kept configuration is one this binary can actually read.
@@ -879,6 +953,10 @@ mod imp {
     /// Deletes the Pier's state under ProgramData, and the directory itself
     /// once nothing else is left in it.
     fn purge_programdata(opts: &Options) -> Result<(), String> {
+        if opts.dry_run {
+            println!("dry-run: purge {}", opts.programdata.display());
+            return Ok(());
+        }
         let entries = match fs::read_dir(&opts.programdata) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -931,13 +1009,11 @@ mod imp {
             return Ok(());
         };
         if opts.dry_run {
-            if config.exists() {
-                println!(
-                    "dry-run: preserve {} beside {}",
-                    config.display(),
-                    parent.display()
-                );
-            }
+            println!(
+                "dry-run: preserve {}, if present, beside {}",
+                config.display(),
+                parent.display()
+            );
             return Ok(());
         }
         if !config.exists() {
@@ -967,6 +1043,13 @@ mod imp {
     /// prefix was put there by someone else and is left alone, which is also why
     /// the directory removal stays conditional on the prefix then being empty.
     fn remove_installer_leftovers(opts: &Options) -> Result<(), String> {
+        if opts.dry_run {
+            println!(
+                "dry-run: remove the copies the installer made in {}",
+                opts.prefix.display()
+            );
+            return Ok(());
+        }
         let entries = match fs::read_dir(&opts.prefix) {
             Ok(entries) => entries,
             // Already gone is the desired end state.
@@ -985,21 +1068,25 @@ mod imp {
         Ok(())
     }
 
-    fn create_dir(opts: &Options, path: &Path) -> Result<(), String> {
-        if opts.dry_run {
-            println!("dry-run: create dir {}", path.display());
-            return Ok(());
-        }
-        fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))
-    }
-
     fn atomic_write(
         opts: &Options,
         path: &Path,
         bytes: &[u8],
         executable: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Payload, String> {
         atomic_write_with_acl(opts, path, bytes, executable, AclClass::PublicFile)
+    }
+
+    /// What a payload write did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Payload {
+        /// The file already held these bytes; its ACL was applied.
+        Unchanged,
+        /// The file was written and its ACL applied.
+        Written,
+        /// A dry run: planned, with nothing below the install directory
+        /// read, since a preview never walks and holds it.
+        Previewed,
     }
 
     fn atomic_write_with_acl(
@@ -1008,7 +1095,19 @@ mod imp {
         bytes: &[u8],
         executable: bool,
         acl_class: AclClass,
-    ) -> Result<(), String> {
+    ) -> Result<Payload, String> {
+        // First, before anything is read: a preview does not walk and hold
+        // the install directory, so nothing below it may be looked up (a
+        // link there would be followed).
+        if opts.dry_run {
+            println!(
+                "dry-run: write {} bytes to {} unless it already holds them, then apply the {} ACL",
+                bytes.len(),
+                path.display(),
+                acl_class.label()
+            );
+            return Ok(Payload::Previewed);
+        }
         // Skipping an identical file is an optimisation, so failing to read it
         // must not fail the install. A file with an empty DACL cannot be read
         // by anyone, including Administrators, and that is a state this
@@ -1025,11 +1124,7 @@ mod imp {
         // repairable upgrade fail on the unchanged Credential Provider DLL.
         if path.exists() && fs::read(path).is_ok_and(|existing| existing == bytes) {
             detail!("unchanged: {}", path.display());
-            return apply_acl(opts, path, acl_class);
-        }
-        if opts.dry_run {
-            println!("dry-run: write {} bytes to {}", bytes.len(), path.display());
-            return Ok(());
+            return apply_acl(opts, path, acl_class).map(|()| Payload::Unchanged);
         }
         if executable && service_running(&opts.service_name)? {
             return Err(format!(
@@ -1041,7 +1136,16 @@ mod imp {
         let parent = path
             .parent()
             .ok_or_else(|| format!("{} has no parent", path.display()))?;
-        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        // A folder made here would inherit its parent's ACL; every folder a
+        // payload goes into is made and secured first (`secure_directory`).
+        if !parent.is_dir() {
+            return Err(format!(
+                "refusing to write {}: {} does not exist, and a payload never makes its own \
+                 folder",
+                path.display(),
+                parent.display()
+            ));
+        }
         let tmp = parent.join(format!(
             ".{}.new-{}",
             path.file_name()
@@ -1065,8 +1169,14 @@ mod imp {
                     .unwrap_or("payload"),
                 timestamp()
             ));
-            fs::create_dir_all(backup.parent().expect("rollback parent"))
-                .map_err(|e| format!("create rollback: {e}"))?;
+            let rollback = backup.parent().expect("rollback parent");
+            if !rollback.is_dir() {
+                return Err(format!(
+                    "refusing to move {} aside: {} does not exist",
+                    path.display(),
+                    rollback.display()
+                ));
+            }
             fs::rename(path, &backup).map_err(|e| {
                 format!(
                     "move existing {} to rollback {}: {e}",
@@ -1077,7 +1187,7 @@ mod imp {
             detail!("rollback backup: {}", backup.display());
         }
         fs::rename(&tmp, path).map_err(|e| format!("publish {}: {e}", path.display()))?;
-        apply_acl(opts, path, acl_class)
+        apply_acl(opts, path, acl_class).map(|()| Payload::Written)
     }
 
     /// Assemble the certificate name list from discovered facts.
@@ -1233,51 +1343,135 @@ mod imp {
     /// point, before or after it is created: an ACL applied through a
     /// junction would protect someone else's folder, and a key written there
     /// would be theirs to read.
-    fn secure_directory(opts: &Options, dir: &Path, class: AclClass) -> Result<(), String> {
-        crate::secure_fs::refuse_reparse_chain(dir)?;
+    fn secure_directory(
+        opts: &Options,
+        dir: &Path,
+        class: AclClass,
+        place: Place,
+    ) -> Result<crate::secure_fs::ChainHold, String> {
+        secure_directory_in(opts, dir, class, Chain::Installer(place))
+    }
+
+    /// What a refused directory is, for the other way out its message names.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Place {
+        /// `--prefix`: binaries.
+        Program,
+        /// `--programdata` and below: configuration, logs, TLS.
+        Data,
+    }
+
+    impl Place {
+        const fn instead(self) -> &'static str {
+            match self {
+                Self::Program => r"such as a new folder under C:\Program Files",
+                Self::Data => r"such as the default --programdata C:\ProgramData\Arcen",
+            }
+        }
+    }
+
+    /// Whose the folders above a directory the installer restricts are.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Chain {
+        /// Above the install prefix or Arcen's `ProgramData`: a folder the
+        /// installer makes is administrator-only from its creation, and
+        /// one a non-administrator could replace is refused
+        /// ([`crate::secure_fs::walk_to`]): otherwise its holder
+        /// could swap in a folder of their own, and the service, running
+        /// as SYSTEM, would load what they put there.
+        Installer(Place),
+        /// Above an operator's own `--tls-only` directory: theirs, made if
+        /// missing and never changed or refused; one a non-administrator
+        /// could replace is named in a warning.
+        Operator,
+    }
+
+    fn secure_directory_in(
+        opts: &Options,
+        dir: &Path,
+        class: AclClass,
+        chain: Chain,
+    ) -> Result<crate::secure_fs::ChainHold, String> {
+        crate::secure_fs::refuse_network_location(
+            match chain {
+                Chain::Installer(Place::Program) => "--prefix",
+                Chain::Installer(Place::Data) | Chain::Operator => "--programdata",
+            },
+            dir,
+        )?;
         if opts.dry_run {
             println!(
-                "dry-run: create or check {} {}",
+                "dry-run: create or check {} {} and the folders above it",
                 class.label(),
                 dir.display()
             );
-            return Ok(());
+            return Ok(crate::secure_fs::ChainHold::default());
         }
-        if let Some(parent) = dir.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("create {}: {error}", parent.display()))?;
-            }
+        // One walk from the volume root, each folder opened (or made)
+        // relative to the one above it, never following a link, every one
+        // held until the caller drops the hold.
+        let option = match chain {
+            Chain::Installer(Place::Program) => "--prefix",
+            Chain::Installer(Place::Data) | Chain::Operator => "--programdata",
+        };
+        let above = match chain {
+            Chain::Installer(place) => crate::secure_fs::Above::Installer {
+                sddl: AclClass::PublicDirectory.sddl(),
+                instead: place.instead(),
+            },
+            Chain::Operator => crate::secure_fs::Above::Operator,
+        };
+        let (mut hold, warning) = crate::secure_fs::walk_to(option, dir, above, true)?;
+        if let Some(warning) = warning {
+            println!(
+                "warning: {warning}. The TLS directory {} is restricted all the same; keep the \
+                 folders above it administrator-only",
+                dir.display()
+            );
         }
-        crate::secure_fs::create_protected_dir(dir, class.sddl())?;
-        let directory = crate::secure_fs::Pinned::directory(dir)?;
-        directory.require_trusted_owner()?;
-        directory.set_security(class.sddl())?;
-        drop(directory);
-        verify_acl(opts, dir, class)
+        hold.open_own(dir, class)?;
+        // Verified through the held handles, never by path: an empty
+        // directory turned into a junction meanwhile is refused, not read.
+        hold.recheck()?;
+        Ok(hold)
     }
 
     /// Provisions only the TLS material: the restricted `ProgramData` and TLS
     /// directories, then [`ensure_tls`]. The service is not touched; a
     /// running Pier serves a change after `sc.exe control ArcenPier 202`.
     fn install_tls_only(opts: &Options) -> Result<(), String> {
+        crate::secure_fs::refuse_network_location("--programdata", &opts.programdata)?;
         let tls = opts.programdata.join("tls");
         let restricted = tls_only_restricted_dirs(opts);
-        if !restricted.contains(&opts.programdata) {
-            // An operator's own folder above `tls`: made if missing, never
-            // re-permissioned, but still free of links.
-            crate::secure_fs::refuse_reparse_chain(&opts.programdata)?;
-            create_dir(opts, &opts.programdata)?;
-        }
+        // An operator's own folder above `tls` is made, if missing, by the
+        // walk to `tls` (`Chain::Operator`): with its parent's ACL, never
+        // re-permissioned, never through a link.
+        let chain = if restricted.contains(&opts.programdata) {
+            Chain::Installer(Place::Data)
+        } else {
+            Chain::Operator
+        };
+        // Held until the material is written.
+        let mut held = Vec::new();
         for dir in restricted {
-            secure_directory(opts, &dir, AclClass::SecretDirectory)?;
+            held.push(secure_directory_in(
+                opts,
+                &dir,
+                AclClass::SecretDirectory,
+                chain,
+            )?);
         }
+        recheck(&held)?;
         ensure_tls(opts, &tls)?;
         verify_acl(opts, &tls.join("host.key"), AclClass::SecretFile)?;
         if !opts.dry_run {
+            // Read while `tls` and every folder above it are still held,
+            // and only from `tls` itself: never through a link.
+            recheck(&held)?;
+            let canonical = canonical_tls_directory(&tls)?;
             let paths = MaterialPaths::in_directory(&tls);
             for path in [&paths.certificate_pin, &paths.spki_pin] {
-                if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(text) = crate::secure_fs::read_in_directory(path, &canonical) {
                     println!("{}: {}", path.display(), text.trim_end());
                 }
             }
@@ -1286,6 +1480,7 @@ mod imp {
                 opts.service_name
             );
         }
+        drop(held);
         Ok(())
     }
 
@@ -1333,7 +1528,29 @@ mod imp {
         }
     }
 
+    /// What a preview of [`ensure_tls`] says it would do: the requested
+    /// operation, described without looking in `tls` (a preview does not
+    /// walk and hold it).
+    fn tls_preview(opts: &Options, tls: &Path) -> String {
+        match tls_request(opts) {
+            ProvisioningRequest::Rekey => format!(
+                "dry-run: would replace the TLS key in {} if installer-owned material exists, \
+                 which invalidates every paired Deck's pin; otherwise refused",
+                tls.display()
+            ),
+            _ => format!(
+                "dry-run: create, keep or renew the TLS material in {}",
+                tls.display()
+            ),
+        }
+    }
+
     fn ensure_tls(opts: &Options, tls: &Path) -> Result<(), String> {
+        if opts.dry_run {
+            // A preview does not walk and hold `tls`, so nothing in it is read.
+            println!("{}", tls_preview(opts, tls));
+            return Ok(());
+        }
         let cert = tls.join("host.crt");
         let key = tls.join("host.key");
         crate::secure_fs::refuse_reparse_chain(tls)?;
@@ -1952,7 +2169,8 @@ mod imp {
             return Ok(());
         }
         let installed_script = opts.programdata.join(EVENTLOG_SOURCE_SCRIPT_NAME);
-        if installed_script.is_file() || opts.dry_run {
+        // A preview reads nothing below the data directory.
+        if opts.dry_run || installed_script.is_file() {
             return run_eventlog_source_script(
                 opts,
                 &installed_script,
@@ -2811,6 +3029,25 @@ mod imp {
         }
 
         #[test]
+        fn a_forced_preview_says_the_key_is_replaced_and_pins_break() {
+            let tls = Path::new(r"C:\ProgramData\Arcen\tls");
+            let mut opts = tls_options(Path::new(r"C:\ProgramData\Arcen"));
+            opts.dry_run = true;
+            opts.tls_only = true;
+            assert_eq!(
+                tls_preview(&opts, tls),
+                r"dry-run: create, keep or renew the TLS material in C:\ProgramData\Arcen\tls"
+            );
+            opts.force = true;
+            assert_eq!(
+                tls_preview(&opts, tls),
+                "dry-run: would replace the TLS key in C:\\ProgramData\\Arcen\\tls if \
+                 installer-owned material exists, which invalidates every paired Deck's pin; \
+                 otherwise refused"
+            );
+        }
+
+        #[test]
         fn tls_only_restricts_an_operator_directory_but_not_its_parent() {
             let custom = tls_options(Path::new(r"D:\certs"));
             assert_eq!(
@@ -2844,6 +3081,574 @@ mod imp {
                     .arg(link)
                     .arg(target),
             );
+        }
+
+        /// A folder on the system drive, shaped like `C:\`: administrator-
+        /// owned, its own DACL SYSTEM and Administrators only, and handing
+        /// every folder made in it "Authenticated Users: Modify", as the
+        /// root of a Windows system drive does.
+        fn prefix_test_root(name: &str) -> PathBuf {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let root = PathBuf::from(format!(
+                r"C:\arcen-installer-prefix-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            crate::secure_fs::create_protected_dir(
+                &root,
+                "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;0x1301bf;;;AU)",
+            )
+            .expect("create the test root");
+            root
+        }
+
+        fn prefix_options(root: &Path, prefix: &Path) -> Options {
+            Options {
+                prefix: prefix.to_path_buf(),
+                programdata: root.join("programdata"),
+                ..tls_options(root)
+            }
+        }
+
+        #[test]
+        fn a_nested_prefix_under_a_folder_users_can_replace_is_refused() {
+            let root = prefix_test_root("replaceable");
+            // `C:\Tools`, made earlier by an administrator: it inherits
+            // "Authenticated Users: Modify", so any user can rename it and
+            // put a folder of their own in its place.
+            let tools = root.join("Tools");
+            fs::create_dir(&tools).expect("create Tools");
+            // An administrator-only folder that a user owns: its owner can
+            // change its DACL whenever they like.
+            let owned = root.join("Owned");
+            crate::secure_fs::create_protected_dir(&owned, AclClass::PublicDirectory.sddl())
+                .expect("create Owned");
+            run_ok(
+                Command::new("icacls")
+                    .arg(&owned)
+                    .args(["/setowner", "*S-1-5-32-545"]),
+            );
+            let cases = [
+                (
+                    tools.join("Arcen").join("Pier"),
+                    AclClass::PublicDirectory,
+                    &tools,
+                    "S-1-5-11",
+                ),
+                (
+                    tools.join("Data").join("Arcen"),
+                    AclClass::SecretDirectory,
+                    &tools,
+                    "S-1-5-11",
+                ),
+                (
+                    owned.join("Arcen").join("Pier"),
+                    AclClass::PublicDirectory,
+                    &owned,
+                    "S-1-5-32-545",
+                ),
+            ];
+            let outcomes: Vec<_> = cases
+                .iter()
+                .map(|(dir, class, _, _)| {
+                    let place = if *class == AclClass::SecretDirectory {
+                        Place::Data
+                    } else {
+                        Place::Program
+                    };
+                    let outcome =
+                        secure_directory(&prefix_options(&root, dir), dir, *class, place).map(drop);
+                    (outcome, dir.parent().expect("parent").exists())
+                })
+                .collect();
+            let _ = fs::remove_dir_all(&root);
+            for ((dir, _, culprit, trustee), (outcome, made)) in cases.iter().zip(outcomes) {
+                let error = outcome.expect_err(&format!("{} is refused", dir.display()));
+                assert!(
+                    error.contains(&culprit.display().to_string()) && error.contains(trustee),
+                    "{error}"
+                );
+                // Never "delete it": it may be a system or shared folder.
+                assert!(!error.contains("delete it (after"), "{error}");
+                assert!(error.contains("separate location"), "{error}");
+                assert!(
+                    !made,
+                    "{} was created below a replaceable folder",
+                    dir.display()
+                );
+            }
+        }
+
+        #[test]
+        fn a_folder_still_held_open_to_be_renamed_is_refused_after_it_is_fixed() {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            let root = prefix_test_root("held");
+            // A user opened `C:\Tools` for DELETE while it inherited Modify;
+            // access is checked at open, so fixing its ACL afterwards leaves
+            // them able to rename it.
+            let tools = root.join("Tools");
+            fs::create_dir(&tools).expect("create Tools");
+            let held = fs::OpenOptions::new()
+                .access_mode(0x0001_0000)
+                .share_mode(0x7)
+                .custom_flags(0x0200_0000)
+                .open(&tools)
+                .expect("open Tools for DELETE");
+            run_ok(Command::new("icacls").arg(&tools).args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+            ]));
+            let prefix = tools.join("Arcen").join("Pier");
+            let outcome = secure_directory(
+                &prefix_options(&root, &prefix),
+                &prefix,
+                AclClass::PublicDirectory,
+                Place::Program,
+            )
+            .map(drop);
+            let made = tools.join("Arcen").exists();
+            drop(held);
+            let _ = fs::remove_dir_all(&root);
+            let error = outcome.expect_err("a folder held open for DELETE is refused");
+            assert!(error.contains(&tools.display().to_string()), "{error}");
+            assert!(!error.contains("delete it (after"), "{error}");
+            assert!(error.contains("separate location"), "{error}");
+            assert!(!made, "created below a folder held open for DELETE");
+        }
+
+        #[test]
+        fn a_widened_grant_to_an_allowed_account_stops_the_next_write() {
+            let root = prefix_test_root("widened");
+            let prefix = root.join("Arcen").join("Pier");
+            let hold = secure_directory(
+                &prefix_options(&root, &prefix),
+                &prefix,
+                AclClass::PublicDirectory,
+                Place::Program,
+            )
+            .expect("installed");
+            let before = hold.recheck();
+            // Authenticated Users already reads the prefix; widening that
+            // same grant to full control adds no trustee.
+            run_ok(
+                Command::new("icacls")
+                    .arg(&prefix)
+                    .args(["/grant", "*S-1-5-11:(OI)(CI)F"]),
+            );
+            let after = hold.recheck();
+            drop(hold);
+            let _ = fs::remove_dir_all(&root);
+            before.expect("the installed ACL passes");
+            assert!(after.is_err(), "a widened grant passed the recheck");
+        }
+
+        #[test]
+        fn a_short_name_is_refused_as_such_not_as_a_share() {
+            let outcome = crate::secure_fs::refuse_network_location(
+                "--prefix",
+                Path::new(r"C:\PROGRA~1\Arcen\Pier"),
+            );
+            // Only where the system drive keeps short names.
+            if let Err(error) = outcome {
+                assert!(error.contains("short-name"), "{error}");
+                assert!(!error.contains("network share"), "{error}");
+            }
+        }
+
+        #[test]
+        fn a_link_to_a_share_in_the_path_is_refused_without_following_it() {
+            let root = prefix_test_root("link");
+            let name = root
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned();
+            let target = root.join("target");
+            fs::create_dir(&target).expect("create target");
+            // A directory symbolic link in the chain to the same folder
+            // through the administrative share.
+            let link = root.join("link");
+            run_ok(
+                Command::new("cmd")
+                    .arg("/C")
+                    .arg("mklink")
+                    .arg("/D")
+                    .arg(&link)
+                    .arg(format!(r"\\localhost\C$\{name}\target")),
+            );
+            let prefix = link.join("Arcen").join("Pier");
+            let outcome = secure_directory(
+                &prefix_options(&root, &prefix),
+                &prefix,
+                AclClass::PublicDirectory,
+                Place::Program,
+            )
+            .map(drop);
+            let followed = target.join("Arcen").exists();
+            let _ = fs::remove_dir(&link);
+            let _ = fs::remove_dir_all(&root);
+            let error = outcome.expect_err("a link in the path is refused");
+            // Refused as a link, before it is followed to the share.
+            assert!(error.contains("reparse point"), "{error}");
+            assert!(!followed, "a folder was made through the link");
+        }
+
+        #[test]
+        fn a_held_chain_cannot_be_renamed_until_it_is_released() {
+            let root = prefix_test_root("held-chain");
+            let prefix = root.join("Tools").join("Arcen").join("Pier");
+            let hold = secure_directory(
+                &prefix_options(&root, &prefix),
+                &prefix,
+                AclClass::PublicDirectory,
+                Place::Program,
+            )
+            .expect("installed");
+            // Nobody, an administrator included, can rename a held folder
+            // (or put a link in its place) while the installer works.
+            let renamed = [
+                (root.join("Tools"), root.join("Tools-moved")),
+                (
+                    root.join("Tools").join("Arcen"),
+                    root.join("Tools").join("Arcen-moved"),
+                ),
+                (
+                    prefix.clone(),
+                    root.join("Tools").join("Arcen").join("Pier-moved"),
+                ),
+            ]
+            .map(|(from, to)| fs::rename(&from, &to).is_ok());
+            drop(hold);
+            let released = fs::rename(root.join("Tools"), root.join("Tools-moved")).is_ok();
+            let _ = fs::remove_dir_all(&root);
+            assert_eq!(renamed, [false; 3], "a held folder was renamed");
+            assert!(released, "the folders stay held after the hold is dropped");
+        }
+
+        #[test]
+        fn a_link_swapped_in_during_the_walk_is_never_followed() {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let root = prefix_test_root("swap");
+            // `a` flips between a real folder and a link to `elsewhere`,
+            // both holding `b`, while the walk runs again and again.
+            let real = root.join("a");
+            let parked = root.join("a-parked");
+            let elsewhere = root.join("elsewhere");
+            let link = root.join("a-link");
+            for dir in [real.join("b"), elsewhere.join("b")] {
+                fs::create_dir_all(&dir).expect("create");
+            }
+            std::os::windows::fs::symlink_dir(&elsewhere, &link).expect("symlink");
+            let prefix = real.join("b").join("Pier");
+            let stop = AtomicBool::new(false);
+            let swaps = AtomicUsize::new(0);
+            let mut outcomes = Vec::new();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        // a -> parked, link -> a, then back; a held `a`
+                        // cannot be moved.
+                        if fs::rename(&real, &parked).is_err() {
+                            continue;
+                        }
+                        if fs::rename(&link, &real).is_ok() {
+                            swaps.fetch_add(1, Ordering::Relaxed);
+                            std::thread::yield_now();
+                            let _ = fs::rename(&real, &link);
+                        }
+                        if fs::rename(&parked, &real).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::time::Instant::now() < deadline {
+                    let walked = crate::secure_fs::walk_to(
+                        "--prefix",
+                        &prefix,
+                        crate::secure_fs::Above::Installer {
+                            sddl: AclClass::PublicDirectory.sddl(),
+                            instead: Place::Program.instead(),
+                        },
+                        false,
+                    );
+                    outcomes.push(walked.map(|(hold, _)| hold.held_paths()));
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            let swapped = swaps.load(Ordering::Relaxed);
+            let _ = fs::remove_dir(&link);
+            let _ = fs::remove_dir(&real);
+            let _ = fs::remove_dir_all(&root);
+            assert!(swapped > 0, "the link was never swapped in");
+            let comparable = |path: &Path| path.display().to_string().to_lowercase();
+            let elsewhere = comparable(&elsewhere);
+            for outcome in &outcomes {
+                match outcome {
+                    Ok(paths) => assert!(
+                        paths
+                            .iter()
+                            .all(|path| !comparable(path).contains(&elsewhere)),
+                        "the walk followed the link: {paths:?}"
+                    ),
+                    Err(error) => assert!(
+                        !error.contains("opened as") && !error.contains("elsewhere"),
+                        "the walk followed the link: {error}"
+                    ),
+                }
+            }
+        }
+
+        #[test]
+        fn a_folder_that_changes_after_it_is_checked_stops_the_next_write() {
+            let root = prefix_test_root("recheck");
+            let prefix = root.join("Tools").join("Arcen").join("Pier");
+            let hold = secure_directory(
+                &prefix_options(&root, &prefix),
+                &prefix,
+                AclClass::PublicDirectory,
+                Place::Program,
+            )
+            .expect("installed");
+            let before = hold.recheck();
+            // An administrator, or a process acting for one, widens a
+            // folder above the prefix while the installer works.
+            run_ok(
+                Command::new("icacls")
+                    .arg(root.join("Tools"))
+                    .args(["/grant", "*S-1-5-11:(D)"]),
+            );
+            let after = hold.recheck();
+            drop(hold);
+            let _ = fs::remove_dir_all(&root);
+            before.expect("unchanged folders pass");
+            let error = after.expect_err("a widened folder stops the next write");
+            assert!(error.contains("S-1-5-11"), "{error}");
+        }
+
+        #[test]
+        fn a_location_is_judged_as_typed_and_used_absolute() {
+            let error = checked_location("--prefix", Path::new(r"\??\UNC\server\share\Pier"))
+                .expect_err("an NT path is refused as typed");
+            assert!(error.contains("network share"), "{error}");
+            let absolute = checked_location("--prefix", Path::new(r"Arcen\Pier")).expect("local");
+            assert!(absolute.is_absolute(), "{}", absolute.display());
+        }
+
+        #[test]
+        fn an_install_folder_on_a_network_share_is_refused() {
+            let root = prefix_test_root("unc");
+            let name = root
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned();
+            // The test root, reached through the administrative share.
+            let shares = [
+                PathBuf::from(format!(r"\\localhost\C$\{name}\Arcen\Pier")),
+                PathBuf::from(format!(r"\\?\UNC\localhost\C$\{name}\Arcen\Pier")),
+            ];
+            let mut outcomes = Vec::new();
+            for dir in &shares {
+                for (class, place) in [
+                    (AclClass::PublicDirectory, Place::Program),
+                    (AclClass::SecretDirectory, Place::Data),
+                ] {
+                    let outcome =
+                        secure_directory(&prefix_options(&root, dir), dir, class, place).map(drop);
+                    outcomes.push((dir.display().to_string(), outcome));
+                }
+            }
+            let made = root.join("Arcen").exists();
+            let _ = fs::remove_dir_all(&root);
+            for (dir, outcome) in outcomes {
+                let error = outcome.expect_err(&format!("{dir} is refused"));
+                assert!(error.contains("network share"), "{dir}: {error}");
+            }
+            assert!(!made, "a folder was created through the share");
+        }
+
+        #[test]
+        fn the_installers_own_folder_held_open_is_never_to_be_deleted() {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            let root = prefix_test_root("own");
+            // The install directory itself (`C:\ProgramData\Arcen\tls`, say),
+            // administrator-only, held open by another program.
+            let tls = root.join("tls");
+            crate::secure_fs::create_protected_dir(&tls, AclClass::SecretDirectory.sddl())
+                .expect("create tls");
+            let held = fs::OpenOptions::new()
+                .access_mode(0x0001_0000)
+                .share_mode(0x7)
+                .custom_flags(0x0200_0000)
+                .open(&tls)
+                .expect("open tls for DELETE");
+            let outcome = secure_directory(
+                &prefix_options(&root, &tls),
+                &tls,
+                AclClass::SecretDirectory,
+                Place::Data,
+            )
+            .map(drop);
+            drop(held);
+            let _ = fs::remove_dir_all(&root);
+            let error = outcome.expect_err("a held folder is refused");
+            assert!(error.contains("close it and run again"), "{error}");
+            assert!(!error.contains("delete it (after"), "{error}");
+        }
+
+        #[test]
+        fn a_preview_reads_nothing_below_an_install_directory() {
+            let root = prefix_test_root("preview");
+            // The prefix is a junction to someone else's folder, already
+            // holding the payload's bytes: a preview must not look inside.
+            let elsewhere = root.join("elsewhere");
+            fs::create_dir(&elsewhere).expect("create elsewhere");
+            fs::write(elsewhere.join("arcen-pier.exe"), b"same").expect("write");
+            let prefix = root.join("Pier");
+            junction(&prefix, &elsewhere);
+            let preview = Options {
+                dry_run: true,
+                ..prefix_options(&root, &prefix)
+            };
+            let planned = atomic_write(&preview, &prefix.join("arcen-pier.exe"), b"same", false);
+            let kept = fs::read(elsewhere.join("arcen-pier.exe")).expect("read");
+            let _ = fs::remove_dir(&prefix);
+            let _ = fs::remove_dir_all(&root);
+            // An identical file found there would have been "unchanged".
+            assert_eq!(planned, Ok(Payload::Previewed));
+            assert_eq!(kept, b"same");
+        }
+
+        #[test]
+        fn pins_are_read_only_from_the_tls_directory_itself() {
+            let root = prefix_test_root("pins");
+            let tls = root.join("tls");
+            crate::secure_fs::create_protected_dir(&tls, AclClass::SecretDirectory.sddl())
+                .expect("create tls");
+            fs::write(tls.join("host.crt.sha256"), "AA:BB\n").expect("write pin");
+            let elsewhere = root.join("elsewhere");
+            fs::create_dir(&elsewhere).expect("create elsewhere");
+            fs::write(elsewhere.join("planted"), "CC:DD\n").expect("write planted");
+            std::os::windows::fs::symlink_file(elsewhere.join("planted"), tls.join("spki.sha256"))
+                .expect("symlink");
+            let canonical = canonical_tls_directory(&tls).expect("canonical");
+            let own = crate::secure_fs::read_in_directory(&tls.join("host.crt.sha256"), &canonical);
+            let planted = crate::secure_fs::read_in_directory(&tls.join("spki.sha256"), &canonical);
+            let _ = fs::remove_file(tls.join("spki.sha256"));
+            let _ = fs::remove_dir_all(&root);
+            assert_eq!(own.expect("the directory's own pin"), "AA:BB\n");
+            assert!(planted.is_err(), "a pin read through a link: {planted:?}");
+        }
+
+        #[test]
+        fn a_payload_is_never_written_into_a_folder_it_would_have_to_create() {
+            let root = prefix_test_root("payload");
+            let missing = root.join("missing");
+            let options = prefix_options(&root, &missing);
+            let outcome = atomic_write(&options, &missing.join("arcen-pier.exe"), b"MZ", false);
+            let made = missing.exists();
+            let _ = fs::remove_dir_all(&root);
+            assert!(
+                outcome.is_err(),
+                "a missing folder is never made by a payload write"
+            );
+            assert!(
+                !made,
+                "the payload write created its folder with an inherited ACL"
+            );
+        }
+
+        #[test]
+        fn a_refused_data_folder_names_the_default_data_folder() {
+            let root = prefix_test_root("hint");
+            let tools = root.join("Tools");
+            fs::create_dir(&tools).expect("create Tools");
+            let data = tools.join("Arcen");
+            let outcome = secure_directory(
+                &prefix_options(&root, &data),
+                &data,
+                AclClass::SecretDirectory,
+                Place::Data,
+            )
+            .map(drop);
+            let _ = fs::remove_dir_all(&root);
+            let error = outcome.expect_err("refused");
+            assert!(error.contains(r"C:\ProgramData\Arcen"), "{error}");
+            assert!(!error.contains("Program Files"), "{error}");
+        }
+
+        #[test]
+        fn the_folders_a_nested_prefix_needs_are_created_administrator_only() {
+            let root = prefix_test_root("created");
+            let prefix = root.join("Tools").join("Arcen").join("Pier");
+            let outcome = secure_directory(
+                &prefix_options(&root, &prefix),
+                &prefix,
+                AclClass::PublicDirectory,
+                Place::Program,
+            )
+            .map(drop);
+            let created: Vec<_> = [root.join("Tools"), root.join("Tools").join("Arcen")]
+                .into_iter()
+                .map(|dir| (dir.display().to_string(), read_sddl(&dir)))
+                .collect();
+            let _ = fs::remove_dir_all(&root);
+            outcome.expect("the prefix is installed");
+            for (dir, sddl) in created {
+                let sddl = sddl.expect("read the created folder's ACL");
+                assert!(sddl.starts_with("O:BA"), "{dir} owner: {sddl}");
+                assert_acl_sddl(&dir, &sddl, AclClass::PublicDirectory)
+                    .expect("protected at creation");
+            }
+        }
+
+        #[test]
+        fn the_default_install_folders_pass_and_are_left_as_they_are() {
+            // Read only: this host's own install is never touched.
+            for dir in [
+                PathBuf::from(r"C:\Program Files\Arcen\Pier"),
+                default_programdata(),
+            ] {
+                let above: Vec<_> = dir
+                    .ancestors()
+                    .skip(1)
+                    .filter(|folder| folder.exists())
+                    .map(|folder| (folder.to_path_buf(), read_sddl(folder).expect("read ACL")))
+                    .collect();
+                assert_eq!(
+                    crate::secure_fs::ancestor_warning(&dir),
+                    None,
+                    "{}",
+                    dir.display()
+                );
+                for (folder, before) in above {
+                    assert_eq!(read_sddl(&folder).expect("read ACL"), before);
+                }
+            }
+        }
+
+        #[test]
+        fn an_operators_tls_folder_is_warned_about_never_refused() {
+            let root = prefix_test_root("operator");
+            // `D:\certs`, the operator's own, inheriting "Modify" for users.
+            let certs = root.join("certs");
+            fs::create_dir_all(certs.join("tls")).expect("create certs");
+            let before = read_sddl(&certs).expect("their ACL");
+            let warning = crate::secure_fs::ancestor_warning(&certs.join("tls"));
+            let outcome = install_tls_only(&tls_options(&certs));
+            let after = read_sddl(&certs).expect("their ACL");
+            let _ = fs::remove_dir_all(&root);
+            outcome.expect("an operator's folder is not refused");
+            let warning = warning.expect("a replaceable folder is named");
+            assert!(
+                warning.contains(&certs.display().to_string()) && warning.contains("S-1-5-11"),
+                "{warning}"
+            );
+            assert_eq!(after, before, "the operator's folder was changed");
         }
 
         #[test]

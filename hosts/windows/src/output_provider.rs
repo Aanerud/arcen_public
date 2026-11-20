@@ -527,6 +527,7 @@ mod tests {
                     Rotation::Degrees0
                 },
                 primary: index == 0,
+                custom_timing: false,
                 color: None,
             })
             .collect();

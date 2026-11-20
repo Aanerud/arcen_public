@@ -99,8 +99,17 @@ an empty program. There is no single-platform `--workspace` build.
   to the bar until a command, Esc, or a click into the picture). The
   window input lets winit/egui see the pointer only there
   (`arcen_deck_core::input::overlay_pointer`); everywhere else the host
-  has it. With the default Displays mode the stream is the monitor's own
-  pixel size, so fullscreen is 1:1.
+  has it. A Help window (About, Keyboard Shortcuts; shared
+  `screens::help_windows`) is modal, windowed or fullscreen: while it is
+  open the UI has every session window's pointer and keyboard (Match My
+  Layout's secondary windows too; the bar's regions stay the root
+  window's, `OverlayPointerRegions::for_secondary`; held host
+  keys are released as on a focus loss), and Esc, Enter or a quick Alt+F4
+  in any session window closes it (a held Alt+F4 still quits); the window
+  input takes that key, its repeats and its release from the host
+  (`DeckInputEvent::DismissModal`). With
+  the default Displays mode the stream is the monitor's own pixel size, so
+  fullscreen is 1:1.
 - **Independent flip.** DWM composes every present unless the video
   swapchain alone covers the monitor: fullscreen, picture 1:1 at the
   origin (stream size = monitor size), opaque, nothing drawn over it. Then

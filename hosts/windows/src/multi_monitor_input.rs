@@ -607,6 +607,7 @@ mod tests {
             refresh_hz: 60,
             rotation: arcen_media::Rotation::Degrees0,
             primary,
+            custom_timing: false,
             color: None,
         }
     }

@@ -6,6 +6,106 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.6] — 2026-11-20
+
+A Windows Pier on a GeForce serves the display it has instead of failing to
+write its EDID; the Windows Deck's Help ▸ About and Keyboard Shortcuts close
+during a session; the Windows installer refuses a custom install folder that
+another user could replace; and a Windows Pier converts its audio mix rate
+with the shared resampler. 0.20.6 speaks protocol v5 and works with every
+0.17.0 to 0.20.5 Deck and Pier.
+
+### Fixed
+
+- **A Windows Pier on a GeForce now starts the session on the display it
+  has.** On a GeForce with a monitor or a dummy plug, 0.20.4 and 0.20.5
+  asked NVIDIA to write the display's EDID, which NVIDIA allows only on
+  Quadro, RTX Pro and GRID cards, and the Deck showed *apply authenticated
+  client display: exact display apply failed (NvAPI_GPU_SetEDID returned
+  NVAPI status -104 (NVAPI_NOT_SUPPORTED)); rollback also failed*. The Pier
+  now reads the card's class before changing anything, never asks a GeForce
+  to write an EDID, and sets the mode of the attached display nearest to the
+  Deck's size. When that is not the Deck's size, the Deck says so and why
+  (*exact display needs a Quadro, RTX Pro or GRID GPU; this host has a
+  GeForce RTX 5090*). A GeForce with no display is refused with a message
+  asking for a monitor, a dummy plug or a virtual display driver; pinned
+  deskside protection, which requires the exact display, is refused before
+  anything changes. The Pier never changes the Windows display scale of
+  such a display: the desk keeps its own, and the Deck is told the scale
+  Windows shows. An HDR session is set at the display's own mode first and
+  is served as HDR only when Windows then shows HDR on it, including sizes
+  larger than Arcen's own HDR display can describe (5120×2880, for example).
+  The Deck is told the refresh the display actually runs at. Undoing a
+  refused EDID write no longer fails when the display still reads back its
+  own EDID, so a recovery journal such a session left behind is restored at
+  the next session. If your host showed this error: upgrade and connect
+  once. Records of the failed sessions set aside as
+  `C:\ProgramData\Arcen\runtime\display-recovery.unrestorable.*.json` do
+  not block anything; leave them. A PC
+  whose only display is a dummy plug also needs `"privacy": {"desk": "off"}`
+  in `pier.json` (Windows reports a dummy plug as a monitor at the desk), or
+  the virtual display driver of the
+  [GeForce guide](docs/operations/windows-geforce-virtual-display.md).
+  The GeForce path is covered by unit tests on a lab with professional
+  NVIDIA GPUs only; it has not yet run on a GeForce.
+- **Windows Deck: Help ▸ About and Help ▸ Keyboard Shortcuts can be closed
+  during a session.** Opened while connected, the About box could not be
+  closed with its OK button (nor Keyboard Shortcuts with its close button)
+  until the session ended: the click went to the remote computer instead.
+  While one of these windows is open, the mouse and keyboard now belong to
+  it, in every Deck window of a Match My Layout session, and the remote
+  computer gets neither, so OK, the close button, Esc, Enter and a quick
+  Alt+F4 close it (holding Alt+F4 still quits), from whichever Deck window
+  has the keyboard. Once it is closed, clicks and keys, Esc included, go
+  to the remote computer again, as before. The key that closed it is not
+  passed on, even while it is still held: holding Enter to close About
+  does not also press Enter on the remote computer, and an Alt still held
+  from the Alt+F4 that closed it is not passed on either. Proven with
+  injected mouse and keyboard input on a lab PC.
+- **Windows installer: a custom install folder can no longer be swapped out
+  by another user.** With a nested `--prefix` such as `C:\Tools\Arcen`, the
+  installer used to create `C:\Tools` with the permissions it inherits
+  from `C:\`, which let any local user rename it and put a folder of
+  their own in its place. That folder would then receive `arcen-pier.exe`
+  and the sign-in DLL that Windows loads as SYSTEM. Every folder the
+  installer now makes above the install folder, or above a custom
+  `--programdata`, can be changed only by SYSTEM and Administrators. An
+  existing folder there is refused if another account owns it, if a
+  non-administrator may rename, delete, re-permission or take ownership
+  of it, or if another process still holds it open with the right to
+  rename it. The message names the folder and the right, and asks you to
+  install into a separate location instead; leave the refused folder as
+  it is, since it may be Windows' own or shared. The folders stay locked
+  in place until the install finishes, and before each file is written
+  every permission entry is checked again, so a grant widened meanwhile
+  stops the install. The default `C:\Program Files` and `C:\ProgramData`
+  locations, and the root of a data drive such as `D:\`, are not
+  affected. An install folder on a network share, on a drive letter that
+  is not a local disk (a mapped share or a `subst` drive), or reached
+  through a link or junction, is refused without the installer contacting
+  any share. A folder of your own that `--tls-only` writes into is left
+  as it is, with a warning if a non-administrator could replace it.
+- A Windows Pier whose output device mixes at a rate other than 48 kHz
+  (44.1 kHz, 96 kHz, a headset in call mode) no longer adds audible
+  artefacts to host audio. Its linear conversion left a mirror image of
+  each tone when converting up, louder the higher the tone: in a 24 kHz
+  mix, the 7 kHz test tone also sounded at 17 kHz only 14 dB down (a
+  1 kHz tone's image was 47 dB down, an 11.9 kHz tone's 6 dB down).
+  Converting down, it passed sound above 24 kHz through as an alias at
+  full level from a 96 kHz mix (3 dB down from 88.2 kHz). It now uses
+  the same shared resampler as the macOS Pier.
+  Measured: a 7 kHz tone mixed at 24 kHz leaves its
+  17 kHz image 124 dB down, and a 30 kHz tone mixed at 96 kHz leaves its
+  18 kHz alias 127 dB down. Near the band edge the filter does less:
+  images within 0.5 kHz of the mix's Nyquist frequency are only about
+  50 dB down (an 11.9 kHz tone at 24 kHz images at 12.1 kHz at −51 dB),
+  and in a 96 kHz mix sound at 24.1 kHz aliases to 23.9 kHz at −47 dB;
+  aliases stay below 16-bit resolution only for sound above 24.9 kHz.
+  Capture no longer allocates for each buffer or packet, and
+  the conversion adds at most 4 ms (at 8 kHz), none at 48 kHz. The lab
+  host's own output device runs at 48 kHz, so other rates are proven by the
+  converter's native measurements, not yet on a device mixing at them.
+
 ## [0.20.5] — 2026-11-20
 
 A Linux Pier joins your own GNOME Wayland session and keeps a joined
@@ -4193,7 +4293,8 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.5...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.6...HEAD
+[0.20.6]: https://github.com/Aanerud/arcen_public/compare/v0.20.5...v0.20.6
 [0.20.5]: https://github.com/Aanerud/arcen_public/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/Aanerud/arcen_public/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/Aanerud/arcen_public/compare/v0.20.2...v0.20.3

@@ -239,7 +239,9 @@ impl SessionInput {
                 self.lock().relative = false;
                 self.local.input(event);
             }
-            DeckInputEvent::Preedit(_) | DeckInputEvent::Shortcut(_) => self.local.input(event),
+            DeckInputEvent::Preedit(_)
+            | DeckInputEvent::Shortcut(_)
+            | DeckInputEvent::DismissModal => self.local.input(event),
         }
     }
 

@@ -19,6 +19,7 @@ pub mod colour_check;
 pub mod connecting;
 pub mod connection_test;
 pub mod fidelity;
+pub mod help_windows;
 pub mod home;
 pub mod host_pointer;
 pub mod keyboard_help;

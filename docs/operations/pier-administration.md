@@ -1239,6 +1239,44 @@ Uninstalling removes the install prefix once it is empty, and then
 `C:\Program Files\Arcen` too when nothing else is left in it. A custom
 `--prefix` outside an `Arcen` directory never has its parent removed.
 
+A custom `--prefix` or `--programdata` must sit under folders that only
+SYSTEM and Administrators can change. The service and the sign-in DLL
+run as SYSTEM from the prefix, so whoever can rename a folder above it
+can put a folder of their own in its place. The installer therefore:
+
+- makes every missing folder above them owned by Administrators, with
+  only SYSTEM and Administrators able to change it (users may read it);
+- refuses an existing folder above them that another account owns, or
+  that a non-administrator may rename, delete, re-permission or take
+  ownership of, or rename the folders in, and one that another process
+  still holds open with the right to rename it. A folder made under a
+  drive root by hand, such as `C:\Tools`, usually inherits
+  "Authenticated Users: Modify" from `C:\` and is refused for that
+  reason. A drive's root itself cannot be renamed, so a data drive's
+  root (`D:\`), which lets users Modify it, is accepted.
+- refuses a `--prefix` or `--programdata` on a network share (a UNC
+  path, or a drive letter mapped to a share): the service and the
+  sign-in DLL must be on a local drive.
+- keeps every one of those folders open, so that none can be renamed,
+  until the binaries are written and registered, and checks them again
+  before each file it writes.
+
+When a folder above the install folder is refused, install into a
+separate location instead: a new folder under `C:\Program Files`, or the
+default `C:\ProgramData\Arcen`. Leave the refused folder as it is. It may
+be Windows' own or shared with other software, so do not delete it on
+the installer's word. Do not repair it in place with `icacls` either:
+Windows checks access when a folder is opened, so a program that opened
+it while it was replaceable may keep the right to change its permissions
+afterwards. The default locations under `C:\Program Files` and
+`C:\ProgramData` pass as they are.
+
+The installer also refuses a location reached through a link or junction
+anywhere in its path, and a drive letter that is not a local disk volume
+(a mapped share, a remote desktop's drive, or a `subst` mapping). It
+judges these without following the link or opening the drive, so it never
+contacts a share.
+
 `--force` is about TLS, typically after `--extra-san`. It does **not** rewrite
 the configuration, so it cannot be used to escape a bad `pier.json`.
 

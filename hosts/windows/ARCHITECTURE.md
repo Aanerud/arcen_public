@@ -163,7 +163,10 @@ The common Windows/Linux schema and Windows platform section are documented in
   and injected traces are portable.
 - `gpu_probe.rs` — `diagnose-host` inventory: adapters, outputs, D3D11/video capability,
   encoder runtimes, same-adapter recommendation. Non-mutating.
-- `audio.rs` — WASAPI loopback capture.
+- `audio.rs` — WASAPI loopback capture. The mix format's sample format and
+  channel layout are adapted here; the rate is converted to audio-v1 by the
+  shared `arcen_media::audio::resample::PcmResampler`. The loop allocates
+  nothing per buffer or packet (packets are fixed `[u8; CHUNK_BYTES]`).
 - `clipboard.rs` — bounded transport queue plus the user-session
   `HWND_MESSAGE`/`AddClipboardFormatListener` adapter.
 - `display.rs` / `edid.rs` / `nvapi.rs` / `recovery.rs` — the physical `DisplayPolicy` transaction
@@ -706,6 +709,40 @@ in `display.rs` takes a `DisplayPolicy`:
   within the shared 1920x1200p30/even-dimension contract and use supported modes;
   an unaligned current mode cannot become the terminal fallback. The applied size is
   honestly reported in ServerHello. Topology is left as-is.
+
+- **A GPU that may not have an EDID written (a GeForce):** NVAPI's exact
+  backend writes the display's EDID (`NvAPI_GPU_SetEDID`), which NVIDIA
+  permits only on Quadro, RTX Pro and GRID GPUs. The class
+  (`NvAPI_GPU_GetQuadroStatus`, `nvapi_inventory`) is read before anything
+  changes, both when the session reconciles the NVIDIA display and when the
+  display transaction picks its backend; a GPU not proved professional never
+  reaches `SetEDID`. The shared `arcen_outputs::edid_provisioning::decide`
+  then serves the attached display (a monitor or dummy plug) `Negotiated` at
+  its own modes, with the limit in ServerHello's `display_resolution`
+  (`exact_unavailable`, `resize`), refuses pinned deskside before any change,
+  and refuses a GPU with no display with what to attach. Undoing an EDID
+  write NVAPI refused with `NVAPI_NOT_SUPPORTED` succeeds when the display
+  reads back its own EDID; a verified write whose purge fails still fails.
+  An HDR request is fitted to the synthesized HDR10 EDID's link only when an
+  EDID will be synthesized (`display::edid_synthesis_permitted`); otherwise
+  the attached display's own mode is set and settled first (no HDR is
+  prepared before it, `advanced_color_before_mode_apply`), then the session's
+  Advanced Color gate turns HDR on for that target and proves it. Multi-display
+  plans record the timing path per monitor (`WindowsMonitorPlan::custom_timing`,
+  internal: production selects one adapter); a fixed-mode monitor is set
+  through CCD, then its planned enumerated refresh through
+  `ChangeDisplaySettingsEx`, and only the refresh Windows reads back is
+  published.
+- **UI scale by GPU class:** the Deck's Windows UI scale step is given only
+  to an output of a GPU proved a Quadro, RTX Pro or GRID
+  (`ui_scale_change_permitted`), single or Match My Layout, and there it is
+  applied and put back exactly as in 0.20.5. A GeForce, any other adapter
+  and an unreadable class never have the Windows scale changed; the hello's
+  `effective_display_scale` reports what Windows shows. No scale change arms
+  a topology rollback of its own. A negotiated fallback whose nearest offered
+  mode is the one the display runs is served unchanged, with nothing armed.
+  A DEVMODE refresh of 0 or 1 (the hardware default) is resolved from the
+  active CCD target, or is unknown and never caps capture or encoding.
 
 The shipped Windows graph is NVENC, the Media Foundation hardware encoder
 (Alpha) and source-built OpenH264, ranked in that order by the shared

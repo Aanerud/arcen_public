@@ -44,7 +44,6 @@ use arcen_deck_core::runtime::session::{
     TerminalDisconnect,
 };
 use arcen_deck_core::runtime::tls::CertInfo;
-use arcen_deck_core::screens::about::{AboutAction, render_about};
 use arcen_deck_core::screens::certificate::{
     CertificateAction, CertificateFacts, render_certificate_warning,
 };
@@ -52,10 +51,10 @@ use arcen_deck_core::screens::connecting::{
     ConnectingAction, DisplaysUnsupportedAction, TopologyConflictAction, render_connecting,
     render_displays_unsupported, render_topology_conflict,
 };
+use arcen_deck_core::screens::help_windows::{HelpWindow, HelpWindows};
 use arcen_deck_core::screens::home::{HomeEffect, HomeViewState, apply_home_action, render_home};
 use arcen_deck_core::screens::keyboard_help::{
-    KeyboardToast, keyboard_status_line, keyboard_switch_toast, render_keyboard_shortcuts,
-    render_keyboard_toast,
+    KeyboardToast, keyboard_status_line, keyboard_switch_toast, render_keyboard_toast,
 };
 use arcen_deck_core::screens::launcher::{LauncherAction, render_launcher_top_bar};
 use arcen_deck_core::screens::menu::{
@@ -169,9 +168,8 @@ pub(super) struct Launcher {
     form_displays_mode: Option<DisplaysMode>,
     form_keyboard: KeyboardSettings,
     remember_username: bool,
-    about_open: bool,
-    /// Help ▸ Keyboard Shortcuts is open.
-    shortcuts_open: bool,
+    /// Help ▸ About and Help ▸ Keyboard Shortcuts: modal over a session.
+    help: HelpWindows,
     native_tablet: NativeTabletComponent,
     /// Settings › Logs › "Create support bundle…" (shared panel).
     support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel,
@@ -211,6 +209,8 @@ pub(super) struct Launcher {
     fullscreen: bool,
     /// Ctrl+Alt+Home opened the connection bar and gave it the keyboard.
     bar_pinned: bool,
+    /// Where the fullscreen connection bar took the pointer this pass.
+    bar_regions: OverlayPointerRegions,
     /// The connection's name, for the connection bar.
     session_title: String,
     /// Commands chosen on the connection bar or by a Deck chord, for the
@@ -357,8 +357,7 @@ impl Launcher {
             form_displays_mode: None,
             form_keyboard: KeyboardSettings::default(),
             remember_username: true,
-            about_open: false,
-            shortcuts_open: false,
+            help: HelpWindows::default(),
             native_tablet: NativeTabletComponent::default(),
             support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel::default(),
             decode_report,
@@ -380,6 +379,7 @@ impl Launcher {
             clipboard: ClipboardController::new(),
             fullscreen: false,
             bar_pinned: false,
+            bar_regions: OverlayPointerRegions::default(),
             session_title: String::new(),
             bar_commands: Vec::new(),
             hwnd,
@@ -484,7 +484,8 @@ impl Launcher {
     }
 
     /// Follows a held Alt+F4: exits after the hold, or sends the tap to the
-    /// host when it is let go sooner.
+    /// host when it is let go sooner (closes the Help window in front when
+    /// one is open).
     fn drive_quit_hold(&mut self, ctx: &egui::Context) {
         let Some(started) = self.quit_hold else {
             return;
@@ -492,10 +493,7 @@ impl Launcher {
         let held = self
             .connection
             .as_ref()
-            .and_then(|connection| {
-                connection.with_window_input(|input| input.holds_deck_key(KEY_F4))
-            })
-            .unwrap_or(false);
+            .is_some_and(|connection| connection.holds_deck_key(KEY_F4));
         match quit_hold_step(held, started.elapsed()) {
             QuitHoldStep::Holding => {
                 paint_quit_hold_notice(ctx, DeckPlatform::Pc, started.elapsed());
@@ -505,6 +503,12 @@ impl Launcher {
                 tracing::info!("Alt+F4 held; exiting the Deck");
                 self.quit_hold = None;
                 self.exit_requested = true;
+            }
+            // Under a Help window the keys are the Deck's: a quick Alt+F4
+            // closes it, as on any Windows dialog.
+            QuitHoldStep::SendToHost if self.help.modal() => {
+                self.quit_hold = None;
+                let _ = self.help.close_front();
             }
             QuitHoldStep::SendToHost => {
                 self.quit_hold = None;
@@ -599,7 +603,7 @@ impl Launcher {
             MenuCommand::ToggleFullscreen if self.connection.is_some() => {
                 return MenuOutcome::ToggleFullscreen;
             }
-            MenuCommand::About => self.about_open = true,
+            MenuCommand::About => self.help.open(HelpWindow::About),
             MenuCommand::Disconnect => self.disconnect("Disconnected"),
             MenuCommand::ToggleStreamStats => self.show_stream_stats = !self.show_stream_stats,
             MenuCommand::ReleaseModifiers => self.window_input(WindowInput::release_modifiers),
@@ -613,7 +617,7 @@ impl Launcher {
                 self.keyboard_owner_changed();
             }
             MenuCommand::SendKey(key) => self.window_input(|input| input.send_key(key)),
-            MenuCommand::KeyboardShortcuts => self.shortcuts_open = true,
+            MenuCommand::KeyboardShortcuts => self.help.open(HelpWindow::KeyboardShortcuts),
             MenuCommand::TogglePointerLock => self.window_input(|input| {
                 let locked = input.pointer_locked();
                 input.set_pointer_lock(!locked);
@@ -633,6 +637,9 @@ impl Launcher {
     /// Draws one pass, exactly as the macOS Deck frames its launcher: white
     /// behind every launcher screen, the launcher bar above all but Settings.
     pub(super) fn ui(&mut self, ui: &mut egui::Ui) {
+        // Before the connection bar reads Esc: it closes a Help window first.
+        let _ = self.help.take_dismiss_key(ui.ctx());
+        self.bar_regions = OverlayPointerRegions::default();
         self.drive_connection(ui.ctx());
         let mut show_connection_bar = false;
         if let Some(connection) = self.connection.as_mut() {
@@ -653,6 +660,11 @@ impl Launcher {
                     // The menu shows no tick yet; the input already let go.
                     LocalInput::PointerLockReleased => {}
                     LocalInput::Preedit(text) => self.preedit = text,
+                    // Esc or Enter in any session window, which the input
+                    // keeps from the host until it is let go.
+                    LocalInput::DismissModal => {
+                        let _ = self.help.close_front();
+                    }
                 }
             }
             self.clipboard
@@ -733,23 +745,32 @@ impl Launcher {
                     }
                 }
             });
-        self.help_windows(ui.ctx());
+        self.help.show(
+            ui.ctx(),
+            crate::VERSION,
+            crate::VERSION,
+            DeckPlatform::Pc,
+            self.settings.keyboard_switch,
+        );
+        self.publish_local_ui();
     }
 
-    /// Help ▸ About and Help ▸ Keyboard Shortcuts, while open.
-    fn help_windows(&mut self, ctx: &egui::Context) {
-        if self.about_open
-            && render_about(ctx, crate::VERSION, crate::VERSION) == AboutAction::Close
-        {
-            self.about_open = false;
+    /// Where the Deck's own UI takes the session windows' input, after this
+    /// pass drew it: the fullscreen connection bar (the root window only),
+    /// and an open Help window (modal, windowed or fullscreen, in every
+    /// session window, Match My Layout's secondary ones too: its OK button
+    /// and Esc are the Deck's, never the host's).
+    fn publish_local_ui(&mut self) {
+        if self.connection.is_none() {
+            return;
         }
-        render_keyboard_shortcuts(
-            ctx,
-            DeckPlatform::Pc,
-            true,
-            self.settings.keyboard_switch,
-            &mut self.shortcuts_open,
-        );
+        let regions = OverlayPointerRegions {
+            modal: self.help.modal(),
+            ..self.bar_regions
+        };
+        if let Some(connection) = self.connection.as_mut() {
+            connection.set_local_ui(regions);
+        }
     }
 
     /// Settings changed: what takes effect at once does, and they are saved.
@@ -1958,7 +1979,8 @@ impl Launcher {
         self.window_input(|input| input.set_fullscreen(fullscreen));
         if !fullscreen {
             self.unpin_bar();
-            self.window_input(|input| input.set_overlay_pointer(OverlayPointerRegions::default()));
+            self.bar_regions = OverlayPointerRegions::default();
+            self.publish_local_ui();
         }
     }
 
@@ -1987,7 +2009,8 @@ impl Launcher {
 
     /// The fullscreen connection bar: nothing is drawn over the video until
     /// the pointer reaches the top edge above it or Ctrl+Alt+Home pins it.
-    /// The window's input learns where the bar takes the pointer.
+    /// The window's input learns where the bar takes the pointer at the end
+    /// of the pass (`publish_local_ui`).
     fn connection_bar(&mut self, ctx: &egui::Context) {
         if self.bar_pinned
             && (self.connection.is_none()
@@ -2026,12 +2049,12 @@ impl Launcher {
             width: f64::from(rect.width()) * ppp,
             height: f64::from(rect.height()) * ppp,
         };
-        let regions = OverlayPointerRegions {
+        self.bar_regions = OverlayPointerRegions {
             reveal: Some(pixels(connection_bar_reveal_zone(ctx.content_rect()))),
             owned: pass.area.map(pixels),
             whole_window: pass.menu_open,
+            modal: false,
         };
-        self.window_input(|input| input.set_overlay_pointer(regions));
     }
 
     /// The session's overlays over the video (menu toggles).
