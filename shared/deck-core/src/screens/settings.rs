@@ -111,6 +111,8 @@ pub struct SettingsValues {
     pub exact_still_image: bool,
     pub canvas: bool,
     pub keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
+    pub capture_mac_system_shortcuts: bool,
+    pub keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord,
 }
 
 impl SettingsValues {
@@ -143,6 +145,8 @@ impl SettingsValues {
             exact_still_image: settings.exact_still_image,
             canvas: settings.canvas,
             keyboard_capture: settings.keyboard_capture,
+            capture_mac_system_shortcuts: settings.capture_mac_system_shortcuts,
+            keyboard_switch: settings.keyboard_switch,
         }
     }
 
@@ -179,6 +183,8 @@ impl SettingsValues {
         settings.exact_still_image = self.exact_still_image;
         settings.canvas = self.canvas;
         settings.keyboard_capture = self.keyboard_capture;
+        settings.capture_mac_system_shortcuts = self.capture_mac_system_shortcuts;
+        settings.keyboard_switch = self.keyboard_switch;
         changed
     }
 }
@@ -396,6 +402,10 @@ pub struct SettingsFacts<'a> {
     /// executor, `crate::canvas::CanvasRequest::for_sink`): the Canvas
     /// screen updates switch is shown only then.
     pub canvas_available: bool,
+    /// Whether this Deck may take the system shortcuts with an event tap
+    /// (macOS: the Accessibility permission); `None` on a Deck that needs
+    /// no permission for it.
+    pub system_shortcut_permission: Option<bool>,
 }
 
 /// What the user asked for on the Settings screen, besides editing values.
@@ -416,6 +426,9 @@ pub enum SettingsAction {
     NativeTabletComponent,
     /// Logs › support bundle.
     SupportBundle(super::support_bundle::SupportBundleAction),
+    /// Input › "Allow in Accessibility…": ask the system for the permission
+    /// the system-shortcut capture needs.
+    AllowSystemShortcutPermission,
 }
 
 /// The note under Settings › Input › Tablet: which saved connection the
@@ -538,6 +551,8 @@ pub fn render_settings(
         mut exact_still_image,
         mut canvas,
         mut keyboard_capture,
+        mut capture_mac_system_shortcuts,
+        mut keyboard_switch,
     } = values.clone();
     let initial_streaming_preset = StreamingPreset::from_settings(performance, color_fidelity);
     let mut streaming_preset = initial_streaming_preset;
@@ -1166,7 +1181,7 @@ pub fn render_settings(
                              into the captured video. This can feel less responsive and depends \
                              on the capture backend including the cursor.",
                         );
-                        if platform == DeckPlatform::Pc {
+                        {
                             ui.add_space(24.0);
                             ui.label(
                                 egui::RichText::new("System shortcuts go to")
@@ -1182,9 +1197,46 @@ pub fn render_settings(
                                     (policy == arcen_input::keyboard::KeyboardCapturePolicy::Host)
                                         .then_some("(Recommended)"),
                                     super::keyboard_help::capture_policy_label(policy),
-                                    &super::keyboard_help::capture_policy_help(policy, platform),
+                                    &super::keyboard_help::capture_policy_help(
+                                        policy,
+                                        platform,
+                                        keyboard_switch,
+                                    ),
                                 );
                             }
+                            if platform == DeckPlatform::Mac {
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(
+                                        &mut capture_mac_system_shortcuts,
+                                        super::keyboard_help::MAC_SYSTEM_SHORTCUTS_LABEL,
+                                    );
+                                    match facts.system_shortcut_permission {
+                                        Some(true) => {
+                                            ui.label(
+                                                egui::RichText::new("Accessibility allowed")
+                                                    .color(egui::Color32::DARK_GRAY)
+                                                    .size(12.0),
+                                            );
+                                        }
+                                        Some(false)
+                                            if ui.button("Allow in Accessibility…").clicked() =>
+                                        {
+                                            actions.push(
+                                                SettingsAction::AllowSystemShortcutPermission,
+                                            );
+                                        }
+                                        Some(false) | None => {}
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        super::keyboard_help::MAC_SYSTEM_SHORTCUTS_HELP,
+                                    )
+                                    .color(egui::Color32::DARK_GRAY),
+                                );
+                            }
+                            keyboard_switch_rows(ui, platform, &mut keyboard_switch);
                             ui.add_space(6.0);
                             ui.label(
                                 egui::RichText::new(
@@ -1878,8 +1930,120 @@ pub fn render_settings(
         exact_still_image,
         canvas,
         keyboard_capture,
+        capture_mac_system_shortcuts,
+        keyboard_switch,
     };
     actions
+}
+
+/// Settings ▸ Input ▸ Keyboard switch: the presets and a custom chord,
+/// checked in shared code ([`super::keyboard_help::keyboard_switch_verdict`]).
+fn keyboard_switch_rows(
+    ui: &mut egui::Ui,
+    platform: DeckPlatform,
+    switch: &mut arcen_input::keyboard::KeyboardSwitchChord,
+) {
+    use arcen_input::keyboard::KeyboardSwitchPreset;
+    let draft_id = egui::Id::new("arcen-keyboard-switch-draft");
+    ui.add_space(24.0);
+    ui.label(
+        egui::RichText::new("Keyboard switch")
+            .color(egui::Color32::BLACK)
+            .size(19.0),
+    );
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(super::keyboard_help::keyboard_switch_help(
+            platform, *switch,
+        ))
+        .color(egui::Color32::DARK_GRAY),
+    );
+    ui.add_space(6.0);
+    let mut preset = switch.preset();
+    let mut custom_draft: Option<String> = ui.ctx().data(|data| data.get_temp::<String>(draft_id));
+    if custom_draft.is_some() {
+        preset = KeyboardSwitchPreset::Custom;
+    }
+    for choice in KeyboardSwitchPreset::ALL {
+        let label = super::keyboard_help::keyboard_switch_preset_label(platform, choice);
+        let selected = preset == choice;
+        if ui.radio(selected, label).clicked() && !selected {
+            match choice.chord() {
+                Some(chord) => {
+                    *switch = chord;
+                    custom_draft = None;
+                }
+                None => custom_draft = Some(switch_chord_draft(platform, *switch)),
+            }
+            preset = choice;
+        }
+        if let (true, Some(note)) = (preset == choice, choice.note()) {
+            ui.label(
+                egui::RichText::new(note)
+                    .color(egui::Color32::DARK_GRAY)
+                    .size(12.0),
+            );
+        }
+    }
+    if preset == KeyboardSwitchPreset::Custom {
+        let mut text = custom_draft.unwrap_or_else(|| switch_chord_draft(platform, *switch));
+        let committed = ui
+            .horizontal(|ui| {
+                ui.label("Chord:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .hint_text("Ctrl+Alt+Shift+K")
+                        .desired_width(220.0),
+                )
+                .lost_focus()
+            })
+            .inner;
+        // A chord is used only once typed out (Enter or leaving the field):
+        // the chords a half-typed one passes through are never applied.
+        let current = super::keyboard_help::switch_chord_text(platform, *switch);
+        match super::keyboard_help::keyboard_switch_verdict(&text) {
+            Ok((chord, warning)) => {
+                if committed {
+                    *switch = chord;
+                }
+                let note = if chord == *switch {
+                    warning
+                } else {
+                    Some(format!(
+                        "Press Enter to use it (now {current}).{}",
+                        warning.map_or_else(String::new, |warning| format!(" {warning}"))
+                    ))
+                };
+                if let Some(note) = note {
+                    ui.label(
+                        egui::RichText::new(note)
+                            .color(egui::Color32::from_rgb(0xA0, 0x60, 0x00))
+                            .size(12.0),
+                    );
+                }
+            }
+            Err(reason) => {
+                ui.label(
+                    egui::RichText::new(format!("{reason} Keeping {current}."))
+                        .color(egui::Color32::from_rgb(0xB0, 0x20, 0x20))
+                        .size(12.0),
+                );
+            }
+        }
+        ui.ctx().data_mut(|data| data.insert_temp(draft_id, text));
+    } else {
+        ui.ctx().data_mut(|data| data.remove::<String>(draft_id));
+    }
+}
+
+fn switch_chord_draft(
+    platform: DeckPlatform,
+    switch: arcen_input::keyboard::KeyboardSwitchChord,
+) -> String {
+    match platform {
+        DeckPlatform::Mac => switch.mac_text().replace('-', "+"),
+        DeckPlatform::Pc => switch.pc_text(),
+    }
 }
 
 /// The pen-button rows under Tablet support: the buttons this Deck's
@@ -2214,6 +2378,8 @@ mod tests {
             exact_still_image: true,
             canvas: true,
             keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Host,
+            capture_mac_system_shortcuts: false,
+            keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord::DEFAULT,
         }
     }
 
@@ -2275,6 +2441,7 @@ mod tests {
                 support_bundle: None,
                 connection_displays: None,
                 canvas_available: false,
+                system_shortcut_permission: None,
             };
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 assert!(render_settings(ui, &mut values, &facts).is_empty());
@@ -2317,6 +2484,7 @@ mod tests {
                     }),
                     connection_displays: Some(("Studio".to_owned(), DisplaysMode::MatchLayout)),
                     canvas_available: false,
+                    system_shortcut_permission: None,
                 };
                 let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                     assert!(render_settings(ui, &mut values, &facts).is_empty());

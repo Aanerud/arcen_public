@@ -814,7 +814,10 @@ afterwards) and GAP-049 (Windows: the desk's input stays live unless deskside
 is enabled; closed later on 2026-11-18 by desk privacy on by default, §5). Closed the same day: GAP-046 (a Linux console's windows go back
 after the Deck's layout, `console_windows`) and GAP-048 (a macOS agent that
 dies is followed by its lock guard, and a restarted agent locks first,
-`console_session::owner_death`).
+`console_session::owner_death`). Closed 2026-11-20: GAP-047 (a Windows broker that dies
+is followed by its session guard, and a starting broker locks the recorded
+session first; `hosts/windows/src/owner_guard.rs`, the same shared
+`owner_death` decisions).
 
 ## Consequences
 

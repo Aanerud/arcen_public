@@ -91,7 +91,9 @@ an empty program. There is no single-platform `--workspace` build.
   composed (lab, phase-swept: 25.9 → 12.2 ms present to glass). At
   interval 0 a frame whose GPU work finishes late can be replaced before
   it is shown (lab: 0–6 % of frames, depending on phase).
-- **Fullscreen draws nothing over the video, for every preset.** The
+- **Fullscreen draws nothing over the video, for every preset**, except
+  the keyboard switch's 2.5-second notice right after the user flips it
+  (shared `keyboard_help::render_keyboard_toast`). The
   connection bar (`render_connection_bar`) opens only when the pointer
   reaches the top-edge strip above it or Ctrl+Alt+Home pins it (keyboard
   to the bar until a command, Esc, or a click into the picture). The

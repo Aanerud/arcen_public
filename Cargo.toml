@@ -64,7 +64,7 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.20.3"
+version = "0.20.4"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -73,19 +73,19 @@ authors = ["TUTTIFRUTTI AS"]
 repository = "https://github.com/Aanerud/arcen_public"
 
 [workspace.dependencies]
-arcen-deck-core = { path = "shared/deck-core", version = "=0.20.3" }
-arcen-identity = { path = "shared/identity", version = "=0.20.3" }
-arcen-input = { path = "shared/input", version = "=0.20.3" }
-arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.20.3" }
-arcen-keel = { path = "shared/keel", version = "=0.20.3" }
-arcen-media = { path = "shared/media", version = "=0.20.3" }
-arcen-observability = { path = "shared/observability", version = "=0.20.3" }
-arcen-outputs = { path = "shared/outputs", version = "=0.20.3" }
-arcen-protocol = { path = "shared/protocol", version = "=0.20.3", default-features = false }
-arcen-session = { path = "shared/session", version = "=0.20.3" }
-arcen-telemetry = { path = "shared/telemetry", version = "=0.20.3" }
-arcen-transport = { path = "shared/transport", version = "=0.20.3", default-features = false }
-arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.20.3" }
+arcen-deck-core = { path = "shared/deck-core", version = "=0.20.4" }
+arcen-identity = { path = "shared/identity", version = "=0.20.4" }
+arcen-input = { path = "shared/input", version = "=0.20.4" }
+arcen-iddcx-provider = { path = "hosts/windows/iddcx-provider", version = "=0.20.4" }
+arcen-keel = { path = "shared/keel", version = "=0.20.4" }
+arcen-media = { path = "shared/media", version = "=0.20.4" }
+arcen-observability = { path = "shared/observability", version = "=0.20.4" }
+arcen-outputs = { path = "shared/outputs", version = "=0.20.4" }
+arcen-protocol = { path = "shared/protocol", version = "=0.20.4", default-features = false }
+arcen-session = { path = "shared/session", version = "=0.20.4" }
+arcen-telemetry = { path = "shared/telemetry", version = "=0.20.4" }
+arcen-transport = { path = "shared/transport", version = "=0.20.4", default-features = false }
+arcen-usb-bridge = { path = "shared/usb-bridge", version = "=0.20.4" }
 bytes = "1.10.1"
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["pkcs8", "rand_core", "std"] }
 ed25519 = { version = "=2.2.3", default-features = false, features = ["pkcs8", "std"] }

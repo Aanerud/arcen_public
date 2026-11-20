@@ -20,6 +20,7 @@ use arcen_protocol::messages::HostPlatform;
 use super::deck_shortcuts::{DeckShortcut, PcModifierState};
 use super::pc::{KEY_DELETE, LockKey, PcKey, PcModifier, iso_key_identifier};
 use super::send_keys::SendKey;
+use super::switch_chord::KeyboardSwitchChord;
 use super::{
     DeckKey, DeckModifiers, HostKeyEdge, KeyboardPolicy, KeyboardSettings, ShortcutMode,
     ShortcutPreference, ShortcutTranslator,
@@ -281,9 +282,15 @@ pub struct HookRouter {
     system_keys: BTreeSet<PcKey>,
     session_keys: BTreeSet<PcKey>,
     held: BTreeSet<PcModifier>,
+    switch: KeyboardSwitchChord,
 }
 
 impl HookRouter {
+    /// The keyboard switch's chord (Settings ▸ Input ▸ Keyboard switch).
+    pub const fn set_switch_chord(&mut self, switch: KeyboardSwitchChord) {
+        self.switch = switch;
+    }
+
     /// Routing begins (the session window got focus, or the grab changed)
     /// with `down` held, as the system saw them.
     pub fn begin(&mut self, down: impl IntoIterator<Item = PcKey>) {
@@ -332,7 +339,7 @@ impl HookRouter {
             return HookRoute::System;
         }
         let deck_chord = matches!(key, PcKey::Position { qt_key, .. }
-            if DeckShortcut::for_pc_key(qt_key, before).is_some());
+            if DeckShortcut::for_pc_key_with(qt_key, before, self.switch).is_some());
         let takes = deck_chord || (grabbed && grab_takes(key, self.modifiers()));
         if !takes {
             self.system_keys.insert(key);
@@ -427,6 +434,8 @@ pub struct PcKeyboardInput {
     /// This computer has the keyboard ([`super::KeyboardCapture`]): keys
     /// are only watched for the escape chord.
     released: bool,
+    /// The keyboard switch's chord.
+    switch: KeyboardSwitchChord,
     raw_count: u64,
     suppressed_count: u64,
 }
@@ -451,6 +460,11 @@ impl PcKeyboardInput {
     #[must_use]
     pub const fn policy(&self) -> KeyboardPolicy {
         self.translator.policy()
+    }
+
+    /// The keyboard switch's chord (Settings ▸ Input ▸ Keyboard switch).
+    pub const fn set_switch_chord(&mut self, switch: KeyboardSwitchChord) {
+        self.switch = switch;
     }
 
     /// The modifier keys held on the PC keyboard.
@@ -577,7 +591,10 @@ impl PcKeyboardInput {
             return Vec::new();
         }
         let edges = if released {
-            self.release_all()
+            self.held.clear();
+            self.composing.clear();
+            self.deck_keys.clear();
+            self.translator.release_all_for_switch()
         } else {
             self.held.clear();
             self.composing.clear();
@@ -623,7 +640,7 @@ impl PcKeyboardInput {
                 }
                 if event.pressed
                     && !event.repeat
-                    && DeckShortcut::for_pc_key(qt_key, self.modifiers())
+                    && DeckShortcut::for_pc_key_with(qt_key, self.modifiers(), self.switch)
                         == Some(DeckShortcut::ReleaseKeyboard)
                 {
                     self.deck_keys.insert(qt_key);
@@ -677,7 +694,9 @@ impl PcKeyboardInput {
                 return self.suppress("deck_shortcut");
             }
             if event.pressed && !event.repeat {
-                if let Some(action) = DeckShortcut::for_pc_key(qt_key, self.modifiers()) {
+                if let Some(action) =
+                    DeckShortcut::for_pc_key_with(qt_key, self.modifiers(), self.switch)
+                {
                     self.deck_keys.insert(qt_key);
                     return PcKeyAction::Shortcut(action);
                 }
@@ -1169,6 +1188,53 @@ mod tests {
                 reason: "deck_shortcut"
             }
         );
+    }
+
+    #[test]
+    fn a_chosen_switch_chord_replaces_control_alt_home() {
+        let mut input = PcKeyboardInput::default();
+        input.set_switch_chord(KeyboardSwitchChord::ALT_F1);
+        let alt = modifier(PcModifier::LeftAlt);
+        let f1 = position(crate::keyboard::pc::KEY_F1);
+        host_edges(&mut input, &[press(alt)]);
+        assert_eq!(
+            input.key(press(f1)),
+            PcKeyAction::Shortcut(DeckShortcut::ReleaseKeyboard)
+        );
+        // Only Alt reached the host: a Control tap masks its release, so the
+        // host never sees Alt pressed and let go alone.
+        let edges = input.set_released(true);
+        assert_eq!(
+            edges.first().map(|edge| (edge.qt_key, edge.pressed)),
+            Some((KEY_CONTROL, true))
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.qt_key == KEY_ALT && !edge.pressed)
+        );
+        assert_ne!(
+            input.key(release(f1)),
+            PcKeyAction::Shortcut(DeckShortcut::ReleaseKeyboard)
+        );
+        // While this computer has the keyboard, only the chosen chord comes
+        // back.
+        let control = modifier(PcModifier::LeftControl);
+        let home = position(crate::keyboard::pc::KEY_HOME);
+        assert_eq!(input.key(press(control)), PcKeyAction::Local);
+        assert_eq!(input.key(press(home)), PcKeyAction::Local);
+        assert_eq!(input.key(release(home)), PcKeyAction::Local);
+        assert_eq!(input.key(release(control)), PcKeyAction::Local);
+        assert_eq!(input.key(press(alt)), PcKeyAction::Local);
+        assert_eq!(
+            input.key(press(f1)),
+            PcKeyAction::Shortcut(DeckShortcut::ReleaseKeyboard)
+        );
+        let mut router = HookRouter::default();
+        router.set_switch_chord(KeyboardSwitchChord::ALT_F1);
+        router.begin([]);
+        assert_eq!(router.route(alt, true, false), HookRoute::System);
+        assert_eq!(router.route(f1, true, false), HookRoute::Session);
     }
 
     #[test]

@@ -220,6 +220,15 @@ impl DedicatedEightBitPresentationStatus {
     }
 }
 
+/// A dedicated presenter's presentation outcomes since they were last
+/// taken: what session health counts, taken every UI pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DedicatedPresentations {
+    pub(crate) frames_confirmed: u64,
+    pub(crate) presented_time_unconfirmed: u64,
+    pub(crate) confirmed_presented_at: Vec<std::time::Instant>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DedicatedPresenterTelemetryDelta {
     pub(crate) drops: u64,

@@ -41,6 +41,10 @@
 //!   inventory, keyed by adapter LUID and CCD target id) and the versioned
 //!   full-topology recovery model. The Pier keeps only the CCD, NVAPI and
 //!   `IddCx` calls that enumerate and apply.
+//! - [`windows_advanced_colour`]: when a Windows session display's colour
+//!   state (SDR, WCG or HDR composition and the user's HDR toggle) admits
+//!   capture, which HDR toggle to change, and what to restore. The Pier
+//!   keeps only the `DisplayConfig` calls that read and set it.
 //! - [`xorg_gpu`]: which PCI GPU a dedicated NVIDIA Xorg `Device` section
 //!   names (`BusID`), decided from host-reported PCI facts, so a template
 //!   never carries one machine's GPU address to another.
@@ -75,6 +79,7 @@ pub mod nvidia_heads;
 pub mod provider;
 pub mod ui_scale;
 pub mod virtual_topology;
+pub mod windows_advanced_colour;
 pub mod windows_multi_monitor;
 pub mod windows_recovery;
 pub mod windows_topology;

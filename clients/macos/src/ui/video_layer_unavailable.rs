@@ -100,6 +100,10 @@ impl DedicatedVideoPresenter {
         DedicatedPresenterTelemetryDelta::default()
     }
 
+    pub(crate) fn take_presentations(&self) -> DedicatedPresentations {
+        DedicatedPresentations::default()
+    }
+
     pub fn teardown(&mut self) {}
 
     pub(crate) fn layer_colour_state(&self) -> Option<LayerColourState> {
@@ -154,6 +158,10 @@ impl DedicatedEightBitVideoPresenter {
 
     pub(crate) fn take_telemetry(&self) -> DedicatedPresenterTelemetryDelta {
         DedicatedPresenterTelemetryDelta::default()
+    }
+
+    pub(crate) fn take_presentations(&self) -> DedicatedPresentations {
+        DedicatedPresentations::default()
     }
 
     pub fn teardown(&mut self) {}

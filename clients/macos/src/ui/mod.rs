@@ -26,6 +26,7 @@ mod refine_overlay;
 pub mod region_runtime;
 mod session_truth;
 mod sharp_cursor;
+mod system_shortcut_tap;
 pub mod text_input;
 pub mod theme;
 pub mod trusted_pins;

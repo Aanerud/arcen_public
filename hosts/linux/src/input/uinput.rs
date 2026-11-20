@@ -733,12 +733,11 @@ impl InputController {
         Ok(())
     }
 
-    /// True: without the tablet-tool device the pen still moves the cursor
-    /// and clicks through the absolute pointer device, which is always
-    /// present (no pressure or tilt then).
+    /// Whether a real tablet-tool device can deliver the advertised pen axes.
+    /// Mouse compatibility without that device does not establish pen support.
     #[must_use]
     pub const fn pen_available(&self) -> bool {
-        true
+        self.tablet_device.is_some()
     }
 
     /// Destroys the virtual tablet-tool device so a bridged physical tablet is
@@ -1084,6 +1083,33 @@ fn relative_motion_events(dx: i32, dy: i32) -> [InputEvent; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires /dev/uinput; creates isolated virtual devices without injecting input"]
+    fn losing_the_tablet_device_removes_advertised_pen_axes() {
+        use arcen_input::pen_emulation::PenCapabilityTruth;
+
+        let identity = SessionInputIdentity::for_x_display(":88").expect("test display");
+        let (controller, _) = InputController::new(1920, 1080, None, identity)
+            .expect("uinput keyboard and pointer devices");
+        assert!(
+            controller.tablet_device.is_some(),
+            "test requires a tablet device"
+        );
+        let mut input = super::super::PierInput::Uinput(controller);
+        assert_eq!(
+            input.pen_capabilities(),
+            PenCapabilityTruth::LINUX_UINPUT_TABLET
+        );
+
+        let super::super::PierInput::Uinput(controller) = &mut input else {
+            unreachable!("constructed uinput above");
+        };
+        assert!(controller.release_tablet_device());
+        assert!(!controller.release_tablet_device());
+        assert_eq!(input.pen_capabilities(), PenCapabilityTruth::UNAVAILABLE);
+        assert!(!input.pen_available());
+    }
 
     /// Proves this module's portable, evdev-independent `pen::BTN_*`
     /// constants (kept dependency-free so `pen.rs` can be unit tested off

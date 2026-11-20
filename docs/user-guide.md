@@ -399,9 +399,95 @@ pressure or tilt.
 
 ## 6. Keyboard
 
-<!-- source: clients/macos/src/ui/home.rs (keyboard_field, shortcut_label, shortcut_description, keyboard_mode_label); clients/macos/src/ui/app.rs (Settings › Input › Typing, Paste as Keystrokes, request_quit, QUIT_HOLD); clients/macos/src/ui/macos_menu.rs (Connection menu items and shortcuts); clients/macos/src/ui/text_input.rs (Keyboard: Characters badge); clients/macos/src/ui/paste_keys.rs; shared/input/src/text/paste.rs (rates and limits); shared/input/src/text/policy.rs (defaults); README.md (Your Mac keyboard on the host) -->
+<!-- source: shared/input/src/keyboard/{capture.rs (KeyboardCapture), switch_chord.rs (KeyboardSwitchChord, check), deck_shortcuts.rs (DeckShortcut), mac_capture.rs (MacTapRouter), send_keys.rs (SendKey), host_keys.rs}; shared/deck-core/src/screens/keyboard_help.rs (status line, notice, switch help, Help sheet, ⌘Tab question); shared/deck-core/src/screens/settings.rs (Settings › Input › Keyboard switch); clients/macos/src/ui/{app.rs, keyboard.rs, system_shortcut_tap.rs, macos_menu.rs, home.rs, text_input.rs, paste_keys.rs}; clients/windows/src/input/{mod.rs, hook.rs}; clients/windows/src/shell/{launcher.rs, menu_bar.rs}; shared/input/src/text/{paste.rs, policy.rs}; shared/input/src/pen_buttons.rs -->
 
-### Your Mac keys on the host
+Most keys simply go to the remote computer. This section explains the one
+thing to learn, the **keyboard switch**, then the keys the Deck keeps, the
+keys your keyboard may lack, and what differs on a Mac and per host.
+
+### The keyboard switch: Remote or Local
+
+The Deck has one switch for the keyboard. Press **Ctrl+Alt+Home** (on a Mac
+**⌃⌥Home**; on a laptop without Home, Fn+⌃⌥←) to flip it.
+
+| | **Remote** (the default) | **Local** |
+| --- | --- | --- |
+| Typing and ordinary shortcuts | go to the remote computer | stay on this computer |
+| Alt+Tab, Alt+Shift+Tab | switch the remote computer's windows | switch this computer's windows |
+| The Windows key, Print Screen | open the remote launcher, reach the remote application | act on this computer |
+| On a Mac: ⌘Tab, ⌘Space, Mission Control (⌃↑, ⌃↓), ⌃←, ⌃→ | go to the remote computer, when [the ⌘Tab switch](#on-a-mac) is on | act on this Mac (app switcher, Spotlight, Spaces) |
+
+- **Clicking the picture** in Local also returns to Remote. That click is
+  not sent, so it never paints a stroke or presses a button on the remote
+  computer.
+- Going to Local first lets go of every key held on the remote computer, so
+  nothing stays stuck down there.
+- Every flip shows a short notice at the top of the window: **Keyboard:
+  Remote — Alt+Tab goes to Z8** (⌘Tab on a Mac), or **Keyboard: This
+  computer**.
+- The indicator keeps saying where the keyboard is: at the right end of the
+  menu bar (**Keyboard: Z8 (Ctrl+Alt+Home to release)** or **Keyboard: this
+  PC (click to return)**), and in fullscreen on a PC the connection bar,
+  which stays open while the keyboard is Local.
+- **Connection › Keyboard: Host or This Computer** flips it from the menu.
+- Each new session starts in Remote.
+
+**Settings › Input › System shortcuts go to** decides whether the system
+shortcuts follow the switch: **The remote computer** (the default; in
+Remote they go there, windowed or fullscreen), **The remote computer when
+fullscreen**, or **This computer** (they always stay here; other keys still
+go to the remote computer in Remote).
+
+### Choosing another chord for the switch
+
+If Ctrl+Alt+Home is awkward on your keyboard, or a remote application needs
+it, choose another one in **Settings › Input › Keyboard switch**:
+
+- **Ctrl+Alt+Home** (on a Mac Control-Option-Home), the default.
+- **Ctrl+Alt+Shift+Z**.
+- **Alt+F1** (on a Mac Option-F1). GNOME uses Alt+F1 to open its
+  Activities overview, so a GNOME desktop no longer gets it.
+- **Custom chord**: type it, for example `Ctrl+Alt+K` or `Ctrl+Shift+Win+F2`
+  (on a Mac, Win means ⌘ and Alt means ⌥).
+
+The Deck checks a custom chord at once and keeps the previous one if it
+cannot work. It refuses a chord the operating system keeps for itself
+(Win+L, Ctrl+Alt+Del, ⌥⌘Esc, ⌃⌘Q), a plain key or Shift and a key (that is
+typing), a chord the Deck already uses for something else, and a chord
+macOS acts on before any app sees it (⌘Tab, ⌘Space, ⌃ and an arrow, the
+screenshot keys). It warns, but allows it, when the chord is one that a
+professional application such as Flame, Maya, Nuke or Resolve uses: that
+application then never gets it. The choice applies to both Decks the same
+way, and the menus, the indicator and Help › Keyboard Shortcuts show the
+chord you chose.
+
+### Send Key
+
+**Connection › Send Key** sends a key your keyboard lacks or the operating
+system would not pass on: Print Screen, Scroll Lock, Pause, Insert,
+Ctrl+Alt+Del, Menu and F13–F24. Each is one press and release, after every
+key held on the remote computer is let go. An item is greyed when the
+remote computer cannot take that key.
+
+### The keys the Deck keeps
+
+Everything else reaches the remote computer, including F9 and the keys
+professional applications rely on. The Deck keeps only:
+
+| PC keyboard | Mac keyboard | What it does |
+| --- | --- | --- |
+| Ctrl+Alt+Home (or your chosen chord) | ⌃⌥Home (or your chosen chord) | The keyboard switch |
+| Ctrl+Alt+F12 | ⌃⌥F12 | Disconnect |
+| Ctrl+Alt+Break or Ctrl+Alt+Enter | ⌃⌘F | Fullscreen on or off |
+| Ctrl+Alt+End | Connection › Send Key › Ctrl+Alt+Del | Send Ctrl+Alt+Del to the remote computer |
+| Alt+F4, held | ⌘Q, held for three seconds | Quit the Deck (a tap goes to the remote computer) |
+
+Releasing stuck keys, the keyboard modes and Paste as Keystrokes are menu
+items without a shortcut.
+
+### On a Mac
+
+#### Your Mac keys on the host
 
 The Deck learns what kind of host it reached and maps your keys the way
 that host expects:
@@ -427,6 +513,49 @@ Each saved connection can change this (**Edit** › **Keyboard shortcuts**):
 
 A Mac host always keeps ⌘ as ⌘. Tick **Left Option is also AltGr (Windows
 hosts)** to type AltGr characters with left ⌥ too.
+
+#### ⌘Tab, ⌘Space and Mission Control
+
+macOS acts on ⌘Tab, ⌘Space, Mission Control and ⌃←/⌃→ before any window
+sees them. To send them to the remote computer in Remote, the Deck needs the
+**Accessibility** permission:
+
+- The first time ⌘Tab takes you out of a session in Remote, the Deck asks
+  once: **Send ⌘Tab to the remote? macOS needs the Accessibility
+  permission.** **Allow** turns the sending on and macOS asks you to allow
+  Arcen Deck in **System Settings › Privacy & Security › Accessibility**.
+  **Not now** is remembered and the Deck does not ask again.
+- You can turn it on or off at any time in **Settings › Input › Send ⌘Tab,
+  ⌘Space and Mission Control to the remote computer** (its **Allow in
+  Accessibility…** button opens the request).
+- Without the permission nothing changes: these chords act on this Mac, and
+  the indicator says **Keyboard: Z8, system shortcuts on this Mac**.
+
+With it, the Deck watches the keyboard only while the switch is Remote and a
+session window is in front, and takes only these chords:
+
+| On this Mac | On the remote computer |
+| --- | --- |
+| ⌘Tab, ⇧⌘Tab | the app switcher (Alt+Tab on Windows and Linux, ⌘Tab on a Mac) |
+| ⌘\`, ⌘Space, ⌥⌘Space, ⌥⌘D, ⇧⌘3, ⇧⌘4, ⇧⌘5 | the same keys, mapped like any other |
+| ⌃↑ (Mission Control), ⌃↓ | Ctrl+↑, Ctrl+↓ |
+| ⌃←, ⌃→ | Ctrl+←, Ctrl+→ (in Local they switch this Mac's Spaces) |
+
+⌃← and ⌃→ follow the switch like every other system shortcut: to move
+between this Mac's Spaces during a session, press ⌃⌥Home first. (Before
+this update a separate setting decided them; it is gone.)
+
+#### Print Screen, Scroll Lock and Pause
+
+A Mac keyboard has no Print Screen, Scroll Lock or Pause key. On a Windows
+or Linux host, **F13**, **F14** and **F15** are those keys: an Apple
+extended keyboard has them in those places, and macOS reports a PC
+keyboard's Print Screen, Scroll Lock and Pause as F13–F15. A Mac host gets
+F13–F15. Without those keys, use **Connection › Send Key**.
+
+F1–F12 reach the remote computer as function keys when you hold Fn, or turn
+on **Use F1, F2, etc. keys as standard function keys** in this Mac's
+keyboard settings.
 
 ### Characters or keys
 
@@ -480,56 +609,44 @@ menu item; ⌃⌥⌘V goes to the host).
 It needs a host that types text (Windows or Linux from Arcen 0.18.0). The
 Mac host does not type text yet and says so.
 
-### Print Screen, Scroll Lock and Pause
+### Pen buttons
 
-A Mac keyboard has no Print Screen, Scroll Lock or Pause key. On a Windows
-or Linux host, **F13**, **F14** and **F15** are those keys: an Apple
-extended keyboard has them in those places, and macOS reports a PC
-keyboard's Print Screen, Scroll Lock and Pause as F13–F15. A Mac host gets
-F13–F15.
+The pen's side buttons are part of the pen, not the keyboard: see
+[Pen and tablet](#5-pen-and-tablet). In **Settings › Input › Tablet
+support**, choose what each button does on the remote computer (Right
+click, Middle click or Off): the Windows Ink barrel button on a PC, the
+lower and upper side switch of a Mac pen. When the tablet driver itself
+turns a button into a click, the Deck sends that click.
 
-From a PC keyboard every Pier takes F13–F24 and the Menu key too, except a
-Mac host, which has no F21–F24, Insert, Print Screen, Scroll Lock or Pause
-(macOS has no such keys); it takes F13–F20 and gives the Menu key to the
-application as a PC keyboard's Menu key on a Mac.
+### What never goes to the remote computer
 
-### Send Key
+Some keys belong to this computer's operating system, which acts on them
+before any application, the Deck included, can see them:
 
-**Connection › Send Key** sends a key your keyboard lacks, on both Decks:
-Print Screen, Scroll Lock, Pause, Insert, Ctrl+Alt+Del, Menu and F13–F24.
-Each is one press and release, after every key held on the host is let go.
+- **Win+L** locks this PC. To lock the remote computer, use its own menu.
+- **Ctrl+Alt+Del** opens this PC's security screen. Use **Connection › Send
+  Key › Ctrl+Alt+Del** (or Ctrl+Alt+End on a PC) for the remote computer's.
+- On a Mac, **⌥⌘Esc** (Force Quit) and **⌃⌘Q** (Lock Screen) always stay on
+  this Mac, and so does every key while another application asks for secure
+  input (a password field elsewhere turns on macOS's Secure Input).
 
-### Who has the keyboard (Windows Deck)
+### Notes per remote computer
 
-While a session window has focus, the host has the keyboard, and its system
-shortcuts go there too: Alt+Tab and Alt+Shift+Tab switch the host's
-windows, the Windows key opens the host's launcher and Print Screen reaches
-the host's application, windowed and fullscreen. The right end of the menu
-bar says so: **Keyboard: Z8 (Ctrl+Alt+Home to release)**.
-
-- **Ctrl+Alt+Home** gives the keyboard to this PC. Every key held on the
-  host is released first, then nothing more reaches the host, Alt+Tab
-  switches this PC's windows, and the menu bar says **Keyboard: this PC
-  (click to return)**. In fullscreen the connection bar stays open and says
-  the same.
-- **Ctrl+Alt+Home** again, or a click into the picture, gives it back. That
-  click is not sent to the host, so it never paints a stroke or presses a
-  button there.
-- **Settings › Input › System shortcuts go to** chooses when the system
-  shortcuts go to the host: **The remote computer** (the default), **The
-  remote computer when fullscreen**, or **This computer**. Windows+L and
-  Ctrl+Alt+Del always stay with this PC; use **Connection › Send Key ›
-  Ctrl+Alt+Del** (or Ctrl+Alt+End) for the host's.
-
-On a Mac Deck, ⌃⌥Home (Fn+⌃⌥← on a laptop) releases every key held on the
-host and the pointer lock; giving the whole keyboard, ⌘Tab included, to the
-host comes with a later release.
+- **Linux with GNOME**: Print Screen opens GNOME's screenshot tool, as it
+  would at the desk, and Alt+F1 opens the Activities overview. An
+  application that wants Print Screen itself needs it unbound in GNOME's
+  keyboard settings.
+- **Windows**: Ctrl+Alt+Del arrives through Send Key or Ctrl+Alt+End.
+  F13–F24 and the Menu key arrive as Windows' own keys.
+- **Mac (preview)**: macOS has no F21–F24, Insert, Print Screen, Scroll Lock
+  or Pause, so the Mac host takes F13–F20 and the Menu key only, and Send
+  Key greys out the rest. Your ⌘ stays ⌘.
 
 ### Help › Keyboard Shortcuts
 
-**Help › Keyboard Shortcuts** lists every key the Deck keeps for itself and
-where everything else went. F9, Ctrl+Win+K/U and Ctrl+Alt+Win+V (on a Mac
-⌃⌘K/U and ⌃⌥⌘V) are not the Deck's any more: they reach the host.
+**Help › Keyboard Shortcuts** lists every key the Deck keeps, the keyboard
+switch with the chord you chose, the menu items and the keys Send Key
+sends, so you can check it during a session.
 
 ### Two keys to remember
 
@@ -773,6 +890,8 @@ and says what to do. Then look for what you see below. Anything marked
 | "This host cannot type text sent from the Deck…" | The host cannot type characters (the Mac host, or a host older than 0.18.0). | Use physical keys; ask about updating the host. |
 | Keys stuck, or every key acting like a shortcut | The host thinks a modifier is still held. | **Connection › Release Stuck Keys**. |
 | Alt+Tab or Print Screen act on the Windows Deck's own PC | This PC has the keyboard (the menu bar says **Keyboard: this PC**), or Settings › Input keeps the system shortcuts here. | Click the picture or press Ctrl+Alt+Home; check **Settings › Input › System shortcuts go to**. |
+| ⌘Tab or ⌘Space act on the Mac, not the host | The tap is off (the default), Arcen Deck is not allowed in Accessibility, this Mac has the keyboard, or a password field elsewhere holds secure input. | Turn on **Settings › Input › Send ⌘Tab, ⌘Space and Mission Control…** and allow Accessibility; click the picture or press ⌃⌥Home. |
+| Nothing I type reaches the host (Mac Deck) | This Mac has the keyboard (the menu bar says **Keyboard: this Mac**). | Click the picture or press ⌃⌥Home. |
 | A black screen just after a Windows sign-in | Windows waits for its desktop to settle before showing it. | Wait about 25 seconds. |
 | The picture does not change | A still desktop sends no new frames; the Deck keeps the last one. | Move the pointer. If it still never updates, run Test connection. |
 | Clipboard does nothing | The host's policy turns it off or one way, or the copy is too large. | Check **Settings › Clipboard › Effective host policy**. |

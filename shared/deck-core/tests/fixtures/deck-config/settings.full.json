@@ -1,6 +1,7 @@
 {
   "canvas": false,
   "canvas_cache_mib": 32,
+  "capture_mac_system_shortcuts": true,
   "clipboard_enabled": false,
   "color_fidelity": "grading_reference",
   "color_fidelity_bit_depth_override": "12",
@@ -18,7 +19,9 @@
   "hidpi_display_mask": 2,
   "hidpi_streaming": true,
   "keyboard_capture": "fullscreen",
+  "keyboard_switch": "Ctrl+Alt+Shift+Z",
   "log_level": 3,
+  "mac_system_shortcut_offer_answered": true,
   "option_key_mode": "both_alt",
   "option_keys": "both_alt",
   "paste_chars_per_second": 10,

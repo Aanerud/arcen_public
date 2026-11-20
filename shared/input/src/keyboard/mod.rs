@@ -30,18 +30,24 @@
 //! - [`KeyboardCapture`] decides who has the keyboard (the host or this
 //!   computer) and [`KeyboardCapturePolicy`] when the system shortcuts go
 //!   to the host;
+//! - [`KeyboardSwitchChord`] is the keyboard switch's chord (Ctrl+Alt+Home
+//!   by default, presets and a checked custom chord);
+//! - [`MacTapRouter`] decides which Mac system shortcuts (⌘Tab, ⌘Space,
+//!   Mission Control) a macOS Deck's event tap takes for the host;
 //! - [`SendKey`] is the Send Key menu, [`KeyRemapTable`] a validated remap
 //!   table, and [`PRO_APP_CHORDS`] the chords no Deck chord may take.
 
 mod capture;
 mod deck_shortcuts;
 pub mod host_keys;
+mod mac_capture;
 pub mod pc;
 mod pc_input;
 mod pro_app_chords;
 pub mod scancode;
 mod send_keys;
 mod shortcuts;
+mod switch_chord;
 pub mod windows;
 
 use arcen_protocol::messages::HostPlatform;
@@ -51,6 +57,11 @@ pub use capture::{
     KeyboardStatus,
 };
 pub use deck_shortcuts::{DeckShortcut, MacChord, PcChord, PcModifierState};
+pub use mac_capture::{
+    MAC_KEY_3, MAC_KEY_4, MAC_KEY_5, MAC_KEY_D, MAC_KEY_DOWN, MAC_KEY_ESCAPE, MAC_KEY_GRAVE,
+    MAC_KEY_HOME, MAC_KEY_LEFT, MAC_KEY_Q, MAC_KEY_RIGHT, MAC_KEY_SPACE, MAC_KEY_TAB, MAC_KEY_UP,
+    MacKeyCode, MacSystemChord, MacTapEvent, MacTapModifiers, MacTapRouter, TapRoute,
+};
 pub use pc_input::{
     AltGrKey, HookRoute, HookRouter, MacHostCommandKey, PcKeyAction, PcKeyEvent, PcKeyboardInput,
     PcKeyboardSettings, SystemChord, grab_takes, resolve_pc_keyboard_policy,
@@ -62,6 +73,9 @@ pub use send_keys::{
 };
 pub use shortcuts::{
     DeckKey, DeckModifiers, HostKeyEdge, ShortcutTranslator, WINDOWS_APP_CONTROL_KEYS,
+};
+pub use switch_chord::{
+    KeyboardSwitchChord, KeyboardSwitchPreset, SwitchChordCheck, SwitchChordRejection,
 };
 
 /// What a connection asks Command and Control to be.

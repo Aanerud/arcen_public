@@ -1340,6 +1340,20 @@ async fn run_correlated_broker(
         user_sid: native_user_sid.clone(),
         armed: took_over || identity_binding != "existing_session",
     };
+    // Covers this attachment if the broker itself dies before the session is
+    // handed back: a guard outside the broker locks it, and the record has a
+    // restarted broker lock it first (`owner_guard`, GAP-047). Released after
+    // `hand_back_session`.
+    let mut owner_guard = {
+        let windows_session_id = identity.session_id;
+        let user_sid = native_user_sid.clone();
+        let lock_on_drop = early_lock.armed;
+        tokio::task::spawn_blocking(move || {
+            crate::owner_guard::OwnerGuard::arm(windows_session_id, &user_sid, lock_on_drop)
+        })
+        .await
+        .map_err(|_| "session guard task failed".to_string())?
+    };
     // The desk's speakers go silent before the session's agent starts and
     // stay so until the session is locked again (`hand_back_session`).
     let local_playback_policy = cfg.local_playback;
@@ -1460,6 +1474,7 @@ async fn run_correlated_broker(
     let hand_back_session_id = identity.session_id;
     let hand_back_sid = native_user_sid.clone();
     early_lock.armed = false;
+    owner_guard.set_lock_on_drop(true);
     // A Deck that fails before streaming leaves the desk as a Deck that
     // left: locked (ADR 0025).
     let mut departure = Departure::AgentFailed;
@@ -1646,6 +1661,7 @@ async fn run_correlated_broker(
         local_playback_lease,
     )
     .await;
+    owner_guard.release();
     match (result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
@@ -1819,7 +1835,7 @@ impl Drop for EarlyLock {
 }
 
 /// How long the session's lock waits for a display journal to be replayed.
-const DISPLAY_RESTORE_WAIT: Duration = Duration::from_secs(15);
+pub(crate) const DISPLAY_RESTORE_WAIT: Duration = Duration::from_secs(15);
 
 /// Waits, bounded, until no display recovery journal is left: a session
 /// agent that exits restores its displays itself, while a failed or

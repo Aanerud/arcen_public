@@ -124,6 +124,10 @@ impl ClientTelemetry {
     /// ([`arcen_media::presentation::presented_frames_for_health`]):
     /// `confirmed` frames carry a presentation timestamp, `unconfirmed` ones
     /// do not and count only until a presenter has reported a timestamp.
+    ///
+    /// Call it as the outcomes are observed (every UI pass), not when they
+    /// are logged: the health window compares them with frames decoded in
+    /// the same five seconds.
     pub fn record_presenter_frames(
         &self,
         confirmed: u64,
@@ -502,6 +506,72 @@ mod tests {
         let (_, _, sample) = telemetry.snapshot(&mut window, None, 5_000, 30, 0);
         assert_eq!(sample.frames_presented, Some(40));
         assert_eq!(arcen_telemetry::unpresented_basis_points(&sample), Some(0));
+    }
+
+    /// Thirty frames a second for twenty seconds, each reported as it is
+    /// presented (as the Decks now take presenter outcomes every UI pass):
+    /// every five-second window balances. Reported in 1.175 s batches, as
+    /// the macOS Deck did with its log, the same stream read 140 of 150
+    /// presented ("Critical") three windows in four.
+    #[test]
+    fn presents_reported_as_observed_balance_every_window() {
+        let telemetry = warmed_telemetry();
+        telemetry.record_presenter_frames(1, 0, true);
+        let mut window = telemetry.window(0);
+        let batched = warmed_telemetry();
+        batched.record_presenter_frames(1, 0, true);
+        let mut batched_window = batched.window(0);
+        let (mut decoded, mut pending_batch, mut alarms) = (0_u64, 0_u64, 0);
+        for frame in 1..=600_u64 {
+            let at_ms = frame * 1_000 / 30;
+            decoded += 1;
+            telemetry.record_media(decoded, decoded, 0, Duration::from_millis(2));
+            telemetry.record_presenter_frames(1, 0, true);
+            batched.record_media(decoded, decoded, 0, Duration::from_millis(2));
+            pending_batch += 1;
+            if at_ms % 1_175 < 1_000 / 30 {
+                batched.record_presenter_frames(pending_batch, 0, true);
+                pending_batch = 0;
+            }
+            if at_ms % 5_000 == 0 {
+                let (_, health, sample) = telemetry.snapshot(&mut window, None, at_ms, 30, 0);
+                assert_eq!(sample.frames_decoded, sample.frames_presented);
+                assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+                let (_, health, _) = batched.snapshot(&mut batched_window, None, at_ms, 30, 0);
+                alarms += usize::from(health.client_experience.state != Some(HealthState::Ok));
+            }
+        }
+        assert!(alarms > 0, "batched reports misattribute presents");
+    }
+
+    /// What is genuinely lost still raises the alarm, and a presenter that
+    /// confirms nothing still reads as a stall.
+    #[test]
+    fn real_loss_and_a_silent_presenter_are_still_reported() {
+        let telemetry = warmed_telemetry();
+        telemetry.record_presenter_frames(1, 0, true);
+        let mut window = telemetry.window(0);
+        telemetry.record_media(150, 150, 0, Duration::from_millis(2));
+        telemetry.record_presenter_frames(130, 0, true);
+        let (_, health, sample) = telemetry.snapshot(&mut window, None, 5_000, 30, 0);
+        assert_eq!(sample.frames_decoded, Some(150));
+        assert_eq!(health.client_experience.state, Some(HealthState::Critical));
+        assert_eq!(
+            health.client_experience.dominant_cause,
+            Some(arcen_telemetry::HealthCause::Loss)
+        );
+
+        let mut decoded = 150;
+        let mut last = None;
+        for step in 2..=4_u64 {
+            decoded += 150;
+            telemetry.record_media(decoded, decoded, 0, Duration::from_millis(2));
+            telemetry.record_presenter_frames(0, 150, true);
+            let (_, health, sample) = telemetry.snapshot(&mut window, None, step * 5_000, 30, 0);
+            assert_eq!(sample.fps_actual, Some(0));
+            last = health.client_experience.state;
+        }
+        assert_eq!(last, Some(HealthState::Critical));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 {
   "canvas": true,
   "canvas_cache_mib": 100,
+  "capture_mac_system_shortcuts": true,
   "clipboard_enabled": false,
   "color_fidelity": "standard",
   "cursor_preference": "local",
@@ -16,7 +17,9 @@
   "hidpi_streaming": true,
   "keyboard_capture": "this_computer",
   "keyboard_grab": "never",
+  "keyboard_switch": "Ctrl+Alt+Home",
   "log_level": 3,
+  "mac_system_shortcut_offer_answered": false,
   "option_key_mode": "left_alt_right_characters",
   "option_keys": "automatic",
   "paste_chars_per_second": 25,

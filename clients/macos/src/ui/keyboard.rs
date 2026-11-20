@@ -58,12 +58,61 @@ pub struct KeyboardInput {
     raw_count: u64,
     emitted_count: u64,
     suppressed_count: u64,
-    /// The escape chord's Home is down: its release is the Deck's too.
+    /// The keyboard switch's key is down: its release is the Deck's too.
     escape_home_held: bool,
+    /// The keyboard switch's chord (Control-Option-Home by default).
+    switch: arcen_input::keyboard::KeyboardSwitchChord,
 }
 
-/// `Qt::Key_Home`, the escape chord's key.
+/// `Qt::Key_Home`, the default keyboard switch's key.
+#[cfg(test)]
 const QT_KEY_HOME: u32 = arcen_input::keyboard::pc::KEY_HOME;
+
+/// Whether a key event is the keyboard switch's chord being pressed (not a
+/// repeat), read the way [`KeyboardInput`] reads keys.
+pub fn is_switch_chord(
+    event: &egui::Event,
+    native: Option<NativeKeyMetadata>,
+    switch: arcen_input::keyboard::KeyboardSwitchChord,
+) -> bool {
+    let egui::Event::Key {
+        key,
+        physical_key,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    } = event
+    else {
+        return false;
+    };
+    let Some(deck_key) = native_deck_key(*key, *physical_key, native, false) else {
+        return false;
+    };
+    switch.matches_mac(arcen_input::keyboard::MacChord {
+        shift: modifiers.shift,
+        ..arcen_input::keyboard::MacChord::new(
+            modifiers.ctrl,
+            modifiers.alt,
+            modifiers.mac_cmd,
+            physical_id(deck_key),
+        )
+    })
+}
+
+fn native_deck_key(
+    key: egui::Key,
+    physical_key: Option<egui::Key>,
+    native: Option<NativeKeyMetadata>,
+    intl_backslash: bool,
+) -> Option<DeckKey> {
+    match native {
+        Some(metadata) if metadata.keypad => Some(DeckKey::Other(metadata.qt_key)),
+        Some(metadata) => mac_grave_or_iso_key(metadata.key_code, iso_keyboard())
+            .map(|position| DeckKey::Other(position.qt_key(intl_backslash)))
+            .or_else(|| egui_key_to_deck(physical_key.unwrap_or(key), intl_backslash)),
+        None => egui_key_to_deck(physical_key.unwrap_or(key), intl_backslash),
+    }
+}
 
 /// The identifier a physical key is tracked by: its key identifier, with
 /// the two Option keys told apart.
@@ -81,6 +130,21 @@ const fn physical_id(key: DeckKey) -> u32 {
 impl KeyboardInput {
     pub fn begin_frame(&mut self) {
         self.frame = self.frame.saturating_add(1);
+    }
+
+    /// The keyboard switch's chord.
+    pub const fn set_switch_chord(&mut self, switch: arcen_input::keyboard::KeyboardSwitchChord) {
+        self.switch = switch;
+    }
+
+    #[cfg(test)]
+    pub fn held_keys_insert_for_test(&mut self, qt_key: u32) {
+        self.held_keys.insert(qt_key);
+    }
+
+    /// Whether ⌘ is held now (as this window last saw it).
+    pub fn command_held(&self) -> bool {
+        self.held_keys.contains(&QT_KEY_META)
     }
 
     pub fn update_focus(&mut self, focused: bool) -> bool {
@@ -124,13 +188,7 @@ impl KeyboardInput {
         }
         let wire_modifiers = qt_modifiers_to_wire(qt_modifiers);
         let intl_backslash = self.translator.policy().intl_backslash;
-        let deck_key = match native {
-            Some(metadata) if metadata.keypad => Some(DeckKey::Other(metadata.qt_key)),
-            Some(metadata) => mac_grave_or_iso_key(metadata.key_code, iso_keyboard())
-                .map(|position| DeckKey::Other(position.qt_key(intl_backslash)))
-                .or_else(|| egui_key_to_deck(physical_key.unwrap_or(*key), intl_backslash)),
-            None => egui_key_to_deck(physical_key.unwrap_or(*key), intl_backslash),
-        };
+        let deck_key = native_deck_key(*key, *physical_key, native, intl_backslash);
         let Some(deck_key) = deck_key else {
             self.suppressed_count = self.suppressed_count.saturating_add(1);
             return KeyboardAction::Suppressed {
@@ -139,6 +197,8 @@ impl KeyboardInput {
                 reason: "unmapped",
             };
         };
+        // The keyboard switch is read on the key as pressed.
+        let switch_key = physical_id(deck_key);
         // F13-F15 are Print Screen, Scroll Lock and Pause on a PC host.
         let deck_key = match deck_key {
             DeckKey::Other(qt_key) => DeckKey::Other(arcen_input::keyboard::mac_key_on_host(
@@ -149,23 +209,24 @@ impl KeyboardInput {
         };
         let qt_key = physical_id(deck_key);
 
-        // Control-Option-Home, the Deck's escape chord: every key held on
-        // the host is released and the pointer lock lets go (F9 reaches
-        // the host). Its own Home edges never do.
+        // The keyboard switch (Control-Option-Home by default): every key
+        // held on the host is released and the pointer lock lets go (F9
+        // reaches the host). Its own key's edges never do.
         let escape = *pressed
             && !*repeat
-            && arcen_input::keyboard::DeckShortcut::for_mac_chord(
+            && arcen_input::keyboard::DeckShortcut::for_mac_chord_with(
                 arcen_input::keyboard::MacChord {
                     shift: modifiers.shift,
                     ..arcen_input::keyboard::MacChord::new(
                         modifiers.ctrl,
                         modifiers.alt,
                         modifiers.mac_cmd,
-                        qt_key,
+                        switch_key,
                     )
                 },
+                self.switch,
             ) == Some(arcen_input::keyboard::DeckShortcut::ReleaseKeyboard);
-        if escape || (qt_key == QT_KEY_HOME && self.escape_home_held) {
+        if escape || (switch_key == self.switch.key && self.escape_home_held) {
             self.suppressed_count = self.suppressed_count.saturating_add(1);
             if *pressed && !*repeat {
                 self.escape_home_held = true;
@@ -245,6 +306,12 @@ impl KeyboardInput {
         }
     }
 
+    /// Forgets a Home held from the escape chord: its release never came
+    /// here (this Mac had the keyboard), so the next Home is a plain key.
+    pub fn clear_escape_home(&mut self) {
+        self.escape_home_held = false;
+    }
+
     pub fn record_delivery(&mut self, sent: bool) {
         if sent {
             self.emitted_count = self.emitted_count.saturating_add(1);
@@ -304,6 +371,13 @@ impl KeyboardInput {
     pub fn release_all(&mut self) -> Vec<HostKeyEdge> {
         self.held_keys.clear();
         self.translator.release_all()
+    }
+
+    /// [`Self::release_all`] when the keyboard switch takes the keyboard
+    /// from the host (an Alt held alone there is masked first).
+    pub fn release_all_for_switch(&mut self) -> Vec<HostKeyEdge> {
+        self.held_keys.clear();
+        self.translator.release_all_for_switch()
     }
 
     /// Forgets every held key without sending anything (the session is

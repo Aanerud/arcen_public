@@ -146,6 +146,7 @@ difference = "Xorg serves an HDR request as Grading unless the desktop is declar
 earned_by = "Xorg has no HDR output model; Mutter before 50 has no HDR screen sharing; Windows advanced colour (DisplayConfig); macOS EDR headroom and Core Image 203-nit white."
 code = [
   { path = "hosts/windows/src/advanced_color.rs", symbol = "AdvancedColorRecoveryEntry" },
+  { path = "shared/outputs/src/windows_advanced_colour.rs", symbol = "setup_poll" },
   { path = "hosts/macos/src/hdr_white.rs", symbol = "kCIContextWorkingColorSpace" },
 ]
 decision = "AGENTS.md"
@@ -352,12 +353,27 @@ code = [
 id = "GAP-052"
 area = "Deck keyboard"
 products = ["clients/macos"]
-difference = "The Windows Deck gives the keyboard to this computer and back (shared KeyboardCapture: Ctrl+Alt+Home, a consumed click into the picture, the menu bar indicator, Settings > Input > System shortcuts go to) and takes the system shortcuts for the host; the macOS Deck sends no Command+Tab, Command+Space or Mission Control chord to the host, its Control-Option-Home only releases held keys and the pointer lock, and it shows no capture indicator or setting."
-why_open = "Not implemented yet (work package K4). The macOS route is an active CGEventTap installed only while the host has the keyboard and the session window is key, which needs the Accessibility permission (a Release/Security decision: entitlement and TCC wording in ENTITLEMENTS.md), re-armed on kCGEventTapDisabledByTimeout and released under Secure Event Input. The shared state machine, chords, wording and cheat sheet are ready for it."
+difference = "Both Decks have one keyboard switch, the same way (shared KeyboardCapture and KeyboardSwitchChord: Ctrl+Alt+Home or Control-Option-Home by default, a chord chosen in Settings > Input > Keyboard switch, a consumed click into the picture, the indicator and a notice on every flip). In Remote the Windows Deck takes the system shortcuts for the host by default; the macOS Deck takes Command+Tab, Command+Space, Mission Control and Control-Left/Right only with Settings > Input > Send Command-Tab, Command-Space and Mission Control on (offered once, in context, the first time Command+Tab leaves a session), which needs the Accessibility permission."
+why_open = "The macOS event tap is built (an active CGEventTap installed only while the host has the keyboard and a session window is key, re-armed on kCGEventTapDisabledByTimeout, passing every event under Secure Event Input or aimed at another process; decisions in the shared MacTapRouter). Without the permission a Mac keeps Command+Tab and the other system chords; turning the tap on by default needs Release/Security approval of asking a Deck user for Accessibility (TCC wording in clients/macos/ENTITLEMENTS.md). Not yet proven with a real keyboard on a Mac Deck."
 owner = "macOS Client"
 code = [
   { path = "shared/input/src/keyboard/capture.rs", symbol = "KeyboardCapture" },
+  { path = "shared/input/src/keyboard/mac_capture.rs", symbol = "MacTapRouter" },
+  { path = "clients/macos/src/ui/system_shortcut_tap.rs", symbol = "CGEventTapCreate" },
   { path = "clients/windows/src/input/mod.rs", symbol = "toggle_keyboard" },
+  { path = "shared/input/src/keyboard/switch_chord.rs", symbol = "KeyboardSwitchChord" },
+]
+
+[[difference]]
+id = "PD-036"
+area = "Deck keyboard"
+products = ["clients/macos", "clients/windows"]
+difference = "Keys that always stay on the Deck's computer, even in Remote: Windows+L and Ctrl+Alt+Del on a Windows Deck (Connection > Send Key sends Ctrl+Alt+Del); Option-Command-Esc (Force Quit), Control-Command-Q (Lock Screen) and every key under Secure Event Input on a macOS Deck. The keyboard switch refuses these chords, and on both Decks the Mac system chords a macOS Deck's tap takes."
+earned_by = "Windows handles Windows+L and the secure attention sequence before any hook. macOS gives an event tap no key while Secure Event Input is on, and keeps Force Quit as the way out of a captured keyboard and Lock Screen as the system's."
+code = [
+  { path = "shared/input/src/keyboard/pc_input.rs", symbol = "grab_takes" },
+  { path = "shared/input/src/keyboard/mac_capture.rs", symbol = "MacSystemChord" },
+  { path = "shared/input/src/keyboard/switch_chord.rs", symbol = "never_delivered" },
 ]
 
 [[difference]]
@@ -632,16 +648,13 @@ owner = "Shared/Architecture"
 code = [{ path = "clients/macos/src/ui/app.rs" }, { path = "clients/windows/src/present/composition.rs" }]
 
 [[gap]]
-id = "GAP-028"
+id = "GAP-054"
 area = "Deck input"
 products = ["clients/macos"]
-difference = "The macOS Deck accumulates wheel and scroll locally; the Windows Deck uses arcen_input::deck_wheel."
-why_open = "Not a verbatim copy: the Mac buckets egui's smoothed f32 scroll points per 120 (its precise path never accumulates); deck_wheel takes integer wheel travel in 120ths per message. The truncate-with-remainder rule is the same; adopting needs a float-travel entry in deck_wheel first, or sub-point travel is lost."
+difference = "The macOS Deck's secondary Match My Layout windows gather a trackpad into whole notches (arcen_input::deck_wheel) even for a host that takes precise scroll; the Windows Deck sends precise, phased scroll from every session window."
+why_open = "Not an OS limit: egui gives every viewport its own MouseWheel events with their phases. A secondary viewport still reads egui's smoothed delta (dispatch_secondary_scroll) into an accumulator built for notches; sending its Point events needs a per-viewport precise send through the region runtime and that monitor's own point-to-pixel scale."
 owner = "macOS Client"
-code = [
-  { path = "clients/macos/src/ui/app.rs", symbol = "accumulate_scroll_ticks" },
-  { path = "shared/input/src/deck_wheel.rs", symbol = "WheelAccumulator" },
-]
+code = [{ path = "clients/macos/src/ui/app.rs", symbol = "dispatch_secondary_scroll" }]
 
 [[gap]]
 id = "GAP-031"
@@ -736,18 +749,6 @@ difference = "While a Deck's session is held for its resume (transport lost, wit
 why_open = "Not implemented yet. Windows cannot unlock a locked session without the user's credential, and a resume carries none. Route: take the held session off the console (WTSDisconnectSession; the desk sees the sign-in screen, which only the account's own password passes) and put it back at the resume as LocalSystem (WTSConnectSessionW, which the Pier already uses to move a parked session onto the console); it needs the held agent's capture and display lease to survive the console switch, and has to be qualified on hardware."
 owner = "Windows Host"
 code = [{ path = "hosts/windows/src/windows_session.rs", symbol = "observe_resumable_bound" }]
-
-[[gap]]
-id = "GAP-047"
-area = "session lifetime"
-products = ["hosts/windows"]
-difference = "A Windows Pier service (broker) that dies while a Deck is attached leaves the user's session unlocked: at start it restores the displays and the speakers (console_recovery, local_playback::recover_left_over) but locks nothing. The Linux Pier locks a journalled console before it gives anything back, at service start and after a launcher that died (console::recover_console). An agent that dies is handed back and locked by the live broker on both."
-why_open = "Not implemented yet, and not earned: the broker already locks a session as the user from session 0 (windows_session::lock_session); it needs the attached session and account journalled next to the display journal and a lock before the start-up restore. ADR 0025 audit 2026-11-18."
-owner = "Windows Host"
-code = [
-  { path = "hosts/windows/src/local_playback.rs", symbol = "recover_left_over" },
-  { path = "hosts/linux/src/session/console.rs", symbol = "recover_console" },
-]
 
 [[gap]]
 id = "GAP-050"
@@ -939,7 +940,7 @@ status = { "clients/macos" = "present", "clients/windows" = "present" }
 id = "deck_shared_wheel"
 description = "Wheel accumulation through arcen_input::deck_wheel"
 proof = 'deck_wheel'
-status = { "clients/macos" = "GAP-028", "clients/windows" = "present" }
+status = { "clients/macos" = "present", "clients/windows" = "present" }
 
 [[capability]]
 id = "deck_shared_colour_uniform"
@@ -1063,7 +1064,7 @@ status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos"
 id = "lock_after_owner_death"
 description = "Locks the user's session before the desk gets it back when the Pier process serving a Deck dies while attached"
 proof = 'recover_console|lock_after_owner'
-status = { "hosts/linux" = "present", "hosts/windows" = "GAP-047", "hosts/macos" = "present" }
+status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "present" }
 
 [[capability]]
 id = "names_conflicting_service"

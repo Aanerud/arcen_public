@@ -236,6 +236,8 @@ fn shared_telemetry(delta: DedicatedPresenterTelemetryDelta) -> PresenterTelemet
         slot_waits: delta.slot_waits,
         frames_received: delta.frames_received,
         frames_submitted: delta.frames_submitted,
+        // The Metal layers do not count their re-presents apart yet.
+        frames_represented: 0,
         frames_confirmed: delta.frames_confirmed,
         compositor_dropped: delta.metal_dropped,
         presented_time_unconfirmed: delta.presented_time_unconfirmed,

@@ -72,6 +72,26 @@ pub fn deck_platform(ctx: &egui::Context) -> DeckPlatform {
         .unwrap_or_default()
 }
 
+fn keyboard_switch_id() -> egui::Id {
+    egui::Id::new("arcen-deck-keyboard-switch")
+}
+
+/// Records the keyboard switch's chord (Settings ▸ Input ▸ Keyboard switch)
+/// for the menus and help that name it; call when settings load or change.
+pub fn set_keyboard_switch(
+    ctx: &egui::Context,
+    switch: arcen_input::keyboard::KeyboardSwitchChord,
+) {
+    ctx.data_mut(|data| data.insert_temp(keyboard_switch_id(), switch));
+}
+
+/// The keyboard switch's chord (the default until a shell says otherwise).
+#[must_use]
+pub fn keyboard_switch(ctx: &egui::Context) -> arcen_input::keyboard::KeyboardSwitchChord {
+    ctx.data(|data| data.get_temp(keyboard_switch_id()))
+        .unwrap_or_default()
+}
+
 /// A Deck chord as the menus spell it: "Control-Option-Home" on a Mac,
 /// "Ctrl+Alt+Home" on a PC (PARITY §4.1); empty for an action without one.
 pub fn chord(platform: DeckPlatform, shortcut: DeckShortcut) -> String {

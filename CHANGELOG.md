@@ -6,6 +6,103 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.4] — 2026-11-20
+
+One keyboard switch on both Decks, with a chord you can choose; slow, fine
+scrolling now arrives from both Decks; a Windows Pier locks the attached
+session even when its service dies; a wide-colour Windows display starts an
+ordinary session at once; and a Linux Pier claims pen support only with a
+working virtual tablet. 0.20.4 speaks protocol v5 and works with every
+0.17.0 to 0.20.3 Deck and Pier.
+
+### Fixed
+
+- A Linux Pier without a working virtual tablet no longer advertises pressure,
+  tilt, eraser or proximity support. Mouse and keyboard remain available.
+- A Windows Pier whose display shows wide colour (WCG, such as Auto Color
+  Management) without HDR now starts an ordinary session straight away. It
+  used to wait about 25 seconds for a plain SDR mode that the display never
+  enters. HDR sessions still start only when Windows really shows HDR.
+- Slow, fine scrolling now arrives on both Decks. On a Mac, a mouse wheel
+  with smooth scrolling that moved less than a whole line did nothing, and
+  very gentle trackpad movement could be lost before it added up to a
+  scroll step. On Windows, a precision touchpad's smallest movements were
+  rounded away for a remote computer that only takes whole wheel steps.
+  Small movements now add up exactly, separately for each Deck window, and
+  are forgotten when the Deck loses focus or reconnects.
+
+- **Windows: a Pier service that dies while a Deck is attached no longer
+  leaves the session unlocked** (GAP-047 closed). The broker now starts a
+  session guard for each attachment: a LocalSystem process outside the
+  broker and the agent's job, reading a pipe only the broker writes. When
+  the pipe closes without a hand-back (the service was killed, crashed or
+  stopped without one), the guard waits, as the live hand-back does, for
+  the display watchdog to give the desk its monitors back, then locks the
+  session (disconnecting it from the console if it will not lock). No
+  restarted service is needed. The broker also records the attached WTS
+  session, its logon, the boot and the account's SID in
+  `recovery\deck-attachment.record`; a broker that starts and finds a
+  record whose exact session is still alive locks it before it gives the
+  desk its speakers or displays back. A record whose session id now
+  belongs to another logon, account or boot locks nobody, and an unreadable
+  one is kept aside without locking anyone. Applications in the session
+  are never ended. The desk's speakers stay silent until the service runs
+  again.
+- **Windows Deck: the root window's monitor in the per-monitor statistics.**
+  With Match my layout, the session's root window counted its frames only
+  for Stream Statistics; the shared per-monitor log line
+  ("per-monitor stream delay") read 0 presented fps for that monitor however
+  well it ran. Every window now reports its new frames through one shared
+  writer, once per frame, and a re-present of a frame already shown no
+  longer counts as a new one (submissions, not a measurement of the glass).
+  A new Match my layout commit restarts the counts instead of reading
+  "nothing presented" against the old total, on both Decks.
+- **False "unpresented" health on a steady macOS Deck stream.** The macOS
+  Deck counted its presenters' outcomes for session health only when it
+  wrote its once-a-second log line, so each five-second window held four or
+  five seconds of presents against five of decoded frames: a stream whose
+  every frame was confirmed on glass alternated between "presented 175 of
+  150" and "140 of 150, Critical". It now takes them every UI pass, as the
+  Windows Deck does; the log line keeps its cadence.
+
+### Changed
+
+- **One keyboard switch, on both Decks.** Ctrl+Alt+Home (⌃⌥Home on a Mac)
+  flips the keyboard between **Remote** and **Local** (this computer); a
+  click into the picture also returns to Remote and is not sent. In Remote,
+  every key and the system shortcuts go to the remote computer: Alt+Tab,
+  Alt+Shift+Tab, the Windows key and Print Screen, and on a Mac ⌘Tab, ⌘Space,
+  Mission Control and now ⌃← and ⌃→ (with the ⌘Tab switch on). In Local they
+  all stay on this computer. Every flip shows a short notice ("Keyboard:
+  Remote — Alt+Tab goes to Z8" / "Keyboard: This computer") besides the
+  indicator.
+
+### Added
+
+- **Settings › Input › Keyboard switch** (both Decks): choose the switch's
+  chord: Ctrl+Alt+Home (the default), Ctrl+Alt+Shift+Z, Alt+F1 (GNOME uses it
+  for its Activities overview) or a typed chord. Shared code refuses chords
+  the system never passes on (Win+L, Ctrl+Alt+Del, ⌥⌘Esc, ⌃⌘Q), plain typing,
+  the Deck's other chords and Mac system chords, and warns when a chord is
+  one a professional application uses. Stored in settings.json as
+  `keyboard_switch` (`"Ctrl+Alt+Home"`); the Help sheet, menus and indicator
+  name the chosen chord.
+- **⌘Tab asked in context (Mac Deck).** The first time ⌘Tab takes you out
+  of a session in Remote without the event tap, the Deck asks once: "Send
+  ⌘Tab to the remote? macOS needs the Accessibility permission." **Allow**
+  turns on the ⌘Tab switch and asks macOS; **Not now** is remembered
+  (`mac_system_shortcut_offer_answered`) and the Deck stays quiet. The switch
+  stays in Settings › Input. Without the permission nothing changes.
+
+#### Upgrade note
+
+- **The Mac's separate ⌃←/⌃→ setting is gone.** "Send ⌃← and ⌃→ (Spaces) to
+  the remote computer too" (`mac_spaces_to_host`) folded into the keyboard
+  switch: with the ⌘Tab switch on, ⌃← and ⌃→ go to the remote computer in
+  Remote and switch this Mac's Spaces in Local. The old key is ignored and
+  dropped from settings.json at the next save. To switch Spaces during a
+  session, press the keyboard switch first.
+
 ## [0.20.3] — 2026-11-18
 
 Speed no longer tears on either Deck, the Windows Deck keeps 60 frames a
@@ -101,8 +198,27 @@ re-issued on 19 November 2026 with these changes.
   computer by default, when fullscreen, or this computer) replaces the
   unsaved keyboard grab and reads its `always`/`fullscreen`/`never` tokens
   (`keyboard_capture` in settings.json). The decisions are shared
-  (`arcen_input::keyboard::KeyboardCapture`); the Mac Deck's event tap
-  follows (on a Mac, ⌃⌥Home releases held keys and the pointer lock).
+  (`arcen_input::keyboard::KeyboardCapture`).
+- **Who has the keyboard (Mac Deck).** The Mac Deck uses the same shared
+  model: **⌃⌥Home** (Fn+⌃⌥← on a laptop) gives the keyboard to this Mac,
+  releasing every key held on the host first, and back; a click into the
+  picture gives it back and is not sent; **Connection › Keyboard: Host or
+  This Computer** does the same; the menu bar says who has it ("Keyboard: Z8
+  (Control-Option-Home to release)" / "Keyboard: this Mac (click to
+  return)"). While this Mac has the keyboard nothing typed reaches the host
+  and ⌘H hides the Deck again.
+- **⌘Tab, ⌘Space and Mission Control to the host (Mac Deck, opt-in).**
+  **Settings › Input › Send ⌘Tab, ⌘Space and Mission Control to the remote
+  computer** (off by default) takes ⌘Tab, ⇧⌘Tab, ⌘\`, ⌘Space, ⌃↑, ⌃↓, the
+  screenshot keys and ⌥⌘D for the host while it has the keyboard and a
+  session window is in front, through an event tap that needs the
+  Accessibility permission (the switch's **Allow in Accessibility…** button
+  asks; the Deck never asks by itself). ⌃← and ⌃→ keep switching this Mac's
+  Spaces unless a second switch sends them too; ⌥⌘Esc, ⌃⌘Q and every key
+  under Secure Event Input stay on the Mac. ⌘Tab is the host's app switcher:
+  Alt+Tab on a Windows or Linux host, ⌘Tab on a Mac host. The decision is
+  shared (`arcen_input::keyboard::MacTapRouter`); settings.json keys
+  `capture_mac_system_shortcuts` and `mac_spaces_to_host`.
 - **Connection › Send Key** on both Decks: Print Screen, Scroll Lock, Pause,
   Insert, Ctrl+Alt+Del, Menu and F13–F24, each a press and release after
   every held key is let go (shared `SendKey`). Key remaps are validated in
@@ -3674,7 +3790,6 @@ on their own operating systems after every shared change, rather than
 cross-checked from macOS. The real Deck completes an authenticated session
 against the macOS Pier.
 
-
 ## [0.10.0] — 2026-09-01
 
 ### Streaming presets and pipeline separation
@@ -3877,7 +3992,9 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.2...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.4...HEAD
+[0.20.4]: https://github.com/Aanerud/arcen_public/compare/v0.20.3...v0.20.4
+[0.20.3]: https://github.com/Aanerud/arcen_public/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/Aanerud/arcen_public/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/Aanerud/arcen_public/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/Aanerud/arcen_public/compare/v0.19.0...v0.20.0

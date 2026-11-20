@@ -110,6 +110,9 @@ fn every_field_changed() -> ClientSettings {
             chars_per_second: 10,
         },
         keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Fullscreen,
+        capture_mac_system_shortcuts: true,
+        mac_system_shortcut_offer_answered: true,
+        keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord::CONTROL_ALT_SHIFT_Z,
     }
 }
 
@@ -155,7 +158,17 @@ fn settings_json_golden_for_defaults_every_field_and_a_legacy_file() {
         loaded.keyboard_capture,
         arcen_input::keyboard::KeyboardCapturePolicy::ThisComputer
     );
+    // The ⌘Tab switch stays; the separate ⌃←/⌃→ setting is gone (those keys
+    // follow the keyboard switch) and the save drops it. A chord the
+    // system never delivers falls back to the default.
+    assert!(loaded.capture_mac_system_shortcuts);
+    assert_eq!(
+        loaded.keyboard_switch,
+        arcen_input::keyboard::KeyboardSwitchChord::DEFAULT
+    );
     save_client_settings(&repository, &loaded).unwrap();
+    let saved = std::fs::read_to_string(legacy.0.join("settings.json")).unwrap();
+    assert!(!saved.contains("mac_spaces_to_host"));
     golden(
         "settings.legacy.out.json",
         &std::fs::read(legacy.0.join("settings.json")).unwrap(),

@@ -2681,6 +2681,22 @@ impl DedicatedPresenterTelemetry {
             .push(std::time::Instant::now());
     }
 
+    /// The presentation outcomes alone, taken as often as the UI pass runs
+    /// (session health counts a frame in the window it was presented in);
+    /// [`Self::drain`] keeps the rest for the once-a-second log.
+    fn take_presentations(&self) -> DedicatedPresentations {
+        DedicatedPresentations {
+            frames_confirmed: self.frames_confirmed.swap(0, Ordering::Relaxed),
+            presented_time_unconfirmed: self.presented_time_unconfirmed.swap(0, Ordering::Relaxed),
+            confirmed_presented_at: self
+                .confirmed_presented_at
+                .lock()
+                .expect("confirmed presentation telemetry poisoned")
+                .drain(..)
+                .collect(),
+        }
+    }
+
     fn drain(&self) -> DedicatedPresenterTelemetryDelta {
         let mut samples = self.latency_us.lock().expect("latency telemetry poisoned");
         samples.sort_unstable();
@@ -3709,6 +3725,10 @@ where
         self.telemetry.drain()
     }
 
+    fn take_presentations(&self) -> DedicatedPresentations {
+        self.telemetry.take_presentations()
+    }
+
     fn has_layer(&self) -> bool {
         self.shared
             .0
@@ -4018,6 +4038,10 @@ impl DedicatedEightBitVideoPresenter {
         self.thread.take_telemetry()
     }
 
+    pub(crate) fn take_presentations(&self) -> DedicatedPresentations {
+        self.thread.take_presentations()
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_async_status_for_test(
         &mut self,
@@ -4225,6 +4249,10 @@ impl DedicatedVideoPresenter {
 
     pub(crate) fn take_telemetry(&self) -> DedicatedPresenterTelemetryDelta {
         self.thread.take_telemetry()
+    }
+
+    pub(crate) fn take_presentations(&self) -> DedicatedPresentations {
+        self.thread.take_presentations()
     }
 
     #[cfg(test)]
@@ -4952,6 +4980,38 @@ mod tests {
     }
 
     // ---- RGB10A2Unorm: the task-brief correction -------------------------
+
+    /// Session health takes the presentation outcomes every UI pass; the
+    /// once-a-second log keeps everything else.
+    #[test]
+    fn presentations_are_taken_apart_from_the_once_a_second_log() {
+        let telemetry = DedicatedPresenterTelemetry::default();
+        for _ in 0..3 {
+            telemetry.record_submitted(
+                Duration::from_millis(16),
+                Duration::ZERO,
+                Duration::from_millis(16),
+            );
+            telemetry.record_confirmed();
+        }
+        telemetry.record_presented_time_unconfirmed();
+
+        let taken = telemetry.take_presentations();
+        assert_eq!(taken.frames_confirmed, 3);
+        assert_eq!(taken.presented_time_unconfirmed, 1);
+        assert_eq!(taken.confirmed_presented_at.len(), 3);
+        assert_eq!(
+            telemetry.take_presentations(),
+            DedicatedPresentations::default()
+        );
+
+        let logged = telemetry.drain();
+        assert_eq!(logged.frames_submitted, 3);
+        assert_eq!(logged.frames_confirmed, 0);
+        assert_eq!(logged.presented_time_unconfirmed, 0);
+        assert!(logged.confirmed_presented_at.is_empty());
+        assert!(logged.latency_p50_us.is_some());
+    }
 
     #[test]
     fn zero_presented_time_callbacks_are_unconfirmed_but_submitted_is_estimated() {
