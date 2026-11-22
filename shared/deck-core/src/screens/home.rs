@@ -30,6 +30,10 @@ const SECTION_TITLE: f32 = 20.0;
 const FORM_COLUMN_W: f32 = 340.0;
 const FORM_GUTTER: f32 = 40.0;
 const FORM_STACK_BELOW: f32 = 760.0;
+/// The air above and below the form's footer row.
+const FORM_FOOTER_AIR: f32 = super::theme::SPACE_SCALE[4];
+/// The form's footer: its row and the air either side of it.
+const FORM_FOOTER_HEIGHT: f32 = 2.0 * FORM_FOOTER_AIR + super::theme::PRIMARY_HEIGHT;
 
 // ── Validate a username string (mirrors the app-level rule) ──────────────────
 fn validate_username(username: &str) -> Option<String> {
@@ -191,9 +195,9 @@ pub enum HomeAction {
     },
     /// Cancel the add/edit form.
     CancelForm,
-    /// Hand a saved connection's Displays choice back to Settings ›
-    /// Displays ("Use Settings" on its panel).
-    FollowAppDisplays(usize),
+    /// Hand every one of a saved connection's own settings back to
+    /// Settings ("Use app defaults" under its Connect).
+    FollowAppDefaults(usize),
     /// Run the connection test against this address. Sends no credentials.
     TestConnection { host: String, port: String },
     /// Select a saved connection and run the connection test against it
@@ -447,23 +451,22 @@ pub fn apply_home_action(
             state.form_username.clear();
             HomeOutcome::effect(HomeEffect::None)
         }
-        HomeAction::FollowAppDisplays(index) => {
+        HomeAction::FollowAppDefaults(index) => {
             let mut outcome = HomeOutcome::effect(HomeEffect::None);
             if let Some(original) = state.saved_connections.get(index).cloned() {
                 let mut updated = original.clone();
-                let mut edited = updated.settings.overrides;
-                edited.displays_mode = crate::overrides::Override::Inherit;
-                updated
-                    .settings
-                    .overrides
-                    .replace_in(edited, &mut updated.settings.unknown);
+                // A value only a newer Deck understands is not shown here,
+                // so it stays (`replace_in`).
+                updated.settings.overrides.replace_in(
+                    crate::overrides::ConnectionOverrides::default(),
+                    &mut updated.settings.unknown,
+                );
                 match repository.update_connection(&original.id, &original, updated) {
                     Ok(store) => {
                         outcome.store = Some(store);
                         outcome.status = Some(format!(
-                            "\u{201c}{}\u{201d} now connects with Settings \u{203a} Displays: {}",
-                            original.name,
-                            state.app_defaults.displays_mode.label()
+                            "\u{201c}{}\u{201d} now uses the app defaults",
+                            original.name
                         ));
                     }
                     Err(error) => {
@@ -1380,20 +1383,30 @@ fn test_report(
     super::connection_test::render(ui, test)
 }
 
-/// The link that hands a connection's Displays back to Settings.
-pub const USE_APP_DEFAULT: &str = "Use app default";
+pub use super::input_choices::USE_APP_DEFAULTS;
 
-/// The machine column's line for a connection that keeps its own Displays
-/// choice ("Displays: Windowed (this connection)"); none while it follows
-/// Settings.
-#[must_use]
-pub fn own_displays_line(overrides: &crate::overrides::ConnectionOverrides) -> Option<String> {
-    match overrides.displays_mode {
-        crate::overrides::Override::Own(mode) => {
-            Some(format!("Displays: {} (this connection)", mode.label()))
-        }
-        crate::overrides::Override::Inherit => None,
-    }
+/// The machine column's quiet summary of the connection's own settings and
+/// the link that hands them back to Settings, at the column's left edge:
+/// the summary wraps, and the link's words start where it starts. Whether
+/// the link was clicked.
+fn own_settings(ui: &mut egui::Ui, summary: &str) -> bool {
+    use super::theme;
+    let colours = theme::colours(ui);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(summary)
+                .color(colours.text2)
+                .size(theme::TEXT_LABEL),
+        )
+        .wrap(),
+    );
+    ui.horizontal(|ui| {
+        // The link pads its words; pull it left by as much so its text
+        // lines up with the summary's.
+        ui.add_space(-super::widgets::TEXT_BUTTON_INSET);
+        super::widgets::text_button(ui, USE_APP_DEFAULTS, false).clicked()
+    })
+    .inner
 }
 
 /// Which credentials a machine's column asks for: the password unless the
@@ -1500,20 +1513,17 @@ fn detail_connection(
         let _ = quiet_option(ui, state.remember_username, "Remember username");
         ui.add_space(theme::OPTION_GAP);
         let _ = quiet_option(ui, &mut state.direct.auto_reconnect, "Auto-reconnect");
-        // Only a connection that keeps its own Displays choice says so,
-        // with the way back to Settings beside it.
-        if let Some(line) = own_displays_line(&saved.settings.overrides) {
-            ui.add_space(theme::OPTION_GAP);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new(line)
-                        .color(colours.text2)
-                        .size(theme::TEXT_LABEL),
-                );
-                if super::widgets::text_button(ui, USE_APP_DEFAULT, false).clicked() {
-                    action = Some(HomeAction::FollowAppDisplays(idx));
-                }
-            });
+        // Only a connection that keeps its own settings says so, with the
+        // way back to Settings under it.
+        if let Some(summary) = super::input_choices::own_settings_summary(
+            super::wording::deck_platform(ui.ctx()),
+            state.app_defaults,
+            &saved.settings.overrides,
+        ) {
+            ui.add_space(theme::CONNECT_TO_OPTIONS);
+            if own_settings(ui, &summary) {
+                action = Some(HomeAction::FollowAppDefaults(idx));
+            }
         }
         ui.add_space(theme::CONNECT_TO_OPTIONS);
         ui.vertical_centered(|ui| {
@@ -1620,7 +1630,7 @@ fn connection_form(
         column
     };
 
-    pane_column(ui, "form_scroll", form_width, 24.0, |ui| {
+    let footer = above_footer(ui, form_width, |ui| {
         ui.label(
             egui::RichText::new(if is_edit {
                 "Edit connection"
@@ -1683,54 +1693,47 @@ fn connection_form(
             ui.add_space(theme::GROUP_GAP);
             machine(ui, state.form_overrides, app);
         }
-        ui.add_space(theme::GROUP_GAP);
-
-        // Test connection, a quiet text action, on the left; Cancel and
-        // Save, one width, on the right in the platform's order, ending on
-        // the form's right edge.
-        let button_w = super::widgets::button_width(ui, &["Add connection", "Cancel", "Save"]);
-        ui.allocate_ui_with_layout(
-            egui::vec2(form_width, theme::PRIMARY_HEIGHT),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.set_width(form_width);
-                ui.spacing_mut().item_spacing.x = theme::BUTTON_GAP;
-                let label = if test_running {
-                    "Testing\u{2026}"
-                } else {
-                    "Test connection"
-                };
-                if super::widgets::text_button(ui, label, test_running)
-                    .on_hover_text(TEST_CONNECTION_TIP)
-                    .clicked()
-                {
-                    test = true;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Right to left: the last button is laid out first.
-                    for button in form_button_order(platform).into_iter().rev() {
-                        match button {
-                            FormButton::Save => {
-                                let label = if is_edit { "Save" } else { "Add connection" };
-                                if super::widgets::primary_button(ui, label, button_w).clicked() {
-                                    submit = true;
-                                }
-                            }
-                            FormButton::Cancel => {
-                                if super::widgets::secondary_button(ui, "Cancel", button_w)
-                                    .clicked()
-                                {
-                                    action = Some(HomeAction::CancelForm);
-                                }
-                            }
-                        }
-                    }
-                });
-            },
-        );
         if let Some(panel) = test_report(ui, state.connection_test) {
             action = Some(HomeAction::ConnectionTest(panel));
         }
+    });
+
+    // Test connection, a quiet text action, on the left; Cancel and Save,
+    // one width, on the right in the platform's order, ending on the
+    // form's right edge.
+    let button_w = super::widgets::button_width(ui, &["Add connection", "Cancel", "Save"]);
+    footer_row(ui, footer, form_width, |ui| {
+        ui.spacing_mut().item_spacing.x = theme::BUTTON_GAP;
+        ui.spacing_mut().item_spacing.x = theme::BUTTON_GAP;
+        let label = if test_running {
+            "Testing\u{2026}"
+        } else {
+            "Test connection"
+        };
+        if super::widgets::text_button(ui, label, test_running)
+            .on_hover_text(TEST_CONNECTION_TIP)
+            .clicked()
+        {
+            test = true;
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Right to left: the last button is laid out first.
+            for button in form_button_order(platform).into_iter().rev() {
+                match button {
+                    FormButton::Save => {
+                        let label = if is_edit { "Save" } else { "Add connection" };
+                        if super::widgets::primary_button(ui, label, button_w).clicked() {
+                            submit = true;
+                        }
+                    }
+                    FormButton::Cancel => {
+                        if super::widgets::secondary_button(ui, "Cancel", button_w).clicked() {
+                            action = Some(HomeAction::CancelForm);
+                        }
+                    }
+                }
+            }
+        });
     });
 
     // Save and Enter never meet a greyed button: what is missing shows
@@ -1806,6 +1809,75 @@ fn connection_form(
 
 /// The form's right column's title.
 pub const ON_THIS_MACHINE: &str = "On this machine";
+
+/// Where the form's footer goes and whether the form runs on under it.
+#[derive(Debug, Clone, Copy)]
+struct Footer {
+    rect: egui::Rect,
+    overflows: bool,
+}
+
+/// The form's body, `max` wide at most and centred, in a scroll area that
+/// ends where the footer begins, at the bottom of the pane; the footer's
+/// place. The body ends with a group's gap above the footer.
+fn above_footer(ui: &mut egui::Ui, max: f32, add: impl FnOnce(&mut egui::Ui)) -> Footer {
+    let pane = ui.available_rect_before_wrap();
+    let top = (pane.bottom() - FORM_FOOTER_HEIGHT).max(pane.top());
+    let body = egui::Rect::from_min_max(pane.min, egui::pos2(pane.right(), top));
+    let scrolled = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(body)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("form_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            column_contents(ui, max, super::theme::GROUP_GAP, add);
+                        });
+                    })
+            },
+        )
+        .inner;
+    Footer {
+        rect: egui::Rect::from_min_max(egui::pos2(pane.left(), top), pane.max),
+        overflows: scrolled.content_size.y > scrolled.inner_rect.height() + 0.5,
+    }
+}
+
+/// The form's footer: one row, as wide as the form's columns and on their
+/// edges ([`column_contents`]), with [`FORM_FOOTER_AIR`] above and below;
+/// a hairline above it while the form runs on under it.
+fn footer_row(ui: &mut egui::Ui, footer: Footer, max: f32, add: impl FnOnce(&mut egui::Ui)) {
+    use super::theme;
+    let pane = footer.rect;
+    if footer.overflows {
+        ui.painter().hline(
+            pane.x_range(),
+            pane.top(),
+            egui::Stroke::new(SIDEBAR_BORDER_W, theme::colours(ui).border),
+        );
+    }
+    let width = (pane.width() - 2.0 * DETAIL_SIDE_MARGIN).clamp(0.0, max);
+    let row = egui::Rect::from_min_size(
+        egui::pos2(
+            pane.left() + ((pane.width() - width) / 2.0).max(0.0),
+            pane.top() + FORM_FOOTER_AIR,
+        ),
+        egui::vec2(width, theme::PRIMARY_HEIGHT),
+    );
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(row)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.set_width(width);
+            add(ui);
+        },
+    );
+}
 
 /// What is wrong with a field, under it, wrapped to its width.
 fn field_problem(ui: &mut egui::Ui, problem: &str, width: f32) {
@@ -1957,7 +2029,7 @@ fn render_acknowledgement(ctx: &egui::Context, feedback: Option<&SignInFeedback>
 }
 
 /// The form's "On this machine" settings: the ⌘ key, the Option key (a Mac
-/// Deck), Typing and Displays, each a list picker that follows Settings
+/// Deck), Typing, Displays and System shortcuts, each a list picker that follows Settings
 /// until the connection keeps its own ("App default (Characters)",
 /// [`super::input_choices`]), `width` wide.
 fn on_this_machine_fields(
@@ -2005,6 +2077,15 @@ fn on_this_machine_fields(
         "connection_displays_mode",
         &field,
         &mut overrides.displays_mode,
+        width,
+    );
+    ui.add_space(super::theme::FIELD_TO_LABEL);
+    let field = choices::system_shortcuts_field(platform, app, overrides);
+    override_picker(
+        ui,
+        "connection_system_shortcuts",
+        &field,
+        &mut overrides.system_shortcuts,
         width,
     );
 }
@@ -2814,6 +2895,8 @@ mod tests {
             "App default (Characters)",
             "Displays",
             app_displays.as_str(),
+            super::super::input_choices::SYSTEM_SHORTCUTS_TITLE,
+            "App default (Off)",
         ] {
             assert!(mac.iter().any(|text| text == wanted), "{wanted}: {mac:?}");
         }
@@ -2910,6 +2993,38 @@ mod tests {
             texts(&clipped.shape, &mut shown);
         }
         (shown, action)
+    }
+
+    /// Every text one settled Home pass draws, with its rectangle.
+    fn home_text_rects(ctx: &egui::Context, home: &mut HomeFixture) -> Vec<(String, egui::Rect)> {
+        fn texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| texts(shape, out)),
+                _ => {}
+            }
+        }
+        let mut state = home.state();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1120.0, 760.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |ui| {
+                let _ = render_home(ui, &mut state);
+            },
+        );
+        let mut shown = Vec::new();
+        for clipped in &output.shapes {
+            texts(&clipped.shape, &mut shown);
+        }
+        shown
     }
 
     fn key(key: egui::Key) -> Vec<egui::Event> {
@@ -3422,7 +3537,7 @@ mod tests {
     #[test]
     fn the_form_sits_in_two_columns_on_one_top_line_and_stacks_when_narrow() {
         let (fields, pickers, save) = form_columns(DEFAULT_HOME);
-        assert_eq!(pickers.len(), 4, "{pickers:?}");
+        assert_eq!(pickers.len(), 5, "{pickers:?}");
         let address = fields[0];
         let first_picker = pickers[0];
         assert!(first_picker.left() > address.right(), "side by side");
@@ -3453,7 +3568,7 @@ mod tests {
             (save.right() - first_picker.right()).abs() < 0.5,
             "{save:?}"
         );
-        assert!(save.top() > pickers[3].bottom());
+        assert!(save.top() > pickers[4].bottom());
 
         // Narrower than the breakpoint: one column, Connection first.
         let narrow = egui::vec2(SIDEBAR_W + FORM_STACK_BELOW - 40.0, 1400.0);
@@ -3475,7 +3590,13 @@ mod tests {
         for gone in ["Keyboard and displays", "All follow Settings"] {
             assert!(shown.iter().all(|(text, _)| text != gone), "{gone}");
         }
-        for wanted in ["Connection", ON_THIS_MACHINE, "Typing", "Displays"] {
+        for wanted in [
+            "Connection",
+            ON_THIS_MACHINE,
+            "Typing",
+            "Displays",
+            super::super::input_choices::SYSTEM_SHORTCUTS_TITLE,
+        ] {
             assert!(shown.iter().any(|(text, _)| text == wanted), "{wanted}");
         }
     }
@@ -4124,30 +4245,61 @@ mod tests {
     }
 
     #[test]
-    fn only_a_connection_with_its_own_displays_says_so_with_the_way_back() {
+    fn only_a_connection_with_its_own_settings_says_so_with_one_way_back() {
+        use crate::overrides::Override;
         let ctx = egui::Context::default();
         let mut home = HomeFixture::new();
         let _ = home.apply(HomeAction::SelectConnection(0));
         let _ = home_frame(&ctx, &mut home, Vec::new());
         let (shown, _) = home_frame(&ctx, &mut home, Vec::new());
-        assert!(shown.iter().all(|(text, _)| text != USE_APP_DEFAULT));
-        assert!(shown.iter().all(|(text, _)| !text.starts_with("Displays:")));
-
-        home.saved[0].settings.overrides.displays_mode =
-            crate::overrides::Override::Own(crate::settings::DisplaysMode::Windowed);
-        let _ = home_frame(&ctx, &mut home, Vec::new());
-        let (shown, _) = home_frame(&ctx, &mut home, Vec::new());
+        assert!(shown.iter().all(|(text, _)| text != USE_APP_DEFAULTS));
         assert!(
             shown
                 .iter()
-                .any(|(text, _)| text == "Displays: Windowed (this connection)"),
-            "{shown:?}"
+                .all(|(text, _)| !text.starts_with("This connection:"))
         );
+
+        // Its own value, the same as the app default: nothing to say.
+        home.saved[0].settings.overrides.displays_mode =
+            Override::Own(crate::settings::DisplaysMode::SinglePrimary);
+        let _ = home_frame(&ctx, &mut home, Vec::new());
+        let (shown, _) = home_frame(&ctx, &mut home, Vec::new());
+        assert!(shown.iter().all(|(text, _)| text != USE_APP_DEFAULTS));
+
+        home.saved[0].settings.overrides = crate::overrides::ConnectionOverrides {
+            typing_mode: Override::Own(arcen_input::text::TypingMode::Keys),
+            option_keys: Override::Own(arcen_input::text::OptionKeyPreference::Chosen(
+                arcen_input::text::OptionKeyMode::LeftAltRightCharacters,
+            )),
+            displays_mode: Override::Own(crate::settings::DisplaysMode::Windowed),
+            system_shortcuts: Override::Own(true),
+            ..crate::overrides::ConnectionOverrides::default()
+        };
+        let _ = home_frame(&ctx, &mut home, Vec::new());
+        let (shown, _) = home_frame(&ctx, &mut home, Vec::new());
+        let summary = "This connection: Left Option is Alt, keys only typing, opens in a \
+                       window, system shortcuts go to the remote computer.";
+        assert!(shown.iter().any(|(text, _)| text == summary), "{shown:?}");
         let at = shown
             .iter()
-            .find(|(text, _)| text == USE_APP_DEFAULT)
+            .find(|(text, _)| text == USE_APP_DEFAULTS)
             .map(|(_, at)| *at)
             .expect("the link");
+        // The link's words start where the summary's do, under it.
+        let rects = home_text_rects(&ctx, &mut home);
+        let rect = |wanted: &str| {
+            rects
+                .iter()
+                .find(|(text, _)| text == wanted)
+                .map(|(_, rect)| *rect)
+                .expect(wanted)
+        };
+        let (words, way_back) = (rect(summary), rect(USE_APP_DEFAULTS));
+        assert!(
+            (words.left() - way_back.left()).abs() < 0.5,
+            "{words:?} {way_back:?}"
+        );
+        assert!(way_back.top() >= words.bottom(), "{words:?} {way_back:?}");
         let _ = home_frame(&ctx, &mut home, vec![egui::Event::PointerMoved(at)]);
         let mut chosen = None;
         for events in click_at(at).into_iter().skip(1) {
@@ -4155,7 +4307,7 @@ mod tests {
             chosen = chosen.or(action);
         }
         assert!(
-            matches!(chosen, Some(HomeAction::FollowAppDisplays(0))),
+            matches!(chosen, Some(HomeAction::FollowAppDefaults(0))),
             "{chosen:?}"
         );
     }

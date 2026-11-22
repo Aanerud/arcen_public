@@ -50,8 +50,19 @@ pub fn screen_is_locked() -> Option<bool> {
     native::screen_is_locked()
 }
 
-/// This GUI session's security session id (`kCGSSessionIDKey`), or `None`
-/// outside a GUI session. Unique among the sessions of one boot.
+/// This process's security session id: the audit session the window
+/// server's login session runs in, as the public `SessionGetInfo` reports it
+/// for `callerSecuritySession` (Security framework, `AuthSession.h`). Unique
+/// among the sessions of one boot, shared by every process in the login
+/// session: an agent launchd restarts in the user's `gui/<uid>` domain gets
+/// the same one (that domain's `asid`). `None` when the security server does
+/// not answer.
+///
+/// Not `CGSessionCopyCurrentDictionary`'s `kCGSSessionIDKey`: that key is
+/// not in the dictionary (measured on macOS 26: the dictionary carries
+/// `kCGSSessionAuditIDKey` and `kSCSecuritySessionID`, both this same
+/// number, and no `kCGSSessionIDKey`), so the attachment record was never
+/// written.
 #[must_use]
 pub fn login_session_id() -> Option<u64> {
     native::login_session_id()
@@ -101,8 +112,6 @@ mod native {
         fn CFGetTypeID(value: CFTypeRef) -> usize;
         fn CFBooleanGetTypeID() -> usize;
         fn CFBooleanGetValue(value: CFTypeRef) -> u8;
-        fn CFNumberGetTypeID() -> usize;
-        fn CFNumberGetValue(number: CFTypeRef, kind: isize, value: *mut c_void) -> bool;
         fn CFRelease(value: CFTypeRef);
     }
 
@@ -111,14 +120,22 @@ mod native {
         fn CGSessionCopyCurrentDictionary() -> CFTypeRef;
     }
 
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
+    }
+
     unsafe extern "C" {
         fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
         fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     }
 
     const UTF8: u32 = 0x0800_0100;
-    const CF_NUMBER_SINT64: isize = 4;
     const RTLD_LAZY: i32 = 0x1;
+    /// `callerSecuritySession`: the session the calling process is in.
+    const CALLER_SECURITY_SESSION: u32 = u32::MAX;
+    /// `noSecuritySession`, never a valid session id.
+    const NO_SECURITY_SESSION: u32 = 0;
 
     /// An owned Core Foundation string, released on drop.
     struct CfString(CFTypeRef);
@@ -164,27 +181,15 @@ mod native {
     }
 
     pub(super) fn login_session_id() -> Option<u64> {
-        // SAFETY: as in `screen_is_locked`.
-        let session = unsafe { CGSessionCopyCurrentDictionary() };
-        if session.is_null() {
-            return None;
-        }
-        let id = CfString::new(c"kCGSSessionIDKey").and_then(|key| {
-            let mut id: i64 = 0;
-            // SAFETY: `session` and `key` are live; the value is borrowed
-            // from the dictionary, checked to be a number before it is read,
-            // and read into an `i64`, which `kCFNumberSInt64Type` writes.
-            let read = unsafe {
-                let value = CFDictionaryGetValue(session, key.0);
-                !value.is_null()
-                    && CFGetTypeID(value) == CFNumberGetTypeID()
-                    && CFNumberGetValue(value, CF_NUMBER_SINT64, (&raw mut id).cast())
-            };
-            read.then_some(id).and_then(|id| u64::try_from(id).ok())
-        });
-        // SAFETY: owned under the copy rule, released once.
-        unsafe { CFRelease(session) };
-        id
+        let mut id = NO_SECURITY_SESSION;
+        // SAFETY: `OSStatus SessionGetInfo(SecuritySessionId, SecuritySessionId
+        // *, SessionAttributeBits *)`, both `UInt32`; it writes the caller's
+        // session id into `id` and nothing through the null attributes
+        // pointer, which the header declares nullable.
+        let status =
+            unsafe { SessionGetInfo(CALLER_SECURITY_SESSION, &raw mut id, std::ptr::null_mut()) };
+        (status == 0 && id != NO_SECURITY_SESSION && id != CALLER_SECURITY_SESSION)
+            .then_some(u64::from(id))
     }
 
     pub(super) fn lock_screen() -> Result<(), LockError> {

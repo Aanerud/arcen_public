@@ -50,7 +50,7 @@ pub use plan::{
 };
 pub use policy::{
     DeckTextAction, DeckTextEvent, HostKeyPositions, HostTextTruth, KeyPhase, KeyStroke,
-    KeyboardMode, OptionKeyMode, OptionKeyPreference, OptionSide, SuppressReason, TextInputPolicy,
-    TypingMode, split_commit,
+    KeyboardMode, OptionKeyMode, OptionKeyPreference, OptionSide, PostedKeyText, SuppressReason,
+    TextInputPolicy, TypingMode, split_commit,
 };
 pub use releases::{LOST_RELEASE_GRACE, ReleaseRecovery, SentPress};

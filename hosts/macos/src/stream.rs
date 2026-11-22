@@ -974,11 +974,16 @@ fn handle_control(
     }
 }
 
-/// The session's keyboard-layout watcher, for a Deck told `host_keymap`.
-/// A watcher that cannot start leaves the Deck assuming the layouts match,
-/// as before, and says so.
-fn start_keymap_watch(host_keymap: bool) -> Option<crate::input::layout::KeymapWatch> {
-    if !host_keymap {
+/// The session's keyboard-layout watcher, for a Deck told `host_keymap`
+/// and for keys posted as `CGEvent`s (`types_keys`), which carry the
+/// layout's characters under Secure Event Input
+/// (`InputController::set_host_keymap`). A watcher that cannot start leaves
+/// the Deck assuming the layouts match, as before, and says so.
+fn start_keymap_watch(
+    host_keymap: bool,
+    types_keys: bool,
+) -> Option<crate::input::layout::KeymapWatch> {
+    if !host_keymap && !types_keys {
         return None;
     }
     match std::env::current_exe()
@@ -996,12 +1001,13 @@ fn start_keymap_watch(host_keymap: bool) -> Option<crate::input::layout::KeymapW
     }
 }
 
-/// The watcher's next notice (`None`: it stopped).
+/// The watcher's next notice, as sent and as read (`None`: it stopped).
 async fn next_keymap_notice(
     watch: Option<&mut crate::input::layout::KeymapWatch>,
-) -> Option<String> {
-    let notice = watch?.next().await?;
-    if let Ok(notice) = serde_json::from_str::<arcen_protocol::messages::HostKeymapMsg>(&notice) {
+) -> Option<(String, Option<arcen_protocol::messages::HostKeymapMsg>)> {
+    let json = watch?.next().await?;
+    let notice = serde_json::from_str::<arcen_protocol::messages::HostKeymapMsg>(&json).ok();
+    if let Some(notice) = notice.as_ref() {
         tracing::info!(
             target: arcen_telemetry::names::target::HID,
             generation = notice.generation,
@@ -1011,7 +1017,24 @@ async fn next_keymap_notice(
             "session keyboard layout read"
         );
     }
-    Some(notice)
+    Some((json, notice))
+}
+
+/// Hands a layout notice to the session's input, and to the Deck when it
+/// was told `host_keymap`.
+async fn take_keymap_notice(
+    priority: &tokio::sync::mpsc::Sender<Message>,
+    host_keymap: bool,
+    input: Option<&mut crate::input_session::InputSession>,
+    (json, notice): (String, Option<arcen_protocol::messages::HostKeymapMsg>),
+) -> Result<(), StreamError> {
+    if let (Some(input), Some(notice)) = (input, notice.as_ref()) {
+        input.set_host_keymap(notice);
+    }
+    if host_keymap {
+        enqueue(priority, Message::Text(json)).await?;
+    }
+    Ok(())
 }
 
 /// Applies one message from the client.
@@ -2012,6 +2035,8 @@ pub struct StreamSession<'a> {
     pub refine: arcen_media::refine::RefinePlan,
     /// Tell the Deck this session's keyboard layout (`host_keymap`).
     pub host_keymap: bool,
+    /// Counts each frame written, for a session that drops the stream.
+    pub sent_frames: arcen_telemetry::SentFrames,
 }
 
 /// How a session's audio is encoded for the wire.
@@ -2118,6 +2143,8 @@ pub struct MultiStreamSession<'a> {
     pub path_signal_connection: Option<quinn::Connection>,
     /// Tell the Deck this session's keyboard layout (`host_keymap`).
     pub host_keymap: bool,
+    /// Counts each frame written, for a session that drops the stream.
+    pub sent_frames: arcen_telemetry::SentFrames,
 }
 
 /// A stream that stopped before the client left cleanly.
@@ -2174,6 +2201,7 @@ pub async fn stream(
         served_pipeline,
         refine: refine_plan,
         host_keymap,
+        sent_frames,
     } = session;
     let operational_motion_priority =
         arcen_media::video::operational_motion_priority(served_pipeline.as_ref(), motion_priority);
@@ -2386,7 +2414,12 @@ pub async fn stream(
         // slot replaces the picture it would have encoded next.
         let mut pending_frame: Option<Produced> = None;
         let mut pending_tile: Option<Vec<u8>> = None;
-        let mut keymap_watch = start_keymap_watch(host_keymap);
+        let mut keymap_watch = start_keymap_watch(
+            host_keymap,
+            input
+                .as_ref()
+                .is_some_and(crate::input_session::InputSession::types_text),
+        );
         let streaming = async {
         loop {
             let host_pen_pointer_due = host_pen_pointer
@@ -2443,7 +2476,9 @@ pub async fn stream(
                 }
                 notice = next_keymap_notice(keymap_watch.as_mut()), if keymap_watch.is_some() => {
                     match notice {
-                        Some(json) => enqueue(&priority, Message::Text(json)).await?,
+                        Some(notice) => {
+                            take_keymap_notice(&priority, host_keymap, input.as_mut(), notice).await?;
+                        }
                         None => keymap_watch = None,
                     }
                     continue;
@@ -2504,7 +2539,7 @@ pub async fn stream(
                             total_frame: &mut total_frame,
                             worst_frame: &mut worst_frame,
                         };
-                        send_frame(permit, frame, &mut stats, accumulators);
+                        send_frame(permit, frame, &mut stats, &sent_frames, accumulators);
                     }
                     continue;
                 }
@@ -2926,6 +2961,7 @@ pub async fn stream_multi(
         audio_encoding,
         path_signal_connection,
         host_keymap,
+        sent_frames,
     } = session;
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
     // Counted before the plans are moved into the producer.
@@ -3123,7 +3159,12 @@ pub async fn stream_multi(
         // while the lane is full the encoder waits, and capture's latest-frame
         // slot replaces the picture it would have encoded next.
         let mut pending_frame: Option<Produced> = None;
-        let mut keymap_watch = start_keymap_watch(host_keymap);
+        let mut keymap_watch = start_keymap_watch(
+            host_keymap,
+            input
+                .as_ref()
+                .is_some_and(crate::input_session::InputSession::types_text),
+        );
         let streaming = async {
         loop {
             tokio::select! {
@@ -3175,7 +3216,9 @@ pub async fn stream_multi(
                 }
                 notice = next_keymap_notice(keymap_watch.as_mut()), if keymap_watch.is_some() => {
                     match notice {
-                        Some(json) => enqueue(&priority, Message::Text(json)).await?,
+                        Some(notice) => {
+                            take_keymap_notice(&priority, host_keymap, input.as_mut(), notice).await?;
+                        }
                         None => keymap_watch = None,
                     }
                     continue;
@@ -3213,7 +3256,7 @@ pub async fn stream_multi(
                             total_frame: &mut total_frame,
                             worst_frame: &mut worst_frame,
                         };
-                        send_frame(permit, frame, &mut stats, accumulators);
+                        send_frame(permit, frame, &mut stats, &sent_frames, accumulators);
                     }
                     continue;
                 }
@@ -3501,6 +3544,7 @@ fn send_frame(
     permit: tokio::sync::mpsc::Permit<'_, Message>,
     frame: Produced,
     stats: &mut StreamStats,
+    sent_frames: &arcen_telemetry::SentFrames,
     totals: Accumulators<'_>,
 ) {
     stats.frames_captured = frame.captured;
@@ -3518,6 +3562,7 @@ fn send_frame(
     *totals.total_frame += frame.took;
     *totals.worst_frame = (*totals.worst_frame).max(frame.took);
     stats.frames_sent += 1;
+    sent_frames.add_one();
     stats.bytes_sent += sent_bytes;
 }
 
@@ -5729,6 +5774,51 @@ mod tests {
             .expect("region header parses");
         assert_eq!(header.frame_type, FrameType::RegionVideoH265);
         assert!(pending.served_pipeline.is_none());
+    }
+
+    #[tokio::test]
+    async fn every_frame_written_is_counted_where_the_session_can_read_it() {
+        let (writer, mut written) = tokio::sync::mpsc::channel::<Message>(4);
+        let mut stats = StreamStats::default();
+        let sent_frames = arcen_telemetry::SentFrames::default();
+        let session_view = sent_frames.clone();
+        let mut timing = [Duration::ZERO; 6];
+        for _ in 0..3 {
+            let permit = writer.reserve().await.expect("writer open");
+            let [queue, send, capture_wait, encode, frame, worst] = &mut timing;
+            send_frame(
+                permit,
+                Produced {
+                    queued_at: Instant::now(),
+                    payload: vec![0, 0, 0, 1, 0x26],
+                    keyframe: false,
+                    captured: 1,
+                    encoded: 1,
+                    took: Duration::from_millis(1),
+                    capture_wait: Duration::ZERO,
+                    encode_took: Duration::from_millis(1),
+                    monitor_id: None,
+                    served_pipeline: None,
+                    refine_before: Vec::new(),
+                },
+                &mut stats,
+                &sent_frames,
+                Accumulators {
+                    total_queue: queue,
+                    total_send: send,
+                    total_capture_wait: capture_wait,
+                    total_encode: encode,
+                    total_frame: frame,
+                    worst_frame: worst,
+                },
+            );
+            assert!(written.try_recv().is_ok());
+        }
+        assert_eq!(stats.frames_sent, 3);
+        // The stream, its statistics and its tally handle gone, as when the
+        // desk watch drops a session's stream.
+        drop((stats, sent_frames));
+        assert_eq!(session_view.count(), 3);
     }
 
     #[test]

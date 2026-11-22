@@ -363,6 +363,65 @@ mod tests {
     }
 
     #[test]
+    fn a_posted_key_carries_text_only_where_its_stored_string_is_wrong() {
+        use crate::text::PostedKeyText;
+        use arcen_protocol::keys::{KEY_SHIFT, MOD_ALT, MOD_CTRL, MOD_KEYPAD, MOD_META, MOD_SHIFT};
+        let notice: HostKeymapMsg = serde_json::from_str(PINNED_US_NOTICE).expect("notice");
+        let us = HostKeyPositions::from_message(&notice);
+        let mut text = PostedKeyText::default();
+        let mut press = |qt_key, modifiers| text.key(Some(&us), qt_key, modifiers, true, true);
+        // Shift+C must carry `C`: the stored string is the unmodified `c`.
+        assert_eq!(press(KEY_SHIFT, MOD_SHIFT), None);
+        assert_eq!(press(0x43, MOD_SHIFT), Some("C"));
+        assert_eq!(press(0x31, MOD_SHIFT), Some("!"));
+        // A key with no modifier already carries what it types.
+        assert_eq!(press(0x43, 0), None);
+        assert_eq!(press(0x30, 0), None);
+        // Shortcuts, Option layers and the keypad stay key codes alone.
+        for modifiers in [MOD_CTRL, MOD_ALT, MOD_META, MOD_KEYPAD, MOD_SHIFT | MOD_ALT] {
+            assert_eq!(press(0x43, modifiers), None);
+        }
+        // Return is no printable position.
+        assert_eq!(press(0x0100_0004, 0), None);
+        assert_eq!(press(0x43, MOD_SHIFT), Some("C"));
+        // A release carries nothing.
+        assert_eq!(text.key(Some(&us), 0x43, MOD_SHIFT, false, true), None);
+        // Outside Secure Event Input, or with no layout, nothing.
+        assert_eq!(text.key(Some(&us), 0x43, MOD_SHIFT, true, false), None);
+        assert_eq!(text.key(None, 0x43, MOD_SHIFT, true, true), None);
+    }
+
+    #[test]
+    fn the_key_after_a_dead_key_is_left_to_compose_under_secure_input() {
+        use crate::text::PostedKeyText;
+        use arcen_protocol::keys::{KEY_SHIFT, MOD_ALT, MOD_SHIFT};
+        let no = HostKeyPositions::from_message(&host_keymap_msg(
+            MACOS_INPUT_SOURCE,
+            vec!["no(mac)".into()],
+            Some("no(mac)".into()),
+            norwegian,
+        ));
+        let mut text = PostedKeyText::default();
+        let mut press = |qt_key, modifiers| text.key(Some(&no), qt_key, modifiers, true, true);
+        assert_eq!(press(0x27, MOD_SHIFT), Some("Æ"));
+        // `¨` (dead) then Shift+A: `Ä` is the operating system's to compose,
+        // so the A carries no string of its own, and Shift is pressed in
+        // between without ending the composition.
+        assert_eq!(press(0x5D, 0), None);
+        assert_eq!(press(KEY_SHIFT, MOD_SHIFT), None);
+        assert_eq!(press(0x41, MOD_SHIFT), None);
+        // Composed: the next Shift key carries its text again.
+        assert_eq!(press(0x41, MOD_SHIFT), Some("A"));
+        // An Option chord may be a dead key (Option+U is `¨` on a US Mac).
+        assert_eq!(press(0x41, MOD_ALT), None);
+        assert_eq!(press(0x41, MOD_SHIFT), None);
+        // A key that ends a composition (Return) ends it.
+        assert_eq!(press(0x5D, 0), None);
+        assert_eq!(press(0x0100_0004, 0), None);
+        assert_eq!(press(0x41, MOD_SHIFT), Some("A"));
+    }
+
+    #[test]
     fn only_printable_positions_are_asked_and_the_notice_is_bounded() {
         let mut asked = Vec::new();
         let notice = host_keymap_msg(MACOS_INPUT_SOURCE, Vec::new(), None, |qt_key| {

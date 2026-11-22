@@ -1354,6 +1354,9 @@ pub enum TerminalDisconnect {
     TlsIdentity,
     Resume(Option<ResumeErrorCode>),
     Configuration,
+    /// The host refused for its own state (busy, its seat or console held),
+    /// not for the credentials.
+    HostRefused(crate::sign_in::HostRefusal),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1569,6 +1572,15 @@ pub enum ConnectSmokeError {
     /// say so; nothing is put in front of them).
     #[error("{}", sign_in_refusal_text(.0))]
     AuthFailed(String),
+    /// The host refused for its own state, not the credentials: another
+    /// session holds it, another remote desktop holds its seat, or its
+    /// console refused. `message` is the host's words as the Deck shows
+    /// them.
+    #[error("{message}")]
+    HostRefused {
+        refusal: crate::sign_in::HostRefusal,
+        message: String,
+    },
     /// The host accepted the sign-in and then could not start the session.
     #[error("the host signed you in but could not start the session: {0}")]
     SessionSetupFailed(String),
@@ -1590,11 +1602,11 @@ pub enum ConnectSmokeError {
          Switch Displays to Primary Display Only in Settings and reconnect to use this host."
     )]
     MultiMonitorUnsupported(String),
-    #[error("host requires interactive disclaimer acceptance")]
+    #[error("{}", DISCLAIMER_REQUIRED_TEXT)]
     DisclaimerRequired,
     #[error("host sent an invalid disclaimer: {0}")]
     InvalidDisclaimer(&'static str),
-    #[error("authentication was declined")]
+    #[error("{}", AUTH_DECLINED_TEXT)]
     AuthDeclined,
     #[error("unexpected first message type: {0}")]
     UnexpectedFirstMessage(String),
@@ -1615,6 +1627,13 @@ pub enum ConnectSmokeError {
     #[error("{0}")]
     TransportUnavailable(String),
 }
+
+/// How [`ConnectSmokeError::AuthDeclined`] reads, in a session end's
+/// message (`crate::sign_in` tells it from a host's refusal by it).
+pub const AUTH_DECLINED_TEXT: &str = "authentication was declined";
+
+/// How [`ConnectSmokeError::DisclaimerRequired`] reads.
+pub const DISCLAIMER_REQUIRED_TEXT: &str = "host requires interactive disclaimer acceptance";
 
 fn sign_in_refusal_text(message: &str) -> &str {
     if message.trim().is_empty() {
@@ -5110,6 +5129,9 @@ fn emit_auth_fail(
 /// so with `session_setup_failed` and a coded reason
 /// (`arcen_session::session_setup`) or, as Piers before it did, only with
 /// its "Video request rejected" wording.
+///
+/// Nor is a host that refused for its own state (busy, its seat or console
+/// held: [`crate::sign_in::HostRefusal`]), whichever flag it set.
 fn auth_refusal(result: &AuthResult) -> ConnectSmokeError {
     use arcen_session::session_setup::SetupRefusal;
     match SetupRefusal::from_message(&result.message) {
@@ -5122,6 +5144,9 @@ fn auth_refusal(result: &AuthResult) -> ConnectSmokeError {
         _ => {}
     }
     let message = bounded_message(&result.message);
+    if let Some(refusal) = crate::sign_in::HostRefusal::from_reason(&result.message) {
+        return ConnectSmokeError::HostRefused { refusal, message };
+    }
     if result.session_setup_failed {
         ConnectSmokeError::SessionSetupFailed(message)
     } else {
@@ -5129,9 +5154,25 @@ fn auth_refusal(result: &AuthResult) -> ConnectSmokeError {
     }
 }
 
+/// The host refusal for its own state that a host's close before the
+/// session started states (`ClosedByHost` carries `": reason"`), if any: a
+/// close of that kind is that refusal, not a dropped connection.
+fn setup_close_refusal(error: &ConnectSmokeError) -> Option<crate::sign_in::HostRefusal> {
+    match error {
+        ConnectSmokeError::ClosedByHost(reason) => {
+            crate::sign_in::HostRefusal::from_reason(reason.trim_start_matches(": "))
+        }
+        _ => None,
+    }
+}
+
 fn connect_error_class(error: &ConnectSmokeError) -> &'static str {
+    if let Some(refusal) = setup_close_refusal(error) {
+        return refusal.reason_class();
+    }
     match error {
         ConnectSmokeError::Timeout => "timeout",
+        ConnectSmokeError::HostRefused { refusal, .. } => refusal.reason_class(),
         ConnectSmokeError::NetworkReachability(failure) => failure.reason_class(),
         ConnectSmokeError::Tls(_)
         | ConnectSmokeError::TlsIdentity(_)
@@ -5159,6 +5200,9 @@ fn disconnect_reason_class(reason: DisconnectReason) -> &'static str {
         DisconnectReason::Transient(_) => "network",
         DisconnectReason::Terminal(TerminalDisconnect::Resume(_)) => "reconnect_failed",
         DisconnectReason::Terminal(TerminalDisconnect::Configuration) => "configuration",
+        DisconnectReason::Terminal(TerminalDisconnect::HostRefused(refusal)) => {
+            refusal.reason_class()
+        }
         DisconnectReason::Terminal(TerminalDisconnect::Protocol) => "protocol",
     }
 }
@@ -5685,7 +5729,7 @@ fn classify_disconnect(error: &ConnectSmokeError) -> SessionEnd {
 
 /// Developer-only (`doc-shots`): the session end the engine reports for
 /// `error`, for a rendered scene that shows its outcome.
-#[cfg(feature = "doc-shots")]
+#[cfg(any(test, feature = "doc-shots"))]
 #[must_use]
 pub fn session_end_for(error: &ConnectSmokeError) -> SessionEnd {
     classify_disconnect(error)
@@ -5706,6 +5750,7 @@ fn microphone_teardown_reason(outcome: &Result<SessionEnd, ConnectSmokeError>) -
         DisconnectReason::Terminal(TerminalDisconnect::TlsIdentity) => "tls_failure",
         DisconnectReason::Terminal(TerminalDisconnect::Resume(_)) => "resume_failure",
         DisconnectReason::Terminal(TerminalDisconnect::Configuration) => "configuration_failure",
+        DisconnectReason::Terminal(TerminalDisconnect::HostRefused(_)) => "host_refused",
         DisconnectReason::Terminal(TerminalDisconnect::Protocol) => "protocol_failure",
     }
 }
@@ -5714,6 +5759,13 @@ fn classify_disconnect_at(error: &ConnectSmokeError, observed_at: Instant) -> Se
     use std::io::ErrorKind;
     use tokio_tungstenite::tungstenite::{Error as WebSocketError, error::ProtocolError};
 
+    if let Some(refusal) = setup_close_refusal(error) {
+        return SessionEnd {
+            reason: DisconnectReason::Terminal(TerminalDisconnect::HostRefused(refusal)),
+            message: bounded_message(&error.to_string()),
+            observed_at,
+        };
+    }
     let reason = match error {
         ConnectSmokeError::SessionClosed => DisconnectReason::Terminal(TerminalDisconnect::Manual),
         ConnectSmokeError::Timeout => {
@@ -5776,6 +5828,9 @@ fn classify_disconnect_at(error: &ConnectSmokeError, observed_at: Instant) -> Se
         | ConnectSmokeError::AuthDeclined
         | ConnectSmokeError::DisclaimerRequired => {
             DisconnectReason::Terminal(TerminalDisconnect::Authentication)
+        }
+        ConnectSmokeError::HostRefused { refusal, .. } => {
+            DisconnectReason::Terminal(TerminalDisconnect::HostRefused(*refusal))
         }
         ConnectSmokeError::Url(_)
         | ConnectSmokeError::Randomness(_)
@@ -7577,6 +7632,112 @@ mod tests {
             classify_disconnect(&error).reason,
             DisconnectReason::Terminal(TerminalDisconnect::Configuration)
         );
+    }
+
+    #[test]
+    fn a_host_refusing_for_its_own_state_is_never_an_authentication_failure() {
+        use crate::sign_in::{HostRefusal, SignInFailure, SignInStage};
+        use arcen_session::console_session::ConsoleRefusal;
+
+        let refused = |message: &str, setup: bool| {
+            let mut result = auth_result(None, None, false);
+            result.success = false;
+            result.session_setup_failed = setup;
+            result.message = message.to_owned();
+            auth_refusal(&result)
+        };
+        // The Windows Deck's field log (`reason_class: "auth"` and a
+        // `SESSION_AUTH_FAIL`, which is emitted only for the "auth" class).
+        let busy = refused("another session is already using this Mac", false);
+        assert!(matches!(
+            busy,
+            ConnectSmokeError::HostRefused {
+                refusal: HostRefusal::Busy,
+                ..
+            }
+        ));
+        assert_eq!(
+            busy.to_string(),
+            "another session is already using this Mac"
+        );
+        assert_eq!(connect_error_class(&busy), "host_busy");
+        let end = classify_disconnect(&busy);
+        assert_eq!(
+            end.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::HostRefused(HostRefusal::Busy))
+        );
+        assert!(!end.transient());
+        assert_eq!(disconnect_reason_class(end.reason), "host_busy");
+        assert_eq!(microphone_teardown_reason(&Err(busy)), "host_refused");
+        assert_eq!(
+            SignInFailure::from_end(&end, SignInStage::Attempt),
+            Some(SignInFailure::HostBusy)
+        );
+
+        // Every console refusal, before or after the host signed the user in.
+        for refusal in ConsoleRefusal::ALL {
+            for setup in [false, true] {
+                let error = refused(refusal.deck_reason(), setup);
+                assert_eq!(connect_error_class(&error), refusal.token(), "{refusal:?}");
+                assert_eq!(
+                    classify_disconnect(&error).reason,
+                    DisconnectReason::Terminal(TerminalDisconnect::HostRefused(
+                        HostRefusal::Console(refusal)
+                    )),
+                    "{refusal:?}"
+                );
+            }
+        }
+        let named = refused(
+            "console_other_user: flame_db is signed in at this Mac; sign in as flame_db, or \
+             switch to your account at the Mac first",
+            false,
+        );
+        assert_eq!(connect_error_class(&named), "console_other_user");
+        assert_eq!(
+            SignInFailure::from_end(&classify_disconnect(&named), SignInStage::Attempt),
+            Some(SignInFailure::ConsoleRefused {
+                refusal: ConsoleRefusal::OtherUser,
+                ended: false,
+            })
+        );
+
+        // The Linux Pier's occupied X11 seat arrives as a close during setup.
+        for reason in [
+            arcen_session::x11_seat::DECK_REASON_SEAT_OCCUPIED.to_owned(),
+            arcen_session::x11_seat::DECK_REASON_SEAT_OTHER_PRODUCT.to_owned(),
+            arcen_session::x11_seat::deck_reason_other_product(Some(
+                &arcen_session::console_session::ForeignService::new(
+                    "labrdp-session",
+                    Some("labrdp.service"),
+                    None,
+                ),
+            )),
+        ] {
+            let closed = ConnectSmokeError::ClosedByHost(format!(": {reason}"));
+            assert_eq!(connect_error_class(&closed), "seat_occupied", "{reason}");
+            let end = classify_disconnect(&closed);
+            assert_eq!(
+                end.reason,
+                DisconnectReason::Terminal(TerminalDisconnect::HostRefused(
+                    HostRefusal::SeatOccupied
+                ))
+            );
+            assert_eq!(end.message, closed.to_string(), "the host's words are kept");
+        }
+        // A close with another reason is still a close.
+        let closed = ConnectSmokeError::ClosedByHost(": too many connections".to_owned());
+        assert_eq!(connect_error_class(&closed), "tcp");
+
+        // A wrong password stays one.
+        for message in ["", "Authentication failed", "Invalid credentials"] {
+            let error = refused(message, false);
+            assert!(
+                matches!(error, ConnectSmokeError::AuthFailed(_)),
+                "{message:?}"
+            );
+            assert_eq!(connect_error_class(&error), "auth");
+        }
     }
 
     #[test]

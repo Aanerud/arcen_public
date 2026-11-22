@@ -794,18 +794,21 @@ fn read_overrides(
         };
         let understood = match (setting, &value) {
             (_, Value::Null) => continue,
-            (OverridableSetting::ClipboardEnabled, Value::Bool(_)) => true,
-            (OverridableSetting::ClipboardEnabled, _) => {
+            (
+                OverridableSetting::ClipboardEnabled | OverridableSetting::SystemShortcuts,
+                Value::Bool(_),
+            ) => true,
+            (OverridableSetting::ClipboardEnabled | OverridableSetting::SystemShortcuts, _) => {
                 return Err(ProfileError::WrongType {
                     field: "overrides",
-                    expected: "true or false for clipboard_enabled",
+                    expected: "true or false for clipboard_enabled and system_shortcuts",
                 });
             }
             (_, Value::String(token)) => token_understood(setting, token),
             (_, _) => {
                 return Err(ProfileError::WrongType {
                     field: "overrides",
-                    expected: "text for each setting but clipboard_enabled",
+                    expected: "text for each setting but clipboard_enabled and system_shortcuts",
                 });
             }
         };
@@ -831,7 +834,7 @@ fn token_understood(setting: OverridableSetting, token: &str) -> bool {
             arcen_input::keyboard::ShortcutPreference::from_token(token).is_some()
         }
         OverridableSetting::DisplaysMode => DisplaysMode::from_wire(token).is_some(),
-        OverridableSetting::ClipboardEnabled => false,
+        OverridableSetting::ClipboardEnabled | OverridableSetting::SystemShortcuts => false,
     }
 }
 
@@ -1328,6 +1331,16 @@ pub fn override_lines(overrides: &ConnectionOverrides) -> Vec<SummaryLine> {
                 "Shared when Settings allows it"
             } else {
                 "Off for this connection"
+            },
+        );
+    }
+    if let Override::Own(to_host) = overrides.system_shortcuts {
+        line(
+            "System shortcuts",
+            if to_host {
+                "Go to the remote computer"
+            } else {
+                "Stay on this computer"
             },
         );
     }
@@ -1898,6 +1911,13 @@ mod tests {
         ));
         assert!(matches!(
             wrong(serde_json::json!({"overrides": {"clipboard_enabled": "no"}})),
+            ProfileError::WrongType {
+                field: "overrides",
+                ..
+            }
+        ));
+        assert!(matches!(
+            wrong(serde_json::json!({"overrides": {"system_shortcuts": "on"}})),
             ProfileError::WrongType {
                 field: "overrides",
                 ..

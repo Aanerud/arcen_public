@@ -894,6 +894,7 @@ async fn serve_desktop(
     >,
     audio: Option<&mut arcen_pier_macos::audio::AudioCaptureSession>,
     audio_channel: Option<tokio::net::UnixStream>,
+    sent_frames: arcen_telemetry::SentFrames,
 ) -> Result<u64, Box<arcen_pier_macos::stream::StreamEnded>> {
     if let Some(multi_monitor) = handshake.multi_monitor.as_ref() {
         return serve_multi_desktop(
@@ -904,6 +905,7 @@ async fn serve_desktop(
             telemetry,
             session_id,
             audio,
+            sent_frames,
         )
         .await;
     }
@@ -998,6 +1000,7 @@ async fn serve_desktop(
             path_signal_connection: socket.get_ref().path_signal_connection(),
             refine: handshake.refine,
             host_keymap: handshake.host_keymap,
+            sent_frames,
         },
     )
     .await?;
@@ -1026,6 +1029,7 @@ async fn serve_multi_desktop(
     telemetry: arcen_pier_macos::observability::HostTelemetry,
     session_id: arcen_telemetry::CorrelationId,
     audio: Option<&mut arcen_pier_macos::audio::AudioCaptureSession>,
+    sent_frames: arcen_telemetry::SentFrames,
 ) -> Result<u64, Box<arcen_pier_macos::stream::StreamEnded>> {
     let epoch =
         arcen_media::MediaStreamEpoch::new(multi_monitor.generation.get()).map_err(|error| {
@@ -1086,6 +1090,7 @@ async fn serve_multi_desktop(
             audio,
             path_signal_connection: socket.get_ref().path_signal_connection(),
             host_keymap: handshake.host_keymap,
+            sent_frames,
         },
     )
     .await?;
@@ -3236,55 +3241,65 @@ async fn serve_one(
             let privacy_lost = desk_privacy
                 .as_ref()
                 .map(arcen_pier_macos::desk_privacy::DeskPrivacy::lost);
-            let served = serve_desktop(
-                socket,
-                &handshake,
-                stream_frames,
-                telemetry.clone(),
-                session_id.clone(),
-                session_microphone.as_mut(),
-                // The capture this session negotiated, not `None`. The lease
-                // was started, announced to the Deck as enabled, and released
-                // at the end — and never handed to the streamer, so nothing
-                // ever drained it. The host promised audio and then held the
-                // only thing that could produce it.
-                if session_audio.delivers {
-                    match session_audio.lease.as_mut() {
-                        Some(SessionAudioLease::Capture(session)) => Some(session),
-                        _ => None,
-                    }
-                } else {
-                    None
-                },
-                audio_channel,
-            );
             // A desk that can no longer be kept private ends the session
             // (`DeskPrivacy::lost`); the hand-back below locks it first.
-            let outcome = match privacy_lost {
-                None => Some(served.await),
-                Some(lost) => tokio::select! {
-                    outcome = served => Some(outcome),
-                    () = privacy_lost_wait(&lost) => None,
+            let outcome = serve_watched(
+                |sent_frames| {
+                    serve_desktop(
+                        socket,
+                        &handshake,
+                        stream_frames,
+                        telemetry.clone(),
+                        session_id.clone(),
+                        session_microphone.as_mut(),
+                        // The capture this session negotiated, not `None`. The lease
+                        // was started, announced to the Deck as enabled, and released
+                        // at the end — and never handed to the streamer, so nothing
+                        // ever drained it. The host promised audio and then held the
+                        // only thing that could produce it.
+                        if session_audio.delivers {
+                            match session_audio.lease.as_mut() {
+                                Some(SessionAudioLease::Capture(session)) => Some(session),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        },
+                        audio_channel,
+                        sent_frames,
+                    )
                 },
-            };
-            if outcome.is_none() {
-                let _ = arcen_pier_macos::net::refuse_with_reason(
-                    socket,
-                    arcen_session::console_session::ConsoleRefusal::PrivacyUnavailable
-                        .deck_reason(),
-                )
-                .await;
+                privacy_lost.as_deref(),
+            )
+            .await;
+            if matches!(outcome, Watched::WatchEnded { .. }) {
+                // Why the desk's privacy ended the session, as the shared
+                // verdict says: a console another account (or the login
+                // window) took over is not a privacy failure.
+                let reason = deck_reason_for_privacy_end(
+                    desk_privacy
+                        .as_ref()
+                        .and_then(arcen_pier_macos::desk_privacy::DeskPrivacy::end_verdict),
+                    session_policy.serving_uid,
+                );
+                let _ = arcen_pier_macos::net::refuse_with_reason(socket, &reason).await;
             }
             if let Some(microphone) = session_microphone.as_mut() {
                 let _ = microphone.shutdown_wait("session_end").await;
             }
             let (reason_class, frames_sent) = match &outcome {
-                None => {
+                Watched::WatchEnded { frames_sent } => {
                     stream_failed = true;
-                    ("privacy_lost", 0)
+                    let end = arcen_session::console_session::desk_privacy::WatchSessionEnd::new(
+                        desk_privacy
+                            .as_ref()
+                            .and_then(arcen_pier_macos::desk_privacy::DeskPrivacy::end_verdict),
+                        *frames_sent,
+                    );
+                    (end.reason_class, end.frames_sent)
                 }
-                Some(Ok(frames)) => ("completed", *frames),
-                Some(Err(ended)) => {
+                Watched::Stream(Ok(frames)) => ("completed", *frames),
+                Watched::Stream(Err(ended)) => {
                     eprintln!("stream ended: {ended}");
                     stream_failed = true;
                     // A capture or encoder that never started used to close
@@ -3494,6 +3509,73 @@ async fn arm_desk_privacy(
         "the desk is private while the Deck is attached"
     );
     Ok(Some(privacy))
+}
+
+/// What the Deck is told when the desk's privacy ends its session: the
+/// shared [`WatchVerdict::deck_refusal`] for who holds the console now,
+/// naming another account the way a refused connection does
+/// (`console::other_user_refusal`).
+///
+/// [`WatchVerdict::deck_refusal`]: arcen_session::console_session::desk_privacy::WatchVerdict::deck_refusal
+fn deck_reason_for_privacy_end(
+    verdict: Option<arcen_session::console_session::desk_privacy::WatchVerdict>,
+    serving_uid: Option<u32>,
+) -> String {
+    use arcen_session::console_session::ConsoleRefusal;
+    use arcen_session::console_session::desk_privacy::WatchVerdict;
+    let holder = arcen_pier_macos::console::console_holder();
+    let refusal = match (verdict, serving_uid) {
+        (Some(verdict), Some(uid)) => verdict.deck_refusal(uid, holder),
+        _ => None,
+    }
+    .unwrap_or(ConsoleRefusal::PrivacyUnavailable);
+    tracing::warn!(
+        target: arcen_telemetry::names::target::SESSION,
+        reason = refusal.token(),
+        console_left = verdict == Some(WatchVerdict::ConsoleLeft),
+        "the desk watch ends the Deck's session"
+    );
+    if refusal == ConsoleRefusal::OtherUser {
+        arcen_pier_macos::console::other_user_refusal(
+            arcen_pier_macos::console::console_owner().as_deref(),
+        )
+    } else {
+        refusal.deck_reason().to_owned()
+    }
+}
+
+/// How a stream under the desk watch ended.
+#[derive(Debug)]
+enum Watched<T> {
+    /// The stream ended by itself.
+    Stream(T),
+    /// The desk watch ended the session and dropped the stream, and its
+    /// statistics with it; `frames_sent` is the tally the stream kept.
+    WatchEnded { frames_sent: u64 },
+}
+
+/// Runs the stream `serve` builds around this session's frame tally until
+/// it ends, or until `privacy_lost` is set. The tally is made here and read
+/// here after the stream is dropped, so a watch-ended session reports what
+/// its own stream sent.
+async fn serve_watched<T, F>(
+    serve: impl FnOnce(arcen_telemetry::SentFrames) -> F,
+    privacy_lost: Option<&std::sync::atomic::AtomicBool>,
+) -> Watched<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let sent_frames = arcen_telemetry::SentFrames::default();
+    let served = serve(sent_frames.clone());
+    match privacy_lost {
+        None => Watched::Stream(served.await),
+        Some(lost) => tokio::select! {
+            outcome = served => Watched::Stream(outcome),
+            () = privacy_lost_wait(lost) => Watched::WatchEnded {
+                frames_sent: sent_frames.count(),
+            },
+        },
+    }
 }
 
 /// Resolves once the desk's privacy is lost.
@@ -4279,6 +4361,38 @@ mod tests {
     fn rejects_missing_config_path() {
         let args = vec!["--config".to_owned()];
         assert!(parse_args(&args).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_session_the_desk_watch_ends_reports_the_frames_its_stream_sent() {
+        use super::{Watched, serve_watched};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lost = AtomicBool::new(false);
+        // The stream `serve_one` runs, counting into the tally it is handed;
+        // the watch ends the session after 42 frames and drops it.
+        let outcome: Watched<u64> = serve_watched(
+            |sent_frames| {
+                let lost = &lost;
+                async move {
+                    for _ in 0..42 {
+                        sent_frames.add_one();
+                        tokio::task::yield_now().await;
+                    }
+                    lost.store(true, Ordering::Release);
+                    std::future::pending::<u64>().await
+                }
+            },
+            Some(&lost),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Watched::WatchEnded { frames_sent: 42 }),
+            "{outcome:?}"
+        );
+
+        // Without a watch the stream's own result stands.
+        let outcome = serve_watched(|_| async { 7_u64 }, None).await;
+        assert!(matches!(outcome, Watched::Stream(7)), "{outcome:?}");
     }
 
     #[tokio::test]

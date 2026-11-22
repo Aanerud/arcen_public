@@ -492,6 +492,7 @@ async fn frames_reach_the_client_and_a_full_frame_request_forces_a_keyframe() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -651,6 +652,7 @@ async fn a_grading_stream_for_an_srgb_deck_says_srgb_in_its_sps() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -770,6 +772,7 @@ async fn idle_desktop_full_frame_request_reencodes_the_last_frame_as_a_keyframe(
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -918,6 +921,7 @@ async fn input_sent_during_a_stream_moves_the_real_pointer() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -1173,6 +1177,7 @@ async fn a_client_clipboard_reaches_the_real_pasteboard() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -1374,6 +1379,7 @@ async fn a_streamed_session_records_what_it_measured() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -1510,6 +1516,7 @@ async fn pen_samples_sent_by_a_client_are_injected_as_tablet_events() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -1701,6 +1708,7 @@ async fn committed_text_is_typed_and_health_stats_carry_the_path() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -1894,6 +1902,7 @@ async fn host_audio_reaches_the_client_when_capture_is_available() {
         let stats = arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -2107,6 +2116,7 @@ async fn a_thirty_fps_session_delivers_near_thirty_fps() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::H264,
@@ -2317,6 +2327,7 @@ async fn a_still_desktop_sends_almost_nothing() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::H264,
@@ -2504,6 +2515,7 @@ async fn a_still_screen_stays_healthy_for_a_minute() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,
@@ -2741,6 +2753,7 @@ async fn a_bridged_tablet_is_published_as_hid_devices_fed_and_torn_down() {
         arcen_pier_macos::stream::stream(
             &mut socket,
             arcen_pier_macos::stream::StreamSession {
+                sent_frames: arcen_telemetry::SentFrames::default(),
                 microphone: None,
                 capture,
                 codec: arcen_pier_macos::encode::EncoderCodec::Hevc,

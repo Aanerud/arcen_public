@@ -328,7 +328,10 @@ impl Scene {
     }
 
     fn app_defaults(&self) -> AppDefaults {
-        AppDefaults::from_settings(&self.settings)
+        AppDefaults::from_settings(
+            &self.settings,
+            self.platform.deck_platform().system_shortcut_route(),
+        )
     }
 
     /// Applies a Home action as both shells do (`apply_home_action`, then
@@ -377,7 +380,7 @@ impl Scene {
         use crate::runtime::session::{ConnectSmokeError, session_end_for};
         let end = session_end_for(&ConnectSmokeError::AuthFailed(PIER_REFUSAL.to_owned()));
         let detail = crate::sign_in::end_detail(&end);
-        let failure = SignInFailure::after_end(end.reason, SignInStage::Attempt)
+        let failure = SignInFailure::from_end(&end, SignInStage::Attempt)
             .unwrap_or(SignInFailure::SessionEnded);
         self.home.direct = self.home.sign_in.return_home(failure, draft, Some(detail));
     }

@@ -195,10 +195,7 @@ impl SettingsValues {
 
 /// How this Deck takes the system shortcuts.
 const fn shortcut_route(platform: DeckPlatform) -> crate::settings::SystemShortcutRoute {
-    match platform {
-        DeckPlatform::Mac => crate::settings::SystemShortcutRoute::MacEventTap,
-        DeckPlatform::Pc => crate::settings::SystemShortcutRoute::PcKeyboardHook,
-    }
+    platform.system_shortcut_route()
 }
 
 /// The settings the system-shortcuts switch reads and writes.
@@ -1012,8 +1009,35 @@ pub fn render_settings(
                                 );
                             }
                             checkbox_help(ui, choices::system_shortcuts_line(platform), Ink::Quiet);
+                            // What a connection without its own value uses now.
+                            let app = crate::overrides::AppDefaults {
+                                typing_mode: crate::overrides::stored_typing_mode(typing_mode),
+                                option_keys: option_key_mode,
+                                displays_mode: displays,
+                                clipboard_enabled,
+                                system_shortcuts: on,
+                            };
+                            if let Some(line) =
+                                choices::use_their_own_line(crate::overrides::connections_with_own(
+                                    facts.connections,
+                                    app,
+                                    crate::overrides::OverridableSetting::SystemShortcuts,
+                                ))
+                            {
+                                checkbox_help(ui, &line, Ink::Quiet);
+                            }
+                            // The permission is one for the whole app: it is
+                            // needed as soon as any connection sends them.
+                            let any_on = on
+                                || facts.connections.iter().any(|connection| {
+                                    connection
+                                        .settings
+                                        .overrides
+                                        .effective_system_shortcuts(on)
+                                        .value
+                                });
                             if let Some(needed) = choices::system_shortcuts_permission(
-                                on,
+                                any_on,
                                 facts.system_shortcut_permission,
                             ) {
                                 checkbox_help(ui, needed, Ink::Note);
@@ -1025,13 +1049,6 @@ pub fn render_settings(
                                 });
                             }
 
-                            // What a connection without its own value uses now.
-                            let app = crate::overrides::AppDefaults {
-                                typing_mode: crate::overrides::stored_typing_mode(typing_mode),
-                                option_keys: option_key_mode,
-                                displays_mode: displays,
-                                clipboard_enabled,
-                            };
                             group_heading(ui, choices::TYPING_HEADING);
                             quiet(
                                 ui,
@@ -2350,6 +2367,75 @@ mod tests {
         // Each Deck names its own shortcuts.
         assert!(choices::system_shortcuts_line(DeckPlatform::Mac).starts_with("⌘Tab"));
         assert!(choices::system_shortcuts_line(DeckPlatform::Pc).starts_with("Alt+Tab"));
+    }
+
+    #[test]
+    fn the_system_shortcuts_switch_counts_connections_with_their_own_and_their_permission() {
+        let connection = |system_shortcuts| crate::config::SavedConnectionSummary {
+            id: "id".to_owned(),
+            kind: crate::config::ConnectionKind::DirectMachine,
+            name: "name".to_owned(),
+            host: "203.0.113.10".to_owned(),
+            port: 18_444,
+            use_tls: true,
+            transport: crate::config::SavedTransport::Quic,
+            identity_security_mode: None,
+            settings: crate::config::SavedConnectionSettings {
+                overrides: crate::overrides::ConnectionOverrides {
+                    system_shortcuts,
+                    ..crate::overrides::ConnectionOverrides::default()
+                },
+                ..crate::config::SavedConnectionSettings::default()
+            },
+            unknown: serde_json::Map::new(),
+        };
+        use crate::overrides::Override;
+        let connections = [
+            connection(Override::Own(true)),
+            connection(Override::Own(false)),
+            connection(Override::Inherit),
+        ];
+        let values = SettingsValues {
+            tab: SettingsTab::Input,
+            ..sample_values()
+        };
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            let texts = panel_text(platform, &values, &sample_facts(platform, &connections));
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text == "2 connections use their own"),
+                "{platform:?}: {texts:?}"
+            );
+        }
+        // Off in Settings, but a connection sends them: the one app-wide
+        // permission is still needed.
+        assert!(!system_shortcuts_to_host(
+            DeckPlatform::Mac,
+            values.keyboard_capture,
+            values.capture_mac_system_shortcuts
+        ));
+        let mut facts = sample_facts(DeckPlatform::Mac, &connections);
+        facts.system_shortcut_permission = Some(false);
+        let texts = panel_text(DeckPlatform::Mac, &values, &facts);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "Needs Accessibility permission."),
+            "{texts:?}"
+        );
+        let following = [connection(Override::Inherit)];
+        let mut facts = sample_facts(DeckPlatform::Mac, &following);
+        facts.system_shortcut_permission = Some(false);
+        let texts = panel_text(DeckPlatform::Mac, &values, &facts);
+        assert!(
+            texts
+                .iter()
+                .all(|text| text != "Needs Accessibility permission."
+                    && !text.contains("use their own")
+                    && !text.contains("uses its own")),
+            "{texts:?}"
+        );
     }
 
     #[test]

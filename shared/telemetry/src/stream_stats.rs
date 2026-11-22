@@ -320,9 +320,45 @@ pub fn stage_averages(elapsed: Duration, frames_sent: u64, totals: StageTotals) 
     averages
 }
 
+/// The frames a stream has written, readable after the stream is gone.
+///
+/// A session that ends its stream by dropping it mid-flight (a Pier's desk
+/// watch does) loses the statistics the stream would have returned, and
+/// `SESSION_END.frames_sent` then read 0 for a session that had streamed.
+/// The stream counts into a clone of this as well, and the session reads it
+/// after the drop.
+#[derive(Debug, Clone, Default)]
+pub struct SentFrames(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl SentFrames {
+    /// Frames written so far, by this handle or any clone of it.
+    #[must_use]
+    pub fn count(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Counts one more frame written.
+    pub fn add_one(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_count_outlives_the_stream_that_kept_it() {
+        let session = SentFrames::default();
+        let stream = session.clone();
+        let streaming = std::thread::spawn(move || {
+            for _ in 0..42 {
+                stream.add_one();
+            }
+        });
+        streaming.join().expect("the stream ends");
+        assert_eq!(session.count(), 42);
+    }
 
     #[test]
     fn a_snapshot_is_not_due_before_the_interval() {

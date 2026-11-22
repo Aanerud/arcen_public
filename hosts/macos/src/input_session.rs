@@ -296,6 +296,12 @@ impl InputSession {
         self.controller.types_text()
     }
 
+    /// Takes the session layout's latest `host_keymap` notice
+    /// ([`InputController::set_host_keymap`]).
+    pub fn set_host_keymap(&mut self, notice: &arcen_protocol::messages::HostKeymapMsg) {
+        self.controller.set_host_keymap(notice);
+    }
+
     /// Takes the reply the last message owes the client, if any.
     pub const fn take_reply(&mut self) -> Option<String> {
         self.reply.take()

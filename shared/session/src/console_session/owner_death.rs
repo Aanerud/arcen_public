@@ -226,17 +226,64 @@ fn parse_decimal(text: &str) -> Option<u64> {
     text.parse().ok()
 }
 
+/// What a Pier process found where its attachment record lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredRecord {
+    /// Nothing there: the read failed with `NotFound`, and only that.
+    Absent,
+    /// Something there that could not be read (permissions, a symlink loop,
+    /// an I/O error, text that is not UTF-8). It may be this session's
+    /// record, so it is not trusted to be absent: it locks.
+    Unreadable,
+    /// The stored text, at most [`StoredRecord::READ_LIMIT`] bytes of it.
+    Text(String),
+}
+
+impl StoredRecord {
+    /// How much of a record is read; longer than any record, so a larger
+    /// file fails to parse (and locks) rather than being trusted.
+    pub const READ_LIMIT: u64 = 512;
+
+    /// Reads the record at `path`, at most [`Self::READ_LIMIT`] bytes.
+    #[must_use]
+    pub fn read(path: &std::path::Path) -> Self {
+        use std::io::Read as _;
+        Self::from_read(std::fs::File::open(path).and_then(|file| {
+            let mut text = String::new();
+            file.take(Self::READ_LIMIT)
+                .read_to_string(&mut text)
+                .map(|_| text)
+        }))
+    }
+
+    /// Classifies a read of the record: only `NotFound` is "no record".
+    #[must_use]
+    pub fn from_read(read: std::io::Result<String>) -> Self {
+        match read {
+            Ok(text) => Self::Text(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
 /// What a Pier process does with the attachment record it finds at start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupRecovery {
     /// No record: nothing was attached.
     Nothing,
     /// A Deck was attached to this login session when the process before
-    /// this one ended: lock the session before serving anything, then
-    /// remove the record.
+    /// this one ended, or the record cannot be trusted: lock the session
+    /// before serving anything, and remove the record only once it is
+    /// locked ([`Self::removes_record`]).
     LockFirst,
-    /// The record names a login session that has ended: remove it.
+    /// The record is of an earlier boot or another account: remove it.
     Stale,
+    /// The record names another login session of this boot and account
+    /// (the process runs outside it, such as over SSH, or the account's
+    /// earlier login session): neither lock nor remove; it is that
+    /// session's agent's, or the next boot's, to decide.
+    LeaveAlone,
 }
 
 impl StartupRecovery {
@@ -245,7 +292,22 @@ impl StartupRecovery {
     pub const fn departure(self) -> Option<Departure> {
         match self {
             Self::LockFirst => Some(Departure::AgentFailed),
-            Self::Nothing | Self::Stale => None,
+            Self::Nothing | Self::Stale | Self::LeaveAlone => None,
+        }
+    }
+
+    /// Whether the record is removed after this recovery, `locked` being
+    /// how the lock of [`Self::LockFirst`] ended. A session left unlocked
+    /// keeps its record, so the next start tries again.
+    #[must_use]
+    pub const fn removes_record(self, locked: Option<OwnerGoneOutcome>) -> bool {
+        match self {
+            Self::Stale => true,
+            Self::LockFirst => match locked {
+                Some(outcome) => outcome.clears_record(),
+                None => false,
+            },
+            Self::Nothing | Self::LeaveAlone => false,
         }
     }
 }
@@ -253,7 +315,9 @@ impl StartupRecovery {
 /// Decides what a Pier process starting in login session `current` does
 /// with the stored record `stored` (`None`: no record). A record that
 /// cannot be parsed locks: it may be this session's, and a lock is only
-/// ever a password away.
+/// ever a password away. A record of another login session is stale only
+/// when it is of another boot or account; one of this boot and account is
+/// left alone, since only the agent in that session may judge it.
 #[must_use]
 pub fn startup_recovery(stored: Option<&str>, current: &AttachmentRecord) -> StartupRecovery {
     let Some(text) = stored else {
@@ -262,7 +326,58 @@ pub fn startup_recovery(stored: Option<&str>, current: &AttachmentRecord) -> Sta
     match AttachmentRecord::parse(text) {
         None => StartupRecovery::LockFirst,
         Some(record) if record == *current => StartupRecovery::LockFirst,
-        Some(_) => StartupRecovery::Stale,
+        Some(record) if record.boot != current.boot || record.account != current.account => {
+            StartupRecovery::Stale
+        }
+        Some(_) => StartupRecovery::LeaveAlone,
+    }
+}
+
+/// [`startup_recovery`] for what a Pier process found
+/// ([`StoredRecord`]), when its own login session may not be readable
+/// (`current` is `None`). A record that cannot be read, or one a process
+/// that cannot name its session finds, locks: it may be this session's.
+#[must_use]
+pub fn startup_recovery_in(
+    stored: &StoredRecord,
+    current: Option<&AttachmentRecord>,
+) -> StartupRecovery {
+    match (stored, current) {
+        (StoredRecord::Absent, _) => StartupRecovery::Nothing,
+        (StoredRecord::Unreadable, _) | (StoredRecord::Text(_), None) => StartupRecovery::LockFirst,
+        (StoredRecord::Text(text), Some(current)) => startup_recovery(Some(text), current),
+    }
+}
+
+/// What [`recover_record`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordRecovery {
+    /// What the record asked for.
+    pub recovery: StartupRecovery,
+    /// How the lock ended, when the record asked for one.
+    pub locked: Option<OwnerGoneOutcome>,
+    /// Whether the record was removed.
+    pub removed: bool,
+}
+
+/// What a Pier process starting in `current` does with the record at
+/// `path`: [`startup_recovery_in`] on what is there, `lock` when that is
+/// [`StartupRecovery::LockFirst`], and the record removed only when
+/// [`StartupRecovery::removes_record`] says so. Fails closed: a record that
+/// cannot be read locks, a session left unlocked keeps its record, and
+/// another login session's record is left alone.
+pub fn recover_record(
+    path: &std::path::Path,
+    current: Option<&AttachmentRecord>,
+    lock: impl FnOnce() -> OwnerGoneOutcome,
+) -> RecordRecovery {
+    let recovery = startup_recovery_in(&StoredRecord::read(path), current);
+    let locked = (recovery == StartupRecovery::LockFirst).then(lock);
+    let removed = recovery.removes_record(locked) && std::fs::remove_file(path).is_ok();
+    RecordRecovery {
+        recovery,
+        locked,
+        removed,
     }
 }
 
@@ -349,6 +464,16 @@ pub enum OwnerGoneOutcome {
     /// The session would not lock for [`super::UNLOCKED_GRACE`]; the desk
     /// got it back unlocked, as after a hand-back whose lock was refused.
     GaveBackUnlocked,
+}
+
+impl OwnerGoneOutcome {
+    /// Whether the attachment record may go: only once the session is
+    /// locked. A session left unlocked (refused, or behind another
+    /// account's console) keeps it for the next start to try again.
+    #[must_use]
+    pub const fn clears_record(self) -> bool {
+        matches!(self, Self::Locked)
+    }
 }
 
 /// The hand-back a lock guard (or the next Pier process) does for an owner
@@ -572,15 +697,87 @@ mod tests {
     }
 
     #[test]
-    fn a_record_of_another_session_boot_or_account_is_stale() {
+    fn only_a_record_that_is_not_there_counts_as_no_record() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            StoredRecord::from_read(Err(Error::from(ErrorKind::NotFound))),
+            StoredRecord::Absent
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::IsADirectory,
+            ErrorKind::Other,
+        ] {
+            let stored = StoredRecord::from_read(Err(Error::from(kind)));
+            assert_eq!(stored, StoredRecord::Unreadable, "{kind:?}");
+            assert_eq!(
+                startup_recovery_in(&stored, Some(&current())),
+                StartupRecovery::LockFirst
+            );
+        }
+        let elsewhere = AttachmentRecord::new("100009", BOOT, 501).expect("record");
+        assert_eq!(
+            startup_recovery_in(&StoredRecord::Unreadable, Some(&elsewhere)),
+            StartupRecovery::LockFirst
+        );
+        let text = current().to_text();
+        assert_eq!(
+            StoredRecord::from_read(Ok(text.clone())),
+            StoredRecord::Text(text)
+        );
+    }
+
+    #[test]
+    fn a_process_that_cannot_name_its_session_locks_on_any_record() {
+        let record = current();
+        assert_eq!(
+            startup_recovery_in(&StoredRecord::Absent, None),
+            StartupRecovery::Nothing
+        );
+        for stored in [
+            StoredRecord::Text(record.to_text()),
+            StoredRecord::Text("garbage".to_owned()),
+            StoredRecord::Unreadable,
+        ] {
+            assert_eq!(
+                startup_recovery_in(&stored, None),
+                StartupRecovery::LockFirst
+            );
+        }
+        assert_eq!(
+            startup_recovery_in(&StoredRecord::Text(record.to_text()), Some(&record)),
+            StartupRecovery::LockFirst
+        );
+    }
+
+    #[test]
+    fn a_record_goes_only_once_its_session_is_locked() {
+        assert!(StartupRecovery::LockFirst.removes_record(Some(OwnerGoneOutcome::Locked)));
+        for left_unlocked in [
+            Some(OwnerGoneOutcome::GaveBackUnlocked),
+            Some(OwnerGoneOutcome::NotOurs),
+            None,
+        ] {
+            assert!(!StartupRecovery::LockFirst.removes_record(left_unlocked));
+        }
+        assert!(StartupRecovery::Stale.removes_record(None));
+        assert!(!StartupRecovery::LeaveAlone.removes_record(None));
+        assert!(!StartupRecovery::Nothing.removes_record(None));
+        assert!(OwnerGoneOutcome::Locked.clears_record());
+        assert!(!OwnerGoneOutcome::GaveBackUnlocked.clears_record());
+    }
+
+    #[test]
+    fn a_record_of_another_boot_or_account_is_stale() {
         let record = current();
         for other in [
-            AttachmentRecord::new("100009", &record.boot, 501),
             AttachmentRecord::new(
                 &record.login_session,
                 "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0",
                 501,
             ),
+            AttachmentRecord::new("100009", "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0", 501),
             AttachmentRecord::new(&record.login_session, &record.boot, 502),
         ] {
             let other = other.expect("record");
@@ -590,6 +787,140 @@ mod tests {
             );
         }
         assert_eq!(StartupRecovery::Stale.departure(), None);
+    }
+
+    #[test]
+    fn a_record_of_another_session_of_this_boot_and_account_is_left_alone() {
+        // A process outside the recorded session (over SSH, say) neither
+        // locks that session nor removes its record.
+        let record = current();
+        let outside = AttachmentRecord::new("100009", &record.boot, 501).expect("record");
+        let recovery = startup_recovery(Some(&record.to_text()), &outside);
+        assert_eq!(recovery, StartupRecovery::LeaveAlone);
+        assert_eq!(recovery.departure(), None);
+        assert!(!recovery.removes_record(None));
+    }
+
+    /// A directory beside the test binary, emptied first; removed by the
+    /// caller.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let binary = std::env::current_exe().expect("test binary");
+        let directory = binary
+            .parent()
+            .expect("binary directory")
+            .join(format!("arcen-owner-death-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("scratch created");
+        directory
+    }
+
+    /// [`recover_record`] with a lock that ends as `outcome`.
+    fn recover_with(
+        path: &std::path::Path,
+        current: &AttachmentRecord,
+        outcome: OwnerGoneOutcome,
+    ) -> RecordRecovery {
+        recover_record(path, Some(current), || outcome)
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_locks_and_is_not_taken_for_absent() {
+        let directory = scratch("unreadable");
+        let current = current();
+        // A directory opens, and reading it fails.
+        let folder = directory.join("folder");
+        std::fs::create_dir(&folder).expect("folder");
+        // Not UTF-8.
+        let binary = directory.join("binary");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).expect("binary");
+        for path in [&folder, &binary] {
+            assert_eq!(StoredRecord::read(path), StoredRecord::Unreadable);
+            assert_eq!(
+                recover_with(path, &current, OwnerGoneOutcome::GaveBackUnlocked),
+                RecordRecovery {
+                    recovery: StartupRecovery::LockFirst,
+                    locked: Some(OwnerGoneOutcome::GaveBackUnlocked),
+                    removed: false,
+                },
+                "{}",
+                path.display()
+            );
+        }
+        let absent = directory.join("absent");
+        assert_eq!(StoredRecord::read(&absent), StoredRecord::Absent);
+        assert_eq!(
+            recover_record(&absent, Some(&current), || panic!("nothing to lock")),
+            RecordRecovery {
+                recovery: StartupRecovery::Nothing,
+                locked: None,
+                removed: false,
+            }
+        );
+        std::fs::remove_dir_all(&directory).expect("scratch removed");
+    }
+
+    #[test]
+    fn a_record_stays_until_its_session_is_locked() {
+        let directory = scratch("unlocked");
+        let path = directory.join("deck-attachment");
+        let current = current();
+        std::fs::write(&path, current.to_text()).expect("record written");
+        for unlocked in [
+            OwnerGoneOutcome::GaveBackUnlocked,
+            OwnerGoneOutcome::NotOurs,
+        ] {
+            let done = recover_with(&path, &current, unlocked);
+            assert_eq!(done.recovery, StartupRecovery::LockFirst);
+            assert_eq!(done.locked, Some(unlocked));
+            assert!(!done.removed);
+            assert_eq!(
+                StoredRecord::read(&path),
+                StoredRecord::Text(current.to_text()),
+                "{unlocked:?}"
+            );
+        }
+        let done = recover_with(&path, &current, OwnerGoneOutcome::Locked);
+        assert!(done.removed);
+        assert_eq!(StoredRecord::read(&path), StoredRecord::Absent);
+        std::fs::remove_dir_all(&directory).expect("scratch removed");
+    }
+
+    #[test]
+    fn only_a_new_boot_or_account_removes_another_sessions_record() {
+        let directory = scratch("stale");
+        let path = directory.join("deck-attachment");
+        let recorded = current();
+        std::fs::write(&path, recorded.to_text()).expect("record written");
+        // A process outside the recorded session, such as one started over
+        // SSH, or the account's next login session in this boot.
+        let outside = AttachmentRecord::new("100250", BOOT, 501).expect("record");
+        assert_eq!(
+            recover_record(&path, Some(&outside), || panic!("not its session to lock")),
+            RecordRecovery {
+                recovery: StartupRecovery::LeaveAlone,
+                locked: None,
+                removed: false,
+            }
+        );
+        assert_eq!(
+            StoredRecord::read(&path),
+            StoredRecord::Text(recorded.to_text())
+        );
+        let next_boot =
+            AttachmentRecord::new("100008", "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0", 501)
+                .expect("record");
+        assert_eq!(
+            recover_record(&path, Some(&next_boot), || panic!(
+                "stale records lock nothing"
+            )),
+            RecordRecovery {
+                recovery: StartupRecovery::Stale,
+                locked: None,
+                removed: true,
+            }
+        );
+        assert_eq!(StoredRecord::read(&path), StoredRecord::Absent);
+        std::fs::remove_dir_all(&directory).expect("scratch removed");
     }
 
     const SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";

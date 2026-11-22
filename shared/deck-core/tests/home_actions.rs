@@ -171,14 +171,21 @@ fn a_saved_connection_is_selected_and_deleting_it_clears_the_selection() {
 }
 
 #[test]
-fn use_settings_hands_a_connections_displays_choice_back_and_persists() {
-    // The field case: Settings › Displays is Primary display only, the saved
-    // connection keeps Match my layout; its panel's "Use Settings" clears it.
-    let dir = ScratchDir::new("follow-displays");
+fn use_app_defaults_hands_every_own_setting_back_and_persists() {
+    // Settings › Displays is Primary display only; the saved connection
+    // keeps its own Displays, Typing and system shortcuts. "Use app
+    // defaults" under its Connect clears all of them.
+    let dir = ScratchDir::new("follow-defaults");
     let repository = ClientConfigRepository::at(dir.0.clone());
     let mut form = Form::default();
     let mut direct = ConnectionDraft::new(ConnectionKind::DirectMachine);
     let mut saved = Vec::new();
+    let own = ConnectionOverrides {
+        displays_mode: Override::Own(DisplaysMode::MatchLayout),
+        typing_mode: Override::Own(arcen_input::text::TypingMode::Keys),
+        system_shortcuts: Override::Own(true),
+        ..ConnectionOverrides::default()
+    };
     apply(
         &mut form,
         &mut direct,
@@ -189,37 +196,29 @@ fn use_settings_hands_a_connections_displays_choice_back_and_persists() {
             host: "203.0.113.100".to_owned(),
             port: 18444,
             username: String::new(),
-            overrides: ConnectionOverrides {
-                displays_mode: Override::Own(DisplaysMode::MatchLayout),
-                ..ConnectionOverrides::default()
-            },
+            overrides: own,
         },
     );
-    assert_eq!(
-        saved[0].settings.overrides.displays_mode,
-        Override::Own(DisplaysMode::MatchLayout)
-    );
+    assert_eq!(saved[0].settings.overrides, own);
     let (effect, status) = apply(
         &mut form,
         &mut direct,
         &mut saved,
         &repository,
-        HomeAction::FollowAppDisplays(0),
+        HomeAction::FollowAppDefaults(0),
     );
     assert!(matches!(effect, HomeEffect::None));
     assert_eq!(
         status.as_deref(),
-        Some(
-            "\u{201c}Z8\u{201d} now connects with Settings \u{203a} Displays: Primary display only"
-        )
+        Some("\u{201c}Z8\u{201d} now uses the app defaults")
     );
-    assert_eq!(saved[0].settings.overrides.displays_mode, Override::Inherit);
+    assert_eq!(saved[0].settings.overrides, ConnectionOverrides::default());
     let file = repository.connections_file().expect("connections file");
     let reloaded =
         arcen_deck_core::config::parse_saved_connections(&std::fs::read(file).unwrap()).unwrap();
     assert_eq!(
-        reloaded.connections[0].settings.overrides.displays_mode,
-        Override::Inherit
+        reloaded.connections[0].settings.overrides,
+        ConnectionOverrides::default()
     );
 }
 

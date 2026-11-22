@@ -6,6 +6,131 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.8] — 2026-11-22
+
+Sign-in refusals say what happened: when a host turns a Deck away for a
+reason other than the password, both Decks now say why in plain words, log
+it as the host's own state rather than a failed sign-in, and do not retry a
+definite refusal. A saved connection can keep its own system-shortcut
+choice, Home sums up what a connection keeps differently from Settings with
+one link back to the app defaults, and New and Edit connection keep their
+buttons in view. The macOS Pier (preview) gives Shift its text under Secure
+Event Input, reports a user switch as such rather than as a privacy
+failure, and a restarted agent now locks the session its Deck was attached
+to. A password with capital letters may still be rejected at a macOS Pier's
+lock screen (see Known issues).
+
+### Added
+
+- **A connection keeps its own system-shortcut choice.** On both Decks,
+  Edit and New connection › **On this machine** has **System shortcuts go
+  to the remote computer**: **App default (…)**, **On** or **Off**, stored
+  as the connection's `system_shortcuts`. Settings › Input says how many
+  connections use their own. On a Mac the Accessibility permission stays
+  one for the whole app: a connection set to On without it is asked the
+  ⌘Tab question once, and Settings shows **Needs Accessibility
+  permission.** while any connection sends them. On a PC the choice decides
+  whether Alt+Tab, the Windows key and Print Screen go to that connection's
+  computer. A connection profile can carry it.
+
+### Changed
+
+- **Home sums up a connection's own settings.** Under **Connect**, a
+  connection that keeps its own ⌘ key, Option key, Typing, Displays or
+  system shortcuts (or a profile's clipboard) different from Settings says
+  so in one quiet line, such as **This connection: Left Option is Alt, keys
+  only typing.**, with one **Use app defaults** link under it that hands
+  them all back to Settings. It replaces the Displays-only line and its
+  **Use app default** link; the link now lines up with the line above it.
+- **New and Edit connection keep their buttons in view.** **Test
+  connection**, **Cancel** and **Save** (or **Add connection**) sit in a
+  footer at the bottom of the window with air above and below; both columns
+  scroll above it in a short window, with a hairline over the footer while
+  the form runs on under it.
+- **Session screens use the shared controls.** Connecting's **Cancel**, the
+  reconnect and sign-in overlays' **Disconnect**, the certificate prompts,
+  the host's notice, the display recoveries and the ⌘Tab question use the
+  same 36-point buttons as Home and Settings.
+
+### Fixed
+
+- **Capitals typed into a macOS Pier while Secure Event Input is held.**
+  A key the macOS Pier posts carries the string its key code types with no
+  modifier (`CGEventCreateKeyboardEvent`; Shift is only a flag), so with
+  Typing "Keys only" an application holding Secure Event Input read Shift+C
+  as `c`. While Secure Event Input is held, a key pressed with Shift alone
+  now carries what the session's layout types at its Shift level (the
+  `keymap-watch` layout, shared `PostedKeyText`): Terminal with Secure
+  Keyboard Entry on reads `AbC1xyZ9` exactly as typed. Keys with no
+  modifier, and the key after a dead key, keep the system's own
+  translation, so accents still compose. Option layers and Caps Lock are
+  not covered yet; Characters typing was not affected. This does not fix
+  the lock screen (see Known issues).
+- **A macOS Pier session whose console switches user is no longer a
+  privacy failure.** With desk privacy on, choosing another account at the
+  streamed lock screen ended the Deck's session with
+  `console_privacy_unavailable`. A console another account holds now ends
+  it with `console_other_user` naming that account, as a new connection is
+  told; the login window in front ends it with `console_session_changed`
+  (connecting again reaches that login window). Only a desk display that
+  stays lit is still `console_privacy_unavailable` (shared
+  `WatchVerdict::deck_refusal`).
+- **Sign-in refusals say what happened.** A host's refusal that is not
+  about the password no longer reads "Wrong username or password.": every
+  `console_*` reason has its own headline (for `console_other_user`,
+  **Someone else is signed in at ‹host› (‹account›). Sign in as that user,
+  or switch to your account there first.**, under **Username**), and so do
+  too many failed sign-ins, an account that may not sign in there, a busy
+  host, a host that cannot take a sign-in, a declined notice and a reason
+  the Deck does not know. A host that ends a session because it could not
+  keep its screen private says **‹host› couldn't keep its screen private,
+  so it ended the session.**, and one that ends it because another account
+  took the console (above) names that account. The host's own words stay
+  under **Details**.
+- **A restarted macOS Pier agent locks the session its Deck was attached
+  to.** The attachment record a restarted agent reads was never written:
+  the agent named its login session by `CGSessionCopyCurrentDictionary`'s
+  `kCGSSessionIDKey`, which that dictionary does not carry, so every
+  session logged "this agent's login session could not be read". The
+  session is now read with the public `SessionGetInfo` (the audit session
+  every process of the login session shares, the same one launchd starts
+  a restarted agent in), and an agent that cannot read it still locks on
+  any record it finds (shared `startup_recovery_in`). The record is now
+  handled fail-closed: a record that cannot be read (permissions, a
+  symlink loop, an I/O error) locks instead of counting as absent, a
+  session the lock left unlocked keeps its record so the next start tries
+  again, and an agent outside the recorded login session (one started over
+  SSH) leaves the record alone; only a new boot or account makes it stale.
+  The lock guard was not affected.
+- **`SESSION_END` of a macOS Pier session ended by desk privacy counts
+  the frames it sent.** The desk watch drops the session's stream, and the
+  statistics with it, so `console_left` and `privacy_lost` sessions
+  reported `frames_sent: 0` however long they had streamed. The stream now
+  also counts into a tally the session reads after the drop (shared
+  `arcen_telemetry::SentFrames` and `WatchSessionEnd`).
+- **A busy or held host is no longer logged as a failed sign-in, and is
+  not retried into another account's console.** Both Decks logged "Another
+  session is already using ‹host›" as `reason_class: "auth"` with a
+  `SESSION_AUTH_FAIL`, as if the password were wrong. A host that refuses
+  for its own state now has its own class on `CLIENT_CONNECT_FAIL` and
+  `CLIENT_SESSION_END`: `host_busy`, `seat_occupied` (the Linux Pier's
+  X11 seat), or the `console_*` code itself, and no `SESSION_AUTH_FAIL`
+  (shared `HostRefusal`). Following a macOS login window into the desktop
+  that replaces it no longer retries a definite refusal: when someone else
+  signs in there (`console_other_user`), or the password is refused, the
+  Deck returns to Home at once instead of trying again up to five times; a
+  host still busy or a desktop not ready yet is still followed, within the
+  same five attempts (shared `reconnect_flow::follows_login_window`).
+
+### Known issues
+
+- **A password with capital letters may be rejected at a macOS Pier's lock
+  screen.** Typed from a Deck, every character arrives (the field shows
+  the right number of dots), but macOS turns the password down. Signing in
+  at the login window works with the same password. The cause is not yet
+  confirmed; the lock screen appears to read the key and the Mac's own
+  Shift state and ignore the text the key carries.
+
 ## [0.20.7] — 2026-11-22
 
 Both Decks have a calm new Home that follows the system's light or dark
@@ -4541,7 +4666,8 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.7...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.8...HEAD
+[0.20.8]: https://github.com/Aanerud/arcen_public/compare/v0.20.7...v0.20.8
 [0.20.7]: https://github.com/Aanerud/arcen_public/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/Aanerud/arcen_public/compare/v0.20.5...v0.20.6
 [0.20.5]: https://github.com/Aanerud/arcen_public/compare/v0.20.4...v0.20.5

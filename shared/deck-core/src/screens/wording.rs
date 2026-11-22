@@ -44,6 +44,15 @@ impl DeckPlatform {
         }
     }
 
+    /// How this Deck takes the system shortcuts for the host.
+    #[must_use]
+    pub const fn system_shortcut_route(self) -> crate::settings::SystemShortcutRoute {
+        match self {
+            Self::Mac => crate::settings::SystemShortcutRoute::MacEventTap,
+            Self::Pc => crate::settings::SystemShortcutRoute::PcKeyboardHook,
+        }
+    }
+
     /// "Mac" / "PC", as in "Mac applications".
     #[must_use]
     pub const fn machine(self) -> &'static str {
