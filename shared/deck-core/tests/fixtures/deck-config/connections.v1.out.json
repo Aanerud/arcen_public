@@ -8,8 +8,7 @@
       "port": 18444,
       "settings": {
         "remembered_username": null,
-        "tablet_mode_requested": "local_termination",
-        "version": 1
+        "version": 2
       },
       "transport": "quic"
     },
@@ -22,8 +21,7 @@
       "security_mode": "high",
       "settings": {
         "remembered_username": null,
-        "tablet_mode_requested": "local_termination",
-        "version": 1
+        "version": 2
       },
       "transport": "quic"
     }

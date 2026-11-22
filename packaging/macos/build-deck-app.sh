@@ -159,7 +159,7 @@ DECK_FEATURES="$(normalize_deck_features "${ARCEN_DECK_FEATURES:-}")"
 DEV_TOOLS_MARKER="ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP"
 USB_EMULATE_MARKER="ARCEN_DECK_USB_EMULATE_FEATURE_MARKER_DO_NOT_SHIP"
 # Lab and developer features a release Deck must never contain.
-RELEASE_FORBIDDEN_FEATURES="dev-tools usb-emulate-lab experimental-raw-hid"
+RELEASE_FORBIDDEN_FEATURES="dev-tools doc-shots usb-emulate-lab experimental-raw-hid"
 # Strings those features compile in; a release binary carrying one is refused
 # even when it was assembled with --no-build from a stale local build.
 DO_NOT_SHIP_MARKERS="$DEV_TOOLS_MARKER $USB_EMULATE_MARKER"

@@ -127,13 +127,13 @@ impl ConnectionTest {
     }
 }
 
-fn verdict_colour(verdict: Verdict) -> egui::Color32 {
+fn verdict_colour(colours: &super::theme::Palette, verdict: Verdict) -> egui::Color32 {
     match verdict {
-        Verdict::Pass => egui::Color32::from_rgb(0x1E, 0x8E, 0x3E),
-        Verdict::Info => egui::Color32::from_rgb(0x1A, 0x73, 0xE8),
-        Verdict::Skipped => egui::Color32::from_rgb(0x9A, 0x9A, 0xA0),
-        Verdict::Warning => egui::Color32::from_rgb(0xC2, 0x7C, 0x0E),
-        Verdict::Fail => egui::Color32::from_rgb(0xC0, 0x20, 0x20),
+        Verdict::Pass => colours.success,
+        Verdict::Info => colours.info,
+        Verdict::Skipped => colours.text2,
+        Verdict::Warning => colours.warning,
+        Verdict::Fail => colours.error,
     }
 }
 
@@ -141,11 +141,8 @@ fn verdict_colour(verdict: Verdict) -> egui::Color32 {
 pub fn render(ui: &mut egui::Ui, test: &ConnectionTest) -> Option<ConnectionTestAction> {
     let mut action = None;
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0xF6, 0xF7, 0xFB))
-        .stroke(egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgb(0xE0, 0xE2, 0xEA),
-        ))
+        .fill(super::theme::colours(ui).panel)
+        .stroke(egui::Stroke::new(1.0, super::theme::colours(ui).border))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::symmetric(16, 12))
         .show(ui, |ui| {
@@ -153,24 +150,28 @@ pub fn render(ui: &mut egui::Ui, test: &ConnectionTest) -> Option<ConnectionTest
                 egui::RichText::new(format!("Connection test — {}", test.target_label))
                     .strong()
                     .size(14.0)
-                    .color(egui::Color32::BLACK),
+                    .color(super::theme::colours(ui).text),
             );
             ui.label(
                 egui::RichText::new("No user name or password is sent.")
                     .size(11.0)
-                    .color(egui::Color32::from_rgb(0x60, 0x60, 0x68)),
+                    .color(super::theme::colours(ui).text2),
             );
+            // The same secondary buttons as the rest of Home.
             ui.horizontal(|ui| {
+                use super::widgets::{button_width, secondary_button};
+                ui.spacing_mut().item_spacing.x = super::theme::BUTTON_GAP;
+                let width = button_width(ui, &["Copy report", "Run again", "Close"]);
                 if test.report().is_some() {
                     let label = if test.copied { "Copied" } else { "Copy report" };
-                    if ui.button(label).clicked() {
+                    if secondary_button(ui, label, width).clicked() {
                         action = Some(ConnectionTestAction::Copy);
                     }
                 }
-                if !test.running() && ui.button("Run again").clicked() {
+                if !test.running() && secondary_button(ui, "Run again", width).clicked() {
                     action = Some(ConnectionTestAction::RunAgain);
                 }
-                if ui.button("Close").clicked() {
+                if secondary_button(ui, "Close", width).clicked() {
                     action = Some(ConnectionTestAction::Close);
                 }
             });
@@ -178,7 +179,7 @@ pub fn render(ui: &mut egui::Ui, test: &ConnectionTest) -> Option<ConnectionTest
             if let Some(error) = &test.input_error {
                 ui.label(
                     egui::RichText::new(error)
-                        .color(verdict_colour(Verdict::Fail))
+                        .color(verdict_colour(&super::theme::colours(ui), Verdict::Fail))
                         .size(13.0),
                 );
             } else if let Some(report) = test.report() {
@@ -186,7 +187,7 @@ pub fn render(ui: &mut egui::Ui, test: &ConnectionTest) -> Option<ConnectionTest
                     egui::RichText::new(report.summary())
                         .strong()
                         .size(13.0)
-                        .color(verdict_colour(report.overall())),
+                        .color(verdict_colour(&super::theme::colours(ui), report.overall())),
                 );
                 ui.add_space(8.0);
                 for step in &report.steps {
@@ -197,7 +198,7 @@ pub fn render(ui: &mut egui::Ui, test: &ConnectionTest) -> Option<ConnectionTest
                                 .monospace()
                                 .strong()
                                 .size(11.0)
-                                .color(verdict_colour(verdict)),
+                                .color(verdict_colour(&super::theme::colours(ui), verdict)),
                         );
                         ui.label(
                             egui::RichText::new(format!(
@@ -215,7 +216,7 @@ pub fn render(ui: &mut egui::Ui, test: &ConnectionTest) -> Option<ConnectionTest
                             egui::RichText::new(detail)
                                 .monospace()
                                 .size(10.5)
-                                .color(egui::Color32::from_rgb(0x50, 0x50, 0x58)),
+                                .color(super::theme::colours(ui).text2),
                         );
                     }
                     let advice = step.finding.action();
@@ -223,14 +224,14 @@ pub fn render(ui: &mut egui::Ui, test: &ConnectionTest) -> Option<ConnectionTest
                         ui.label(
                             egui::RichText::new(format!("What to do: {advice}"))
                                 .size(11.5)
-                                .color(verdict_colour(verdict)),
+                                .color(verdict_colour(&super::theme::colours(ui), verdict)),
                         );
                     }
                     ui.label(
                         egui::RichText::new(step.finding.code())
                             .monospace()
                             .size(9.5)
-                            .color(egui::Color32::from_rgb(0x9A, 0x9A, 0xA0)),
+                            .color(super::theme::colours(ui).text2),
                     );
                     ui.add_space(6.0);
                 }

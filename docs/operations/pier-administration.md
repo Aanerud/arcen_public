@@ -1844,7 +1844,7 @@ will not start — are in [Troubleshooting](troubleshooting.md). Every code the
 Pier logs or sends a Deck is explained in [Error codes](error-codes.md).
 
 The fastest first step for any connection problem needs no password: on the
-Deck, **Test connection** in the connection editor, or
+Deck, **Test connection** in a connection's **⋮** menu or the connection form, or
 `arcen-deck diagnose <host>` from a terminal. It checks name resolution, UDP
 18444 with a real QUIC handshake, the certificate against the identity the
 Deck remembers, the Pier's greeting before sign-in, the path MTU and the round

@@ -222,23 +222,202 @@ pub fn load(path: &Path) -> TrustedPinStore {
     }
 }
 
-/// Writes the store, creating the directory if needed.
+/// Writes the whole store, creating the directory if needed, under the
+/// store's lock ([`lock`]) and through [`crate::config::atomic_write_json`]
+/// (a temporary file, synced, renamed over it), so an interrupted write
+/// cannot leave a truncated file that would silently forget every host.
 ///
-/// Written through a temporary file and renamed, so an interrupted write cannot
-/// leave a truncated file that would silently forget every host.
+/// Only for a store this process owns entirely (tests, tools): a Deck
+/// changes one endpoint at a time with [`remember_reviewed`], which never
+/// writes back another Deck window's identities.
 ///
 /// # Errors
 ///
-/// Creating the directory, writing or renaming the file failed.
+/// Another Deck holds the lock, or creating, writing or renaming failed.
 pub fn save(path: &Path, store: &TrustedPinStore) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let _lock = lock_file(path).map_err(PinWriteError::into_io)?;
+    write(path, store).map_err(PinWriteError::into_io)
+}
+
+fn write(path: &Path, store: &TrustedPinStore) -> Result<(), PinWriteError> {
     let serialized = serde_json::to_vec_pretty(store)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, &serialized)?;
-    std::fs::rename(&temporary, path)
+    crate::config::atomic_write_json(path, &serialized).map_err(PinWriteError::from)
+}
+
+fn lock_file(path: &Path) -> Result<std::fs::File, PinWriteError> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    crate::settings::ClientConfigRepository::lock_file(&path.with_file_name(name))
+        .map_err(PinWriteError::from)
+}
+
+/// Why a remembered identity was not written. Nothing on disk changed.
+#[derive(Debug)]
+pub enum PinWriteError {
+    /// There is no settings folder.
+    Unavailable,
+    /// Another Deck window is writing the identities; try again.
+    Busy,
+    /// The identity on disk for the endpoint is no longer the one the user
+    /// was shown (another Deck window changed it): the user must look
+    /// again.
+    Changed {
+        /// What is on disk for it now.
+        current: Option<TlsPin>,
+    },
+    /// A newer Deck wrote the file; this one does not rewrite it.
+    Newer,
+    /// Reading or writing failed.
+    Io(std::io::Error),
+}
+
+impl PinWriteError {
+    fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Io(error) => error,
+            other => std::io::Error::other(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for PinWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("the settings folder is unavailable"),
+            Self::Busy => formatter.write_str("another Arcen Deck window is saving identities"),
+            Self::Changed { .. } => formatter
+                .write_str("another Arcen Deck window changed this host's trusted identity"),
+            Self::Newer => formatter.write_str("a newer Arcen Deck saved the identities"),
+            Self::Io(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PinWriteError {}
+
+impl From<std::io::Error> for PinWriteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<crate::settings::ClientConfigError> for PinWriteError {
+    fn from(error: crate::settings::ClientConfigError) -> Self {
+        use crate::settings::ClientConfigError;
+        match error {
+            ClientConfigError::ConfigUnavailable => Self::Unavailable,
+            ClientConfigError::ConfigBusy => Self::Busy,
+            ClientConfigError::Io(error) => Self::Io(error),
+            other => Self::Io(std::io::Error::other(other.to_string())),
+        }
+    }
+}
+
+/// The identities on disk, held for one read-modify-write: no other Deck
+/// window writes them until this is committed or dropped.
+#[derive(Debug)]
+pub struct LockedPins {
+    _lock: std::fs::File,
+    path: std::path::PathBuf,
+    store: TrustedPinStore,
+}
+
+/// Takes the identities' lock and reads them as they are now.
+///
+/// # Errors
+///
+/// [`PinWriteError::Busy`] while another Deck writes them,
+/// [`PinWriteError::Newer`] for a newer Deck's file.
+pub fn lock(path: &Path) -> Result<LockedPins, PinWriteError> {
+    let lock = lock_file(path)?;
+    if let Ok(bytes) = std::fs::read(path)
+        && let Ok(store) = serde_json::from_slice::<TrustedPinStore>(&bytes)
+        && store.version > TRUSTED_PINS_VERSION
+    {
+        return Err(PinWriteError::Newer);
+    }
+    Ok(LockedPins {
+        _lock: lock,
+        path: path.to_owned(),
+        store: load(path),
+    })
+}
+
+impl LockedPins {
+    /// The identities on disk.
+    #[must_use]
+    pub const fn store(&self) -> &TrustedPinStore {
+        &self.store
+    }
+
+    /// The identity on disk for `endpoint`.
+    #[must_use]
+    pub fn current(&self, endpoint: &str) -> Option<TlsPin> {
+        self.store.pins.get(endpoint).and_then(StoredPin::to_pin)
+    }
+
+    /// Fails with [`PinWriteError::Changed`] unless the identity on disk
+    /// for `endpoint` is still `expected`.
+    ///
+    /// # Errors
+    ///
+    /// As above.
+    pub fn expect(&self, endpoint: &str, expected: Option<TlsPin>) -> Result<(), PinWriteError> {
+        let current = self.current(endpoint);
+        if current == expected {
+            Ok(())
+        } else {
+            Err(PinWriteError::Changed { current })
+        }
+    }
+
+    /// Writes `pin` for `endpoint` only, replacing its entry in the same
+    /// write, and returns the store as written.
+    ///
+    /// # Errors
+    ///
+    /// Writing failed.
+    pub fn commit(
+        mut self,
+        endpoint: &str,
+        pin: &TlsPin,
+        label: Option<String>,
+    ) -> Result<TrustedPinStore, PinWriteError> {
+        self.store.version = TRUSTED_PINS_VERSION;
+        self.store.remember(endpoint, pin, label);
+        write(&self.path, &self.store)?;
+        Ok(self.store)
+    }
+}
+
+/// Remembers `pin` for `endpoint`, on disk and in `pins`, in one locked
+/// read-modify-write of that endpoint alone, provided the identity on disk
+/// for it is still `expected` (what the user was shown). Another Deck
+/// window's identities, older or newer, are never written back.
+///
+/// On success `pins` is the store as written. On
+/// [`PinWriteError::Changed`] it is the store as it is on disk, so the
+/// user can be shown the identity now trusted. Otherwise it is unchanged.
+///
+/// # Errors
+///
+/// See [`PinWriteError`].
+pub fn remember_reviewed(
+    path: Option<&Path>,
+    pins: &mut TrustedPinStore,
+    endpoint: &str,
+    expected: Option<TlsPin>,
+    pin: &TlsPin,
+    label: Option<String>,
+) -> Result<(), PinWriteError> {
+    let locked = lock(path.ok_or(PinWriteError::Unavailable)?)?;
+    if let Err(error) = locked.expect(endpoint, expected) {
+        *pins = locked.store;
+        return Err(error);
+    }
+    *pins = locked.commit(endpoint, pin, label)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -386,6 +565,95 @@ mod tests {
             pin(PinKind::CertificateSha256, 0x22)
         );
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A folder in the build's target directory, not the system's.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let folder = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(format!("arcen-pins-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    #[test]
+    fn a_reviewed_identity_changes_only_its_endpoint_and_never_rolls_back_another() {
+        let folder = scratch("reviewed");
+        let path = folder.join("trusted_pins.json");
+        let spki = |seed| pin(PinKind::SubjectPublicKeyInfoSha256, seed);
+        // This window read A only; another window has since added B and
+        // rotated C.
+        let mut ours = TrustedPinStore::default();
+        ours.remember("a:18444", &spki(1), None);
+        ours.remember("c:18444", &spki(3), None);
+        let mut disk = ours.clone();
+        disk.remember("b:18444", &spki(2), None);
+        disk.remember("c:18444", &spki(4), None);
+        save(&path, &disk).unwrap();
+
+        remember_reviewed(
+            Some(&path),
+            &mut ours,
+            "d:18444",
+            None,
+            &spki(5),
+            Some("D".to_owned()),
+        )
+        .unwrap();
+        let reloaded = load(&path).resolved();
+        assert_eq!(reloaded["b:18444"], spki(2));
+        assert_eq!(reloaded["c:18444"], spki(4), "the rotation stays");
+        assert_eq!(reloaded["d:18444"], spki(5));
+        assert_eq!(ours.resolved(), reloaded, "the window adopts the disk");
+
+        // C was reviewed as 3, but disk says 4: nothing is written and the
+        // window is shown what is trusted now.
+        let mut stale = TrustedPinStore::default();
+        stale.remember("c:18444", &spki(3), None);
+        let error = remember_reviewed(
+            Some(&path),
+            &mut stale,
+            "c:18444",
+            Some(spki(3)),
+            &spki(6),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PinWriteError::Changed { current: Some(now) } if now == spki(4)));
+        assert_eq!(load(&path).resolved()["c:18444"], spki(4));
+        assert_eq!(stale.resolved()["c:18444"], spki(4));
+        // Only the file and its lock: every temporary was renamed.
+        let mut names: Vec<_> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["trusted_pins.json", "trusted_pins.json.lock"]);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn identities_are_not_written_while_another_window_holds_them() {
+        let folder = scratch("busy");
+        let path = folder.join("trusted_pins.json");
+        let held = lock(&path).unwrap();
+        let mut pins = TrustedPinStore::default();
+        let error = remember_reviewed(
+            Some(&path),
+            &mut pins,
+            "a:18444",
+            None,
+            &pin(PinKind::CertificateSha256, 1),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PinWriteError::Busy), "{error}");
+        assert!(!path.exists());
+        drop(held);
+        let _ = std::fs::remove_dir_all(folder);
     }
 
     #[test]

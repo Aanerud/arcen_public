@@ -34,6 +34,7 @@
 //! | `egui` | the shared Deck screens (`screens`: Home, Settings, connection test, theme) | egui (no eframe, no wgpu) |
 //! | `wgpu-presenter` | the portable wgpu video paint callback | egui-wgpu, wgpu |
 //! | `support-bundle` | the support bundle writer ([`support_bundle::create`]) | zip (deflate) |
+//! | `doc-shots` | developer-only: the manual's screenshots (`doc_shots`), never in a release | `runtime`, `wgpu-presenter`, png, pollster |
 //!
 //! CI proves the default graph contains no tokio, quinn, egui, wgpu or
 //! product package; a shell that only needs settings never pulls a runtime.
@@ -67,6 +68,8 @@ pub mod display_fit;
 #[cfg(feature = "runtime")]
 pub mod display_follow;
 pub mod display_note;
+#[cfg(feature = "doc-shots")]
+pub mod doc_shots;
 pub mod input;
 pub mod installed_copies;
 pub mod keymap;
@@ -76,9 +79,12 @@ pub mod logging;
 pub mod microphone;
 pub mod multi_window;
 pub mod network;
+pub mod overrides;
 pub mod password_text;
 pub mod paste_keys;
+pub mod presence;
 pub mod present;
+pub mod profile;
 pub mod quick_connect;
 pub mod reconnect;
 #[cfg(feature = "runtime")]
@@ -86,6 +92,7 @@ pub mod reconnect_flow;
 pub mod services;
 pub mod session_truth;
 pub mod settings;
+pub mod sign_in;
 pub mod support_bundle;
 pub mod trusted_pins;
 pub mod ui_pacing;

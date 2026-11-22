@@ -17,8 +17,13 @@
 
 mod backdrop;
 mod displays;
+/// Developer-only (`doc-shots`): the manual's screenshots in this Deck's
+/// setup and root frame.
+#[cfg(feature = "doc-shots")]
+pub mod doc_shots;
 mod launcher;
 mod menu_bar;
+mod modal_loop;
 mod overlay;
 mod secondary;
 mod session;
@@ -36,7 +41,7 @@ use arcen_deck_core::password_text::read_password_text;
 use arcen_deck_core::quick_connect::parse_quick_connect;
 use arcen_deck_core::runtime::tls::{TlsTrustConfig, parse_fingerprint};
 use arcen_deck_core::screens::wording::{DeckPlatform, set_deck_platform};
-use arcen_deck_core::ui_pacing::PassPacer;
+use arcen_deck_core::ui_pacing::{PassEvent, PassPacer, RepaintRequest};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -59,6 +64,8 @@ enum UserEvent {
     Repaint(Duration),
     /// The media worker published decoded frames ([`MediaWake`]).
     Media,
+    /// Windows is running a modal loop on the window ([`modal_loop`]).
+    ModalTick,
 }
 
 /// The loop's proxy for [`MediaWake`], set once the loop exists.
@@ -123,6 +130,14 @@ fn quick_start(args: &[String]) -> Result<Option<QuickStart>, String> {
         stream_stats: request.stream_stats,
         quit_after: request.quit_after_secs.map(Duration::from_secs),
     }))
+}
+
+/// The Deck's egui setup when its window opens: the shared theme (fonts,
+/// style, both palettes), and "this PC" in the shared screens. The
+/// manual's screenshots reuse it (`doc_shots`).
+pub(crate) fn setup_egui(ctx: &egui::Context) {
+    arcen_deck_core::screens::theme::apply(ctx);
+    set_deck_platform(ctx, DeckPlatform::Pc);
 }
 
 /// Runs the Deck's window until it closes. Returns the process exit code.
@@ -213,6 +228,7 @@ struct DeckWindow {
     gpu: Gpu,
     egui: egui_winit::State,
     menu_bar: menu_bar::MenuBar,
+    modal_loop: modal_loop::ModalLoop,
     backdrop: backdrop::Backdrop,
     launcher: launcher::Launcher,
     /// What the overlay's last presented pass covers.
@@ -301,6 +317,10 @@ impl Shell {
             let _ = wake.send_event(UserEvent::Repaint(Duration::ZERO));
         })?;
         menu_bar.set_session_active(false);
+        let tick = self.proxy.clone();
+        let modal_loop = modal_loop::ModalLoop::install(hwnd, move || {
+            let _ = tick.send_event(UserEvent::ModalTick);
+        })?;
         let backdrop = backdrop::Backdrop::install(hwnd)?;
         let gpu = Gpu::create(&choice)?;
         let tree = CompositionTree::new(&gpu, hwnd)?;
@@ -311,8 +331,7 @@ impl Shell {
         let tree: SharedTree = Arc::new(std::sync::Mutex::new(tree));
 
         let ctx = egui::Context::default();
-        arcen_deck_core::screens::theme::apply(&ctx);
-        set_deck_platform(&ctx, DeckPlatform::Pc);
+        setup_egui(&ctx);
         let proxy = self.proxy.clone();
         ctx.set_request_repaint_callback(move |info| {
             let _ = proxy.send_event(UserEvent::Repaint(info.delay));
@@ -327,7 +346,9 @@ impl Shell {
             egui::ViewportId::ROOT,
             &window,
             Some(scale),
-            None,
+            // The system's light or dark appearance from the first pass
+            // (egui-winit follows its changes from then on).
+            window.theme(),
             Some(overlay.max_texture_side()),
         );
         let launcher = launcher::Launcher::new(
@@ -344,6 +365,7 @@ impl Shell {
             gpu,
             egui,
             menu_bar,
+            modal_loop,
             backdrop,
             launcher,
             overlay_region: OverlayRegion::default(),
@@ -365,14 +387,42 @@ struct ShownPass {
 }
 
 impl DeckWindow {
+    /// A UI pass, unless one ran less than a refresh ago: egui asks for two
+    /// more passes after every input pass, so a pass asked for sooner is
+    /// held until then and carries what arrived meanwhile.
+    fn paced_pass(&mut self) {
+        if self.pacer.admit(Instant::now(), self.refresh_period) {
+            self.paint();
+        } else if let Some(due) = self.pacer.held_until(self.refresh_period) {
+            self.repaint_at = Some(self.repaint_at.map_or(due, |at| at.min(due)));
+        }
+    }
+
+    /// While Windows runs a menu or a move on the window, the due pass (or,
+    /// with `woken`, the pass the media worker woke the loop for) runs
+    /// here: `about_to_wait` runs no pass until the loop ends.
+    fn run_modal_pass(&mut self, woken: bool) {
+        if self.modal_loop.active()
+            && (woken || self.repaint_at.is_some_and(|at| at <= Instant::now()))
+        {
+            self.repaint_at = None;
+            self.paced_pass();
+        }
+    }
+
     fn paint(&mut self) {
         let raw = self.egui.take_egui_input(&self.window);
         let ctx = self.egui.egui_ctx().clone();
+        // Windows' "Animation effects" off makes every animation instant.
+        arcen_deck_core::screens::theme::set_reduce_motion(
+            &ctx,
+            crate::platform::motion::reduce_motion(),
+        );
         let launcher = &mut self.launcher;
         let output = ctx.run_ui(raw, |ui| launcher.ui(ui));
         self.menu_bar.set_session_active(self.launcher.in_session());
         self.menu_bar
-            .set_keyboard_status(&self.launcher.keyboard_status_line());
+            .set_keyboard_status(&self.launcher.session_status_line());
         self.menu_bar
             .set_switch_chord(self.launcher.keyboard_switch());
         self.backdrop.set_fill(if self.launcher.in_session() {
@@ -541,6 +591,11 @@ impl ApplicationHandler<UserEvent> for Shell {
         let Some(window) = self.window.as_mut() else {
             return;
         };
+        let pass_event = match event {
+            WindowEvent::RedrawRequested => PassEvent::Redraw,
+            WindowEvent::ScaleFactorChanged { .. } => PassEvent::ScaleChange,
+            _ => PassEvent::Other,
+        };
         let response = window.egui.on_window_event(&window.window, &event);
         match event {
             WindowEvent::CloseRequested => {
@@ -568,35 +623,42 @@ impl ApplicationHandler<UserEvent> for Shell {
                 note_display(&self.platform, window);
             }
             WindowEvent::RedrawRequested => {
-                // egui asks for two more passes after every input pass: a
-                // pass asked for sooner than one refresh after the last is
-                // held until then and carries what arrived meanwhile.
-                if window.pacer.admit(Instant::now(), window.refresh_period) {
-                    window.paint();
-                } else if let Some(due) = window.pacer.held_until(window.refresh_period) {
-                    window.repaint_at = Some(window.repaint_at.map_or(due, |at| at.min(due)));
-                }
+                window.paced_pass();
             }
             _ => {}
         }
-        if response.repaint {
-            window.window.request_redraw();
+        // No redraw is asked for here: egui-winit wants a repaint for the
+        // redraw itself (a redraw per redraw kept a core busy on an idle
+        // Home), a scale change's pass waits for the resize winit sends
+        // next, and any other pass is paced from `about_to_wait`.
+        let request = RepaintRequest::for_window_event(pass_event, response.repaint);
+        if request == RepaintRequest::Due {
+            window.repaint_at = request.merged(window.repaint_at, Instant::now());
+            // No `about_to_wait` during a menu or a move (see `user_event`).
+            window.run_modal_pass(false);
         }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-        let delay = match event {
-            UserEvent::Repaint(delay) => delay,
-            UserEvent::Media => {
-                // `about_to_wait` follows and hands out the frames.
-                MEDIA_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
-                return;
-            }
-        };
-        if let Some(window) = self.window.as_mut() {
-            let at = Instant::now() + delay;
-            window.repaint_at = Some(window.repaint_at.map_or(at, |current| current.min(at)));
+        if matches!(event, UserEvent::Media) {
+            MEDIA_WAKE_PENDING.store(false, std::sync::atomic::Ordering::Release);
         }
+        let Some(window) = self.window.as_mut() else {
+            return;
+        };
+        match event {
+            UserEvent::Repaint(delay) => {
+                let at = Instant::now() + delay;
+                window.repaint_at = Some(window.repaint_at.map_or(at, |current| current.min(at)));
+            }
+            // `about_to_wait` follows and hands out the frames.
+            UserEvent::Media | UserEvent::ModalTick => {}
+        }
+        // No `about_to_wait` comes while Windows runs a menu or a move, and
+        // the menu's loop brings no `WM_PAINT` for a redraw asked for: a
+        // pass due now, or one the media worker woke for (a frame, or the
+        // session's end), runs from here. The rest waits for the loop's end.
+        window.run_modal_pass(matches!(event, UserEvent::Media));
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {

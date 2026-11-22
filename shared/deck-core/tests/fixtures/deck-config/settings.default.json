@@ -28,5 +28,6 @@
   "security_mode": "medium",
   "tablet_input_enabled": true,
   "tablet_mode_requested": "local_termination",
-  "typing_mode": "auto"
+  "typing_mode": "auto",
+  "version": 2
 }

@@ -2,6 +2,9 @@
 
 > Measuring feel and latency with the real Deck window instead? See
 > [`realscreen.md`](realscreen.md).
+>
+> Rendering the user manual's Deck screenshots? See
+> [`deck-manual-screenshots.md`](deck-manual-screenshots.md).
 
 Operator runbook for the grader/VFX colour work (4:4:4 chroma, 10-bit depth,
 full-range colour, negotiated end to end). Read

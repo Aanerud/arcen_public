@@ -144,7 +144,14 @@ still reaches it (shared `HookRouter::blocked_below`).
 The session window's UI passes begin at most once per refresh of its
 display (shared `arcen_deck_core::ui_pacing::PassPacer`, as on the Mac):
 egui asks for two more passes after every input pass, and a held pass runs
-when due through `repaint_at`. A resize or scale change runs at once. Text
+when due through `repaint_at`. A resize or scale change runs at once. A
+window event asks for a pass only through the shared
+`ui_pacing::RepaintRequest` (into `repaint_at`, never a direct redraw), and
+never for the redraw itself: egui-winit answers `repaint: true` to
+`RedrawRequested`, and a redraw per redraw kept a core busy on an idle
+Home. A scale change asks for none either: winit has not resized the window
+for it yet, and the `Resized` it sends next releases the pacer and paints.
+Text
 that changes on every pass presents the overlay on every pass, which moves
 the video's DWM deadline: pace it (Stream Statistics uses
 `ui_pacing::PacedValue`, `STATS_PANEL_REFRESH`).

@@ -54,6 +54,11 @@ wgpu-presenter = ["egui", "dep:egui-wgpu", "dep:wgpu"]
 support-bundle = ["dep:arcen-observability", "arcen-observability/support-bundle"]
 # Developer-only streaming overrides (the macOS Deck's `dev-tools`).
 dev-tools = []
+# Developer-only: renders the Deck manual's scenes offscreen to PNG, with the
+# position of each named control (`doc_shots`, docs/testing/deck-manual-screenshots.md).
+# It does not enable `dev-tools`, which changes what Settings shows; a Deck
+# built with it carries the do-not-ship marker, so release packaging refuses it.
+doc-shots = ["runtime", "wgpu-presenter", "dep:png", "dep:pollster"]
 # Native tablet bridge (the macOS Deck's `native-tablet`; the Windows
 # Deck's optional USB component).
 native-tablet = ["runtime"]
@@ -96,6 +101,10 @@ x509-parser = { version = "0.18.1", optional = true }
 egui = { version = "0.35", default-features = false, optional = true }
 egui-wgpu = { version = "0.35", default-features = false, optional = true }
 wgpu = { version = "29", default-features = false, features = ["std", "wgsl"], optional = true }
+# doc-shots: the PNG writer and the blocking wait for wgpu's adapter, at the
+# versions the macOS and Windows Decks already build with.
+png = { workspace = true, optional = true }
+pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]
 rcgen = "0.14.8"

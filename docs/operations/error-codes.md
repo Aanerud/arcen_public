@@ -33,7 +33,7 @@ not a code; those are listed in the
 
 ## Connection test
 
-Run from the Deck's connection editor (**Test connection**) or the command line
+Run from a connection's **⋮** menu or the connection form (**Test connection**) in the Deck, or the command line
 (`"/Applications/Arcen Deck.app/Contents/MacOS/arcen-deck" diagnose <host[:port]>`;
 on an Intel Mac, `Arcen Deck Intel.app`).
 It checks, in order: name resolution, UDP reachability (a real QUIC handshake),
@@ -58,7 +58,7 @@ password. Exit status: 0 ready, 1 warnings, 2 cannot connect.
 | `diag.cert.supplied_match` | **PASS.** The Pier presented the fingerprint you supplied. | Nothing. |
 | `diag.cert.system_trusted` | **PASS.** The certificate is issued by an authority this computer trusts. | Nothing. |
 | `diag.cert.first_use` | **INFO.** This Deck has not met this Pier before; it will show the fingerprint and ask you to confirm it. | Before you trust it, compare the SPKI fingerprint below with the Pier's: host.spki-sha256 in the Pier's configuration directory, or the spki_sha256 field of its TLS_CERTIFICATE_ACTIVE (1400) log record. |
-| `diag.cert.mismatch` | **FAIL.** The Pier presented a different identity from the one this Deck expects. | Do not sign in. Ask the Pier's administrator whether its certificate was replaced and compare the SPKI fingerprint below with host.spki-sha256 on the Pier. Only if they match, choose Forget and Verify in the Deck. |
+| `diag.cert.mismatch` | **FAIL.** The Pier presented a different identity from the one this Deck expects. | Do not sign in. Ask the Pier's administrator whether its certificate was replaced and compare the SPKI fingerprint below with host.spki-sha256 on the Pier. Only if they match, choose Trust the new identity… in the Deck and confirm. |
 | `diag.cert.name_mismatch` | **FAIL.** The certificate does not name the address you connected to. | Connect with a name or address the certificate lists, or reissue the certificate with this name (tls.expected_sans, or rerun the installer). |
 | `diag.cert.expired` | **FAIL.** The Pier's certificate has expired. | Renew the Pier's certificate (rerun the installer; Linux and macOS also `arcen-pier new-host-cert`), and check that the Pier's and this Mac's clocks are right. |
 | `diag.cert.not_yet_valid` | **FAIL.** The Pier's certificate is not valid yet. | Renew the Pier's certificate (rerun the installer; Linux and macOS also `arcen-pier new-host-cert`), and check that the Pier's and this Mac's clocks are right. |

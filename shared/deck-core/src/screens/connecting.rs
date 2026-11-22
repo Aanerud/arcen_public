@@ -47,7 +47,7 @@ pub fn render_connecting(
         ui.add_space(28.0);
         ui.heading(
             egui::RichText::new("Connecting")
-                .color(egui::Color32::BLACK)
+                .color(super::theme::colours(ui).text)
                 .size(28.0),
         );
         ui.add_space(18.0);
@@ -61,20 +61,20 @@ pub fn render_connecting(
                     draft.username.as_str()
                 }
             ))
-            .color(egui::Color32::DARK_GRAY)
+            .color(super::theme::colours(ui).text2)
             .size(17.0),
         );
         ui.add_space(12.0);
         ui.label(
             egui::RichText::new(status)
-                .color(egui::Color32::from_rgb(0x66, 0x66, 0x66))
+                .color(super::theme::colours(ui).text2)
                 .size(15.0),
         );
         if let Some(hint) = hint {
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(hint)
-                    .color(egui::Color32::from_rgb(0xA0, 0x62, 0x36))
+                    .color(super::theme::colours(ui).warning)
                     .size(13.0),
             );
         }
@@ -100,7 +100,7 @@ pub fn render_topology_conflict(
         ui.add_space(150.0);
         ui.heading(
             egui::RichText::new("This desktop was started without your layout")
-                .color(egui::Color32::BLACK)
+                .color(super::theme::colours(ui).text)
                 .size(26.0),
         );
         ui.add_space(18.0);
@@ -110,7 +110,7 @@ pub fn render_topology_conflict(
                  current display arrangement.",
                 draft.display_name(),
             ))
-            .color(egui::Color32::DARK_GRAY)
+            .color(super::theme::colours(ui).text2)
             .size(16.0),
         );
         ui.add_space(34.0);
@@ -126,9 +126,9 @@ pub fn render_topology_conflict(
                     egui::Button::new(
                         egui::RichText::new("Reconnect to your session")
                             .size(15.0)
-                            .color(egui::Color32::WHITE),
+                            .color(super::theme::colours(ui).on_primary),
                     )
-                    .fill(egui::Color32::from_rgb(0xC9, 0x78, 0x50))
+                    .fill(super::theme::colours(ui).primary)
                     .corner_radius(8.0),
                 )
                 .clicked()
@@ -142,13 +142,10 @@ pub fn render_topology_conflict(
                     egui::Button::new(
                         egui::RichText::new("Start fresh with my layout")
                             .size(15.0)
-                            .color(egui::Color32::from_rgb(0x44, 0x44, 0x4A)),
+                            .color(super::theme::colours(ui).text2),
                     )
                     .fill(egui::Color32::TRANSPARENT)
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(0xCB, 0xC5, 0xB9),
-                    ))
+                    .stroke(egui::Stroke::new(1.0, super::theme::colours(ui).border))
                     .corner_radius(8.0),
                 )
                 .clicked()
@@ -163,7 +160,7 @@ pub fn render_topology_conflict(
                 "Reconnecting keeps your open applications and uses your main display \
                  only. Starting fresh matches your layout and closes them.",
             )
-            .color(egui::Color32::from_rgb(0x77, 0x77, 0x77))
+            .color(super::theme::colours(ui).text2)
             .size(13.0),
         );
         ui.add_space(28.0);
@@ -173,7 +170,7 @@ pub fn render_topology_conflict(
                 egui::Button::new(
                     egui::RichText::new("Cancel")
                         .size(14.0)
-                        .color(egui::Color32::from_rgb(0x66, 0x66, 0x6A)),
+                        .color(super::theme::colours(ui).text2),
                 )
                 .fill(egui::Color32::TRANSPARENT)
                 .stroke(egui::Stroke::NONE),
@@ -197,7 +194,7 @@ pub fn render_displays_unsupported(
         ui.add_space(150.0);
         ui.heading(
             egui::RichText::new("This host cannot match all active displays")
-                .color(egui::Color32::BLACK)
+                .color(super::theme::colours(ui).text)
                 .size(26.0),
         );
         ui.add_space(18.0);
@@ -207,7 +204,7 @@ pub fn render_displays_unsupported(
                 draft.display_name(),
                 status,
             ))
-            .color(egui::Color32::DARK_GRAY)
+            .color(super::theme::colours(ui).text2)
             .size(16.0),
         );
         ui.add_space(34.0);
@@ -218,9 +215,9 @@ pub fn render_displays_unsupported(
                 egui::Button::new(
                     egui::RichText::new("Use Primary Display Only")
                         .size(15.0)
-                        .color(egui::Color32::WHITE),
+                        .color(super::theme::colours(ui).on_primary),
                 )
-                .fill(egui::Color32::from_rgb(0xC9, 0x78, 0x50))
+                .fill(super::theme::colours(ui).primary)
                 .corner_radius(8.0),
             )
             .clicked()
@@ -234,7 +231,7 @@ pub fn render_displays_unsupported(
                 "This is remembered for this connection only. Your other \
                  connections keep matching your layout.",
             )
-            .color(egui::Color32::from_rgb(0x77, 0x77, 0x77))
+            .color(super::theme::colours(ui).text2)
             .size(13.0),
         );
         ui.add_space(28.0);
@@ -244,7 +241,7 @@ pub fn render_displays_unsupported(
                 egui::Button::new(
                     egui::RichText::new("Cancel")
                         .size(14.0)
-                        .color(egui::Color32::from_rgb(0x66, 0x66, 0x6A)),
+                        .color(super::theme::colours(ui).text2),
                 )
                 .fill(egui::Color32::TRANSPARENT)
                 .stroke(egui::Stroke::NONE),

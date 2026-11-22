@@ -26,8 +26,9 @@
 //! `cargo xwin check --target x86_64-pc-windows-msvc -p arcen-deck-windows`.
 
 /// Release packaging scans `arcen-deck.exe` for this marker and refuses to
-/// ship it, so a developer build can never become a release.
-#[cfg(feature = "dev-tools")]
+/// ship it, so a developer build (`dev-tools`, or `doc-shots` for the
+/// manual's screenshots) can never become a release.
+#[cfg(any(feature = "dev-tools", feature = "doc-shots"))]
 #[used]
 pub static ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER: &[u8] =
     b"ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP";
@@ -135,6 +136,11 @@ pub fn run(args: &[std::ffi::OsString]) -> std::process::ExitCode {
         .collect();
     if rest.first().map(String::as_str) == Some("support-bundle") {
         return support_bundle_command(&rest[1..]);
+    }
+    #[cfg(feature = "doc-shots")]
+    if rest.first().map(String::as_str) == Some("doc-shots") {
+        let code = shell::doc_shots::run(&rest[1..]);
+        return std::process::ExitCode::from(u8::try_from(code).unwrap_or(1));
     }
     shell::run(&rest)
 }

@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use super::theme;
 use super::wording::DeckPlatform;
 
 /// What the user asked of the panel.
@@ -255,21 +254,20 @@ pub fn render_support_bundle_panel(
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.label(
             egui::RichText::new("Support bundle")
-                .color(egui::Color32::BLACK)
-                .size(19.0),
+                .color(super::theme::colours(ui).text)
+                .size(20.0),
         );
         ui.add_space(6.0);
         ui.label(
-            egui::RichText::new(contents_description(platform)).color(egui::Color32::DARK_GRAY),
+            egui::RichText::new(contents_description(platform))
+                .color(super::theme::colours(ui).text2),
         );
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Save in").color(egui::Color32::DARK_GRAY));
+            ui.label(egui::RichText::new("Save in").color(super::theme::colours(ui).text2));
             ui.label(egui::RichText::new(&view.folder).monospace());
             if view.can_choose
-                && ui
-                    .add_enabled(!view.busy, egui::Button::new("Change…"))
-                    .clicked()
+                && super::widgets::fitted_button(ui, "Change\u{2026}", !view.busy).clicked()
             {
                 actions.push(SupportBundleAction::ChooseFolder);
             }
@@ -288,47 +286,49 @@ pub fn render_support_bundle_panel(
         }
         ui.label(
             egui::RichText::new(CRASH_REPORTS_HINT)
-                .small()
-                .color(egui::Color32::DARK_GRAY),
+                .size(super::theme::TEXT_LABEL)
+                .color(super::theme::colours(ui).text2),
         );
-        ui.add_space(8.0);
+        ui.add_space(super::theme::SPACE_SCALE[3]);
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!view.busy, egui::Button::new("Create bundle"))
-                .clicked()
-            {
+            ui.spacing_mut().item_spacing.x = super::theme::BUTTON_GAP;
+            if super::widgets::fitted_button(ui, "Create bundle", !view.busy).clicked() {
                 actions.push(SupportBundleAction::Create);
             }
-            if ui.button("Close").clicked() {
+            if super::widgets::fitted_button(ui, "Close", true).clicked() {
                 actions.push(SupportBundleAction::Close);
             }
             if view.busy {
                 ui.spinner();
                 ui.label(
                     egui::RichText::new("Creating the support bundle…")
-                        .color(egui::Color32::DARK_GRAY),
+                        .color(super::theme::colours(ui).text2),
                 );
             }
         });
         if let Some(saved) = &view.saved {
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("Saved").color(theme::ACCENT));
+            ui.label(egui::RichText::new("Saved").color(super::theme::colours(ui).accent_text));
             ui.add(egui::Label::new(egui::RichText::new(saved).monospace()).selectable(true));
+            ui.add_space(super::theme::SPACE_SCALE[1]);
             ui.horizontal(|ui| {
-                if ui.button("Copy path").clicked() {
+                ui.spacing_mut().item_spacing.x = super::theme::BUTTON_GAP;
+                if super::widgets::fitted_button(ui, "Copy path", true).clicked() {
                     actions.push(SupportBundleAction::CopyPath);
                 }
-                if ui.button("📂  Show in folder").clicked() {
+                if super::widgets::fitted_button(ui, "Show in folder", true).clicked() {
                     actions.push(SupportBundleAction::ShowInFolder);
                 }
                 if view.copied {
-                    ui.label(egui::RichText::new("Path copied.").color(egui::Color32::DARK_GRAY));
+                    ui.label(
+                        egui::RichText::new("Path copied.").color(super::theme::colours(ui).text2),
+                    );
                 }
             });
         }
         if let Some(error) = &view.error {
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(error).color(theme::DANGER));
+            ui.label(egui::RichText::new(error).color(super::theme::colours(ui).error));
         }
     });
     actions

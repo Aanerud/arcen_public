@@ -94,6 +94,61 @@ impl PassPacer {
     }
 }
 
+/// What one window event asks of the window's next UI pass, given whether
+/// the UI (egui-winit's `EventResponse::repaint`) wants one.
+///
+/// egui-winit answers `repaint: true` for the window's redraw event itself.
+/// A shell that asks for a redraw on that answer asks for one redraw per
+/// redraw: the pacer holds almost all of them, and the event loop never
+/// sleeps (the Windows Deck kept a core busy on an idle Home, 12,000 to
+/// 23,000 redraws a second).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepaintRequest {
+    /// No further pass: the UI wants none, or the event is the redraw the
+    /// pass runs in, or a scale change whose resize is still to come.
+    None,
+    /// A pass is due now. It reaches the window through its pending pass
+    /// time and its [`PassPacer`], never as an immediate redraw, so it is
+    /// paced like every other pass.
+    Due,
+}
+
+/// Which window event a [`RepaintRequest`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassEvent {
+    /// The redraw the shell runs its pass in.
+    Redraw,
+    /// The window's scale changed. The window has not been resized for it
+    /// yet (winit resizes it after this event, on Windows inside the same
+    /// `WM_DPICHANGED`): a pass now would lay out the new scale in the old
+    /// size, and use up the pacer's release. The resize that follows
+    /// releases the pacer and runs the pass.
+    ScaleChange,
+    /// Any other event: input, resize, focus, occlusion.
+    Other,
+}
+
+impl RepaintRequest {
+    /// The request of a window event.
+    #[must_use]
+    pub const fn for_window_event(event: PassEvent, ui_wants_repaint: bool) -> Self {
+        match event {
+            PassEvent::Other if ui_wants_repaint => Self::Due,
+            PassEvent::Other | PassEvent::Redraw | PassEvent::ScaleChange => Self::None,
+        }
+    }
+
+    /// The window's pending pass time with this request made at `now`: the
+    /// earlier of the two.
+    #[must_use]
+    pub fn merged(self, pending: Option<Instant>, now: Instant) -> Option<Instant> {
+        match self {
+            Self::None => pending,
+            Self::Due => Some(pending.map_or(now, |at| at.min(now))),
+        }
+    }
+}
+
 /// A value shown on screen that is rebuilt at most once per `interval`, so
 /// what draws it changes no more often than that (Stream Statistics' text).
 #[derive(Debug, Clone)]
@@ -167,6 +222,70 @@ mod tests {
     }
 
     const REFRESH_120: Duration = Duration::from_micros(8_333);
+
+    #[test]
+    fn only_an_event_other_than_the_redraw_or_a_scale_change_asks_for_a_pass() {
+        for (event, wants, request) in [
+            (PassEvent::Redraw, true, RepaintRequest::None),
+            (PassEvent::Redraw, false, RepaintRequest::None),
+            // The resize winit sends after it runs the pass.
+            (PassEvent::ScaleChange, true, RepaintRequest::None),
+            (PassEvent::ScaleChange, false, RepaintRequest::None),
+            (PassEvent::Other, false, RepaintRequest::None),
+            (PassEvent::Other, true, RepaintRequest::Due),
+        ] {
+            assert_eq!(
+                RepaintRequest::for_window_event(event, wants),
+                request,
+                "{event:?} {wants}"
+            );
+        }
+        let now = Instant::now();
+        let earlier = now.checked_sub(Duration::from_millis(5)).unwrap_or(now);
+        let later = now + Duration::from_millis(5);
+        assert_eq!(RepaintRequest::None.merged(Some(later), now), Some(later));
+        assert_eq!(RepaintRequest::None.merged(None, now), None);
+        assert_eq!(RepaintRequest::Due.merged(None, now), Some(now));
+        assert_eq!(RepaintRequest::Due.merged(Some(later), now), Some(now));
+        assert_eq!(
+            RepaintRequest::Due.merged(Some(earlier), now),
+            Some(earlier)
+        );
+    }
+
+    /// The Windows Deck's loop on an idle Home: one input, then egui wants
+    /// nothing more but answers `repaint: true` for every redraw. The loop
+    /// must go back to sleep (it spun at 12,000+ redraws a second).
+    #[test]
+    fn an_idle_window_stops_redrawing_after_its_pass() {
+        let start = Instant::now();
+        let mut pacer = PassPacer::default();
+        let mut pending =
+            RepaintRequest::for_window_event(PassEvent::Other, true).merged(None, start);
+        let mut redraw_queued = false;
+        let mut redraws = 0;
+        let mut now = start;
+        while now < start + Duration::from_secs(1) {
+            if redraw_queued {
+                redraw_queued = false;
+                redraws += 1;
+                if !pacer.admit(now, Some(REFRESH_120))
+                    && let Some(due) = pacer.held_until(Some(REFRESH_120))
+                {
+                    pending = RepaintRequest::Due.merged(pending, due);
+                }
+                pending =
+                    RepaintRequest::for_window_event(PassEvent::Redraw, true).merged(pending, now);
+            } else if pending.is_some_and(|at| at <= now) {
+                // `about_to_wait`: a due pass becomes a redraw.
+                pending = None;
+                redraw_queued = true;
+            }
+            now += Duration::from_micros(100);
+        }
+        assert_eq!(redraws, 1);
+        assert_eq!(pending, None);
+    }
 
     /// Live, Match My Layout, mouse over the root window: 55 events a
     /// second asked for 165 passes (each input pass and egui's two settle

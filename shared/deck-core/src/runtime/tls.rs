@@ -27,10 +27,12 @@ use std::sync::Arc;
 use thiserror::Error;
 use x509_parser::parse_x509_certificate;
 
-pub const INSECURE_ENV_KEY: &str = "ARCEN_ACCEPT_INSECURE";
-pub const INSECURE_ENV_VALUE: &str = "1";
-pub const TOFU_PIN_MISMATCH_ERROR: &str = "Arcen TOFU certificate fingerprint changed";
-pub const TOFU_CAPTURE_REJECT_ERROR: &str = "Arcen TOFU certificate captured; handshake rejected";
+pub const INSECURE_ENV_KEY: &str = crate::settings::ACCEPT_INSECURE_ENV_KEY;
+pub const INSECURE_ENV_VALUE: &str = crate::settings::ACCEPT_INSECURE_ENV_VALUE;
+pub const TOFU_PIN_MISMATCH_ERROR: &str =
+    "this host's certificate is not the one this Deck remembered for it";
+pub const TOFU_CAPTURE_REJECT_ERROR: &str =
+    "Arcen stopped the connection to show you this host's certificate first";
 
 pub type Sha256Fingerprint = [u8; 32];
 
@@ -255,9 +257,17 @@ impl TlsTrustConfig {
             TlsTrustMode::PrivateCa { ca_bundle } => ClientConfig::builder()
                 .with_root_certificates(roots_with_private_ca(ca_bundle)?)
                 .with_no_client_auth(),
-            TlsTrustMode::TofuPinned { pin } => custom_verifier_client_config(Arc::new(
-                PinningVerifier::new(*pin, webpki_verifier(native_roots()?)?),
-            )),
+            TlsTrustMode::TofuPinned { pin } => {
+                *self
+                    .captured_certificate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                custom_verifier_client_config(Arc::new(PinningVerifier::new(
+                    *pin,
+                    webpki_verifier(native_roots()?)?,
+                    self.captured_certificate.clone(),
+                )))
+            }
             TlsTrustMode::TofuPending => {
                 *self
                     .captured_certificate
@@ -573,13 +583,22 @@ fn cert_info(
 struct PinningVerifier {
     pin: TlsPin,
     signature_verifier: Arc<dyn ServerCertVerifier>,
+    /// The certificate a host presented instead of the pinned one, so the
+    /// Deck can show it next to the remembered one ("identity changed").
+    /// Never trusted from here.
+    presented_instead: Arc<std::sync::Mutex<Option<CertInfo>>>,
 }
 
 impl PinningVerifier {
-    fn new(pin: TlsPin, signature_verifier: Arc<dyn ServerCertVerifier>) -> Self {
+    fn new(
+        pin: TlsPin,
+        signature_verifier: Arc<dyn ServerCertVerifier>,
+        presented_instead: Arc<std::sync::Mutex<Option<CertInfo>>>,
+    ) -> Self {
         Self {
             pin,
             signature_verifier,
+            presented_instead,
         }
     }
 }
@@ -612,6 +631,10 @@ impl ServerCertVerifier for PinningVerifier {
         if matched {
             Ok(ServerCertVerified::assertion())
         } else {
+            *self
+                .presented_instead
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(info);
             Err(RustlsError::General(TOFU_PIN_MISMATCH_ERROR.to_string()))
         }
     }
@@ -1395,6 +1418,7 @@ mod tests {
                 fingerprint_sha256(expired.as_ref()),
             ),
             Arc::new(UnknownIssuerVerifier),
+            Arc::default(),
         );
 
         let error = verifier
@@ -1464,9 +1488,17 @@ mod tests {
         });
         let rekeyed = generated_leaf(&["tofu.example.test"], |_| {});
         let info = cert_info("", &accepted, &server_name("tofu.example.test")).unwrap();
-        let certificate_verifier =
-            PinningVerifier::new(info.certificate_sha256, Arc::new(UnknownIssuerVerifier));
-        let spki_verifier = PinningVerifier::new(info.spki_sha256, Arc::new(UnknownIssuerVerifier));
+        let presented = Arc::default();
+        let certificate_verifier = PinningVerifier::new(
+            info.certificate_sha256,
+            Arc::new(UnknownIssuerVerifier),
+            Arc::clone(&presented),
+        );
+        let spki_verifier = PinningVerifier::new(
+            info.spki_sha256,
+            Arc::new(UnknownIssuerVerifier),
+            Arc::default(),
+        );
         let name = server_name("tofu.example.test");
 
         assert!(
@@ -1478,6 +1510,16 @@ mod tests {
             .verify_server_cert(&renewed, &[], &name, &[], test_now())
             .unwrap_err();
         assert!(is_tofu_pin_mismatch_message(&error.to_string()));
+        // The certificate presented instead is kept to show, never trusted.
+        let renewed_info = cert_info("", &renewed, &name).unwrap();
+        assert_eq!(
+            presented
+                .lock()
+                .unwrap()
+                .take()
+                .map(|shown| shown.certificate_sha256),
+            Some(renewed_info.certificate_sha256)
+        );
         assert!(
             spki_verifier
                 .verify_server_cert(&renewed, &[], &name, &[], test_now())

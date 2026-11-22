@@ -249,6 +249,27 @@ mod platform {
     }
 
     thread_local! {
+        /// The indicator's line saying the host turned the clipboard off.
+        static CLIPBOARD_NOTICE: std::cell::RefCell<Option<Retained<NSMenuItem>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Shows the shared clipboard notice in the keyboard indicator's menu
+    /// (`arcen_deck_core::clipboard::HostClipboard::session_notice`), or
+    /// hides it. Main thread only; a no-op elsewhere.
+    pub fn set_clipboard_notice(notice: Option<&str>) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        CLIPBOARD_NOTICE.with(|item| {
+            if let Some(item) = item.borrow().as_ref() {
+                item.setTitle(&ns(notice.unwrap_or_default()));
+                item.setHidden(notice.is_none());
+            }
+        });
+    }
+
+    thread_local! {
         /// Physical Keys, Characters and Stop Typing, whose state follows
         /// the session.
         static KEYBOARD_ITEMS: std::cell::RefCell<Option<[Retained<NSMenuItem>; 3]>> =
@@ -575,6 +596,11 @@ mod platform {
             sel!(arcenToggleKeyboardCapture:),
             None,
         ));
+        // No action, so the system shows it greyed: a fact, not a command.
+        let clipboard_notice = NSMenuItem::new(mtm);
+        clipboard_notice.setHidden(true);
+        keyboard_menu.addItem(&clipboard_notice);
+        CLIPBOARD_NOTICE.with(|item| *item.borrow_mut() = Some(clipboard_notice));
         let keyboard_item = NSMenuItem::new(mtm);
         keyboard_item.setSubmenu(Some(&keyboard_menu));
         keyboard_item.setHidden(true);
@@ -695,6 +721,7 @@ mod platform {
     }
     pub fn set_keyboard_state(_characters: bool, _typing: bool) {}
     pub fn set_keyboard_status(_line: &str) {}
+    pub fn set_clipboard_notice(_notice: Option<&str>) {}
 }
 
 pub fn install() {
@@ -724,6 +751,11 @@ pub fn set_keyboard_state(characters: bool, typing: bool) {
 /// See `platform::set_keyboard_status`.
 pub fn set_keyboard_status(line: &str) {
     platform::set_keyboard_status(line);
+}
+
+/// See `platform::set_clipboard_notice`.
+pub fn set_clipboard_notice(notice: Option<&str>) {
+    platform::set_clipboard_notice(notice);
 }
 
 /// See `platform::forward_app_shortcuts_to_host`.

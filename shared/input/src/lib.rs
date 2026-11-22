@@ -44,7 +44,8 @@ pub mod virtual_device;
 pub use lane_outbox::{InputLaneOutbox, InputRecordClass, PEN_CONTACT_BACKLOG_CAP};
 pub use negotiation::{
     CursorModeNegotiationReason, ResolvedCursorMode, ResolvedTabletMode,
-    TabletModeNegotiationReason, resolve_cursor_mode, resolve_tablet_mode,
+    TabletModeNegotiationReason, resolve_automatic_cursor_mode, resolve_cursor_mode,
+    resolve_tablet_mode,
 };
 pub use output_local::{OutputLocalPoint, OutputRect, locate_normalized, locate_output};
 pub use pen_edges::{MAX_BARREL_BUTTONS, PenEdge, PenToolState, plan_pen_edges};

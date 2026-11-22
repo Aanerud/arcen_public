@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-pam-greeter"
-version = "0.20.6"
+version = "0.20.7"
 edition = "2021"
 description = "Arcen's PAM module for the GNOME login screen's pre-authenticated sign-in: turns a one-time token the Pier issued into the user (ADR 0025)."
 publish.workspace = true

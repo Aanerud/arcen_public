@@ -334,13 +334,13 @@ impl PasteKeys {
             let (title, detail) = if typing.phase() == PastePhase::WaitingForRelease {
                 (
                     "Release the modifier keys to start typing".to_owned(),
-                    format!("{total} characters from the clipboard · Esc stops"),
+                    format!("{total} characters from the clipboard. Esc stops."),
                 )
             } else {
                 (
                     format!("Typing the clipboard: {typed} of {total}"),
                     format!(
-                        "About {} left · Esc stops",
+                        "About {} left. Esc stops.",
                         format_duration(typing.remaining())
                     ),
                 )

@@ -53,3 +53,125 @@ pub trait PlatformClipboard {
     /// whether the write took.
     fn write(&mut self, origin_marker: &[u8], kind: ClipboardContentKind, bytes: &[u8]) -> bool;
 }
+
+/// What the in-session notice says when the host blocks the clipboard.
+pub const HOST_TURNED_CLIPBOARD_OFF: &str = "Clipboard is turned off by this host.";
+
+/// The host's clipboard policy as its hello advertised it
+/// (`ServerHelloMsg::clipboard`). Every Pier advertises its policy, with
+/// the direction `disabled` when its operator or its session forbids the
+/// clipboard; a Pier that predates the clipboard advertises nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostClipboard {
+    /// No policy: an older Pier, or no session yet. Nothing is said.
+    NotAdvertised,
+    /// The Pier turned the clipboard off.
+    TurnedOff,
+    /// The Pier allows it, within this policy.
+    Allowed(arcen_protocol::messages::ClipboardPolicyMsg),
+}
+
+impl HostClipboard {
+    /// The host's side, from its hello.
+    #[must_use]
+    pub fn from_hello(policy: Option<arcen_protocol::messages::ClipboardPolicyMsg>) -> Self {
+        match policy {
+            None => Self::NotAdvertised,
+            Some(policy)
+                if policy.direction
+                    == arcen_protocol::messages::ClipboardDirectionMsg::Disabled =>
+            {
+                Self::TurnedOff
+            }
+            Some(policy) => Self::Allowed(policy),
+        }
+    }
+
+    /// What the session says about the clipboard: only that the host turned
+    /// it off, and only when the user shares it (with sharing off in
+    /// Settings, the user's own choice already explains it). Never a
+    /// setting the user can change: the host has the last word.
+    #[must_use]
+    pub const fn session_notice(self, user_shares_clipboard: bool) -> Option<&'static str> {
+        match self {
+            Self::TurnedOff if user_shares_clipboard => Some(HOST_TURNED_CLIPBOARD_OFF),
+            Self::TurnedOff | Self::NotAdvertised | Self::Allowed(_) => None,
+        }
+    }
+
+    /// The notice for a session that connected with `overrides` over the
+    /// app-wide consent `app_shares`: the same effective value the session
+    /// itself connects with, so a connection that turned the clipboard off
+    /// itself is never told the host did.
+    #[must_use]
+    pub const fn connection_notice(
+        self,
+        overrides: &crate::overrides::ConnectionOverrides,
+        app_shares: bool,
+    ) -> Option<&'static str> {
+        self.session_notice(overrides.effective_clipboard_enabled(app_shares).value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcen_protocol::messages::{
+        ClipboardContentMsg, ClipboardDirectionMsg, ClipboardPolicyMsg,
+    };
+
+    fn policy(direction: ClipboardDirectionMsg) -> ClipboardPolicyMsg {
+        ClipboardPolicyMsg {
+            protocol_version: arcen_protocol::messages::CLIPBOARD_PROTOCOL_VERSION,
+            direction,
+            content: ClipboardContentMsg::All,
+            max_bytes: 1 << 20,
+        }
+    }
+
+    #[test]
+    fn the_session_says_the_host_turned_the_clipboard_off_only_when_it_did() {
+        let off = HostClipboard::from_hello(Some(policy(ClipboardDirectionMsg::Disabled)));
+        assert_eq!(off, HostClipboard::TurnedOff);
+        assert_eq!(off.session_notice(true), Some(HOST_TURNED_CLIPBOARD_OFF));
+        // The user's own choice explains itself.
+        assert_eq!(off.session_notice(false), None);
+        // An older Pier says nothing, so neither does the Deck.
+        assert_eq!(HostClipboard::from_hello(None).session_notice(true), None);
+        for direction in [
+            ClipboardDirectionMsg::Both,
+            ClipboardDirectionMsg::ClientToHost,
+            ClipboardDirectionMsg::HostToClient,
+        ] {
+            let allowed = HostClipboard::from_hello(Some(policy(direction)));
+            assert!(matches!(allowed, HostClipboard::Allowed(_)));
+            assert_eq!(allowed.session_notice(true), None);
+        }
+    }
+
+    #[test]
+    fn a_connection_that_turned_the_clipboard_off_is_not_told_the_host_did() {
+        use crate::overrides::{ConnectionOverrides, Override};
+        let off = HostClipboard::from_hello(Some(policy(ClipboardDirectionMsg::Disabled)));
+        let follows = ConnectionOverrides::default();
+        let own_off = ConnectionOverrides {
+            clipboard_enabled: Override::Own(false),
+            ..ConnectionOverrides::default()
+        };
+        let own_on = ConnectionOverrides {
+            clipboard_enabled: Override::Own(true),
+            ..ConnectionOverrides::default()
+        };
+        assert_eq!(
+            off.connection_notice(&follows, true),
+            Some(HOST_TURNED_CLIPBOARD_OFF)
+        );
+        assert_eq!(off.connection_notice(&own_off, true), None);
+        assert_eq!(
+            off.connection_notice(&own_on, true),
+            Some(HOST_TURNED_CLIPBOARD_OFF)
+        );
+        // A connection cannot share what Settings does not.
+        assert_eq!(off.connection_notice(&own_on, false), None);
+    }
+}

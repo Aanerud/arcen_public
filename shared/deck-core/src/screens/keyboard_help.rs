@@ -65,18 +65,18 @@ pub fn keyboard_status_line(
     }
 }
 
-/// The macOS Deck's switch for its event tap (Settings ▸ Input).
-pub const MAC_SYSTEM_SHORTCUTS_LABEL: &str =
-    "Send ⌘Tab, ⌘Space and Mission Control to the remote computer";
-
-/// What the switch does and what it needs.
-pub const MAC_SYSTEM_SHORTCUTS_HELP: &str = "macOS acts on these before any window sees them. To send them, Arcen Deck watches the \
-     keyboard while a session window is in front and the remote computer has the keyboard, \
-     which needs the Accessibility permission (System Settings ▸ Privacy & Security ▸ \
-     Accessibility). It takes only ⌘Tab, ⌘`, ⌘Space, ⌃↑, ⌃↓, ⌃←, ⌃→, the screenshot keys \
-     (⇧⌘3, 4, 5) and ⌥⌘D, and only while the keyboard switch says Remote; ⌥⌘Esc, ⌃⌘Q and \
-     every key while a password field asks for secure input stay on this Mac. Off, these \
-     chords act on this Mac as before.";
+/// The session's status line, as a Deck with one status line shows it
+/// (the Windows Deck's menu bar and connection bar): who has the keyboard,
+/// then any clipboard notice as a sentence of its own
+/// (`crate::clipboard::HostClipboard::session_notice`). Empty outside a
+/// session.
+#[must_use]
+pub fn session_status_line(keyboard: String, clipboard: Option<&str>) -> String {
+    match clipboard {
+        Some(notice) if !keyboard.is_empty() => format!("{keyboard}. {notice}"),
+        _ => keyboard,
+    }
+}
 
 /// The one-time question when ⌘Tab is pressed in a session without the
 /// permission.
@@ -93,7 +93,7 @@ pub fn keyboard_switch_help(platform: DeckPlatform, switch: KeyboardSwitchChord)
     let machine = platform.this_machine();
     let shortcuts = match platform {
         DeckPlatform::Pc => "Alt+Tab, the Windows key and Print Screen",
-        DeckPlatform::Mac => "⌘Tab, ⌘Space, Mission Control and ⌃←/⌃→",
+        DeckPlatform::Mac => "⌘Tab, ⌘Space, Mission Control and Control-←/→",
     };
     format!(
         "{keys} flips the keyboard between the remote computer (Remote) and {machine} (Local). \
@@ -379,12 +379,12 @@ pub fn keyboard_shortcut_sheet(
                     "F1–F12 to the remote computer (or use F1, F2, etc. as standard function keys)",
                 ),
                 row(
-                    "⌘Tab, ⌘Space, ⌃↑, ⌃←, ⌃→".to_owned(),
-                    "To the remote computer in Remote, with Settings ▸ Input ▸ Send ⌘Tab, \
-                     ⌘Space and Mission Control on (needs Accessibility); on this Mac in Local",
+                    "⌘Tab, ⌘Space, Control-↑, Control-←, Control-→".to_owned(),
+                    "To the remote computer in Remote, with Settings ▸ Input ▸ System \
+                     shortcuts on (needs Accessibility); on this Mac in Local",
                 ),
                 row(
-                    "⌥⌘Esc, ⌃⌘Q".to_owned(),
+                    "Option-⌘-Esc, Control-⌘-Q".to_owned(),
                     "Force Quit and Lock Screen, always on this Mac",
                 ),
             ],
@@ -499,7 +499,7 @@ mod tests {
         assert!(mac.iter().any(|row| row.keys == "Control-Option-Home"));
         assert!(mac.iter().any(|row| row.keys == "Click the picture"));
         assert!(mac.iter().any(|row| row.keys.starts_with("⌘Tab")));
-        assert!(mac.iter().any(|row| row.keys.contains("⌃←")));
+        assert!(mac.iter().any(|row| row.keys.contains("Control-←")));
     }
 
     #[test]
@@ -588,5 +588,19 @@ mod tests {
             render_keyboard_toast(ui.ctx(), &mut toast);
         });
         assert!(toast.is_none());
+    }
+
+    #[test]
+    fn the_status_line_adds_the_hosts_clipboard_notice_in_a_session_only() {
+        let notice = Some(crate::clipboard::HOST_TURNED_CLIPBOARD_OFF);
+        assert_eq!(
+            session_status_line("Keyboard: Z8".to_owned(), notice),
+            "Keyboard: Z8. Clipboard is turned off by this host."
+        );
+        assert_eq!(session_status_line(String::new(), notice), "");
+        assert_eq!(
+            session_status_line("Keyboard: Z8".to_owned(), None),
+            "Keyboard: Z8"
+        );
     }
 }

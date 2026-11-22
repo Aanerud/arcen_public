@@ -319,7 +319,7 @@ click on Linux.
   movement (the pen owns the pointer). The macOS Deck reads the same from
   right/other-mouse tablet events (`driver_click_for_event`); while the driver
   holds a click, the side switches' position bits are not read.
-- **Settings** (Settings › Input › Tablet support, `pen_barrel_button`,
+- **Settings** (Settings › Tablet › Tablet support, `pen_barrel_button`,
   `pen_lower_button`, `pen_upper_button`): Right click, Middle click or Off for
   the buttons the operating system reports by position: the Windows Ink
   barrel (default Right click) on Windows; the lower (default Right click) and

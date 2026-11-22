@@ -45,7 +45,10 @@ use arcen_deck_core::runtime::session::{
 };
 use arcen_deck_core::runtime::tls::CertInfo;
 use arcen_deck_core::screens::certificate::{
-    CertificateAction, CertificateFacts, render_certificate_warning,
+    CertificateAction, CertificateChangedAction, CertificateChangedStep, CertificateFacts,
+    IdentityChange, IdentityChangeOutcome, IdentityReplaced, certificate_retry_auth,
+    identity_change_outcome, render_certificate_changed, render_certificate_warning,
+    replace_remembered_identity,
 };
 use arcen_deck_core::screens::connecting::{
     ConnectingAction, DisplaysUnsupportedAction, TopologyConflictAction, render_connecting,
@@ -56,7 +59,7 @@ use arcen_deck_core::screens::home::{HomeEffect, HomeViewState, apply_home_actio
 use arcen_deck_core::screens::keyboard_help::{
     KeyboardToast, keyboard_status_line, keyboard_switch_toast, render_keyboard_toast,
 };
-use arcen_deck_core::screens::launcher::{LauncherAction, render_launcher_top_bar};
+use arcen_deck_core::screens::launcher::{TopBarAction, open_user_guide, render_launcher_top_bar};
 use arcen_deck_core::screens::menu::{
     MenuCommand, QuitHoldStep, connection_bar_reveal_zone, paint_quit_hold_notice, quit_hold_step,
     render_connection_bar,
@@ -66,11 +69,9 @@ use arcen_deck_core::screens::reconnect::{
 };
 use arcen_deck_core::screens::settings::{
     NativeTabletComponent, SettingsAction, SettingsFacts, SettingsMonitor, SettingsTab,
-    SettingsValues, render_settings, tablet_scope_note,
+    SettingsValues, render_settings,
 };
-use arcen_deck_core::screens::sign_in::{
-    CredentialAction, CredentialsView, DisclaimerAction, render_credentials, render_disclaimer,
-};
+use arcen_deck_core::screens::sign_in::{DisclaimerAction, render_disclaimer};
 use arcen_deck_core::screens::statistics::{
     DecodeTruth, TabletMonitorFacts, paint_negotiated_truth_panel, paint_stream_stats,
     paint_tablet_monitor_panel,
@@ -79,6 +80,7 @@ use arcen_deck_core::screens::wording::DeckPlatform;
 use arcen_deck_core::settings::{
     ClientConfigRepository, ClientSettings, DisplaysMode, SecurityMode,
 };
+use arcen_deck_core::sign_in::{SignInFailure, SignInStage, SignInState};
 use arcen_deck_core::trusted_pins::TrustedPinStore;
 use arcen_deck_core::ui_pacing::{PacedValue, STATS_PANEL_REFRESH};
 use arcen_input::keyboard::pc::KEY_F4;
@@ -92,12 +94,13 @@ use crate::input::WindowInput;
 use crate::media::VideoSurface;
 use arcen_deck_core::input::overlay_pointer::OverlayPointerRegions;
 use arcen_deck_core::multi_window::runtime::ActiveDisplayInfo;
+use arcen_deck_core::overrides::ConnectionOverrides;
 use arcen_deck_core::screens::host_pointer::paint_host_pointer;
 use arcen_deck_core::screens::text_input::{
     NOTICE_DURATION, characters_unavailable_notice, keyboard_mode_notice, paint_text_input_overlays,
 };
 use arcen_input::deck_pen::ImageRect;
-use arcen_input::keyboard::{DeckShortcut, KeyboardSettings};
+use arcen_input::keyboard::DeckShortcut;
 use arcen_input::text::{KeyboardMode, TypingMode};
 use arcen_media::SessionMonitorId;
 use arcen_protocol::messages::TabletModeMsg;
@@ -119,7 +122,8 @@ enum Screen {
     Connecting(ConnectionDraft),
     Certificate(ConnectionDraft, Box<CertInfo>),
     Disclaimer(ConnectionDraft, String),
-    Credentials(ConnectionDraft),
+    /// "This computer's identity has changed" (the Mac's screen, shared).
+    CertificateChanged(Box<ChangedIdentity>),
     InSession,
     /// "Lost connection, attempting to reconnect" over the last picture;
     /// `true` once an attempt is resuming.
@@ -130,6 +134,15 @@ enum Screen {
     TopologyConflict(ConnectionDraft),
     /// "This host cannot match all active displays" (CN-09).
     DisplaysUnsupported(ConnectionDraft),
+}
+
+/// The identity-changed screen's facts: the connection and the comparison
+/// shown, which carries the presented identity "Trust and connect" trusts
+/// (`IdentityChange::replacement`).
+#[derive(Debug, Clone)]
+struct ChangedIdentity {
+    draft: ConnectionDraft,
+    change: IdentityChange,
 }
 
 /// A sign-in screen the Deck follows into the desktop that replaces it (the
@@ -163,16 +176,20 @@ pub(super) struct Launcher {
     editing_index: Option<usize>,
     form_name: String,
     form_host: String,
-    form_port: String,
     form_username: String,
-    form_displays_mode: Option<DisplaysMode>,
-    form_keyboard: KeyboardSettings,
+    form_overrides: ConnectionOverrides,
     remember_username: bool,
+    /// The last sign-in outcome Home shows under the selected connection's
+    /// field, or in an acknowledgement box (`arcen_deck_core::sign_in`).
+    sign_in: SignInState,
     /// Help ▸ About and Help ▸ Keyboard Shortcuts: modal over a session.
     help: HelpWindows,
     native_tablet: NativeTabletComponent,
     /// Settings › Logs › "Create support bundle…" (shared panel).
     support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel,
+    /// Home's Export… and Import… of `.arcen` connection files, and the
+    /// import summary (shared).
+    profile_sharing: arcen_deck_core::screens::profile::ProfileSharing,
     /// What the decoder proved, read once off the UI thread (a D3D11
     /// probe), for Settings' Grading/HDR reasons.
     decode_report: Arc<std::sync::OnceLock<arcen_deck_core::decode_report::DecodeReport>>,
@@ -183,13 +200,11 @@ pub(super) struct Launcher {
     /// request. Cleared whenever the attempt ends, so they never reach
     /// another host.
     deferred_auth: Option<AuthSubmission>,
-    /// The credentials of an attempt paused at the certificate warning,
-    /// carried only into that warning's own retry (the Mac's
-    /// `preloaded_auth`).
-    certificate_auth: Option<AuthSubmission>,
     /// Pins the user trusted for this run of the Deck (never saved).
     accepted_pins: TrustedPinStore,
     remembered_pins: TrustedPinStore,
+    /// What Export or Import last did, under Home's list until dismissed.
+    home_notice: Option<arcen_deck_core::screens::home::HomeNotice>,
     show_stream_stats: bool,
     /// Stream Statistics' text, rebuilt at the Mac's rate: text that
     /// changed every pass presented the overlay with every video frame.
@@ -218,10 +233,11 @@ pub(super) struct Launcher {
     bar_commands: Vec<MenuCommand>,
     /// The window whose keyboard, mouse and pen a session takes.
     hwnd: HWND,
-    /// The keyboard settings of the connection being made.
-    session_keyboard: KeyboardSettings,
-    /// Keyboard: Physical Keys / Characters for this session (the
-    /// connection's choice until the menu changes it).
+    /// The own values of the connection being made (Command, Typing,
+    /// Option keys); everything else follows Settings.
+    session_overrides: ConnectionOverrides,
+    /// Keyboard: Physical Keys / Characters, chosen from the menu for this
+    /// session.
     session_keyboard_mode: Option<KeyboardMode>,
     /// The input method's composition, shown until it commits.
     preedit: Option<String>,
@@ -242,6 +258,8 @@ pub(super) struct Launcher {
     reconnect_options: Option<ConnectOptions>,
     /// The connection being made or resumed (no password).
     active_connection: Option<ConnectionDraft>,
+    /// The clipboard policy the session's host advertised in its hello.
+    host_clipboard: Option<arcen_protocol::messages::ClipboardPolicyMsg>,
     reconnect_clock: SystemClock,
     reconnect_jitter: SystemJitter,
     /// The lost connection, kept only so its last picture stays under the
@@ -260,9 +278,13 @@ pub(super) struct Launcher {
     /// The topology conflict's "Start fresh": the next attempt asks the
     /// host to replace its desktop.
     pending_desktop_replacement: bool,
-    /// The credentials of an attempt a display recovery stopped, for its
-    /// retry.
+    /// The credentials of an attempt a display recovery, a changed identity
+    /// or the certificate warning stopped, carried only into that screen's
+    /// own retry (the Mac's rule); any other way out drops them
+    /// (`leave_recovery`).
     recovery_auth: Option<AuthSubmission>,
+    /// The identity-changed screen's step (asking, or confirming the trust).
+    certificate_change_step: CertificateChangedStep,
     /// The connection's display plan (pinned or following the window).
     display_plan: Option<DisplayPlan>,
     /// The Match My Layout layout this connection asked for.
@@ -352,22 +374,22 @@ impl Launcher {
             editing_index: None,
             form_name: String::new(),
             form_host: String::new(),
-            form_port: String::new(),
             form_username: String::new(),
-            form_displays_mode: None,
-            form_keyboard: KeyboardSettings::default(),
+            form_overrides: ConnectionOverrides::default(),
             remember_username: true,
+            sign_in: SignInState::default(),
             help: HelpWindows::default(),
             native_tablet: NativeTabletComponent::default(),
             support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel::default(),
+            profile_sharing: arcen_deck_core::screens::profile::ProfileSharing::default(),
             decode_report,
             surface,
             connection: None,
             generation: 0,
             deferred_auth: None,
-            certificate_auth: None,
             accepted_pins: TrustedPinStore::default(),
             remembered_pins,
+            home_notice: None,
             show_stream_stats: false,
             stream_stats_text: PacedValue::new(STATS_PANEL_REFRESH),
             show_negotiated_truth: false,
@@ -383,7 +405,7 @@ impl Launcher {
             session_title: String::new(),
             bar_commands: Vec::new(),
             hwnd,
-            session_keyboard: KeyboardSettings::default(),
+            session_overrides: ConnectionOverrides::default(),
             session_keyboard_mode: None,
             preedit: None,
             notice: None,
@@ -394,6 +416,7 @@ impl Launcher {
             reconnect: None,
             reconnect_options: None,
             active_connection: None,
+            host_clipboard: None,
             reconnect_clock: SystemClock::default(),
             reconnect_jitter: SystemJitter,
             held: None,
@@ -403,6 +426,7 @@ impl Launcher {
             tablet_hint_shown: false,
             pending_desktop_replacement: false,
             recovery_auth: None,
+            certificate_change_step: CertificateChangedStep::default(),
             display_plan: None,
             requested_topology: None,
             display_fit: DisplayFitTracker::new(),
@@ -437,6 +461,24 @@ impl Launcher {
         self.show_stream_stats = stream_stats;
         self.quit_after = quit_after;
         self.unattended_started = quit_after.map(|_| std::time::Instant::now());
+        let mut draft = draft;
+        // The saved connection the command line names unambiguously, as on
+        // the Mac: its own values (a withheld clipboard among them) apply,
+        // and a `--pin-sha256` stays.
+        if let Some(index) = draft.match_saved(&self.saved, self.settings.security_mode) {
+            let id = self.saved[index].id.clone();
+            if draft.username.is_empty() {
+                draft.username = self.saved[index]
+                    .settings
+                    .remembered_username
+                    .clone()
+                    .unwrap_or_default();
+            }
+            match self.repository.set_last_selected(&id) {
+                Ok(store) => self.reconcile(store),
+                Err(error) => tracing::warn!(%error, "quick-connect selection was not persisted"),
+            }
+        }
         self.start_connection(draft, None, ctx);
     }
 
@@ -464,9 +506,12 @@ impl Launcher {
     }
 
     /// The typing mode in force: the session's keyboard mode over the
-    /// Typing setting.
+    /// connection's Typing, else Settings'.
     fn typing_mode(&self) -> TypingMode {
-        let setting = self.settings.typing_mode;
+        let setting = self
+            .session_overrides
+            .effective_typing_mode(self.settings.typing_mode)
+            .value;
         self.session_keyboard_mode
             .map_or(setting, |mode| mode.typing_mode(setting))
     }
@@ -546,7 +591,7 @@ impl Launcher {
             // an answer without a deadline.
             let prompt = matches!(
                 self.screen,
-                Screen::Certificate(..) | Screen::Disclaimer(..) | Screen::Credentials(_)
+                Screen::Certificate(..) | Screen::Disclaimer(..) | Screen::CertificateChanged(_)
             );
             let late = self
                 .unattended_started
@@ -684,14 +729,19 @@ impl Launcher {
             .fill(if in_session {
                 egui::Color32::TRANSPARENT
             } else {
-                egui::Color32::WHITE
+                launcher_root_frame(ui).fill
             })
             .inner_margin(0.0)
             .show(ui, |ui| {
                 ui.set_min_size(available);
                 let launcher_screen = !(in_session || matches!(self.screen, Screen::Settings));
-                if launcher_screen && render_launcher_top_bar(ui) == LauncherAction::OpenSettings {
-                    self.screen = Screen::Settings;
+                match launcher_screen
+                    .then(|| render_launcher_top_bar(ui))
+                    .flatten()
+                {
+                    Some(TopBarAction::Settings) => self.screen = Screen::Settings,
+                    Some(TopBarAction::Help) => open_user_guide(ui.ctx()),
+                    None => {}
                 }
                 match &self.screen {
                     Screen::Home => self.home(ui),
@@ -705,6 +755,7 @@ impl Launcher {
                         }
                     }
                     Screen::Certificate(..) => self.certificate_screen(ui),
+                    Screen::CertificateChanged(_) => self.certificate_changed_screen(ui),
                     Screen::Disclaimer(draft, text) => {
                         let (draft, text) = (draft.clone(), text.clone());
                         match render_disclaimer(ui, &draft, &text) {
@@ -716,22 +767,6 @@ impl Launcher {
                                 }
                                 self.disconnect("Disclaimer declined");
                             }
-                        }
-                    }
-                    Screen::Credentials(draft) => {
-                        let mut draft = draft.clone();
-                        let error = self.status.strip_prefix("Connection error: ");
-                        let mut view = CredentialsView {
-                            draft: &mut draft,
-                            note: None,
-                            error,
-                            remember_username: &mut self.remember_username,
-                        };
-                        let action = render_credentials(ui, &mut view);
-                        match action {
-                            CredentialAction::None => self.screen = Screen::Credentials(draft),
-                            CredentialAction::Back => self.disconnect("Ready"),
-                            CredentialAction::Connect => self.credentials_connect(draft, ui.ctx()),
                         }
                     }
                     Screen::InSession => {
@@ -752,7 +787,27 @@ impl Launcher {
             DeckPlatform::Pc,
             self.settings.keyboard_switch,
         );
+        self.leave_recovery();
         self.publish_local_ui();
+    }
+
+    /// The Mac's `leave_recovery`: the password kept for a recovery choice
+    /// (or the certificate warning's retry) lives only while that screen
+    /// shows; Settings, Home or anything
+    /// else drops it (`AuthSubmission` wipes itself on drop). A choice takes
+    /// it itself.
+    fn leave_recovery(&mut self) {
+        if self.recovery_auth.is_some()
+            && !matches!(
+                self.screen,
+                Screen::TopologyConflict(_)
+                    | Screen::DisplaysUnsupported(_)
+                    | Screen::CertificateChanged(_)
+                    | Screen::Certificate(..)
+            )
+        {
+            self.recovery_auth = None;
+        }
     }
 
     /// Where the Deck's own UI takes the session windows' input, after this
@@ -782,6 +837,23 @@ impl Launcher {
         if let Err(error) = save_client_settings(&self.repository, &self.settings) {
             self.status = format!("Settings were not saved: {error}");
         }
+    }
+
+    /// The status line the menu bar and the connection bar show: who has
+    /// the keyboard, and whether the host turned the clipboard off.
+    pub(super) fn session_status_line(&self) -> String {
+        arcen_deck_core::screens::keyboard_help::session_status_line(
+            self.keyboard_status_line(),
+            self.host_clipboard_notice(),
+        )
+    }
+
+    /// The host's clipboard notice for the clipboard value this session
+    /// connected with (the connection's own over Settings); `None` outside
+    /// a session.
+    fn host_clipboard_notice(&self) -> Option<&'static str> {
+        arcen_deck_core::clipboard::HostClipboard::from_hello(self.host_clipboard)
+            .connection_notice(&self.session_overrides, self.settings.clipboard_enabled)
     }
 
     /// Who has the keyboard, as the indicator says it ("Keyboard: Z8
@@ -856,12 +928,25 @@ impl Launcher {
     }
 
     fn home(&mut self, ui: &mut egui::Ui) {
-        let operator_notice = (self.settings.security_mode == SecurityMode::Low).then_some(
-            "Insecure mode: this Deck is not verifying Pier certificates. \
+        if self.profile_sharing.is_open() {
+            let outcome = self.profile_sharing.show(
+                ui.ctx(),
+                &mut arcen_deck_core::screens::profile::ProfileContext {
+                    services: &*self.services,
+                    repository: &self.repository,
+                    security_mode: self.settings.security_mode,
+                    saved: &self.saved,
+                    pins: &mut self.remembered_pins,
+                },
+            );
+            self.apply_profile_outcome(outcome);
+        }
+        let operator_notice = (self.settings.security_mode.in_force() == SecurityMode::Low)
+            .then_some(
+                "Insecure mode: this Deck is not verifying Pier certificates. \
              Anyone able to intercept the connection can read and control \
              this session.",
-        );
-        let connection_error = self.status.strip_prefix("Connection error: ");
+            );
         let mut state = HomeViewState {
             direct: &mut self.direct,
             saved_connections: &self.saved,
@@ -871,14 +956,14 @@ impl Launcher {
             editing_index: &mut self.editing_index,
             form_name: &mut self.form_name,
             form_host: &mut self.form_host,
-            form_port: &mut self.form_port,
             form_username: &mut self.form_username,
-            form_displays_mode: &mut self.form_displays_mode,
-            form_keyboard: &mut self.form_keyboard,
-            app_displays_mode: self.settings.displays_mode,
-            connection_error,
+            form_overrides: &mut self.form_overrides,
+            app_defaults: arcen_deck_core::overrides::AppDefaults::from_settings(&self.settings),
+            sign_in: &mut self.sign_in,
+            overlay_open: self.help.modal(),
             remember_username: &mut self.remember_username,
             connection_test: None,
+            notice: &mut self.home_notice,
         };
         let Some(action) = render_home(ui, &mut state) else {
             return;
@@ -897,6 +982,31 @@ impl Launcher {
         }
         match outcome.effect {
             HomeEffect::None | HomeEffect::ConnectionTest(_) => {}
+            HomeEffect::ExportProfile(index) => {
+                let outcome = self.profile_sharing.export(
+                    index,
+                    &arcen_deck_core::screens::profile::ProfileContext {
+                        services: &*self.services,
+                        repository: &self.repository,
+                        security_mode: self.settings.security_mode,
+                        saved: &self.saved,
+                        pins: &mut self.remembered_pins,
+                    },
+                );
+                self.apply_profile_outcome(outcome);
+            }
+            HomeEffect::ImportProfile => {
+                let outcome = self.profile_sharing.import(
+                    &arcen_deck_core::screens::profile::ProfileContext {
+                        services: &*self.services,
+                        repository: &self.repository,
+                        security_mode: self.settings.security_mode,
+                        saved: &self.saved,
+                        pins: &mut self.remembered_pins,
+                    },
+                );
+                self.apply_profile_outcome(outcome);
+            }
             HomeEffect::TestConnection { .. } => {
                 "Connection test is not in this build of the Windows Deck yet."
                     .clone_into(&mut self.status);
@@ -909,9 +1019,6 @@ impl Launcher {
                             self.status = format!("Connection could not be selected: {error}");
                             return;
                         }
-                    }
-                    if let Some(saved) = self.saved.iter().find(|saved| &saved.id == id) {
-                        self.settings.tablet_mode_requested = saved.settings.tablet_mode_requested;
                     }
                 }
                 self.start_connection(draft, None, ui.ctx());
@@ -950,7 +1057,7 @@ impl Launcher {
             .saved_connection_id
             .as_ref()
             .and_then(|id| self.saved.iter().find(|saved| &saved.id == id))
-            .and_then(|saved| saved.settings.displays_mode);
+            .and_then(|saved| saved.settings.overrides.displays_mode.own());
         let source = arcen_deck_core::connect_plan::displays_mode_source(
             self.pending_displays_override.as_ref(),
             &endpoint,
@@ -987,9 +1094,16 @@ impl Launcher {
         };
         let tls = tls_trust_for(self.settings.security_mode, endpoint, pin);
         let telemetry = Arc::new(ClientTelemetry::default());
+        self.session_overrides = draft
+            .saved_connection_id
+            .as_ref()
+            .and_then(|id| self.saved.iter().find(|saved| &saved.id == id))
+            .map(|saved| saved.settings.overrides)
+            .unwrap_or_default();
+        self.session_keyboard_mode = None;
         let (options, plan) = connect_options(
             &draft,
-            &self.settings,
+            &self.session_overrides.apply_to(&self.settings),
             mode,
             approved,
             std::mem::take(&mut self.pending_desktop_replacement),
@@ -1006,13 +1120,6 @@ impl Launcher {
         self.generation = self.generation.wrapping_add(1);
         self.status = format!("Connecting to {}...", draft.display_name());
         draft.display_name().clone_into(&mut self.session_title);
-        self.session_keyboard = draft
-            .saved_connection_id
-            .as_ref()
-            .and_then(|id| self.saved.iter().find(|saved| &saved.id == id))
-            .map(|saved| saved.settings.keyboard)
-            .unwrap_or_default();
-        self.session_keyboard_mode = self.session_keyboard.typing;
         self.configure_reconnect(&draft, &options);
         let holder_nonce = self
             .reconnect
@@ -1036,7 +1143,17 @@ impl Launcher {
                 self.screen = Screen::Connecting(draft);
             }
             Err(error) => {
+                // The attempt never started: its credentials go now.
+                self.deferred_auth = None;
+                self.submitted_auth = None;
                 self.status = format!("Connection error: {error}");
+                self.end_reconnect();
+                self.active_connection = None;
+                self.direct = self.sign_in.return_home(
+                    SignInFailure::ConnectionFailed,
+                    draft,
+                    Some(error.to_string()),
+                );
                 self.screen = Screen::Home;
             }
         }
@@ -1056,9 +1173,7 @@ impl Launcher {
             return;
         };
         let draft = match &self.screen {
-            Screen::Connecting(draft)
-            | Screen::Credentials(draft)
-            | Screen::Disclaimer(draft, _) => Some(draft.clone()),
+            Screen::Connecting(draft) | Screen::Disclaimer(draft, _) => Some(draft.clone()),
             _ => self.active_connection.clone(),
         };
         match connection.poll() {
@@ -1083,6 +1198,14 @@ impl Launcher {
                 let Some(connection) = self.connection.as_mut() else {
                     return;
                 };
+                self.host_clipboard = connection
+                    .media()
+                    .shared()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .server_hello
+                    .as_ref()
+                    .and_then(|hello| hello.clipboard);
                 // A host that applied Match My Layout gets one window per
                 // monitor, or the session ends (the Mac's rule).
                 if let Err(reason) = connection.begin_multi_window(self.requested_topology.as_ref())
@@ -1103,8 +1226,10 @@ impl Launcher {
                 }
                 let attached = connection.attach_input(
                     self.hwnd,
-                    self.session_keyboard,
-                    self.settings.option_key_mode,
+                    self.session_overrides.keyboard_settings(),
+                    self.session_overrides
+                        .effective_option_keys(self.settings.option_key_mode)
+                        .value,
                     (
                         self.settings.tablet_mode_requested,
                         self.settings.pen_buttons,
@@ -1140,18 +1265,22 @@ impl Launcher {
                     .chain(tablet_hint)
                     .collect();
                 if !notes.is_empty() {
-                    self.notify(notes.join(" · "));
+                    self.notify(notes.join(" "));
                 }
                 self.screen = Screen::InSession;
             }
             SessionNews::CertificateUntrusted(info) => {
                 let typed = self.deferred_auth.take();
                 self.disconnect_quietly();
-                self.certificate_auth = typed;
+                // The warning owns it: only its approved retry takes it.
+                self.recovery_auth = typed;
                 self.status = format!("Verify server certificate for {}", info.endpoint);
                 if let Some(draft) = draft {
                     self.screen = Screen::Certificate(draft, Box::new(info));
                 }
+            }
+            SessionNews::CertificateChanged(presented) => {
+                self.handle_certificate_changed(draft, presented);
             }
             SessionNews::AuthRequired(request) => {
                 let Some(draft) = draft else { return };
@@ -1245,7 +1374,7 @@ impl Launcher {
         {
             controller.terminal();
             "Host returned an invalid session-resume response".clone_into(&mut self.status);
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, Some(self.status.clone()));
             return;
         }
         if kind != AuthenticationKind::Refresh
@@ -1255,7 +1384,7 @@ impl Launcher {
                 .is_some_and(Connection::accept_authentication)
         {
             "Connection closed before resume was accepted".clone_into(&mut self.status);
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, Some(self.status.clone()));
             return;
         }
         if kind == AuthenticationKind::Resume {
@@ -1273,6 +1402,16 @@ impl Launcher {
         self.preedit = None;
         self.quit_hold = None;
         self.status = format!("Connection error: {}", end.message);
+        // Whether a desktop was up decides the words (shared
+        // `SignInFailure::after_end`).
+        let stage = if matches!(
+            self.screen,
+            Screen::InSession | Screen::Reconnecting(..) | Screen::SigningIn
+        ) {
+            SignInStage::Session
+        } else {
+            SignInStage::Attempt
+        };
         let lost = self.connection.take();
         let resuming = matches!(self.screen, Screen::Reconnecting(_, true));
         if self.follow_login_window(end) {
@@ -1323,13 +1462,101 @@ impl Launcher {
             self.screen = Screen::Home;
             return;
         }
-        if resuming {
-            // The resume itself was refused or ran out: sign in again.
-            self.return_to_credentials();
+        // Back on Home with the connection selected and the outcome said in
+        // plain words: a refused resume asks to sign in again, as does
+        // anything else that ends the attempt or session.
+        let failure = if resuming {
+            SignInFailure::after_end(end.reason, SignInStage::Session)
+        } else {
+            SignInFailure::after_end(end.reason, stage)
+        };
+        self.return_home(
+            failure.unwrap_or(SignInFailure::SessionEnded),
+            Some(arcen_deck_core::sign_in::end_detail(end)),
+        );
+    }
+
+    /// The Mac's `handle_certificate_changed`: a host this Deck pinned
+    /// presented another certificate. A remembered identity gets the shared
+    /// recovery screen; anything else goes back to Home with the plain box.
+    fn handle_certificate_changed(&mut self, draft: Option<ConnectionDraft>, presented: CertInfo) {
+        let recovery_auth = self
+            .deferred_auth
+            .take()
+            .or_else(|| self.submitted_auth.take());
+        self.disconnect("This computer's identity has changed.");
+        let Some(draft) = draft else {
             return;
+        };
+        // Shared with the Mac: a pin the connection carries (`--pin-sha256`)
+        // is never offered for replacement.
+        match identity_change_outcome(&draft, &self.remembered_pins, &presented) {
+            IdentityChangeOutcome::Recover(change) => {
+                tracing::warn!(
+                    endpoint = %change.endpoint,
+                    remembered_fingerprint = %change.remembered,
+                    presented_fingerprint = %change.presented,
+                    "a remembered host identity no longer matches; offering the recovery",
+                );
+                self.certificate_change_step = CertificateChangedStep::default();
+                self.recovery_auth = recovery_auth;
+                self.screen =
+                    Screen::CertificateChanged(Box::new(ChangedIdentity { draft, change }));
+            }
+            IdentityChangeOutcome::Refuse { detail } => {
+                self.direct = self.sign_in.return_home(
+                    SignInFailure::HostIdentityChanged,
+                    draft,
+                    Some(detail),
+                );
+            }
         }
-        self.end_reconnect();
-        self.screen = Screen::Home;
+    }
+
+    /// The shared identity-changed screen: Cancel leaves the remembered
+    /// identity; "Trust and connect" replaces it and connects.
+    fn certificate_changed_screen(&mut self, ui: &mut egui::Ui) {
+        let Screen::CertificateChanged(changed) = &self.screen else {
+            return;
+        };
+        let changed = changed.clone();
+        match render_certificate_changed(ui, &changed.change, &mut self.certificate_change_step) {
+            CertificateChangedAction::None => {}
+            CertificateChangedAction::Cancel => {
+                self.certificate_change_step = CertificateChangedStep::default();
+                self.recovery_auth = None;
+                "Connection cancelled; this host is still trusted under its previous identity."
+                    .clone_into(&mut self.status);
+                self.screen = Screen::Home;
+            }
+            CertificateChangedAction::TrustNewIdentity => {
+                self.certificate_change_step = CertificateChangedStep::default();
+                let ChangedIdentity { draft, change, .. } = *changed;
+                let preloaded = self.recovery_auth.take();
+                // The identity shown, of the remembered one's kind, in one
+                // locked write of this endpoint (shared with the Mac).
+                self.accepted_pins.forget(&change.endpoint);
+                match replace_remembered_identity(
+                    &self.repository,
+                    &mut self.remembered_pins,
+                    &change,
+                ) {
+                    IdentityReplaced::Saved => {
+                        self.start_connection(draft, preloaded, ui.ctx());
+                    }
+                    IdentityReplaced::ThisRunOnly(status) => {
+                        self.status = status;
+                        self.start_connection(draft, preloaded, ui.ctx());
+                    }
+                    IdentityReplaced::ChangedElsewhere => {
+                        "This host's trusted identity changed in another Arcen Deck window. \
+                         Nothing was trusted: connect again to check it."
+                            .clone_into(&mut self.status);
+                        self.screen = Screen::Home;
+                    }
+                }
+            }
+        }
     }
 
     /// The two display recoveries a host can ask for (CN-08, CN-09), with
@@ -1461,7 +1688,7 @@ impl Launcher {
         };
         if controller.expire(now) {
             "Session resume window expired".clone_into(&mut self.status);
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, Some(self.status.clone()));
             return;
         }
         if !is_reconnecting(self.reconnect.as_ref()) {
@@ -1475,7 +1702,7 @@ impl Launcher {
             .zip(self.reconnect_options.as_ref())
             .map(|(draft, options)| self.reconnect_identity(draft, options, false))
         else {
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, None);
             return;
         };
         let generation = self.generation;
@@ -1491,7 +1718,7 @@ impl Launcher {
         ) {
             ResumeLaunch::Idle => {}
             ResumeLaunch::Abandon => {
-                self.return_to_credentials();
+                self.return_home(SignInFailure::SessionEnded, None);
                 return;
             }
             ResumeLaunch::Launch {
@@ -1518,7 +1745,7 @@ impl Launcher {
                     }
                     Err(error) => {
                         self.status = format!("Connection error: {error}");
-                        self.return_to_credentials();
+                        self.return_home(SignInFailure::SessionEnded, Some(error.to_string()));
                         return;
                     }
                 }
@@ -1537,16 +1764,18 @@ impl Launcher {
         }
     }
 
-    /// The Mac's `return_to_credentials`: the resume is over; sign in again.
-    fn return_to_credentials(&mut self) {
+    /// The Mac's `return_home`: the attempt or session is over without a
+    /// desktop. Home, the same connection selected, its password cleared
+    /// and focused, and `failure` in plain words under it (or in a box), by
+    /// the shared `arcen_deck_core::sign_in`; `detail` goes to the log and
+    /// "Details".
+    fn return_home(&mut self, failure: SignInFailure, detail: Option<String>) {
         self.disconnect_quietly();
         self.end_reconnect();
-        if let Some(mut draft) = self.active_connection.take() {
-            zeroize::Zeroize::zeroize(&mut draft.password);
-            self.screen = Screen::Credentials(draft);
-        } else {
-            self.screen = Screen::Home;
+        if let Some(draft) = self.active_connection.take() {
+            self.direct = self.sign_in.return_home(failure, draft, detail);
         }
+        self.screen = Screen::Home;
     }
 
     /// Drops the reconnect controller as terminal (never resumed again).
@@ -1630,7 +1859,7 @@ impl Launcher {
             self.login_window_handover = None;
             "Sign-in hand-over could not continue: connection destination was lost."
                 .clone_into(&mut self.status);
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, Some(self.status.clone()));
             return;
         };
         // Starting a connection drops the hand-over; it is carried across
@@ -1645,27 +1874,16 @@ impl Launcher {
         }
     }
 
-    /// The sign-in screen's Connect: answers the host's auth request, or,
-    /// when a resume ended and no connection is waiting for it, starts a
-    /// fresh connection with the credentials (the Mac's credentials screen).
-    fn credentials_connect(&mut self, mut draft: ConnectionDraft, ctx: &egui::Context) {
-        let submission = AuthSubmission {
-            username: draft.username.clone(),
-            password: std::mem::take(&mut draft.password),
-        };
-        if self.connection.is_none() {
-            self.start_connection(draft, Some(submission), ctx);
-        } else {
-            self.deferred_auth = Some(submission);
-            self.answer_auth(draft);
-        }
-    }
-
-    /// Answers the host's auth request: with the credentials already typed,
-    /// else the sign-in screen.
+    /// Answers the host's auth request with the credentials already typed.
+    /// Without them the waiting attempt is closed and Home asks for the
+    /// password under the connection's field; Connect there starts afresh.
     fn answer_auth(&mut self, draft: ConnectionDraft) {
         let Some(submission) = self.deferred_auth.take() else {
-            self.screen = Screen::Credentials(draft);
+            let status = format!("Enter password for {}", draft.display_name());
+            self.disconnect(&status);
+            self.direct = self
+                .sign_in
+                .return_home(SignInFailure::PasswordRequired, draft, None);
             return;
         };
         self.submitted_auth = Some(submission.clone());
@@ -1701,7 +1919,7 @@ impl Launcher {
         match action {
             CertificateAction::None => {}
             CertificateAction::Cancel => {
-                self.certificate_auth = None;
+                let _ = certificate_retry_auth(action, &mut self.recovery_auth);
                 "Certificate trust cancelled".clone_into(&mut self.status);
                 self.screen = Screen::Home;
             }
@@ -1712,12 +1930,15 @@ impl Launcher {
                 if action == CertificateAction::TrustAndRemember {
                     self.remember_pin(&draft, &endpoint, &info);
                 }
-                let preloaded = self.certificate_auth.take();
+                let preloaded = certificate_retry_auth(action, &mut self.recovery_auth);
                 self.start_connection(draft, preloaded, ui.ctx());
             }
         }
     }
 
+    /// "Trust and remember" on the certificate warning: this endpoint only,
+    /// under the identities' lock, and only while none is remembered for
+    /// it on disk either (the warning showed it as unknown).
     fn remember_pin(&mut self, draft: &ConnectionDraft, endpoint: &str, info: &CertInfo) {
         let label = draft
             .saved_connection_id
@@ -1725,15 +1946,18 @@ impl Launcher {
             .and_then(|id| self.saved.iter().find(|saved| &saved.id == id))
             .map(|saved| saved.name.clone())
             .filter(|name| !name.trim().is_empty());
-        self.remembered_pins
-            .remember(endpoint, &info.spki_sha256, label);
-        let saved = self
-            .repository
-            .trusted_pins_file()
-            .map(|path| arcen_deck_core::trusted_pins::save(&path, &self.remembered_pins));
-        if !matches!(saved, Some(Ok(()))) {
-            "Trusted for this session only: the identity could not be saved."
-                .clone_into(&mut self.status);
+        let expected = self.remembered_pins.resolved().get(endpoint).copied();
+        let path = self.repository.trusted_pins_file();
+        if let Err(error) = arcen_deck_core::trusted_pins::remember_reviewed(
+            path.as_deref(),
+            &mut self.remembered_pins,
+            endpoint,
+            expected,
+            &info.spki_sha256,
+            label,
+        ) {
+            tracing::warn!(%endpoint, %error, "could not record the remembered host identity");
+            self.status = format!("Trusted for this session only: {error}.");
         }
     }
 
@@ -1890,7 +2114,7 @@ impl Launcher {
 
     /// A multi-window session that cannot go on (the Mac's
     /// `multi_window_failure`): a reconnect when this connection may resume,
-    /// otherwise sign in again.
+    /// otherwise Home, asking to sign in again.
     fn multi_window_failure(&mut self, reason: &str, ctx: &egui::Context) {
         self.status = format!("Multi-monitor session ended: {reason}");
         self.clipboard.detach();
@@ -1914,7 +2138,7 @@ impl Launcher {
             ctx.request_repaint();
             return;
         }
-        self.return_to_credentials();
+        self.return_home(SignInFailure::SessionEnded, Some(reason.to_owned()));
         ctx.request_repaint();
     }
 
@@ -1953,7 +2177,12 @@ impl Launcher {
 
     /// Gives a secondary window's input to the session.
     pub(super) fn attach_secondary_input(&mut self, hwnd: HWND, monitor: SessionMonitorId) {
-        let (keyboard, option_keys) = (self.session_keyboard, self.settings.option_key_mode);
+        let (keyboard, option_keys) = (
+            self.session_overrides.keyboard_settings(),
+            self.session_overrides
+                .effective_option_keys(self.settings.option_key_mode)
+                .value,
+        );
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
@@ -2020,11 +2249,11 @@ impl Launcher {
             // A click into the picture took the keyboard back, or Esc.
             self.unpin_bar();
         }
-        let status = self.keyboard_status_line();
+        let status = self.session_status_line();
         let title = if status.is_empty() {
             self.session_title.clone()
         } else {
-            format!("{} · {status}", self.session_title)
+            format!("{} \u{2014} {status}", self.session_title)
         };
         let pass = render_connection_bar(
             ctx,
@@ -2257,6 +2486,9 @@ impl Launcher {
 
     /// Ends the session and returns to Home with `status`.
     fn disconnect(&mut self, status: &str) {
+        // A password never outlives its attempt on Home (the shared Connect
+        // already took it; this covers any other way in).
+        zeroize::Zeroize::zeroize(&mut self.direct.password);
         self.disconnect_quietly();
         // A deliberate disconnect is never resumed (the Mac's
         // `manual_cancel`).
@@ -2279,8 +2511,8 @@ impl Launcher {
         self.clipboard.detach();
         self.preedit = None;
         self.deferred_auth = None;
-        self.certificate_auth = None;
         self.submitted_auth = None;
+        self.host_clipboard = None;
         if let Some(connection) = self.connection.take() {
             connection.close();
         }
@@ -2299,6 +2531,32 @@ impl Launcher {
         }
     }
 
+    /// Applies Export's or Import's outcome as a Home outcome.
+    fn apply_profile_outcome(
+        &mut self,
+        outcome: arcen_deck_core::screens::profile::ProfileOutcome,
+    ) {
+        if let Some(notice) = outcome.home_notice() {
+            self.home_notice = Some(notice);
+        }
+        if let Some(store) = outcome.store {
+            self.reconcile(store);
+        }
+        if let Some(status) = outcome.status {
+            self.status = status;
+        }
+        if let Some(id) = outcome.select {
+            self.show_add_form = false;
+            self.editing_index = None;
+            arcen_deck_core::screens::profile::select(
+                &mut self.direct,
+                &mut self.sign_in,
+                &self.saved,
+                &id,
+            );
+        }
+    }
+
     fn reconcile(&mut self, store: arcen_deck_core::settings::SavedConnectionsStore) {
         self.saved = store.connections;
         self.last_selected = store.last_selected_connection_id;
@@ -2306,18 +2564,13 @@ impl Launcher {
 
     fn settings_screen(&mut self, ui: &mut egui::Ui) {
         let monitors = self.monitors.clone();
-        let selected_name = self.last_selected.as_ref().and_then(|id| {
-            self.saved
-                .iter()
-                .find(|saved| &saved.id == id)
-                .map(|saved| saved.name.as_str())
-        });
+        let host_clipboard_notice = self.host_clipboard_notice();
         let facts = SettingsFacts {
             hdr_screen: self.services.any_display_is_hdr(),
             notch: None,
             monitors: &monitors,
-            clipboard_policy: None,
-            tablet_scope_note: tablet_scope_note(selected_name),
+            host_clipboard_notice,
+            connections: &self.saved,
             native_tablet: self
                 .native_tablet
                 .control(self.services.as_ref(), DeckPlatform::Pc),
@@ -2325,7 +2578,10 @@ impl Launcher {
             support_bundle: Some(self.support_bundle.view(self.services.as_ref())),
             connection_displays: self.last_selected.as_ref().and_then(|id| {
                 let saved = self.saved.iter().find(|saved| &saved.id == id)?;
-                Some((saved.name.clone(), saved.settings.displays_mode?))
+                Some((
+                    saved.name.clone(),
+                    saved.settings.overrides.displays_mode.own()?,
+                ))
             }),
             canvas_available: arcen_deck_core::canvas::CanvasRequest::for_sink::<
                 crate::media::WindowSink,
@@ -2336,22 +2592,8 @@ impl Launcher {
         let mut values = SettingsValues::from_client_settings(&self.settings, self.settings_tab);
         let actions = render_settings(ui, &mut values, &facts);
         self.settings_tab = values.tab;
-        // The tablet mode is kept per saved connection, as on the Mac; a
-        // choice that cannot be written there is not taken.
-        if values.tablet_mode_requested != self.settings.tablet_mode_requested
-            && let Some(id) = self.last_selected.clone()
-        {
-            match self
-                .repository
-                .set_tablet_mode_requested(&id, values.tablet_mode_requested)
-            {
-                Ok(store) => self.reconcile(store),
-                Err(error) => {
-                    values.tablet_mode_requested = self.settings.tablet_mode_requested;
-                    self.status = format!("Tablet mode was not saved for this connection: {error}");
-                }
-            }
-        }
+        // The tablet mode is one choice for every connection, saved with
+        // the rest of Settings (0.20.7).
         if values.apply_to(&mut self.settings) {
             self.settings_changed();
         }
@@ -2424,4 +2666,12 @@ fn probe_decode_report(
             let _ = filled.set(services.decode_report());
         });
     cell
+}
+
+/// The window's background on every launcher screen and Settings (a
+/// session leaves it clear for the video).
+pub(super) fn launcher_root_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(arcen_deck_core::screens::theme::colours(ui).bg)
+        .inner_margin(0.0)
 }

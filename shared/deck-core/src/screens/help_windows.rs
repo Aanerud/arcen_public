@@ -67,15 +67,11 @@ impl HelpWindows {
     /// no text field has it. Call before anything else reads Esc this pass
     /// (the connection bar unpins on it). Returns the window closed.
     pub fn take_dismiss_key(&mut self, ctx: &egui::Context) -> Option<HelpWindow> {
-        if self.open.is_empty() || ctx.egui_wants_keyboard_input() {
-            return None;
+        if !self.open.is_empty() && take_dismiss_key(ctx) {
+            self.close_front()
+        } else {
+            None
         }
-        let pressed = ctx.input_mut(|input| {
-            input.focused
-                && (input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
-                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-        });
-        if pressed { self.close_front() } else { None }
     }
 
     /// Draws the open windows; their OK and close buttons close them.
@@ -100,6 +96,21 @@ impl HelpWindows {
                 .retain(|open| *open != HelpWindow::KeyboardShortcuts);
         }
     }
+}
+
+/// Takes this pass's Esc or Enter for a Deck window over the screen (a
+/// Help window, the macOS Deck's Keyboard Shortcuts), so nothing under it
+/// acts on the key: only while the Deck's window has the keyboard focus
+/// and no text field has it. Call only while such a window is open, before
+/// anything else reads the key this pass.
+#[must_use]
+pub fn take_dismiss_key(ctx: &egui::Context) -> bool {
+    !ctx.egui_wants_keyboard_input()
+        && ctx.input_mut(|input| {
+            input.focused
+                && (input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        })
 }
 
 #[cfg(test)]
