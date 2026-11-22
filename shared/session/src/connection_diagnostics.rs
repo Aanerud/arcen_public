@@ -591,7 +591,7 @@ impl Finding {
                 "Before you trust it, compare the SPKI fingerprint below with the Pier's: host.spki-sha256 in the Pier's configuration directory, or the spki_sha256 field of its TLS_CERTIFICATE_ACTIVE (1400) log record."
             }
             Self::CertMismatch => {
-                "Do not sign in. Ask the Pier's administrator whether its certificate was replaced and compare the SPKI fingerprint below with host.spki-sha256 on the Pier. Only if they match, choose Forget and Verify in the Deck."
+                "Do not sign in. Ask the Pier's administrator whether its certificate was replaced and compare the SPKI fingerprint below with host.spki-sha256 on the Pier. Only if they match, choose Trust the new identity… in the Deck and confirm."
             }
             Self::CertNameMismatch => {
                 "Connect with a name or address the certificate lists, or reissue the certificate with this name (tls.expected_sans, or rerun the installer)."

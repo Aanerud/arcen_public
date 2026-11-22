@@ -123,35 +123,24 @@ impl ConnectionKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedConnectionSettings {
+    /// The version this connection's settings were read as; they are
+    /// written as [`SAVED_CONNECTION_SETTINGS_VERSION`].
     pub version: u32,
     pub remembered_username: Option<String>,
-    pub tablet_mode_requested: arcen_protocol::messages::TabletModeMsg,
-    /// This connection's own Displays choice, or `None` to follow the
-    /// application-wide default.
-    ///
-    /// Deliberately an `Option` rather than a concrete mode: the display
-    /// layout a host can serve is a property of that host, not of the user's
-    /// general preference. A host that advertises `max_monitors: 1` rejects
-    /// Match My Layout outright, and before this the only remedy was to
-    /// change the global setting and change it back after switching hosts.
-    /// `None` (the default, and the value every previously saved connection
-    /// parses as) preserves exactly the old application-wide behaviour.
-    pub displays_mode: Option<crate::settings::DisplaysMode>,
-    /// What Command, Control and Option are on this connection's host.
-    /// The default (and every connection saved before it existed) follows
-    /// the host's platform, learnt from its hello.
-    pub keyboard: arcen_input::keyboard::KeyboardSettings,
+    /// This connection's own values for the settings that depend on the
+    /// host (Typing, Option keys, Command, Displays, clipboard); everything
+    /// else follows Settings. The tablet mode is not one of them: it is
+    /// application-wide (`ClientSettings::tablet_mode_requested`).
+    pub overrides: crate::overrides::ConnectionOverrides,
     pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for SavedConnectionSettings {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: SAVED_CONNECTION_SETTINGS_VERSION,
             remembered_username: None,
-            tablet_mode_requested: arcen_protocol::messages::TabletModeMsg::LocalTermination,
-            displays_mode: None,
-            keyboard: arcen_input::keyboard::KeyboardSettings::default(),
+            overrides: crate::overrides::ConnectionOverrides::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -425,6 +414,7 @@ pub fn parse_saved_connections(bytes: &[u8]) -> Result<SavedConnectionsStore, Cl
     })
 }
 
+#[must_use]
 pub fn parse_saved_connection_settings(
     value: Option<serde_json::Value>,
 ) -> SavedConnectionSettings {
@@ -435,7 +425,7 @@ pub fn parse_saved_connection_settings(
         .remove("version")
         .and_then(|value| value.as_u64())
         .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(SAVED_CONNECTION_SETTINGS_VERSION);
+        .unwrap_or(1);
     let remembered_username = match unknown.get("remembered_username") {
         Some(serde_json::Value::String(value)) => {
             let value = validated_remembered_username(value);
@@ -448,54 +438,48 @@ pub fn parse_saved_connection_settings(
         }
         _ => None,
     };
-    let tablet_mode_requested = match unknown
-        .remove("tablet_mode_requested")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-    {
-        // `wacom_usb_bridge` is the 0.15 spelling, still written so an older
-        // Deck reads this file; the neutral spelling is accepted too.
-        Some("wacom_usb_bridge" | "usb_tablet_bridge") => TabletModeMsg::UsbTabletBridge,
-        Some("disabled_mouse_compat") => TabletModeMsg::DisabledMouseCompat,
-        _ => TabletModeMsg::LocalTermination,
-    };
-    // An unrecognised or absent value resolves to `None` -- follow the
-    // application default -- and is removed from `unknown` either way so a
-    // stale key can never shadow the parsed field on the next write.
-    let displays_mode = unknown
-        .remove("displays_mode")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-        .and_then(DisplaysMode::from_wire);
-    // Absent or unrecognised: the host platform's own mapping. Saved
-    // connections from before these settings existed read as that.
-    let shortcuts = unknown
-        .remove("keyboard_shortcuts")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-        .and_then(arcen_input::keyboard::ShortcutPreference::from_token)
-        .unwrap_or_default();
-    let left_option_altgr = unknown
-        .remove("left_option_altgr")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    // Absent or unrecognised: the application-wide typing setting.
-    let typing = unknown
-        .remove("keyboard_mode")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .as_deref()
-        .and_then(arcen_input::text::KeyboardMode::from_token);
+    let mut overrides = crate::overrides::ConnectionOverrides::take_from(&mut unknown);
+    migrate_connection_settings_v1(&mut unknown, &mut overrides);
     SavedConnectionSettings {
         version,
         remembered_username,
-        tablet_mode_requested,
-        displays_mode,
-        keyboard: arcen_input::keyboard::KeyboardSettings {
-            shortcuts,
-            left_option_altgr,
-            typing,
-        },
+        overrides,
         unknown,
+    }
+}
+
+/// The keys connection settings version 1 (0.20.6 and older) wrote that
+/// 0.20.7 retired. Only an older Deck writes them, so they are consumed on
+/// every read and none is written back:
+///
+/// - `tablet_mode_requested`: the tablet mode is application-wide now
+///   (`ClientSettings::tablet_mode_requested`); a connection's own choice is
+///   dropped.
+/// - `left_option_altgr`: replaced by the connection's Option keys, which
+///   start at the application default (Automatic).
+/// - `keyboard_mode`: the connection's Typing. `characters` ("always
+///   characters", no longer a setting) becomes Characters
+///   ([`arcen_input::text::TypingMode::Auto`]); `physical` follows the
+///   Typing setting, which is what it did. A `typing_mode` the connection
+///   already has wins.
+///
+/// The Connection menu's per-session Keyboard: Characters is unaffected.
+fn migrate_connection_settings_v1(
+    unknown: &mut serde_json::Map<String, serde_json::Value>,
+    overrides: &mut crate::overrides::ConnectionOverrides,
+) {
+    unknown.remove("tablet_mode_requested");
+    unknown.remove("left_option_altgr");
+    let keyboard_mode = unknown
+        .remove("keyboard_mode")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .as_deref()
+        .and_then(arcen_input::text::KeyboardMode::from_token);
+    if overrides.typing_mode == crate::overrides::Override::Inherit
+        && keyboard_mode == Some(arcen_input::text::KeyboardMode::Characters)
+    {
+        overrides.typing_mode =
+            crate::overrides::Override::Own(arcen_input::text::TypingMode::Auto);
     }
 }
 
@@ -507,7 +491,13 @@ pub fn serialize_saved_connections(
         .iter()
         .map(|c| {
             let mut settings = c.settings.unknown.clone();
-            settings.insert("version".to_string(), c.settings.version.into());
+            settings.insert(
+                "version".to_string(),
+                c.settings
+                    .version
+                    .max(SAVED_CONNECTION_SETTINGS_VERSION)
+                    .into(),
+            );
             if let Some(username) = &c.settings.remembered_username {
                 settings.insert(
                     "remembered_username".to_string(),
@@ -518,50 +508,9 @@ pub fn serialize_saved_connections(
                     .entry("remembered_username".to_string())
                     .or_insert(serde_json::Value::Null);
             }
-            settings.insert(
-                "tablet_mode_requested".to_string(),
-                match c.settings.tablet_mode_requested {
-                    TabletModeMsg::LocalTermination => "local_termination",
-                    TabletModeMsg::UsbTabletBridge => "wacom_usb_bridge",
-                    TabletModeMsg::DisabledMouseCompat => "disabled_mouse_compat",
-                }
-                .into(),
-            );
-            // Absent rather than null when this connection follows the
-            // application default, so an untouched connection's stored
-            // shape is unchanged from before this setting existed.
-            match c.settings.displays_mode {
-                Some(mode) => {
-                    settings.insert("displays_mode".to_string(), mode.as_wire().into());
-                }
-                None => {
-                    settings.remove("displays_mode");
-                }
-            }
-            // Absent while they are the defaults, so an untouched connection
-            // is stored exactly as before.
-            let keyboard = c.settings.keyboard;
-            if keyboard.shortcuts == arcen_input::keyboard::ShortcutPreference::Automatic {
-                settings.remove("keyboard_shortcuts");
-            } else {
-                settings.insert(
-                    "keyboard_shortcuts".to_string(),
-                    keyboard.shortcuts.token().into(),
-                );
-            }
-            if keyboard.left_option_altgr {
-                settings.insert("left_option_altgr".to_string(), true.into());
-            } else {
-                settings.remove("left_option_altgr");
-            }
-            match keyboard.typing {
-                Some(mode) => {
-                    settings.insert("keyboard_mode".to_string(), mode.token().into());
-                }
-                None => {
-                    settings.remove("keyboard_mode");
-                }
-            }
+            // Absent where the connection follows Settings, so an untouched
+            // connection's stored shape is unchanged.
+            c.settings.overrides.write_into(&mut settings);
             let mut entry = c.unknown.clone();
             entry.insert("id".to_string(), c.id.clone().into());
             entry.insert("kind".to_string(), c.kind.as_key().into());
@@ -612,7 +561,11 @@ pub fn write_saved_connections(
         .ok_or(ClientConfigError::ConfigUnavailable)?;
     let bytes = serialize_saved_connections(store)?;
     atomic_write_json(&path, &bytes)?;
-    store.fingerprint = Some(Sha256::digest(&bytes).into());
+    // The caller keeps what the next read finds: the bytes just written,
+    // parsed, so versions bumped and keys migrated on the way out are the
+    // snapshot's too (otherwise its next edit no longer matches the file
+    // and reads as another process's change).
+    *store = parse_saved_connections(&bytes)?;
     Ok(())
 }
 
@@ -764,29 +717,46 @@ pub fn migrate_legacy_username(
     Ok(())
 }
 
-#[allow(
-    clippy::too_many_lines,
-    clippy::cast_possible_truncation,
-    reason = "one schema walk, moved verbatim; out-of-range numbers keep their historical wrap"
-)]
 pub fn load_client_settings(
     repository: &ClientConfigRepository,
 ) -> Result<ClientSettings, ClientConfigError> {
-    let mut settings = ClientSettings::default();
     let path = repository
         .settings_file()
         .ok_or(ClientConfigError::ConfigUnavailable)?;
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(settings),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ClientSettings::default());
+        }
         Err(error) => return Err(error.into()),
     };
-    let value = serde_json::from_str::<serde_json::Value>(&text)?;
+    parse_client_settings(&serde_json::from_str::<serde_json::Value>(&text)?)
+}
+
+/// The settings a `settings.json` document holds, migrated to
+/// [`CLIENT_SETTINGS_VERSION`] ([`migrate_client_settings`]). Unknown and
+/// unreadable keys leave their defaults; the document is never changed
+/// here (the next [`save_client_settings`] writes the migrated values and
+/// the version, keeping every key it does not know).
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    reason = "one schema walk, moved verbatim; out-of-range numbers keep their historical wrap"
+)]
+pub fn parse_client_settings(
+    value: &serde_json::Value,
+) -> Result<ClientSettings, ClientConfigError> {
+    let mut settings = ClientSettings::default();
     if !value.is_object() {
         return Err(ClientConfigError::Invalid(
             "top-level value must be an object",
         ));
     }
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(1);
     if let Some(level) = value.get("log_level").and_then(serde_json::Value::as_u64) {
         settings.log_level = LogLevel::from_index(level as u8);
     }
@@ -1024,10 +994,42 @@ pub fn load_client_settings(
         settings.paste.chars_per_second = rate;
     }
     settings.paste = settings.paste.clamped();
+    migrate_client_settings(&mut settings, version);
     Ok(settings)
 }
 
-#[allow(clippy::too_many_lines, reason = "one schema write, moved verbatim")]
+/// The settings version this Deck writes (`"version"` in `settings.json`;
+/// a file without one is version 1).
+pub const CLIENT_SETTINGS_VERSION: u32 = 2;
+
+/// Brings settings read from a version-`version` file to
+/// [`CLIENT_SETTINGS_VERSION`].
+///
+/// Version 1 to 2 (0.20.7), once, as the file is written as version 2:
+/// - the tablet mode becomes one application-wide choice, Tablet support for
+///   everyone (each saved connection's own mode is dropped);
+/// - the Option keys go back to Automatic.
+///
+/// Every version: "always characters" is Characters and "system shortcuts
+/// to the remote computer when fullscreen" is the system-shortcuts switch on
+/// ([`ClientSettings::set_system_shortcuts_to_host`]), since neither is a
+/// setting any more. Paste as Keystrokes and everything else keep their
+/// values, the cursor choice included: it is the request a host that does
+/// not know the automatic cursor serves (`cursor_automatic_v1`).
+pub fn migrate_client_settings(settings: &mut ClientSettings, version: u32) {
+    if version < 2 {
+        settings.tablet_mode_requested = TabletModeMsg::LocalTermination;
+        settings.tablet_input_enabled =
+            tablet_mode_allows_typed_pen(TabletModeMsg::LocalTermination);
+        settings.option_key_mode = arcen_input::text::OptionKeyPreference::Automatic;
+    }
+    settings.typing_mode = crate::overrides::stored_typing_mode(settings.typing_mode);
+    if settings.keyboard_capture == arcen_input::keyboard::KeyboardCapturePolicy::Fullscreen {
+        settings.keyboard_capture = arcen_input::keyboard::KeyboardCapturePolicy::Host;
+        settings.capture_mac_system_shortcuts = true;
+    }
+}
+
 pub fn save_client_settings(
     repository: &ClientConfigRepository,
     settings: &ClientSettings,
@@ -1045,6 +1047,27 @@ pub fn save_client_settings(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
         Err(error) => return Err(error.into()),
     };
+    write_client_settings_into(settings, &mut value);
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(value))?;
+    atomic_write_json(&path, &bytes)
+}
+
+/// Writes `settings` into a `settings.json` object, as version
+/// [`CLIENT_SETTINGS_VERSION`] or the object's own when that is newer (a
+/// newer Deck's file keeps its version, so its migrations never run
+/// twice); keys it does not write stay as they are.
+#[allow(clippy::too_many_lines, reason = "one schema write, moved verbatim")]
+pub fn write_client_settings_into(
+    settings: &ClientSettings,
+    value: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(1)
+        .max(CLIENT_SETTINGS_VERSION);
+    value.insert("version".to_string(), version.into());
     value.insert("log_level".to_string(), settings.log_level.index().into());
     value.insert(
         "security_mode".to_string(),
@@ -1240,8 +1263,6 @@ pub fn save_client_settings(
             .token()
             .into(),
     );
-    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(value))?;
-    atomic_write_json(&path, &bytes)
 }
 
 pub fn load_legacy_remembered_username(repository: &ClientConfigRepository) -> Option<String> {
@@ -1288,4 +1309,254 @@ pub fn clear_legacy_remembered_username(
         atomic_write_json(&path, &serde_json::to_vec_pretty(&value)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overrides::{ConnectionOverrides, Override};
+    use arcen_input::keyboard::KeyboardCapturePolicy;
+    use arcen_input::text::{OptionKeyMode, OptionKeyPreference, TypingMode};
+
+    fn settings(json: serde_json::Value) -> ClientSettings {
+        parse_client_settings(&json).expect("settings parse")
+    }
+
+    fn written(settings: &ClientSettings) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        write_client_settings_into(settings, &mut object);
+        serde_json::Value::Object(object)
+    }
+
+    fn connection_settings(json: serde_json::Value) -> SavedConnectionSettings {
+        parse_saved_connection_settings(Some(json))
+    }
+
+    #[test]
+    fn a_store_written_once_after_migration_can_be_edited_by_the_same_deck() {
+        let root = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(format!("arcen-config-migrated-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repository = ClientConfigRepository::at(root.clone());
+        // A 0.20.6 store: connection settings version 1, a retired key.
+        std::fs::write(
+            repository.connections_file().unwrap(),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 2,
+                "connections": [{
+                    "id": "studio", "name": "Studio", "host": "203.0.113.10",
+                    "port": 18444, "transport": "quic",
+                    "settings": {"version": 1, "keyboard_mode": "characters"},
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // The first write (selecting it) migrates the file...
+        let store = repository.set_last_selected("studio").unwrap();
+        // ...and the snapshot it returns is what the file now holds, so the
+        // next edit is not mistaken for another process's change.
+        let original = store.connections[0].clone();
+        assert_eq!(original.settings.version, SAVED_CONNECTION_SETTINGS_VERSION);
+        let mut renamed = original.clone();
+        renamed.name = "Studio B".to_owned();
+        let store = repository
+            .update_connection("studio", &original, renamed)
+            .unwrap();
+        assert_eq!(store.connections[0].name, "Studio B");
+        let on_disk = load_saved_connections(&repository).unwrap().unwrap();
+        assert_eq!(
+            store.connections, on_disk.connections,
+            "the snapshot is the file"
+        );
+        assert_eq!(store.fingerprint, on_disk.fingerprint);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_cursor_in_remote_video_is_kept() {
+        // No automatic fallback to the host's cursor exists yet, so the
+        // choice stays; only the version moves on.
+        let read = settings(serde_json::json!({"cursor_preference": "host"}));
+        assert_eq!(read.cursor_preference, CursorMode::Host);
+        assert_eq!(written(&read)["version"], CLIENT_SETTINGS_VERSION);
+        assert_eq!(written(&read)["cursor_preference"], "host");
+    }
+
+    #[test]
+    fn a_newer_settings_object_keeps_its_version_and_unknown_keys() {
+        let file = serde_json::json!({
+            "version": 3,
+            "typing_mode": "keys",
+            "a_version_3_setting": {"kept": true},
+        });
+        let read = settings(file.clone());
+        assert_eq!(read.typing_mode, TypingMode::Keys);
+        let mut object = file.as_object().cloned().unwrap();
+        write_client_settings_into(&read, &mut object);
+        assert_eq!(object["version"], 3);
+        assert_eq!(object["a_version_3_setting"]["kept"], true);
+    }
+
+    #[test]
+    fn always_characters_becomes_characters() {
+        for version in [1, 2] {
+            let read = settings(serde_json::json!({
+                "version": version,
+                "typing_mode": "characters",
+            }));
+            assert_eq!(read.typing_mode, TypingMode::Auto, "version {version}");
+            assert_eq!(written(&read)["typing_mode"], "auto");
+        }
+        let keys = settings(serde_json::json!({"typing_mode": "keys"}));
+        assert_eq!(keys.typing_mode, TypingMode::Keys);
+        // The Connection menu's per-session Characters still types every
+        // character as text over the migrated setting.
+        assert_eq!(
+            arcen_input::text::KeyboardMode::Characters.typing_mode(TypingMode::Auto),
+            TypingMode::Characters
+        );
+    }
+
+    #[test]
+    fn remote_when_fullscreen_becomes_the_system_shortcuts_switch_on() {
+        use crate::settings::SystemShortcutRoute::{MacEventTap, PcKeyboardHook};
+        let read = settings(serde_json::json!({
+            "keyboard_capture": "fullscreen",
+            "capture_mac_system_shortcuts": false,
+        }));
+        assert_eq!(read.keyboard_capture, KeyboardCapturePolicy::Host);
+        assert!(read.system_shortcuts_to_host(MacEventTap));
+        assert!(read.system_shortcuts_to_host(PcKeyboardHook));
+        // The defaults are unchanged: off on a Mac, on on a PC.
+        let defaults = ClientSettings::default();
+        assert!(!defaults.system_shortcuts_to_host(MacEventTap));
+        assert!(defaults.system_shortcuts_to_host(PcKeyboardHook));
+        let this_computer = settings(serde_json::json!({
+            "keyboard_capture": "this_computer",
+            "capture_mac_system_shortcuts": true,
+        }));
+        assert!(!this_computer.system_shortcuts_to_host(MacEventTap));
+        assert!(!this_computer.system_shortcuts_to_host(PcKeyboardHook));
+        let mut switched = this_computer;
+        switched.set_system_shortcuts_to_host(MacEventTap, true);
+        assert!(switched.system_shortcuts_to_host(MacEventTap));
+        switched.set_system_shortcuts_to_host(PcKeyboardHook, false);
+        assert_eq!(
+            switched.keyboard_capture,
+            KeyboardCapturePolicy::ThisComputer
+        );
+    }
+
+    #[test]
+    fn the_tablet_mode_is_one_choice_and_everyone_starts_on_tablet_support() {
+        let read = settings(serde_json::json!({
+            "tablet_mode_requested": "wacom_usb_bridge",
+            "tablet_input_enabled": false,
+        }));
+        assert_eq!(read.tablet_mode_requested, TabletModeMsg::LocalTermination);
+        assert!(read.tablet_input_enabled);
+        let current = settings(serde_json::json!({
+            "version": 2,
+            "tablet_mode_requested": "wacom_usb_bridge",
+        }));
+        assert_eq!(
+            current.tablet_mode_requested,
+            TabletModeMsg::UsbTabletBridge
+        );
+        // A connection's own mode is dropped, and never written back.
+        let connection = connection_settings(serde_json::json!({
+            "version": 1,
+            "tablet_mode_requested": "wacom_usb_bridge",
+        }));
+        assert!(connection.unknown.is_empty());
+        let store = SavedConnectionsStore::with_connections(vec![SavedConnectionSummary {
+            id: "studio".to_owned(),
+            kind: ConnectionKind::DirectMachine,
+            name: "Studio".to_owned(),
+            host: "203.0.113.10".to_owned(),
+            port: 18_444,
+            use_tls: true,
+            transport: SavedTransport::Quic,
+            identity_security_mode: None,
+            settings: connection,
+            unknown: serde_json::Map::new(),
+        }]);
+        let bytes = serialize_saved_connections(&store).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("tablet_mode_requested"), "{text}");
+        assert!(text.contains("\"version\": 2"), "{text}");
+    }
+
+    #[test]
+    fn the_option_keys_go_back_to_automatic_everywhere() {
+        let read = settings(serde_json::json!({
+            "option_keys": "both_characters",
+            "option_key_mode": "both_characters",
+        }));
+        assert_eq!(read.option_key_mode, OptionKeyPreference::Automatic);
+        let current = settings(serde_json::json!({
+            "version": 2,
+            "option_keys": "both_characters",
+            "option_key_mode": "both_characters",
+        }));
+        assert_eq!(
+            current.option_key_mode,
+            OptionKeyPreference::Chosen(OptionKeyMode::BothCharacters)
+        );
+        let connection = connection_settings(serde_json::json!({
+            "version": 1,
+            "left_option_altgr": true,
+        }));
+        assert_eq!(connection.overrides.option_keys, Override::Inherit);
+        assert!(connection.unknown.is_empty());
+    }
+
+    #[test]
+    fn a_connections_keyboard_mode_becomes_its_typing() {
+        let characters = connection_settings(serde_json::json!({"keyboard_mode": "characters"}));
+        assert_eq!(
+            characters.overrides.typing_mode,
+            Override::Own(TypingMode::Auto)
+        );
+        let physical = connection_settings(serde_json::json!({"keyboard_mode": "physical"}));
+        assert_eq!(physical.overrides, ConnectionOverrides::default());
+        let both = connection_settings(serde_json::json!({
+            "keyboard_mode": "characters",
+            "typing_mode": "keys",
+        }));
+        assert_eq!(both.overrides.typing_mode, Override::Own(TypingMode::Keys));
+        assert!(both.unknown.is_empty());
+    }
+
+    #[test]
+    fn the_migration_keeps_paste_tuning_and_everything_else() {
+        let read = settings(serde_json::json!({
+            "paste_confirm_above": 500,
+            "paste_chars_per_second": 10,
+            "displays_mode": "windowed",
+            "clipboard_enabled": false,
+            "keyboard_switch": "Ctrl+Alt+Shift+Z",
+            "pen_barrel_button": "middle_click",
+        }));
+        assert_eq!(read.paste.confirm_above, 500);
+        assert_eq!(read.paste.chars_per_second, 10);
+        assert_eq!(read.displays_mode, DisplaysMode::Windowed);
+        assert!(!read.clipboard_enabled);
+        assert_eq!(
+            read.keyboard_switch,
+            arcen_input::keyboard::KeyboardSwitchChord::CONTROL_ALT_SHIFT_Z
+        );
+        assert_eq!(
+            read.pen_buttons.barrel,
+            arcen_input::pen_buttons::PenButtonAction::MiddleClick
+        );
+        // Reading what was written migrates nothing again.
+        let again = settings(written(&read));
+        assert_eq!(written(&again), written(&read));
+    }
 }

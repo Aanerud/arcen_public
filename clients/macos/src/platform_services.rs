@@ -192,6 +192,14 @@ impl DeckServices for MacDeckServices {
         crate::support::choose_folder(start)
     }
 
+    fn choose_profile_to_save(&self, suggested_file_name: &str) -> Option<PathBuf> {
+        crate::support::choose_profile_to_save(suggested_file_name)
+    }
+
+    fn choose_profile_to_open(&self) -> Option<PathBuf> {
+        crate::support::choose_profile_to_open()
+    }
+
     fn reveal_in_file_browser(&self, path: &std::path::Path) -> bool {
         crate::support::reveal(path)
     }

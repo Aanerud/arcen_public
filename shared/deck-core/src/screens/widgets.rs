@@ -1,103 +1,297 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Small widgets the shared screens draw with: the Settings radio rows and
-//! the Settings sidebar.
+//! Small widgets the shared screens draw with: fields, the primary and
+//! secondary buttons, the quiet text button, the focus ring and the
+//! Settings sidebar.
 
 use std::time::Duration;
 
-/// A radio option with a title (plus optional accent badge) and a wrapped,
-/// indented description — the row layout used across the Advanced panel.
-pub fn settings_radio<T: PartialEq>(
-    ui: &mut egui::Ui,
-    current: &mut T,
-    value: T,
-    badge: Option<&str>,
-    title: &str,
-    description: &str,
-) {
-    settings_radio_with_trailing(ui, current, value, badge, title, description, |_| {});
-}
-
-/// `settings_radio` with a right-aligned control on the option's own row.
-///
-/// Used where an option depends on something the user may still have to set
-/// up: the status belongs beside the choice it gates, not in a block below it
-/// that only appears once the option is already broken.
-pub fn settings_radio_with_trailing<T: PartialEq>(
-    ui: &mut egui::Ui,
-    current: &mut T,
-    value: T,
-    badge: Option<&str>,
-    title: &str,
-    description: &str,
-    trailing: impl FnOnce(&mut egui::Ui),
-) {
-    ui.horizontal(|ui| {
-        ui.radio_value(
-            current,
-            value,
-            egui::RichText::new(title)
-                .color(egui::Color32::BLACK)
-                .size(16.0),
-        );
-        if let Some(badge) = badge {
-            ui.label(
-                // Muted copper: secondary to the option label, but in the same
-                // family as the rest of the palette.
-                egui::RichText::new(badge)
-                    .color(egui::Color32::from_rgb(0xB0, 0x8A, 0x6E))
-                    .size(15.0),
-            );
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), trailing);
-    });
-    ui.indent(title, |ui| {
-        ui.label(egui::RichText::new(description).color(egui::Color32::DARK_GRAY));
-    });
-    ui.add_space(12.0);
-}
-
-/// A section heading in the Settings sidebar ("GENERAL", "SYSTEM").
+/// A section heading in the Settings sidebar ("General", "System"): a
+/// sentence-case label in the secondary colour, untracked.
 pub fn settings_nav_section_label(ui: &mut egui::Ui, label: &str) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.add_space(12.0);
+        let colour = super::theme::colours(ui).text2;
         ui.label(
             egui::RichText::new(label)
-                .size(10.0)
-                .strong()
-                .color(egui::Color32::from_rgb(0x8B, 0x8B, 0x9A)),
+                .size(super::theme::TEXT_LABEL)
+                .color(colour),
         );
     });
     ui.add_space(4.0);
 }
 
-/// One left-nav item in the Settings sidebar. Active items get a light accent
-/// highlight pill and accent text (matching the reference design); the label is
-/// painted directly so we control the vertical padding precisely. Returns true
-/// when clicked.
-pub fn settings_nav_item(
+/// A field's label: sentence case, the secondary colour, the label size,
+/// above its input.
+pub fn field_label(ui: &mut egui::Ui, label: &str) {
+    let colour = super::theme::colours(ui).text2;
+    ui.label(
+        egui::RichText::new(label)
+            .size(super::theme::TEXT_LABEL)
+            .color(colour),
+    );
+    ui.add_space(super::theme::LABEL_TO_FIELD);
+}
+
+/// A single-line input with a constant 1-point border; focus adds a
+/// 2-point accent outline outside it at once (the border never changes).
+pub fn text_field(
     ui: &mut egui::Ui,
-    label: &str,
-    active: bool,
-    accent: egui::Color32,
-) -> bool {
+    value: &mut String,
+    password: bool,
+    width: f32,
+    hint: &str,
+) -> egui::Response {
+    use super::theme;
+    let colours = theme::colours(ui);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, theme::CONTROL_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.painter()
+        .rect_filled(rect, theme::CONTROL_RADIUS, colours.field);
+    let response = ui.put(
+        rect,
+        egui::TextEdit::singleline(value)
+            // Our own border and ring, painted around it; no egui frame.
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 4)))
+            .vertical_align(egui::Align::Center)
+            .password(password)
+            .hint_text(hint)
+            .font(egui::FontId::proportional(theme::TEXT_BODY))
+            .text_color(colours.text)
+            .desired_width(width),
+    );
+    field_outline(ui, rect, response.has_focus());
+    response
+}
+
+/// A control's 1-point border and, when focused, the 2-point accent ring
+/// outside it.
+pub fn field_outline(ui: &egui::Ui, rect: egui::Rect, focused: bool) {
+    use super::theme;
+    ui.painter().rect_stroke(
+        rect,
+        theme::CONTROL_RADIUS,
+        egui::Stroke::new(1.0, theme::colours(ui).field_border),
+        egui::StrokeKind::Inside,
+    );
+    if focused {
+        focus_ring(ui, rect);
+    }
+}
+
+/// The primary button's look in every state: [`super::theme::PRIMARY_FILL`],
+/// darker under the pointer and darker still pressed; its white text is
+/// the same in every state.
+pub fn primary_visuals(visuals: &mut egui::Visuals) {
+    use super::theme;
+    let colours = theme::Palette::of(visuals.dark_mode);
+    let widgets = &mut visuals.widgets;
+    for (state, fill) in [
+        (&mut widgets.inactive, colours.primary),
+        (&mut widgets.hovered, colours.primary_hover),
+        (&mut widgets.active, colours.primary_pressed),
+    ] {
+        state.weak_bg_fill = fill;
+        state.bg_fill = fill;
+        state.bg_stroke = egui::Stroke::NONE;
+        state.fg_stroke.color = colours.on_primary;
+        state.expansion = 0.0;
+        state.corner_radius = egui::CornerRadius::from(theme::CONTROL_RADIUS);
+    }
+}
+
+/// The secondary look in every state: the field's fill and border, the
+/// hover tint under the pointer and the pressed tint pressed; its text is
+/// the same in every state.
+pub fn secondary_visuals(visuals: &mut egui::Visuals) {
+    use super::theme;
+    let colours = theme::Palette::of(visuals.dark_mode);
+    let widgets = &mut visuals.widgets;
+    for (state, fill) in [
+        (&mut widgets.inactive, colours.field),
+        (&mut widgets.hovered, colours.hover),
+        (&mut widgets.active, colours.pressed),
+        (&mut widgets.open, colours.hover),
+    ] {
+        state.weak_bg_fill = fill;
+        state.bg_fill = fill;
+        state.bg_stroke = egui::Stroke::new(1.0, colours.field_border);
+        state.fg_stroke.color = colours.text;
+        state.expansion = 0.0;
+        state.corner_radius = egui::CornerRadius::from(theme::CONTROL_RADIUS);
+    }
+}
+
+/// How wide buttons side by side are: the widest of `labels` at the button
+/// size, plus [`super::theme::BUTTON_PADDING_X`] on each side, so no label
+/// touches its button's edge.
+#[must_use]
+pub fn button_width(ui: &egui::Ui, labels: &[&str]) -> f32 {
+    use super::theme;
+    // Measured at the primary's (larger) size, so either kind fits.
+    let font = egui::FontId::proportional(theme::PRIMARY_TEXT);
+    let widest = labels
+        .iter()
+        .map(|label| {
+            ui.ctx().fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(
+                        (*label).to_owned(),
+                        font.clone(),
+                        egui::Color32::PLACEHOLDER,
+                    )
+                    .size()
+                    .x
+            })
+        })
+        .fold(0.0_f32, f32::max);
+    widest + 2.0 * theme::BUTTON_PADDING_X
+}
+
+/// The one filled button on a scene (Connect, a form's Save):
+/// [`primary_visuals`], [`super::theme::PRIMARY_HEIGHT`] tall, `width`
+/// wide. Never disabled: a click on an action that cannot go ahead yet
+/// says why, under the field to fix, and puts the focus there.
+pub fn primary_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+    use super::theme;
+    let response = ui
+        .scope(|ui| {
+            let on_primary = theme::colours(ui).on_primary;
+            primary_visuals(ui.visuals_mut());
+            ui.add_sized(
+                [width, theme::PRIMARY_HEIGHT],
+                egui::Button::new(
+                    egui::RichText::new(label)
+                        .color(on_primary)
+                        .size(theme::PRIMARY_TEXT),
+                ),
+            )
+        })
+        .inner;
+    if response.has_focus() {
+        focus_ring(ui, response.rect);
+    }
+    response
+}
+
+/// Every other button (Edit, Cancel, Import…): [`secondary_visuals`], as
+/// tall as the primary, with the same radius and text, `width` wide.
+pub fn secondary_button(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+    use super::theme;
+    let response = ui
+        .scope(|ui| {
+            let text = theme::colours(ui).text;
+            secondary_visuals(ui.visuals_mut());
+            ui.add_sized(
+                [width, theme::CONTROL_HEIGHT],
+                egui::Button::new(
+                    egui::RichText::new(label)
+                        .color(text)
+                        .size(theme::BUTTON_TEXT),
+                ),
+            )
+        })
+        .inner;
+    if response.has_focus() {
+        focus_ring(ui, response.rect);
+    }
+    response
+}
+
+/// A secondary button as wide as its label needs, greyed out unless
+/// `enabled` (an action already under way).
+pub fn fitted_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let width = button_width(ui, &[label]);
+    ui.add_enabled_ui(enabled, |ui| secondary_button(ui, label, width))
+        .inner
+}
+
+/// A quiet action beside the buttons (Test connection): text in the
+/// secondary ink, no box, underlined under the pointer, as tall as the
+/// buttons so it lines up with them. `busy` keeps it from starting again.
+pub fn text_button(ui: &mut egui::Ui, label: &str, busy: bool) -> egui::Response {
+    use super::theme;
+    let colours = theme::colours(ui);
+    let font = egui::FontId::proportional(theme::BUTTON_TEXT);
+    let galley = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(label.to_owned(), font, colours.text2));
+    let sense = if busy {
+        egui::Sense::hover()
+    } else {
+        egui::Sense::click()
+    };
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 8.0, theme::CONTROL_HEIGHT),
+        sense,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, label));
+    if ui.is_rect_visible(rect) {
+        let at = egui::pos2(rect.left() + 4.0, rect.center().y - galley.size().y / 2.0);
+        let underline = response.hovered() && !busy;
+        let width = galley.size().x;
+        let ink = if underline {
+            colours.text
+        } else {
+            colours.text2
+        };
+        ui.painter().galley(at, galley, ink);
+        if underline {
+            let y = rect.center().y + theme::BUTTON_TEXT * 0.55;
+            ui.painter().line_segment(
+                [egui::pos2(at.x, y), egui::pos2(at.x + width, y)],
+                egui::Stroke::new(1.0, ink),
+            );
+        }
+        if response.has_focus() {
+            focus_ring(ui, rect);
+        }
+    }
+    if response.hovered() && !busy {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// The 2-point accent focus ring outside a control.
+pub fn focus_ring(ui: &egui::Ui, rect: egui::Rect) {
+    use super::theme;
+    ui.painter().rect_stroke(
+        rect,
+        theme::CONTROL_RADIUS + 1.0,
+        egui::Stroke::new(theme::FOCUS_RING_WIDTH, theme::colours(ui).accent),
+        egui::StrokeKind::Outside,
+    );
+}
+
+/// One left-nav item in the Settings sidebar: the active one on the
+/// selection tint with the accent bar at its left edge, as Home's selected
+/// row; the label painted directly so the vertical padding is exact.
+/// Returns true when clicked.
+pub fn settings_nav_item(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    let colours = super::theme::colours(ui);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(202.0, 42.0), egui::Sense::click());
     let bg = if active {
-        egui::Color32::from_rgb(0xE5, 0xDE, 0xD2)
+        Some(colours.selected)
     } else if response.hovered() {
-        egui::Color32::from_rgb(0xF0, 0xEC, 0xE4)
+        Some(colours.hover)
     } else {
-        egui::Color32::TRANSPARENT
+        None
     };
-    if bg != egui::Color32::TRANSPARENT {
+    if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 6.0, bg);
     }
-    let color = if active {
-        accent
-    } else {
-        egui::Color32::from_rgb(0x1A, 0x1A, 0x1A)
-    };
+    if active {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
+            0.0,
+            colours.accent,
+        );
+    }
+    let color = colours.text;
     let galley =
         ui.painter()
             .layout_no_wrap(label.to_string(), egui::FontId::proportional(16.0), color);
@@ -107,88 +301,6 @@ pub fn settings_nav_item(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response.clicked()
-}
-
-/// A "back" control whose left chevron is hand-painted, because egui's bundled
-/// fonts render the "←" glyph as a tofu box. Draws `‹ label` in the accent colour and reports
-/// clicks like a normal button.
-pub fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let color_normal = super::theme::TEXT_SECONDARY;
-    let color_hover = super::theme::TEXT_PRIMARY;
-    let font = egui::FontId::proportional(17.0);
-    let chevron_w = 9.0;
-    let gap = 9.0;
-    let pad = egui::vec2(2.0, 6.0);
-
-    let text_size = ui
-        .painter()
-        .layout_no_wrap(label.to_string(), font.clone(), color_normal)
-        .size();
-    let size = egui::vec2(
-        pad.x * 2.0 + chevron_w + gap + text_size.x,
-        pad.y * 2.0 + text_size.y.max(18.0),
-    );
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let color = if response.hovered() {
-        color_hover
-    } else {
-        color_normal
-    };
-
-    // Left-pointing chevron.
-    let cx = rect.left() + pad.x + chevron_w;
-    let cy = rect.center().y;
-    let half = 5.0;
-    let stroke = egui::Stroke::new(2.0, color);
-    ui.painter().line_segment(
-        [
-            egui::pos2(cx, cy - half),
-            egui::pos2(rect.left() + pad.x, cy),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(rect.left() + pad.x, cy),
-            egui::pos2(cx, cy + half),
-        ],
-        stroke,
-    );
-
-    let text_pos = egui::pos2(
-        rect.left() + pad.x + chevron_w + gap,
-        rect.center().y - text_size.y * 0.5,
-    );
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font, color);
-    ui.painter().galley(text_pos, galley, color);
-
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
-}
-
-/// A labelled single-line field with an accent underline (sign-in, add connection).
-pub fn labelled_line_edit(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool) {
-    let width = ui.available_width();
-    ui.label(
-        egui::RichText::new(label)
-            .color(egui::Color32::from_rgb(0x4A, 0x4A, 0x4A))
-            .strong(),
-    );
-    let edit = egui::TextEdit::singleline(value)
-        .desired_width(width)
-        .vertical_align(egui::Align::Center)
-        .font(egui::TextStyle::Heading)
-        .password(password)
-        .frame(egui::Frame::NONE);
-    ui.scope(|ui| {
-        ui.style_mut().spacing.interact_size.y = 34.0;
-        ui.add_sized([width, 34.0], edit);
-    });
-    let y = ui.cursor().min.y;
-    let rect = egui::Rect::from_min_size(egui::pos2(ui.cursor().min.x, y), egui::vec2(width, 1.0));
-    ui.painter().rect_filled(rect, 0.0, super::theme::ACCENT);
 }
 
 /// How often the connecting arc moves.
@@ -225,7 +337,7 @@ pub fn paint_connecting_progress(ui: &mut egui::Ui, size: f32) {
         .collect();
     ui.painter().add(egui::Shape::line(
         points,
-        egui::Stroke::new(3.0, egui::Color32::from_rgb(0x66, 0x66, 0x66)),
+        egui::Stroke::new(3.0, super::theme::colours(ui).text2),
     ));
 }
 

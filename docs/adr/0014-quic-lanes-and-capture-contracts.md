@@ -1273,3 +1273,49 @@ Recorded with host cursor positions.
    monitor mapping), rotated Xorg heads, secondary Deck viewports, relayed
    (session-agent) Piers — the shared relay drops the record — and the
    Windows and macOS Piers.
+
+
+## Amendment 22 (2026-11-21): the automatic cursor
+
+Recorded with the automatic cursor (0.20.7, where the cursor setting leaves
+Settings).
+
+1. **Rule.** One shared decision,
+   `arcen_input::resolve_automatic_cursor_mode`: a host that sends cursor
+   images serves `local` (the Deck draws them, at the speed of the hand); a
+   host that sends none draws the pointer into the video (`host`), so its
+   shape is right; a host that can do neither leaves the Deck's arrow.
+2. **Negotiation, additive.** Every Deck sends
+   `AuthResponse.cursor_automatic_v1 = true` (echoed in `ClientHelloMsg`)
+   together with its stored `cursor_preference`, unchanged. A Pier that
+   knows the flag decides by the rule and ignores the stored request (it is
+   echoed in `requested`), answering with `CursorModeResultMsg.automatic`.
+   A Pier that does not know it serves `cursor_preference` exactly as
+   before, so the stored value is the request to older hosts. Every field is
+   omitted when false and ignored by older peers; `PROTOCOL_VERSION` stays
+   5, and no enum gains a variant (the reason is the existing free string).
+3. **The Deck's pointer.** The Deck hides its pointer whenever the result's
+   `active` is `host` (`CursorModeResultMsg::host_draws_pointer`), whatever
+   was requested or accepted: Host means the pointer is in the video. This
+   also covers a Linux Wayland desktop embedded in Host mode that answers a
+   `local` request with `host` (amendment 21 kept the Deck's pointer there,
+   which showed two). Every Pier reports `host` only when its capture
+   composites the pointer: Linux from the capenc plan after its capture
+   constraints (NvFBC; a Wayland stream's own cursor mode; Xorg depth-30
+   moves Host to Local), Windows for a request it serves through WGC with
+   cursor capture on, and macOS from the settled authority that turns on
+   `SCStreamConfiguration.showsCursor`.
+4. **Compatibility.** An older Deck never sends the flag, so it gets its
+   preference as before and never a pointer in the video it did not ask
+   for. An older Pier never answers `automatic` and serves the stored
+   preference, so a Host choice keeps Host and a Local one keeps Local.
+5. **Piers.** The macOS Pier applies the rule. It sends no cursor images
+   (`NSCursor` reports the calling process's cursor, not the desktop's), so
+   it serves `host` and turns on `showsCursor` (single and Match My Layout
+   captures). The Linux and Windows Piers do not read the flag yet: they
+   serve the stored preference, with cursor images where their watchers run.
+6. **Decks.** The shared media worker turns a host-drawn result into a
+   hidden Deck cursor (`DeckCursor::Hidden`), so a Windows Deck hides its
+   pointer over the picture; the macOS Deck stops drawing its own pointer.
+7. **Settings.** No stored value is migrated: `cursor_preference` stays as
+   the user left it, as the request to hosts older than this amendment.

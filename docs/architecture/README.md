@@ -116,6 +116,7 @@ disagree or cross-product copies grow. The Shared Adoption Index trend is in
 | [`transport.md`](transport.md) | Direct QUIC: carrier, lanes, congestion control, known gaps |
 | [`tls-certificate-lifecycle.md`](tls-certificate-lifecycle.md) | Certificate generation, validation, pinning and reload |
 | [`session-auto-reconnect.md`](session-auto-reconnect.md) | Credential-free resume after a dropped connection |
+| [`host-presence.md`](host-presence.md) | The status line on Deck Home: what feeds it today (nothing) and a future presence service |
 | [`media-plan-resolution.md`](media-plan-resolution.md) | How a requested preset becomes a served pipeline; portable software H.264 |
 | [`color-fidelity.md`](color-fidelity.md) | Ten-bit, 4:4:4, full range, Grading and HDR from capture to the Deck |
 | [`encode-intent.md`](encode-intent.md) | Interactive versus grading encoder intent |

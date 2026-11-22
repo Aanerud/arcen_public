@@ -27,12 +27,12 @@ pub struct ColourCheckView<'a> {
     pub notice: Option<&'a str>,
 }
 
-fn status_colour(status: Status) -> egui::Color32 {
+fn status_colour(colours: &super::theme::Palette, status: Status) -> egui::Color32 {
     match status {
-        Status::Pass => egui::Color32::from_rgb(0x1E, 0x8E, 0x3E),
-        Status::Info => egui::Color32::from_rgb(0x1A, 0x73, 0xE8),
-        Status::Warn => egui::Color32::from_rgb(0xC2, 0x7C, 0x0E),
-        Status::Fail => egui::Color32::from_rgb(0xC0, 0x20, 0x20),
+        Status::Pass => colours.success,
+        Status::Info => colours.info,
+        Status::Warn => colours.warning,
+        Status::Fail => colours.error,
     }
 }
 
@@ -56,17 +56,17 @@ pub fn render_colour_check(
         .default_pos(screen.right_top() + egui::vec2(-600.0, 40.0))
         .frame(
             egui::Frame::window(&ctx.global_style())
-                .fill(egui::Color32::from_rgb(0xF6, 0xF7, 0xFB))
+                .fill(super::theme::colours_of(ctx).panel)
                 .inner_margin(egui::Margin::symmetric(14, 12)),
         )
         .show(ctx, |ui| {
-            ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(0x20, 0x20, 0x24));
+            ui.visuals_mut().override_text_color = Some(super::theme::colours(ui).text);
             let overall = report.overall();
             ui.label(
                 egui::RichText::new(format!("{} {}", overall.symbol(), report.summary()))
                     .strong()
                     .size(14.0)
-                    .color(status_colour(overall)),
+                    .color(status_colour(&super::theme::colours(ui), overall)),
             );
             if let Some(host) = &report.host_label {
                 ui.label(egui::RichText::new(host).size(11.0));
@@ -76,7 +76,7 @@ pub fn render_colour_check(
                     "Read-only on the host: the Deck never changes a host setting.",
                 )
                 .size(11.0)
-                .color(egui::Color32::from_rgb(0x60, 0x60, 0x68)),
+                .color(super::theme::colours(ui).text2),
             );
             ui.horizontal_wrapped(|ui| {
                 let recommended = report.recommended_fixes();
@@ -137,14 +137,14 @@ pub fn render_colour_check(
                                     egui::RichText::new(status.symbol())
                                         .strong()
                                         .size(14.0)
-                                        .color(status_colour(status)),
+                                        .color(status_colour(&super::theme::colours(ui), status)),
                                 );
                                 ui.label(egui::RichText::new(item.title).strong().size(12.5));
                                 ui.label(
                                     egui::RichText::new(item.finding.code())
                                         .monospace()
                                         .size(9.5)
-                                        .color(egui::Color32::from_rgb(0x9A, 0x9A, 0xA0)),
+                                        .color(super::theme::colours(ui).text2),
                                 );
                             });
                             ui.indent(item.finding.code(), |ui| {
@@ -154,7 +154,7 @@ pub fn render_colour_check(
                                         egui::RichText::new(detail)
                                             .monospace()
                                             .size(10.5)
-                                            .color(egui::Color32::from_rgb(0x50, 0x50, 0x58)),
+                                            .color(super::theme::colours(ui).text2),
                                     );
                                 }
                                 let advice = item.finding.action();
@@ -162,7 +162,10 @@ pub fn render_colour_check(
                                     ui.label(
                                         egui::RichText::new(format!("What to do: {advice}"))
                                             .size(11.5)
-                                            .color(status_colour(status)),
+                                            .color(status_colour(
+                                                &super::theme::colours(ui),
+                                                status,
+                                            )),
                                     );
                                 }
                                 if !item.fixes.is_empty() {

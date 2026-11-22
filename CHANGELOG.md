@@ -6,6 +6,254 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.20.7] — 2026-11-22
+
+Both Decks have a calm new Home that follows the system's light or dark
+appearance: a list of connections, the selected machine in one column with
+one Connect, and two-column New and Edit connection forms; sign-in errors
+appear under their field instead of on a separate page; a connection can be
+shared as an `.arcen` file; Settings hold this computer's choices, with
+Input and Tablet pages of their own, and a saved connection may keep its
+own Typing, Option keys, ⌘ key and Displays (a one-time migration moves
+0.20.6 settings over; the tablet mode restarts on Tablet support and the
+Option keys on Automatic); the cursor is automatic, and a 0.20.7 macOS Pier
+draws the pointer into the video for a 0.20.7 Deck; host identities, pins
+and passwords keep to the connection they belong to; and the Windows Deck
+no longer keeps a CPU core busy while idle or freezes when a session ends
+inside a menu. 0.20.7 speaks protocol v5 and works with every 0.17.0 to
+0.20.6 Deck and Pier.
+
+### Added
+
+- **Share a connection as a file.** On the macOS and Windows Decks,
+  **Export…** in a connection's **⋮** menu saves it as an `.arcen` file, and
+  **Import…** at the top of the Connections list adds one. The file holds
+  the name, address, port, username and the choices the connection keeps
+  for itself, under the same names as in Settings; it never holds a
+  password, token or resume grant. Import shows a summary first and saves
+  nothing until you choose **Import**; a connection to the same machine is
+  replaced or kept beside the new one only when you say so; a host identity
+  in the file is trusted only when you tick it, and one that differs from
+  the identity you already trust is shown beside it with a warning. Fields
+  a newer Arcen adds are kept; fields that look like passwords, tokens or
+  file paths are ignored. Files over 64 KB, nested too deeply or written in
+  a newer format are refused with a reason. See *Share a connection* in the
+  user guide.
+
+### Changed
+
+- **A calm new Home, light or dark with your system.** On both Decks
+  (validated on the Mac; the Windows Deck takes the same shared screens):
+  - **Home is a calm list.** Your connections are on the left, each with
+    its name and one quiet line under it (its address today; the same line
+    is reserved for a machine's status, such as *Ready* or *You're signed
+    in · resume*, once a host or service can report it: no Pier says
+    who is signed in yet, so the Deck never guesses). The selected machine
+    is on the right in one centred column: its name (its address when you
+    point at it), Username and Password, one large **Connect**, the small
+    **Remember username** and **Auto-reconnect**, and **Edit** as a quiet
+    link. *Not encrypted (insecure mode)* shows only when that is so.
+  - **The Deck follows your system's light or dark appearance**, live:
+    switch macOS (or Windows) to Dark and the Deck turns a dim, neutral grey
+    for grading suites, menus, lists, popups, tooltips and scroll bars
+    included, with no stray light lines. There is no appearance setting.
+  - **New and Edit connection have two columns**: **Connection** (Address
+    as `host`, `host:port` or `[v6]:port`, an optional Name and an optional
+    Username) and **On this machine** (the ⌘ key, the Option key on a Mac,
+    Typing and Displays), always shown, one under the other in a narrow
+    window. **Test connection** is a quiet link at the bottom left;
+    **Cancel** and **Add connection** or **Save** are on the right, in each
+    system's order. Everything fits the default window without scrolling.
+  - **Choices open in place.** Every choice from a short list, in the
+    connection form and in Settings, shows the value in force and one line
+    on what it does; click it and the choices open under it, the one in
+    force in orange. Esc, a click elsewhere or Tab closes it; Up, Down and
+    Return work it from the keyboard. With the system's Reduce motion (a
+    Mac) or Animation effects off (Windows), it and every other animation
+    are instant.
+  - **Settings pages are calmer**: the same orange bar as Home, with
+    **Done** where the gear was; one centred column with plain headings in
+    sentence case and one spacing scale; a list for each short choice, a
+    tick box for each switch with its explanation in the small grey help
+    style under its label, and every button (Colour check…, Show in folder,
+    Create support bundle…, Refresh) the same 36-point control as on Home.
+  - **One set of controls**: one filled button per screen (**Connect**,
+    **Add connection**, **Save**, **OK**), 44 points tall in a slightly
+    deeper orange so its white text reads at 4.5:1 in every state; every
+    other control 36 points; every field, list and secondary button with an
+    outline at 3:1 or more in both palettes, and an orange ring while you
+    type in a field; text at 4.5:1 or more in both
+    palettes, under the pointer too. **Connect** is never greyed out: with
+    no password it says *Enter your password to connect.* under the field.
+  - **The orange bar** is slim, with **Help** (this guide) and **Settings**
+    on its right. **＋** beside **Connections** opens **New connection…**
+    and **Import from file…** (⌘N on a Mac, Ctrl+N on a PC, opens New
+    connection). A connection's **⋮** menu (**Edit**, **Test connection**,
+    **Export…**, **Delete**) shows on the selected row and the row under
+    the pointer. Return saves the connection form, Esc cancels it.
+  - The user guide now lists every menu and shortcut on both Decks
+    (*Menus and keyboard shortcuts*).
+  - The macOS Deck's microphone badge in a session reads *Mic on* rather
+    than in capitals.
+- **Signing in no longer leaves your connections for a separate page.** On
+  the macOS and Windows Decks, when Connect is missing a password, the host
+  refuses the username or password, the host cannot be reached, or a
+  session ends and needs you to sign in again, the Deck stays on your
+  connections with the same connection selected, clears the password, puts
+  the cursor in the field and says what happened under it in plain words:
+  *Wrong username or password.*, *Enter your password to connect.*,
+  *Couldn't reach ‹host›. Check that it's on and that Arcen is running
+  there.*, or *Your session ended. Sign in again to continue.* The
+  technical reason is in the log and under **Details**. Only something that
+  is not about a field (the host ended your session, restarted, or its
+  identity changed) opens a box to read and close with **OK**. The host's
+  notice before sign-in and the certificate check stay as they were. After
+  a display recovery choice (*Start fresh*, *Reconnect* or *Primary display
+  only*), the macOS Deck no longer asks again for the password you just
+  typed, as the Windows Deck already did.
+- **Settings are this Mac or PC and you; a saved connection is that
+  machine.** A saved connection can keep its own Typing, Option keys, ⌘ key
+  and Displays; anything it does not set follows Settings. The first time
+  0.20.7 starts, it moves your settings over once, and nothing else changes:
+  - **Typing: Always characters** becomes **Characters**. **Connection ›
+    Keyboard: Characters** still types every character as text for a
+    session, and a connection set to **Characters** keeps it.
+  - **System shortcuts go to: The remote computer when fullscreen** becomes
+    **System shortcuts go to the remote computer**, turned on.
+  - **The tablet mode is one choice for every connection**, and everyone
+    starts on **Tablet support**. Choose Native tablet or Mouse only again
+    in **Settings › Tablet** if you used them.
+  - **The Option keys go back to Automatic**, in Settings and on every
+    connection; **Left Option is also AltGr** is gone.
+  - **Paste as Keystrokes** keeps its speed and its ask-first limit.
+- **Settings › Input is short, and the tablet has its own page.** On both
+  Decks, Input now says in two lines what Arcen sends and which keys move
+  the keyboard (with **Learn more**), then has one heading per group:
+  **Keyboard** (one switch, **System shortcuts go to the remote computer**,
+  which on a Mac says when it needs the Accessibility permission and opens
+  System Settings; still off by default on a Mac and on by default on a
+  PC), **Typing** (**Characters** or **Keys only**, with how many
+  connections use their own) and **Clipboard** (**Share the clipboard with
+  remote computers**). The **Cursor** choice is gone from Settings: the
+  cursor is automatic, and a host that still follows the choice gets the
+  one you had.
+  **Settings › Tablet**, directly under Input, has **Tablet support**,
+  **Native tablet** (with the component's status) and **Mouse only**, one
+  line each, the pen buttons under Tablet support and *Changes apply from
+  the next connection.* The keyboard-switch chord and the Paste as
+  Keystrokes **Speed** and **Ask before pasting more than** moved to
+  **Settings › Advanced › Input**. The Option keys are no longer in
+  Settings at all, and the separate Clipboard page is gone. The longer
+  explanations (system shortcuts and Secure Input, Accessibility, typing,
+  the tablet modes per host, Paste as Keystrokes) are in the user guide.
+- **Edit Connection has two groups.** **Connection** (name, address, port,
+  username) and **On this machine**: **⌘ key** (was *Keyboard shortcuts*;
+  on the Windows Deck *Command key on a Mac host*), **Option key**
+  (**Automatic** or a fixed choice; Mac only), **Typing** and **Displays**.
+  A value the connection takes from Settings reads, for example, **App
+  default (Characters)**.
+- **The session says when the host turned the clipboard off**:
+  *Clipboard is turned off by this host.*, in the keyboard indicator's menu
+  on a Mac and beside the keyboard indicator on a PC. It is not a setting.
+- **The cursor is automatic.** The Deck draws the pointer when the host
+  sends its cursor images, so it moves at the speed of your hand in the
+  host's own shapes. A 0.20.7 Mac host cannot send its pointer's shape, so
+  it draws the pointer into the video and the Deck shows none, instead of a
+  plain arrow. Whenever a host draws the pointer into the video, the Deck
+  now hides its own, so a Linux desktop that does so no longer shows two
+  pointers. Linux and Windows hosts, and Mac hosts older than 0.20.7, keep
+  your earlier cursor choice exactly as before; nothing in your settings
+  changes.
+
+### Fixed
+
+- **The Windows Deck no longer keeps a CPU core busy while idle.** On Home,
+  or in a session, it asked for a new picture every time it drew one, and
+  used most of a core doing nothing. It now draws only when something
+  changed, at most once per refresh of your display.
+- **The import summary's buttons are in the Windows order on the Windows
+  Deck,** **Import** then **Cancel**, as in the connection form; the macOS
+  Deck keeps **Cancel** then **Import**.
+- **A sign-in error no longer follows you around Home.** On the Windows
+  Deck, *Wrong username or password.* also showed as a red banner at the
+  top that stayed on other connections and on the New Connection form and
+  pushed the page down. Sign-in messages now appear only under their field
+  on both Decks, and go as soon as you type in the field, choose another
+  connection or open a connection form.
+- **Your password is cleared once you connect.** It stayed in the field
+  after Disconnect, so typing it again added to the old one and failed.
+- **A host whose identity changed can be trusted again from the Windows
+  Deck.** It showed only an OK box with internal wording. Both Decks now
+  show *This computer's identity has changed* with the remembered and the
+  new fingerprint; **Cancel** is the default, and **Trust the new
+  identity…** asks once more before the Deck remembers the new identity and
+  connects. On the macOS Deck this replaces **Forget and Verify**.
+- **Return in the username or password field connects,** on both Decks;
+  with no password it asks for one.
+- **Plainer details.** A connection that timed out says so instead of
+  *websocket error: IO error: timed out*; a refused sign-in no longer reads
+  *authentication failed: Authentication failed*; **Verify this host** shows
+  the certificate's validity as dates and calls Trust Once what it is.
+- **The connection form checks the port.** A port that is not a number from
+  1 to 65535 is named under the field, and the connection cannot be saved
+  until it is fixed.
+- **A session that ends no longer freezes the Windows Deck.** If the host
+  restarted or the connection dropped while a menu was open, or while the
+  menu bar was still highlighted after you closed a menu with Esc, the
+  window kept showing the last picture of the desktop, with no message,
+  until you clicked into it. The Deck now notices at
+  once: it reconnects when Auto-reconnect is on, and otherwise, or when
+  the host can no longer resume the session, goes back to your
+  connections and says why.
+- **No more empty boxes for key symbols.** The Decks' text font has no
+  arrows, ⇧ or ▸, which drew as empty boxes in Settings and Help › Keyboard
+  Shortcuts; they now come from the monospace font the Decks already carry.
+  ⌃ and ⌥, which no bundled font has, are spelled out (*Control-←*).
+- **Settings text wraps at the window's edge** instead of running past it
+  in a narrow window.
+- **Plainer words on Home and in Settings, on both Decks** (from a Windows
+  Deck walkthrough):
+  - A saved connection that keeps its own Displays choice says so in its
+    column on Home, **Displays: Windowed (this connection)**, with a small
+    **Use app default** link that hands it back to Settings; one that
+    follows Settings shows no line.
+  - Settings › Displays explains each choice in one line, in each Deck's own
+    terms: the Windows Deck no longer mentions macOS Spaces or the notch.
+  - Edit Connection's Displays choices open in place, under it, instead of
+    in a list over its own title.
+  - Settings › Microphone and Settings › Advanced › **Certificate checking**
+    (was *Security modes*: **High**, **Medium**, **Low**, one line each) say
+    what they do without developer terms.
+  - Home with nothing to show says **Add a connection, or import one from a
+    file.**, with **Add Connection** and **Import…** buttons.
+  - The Windows Deck's greyed **Colour Check…** says why: *(not on Windows
+    yet)*.
+  - The pen-button note under Tablet support is no longer tiny.
+  - **Esc** cancels New and Edit Connection, as **Cancel** does, unless a
+    list, a box or a Help window is open over the form; on the macOS Deck
+    Esc closes Help › Keyboard Shortcuts first, as on the Windows Deck.
+  - **Low** certificate checking is offered only when the Deck was started
+    with `ARCEN_ACCEPT_INSECURE=1`, the one way it can work. A saved Low
+    without it now checks as Medium, and Settings says so, instead of
+    failing every connection.
+- **Connections, identities and files keep to the machine they belong to,
+  on both Decks.** A certificate pin given for one host (`--pin-sha256`, or
+  a failed attempt) no longer follows you to another connection; after you
+  change a connection's address, **Connect** dials the new one and the
+  password typed for the old one is cleared. Trusting a host's new identity
+  remembers exactly the fingerprint you were shown, and saving an identity
+  (also from an import) changes only that machine's entry, never undoing a
+  change another Deck window made; if one did, you are asked again.
+  `--connect` on the Windows Deck now uses the saved connection's own
+  choices, such as a clipboard it keeps off. A password is no longer kept
+  after you leave the certificate prompt or the connection could not
+  start. A settings value written by a newer Arcen is kept instead of being
+  erased when you select a connection, and editing a connection right after
+  the first start of 0.20.7 no longer fails with *changed in another
+  process*. Export writes a file that always imports (or says why it
+  cannot, and leaves the old file), and what Export and Import did now
+  shows under the connection list until you dismiss it.
+
 ## [0.20.6] — 2026-11-20
 
 A Windows Pier on a GeForce serves the display it has instead of failing to
@@ -4293,7 +4541,8 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.6...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.7...HEAD
+[0.20.7]: https://github.com/Aanerud/arcen_public/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/Aanerud/arcen_public/compare/v0.20.5...v0.20.6
 [0.20.5]: https://github.com/Aanerud/arcen_public/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/Aanerud/arcen_public/compare/v0.20.3...v0.20.4

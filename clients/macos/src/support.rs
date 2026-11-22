@@ -172,6 +172,80 @@ pub fn choose_folder(start: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
+/// A save panel for a connection profile (`.arcen`), proposing
+/// `file_name` on the Desktop (main thread only). The panel confirms
+/// replacing an existing file.
+#[must_use]
+pub fn choose_profile_to_save(file_name: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSModalResponseOK, NSSavePanel};
+        use objc2_foundation::NSString;
+        let mtm = objc2::MainThreadMarker::new()?;
+        let panel = NSSavePanel::savePanel(mtm);
+        panel.setCanCreateDirectories(true);
+        panel.setExtensionHidden(false);
+        panel.setNameFieldStringValue(&NSString::from_str(file_name));
+        panel.setMessage(Some(&NSString::from_str(
+            "The file holds the connection's address, username and settings. It never holds \
+             a password.",
+        )));
+        if let Some(desktop) = desktop() {
+            panel.setDirectoryURL(Some(&file_url(&desktop)));
+        }
+        if panel.runModal() != NSModalResponseOK {
+            return None;
+        }
+        panel
+            .URL()
+            .and_then(|url| url.path())
+            .map(|path| PathBuf::from(path.to_string()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = file_name;
+        None
+    }
+}
+
+/// An open panel that chooses one connection profile (main thread only).
+/// Any file may be chosen; the shared reader validates it.
+#[must_use]
+pub fn choose_profile_to_open() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
+        use objc2_foundation::NSString;
+        let mtm = objc2::MainThreadMarker::new()?;
+        let panel = NSOpenPanel::openPanel(mtm);
+        panel.setCanChooseDirectories(false);
+        panel.setCanChooseFiles(true);
+        panel.setAllowsMultipleSelection(false);
+        panel.setPrompt(Some(&NSString::from_str("Import")));
+        panel.setMessage(Some(&NSString::from_str(
+            "Choose an Arcen connection file (.arcen).",
+        )));
+        if panel.runModal() != NSModalResponseOK {
+            return None;
+        }
+        panel
+            .URL()
+            .and_then(|url| url.path())
+            .map(|path| PathBuf::from(path.to_string()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn file_url(path: &Path) -> objc2::rc::Retained<objc2_foundation::NSURL> {
+    objc2_foundation::NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
+        &path.display().to_string(),
+    ))
+}
+
 /// Shows `path` selected in Finder (`open -R`).
 #[must_use]
 pub fn reveal(path: &Path) -> bool {

@@ -1209,6 +1209,17 @@ pub struct AuthResponse {
     /// `false` for every older client, which never receives the record.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cursor_position_v1: bool,
+    /// The automatic cursor: a host that knows it ignores
+    /// [`Self::cursor_preference`] and decides itself
+    /// (`arcen_input::resolve_automatic_cursor_mode`): a host that sends
+    /// cursor images serves Local (the client draws them); one that sends
+    /// none draws the pointer into the video and says so with
+    /// [`CursorModeResultMsg::automatic`]. A host that does not know it
+    /// serves `cursor_preference` exactly as before, so the preference is the
+    /// client's request to older hosts. Absent and `false` for every older
+    /// client, which never gets a host-drawn pointer it did not ask for.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_automatic_v1: bool,
     /// Explicit client instruction to replace a persistent desktop whose
     /// committed multi-monitor topology cannot serve this request.
     ///
@@ -1329,6 +1340,7 @@ impl std::fmt::Debug for AuthResponse {
             .field("cursor_preference", &self.cursor_preference)
             .field("cursor_image_v1", &self.cursor_image_v1)
             .field("cursor_position_v1", &self.cursor_position_v1)
+            .field("cursor_automatic_v1", &self.cursor_automatic_v1)
             .field("lossless_refine_v1", &self.lossless_refine_v1)
             .field("canvas_v1", &self.canvas_v1)
             .field("display_refresh_v1", &self.display_refresh_v1)
@@ -1378,6 +1390,7 @@ impl AuthResponse {
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
             cursor_position_v1: false,
+            cursor_automatic_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
             canvas_v1: None,
@@ -1406,6 +1419,7 @@ impl AuthResponse {
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
             cursor_position_v1: false,
+            cursor_automatic_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
             canvas_v1: None,
@@ -1434,6 +1448,7 @@ impl AuthResponse {
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
             cursor_position_v1: false,
+            cursor_automatic_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
             canvas_v1: None,
@@ -1463,6 +1478,7 @@ impl AuthResponse {
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
             cursor_position_v1: false,
+            cursor_automatic_v1: false,
             replace_incompatible_desktop: false,
             lossless_refine_v1: None,
             canvas_v1: None,
@@ -1658,6 +1674,13 @@ impl AuthResponse {
     #[must_use]
     pub const fn with_cursor_position_v1(mut self, supported: bool) -> Self {
         self.cursor_position_v1 = supported;
+        self
+    }
+
+    /// Asks for the automatic cursor ([`Self::cursor_automatic_v1`]).
+    #[must_use]
+    pub const fn with_cursor_automatic_v1(mut self, automatic: bool) -> Self {
+        self.cursor_automatic_v1 = automatic;
         self
     }
 
@@ -2367,6 +2390,9 @@ pub struct ClientHelloMsg {
     /// Echo of [`AuthResponse::cursor_position_v1`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub cursor_position_v1: bool,
+    /// Echo of [`AuthResponse::cursor_automatic_v1`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cursor_automatic_v1: bool,
     /// Tablet mode requested by the client for this connection.
     #[serde(default, skip_serializing_if = "is_default_tablet_mode")]
     pub tablet_mode_requested: TabletModeMsg,
@@ -2436,6 +2462,7 @@ impl Default for ClientHelloMsg {
             cursor_preference: CursorMode::Local,
             cursor_image_v1: false,
             cursor_position_v1: false,
+            cursor_automatic_v1: false,
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             tablet_mode_capabilities: TabletModeCapabilitiesMsg::default(),
             device_capabilities: BTreeMap::new(),
@@ -2534,6 +2561,13 @@ impl ClientHelloMsg {
     #[must_use]
     pub const fn with_cursor_position_v1(mut self, supported: bool) -> Self {
         self.cursor_position_v1 = supported;
+        self
+    }
+
+    /// Asks for the automatic cursor ([`Self::cursor_automatic_v1`]).
+    #[must_use]
+    pub const fn with_cursor_automatic_v1(mut self, automatic: bool) -> Self {
+        self.cursor_automatic_v1 = automatic;
         self
     }
 
@@ -3144,6 +3178,26 @@ pub struct CursorModeResultMsg {
     /// pointer for this attachment.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cursor_positions: bool,
+    /// The host settled this authority by the automatic-cursor rule the
+    /// client asked for ([`AuthResponse::cursor_automatic_v1`]) rather than
+    /// by `requested`. Absent and `false` from older hosts and for every
+    /// client that did not ask. Informational: [`Self::host_draws_pointer`]
+    /// reads `active` alone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub automatic: bool,
+}
+
+impl CursorModeResultMsg {
+    /// Whether the host draws the pointer into the video, so the client
+    /// shows no pointer of its own: whenever `active` is
+    /// [`CursorMode::Host`], whatever was requested or accepted. Every Pier
+    /// reports Host only when its capture composites the pointer (a Wayland
+    /// desktop embedded in Host mode answers a Local request with Host), so
+    /// a client pointer as well would be a second one.
+    #[must_use]
+    pub const fn host_draws_pointer(&self) -> bool {
+        matches!(self.active, CursorMode::Host)
+    }
 }
 
 fn default_cursor_mode_result_type() -> String {
@@ -3160,6 +3214,7 @@ impl Default for CursorModeResultMsg {
             reason: CursorModeReason::default(),
             cursor_images: false,
             cursor_positions: false,
+            automatic: false,
         }
     }
 }
@@ -5924,6 +5979,89 @@ mod tests {
         )
         .unwrap();
         assert!(result.cursor_images);
+    }
+
+    #[test]
+    fn the_automatic_cursor_is_additive_and_older_peers_ignore_it() {
+        // Nothing is sent unless asked, so older peers see the same bytes.
+        for json in [
+            serde_json::to_value(AuthResponse::none()).unwrap(),
+            serde_json::to_value(ClientHelloMsg::default()).unwrap(),
+        ] {
+            assert!(json.get("cursor_automatic_v1").is_none());
+        }
+        let result_json = serde_json::to_value(CursorModeResultMsg::default()).unwrap();
+        assert!(result_json.get("automatic").is_none());
+        // An older Deck's request and an older Pier's result read as "not
+        // automatic".
+        let auth: AuthResponse = serde_json::from_str(
+            r#"{"type":"auth_response","method":"none","username":"","credential":"","screen_width":0,"screen_height":0}"#,
+        )
+        .unwrap();
+        assert!(!auth.cursor_automatic_v1);
+        let old_pier: CursorModeResultMsg = serde_json::from_str(
+            r#"{"type":"cursor_mode_result","requested":"local","active":"local","accepted":true,"reason":""}"#,
+        )
+        .unwrap();
+        assert!(!old_pier.automatic && !old_pier.host_draws_pointer());
+        // Round trip when asked.
+        let auth: AuthResponse = serde_json::from_value(
+            serde_json::to_value(AuthResponse::none().with_cursor_automatic_v1(true)).unwrap(),
+        )
+        .unwrap();
+        let hello: ClientHelloMsg = serde_json::from_value(
+            serde_json::to_value(ClientHelloMsg::default().with_cursor_automatic_v1(true)).unwrap(),
+        )
+        .unwrap();
+        assert!(auth.cursor_automatic_v1 && hello.cursor_automatic_v1);
+        // A 0.20.6 Deck reads a new Pier's result; a 0.20.6 Pier reads a new
+        // Deck's request: unknown fields are ignored, never refused.
+        #[derive(Deserialize)]
+        #[allow(dead_code, reason = "the 0.20.6 shape, read only")]
+        struct ResultBefore {
+            requested: CursorMode,
+            active: CursorMode,
+            accepted: bool,
+            #[serde(default)]
+            cursor_images: bool,
+        }
+        let automatic = CursorModeResultMsg {
+            active: CursorMode::Host,
+            accepted: true,
+            automatic: true,
+            ..CursorModeResultMsg::default()
+        };
+        let before: ResultBefore =
+            serde_json::from_value(serde_json::to_value(&automatic).unwrap()).unwrap();
+        assert_eq!(before.active, CursorMode::Host);
+        let mut future =
+            serde_json::to_value(AuthResponse::none().with_cursor_automatic_v1(true)).unwrap();
+        future["a_future_cursor_field"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AuthResponse>(future).is_ok());
+    }
+
+    #[test]
+    fn the_client_hides_its_pointer_only_when_the_host_draws_it() {
+        let result = |requested, active, accepted, automatic| CursorModeResultMsg {
+            requested,
+            active,
+            accepted,
+            automatic,
+            ..CursorModeResultMsg::default()
+        };
+        use CursorMode::{Host, Local};
+        // Active Host is in the pixels: an accepted Host request, the
+        // automatic fallback, and a Linux Wayland desktop embedded in Host
+        // mode answering a Local request.
+        assert!(result(Host, Host, true, false).host_draws_pointer());
+        assert!(result(Local, Host, true, true).host_draws_pointer());
+        assert!(result(Host, Host, true, true).host_draws_pointer());
+        assert!(result(Local, Host, false, false).host_draws_pointer());
+        // Active Local is the client's: the automatic cursor with images,
+        // and a refused Host request.
+        assert!(!result(Local, Local, true, true).host_draws_pointer());
+        assert!(!result(Host, Local, true, true).host_draws_pointer());
+        assert!(!result(Host, Local, false, false).host_draws_pointer());
     }
 
     #[test]

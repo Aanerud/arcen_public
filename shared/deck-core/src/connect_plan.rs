@@ -812,36 +812,33 @@ pub fn connection_displays_follow_label(connection: &str) -> String {
     format!("Use this setting for \u{201c}{connection}\u{201d}")
 }
 
-/// What a saved connection's panel says it connects with, next to Connect:
-/// the mode, where it comes from and, when the connection's own choice
-/// differs from Settings › Displays, that it wins over it (`true`). A field
-/// report of "Primary display only still gives two displays" was a saved
-/// connection keeping Match my layout, visible only in its editor.
+/// What a saved connection's panel says it connects with, next to Connect,
+/// in the style every inherited value uses: "App default (Match my
+/// layout)" while it follows Settings › Displays, "Windowed (this
+/// connection)" with a [`CONNECTION_DISPLAYS_USE_SETTINGS`] link while it
+/// sets its own (`true`). A field report of "Primary display only still
+/// gives two displays" was a saved connection keeping Match my layout,
+/// visible only in its editor.
 #[must_use]
 pub fn connection_displays_line(
-    saved: Option<DisplaysMode>,
+    saved: crate::overrides::Override<DisplaysMode>,
     settings: DisplaysMode,
 ) -> (String, bool) {
-    match saved {
-        None => (format!("{} (from Settings)", settings.label()), false),
-        Some(mode) if mode == settings => (
-            format!("{} (this connection\u{2019}s own choice)", mode.label()),
-            false,
-        ),
-        Some(mode) => (
-            format!(
-                "{} (this connection\u{2019}s own choice; overrides Settings: {})",
-                mode.label(),
-                settings.label()
-            ),
+    let effective = saved.resolve(settings);
+    match effective.source {
+        crate::overrides::SettingSource::AppDefault => {
+            (format!("App default ({})", effective.value.label()), false)
+        }
+        crate::overrides::SettingSource::ThisConnection => (
+            format!("{} (this connection)", effective.value.label()),
             true,
         ),
     }
 }
 
-/// The button on a saved connection's panel that hands it back to
-/// Settings › Displays.
-pub const CONNECTION_DISPLAYS_USE_SETTINGS: &str = "Use Settings";
+/// The link at the end of a saved connection's own Displays line that
+/// hands it back to Settings › Displays.
+pub const CONNECTION_DISPLAYS_USE_SETTINGS: &str = "Use app default";
 
 /// A display recovery the user has to choose, recognised from how a
 /// connection ended.
@@ -878,7 +875,6 @@ pub struct DisplaysRecoveryRetry {
     /// Persist this mode on the saved connection.
     pub remember: Option<DisplaysMode>,
     pub status: &'static str,
-    pub credentials_note: &'static str,
 }
 
 /// The topology conflict's choice. Replacing starts a fresh desktop with
@@ -893,7 +889,6 @@ pub fn topology_conflict_retry(endpoint: &str, replace: bool) -> DisplaysRecover
             displays_override: None,
             remember: None,
             status: "Starting a fresh session with your layout…",
-            credentials_note: "Signing in again to start a fresh session with your layout.",
         }
     } else {
         DisplaysRecoveryRetry {
@@ -901,7 +896,6 @@ pub fn topology_conflict_retry(endpoint: &str, replace: bool) -> DisplaysRecover
             displays_override: Some((endpoint.to_owned(), DisplaysMode::SinglePrimary)),
             remember: None,
             status: "Reconnecting to your existing session…",
-            credentials_note: "Signing in again to reconnect to your existing session.",
         }
     }
 }
@@ -916,7 +910,6 @@ pub fn displays_unsupported_retry(endpoint: &str) -> DisplaysRecoveryRetry {
         displays_override: Some((endpoint.to_owned(), DisplaysMode::SinglePrimary)),
         remember: Some(DisplaysMode::SinglePrimary),
         status: "Connecting with this host's single display…",
-        credentials_note: "Signing in again with Primary Display Only.",
     }
 }
 
@@ -1057,7 +1050,9 @@ pub fn tls_trust_for(
 ) -> Option<crate::runtime::tls::TlsTrustConfig> {
     use crate::runtime::tls::TlsTrustConfig;
     use crate::settings::SecurityMode;
-    match security {
+    // Low without ARCEN_ACCEPT_INSECURE=1 checks as Medium, as Settings
+    // shows it, instead of failing every connection at the double gate.
+    match security.in_force() {
         SecurityMode::High => None,
         SecurityMode::Medium => Some(match pin {
             Some(pin) => match pin.kind {
@@ -1082,24 +1077,26 @@ mod tests {
 
     #[test]
     fn a_saved_connections_panel_says_which_displays_choice_it_connects_with() {
-        let (line, overrides) =
-            connection_displays_line(Some(DisplaysMode::MatchLayout), DisplaysMode::SinglePrimary);
-        assert!(overrides);
+        use crate::overrides::Override;
         assert_eq!(
-            line,
-            "Match my layout (this connection\u{2019}s own choice; overrides Settings: \
-             Primary display only)"
+            connection_displays_line(
+                Override::Own(DisplaysMode::Windowed),
+                DisplaysMode::MatchLayout
+            ),
+            ("Windowed (this connection)".to_owned(), true)
         );
+        // Its own value, even when Settings has the same one: the link hands
+        // it back.
         assert_eq!(
-            connection_displays_line(None, DisplaysMode::SinglePrimary),
-            ("Primary display only (from Settings)".to_owned(), false)
-        );
-        assert!(
-            !connection_displays_line(
-                Some(DisplaysMode::SinglePrimary),
+            connection_displays_line(
+                Override::Own(DisplaysMode::SinglePrimary),
                 DisplaysMode::SinglePrimary
-            )
-            .1
+            ),
+            ("Primary display only (this connection)".to_owned(), true)
+        );
+        assert_eq!(
+            connection_displays_line(Override::Inherit, DisplaysMode::MatchLayout),
+            ("App default (Match my layout)".to_owned(), false)
         );
     }
 

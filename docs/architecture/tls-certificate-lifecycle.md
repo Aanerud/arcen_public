@@ -95,7 +95,7 @@ the SPKI in an endpoint-keyed map in the current Deck process; it is never
 written to a bookmark or other persistent storage. A same-key renewal matches;
 a rekey causes a new capture-and-reject prompt. Existing whole-certificate pins
 retain their original semantics. The system/private-CA paths and the existing
-Low-security double gate (`Security mode - Low` plus
+Low-security double gate (Settings › Advanced › Certificate checking › Low plus
 `ARCEN_ACCEPT_INSECURE=1`) are unchanged.
 
 ## Reload and expiry

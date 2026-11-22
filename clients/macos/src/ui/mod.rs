@@ -8,6 +8,10 @@ mod canvas_metal;
 pub mod colour_check;
 pub mod connection_test;
 pub mod display_fit;
+/// Developer-only (`doc-shots`): the manual's screenshots in this Deck's
+/// setup and root frame.
+#[cfg(feature = "doc-shots")]
+pub mod doc_shots;
 pub mod home;
 mod keyboard;
 mod macos_menu;
@@ -25,6 +29,8 @@ pub(crate) mod pen_input;
 mod refine_overlay;
 pub mod region_runtime;
 mod session_truth;
+#[cfg(test)]
+mod settings_page_tests;
 mod sharp_cursor;
 mod system_shortcut_tap;
 pub mod text_input;

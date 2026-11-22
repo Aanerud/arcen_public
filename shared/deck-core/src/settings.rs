@@ -103,6 +103,44 @@ impl SecurityMode {
             _ => SecurityMode::Medium,
         }
     }
+
+    /// The mode a connection uses when Low may skip certificate checks only
+    /// if `low_allowed` ([`low_security_allowed`]): without it, Low checks
+    /// as Medium instead of failing every connection.
+    #[must_use]
+    pub const fn in_force_with(self, low_allowed: bool) -> Self {
+        match self {
+            Self::Low if !low_allowed => Self::Medium,
+            other => other,
+        }
+    }
+
+    /// [`Self::in_force_with`] for this process's environment.
+    #[must_use]
+    pub fn in_force(self) -> Self {
+        self.in_force_with(low_security_allowed())
+    }
+}
+
+/// The environment variable that alone lets Low skip certificate checks:
+/// the half of the TLS double gate a user sets (the Deck passes the other
+/// half itself for Low). Nothing in the Deck's UI sets it.
+pub const ACCEPT_INSECURE_ENV_KEY: &str = "ARCEN_ACCEPT_INSECURE";
+
+/// Its one accepted value.
+pub const ACCEPT_INSECURE_ENV_VALUE: &str = "1";
+
+/// Whether this process may use Low at all (`ARCEN_ACCEPT_INSECURE=1`);
+/// Settings offers Low only then.
+#[must_use]
+pub fn low_security_allowed() -> bool {
+    low_security_allowed_with(std::env::var(ACCEPT_INSECURE_ENV_KEY).ok().as_deref())
+}
+
+/// [`low_security_allowed`] with the environment value passed in.
+#[must_use]
+pub fn low_security_allowed_with(env_value: Option<&str>) -> bool {
+    env_value == Some(ACCEPT_INSECURE_ENV_VALUE)
 }
 
 /// Preferred frame-rate/latency profile for the video stream.
@@ -649,31 +687,6 @@ impl DisplaysMode {
             DisplaysMode::Windowed => "Windowed",
         }
     }
-
-    /// One-line explanation shown under the selector in the Displays panel.
-    #[must_use]
-    pub fn description(self) -> &'static str {
-        match self {
-            DisplaysMode::MatchLayout => {
-                "Match up to 4 of your displays with real native fullscreen windows on a \
-                 host that supports it, each pixel-exact. Requires Separate Spaces on and \
-                 standard fullscreen (Notch area off) locally, and requires the host to \
-                 support and accept it. If the host doesn't support multi-monitor, or the \
-                 local layout can't be applied, the connection fails, with an error that \
-                 clearly explains why, instead of silently falling back to the primary \
-                 display — switch to Primary Display Only and reconnect to use this host."
-            }
-            DisplaysMode::SinglePrimary => {
-                "Stream only your primary display, sized to what the Deck can show in \
-                 fullscreen so the image is pixel-exact. The stream does not resize \
-                 with the app window."
-            }
-            DisplaysMode::Windowed => {
-                "Stream your primary display into a resizable window. The image \
-                 scales to fit the window instead of taking over a whole monitor."
-            }
-        }
-    }
 }
 
 /// Client preferences. Microphone consent is intentionally runtime-only; all
@@ -761,8 +774,11 @@ pub struct ClientSettings {
     /// and reports back, while intent is a one-way knob that never changes
     /// which pixels are asked for (see [`arcen_media::EncodeIntent`]).
     pub encode_intent: arcen_media::EncodeIntent,
-    /// How typed characters reach a host that takes committed text
-    /// (`arcen_input::text::TypingMode`; Auto by default).
+    /// How typed characters reach a host that takes committed text: Auto
+    /// (shown as Characters, the default) or Keys only. "Always characters"
+    /// is no longer a setting; it is read as Characters, and only a
+    /// session's Connection-menu Keyboard: Characters types every character
+    /// as text (`arcen_input::text::KeyboardMode::typing_mode`).
     pub typing_mode: arcen_input::text::TypingMode,
     /// What each Option key does: Automatic by default (a Mac host keeps
     /// both as Option; other hosts get left Alt, right characters).
@@ -788,7 +804,10 @@ pub struct ClientSettings {
 }
 
 pub const SAVED_CONNECTIONS_VERSION: u32 = 2;
-pub const SAVED_CONNECTION_SETTINGS_VERSION: u32 = 1;
+/// Version 2 (0.20.7): the connection's own settings are
+/// [`crate::overrides::ConnectionOverrides`]; its tablet mode, Left Option
+/// as `AltGr` and keyboard mode keys are retired.
+pub const SAVED_CONNECTION_SETTINGS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct SavedConnectionsStore {
@@ -850,6 +869,58 @@ impl Default for ClientSettings {
             capture_mac_system_shortcuts: false,
             mac_system_shortcut_offer_answered: false,
             keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord::DEFAULT,
+        }
+    }
+}
+
+/// How a Deck takes the system shortcuts for the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemShortcutRoute {
+    /// A macOS Deck's event tap (⌘Tab, ⌘Space, Mission Control), which
+    /// needs the Accessibility permission
+    /// ([`ClientSettings::capture_mac_system_shortcuts`]).
+    MacEventTap,
+    /// A PC Deck's keyboard hook (Alt+Tab, the Windows key, Print Screen),
+    /// [`ClientSettings::keyboard_capture`].
+    PcKeyboardHook,
+}
+
+impl ClientSettings {
+    /// The one system-shortcuts switch: whether the system shortcuts go to
+    /// the remote computer while it has the keyboard. Off by default on a
+    /// Mac (it needs the Accessibility permission), on by default on a PC.
+    #[must_use]
+    pub fn system_shortcuts_to_host(&self, route: SystemShortcutRoute) -> bool {
+        use arcen_input::keyboard::KeyboardCapturePolicy;
+        match route {
+            SystemShortcutRoute::MacEventTap => {
+                self.capture_mac_system_shortcuts
+                    && self.keyboard_capture != KeyboardCapturePolicy::ThisComputer
+            }
+            SystemShortcutRoute::PcKeyboardHook => {
+                self.keyboard_capture != KeyboardCapturePolicy::ThisComputer
+            }
+        }
+    }
+
+    /// Turns the system-shortcuts switch on (the remote computer, whenever a
+    /// session window has the keyboard) or off (this computer).
+    pub fn set_system_shortcuts_to_host(&mut self, route: SystemShortcutRoute, on: bool) {
+        use arcen_input::keyboard::KeyboardCapturePolicy;
+        match route {
+            SystemShortcutRoute::MacEventTap => {
+                self.capture_mac_system_shortcuts = on;
+                if on {
+                    self.keyboard_capture = KeyboardCapturePolicy::Host;
+                }
+            }
+            SystemShortcutRoute::PcKeyboardHook => {
+                self.keyboard_capture = if on {
+                    KeyboardCapturePolicy::Host
+                } else {
+                    KeyboardCapturePolicy::ThisComputer
+                };
+            }
         }
     }
 }
@@ -987,6 +1058,18 @@ impl ClientConfigRepository {
         let path = self
             .connections_lock_file()
             .ok_or(ClientConfigError::ConfigUnavailable)?;
+        Self::lock_file(&path)
+    }
+
+    /// Takes the advisory lock on `path` (created if absent), waiting at
+    /// most [`Self::CONNECTION_LOCK_TIMEOUT`]; held until the file is
+    /// dropped. Every Deck process writing the same configuration file
+    /// takes the same lock first.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientConfigError::ConfigBusy`] when another process holds it.
+    pub fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ClientConfigError> {
         let parent = path.parent().ok_or(ClientConfigError::ConfigUnavailable)?;
         std::fs::create_dir_all(parent)?;
         let file = std::fs::OpenOptions::new()
@@ -1052,20 +1135,17 @@ impl ClientConfigRepository {
         })
     }
 
+    /// Saves the tablet mode, one choice for every connection (it is no
+    /// longer kept per saved connection), and returns the settings saved.
     pub fn set_tablet_mode_requested(
         &self,
-        id: &str,
         mode: TabletModeMsg,
-    ) -> Result<SavedConnectionsStore, ClientConfigError> {
-        self.mutate_connections(|store| {
-            let saved = store
-                .connections
-                .iter_mut()
-                .find(|saved| saved.id == id)
-                .ok_or_else(|| ClientConfigError::ConnectionMissing(id.to_string()))?;
-            saved.settings.tablet_mode_requested = mode;
-            Ok(())
-        })
+    ) -> Result<ClientSettings, ClientConfigError> {
+        let mut settings = crate::config::load_client_settings(self)?;
+        settings.tablet_mode_requested = mode;
+        settings.tablet_input_enabled = tablet_mode_allows_typed_pen(mode);
+        crate::config::save_client_settings(self, &settings)?;
+        Ok(settings)
     }
 
     pub fn set_displays_mode(
@@ -1079,7 +1159,12 @@ impl ClientConfigRepository {
                 .iter_mut()
                 .find(|saved| saved.id == id)
                 .ok_or_else(|| ClientConfigError::ConnectionMissing(id.to_string()))?;
-            saved.settings.displays_mode = mode;
+            let mut edited = saved.settings.overrides;
+            edited.displays_mode = mode.into();
+            saved
+                .settings
+                .overrides
+                .replace_in(edited, &mut saved.settings.unknown);
             Ok(())
         })
     }

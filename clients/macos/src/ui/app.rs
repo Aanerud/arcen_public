@@ -68,8 +68,10 @@ use arcen_deck_core::input::pointer_drag::{
 };
 use arcen_deck_core::reconnect_flow::ResumeLaunch;
 use arcen_deck_core::screens::certificate::{
-    render_certificate_changed, render_certificate_warning, CertificateAction,
-    CertificateChangedAction, CertificateFacts, RememberedIdentity,
+    certificate_retry_auth, render_certificate_changed, render_certificate_warning,
+    replace_remembered_identity, CertificateAction, CertificateChangedAction,
+    CertificateChangedStep, CertificateFacts, IdentityChange, IdentityChangeOutcome,
+    IdentityReplaced,
 };
 use arcen_deck_core::screens::connecting::{
     render_connecting, render_displays_unsupported, render_topology_conflict, ConnectingAction,
@@ -78,9 +80,7 @@ use arcen_deck_core::screens::connecting::{
 use arcen_deck_core::screens::reconnect::{
     render_reconnecting, render_signing_in, HeldFrame, HeldFrameAction,
 };
-use arcen_deck_core::screens::sign_in::{
-    render_credentials, render_disclaimer, CredentialAction, CredentialsView, DisclaimerAction,
-};
+use arcen_deck_core::screens::sign_in::{render_disclaimer, DisclaimerAction};
 #[cfg(test)]
 use arcen_deck_core::screens::statistics::{client_video_health_rows, host_path_row};
 use arcen_deck_core::screens::statistics::{
@@ -88,7 +88,7 @@ use arcen_deck_core::screens::statistics::{
     paint_negotiated_truth_panel, paint_presentation_warning, paint_stream_stats,
     paint_truth_badge, stream_pipeline_label, DecodeTruth, HealthOverlayFacts,
 };
-use arcen_deck_core::screens::widgets::{back_button, labelled_line_edit};
+use arcen_deck_core::sign_in::{SignInFailure, SignInStage, SignInState};
 use arcen_input::deck_pen::ImageRect;
 use arcen_input::deck_wheel::{WheelAccumulator, WheelAxis};
 #[cfg(test)]
@@ -847,14 +847,23 @@ enum FocusedKeyboardViewport {
 /// routes through. Every caller uses this instead of re-deriving what the
 /// call did to the visible screen from `self.screen`/`self.reconnect`
 /// afterwards.
+/// The identity-changed screen's facts: the connection and the comparison
+/// shown, which carries the presented identity "Trust and connect" trusts
+/// (`IdentityChange::replacement`).
+#[derive(Debug, Clone)]
+pub struct ChangedIdentity {
+    draft: ConnectionDraft,
+    change: IdentityChange,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultiWindowFailureOutcome {
     /// A still-valid, still-permitted reconnect credential was scheduled;
     /// `AppScreen` moved to `Reconnecting`/`Resuming`.
     ReconnectScheduled,
     /// No reconnect was available or permitted; `AppScreen` moved
-    /// explicitly to `Credentials` or `Home` via `return_to_credentials`.
-    ReturnedToCredentialsOrHome,
+    /// explicitly to `Home` via `return_home`, with the connection selected.
+    ReturnedHome,
 }
 
 /// Typed outcome of [`ArcenApp::begin_multi_window_if_applicable`]. Its
@@ -868,7 +877,7 @@ enum MultiWindowFailureOutcome {
 /// block, which would otherwise unconditionally re-affirm
 /// `AppScreen::InSession` from a frame the now-torn-down media worker
 /// already queued before it -- would silently resurrect a stale in-session
-/// screen over the freshly-set `Reconnecting`/`Credentials`/`Home` one.
+/// screen over the freshly-set `Reconnecting`/`Home` one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultiWindowBeginOutcome {
     /// The runtime gate is off, no multi-monitor-v1 topology was applied,
@@ -897,18 +906,16 @@ fn synthetic_native_key_event(
 #[derive(Debug, Clone)]
 pub enum AppScreen {
     Home,
-    AddConnection,
     CertificateWarning(ConnectionDraft, CertInfo),
-    /// A *remembered* host identity no longer matches what answered.
+    /// A *remembered* host identity no longer matches what answered: the
+    /// shared "This computer's identity has changed" screen, the remembered
+    /// fingerprint next to the presented one, Cancel the default and the
+    /// new identity trusted only after a confirmation.
     ///
     /// Distinct from [`AppScreen::CertificateWarning`], which is the ordinary
-    /// first-use prompt for an unknown host. This one means trust already
-    /// existed and broke, so it never offers plain "trust": the only forward
-    /// move is to forget the old identity deliberately and be re-prompted with
-    /// the new one, which the user then compares as they did the first time.
-    CertificateChanged(ConnectionDraft, crate::ui::trusted_pins::StoredPin),
+    /// first-use prompt for an unknown host.
+    CertificateChanged(Box<ChangedIdentity>),
     Disclaimer(ConnectionDraft, String),
-    Credentials(ConnectionDraft),
     Connecting(ConnectionDraft),
     LaunchingSession(ConnectionDraft),
     InSession,
@@ -973,8 +980,7 @@ struct LoginWindowHandover {
     auth: crate::transport::websocket::AuthSubmission,
 }
 
-use arcen_deck_core::screens::settings::{tablet_mode_description, tablet_mode_label, SettingsTab};
-use arcen_deck_core::screens::wording::deck_platform;
+use arcen_deck_core::screens::settings::SettingsTab;
 
 fn stream_profile_video_variant(
     profile: &StreamProfile,
@@ -1200,27 +1206,6 @@ fn tablet_mode_result_is_consistent(result: &TabletModeResultMsg) -> bool {
         _ => false,
     }
 }
-
-/// Tablet modes this build can actually run, in display order.
-///
-/// Settings shows the bridged mode with "(not available in this build)" so its
-/// existence stays discoverable. The connection dialog is a different job: a
-/// connection saved with a mode this build cannot run fails later, at connect
-/// time, for a reason the dialog never mentioned. Offering it there only
-/// manufactures broken configurations.
-#[cfg(feature = "native-tablet")]
-const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
-    TabletModeMsg::LocalTermination,
-    TabletModeMsg::UsbTabletBridge,
-    TabletModeMsg::DisabledMouseCompat,
-];
-
-/// Tablet modes this build can actually run, in display order.
-#[cfg(not(feature = "native-tablet"))]
-const TABLET_MODE_CHOICES: &[TabletModeMsg] = &[
-    TabletModeMsg::LocalTermination,
-    TabletModeMsg::DisabledMouseCompat,
-];
 
 pub use arcen_deck_core::config::*;
 use arcen_deck_core::screens::host_pointer::host_pointer_point;
@@ -1497,12 +1482,9 @@ pub struct ArcenApp {
     pending_desktop_replacement: bool,
     /// One-shot explanation shown above the credentials form.
     ///
-    /// A recovery choice (reconnect/replace, or accept a single display)
-    /// retries as a genuinely new connection, and the typed password was
-    /// zeroized when it was submitted, so the host asks for credentials
-    /// again. That is correct, but silently re-showing the same form reads as
-    /// the app having lost the password. Say why instead.
-    credentials_note: Option<String>,
+    /// The last sign-in outcome Home shows under the selected connection's
+    /// field, or in an acknowledgement box (`arcen_deck_core::sign_in`).
+    sign_in: SignInState,
     /// Per-secondary-monitor fractional relative-motion accumulator, keyed
     /// by the negotiated `SessionMonitorId` that owns `secondary_pointer_lock`
     /// -- entirely separate from root's own `relative_motion` above, for the
@@ -1711,14 +1693,10 @@ pub struct ArcenApp {
     native_menu_refreshed: bool,
     add_connection_host: String,
     add_connection_name: String,
-    add_connection_port: String,
     add_connection_username: String,
-    add_connection_tablet_mode_requested: TabletModeMsg,
-    /// Working value for the connection form's Displays selector; `None`
-    /// means "Use app default".
-    add_connection_displays_mode: Option<DisplaysMode>,
-    /// Working value for the connection form's Keyboard settings.
-    add_connection_keyboard: arcen_input::keyboard::KeyboardSettings,
+    /// Working values for the connection form's own-value settings
+    /// (Displays, Command, Typing).
+    add_connection_overrides: arcen_deck_core::overrides::ConnectionOverrides,
     editing_index: Option<usize>,
     /// `true` when the Home detail panel is showing the "Add connection" form.
     home_add_mode: bool,
@@ -1733,14 +1711,16 @@ pub struct ArcenApp {
     /// identity has changed fails terminally instead of re-asking a question
     /// the user has already answered.
     remembered_tls_pins: crate::ui::trusted_pins::TrustedPinStore,
+    /// What Export or Import last did, under Home's list until dismissed.
+    home_notice: Option<arcen_deck_core::screens::home::HomeNotice>,
     /// The connection test shown on the Home screen (Test connection).
     connection_test: Option<crate::ui::connection_test::ConnectionTest>,
-    /// Ticked by the user on the changed-identity screen.
+    /// The changed-identity screen's step (asking, or confirming the trust).
     ///
     /// Held on the app rather than inside the modal so the modal stays a pure
-    /// renderer, and so the tick is cleared whenever that screen is entered or
-    /// left — a confirmation must never survive from one incident to the next.
-    certificate_change_acknowledged: bool,
+    /// renderer, and reset whenever that screen is entered or left — a
+    /// confirmation must never survive from one incident to the next.
+    certificate_change_step: CertificateChangedStep,
     pending_connection: Option<ConnectionDraft>,
     last_audio_queued_ms: usize,
     remember_username: bool,
@@ -1751,6 +1731,9 @@ pub struct ArcenApp {
     native_tablet: arcen_deck_core::screens::settings::NativeTabletComponent,
     /// Settings › Logs › "Create support bundle…" (shared panel).
     support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel,
+    /// Home's Export… and Import… of `.arcen` connection files, and the
+    /// import summary (shared).
+    profile_sharing: arcen_deck_core::screens::profile::ProfileSharing,
     log_level: LogLevel,
     security_mode: SecurityMode,
     performance_mode: PerformanceMode,
@@ -1776,18 +1759,18 @@ pub struct ArcenApp {
     pending_displays_override: Option<(String, DisplaysMode)>,
     /// Credentials preserved across a recovery choice.
     ///
-    /// `drop_session_handles` clears `deferred_auth` when the host closes, so
-    /// without holding it here a user who picks "reconnect" or "use this
+    /// `drop_session_handles` clears `deferred_auth` and `submitted_auth`
+    /// when the host closes, so without holding it here a user who picks "reconnect" or "use this
     /// host's single display" is asked to type a password they supplied
     /// seconds earlier, for what looks to them like one attempt. Mirrors the
     /// certificate prompt, which already preserves it for the same reason.
     /// Consumed by whichever recovery choice is taken, and dropped if the
     /// user cancels.
     recovery_auth: Option<crate::transport::websocket::AuthSubmission>,
-    /// Credentials typed on the credentials screen, kept only until the
-    /// host's hello says whether this session is its sign-in screen. Sent
-    /// directly, they are otherwise gone by then, and the sign-in hand-over
-    /// needs them.
+    /// Credentials sent to the host, kept only until the host's hello says
+    /// whether this session is its sign-in screen (or, if the host closes
+    /// first, for a recovery choice). Sent directly, they are otherwise gone
+    /// by then, and the sign-in hand-over needs them.
     submitted_auth: Option<crate::transport::websocket::AuthSubmission>,
     /// Following the host's sign-in screen into the desktop that replaces it.
     /// Holds the credentials only while the session is a sign-in screen or is
@@ -1839,9 +1822,10 @@ pub struct ArcenApp {
     /// `close_multi_window_session`.
     active_secondary_keyboard_focus: Option<arcen_media::SessionMonitorId>,
     native_key_metadata: VecDeque<NativeKeyMetadata>,
-    /// The keyboard settings of the connection being made; the host's
-    /// hello turns them into the keyboard policy.
-    active_keyboard: arcen_input::keyboard::KeyboardSettings,
+    /// The own values of the connection being made (Command, Typing,
+    /// Option keys, clipboard); the host's hello turns its keyboard
+    /// settings into the keyboard policy.
+    active_overrides: arcen_deck_core::overrides::ConnectionOverrides,
     reconnect: Option<ReconnectController>,
     reconnect_clock: SystemClock,
     reconnect_jitter: SystemJitter,
@@ -1899,6 +1883,8 @@ pub struct ArcenApp {
     system_shortcut_tap: Option<crate::ui::system_shortcut_tap::SystemShortcutTap>,
     /// The keyboard indicator the menu bar shows.
     keyboard_status_shown: String,
+    /// The clipboard notice the keyboard indicator's menu shows now.
+    clipboard_notice_shown: Option<&'static str>,
     /// Help ▸ Keyboard Shortcuts is open.
     keyboard_shortcuts_open: bool,
     /// Mirrors `ClientSettings::option_key_mode`.
@@ -1908,7 +1894,7 @@ pub struct ArcenApp {
     paste_keys: crate::ui::paste_keys::PasteKeys,
     /// The keyboard mode chosen from the menu during a session, and the
     /// endpoint it was chosen for: it outlives reconnects to that endpoint
-    /// and wins over the connection's saved mode.
+    /// and wins over the connection's Typing.
     session_keyboard_mode: Option<(String, arcen_input::text::KeyboardMode)>,
     /// The endpoint of the connection being made or held.
     keyboard_endpoint: String,
@@ -2056,9 +2042,23 @@ fn wants_dedicated_eight_bit_layer_state(
         && active.chroma == Some(arcen_media::ChromaSubsampling::Yuv420)
 }
 
+/// The Deck's egui setup when its window opens: the shared theme (fonts,
+/// style, both palettes). The manual's screenshots reuse it
+/// (`ui::doc_shots`).
+pub fn setup_egui(ctx: &egui::Context) {
+    theme::apply(ctx);
+}
+
+/// The window's background on every launcher screen and Settings.
+pub fn launcher_root_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::colours(ui).bg)
+        .inner_margin(0.0)
+}
+
 impl ArcenApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        theme::apply(&cc.egui_ctx);
+        setup_egui(&cc.egui_ctx);
         Self::default()
     }
 
@@ -2066,7 +2066,7 @@ impl ArcenApp {
         cc: &eframe::CreationContext<'_>,
         mut options: ConnectOptions,
     ) -> Self {
-        theme::apply(&cc.egui_ctx);
+        setup_egui(&cc.egui_ctx);
         let host = options.host.clone();
         let display_mode = DisplaysMode::from_key(&options.displays_mode);
         let mut app = Self {
@@ -2097,7 +2097,7 @@ impl ArcenApp {
             auto_reconnect: true,
         };
         app.apply_saved_connection_to_quick_connect(&mut options, &mut draft);
-        app.active_keyboard = app.saved_keyboard_for(&draft);
+        app.active_overrides = app.saved_overrides_for(&draft);
         app.enter_keyboard_endpoint(connection_endpoint(&draft));
         // A saved connection's own Displays choice wins; otherwise the
         // launch arguments' mode governs this session.
@@ -2227,13 +2227,8 @@ impl ArcenApp {
                 connections_error = Some(error.to_string());
             }
         }
-        let tablet_mode_requested = saved_store
-            .last_selected_connection_id
-            .as_deref()
-            .and_then(|id| saved_store.connections.iter().find(|saved| saved.id == id))
-            .map_or(settings.tablet_mode_requested, |saved| {
-                saved.settings.tablet_mode_requested
-            });
+        // One tablet mode for every connection (0.20.7).
+        let tablet_mode_requested = settings.tablet_mode_requested;
         // Apply the user's saved "Log level" to the already-initialised logging
         // backbone (main() brought it up at Info before the UI existed).
         crate::logging::set_level(settings.log_level.profile());
@@ -2357,7 +2352,7 @@ impl ArcenApp {
             pointer_drag: PointerDragCapture::default(),
             pointer_surfaces: Vec::new(),
             pending_desktop_replacement: false,
-            credentials_note: None,
+            sign_in: SignInState::default(),
             secondary_relative_motion: BTreeMap::new(),
             secondary_last_known_local_fraction: BTreeMap::new(),
             secondary_pointer_contained: BTreeMap::new(),
@@ -2463,23 +2458,22 @@ impl ArcenApp {
             native_menu_refreshed: false,
             add_connection_host: String::new(),
             add_connection_name: String::new(),
-            add_connection_port: String::new(),
             add_connection_username: String::new(),
-            add_connection_tablet_mode_requested: tablet_mode_requested,
-            add_connection_displays_mode: None,
-            add_connection_keyboard: arcen_input::keyboard::KeyboardSettings::default(),
+            add_connection_overrides: arcen_deck_core::overrides::ConnectionOverrides::default(),
             editing_index: None,
             connection_search: String::new(),
             accepted_tls_pins: Arc::new(Mutex::new(HashMap::new())),
             remembered_tls_pins,
+            home_notice: None,
             connection_test: None,
-            certificate_change_acknowledged: false,
+            certificate_change_step: CertificateChangedStep::default(),
             pending_connection: None,
             last_audio_queued_ms: 0,
             remember_username: true,
             settings_tab: SettingsTab::Streaming,
             native_tablet: Default::default(),
             support_bundle: Default::default(),
+            profile_sharing: Default::default(),
             log_level: settings.log_level,
             security_mode: settings.security_mode,
             performance_mode: settings.performance_mode,
@@ -2505,7 +2499,7 @@ impl ArcenApp {
             active_keyboard_viewport: None,
             active_secondary_keyboard_focus: None,
             native_key_metadata: VecDeque::new(),
-            active_keyboard: arcen_input::keyboard::KeyboardSettings::default(),
+            active_overrides: arcen_deck_core::overrides::ConnectionOverrides::default(),
             reconnect: None,
             reconnect_clock: SystemClock::default(),
             reconnect_jitter: SystemJitter,
@@ -2533,6 +2527,7 @@ impl ArcenApp {
             consumed_picture_buttons: 0,
             system_shortcut_tap: None,
             keyboard_status_shown: String::new(),
+            clipboard_notice_shown: None,
             keyboard_shortcuts_open: false,
             option_key_mode: settings.option_key_mode,
             paste_keys: {
@@ -2843,6 +2838,8 @@ impl eframe::App for ArcenApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // macOS "Reduce motion" makes every animation instant.
+        theme::set_reduce_motion(ui.ctx(), system_reduce_motion());
         self.ui_layout_load.note();
         self.lead_cursor_wanted = false;
         let available = ui.available_size();
@@ -2868,12 +2865,22 @@ impl eframe::App for ArcenApp {
                         egui::Color32::BLACK
                     }
                 } else {
-                    egui::Color32::WHITE
+                    launcher_root_frame(ui).fill
                 },
             )
             .inner_margin(0.0)
             .show(ui, |ui| {
                 ui.set_min_size(available);
+                // Esc or Enter closes Keyboard Shortcuts before anything
+                // under it reads the key, as on the Windows Deck (shared
+                // `help_windows::take_dismiss_key`); a session's keys stay
+                // the host's.
+                if self.keyboard_shortcuts_open
+                    && !matches!(self.screen, AppScreen::InSession)
+                    && arcen_deck_core::screens::help_windows::take_dismiss_key(ui.ctx())
+                {
+                    self.keyboard_shortcuts_open = false;
+                }
                 if !matches!(
                     self.screen,
                     AppScreen::InSession
@@ -2894,12 +2901,12 @@ impl eframe::App for ArcenApp {
                         // that matters: the whole point of the mode is that the
                         // usual protection is off, and a user who forgot they
                         // enabled it had no way to notice.
-                        let operator_notice = (self.security_mode == SecurityMode::Low).then_some(
-                            "Insecure mode: this Deck is not verifying Pier certificates. \
+                        let operator_notice = (self.security_mode.in_force() == SecurityMode::Low)
+                            .then_some(
+                                "Insecure mode: this Deck is not verifying Pier certificates. \
                              Anyone able to intercept the connection can read and control \
                              this session.",
-                        );
-                        let conn_error = self.status.strip_prefix("Connection error: ");
+                            );
                         if let Some(test) = &mut self.connection_test {
                             test.poll();
                         }
@@ -2912,14 +2919,21 @@ impl eframe::App for ArcenApp {
                             editing_index: &mut self.editing_index,
                             form_name: &mut self.add_connection_name,
                             form_host: &mut self.add_connection_host,
-                            form_port: &mut self.add_connection_port,
                             form_username: &mut self.add_connection_username,
-                            form_displays_mode: &mut self.add_connection_displays_mode,
-                            form_keyboard: &mut self.add_connection_keyboard,
-                            app_displays_mode: self.displays_mode,
-                            connection_error: conn_error,
+                            form_overrides: &mut self.add_connection_overrides,
+                            app_defaults: arcen_deck_core::overrides::AppDefaults {
+                                typing_mode: arcen_deck_core::overrides::stored_typing_mode(
+                                    self.typing_mode,
+                                ),
+                                option_keys: self.option_key_mode,
+                                displays_mode: self.displays_mode,
+                                clipboard_enabled: self.clipboard_enabled,
+                            },
+                            sign_in: &mut self.sign_in,
+                            overlay_open: self.keyboard_shortcuts_open || self.colour_check.open,
                             remember_username: &mut self.remember_username,
                             connection_test: self.connection_test.as_ref(),
+                            notice: &mut self.home_notice,
                         };
                         if let Some(action) = render_home(ui, &mut state) {
                             let keeps_test = matches!(
@@ -2943,6 +2957,33 @@ impl eframe::App for ArcenApp {
                             }
                             match outcome.effect {
                                 HomeEffect::None => {}
+                                HomeEffect::ExportProfile(index) => {
+                                    let services = crate::platform_services::services();
+                                    let outcome = self.profile_sharing.export(
+                                        index,
+                                        &arcen_deck_core::screens::profile::ProfileContext {
+                                            services: &*services,
+                                            repository: &self.config_repository,
+                                            security_mode: self.security_mode,
+                                            saved: &self.saved_connections,
+                                            pins: &mut self.remembered_tls_pins,
+                                        },
+                                    );
+                                    self.apply_profile_outcome(outcome);
+                                }
+                                HomeEffect::ImportProfile => {
+                                    let services = crate::platform_services::services();
+                                    let outcome = self.profile_sharing.import(
+                                        &arcen_deck_core::screens::profile::ProfileContext {
+                                            services: &*services,
+                                            repository: &self.config_repository,
+                                            security_mode: self.security_mode,
+                                            saved: &self.saved_connections,
+                                            pins: &mut self.remembered_tls_pins,
+                                        },
+                                    );
+                                    self.apply_profile_outcome(outcome);
+                                }
                                 HomeEffect::TestConnection { host, port } => {
                                     self.connection_test = Some(crate::ui::connection_test::start(
                                         &host,
@@ -2975,9 +3016,9 @@ impl eframe::App for ArcenApp {
                                     }
                                 }
                                 HomeEffect::Connect(mut draft) => {
-                                    // If the detail panel provided a password, pre-load
-                                    // an explicit auth submission so the Credentials
-                                    // screen is skipped. Threaded through as an explicit
+                                    // Home only connects with a password (shared
+                                    // `SignInState::connect`); pre-load it as an
+                                    // explicit auth submission. Threaded through as an explicit
                                     // argument -- never via `self.deferred_auth` -- all
                                     // the way into `start_connection`, which installs it
                                     // atomically immediately before the network launch:
@@ -2987,7 +3028,7 @@ impl eframe::App for ArcenApp {
                                     // left a real window where the session was already
                                     // live but `deferred_auth` was `None`, and an
                                     // immediate `AuthRequest` could wrongly fall through
-                                    // to the Credentials screen.
+                                    // to asking for the password again.
                                     let submission = if draft.password.is_empty() {
                                         None
                                     } else {
@@ -3000,8 +3041,21 @@ impl eframe::App for ArcenApp {
                                 }
                             }
                         }
+                        if self.profile_sharing.is_open() {
+                            let services = crate::platform_services::services();
+                            let outcome = self.profile_sharing.show(
+                                ui.ctx(),
+                                &mut arcen_deck_core::screens::profile::ProfileContext {
+                                    services: &*services,
+                                    repository: &self.config_repository,
+                                    security_mode: self.security_mode,
+                                    saved: &self.saved_connections,
+                                    pins: &mut self.remembered_tls_pins,
+                                },
+                            );
+                            self.apply_profile_outcome(outcome);
+                        }
                     }
-                    AppScreen::AddConnection => self.add_connection_screen(ui),
                     AppScreen::CertificateWarning(draft, info) => {
                         let facts = CertificateFacts {
                             endpoint: info.endpoint.clone(),
@@ -3018,68 +3072,57 @@ impl eframe::App for ArcenApp {
                                 self.screen = AppScreen::CertificateWarning(draft, info);
                             }
                             CertificateAction::Cancel => {
+                                // The prompt's sign-in goes with it.
+                                let _ =
+                                    certificate_retry_auth(cert_action, &mut self.recovery_auth);
                                 self.status = "Certificate trust cancelled".to_string();
                                 self.screen = AppScreen::Home;
                             }
-                            CertificateAction::TrustForSession => {
-                                self.trust_certificate_for_session(&draft, &info);
-                                // `deferred_auth` (if any) was already captured onto
-                                // `self` by `handle_certificate_untrusted` before this
-                                // screen was shown. Take it out and thread it through as
-                                // `start_connection`'s own explicit argument -- it
-                                // installs it atomically immediately before
-                                // `launch_session`, never reading `self.deferred_auth`
-                                // itself. Taking it out here first and restoring it onto
-                                // `self` only *after* `start_connection` returns (the old
-                                // pattern) would reopen the exact same race this fixes,
-                                // since `start_connection` already launches the session
-                                // by the time it returns.
-                                let preloaded_auth = self.deferred_auth.take();
-                                self.start_connection(draft, preloaded_auth, ui.ctx());
-                            }
-                            CertificateAction::TrustAndRemember => {
-                                self.trust_certificate_permanently(&draft, &info);
-                                let preloaded_auth = self.deferred_auth.take();
+                            CertificateAction::TrustForSession
+                            | CertificateAction::TrustAndRemember => {
+                                if cert_action == CertificateAction::TrustAndRemember {
+                                    self.trust_certificate_permanently(&draft, &info);
+                                } else {
+                                    self.trust_certificate_for_session(&draft, &info);
+                                }
+                                // The sign-in `handle_certificate_untrusted`
+                                // kept for the prompt, taken out and handed
+                                // to `start_connection` as its own argument:
+                                // it installs it immediately before
+                                // `launch_session`, so an immediate auth
+                                // request finds it.
+                                let preloaded_auth =
+                                    certificate_retry_auth(cert_action, &mut self.recovery_auth);
                                 self.start_connection(draft, preloaded_auth, ui.ctx());
                             }
                         }
                     }
-                    AppScreen::CertificateChanged(draft, remembered) => {
-                        let endpoint = connection_endpoint(&draft);
-                        let identity = RememberedIdentity {
-                            label: remembered.label.clone(),
-                            pinned_at: remembered.pinned_at.clone(),
-                            spki_display: remembered
-                                .to_pin()
-                                .map(|pin| crate::transport::tls::format_fingerprint(&pin.digest))
-                                .unwrap_or_else(|| remembered.digest.clone()),
-                        };
+                    AppScreen::CertificateChanged(changed) => {
                         match render_certificate_changed(
                             ui,
-                            &endpoint,
-                            &identity,
-                            &mut self.certificate_change_acknowledged,
+                            &changed.change,
+                            &mut self.certificate_change_step,
                         ) {
                             CertificateChangedAction::None => {
-                                self.screen = AppScreen::CertificateChanged(draft, remembered);
+                                self.screen = AppScreen::CertificateChanged(changed);
                             }
                             CertificateChangedAction::Cancel => {
-                                self.certificate_change_acknowledged = false;
+                                self.certificate_change_step = CertificateChangedStep::default();
                                 self.recovery_auth = None;
                                 self.status = "Connection cancelled; this host is still \
                                                trusted under its previous identity."
                                     .to_string();
                                 self.screen = AppScreen::Home;
                             }
-                            CertificateChangedAction::ForgetAndReconnect => {
-                                self.certificate_change_acknowledged = false;
-                                self.forget_remembered_identity(&endpoint);
-                                // Dial again at once. With no pin left, the
-                                // attempt stops at the ordinary first-use
-                                // prompt, which shows the replacement
-                                // fingerprint before anything is trusted.
+                            CertificateChangedAction::TrustNewIdentity => {
+                                self.certificate_change_step = CertificateChangedStep::default();
+                                let ChangedIdentity { draft, change, .. } = *changed;
                                 let preserved = self.recovery_auth.take();
-                                self.begin_connection_flow(draft, preserved, ui.ctx());
+                                if self.trust_new_identity(&change) {
+                                    self.begin_connection_flow(draft, preserved, ui.ctx());
+                                } else {
+                                    self.screen = AppScreen::Home;
+                                }
                             }
                         }
                     }
@@ -3092,7 +3135,7 @@ impl eframe::App for ArcenApp {
                                 if let Some(submission) = self.deferred_auth.take() {
                                     self.submit_auth_submission(draft, submission);
                                 } else {
-                                    self.show_credentials(draft);
+                                    self.ask_for_password(draft);
                                 }
                             }
                             DisclaimerAction::Decline => {
@@ -3101,28 +3144,6 @@ impl eframe::App for ArcenApp {
                                 self.decline_disclaimer();
                                 self.status = "Disclaimer declined".to_string();
                                 self.screen = AppScreen::Home;
-                            }
-                        }
-                    }
-                    AppScreen::Credentials(mut draft) => {
-                        let credentials_note = self.credentials_note.clone();
-                        let mut view = CredentialsView {
-                            draft: &mut draft,
-                            note: credentials_note.as_deref(),
-                            error: self.status.strip_prefix("Connection error: "),
-                            remember_username: &mut self.remember_username,
-                        };
-                        let action = render_credentials(ui, &mut view);
-                        match action {
-                            CredentialAction::None => self.screen = AppScreen::Credentials(draft),
-                            // Back must actually leave: re-running the
-                            // connection flow lands right back on this screen
-                            // once the host is trusted.
-                            CredentialAction::Back => {
-                                self.cancel_credentials(draft);
-                            }
-                            CredentialAction::Connect => {
-                                self.submit_credentials(draft);
                             }
                         }
                     }
@@ -3143,6 +3164,7 @@ impl eframe::App for ArcenApp {
                     }
                 }
             });
+        self.leave_recovery();
         if self.microphone_active {
             Self::paint_microphone_indicator(ui);
         }
@@ -3231,6 +3253,7 @@ impl ArcenApp {
             tablet_mode_result,
             display_update_result,
             certificate_untrusted,
+            certificate_changed,
             pending_cursor_shape,
             pending_host_cursor,
             pending_host_pointer,
@@ -3340,6 +3363,7 @@ impl ArcenApp {
                 state.tablet_mode_result.take(),
                 state.display_update_result.take(),
                 state.certificate_untrusted.take(),
+                state.certificate_changed.take(),
                 state.pending_cursor_shape.take(),
                 state.pending_host_cursor.take(),
                 state.pending_host_pointer.take(),
@@ -3368,6 +3392,10 @@ impl ArcenApp {
 
         if let Some(info) = certificate_untrusted {
             self.handle_certificate_untrusted(info);
+            return;
+        }
+        if let Some(info) = certificate_changed {
+            self.handle_certificate_changed(info);
             return;
         }
 
@@ -3686,7 +3714,7 @@ impl ArcenApp {
             // would unconditionally re-affirm `AppScreen::InSession` from
             // a frame the now-torn-down worker already queued before the
             // failure, silently overwriting the just-set
-            // `Reconnecting`/`Credentials`/`Home` screen. The same check
+            // `Reconnecting`/`Home` screen. The same check
             // also fires defensively if session handles or the connection
             // generation changed for any other reason during this call.
             let session_handles_changed = self.connection_generation != generation
@@ -4319,7 +4347,7 @@ impl ArcenApp {
         //
         // `multi_window_failure` -> `drop_session_handles` can legitimately
         // call this method *twice* for the same failure (once directly,
-        // then again from `return_to_credentials`'s own
+        // then again from `return_home`'s own
         // `drop_session_handles` when no reconnect gets scheduled) --
         // every other reset below is naturally idempotent, but a bare
         // unconditional `self.root_pre_entry_snapshot.take()` here is not:
@@ -6435,6 +6463,9 @@ impl ArcenApp {
     /// Tear down the active session: signal the worker/transport to close and
     /// drop the UI-side handles so `sync_media_state` becomes a no-op.
     fn disconnect(&mut self) {
+        // A password never outlives its attempt on Home (the shared Connect
+        // already took it; this covers any other way in).
+        self.direct.password.zeroize();
         self.login_window_handover = None;
         self.stream_stats_text.clear();
         self.layout_note = None;
@@ -6480,7 +6511,7 @@ impl ArcenApp {
     /// Then either preserves/schedules a reconnect attempt -- mirroring
     /// `handle_connection_closed`'s own transient-reconnect branch exactly
     /// -- when this generation's `ReconnectController` still permits
-    /// scheduling one, or falls through to `return_to_credentials`.
+    /// scheduling one, or falls through to `return_home`.
     fn multi_window_failure(
         &mut self,
         ctx: &egui::Context,
@@ -6509,9 +6540,9 @@ impl ArcenApp {
             }
         }
 
-        self.return_to_credentials();
+        self.return_home(SignInFailure::SessionEnded, Some(reason.to_owned()));
         ctx.request_repaint();
-        MultiWindowFailureOutcome::ReturnedToCredentialsOrHome
+        MultiWindowFailureOutcome::ReturnedHome
     }
 
     fn multi_window_failure_fresh(
@@ -6526,9 +6557,9 @@ impl ArcenApp {
         }
         self.reconnect = None;
         self.reconnect_options = None;
-        self.return_to_credentials();
+        self.return_home(SignInFailure::SessionEnded, Some(reason.to_owned()));
         ctx.request_repaint();
-        MultiWindowFailureOutcome::ReturnedToCredentialsOrHome
+        MultiWindowFailureOutcome::ReturnedHome
     }
 
     /// The Displays mode this connection attempt must actually use: the
@@ -6586,6 +6617,9 @@ impl ArcenApp {
     }
 
     fn drop_session_handles_preserving_native_hold(&mut self, preserve_native_hold: bool) {
+        // A recovery screen stores it after this teardown; a recovery choice
+        // takes it before the next attempt tears down.
+        self.recovery_auth = None;
         self.release_pointer_lock("disconnect");
         self.release_remote_keys("disconnect");
         self.release_pen_authority("disconnect");
@@ -6679,7 +6713,7 @@ impl ArcenApp {
         ui.painter().text(
             indicator.center(),
             egui::Align2::CENTER_CENTER,
-            "MIC ACTIVE",
+            "Mic on",
             egui::FontId::proportional(13.0),
             egui::Color32::WHITE,
         );
@@ -6719,19 +6753,10 @@ impl ArcenApp {
         } else if let Some(submission) = self.deferred_auth.take() {
             self.submit_auth_submission(draft, submission);
         } else {
-            // If we reach this path, the server is asking for credentials that
-            // were not pre-supplied. That is a real fallback, but it should not
-            // happen for the quick-connect flow that already seeded deferred_auth.
-            self.show_credentials(draft);
+            // The host asks for a password this attempt does not carry (a
+            // launch-time quick connect, say): Home asks for it.
+            self.ask_for_password(draft);
         }
-    }
-
-    fn cancel_credentials(&mut self, mut draft: ConnectionDraft) {
-        draft.auto_reconnect = false;
-        self.credentials_note = None;
-        self.disconnect();
-        self.status = "Authentication cancelled".to_string();
-        self.screen = AppScreen::Home;
     }
 
     /// Apply a command dispatched from the native macOS menu bar. The native
@@ -6902,28 +6927,17 @@ impl ArcenApp {
             return;
         }
 
-        // Only a host-accepted request for a host-drawn cursor hides this
-        // Mac's cursor. A Local request always keeps it: it moves with the
-        // window server at display rate, never at the video's rate. A host
-        // that still draws its cursor into the video (an older Wayland Pier,
-        // or a desktop opened by a Deck that asked for a host cursor) shows
-        // a second, lagging pointer in the pixels; that is the host's to
-        // fix, never a reason to hide the one that keeps up.
-        self.active_cursor_mode = match (result.requested, result.active) {
-            (CursorMode::Host, CursorMode::Host)
-                if result.accepted && self.session_commands.is_some() =>
-            {
-                CursorMode::Host
-            }
-            _ => CursorMode::Local,
+        // Whenever the host reports Host, the pointer is in the video (the
+        // shared `host_draws_pointer`): an accepted Host request, the
+        // automatic cursor on a host that sends no cursor images, or a
+        // Wayland desktop embedded in Host mode answering a Local request.
+        // This Mac's cursor would be a second one, so it is hidden.
+        self.active_cursor_mode = if result.host_draws_pointer() && self.session_commands.is_some()
+        {
+            CursorMode::Host
+        } else {
+            CursorMode::Local
         };
-        if result.requested == CursorMode::Local && result.active == CursorMode::Host {
-            tracing::warn!(
-                target: crate::logging::target::SESSION,
-                reason = result.reason.as_str(),
-                "host also draws its cursor into the video; the Deck keeps drawing this Mac's cursor",
-            );
-        }
         self.host_cursor_images = result.cursor_images;
         self.host_cursor_positions = result.cursor_positions;
         if !result.cursor_positions {
@@ -6935,6 +6949,7 @@ impl ArcenApp {
             requested = ?result.requested,
             active = ?self.active_cursor_mode,
             accepted = result.accepted,
+            automatic = result.automatic,
             cursor_images = result.cursor_images,
             cursor_positions = result.cursor_positions,
             reason = result.reason.as_str(),
@@ -7275,11 +7290,19 @@ impl ArcenApp {
     }
 
     fn launcher_top_bar(&mut self, ui: &mut egui::Ui) {
-        if arcen_deck_core::screens::launcher::render_launcher_top_bar(ui)
-            == arcen_deck_core::screens::launcher::LauncherAction::OpenSettings
-        {
-            self.screen = AppScreen::Settings;
+        use arcen_deck_core::screens::launcher::{
+            open_user_guide, render_launcher_top_bar, TopBarAction,
+        };
+        match render_launcher_top_bar(ui) {
+            Some(TopBarAction::Settings) => self.open_settings(),
+            Some(TopBarAction::Help) => open_user_guide(ui.ctx()),
+            None => {}
         }
+    }
+
+    fn open_settings(&mut self) {
+        self.screen = AppScreen::Settings;
+        self.leave_recovery();
     }
 
     fn begin_connection_flow(
@@ -7309,13 +7332,6 @@ impl ArcenApp {
                     self.reconcile_saved_connections(store);
                     draft.username.clear();
                     self.load_saved_username(&mut draft);
-                    if let Some(saved) = self.saved_connections.iter().find(|saved| saved.id == id)
-                    {
-                        self.tablet_mode_requested = saved.settings.tablet_mode_requested;
-                        self.tablet_mode_active = self.tablet_mode_requested;
-                        self.tablet_input_enabled =
-                            tablet_mode_allows_typed_pen(self.tablet_mode_requested);
-                    }
                 }
                 Err(error) => {
                     self.status = format!("Connection could not be selected: {error}");
@@ -7366,24 +7382,29 @@ impl ArcenApp {
             .iter()
             .find(|saved| saved.id == *id)?
             .settings
+            .overrides
             .displays_mode
+            .own()
     }
 
-    /// This connection's saved keyboard settings; the defaults (the host
-    /// platform's own mapping) when it is unsaved.
-    fn saved_keyboard_for(
+    /// This connection's own values; none (everything follows Settings)
+    /// when it is unsaved.
+    fn saved_overrides_for(
         &self,
         draft: &ConnectionDraft,
-    ) -> arcen_input::keyboard::KeyboardSettings {
+    ) -> arcen_deck_core::overrides::ConnectionOverrides {
         draft
             .saved_connection_id
             .as_ref()
             .and_then(|id| self.saved_connections.iter().find(|saved| saved.id == *id))
-            .map(|saved| saved.settings.keyboard)
+            .map(|saved| saved.settings.overrides)
             .unwrap_or_default()
     }
 
-    fn show_credentials(&mut self, mut draft: ConnectionDraft) {
+    /// The host asked for a password this attempt does not carry: the
+    /// waiting attempt is closed and Home asks for it under the selected
+    /// connection's password field. Connect there starts a fresh attempt.
+    fn ask_for_password(&mut self, mut draft: ConnectionDraft) {
         if draft.username.is_empty() {
             self.load_saved_username(&mut draft);
             if draft.username.is_empty() {
@@ -7407,8 +7428,12 @@ impl ArcenApp {
                 }
             }
         }
+        self.disconnect();
         self.status = format!("Enter password for {}", display_name_for_draft(&draft));
-        self.screen = AppScreen::Credentials(draft);
+        self.direct = self
+            .sign_in
+            .return_home(SignInFailure::PasswordRequired, draft, None);
+        self.screen = AppScreen::Home;
     }
 
     /// Runs the Match My Layout preflight against the live displays and
@@ -7502,8 +7527,8 @@ impl ArcenApp {
         // this local until immediately before `launch_session` re-installs
         // it atomically -- closing the window an immediate `AuthRequest`
         // arriving during/just after launch could otherwise observe
-        // `deferred_auth` as `None` and wrongly fall through to the
-        // Credentials screen. Every early return below (before
+        // `deferred_auth` as `None` and wrongly ask for the password again.
+        // Every early return below (before
         // `launch_session` is ever reached) simply drops `preloaded_auth`
         // without installing it: the attempt never launched, so there is no
         // session left for it to auto-submit into.
@@ -7586,7 +7611,7 @@ impl ArcenApp {
             host = connection_endpoint(&draft),
             "arcen-deck connecting",
         );
-        self.active_keyboard = self.saved_keyboard_for(&draft);
+        self.active_overrides = self.saved_overrides_for(&draft);
         self.enter_keyboard_endpoint(connection_endpoint(&draft));
         let (options, policy) =
             self.connect_options_with_stream_sizing_policy(&draft, approved_multi_monitor_topology);
@@ -7697,7 +7722,7 @@ impl ArcenApp {
             controller.terminal();
             self.status = "Host returned an invalid session-resume response".to_string();
             self.drop_session_handles();
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, Some(self.status.clone()));
             return false;
         }
         if kind != AuthenticationKind::Refresh
@@ -7708,7 +7733,7 @@ impl ArcenApp {
         {
             self.status = "Connection closed before resume was accepted".to_string();
             self.drop_session_handles();
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, Some(self.status.clone()));
             return false;
         }
         if kind == AuthenticationKind::Resume {
@@ -7828,7 +7853,7 @@ impl ArcenApp {
             .is_some_and(|controller| controller.expire(now))
         {
             self.status = "Session resume window expired".to_string();
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, Some(self.status.clone()));
             return;
         }
         // Only a reconnecting controller can issue an attempt, and only that
@@ -7856,7 +7881,7 @@ impl ArcenApp {
                 )
             })
         else {
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, None);
             return;
         };
 
@@ -7869,7 +7894,7 @@ impl ArcenApp {
         ) {
             ResumeLaunch::Idle => {}
             ResumeLaunch::Abandon => {
-                self.return_to_credentials();
+                self.return_home(SignInFailure::SessionEnded, None);
                 return;
             }
             ResumeLaunch::Launch {
@@ -7899,36 +7924,40 @@ impl ArcenApp {
         };
     }
 
-    fn return_to_credentials(&mut self) {
+    /// The attempt or session is over without a desktop: back to Home with
+    /// the same connection selected, its password cleared and focused, and
+    /// `failure` said in plain words under it (or in a box), by the shared
+    /// `arcen_deck_core::sign_in`. `detail` goes to the log and "Details".
+    fn return_home(&mut self, failure: SignInFailure, detail: Option<String>) {
         if let Some(controller) = &mut self.reconnect {
             controller.terminal();
         }
         self.reconnect = None;
         self.reconnect_options = None;
         self.drop_session_handles();
-        if let Some(mut draft) = self.active_connection.take() {
-            draft.password.zeroize();
+        let draft = self.active_connection.take();
+        self.show_home_outcome(draft, failure, detail);
+    }
+
+    /// Home, with `failure` under `draft`'s connection when there is one.
+    fn show_home_outcome(
+        &mut self,
+        draft: Option<ConnectionDraft>,
+        failure: SignInFailure,
+        detail: Option<String>,
+    ) {
+        if let Some(mut draft) = draft {
             if draft.username.is_empty() {
                 self.load_saved_username(&mut draft);
             }
-            self.screen = AppScreen::Credentials(draft);
-        } else {
-            self.screen = AppScreen::Home;
+            self.direct = self.sign_in.return_home(failure, draft, detail);
         }
-    }
-
-    fn submit_credentials(&mut self, mut draft: ConnectionDraft) {
-        let submission = AuthSubmission {
-            username: draft.username.clone(),
-            password: std::mem::take(&mut draft.password),
-        };
-        self.submit_auth_submission(draft, submission);
+        self.screen = AppScreen::Home;
     }
 
     fn submit_auth_submission(&mut self, draft: ConnectionDraft, submission: AuthSubmission) {
         let submitted_username = submission.username.clone();
         self.submitted_auth = Some(submission.clone());
-        self.credentials_note = None;
         let mut active = draft.clone();
         active.password.zeroize();
         self.active_connection = Some(active);
@@ -7967,14 +7996,14 @@ impl ArcenApp {
             self.disconnect();
             return;
         };
-        // TLS trust failure occurs before auth submission. Preserve the quick-
-        // connect auth payload so trust+retry does not force a second login UI.
+        // TLS trust failure occurs before auth submission. The prompt keeps
+        // the sign-in for the retry it may approve, and only for that
+        // (`certificate_retry_auth`; leaving the prompt any other way drops
+        // it, `leave_recovery`), so trust+retry does not ask again.
         let preserved_auth = self.deferred_auth.take();
         draft.password.zeroize();
         self.disconnect();
-        if self.deferred_auth.is_none() {
-            self.deferred_auth = preserved_auth;
-        }
+        self.recovery_auth = preserved_auth;
         self.status = format!("Verify server certificate for {}", info.endpoint);
         tracing::info!(
             target: crate::logging::target::UI,
@@ -8012,40 +8041,41 @@ impl ArcenApp {
             })
             .map(|connection| connection.name.clone())
             .filter(|name| !name.trim().is_empty());
-        self.remembered_tls_pins
-            .remember(&endpoint, &info.spki_sha256, label);
+        // Only this endpoint is written, under the identities' lock, and
+        // only while none is remembered for it on disk either (the prompt
+        // showed it as unknown): another window's identities stay.
+        let expected = self.remembered_tls_pins.resolved().get(&endpoint).copied();
+        let path = self.config_repository.trusted_pins_file();
+        let written = crate::ui::trusted_pins::remember_reviewed(
+            path.as_deref(),
+            &mut self.remembered_tls_pins,
+            &endpoint,
+            expected,
+            &info.spki_sha256,
+            label,
+        );
 
         // Also seed the process cache, so the retry that immediately follows
         // does not depend on the write having landed.
         self.trust_certificate_for_session(draft, info);
 
-        let Some(path) = self.config_repository.trusted_pins_file() else {
-            tracing::warn!(
-                target: crate::logging::target::UI,
-                %endpoint,
-                "no configuration directory; this host is trusted for this session only",
-            );
-            self.status =
-                "Trusted for this session only: the settings folder is unavailable.".to_string();
-            return;
-        };
-        if let Err(error) = crate::ui::trusted_pins::save(&path, &self.remembered_tls_pins) {
-            // Say so rather than implying a durability that does not exist.
-            tracing::warn!(
-                target: crate::logging::target::UI,
-                %endpoint,
-                %error,
-                "could not record the remembered host identity",
-            );
-            self.status =
-                "Trusted for this session only: the identity could not be saved.".to_string();
-        } else {
-            tracing::info!(
+        match written {
+            Ok(()) => tracing::info!(
                 target: crate::logging::target::UI,
                 %endpoint,
                 fingerprint = %info.spki_sha256_display,
                 "remembered this host's identity",
-            );
+            ),
+            Err(error) => {
+                // Say so rather than implying a durability that does not exist.
+                tracing::warn!(
+                    target: crate::logging::target::UI,
+                    %endpoint,
+                    %error,
+                    "could not record the remembered host identity",
+                );
+                self.status = format!("Trusted for this session only: {error}.");
+            }
         }
     }
 
@@ -8080,6 +8110,20 @@ impl ArcenApp {
         });
         self.status = format!("Connection error: {}", end.message);
         self.colour_check.last_close = Some(end.message.clone());
+        // Whether a desktop was up decides the words: a lost transport while
+        // connecting is "couldn't reach"; in a session it is "session ended".
+        let stage = if self.session_hello_handled
+            || matches!(
+                self.screen,
+                AppScreen::InSession
+                    | AppScreen::Reconnecting(_)
+                    | AppScreen::Resuming(_)
+                    | AppScreen::SigningIn
+            ) {
+            SignInStage::Session
+        } else {
+            SignInStage::Attempt
+        };
         // A fix's reconnect that the host refused brings the panel back, with
         // the host's reason.
         if std::mem::take(&mut self.colour_check.reopen_on_session) {
@@ -8094,9 +8138,14 @@ impl ArcenApp {
         // certificate prompt: `drop_session_handles` clears `deferred_auth`,
         // so without this a user who picks a recovery option is asked for a
         // password they already gave seconds earlier, for what looks to them
-        // like the same connection attempt. Anything that is not a recovery
-        // path drops it here, unchanged from before.
-        let recovery_auth = self.deferred_auth.take();
+        // like the same connection attempt. A submission already sent is
+        // kept too (the Windows Deck's rule): there is no sign-in page to
+        // ask again on, and asking on Home would lose the recovery choice.
+        // Anything that is not a recovery path drops it here.
+        let recovery_auth = self
+            .deferred_auth
+            .take()
+            .or_else(|| self.submitted_auth.take());
         let native_hold_close_can_continue = !matches!(
             end.reason,
             DisconnectReason::Terminal(
@@ -8160,10 +8209,6 @@ impl ArcenApp {
             }
         }
 
-        // Computed before `end.message` can be moved into the reconnect
-        // scheduler below.
-        let tofu_pin_mismatch = crate::transport::tls::is_tofu_pin_mismatch_message(&end.message);
-
         if arcen_deck_core::reconnect_flow::schedule_after_end(
             self.reconnect.as_mut(),
             generation,
@@ -8194,308 +8239,106 @@ impl ArcenApp {
             self.reconnect = None;
             self.reconnect_options = None;
             let draft = self.active_connection.take();
-
-            // Offer the recovery only for an identity this Deck chose to
-            // remember. A pin supplied by configuration is someone else's
-            // assertion about the host, and the Deck must not offer to discard
-            // it; a session-only pin evaporates on quit and needs no UI. Both
-            // still fail closed, exactly as before.
-            if tofu_pin_mismatch {
-                if let Some(draft) = draft {
-                    let endpoint = connection_endpoint(&draft);
-                    let configured_pin = draft.tls_trust.is_some();
-                    let remembered = self.remembered_tls_pins.pins.get(&endpoint).cloned();
-                    if let (false, Some(remembered)) = (configured_pin, remembered) {
-                        tracing::warn!(
-                            target: crate::logging::target::UI,
-                            %endpoint,
-                            remembered_fingerprint = %remembered.digest,
-                            "a remembered host identity no longer matches; offering to forget it",
-                        );
-                        self.certificate_change_acknowledged = false;
-                        // Kept for the immediate re-dial after forgetting, so
-                        // the user is not asked for a password twice.
-                        self.recovery_auth = recovery_auth;
-                        self.status = "This host's identity changed.".to_string();
-                        self.screen = AppScreen::CertificateChanged(draft, remembered);
-                        return;
-                    }
-                }
-            }
-            self.screen = AppScreen::Home;
+            // A remembered identity that changed arrives as
+            // `SessionEvent::CertificateChanged` (`handle_certificate_changed`),
+            // with the certificate presented instead; this is every other
+            // identity failure.
+            let detail = arcen_deck_core::sign_in::end_detail(&end);
+            self.show_home_outcome(draft, SignInFailure::HostIdentityChanged, Some(detail));
             return;
         }
-        self.return_to_credentials();
+        let detail = arcen_deck_core::sign_in::end_detail(&end);
+        let failure =
+            SignInFailure::after_end(end.reason, stage).unwrap_or(SignInFailure::SessionEnded);
+        self.return_home(failure, Some(detail));
     }
 
-    /// Drops the remembered identity for `endpoint` and persists the removal.
-    ///
-    /// Deliberately does not trust anything in its place. The next connection
-    /// finds no pin, runs the ordinary first-use path, and shows the new
-    /// fingerprint for comparison before the user commits to it.
-    fn forget_remembered_identity(&mut self, endpoint: &str) {
-        if !self.remembered_tls_pins.forget(endpoint) {
+    /// A host this Deck pinned presented another certificate: the session
+    /// never started and no credentials were sent. A remembered identity
+    /// gets the shared recovery screen; a configured or session-only pin
+    /// goes back to Home with the plain box.
+    fn handle_certificate_changed(&mut self, presented: CertInfo) {
+        let draft = self
+            .pending_connection
+            .clone()
+            .or_else(|| self.active_connection.clone());
+        // Kept for the connection that follows trusting the new identity, so
+        // the user is not asked for the password just typed.
+        let recovery_auth = self
+            .deferred_auth
+            .take()
+            .or_else(|| self.submitted_auth.take());
+        self.disconnect();
+        let Some(mut draft) = draft else {
+            self.screen = AppScreen::Home;
             return;
+        };
+        draft.password.zeroize();
+        match arcen_deck_core::screens::certificate::identity_change_outcome(
+            &draft,
+            &self.remembered_tls_pins,
+            &presented,
+        ) {
+            IdentityChangeOutcome::Recover(change) => {
+                tracing::warn!(
+                    target: crate::logging::target::UI,
+                    endpoint = %change.endpoint,
+                    remembered_fingerprint = %change.remembered,
+                    presented_fingerprint = %change.presented,
+                    "a remembered host identity no longer matches; offering the recovery",
+                );
+                self.certificate_change_step = CertificateChangedStep::default();
+                self.recovery_auth = recovery_auth;
+                self.status = "This computer's identity has changed.".to_string();
+                self.screen =
+                    AppScreen::CertificateChanged(Box::new(ChangedIdentity { draft, change }));
+            }
+            IdentityChangeOutcome::Refuse { detail } => {
+                self.show_home_outcome(
+                    Some(draft),
+                    SignInFailure::HostIdentityChanged,
+                    Some(detail),
+                );
+            }
         }
-        // The session cache would otherwise re-assert the identity that was
-        // just forgotten, and the retry would fail closed all over again.
+    }
+
+    /// "Trust and connect" on the identity-changed screen: the remembered
+    /// identity is replaced by the one the screen showed, the same kind, on
+    /// disk (one locked write of that endpoint) and for this run. Returns
+    /// whether to connect: not when another window changed the identity
+    /// while the screen was open.
+    fn trust_new_identity(&mut self, change: &IdentityChange) -> bool {
+        // The session cache must not re-assert the identity just replaced.
         self.accepted_tls_pins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(endpoint);
-
-        let Some(path) = self.config_repository.trusted_pins_file() else {
-            self.status = "Forgotten for this session only: the settings folder is \
-                           unavailable."
-                .to_string();
-            return;
-        };
-        if let Err(error) = crate::ui::trusted_pins::save(&path, &self.remembered_tls_pins) {
-            tracing::warn!(
-                target: crate::logging::target::UI,
-                %endpoint,
-                %error,
-                "could not persist forgetting this host's identity",
-            );
-            self.status =
-                "Forgotten for this session only: the change could not be saved.".to_string();
-        } else {
-            tracing::info!(
-                target: crate::logging::target::UI,
-                %endpoint,
-                "forgot this host's remembered identity at the user's request",
-            );
-            self.status = "Host identity forgotten. Verify the new one.".to_string();
+            .remove(&change.endpoint);
+        match replace_remembered_identity(
+            &self.config_repository,
+            &mut self.remembered_tls_pins,
+            change,
+        ) {
+            IdentityReplaced::Saved => {
+                tracing::info!(
+                    target: crate::logging::target::UI,
+                    endpoint = %change.endpoint,
+                    fingerprint = %change.presented,
+                    "replaced this host's remembered identity at the user's request",
+                );
+                true
+            }
+            IdentityReplaced::ThisRunOnly(status) => {
+                self.status = status;
+                true
+            }
+            IdentityReplaced::ChangedElsewhere => {
+                self.status = "This host's trusted identity changed in another Arcen Deck \
+                               window. Nothing was trusted: connect again to check it."
+                    .to_string();
+                false
+            }
         }
-    }
-
-    #[cfg(test)]
-    fn prepare_saved_connection_editor(&mut self, index: usize) {
-        let Some(saved) = self.saved_connections.get(index).cloned() else {
-            return;
-        };
-        self.add_connection_host = saved.host;
-        self.add_connection_name = saved.name;
-        self.add_connection_port = if saved.port != 0 {
-            saved.port
-        } else {
-            saved.transport.default_port()
-        }
-        .to_string();
-        self.add_connection_username = saved.settings.remembered_username.unwrap_or_default();
-        self.add_connection_tablet_mode_requested = saved.settings.tablet_mode_requested;
-        self.add_connection_displays_mode = saved.settings.displays_mode;
-        self.add_connection_keyboard = saved.settings.keyboard;
-        self.editing_index = Some(index);
-        self.screen = AppScreen::AddConnection;
-    }
-
-    fn add_connection_screen(&mut self, ui: &mut egui::Ui) {
-        let editing = self.editing_index.is_some();
-        ui.add_space(80.0);
-        ui.horizontal_top(|ui| {
-            ui.add_space(72.0);
-            ui.vertical(|ui| {
-                ui.set_width(360.0);
-                ui.add_space(28.0);
-                if back_button(ui, "Saved connections").clicked() {
-                    self.editing_index = None;
-                    self.add_connection_host.clear();
-                    self.add_connection_name.clear();
-                    self.add_connection_port.clear();
-                    self.add_connection_username.clear();
-                    self.screen = AppScreen::Home;
-                }
-                ui.add_space(34.0);
-                ui.heading(
-                    egui::RichText::new(if editing {
-                        "Edit connection"
-                    } else {
-                        "Add connection"
-                    })
-                    .color(egui::Color32::BLACK)
-                    .size(30.0),
-                );
-                ui.add_space(24.0);
-                ui.label(
-                    egui::RichText::new("Enter the host address.")
-                        .color(egui::Color32::from_rgb(0x5F, 0x5F, 0x5F))
-                        .size(16.0),
-                );
-            });
-
-            ui.add_space(86.0);
-            ui.vertical(|ui| {
-                ui.set_width(420.0);
-                ui.add_space(24.0);
-                labelled_line_edit(ui, "Address", &mut self.add_connection_host, false);
-                labelled_line_edit(ui, "Port", &mut self.add_connection_port, false);
-                ui.add_space(28.0);
-                labelled_line_edit(ui, "Connection Name", &mut self.add_connection_name, false);
-                ui.add_space(28.0);
-                labelled_line_edit(
-                    ui,
-                    "Remember username (optional)",
-                    &mut self.add_connection_username,
-                    false,
-                );
-                let username_valid = self.add_connection_username.trim().is_empty()
-                    || validated_remembered_username(&self.add_connection_username).is_some();
-                if !username_valid {
-                    ui.label(
-                        egui::RichText::new(
-                            "Username must be at most 255 bytes and contain no control characters.",
-                        )
-                        .color(egui::Color32::from_rgb(0xC0, 0x20, 0x20))
-                        .size(13.0),
-                    );
-                }
-                let parsed_port = self.add_connection_port.trim().parse::<u16>().ok();
-                let port_valid =
-                    parsed_port.is_some_and(|port| SavedTransport::Quic.accepts_port(port));
-                if !port_valid {
-                    ui.label(
-                        egui::RichText::new(SavedTransport::Quic.port_validation_message())
-                            .color(egui::Color32::from_rgb(0xC0, 0x20, 0x20))
-                            .size(13.0),
-                    );
-                }
-                ui.add_space(28.0);
-                ui.label(
-                    egui::RichText::new("Tablet mode")
-                        .color(egui::Color32::from_rgb(0x5F, 0x5F, 0x5F))
-                        .size(13.0),
-                );
-                egui::ComboBox::from_id_salt("saved_connection_tablet_mode")
-                    .selected_text(tablet_mode_label(self.add_connection_tablet_mode_requested))
-                    .show_ui(ui, |ui| {
-                        for mode in TABLET_MODE_CHOICES.iter().copied() {
-                            ui.selectable_value(
-                                &mut self.add_connection_tablet_mode_requested,
-                                mode,
-                                tablet_mode_label(mode),
-                            );
-                        }
-                    });
-                ui.label(
-                    egui::RichText::new(tablet_mode_description(
-                        self.add_connection_tablet_mode_requested,
-                        deck_platform(ui.ctx()),
-                    ))
-                    .color(egui::Color32::DARK_GRAY)
-                    .size(12.0),
-                );
-                ui.add_space(30.0);
-
-                let can_add = !self.add_connection_host.trim().is_empty()
-                    && !self.add_connection_name.trim().is_empty()
-                    && username_valid
-                    && port_valid;
-                let fill = if can_add {
-                    theme::ACCENT
-                } else {
-                    egui::Color32::from_rgb(0xF0, 0xF0, 0xF0)
-                };
-                let text = if can_add {
-                    egui::Color32::WHITE
-                } else {
-                    egui::Color32::from_rgb(0xA8, 0xA8, 0xA8)
-                };
-                let response = ui.add_sized(
-                    [420.0, 52.0],
-                    egui::Button::new(
-                        egui::RichText::new(if editing {
-                            "Save changes"
-                        } else {
-                            "Add connection"
-                        })
-                        .color(text)
-                        .size(18.0),
-                    )
-                    .fill(fill)
-                    .stroke(egui::Stroke::NONE),
-                );
-                if can_add && response.clicked() {
-                    let host = self.add_connection_host.trim().to_string();
-                    let name = self.add_connection_name.trim().to_string();
-                    let port = parsed_port
-                        .filter(|port| SavedTransport::Quic.accepts_port(*port))
-                        .unwrap_or_else(|| SavedTransport::Quic.default_port());
-                    let saved_result = match self.editing_index {
-                        Some(index) if index < self.saved_connections.len() => {
-                            let original = self.saved_connections[index].clone();
-                            let mut updated = original.clone();
-                            updated.name = name.clone();
-                            updated.host = host.clone();
-                            updated.port = port;
-                            updated.use_tls = true;
-                            updated.transport = SavedTransport::Quic;
-                            updated.settings.remembered_username =
-                                validated_remembered_username(&self.add_connection_username);
-                            updated.settings.tablet_mode_requested =
-                                self.add_connection_tablet_mode_requested;
-                            updated.settings.unknown.remove("remembered_username");
-                            self.config_repository
-                                .update_connection(&original.id, &original, updated)
-                                .map(|store| (store, format!("Updated {name}"), None))
-                        }
-                        _ => {
-                            let id = new_saved_connection_id(
-                                ConnectionKind::DirectMachine,
-                                &host,
-                                port,
-                                true,
-                                self.security_mode,
-                                &name,
-                                self.saved_connections.len(),
-                            );
-                            let connection = SavedConnectionSummary {
-                                id: id.clone(),
-                                kind: ConnectionKind::DirectMachine,
-                                name: name.clone(),
-                                host: host.clone(),
-                                port,
-                                use_tls: true,
-                                transport: SavedTransport::Quic,
-                                identity_security_mode: Some(self.security_mode.key().to_string()),
-                                settings: SavedConnectionSettings {
-                                    remembered_username: validated_remembered_username(
-                                        &self.add_connection_username,
-                                    ),
-                                    tablet_mode_requested: self
-                                        .add_connection_tablet_mode_requested,
-                                    ..SavedConnectionSettings::default()
-                                },
-                                unknown: serde_json::Map::new(),
-                            };
-                            self.config_repository
-                                .add_connection(connection)
-                                .map(|store| (store, format!("Added {name}"), Some(id)))
-                        }
-                    };
-                    match saved_result {
-                        Ok((store, status, added_id)) => {
-                            self.reconcile_saved_connections(store);
-                            if let Some(id) = added_id {
-                                self.direct.saved_connection_id = Some(id);
-                                self.direct.host = host;
-                                self.direct.port = port;
-                            }
-                            self.status = status;
-                            self.editing_index = None;
-                            self.add_connection_host.clear();
-                            self.add_connection_name.clear();
-                            self.add_connection_port.clear();
-                            self.add_connection_username.clear();
-                            self.screen = AppScreen::Home;
-                        }
-                        Err(error) => {
-                            self.status = format!("Connection was not saved: {error}");
-                        }
-                    }
-                }
-            });
-        });
     }
 
     /// Presents the two real recoveries for a host multi-monitor topology
@@ -8522,12 +8365,32 @@ impl ArcenApp {
         self.resolve_topology_conflict(draft, replace, &ctx);
     }
 
+    /// The one transition out of the recovery screens (topology conflict,
+    /// displays unsupported, changed identity) other than a recovery choice,
+    /// which takes `recovery_auth` itself: Settings, Home, a menu command or
+    /// anything else drops the kept password (`AuthSubmission` wipes itself
+    /// on drop). Run once per pass, after the screen was drawn.
+    fn leave_recovery(&mut self) {
+        if self.recovery_auth.is_some() && !self.screen_keeps_recovery_auth() {
+            self.recovery_auth = None;
+        }
+    }
+
+    const fn screen_keeps_recovery_auth(&self) -> bool {
+        matches!(
+            self.screen,
+            AppScreen::TopologyConflict(_)
+                | AppScreen::DisplaysUnsupported(_)
+                | AppScreen::CertificateChanged(..)
+                | AppScreen::CertificateWarning(..)
+        )
+    }
+
     /// Cancel on either display recovery screen.
     fn cancel_display_recovery(&mut self) {
         self.status.clear();
         // Never keep credentials alive past a cancelled recovery.
         self.recovery_auth = None;
-        self.credentials_note = None;
         self.screen = AppScreen::Home;
     }
 
@@ -8567,7 +8430,6 @@ impl ArcenApp {
             self.pending_displays_override = retry.displays_override;
         }
         self.status = retry.status.to_string();
-        self.credentials_note = Some(retry.credentials_note.to_string());
     }
 
     /// Offers the non-destructive recovery available when a host cannot serve
@@ -8605,7 +8467,6 @@ impl ArcenApp {
             self.remember_displays_mode_for(draft, mode);
         }
         self.status = retry.status.to_string();
-        self.credentials_note = Some(retry.credentials_note.to_string());
         tracing::info!(
             target: crate::logging::target::SESSION,
             "user accepted Primary Display Only for a host that cannot serve the complete layout",
@@ -8681,11 +8542,11 @@ impl ArcenApp {
             hdr_screen: self.hdr_screen_available(),
             notch: Some(!notch_insets.is_zero()),
             monitors: &monitors,
-            clipboard_policy: self
-                .clipboard_session
+            host_clipboard_notice: self
+                .session_commands
                 .as_ref()
-                .and_then(crate::clipboard::ClipboardSession::policy),
-            tablet_scope_note: self.tablet_mode_scope_note(),
+                .and_then(|_| self.host_clipboard_notice()),
+            connections: &self.saved_connections,
             native_tablet,
             decode: Some(crate::platform_services::services().decode_report()),
             support_bundle: Some(
@@ -8694,7 +8555,10 @@ impl ArcenApp {
             ),
             connection_displays: self.tablet_mode_connection_id().and_then(|id| {
                 let saved = self.saved_connections.iter().find(|saved| saved.id == id)?;
-                Some((saved.name.clone(), saved.settings.displays_mode?))
+                Some((
+                    saved.name.clone(),
+                    saved.settings.overrides.displays_mode.own()?,
+                ))
             }),
             canvas_available: canvas_request(true, self.canvas_cache_mib)
                 != arcen_deck_core::canvas::CanvasRequest::Unavailable,
@@ -8747,7 +8611,7 @@ impl ArcenApp {
             paste_settings,
             clipboard_enabled,
             microphone_enabled,
-            mut tablet_mode_requested,
+            tablet_mode_requested,
             pen_buttons,
             exact_still_image,
             canvas,
@@ -8799,15 +8663,6 @@ impl ArcenApp {
                 });
         }
         let old_mode = self.tablet_mode_requested;
-        let tablet_mode_persistence_error = if tablet_mode_requested != old_mode {
-            self.persist_tablet_mode_for_selected_connection(tablet_mode_requested)
-                .err()
-        } else {
-            None
-        };
-        if tablet_mode_persistence_error.is_some() {
-            tablet_mode_requested = old_mode;
-        }
         let encode_intent = color_fidelity.preset.encode_intent();
         let changed = log_level != self.log_level
             || security != self.security_mode
@@ -8885,10 +8740,6 @@ impl ArcenApp {
             self.status = format!("Settings were not saved; microphone disabled: {error}");
             tracing::error!(%error, "client settings persistence failed closed");
         }
-        if let Some(error) = tablet_mode_persistence_error.as_ref() {
-            self.status = format!("Tablet mode was not saved for this connection: {error}");
-            tracing::error!(%error, "saved connection tablet mode update failed");
-        }
         if clipboard_disabled_now {
             if self.session_commands.is_some() {
                 self.disconnect();
@@ -8956,6 +8807,32 @@ impl ArcenApp {
         }
     }
 
+    /// Applies Export's or Import's outcome as a Home outcome.
+    fn apply_profile_outcome(
+        &mut self,
+        outcome: arcen_deck_core::screens::profile::ProfileOutcome,
+    ) {
+        if let Some(notice) = outcome.home_notice() {
+            self.home_notice = Some(notice);
+        }
+        if let Some(store) = outcome.store {
+            self.reconcile_saved_connections(store);
+        }
+        if let Some(status) = outcome.status {
+            self.status = status;
+        }
+        if let Some(id) = outcome.select {
+            self.home_add_mode = false;
+            self.editing_index = None;
+            arcen_deck_core::screens::profile::select(
+                &mut self.direct,
+                &mut self.sign_in,
+                &self.saved_connections,
+                &id,
+            );
+        }
+    }
+
     fn reconcile_saved_connections(&mut self, store: SavedConnectionsStore) {
         self.saved_connections_version = store.version;
         self.saved_connections = store.connections;
@@ -9010,12 +8887,12 @@ impl ArcenApp {
         // This connection's own Displays choice, or `None` to keep
         // following the application default. Never written back into
         // `self.displays_mode`, which stays the app-wide default.
-        self.active_displays_mode = saved.settings.displays_mode;
-        options.tablet_mode_requested = saved.settings.tablet_mode_requested;
-        options.tablet_input_enabled = tablet_mode_allows_typed_pen(options.tablet_mode_requested);
-        self.tablet_mode_requested = options.tablet_mode_requested;
-        self.tablet_mode_active = self.tablet_mode_requested;
-        self.tablet_input_enabled = options.tablet_input_enabled;
+        self.active_displays_mode = saved.settings.overrides.displays_mode.own();
+        options.clipboard_enabled = saved
+            .settings
+            .overrides
+            .effective_clipboard_enabled(self.clipboard_enabled)
+            .value;
         draft.saved_connection_id = Some(saved_id.clone());
         let load_saved_username = options.username.is_empty();
         match self.config_repository.set_last_selected(&saved_id) {
@@ -9096,63 +8973,18 @@ impl ArcenApp {
         }
     }
 
-    /// The saved connection a tablet mode choice is written to.
+    /// The saved connection Settings refers to (its own Displays choice).
+    /// The tablet mode is application-wide since 0.20.7.
     ///
     /// Deliberately NOT falling back to the last selection when an active
     /// connection has no saved id: a quick-connect session must never
-    /// rewrite some unrelated saved connection's settings. Guarded by
-    /// `unsaved_active_connection_never_updates_last_selected_tablet_mode`.
+    /// rewrite some unrelated saved connection's settings.
     fn tablet_mode_connection_id(&self) -> Option<String> {
         if let Some(connection) = self.active_connection.as_ref() {
             connection.saved_connection_id.clone()
         } else {
             self.last_selected_connection_id.clone()
         }
-    }
-
-    /// Says which connection the Tablet choice belongs to. The mode is kept
-    /// per saved connection, and the Settings page used to give no sign of
-    /// it: an owner who chose Native tablet for three hosts connected to a
-    /// fourth with the Tablet support it had been saved with two months
-    /// earlier.
-    fn tablet_mode_scope_note(&self) -> String {
-        let name = self.tablet_mode_connection_id().and_then(|id| {
-            self.saved_connections
-                .iter()
-                .find(|saved| saved.id == id)
-                .map(|saved| saved.name.clone())
-        });
-        arcen_deck_core::screens::settings::tablet_scope_note(name.as_deref())
-    }
-
-    fn persist_tablet_mode_for_selected_connection(
-        &mut self,
-        mode: TabletModeMsg,
-    ) -> Result<(), ClientConfigError> {
-        let Some(id) = self.tablet_mode_connection_id() else {
-            // Nothing to write to. Correct, but previously silent: a tablet
-            // choice that cannot be persisted looks to the user like the
-            // setting was ignored, with nothing anywhere explaining why.
-            tracing::warn!(
-                target: crate::logging::target::UI,
-                ?mode,
-                "tablet mode could not be persisted: no saved connection is selected",
-            );
-            return Ok(());
-        };
-        if self
-            .saved_connections
-            .iter()
-            .find(|saved| saved.id == id)
-            .is_some_and(|saved| saved.settings.tablet_mode_requested == mode)
-        {
-            return Ok(());
-        }
-        let store = self
-            .config_repository
-            .set_tablet_mode_requested(&id, mode)?;
-        self.reconcile_saved_connections(store);
-        Ok(())
     }
 
     fn persist_settings(&self) -> Result<(), ClientConfigError> {
@@ -9330,7 +9162,10 @@ impl ArcenApp {
         options.replace_incompatible_desktop = self.pending_desktop_replacement;
         options.timezone = crate::timezone::current_identifier();
         options.cursor_preference = self.cursor_preference;
-        options.clipboard_enabled = self.clipboard_enabled;
+        options.clipboard_enabled = self
+            .active_overrides
+            .effective_clipboard_enabled(self.clipboard_enabled)
+            .value;
         options.microphone_enabled = self.microphone_enabled;
         options.tablet_input_enabled = self.tablet_input_enabled;
         options.tablet_mode_requested = self.tablet_mode_requested;
@@ -9646,7 +9481,7 @@ impl ArcenApp {
             self.login_window_handover = None;
             self.status = "Sign-in hand-over could not continue: connection destination was lost."
                 .to_string();
-            self.return_to_credentials();
+            self.return_home(SignInFailure::SessionEnded, Some(self.status.clone()));
             ctx.request_repaint();
             return;
         };
@@ -12161,20 +11996,24 @@ impl ArcenApp {
     }
 
     /// The keyboard mode in force: the menu's choice for this endpoint, else
-    /// the connection's saved mode, else none (the typing setting alone).
+    /// none (the connection's Typing, else Settings').
     fn keyboard_mode(&self) -> Option<arcen_input::text::KeyboardMode> {
         self.session_keyboard_mode
             .as_ref()
             .filter(|(chosen_for, _)| *chosen_for == self.keyboard_endpoint)
             .map(|(_, mode)| *mode)
-            .or(self.active_keyboard.typing)
     }
 
-    /// Applies the typing setting under the keyboard mode in force.
+    /// Applies the typing setting (the connection's own, else Settings')
+    /// under the keyboard mode in force.
     fn apply_typing_mode(&mut self) {
+        let setting = self
+            .active_overrides
+            .effective_typing_mode(self.typing_mode)
+            .value;
         let typing = self
             .keyboard_mode()
-            .map_or(self.typing_mode, |mode| mode.typing_mode(self.typing_mode));
+            .map_or(setting, |mode| mode.typing_mode(setting));
         if typing != self.text_input.mode() {
             tracing::info!(
                 target: crate::logging::target::INPUT,
@@ -12184,7 +12023,11 @@ impl ArcenApp {
                 "typing mode in force"
             );
         }
-        self.text_input.configure(typing, self.option_key_mode);
+        let option_keys = self
+            .active_overrides
+            .effective_option_keys(self.option_key_mode)
+            .value;
+        self.text_input.configure(typing, option_keys);
     }
 
     /// The menu's keyboard mode for this session (Control+Command+K/U, as
@@ -12437,7 +12280,7 @@ impl ArcenApp {
         let policy = arcen_input::keyboard::resolve_keyboard_policy(
             platform,
             extended_keys,
-            self.active_keyboard,
+            self.active_overrides.keyboard_settings(),
         )
         .with_host_meta_mask(host_meta_mask);
         let released = self.keyboard.set_policy(policy);
@@ -12447,7 +12290,7 @@ impl ArcenApp {
             ?platform,
             extended_keys,
             shortcuts = ?policy.shortcuts,
-            setting = self.active_keyboard.shortcuts.token(),
+            setting = self.active_overrides.effective_keyboard_shortcuts().value.token(),
             right_option_altgr = policy.right_option_altgr,
             left_option_altgr = policy.left_option_altgr,
             intl_backslash = policy.intl_backslash,
@@ -12882,6 +12725,27 @@ impl ArcenApp {
             macos_menu::set_keyboard_status(&line);
             self.keyboard_status_shown = line;
         }
+        let clipboard_notice = self.clipboard_notice();
+        if clipboard_notice != self.clipboard_notice_shown {
+            macos_menu::set_clipboard_notice(clipboard_notice);
+            self.clipboard_notice_shown = clipboard_notice;
+        }
+    }
+
+    /// "Clipboard is turned off by this host." while a session's host
+    /// blocks the clipboard the user shares (shared decision).
+    fn clipboard_notice(&self) -> Option<&'static str> {
+        if !self.keyboard_owner_session {
+            return None;
+        }
+        self.host_clipboard_notice()
+    }
+
+    /// The host's clipboard notice for the clipboard value this session
+    /// connected with (the connection's own over Settings).
+    fn host_clipboard_notice(&self) -> Option<&'static str> {
+        arcen_deck_core::clipboard::HostClipboard::from_hello(self.host_clipboard_policy)
+            .connection_notice(&self.active_overrides, self.clipboard_enabled)
     }
 
     /// Installs the event tap while the switch is on, the host has the
@@ -14740,7 +14604,10 @@ fn connect_options_from_draft(draft: &ConnectionDraft) -> ConnectOptions {
 
 /// The canvas this Deck asks for (ADR 0028): from the eight-bit presenter's
 /// canvas executor, so nothing is advertised until it has one.
-fn canvas_request(enabled: bool, cache_mib: u32) -> arcen_deck_core::canvas::CanvasRequest {
+pub(crate) fn canvas_request(
+    enabled: bool,
+    cache_mib: u32,
+) -> arcen_deck_core::canvas::CanvasRequest {
     arcen_deck_core::canvas::CanvasRequest::for_sink::<DedicatedEightBitVideoPresenter>(
         enabled, cache_mib,
     )
@@ -15263,6 +15130,18 @@ fn app_icon() -> egui::IconData {
             height: 0,
         }
     })
+}
+
+/// Whether macOS asks for reduced motion (System Settings › Accessibility ›
+/// Display › Reduce motion), read each pass so a change applies at once.
+#[cfg(target_os = "macos")]
+fn system_reduce_motion() -> bool {
+    objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn system_reduce_motion() -> bool {
+    false
 }
 
 pub fn run_native_app(mut initial_connect: Option<ConnectOptions>) -> eframe::Result<()> {
@@ -17017,37 +16896,6 @@ mod tests {
     }
 
     #[test]
-    fn the_connection_dialog_only_offers_tablet_modes_this_build_can_run() {
-        // A connection saved with the bridged mode in a build that lacks
-        // native-tablet fails at connect time, long after the dialog that
-        // offered it. Settings keeps the mode visible and marked
-        // "(not available in this build)"; the creation path must not hand
-        // anyone a configuration that cannot work.
-        assert!(
-            TABLET_MODE_CHOICES.contains(&TabletModeMsg::LocalTermination),
-            "the default tablet mode must always be offered"
-        );
-        assert!(
-            TABLET_MODE_CHOICES.contains(&TabletModeMsg::DisabledMouseCompat),
-            "opting out of tablet redirection must always be offered"
-        );
-        assert_eq!(
-            TABLET_MODE_CHOICES.contains(&TabletModeMsg::UsbTabletBridge),
-            cfg!(feature = "native-tablet"),
-            "the USB-bridged mode must be offered exactly when it is compiled in"
-        );
-        assert_eq!(
-            TABLET_MODE_CHOICES.len(),
-            if cfg!(feature = "native-tablet") {
-                3
-            } else {
-                2
-            },
-            "released builds expose two tablet modes, not three"
-        );
-    }
-
-    #[test]
     fn tablet_mode_pending_state_keeps_native_bridge_explicit() {
         assert_eq!(
             provisional_tablet_mode_active(
@@ -17401,117 +17249,46 @@ mod tests {
     }
 
     #[test]
-    fn saved_connection_editor_uses_that_connections_tablet_mode() {
-        let mut local = saved_connection("local", "Local", "local", 18443, None);
-        local.settings.tablet_mode_requested = TabletModeMsg::LocalTermination;
-        let mut native = saved_connection("native", "Native", "native", 18443, None);
-        native.settings.tablet_mode_requested = TabletModeMsg::UsbTabletBridge;
-        let mut app = ArcenApp {
-            saved_connections: vec![local, native],
-            tablet_mode_requested: TabletModeMsg::UsbTabletBridge,
-            ..ArcenApp::default()
-        };
-
-        app.prepare_saved_connection_editor(0);
-
-        assert_eq!(
-            app.add_connection_tablet_mode_requested,
-            TabletModeMsg::LocalTermination
-        );
-    }
-
-    #[test]
-    fn selected_connection_tablet_mode_update_preserves_other_and_future_fields() {
-        let dir = test_config_dir("arcen-tablet-mode-connection");
+    fn the_tablet_mode_is_one_choice_for_every_connection() {
+        let dir = test_config_dir("arcen-tablet-mode-app-wide");
         let _ = std::fs::remove_dir_all(&dir);
         let repository = ClientConfigRepository::at(dir.clone());
-        let mut first = saved_connection("one", "One", "one", 18443, None);
-        first.settings.unknown.insert(
+        let settings = ClientSettings {
+            tablet_mode_requested: TabletModeMsg::DisabledMouseCompat,
+            ..ClientSettings::default()
+        };
+        save_client_settings(&repository, &settings).unwrap();
+        // A connection an older Deck saved with its own mode.
+        let mut native = saved_connection("native", "Native", "native", 18443, None);
+        native.settings.unknown.insert(
             "future_setting".to_string(),
             serde_json::json!({"keep": true}),
         );
-        first
-            .unknown
-            .insert("future_connection".to_string(), serde_json::json!(7));
-        let mut second = saved_connection("two", "Two", "two", 18443, None);
-        second.settings.tablet_mode_requested = TabletModeMsg::UsbTabletBridge;
-        let mut store = SavedConnectionsStore::with_connections(vec![first, second]);
-        store.last_selected_connection_id = Some("one".to_string());
-        save_saved_connections(&repository, &store);
-        let mut app = ArcenApp::from_config_repository(repository.clone());
+        let mut store = SavedConnectionsStore::with_connections(vec![native]);
+        store.last_selected_connection_id = Some("native".to_string());
+        let mut bytes: serde_json::Value =
+            serde_json::from_slice(&serialize_saved_connections(&store).unwrap()).unwrap();
+        bytes["connections"][0]["settings"]["tablet_mode_requested"] =
+            serde_json::json!("wacom_usb_bridge");
+        std::fs::write(
+            repository.connections_file().unwrap(),
+            serde_json::to_vec(&bytes).unwrap(),
+        )
+        .unwrap();
 
-        app.persist_tablet_mode_for_selected_connection(TabletModeMsg::DisabledMouseCompat)
-            .unwrap();
-
-        let saved = load_saved_connections(&repository).unwrap().unwrap();
+        let app = ArcenApp::from_config_repository(repository.clone());
         assert_eq!(
-            saved.connections[0].settings.tablet_mode_requested,
+            app.tablet_mode_requested,
             TabletModeMsg::DisabledMouseCompat
         );
-        assert_eq!(
-            saved.connections[1].settings.tablet_mode_requested,
-            TabletModeMsg::UsbTabletBridge
-        );
+        let saved = load_saved_connections(&repository).unwrap().unwrap();
+        assert!(!saved.connections[0]
+            .settings
+            .unknown
+            .contains_key("tablet_mode_requested"));
         assert_eq!(
             saved.connections[0].settings.unknown["future_setting"]["keep"],
             true
-        );
-        assert_eq!(saved.connections[0].unknown["future_connection"], 7);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn the_tablet_setting_names_the_connection_it_is_saved_for() {
-        let dir = test_config_dir("arcen-tablet-mode-scope-note");
-        let _ = std::fs::remove_dir_all(&dir);
-        let repository = ClientConfigRepository::at(dir.clone());
-        let mut store = SavedConnectionsStore::with_connections(vec![
-            saved_connection("a", "Studio Mac", "a", 18444, None),
-            saved_connection("b", "Linux desk", "b", 18444, None),
-        ]);
-        store.last_selected_connection_id = Some("a".to_string());
-        save_saved_connections(&repository, &store);
-        let mut app = ArcenApp::from_config_repository(repository);
-        assert!(app
-            .tablet_mode_scope_note()
-            .contains("\u{201c}Studio Mac\u{201d} only"));
-
-        let mut active = ConnectionDraft::new(ConnectionKind::DirectMachine);
-        active.saved_connection_id = Some("b".to_string());
-        app.active_connection = Some(active);
-        assert!(app
-            .tablet_mode_scope_note()
-            .contains("\u{201c}Linux desk\u{201d} only"));
-
-        let mut quick = ConnectionDraft::new(ConnectionKind::DirectMachine);
-        quick.host = "quick-connect.example".to_string();
-        app.active_connection = Some(quick);
-        assert!(app.tablet_mode_scope_note().contains("this session only"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn unsaved_active_connection_never_updates_last_selected_tablet_mode() {
-        let dir = test_config_dir("arcen-tablet-mode-unsaved-active");
-        let _ = std::fs::remove_dir_all(&dir);
-        let repository = ClientConfigRepository::at(dir.clone());
-        let mut saved = saved_connection("saved", "Saved", "saved", 18443, None);
-        saved.settings.tablet_mode_requested = TabletModeMsg::LocalTermination;
-        let mut store = SavedConnectionsStore::with_connections(vec![saved]);
-        store.last_selected_connection_id = Some("saved".to_string());
-        save_saved_connections(&repository, &store);
-        let mut unsaved = ConnectionDraft::new(ConnectionKind::DirectMachine);
-        unsaved.host = "quick-connect.example".to_string();
-        let mut app = ArcenApp::from_config_repository(repository.clone());
-        app.active_connection = Some(unsaved);
-
-        app.persist_tablet_mode_for_selected_connection(TabletModeMsg::UsbTabletBridge)
-            .unwrap();
-
-        let reloaded = load_saved_connections(&repository).unwrap().unwrap();
-        assert_eq!(
-            reloaded.connections[0].settings.tablet_mode_requested,
-            TabletModeMsg::LocalTermination
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -18886,12 +18663,16 @@ mod tests {
         app.choose_session_keyboard_mode(KeyboardMode::Physical);
         assert_eq!(app.text_input.mode(), TypingMode::Auto);
         app.choose_session_keyboard_mode(KeyboardMode::Characters);
-        // Another host: its own saved mode (none) and the typing setting.
+        // Another host: its own Typing (none) and the typing setting.
         app.enter_keyboard_endpoint("host-b.example.internal:18444".to_owned());
         assert_eq!(app.text_input.mode(), TypingMode::Auto);
-        // A saved Characters connection starts in Characters.
-        app.active_keyboard.typing = Some(KeyboardMode::Characters);
+        // A connection with its own Typing, Keys only, starts in it.
+        app.active_overrides.typing_mode =
+            arcen_deck_core::overrides::Override::Own(TypingMode::Keys);
         app.enter_keyboard_endpoint("host-c.example.internal:18444".to_owned());
+        assert_eq!(app.text_input.mode(), TypingMode::Keys);
+        // The menu's Characters still types every character as text.
+        app.choose_session_keyboard_mode(KeyboardMode::Characters);
         assert_eq!(app.text_input.mode(), TypingMode::Characters);
     }
 
@@ -18908,20 +18689,21 @@ mod tests {
 
     #[test]
     fn a_saved_keyboard_mode_is_read_and_absent_follows_the_setting() {
+        use arcen_deck_core::overrides::Override;
         let saved = parse_saved_connection_settings(Some(serde_json::json!({
             "keyboard_mode": "characters"
         })));
         assert_eq!(
-            saved.keyboard.typing,
-            Some(arcen_input::text::KeyboardMode::Characters)
+            saved.overrides.typing_mode,
+            Override::Own(arcen_input::text::TypingMode::Auto)
         );
         assert!(!saved.unknown.contains_key("keyboard_mode"));
         let absent = parse_saved_connection_settings(Some(serde_json::json!({})));
-        assert_eq!(absent.keyboard.typing, None);
+        assert_eq!(absent.overrides.typing_mode, Override::Inherit);
         let bogus = parse_saved_connection_settings(Some(serde_json::json!({
             "keyboard_mode": "unicode"
         })));
-        assert_eq!(bogus.keyboard.typing, None);
+        assert_eq!(bogus.overrides.typing_mode, Override::Inherit);
     }
 
     #[test]
@@ -20241,13 +20023,12 @@ mod tests {
     }
 
     #[test]
-    fn a_local_request_keeps_the_local_cursor_even_when_the_host_draws_one() {
-        let mut app = ArcenApp::default();
+    fn a_wayland_desktop_that_embeds_the_cursor_hides_this_macs_pointer() {
+        let (mut app, _receiver) = app_with_command_channel();
         app.connection_generation = 3;
-        // A Wayland desktop that records its cursor into the video answers a
-        // client-drawn request truthfully: the cursor is in the pixels. The
-        // Mac's own cursor still moves locally; it is never traded for one
-        // that moves at the video's rate.
+        // A Linux Wayland desktop embedded in Host mode answers a Local
+        // request truthfully: the pointer is in the pixels. A Mac pointer
+        // as well would be a second one.
         app.apply_cursor_mode_result(
             CursorModeResultMsg {
                 requested: CursorMode::Local,
@@ -20257,8 +20038,8 @@ mod tests {
             },
             3,
         );
-        assert_eq!(app.active_cursor_mode, CursorMode::Local);
-        assert_eq!(app.viewer_cursor_icon(), egui::CursorIcon::Default);
+        assert_eq!(app.active_cursor_mode, CursorMode::Host);
+        assert_eq!(app.viewer_cursor_icon(), egui::CursorIcon::None);
         assert!(!app.host_cursor_images);
         app.apply_cursor_mode_result(
             CursorModeResultMsg {
@@ -20272,6 +20053,75 @@ mod tests {
         );
         assert_eq!(app.active_cursor_mode, CursorMode::Local);
         assert!(app.host_cursor_images);
+    }
+
+    #[test]
+    fn the_automatic_cursor_hides_this_macs_pointer_only_when_the_host_draws_it() {
+        let (mut app, _receiver) = app_with_command_channel();
+        app.connection_generation = 4;
+        // An older Pier never says `automatic`: the Mac keeps its pointer.
+        app.apply_cursor_mode_result(
+            CursorModeResultMsg {
+                requested: CursorMode::Local,
+                active: CursorMode::Local,
+                accepted: true,
+                ..CursorModeResultMsg::default()
+            },
+            4,
+        );
+        assert_eq!(app.active_cursor_mode, CursorMode::Local);
+        // A Pier with cursor images keeps Local under the automatic rule.
+        app.apply_cursor_mode_result(
+            CursorModeResultMsg {
+                requested: CursorMode::Local,
+                active: CursorMode::Local,
+                accepted: true,
+                automatic: true,
+                cursor_images: true,
+                ..CursorModeResultMsg::default()
+            },
+            4,
+        );
+        assert_eq!(app.active_cursor_mode, CursorMode::Local);
+        // A macOS Pier (no cursor images) draws the pointer into the video.
+        app.apply_cursor_mode_result(
+            CursorModeResultMsg {
+                requested: CursorMode::Local,
+                active: CursorMode::Host,
+                accepted: true,
+                automatic: true,
+                ..CursorModeResultMsg::default()
+            },
+            4,
+        );
+        assert_eq!(app.active_cursor_mode, CursorMode::Host);
+        assert_eq!(app.viewer_cursor_icon(), egui::CursorIcon::None);
+        // A stored Host on an older Pier is served as before: Host.
+        app.cursor_preference = CursorMode::Host;
+        app.apply_cursor_mode_result(
+            CursorModeResultMsg {
+                requested: CursorMode::Host,
+                active: CursorMode::Host,
+                accepted: true,
+                ..CursorModeResultMsg::default()
+            },
+            4,
+        );
+        assert_eq!(app.active_cursor_mode, CursorMode::Host);
+        // A new Pier with cursor images ignores the stored Host: this Mac
+        // draws them.
+        app.apply_cursor_mode_result(
+            CursorModeResultMsg {
+                requested: CursorMode::Host,
+                active: CursorMode::Local,
+                accepted: true,
+                automatic: true,
+                cursor_images: true,
+                ..CursorModeResultMsg::default()
+            },
+            4,
+        );
+        assert_eq!(app.active_cursor_mode, CursorMode::Local);
     }
 
     fn host_cursor_record(
@@ -24554,7 +24404,7 @@ mod tests {
         if let Some(submission) = app.deferred_auth.take() {
             app.submit_auth_submission(disclaimer_draft, submission);
         } else {
-            app.show_credentials(disclaimer_draft);
+            app.ask_for_password(disclaimer_draft);
         }
 
         let SessionCommand::SubmitAuth(submission) = received.try_recv().unwrap() else {
@@ -24618,8 +24468,8 @@ mod tests {
         // preload-before-launch order) must be installed onto
         // `self.deferred_auth` no later than the moment the network launch
         // happens -- proven here by driving an `AuthRequest` immediately
-        // afterward and confirming it auto-submits, never falling through to
-        // the Credentials screen.
+        // afterward and confirming it auto-submits, never asking for the
+        // password again.
         let mut app = ArcenApp {
             displays_mode: DisplaysMode::SinglePrimary,
             ..ArcenApp::default()
@@ -24667,19 +24517,18 @@ mod tests {
         assert_eq!(submission.password, "dummy-password");
         assert!(app.deferred_auth.is_none());
         assert!(
-            !matches!(app.screen, AppScreen::Credentials(_)),
-            "a preloaded submission must never show the Credentials screen",
+            app.sign_in.feedback().is_none(),
+            "a preloaded submission must never ask for the password",
         );
     }
 
     #[tokio::test]
-    async fn start_connection_without_a_preloaded_submission_still_shows_credentials() {
+    async fn start_connection_without_a_preloaded_submission_asks_for_the_password_on_home() {
         // Saved-connection deferred-auth race fix, part 2: a caller with
-        // nothing preloaded (`preloaded_auth: None`, exactly
-        // `HomeAction::Connect`'s own no-password path) must keep
-        // `deferred_auth` `None` all the way through the network launch, so
-        // an immediate `AuthRequest` still falls through to the Credentials
-        // screen exactly as before this fix.
+        // nothing preloaded (`preloaded_auth: None`, a launch-time quick
+        // connect) must keep `deferred_auth` `None` all the way through the
+        // network launch, so an immediate `AuthRequest` closes the waiting
+        // attempt and Home asks for the password under its field.
         let mut app = ArcenApp {
             displays_mode: DisplaysMode::SinglePrimary,
             ..ArcenApp::default()
@@ -24707,9 +24556,15 @@ mod tests {
             multi_monitor_v1: None,
         });
 
-        assert!(matches!(app.screen, AppScreen::Credentials(_)));
+        assert!(matches!(app.screen, AppScreen::Home));
+        assert_eq!(
+            app.sign_in.feedback().map(|feedback| feedback.failure),
+            Some(SignInFailure::PasswordRequired)
+        );
+        assert!(app.direct.password.is_empty());
         assert!(
-            received.try_recv().is_err(),
+            std::iter::from_fn(|| received.try_recv().ok())
+                .all(|command| !matches!(command, SessionCommand::SubmitAuth(_))),
             "nothing must auto-submit when no submission was ever preloaded",
         );
     }
@@ -24755,20 +24610,21 @@ mod tests {
         });
 
         assert!(
-            matches!(app.screen, AppScreen::Credentials(_)),
+            matches!(app.screen, AppScreen::Home) && app.sign_in.feedback().is_some(),
             "the obsolete submission must never auto-submit",
         );
-        assert!(received.try_recv().is_err());
+        assert!(std::iter::from_fn(|| received.try_recv().ok())
+            .all(|command| !matches!(command, SessionCommand::SubmitAuth(_))));
     }
 
     #[test]
-    fn cancelling_credentials_closes_the_waiting_authentication() {
+    fn a_password_request_without_a_password_closes_the_waiting_authentication() {
         let mut app = ArcenApp::default();
         let (commands, mut received) = mpsc::unbounded_channel();
         app.session_commands = Some(SessionCommandSender::for_test(commands));
         app.pending_connection = Some(ConnectionDraft::new(ConnectionKind::DirectMachine));
 
-        app.cancel_credentials(ConnectionDraft::new(ConnectionKind::DirectMachine));
+        app.ask_for_password(ConnectionDraft::new(ConnectionKind::DirectMachine));
 
         let mut saw_close = false;
         while let Ok(command) = received.try_recv() {
@@ -25159,6 +25015,37 @@ mod tests {
     }
 
     #[test]
+    fn abandoning_the_certificate_prompt_drops_its_sign_in() {
+        let prompt = || {
+            let mut app = ArcenApp::default();
+            let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+            draft.host = "tofu-host.local".to_string();
+            app.pending_connection = Some(draft);
+            app.deferred_auth = Some(AuthSubmission {
+                username: "operator".to_string(),
+                password: "dummy-password".to_string(),
+            });
+            app.handle_certificate_untrusted(test_cert_info());
+            assert!(app.recovery_auth.is_some());
+            app
+        };
+        // Cancel.
+        let mut app = prompt();
+        let _ = certificate_retry_auth(CertificateAction::Cancel, &mut app.recovery_auth);
+        app.screen = AppScreen::Home;
+        app.leave_recovery();
+        assert!(app.recovery_auth.is_none() && app.deferred_auth.is_none());
+        // Settings from the prompt.
+        let mut app = prompt();
+        app.open_settings();
+        assert!(app.recovery_auth.is_none() && app.deferred_auth.is_none());
+        // While it shows, it keeps it for an approved retry.
+        let mut app = prompt();
+        app.leave_recovery();
+        assert!(app.recovery_auth.is_some());
+    }
+
+    #[test]
     fn certificate_warning_preserves_deferred_quick_connect_credentials() {
         let mut app = ArcenApp::default();
         let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
@@ -25173,12 +25060,13 @@ mod tests {
         app.handle_certificate_untrusted(test_cert_info());
 
         assert!(matches!(app.screen, AppScreen::CertificateWarning(_, _)));
-        assert!(app
-            .deferred_auth
+        // The prompt holds it for the retry it may approve.
+        let retry =
+            certificate_retry_auth(CertificateAction::TrustForSession, &mut app.recovery_auth);
+        assert!(retry
             .as_ref()
             .is_some_and(|submission| submission.username == "operator"));
-        assert!(app
-            .deferred_auth
+        assert!(retry
             .as_ref()
             .is_some_and(|submission| submission.password == "dummy-password"));
     }
@@ -25254,11 +25142,20 @@ mod tests {
         let draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
 
         let options = app.connect_options(&draft);
-        assert!(matches!(
-            options.tls.mode,
-            crate::transport::tls::TlsTrustMode::InsecureSkipVerify
-        ));
-        assert!(options.tls.insecure_cli_flag);
+        if arcen_deck_core::settings::low_security_allowed() {
+            assert!(matches!(
+                options.tls.mode,
+                crate::transport::tls::TlsTrustMode::InsecureSkipVerify
+            ));
+            assert!(options.tls.insecure_cli_flag);
+        } else {
+            // Without ARCEN_ACCEPT_INSECURE=1, Low checks as Medium instead
+            // of failing at the double gate.
+            assert!(!matches!(
+                options.tls.mode,
+                crate::transport::tls::TlsTrustMode::InsecureSkipVerify
+            ));
+        }
     }
 
     #[test]
@@ -25376,13 +25273,13 @@ mod tests {
                     ),
                 },
                 encode_intent: arcen_media::EncodeIntent::Quality,
-                typing_mode: arcen_input::text::TypingMode::Characters,
+                typing_mode: arcen_input::text::TypingMode::Keys,
                 option_key_mode: arcen_input::text::OptionKeyMode::BothAlt.into(),
                 paste: arcen_input::text::PasteSettings {
                     confirm_above: 500,
                     chars_per_second: 10,
                 },
-                keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Fullscreen,
+                keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::ThisComputer,
                 capture_mac_system_shortcuts: true,
                 mac_system_shortcut_offer_answered: true,
                 keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord::ALT_F1,
@@ -25398,10 +25295,7 @@ mod tests {
             },
             "Paste as Keystrokes settings round-trip through settings.json"
         );
-        assert_eq!(
-            loaded.typing_mode,
-            arcen_input::text::TypingMode::Characters
-        );
+        assert_eq!(loaded.typing_mode, arcen_input::text::TypingMode::Keys);
         assert_eq!(
             loaded.option_key_mode,
             arcen_input::text::OptionKeyMode::BothAlt.into()
@@ -25637,10 +25531,12 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("scratch config dir");
 
         let mut pinned = saved_connection("pinned-id", "pinned", "10.0.0.9", 18444, None);
-        pinned.settings.displays_mode = Some(DisplaysMode::SinglePrimary);
+        pinned.settings.overrides.displays_mode =
+            arcen_deck_core::overrides::Override::Own(DisplaysMode::SinglePrimary);
         let following = saved_connection("following-id", "following", "10.0.0.10", 18444, None);
         assert_eq!(
-            following.settings.displays_mode, None,
+            following.settings.overrides.displays_mode.own(),
+            None,
             "a connection with no explicit choice must follow the app default",
         );
         let store = SavedConnectionsStore::with_connections(vec![pinned, following]);
@@ -25648,10 +25544,21 @@ mod tests {
 
         let reloaded = parse_saved_connections(&bytes).expect("parse");
         assert_eq!(
-            reloaded.connections[0].settings.displays_mode,
+            reloaded.connections[0]
+                .settings
+                .overrides
+                .displays_mode
+                .own(),
             Some(DisplaysMode::SinglePrimary),
         );
-        assert_eq!(reloaded.connections[1].settings.displays_mode, None);
+        assert_eq!(
+            reloaded.connections[1]
+                .settings
+                .overrides
+                .displays_mode
+                .own(),
+            None
+        );
 
         // A connection that follows the default must not even carry the key,
         // so its stored shape is unchanged from before this setting existed.
@@ -25672,11 +25579,17 @@ mod tests {
             "version": 1,
             "displays_mode": "tiled_holograms",
         })));
-        assert_eq!(settings.displays_mode, None);
-        assert!(
-            !settings.unknown.contains_key("displays_mode"),
-            "the parsed key must not linger in the passthrough map and shadow the field",
-        );
+        assert_eq!(settings.overrides.displays_mode.own(), None);
+        // Kept as written, for the newer Deck that wrote it, until the user
+        // sets Displays here; it never shadows a value of this Deck's own.
+        assert_eq!(settings.unknown["displays_mode"], "tiled_holograms");
+        let mut written = settings.unknown.clone();
+        arcen_deck_core::overrides::ConnectionOverrides {
+            displays_mode: arcen_deck_core::overrides::Override::Own(DisplaysMode::Windowed),
+            ..settings.overrides
+        }
+        .write_into(&mut written);
+        assert_eq!(written["displays_mode"], DisplaysMode::Windowed.as_wire());
     }
 
     #[test]
@@ -26003,7 +25916,11 @@ mod tests {
         co.username = r"AD\artist.user".to_string();
         co.password = "not-persisted".to_string();
 
-        app.submit_credentials(co);
+        let submission = AuthSubmission {
+            username: co.username.clone(),
+            password: std::mem::take(&mut co.password),
+        };
+        app.submit_auth_submission(co, submission);
 
         let SessionCommand::SubmitAuth(submission) = received.try_recv().unwrap() else {
             panic!("expected submitted credentials");
@@ -26144,12 +26061,10 @@ mod tests {
         let mut selected = ConnectionDraft::new(ConnectionKind::DirectMachine);
         selected.saved_connection_id = Some(app.saved_connections[0].id.clone());
         selected.host = app.saved_connections[0].host.clone();
-        app.show_credentials(selected);
+        app.ask_for_password(selected);
 
-        let AppScreen::Credentials(credentials) = &app.screen else {
-            panic!("expected credentials screen");
-        };
-        assert!(credentials.username.is_empty());
+        assert!(matches!(app.screen, AppScreen::Home));
+        assert!(app.direct.username.is_empty());
         assert!(app
             .saved_connections
             .iter()
@@ -26321,19 +26236,6 @@ mod tests {
         assert_eq!(store.connections[0].transport, SavedTransport::Quic);
         assert_eq!(store.connections[0].port, 18_444);
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn quic_saved_connection_editor_preserves_port() {
-        let saved = saved_connection("quic", "QUIC host", "pier.example", 19_444, None);
-        let mut app = ArcenApp {
-            saved_connections: vec![saved],
-            ..ArcenApp::default()
-        };
-
-        app.prepare_saved_connection_editor(0);
-
-        assert_eq!(app.add_connection_port, "19444");
     }
 
     #[test]
@@ -27438,13 +27340,60 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_remembered_identity_offers_to_forget_it() {
+    fn disconnect_wipes_the_password_typed_on_home() {
+        let mut app = ArcenApp::default();
+        app.direct.password = "dummy-password".to_string();
+        app.disconnect();
+        assert!(app.direct.password.is_empty());
+    }
+
+    #[test]
+    fn leaving_a_recovery_screen_for_settings_drops_the_kept_password() {
+        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        draft.host = "pier.example.internal".to_string();
+        for screen in [
+            AppScreen::TopologyConflict(draft.clone()),
+            AppScreen::DisplaysUnsupported(draft.clone()),
+        ] {
+            let mut app = ArcenApp {
+                screen,
+                recovery_auth: Some(AuthSubmission {
+                    username: "operator".to_string(),
+                    password: "dummy-password".to_string(),
+                }),
+                ..ArcenApp::default()
+            };
+            // A pass on the recovery screen keeps it for the choice.
+            app.leave_recovery();
+            assert!(app.recovery_auth.is_some());
+            // The launcher bar's Settings, then Settings' Close.
+            app.open_settings();
+            assert!(app.recovery_auth.is_none(), "{:?}", app.screen);
+            app.screen = AppScreen::Home;
+            app.leave_recovery();
+            assert!(app.recovery_auth.is_none());
+        }
+        // Any teardown drops it too.
+        let mut app = ArcenApp {
+            recovery_auth: Some(AuthSubmission {
+                username: "operator".to_string(),
+                password: "dummy-password".to_string(),
+            }),
+            ..ArcenApp::default()
+        };
+        app.disconnect();
+        assert!(app.recovery_auth.is_none());
+    }
+
+    #[test]
+    fn a_changed_remembered_identity_offers_the_recovery_and_trusts_the_new_one_on_confirmation() {
         // Without this the user is stuck: the pin is durable, it no longer
-        // matches, and nothing in the app can clear it.
+        // matches, and nothing in the app can replace it.
         let dir = test_config_dir("arcen-changed-identity-offer");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut app = ArcenApp::from_config_repository(ClientConfigRepository::at(dir.clone()));
+        let repository = ClientConfigRepository::at(dir.clone());
+        let mut app = ArcenApp::from_config_repository(repository.clone());
         app.security_mode = SecurityMode::Medium;
 
         let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
@@ -27453,111 +27402,183 @@ mod tests {
         let endpoint = connection_endpoint(&draft);
         let info = certificate_info_fixture(&endpoint);
         app.trust_certificate_permanently(&draft, &info);
+        let mut presented = certificate_info_fixture(&endpoint);
+        presented.spki_sha256 = TlsPin::new(
+            arcen_transport::tls::PinKind::SubjectPublicKeyInfoSha256,
+            [0x77; 32],
+        );
+        presented.spki_sha256_display = crate::transport::tls::format_fingerprint(&[0x77; 32]);
 
+        app.pending_connection = Some(draft.clone());
         app.active_connection = Some(draft.clone());
-        app.deferred_auth = Some(AuthSubmission {
+        app.submitted_auth = Some(AuthSubmission {
             username: "operator".to_string(),
             password: "dummy-password".to_string(),
         });
         app.screen = AppScreen::Connecting(draft);
-        app.handle_connection_closed(
-            Some(SessionEnd {
-                reason: DisconnectReason::Terminal(TerminalDisconnect::TlsIdentity),
-                message: format!(
-                    "TLS error: {}",
-                    crate::transport::tls::TOFU_PIN_MISMATCH_ERROR
-                ),
-                observed_at: Instant::now(),
-            }),
-            0,
-            &egui::Context::default(),
-        );
+        app.handle_certificate_changed(presented.clone());
 
-        assert!(
-            matches!(app.screen, AppScreen::CertificateChanged(..)),
-            "a changed remembered identity should offer a recovery"
-        );
-        // Kept for the re-dial that follows "Forget and Verify", so the user
-        // is not asked for the password they just typed.
+        let AppScreen::CertificateChanged(changed) = &app.screen else {
+            panic!("a changed remembered identity should offer a recovery");
+        };
+        // Both fingerprints, in plain words: no "TOFU".
+        assert_eq!(changed.change.presented, presented.spki_sha256_display);
+        assert_eq!(changed.change.remembered, info.spki_sha256_display);
+        assert!(!changed.change.fingerprint_of.contains("TOFU"));
+        // Kept for the connection that follows trusting the new identity, so
+        // the user is not asked for the password they just typed.
         assert!(app
             .recovery_auth
             .as_ref()
             .is_some_and(|auth| auth.username == "operator"));
-        // Showing the offer must not itself discard anything.
+        // Showing the offer must not itself trust or discard anything.
         assert_eq!(app.effective_tls_pin(&endpoint), Some(info.spki_sha256));
-        assert!(
-            !app.certificate_change_acknowledged,
-            "confirmation must start unticked"
+        assert!(!app.certificate_change_step.confirming());
+
+        // "Trust and connect" replaces the remembered identity, durably.
+        let change = changed.change.clone();
+        assert!(app.trust_new_identity(&change));
+        assert_eq!(
+            app.effective_tls_pin(&endpoint),
+            Some(presented.spki_sha256)
+        );
+        let reopened = ArcenApp::from_config_repository(repository);
+        assert_eq!(
+            reopened.effective_tls_pin(&endpoint),
+            Some(presented.spki_sha256)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn forgetting_clears_the_pin_everywhere_and_trusts_nothing_in_its_place() {
-        let dir = test_config_dir("arcen-forget-identity");
+    fn a_configured_pin_that_changed_is_never_offered_for_replacement() {
+        let mut app = ArcenApp {
+            security_mode: SecurityMode::Medium,
+            ..ArcenApp::default()
+        };
+        let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        draft.host = "pinned-host.local".to_string();
+        draft.tls_trust = Some(TlsTrustConfig::pinned_certificate([0x42; 32]));
+        app.pending_connection = Some(draft.clone());
+        app.screen = AppScreen::Connecting(draft);
+
+        app.handle_certificate_changed(certificate_info_fixture("pinned-host.local:18444"));
+
+        assert!(matches!(app.screen, AppScreen::Home));
+        assert_eq!(
+            app.sign_in
+                .acknowledgement()
+                .map(|feedback| feedback.failure),
+            Some(SignInFailure::HostIdentityChanged)
+        );
+        assert!(app.accepted_tls_pins.lock().unwrap().is_empty());
+        assert!(app.recovery_auth.is_none());
+    }
+
+    #[test]
+    fn a_remembered_certificate_pin_is_replaced_by_the_certificate_the_screen_showed() {
+        let dir = test_config_dir("arcen-replace-certificate-pin");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let repository = ClientConfigRepository::at(dir.clone());
-
         let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
         draft.host = "pier.example.internal".to_string();
         draft.port = 18_444;
         let endpoint = connection_endpoint(&draft);
-        let info = certificate_info_fixture(&endpoint);
-
+        // A certificate pin, as an import or an older Deck remembers one.
+        let mut pins = crate::ui::trusted_pins::TrustedPinStore::default();
+        pins.remember(
+            &endpoint,
+            &TlsPin::new(arcen_transport::tls::PinKind::CertificateSha256, [0x11; 32]),
+            Some("Studio".to_string()),
+        );
+        crate::ui::trusted_pins::save(&repository.trusted_pins_file().unwrap(), &pins).unwrap();
         let mut app = ArcenApp::from_config_repository(repository.clone());
         app.security_mode = SecurityMode::Medium;
-        app.trust_certificate_permanently(&draft, &info);
-        assert_eq!(app.effective_tls_pin(&endpoint), Some(info.spki_sha256));
+        app.pending_connection = Some(draft.clone());
+        app.screen = AppScreen::Connecting(draft);
+        let presented = certificate_info_fixture(&endpoint);
+        app.handle_certificate_changed(presented.clone());
+        let AppScreen::CertificateChanged(changed) = &app.screen else {
+            panic!("a changed remembered identity should offer a recovery");
+        };
+        assert_eq!(changed.change.fingerprint_of, "certificate");
+        assert_eq!(
+            changed.change.presented,
+            presented.certificate_sha256_display
+        );
+        let change = changed.change.clone();
 
-        app.forget_remembered_identity(&endpoint);
-
-        // Both stores, or the session cache would re-assert what was forgotten
-        // and the retry would fail closed all over again.
+        assert!(app.trust_new_identity(&change));
+        // What was shown is what is enforced and remembered: the
+        // certificate, not its public key.
         assert_eq!(
             app.effective_tls_pin(&endpoint),
-            None,
-            "forgetting left a pin behind"
+            Some(presented.certificate_sha256)
         );
-        // Forgetting is not trusting: nothing takes the old pin's place, so the
-        // next connection runs the ordinary first-use prompt.
         let reopened = ArcenApp::from_config_repository(repository);
         assert_eq!(
             reopened.effective_tls_pin(&endpoint),
-            None,
-            "the removal did not survive a relaunch"
+            Some(presented.certificate_sha256)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn forgetting_is_scoped_to_the_endpoint_that_changed() {
-        let dir = test_config_dir("arcen-forget-scope");
+    fn replacing_an_identity_keeps_every_other_host_and_another_windows_change() {
+        let dir = test_config_dir("arcen-replace-scope");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut app = ArcenApp::from_config_repository(ClientConfigRepository::at(dir.clone()));
+        let repository = ClientConfigRepository::at(dir.clone());
+        let mut app = ArcenApp::from_config_repository(repository.clone());
         app.security_mode = SecurityMode::Medium;
-
-        let mut first = ConnectionDraft::new(ConnectionKind::DirectMachine);
-        first.host = "one.example.internal".to_string();
-        first.port = 18_444;
-        let mut second = ConnectionDraft::new(ConnectionKind::DirectMachine);
-        second.host = "two.example.internal".to_string();
-        second.port = 18_444;
+        let draft_for = |host: &str| {
+            let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
+            draft.host = host.to_string();
+            draft.port = 18_444;
+            draft
+        };
+        let first = draft_for("one.example.internal");
+        let second = draft_for("two.example.internal");
         let first_endpoint = connection_endpoint(&first);
         let second_endpoint = connection_endpoint(&second);
-        let first_info = certificate_info_fixture(&first_endpoint);
         let second_info = certificate_info_fixture(&second_endpoint);
-        app.trust_certificate_permanently(&first, &first_info);
+        app.trust_certificate_permanently(&first, &certificate_info_fixture(&first_endpoint));
         app.trust_certificate_permanently(&second, &second_info);
+        // Another Deck window trusts a third host meanwhile.
+        let third = draft_for("three.example.internal");
+        let third_info = certificate_info_fixture(&connection_endpoint(&third));
+        ArcenApp::from_config_repository(repository.clone())
+            .trust_certificate_permanently(&third, &third_info);
 
-        app.forget_remembered_identity(&first_endpoint);
+        app.pending_connection = Some(first.clone());
+        app.screen = AppScreen::Connecting(first);
+        let mut presented = certificate_info_fixture(&first_endpoint);
+        presented.spki_sha256 = TlsPin::new(
+            arcen_transport::tls::PinKind::SubjectPublicKeyInfoSha256,
+            [0x77; 32],
+        );
+        app.handle_certificate_changed(presented.clone());
+        let AppScreen::CertificateChanged(changed) = &app.screen else {
+            panic!("a changed remembered identity should offer a recovery");
+        };
+        let change = changed.change.clone();
+        assert!(app.trust_new_identity(&change));
 
-        assert_eq!(app.effective_tls_pin(&first_endpoint), None);
+        let reopened = ArcenApp::from_config_repository(repository);
         assert_eq!(
-            app.effective_tls_pin(&second_endpoint),
+            reopened.effective_tls_pin(&first_endpoint),
+            Some(presented.spki_sha256)
+        );
+        assert_eq!(
+            reopened.effective_tls_pin(&second_endpoint),
             Some(second_info.spki_sha256),
             "an unrelated host lost its remembered identity"
+        );
+        assert_eq!(
+            reopened.effective_tls_pin(&connection_endpoint(&third)),
+            Some(third_info.spki_sha256),
+            "another window's identity was rolled back"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -27594,7 +27615,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_resume_returns_to_credentials() {
+    fn expired_resume_returns_home_asking_to_sign_in_again() {
         let mut app = ArcenApp::default();
         let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
         draft.host = "pier.example.internal".to_string();
@@ -27617,8 +27638,14 @@ mod tests {
         // An expired resume grant means the bounded reconnect window closed, so
         // the user authenticates again. This used to be special-cased into a
         // "renew your licence" dead end; there is no licence, and asking for
-        // credentials is the correct and only recovery.
-        assert!(matches!(app.screen, AppScreen::Credentials(_)));
+        // credentials is the correct and only recovery: on Home, under the
+        // same connection's password.
+        assert!(matches!(app.screen, AppScreen::Home));
+        assert_eq!(app.direct.host, "pier.example.internal");
+        assert_eq!(
+            app.sign_in.feedback().map(|feedback| feedback.failure),
+            Some(SignInFailure::SessionEnded)
+        );
     }
 
     #[test]
@@ -27728,7 +27755,7 @@ mod tests {
         );
         assert!(
             matches!(app.screen, AppScreen::InSession),
-            "the live session must stay in session, never bounced to Credentials/Home, got {:?}",
+            "the live session must stay in session, never bounced to Home, got {:?}",
             app.screen
         );
     }
@@ -27808,7 +27835,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            MultiWindowFailureOutcome::ReturnedToCredentialsOrHome,
+            MultiWindowFailureOutcome::ReturnedHome,
             "typed outcome must reflect the return-to-credentials/home path taken",
         );
         assert!(
@@ -27821,7 +27848,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_window_failure_falls_back_to_credentials_when_a_draft_survives_and_reconnect_is_unavailable(
+    fn multi_window_failure_returns_home_with_the_connection_when_a_draft_survives_and_reconnect_is_unavailable(
     ) {
         let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
         draft.host = "multi-monitor-host.local".to_string();
@@ -27837,14 +27864,18 @@ mod tests {
 
         assert_eq!(
             outcome,
-            MultiWindowFailureOutcome::ReturnedToCredentialsOrHome,
+            MultiWindowFailureOutcome::ReturnedHome,
             "typed outcome must reflect the return-to-credentials/home path taken",
         );
         assert!(
-            matches!(app.screen, AppScreen::Credentials(_)),
-            "expected Credentials with a surviving connection draft, got {:?}",
+            matches!(app.screen, AppScreen::Home),
+            "expected Home with the surviving connection draft, got {:?}",
             app.screen
         );
+        assert_eq!(app.direct.host, "multi-monitor-host.local");
+        assert!(app.sign_in.feedback().is_some_and(
+            |feedback| feedback.detail.as_deref() == Some("multi-window entry aborted")
+        ));
         assert!(!matches!(app.screen, AppScreen::InSession));
     }
 
@@ -28459,12 +28490,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_media_state_stops_immediately_after_a_multi_window_teardown_that_falls_back_to_credentials(
-    ) {
+    fn sync_media_state_stops_immediately_after_a_multi_window_teardown_that_returns_home() {
         // Same as the `Reconnecting` case above, but for the
-        // `return_to_credentials` branch of `multi_window_failure`: a
-        // queued frame must not resurrect `InSession` over `Credentials`
-        // either.
+        // `return_home` branch of `multi_window_failure`: a queued frame
+        // must not resurrect `InSession` over `Home` either.
         let generation = 43;
         let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
         draft.host = "multi-monitor-host.local".to_string();
@@ -28477,11 +28506,8 @@ mod tests {
         };
         let real_outcome =
             app.multi_window_failure(&egui::Context::default(), "multi-window entry aborted");
-        assert_eq!(
-            real_outcome,
-            MultiWindowFailureOutcome::ReturnedToCredentialsOrHome
-        );
-        assert!(matches!(app.screen, AppScreen::Credentials(_)));
+        assert_eq!(real_outcome, MultiWindowFailureOutcome::ReturnedHome);
+        assert!(matches!(app.screen, AppScreen::Home));
 
         let hello = multi_window_test_hello(
             1,
@@ -28508,9 +28534,9 @@ mod tests {
         app.sync_media_state(&egui::Context::default());
 
         assert!(
-            matches!(app.screen, AppScreen::Credentials(_)),
+            matches!(app.screen, AppScreen::Home),
             "the queued frame must never resurrect InSession over the already-set \
-             Credentials screen, got {:?}",
+             Home screen, got {:?}",
             app.screen
         );
         assert!(!matches!(app.screen, AppScreen::InSession));
@@ -31481,7 +31507,7 @@ mod tests {
     ) {
         // `multi_window_failure` can legitimately call `drop_session_handles`
         // (and so this method) twice for one failure: once directly, then
-        // again from `return_to_credentials`'s own `drop_session_handles`
+        // again from `return_home`'s own `drop_session_handles`
         // when no reconnect gets scheduled. Every other reset this method
         // performs is naturally idempotent; `pending_root_restore` must be
         // too -- a second, already-empty call must never overwrite what the

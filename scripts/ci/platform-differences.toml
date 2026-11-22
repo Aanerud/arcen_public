@@ -539,6 +539,20 @@ code = [
 ]
 decision = "docs/architecture/pen-tablet-input.md"
 
+[[difference]]
+id = "PD-039"
+area = "automatic cursor"
+products = ["hosts/linux", "hosts/windows", "hosts/macos"]
+difference = "Who draws the pointer under the automatic cursor, which every Deck asks for. The rule is shared (arcen_input::resolve_automatic_cursor_mode; the Deck hides its pointer whenever the result is Host, CursorModeResultMsg::host_draws_pointer): cursor images from the host mean the Deck draws; none mean the host draws the pointer into the video. The macOS Pier sends no cursor images, so it serves Host and turns on ScreenCaptureKit's showsCursor; the Linux and Windows Piers do not read the flag yet and serve the Deck's stored preference, Local with cursor images from their cursor watchers."
+earned_by = "macOS gives no process the desktop pointer's image: NSCursor.currentSystemCursor reports the calling process's own cursor (measured in hosts/macos/src/cursor_probe.rs), and Apple points at SCStreamConfiguration.showsCursor instead. X11 (XFixes), Mutter's screencast cursor metadata and Windows (GetCursorInfo) give the image."
+code = [
+  { path = "hosts/macos/src/session.rs", symbol = "HOST_SENDS_CURSOR_IMAGES" },
+  { path = "hosts/macos/src/cursor_probe.rs", symbol = "currentSystemCursor" },
+  { path = "hosts/linux/src/net/server.rs", symbol = "x11_cursor_watcher" },
+  { path = "hosts/windows/src/cursor_watcher.rs", symbol = "deck_draws_images" },
+]
+decision = "docs/adr/0014-quic-lanes-and-capture-contracts.md"
+
 # --- Open gaps (unearned) -------------------------------------------------------
 
 [[gap]]
@@ -933,6 +947,12 @@ id = "stranded_window_repatriation"
 description = "Moves windows a session stranded back to a visible display"
 proof = 'display_lease::'
 status = { "hosts/linux" = "present", "hosts/windows" = "present", "hosts/macos" = "PD-032" }
+
+[[capability]]
+id = "deck_launcher_bar"
+description = "The launcher bar from arcen_deck_core::screens::launcher (Arcen orange, 36 points, Help and Settings on the right)"
+proof = 'render_launcher_top_bar'
+status = { "clients/macos" = "present", "clients/windows" = "present" }
 
 [[capability]]
 id = "deck_truth_badge"

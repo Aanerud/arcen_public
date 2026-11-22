@@ -7,8 +7,8 @@ pub use arcen_deck_core::about::{SOURCE_OFFER, SOURCE_URL};
 /// Release packaging scans the final binary for this marker and refuses to
 /// ship it. It must stay compiled into every `dev-tools` binary, including
 /// `--no-build` package assemblies, so stale local artefacts cannot become a
-/// release.
-#[cfg(feature = "dev-tools")]
+/// release. A `doc-shots` build (the manual's screenshots) carries it too.
+#[cfg(any(feature = "dev-tools", feature = "doc-shots"))]
 #[used]
 pub static ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER: &[u8] =
     b"ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP";

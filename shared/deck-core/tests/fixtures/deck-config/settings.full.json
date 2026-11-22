@@ -18,7 +18,7 @@
   "fullscreen_uses_notch_area": true,
   "hidpi_display_mask": 2,
   "hidpi_streaming": true,
-  "keyboard_capture": "fullscreen",
+  "keyboard_capture": "this_computer",
   "keyboard_switch": "Ctrl+Alt+Shift+Z",
   "log_level": 3,
   "mac_system_shortcut_offer_answered": true,
@@ -34,5 +34,6 @@
   "security_mode": "low",
   "tablet_input_enabled": false,
   "tablet_mode_requested": "disabled_mouse_compat",
-  "typing_mode": "characters"
+  "typing_mode": "keys",
+  "version": 2
 }

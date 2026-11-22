@@ -10,7 +10,8 @@
 //! files keep loading and keep their unknown fields across the move.
 //!
 //! The fixtures live in `shared/deck-core/tests/fixtures/deck-config/`
-//! (written by the macOS Deck before the move, unchanged since).
+//! (written by the macOS Deck before the move; the outputs were regenerated
+//! once for 0.20.7's settings version 2, `config::migrate_client_settings`).
 //! `*.in.json` are hand-written inputs (older shapes, unknown fields);
 //! everything else is golden output. Regenerate the golden files only for an
 //! intended format change: `ARCEN_UPDATE_GOLDEN=1 cargo test -p
@@ -19,6 +20,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
 use arcen_deck_core::config::*;
+use arcen_deck_core::overrides::Override;
 use arcen_deck_core::settings::*;
 use arcen_deck_core::trusted_pins;
 use arcen_protocol::messages::{CursorMode, TabletModeMsg};
@@ -103,13 +105,13 @@ fn every_field_changed() -> ClientSettings {
             ),
         },
         encode_intent: arcen_media::EncodeIntent::Quality,
-        typing_mode: arcen_input::text::TypingMode::Characters,
+        typing_mode: arcen_input::text::TypingMode::Keys,
         option_key_mode: arcen_input::text::OptionKeyMode::BothAlt.into(),
         paste: arcen_input::text::PasteSettings {
             confirm_above: 500,
             chars_per_second: 10,
         },
-        keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Fullscreen,
+        keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::ThisComputer,
         capture_mac_system_shortcuts: true,
         mac_system_shortcut_offer_answered: true,
         keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord::CONTROL_ALT_SHIFT_Z,
@@ -175,6 +177,53 @@ fn settings_json_golden_for_defaults_every_field_and_a_legacy_file() {
     );
 }
 
+/// A file a newer Deck wrote keeps its version and the keys this Deck does
+/// not know through a load and a save, so its own migrations never run twice.
+#[test]
+fn a_newer_settings_file_keeps_its_version_and_unknown_keys() {
+    let dir = ScratchDir::new("settings-v3");
+    std::fs::write(
+        dir.0.join("settings.json"),
+        br#"{"version":3,"typing_mode":"keys","a_version_3_setting":{"kept":true}}"#,
+    )
+    .unwrap();
+    let repository = ClientConfigRepository::at(dir.0.clone());
+    let loaded = load_client_settings(&repository).unwrap();
+    assert_eq!(loaded.typing_mode, arcen_input::text::TypingMode::Keys);
+    save_client_settings(&repository, &loaded).unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.0.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(saved["version"], 3);
+    assert_eq!(saved["a_version_3_setting"]["kept"], true);
+}
+
+/// The stored cursor choice is never migrated: it is what a Deck asks a
+/// host older than 0.20.7 for, alongside the automatic cursor that newer
+/// hosts follow, so a Host choice keeps Host on those hosts.
+#[test]
+fn the_stored_cursor_choice_is_kept_for_older_hosts() {
+    let dir = ScratchDir::new("cursor-fallback");
+    let repository = ClientConfigRepository::at(dir.0.clone());
+    let file = dir.0.join("settings.json");
+    for (before, expected) in [
+        (r#"{"cursor_preference":"host"}"#, CursorMode::Host),
+        (
+            r#"{"version":2,"cursor_preference":"host"}"#,
+            CursorMode::Host,
+        ),
+        (r#"{"cursor_preference":"local"}"#, CursorMode::Local),
+    ] {
+        std::fs::write(&file, before).unwrap();
+        let loaded = load_client_settings(&repository).unwrap();
+        assert_eq!(loaded.cursor_preference, expected, "{before}");
+        save_client_settings(&repository, &loaded).unwrap();
+        assert_eq!(
+            load_client_settings(&repository).unwrap().cursor_preference,
+            expected
+        );
+    }
+}
+
 #[test]
 fn connections_json_golden_for_a_current_and_a_legacy_file() {
     for (input, output) in [
@@ -202,15 +251,29 @@ fn connections_json_golden_for_a_current_and_a_legacy_file() {
         studio.settings.remembered_username.as_deref(),
         Some(r"AD\artist.user")
     );
+    // 0.20.7 (connection settings version 2): the connection's own tablet
+    // mode and Left Option as AltGr are dropped, its Displays and Command
+    // choices stay its own, and its keyboard mode "characters" is its own
+    // Typing: Characters.
     assert_eq!(
-        studio.settings.tablet_mode_requested,
-        TabletModeMsg::UsbTabletBridge
+        studio.settings.overrides,
+        arcen_deck_core::overrides::ConnectionOverrides {
+            typing_mode: Override::Own(arcen_input::text::TypingMode::Auto),
+            keyboard_shortcuts: Override::Own(
+                arcen_input::keyboard::ShortcutPreference::SwapCommandControl
+            ),
+            displays_mode: Override::Own(DisplaysMode::SinglePrimary),
+            ..Default::default()
+        }
     );
-    assert_eq!(
-        studio.settings.displays_mode,
-        Some(DisplaysMode::SinglePrimary)
-    );
-    assert!(studio.settings.keyboard.left_option_altgr);
+    for retired in [
+        "tablet_mode_requested",
+        "left_option_altgr",
+        "keyboard_mode",
+    ] {
+        assert!(!studio.settings.unknown.contains_key(retired), "{retired}");
+    }
+    assert_eq!(studio.settings.unknown["future_setting"], "kept");
 }
 
 /// The Deck no longer has a WSS transport: every saved connection an older
@@ -244,14 +307,10 @@ fn connections_json_saved_as_wss_load_as_quic_without_losing_data() {
         Some(r"AD\artist.user")
     );
     assert_eq!(
-        studio.settings.tablet_mode_requested,
-        TabletModeMsg::UsbTabletBridge
+        studio.settings.overrides.displays_mode,
+        Override::Own(DisplaysMode::SinglePrimary)
     );
-    assert_eq!(
-        studio.settings.displays_mode,
-        Some(DisplaysMode::SinglePrimary)
-    );
-    assert!(studio.settings.keyboard.left_option_altgr);
+    assert_eq!(studio.settings.overrides.typing_mode, Override::Inherit);
     assert_eq!(studio.unknown["future_entry_field"]["kept"], true);
     // An entry without an id gets the same id a QUIC entry at the QUIC port
     // would, so a later load finds the same connection.

@@ -347,12 +347,12 @@ class ReleaseFeatureGateTests(unittest.TestCase):
     """A release Deck must never contain a lab or developer feature."""
 
     SCRIPT = ROOT / "build-deck-app.sh"
-    FORBIDDEN = ("dev-tools", "usb-emulate-lab", "experimental-raw-hid")
+    FORBIDDEN = ("dev-tools", "doc-shots", "usb-emulate-lab", "experimental-raw-hid")
 
     def test_every_lab_feature_is_forbidden_and_every_marker_is_scanned(self):
         script = self.SCRIPT.read_text(encoding="utf-8")
         self.assertIn(
-            'RELEASE_FORBIDDEN_FEATURES="dev-tools usb-emulate-lab experimental-raw-hid"',
+            'RELEASE_FORBIDDEN_FEATURES="dev-tools doc-shots usb-emulate-lab experimental-raw-hid"',
             script,
         )
         self.assertIn('DO_NOT_SHIP_MARKERS="$DEV_TOOLS_MARKER $USB_EMULATE_MARKER"', script)

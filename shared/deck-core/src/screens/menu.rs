@@ -87,7 +87,13 @@ impl MenuCommand {
             Self::ToggleTabletMonitor => "Tablet Monitor",
             Self::StopTyping => "Stop Typing",
             Self::ToggleNegotiatedTruth => "Negotiated Truth",
-            Self::ToggleColourCheck => "Colour Check…",
+            // The Windows Deck greys it: its Colour check needs display
+            // facts, a frame readback and a report folder it does not have
+            // yet (GAP-024). The title says so instead of a bare grey item.
+            Self::ToggleColourCheck => match platform {
+                DeckPlatform::Mac => "Colour Check…",
+                DeckPlatform::Pc => "Colour Check… (not on Windows yet)",
+            },
             Self::CycleTestPattern => "Cycle Test Pattern Readout",
             Self::Quit { .. }
             | Self::Disconnect
@@ -544,6 +550,18 @@ mod tests {
                 ),
                 ("Help", vec!["Keyboard Shortcuts"]),
             ]
+        );
+    }
+
+    #[test]
+    fn a_greyed_colour_check_says_why_on_the_pc_only() {
+        assert_eq!(
+            MenuCommand::ToggleColourCheck.title(DeckPlatform::Mac),
+            "Colour Check…"
+        );
+        assert_eq!(
+            MenuCommand::ToggleColourCheck.title(DeckPlatform::Pc),
+            "Colour Check… (not on Windows yet)"
         );
     }
 

@@ -7,9 +7,9 @@
 
 use arcen_deck_core::config::{ConnectionKind, SavedConnectionSummary};
 use arcen_deck_core::connection_draft::ConnectionDraft;
+use arcen_deck_core::overrides::{ConnectionOverrides, Override};
 use arcen_deck_core::screens::home::{HomeAction, HomeEffect, HomeViewState, apply_home_action};
 use arcen_deck_core::settings::{ClientConfigRepository, DisplaysMode, SecurityMode};
-use arcen_input::keyboard::KeyboardSettings;
 
 struct ScratchDir(std::path::PathBuf);
 
@@ -36,11 +36,11 @@ struct Form {
     editing: Option<usize>,
     name: String,
     host: String,
-    port: String,
     username: String,
-    displays: Option<DisplaysMode>,
-    keyboard: KeyboardSettings,
+    overrides: ConnectionOverrides,
     remember: bool,
+    sign_in: arcen_deck_core::sign_in::SignInState,
+    notice: Option<arcen_deck_core::screens::home::HomeNotice>,
 }
 
 fn apply(
@@ -59,20 +59,58 @@ fn apply(
         editing_index: &mut form.editing,
         form_name: &mut form.name,
         form_host: &mut form.host,
-        form_port: &mut form.port,
         form_username: &mut form.username,
-        form_displays_mode: &mut form.displays,
-        form_keyboard: &mut form.keyboard,
-        app_displays_mode: DisplaysMode::SinglePrimary,
-        connection_error: None,
+        form_overrides: &mut form.overrides,
+        app_defaults: arcen_deck_core::overrides::AppDefaults {
+            displays_mode: DisplaysMode::SinglePrimary,
+            ..arcen_deck_core::overrides::AppDefaults::default()
+        },
+        sign_in: &mut form.sign_in,
+        overlay_open: false,
         remember_username: &mut form.remember,
         connection_test: None,
+        notice: &mut form.notice,
     };
     let outcome = apply_home_action(&mut state, action, repository, SecurityMode::Medium);
     if let Some(store) = outcome.store {
         *saved = store.connections;
     }
     (outcome.effect, outcome.status)
+}
+
+#[test]
+fn saving_a_new_connection_drops_another_connection_s_sign_in_error() {
+    let dir = ScratchDir::new("save-clears-sign-in");
+    let repository = ClientConfigRepository::at(dir.0.clone());
+    let mut form = Form::default();
+    let mut direct = ConnectionDraft::new(ConnectionKind::DirectMachine);
+    direct.saved_connection_id = Some("lab".to_owned());
+    direct.host = "203.0.113.82".to_owned();
+    direct = form.sign_in.return_home(
+        arcen_deck_core::sign_in::SignInFailure::CredentialsRefused,
+        direct,
+        None,
+    );
+    let mut saved = Vec::new();
+    let (_, status) = apply(
+        &mut form,
+        &mut direct,
+        &mut saved,
+        &repository,
+        HomeAction::SaveNew {
+            name: "Unreachable test".to_owned(),
+            host: "203.0.113.10".to_owned(),
+            port: 18444,
+            username: String::new(),
+            overrides: ConnectionOverrides::default(),
+        },
+    );
+    assert_eq!(status.as_deref(), Some("Added Unreachable test"));
+    assert_eq!(
+        direct.saved_connection_id.as_deref(),
+        Some(saved[0].id.as_str())
+    );
+    assert!(form.sign_in.feedback().is_none());
 }
 
 #[test]
@@ -91,7 +129,7 @@ fn a_saved_connection_is_selected_and_deleting_it_clears_the_selection() {
         HomeAction::BeginAdd,
     );
     assert!(form.show_add);
-    assert_eq!(form.port, "18444");
+    assert!(form.host.is_empty());
 
     let (effect, status) = apply(
         &mut form,
@@ -101,10 +139,9 @@ fn a_saved_connection_is_selected_and_deleting_it_clears_the_selection() {
         HomeAction::SaveNew {
             name: "Studio".to_owned(),
             host: "203.0.113.82".to_owned(),
-            port: "0".to_owned(),
+            port: 0,
             username: "alice".to_owned(),
-            displays_mode: None,
-            keyboard: KeyboardSettings::default(),
+            overrides: ConnectionOverrides::default(),
         },
     );
     assert!(matches!(effect, HomeEffect::None));
@@ -150,15 +187,17 @@ fn use_settings_hands_a_connections_displays_choice_back_and_persists() {
         HomeAction::SaveNew {
             name: "Z8".to_owned(),
             host: "203.0.113.100".to_owned(),
-            port: "18444".to_owned(),
+            port: 18444,
             username: String::new(),
-            displays_mode: Some(DisplaysMode::MatchLayout),
-            keyboard: KeyboardSettings::default(),
+            overrides: ConnectionOverrides {
+                displays_mode: Override::Own(DisplaysMode::MatchLayout),
+                ..ConnectionOverrides::default()
+            },
         },
     );
     assert_eq!(
-        saved[0].settings.displays_mode,
-        Some(DisplaysMode::MatchLayout)
+        saved[0].settings.overrides.displays_mode,
+        Override::Own(DisplaysMode::MatchLayout)
     );
     let (effect, status) = apply(
         &mut form,
@@ -174,11 +213,14 @@ fn use_settings_hands_a_connections_displays_choice_back_and_persists() {
             "\u{201c}Z8\u{201d} now connects with Settings \u{203a} Displays: Primary display only"
         )
     );
-    assert_eq!(saved[0].settings.displays_mode, None);
+    assert_eq!(saved[0].settings.overrides.displays_mode, Override::Inherit);
     let file = repository.connections_file().expect("connections file");
     let reloaded =
         arcen_deck_core::config::parse_saved_connections(&std::fs::read(file).unwrap()).unwrap();
-    assert_eq!(reloaded.connections[0].settings.displays_mode, None);
+    assert_eq!(
+        reloaded.connections[0].settings.overrides.displays_mode,
+        Override::Inherit
+    );
 }
 
 #[test]
@@ -190,6 +232,8 @@ fn connect_and_test_are_left_to_the_shell() {
     let mut saved = Vec::new();
     let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine);
     draft.host = "pier.example.internal".to_owned();
+    draft.username = "artist".to_owned();
+    draft.password = "dummy-password".to_owned();
     let (effect, status) = apply(
         &mut form,
         &mut direct,

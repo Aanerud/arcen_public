@@ -28,6 +28,7 @@
         "directories",
         "display",
         "display_fit",
+        "doc_shots",
         "input",
         "installed_copies",
         "keymap",
@@ -54,6 +55,9 @@
       "forwarded_features": {
         "dev-tools": [
           "dev-tools"
+        ],
+        "doc-shots": [
+          "doc-shots"
         ],
         "experimental-raw-hid": [
           "experimental-raw-hid"
@@ -203,6 +207,7 @@
         "directories",
         "display",
         "display_fit",
+        "doc_shots",
         "input",
         "log_target",
         "logging",
@@ -216,7 +221,8 @@
         "screens",
         "services",
         "settings",
-        "support_bundle"
+        "support_bundle",
+        "ui_pacing"
       ],
       "features": [
         "egui",
@@ -225,6 +231,9 @@
       "forwarded_features": {
         "dev-tools": [
           "dev-tools"
+        ],
+        "doc-shots": [
+          "doc-shots"
         ]
       },
       "production_uses": [

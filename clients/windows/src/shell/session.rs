@@ -66,6 +66,8 @@ pub(super) enum SessionNews {
     Quiet,
     /// The host's certificate is not trusted: ask the user.
     CertificateUntrusted(CertInfo),
+    /// A host this Deck pinned presented this certificate instead.
+    CertificateChanged(CertInfo),
     /// The host asks for credentials (possibly after a disclaimer).
     AuthRequired(AuthRequest),
     /// The host authenticated the attachment (with its resume grant, if
@@ -443,6 +445,9 @@ impl Connection {
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(info) = state.certificate_untrusted.take() {
             return SessionNews::CertificateUntrusted(info);
+        }
+        if let Some(info) = state.certificate_changed.take() {
+            return SessionNews::CertificateChanged(info);
         }
         if let Some(request) = state.pending_auth.take() {
             return SessionNews::AuthRequired(request);

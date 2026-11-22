@@ -78,6 +78,13 @@ fn print_platform_report() {
 
 #[tokio::main]
 async fn main() {
+    // Developer-only: the manual's screenshots, offscreen. Before logging,
+    // which would open this Mac's Deck log.
+    #[cfg(feature = "doc-shots")]
+    if std::env::args().nth(1).as_deref() == Some("doc-shots") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(arcen_deck::ui::doc_shots::run(&args));
+    }
     // Logging is infrastructure: bring it up before anything else so every
     // subsystem has a sink from the first line. The GUI later re-points the
     // level at the user's saved "Log level" preference; CLI paths keep Info.
@@ -1469,6 +1476,9 @@ async fn input_smoke(
             }
             SessionEvent::CertificateUntrusted(_) => {
                 return Err("server certificate requires interactive trust".to_string());
+            }
+            SessionEvent::CertificateChanged(_) => {
+                return Err("this host's identity changed since it was trusted".to_string());
             }
             SessionEvent::Json(value) => {
                 if hard_mode
@@ -3119,6 +3129,9 @@ async fn media_smoke(
         match event {
             SessionEvent::CertificateUntrusted(_) => {
                 return Err("server certificate requires interactive trust".to_string());
+            }
+            SessionEvent::CertificateChanged(_) => {
+                return Err("this host's identity changed since it was trusted".to_string());
             }
             SessionEvent::ServerHello(hello) => {
                 if canvas_smoke.is_some() {

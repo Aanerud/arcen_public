@@ -9,7 +9,8 @@ policies behind the keys.
 
 **Start with the connection test.** It answers most "it does not work"
 questions in five seconds and needs no password: in the Deck, open a
-connection and choose **Test connection** (also in the connection editor), or
+connection's **⋮** menu and choose **Test connection** (the New and Edit
+connection forms have it too, at the bottom left), or
 from a terminal:
 
 ```sh
@@ -49,7 +50,7 @@ Run **Test connection**; the first failing step decides.
 | `diag.udp.refused` | The machine is up but nothing listens on that port. | Start the Pier service, or use the port in `listen.port`. |
 | `diag.udp.local_network_unreachable` | macOS blocks Arcen Deck from the local network, or the Pier is off. | System Settings › Privacy & Security › Local Network: enable Arcen Deck. |
 | `diag.udp.transport_mismatch`, `diag.greeting.unexpected` | The Deck and Pier are from releases that do not speak the same transport. | Update both to the same release. |
-| `diag.cert.mismatch` | The Pier presents a different identity from the one this Deck remembers: a reinstalled Pier, a replaced certificate, or an impostor. | **Do not sign in.** Compare the SPKI fingerprint in the report with `host.spki-sha256` in the Pier's configuration directory. Only if they match, choose **Forget and Verify** when the Deck offers it. |
+| `diag.cert.mismatch` | The Pier presents a different identity from the one this Deck remembers: a reinstalled Pier, a replaced certificate, or an impostor. | **Do not sign in.** Compare the SPKI fingerprint in the report with `host.spki-sha256` in the Pier's configuration directory. Only if they match, choose **Trust the new identity…** when the Deck offers it, and confirm. |
 | `diag.cert.expired`, `diag.cert.not_yet_valid` | The Pier's certificate is out of date, or a clock is wrong. | Renew it (rerun the installer; `arcen-pier new-host-cert` on Linux and macOS) and check both clocks. |
 | `diag.cert.name_mismatch` | The certificate does not list the name or address you typed. | Connect with a name it lists, or reissue it with that name. |
 | `diag.mtu.too_small` | A VPN or tunnel interface below 1228 bytes cannot carry QUIC's 1200-byte packets. | Raise the tunnel MTU to at least 1280. |
@@ -132,7 +133,7 @@ Each preset is a separate capture pipeline; see
 
 | Cause | How to tell | Fix |
 | --- | --- | --- |
-| The connection's tablet mode is **Mouse compatibility only** | **Settings › Input › Tablet** (saved with the connection selected in the Connections list). | Choose **Tablet support** and connect again; a mode change takes effect on the next connection. |
+| The tablet mode is **Mouse only** | **Settings › Tablet** (one choice for every connection). | Choose **Tablet support** and connect again; a mode change takes effect on the next connection. |
 | A headless Linux Wayland desktop | GNOME's input emulation has no stylus yet, so pen events arrive as a mouse. | Let the desktop run natively on its own seat (`wayland.session_mode: auto` with a qualified native seat; one per host). See [Native Wayland seat](error-codes.md#native-wayland-seat) for why a seat was not available. |
 | Native tablet (USB bridged) on a host that cannot take it | Headless Wayland desktops, Linux hosts that have not enabled it, and a Windows session without a Windows Ink pen device refuse it, and the Deck says why and keeps mouse control. | Use **Tablet support**, or on a Linux host enable it (`install-arcen-pier --native-tablet`; [Native tablet](pier-administration.md#native-tablet-usbnative_tablet)). A Windows host needs nothing installed: it reads the pen itself and injects Windows Ink. |
 | An application that reads only mouse events, or a Windows application set to Wintab | Pressure works in other applications. | Enable the application's tablet input. On Windows choose Windows Ink: per-application settings are in [Windows applications: choose Windows Ink](pen-tablet-input.md#4a-windows-applications-choose-windows-ink). Arcen does not support Wintab, so an application with no Windows Ink mode (Mari 4.7 and earlier) gets no pressure ([ADR 0017](../adr/0017-forward-only-pen-input.md)). |
@@ -145,8 +146,8 @@ Validation steps per host are in [Pen and tablet input](pen-tablet-input.md).
 | --- | --- | --- |
 | The host session's keyboard layout differs from the Mac's | Letters land in the wrong places (`z`/`y`, `æøå` as punctuation). Keys are sent by position and the host's layout decides the character. | Switch the session to **Connection › Keyboard: Characters** (⌃⌘U; ⌃⌘K goes back), or save the connection with Keyboard mode **Characters**: every typed character then arrives as on the Mac. Or set the host session's layout to match the Mac. Needs a Windows, Linux Xorg or Linux Wayland Pier from 0.18.0. |
 | Characters mode is on where keys are needed | A game, a VM console or an application that reads keys misbehaves; the video shows **Keyboard: Characters**. | ⌃⌘K (Physical Keys). |
-| Option is Alt, or Option types characters, the wrong way round | `Option` shortcuts or special characters misbehave. | Settings › Input: choose how the left and right Option keys behave (**Automatic**, the default, keeps both as Option on a Mac host); on a Windows host right Option is AltGr (Edit connection › **Left Option is also AltGr** for the left one). |
-| `⌘` shortcuts do not do what you expect | Each host gets its own mapping: on Windows ⌘ is the Windows key except ⌘C/X/V/A/Z/F/W, on Linux ⌘ is Ctrl. | Edit connection › **Keyboard shortcuts**; see the README, "Your Mac keyboard on the host". |
+| Option is Alt, or Option types characters, the wrong way round | `Option` shortcuts or special characters misbehave. | Edit connection › On this machine › **Option key**: choose how the left and right Option keys behave for that host (**App default (Automatic)** keeps both as Option on a Mac host; on a Windows or Linux host left Option is Alt and right Option is AltGr). |
+| `⌘` shortcuts do not do what you expect | Each host gets its own mapping: on Windows ⌘ is the Windows key except ⌘C/X/V/A/Z/F/W, on Linux ⌘ is Ctrl. | Edit connection › On this machine › **⌘ key**; see the README, "Your Mac keyboard on the host". |
 | Characters outside the session layout on GNOME 49 | The Deck reports characters the host could not type. | The compositor lacks libei text input; type them on the host's layout. |
 
 ## Cannot paste into the sign-in screen
@@ -162,7 +163,7 @@ plain text there.
 | The host's clipboard policy keeps the Mac's clipboard out | "This host's administrator does not allow text from this Mac's clipboard…" | `clipboard.direction` excludes Mac-to-host text; Paste as Keystrokes honours it by design. |
 | Nothing happens until you let go | **Release the modifier keys to start typing**. | Typing waits while any modifier is held, so no character becomes a shortcut. |
 | A password did not sign in | The field shows the right number of dots but sign-in fails, or the screen's curtain was still down. | Click the password field (or press a key to lift the lock-screen curtain) first, then paste. The line break at the end of copied text is never typed — press Return yourself. |
-| Characters are missing in a slow console | Some characters did not arrive. | Settings › Input › Paste as Keystrokes › **Typing speed**: 10 or 25 characters a second. |
+| Characters are missing in a slow console | Some characters did not arrive. | Settings › Advanced › Input › Paste as Keystrokes › **Speed**: 10 or 25 characters a second. |
 | Characters were refused | "N characters were not typed: …" | On GNOME 49 Wayland, characters outside the session layout (on a UK layout: `å`, `é`, `ü`, emoji, Cyrillic; dead-key accents on any layout) need libei text input, which GNOME 49 does not offer; add the layout that has them as the session's input source, or type them on the host. When the session's keymap holds several different layouts — several input sources, or GNOME's extra layout for the locale (a Norwegian source on an English-locale host is `no,gb`) — GNOME does not say reliably which one is active, so only characters every layout types on the same keys are typed by key; the Pier log line "session keyboard layout read" shows the groups. The Pier types only what the session layout proves, so a character is refused rather than typed wrong. The characters are counted, never shown. |
 | It types into the wrong place | Typing goes wherever the host's keyboard focus is. | Esc stops it at once; click the right field and paste again. Keys you press while it types are not sent. |
 

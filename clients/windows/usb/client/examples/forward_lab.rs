@@ -332,7 +332,7 @@ mod lab {
                 SessionEvent::Authenticated(_) => {
                     let _ = session.commands.send(SessionCommand::AcceptAuthentication);
                 }
-                SessionEvent::CertificateUntrusted(_) => {
+                SessionEvent::CertificateUntrusted(_) | SessionEvent::CertificateChanged(_) => {
                     break Err("the Pier's certificate does not match the pin".to_owned());
                 }
                 SessionEvent::ServerHello(hello) => {

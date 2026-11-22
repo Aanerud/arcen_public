@@ -216,10 +216,13 @@ same address is protected too.
 This is the point of the whole ceremony. Once a fingerprint is recorded, a
 different one is a hard error with no "trust anyway" button, because an
 impostor's certificate would otherwise raise exactly the same friendly dialog
-the real host raised the first time. If the host really was reinstalled, you
-can confirm that you checked with its administrator and choose *Forget and
-Verify*. The Deck drops the old fingerprint, reconnects at once and shows you
-the new one to compare before anything is trusted.
+the real host raised the first time. If the host really was reinstalled, the
+Deck shows the remembered fingerprint next to the new one, of the same kind,
+and you can confirm that you checked with its administrator and choose *Trust
+and connect*. That replaces the remembered fingerprint with exactly the one
+shown (a certificate fingerprint stays a certificate fingerprint) in a single
+write, and only if no other Deck window changed it meanwhile; otherwise
+nothing is trusted and the next connection asks again.
 
 **Pins are compared in constant time**, so an attacker cannot learn a pin by
 measuring how long a rejection takes. A pin changes only when you change it.

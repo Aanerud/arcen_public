@@ -13,6 +13,10 @@ pub enum CursorModeNegotiationReason {
     Accepted,
     /// The client asked the host to draw the cursor, but the host cannot.
     HostCursorUnavailable,
+    /// The automatic cursor: the host sends no cursor images, so it draws
+    /// the pointer into the video and the Deck shows none
+    /// ([`resolve_automatic_cursor_mode`]).
+    NoCursorImages,
 }
 
 impl CursorModeNegotiationReason {
@@ -23,6 +27,9 @@ impl CursorModeNegotiationReason {
             Self::Accepted => "",
             Self::HostCursorUnavailable => {
                 "host cursor mode is unavailable; client-rendered cursor remains active"
+            }
+            Self::NoCursorImages => {
+                "automatic cursor: host sends no cursor images, so it draws the pointer into the video"
             }
         }
     }
@@ -48,6 +55,42 @@ impl From<ResolvedCursorMode> for CursorModeNegotiation {
             active: resolved.active,
             accepted: resolved.accepted,
         }
+    }
+}
+
+/// The automatic cursor, the one decision for a Deck that leaves the
+/// pointer to Arcen (`cursor_automatic_v1`): when the host sends cursor
+/// images, the Deck draws the pointer, which moves at the speed of the hand
+/// and has the host's shape; when it sends none, the host draws the pointer
+/// into the video if it can, so the shape is right, and the Deck shows none.
+/// A host that can do neither leaves the Deck's arrow.
+///
+/// `requested` is the Deck's stored request, which only hosts older than the
+/// automatic cursor serve; it is echoed and does not change the outcome.
+/// Every automatic result is `accepted`: the Deck asked for exactly this
+/// rule.
+#[must_use]
+pub const fn resolve_automatic_cursor_mode(
+    requested: CursorMode,
+    host_cursor: CapabilityAvailability,
+    host_sends_cursor_images: bool,
+) -> ResolvedCursorMode {
+    let (active, reason) = match (host_sends_cursor_images, host_cursor) {
+        (true, _) => (CursorMode::Local, CursorModeNegotiationReason::Accepted),
+        (false, CapabilityAvailability::Available) => (
+            CursorMode::Host,
+            CursorModeNegotiationReason::NoCursorImages,
+        ),
+        (false, CapabilityAvailability::Unavailable | CapabilityAvailability::Unknown) => (
+            CursorMode::Local,
+            CursorModeNegotiationReason::HostCursorUnavailable,
+        ),
+    };
+    ResolvedCursorMode {
+        requested,
+        active,
+        accepted: true,
+        reason,
     }
 }
 
@@ -187,6 +230,43 @@ pub const fn resolve_tablet_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_automatic_cursor_is_the_decks_with_images_and_the_hosts_without() {
+        // The stored request is echoed and never changes the outcome.
+        for requested in [CursorMode::Local, CursorMode::Host] {
+            for host_cursor in [
+                CapabilityAvailability::Available,
+                CapabilityAvailability::Unavailable,
+                CapabilityAvailability::Unknown,
+            ] {
+                let images = resolve_automatic_cursor_mode(requested, host_cursor, true);
+                assert_eq!(images.requested, requested);
+                assert_eq!(images.active, CursorMode::Local, "{host_cursor:?}");
+                assert_eq!(images.reason, CursorModeNegotiationReason::Accepted);
+                assert!(images.accepted);
+            }
+            let without =
+                resolve_automatic_cursor_mode(requested, CapabilityAvailability::Available, false);
+            assert_eq!(without.requested, requested);
+            assert_eq!(without.active, CursorMode::Host);
+            assert!(without.accepted);
+            assert_eq!(without.reason, CursorModeNegotiationReason::NoCursorImages);
+        }
+        // The reason travels as a bounded string (`CursorModeReason`).
+        assert!(CursorModeNegotiationReason::NoCursorImages.as_str().len() <= 160);
+        for host_cursor in [
+            CapabilityAvailability::Unavailable,
+            CapabilityAvailability::Unknown,
+        ] {
+            let arrow = resolve_automatic_cursor_mode(CursorMode::Local, host_cursor, false);
+            assert_eq!(arrow.active, CursorMode::Local);
+            assert_eq!(
+                arrow.reason,
+                CursorModeNegotiationReason::HostCursorUnavailable
+            );
+        }
+    }
 
     #[test]
     fn cursor_result_downgrades_unavailable_host_cursor() {

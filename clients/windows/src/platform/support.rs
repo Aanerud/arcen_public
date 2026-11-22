@@ -3,7 +3,8 @@
 //! The Windows side of the support bundle: GPUs and their drivers, the
 //! Windows build, crash-dump registration and this Deck's WER minidumps,
 //! the Desktop, the folder dialog and Explorer. The bundle itself is
-//! shared (`arcen_deck_core::support_bundle`).
+//! shared (`arcen_deck_core::support_bundle`). Also the save and open
+//! dialogs for connection profiles (`arcen_deck_core::profile`).
 
 #![allow(
     unsafe_code,
@@ -196,6 +197,125 @@ pub fn choose_folder(start: Option<&Path>) -> Option<PathBuf> {
             CoUninitialize();
         }
         chosen
+    }
+}
+
+/// The save dialog for a connection profile (`IFileSaveDialog`), proposing
+/// `file_name` on the Desktop; it adds `.arcen` when the name has no
+/// extension and confirms replacing a file. Modal to no window; UI thread.
+#[must_use]
+pub fn choose_profile_to_save(file_name: &str) -> Option<PathBuf> {
+    use windows::Win32::UI::Shell::{
+        FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT, FileSaveDialog, IFileSaveDialog,
+    };
+    use windows::core::HSTRING;
+    let start = super::folders::desktop_dir();
+    with_file_dialog(|create| {
+        // SAFETY: called by `with_file_dialog` on this thread with COM
+        // initialised; the dialog is owned and released on drop.
+        unsafe {
+            let dialog: IFileSaveDialog = create(&FileSaveDialog)?;
+            let options = dialog.GetOptions().ok()?;
+            dialog
+                .SetOptions(options | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM)
+                .ok()?;
+            let _ = dialog.SetTitle(&HSTRING::from("Export connection"));
+            let _ = dialog
+                .SetDefaultExtension(&HSTRING::from(arcen_deck_core::profile::PROFILE_EXTENSION));
+            let _ = dialog.SetFileName(&HSTRING::from(file_name));
+            set_start_folder(&dialog, start.as_deref());
+            dialog.Show(None).ok()?;
+            result_path(&dialog.GetResult().ok()?)
+        }
+    })
+}
+
+/// The open dialog for a connection profile (`IFileOpenDialog`). Any file
+/// may be chosen; the shared reader validates it. Modal to no window; UI
+/// thread.
+#[must_use]
+pub fn choose_profile_to_open() -> Option<PathBuf> {
+    use windows::Win32::UI::Shell::{
+        FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FileOpenDialog, IFileOpenDialog,
+    };
+    use windows::core::HSTRING;
+    with_file_dialog(|create| {
+        // SAFETY: as in `choose_profile_to_save`.
+        unsafe {
+            let dialog: IFileOpenDialog = create(&FileOpenDialog)?;
+            let options = dialog.GetOptions().ok()?;
+            dialog
+                .SetOptions(options | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM)
+                .ok()?;
+            let _ = dialog.SetTitle(&HSTRING::from("Import connection"));
+            let _ = dialog
+                .SetDefaultExtension(&HSTRING::from(arcen_deck_core::profile::PROFILE_EXTENSION));
+            dialog.Show(None).ok()?;
+            result_path(&dialog.GetResult().ok()?)
+        }
+    })
+}
+
+/// Runs `body` with COM initialised on this thread (balanced when this call
+/// initialised it), handing it a creator for in-process dialog objects.
+fn with_file_dialog<T>(
+    body: impl FnOnce(&dyn Fn(&windows::core::GUID) -> Option<T>) -> Option<PathBuf>,
+) -> Option<PathBuf>
+where
+    T: windows::core::Interface,
+{
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
+        CoInitializeEx, CoUninitialize,
+    };
+    // SAFETY: COM on this (UI) thread, uninitialised once only when this
+    // call initialised it; the created object is owned by `body`.
+    unsafe {
+        let initialised = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let create = |class: &windows::core::GUID| -> Option<T> {
+            CoCreateInstance(class, None, CLSCTX_INPROC_SERVER).ok()
+        };
+        let chosen = body(&create);
+        if initialised.is_ok() {
+            CoUninitialize();
+        }
+        chosen
+    }
+}
+
+/// Starts `dialog` in `folder`, when there is one.
+///
+/// # Safety
+///
+/// COM is initialised on this thread.
+unsafe fn set_start_folder(dialog: &windows::Win32::UI::Shell::IFileDialog, folder: Option<&Path>) {
+    use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName};
+    use windows::core::HSTRING;
+    if let Some(folder) = folder
+        // SAFETY: the caller's contract; the item is owned and released.
+        && let Ok(item) = unsafe {
+            SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(folder.as_os_str()), None)
+        }
+    {
+        // SAFETY: as above.
+        let _ = unsafe { dialog.SetFolder(&item) };
+    }
+}
+
+/// The file-system path of a dialog's result.
+///
+/// # Safety
+///
+/// COM is initialised on this thread.
+unsafe fn result_path(item: &windows::Win32::UI::Shell::IShellItem) -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::SIGDN_FILESYSPATH;
+    // SAFETY: the caller's contract; the name is freed once.
+    unsafe {
+        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let path = name.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(name.0.cast()));
+        path
     }
 }
 

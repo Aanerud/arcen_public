@@ -2,7 +2,7 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! The shared Deck screens (feature `egui`).
 //!
-//! Extraction step 6 moves the macOS Deck's home, settings, credentials,
+//! Extraction step 6 moves the macOS Deck's home, settings,
 //! certificate, reconnect, signing-in and statistics screens here as
 //! view-state plus action enums, so both Decks render the same UI with the
 //! same wording (1:1 look and feel). This feature depends on
@@ -22,9 +22,13 @@ pub mod fidelity;
 pub mod help_windows;
 pub mod home;
 pub mod host_pointer;
+pub mod icons;
+pub mod input_choices;
 pub mod keyboard_help;
 pub mod launcher;
+pub mod list_picker;
 pub mod menu;
+pub mod profile;
 pub mod reconnect;
 pub mod settings;
 pub mod sign_in;

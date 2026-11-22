@@ -16,6 +16,7 @@
 pub mod build;
 pub mod folders;
 pub mod installed_copies;
+pub mod motion;
 pub mod netinfo;
 pub mod password_file;
 pub mod pen;
@@ -294,6 +295,14 @@ impl DeckServices for WindowsDeckServices {
 
     fn choose_folder(&self, start: Option<&std::path::Path>) -> Option<PathBuf> {
         support::choose_folder(start)
+    }
+
+    fn choose_profile_to_save(&self, suggested_file_name: &str) -> Option<PathBuf> {
+        support::choose_profile_to_save(suggested_file_name)
+    }
+
+    fn choose_profile_to_open(&self) -> Option<PathBuf> {
+        support::choose_profile_to_open()
     }
 
     fn reveal_in_file_browser(&self, path: &std::path::Path) -> bool {

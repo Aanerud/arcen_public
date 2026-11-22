@@ -30,6 +30,11 @@ default = []
 # `packaging/windows-deck/build.ps1` refuses any arcen-deck.exe that carries
 # the ARCEN_DECK_DEV_TOOLS_FEATURE_MARKER_DO_NOT_SHIP string.
 dev-tools = ["arcen-deck-core/dev-tools"]
+# Developer-only, never in a release package: `arcen-deck.exe doc-shots`
+# renders the user manual's screenshots offscreen
+# (docs/testing/deck-manual-screenshots.md). It leaves `dev-tools` off, which
+# changes what Settings shows, and carries the same do-not-ship marker.
+doc-shots = ["arcen-deck-core/doc-shots"]
 
 [dependencies]
 # ui: the shared screens and the session engine (platform: the log runtime).

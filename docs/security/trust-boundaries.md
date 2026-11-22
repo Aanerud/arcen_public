@@ -243,7 +243,12 @@ security may capture only an otherwise-valid `UnknownIssuer` leaf, reject that
 probe handshake, display actual hashes/validity and the peer address that
 presented them, and accept an SPKI only after an explicit user action. The user
 chooses between accepting for the current process and recording the identity in
-`trusted_pins.json`; no Arcen protocol data precedes either. A recorded identity
+`trusted_pins.json`; no Arcen protocol data precedes either. Every write to
+`trusted_pins.json` (a remembered identity, its replacement after a confirmed
+change, an imported connection's identity) changes one endpoint under an
+advisory lock, through a synced temporary file renamed into place, and only
+while that endpoint's identity on disk is still the one the user reviewed, so
+one Deck window never rolls back another's. A recorded identity
 is loaded before any connection and installs a pinning verifier rather than a
 capturing one, so a subsequent mismatch is terminal and cannot be re-prompted.
 Rekey requires new trust. Each concurrently dialled address captures into its

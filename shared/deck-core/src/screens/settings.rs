@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! Settings: the eight panels (Language, Streaming, Displays, Microphone,
-//! Clipboard, Input, Logs, Advanced) with the same wording on both Decks.
+//! Input, Tablet, Logs, Advanced) with the same wording on both Decks.
+//! Input, Tablet and Advanced › Input take their words from
+//! [`super::input_choices`].
 //!
 //! The shell hands in a copy of the current values ([`SettingsValues`]) and
 //! what the platform knows ([`SettingsFacts`]); [`render_settings`] edits the
@@ -11,12 +13,12 @@
 use arcen_input::pen_buttons::{PenButtonAction, PenButtonSettings};
 use arcen_input::text::paste::PasteSettings;
 use arcen_input::text::{OptionKeyPreference, TypingMode};
-use arcen_protocol::messages::{ClientMonitor, ClipboardPolicyMsg, CursorMode, TabletModeMsg};
+use arcen_protocol::messages::{ClientMonitor, CursorMode, TabletModeMsg};
 
+use super::input_choices::{self as choices, Choice};
+use super::list_picker::list_picker;
 use super::theme;
-use super::widgets::{
-    settings_nav_item, settings_nav_section_label, settings_radio, settings_radio_with_trailing,
-};
+use super::widgets::{settings_nav_item, settings_nav_section_label};
 use super::wording::{DeckPlatform, deck_platform};
 use crate::settings::{
     ColorFidelity, ColorFidelitySettings, DisplaysMode, LogLevel, PerformanceMode, RemoteUiScale,
@@ -33,8 +35,10 @@ pub enum SettingsTab {
     Streaming,
     Displays,
     Microphone,
-    Clipboard,
     Input,
+    /// The tablet mode, one choice for every connection (0.20.7), directly
+    /// under Input.
+    Tablet,
     Logs,
     Advanced,
 }
@@ -47,8 +51,8 @@ impl SettingsTab {
             Self::Streaming => "Streaming",
             Self::Displays => "Displays",
             Self::Microphone => "Microphone",
-            Self::Clipboard => "Clipboard",
             Self::Input => "Input",
+            Self::Tablet => "Tablet",
             Self::Logs => "Logs",
             Self::Advanced => "Advanced",
         }
@@ -189,6 +193,51 @@ impl SettingsValues {
     }
 }
 
+/// How this Deck takes the system shortcuts.
+const fn shortcut_route(platform: DeckPlatform) -> crate::settings::SystemShortcutRoute {
+    match platform {
+        DeckPlatform::Mac => crate::settings::SystemShortcutRoute::MacEventTap,
+        DeckPlatform::Pc => crate::settings::SystemShortcutRoute::PcKeyboardHook,
+    }
+}
+
+/// The settings the system-shortcuts switch reads and writes.
+fn shortcut_settings(
+    keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
+    capture_mac_system_shortcuts: bool,
+) -> crate::settings::ClientSettings {
+    crate::settings::ClientSettings {
+        keyboard_capture,
+        capture_mac_system_shortcuts,
+        ..crate::settings::ClientSettings::default()
+    }
+}
+
+/// Settings › Input › Keyboard's one switch, as this Deck takes the system
+/// shortcuts ([`crate::settings::ClientSettings::system_shortcuts_to_host`]).
+fn system_shortcuts_to_host(
+    platform: DeckPlatform,
+    keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
+    capture_mac_system_shortcuts: bool,
+) -> bool {
+    shortcut_settings(keyboard_capture, capture_mac_system_shortcuts)
+        .system_shortcuts_to_host(shortcut_route(platform))
+}
+
+/// Turns the switch on or off: on a Mac the event tap and the remote
+/// computer's policy, on a PC the keyboard hook's policy.
+fn set_system_shortcuts_to_host(
+    platform: DeckPlatform,
+    on: bool,
+    keyboard_capture: &mut arcen_input::keyboard::KeyboardCapturePolicy,
+    capture_mac_system_shortcuts: &mut bool,
+) {
+    let mut settings = shortcut_settings(*keyboard_capture, *capture_mac_system_shortcuts);
+    settings.set_system_shortcuts_to_host(shortcut_route(platform), on);
+    *keyboard_capture = settings.keyboard_capture;
+    *capture_mac_system_shortcuts = settings.capture_mac_system_shortcuts;
+}
+
 /// One display in the Displays panel.
 #[derive(Debug, Clone)]
 pub struct SettingsMonitor {
@@ -205,7 +254,8 @@ impl SettingsMonitor {
     }
 }
 
-/// How the Native tablet component's button is tinted.
+/// Where the Native tablet component stands: its guidance reads as a note
+/// while it waits for the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentTint {
     /// Installed and running.
@@ -214,17 +264,6 @@ pub enum ComponentTint {
     Attention,
     /// Something to do (install, start, recheck).
     Action,
-}
-
-impl ComponentTint {
-    #[must_use]
-    pub const fn colour(self) -> egui::Color32 {
-        match self {
-            Self::Ready => theme::SUCCESS,
-            Self::Attention => theme::WARNING,
-            Self::Action => theme::ACCENT,
-        }
-    }
 }
 
 /// Where the Native tablet component stands, as the Input panel shows it:
@@ -384,10 +423,13 @@ pub struct SettingsFacts<'a> {
     /// `Some(has_notch)` where the Deck has a notch setting at all.
     pub notch: Option<bool>,
     pub monitors: &'a [SettingsMonitor],
-    /// The clipboard policy the host granted in the current session.
-    pub clipboard_policy: Option<ClipboardPolicyMsg>,
-    /// Which connection the tablet mode is saved for.
-    pub tablet_scope_note: String,
+    /// What the current session says about its host's clipboard policy
+    /// ([`crate::clipboard::HostClipboard::connection_notice`], with the
+    /// clipboard value the session connected with), shown under Input ›
+    /// Clipboard; `None` outside a session.
+    pub host_clipboard_notice: Option<&'static str>,
+    /// The saved connections, for "N connections use their own".
+    pub connections: &'a [crate::config::SavedConnectionSummary],
     /// The Native tablet component, or `None` when this build has none.
     pub native_tablet: Option<NativeTabletControl>,
     /// What the decoder proved, for why Grading or HDR is unavailable
@@ -426,94 +468,9 @@ pub enum SettingsAction {
     NativeTabletComponent,
     /// Logs › support bundle.
     SupportBundle(super::support_bundle::SupportBundleAction),
-    /// Input › "Allow in Accessibility…": ask the system for the permission
-    /// the system-shortcut capture needs.
+    /// Input › Keyboard › "Open System Settings…": ask the system for the
+    /// permission the system-shortcut capture needs.
     AllowSystemShortcutPermission,
-}
-
-/// The note under Settings › Input › Tablet: which saved connection the
-/// tablet mode is remembered for, if any.
-#[must_use]
-pub fn tablet_scope_note(connection_name: Option<&str>) -> String {
-    match connection_name {
-        Some(name) => format!(
-            "Remembered for \u{201c}{name}\u{201d} only. Each saved connection keeps its \
-             own tablet mode; choose it again for your other hosts."
-        ),
-        None => {
-            "Applies to this session only: select a saved connection to remember it.".to_string()
-        }
-    }
-}
-
-#[must_use]
-pub const fn tablet_mode_label(mode: TabletModeMsg) -> &'static str {
-    match mode {
-        TabletModeMsg::LocalTermination => "Tablet support",
-        TabletModeMsg::UsbTabletBridge => "Native tablet (USB bridged)",
-        TabletModeMsg::DisabledMouseCompat => "Mouse compatibility only",
-    }
-}
-
-/// What Native tablet does on each kind of host, one sentence each, where a
-/// host genuinely differs (Q-16: any tablet by default; the exceptions are
-/// stated, never hidden).
-pub const NATIVE_TABLET_TARGET_NOTES: [&str; 3] = [
-    "On a Linux host the host's own driver claims the tablet; an X11 desktop needs \
-     xf86-input-wacom, and a headless Wayland desktop refuses Native tablet because it has no \
-     seat to confine a USB device to.",
-    "On a macOS host Arcen reads the pen itself, from any tablet that reports a standard pen \
-     (pressure, tilt, buttons and eraser), with more for models that have a dedicated reader; \
-     touch and the tablet's own keys are not used there.",
-    "On a Windows host Arcen also reads the pen itself, from any tablet that reports a standard \
-     pen, and injects it as a Windows Ink pen (pressure, tilt, buttons and eraser), with no \
-     driver installed; touch and the tablet's own keys are not used there.",
-];
-
-#[must_use]
-pub fn tablet_mode_description(mode: TabletModeMsg, platform: DeckPlatform) -> String {
-    let targets = NATIVE_TABLET_TARGET_NOTES.join(" ");
-    let this = platform.this_machine();
-    let this_capital = platform.this_machine_capitalised();
-    let apps = words::applications(platform);
-    let os = words::os_name(platform);
-    match mode {
-        // Both descriptions lead with the network, because that is the choice
-        // the operator is actually making. Everything else about these two
-        // modes follows from where the pen is interpreted, and where the pen is
-        // interpreted is decided by how far away the host is.
-        TabletModeMsg::LocalTermination => format!(
-            "For Wi-Fi, 5G, and working away from the office — good enough for most remote \
-             work. {this_capital}'s tablet driver reads the pen and Arcen sends finished pen events \
-             to the host, so no tablet driver is needed there and no pen sample has to wait for \
-             a reply. Distance costs you responsiveness, not correctness.\n\n\
-             Pressure, tilt, rotation, eraser, proximity, and barrel buttons all work; finger \
-             touch and the tablet's own buttons stay on {this}. The tablet also stays usable \
-             in {apps} while you are connected. Any pen tablet works, and handedness and \
-             mapping follow {this}'s own pen and tablet settings."
-        ),
-        TabletModeMsg::UsbTabletBridge => format!(
-            "For a LAN — the office nearby, not the other side of the country. As close to \
-             plugging the tablet straight into the host as a network allows: a privileged \
-             Arcen helper takes the device away from {os} and forwards its raw USB traffic, \
-             and the host's own driver for that tablet claims it exactly as if it were plugged \
-             in there. Any pen tablet works; models with a dedicated reader get extra features. \
-             The whole device works — pressure, tilt, rotation, eraser, the tablet's own \
-             buttons, and finger touch — wherever the host's own driver claims it.\n\n\
-             {targets}\n\n\
-             In exchange: every pen sample makes a full round trip to the host, so latency is \
-             felt directly and this is not a WAN mode. {apps} cannot use the tablet \
-             until you disconnect, and the host needs its own driver for the tablet and USB \
-             virtualization. The host's driver moves the host's pointer; with Local cursor \
-             rendering Arcen Deck draws the cursor where the host reports it, which is the \
-             recommended pairing (host cursor rendering also works, one video round trip \
-             later). The helper is what runs privileged; Arcen Deck itself never does."
-        ),
-        TabletModeMsg::DisabledMouseCompat => "No tablet redirection. The pen behaves as a mouse; \
-             no pressure, tilt, eraser, proximity, or tablet buttons are available. No \
-             tablet-specific Arcen dependencies."
-            .to_owned(),
-    }
 }
 
 /// Draws the Settings screen. Edits `values` in place and returns what the
@@ -524,7 +481,6 @@ pub fn render_settings(
     facts: &SettingsFacts<'_>,
 ) -> Vec<SettingsAction> {
     let platform = deck_platform(ui.ctx());
-    let accent = theme::ACCENT;
     let mut actions = Vec::new();
     // Work on copies so the nested egui closures don't fight the borrow
     // checker; write back once at the end.
@@ -540,9 +496,9 @@ pub fn render_settings(
         mut remote_ui_scale_percent,
         mut full_color_display_mask,
         mut hidpi_display_mask,
-        mut cursor_preference,
+        cursor_preference,
         mut typing_mode,
-        mut option_key_mode,
+        option_key_mode,
         mut paste_settings,
         mut clipboard_enabled,
         mut microphone_enabled,
@@ -572,324 +528,298 @@ pub fn render_settings(
     // What the panel shows when it opens: an unavailable preset is shown as
     // the one a session would fall back to, but only a click saves.
     let shown_streaming_preset = streaming_preset;
-    let effective_clipboard = facts.clipboard_policy;
 
-    // No accent header bar — the reference design relies on the native
-    // window frame. We keep only a subtle top-right "Done" ghost button to
-    // return Home, since this is a single-window app rather than a separate
-    // settings window. Settings persist live on change, so there is no Save.
-    let width = ui.available_width();
-    ui.add_space(10.0);
-    ui.horizontal(|ui| {
-        ui.set_width(width);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(28.0);
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("Done")
-                            .color(accent)
-                            .size(15.0)
-                            .strong(),
-                    )
-                    // Warm neutrals taken from the Settings nav pills below
-                    // (hover and active), so the ghost button belongs to the
-                    // same palette instead of introducing a second hue.
-                    .fill(egui::Color32::from_rgb(0xF0, 0xEC, 0xE4))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(0xE5, 0xDE, 0xD2),
-                    ))
-                    .corner_radius(8.0)
-                    .min_size(egui::vec2(72.0, 32.0)),
-                )
-                .clicked()
-            {
-                actions.push(SettingsAction::Close);
-            }
-        });
-    });
-    ui.add_space(2.0);
+    // The same orange bar as Home, so Settings reads as the same app: Help,
+    // and Done where Home has the gear. Settings persist live on change,
+    // so there is no Save.
+    match super::launcher::render_settings_top_bar(ui) {
+        Some(super::launcher::SettingsBarAction::Done) => actions.push(SettingsAction::Close),
+        Some(super::launcher::SettingsBarAction::Help) => {
+            super::launcher::open_user_guide(ui.ctx());
+        }
+        None => {}
+    }
+    ui.add_space(theme::SPACE_SCALE[4]);
 
-    let heading_col = egui::Color32::from_rgb(0x1A, 0x1A, 0x1A);
     let body_height = ui.available_height();
     ui.horizontal_top(|ui| {
-            ui.set_min_height(body_height);
-            // Sidebar — white column, active item highlighted (reference look).
-            // Wrapped in an explicit vertical: a row/Frame inherits the parent's
-            // horizontal layout and would otherwise stack items left-to-right.
-            ui.add_space(22.0);
-            ui.vertical(|ui| {
-                ui.set_width(210.0);
-                ui.add_space(2.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("settings_nav_scroll")
-                    .max_height(body_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        settings_nav_section_label(ui, "GENERAL");
-                        for item in [
-                            SettingsTab::Language,
-                            SettingsTab::Streaming,
-                            SettingsTab::Displays,
-                        ] {
-                            if settings_nav_item(ui, item.label(), item == tab, accent) {
-                                tab = item;
-                            }
-                            ui.add_space(2.0);
+        ui.set_min_height(body_height);
+        // Sidebar — white column, active item highlighted (reference look).
+        // Wrapped in an explicit vertical: a row/Frame inherits the parent's
+        // horizontal layout and would otherwise stack items left-to-right.
+        ui.add_space(22.0);
+        ui.vertical(|ui| {
+            ui.set_width(210.0);
+            ui.add_space(2.0);
+            egui::ScrollArea::vertical()
+                .id_salt("settings_nav_scroll")
+                .max_height(body_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    settings_nav_section_label(ui, "General");
+                    for item in [
+                        SettingsTab::Language,
+                        SettingsTab::Streaming,
+                        SettingsTab::Displays,
+                    ] {
+                        if settings_nav_item(ui, item.label(), item == tab) {
+                            tab = item;
                         }
+                        ui.add_space(2.0);
+                    }
 
-                        ui.add_space(8.0);
-                        settings_nav_section_label(ui, "INPUT & DEVICES");
-                        for item in [
-                            SettingsTab::Microphone,
-                            SettingsTab::Clipboard,
-                            SettingsTab::Input,
-                        ] {
-                            if settings_nav_item(ui, item.label(), item == tab, accent) {
-                                tab = item;
-                            }
-                            ui.add_space(2.0);
+                    ui.add_space(8.0);
+                    settings_nav_section_label(ui, "Input and devices");
+                    for item in [
+                        SettingsTab::Microphone,
+                        SettingsTab::Input,
+                        SettingsTab::Tablet,
+                    ] {
+                        if settings_nav_item(ui, item.label(), item == tab) {
+                            tab = item;
                         }
+                        ui.add_space(2.0);
+                    }
 
-                        ui.add_space(8.0);
-                        settings_nav_section_label(ui, "SYSTEM");
-                        for item in [SettingsTab::Logs, SettingsTab::Advanced] {
-                            if settings_nav_item(ui, item.label(), item == tab, accent) {
-                                tab = item;
-                            }
-                            ui.add_space(2.0);
+                    ui.add_space(8.0);
+                    settings_nav_section_label(ui, "System");
+                    for item in [SettingsTab::Logs, SettingsTab::Advanced] {
+                        if settings_nav_item(ui, item.label(), item == tab) {
+                            tab = item;
                         }
-                    });
-            });
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(44.0);
-            ui.vertical(|ui| {
-                ui.set_width((ui.available_width() - 44.0).clamp(360.0, 760.0));
-                egui::ScrollArea::vertical()
-                    .id_salt("settings_content_scroll")
-                    .max_height(body_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                        ui.add_space(2.0);
+                    }
+                });
+        });
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(44.0);
+        // The page: one column, at most `PAGE_COLUMN_MAX` wide, centred
+        // in what the sections leave; text wraps at its edge.
+        let room = ui.available_width();
+        let column = (room - 2.0 * 24.0).clamp(0.0, PAGE_COLUMN_MAX);
+        ui.add_space(((room - column) / 2.0 - 44.0).max(0.0));
+        ui.vertical(|ui| {
+            ui.set_width(column);
+            egui::ScrollArea::vertical()
+                .id_salt("settings_content_scroll")
+                .max_height(body_height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                     // Bump the body text size for the whole content column so the
                     // descriptions read at reference proportions without touching
                     // every label individually.
-                    ui.style_mut().text_styles.insert(
-                        egui::TextStyle::Body,
-                        egui::FontId::proportional(16.0),
-                    );
+                    ui.style_mut()
+                        .text_styles
+                        .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
                     ui.add_space(16.0);
                     match tab {
-                    SettingsTab::Language => {
-                        ui.label(
-                            egui::RichText::new("Language")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Select the preferred language for your Arcen client.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(24.0);
-                        egui::ComboBox::from_id_salt("language")
-                            .selected_text("English (US)")
-                            .show_ui(ui, |ui| {
-                                let _ = ui.selectable_label(true, "English (US)");
-                            });
-                    }
-                    SettingsTab::Streaming => {
-                        ui.label(
-                            egui::RichText::new("Streaming")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
+                        SettingsTab::Language => {
+                            page_title(ui, "Language");
+                            ui.label(
+                                egui::RichText::new(
+                                    "Select the preferred language for your Arcen client.",
+                                )
+                                .color(theme::colours(ui).text2),
+                            );
+                            ui.add_space(theme::SPACE_SCALE[4]);
+                            let mut language = ();
+                            let _ = list_picker(
+                                ui,
+                                "language",
+                                Some("Language"),
+                                &mut language,
+                                &[((), "English (US)".to_owned())],
+                                None,
+                                picker_width(ui),
+                            );
+                        }
+                        SettingsTab::Streaming => {
+                            page_title(ui, "Streaming");
+                            ui.label(
                             egui::RichText::new(
                                 "Choose the result you need. Each preset fixes frame rate, colour \
                                  fidelity, and encoder intent together so the request cannot \
                                  become an accidental combination of unrelated switches.",
                             )
-                            .color(egui::Color32::DARK_GRAY),
+                            .color(theme::colours(ui).text2),
                         );
-                        ui.add_space(16.0);
-                        for preset in StreamingPreset::PRIMARY {
-                            let unavailable = match preset {
-                                StreamingPreset::Grading => fidelity.grading.as_deref(),
-                                StreamingPreset::Hdr => fidelity.hdr.as_deref(),
-                                _ => None,
-                            };
-                            ui.add_enabled_ui(unavailable.is_none(), |ui| {
-                                settings_radio(
-                                    ui,
-                                    &mut streaming_preset,
-                                    preset,
-                                    (preset == StreamingPreset::Auto).then_some("(Default)"),
-                                    preset.title(),
-                                    unavailable.unwrap_or_else(|| preset.description()),
-                                );
-                            });
-                        }
-                        if let Some(codecs) = fidelity.codecs.as_deref() {
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(codecs).color(egui::Color32::DARK_GRAY),
+                            ui.add_space(theme::SPACE_SCALE[4]);
+                            // The presets this Deck can serve, in a picker; the
+                            // others under it, each with why not.
+                            let mut available = Vec::new();
+                            let mut unavailable = Vec::new();
+                            for preset in StreamingPreset::PRIMARY {
+                                let why_not = match preset {
+                                    StreamingPreset::Grading => fidelity.grading.as_deref(),
+                                    StreamingPreset::Hdr => fidelity.hdr.as_deref(),
+                                    _ => None,
+                                };
+                                match why_not {
+                                    Some(reason) => unavailable.push((preset, reason)),
+                                    None => available.push(preset),
+                                }
+                            }
+                            let rows: Vec<Choice<StreamingPreset>> = available
+                                .iter()
+                                .map(|preset| Choice {
+                                    value: *preset,
+                                    title: preset.title().to_owned(),
+                                    badge: (*preset == StreamingPreset::Auto)
+                                        .then_some("(Default)"),
+                                    line: preset.description().to_owned(),
+                                })
+                                .collect();
+                            choice_picker(
+                                ui,
+                                "streaming_preset",
+                                Some("Preset"),
+                                &mut streaming_preset,
+                                &rows,
                             );
-                        }
-                        if streaming_preset != shown_streaming_preset {
-                            streaming_preset.apply_to(&mut performance, &mut color_fidelity);
-                        }
-                        if initial_streaming_preset == StreamingPreset::Custom
-                            && streaming_preset == StreamingPreset::Custom
-                        {
-                            ui.label(
+                            for (preset, reason) in unavailable {
+                                ui.add_space(6.0);
+                                quiet(ui, &format!("{}: {reason}", preset.title()));
+                            }
+                            if let Some(codecs) = fidelity.codecs.as_deref() {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(codecs).color(theme::colours(ui).text2),
+                                );
+                            }
+                            if streaming_preset != shown_streaming_preset {
+                                streaming_preset.apply_to(&mut performance, &mut color_fidelity);
+                            }
+                            if initial_streaming_preset == StreamingPreset::Custom
+                                && streaming_preset == StreamingPreset::Custom
+                            {
+                                ui.label(
                                 egui::RichText::new(
                                     "A developer-defined configuration is active. Choose one of \
                                      the four presets above to return to the supported product \
                                      surface.",
                                 )
-                                .color(theme::DANGER),
+                                .color(theme::colours(ui).error),
                             );
-                        }
-                        ui.add_space(18.0);
-                        ui.checkbox(&mut exact_still_image, "Exact still image");
-                        ui.label(
-                            egui::RichText::new(EXACT_STILL_IMAGE_DESCRIPTION)
-                                .color(egui::Color32::DARK_GRAY),
-                        );
-                        if facts.canvas_available {
-                            ui.add_space(12.0);
-                            ui.checkbox(&mut canvas, "Canvas screen updates");
-                            ui.label(
-                                egui::RichText::new(CANVAS_DESCRIPTION)
-                                    .color(egui::Color32::DARK_GRAY),
-                            );
-                        }
-                        ui.add_space(12.0);
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Colour check…").clicked() {
+                            }
+                            ui.add_space(theme::GROUP_GAP);
+                            ui.checkbox(&mut exact_still_image, "Exact still image");
+                            checkbox_help(ui, EXACT_STILL_IMAGE_DESCRIPTION, Ink::Quiet);
+                            if facts.canvas_available {
+                                ui.add_space(theme::FIELD_TO_LABEL);
+                                ui.checkbox(&mut canvas, "Canvas screen updates");
+                                checkbox_help(ui, CANVAS_DESCRIPTION, Ink::Quiet);
+                            }
+                            ui.add_space(theme::GROUP_GAP);
+                            if button(ui, "Colour check\u{2026}").clicked() {
                                 actions.push(SettingsAction::OpenColourCheck);
                             }
-                            ui.label(
-                                egui::RichText::new(format!(
+                            help_line(
+                                ui,
+                                &format!(
                                     "What the host serves, what {} shows, and whether the \
                                      code values arrive exactly.",
                                     platform.this_machine()
-                                ))
-                                .color(egui::Color32::DARK_GRAY),
-                            );
-                        });
-                    }
-                    SettingsTab::Displays => {
-                        ui.label(
-                            egui::RichText::new("Displays")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Choose how the remote stream is sized. Windowed follows the app \
-                                 window. The other modes size the stream to what the Deck can \
-                                 actually show in fullscreen and enter fullscreen on connect.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(16.0);
-                        for mode in DisplaysMode::ALL {
-                            settings_radio(
-                                ui,
-                                &mut displays,
-                                mode,
-                                None,
-                                mode.label(),
-                                mode.description(),
+                                ),
+                                Ink::Quiet,
                             );
                         }
-                        if let Some((connection, mode)) = &facts.connection_displays {
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    crate::connect_plan::connection_displays_note(
+                        SettingsTab::Displays => {
+                            page_title(ui, "Displays");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(choices::DISPLAYS_INTRO)
+                                        .color(theme::colours(ui).text2),
+                                );
+                                learn_more(ui, choices::DISPLAYS_GUIDE_SECTION);
+                            });
+                            ui.add_space(theme::SPACE_SCALE[4]);
+                            let rows: Vec<Choice<DisplaysMode>> = DisplaysMode::ALL
+                                .iter()
+                                .map(|mode| Choice {
+                                    value: *mode,
+                                    title: mode.label().to_owned(),
+                                    badge: None,
+                                    line: choices::displays_line(*mode, platform).to_owned(),
+                                })
+                                .collect();
+                            choice_picker(
+                                ui,
+                                "displays_mode",
+                                Some("Displays"),
+                                &mut displays,
+                                &rows,
+                            );
+                            if let Some((connection, mode)) = &facts.connection_displays {
+                                help_line(
+                                    ui,
+                                    &crate::connect_plan::connection_displays_note(
                                         connection, *mode,
                                     ),
+                                    Ink::Note,
+                                );
+                                ui.add_space(theme::SPACE_SCALE[1]);
+                                if button(
+                                    ui,
+                                    &crate::connect_plan::connection_displays_follow_label(
+                                        connection,
+                                    ),
                                 )
-                                .color(egui::Color32::from_rgb(0x8A, 0x6D, 0x3B)),
-                            );
-                            ui.add_space(4.0);
-                            if ui
-                                .button(crate::connect_plan::connection_displays_follow_label(
-                                    connection,
-                                ))
                                 .clicked()
-                            {
-                                actions.push(SettingsAction::FollowDisplaysSetting);
+                                {
+                                    actions.push(SettingsAction::FollowDisplaysSetting);
+                                }
                             }
-                        }
 
-                        // A screen with no notch at all (the Windows Deck)
-                        // has no notch section (PARITY Q-7).
-                        if let Some(has_notch) = facts.notch {
-                        ui.add_space(22.0);
-                        ui.label(
-                            egui::RichText::new("Notch area")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(8.0);
-                        ui.add_enabled_ui(has_notch, |ui| {
-                            ui.checkbox(
-                                &mut use_notch_area,
-                                "Extend fullscreen under the notch",
-                            );
-                        });
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(if has_notch {
-                                "Off: the remote desktop fills the area below the notch, \
+                            // A screen with no notch at all (the Windows Deck)
+                            // has no notch section (PARITY Q-7).
+                            if let Some(has_notch) = facts.notch {
+                                group_heading(ui, "Notch area");
+                                ui.add_enabled_ui(has_notch, |ui| {
+                                    ui.checkbox(
+                                        &mut use_notch_area,
+                                        "Extend fullscreen under the notch",
+                                    );
+                                });
+                                checkbox_help(
+                                    ui,
+                                    if has_notch {
+                                        "Off: the remote desktop fills the area below the notch, \
                                  1:1 and unscaled, and the notch strip stays black. On: \
                                  Arcen takes the whole panel instead of using macOS \
                                  fullscreen, so the desktop is still 1:1 but extends \
                                  beside and behind the notch — the notch itself covers a \
                                  slice of the remote screen's top edge. Takes effect at \
                                  the next connection."
-                            } else {
-                                "Not applicable: this display has no notch, so fullscreen \
+                                    } else {
+                                        "Not applicable: this display has no notch, so fullscreen \
                                  already uses the whole panel."
-                            })
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        }
+                                    },
+                                    Ink::Quiet,
+                                );
+                            }
 
-                        ui.add_space(22.0);
-                        ui.label(
-                            egui::RichText::new("Remote UI scale")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(8.0);
-                        let mut remote_ui_scale =
-                            RemoteUiScale::from_percent(remote_ui_scale_percent);
-                        egui::ComboBox::from_id_salt("remote_ui_scale")
-                            .selected_text(remote_ui_scale.label())
-                            .show_ui(ui, |ui| {
-                                for scale in RemoteUiScale::ALL {
-                                    ui.selectable_value(
-                                        &mut remote_ui_scale,
-                                        scale,
-                                        scale.label(),
-                                    );
-                                }
-                            });
-                        remote_ui_scale_percent = remote_ui_scale.as_percent();
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "How large the remote desktop's own interface is, on hosts \
+                            group_heading(ui, "Remote UI scale");
+                            let mut remote_ui_scale =
+                                RemoteUiScale::from_percent(remote_ui_scale_percent);
+                            let scales: Vec<(RemoteUiScale, String)> = RemoteUiScale::ALL
+                                .iter()
+                                .map(|scale| (*scale, scale.label().clone()))
+                                .collect();
+                            let _ = list_picker(
+                                ui,
+                                "remote_ui_scale",
+                                None,
+                                &mut remote_ui_scale,
+                                &scales,
+                                None,
+                                picker_width(ui),
+                            );
+                            remote_ui_scale_percent = remote_ui_scale.as_percent();
+                            help_line(
+                                ui,
+                                &format!(
+                                    "How large the remote desktop's own interface is, on hosts \
                                  that take their scaling from the display Arcen advertises \
                                  — that is Windows. Automatic reports this panel's real \
                                  size, so Windows picks the scaling matching its physical \
@@ -897,44 +827,26 @@ pub fn render_settings(
                                  percentage trades apparent size for desktop space. This \
                                  changes the remote desktop's layout, never the stream's \
                                  1:1 pixel mapping. Takes effect at the next connection.",
-                                words::dense_panel(platform)
-                            ))
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(
+                                    words::dense_panel(platform)
+                                ),
+                                Ink::Quiet,
+                            );
+                            help_line(
+                                ui,
                                 "Linux hosts ignore this. A GNOME session on Xorg offers \
                                  only 100% and 200%, and chooses for itself. To change \
                                  apparent size on a Linux host, use HiDPI streaming below: \
                                  with it off the remote interface is roughly twice the \
                                  size it is with it on.",
-                            )
-                            .color(egui::Color32::from_rgb(0x8A, 0x6D, 0x3B)),
-                        );
+                                Ink::Note,
+                            );
 
-                        ui.add_space(22.0);
-                        ui.label(
-                            egui::RichText::new(words::hidpi_heading(platform))
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(8.0);
-                        ui.checkbox(&mut hidpi, words::hidpi_checkbox(platform));
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(words::hidpi_description(platform))
-                            .color(egui::Color32::DARK_GRAY),
-                        );
+                            group_heading(ui, words::hidpi_heading(platform));
+                            ui.checkbox(&mut hidpi, words::hidpi_checkbox(platform));
+                            checkbox_help(ui, words::hidpi_description(platform), Ink::Quiet);
 
-                        ui.add_space(22.0);
-                        ui.label(
-                            egui::RichText::new("Per-display color priority")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
+                            group_heading(ui, "Per-display color priority");
+                            ui.label(
                             egui::RichText::new(
                                 "Advanced: require full-color 4:4:4 on selected display numbers. \
                                  When at least one is selected, unselected displays may use \
@@ -942,970 +854,562 @@ pub fn render_settings(
                                  decides which configured GPU/encoder resources may be used and \
                                  rejects the whole layout if it cannot satisfy every requirement.",
                             )
-                            .color(egui::Color32::DARK_GRAY),
+                            .color(theme::colours(ui).text2),
                         );
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Detected displays")
-                                    .color(egui::Color32::BLACK)
-                                    .size(19.0),
-                            );
-                            ui.add_space(10.0);
-                            if ui.button("↻  Refresh").clicked() {
+                            group_heading(ui, "Detected displays");
+                            if button(ui, "Refresh").clicked() {
                                 actions.push(SettingsAction::RefreshDisplays);
                             }
-                        });
-                        ui.add_space(8.0);
-                        if facts.monitors.is_empty() {
-                            ui.label(
-                                egui::RichText::new(
-                                    "No displays detected on this platform. The host will fall \
+                            ui.add_space(theme::SPACE_SCALE[2]);
+                            if facts.monitors.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "No displays detected on this platform. The host will fall \
                                      back to its configured default size.",
-                                )
-                                .color(egui::Color32::DARK_GRAY),
-                            );
-                        } else {
-                            for (idx, row) in facts.monitors.iter().enumerate() {
-                                let mon = &row.monitor;
-                                let name = if mon.name.is_empty() {
-                                    format!("Display {}", idx + 1)
-                                } else {
-                                    mon.name.clone()
-                                };
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!("{}", idx + 1))
-                                            .strong()
-                                            .color(egui::Color32::WHITE)
-                                            .background_color(egui::Color32::from_rgb(
-                                                0x00, 0x89, 0x89,
-                                            )),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(&name)
-                                            .color(egui::Color32::BLACK)
-                                            .size(16.0),
-                                    );
-                                    if mon.is_primary {
+                                    )
+                                    .color(theme::colours(ui).text2),
+                                );
+                            } else {
+                                for (idx, row) in facts.monitors.iter().enumerate() {
+                                    let mon = &row.monitor;
+                                    let name = if mon.name.is_empty() {
+                                        format!("Display {}", idx + 1)
+                                    } else {
+                                        mon.name.clone()
+                                    };
+                                    ui.horizontal(|ui| {
                                         ui.label(
-                                            egui::RichText::new("• Primary")
-                                                .color(egui::Color32::from_rgb(
-                                                    0x00, 0x89, 0x89,
-                                                ))
-                                                .size(14.0),
+                                            egui::RichText::new(format!("{}", idx + 1))
+                                                .strong()
+                                                .color(theme::colours(ui).text2),
                                         );
-                                    }
-                                    if idx < 4 {
-                                        let bit = 1u8 << idx;
-                                        let mut full_color =
-                                            full_color_display_mask & bit != 0;
-                                        if ui
-                                            .checkbox(&mut full_color, "Require 4:4:4")
-                                            .changed()
-                                        {
-                                            if full_color {
-                                                full_color_display_mask |= bit;
-                                            } else {
-                                                full_color_display_mask &= !bit;
-                                            }
+                                        ui.label(
+                                            egui::RichText::new(&name)
+                                                .color(theme::colours(ui).text)
+                                                .size(16.0),
+                                        );
+                                        if mon.is_primary {
+                                            ui.label(
+                                                egui::RichText::new("Primary")
+                                                    .color(theme::colours(ui).text2)
+                                                    .size(14.0),
+                                            );
                                         }
-                                        // Only a Retina/scaled panel has
-                                        // backing pixels to stream; offering
-                                        // this on a 1x display would promise
-                                        // a sharpness it cannot deliver
-                                        // while quadrupling nothing.
-                                        if mon.scale > 1.0 {
-                                            let mut hidpi = hidpi_display_mask & bit != 0;
+                                        if idx < 4 {
+                                            let bit = 1u8 << idx;
+                                            let mut full_color = full_color_display_mask & bit != 0;
                                             if ui
-                                                .checkbox(&mut hidpi, "Full resolution")
-                                                .on_hover_text(
-                                                    "Streams this display's full backing \
+                                                .checkbox(&mut full_color, "Require 4:4:4")
+                                                .changed()
+                                            {
+                                                if full_color {
+                                                    full_color_display_mask |= bit;
+                                                } else {
+                                                    full_color_display_mask &= !bit;
+                                                }
+                                            }
+                                            // Only a Retina/scaled panel has
+                                            // backing pixels to stream; offering
+                                            // this on a 1x display would promise
+                                            // a sharpness it cannot deliver
+                                            // while quadrupling nothing.
+                                            if mon.scale > 1.0 {
+                                                let mut hidpi = hidpi_display_mask & bit != 0;
+                                                if ui
+                                                    .checkbox(&mut hidpi, "Full resolution")
+                                                    .on_hover_text(
+                                                        "Streams this display's full backing \
                                                      resolution so the remote desktop applies \
                                                      its own scaling. Sharper and correctly \
                                                      sized, at roughly four times the pixels.",
-                                                )
-                                                .changed()
-                                            {
-                                                if hidpi {
-                                                    hidpi_display_mask |= bit;
-                                                } else {
-                                                    hidpi_display_mask &= !bit;
+                                                    )
+                                                    .changed()
+                                                {
+                                                    if hidpi {
+                                                        hidpi_display_mask |= bit;
+                                                    } else {
+                                                        hidpi_display_mask &= !bit;
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                });
-                                let scale = if (mon.scale - mon.scale.round()).abs() < 0.05 {
-                                    format!("{:.0}x", mon.scale.round())
-                                } else {
-                                    format!("{:.2}x", mon.scale)
-                                };
-                                ui.indent(("mon", idx), |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} × {} px   ·   scale {}   ·   {} Hz   ·   at ({}, {})",
-                                            mon.width_px,
-                                            mon.height_px,
-                                            scale,
-                                            mon.refresh_hz,
-                                            mon.x,
-                                            mon.y,
-                                        ))
-                                        .color(egui::Color32::DARK_GRAY),
-                                    );
-                                    // Fullscreen presentation size: what a
-                                    // pinned session actually streams. Shown
-                                    // only when it differs, i.e. on a notched
-                                    // panel, so the number is never a mystery.
-                                    if let Some([pw, ph]) = row
-                                        .fullscreen_size(hidpi)
-                                        .filter(|size| {
-                                            *size != [mon.width_px, mon.height_px]
-                                        })
-                                    {
+                                    });
+                                    let scale = if (mon.scale - mon.scale.round()).abs() < 0.05 {
+                                        format!("{:.0}x", mon.scale.round())
+                                    } else {
+                                        format!("{:.2}x", mon.scale)
+                                    };
+                                    ui.indent(("mon", idx), |ui| {
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "streams {pw} × {ph} px in fullscreen{}",
-                                                words::fullscreen_size_reason(platform)
+                                                "{} × {} px, scale {}, {} Hz, at ({}, {})",
+                                                mon.width_px,
+                                                mon.height_px,
+                                                scale,
+                                                mon.refresh_hz,
+                                                mon.x,
+                                                mon.y,
                                             ))
-                                            .color(egui::Color32::DARK_GRAY),
+                                            .color(theme::colours(ui).text2),
                                         );
-                                    }
-                                });
-                                ui.add_space(6.0);
-                            }
-                        }
-                    }
-                    SettingsTab::Microphone => {
-                        ui.label(
-                            egui::RichText::new("Microphone")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.checkbox(
-                            &mut microphone_enabled,
-                            "Allow microphone forwarding for this launch",
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Off by default. When enabled, Deck still waits for host policy, \
-                                 negotiated microphone-v1 capabilities, and {} microphone \
-                                 permission before capture starts. Disabling this setting stops \
-                                 capture and requires reconnecting.",
-                                words::os_name(platform)
-                            ))
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                    }
-                    SettingsTab::Clipboard => {
-                        ui.label(
-                            egui::RichText::new("Clipboard")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.checkbox(&mut clipboard_enabled, "Enable clipboard redirection");
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Clipboard redirection is enabled by default. The host is \
-                                 authoritative and may narrow or disable direction, content, and \
-                                 transfer size. Turning this off advertises no clipboard \
-                                 capability and starts no pasteboard polling.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("Effective host policy")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        let policy_text = if !clipboard_enabled {
-                            "Disabled locally".to_string()
-                        } else if let Some(policy) = effective_clipboard {
-                            format!(
-                                "{:?} · {:?} · {} MiB",
-                                policy.direction,
-                                policy.content,
-                                policy.max_bytes / (1024 * 1024)
-                            )
-                        } else {
-                            "Not negotiated or disabled by host".to_string()
-                        };
-                        ui.label(
-                            egui::RichText::new(policy_text).color(egui::Color32::DARK_GRAY),
-                        );
-                    }
-                    SettingsTab::Input => {
-                        ui.label(
-                            egui::RichText::new("Input")
-                                .color(egui::Color32::BLACK)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Mouse, keyboard, and tablet input are sent to the remote \
-                                 computer. Cursor rendering only chooses where the pointer is \
-                                 drawn; it never turns remote mouse control off.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(24.0);
-                        ui.label(
-                            egui::RichText::new("Pointer and cursor")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        settings_radio(
-                            ui,
-                            &mut cursor_preference,
-                            CursorMode::Local,
-                            Some("(Recommended)"),
-                            "Client-rendered cursor",
-                            "Your mouse controls the remote computer while Arcen Deck draws the pointer \
-                             locally for immediate response. Works with every host.",
-                        );
-                        settings_radio(
-                            ui,
-                            &mut cursor_preference,
-                            CursorMode::Host,
-                            None,
-                            "Cursor in remote video",
-                            "Your mouse still controls the remote computer, but the host draws the pointer \
-                             into the captured video. This can feel less responsive and depends \
-                             on the capture backend including the cursor.",
-                        );
-                        {
-                            ui.add_space(24.0);
-                            ui.label(
-                                egui::RichText::new("System shortcuts go to")
-                                    .color(egui::Color32::BLACK)
-                                    .size(19.0),
-                            );
-                            ui.add_space(10.0);
-                            for policy in arcen_input::keyboard::KeyboardCapturePolicy::ALL {
-                                settings_radio(
-                                    ui,
-                                    &mut keyboard_capture,
-                                    policy,
-                                    (policy == arcen_input::keyboard::KeyboardCapturePolicy::Host)
-                                        .then_some("(Recommended)"),
-                                    super::keyboard_help::capture_policy_label(policy),
-                                    &super::keyboard_help::capture_policy_help(
-                                        policy,
-                                        platform,
-                                        keyboard_switch,
-                                    ),
-                                );
-                            }
-                            if platform == DeckPlatform::Mac {
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(
-                                        &mut capture_mac_system_shortcuts,
-                                        super::keyboard_help::MAC_SYSTEM_SHORTCUTS_LABEL,
-                                    );
-                                    match facts.system_shortcut_permission {
-                                        Some(true) => {
+                                        // Fullscreen presentation size: what a
+                                        // pinned session actually streams. Shown
+                                        // only when it differs, i.e. on a notched
+                                        // panel, so the number is never a mystery.
+                                        if let Some([pw, ph]) = row
+                                            .fullscreen_size(hidpi)
+                                            .filter(|size| *size != [mon.width_px, mon.height_px])
+                                        {
                                             ui.label(
-                                                egui::RichText::new("Accessibility allowed")
-                                                    .color(egui::Color32::DARK_GRAY)
-                                                    .size(12.0),
+                                                egui::RichText::new(format!(
+                                                    "streams {pw} × {ph} px in fullscreen{}",
+                                                    words::fullscreen_size_reason(platform)
+                                                ))
+                                                .color(theme::colours(ui).text2),
                                             );
                                         }
-                                        Some(false)
-                                            if ui.button("Allow in Accessibility…").clicked() =>
-                                        {
-                                            actions.push(
-                                                SettingsAction::AllowSystemShortcutPermission,
-                                            );
-                                        }
-                                        Some(false) | None => {}
-                                    }
-                                });
-                                ui.label(
-                                    egui::RichText::new(
-                                        super::keyboard_help::MAC_SYSTEM_SHORTCUTS_HELP,
-                                    )
-                                    .color(egui::Color32::DARK_GRAY),
-                                );
-                            }
-                            keyboard_switch_rows(ui, platform, &mut keyboard_switch);
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Help ▸ Keyboard Shortcuts lists every key Arcen Deck keeps \
-                                     and the keys Connection ▸ Send Key sends.",
-                                )
-                                .color(egui::Color32::DARK_GRAY)
-                                .size(12.0),
-                            );
-                        }
-                        ui.add_space(24.0);
-                        ui.label(
-                            egui::RichText::new("Typing")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        {
-                            use arcen_input::text::{OptionKeyMode, OptionKeyPreference, TypingMode};
-                            settings_radio(
-                                ui,
-                                &mut typing_mode,
-                                TypingMode::Auto,
-                                Some("(Recommended)"),
-                                &format!("Characters as on {}", platform.this_machine()),
-                                "Keys go to the remote computer as keys, except where its keyboard \
-                                 layout would type a different character: those, and everything your \
-                                 input method composes (accents, dead keys, Japanese, Chinese, emoji), \
-                                 arrive as the characters you typed. Needs a host that types text.",
-                            );
-                            settings_radio(
-                                ui,
-                                &mut typing_mode,
-                                TypingMode::Keys,
-                                None,
-                                "Keys only",
-                                "Every key goes as a key; the remote keyboard layout decides each \
-                                 character. Best for games. The input method does not compose.",
-                            );
-                            settings_radio(
-                                ui,
-                                &mut typing_mode,
-                                TypingMode::Characters,
-                                None,
-                                "Always characters",
-                                "Every typed character arrives as typed, whatever the remote layout. \
-                                 Shortcuts still go as keys; held letter keys do not.",
-                            );
-                            ui.add_space(10.0);
-                            if platform == DeckPlatform::Mac {
-                                settings_radio(
-                                    ui,
-                                    &mut option_key_mode,
-                                    OptionKeyPreference::Automatic,
-                                    Some("(Recommended)"),
-                                    "Automatic",
-                                    "On a Mac host both Option keys stay Option, as on this Mac. On \
-                                     other hosts left Option is Alt and right Option types this \
-                                     Mac's special characters.",
-                                );
-                                settings_radio(
-                                    ui,
-                                    &mut option_key_mode,
-                                    OptionKeyPreference::Chosen(OptionKeyMode::LeftAltRightCharacters),
-                                    None,
-                                    "Left Option is Alt, right Option types characters",
-                                    "Left Option sends Alt shortcuts to the remote computer; right Option \
-                                     types the special characters it types on this Mac.",
-                                );
-                                settings_radio(
-                                    ui,
-                                    &mut option_key_mode,
-                                    OptionKeyPreference::Chosen(OptionKeyMode::BothAlt),
-                                    None,
-                                    "Both Option keys are Alt",
-                                    "Both Option keys send Alt shortcuts.",
-                                );
-                                settings_radio(
-                                    ui,
-                                    &mut option_key_mode,
-                                    OptionKeyPreference::Chosen(OptionKeyMode::BothCharacters),
-                                    None,
-                                    "Both Option keys type characters",
-                                    "Both Option keys type this Mac's special characters.",
-                                );
-                            } else {
-                                // A PC keyboard has Alt and AltGr, not two
-                                // Option keys (PARITY Q-4).
-                                settings_radio(
-                                    ui,
-                                    &mut option_key_mode,
-                                    OptionKeyPreference::Automatic,
-                                    Some("(Recommended)"),
-                                    "AltGr types characters",
-                                    "Alt sends Alt shortcuts to the remote computer; AltGr types \
-                                     the special characters it types on this PC.",
-                                );
-                                settings_radio(
-                                    ui,
-                                    &mut option_key_mode,
-                                    OptionKeyPreference::Chosen(OptionKeyMode::BothAlt),
-                                    None,
-                                    "AltGr is Alt",
-                                    "Both Alt keys send Alt shortcuts.",
-                                );
-                            }
-                            ui.add_space(10.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "The Connection menu's Keyboard: Characters switches a session \
-                                     to characters and Physical Keys back; a saved connection can \
-                                     start in either.",
-                                )
-                                .color(egui::Color32::DARK_GRAY)
-                                .size(12.0),
-                            );
-                        }
-                        ui.add_space(24.0);
-                        ui.label(
-                            egui::RichText::new("Paste as Keystrokes")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "The Connection menu's Paste as Keystrokes types {} clipboard \
-                                 text into the remote computer, for sign-in screens and consoles \
-                                 that clipboard sharing cannot reach. Esc stops it.",
-                                platform.this_machines(),
-                            ))
-                            .color(egui::Color32::DARK_GRAY)
-                            .size(12.0),
-                        );
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Typing speed");
-                            egui::ComboBox::from_id_salt("paste_chars_per_second")
-                                .selected_text(format!(
-                                    "{} characters a second",
-                                    paste_settings.chars_per_second
-                                ))
-                                .show_ui(ui, |ui| {
-                                    for rate in arcen_input::text::paste::RATE_CHOICES {
-                                        let label = if rate
-                                            == arcen_input::text::paste::DEFAULT_CHARS_PER_SECOND
-                                        {
-                                            format!("{rate} characters a second (default)")
-                                        } else {
-                                            format!("{rate} characters a second")
-                                        };
-                                        ui.selectable_value(
-                                            &mut paste_settings.chars_per_second,
-                                            rate,
-                                            label,
-                                        );
-                                    }
-                                });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Ask first above");
-                            egui::ComboBox::from_id_salt("paste_confirm_above")
-                                .selected_text(format!(
-                                    "{} characters",
-                                    paste_settings.confirm_above
-                                ))
-                                .show_ui(ui, |ui| {
-                                    for chars in arcen_input::text::paste::CONFIRM_CHOICES {
-                                        ui.selectable_value(
-                                            &mut paste_settings.confirm_above,
-                                            chars,
-                                            format!("{chars} characters"),
-                                        );
-                                    }
-                                });
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Slow the speed down for virtual machine consoles and older \
-                                 applications that drop keys.",
-                            )
-                            .color(egui::Color32::GRAY)
-                            .size(11.0),
-                        );
-                        ui.add_space(24.0);
-                        // One surface owns every input decision. Tablet mode
-                        // and non-HID USB forwarding used to live in two
-                        // different tabs, and the tab named for USB was the
-                        // one that did *not* control the tablet bridge.
-                        ui.label(
-                            egui::RichText::new("Tablet")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.label(
-                            egui::RichText::new(facts.tablet_scope_note.as_str())
-                                .color(egui::Color32::GRAY)
-                                .size(11.0),
-                        );
-                        ui.add_space(10.0);
-                        settings_radio(
-                            ui,
-                            &mut tablet_mode_requested,
-                            TabletModeMsg::LocalTermination,
-                            Some("(Recommended for WAN)"),
-                            tablet_mode_label(TabletModeMsg::LocalTermination),
-                            &tablet_mode_description(TabletModeMsg::LocalTermination, platform),
-                        );
-                        if tablet_mode_requested == TabletModeMsg::LocalTermination {
-                            pen_button_rows(ui, platform, &mut pen_buttons);
-                        }
-                        // The helper control sits on the option's own row and
-                        // states where the helper stands, because that is the
-                        // one prerequisite the user can act on from here. It
-                        // used to be a parenthetical badge plus a block of
-                        // buttons that appeared only once the helper was
-                        // *already* missing, which put the status and the fix
-                        // in two different places and left an installed helper
-                        // with nothing to click. Read once per settings visit,
-                        // not per frame: each read is an XPC round trip to
-                        // `smd`.
-                        if let Some(control) = &facts.native_tablet {
-                            settings_radio_with_trailing(
-                                ui,
-                                &mut tablet_mode_requested,
-                                TabletModeMsg::UsbTabletBridge,
-                                None,
-                                tablet_mode_label(TabletModeMsg::UsbTabletBridge),
-                                &tablet_mode_description(TabletModeMsg::UsbTabletBridge, platform),
-                                |ui| {
-                                    let label = egui::RichText::new(control.action_label.as_str())
-                                        .color(control.tint.colour())
-                                        .size(14.0);
-                                    if ui
-                                        .button(label)
-                                        .on_hover_text(control.guidance.as_str())
-                                        .clicked()
-                                    {
-                                        actions.push(SettingsAction::NativeTabletComponent);
-                                    }
-                                },
-                            );
-                            if !control.ready {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(28.0);
-                                    ui.label(
-                                        egui::RichText::new(control.guidance.as_str())
-                                            .color(egui::Color32::DARK_GRAY),
-                                    );
-                                });
-                                ui.add_space(8.0);
-                            }
-                            if let Some(error) = &control.error {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(28.0);
-                                    ui.label(egui::RichText::new(error.as_str()).color(theme::DANGER));
-                                });
-                                ui.add_space(8.0);
-                            }
-                        } else {
-                            settings_radio(
-                                ui,
-                                &mut tablet_mode_requested,
-                                TabletModeMsg::UsbTabletBridge,
-                                Some("(not available in this build)"),
-                                tablet_mode_label(TabletModeMsg::UsbTabletBridge),
-                                &tablet_mode_description(TabletModeMsg::UsbTabletBridge, platform),
-                            );
-                        }
-                        // A bridged tablet moves the *host's* pointer, and a
-                        // captured tablet no longer moves this Mac's. With
-                        // Local cursor rendering the Deck draws the cursor
-                        // where the host reports its pointer
-                        // (`cursor_position_v1`), the recommended pairing; a
-                        // host that cannot report it leaves the pen without a
-                        // visible pointer, so host cursor rendering stays
-                        // offered next to the choice.
-                        if tablet_mode_requested == TabletModeMsg::UsbTabletBridge
-                            && cursor_preference == CursorMode::Local
-                        {
-                            ui.horizontal(|ui| {
-                                ui.add_space(28.0);
-                                ui.label(
-                                    egui::RichText::new(
-                                        "With Local cursor rendering the pen's pointer is drawn \
-                                         where the host reports it. If the host cannot report \
-                                         its pointer, the pen has no visible pointer: use the \
-                                         host cursor instead.",
-                                    )
-                                    .color(theme::TEXT_SECONDARY),
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.add_space(28.0);
-                                if ui.button("Use host cursor").clicked() {
-                                    cursor_preference = CursorMode::Host;
+                                    });
+                                    ui.add_space(6.0);
                                 }
-                            });
-                            ui.add_space(8.0);
+                            }
                         }
-                        settings_radio(
-                            ui,
-                            &mut tablet_mode_requested,
-                            TabletModeMsg::DisabledMouseCompat,
-                            None,
-                            tablet_mode_label(TabletModeMsg::DisabledMouseCompat),
-                            &tablet_mode_description(TabletModeMsg::DisabledMouseCompat, platform),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Mode changes take effect on the next connection.\n\n\
-                                 Native tablet hands the tablet itself to the host: a Linux \
-                                 host's own driver claims it on a virtual USB controller, a \
-                                 macOS or Windows host reads the pen itself, with no driver \
-                                 installed. Tablet support needs nothing on the host and works \
-                                 over any network.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(24.0);
-                    }
-                    SettingsTab::Logs => {
-                        ui.label(
-                            egui::RichText::new("Logs").color(heading_col).size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new(
+                        SettingsTab::Microphone => {
+                            page_title(ui, "Microphone");
+                            ui.checkbox(
+                                &mut microphone_enabled,
+                                "Allow microphone forwarding for this launch",
+                            );
+                            checkbox_help(ui, &choices::microphone_line(platform), Ink::Quiet);
+                        }
+                        SettingsTab::Input => {
+                            page_title(ui, "Input");
+                            let [intro, switch_line] =
+                                choices::input_intro(platform, keyboard_switch);
+                            quiet(ui, &intro);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(switch_line)
+                                        .color(theme::colours(ui).text2),
+                                );
+                                learn_more(ui, choices::KEYBOARD_GUIDE_SECTION);
+                            });
+
+                            group_heading(ui, choices::KEYBOARD_HEADING);
+                            let mut on = system_shortcuts_to_host(
+                                platform,
+                                keyboard_capture,
+                                capture_mac_system_shortcuts,
+                            );
+                            if ui
+                                .checkbox(&mut on, choices::SYSTEM_SHORTCUTS_TITLE)
+                                .changed()
+                            {
+                                set_system_shortcuts_to_host(
+                                    platform,
+                                    on,
+                                    &mut keyboard_capture,
+                                    &mut capture_mac_system_shortcuts,
+                                );
+                            }
+                            checkbox_help(ui, choices::system_shortcuts_line(platform), Ink::Quiet);
+                            if let Some(needed) = choices::system_shortcuts_permission(
+                                on,
+                                facts.system_shortcut_permission,
+                            ) {
+                                checkbox_help(ui, needed, Ink::Note);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(checkbox_indent(ui));
+                                    if button(ui, choices::OPEN_SYSTEM_SETTINGS).clicked() {
+                                        actions.push(SettingsAction::AllowSystemShortcutPermission);
+                                    }
+                                });
+                            }
+
+                            // What a connection without its own value uses now.
+                            let app = crate::overrides::AppDefaults {
+                                typing_mode: crate::overrides::stored_typing_mode(typing_mode),
+                                option_keys: option_key_mode,
+                                displays_mode: displays,
+                                clipboard_enabled,
+                            };
+                            group_heading(ui, choices::TYPING_HEADING);
+                            quiet(
+                                ui,
+                                &choices::default_for_all_connections(
+                                    crate::overrides::connections_with_own(
+                                        facts.connections,
+                                        app,
+                                        crate::overrides::OverridableSetting::TypingMode,
+                                    ),
+                                ),
+                            );
+                            ui.add_space(8.0);
+                            let stored = crate::overrides::stored_typing_mode(typing_mode);
+                            let mut typing = stored;
+                            choice_picker(
+                                ui,
+                                "typing_mode",
+                                None,
+                                &mut typing,
+                                &choices::typing_choices(),
+                            );
+                            if typing != stored {
+                                typing_mode = typing;
+                            }
+
+                            group_heading(ui, choices::CLIPBOARD_HEADING);
+                            ui.checkbox(&mut clipboard_enabled, choices::CLIPBOARD_TITLE);
+                            if let Some(line) =
+                                choices::clipboard_line(crate::overrides::connections_with_own(
+                                    facts.connections,
+                                    crate::overrides::AppDefaults {
+                                        clipboard_enabled,
+                                        ..app
+                                    },
+                                    crate::overrides::OverridableSetting::ClipboardEnabled,
+                                ))
+                            {
+                                checkbox_help(ui, &line, Ink::Quiet);
+                            }
+                            if let Some(notice) = facts.host_clipboard_notice {
+                                checkbox_help(ui, notice, Ink::Note);
+                            }
+                        }
+                        SettingsTab::Tablet => {
+                            page_title(ui, "Tablet");
+                            let mut rows = choices::tablet_choices().to_vec();
+                            if facts.native_tablet.is_none() {
+                                for row in &mut rows {
+                                    if row.value == TabletModeMsg::UsbTabletBridge {
+                                        row.badge = Some(choices::NATIVE_TABLET_NOT_IN_BUILD);
+                                    }
+                                }
+                            }
+                            choice_picker(
+                                ui,
+                                "tablet_mode",
+                                None,
+                                &mut tablet_mode_requested,
+                                &rows,
+                            );
+                            match tablet_mode_requested {
+                                TabletModeMsg::UsbTabletBridge => {
+                                    if let Some(control) = facts.native_tablet.as_ref() {
+                                        native_tablet_control(ui, control, &mut actions);
+                                    }
+                                }
+                                TabletModeMsg::LocalTermination => {
+                                    pen_button_rows(ui, platform, &mut pen_buttons);
+                                }
+                                TabletModeMsg::DisabledMouseCompat => {}
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(choices::TABLET_FOOTER)
+                                        .color(theme::colours(ui).text2),
+                                );
+                                learn_more(ui, choices::TABLET_GUIDE_SECTION);
+                            });
+                            ui.add_space(24.0);
+                        }
+                        SettingsTab::Logs => {
+                            page_title(ui, "Logs");
+                            quiet(
+                                ui,
                                 "Set the level of detail captured by the logs. Level 0 (Critical) \
                                  provides the least information and Level 3 (Debug) provides the \
                                  most information.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new("Log level")
-                                .color(egui::Color32::DARK_GRAY)
-                                .size(13.0),
-                        );
-                        egui::ComboBox::from_id_salt("log_level")
-                            .selected_text(log_level.label())
-                            .show_ui(ui, |ui| {
-                                for level in LogLevel::ALL {
-                                    ui.selectable_value(&mut log_level, level, level.label());
+                            );
+                            ui.add_space(theme::SPACE_SCALE[4]);
+                            let levels: Vec<(LogLevel, String)> = LogLevel::ALL
+                                .iter()
+                                .map(|level| (*level, level.label().to_string()))
+                                .collect();
+                            let _ = list_picker(
+                                ui,
+                                "log_level",
+                                Some("Log level"),
+                                &mut log_level,
+                                &levels,
+                                None,
+                                picker_width(ui),
+                            );
+                            ui.add_space(theme::GROUP_GAP);
+                            // The log's two actions side by side, one width.
+                            let labels = ["Show in folder", "Create support bundle\u{2026}"];
+                            let width = super::widgets::button_width(ui, &labels);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = theme::BUTTON_GAP;
+                                if super::widgets::secondary_button(ui, labels[0], width).clicked()
+                                {
+                                    actions.push(SettingsAction::ShowLogFolder);
+                                }
+                                if let Some(bundle) = &facts.support_bundle {
+                                    let open = ui
+                                        .add_enabled_ui(!bundle.open, |ui| {
+                                            super::widgets::secondary_button(ui, labels[1], width)
+                                        })
+                                        .inner;
+                                    if open.clicked() {
+                                        actions.push(SettingsAction::SupportBundle(
+                                            super::support_bundle::SupportBundleAction::Open,
+                                        ));
+                                    }
                                 }
                             });
-                        ui.add_space(20.0);
-                        if ui.button("📂  Show in folder").clicked() {
-                            actions.push(SettingsAction::ShowLogFolder);
-                        }
-                        if let Some(bundle) = &facts.support_bundle {
-                            ui.add_space(12.0);
-                            if ui
-                                .add_enabled(
-                                    !bundle.open,
-                                    egui::Button::new("Create support bundle…"),
-                                )
-                                .clicked()
-                            {
-                                actions.push(SettingsAction::SupportBundle(
-                                    super::support_bundle::SupportBundleAction::Open,
-                                ));
+                            if let Some(bundle) = &facts.support_bundle {
+                                ui.add_space(theme::SPACE_SCALE[3]);
+                                actions.extend(
+                                    super::support_bundle::render_support_bundle_panel(
+                                        ui, bundle, platform,
+                                    )
+                                    .into_iter()
+                                    .map(SettingsAction::SupportBundle),
+                                );
                             }
-                            actions.extend(
-                                super::support_bundle::render_support_bundle_panel(
-                                    ui, bundle, platform,
-                                )
-                                .into_iter()
-                                .map(SettingsAction::SupportBundle),
-                            );
                         }
-                    }
-                    SettingsTab::Advanced => {
-                        ui.label(
-                            egui::RichText::new("Advanced")
-                                .color(heading_col)
-                                .size(30.0),
-                        );
-                        ui.add_space(18.0);
-                        ui.label(
-                            egui::RichText::new("Security modes")
-                                .color(egui::Color32::BLACK)
-                                .size(19.0),
-                        );
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "The Arcen client uses certificates to verify that the server \
-                                 connection is secure. Select your desired security mode:",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(12.0);
-                        settings_radio(
-                            ui,
-                            &mut security,
-                            SecurityMode::High,
-                            None,
-                            "Security mode - High",
-                            "Fully verified. You cannot connect unless the certificate is verified.",
-                        );
-                        settings_radio(
-                            ui,
-                            &mut security,
-                            SecurityMode::Medium,
-                            None,
-                            "Security mode - Medium",
-                            "If the certificate cannot be verified, you will get a warning, but can still connect.",
-                        );
-                        settings_radio(
-                            ui,
-                            &mut security,
-                            SecurityMode::Low,
-                            None,
-                            "Security mode - Low",
-                            "No certificate verification required to connect.",
-                        );
-                        if cfg!(feature = "dev-tools") {
-                            ui.add_space(16.0);
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new("Advanced: streaming overrides")
-                                    .color(egui::Color32::BLACK)
-                                    .size(16.0),
-                            )
-                            .id_salt("color_fidelity_advanced")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("Frame-rate ceiling")
-                                        .color(egui::Color32::BLACK),
-                                );
-                                egui::ComboBox::from_id_salt("streaming_performance_override")
-                                    .selected_text(match performance {
-                                        PerformanceMode::Standard => "30 fps",
-                                        PerformanceMode::High | PerformanceMode::HighLegacy => {
-                                            "60 fps"
-                                        }
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut performance,
-                                            PerformanceMode::Standard,
-                                            "30 fps",
-                                        );
-                                        ui.selectable_value(
-                                            &mut performance,
-                                            PerformanceMode::High,
-                                            "60 fps",
-                                        );
-                                    });
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new("Base colour contract")
-                                        .color(egui::Color32::BLACK),
-                                );
-                                egui::ComboBox::from_id_salt("color_fidelity_preset_override")
-                                    .selected_text(color_fidelity.preset.title())
-                                    .show_ui(ui, |ui| {
-                                        for preset in [
-                                            ColorFidelity::Standard,
-                                            ColorFidelity::FullColour,
-                                            ColorFidelity::GradingReference,
-                                            ColorFidelity::Hdr10,
-                                        ] {
-                                            ui.selectable_value(
-                                                &mut color_fidelity.preset,
-                                                preset,
-                                                preset.title(),
-                                            );
-                                        }
-                                    });
-                                ui.label(
-                                    egui::RichText::new(color_fidelity.preset.describe())
-                                        .color(egui::Color32::DARK_GRAY),
-                                );
-                                ui.add_space(12.0);
+                        SettingsTab::Advanced => {
                             ui.label(
-                                egui::RichText::new(
+                                egui::RichText::new("Advanced")
+                                    .color(theme::colours(ui).text)
+                                    .size(PAGE_TITLE),
+                            );
+                            group_heading(ui, choices::CERTIFICATE_HEADING);
+                            quiet(ui, choices::CERTIFICATE_INTRO);
+                            ui.add_space(12.0);
+                            // Low only where this Deck may skip the checks; a saved
+                            // Low that cannot is shown as the Medium it checks
+                            // as, and only a click saves.
+                            let low_allowed = crate::settings::low_security_allowed();
+                            let shown = security.in_force_with(low_allowed);
+                            let mut chosen = shown;
+                            choice_picker(
+                                ui,
+                                "certificate_checking",
+                                None,
+                                &mut chosen,
+                                &choices::certificate_choices(low_allowed),
+                            );
+                            if chosen != shown {
+                                security = chosen;
+                            }
+                            if security != security.in_force_with(low_allowed) {
+                                help_line(ui, choices::LOW_SECURITY_OFF_NOTE, Ink::Note);
+                            }
+
+                            group_heading(ui, choices::ADVANCED_INPUT_HEADING);
+                            keyboard_switch_rows(ui, platform, &mut keyboard_switch);
+                            help_line(
+                                ui,
+                                "Help ▸ Keyboard Shortcuts lists every key Arcen Deck keeps and \
+                                 the keys Connection ▸ Send Key sends.",
+                                Ink::Quiet,
+                            );
+                            sub_heading(ui, choices::PASTE_HEADING);
+                            let rates: Vec<(u32, String)> = arcen_input::text::paste::RATE_CHOICES
+                                .iter()
+                                .map(|rate| (*rate, choices::paste_speed_choice(*rate)))
+                                .collect();
+                            let _ = list_picker(
+                                ui,
+                                "paste_chars_per_second",
+                                Some(choices::PASTE_SPEED),
+                                &mut paste_settings.chars_per_second,
+                                &rates,
+                                None,
+                                picker_width(ui),
+                            );
+                            ui.add_space(theme::FIELD_TO_LABEL);
+                            let limits: Vec<(usize, String)> =
+                                arcen_input::text::paste::CONFIRM_CHOICES
+                                    .iter()
+                                    .map(|chars| (*chars, choices::paste_ask_choice(*chars)))
+                                    .collect();
+                            let _ = list_picker(
+                                ui,
+                                "paste_confirm_above",
+                                Some(choices::PASTE_ASK_ABOVE),
+                                &mut paste_settings.confirm_above,
+                                &limits,
+                                None,
+                                picker_width(ui),
+                            );
+                            if cfg!(feature = "dev-tools") {
+                                // Developer builds only: the same controls as
+                                // every page, the list pickers.
+                                group_heading(ui, "Streaming overrides (developer build)");
+                                let width = picker_width(ui);
+                                let mut ceiling = match performance {
+                                    PerformanceMode::Standard => PerformanceMode::Standard,
+                                    PerformanceMode::High | PerformanceMode::HighLegacy => {
+                                        PerformanceMode::High
+                                    }
+                                };
+                                let ceilings = [
+                                    (PerformanceMode::Standard, "30 fps".to_owned()),
+                                    (PerformanceMode::High, "60 fps".to_owned()),
+                                ];
+                                if list_picker(
+                                    ui,
+                                    "streaming_performance_override",
+                                    Some("Frame-rate ceiling"),
+                                    &mut ceiling,
+                                    &ceilings,
+                                    None,
+                                    width,
+                                )
+                                .changed
+                                {
+                                    performance = ceiling;
+                                }
+                                ui.add_space(theme::FIELD_TO_LABEL);
+                                let presets: Vec<(ColorFidelity, String)> = [
+                                    ColorFidelity::Standard,
+                                    ColorFidelity::FullColour,
+                                    ColorFidelity::GradingReference,
+                                    ColorFidelity::Hdr10,
+                                ]
+                                .iter()
+                                .map(|preset| (*preset, preset.title().to_owned()))
+                                .collect();
+                                let described = color_fidelity.preset.describe();
+                                let _ = list_picker(
+                                    ui,
+                                    "color_fidelity_preset_override",
+                                    Some("Base colour contract"),
+                                    &mut color_fidelity.preset,
+                                    &presets,
+                                    Some(described),
+                                    width,
+                                );
+                                ui.add_space(theme::SPACE_SCALE[3]);
+                                quiet(
+                                    ui,
                                     "Pin individual axes on top of the preset above. Each \
                                      defaults to \"Follow preset\", which is exactly the \
                                      preset's own value, so it stays invisible until you \
-                                     explicitly pin it -- and a later preset change never \
+                                     explicitly pin it, and a later preset change never \
                                      discards an axis you pinned here.",
-                                )
-                                .color(egui::Color32::DARK_GRAY),
-                            );
-                            ui.add_space(10.0);
-                            ui.label(egui::RichText::new("Codec").color(egui::Color32::BLACK));
-                            egui::ComboBox::from_id_salt("color_fidelity_codec_override")
-                                .selected_text(color_fidelity.overrides.codec.map_or(
-                                    "Follow preset".to_string(),
-                                    |codec| color_fidelity_codec_label(codec).to_string(),
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.codec,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for codec in arcen_media::VideoCodec::ALL.iter().copied() {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.codec,
-                                            Some(codec),
-                                            color_fidelity_codec_label(codec),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new("Chroma").color(egui::Color32::BLACK));
-                            egui::ComboBox::from_id_salt("color_fidelity_chroma_override")
-                                .selected_text(color_fidelity.overrides.chroma.map_or(
-                                    "Follow preset".to_string(),
-                                    |chroma| color_fidelity_chroma_label(chroma).to_string(),
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.chroma,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for chroma in
-                                        arcen_media::ChromaSubsampling::ALL.iter().copied()
-                                    {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.chroma,
-                                            Some(chroma),
-                                            color_fidelity_chroma_label(chroma),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Bit depth").color(egui::Color32::BLACK),
-                            );
-                            egui::ComboBox::from_id_salt("color_fidelity_bit_depth_override")
-                                .selected_text(
-                                    color_fidelity.overrides.bit_depth.map_or(
-                                        "Follow preset".to_string(),
+                                );
+                                let overrides = &mut color_fidelity.overrides;
+                                ui.add_space(theme::FIELD_TO_LABEL);
+                                let _ = list_picker(
+                                    ui,
+                                    "color_fidelity_codec_override",
+                                    Some("Codec"),
+                                    &mut overrides.codec,
+                                    &pinned(arcen_media::VideoCodec::ALL, |codec| {
+                                        color_fidelity_codec_label(codec).to_string()
+                                    }),
+                                    None,
+                                    width,
+                                );
+                                ui.add_space(theme::FIELD_TO_LABEL);
+                                let _ = list_picker(
+                                    ui,
+                                    "color_fidelity_chroma_override",
+                                    Some("Chroma"),
+                                    &mut overrides.chroma,
+                                    &pinned(arcen_media::ChromaSubsampling::ALL, |chroma| {
+                                        color_fidelity_chroma_label(chroma).to_string()
+                                    }),
+                                    None,
+                                    width,
+                                );
+                                ui.add_space(theme::FIELD_TO_LABEL);
+                                let _ = list_picker(
+                                    ui,
+                                    "color_fidelity_bit_depth_override",
+                                    Some("Bit depth"),
+                                    &mut overrides.bit_depth,
+                                    &pinned(
+                                        arcen_media::BitDepth::ALL,
                                         color_fidelity_bit_depth_label,
                                     ),
-                                )
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.bit_depth,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for bit_depth in arcen_media::BitDepth::ALL.iter().copied() {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.bit_depth,
-                                            Some(bit_depth),
-                                            color_fidelity_bit_depth_label(bit_depth),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Colour range").color(egui::Color32::BLACK),
-                            );
-                            egui::ComboBox::from_id_salt("color_fidelity_range_override")
-                                .selected_text(color_fidelity.overrides.range.map_or(
-                                    "Follow preset".to_string(),
-                                    |range| color_fidelity_range_label(range).to_string(),
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.range,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for range in arcen_media::ColorRange::ALL.iter().copied() {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.range,
-                                            Some(range),
-                                            color_fidelity_range_label(range),
-                                        );
-                                    }
-                                });
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new("Matrix").color(egui::Color32::BLACK));
-                            egui::ComboBox::from_id_salt("color_fidelity_matrix_override")
-                                .selected_text(color_fidelity.overrides.matrix.map_or(
-                                    "Follow preset".to_string(),
-                                    |matrix| color_fidelity_matrix_label(matrix).to_string(),
-                                ))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.overrides.matrix,
-                                        None,
-                                        "Follow preset",
-                                    );
-                                    for matrix in arcen_media::ColorMatrix::ALL.iter().copied() {
-                                        ui.selectable_value(
-                                            &mut color_fidelity.overrides.matrix,
-                                            Some(matrix),
-                                            color_fidelity_matrix_label(matrix),
-                                        );
-                                    }
-                                });
-                            });
-                            ui.add_space(16.0);
-                            ui.label(
-                            egui::RichText::new("Variant (testing)")
-                                .color(egui::Color32::BLACK)
-                                .size(16.0),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Pin an exact probe-matrix row, bypassing the preset and \
-                                 Advanced overrides above entirely. This is how the w0 testing \
-                                 machine drives the colour-variation matrix directly. Leave at \
-                                 None for ordinary use.",
-                            )
-                            .color(egui::Color32::DARK_GRAY),
-                        );
-                        ui.add_space(8.0);
-                        egui::ComboBox::from_id_salt("color_fidelity_variant_override")
-                            .selected_text(
-                                color_fidelity
-                                    .variant_override
-                                    .map_or("None".to_string(), arcen_media::video::VideoVariant::describe),
-                            )
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut color_fidelity.variant_override,
                                     None,
-                                    "None",
+                                    width,
                                 );
-                                for variant in arcen_media::video::PROBE_MATRIX.iter().copied() {
-                                    ui.selectable_value(
-                                        &mut color_fidelity.variant_override,
-                                        Some(variant),
-                                        format!("{} ({})", variant.describe(), variant.id()),
-                                    );
-                                }
-                            });
-                        ui.add_space(16.0);
-                        let color_fidelity_resolved = color_fidelity.resolved_variant();
-                        let color_fidelity_effective =
-                            effective_color_fidelity_variant(color_fidelity);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Resolving to: {}",
-                                color_fidelity_effective.describe()
-                            ))
-                            .color(egui::Color32::BLACK)
-                            .strong(),
-                        );
-                            if !color_fidelity_resolved.is_coherent() {
-                                ui.add_space(6.0);
+                                ui.add_space(theme::FIELD_TO_LABEL);
+                                let _ = list_picker(
+                                    ui,
+                                    "color_fidelity_range_override",
+                                    Some("Colour range"),
+                                    &mut overrides.range,
+                                    &pinned(arcen_media::ColorRange::ALL, |range| {
+                                        color_fidelity_range_label(range).to_string()
+                                    }),
+                                    None,
+                                    width,
+                                );
+                                ui.add_space(theme::FIELD_TO_LABEL);
+                                let _ = list_picker(
+                                    ui,
+                                    "color_fidelity_matrix_override",
+                                    Some("Matrix"),
+                                    &mut overrides.matrix,
+                                    &pinned(arcen_media::ColorMatrix::ALL, |matrix| {
+                                        color_fidelity_matrix_label(matrix).to_string()
+                                    }),
+                                    None,
+                                    width,
+                                );
+                                sub_heading(ui, "Variant (testing)");
+                                quiet(
+                                    ui,
+                                    "Pin an exact probe-matrix row, bypassing the preset and \
+                                     the overrides above entirely. This is how the w0 testing \
+                                     machine drives the colour-variation matrix directly. Leave \
+                                     at None for ordinary use.",
+                                );
+                                ui.add_space(theme::FIELD_TO_LABEL);
+                                let variants: Vec<_> = std::iter::once((None, "None".to_owned()))
+                                    .chain(arcen_media::video::PROBE_MATRIX.iter().map(|variant| {
+                                        (
+                                            Some(*variant),
+                                            format!("{} ({})", variant.describe(), variant.id()),
+                                        )
+                                    }))
+                                    .collect();
+                                let _ = list_picker(
+                                    ui,
+                                    "color_fidelity_variant_override",
+                                    None,
+                                    &mut color_fidelity.variant_override,
+                                    &variants,
+                                    None,
+                                    width,
+                                );
+                                ui.add_space(theme::SPACE_SCALE[3]);
+                                let color_fidelity_resolved = color_fidelity.resolved_variant();
+                                let color_fidelity_effective =
+                                    effective_color_fidelity_variant(color_fidelity);
                                 ui.label(
+                                    egui::RichText::new(format!(
+                                        "Resolving to: {}",
+                                        color_fidelity_effective.describe()
+                                    ))
+                                    .color(theme::colours(ui).text)
+                                    .strong(),
+                                );
+                                if !color_fidelity_resolved.is_coherent() {
+                                    ui.add_space(6.0);
+                                    ui.label(
                                 egui::RichText::new(format!(
                                     "This exact combination ({}) is not offered. Falling back \
                                      to the {} preset when you connect.",
                                     color_fidelity_resolved.describe(),
                                     color_fidelity.preset.title(),
                                 ))
-                                    .color(theme::DANGER),
+                                    .color(theme::colours(ui).error),
                                 );
+                                }
                             }
                         }
                     }
-                    }
                 });
-            });
         });
+    });
 
     *values = SettingsValues {
         tab,
@@ -1936,7 +1440,7 @@ pub fn render_settings(
     actions
 }
 
-/// Settings ▸ Input ▸ Keyboard switch: the presets and a custom chord,
+/// Settings ▸ Advanced ▸ Input ▸ Keyboard switch: the presets and a custom chord,
 /// checked in shared code ([`super::keyboard_help::keyboard_switch_verdict`]).
 fn keyboard_switch_rows(
     ui: &mut egui::Ui,
@@ -1945,18 +1449,12 @@ fn keyboard_switch_rows(
 ) {
     use arcen_input::keyboard::KeyboardSwitchPreset;
     let draft_id = egui::Id::new("arcen-keyboard-switch-draft");
-    ui.add_space(24.0);
-    ui.label(
-        egui::RichText::new("Keyboard switch")
-            .color(egui::Color32::BLACK)
-            .size(19.0),
-    );
-    ui.add_space(6.0);
+    sub_heading(ui, choices::KEYBOARD_SWITCH_HEADING);
     ui.label(
         egui::RichText::new(super::keyboard_help::keyboard_switch_help(
             platform, *switch,
         ))
-        .color(egui::Color32::DARK_GRAY),
+        .color(theme::colours(ui).text2),
     );
     ui.add_space(6.0);
     let mut preset = switch.preset();
@@ -1964,40 +1462,43 @@ fn keyboard_switch_rows(
     if custom_draft.is_some() {
         preset = KeyboardSwitchPreset::Custom;
     }
-    for choice in KeyboardSwitchPreset::ALL {
-        let label = super::keyboard_help::keyboard_switch_preset_label(platform, choice);
-        let selected = preset == choice;
-        if ui.radio(selected, label).clicked() && !selected {
-            match choice.chord() {
-                Some(chord) => {
-                    *switch = chord;
-                    custom_draft = None;
-                }
-                None => custom_draft = Some(switch_chord_draft(platform, *switch)),
+    let presets: Vec<(KeyboardSwitchPreset, String)> = KeyboardSwitchPreset::ALL
+        .iter()
+        .map(|choice| {
+            (
+                *choice,
+                super::keyboard_help::keyboard_switch_preset_label(platform, *choice),
+            )
+        })
+        .collect();
+    let mut chosen = preset;
+    let note = preset.note();
+    let picked = list_picker(
+        ui,
+        "keyboard_switch_preset",
+        None,
+        &mut chosen,
+        &presets,
+        note,
+        picker_width(ui),
+    );
+    if picked.changed && chosen != preset {
+        match chosen.chord() {
+            Some(chord) => {
+                *switch = chord;
+                custom_draft = None;
             }
-            preset = choice;
+            None => custom_draft = Some(switch_chord_draft(platform, *switch)),
         }
-        if let (true, Some(note)) = (preset == choice, choice.note()) {
-            ui.label(
-                egui::RichText::new(note)
-                    .color(egui::Color32::DARK_GRAY)
-                    .size(12.0),
-            );
-        }
+        preset = chosen;
     }
     if preset == KeyboardSwitchPreset::Custom {
         let mut text = custom_draft.unwrap_or_else(|| switch_chord_draft(platform, *switch));
-        let committed = ui
-            .horizontal(|ui| {
-                ui.label("Chord:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut text)
-                        .hint_text("Ctrl+Alt+Shift+K")
-                        .desired_width(220.0),
-                )
-                .lost_focus()
-            })
-            .inner;
+        ui.add_space(theme::FIELD_TO_LABEL);
+        super::widgets::field_label(ui, "Chord");
+        let committed =
+            super::widgets::text_field(ui, &mut text, false, picker_width(ui), "Ctrl+Alt+Shift+K")
+                .lost_focus();
         // A chord is used only once typed out (Enter or leaving the field):
         // the chords a half-typed one passes through are never applied.
         let current = super::keyboard_help::switch_chord_text(platform, *switch);
@@ -2015,19 +1516,11 @@ fn keyboard_switch_rows(
                     ))
                 };
                 if let Some(note) = note {
-                    ui.label(
-                        egui::RichText::new(note)
-                            .color(egui::Color32::from_rgb(0xA0, 0x60, 0x00))
-                            .size(12.0),
-                    );
+                    help_line(ui, &note, Ink::Note);
                 }
             }
             Err(reason) => {
-                ui.label(
-                    egui::RichText::new(format!("{reason} Keeping {current}."))
-                        .color(egui::Color32::from_rgb(0xB0, 0x20, 0x20))
-                        .size(12.0),
-                );
+                help_line(ui, &format!("{reason} Keeping {current}."), Ink::Error);
             }
         }
         ui.ctx().data_mut(|data| data.insert_temp(draft_id, text));
@@ -2057,28 +1550,205 @@ fn pen_button_rows(ui: &mut egui::Ui, platform: DeckPlatform, buttons: &mut PenB
             ("pen_upper_button", "Upper pen button", &mut buttons.upper),
         ],
     };
+    let actions: Vec<(PenButtonAction, String)> = PenButtonAction::ALL
+        .iter()
+        .map(|choice| (*choice, choice.label().to_string()))
+        .collect();
     for (id, label, action) in rows {
-        ui.horizontal(|ui| {
-            ui.add_space(28.0);
-            ui.label(label);
-            egui::ComboBox::from_id_salt(id)
-                .selected_text(action.label())
-                .show_ui(ui, |ui| {
-                    for choice in PenButtonAction::ALL {
-                        ui.selectable_value(&mut *action, choice, choice.label());
-                    }
-                });
-        });
-    }
-    ui.horizontal(|ui| {
-        ui.add_space(28.0);
-        ui.label(
-            egui::RichText::new(pen_button_note(platform))
-                .color(egui::Color32::GRAY)
-                .size(11.0),
+        ui.add_space(theme::FIELD_TO_LABEL);
+        let _ = list_picker(
+            ui,
+            id,
+            Some(label),
+            action,
+            &actions,
+            None,
+            picker_width(ui),
         );
+    }
+    ui.add_space(theme::FIELD_TO_HELP);
+    quiet(ui, pen_button_note(platform));
+    ui.add_space(12.0);
+}
+
+/// Native tablet support's component: its control (the one prerequisite
+/// the user can act on from here), what it still needs and its last error.
+fn native_tablet_control(
+    ui: &mut egui::Ui,
+    control: &NativeTabletControl,
+    actions: &mut Vec<SettingsAction>,
+) {
+    ui.add_space(theme::FIELD_TO_LABEL);
+    if button(ui, control.action_label.as_str())
+        .on_hover_text(control.guidance.as_str())
+        .clicked()
+    {
+        actions.push(SettingsAction::NativeTabletComponent);
+    }
+    if !control.ready {
+        // Waiting on the user (an approval in System Settings) reads as a
+        // note; anything else as the button's explanation.
+        let ink = match control.tint {
+            ComponentTint::Attention => Ink::Note,
+            ComponentTint::Ready | ComponentTint::Action => Ink::Quiet,
+        };
+        help_line(ui, &control.guidance, ink);
+    }
+    if let Some(error) = &control.error {
+        help_line(ui, error, Ink::Error);
+    }
+}
+
+/// "Learn more", linking to a section of the user guide. It never breaks
+/// across lines: at the end of a wrapped line it moves to the next one
+/// whole.
+fn learn_more(ui: &mut egui::Ui, section: &str) {
+    ui.scope(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.hyperlink_to(choices::LEARN_MORE, choices::user_guide_url(section));
     });
-    ui.add_space(8.0);
+}
+
+/// The page column's widest.
+const PAGE_COLUMN_MAX: f32 = 560.0;
+/// A page's title.
+const PAGE_TITLE: f32 = 26.0;
+/// A group's heading.
+const SECTION_TITLE: f32 = 20.0;
+
+/// How a line under a control reads.
+#[derive(Debug, Clone, Copy)]
+enum Ink {
+    /// An explanation.
+    Quiet,
+    /// Something the user should know, not an error.
+    Note,
+    Error,
+}
+
+/// A list picker's width on a page.
+fn picker_width(ui: &egui::Ui) -> f32 {
+    ui.available_width().min(theme::COLUMN_MAX)
+}
+
+/// A panel's title.
+fn page_title(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .color(theme::colours(ui).text)
+            .size(PAGE_TITLE),
+    );
+    ui.add_space(theme::SPACE_SCALE[3]);
+}
+
+/// One heading per group of choices.
+fn group_heading(ui: &mut egui::Ui, heading: &str) {
+    ui.add_space(theme::GROUP_GAP);
+    ui.label(
+        egui::RichText::new(heading)
+            .color(theme::colours(ui).text)
+            .size(SECTION_TITLE),
+    );
+    ui.add_space(theme::SPACE_SCALE[1]);
+}
+
+/// A heading inside a group.
+fn sub_heading(ui: &mut egui::Ui, heading: &str) {
+    ui.add_space(theme::SPACE_SCALE[4]);
+    ui.label(
+        egui::RichText::new(heading)
+            .color(theme::colours(ui).text)
+            .size(16.0),
+    );
+    ui.add_space(theme::SPACE_SCALE[1]);
+}
+
+/// A line of explanation, wrapped to the column.
+fn quiet(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(theme::colours(ui).text2));
+}
+
+/// A control's description or note under it: the small, muted help style
+/// every control uses (the list picker's own help line included).
+fn help_line(ui: &mut egui::Ui, text: &str, ink: Ink) {
+    let colours = theme::colours(ui);
+    let colour = match ink {
+        Ink::Quiet => colours.text2,
+        Ink::Note => colours.warning,
+        Ink::Error => colours.error,
+    };
+    ui.add_space(theme::FIELD_TO_HELP);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(theme::TEXT_LABEL)
+                .color(colour),
+        )
+        .wrap(),
+    );
+}
+
+/// How far a check box's label starts from its box: its description
+/// lines up with the label.
+fn checkbox_indent(ui: &egui::Ui) -> f32 {
+    ui.spacing().icon_width + ui.spacing().icon_spacing
+}
+
+/// A check box's description, aligned with its label text.
+fn checkbox_help(ui: &mut egui::Ui, text: &str, ink: Ink) {
+    let indent = checkbox_indent(ui);
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.vertical(|ui| help_line(ui, text, ink));
+    });
+}
+
+/// A Settings button: the shared secondary button, as wide as its label
+/// needs.
+fn button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let width = super::widgets::button_width(ui, &[label]);
+    super::widgets::secondary_button(ui, label, width)
+}
+
+/// A developer override's choices: "Follow preset", then each value.
+fn pinned<T: Copy>(all: &[T], label: impl Fn(T) -> String) -> Vec<(Option<T>, String)> {
+    std::iter::once((None, "Follow preset".to_owned()))
+        .chain(all.iter().map(|value| (Some(*value), label(*value))))
+        .collect()
+}
+
+/// A group's choices in one list picker: each choice's title (and badge),
+/// the chosen one's line under it.
+fn choice_picker<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    id: &str,
+    title: Option<&str>,
+    current: &mut T,
+    rows: &[Choice<T>],
+) {
+    let labels: Vec<(T, String)> = rows
+        .iter()
+        .map(|choice| {
+            let label = match choice.badge {
+                Some(badge) => format!("{} {badge}", choice.title),
+                None => choice.title.clone(),
+            };
+            (choice.value, label)
+        })
+        .collect();
+    let help = rows
+        .iter()
+        .find(|choice| choice.value == *current)
+        .map(|choice| choice.line.clone());
+    let _ = list_picker(
+        ui,
+        id,
+        title,
+        current,
+        &labels,
+        help.as_deref(),
+        picker_width(ui),
+    );
 }
 
 /// The note under the pen-button rows.
@@ -2101,20 +1771,6 @@ pub const fn pen_button_note(platform: DeckPlatform) -> &'static str {
 /// The few phrases that name the machine, its operating system or its keys.
 mod words {
     use super::DeckPlatform;
-
-    pub(super) const fn os_name(platform: DeckPlatform) -> &'static str {
-        match platform {
-            DeckPlatform::Mac => "macOS",
-            DeckPlatform::Pc => "Windows",
-        }
-    }
-
-    pub(super) const fn applications(platform: DeckPlatform) -> &'static str {
-        match platform {
-            DeckPlatform::Mac => "Mac applications",
-            DeckPlatform::Pc => "Windows applications",
-        }
-    }
 
     pub(super) const fn dense_panel(platform: DeckPlatform) -> &'static str {
         match platform {
@@ -2190,38 +1846,6 @@ mod tests {
         assert_eq!(pc(DeckShortcut::Disconnect), "Ctrl+Alt+F12");
         assert_eq!(pc(DeckShortcut::ToggleFullscreen), "Ctrl+Alt+Break");
         assert_eq!(pc(DeckShortcut::Quit), "Alt+F4");
-    }
-
-    #[test]
-    fn the_mac_tablet_wording_is_unchanged_and_the_pc_names_itself() {
-        let mac = tablet_mode_description(TabletModeMsg::LocalTermination, DeckPlatform::Mac);
-        assert!(mac.contains("This Mac's tablet driver reads the pen"));
-        assert!(mac.contains("stay on this Mac. The tablet also stays usable in Mac applications"));
-        let pc = tablet_mode_description(TabletModeMsg::UsbTabletBridge, DeckPlatform::Pc);
-        assert!(pc.contains("takes the device away from Windows"));
-        assert!(!pc.contains("Mac"));
-    }
-
-    /// Q-16 and Q-17: any tablet works in both modes, Tablet support follows
-    /// the Deck's own pen settings, and Native tablet states per host what
-    /// differs, on both Decks alike.
-    #[test]
-    fn any_tablet_works_and_each_host_says_what_differs() {
-        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
-            let native = tablet_mode_description(TabletModeMsg::UsbTabletBridge, platform);
-            assert!(native.contains(
-                "Any pen tablet works; models with a dedicated reader get extra features."
-            ));
-            assert!(!native.contains("never interprets"));
-            for note in NATIVE_TABLET_TARGET_NOTES {
-                assert!(native.contains(note), "{note}");
-            }
-            let local = tablet_mode_description(TabletModeMsg::LocalTermination, platform);
-            assert!(local.contains(&format!(
-                "handedness and mapping follow {}'s own pen and tablet settings",
-                platform.this_machine()
-            )));
-        }
     }
 
     #[cfg(feature = "runtime")]
@@ -2434,8 +2058,8 @@ mod tests {
                 hdr_screen: false,
                 notch: None,
                 monitors: &[],
-                clipboard_policy: None,
-                tablet_scope_note: String::new(),
+                host_clipboard_notice: None,
+                connections: &[],
                 native_tablet: None,
                 decode: Some(report.clone()),
                 support_bundle: None,
@@ -2450,19 +2074,116 @@ mod tests {
         }
     }
 
+    const ALL_TABS: [SettingsTab; 8] = [
+        SettingsTab::Language,
+        SettingsTab::Streaming,
+        SettingsTab::Displays,
+        SettingsTab::Microphone,
+        SettingsTab::Input,
+        SettingsTab::Tablet,
+        SettingsTab::Logs,
+        SettingsTab::Advanced,
+    ];
+
+    fn sample_facts(
+        platform: DeckPlatform,
+        connections: &[crate::config::SavedConnectionSummary],
+    ) -> SettingsFacts<'_> {
+        SettingsFacts {
+            hdr_screen: false,
+            notch: (platform == DeckPlatform::Mac).then_some(false),
+            monitors: &[],
+            host_clipboard_notice: None,
+            connections,
+            native_tablet: None,
+            decode: None,
+            support_bundle: Some(super::super::support_bundle::SupportBundleView {
+                open: true,
+                ..super::super::support_bundle::SupportBundleView::default()
+            }),
+            connection_displays: Some(("Studio".to_owned(), DisplaysMode::MatchLayout)),
+            canvas_available: false,
+            system_shortcut_permission: None,
+        }
+    }
+
+    fn collect_text(shape: &egui::Shape, texts: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => texts.push(text.galley.job.text.clone()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, texts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every piece of text a panel draws, in order.
+    fn page_text(
+        platform: DeckPlatform,
+        values: &SettingsValues,
+        facts: &SettingsFacts<'_>,
+    ) -> Vec<String> {
+        let ctx = egui::Context::default();
+        super::super::wording::set_deck_platform(&ctx, platform);
+        let mut values = values.clone();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 6000.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            let _ = render_settings(ui, &mut values, facts);
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// The panel's own text, without the sidebar (which ends with
+    /// Advanced).
+    fn panel_text(
+        platform: DeckPlatform,
+        values: &SettingsValues,
+        facts: &SettingsFacts<'_>,
+    ) -> Vec<String> {
+        let mut texts = page_text(platform, values, facts);
+        let sidebar_end = texts
+            .iter()
+            .position(|text| text == SettingsTab::Advanced.label())
+            .expect("the sidebar");
+        texts.drain(..=sidebar_end);
+        texts
+    }
+
+    #[test]
+    fn the_sidebar_labels_are_in_sentence_case() {
+        let texts = page_text(
+            DeckPlatform::Mac,
+            &sample_values(),
+            &sample_facts(DeckPlatform::Mac, &[]),
+        );
+        for label in ["General", "Input and devices", "System"] {
+            assert!(texts.iter().any(|text| text == label), "{label}: {texts:?}");
+        }
+        for text in &texts {
+            let letters: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
+            assert!(
+                letters.len() < 4 || letters.iter().any(|c| c.is_lowercase()),
+                "tracked capitals: {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_panel_draws_on_both_decks_without_changing_a_value() {
         for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
-            for tab in [
-                SettingsTab::Language,
-                SettingsTab::Streaming,
-                SettingsTab::Displays,
-                SettingsTab::Microphone,
-                SettingsTab::Clipboard,
-                SettingsTab::Input,
-                SettingsTab::Logs,
-                SettingsTab::Advanced,
-            ] {
+            for tab in ALL_TABS {
                 let ctx = egui::Context::default();
                 super::super::wording::set_deck_platform(&ctx, platform);
                 let mut values = SettingsValues {
@@ -2470,27 +2191,510 @@ mod tests {
                     ..sample_values()
                 };
                 let before = values.clone();
-                let facts = SettingsFacts {
-                    hdr_screen: false,
-                    notch: (platform == DeckPlatform::Mac).then_some(false),
-                    monitors: &[],
-                    clipboard_policy: None,
-                    tablet_scope_note: String::new(),
-                    native_tablet: None,
-                    decode: None,
-                    support_bundle: Some(super::super::support_bundle::SupportBundleView {
-                        open: true,
-                        ..super::super::support_bundle::SupportBundleView::default()
-                    }),
-                    connection_displays: Some(("Studio".to_owned(), DisplaysMode::MatchLayout)),
-                    canvas_available: false,
-                    system_shortcut_permission: None,
-                };
+                let facts = sample_facts(platform, &[]);
                 let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                     assert!(render_settings(ui, &mut values, &facts).is_empty());
                 });
                 assert_eq!(values, before, "{tab:?} on {platform:?}");
             }
         }
+    }
+
+    #[test]
+    fn every_page_follows_both_palettes_with_readable_text_and_no_light_line() {
+        use super::super::theme::{Palette, apply, checks, contrast_ratio};
+        fn flatten(shape: egui::Shape, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.into_iter().for_each(|s| flatten(s, out)),
+                shape => out.push(shape),
+            }
+        }
+        for dark in [false, true] {
+            let colours = Palette::of(dark);
+            for tab in ALL_TABS {
+                let ctx = egui::Context::default();
+                apply(&ctx);
+                ctx.set_theme(if dark {
+                    egui::Theme::Dark
+                } else {
+                    egui::Theme::Light
+                });
+                super::super::wording::set_deck_platform(&ctx, DeckPlatform::Mac);
+                let mut values = SettingsValues {
+                    tab,
+                    ..sample_values()
+                };
+                let facts = sample_facts(DeckPlatform::Mac, &[]);
+                let mut shapes = Vec::new();
+                for _ in 0..2 {
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1120.0, 724.0),
+                            )),
+                            ..egui::RawInput::default()
+                        },
+                        |ui| {
+                            let _ = render_settings(ui, &mut values, &facts);
+                        },
+                    );
+                    shapes.clear();
+                    for clipped in output.shapes {
+                        flatten(clipped.shape, &mut shapes);
+                    }
+                }
+                for colour in checks::painted_colours(&shapes, colours.bg) {
+                    assert!(
+                        checks::quiet_enough(&colours, colour),
+                        "{tab:?}, dark {dark}: {colour:?}"
+                    );
+                }
+                for (text, ink, ground) in checks::texts_on_their_ground(&shapes, colours.bg) {
+                    let ratio = contrast_ratio(ink, ground);
+                    assert!(
+                        ratio >= 4.5,
+                        "{tab:?}, dark {dark}: {text:?} {ratio:.2}:1 ({ink:?} on {ground:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether the Deck's fonts draw `c` (Latin-1, or a symbol
+    /// `theme::DRAWN_SYMBOLS` lists, which the macOS Deck checks against
+    /// the real fonts).
+    fn drawn(c: char) -> bool {
+        u32::from(c) <= 0xFF || super::super::theme::DRAWN_SYMBOLS.contains(c)
+    }
+
+    #[test]
+    fn no_panel_shows_a_character_its_fonts_draw_as_an_empty_box() {
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            for tab in ALL_TABS {
+                let values = SettingsValues {
+                    tab,
+                    ..sample_values()
+                };
+                let texts = page_text(platform, &values, &sample_facts(platform, &[]));
+                assert!(!texts.is_empty(), "{tab:?} on {platform:?}");
+                for text in texts {
+                    assert!(!text.contains('□'), "{text:?}");
+                    assert!(
+                        text.chars().all(drawn),
+                        "{tab:?} on {platform:?}: {:?} in {text:?}",
+                        text.chars().filter(|c| !drawn(*c)).collect::<String>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_input_page_has_one_heading_per_group_and_says_what_each_deck_does() {
+        let connections = [
+            crate::overrides::ConnectionOverrides {
+                typing_mode: crate::overrides::Override::Own(TypingMode::Keys),
+                clipboard_enabled: crate::overrides::Override::Own(false),
+                ..crate::overrides::ConnectionOverrides::default()
+            },
+            crate::overrides::ConnectionOverrides {
+                typing_mode: crate::overrides::Override::Own(TypingMode::Auto),
+                ..crate::overrides::ConnectionOverrides::default()
+            },
+            crate::overrides::ConnectionOverrides::default(),
+        ]
+        .map(|overrides| crate::config::SavedConnectionSummary {
+            id: "id".to_owned(),
+            kind: crate::config::ConnectionKind::DirectMachine,
+            name: "name".to_owned(),
+            host: "203.0.113.10".to_owned(),
+            port: 18_444,
+            use_tls: true,
+            transport: crate::config::SavedTransport::Quic,
+            identity_security_mode: None,
+            settings: crate::config::SavedConnectionSettings {
+                overrides,
+                ..crate::config::SavedConnectionSettings::default()
+            },
+            unknown: serde_json::Map::new(),
+        });
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            let values = SettingsValues {
+                tab: SettingsTab::Input,
+                ..sample_values()
+            };
+            let mut facts = sample_facts(platform, &connections);
+            facts.host_clipboard_notice = Some(crate::clipboard::HOST_TURNED_CLIPBOARD_OFF);
+            let texts = panel_text(platform, &values, &facts);
+            let count = |wanted: &str| texts.iter().filter(|text| *text == wanted).count();
+            for heading in ["Input", "Keyboard", "Typing", "Clipboard"] {
+                assert_eq!(count(heading), 1, "{heading} on {platform:?}: {texts:?}");
+            }
+            for line in [
+                choices::input_intro(platform, values.keyboard_switch)[1].as_str(),
+                choices::SYSTEM_SHORTCUTS_TITLE,
+                choices::system_shortcuts_line(platform),
+                "Default for all connections. 2 connections use their own.",
+                choices::CLIPBOARD_TITLE,
+                "1 connection uses its own",
+                "Clipboard is turned off by this host.",
+                choices::LEARN_MORE,
+            ] {
+                assert_eq!(count(line), 1, "{line} on {platform:?}: {texts:?}");
+            }
+            // The Option key and Paste as Keystrokes are not on this page.
+            assert!(texts.iter().all(|text| !text.contains("Option key")));
+            assert!(texts.iter().all(|text| !text.contains("Paste")));
+        }
+        // Each Deck names its own shortcuts.
+        assert!(choices::system_shortcuts_line(DeckPlatform::Mac).starts_with("⌘Tab"));
+        assert!(choices::system_shortcuts_line(DeckPlatform::Pc).starts_with("Alt+Tab"));
+    }
+
+    #[test]
+    fn the_tablet_page_is_one_picker_and_its_footer() {
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            let values = SettingsValues {
+                tab: SettingsTab::Tablet,
+                ..sample_values()
+            };
+            let texts = panel_text(platform, &values, &sample_facts(platform, &[]));
+            // One picker: the choice in force and its line, the others
+            // only once it opens.
+            let chosen = choices::tablet_choices()
+                .into_iter()
+                .find(|choice| choice.value == values.tablet_mode_requested)
+                .expect("a tablet choice");
+            assert_eq!(
+                texts
+                    .iter()
+                    .filter(|text| text.starts_with(chosen.title.as_str()))
+                    .count(),
+                1,
+                "{texts:?}"
+            );
+            assert_eq!(texts.iter().filter(|text| **text == chosen.line).count(), 1);
+            for other in choices::tablet_choices() {
+                if other.value != chosen.value {
+                    assert!(texts.iter().all(|text| *text != other.line), "{texts:?}");
+                }
+            }
+            assert!(texts.iter().any(|text| text == choices::TABLET_FOOTER));
+            // The pen buttons, under Tablet support: one on a PC.
+            let pen_buttons = texts
+                .iter()
+                .filter(|text| text.ends_with("pen button") || *text == "Pen button")
+                .count();
+            assert_eq!(
+                pen_buttons,
+                if platform == DeckPlatform::Pc { 1 } else { 2 },
+                "{texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn advanced_input_has_the_paste_tuning_and_the_keyboard_switch_but_no_option_key() {
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            let values = SettingsValues {
+                tab: SettingsTab::Advanced,
+                ..sample_values()
+            };
+            let texts = panel_text(platform, &values, &sample_facts(platform, &[]));
+            for wanted in [
+                choices::ADVANCED_INPUT_HEADING,
+                choices::KEYBOARD_SWITCH_HEADING,
+                choices::PASTE_HEADING,
+                choices::PASTE_SPEED,
+                choices::PASTE_ASK_ABOVE,
+            ] {
+                assert_eq!(
+                    texts.iter().filter(|text| *text == wanted).count(),
+                    1,
+                    "{wanted} on {platform:?}"
+                );
+            }
+            assert!(texts.iter().all(|text| !text.contains("Option key")
+                && !text.contains("AltGr")
+                && !text.contains("Option is Alt")));
+        }
+    }
+
+    #[test]
+    fn a_saved_low_this_deck_cannot_use_shows_as_medium_with_a_note() {
+        if crate::settings::low_security_allowed() {
+            // ARCEN_ACCEPT_INSECURE=1 in this environment: Low is offered.
+            return;
+        }
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            let values = SettingsValues {
+                tab: SettingsTab::Advanced,
+                security: SecurityMode::Low,
+                ..sample_values()
+            };
+            let texts = panel_text(platform, &values, &sample_facts(platform, &[]));
+            assert!(texts.iter().all(|text| text != "Low"), "{texts:?}");
+            assert!(
+                texts.iter().any(|text| text.starts_with("Medium")),
+                "{texts:?}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text == choices::LOW_SECURITY_OFF_NOTE)
+            );
+            // Looking saves nothing.
+            let ctx = egui::Context::default();
+            super::super::wording::set_deck_platform(&ctx, platform);
+            let mut shown = values.clone();
+            let facts = sample_facts(platform, &[]);
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                assert!(render_settings(ui, &mut shown, &facts).is_empty());
+            });
+            assert_eq!(shown, values);
+        }
+        assert_eq!(SecurityMode::Low.in_force_with(false), SecurityMode::Medium);
+        assert_eq!(SecurityMode::Low.in_force_with(true), SecurityMode::Low);
+        assert!(crate::settings::low_security_allowed_with(Some("1")));
+        assert!(!crate::settings::low_security_allowed_with(Some("true")));
+        assert!(!crate::settings::low_security_allowed_with(None));
+    }
+
+    #[test]
+    fn every_choice_is_one_line() {
+        let platforms = [DeckPlatform::Mac, DeckPlatform::Pc];
+        let mut rows: Vec<(String, String)> = Vec::new();
+        rows.extend(
+            choices::typing_choices()
+                .into_iter()
+                .map(|choice| (choice.title, choice.line)),
+        );
+        rows.extend(
+            choices::tablet_choices()
+                .into_iter()
+                .map(|choice| (choice.title, choice.line)),
+        );
+        for platform in platforms {
+            rows.push((
+                choices::SYSTEM_SHORTCUTS_TITLE.to_owned(),
+                choices::system_shortcuts_line(platform).to_owned(),
+            ));
+        }
+        for (title, line) in rows {
+            assert!(!title.contains('\n') && title.len() <= 48, "{title:?}");
+            assert!(
+                !line.contains('\n') && line.chars().count() <= 100,
+                "{line:?}"
+            );
+            assert_eq!(line.matches(". ").count(), 0, "one sentence: {line:?}");
+            assert!(line.chars().all(drawn) && title.chars().all(drawn));
+        }
+    }
+
+    #[test]
+    fn the_one_system_shortcuts_switch_keeps_each_decks_default() {
+        use arcen_input::keyboard::KeyboardCapturePolicy::{Host, ThisComputer};
+        let defaults = crate::settings::ClientSettings::default();
+        // Off on a Mac (it needs Accessibility), on on a PC, as before.
+        assert!(!system_shortcuts_to_host(
+            DeckPlatform::Mac,
+            defaults.keyboard_capture,
+            defaults.capture_mac_system_shortcuts
+        ));
+        assert!(system_shortcuts_to_host(
+            DeckPlatform::Pc,
+            defaults.keyboard_capture,
+            defaults.capture_mac_system_shortcuts
+        ));
+        let (mut capture, mut mac) = (ThisComputer, false);
+        set_system_shortcuts_to_host(DeckPlatform::Mac, true, &mut capture, &mut mac);
+        assert_eq!((capture, mac), (Host, true));
+        set_system_shortcuts_to_host(DeckPlatform::Mac, false, &mut capture, &mut mac);
+        assert!(!mac);
+        assert!(!system_shortcuts_to_host(DeckPlatform::Mac, capture, mac));
+        let (mut capture, mut mac) = (Host, false);
+        set_system_shortcuts_to_host(DeckPlatform::Pc, false, &mut capture, &mut mac);
+        assert_eq!(capture, ThisComputer);
+        set_system_shortcuts_to_host(DeckPlatform::Pc, true, &mut capture, &mut mac);
+        assert_eq!(capture, Host);
+    }
+
+    #[test]
+    fn every_short_single_choice_is_the_shared_list_picker() {
+        let source = include_str!("settings.rs");
+        let code = source.split("#[cfg(test)]").next().expect("the code");
+        // No radio rows and no combo boxes, the developer build's
+        // streaming overrides included.
+        assert!(!code.contains(".radio(") && !code.contains("radio_value("));
+        assert!(!code.contains("ComboBox"));
+        for id in [
+            "\"language\"",
+            "\"streaming_preset\"",
+            "\"displays_mode\"",
+            "\"remote_ui_scale\"",
+            "\"typing_mode\"",
+            "\"tablet_mode\"",
+            "\"log_level\"",
+            "\"certificate_checking\"",
+            "\"paste_chars_per_second\"",
+            "\"paste_confirm_above\"",
+            "\"keyboard_switch_preset\"",
+            "\"streaming_performance_override\"",
+            "\"color_fidelity_variant_override\"",
+        ] {
+            assert!(code.contains(id), "{id} is a list picker");
+        }
+    }
+
+    /// Every shape one settled pass of `tab` draws, themed, at 1120 x 760.
+    fn page_shapes(tab: SettingsTab, dark: bool) -> Vec<egui::Shape> {
+        fn flatten(shape: egui::Shape, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.into_iter().for_each(|s| flatten(s, out)),
+                shape => out.push(shape),
+            }
+        }
+        let ctx = egui::Context::default();
+        super::super::theme::apply(&ctx);
+        ctx.set_theme(if dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        });
+        super::super::wording::set_deck_platform(&ctx, DeckPlatform::Mac);
+        let mut values = SettingsValues {
+            tab,
+            ..sample_values()
+        };
+        let facts = SettingsFacts {
+            native_tablet: Some(NativeTabletControl {
+                action_label: "Install\u{2026}".to_owned(),
+                tint: ComponentTint::Action,
+                ready: false,
+                guidance: "Needs its component.".to_owned(),
+                error: None,
+            }),
+            system_shortcut_permission: Some(false),
+            canvas_available: true,
+            ..sample_facts(DeckPlatform::Mac, &[])
+        };
+        if tab == SettingsTab::Tablet {
+            values.tablet_mode_requested = TabletModeMsg::UsbTabletBridge;
+        }
+        if tab == SettingsTab::Input {
+            set_system_shortcuts_to_host(
+                DeckPlatform::Mac,
+                true,
+                &mut values.keyboard_capture,
+                &mut values.capture_mac_system_shortcuts,
+            );
+        }
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1120.0, 760.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    let _ = render_settings(ui, &mut values, &facts);
+                },
+            );
+            shapes.clear();
+            for clipped in output.shapes {
+                flatten(clipped.shape, &mut shapes);
+            }
+        }
+        shapes
+    }
+
+    #[test]
+    fn every_settings_button_is_the_shared_control_and_the_bar_shows() {
+        use super::super::launcher::{LAUNCHER_BAR_FILL, LAUNCHER_BAR_HEIGHT};
+        use super::super::theme::{CONTROL_HEIGHT, Palette};
+        for dark in [false, true] {
+            let colours = Palette::of(dark);
+            for tab in ALL_TABS {
+                let shapes = page_shapes(tab, dark);
+                // The orange bar across the top, with Done and no gear.
+                assert!(
+                    shapes
+                        .iter()
+                        .any(|shape| matches!(shape, egui::Shape::Rect(rect)
+                        if rect.fill == LAUNCHER_BAR_FILL
+                            && rect.rect.top() < 1.0
+                            && (rect.rect.height() - LAUNCHER_BAR_HEIGHT).abs() < 0.5)),
+                    "{tab:?}: the bar"
+                );
+                assert!(
+                    shapes
+                        .iter()
+                        .any(|shape| matches!(shape, egui::Shape::Text(text)
+                        if text.galley.job.text == "Done" && text.pos.y < LAUNCHER_BAR_HEIGHT)),
+                    "{tab:?}: Done on the bar"
+                );
+                // Every outlined control (a button, a field, a picker) is
+                // the shared one: as tall as every control.
+                for shape in &shapes {
+                    if let egui::Shape::Rect(rect) = shape
+                        && rect.stroke.width > 0.0
+                        && rect.stroke.color == colours.field_border
+                        && rect.rect.width() > 24.0
+                    {
+                        assert!(
+                            (rect.rect.height() - CONTROL_HEIGHT).abs() < 0.5,
+                            "{tab:?}, dark {dark}: a control {:?} tall",
+                            rect.rect.height()
+                        );
+                    }
+                }
+            }
+        }
+        // And in the code: no stock egui button on a page.
+        for source in [
+            include_str!("settings.rs"),
+            include_str!("support_bundle.rs"),
+            include_str!("profile.rs"),
+        ] {
+            let code = source.split("#[cfg(test)]").next().expect("the code");
+            assert!(!code.contains(".button(") && !code.contains("Button::new("));
+        }
+    }
+
+    #[test]
+    fn every_controls_description_is_the_small_muted_help() {
+        let shapes = page_shapes(SettingsTab::Streaming, true);
+        let texts: Vec<_> = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        let size = |wanted: &str| {
+            texts
+                .iter()
+                .find(|text| text.galley.job.text == wanted)
+                .and_then(|text| text.galley.job.sections.first())
+                .map_or_else(
+                    || panic!("no {wanted}"),
+                    |section| section.format.font_id.size,
+                )
+        };
+        let x = |wanted: &str| {
+            texts
+                .iter()
+                .find(|text| text.galley.job.text == wanted)
+                .map_or_else(|| panic!("no {wanted}"), |text| text.pos.x)
+        };
+        for description in [EXACT_STILL_IMAGE_DESCRIPTION, CANVAS_DESCRIPTION] {
+            assert!((size(description) - theme::TEXT_LABEL).abs() < 0.01);
+        }
+        // Under its check box's label, not its box.
+        assert!((x(EXACT_STILL_IMAGE_DESCRIPTION) - x("Exact still image")).abs() < 1.0);
     }
 }

@@ -922,7 +922,9 @@ async fn serve_desktop(
     // the only way this host can show the right shape — reading the shape to
     // send separately does not work, measured: NSCursor's system cursor does
     // not follow another process's pointer, which is why Apple deprecated that
-    // reader and pointed at this instead.
+    // reader and pointed at this instead. `cursor_mode` is the settled
+    // authority: a Deck that asked for the automatic cursor gets Host here,
+    // because this host sends no cursor images.
     let shows_cursor = handshake.cursor_mode == arcen_protocol::messages::CursorMode::Host;
     let capture = match handshake.plan.tier {
         arcen_media::session_plan::VideoTier::Standard => {
@@ -1036,7 +1038,9 @@ async fn serve_multi_desktop(
         .monitors
         .iter()
         .map(|monitor| arcen_pier_macos::stream::RegionStreamPlan {
-            capture: multi_capture_config(handshake.plan, monitor.fps, monitor),
+            capture: multi_capture_config(handshake.plan, monitor.fps, monitor).showing_cursor(
+                handshake.cursor_mode == arcen_protocol::messages::CursorMode::Host,
+            ),
             monitor_id: monitor.session_monitor_id,
             topology_generation: multi_monitor.generation,
             stream_epoch: epoch,

@@ -906,7 +906,7 @@ mod lab {
             pump_messages();
             while let Ok(event) = handle.events.try_recv() {
                 match event {
-                    SessionEvent::CertificateUntrusted(_) => {
+                    SessionEvent::CertificateUntrusted(_) | SessionEvent::CertificateChanged(_) => {
                         println!("session=FAIL certificate does not match the pin");
                         let _ = handle.commands.send(SessionCommand::Close);
                     }

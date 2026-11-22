@@ -28,19 +28,19 @@ pub fn render_about(ctx: &egui::Context, version: &str, build: &str) -> AboutAct
                     egui::RichText::new("Arcen Deck")
                         .strong()
                         .size(15.0)
-                        .color(egui::Color32::BLACK),
+                        .color(super::theme::colours(ui).text),
                 );
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(format!("Version {version} ({build})"))
                         .size(11.0)
-                        .color(egui::Color32::DARK_GRAY),
+                        .color(super::theme::colours(ui).text2),
                 );
                 ui.add_space(10.0);
                 ui.label(
                     egui::RichText::new(crate::about::COPYRIGHT_LINE)
                         .size(11.0)
-                        .color(egui::Color32::DARK_GRAY),
+                        .color(super::theme::colours(ui).text2),
                 );
                 ui.add_space(6.0);
                 ui.hyperlink_to("Source code", crate::about::SOURCE_URL);

@@ -33,6 +33,7 @@ against, so it can be checked again when the app changes.
 12. [Disconnecting, quitting and signing out](#12-disconnecting-quitting-and-signing-out)
 13. [When something goes wrong](#13-when-something-goes-wrong)
 14. [Where to get help](#14-where-to-get-help)
+15. [Menus and keyboard shortcuts](#15-menus-and-keyboard-shortcuts)
 
 ---
 
@@ -65,7 +66,44 @@ connections, remembered host certificates and settings stay in
 
 ## 2. Connect and sign in
 
-<!-- source: clients/macos/src/ui/home.rs (Connections sidebar, New Connection form, Remember username, Auto-reconnect, Test connection); clients/macos/src/ui/app.rs (cert_warning_modal, certificate_changed_modal, Security modes, Review before connect, connection_serialization_never_contains_passwords); clients/macos/src/ui/connection_test.rs; README.md (Connect) -->
+<!-- source: shared/deck-core/src/screens/home.rs (the calm list, the machine's column, the two-column New and Edit connection form, Remember username, Auto-reconnect, the ＋ and ⋮ menus); shared/deck-core/src/screens/list_picker.rs (the list picker); shared/deck-core/src/presence.rs (HostPresence, NoPresence, DemoPresence); shared/deck-core/src/screens/{widgets,theme,icons,launcher}.rs (fields, buttons, the two palettes, icons, the orange bar); clients/macos/src/ui/app.rs (cert_warning_modal, certificate_changed_modal, Security modes, Review before connect, connection_serialization_never_contains_passwords); clients/macos/src/ui/connection_test.rs; shared/deck-core/src/sign_in.rs (SignInFailure messages); README.md (Connect) -->
+
+### Home at a glance
+
+The Deck opens on **Home**: your saved connections on the left, the
+selected one on the right. It keeps out of your way on purpose:
+
+- **The list.** Each connection shows its name and, under it, one quiet
+  line. Today that line is the connection's address. The same line is
+  reserved for the machine's status (**Ready**, **You're signed in ·
+  resume**, **In use by someone else**, **Off**) once a host or service
+  can report it; no Pier reports who is signed in today, so the
+  Deck never guesses. The selected connection is tinted, with an orange bar
+  at its left edge.
+- **The right side.** One centred column: the machine's name (point at it
+  to see its address), the **Username** and **Password** it needs, one large
+  **Connect** button, **Remember username** and **Auto-reconnect** under
+  it (and, only for a connection with its own Displays choice, a line
+  saying so with **Use app default**), and **Edit** as a quiet link at the
+  bottom. When a status source
+  says your own session is still signed in there, the button reads
+  **Resume** and asks for no password.
+- **The orange bar** at the top holds two buttons on its right, outside a
+  session: **?** opens this guide, the gear opens **Settings**.
+- **Light or dark.** The Deck follows your Mac's (or PC's) appearance:
+  choose Light or Dark in the system settings, or Auto, and the Deck
+  changes with it straight away, menus, lists and tooltips included. There
+  is no separate setting in the Deck.
+
+The **＋** beside **Connections** opens **New connection…** and **Import
+from file…**. A connection's **⋮** menu, on the selected row and the row
+under the pointer, has **Edit**, **Test connection**, **Export…** and
+**Delete**.
+
+Keys on Home: ⌘N on a Mac, Ctrl+N on a PC, opens **New connection**.
+Return in the username or password field connects. In the connection form,
+Return saves and Esc cancels, unless a list is open: then the key belongs
+to the list.
 
 ### Save a connection
 
@@ -74,31 +112,92 @@ Your administrator gives you an address (a name such as
 tells you which account to use. Arcen has no accounts of its own: you sign
 in with your ordinary account on that workstation.
 
-1. Open Arcen Deck and choose **+ Add Connection** at the bottom of the
-   **Connections** list.
-2. Fill in **Name** (anything you like), **Host Address**, and **Port**
-   (leave it at 18444 unless told otherwise). **Remembered Username** is
-   optional.
-3. Choose **Add Connection**.
+1. Open Arcen Deck, choose **＋** beside **Connections** at the top of the
+   list, then **New connection…** (or press ⌘N on a Mac, Ctrl+N on a PC).
+   With nothing saved yet, Home also has **Add connection** and **Import…**
+   buttons.
+2. The form has two columns, side by side when the window is wide enough
+   and one under the other when it is narrow:
+   - **Connection**: the **Address** (add `:port` only if you were given a
+     port other than 18444, as in `workstation.example.internal:19444`; an
+     IPv6 address with a port is written `[2001:db8::7]:19444`), **Name
+     (optional)**, named after the address when left empty, and **Username
+     (optional)**.
+   - **On this machine**: what this Deck does for that connection, the **⌘
+     key**, the **Option key** (on a Mac), **Typing** and **Displays**. Each
+     shows the value in force and one line on what it does. **App default
+     (…)** means the connection follows Settings. Leave them on their
+     defaults to start with; sections 6 and 9 explain them.
+3. Choose **Add connection**, or press Return. If something is missing or
+   wrong, the form says so under the field and puts the cursor there. Esc
+   or **Cancel** leaves it. A Mac puts **Cancel** before **Add
+   connection**, Windows after it, as each system's own dialogs do.
+   **Test connection**, at the bottom left, checks the address you typed
+   before you save it.
 
-The same form has **Displays** and **Keyboard** choices for this connection
-only. Leave them on their defaults to start with; sections 6 and 9 explain
-them. To change a saved connection later, select it and choose **Edit**.
+To change a saved connection later, choose **Edit** under its **Connect**
+button, or **Edit** in its **⋮** menu.
+
+**Choosing from a list.** Every choice from a short list, in this form and
+in Settings, works the same way: click the value and the choices open in
+place, pushing what follows down; the one in force is in orange with a bar
+at its left. Click a choice to take it. Esc, a click elsewhere or Tab
+closes the list without changing anything. From the keyboard: Tab to the
+value, Down or Return opens it, Up and Down move, Return chooses. With
+**Reduce motion** on (System Settings › Accessibility › Display on a Mac;
+**Animation effects** off on Windows), lists and menus open at once
+without sliding or fading.
+
+### Settings
+
+Open **Settings** with the gear at the right of the orange bar. Its
+sections are on the left: **General** (Language, Streaming, Displays),
+**Input and devices** (Microphone, Input, Tablet) and **System** (Logs,
+Advanced). Each page is one centred column: a title, short groups with a
+plain heading, a list for each choice from a short list (see **Choosing
+from a list** above), a tick box for each switch with its explanation in
+small grey text under it, and buttons the same size and shape as on Home.
+The orange bar stays at the top, with **?** and, where the gear was,
+**Done**, which goes back to Home. Changes save as you make them.
 
 ### Test before you sign in
 
-Select a connection (or open its form) and choose **Test connection**. It
-checks the whole way to the
-workstation: the name, the network port, the host's certificate, the host's
-greeting, the packet size and the round trip. It sends no user name or
-password. Each failing step says **What to do**. **Copy report** puts the
-result on the clipboard, ready to send to your administrator.
+Open a connection's **⋮** menu and choose **Test connection**; the report
+shows on that connection. The New and Edit connection forms have it too,
+at the bottom left. It checks the whole way to the workstation: the name,
+the network port, the host's certificate, the host's greeting, the packet
+size and the round trip. It sends no user name or password. Each failing
+step says **What to do**. **Copy report** puts the result on the
+clipboard, ready to send to your administrator.
 
 ### Sign in
 
-Select the connection, type your **Username** and **Password**, and choose
-**Connect**. Tick **Remember username** if you like. The Deck never saves
-your password.
+Select the connection. Its name is at the top of the right side (a
+warning, **Not encrypted (insecure mode)**, shows under it only when a
+connection is not encrypted, which only insecure mode allows). Type your
+**Username** and **Password**, and choose **Connect** or press Return. The
+Deck never saves your password, and the password field is empty again once
+you connect, so it is gone after you disconnect.
+
+Signing in happens on the connection itself; there is no separate sign-in
+page. If something stops it, the Deck stays on your connections with the
+same connection selected, clears the password, puts the cursor in the field
+to fix and says what happened under it. The message goes as soon as you
+start typing, when you choose another connection, or when you open a
+connection form:
+
+- **Enter your password to connect.** Connect was chosen with no password,
+  or the host asked for one.
+- **Wrong username or password.** The host refused them.
+- **Couldn't reach ‹host›. Check that it's on and that Arcen is running
+  there.** Nothing answered.
+- **Your session ended. Sign in again to continue.** A session could not be
+  resumed (see [Reconnecting after a dropout](#11-reconnecting-after-a-dropout)).
+
+Where it helps, **Details** under the message shows the technical reason,
+which is also in the Deck's log. Only something that is not about a field,
+such as the host ending your session, the host restarting or the host's
+identity, opens a box for you to read and close with **OK**.
 
 If the host shows a notice before sign-in, the Deck shows it under **Review
 before connect**. Choose **Accept** to continue or **Decline** to stop.
@@ -111,32 +210,113 @@ administrator gives you, then choose:
 
 - **Trust and Remember**: the Deck remembers this host and warns you if its
   identity ever changes. This is the usual choice.
-- **Trust Once**: trust it for this session only.
+- **Trust Once**: trust it only until you quit the Deck.
 - **Cancel**: do not connect.
+
+The certificate's validity is shown as dates (UTC).
 
 ### If the host's identity changed
 
 If a remembered host presents a different certificate, the Deck stops and
-shows **This host's identity changed**. It has not sent your password. This
-happens when a host is reinstalled or its certificate is renewed, and it is
-also what an attack looks like. Ask your administrator before you continue.
-Only when they confirm the change, tick **I confirmed with the host
-administrator that its certificate changed** and choose **Forget and
-Verify**. The Deck then shows the new fingerprint for you to compare, as on
-the first connection.
+shows **This computer's identity has changed**, with the fingerprint it
+remembered next to the one the host presents now. It has not sent your
+password. This can happen after a reinstall, or it can mean someone is
+intercepting the connection: ask your administrator if you're not sure.
+
+- **Cancel** (the default, also Return or Escape) leaves everything as it
+  was.
+- **Trust the new identity…** asks once more. Only when your administrator
+  confirmed the change, choose **Trust and connect**: the Deck remembers the
+  new identity instead of the old one and connects.
 
 ### Certificate checking
 
-**Settings › Advanced › Security modes** decides how strict the Deck is.
+**Settings › Advanced › Certificate checking** decides how strict the Deck is.
 **Medium** is the default: a certificate that no trusted authority issued
 gets the **Verify this host** prompt above. **High** refuses to connect
 unless a certificate authority this computer trusts issued the host's
 certificate. Every Arcen host makes its own self-signed certificate, so High
 refuses a host, and says why, until its administrator installs a
 certificate from a trusted authority. Medium checks such a host by its
-fingerprint instead. **Low** skips the check; avoid it.
-Open Settings with the gear button (⚙) at the top of the Deck window when
-you are not in a session.
+fingerprint instead. **Low** skips the check; avoid it. Settings offers it
+only when Arcen Deck was started with `ARCEN_ACCEPT_INSECURE=1`; a saved
+Low without it checks as Medium, and Settings says so.
+Open Settings with the gear button (⚙) at the right of the orange bar at
+the top of the Deck window when you are not in a session; the **?** beside
+it opens this guide.
+
+### Share a connection
+
+<!-- source: shared/deck-core/src/profile.rs (ConnectionProfile, review_import, commit_import, MAX_PROFILE_BYTES); shared/deck-core/src/screens/profile.rs (import summary); shared/deck-core/src/screens/home.rs (Export…, Import…); clients/macos/src/support.rs, clients/windows/src/platform/support.rs (file dialogs) -->
+
+A saved connection can travel as a small file ending in `.arcen`, for
+example from an administrator to the people who use a workstation.
+
+- **Export:** open the **⋮** menu beside a connection and choose
+  **Export…**, then choose where to save the file.
+- **Import:** choose **＋** beside **Connections**, then **Import from
+  file…**, and pick the file.
+
+The file holds the connection's name, address, port and username, and the
+choices it keeps for itself (Typing, Option key, ⌘ key, Displays and
+clipboard), under the same names as in Settings. Everything it does not
+set follows your own Settings, and the host's own policy still decides what
+a session may do. **It never holds a password**, a token or anything that
+would let someone sign in as you.
+
+Import shows a summary before anything is saved: what will be added, which
+choices the connection keeps for itself, and whether the file includes the
+host's identity. Choose **Import** to save it or **Cancel** to leave
+everything as it was.
+
+- **If you already have a connection to the same address and port,** the
+  Deck never overwrites it silently: choose **Replace it with this file's
+  connection** or **Keep both** (the new one gets a name such as
+  *Studio (2)*).
+- **The host's identity is not trusted just because a file says so.** If
+  the file includes one, it is shown with its fingerprint and **Trust this
+  host identity** is off. Tick it only if you trust whoever sent the file
+  and can compare the fingerprint with your administrator's. Left off, the
+  Deck asks you to verify the host the first time you connect, as usual.
+- **If the file's identity differs from the one you already trust** for
+  that host, the summary shows both fingerprints and warns you. Your
+  current identity stays unless you tick **Replace the identity I trust
+  with the one in this file**; do that only when your administrator told
+  you the host's identity changed.
+- Fields a newer Arcen added are kept and written back when you export the
+  connection again. Fields that look like a password, token or file path
+  are ignored, and the summary says so; so are fields whose names hold
+  hidden or invisible characters or run past 64 characters, which the
+  summary only counts.
+- **Replace keeps the address exactly as you saved it**, so the host
+  identity you already trust for that connection keeps applying.
+
+- **If another Deck window changed the host's trusted identity** while the
+  summary was open, nothing is saved and the summary shows the identity
+  trusted now, to decide again.
+
+A file larger than 64 KB, nested more than 16 levels deep, written by a
+newer Arcen in a format this Deck cannot read, or with a field of the wrong
+kind is refused with a message saying why. Export never writes a file
+another Deck would refuse: a connection carrying more than 64 KB of extra
+fields is not exported, and the file already there is left as it was. What
+Export and Import did shows in a short note under the connection list until
+you choose **Dismiss**. The file looks like this:
+
+```json
+{
+  "format": "arcen-connection",
+  "version": 1,
+  "name": "Studio workstation",
+  "address": "workstation.example.internal",
+  "port": 18444,
+  "username": "alice",
+  "overrides": { "typing_mode": "keys", "displays_mode": "windowed" },
+  "host_identity": { "kind": "spki_sha256", "digest": "<64 hexadecimal digits>" }
+}
+```
+
+Only `format`, `version`, `name` and `address` are required.
 
 ## 3. Choose a preset
 
@@ -202,7 +382,9 @@ If it stays, choose Auto and send the Deck log to your administrator.
 <!-- source: docs/operations/colour-check.md; clients/macos/src/ui/colour_check.rs; clients/macos/src/ui/macos_menu.rs (Session › Colour Check…); clients/macos/src/ui/app.rs (Settings › Streaming › Colour check…) -->
 
 Before you judge a picture, open **Session › Colour Check…** (or
-**Settings › Streaming › Colour check…** at any time). It is a checklist
+**Settings › Streaming › Colour check…** at any time). The Windows Deck
+does not have it yet: its menu item is greyed and says *(not on Windows
+yet)*. It is a checklist
 that answers one question: is what I see what the host has?
 
 It marks each item ✓ (right for colour-critical work), ℹ (worth knowing),
@@ -296,13 +478,22 @@ sending a lossless screenshot of what stopped moving, piece by piece.
 
 ## 5. Pen and tablet
 
-<!-- source: clients/macos/src/ui/app.rs (tablet_mode_label, tablet_mode_description, Settings › Input › Tablet, set_tablet_mode_requested); clients/macos/src/ui/macos_menu.rs (View › Tablet Monitor); shared/input/src/negotiation.rs and hosts/windows/src/session.rs (refusal texts); docs/adr/0017-forward-only-pen-input.md; docs/adr/0018-unified-typed-devices.md; docs/operations/pen-tablet-input.md; README.md (Pen and tablet) -->
+<!-- source: shared/deck-core/src/screens/input_choices.rs (tablet_choices, TABLET_FOOTER); shared/deck-core/src/screens/settings.rs (Settings › Tablet); clients/macos/src/ui/app.rs (set_tablet_mode_requested); clients/macos/src/ui/macos_menu.rs (View › Tablet Monitor); shared/input/src/negotiation.rs and hosts/windows/src/session.rs (refusal texts); docs/adr/0017-forward-only-pen-input.md; docs/adr/0018-unified-typed-devices.md; docs/operations/pen-tablet-input.md; README.md (Pen and tablet) -->
 
 Any pen tablet works, whoever made it. Choose the mode in **Settings ›
-Input › Tablet**. The choice is saved with the connection you have
-selected (the page names it), and takes effect on the next connection.
-Every other saved connection keeps its own mode, so choose Native tablet
-again for each host you want it on.
+Tablet**, directly under Input:
+
+| Choice | In one line |
+| --- | --- |
+| **Tablet support** (Recommended) | Your pen works as a pen on the remote computer. |
+| **Native tablet** | The remote computer's tablet driver talks to your tablet. |
+| **Mouse only** | Your pen moves the pointer like a mouse. |
+
+The choice applies to every connection; changes apply from the next
+connection. (Before 0.20.7 each saved connection kept its own mode; 0.20.7
+starts everyone on Tablet support.) Which one to choose comes down to the
+network between you and the host: Tablet support for Wi-Fi, 5G and working
+away from the office, Native tablet only on an office network.
 
 ### Tablet support (the default, and the right choice almost always)
 
@@ -375,31 +566,30 @@ tablet maker's driver get it back.
 
 If you do use it, it needs macOS 13 or later and the Arcen USB component, a
 small helper (on Intel Macs it has not been tried with a real tablet yet).
-**Settings › Input › Tablet** installs it (**Install component…** beside
+**Settings › Tablet** installs it (**Install component…** beside
 Native tablet), and you approve it once in System Settings › General › Login
 Items. The button beside Native tablet always says where the component
 stands. The Deck itself never runs with
-extra privileges. Keep cursor rendering on **Local** (the connection dialog recommends it):
-the host's own driver
-moves the host's pointer, and the Deck draws the pen's pointer where the host
-reports it, without waiting for the video. Moving the Mac's mouse brings its
-own pointer back at once. A host that cannot report its pointer (older
-versions) leaves the bridged pen without a visible pointer; choose **Use host
-cursor** there.
+extra privileges. The host's own driver moves the host's pointer, and the
+Deck draws the pen's pointer where the host reports it, without waiting for
+the video. Moving the Mac's mouse brings its own pointer back at once. A
+host that cannot report its pointer (older versions) leaves the bridged pen
+without a visible pointer.
 
 The project's direction is to describe each device by what it can do, so
 the host builds a matching virtual pen (or other device) without a driver.
 That design is [ADR 0018](adr/0018-unified-typed-devices.md); it is not
 built yet, and nothing about Tablet support changes because of it.
 
-### Mouse compatibility only
+### Mouse only
 
 No pen redirection: the pen moves the pointer like a mouse, with no
-pressure or tilt.
+pressure, tilt, eraser, proximity or tablet buttons, and nothing
+tablet-specific is needed on either side.
 
 ## 6. Keyboard
 
-<!-- source: shared/input/src/keyboard/{capture.rs (KeyboardCapture), switch_chord.rs (KeyboardSwitchChord, check), deck_shortcuts.rs (DeckShortcut), mac_capture.rs (MacTapRouter), send_keys.rs (SendKey), host_keys.rs}; shared/deck-core/src/screens/keyboard_help.rs (status line, notice, switch help, Help sheet, ⌘Tab question); shared/deck-core/src/screens/settings.rs (Settings › Input › Keyboard switch); clients/macos/src/ui/{app.rs, keyboard.rs, system_shortcut_tap.rs, macos_menu.rs, home.rs, text_input.rs, paste_keys.rs}; clients/windows/src/input/{mod.rs, hook.rs}; clients/windows/src/shell/{launcher.rs, menu_bar.rs}; shared/input/src/text/{paste.rs, policy.rs}; shared/input/src/pen_buttons.rs -->
+<!-- source: shared/input/src/keyboard/{capture.rs (KeyboardCapture), switch_chord.rs (KeyboardSwitchChord, check), deck_shortcuts.rs (DeckShortcut), mac_capture.rs (MacTapRouter), send_keys.rs (SendKey), host_keys.rs}; shared/deck-core/src/screens/keyboard_help.rs (status line, notice, switch help, Help sheet, ⌘Tab question); shared/deck-core/src/screens/input_choices.rs (Settings › Input, Advanced › Input, Edit Connection › On this machine); shared/deck-core/src/screens/settings.rs (Settings › Advanced › Input › Keyboard switch); clients/macos/src/ui/{app.rs, keyboard.rs, system_shortcut_tap.rs, macos_menu.rs, home.rs, text_input.rs, paste_keys.rs}; clients/windows/src/input/{mod.rs, hook.rs}; clients/windows/src/shell/{launcher.rs, menu_bar.rs}; shared/input/src/text/{paste.rs, policy.rs}; shared/input/src/pen_buttons.rs -->
 
 Most keys simply go to the remote computer. This section explains the one
 thing to learn, the **keyboard switch**, then the keys the Deck keeps, the
@@ -432,16 +622,21 @@ The Deck has one switch for the keyboard. Press **Ctrl+Alt+Home** (on a Mac
 - **Connection › Keyboard: Host or This Computer** flips it from the menu.
 - Each new session starts in Remote.
 
-**Settings › Input › System shortcuts go to** decides whether the system
-shortcuts follow the switch: **The remote computer** (the default; in
-Remote they go there, windowed or fullscreen), **The remote computer when
-fullscreen**, or **This computer** (they always stay here; other keys still
-go to the remote computer in Remote).
+**Settings › Input › Keyboard › System shortcuts go to the remote
+computer** decides whether the system shortcuts follow the switch. On, in
+Remote they go there, windowed or fullscreen; off, they always stay on this
+computer, and other keys still go to the remote computer in Remote. It is
+on by default on a PC (Alt+Tab, the Windows key and Print Screen) and off by
+default on a Mac, where it needs the Accessibility permission
+([⌘Tab, ⌘Space and Mission Control](#tab-space-and-mission-control)).
+0.20.7 made this one switch: **The remote computer when fullscreen** became
+on.
 
 ### Choosing another chord for the switch
 
 If Ctrl+Alt+Home is awkward on your keyboard, or a remote application needs
-it, choose another one in **Settings › Input › Keyboard switch**:
+it, choose another one in **Settings › Advanced › Input › Keyboard
+switch** (Settings › Input names the chord in use):
 
 - **Ctrl+Alt+Home** (on a Mac Control-Option-Home), the default.
 - **Ctrl+Alt+Shift+Z**.
@@ -503,16 +698,33 @@ own opens Start, ⌘E opens File Explorer, and right ⌥ is AltGr, so on a
 Norwegian Windows layout right ⌥2 types `@`. Keys are sent by position, so
 choose the Windows keyboard layout that matches your Mac keyboard.
 
-Each saved connection can change this (**Edit** › **Keyboard shortcuts**):
+Each saved connection can change this (**Edit** › **On this machine** ›
+**⌘ key**; the line under it says what the choice in force does, and the
+table above is the full mapping):
 
-- **Automatic (by host)**, the default, as in the table.
+- **App default (Automatic)**, the default, as in the table.
 - **⌘ is the Windows key, Mac edit shortcuts**: the Windows App behaviour.
 - **⌘ and Control swapped**: ⌘ is Ctrl for every key, Control is the
   Windows key.
 - **⌘ is Control**: ⌘ and Control are both Ctrl.
 
-A Mac host always keeps ⌘ as ⌘. Tick **Left Option is also AltGr (Windows
-hosts)** to type AltGr characters with left ⌥ too.
+A Mac host always keeps ⌘ as ⌘. On the Windows Deck the same choice is
+**Command key on a Mac host**: **Ctrl, as on Windows** (the default) or
+**Windows key, keys as labelled**.
+
+The ⌥ keys are a choice of each connection too (**Edit** › **On this
+machine** › **Option key**), not of Settings:
+
+- **App default (Automatic)**: a Mac host keeps both Option keys as Option;
+  on other hosts left ⌥ is Alt and right ⌥ types this Mac's special
+  characters (AltGr).
+- **Left Option is Alt, right Option types characters**.
+- **Both Option keys are Alt**: both send Alt shortcuts.
+- **Both Option keys type characters**: both type this Mac's special
+  characters.
+
+0.20.7 removed the **Left Option is also AltGr** checkbox and moved the ⌥
+choice out of Settings; everyone starts on Automatic.
 
 #### ⌘Tab, ⌘Space and Mission Control
 
@@ -525,9 +737,10 @@ sees them. To send them to the remote computer in Remote, the Deck needs the
   permission.** **Allow** turns the sending on and macOS asks you to allow
   Arcen Deck in **System Settings › Privacy & Security › Accessibility**.
   **Not now** is remembered and the Deck does not ask again.
-- You can turn it on or off at any time in **Settings › Input › Send ⌘Tab,
-  ⌘Space and Mission Control to the remote computer** (its **Allow in
-  Accessibility…** button opens the request).
+- You can turn it on or off at any time in **Settings › Input › Keyboard ›
+  System shortcuts go to the remote computer**. While it is on without the
+  permission, the switch says **Needs Accessibility permission.** and its
+  **Open System Settings…** button opens the request.
 - Without the permission nothing changes: these chords act on this Mac, and
   the indicator says **Keyboard: Z8, system shortcuts on this Mac**.
 
@@ -544,6 +757,11 @@ session window is in front, and takes only these chords:
 ⌃← and ⌃→ follow the switch like every other system shortcut: to move
 between this Mac's Spaces during a session, press ⌃⌥Home first. (Before
 this update a separate setting decided them; it is gone.)
+
+macOS never lets the Deck take ⌥⌘Esc (Force Quit) or ⌃⌘Q (Lock Screen),
+and while a password field anywhere on this Mac asks for **Secure Input**,
+macOS hands no key to the event tap at all: those keys act on this Mac
+until the password field lets go.
 
 #### Print Screen, Scroll Lock and Pause
 
@@ -575,16 +793,29 @@ These are menu items without a shortcut: ⌃⌘K and ⌃⌘U go to the host
 In Characters mode the picture shows a small **Keyboard: Characters**
 badge. Shortcuts, arrows, function keys, Esc, Return, Tab and Backspace stay
 keys. A game or a virtual-machine console that reads key positions may
-misbehave; switch back with **Connection › Keyboard: Physical Keys**. A saved connection can start in either
-mode (**Edit** › **Keyboard mode**). Characters mode needs a Windows or
+misbehave; switch back with **Connection › Keyboard: Physical Keys**. A saved connection can keep its
+own Typing (**Edit** › **On this machine** › **Typing**). Characters mode needs a Windows or
 Linux host from Arcen 0.18.0; a host that cannot type text says so and
 keeps physical keys.
 
-**Settings › Input › Typing** sets the everyday behaviour: **Characters as
-on this Mac** (recommended: keys as keys, except characters the host's
-layout would type differently and whatever your input method composes),
-**Keys only**, or **Always characters**. The same panel sets what the left
-and right ⌥ keys do.
+**Settings › Input › Typing** sets the everyday behaviour for every
+connection:
+
+- **Characters** (Recommended) sends the letters you type, whatever the
+  remote keyboard layout: keys go as keys, except where the host's layout
+  would type a different character; those, and whatever your input method
+  composes (accents, dead keys, Japanese, Chinese, emoji), arrive as the
+  characters you typed. It needs a host that types text.
+- **Keys only** sends physical keys, for games and apps that read key
+  positions; the host's layout decides each character and the input method
+  does not compose.
+
+The line beside it says how many saved connections keep their own Typing
+("Default for all connections. 2 connections use their own."); a
+connection's **Edit** › **On this machine** › **Typing** shows **App default
+(Characters)** while it follows Settings. (0.20.7 dropped **Always
+characters**: it became Characters; **Connection › Keyboard: Characters**
+still types every character as text for a session.)
 
 ### Paste as Keystrokes
 
@@ -596,9 +827,10 @@ menu item; ⌃⌥⌘V goes to the host).
 - It waits until you let go of every modifier key ("Release the modifier
   keys to start typing"), so no character becomes a shortcut.
 - It types 25 characters a second by default. Slow it down in **Settings ›
-  Input › Paste as Keystrokes › Typing speed** for consoles that drop keys.
-- It asks first above 2,000 characters (adjustable) and never types more
-  than 100,000.
+  Advanced › Input › Paste as Keystrokes › Speed** for virtual-machine
+  consoles and older applications that drop keys.
+- It asks first above 2,000 characters (**Ask before pasting more than**,
+  in the same place) and never types more than 100,000.
 - **Esc** or **Connection › Stop Typing** stops it. Keys you press while it
   types are not sent.
 - A line break at the very end is not typed, so a pasted password never
@@ -612,11 +844,24 @@ Mac host does not type text yet and says so.
 ### Pen buttons
 
 The pen's side buttons are part of the pen, not the keyboard: see
-[Pen and tablet](#5-pen-and-tablet). In **Settings › Input › Tablet
-support**, choose what each button does on the remote computer (Right
+[Pen and tablet](#5-pen-and-tablet). In **Settings › Tablet**, under
+**Tablet support**, choose what each button does on the remote computer (Right
 click, Middle click or Off): the Windows Ink barrel button on a PC, the
 lower and upper side switch of a Mac pen. When the tablet driver itself
 turns a button into a click, the Deck sends that click.
+
+### The pointer
+
+Your mouse always controls the remote computer, and the pointer is
+automatic; there is no setting for it. A host that sends its pointer's
+shapes lets this Mac or PC draw the pointer, so it moves at the speed of
+your hand in the host's own shapes. A 0.20.7 Mac host cannot send them, so
+it draws the pointer into the picture, one video round trip later, and the
+Deck shows none of its own. Whenever a host draws the pointer into the
+picture, the Deck hides its own, so you never see two. Linux and Windows
+hosts, and Mac hosts older than 0.20.7, keep the cursor choice you had
+before 0.20.7 (the Deck draws the pointer, unless you had chosen the
+host's).
 
 ### What never goes to the remote computer
 
@@ -660,15 +905,23 @@ sends, so you can check it during a session.
 
 ## 7. Clipboard
 
-<!-- source: clients/macos/src/ui/app.rs (Settings › Clipboard, Effective host policy); docs/security/clipboard-redirection.md; docs/operations/troubleshooting.md (Clipboard does not work); README.md (What a session carries) -->
+<!-- source: shared/deck-core/src/screens/input_choices.rs (Settings › Input › Clipboard); shared/deck-core/src/clipboard.rs (HostClipboard, "Clipboard is turned off by this host."); docs/security/clipboard-redirection.md; docs/operations/troubleshooting.md (Clipboard does not work); README.md (What a session carries) -->
 
 Copy on one side, paste on the other. Text and images work in both
 directions, as far as the host allows: the host decides the direction, the
 content and the size limit, and the Deck cannot override it.
 
-- **Settings › Clipboard** shows **Effective host policy** for the current
-  session, and has **Enable clipboard redirection** (on by default) if you
-  want it off.
+- **Settings › Input › Clipboard › Share the clipboard with remote
+  computers** is your consent, on by default. Off, the Deck offers the host
+  no clipboard at all and never reads yours.
+- A connection profile can keep the clipboard off for one machine; the line
+  under the switch says how many connections do ("1 connection uses its
+  own"). No connection can turn it on when you turned it off.
+- The host has the last word. When it turns the clipboard off, the session
+  says **Clipboard is turned off by this host.**: on a Mac in the menu of
+  the keyboard indicator at the right of the menu bar, on a PC beside the
+  keyboard indicator in the menu bar and the fullscreen connection bar. It
+  is not a setting you can change on the Deck.
 - Plain text and images are carried. Files and formatted text (HTML, RTF)
   are not.
 - A very large copy can be refused by the host (8 MiB by default). The
@@ -716,8 +969,9 @@ does not ship. On the Mac host (preview) it is built but not yet qualified.
 
 - **Match my layout** (default): each of your displays, up to four, gets
   its own display on the host, shown full-screen and pixel for pixel. It
-  needs macOS's "Displays have separate Spaces" turned on, **Extend
-  fullscreen under the notch** turned off, and a host that supports it. If
+  needs a host that supports it, and on a Mac, macOS's "Displays have
+  separate Spaces" turned on and **Extend fullscreen under the notch**
+  turned off. If
   it cannot be done, the connection fails with a message that says why
   rather than quietly showing one display. A display you turned on its side
   (portrait) gets a portrait display on the host; a host that cannot rotate
@@ -733,11 +987,14 @@ negotiated with this host". For that host, edit the connection and set its
 **Displays** to **Primary display only**; other connections keep the
 default.
 
-A connection's own **Displays** choice wins over Settings › Displays.
-Select the connection on Home: its **Displays** line says which choice it
-connects with, and where it comes from. When the connection's own choice
-overrides the setting the line says so, and **Use Settings** hands the
-connection back to Settings › Displays.
+A connection's own **Displays** choice wins over Settings › Displays. Its
+**Edit** › **On this machine** › **Displays** shows **App default (Match
+my layout)** while it follows Settings, or the choice it keeps. A
+connection that keeps its own says so on Home, under **Connect**:
+**Displays: Windowed (this connection)**, with a **Use app default** link
+that hands it back to Settings (a connection that follows Settings shows no
+such line). Settings › Displays says it too ("‹name› has its own Displays
+choice, …"), with a **Use this setting for ‹name›** button.
 
 If you reconnect to a desktop that was started without your current
 layout, the Deck asks: **Reconnect to your session** keeps your open
@@ -826,8 +1083,11 @@ password**, as long as you are back within the host's reconnect window
 - **Auto-reconnect** (under the connection, on by default) controls this.
 - **Disconnect** on that screen gives up and returns to your connections.
 - If the host refuses to resume (the window ran out, the host restarted,
-  you signed out on the host), the Deck asks for your password again.
-  Nothing on the desktop is lost by that; only the shortcut is.
+  you signed out on the host), the Deck returns to your connections with
+  the same connection selected and asks for your password there: **Your
+  session ended. Sign in again to continue.** A host that restarted says
+  so in a box first. Nothing on the desktop is lost by that; only the
+  shortcut is.
 - It never resumes after you chose Disconnect yourself, or after the
   host's identity changed.
 - On a Linux host you do not have to wait: signing in again with your
@@ -869,9 +1129,10 @@ and says what to do. Then look for what you see below. Anything marked
 | --- | --- | --- |
 | The test cannot reach the host (`diag.udp.timeout`) | Nothing answers on the network port: the host is off, or a firewall or VPN blocks it. | Check you are on the right network or VPN; otherwise ask your administrator. |
 | `diag.udp.local_network_unreachable` | macOS is blocking Arcen Deck from the local network. | System Settings › Privacy & Security › Local Network: turn on Arcen Deck. |
-| **This host's identity changed** | The host presents a different certificate from the one you trusted. | Do not sign in. Ask your administrator; see [If the host's identity changed](#if-the-hosts-identity-changed). |
-| Authentication failed | Wrong account or password, or the account is locked out. | Check the account; wait out a lockout. Arcen never checks passwords itself. |
-| "The host signed you in but could not start the session" | Your password was right, but the desktop did not start. | Ask your administrator; the host's log names the cause. |
+| **This computer's identity has changed** | The host presents a different certificate from the one you trusted. | Do not sign in. Ask your administrator; see [If the host's identity changed](#if-the-hosts-identity-changed). |
+| **Couldn't reach ‹host›. Check that it's on and that Arcen is running there.** | Nothing answered the connection: the host is off, Arcen is not running there, or the network is in the way. | Run **Test connection**; check your network or VPN; otherwise ask your administrator. |
+| **Wrong username or password.** | Wrong account or password, or the account is locked out. | Check the account; wait out a lockout. Arcen never checks passwords itself. |
+| **Couldn't start a session on ‹host›.** | Your password was right, but the desktop did not start. **Details** in the box gives the host's reason. | Ask your administrator; the host's log names the cause. |
 | "Another remote desktop is active on this host (one X11 desktop per host)" | Someone, possibly you elsewhere, has a desktop open on this Linux host. | They (or you) sign out there, or wait for it to time out. |
 | The waiting desktop belongs to another user | Another person disconnected recently; the host keeps their place for the reconnect window. | Wait a few minutes and try again. |
 | "The host could not mute its own speakers…" | The host would have played your session's sound aloud, so it refused. | Ask your administrator. |
@@ -881,7 +1142,7 @@ and says what to do. Then look for what you see below. Anything marked
 | Grading or HDR refused (`gpu_sessions_in_use`, `gpu_encoder_unavailable`, …) | The host's graphics card cannot encode that preset now, or at all. | Connect with Auto or Speed; for `gpu_sessions_in_use`, close other encoding sessions on the host. See [Grading and HDR refusals](operations/error-codes.md#grading-and-hdr-refusals). |
 | HDR refused on Windows (`hdr_not_activated`, `hdr_link_exceeded`) | Windows could not switch the display to HDR, or the size is too large for HDR. | Use Grading, or turn off Retina streaming, or use one display. |
 | HDR greyed out | None of your Mac's displays can show HDR. | Connect an HDR display, or use Grading. |
-| The pen acts as a mouse | The tablet mode is Mouse compatibility, the host is a Linux Wayland desktop without a pen seat, or the application uses Wintab. | **Settings › Input › Tablet › Tablet support**; on Windows, set the application to Windows Ink. |
+| The pen acts as a mouse | The tablet mode is Mouse only, the host is a Linux Wayland desktop without a pen seat, or the application uses Wintab. | **Settings › Tablet › Tablet support**; on Windows, set the application to Windows Ink. |
 | No pressure from a Windows Deck; the Deck said "Your tablet is sending mouse input…" | The tablet's driver gives the Deck mouse input, not a pen (Wacom: Use Windows Ink is off for the Deck). | In Wacom Tablet Properties › Mapping, turn on **Use Windows Ink** for Arcen Deck (or Other Programs). |
 | A web page on a Mac host says *Pointer type: Mouse*, pressure 0.50 | The page is open in Safari. Safari on macOS reports every pen as a mouse, including one plugged straight into that Mac: WebKit takes no pen data from macOS. | Use Chrome on the host (it reports pen, pressure, tilt and rotation), or a native drawing application. |
 | "Native tablet is not enabled on this host…" | The host's administrator has not turned Native tablet on (`usb.native_tablet`). | Choose **Tablet support**, or ask the administrator to enable it. |
@@ -889,12 +1150,12 @@ and says what to do. Then look for what you see below. Anything marked
 | Wrong characters, `z` and `y` swapped, `æøå` as punctuation | The host's keyboard layout differs from your Mac's. | **Connection › Keyboard: Characters**, or match the layouts. |
 | "This host cannot type text sent from the Deck…" | The host cannot type characters (the Mac host, or a host older than 0.18.0). | Use physical keys; ask about updating the host. |
 | Keys stuck, or every key acting like a shortcut | The host thinks a modifier is still held. | **Connection › Release Stuck Keys**. |
-| Alt+Tab or Print Screen act on the Windows Deck's own PC | This PC has the keyboard (the menu bar says **Keyboard: this PC**), or Settings › Input keeps the system shortcuts here. | Click the picture or press Ctrl+Alt+Home; check **Settings › Input › System shortcuts go to**. |
-| ⌘Tab or ⌘Space act on the Mac, not the host | The tap is off (the default), Arcen Deck is not allowed in Accessibility, this Mac has the keyboard, or a password field elsewhere holds secure input. | Turn on **Settings › Input › Send ⌘Tab, ⌘Space and Mission Control…** and allow Accessibility; click the picture or press ⌃⌥Home. |
+| Alt+Tab or Print Screen act on the Windows Deck's own PC | This PC has the keyboard (the menu bar says **Keyboard: this PC**), or Settings › Input keeps the system shortcuts here. | Click the picture or press Ctrl+Alt+Home; turn on **Settings › Input › System shortcuts go to the remote computer**. |
+| ⌘Tab or ⌘Space act on the Mac, not the host | The switch is off (the default), Arcen Deck is not allowed in Accessibility, this Mac has the keyboard, or a password field elsewhere holds Secure Input. | Turn on **Settings › Input › System shortcuts go to the remote computer** and allow Accessibility; click the picture or press ⌃⌥Home. |
 | Nothing I type reaches the host (Mac Deck) | This Mac has the keyboard (the menu bar says **Keyboard: this Mac**). | Click the picture or press ⌃⌥Home. |
 | A black screen just after a Windows sign-in | Windows waits for its desktop to settle before showing it. | Wait about 25 seconds. |
 | The picture does not change | A still desktop sends no new frames; the Deck keeps the last one. | Move the pointer. If it still never updates, run Test connection. |
-| Clipboard does nothing | The host's policy turns it off or one way, or the copy is too large. | Check **Settings › Clipboard › Effective host policy**. |
+| Clipboard does nothing | **Share the clipboard** is off, the host's policy turns it off or one way, or the copy is too large. | Check **Settings › Input › Clipboard**; the session says **Clipboard is turned off by this host.** when the host blocks it. |
 | No microphone on the host | Not turned on this launch, the host does not allow it, or it is a Windows host. | See [Sound and microphone](#8-sound-and-microphone). |
 
 The full lists for administrators are [Troubleshooting](operations/troubleshooting.md)
@@ -916,3 +1177,71 @@ and [Error codes](operations/error-codes.md).
    names or customer material in a report.
 3. **A security problem** goes through the private process in
    [SECURITY.md](../SECURITY.md), never a public report.
+
+## 15. Menus and keyboard shortcuts
+
+<!-- source: shared/deck-core/src/screens/menu.rs (deck_menus, MenuCommand titles, render_connection_bar, QUIT_HOLD); shared/input/src/keyboard/deck_shortcuts.rs (DeckShortcut chords); clients/macos/src/ui/macos_menu.rs (the application menu, key equivalents); clients/windows/src/shell/menu_bar.rs; shared/deck-core/src/screens/launcher.rs (the orange bar) -->
+
+Both Decks list the same commands. On a Mac they are in the menu bar at the
+top of the screen; on Windows in the window's menu bar and, in fullscreen,
+in the **connection bar**, which appears when the pointer reaches the top
+edge of the screen (or stays while Ctrl+Alt+Home has given this PC the
+keyboard) and draws nothing over the picture otherwise. Commands that need
+a session are greyed outside one. Outside a session the orange bar at the
+top of the window has **?** (this guide) and the gear (**Settings**); in
+Settings, **?** and **Done**.
+
+**Arcen Deck** (the Mac's application menu)
+
+| Item | Shortcut |
+| --- | --- |
+| About Arcen Deck | |
+| Services | |
+| Hide Arcen Deck | ⌘H |
+| Hide Others | ⌥⌘H |
+| Show All | |
+| Quit Arcen Deck | ⌘Q (in a session, hold it for 3 seconds; a tap goes to the host) |
+
+**Connection**
+
+| Item | Mac | Windows |
+| --- | --- | --- |
+| Disconnect | Control-Option-F12 | Ctrl+Alt+F12 |
+| Release Stuck Keys | | |
+| Send Ctrl+Alt+Del | (in Send Key) | Ctrl+Alt+End |
+| Keyboard: Host or This Computer | Control-Option-Home, or the chord chosen in Settings › Advanced | Ctrl+Alt+Home, or the chord chosen |
+| Send Key › Print Screen, Scroll Lock, Pause, Insert, Ctrl+Alt+Del, Menu, F13 to F24 | | |
+| Paste as Keystrokes | | |
+| Stop Typing | Esc while typing | Esc while typing |
+| Keyboard: Physical Keys | | |
+| Keyboard: Characters | | |
+| Exit (Windows) | | Alt+F4 (in a session, hold it for 3 seconds) |
+
+**View**
+
+| Item | Mac | Windows |
+| --- | --- | --- |
+| Show Fullscreen | Control-Command-F | Ctrl+Alt+Break |
+| Pointer Lock | | |
+| Tablet Monitor | | |
+
+**Session**
+
+| Item | Note |
+| --- | --- |
+| Connection Health | |
+| Stream Statistics | |
+| Lossless Tile View | |
+| Negotiated Truth | |
+| Colour Check… | Mac only for now; Windows shows it as "(not on Windows yet)" |
+
+**Help**
+
+| Item | Note |
+| --- | --- |
+| About Arcen Deck | Windows; on a Mac it is in the application menu |
+| Keyboard Shortcuts | the list of every key the Deck keeps |
+
+On Home: ⌘N (Ctrl+N on Windows) opens **New connection**; Return connects
+from the username or password field and saves the connection form; Esc
+cancels the form or closes an open list first.

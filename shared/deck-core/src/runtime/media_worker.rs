@@ -283,6 +283,28 @@ impl PresentationRecovery {
     }
 }
 
+/// What a cursor result asks of the Deck's own pointer: none while the host
+/// draws the pointer into the video (`active` Host,
+/// `CursorModeResultMsg::host_draws_pointer`), so every Deck that shows the
+/// shared cursor state hides its pointer over the picture. `None` leaves the
+/// pointer as it is.
+fn deck_cursor_for_result(result: &CursorModeResultMsg) -> Option<arcen_input::cursor::DeckCursor> {
+    tracing::info!(
+        target: crate::log_target::SESSION,
+        requested = ?result.requested,
+        active = ?result.active,
+        accepted = result.accepted,
+        automatic = result.automatic,
+        cursor_images = result.cursor_images,
+        host_draws_pointer = result.host_draws_pointer(),
+        reason = result.reason.as_str(),
+        "cursor authority from the host"
+    );
+    result
+        .host_draws_pointer()
+        .then_some(arcen_input::cursor::DeckCursor::Hidden)
+}
+
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct LatestFrameMailbox<T> {
@@ -356,6 +378,9 @@ pub struct SharedMediaState<M: MediaPlatform> {
     /// takes this state's lock, the UI copies the snapshot from here.
     pub audio_playback: crate::runtime::audio_worker::AudioPlaybackCell,
     pub certificate_untrusted: Option<CertInfo>,
+    /// A pinned host presented this certificate instead of the pinned one
+    /// (`SessionEvent::CertificateChanged`); the session is closed.
+    pub certificate_changed: Option<CertInfo>,
     pub pending_auth: Option<AuthRequest>,
     pub pending_authentication: Option<SessionAuthentication>,
     pub connection_status_hint: Option<String>,
@@ -592,6 +617,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
         Self {
             audio_playback: Default::default(),
             certificate_untrusted: Default::default(),
+            certificate_changed: Default::default(),
             pending_auth: Default::default(),
             pending_authentication: Default::default(),
             connection_status_hint: Default::default(),
@@ -968,6 +994,14 @@ pub fn spawn_media_worker<M, F>(
                         repaint.request_repaint();
                         return;
                     }
+                    SessionEvent::CertificateChanged(info) => {
+                        let mut state = shared.lock().expect("media state poisoned");
+                        state.certificate_changed = Some(info);
+                        state.closed = true;
+                        drop(state);
+                        repaint.request_repaint();
+                        return;
+                    }
                     SessionEvent::AuthRequired(request) => {
                         shared.lock().expect("media state poisoned").pending_auth = Some(request);
                         repaint.request_repaint();
@@ -1078,6 +1112,9 @@ pub fn spawn_media_worker<M, F>(
                                 if let Ok(result) =
                                     serde_json::from_value::<CursorModeResultMsg>(value)
                                 {
+                                    if let Some(cursor) = deck_cursor_for_result(&result) {
+                                        state.pending_host_cursor = Some(cursor);
+                                    }
                                     state.cursor_mode_result = Some(result);
                                 }
                             }
@@ -3607,6 +3644,44 @@ fn wire_clock_age_ms(timestamp_ms: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_deck_hides_its_pointer_only_while_the_host_draws_it() {
+        use arcen_protocol::messages::CursorMode;
+        let result = |requested, active, accepted, automatic| CursorModeResultMsg {
+            requested,
+            active,
+            accepted,
+            automatic,
+            ..CursorModeResultMsg::default()
+        };
+        // New Deck, new macOS Pier without cursor images: the host draws.
+        assert_eq!(
+            deck_cursor_for_result(&result(CursorMode::Local, CursorMode::Host, true, true)),
+            Some(arcen_input::cursor::DeckCursor::Hidden)
+        );
+        // An accepted Host request: the host draws it too.
+        assert_eq!(
+            deck_cursor_for_result(&result(CursorMode::Host, CursorMode::Host, true, false)),
+            Some(arcen_input::cursor::DeckCursor::Hidden)
+        );
+        // A Linux Wayland desktop embedded in Host mode answers a Local
+        // request with Host: the pointer is in the pixels, so the Deck's
+        // would be a second one.
+        assert_eq!(
+            deck_cursor_for_result(&result(CursorMode::Local, CursorMode::Host, false, false)),
+            Some(arcen_input::cursor::DeckCursor::Hidden)
+        );
+        // New Deck, old Pier serving Local, a host with images, and a
+        // refused Host request: the Deck keeps its pointer.
+        for kept in [
+            result(CursorMode::Local, CursorMode::Local, true, false),
+            result(CursorMode::Local, CursorMode::Local, true, true),
+            result(CursorMode::Host, CursorMode::Local, false, false),
+        ] {
+            assert_eq!(deck_cursor_for_result(&kept), None, "{kept:?}");
+        }
+    }
     use crate::decode::{NativeDecodedVideoFrame, NativePictureFormat, VideoDecodeError};
     use crate::present::{LayerColourState, PresenterFailure, PresenterFailureStage};
     use crate::present::{PresenterPipeline, PresenterTelemetryDelta};

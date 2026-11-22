@@ -575,6 +575,9 @@ pub struct ConnectSmokeResult {
 #[derive(Debug)]
 pub enum SessionEvent {
     CertificateUntrusted(CertInfo),
+    /// A host this Deck pinned presented this certificate instead: the
+    /// session never started and no credentials were sent.
+    CertificateChanged(CertInfo),
     AuthRequired(AuthRequest),
     Authenticated(SessionAuthentication),
     ServerHello(ServerHelloMsg),
@@ -1538,7 +1541,9 @@ pub const MULTI_MONITOR_UNSUPPORTED_PREFIX: &str =
 pub enum ConnectSmokeError {
     #[error("invalid WebSocket URL: {0}")]
     Url(#[from] url::ParseError),
-    #[error("websocket error: {0}")]
+    /// The session's message framing or the connection under it (QUIC
+    /// lanes; the type is tungstenite's, the transport is not WebSocket).
+    #[error("connection error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
@@ -1553,11 +1558,16 @@ pub enum ConnectSmokeError {
     UntrustedIssuer(String),
     #[error("untrusted server certificate")]
     CertificateUntrusted(CertInfo),
+    /// A pinned host presented this certificate instead of the pinned one.
+    #[error("{TOFU_PIN_MISMATCH_ERROR}")]
+    CertificateChanged(CertInfo),
     #[error("connection timed out")]
     Timeout,
     #[error("{0}")]
     NetworkReachability(ReachabilityFailure),
-    #[error("authentication failed: {0}")]
+    /// The host refused the sign-in, in the host's own words (they already
+    /// say so; nothing is put in front of them).
+    #[error("{}", sign_in_refusal_text(.0))]
     AuthFailed(String),
     /// The host accepted the sign-in and then could not start the session.
     #[error("the host signed you in but could not start the session: {0}")]
@@ -1604,6 +1614,14 @@ pub enum ConnectSmokeError {
     SessionClosed,
     #[error("{0}")]
     TransportUnavailable(String),
+}
+
+fn sign_in_refusal_text(message: &str) -> &str {
+    if message.trim().is_empty() {
+        "the host refused the sign-in"
+    } else {
+        message
+    }
 }
 
 pub async fn connect_smoke(
@@ -1885,6 +1903,15 @@ fn publish_session_result(
         }
         Err(ConnectSmokeError::CertificateUntrusted(info)) => {
             let _ = tx.send(SessionEvent::CertificateUntrusted(info));
+        }
+        Err(ConnectSmokeError::CertificateChanged(info)) => {
+            tracing::warn!(
+                target: crate::log_target::TLS,
+                endpoint = %info.endpoint,
+                presented_spki_sha256 = %info.spki_sha256_display,
+                "a pinned host presented a different certificate",
+            );
+            let _ = tx.send(SessionEvent::CertificateChanged(info));
         }
         Err(error) => {
             tracing::warn!(
@@ -3262,6 +3289,9 @@ async fn open_quic_socket(
 
     let mut probe_book = AdvisoryProbeBook::new(&addresses);
     let mut last_error = None;
+    // A pinned host that presented another certificate. Another address may
+    // still present the pinned one, so this is reported only if none does.
+    let mut changed_identity = None;
     let mut attempts = FuturesUnordered::new();
     let mut probes = FuturesUnordered::new();
     for remote_addr in addresses.iter().copied() {
@@ -3346,6 +3376,11 @@ async fn open_quic_socket(
     while !attempts.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            // No address presented the pinned certificate in time: a change
+            // one did present is the answer, not the silent one's timeout.
+            if let Some(info) = changed_identity {
+                return Err(ConnectSmokeError::CertificateChanged(info));
+            }
             return Err(probe_book.timeout_failure().map_or(
                 ConnectSmokeError::Timeout,
                 ConnectSmokeError::NetworkReachability,
@@ -3379,6 +3414,14 @@ async fn open_quic_socket(
                             }
                             return Err(mapped);
                         }
+                        if is_tofu_pin_mismatch_message(&mapped.to_string())
+                            && let Some(mut info) = attempt_tls.take_captured_certificate()
+                        {
+                            info.peer_address = Some(remote_addr.to_string());
+                            format!("{}:{}", options.host, options.port)
+                                .clone_into(&mut info.endpoint);
+                            changed_identity = Some(info);
+                        }
                         last_error = Some(mapped);
                     }
                     None => {}
@@ -3404,6 +3447,9 @@ async fn open_quic_socket(
                 }
             }
             () = tokio::time::sleep(remaining) => {
+                if let Some(info) = changed_identity {
+                    return Err(ConnectSmokeError::CertificateChanged(info));
+                }
                 return Err(probe_book
                     .timeout_failure()
                     .map_or(ConnectSmokeError::Timeout, ConnectSmokeError::NetworkReachability));
@@ -3412,6 +3458,9 @@ async fn open_quic_socket(
         }
     }
 
+    if let Some(info) = changed_identity {
+        return Err(ConnectSmokeError::CertificateChanged(info));
+    }
     Err(last_error.unwrap_or_else(|| {
         probe_book.timeout_failure().map_or_else(
             || {
@@ -4103,6 +4152,13 @@ pub const DECK_DRAWS_CURSOR_IMAGES: bool = true;
 /// reason the Deck did not cause, such as a USB-bridged tablet.
 pub const DECK_FOLLOWS_HOST_POINTER: bool = true;
 
+/// The Deck always asks for the automatic cursor (`cursor_automatic_v1`):
+/// a host that knows it decides (cursor images: the Deck draws them; none:
+/// the host draws the pointer into the video). The stored
+/// `cursor_preference` still goes with it, unchanged, as the request a host
+/// older than 0.20.7 serves, so a Host choice keeps Host there.
+pub const DECK_ASKS_FOR_AUTOMATIC_CURSOR: bool = true;
+
 fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions) -> AuthResponse {
     let mut response = response
         .with_displays(options.monitors.clone(), &options.displays_mode)
@@ -4110,6 +4166,7 @@ fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions)
         .with_cursor_preference(options.cursor_preference)
         .with_cursor_image_v1(DECK_DRAWS_CURSOR_IMAGES)
         .with_cursor_position_v1(DECK_FOLLOWS_HOST_POINTER)
+        .with_cursor_automatic_v1(DECK_ASKS_FOR_AUTOMATIC_CURSOR)
         .with_display_refresh(options.display_refresh.clone());
     let capabilities = options.services.decode_capabilities();
     // `options.profile` is already decodable (`keep_profile_decodable` at
@@ -4364,6 +4421,7 @@ fn client_hello_with_usb_device(
             .with_cursor_preference(options.cursor_preference)
             .with_cursor_image_v1(DECK_DRAWS_CURSOR_IMAGES)
             .with_cursor_position_v1(DECK_FOLLOWS_HOST_POINTER)
+            .with_cursor_automatic_v1(DECK_ASKS_FOR_AUTOMATIC_CURSOR)
             .with_network_snapshot(network)
     };
     let hello = apply_decode_capabilities(hello, options.services.decode_capabilities());
@@ -5078,7 +5136,8 @@ fn connect_error_class(error: &ConnectSmokeError) -> &'static str {
         ConnectSmokeError::Tls(_)
         | ConnectSmokeError::TlsIdentity(_)
         | ConnectSmokeError::UntrustedIssuer(_)
-        | ConnectSmokeError::CertificateUntrusted(_) => "tls",
+        | ConnectSmokeError::CertificateUntrusted(_)
+        | ConnectSmokeError::CertificateChanged(_) => "tls",
         ConnectSmokeError::AuthFailed(_)
         | ConnectSmokeError::AuthDeclined
         | ConnectSmokeError::DisclaimerRequired => "auth",
@@ -5624,6 +5683,14 @@ fn classify_disconnect(error: &ConnectSmokeError) -> SessionEnd {
     classify_disconnect_at(error, Instant::now())
 }
 
+/// Developer-only (`doc-shots`): the session end the engine reports for
+/// `error`, for a rendered scene that shows its outcome.
+#[cfg(feature = "doc-shots")]
+#[must_use]
+pub fn session_end_for(error: &ConnectSmokeError) -> SessionEnd {
+    classify_disconnect(error)
+}
+
 fn microphone_teardown_reason(outcome: &Result<SessionEnd, ConnectSmokeError>) -> &'static str {
     let reason = match outcome {
         Ok(end) => end.reason,
@@ -5698,7 +5765,8 @@ fn classify_disconnect_at(error: &ConnectSmokeError, observed_at: Instant) -> Se
         | ConnectSmokeError::Tls(_)
         | ConnectSmokeError::TlsIdentity(_)
         | ConnectSmokeError::UntrustedIssuer(_)
-        | ConnectSmokeError::CertificateUntrusted(_) => {
+        | ConnectSmokeError::CertificateUntrusted(_)
+        | ConnectSmokeError::CertificateChanged(_) => {
             DisconnectReason::Terminal(TerminalDisconnect::TlsIdentity)
         }
         ConnectSmokeError::ResumeRejected { error_code, .. } => {
@@ -7268,6 +7336,21 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_sign_in_reads_once_in_the_host_s_words() {
+        assert_eq!(
+            ConnectSmokeError::AuthFailed(
+                "Authentication failed: wrong user name or password".to_owned()
+            )
+            .to_string(),
+            "Authentication failed: wrong user name or password"
+        );
+        assert_eq!(
+            ConnectSmokeError::AuthFailed(String::new()).to_string(),
+            "the host refused the sign-in"
+        );
+    }
+
+    #[test]
     fn only_typed_capture_result_becomes_certificate_event() {
         let (tx, mut events) = mpsc::unbounded_channel();
         let info = untrusted_cert_info();
@@ -7278,6 +7361,18 @@ mod tests {
         assert!(matches!(
             events.try_recv(),
             Ok(SessionEvent::CertificateUntrusted(captured)) if captured == info
+        ));
+        assert!(events.try_recv().is_err());
+
+        // A pinned host's other certificate reaches the Deck to show next to
+        // the remembered one, not as a plain TLS failure.
+        publish_session_result(
+            Err(ConnectSmokeError::CertificateChanged(info.clone())),
+            &tx,
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SessionEvent::CertificateChanged(presented)) if presented == info
         ));
         assert!(events.try_recv().is_err());
 
@@ -8188,6 +8283,17 @@ mod tests {
         assert_eq!(auth.timezone, options.timezone);
         assert_eq!(hello.timezone, auth.timezone);
         assert_eq!(auth.cursor_preference, CursorMode::Host);
+        // The automatic cursor is always asked for; the stored preference
+        // goes with it unchanged, for hosts older than the automatic cursor.
+        assert!(auth.cursor_automatic_v1 && hello.cursor_automatic_v1);
+        assert_eq!(hello.cursor_preference, CursorMode::Host);
+        let mut local = options.clone();
+        local.cursor_preference = CursorMode::Local;
+        let local_auth = auth_response_with_metadata(AuthResponse::none(), &local);
+        let local_hello =
+            client_hello_with_metadata(&local, &CorrelationId::from_uuid_v4_bytes([0; 16]));
+        assert!(local_auth.cursor_automatic_v1 && local_hello.cursor_automatic_v1);
+        assert_eq!(local_auth.cursor_preference, CursorMode::Local);
         let initial_video = auth
             .initial_video
             .as_ref()

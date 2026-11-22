@@ -35,7 +35,7 @@ Arcen Deck build `1d6af87` or later.
 - The saved connection set to **Tablet support** (the default,
   `tablet_mode_requested = local_termination`; see
   `clients/macos/SETTINGS.md`) unless a step below explicitly switches to
-  **Mouse compatibility only** to exercise fallback behavior.
+  **Mouse only** to exercise fallback behavior.
 
 Bridge mode operational note: Native tablet (USB bridged) — wire token
 `wacom_usb_bridge`, a legacy name for a vendor-neutral mode — is visible in Deck settings,

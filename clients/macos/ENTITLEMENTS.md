@@ -94,7 +94,7 @@ are separate Apple mechanisms. An app can need one, both, or neither for a given
   TCC, and optional. The Deck's system-shortcut event tap
   (`clients/macos/src/ui/system_shortcut_tap.rs`: an active `CGEventTap` at the session
   level that takes ⌘Tab, ⌘Space and Mission Control for the host) needs it. It is off
-  by default (Settings › Input › "Send ⌘Tab, ⌘Space and Mission Control to the remote
+  by default (Settings › Input › Keyboard › "System shortcuts go to the remote
   computer"); the Deck checks `AXIsProcessTrusted()` and never creates the tap without
   the grant, and it asks for the grant (`AXIsProcessTrustedWithOptions` with the
   prompt option) only when the user clicks **Allow in Accessibility…** next to that

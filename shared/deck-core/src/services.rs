@@ -259,6 +259,23 @@ pub trait DeckServices: Send + Sync + 'static {
         None
     }
 
+    /// **UI thread.** Asks where to save a connection profile (`.arcen`,
+    /// [`crate::profile`]), proposing `suggested_file_name`, with the
+    /// platform's own save dialog (which confirms replacing a file).
+    /// `None` when cancelled or unsupported. Added in 0.20.7; the default
+    /// keeps a shell without it building.
+    fn choose_profile_to_save(&self, suggested_file_name: &str) -> Option<PathBuf> {
+        let _ = suggested_file_name;
+        None
+    }
+
+    /// **UI thread.** Asks for a connection profile to import, with the
+    /// platform's own open dialog. `None` when cancelled or unsupported.
+    /// The file is validated by [`crate::profile`], whatever its name.
+    fn choose_profile_to_open(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// Shows `path` selected in Finder or Explorer. Returns whether the
     /// file browser started.
     fn reveal_in_file_browser(&self, path: &std::path::Path) -> bool {
