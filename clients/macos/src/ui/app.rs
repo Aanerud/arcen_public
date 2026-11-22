@@ -1863,6 +1863,10 @@ pub struct ArcenApp {
     /// ⌘Tab took this Mac out of a session without the event tap: ask once,
     /// when a session window has the focus again.
     mac_system_shortcut_offer_pending: bool,
+    /// The connection's own switch sends the system shortcuts and the
+    /// question was answered for it (once per connection; the answer only
+    /// asks for the permission, which stays one for the whole app).
+    connection_shortcut_offer_answered: bool,
     /// Mirrors `ClientSettings::keyboard_switch`.
     keyboard_switch: arcen_input::keyboard::KeyboardSwitchChord,
     /// The keyboard switch's notice after a flip, while it shows.
@@ -2098,6 +2102,7 @@ impl ArcenApp {
         };
         app.apply_saved_connection_to_quick_connect(&mut options, &mut draft);
         app.active_overrides = app.saved_overrides_for(&draft);
+        app.connection_shortcut_offer_answered = false;
         app.enter_keyboard_endpoint(connection_endpoint(&draft));
         // A saved connection's own Displays choice wins; otherwise the
         // launch arguments' mode governs this session.
@@ -2519,6 +2524,7 @@ impl ArcenApp {
             capture_mac_system_shortcuts: settings.capture_mac_system_shortcuts,
             mac_system_shortcut_offer_answered: settings.mac_system_shortcut_offer_answered,
             mac_system_shortcut_offer_pending: false,
+            connection_shortcut_offer_answered: false,
             keyboard_switch: settings.keyboard_switch,
             keyboard_toast: None,
             keyboard_toast_text: None,
@@ -2910,6 +2916,9 @@ impl eframe::App for ArcenApp {
                         if let Some(test) = &mut self.connection_test {
                             test.poll();
                         }
+                        let system_shortcuts = self
+                            .app_shortcut_capture()
+                            .to_host(SystemShortcutRoute::MacEventTap);
                         let mut state = HomeViewState {
                             direct: &mut self.direct,
                             saved_connections: &self.saved_connections,
@@ -2928,6 +2937,7 @@ impl eframe::App for ArcenApp {
                                 option_keys: self.option_key_mode,
                                 displays_mode: self.displays_mode,
                                 clipboard_enabled: self.clipboard_enabled,
+                                system_shortcuts,
                             },
                             sign_in: &mut self.sign_in,
                             overlay_open: self.keyboard_shortcuts_open || self.colour_check.open,
@@ -7612,6 +7622,7 @@ impl ArcenApp {
             "arcen-deck connecting",
         );
         self.active_overrides = self.saved_overrides_for(&draft);
+        self.connection_shortcut_offer_answered = false;
         self.enter_keyboard_endpoint(connection_endpoint(&draft));
         let (options, policy) =
             self.connect_options_with_stream_sizing_policy(&draft, approved_multi_monitor_topology);
@@ -8248,8 +8259,7 @@ impl ArcenApp {
             return;
         }
         let detail = arcen_deck_core::sign_in::end_detail(&end);
-        let failure =
-            SignInFailure::after_end(end.reason, stage).unwrap_or(SignInFailure::SessionEnded);
+        let failure = SignInFailure::from_end(&end, stage).unwrap_or(SignInFailure::SessionEnded);
         self.return_home(failure, Some(detail));
     }
 
@@ -9430,19 +9440,17 @@ impl ArcenApp {
     /// Decides whether a closed session was a sign-in screen giving way to a
     /// desktop, and if so schedules the reconnect and holds the last frame.
     ///
-    /// Returns whether it did. A deliberate disconnect and a host whose
-    /// identity changed are never followed, and neither is anything once the
-    /// shared schedule has run out of attempts.
+    /// Returns whether it did. What is followed is shared
+    /// (`reconnect_flow::follows_login_window`): never a deliberate
+    /// disconnect, a host whose identity changed or a definite refusal such
+    /// as `console_other_user`, and nothing once the shared schedule has run
+    /// out of attempts.
     fn follow_login_window(&mut self, end: &SessionEnd, ctx: &egui::Context) -> bool {
         let Some(handover) = self.login_window_handover.as_mut() else {
             return false;
         };
-        let followable = !matches!(
-            end.reason,
-            DisconnectReason::Terminal(
-                TerminalDisconnect::Manual | TerminalDisconnect::TlsIdentity
-            )
-        ) && self.active_connection.is_some();
+        let followable = arcen_deck_core::reconnect_flow::follows_login_window(end)
+            && self.active_connection.is_some();
         let due = if followable {
             handover
                 .schedule
@@ -12638,16 +12646,30 @@ impl ArcenApp {
         self.keyboard_toast_text = Some(text);
     }
 
+    /// Whether the ⌘Tab question was answered for this session: the
+    /// app-wide answer, or this connection's when its own switch sends the
+    /// system shortcuts. A connection whose own switch keeps them on this
+    /// Mac is never asked.
+    fn mac_system_shortcut_offer_settled(&self) -> bool {
+        match self.active_overrides.system_shortcuts.own() {
+            Some(true) => self.connection_shortcut_offer_answered,
+            Some(false) => true,
+            None => self.mac_system_shortcut_offer_answered,
+        }
+    }
+
     /// A session window lost the focus while ⌘ was held, the remote
     /// computer had the keyboard and no event tap took ⌘Tab: macOS switched
     /// apps. The first time, the Deck offers to send ⌘Tab to the remote
-    /// computer (it needs Accessibility); "Not now" is remembered.
+    /// computer (it needs Accessibility); "Not now" is remembered. A
+    /// connection whose own switch sends them, without the permission, is
+    /// asked once per connection.
     fn note_command_tab_without_tap(&mut self) {
         let tap_takes = self
             .system_shortcut_tap
             .as_ref()
             .is_some_and(|tap| tap.state().takes_shortcuts());
-        if !self.mac_system_shortcut_offer_answered
+        if !self.mac_system_shortcut_offer_settled()
             && self.keyboard_owner_session
             && !self.keyboard_released()
             && self
@@ -12668,7 +12690,7 @@ impl ArcenApp {
     /// The one-time question, while a session window has the focus again.
     fn mac_system_shortcut_offer(&mut self, ctx: &egui::Context) {
         if !self.mac_system_shortcut_offer_pending
-            || self.mac_system_shortcut_offer_answered
+            || self.mac_system_shortcut_offer_settled()
             || !self.keyboard_owner_session
             || !self.keyboard.focused()
         {
@@ -12679,13 +12701,30 @@ impl ArcenApp {
             return;
         };
         self.mac_system_shortcut_offer_pending = false;
-        self.mac_system_shortcut_offer_answered = true;
+        // The connection already sends them: only the permission was
+        // missing, and Settings' switch stays as it is.
+        let for_connection = self.active_overrides.system_shortcuts.own() == Some(true);
+        if for_connection {
+            self.connection_shortcut_offer_answered = true;
+        } else {
+            self.mac_system_shortcut_offer_answered = true;
+        }
         if allow {
-            self.capture_mac_system_shortcuts = true;
+            if !for_connection {
+                self.capture_mac_system_shortcuts = true;
+            }
             if !crate::ui::system_shortcut_tap::accessibility_allowed() {
                 crate::ui::system_shortcut_tap::request_accessibility();
             }
             self.sync_system_shortcut_tap();
+        }
+        if for_connection {
+            tracing::info!(
+                target: crate::logging::target::INPUT,
+                allow,
+                "command-tab offer answered for this connection"
+            );
+            return;
         }
         tracing::info!(
             target: crate::logging::target::INPUT,
@@ -12707,7 +12746,8 @@ impl ArcenApp {
             self.consumed_picture_buttons = 0;
             self.keyboard.clear_escape_home();
         }
-        self.keyboard_owner.set_policy(self.keyboard_capture);
+        self.keyboard_owner
+            .set_policy(self.session_shortcut_capture().keyboard_capture);
         arcen_deck_core::screens::wording::set_keyboard_switch(ctx, self.keyboard_switch);
         self.keyboard.set_switch_chord(self.keyboard_switch);
         self.keyboard_owner.set_focused(self.keyboard.focused());
@@ -12748,11 +12788,32 @@ impl ArcenApp {
             .connection_notice(&self.active_overrides, self.clipboard_enabled)
     }
 
-    /// Installs the event tap while the switch is on, the host has the
-    /// keyboard, the policy takes the system shortcuts and a session window
-    /// has the keyboard focus; removes it otherwise.
+    /// Settings › Input's system-shortcut values.
+    fn app_shortcut_capture(&self) -> SystemShortcutCapture {
+        SystemShortcutCapture {
+            capture_mac_system_shortcuts: self.capture_mac_system_shortcuts,
+            keyboard_capture: self.keyboard_capture,
+        }
+    }
+
+    /// The system-shortcut values in force: in a session, the connection's
+    /// own switch over Settings'.
+    fn session_shortcut_capture(&self) -> SystemShortcutCapture {
+        let app = self.app_shortcut_capture();
+        if self.keyboard_owner_session {
+            self.active_overrides
+                .system_shortcut_capture(app, SystemShortcutRoute::MacEventTap)
+        } else {
+            app
+        }
+    }
+
+    /// Installs the event tap while the switch is on (the connection's own,
+    /// else Settings'), the host has the keyboard, the policy takes the
+    /// system shortcuts and a session window has the keyboard focus;
+    /// removes it otherwise.
     fn sync_system_shortcut_tap(&mut self) {
-        let wanted = self.capture_mac_system_shortcuts
+        let wanted = self.session_shortcut_capture().capture_mac_system_shortcuts
             && self.keyboard_owner_session
             && self.keyboard_owner.takes_system_shortcuts();
         if let Some(tap) = self.system_shortcut_tap.as_mut() {
@@ -18137,6 +18198,46 @@ mod tests {
             .held_keys_insert_for_test(crate::protocol::keymap::QT_KEY_META);
         app.update_viewer_keyboard_focus(false);
         assert!(!app.mac_system_shortcut_offer_pending);
+    }
+
+    #[test]
+    fn a_connections_own_system_shortcuts_switch_decides_its_session() {
+        use arcen_deck_core::overrides::Override;
+        let (mut app, _receiver) = app_with_captured_keyboard();
+        app.capture_mac_system_shortcuts = false;
+        app.mac_system_shortcut_offer_answered = true;
+        // Its own On: the tap is wanted though Settings' switch is off.
+        app.active_overrides.system_shortcuts = Override::Own(true);
+        assert!(app.session_shortcut_capture().capture_mac_system_shortcuts);
+        assert!(!app.app_shortcut_capture().capture_mac_system_shortcuts);
+        // Without the permission, ⌘Tab asks once for this connection, even
+        // after "Not now" for the app.
+        app.keyboard.update_focus(true);
+        app.keyboard
+            .held_keys_insert_for_test(crate::protocol::keymap::QT_KEY_META);
+        app.update_viewer_keyboard_focus(false);
+        assert!(app.mac_system_shortcut_offer_pending);
+        app.mac_system_shortcut_offer_pending = false;
+        app.connection_shortcut_offer_answered = true;
+        app.keyboard.update_focus(true);
+        app.keyboard
+            .held_keys_insert_for_test(crate::protocol::keymap::QT_KEY_META);
+        app.update_viewer_keyboard_focus(false);
+        assert!(!app.mac_system_shortcut_offer_pending);
+        // Its own Off: never the tap, never the question, whatever Settings
+        // says.
+        app.capture_mac_system_shortcuts = true;
+        app.mac_system_shortcut_offer_answered = false;
+        app.active_overrides.system_shortcuts = Override::Own(false);
+        assert!(!app.session_shortcut_capture().capture_mac_system_shortcuts);
+        app.keyboard.update_focus(true);
+        app.keyboard
+            .held_keys_insert_for_test(crate::protocol::keymap::QT_KEY_META);
+        app.update_viewer_keyboard_focus(false);
+        assert!(!app.mac_system_shortcut_offer_pending);
+        // Outside a session, Settings' values.
+        app.keyboard_owner_session = false;
+        assert!(app.session_shortcut_capture().capture_mac_system_shortcuts);
     }
 
     #[test]

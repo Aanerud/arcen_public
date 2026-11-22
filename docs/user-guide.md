@@ -83,9 +83,12 @@ selected one on the right. It keeps out of your way on purpose:
 - **The right side.** One centred column: the machine's name (point at it
   to see its address), the **Username** and **Password** it needs, one large
   **Connect** button, **Remember username** and **Auto-reconnect** under
-  it (and, only for a connection with its own Displays choice, a line
-  saying so with **Use app default**), and **Edit** as a quiet link at the
-  bottom. When a status source
+  it, and **Edit** as a quiet link at the bottom. A connection that keeps
+  its own value for something in **On this machine** says so under
+  **Connect** in one quiet line, such as **This connection: Left Option is
+  Alt, keys only typing.**, with a **Use app defaults** link under it that
+  hands every one of them back to Settings. Only values that differ from
+  Settings are listed; with none, there is no line. When a status source
   says your own session is still signed in there, the button reads
   **Resume** and asks for no password.
 - **The orange bar** at the top holds two buttons on its right, outside a
@@ -124,16 +127,18 @@ in with your ordinary account on that workstation.
      (optional)**, named after the address when left empty, and **Username
      (optional)**.
    - **On this machine**: what this Deck does for that connection, the **⌘
-     key**, the **Option key** (on a Mac), **Typing** and **Displays**. Each
-     shows the value in force and one line on what it does. **App default
-     (…)** means the connection follows Settings. Leave them on their
+     key**, the **Option key** (on a Mac), **Typing**, **Displays** and
+     **System shortcuts go to the remote computer** (**On** or **Off**).
+     Each shows the value in force and one line on what it does. **App
+     default (…)** means the connection follows Settings. Leave them on their
      defaults to start with; sections 6 and 9 explain them.
 3. Choose **Add connection**, or press Return. If something is missing or
    wrong, the form says so under the field and puts the cursor there. Esc
    or **Cancel** leaves it. A Mac puts **Cancel** before **Add
    connection**, Windows after it, as each system's own dialogs do.
    **Test connection**, at the bottom left, checks the address you typed
-   before you save it.
+   before you save it. These three stay at the bottom of the window; in a
+   short window the form scrolls above them.
 
 To change a saved connection later, choose **Edit** under its **Connect**
 button, or **Edit** in its **⋮** menu.
@@ -189,6 +194,14 @@ connection form:
 - **Enter your password to connect.** Connect was chosen with no password,
   or the host asked for one.
 - **Wrong username or password.** The host refused them.
+- **Someone else is signed in at ‹host› (‹account›). Sign in as that user,
+  or switch to your account there first.** Your password was right, but
+  another account holds that computer's screen. The message sits under
+  **Username**.
+- **Too many failed sign-ins. Wait a few minutes, then try again.** The
+  host stopped checking passwords for a while.
+- **‹host› refused the sign-in. Its reason is under Details.** The host
+  gave a reason the Deck does not know; **Details** has its words.
 - **Couldn't reach ‹host›. Check that it's on and that Arcen is running
   there.** Nothing answered.
 - **Your session ended. Sign in again to continue.** A session could not be
@@ -197,7 +210,11 @@ connection form:
 Where it helps, **Details** under the message shows the technical reason,
 which is also in the Deck's log. Only something that is not about a field,
 such as the host ending your session, the host restarting or the host's
-identity, opens a box for you to read and close with **OK**.
+identity, opens a box for you to read and close with **OK**. When the host
+ends a session for its own reason, the box says that reason in plain words,
+for example **‹host› couldn't keep its screen private, so it ended the
+session.**; the host's code (here `console_privacy_unavailable`) is under
+**Details**.
 
 If the host shows a notice before sign-in, the Deck shows it under **Review
 before connect**. Choose **Accept** to continue or **Decline** to stop.
@@ -258,8 +275,8 @@ example from an administrator to the people who use a workstation.
   file…**, and pick the file.
 
 The file holds the connection's name, address, port and username, and the
-choices it keeps for itself (Typing, Option key, ⌘ key, Displays and
-clipboard), under the same names as in Settings. Everything it does not
+choices it keeps for itself (Typing, Option key, ⌘ key, Displays, system
+shortcuts and clipboard), under the same names as in Settings. Everything it does not
 set follows your own Settings, and the host's own policy still decides what
 a session may do. **It never holds a password**, a token or anything that
 would let someone sign in as you.
@@ -631,6 +648,10 @@ default on a Mac, where it needs the Accessibility permission
 ([⌘Tab, ⌘Space and Mission Control](#tab-space-and-mission-control)).
 0.20.7 made this one switch: **The remote computer when fullscreen** became
 on.
+A connection can keep its own choice (**Edit** › **On this machine** ›
+**System shortcuts go to the remote computer**: **On** or **Off**); Settings
+then says how many connections use their own, and Home lists it in that
+connection's summary line.
 
 ### Choosing another chord for the switch
 
@@ -741,6 +762,14 @@ sees them. To send them to the remote computer in Remote, the Deck needs the
   System shortcuts go to the remote computer**. While it is on without the
   permission, the switch says **Needs Accessibility permission.** and its
   **Open System Settings…** button opens the request.
+- Each connection can keep its own choice: **Edit** › **On this machine**
+  › **System shortcuts go to the remote computer**, **App default (…)**,
+  **On** or **Off**. Settings counts the connections that do ("1 connection
+  uses its own"). The permission is one for the whole app: a connection set
+  to **On** without it gets the same question the first time ⌘Tab leaves its
+  session, and Settings shows **Needs Accessibility permission.** while any
+  connection sends them. On a PC the same choice decides whether Alt+Tab,
+  the Windows key and Print Screen go to that connection's computer.
 - Without the permission nothing changes: these chords act on this Mac, and
   the indicator says **Keyboard: Z8, system shortcuts on this Mac**.
 
@@ -990,10 +1019,10 @@ default.
 A connection's own **Displays** choice wins over Settings › Displays. Its
 **Edit** › **On this machine** › **Displays** shows **App default (Match
 my layout)** while it follows Settings, or the choice it keeps. A
-connection that keeps its own says so on Home, under **Connect**:
-**Displays: Windowed (this connection)**, with a **Use app default** link
-that hands it back to Settings (a connection that follows Settings shows no
-such line). Settings › Displays says it too ("‹name› has its own Displays
+connection that keeps its own says so on Home, under **Connect**, in its
+summary line (**This connection: Opens in a window.**), with a **Use app
+defaults** link that hands it, and the connection's other own settings,
+back to Settings (a connection that follows Settings shows no such line). Settings › Displays says it too ("‹name› has its own Displays
 choice, …"), with a **Use this setting for ‹name›** button.
 
 If you reconnect to a desktop that was started without your current
@@ -1132,6 +1161,9 @@ and says what to do. Then look for what you see below. Anything marked
 | **This computer's identity has changed** | The host presents a different certificate from the one you trusted. | Do not sign in. Ask your administrator; see [If the host's identity changed](#if-the-hosts-identity-changed). |
 | **Couldn't reach ‹host›. Check that it's on and that Arcen is running there.** | Nothing answered the connection: the host is off, Arcen is not running there, or the network is in the way. | Run **Test connection**; check your network or VPN; otherwise ask your administrator. |
 | **Wrong username or password.** | Wrong account or password, or the account is locked out. | Check the account; wait out a lockout. Arcen never checks passwords itself. |
+| **Someone else is signed in at ‹host› (‹account›).** | Your password was right, but another account holds that computer's screen (`console_other_user`). | Sign in as that account, or switch to yours at the computer first. |
+| **‹host› couldn't keep its screen private, so it ended the session.** | The host could not blank its own screens, speakers and input for you (`console_privacy_unavailable`), so it would not stream. | Ask your administrator; **Details** has the host's reason. |
+| **Too many failed sign-ins. Wait a few minutes, then try again.** | The host refuses sign-ins from you for a while after several wrong passwords. | Wait a few minutes; check the password. |
 | **Couldn't start a session on ‹host›.** | Your password was right, but the desktop did not start. **Details** in the box gives the host's reason. | Ask your administrator; the host's log names the cause. |
 | "Another remote desktop is active on this host (one X11 desktop per host)" | Someone, possibly you elsewhere, has a desktop open on this Linux host. | They (or you) sign out there, or wait for it to time out. |
 | The waiting desktop belongs to another user | Another person disconnected recently; the host keeps their place for the reconnect window. | Wait a few minutes and try again. |

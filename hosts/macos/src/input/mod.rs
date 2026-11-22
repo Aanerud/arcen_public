@@ -155,7 +155,21 @@ unsafe extern "C" {
     fn CGWarpMouseCursorPosition(new_position: CGPoint) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+    fn CGEventSourceFlagsState(state_id: i32) -> u64;
     fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, string: *const u16);
+}
+
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn IsSecureEventInputEnabled() -> u8;
+}
+
+/// Whether an application holds Secure Event Input (a password field, the
+/// lock screen): system-wide, read per call.
+#[must_use]
+pub fn secure_event_input() -> bool {
+    // SAFETY: no arguments, reads system state.
+    unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -295,6 +309,34 @@ impl DesktopBounds {
             y: (self.origin_y + clamped_y * self.height).min(last_y),
         }
     }
+}
+
+/// A key event, owned by the caller (`CFRelease`), or `None` when
+/// `CoreGraphics` refuses one. `CGEventCreateKeyboardEvent` gives the event
+/// the string its key code types with no modifier, and `CGEventSetFlags`
+/// does not change it (Shift+C carries `c`); `text`, when given, replaces
+/// that string.
+fn key_event(
+    source: CGEventSourceRef,
+    code: u16,
+    pressed: bool,
+    flags: u64,
+    text: Option<&[u16]>,
+) -> Option<CGEventRef> {
+    // SAFETY: `source` is a live event source or null, which the call takes.
+    let event = unsafe { CGEventCreateKeyboardEvent(source, code, pressed) };
+    if event.is_null() {
+        return None;
+    }
+    // SAFETY: `event` is a live event we own; `text` outlives the call, which
+    // copies the string into the event.
+    unsafe {
+        CGEventSetFlags(event, flags);
+        if let Some(text) = text {
+            CGEventKeyboardSetUnicodeString(event, text.len(), text.as_ptr());
+        }
+    }
+    Some(event)
 }
 
 /// Translates a shared modifier mask into `CoreGraphics` event flags.
@@ -495,6 +537,15 @@ pub struct InputController {
     last_position: CGPoint,
     pen: PenToolState,
     stats: InputStats,
+    /// What the session's layout types at each printable position (the
+    /// `keymap-watch` notices), for keys posted under Secure Event Input.
+    host_keys: Option<arcen_input::text::HostKeyPositions>,
+    /// Which posted keys need their own characters (shared: Shift chords
+    /// only, never the key after a dead key).
+    posted_text: arcen_input::text::PostedKeyText,
+    /// Whether the last key posted under Secure Event Input carried the
+    /// layout's characters (logged on each change, never per key).
+    secure_key_text: bool,
 }
 
 // SAFETY: a `CGEventSource` is an immutable CF object and the controller owns
@@ -605,7 +656,68 @@ impl InputController {
             },
             pen: PenToolState::default(),
             stats: InputStats::default(),
+            host_keys: None,
+            posted_text: arcen_input::text::PostedKeyText::default(),
+            secure_key_text: false,
         }
+    }
+
+    /// Takes the session layout's latest `host_keymap` notice: what a key
+    /// posted under Secure Event Input types.
+    pub fn set_host_keymap(&mut self, notice: &arcen_protocol::messages::HostKeymapMsg) {
+        let positions = arcen_input::text::HostKeyPositions::from_message(notice);
+        self.host_keys = positions.describes_keys().then_some(positions);
+    }
+
+    /// The characters a key posted now must carry itself: under Secure
+    /// Event Input (the lock screen, a password field) the focused field
+    /// reads the event's string rather than translating the key code and
+    /// flags, and `CGEventCreateKeyboardEvent` computes that string from the
+    /// key code alone (Shift+C carries `c`; measured). Secure Event Input is
+    /// system-wide (Secure Keyboard Entry, password managers), so only what
+    /// that string gets wrong is given (shared `PostedKeyText`): a Shift
+    /// chord whose Shift level differs, never a key with no modifier and
+    /// never the key after a dead key, which the system must compose. `None`
+    /// also outside Secure Event Input, without a layout notice and with
+    /// Caps Lock on (the notice describes it off): the key code alone, as
+    /// before.
+    fn secure_key_text(&mut self, event: &KeyboardEvent) -> Option<Vec<u16>> {
+        let secure = event.pressed && self.host_keys.is_some() && secure_event_input();
+        // SAFETY: a plain read of the HID system's modifier state.
+        let caps_lock = secure
+            && (event.caps_lock_on == Some(true)
+                || unsafe { CGEventSourceFlagsState(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM) }
+                    & K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT
+                    != 0);
+        let text = self
+            .posted_text
+            .key(
+                self.host_keys.as_ref(),
+                event.key_id,
+                event.modifiers.0,
+                event.pressed,
+                secure && !caps_lock,
+            )
+            .map(|text| text.encode_utf16().collect::<Vec<u16>>());
+        if !event.pressed {
+            return text;
+        }
+        if secure != self.secure_key_text {
+            self.secure_key_text = secure;
+            if secure {
+                tracing::info!(
+                    target: arcen_telemetry::names::target::HID,
+                    caps_lock,
+                    "Secure Event Input is held: Shift chords carry the session layout's characters"
+                );
+            } else {
+                tracing::info!(
+                    target: arcen_telemetry::names::target::HID,
+                    "Secure Event Input released: Shift chords are key codes alone again"
+                );
+            }
+        }
+        text
     }
 
     /// The virtual devices, which must exist in HID-only mode.
@@ -739,7 +851,8 @@ impl InputController {
             return Err(InputError::VirtualHidUnavailable);
         }
         let flags = modifier_flags(event.modifiers.0, event.caps_lock_on);
-        self.post_key(code, event.pressed, flags)?;
+        let text = self.secure_key_text(event);
+        self.post_key(code, event.pressed, flags, text.as_deref())?;
         if event.pressed {
             self.held_keys.insert(code);
         } else {
@@ -749,15 +862,17 @@ impl InputController {
         Ok(())
     }
 
-    fn post_key(&self, code: u16, pressed: bool, flags: u64) -> Result<(), InputError> {
-        // SAFETY: the source is live for the controller's lifetime.
-        let event = unsafe { CGEventCreateKeyboardEvent(self.source, code, pressed) };
-        if event.is_null() {
-            return Err(InputError::EventCreationFailed("keyboard"));
-        }
+    fn post_key(
+        &self,
+        code: u16,
+        pressed: bool,
+        flags: u64,
+        text: Option<&[u16]>,
+    ) -> Result<(), InputError> {
+        let event = key_event(self.source, code, pressed, flags, text)
+            .ok_or(InputError::EventCreationFailed("keyboard"))?;
         // SAFETY: `event` is a live event we own.
         unsafe {
-            CGEventSetFlags(event, flags);
             CGEventPost(K_CG_HID_EVENT_TAP, event);
             CFRelease(event.cast_const());
         }
@@ -1565,7 +1680,7 @@ impl InputController {
 
         let keys: Vec<u16> = self.held_keys.iter().copied().collect();
         for code in keys {
-            if let Err(error) = self.post_key(code, false, 0) {
+            if let Err(error) = self.post_key(code, false, 0, None) {
                 first_error.get_or_insert(error);
             }
         }
@@ -1575,7 +1690,7 @@ impl InputController {
         // a key press this controller never saw the release for, and a stuck
         // Command key makes the machine unusable for whoever is sitting at it.
         for code in keymap::MODIFIER_CODES {
-            if let Err(error) = self.post_key(code, false, 0) {
+            if let Err(error) = self.post_key(code, false, 0, None) {
                 first_error.get_or_insert(error);
             }
         }
@@ -2086,6 +2201,41 @@ mod tests {
         assert!(!DesktopBounds::new(0.0, 0.0, 0.0, 1080.0).is_usable());
         assert!(!DesktopBounds::new(0.0, 0.0, 1920.0, 0.0).is_usable());
         assert!(DesktopBounds::new(0.0, 0.0, 1920.0, 1080.0).is_usable());
+    }
+
+    #[test]
+    fn a_shifted_key_carries_the_layout_text_it_is_given() {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventKeyboardGetUnicodeString(
+                event: CGEventRef,
+                max_length: usize,
+                actual_length: *mut usize,
+                string: *mut u16,
+            );
+        }
+        let string = |modifiers: u32, text: Option<&[u16]>| {
+            // SAFETY: creating an event source has no preconditions.
+            let source = unsafe { CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM) };
+            assert!(!source.is_null());
+            let flags = modifier_flags(modifiers, None);
+            let event = key_event(source, 0x08, true, flags, text).expect("key event");
+            let mut units = [0_u16; 8];
+            let mut length = 0_usize;
+            // SAFETY: a live event; the buffer holds 8 units.
+            unsafe {
+                CGEventKeyboardGetUnicodeString(event, 8, &raw mut length, units.as_mut_ptr());
+                release_core_foundation(event.cast_const());
+                release_core_foundation(source.cast_const());
+            }
+            String::from_utf16_lossy(&units[..length.min(8)])
+        };
+        // The key code alone: Shift is a flag the string ignores (`c` on a
+        // Latin layout), which is what a field holding Secure Event Input
+        // types.
+        assert_eq!(string(keymap::MOD_SHIFT, None), string(0, None));
+        let shifted: Vec<u16> = "C".encode_utf16().collect();
+        assert_eq!(string(keymap::MOD_SHIFT, Some(&shifted)), "C");
     }
 
     #[test]

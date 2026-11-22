@@ -202,6 +202,70 @@ pub enum WatchVerdict {
     PrivacyLost,
 }
 
+impl WatchVerdict {
+    /// What the Deck whose attachment to `serving_uid`'s session this
+    /// verdict ends is told, `holder` being who holds the console as it
+    /// ends; `None` for [`Self::Hold`].
+    ///
+    /// A console that left the account is not a privacy failure: the desk
+    /// was private until then, and its displays and input now belong to
+    /// whoever holds it (ADR 0025 §4). Another account's session in front
+    /// is [`super::ConsoleRefusal::OtherUser`], as the same Deck connecting
+    /// now is told; the login window in front (the account's session gone
+    /// to the background, a switch of user under way) is
+    /// [`super::ConsoleRefusal::SessionChanged`]: signing in again reaches
+    /// that login window. Only a display that stayed lit is
+    /// [`super::ConsoleRefusal::PrivacyUnavailable`].
+    #[must_use]
+    pub const fn deck_refusal(
+        self,
+        serving_uid: u32,
+        holder: crate::agent_relay::ConsoleHolder,
+    ) -> Option<super::ConsoleRefusal> {
+        use super::ConsoleRefusal;
+        use crate::agent_relay::ConsoleHolder;
+        match (self, holder) {
+            (Self::Hold, _) => None,
+            (Self::PrivacyLost, _) => Some(ConsoleRefusal::PrivacyUnavailable),
+            (Self::ConsoleLeft, ConsoleHolder::User(uid)) if uid != serving_uid => {
+                Some(ConsoleRefusal::OtherUser)
+            }
+            (Self::ConsoleLeft, _) => Some(ConsoleRefusal::SessionChanged),
+        }
+    }
+}
+
+/// What `SESSION_END` reports for a Deck session the desk watch ended.
+///
+/// The watch ends a session by dropping its stream mid-flight, so the
+/// stream's own statistics are gone: `frames_sent` is the count the stream
+/// kept where the session could still read it, never zero for a session
+/// that streamed. A console that left the account (`console_left`) is not a
+/// privacy failure (`privacy_lost`, also when the verdict was not kept).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchSessionEnd {
+    /// `SESSION_END.reason_class`.
+    pub reason_class: &'static str,
+    /// `SESSION_END.frames_sent`.
+    pub frames_sent: u64,
+}
+
+impl WatchSessionEnd {
+    /// The report for a session ended on `verdict` after its stream sent
+    /// `frames_sent` frames.
+    #[must_use]
+    pub const fn new(verdict: Option<WatchVerdict>, frames_sent: u64) -> Self {
+        let reason_class = match verdict {
+            Some(WatchVerdict::ConsoleLeft) => "console_left",
+            Some(WatchVerdict::PrivacyLost | WatchVerdict::Hold) | None => "privacy_lost",
+        };
+        Self {
+            reason_class,
+            frames_sent,
+        }
+    }
+}
+
 /// The watcher's memory between observations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrivacyWatch {
@@ -509,6 +573,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_session_the_watch_ends_reports_its_class_and_the_frames_it_sent() {
+        assert_eq!(
+            WatchSessionEnd::new(Some(WatchVerdict::ConsoleLeft), 42),
+            WatchSessionEnd {
+                reason_class: "console_left",
+                frames_sent: 42
+            }
+        );
+        for verdict in [Some(WatchVerdict::PrivacyLost), None] {
+            assert_eq!(
+                WatchSessionEnd::new(verdict, 7),
+                WatchSessionEnd {
+                    reason_class: "privacy_lost",
+                    frames_sent: 7
+                }
+            );
+        }
+    }
+
+    #[test]
     fn desk_privacy_is_on_unless_the_administrator_turns_it_off() {
         let default = DeskPrivacyPolicy::resolve(None);
         assert!(default.enabled);
@@ -671,6 +755,40 @@ mod tests {
             assert_eq!(watch.console(false), WatchVerdict::Hold);
         }
         assert_eq!(watch.console(false), WatchVerdict::ConsoleLeft);
+    }
+
+    #[test]
+    fn a_console_that_left_the_account_is_not_a_privacy_failure() {
+        use super::super::ConsoleRefusal;
+        use crate::agent_relay::ConsoleHolder;
+        let serving = 501;
+        // Another account signed in (a user switch completed): the Deck is
+        // told what it is told connecting now.
+        assert_eq!(
+            WatchVerdict::ConsoleLeft.deck_refusal(serving, ConsoleHolder::User(502)),
+            Some(ConsoleRefusal::OtherUser)
+        );
+        // The login window in front: the account's session went to the
+        // background; signing in again reaches that login window.
+        assert_eq!(
+            WatchVerdict::ConsoleLeft.deck_refusal(serving, ConsoleHolder::LoginWindow),
+            Some(ConsoleRefusal::SessionChanged)
+        );
+        assert_eq!(
+            WatchVerdict::ConsoleLeft.deck_refusal(serving, ConsoleHolder::User(serving)),
+            Some(ConsoleRefusal::SessionChanged)
+        );
+        // Only a desk that could not be kept dark is a privacy failure.
+        for holder in [ConsoleHolder::User(serving), ConsoleHolder::User(502)] {
+            assert_eq!(
+                WatchVerdict::PrivacyLost.deck_refusal(serving, holder),
+                Some(ConsoleRefusal::PrivacyUnavailable)
+            );
+        }
+        assert_eq!(
+            WatchVerdict::Hold.deck_refusal(serving, ConsoleHolder::LoginWindow),
+            None
+        );
     }
 
     #[test]

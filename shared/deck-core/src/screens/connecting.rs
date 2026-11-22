@@ -4,7 +4,9 @@
 //! session starts (a desktop started without the layout, a host that cannot
 //! serve every display). The shell owns the connection and maps each action.
 
-use super::widgets::paint_connecting_progress;
+use super::widgets::{
+    button_width, paint_connecting_progress, primary_button, secondary_button, text_button,
+};
 use crate::connection_draft::ConnectionDraft;
 
 /// What the user did on the Connecting screen.
@@ -79,10 +81,8 @@ pub fn render_connecting(
             );
         }
         ui.add_space(36.0);
-        if ui
-            .add_sized([112.0, 40.0], egui::Button::new("Cancel"))
-            .clicked()
-        {
+        let width = button_width(ui, &["Cancel"]);
+        if secondary_button(ui, "Cancel", width).clicked() {
             action = ConnectingAction::Cancel;
         }
     });
@@ -116,40 +116,19 @@ pub fn render_topology_conflict(
         ui.add_space(34.0);
 
         ui.horizontal(|ui| {
+            let (reconnect, start_fresh) =
+                ("Reconnect to your session", "Start fresh with my layout");
+            let width = button_width(ui, &[reconnect, start_fresh]);
             // Centre the pair inside the available width.
-            let pair_width = 250.0 + 12.0 + 250.0;
+            let pair_width = 2.0 * width + super::theme::BUTTON_GAP;
             let indent = ((ui.available_width() - pair_width) / 2.0).max(0.0);
             ui.add_space(indent);
-            if ui
-                .add_sized(
-                    [250.0, 44.0],
-                    egui::Button::new(
-                        egui::RichText::new("Reconnect to your session")
-                            .size(15.0)
-                            .color(super::theme::colours(ui).on_primary),
-                    )
-                    .fill(super::theme::colours(ui).primary)
-                    .corner_radius(8.0),
-                )
-                .clicked()
-            {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if primary_button(ui, reconnect, width).clicked() {
                 action = TopologyConflictAction::Reconnect;
             }
-            ui.add_space(12.0);
-            if ui
-                .add_sized(
-                    [250.0, 44.0],
-                    egui::Button::new(
-                        egui::RichText::new("Start fresh with my layout")
-                            .size(15.0)
-                            .color(super::theme::colours(ui).text2),
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .stroke(egui::Stroke::new(1.0, super::theme::colours(ui).border))
-                    .corner_radius(8.0),
-                )
-                .clicked()
-            {
+            ui.add_space(super::theme::BUTTON_GAP);
+            if secondary_button(ui, start_fresh, width).clicked() {
                 action = TopologyConflictAction::StartFresh;
             }
         });
@@ -164,19 +143,7 @@ pub fn render_topology_conflict(
             .size(13.0),
         );
         ui.add_space(28.0);
-        if ui
-            .add_sized(
-                [140.0, 36.0],
-                egui::Button::new(
-                    egui::RichText::new("Cancel")
-                        .size(14.0)
-                        .color(super::theme::colours(ui).text2),
-                )
-                .fill(egui::Color32::TRANSPARENT)
-                .stroke(egui::Stroke::NONE),
-            )
-            .clicked()
-        {
+        if text_button(ui, "Cancel", false).clicked() {
             action = TopologyConflictAction::Cancel;
         }
     });
@@ -209,19 +176,9 @@ pub fn render_displays_unsupported(
         );
         ui.add_space(34.0);
 
-        if ui
-            .add_sized(
-                [280.0, 44.0],
-                egui::Button::new(
-                    egui::RichText::new("Use Primary Display Only")
-                        .size(15.0)
-                        .color(super::theme::colours(ui).on_primary),
-                )
-                .fill(super::theme::colours(ui).primary)
-                .corner_radius(8.0),
-            )
-            .clicked()
-        {
+        let primary_only = "Use Primary Display Only";
+        let width = button_width(ui, &[primary_only]);
+        if primary_button(ui, primary_only, width).clicked() {
             action = DisplaysUnsupportedAction::UsePrimaryOnly;
         }
 
@@ -235,19 +192,7 @@ pub fn render_displays_unsupported(
             .size(13.0),
         );
         ui.add_space(28.0);
-        if ui
-            .add_sized(
-                [140.0, 36.0],
-                egui::Button::new(
-                    egui::RichText::new("Cancel")
-                        .size(14.0)
-                        .color(super::theme::colours(ui).text2),
-                )
-                .fill(egui::Color32::TRANSPARENT)
-                .stroke(egui::Stroke::NONE),
-            )
-            .clicked()
-        {
+        if text_button(ui, "Cancel", false).clicked() {
             action = DisplaysUnsupportedAction::Cancel;
         }
     });

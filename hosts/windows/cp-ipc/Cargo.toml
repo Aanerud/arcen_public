@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-cp-ipc"
-version = "0.20.7"
+version = "0.20.8"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["TUTTIFRUTTI AS"]

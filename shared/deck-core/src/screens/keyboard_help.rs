@@ -232,10 +232,12 @@ pub fn render_mac_shortcut_offer(ctx: &egui::Context) -> Option<bool> {
             ui.label(MAC_SHORTCUT_OFFER_TEXT);
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Allow").clicked() {
+                let width = super::widgets::button_width(ui, &["Allow", "Not now"]);
+                ui.spacing_mut().item_spacing.x = super::theme::BUTTON_GAP;
+                if super::widgets::primary_button(ui, "Allow", width).clicked() {
                     answer = Some(true);
                 }
-                if ui.button("Not now").clicked() {
+                if super::widgets::secondary_button(ui, "Not now", width).clicked() {
                     answer = Some(false);
                 }
             });

@@ -373,38 +373,16 @@ pub fn render_certificate_warning(ui: &mut egui::Ui, info: &CertificateFacts) ->
             );
             ui.add_space(22.0);
             ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Trust and Remember")
-                                .color(super::theme::colours(ui).on_primary)
-                                .size(14.0),
-                        )
-                        .fill(super::theme::colours(ui).primary)
-                        .min_size(egui::vec2(184.0, 36.0)),
-                    )
-                    .clicked()
-                {
+                use super::widgets::{button_width, primary_button, secondary_button};
+                ui.spacing_mut().item_spacing.x = super::theme::BUTTON_GAP;
+                let remember = "Trust and Remember";
+                if primary_button(ui, remember, button_width(ui, &[remember])).clicked() {
                     action = CertificateAction::TrustAndRemember;
                 }
-                ui.add_space(8.0);
-                if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("Trust Once").size(14.0))
-                            .min_size(egui::vec2(120.0, 36.0)),
-                    )
-                    .clicked()
-                {
+                if secondary_button(ui, "Trust Once", button_width(ui, &["Trust Once"])).clicked() {
                     action = CertificateAction::TrustForSession;
                 }
-                ui.add_space(8.0);
-                if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("Cancel").size(14.0))
-                            .min_size(egui::vec2(88.0, 36.0)),
-                    )
-                    .clicked()
-                {
+                if secondary_button(ui, "Cancel", button_width(ui, &["Cancel"])).clicked() {
                     action = CertificateAction::Cancel;
                 }
             });
@@ -513,55 +491,28 @@ pub fn render_certificate_changed(
                 );
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
-                    let back = ui.add(
-                        egui::Button::new(egui::RichText::new("Go back").size(14.0))
-                            .min_size(egui::vec2(110.0, 36.0)),
-                    );
+                    use super::widgets::{button_width, secondary_button};
+                    ui.spacing_mut().item_spacing.x = super::theme::BUTTON_GAP;
+                    let back = secondary_button(ui, "Go back", button_width(ui, &["Go back"]));
                     back.request_focus();
                     if back.clicked() {
                         press = Some(CertificateChangedPress::GoBack);
                     }
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Trust and connect")
-                                    .color(super::theme::colours(ui).on_primary)
-                                    .size(14.0),
-                            )
-                            .fill(danger)
-                            .min_size(egui::vec2(170.0, 36.0)),
-                        )
-                        .clicked()
-                    {
+                    if danger_button(ui, "Trust and connect", danger).clicked() {
                         press = Some(CertificateChangedPress::Confirm);
                     }
                 });
             } else {
                 ui.horizontal(|ui| {
-                    let cancel = ui.add(
-                        egui::Button::new(
-                            egui::RichText::new("Cancel")
-                                .color(super::theme::colours(ui).on_primary)
-                                .size(14.0),
-                        )
-                        .fill(super::theme::colours(ui).primary)
-                        .min_size(egui::vec2(110.0, 36.0)),
-                    );
+                    use super::widgets::{button_width, primary_button, secondary_button};
+                    ui.spacing_mut().item_spacing.x = super::theme::BUTTON_GAP;
+                    let cancel = primary_button(ui, "Cancel", button_width(ui, &["Cancel"]));
                     cancel.request_focus();
                     if cancel.clicked() {
                         press = Some(CertificateChangedPress::Cancel);
                     }
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new("Trust the new identity\u{2026}").size(14.0),
-                            )
-                            .min_size(egui::vec2(200.0, 36.0)),
-                        )
-                        .clicked()
-                    {
+                    let trust = "Trust the new identity\u{2026}";
+                    if secondary_button(ui, trust, button_width(ui, &[trust])).clicked() {
                         press = Some(CertificateChangedPress::TrustNewIdentity);
                     }
                 });
@@ -575,6 +526,27 @@ pub fn render_certificate_changed(
         press = Some(CertificateChangedPress::Default);
     }
     press.map_or(CertificateChangedAction::None, |press| step.press(press))
+}
+
+/// The confirmation that replaces a remembered identity: the shared
+/// control's size, text and radius, filled with the danger colour.
+fn danger_button(ui: &mut egui::Ui, label: &str, fill: egui::Color32) -> egui::Response {
+    use super::theme;
+    let width = super::widgets::button_width(ui, &[label]);
+    let response = ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .color(theme::colours(ui).on_primary)
+                .size(theme::BUTTON_TEXT),
+        )
+        .fill(fill)
+        .corner_radius(theme::CONTROL_RADIUS)
+        .min_size(egui::vec2(width, theme::CONTROL_HEIGHT)),
+    );
+    if response.has_focus() {
+        super::widgets::focus_ring(ui, response.rect);
+    }
+    response
 }
 
 #[cfg(test)]

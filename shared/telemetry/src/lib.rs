@@ -50,7 +50,7 @@ pub use schema::{
     TelemetryTarget,
 };
 pub use stream_stats::{
-    DEFAULT_SNAPSHOT_INTERVAL_SECS, RoundedPercentiles, SnapshotCadence, SnapshotRates,
+    DEFAULT_SNAPSHOT_INTERVAL_SECS, RoundedPercentiles, SentFrames, SnapshotCadence, SnapshotRates,
     StageAverages, StageTotals, WireDelayEstimator, rate_per_second, rounded_percentiles_ms,
     stage_averages,
 };

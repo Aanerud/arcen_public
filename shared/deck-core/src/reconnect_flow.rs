@@ -20,6 +20,7 @@ use crate::runtime::session::{
     AuthenticationKind, ConnectOptions, SessionAuthentication, SessionEnd,
 };
 use crate::settings::SecurityMode;
+use crate::sign_in::{SignInFailure, SignInStage};
 use arcen_protocol::messages::{ClientMonitor, SafeAreaPolicyMsg};
 
 /// The schedule that follows a host's sign-in screen into its desktop.
@@ -192,6 +193,30 @@ pub fn schedule_after_end<J: JitterSource>(
         })
 }
 
+/// Whether a hand-over from a host's sign-in screen follows this end into
+/// the desktop that replaces it (the shells' `follow_login_window`, which
+/// then asks the shared [`HandoverSchedule`] when).
+///
+/// The sign-in screen's session closing, a lost transport, a desktop that
+/// is not ready yet, or a host still held by the sign-in screen's own
+/// session are followed, at most [`HandoverSchedule`]'s attempts. A
+/// deliberate disconnect, a host whose identity changed, and a definite
+/// refusal ([`SignInFailure::is_definite`]: another account at the console
+/// (`console_other_user`), a wrong password…) are not: waiting cannot change
+/// them, and ADR 0025 never takes another account's session over. Each
+/// hand-over attempt is a fresh sign-in, so the end is read as one.
+#[must_use]
+pub fn follows_login_window(end: &SessionEnd) -> bool {
+    use crate::runtime::session::{DisconnectReason, TerminalDisconnect};
+    if matches!(
+        end.reason,
+        DisconnectReason::Terminal(TerminalDisconnect::Manual | TerminalDisconnect::TlsIdentity)
+    ) {
+        return false;
+    }
+    SignInFailure::from_end(end, SignInStage::Attempt).is_none_or(|failure| !failure.is_definite())
+}
+
 /// What [`next_resume_launch`] decided.
 #[derive(Debug)]
 pub enum ResumeLaunch {
@@ -358,6 +383,80 @@ mod tests {
         }
         let (_, resuming) = ReconnectOverlay::from_phase(controller.phase()).unwrap();
         assert!(resuming);
+    }
+
+    #[test]
+    fn a_sign_in_screen_is_followed_but_never_into_another_account_s_console() {
+        use crate::runtime::session::{ConnectSmokeError, session_end_for};
+        use crate::sign_in::HostRefusal;
+        use arcen_session::console_session::ConsoleRefusal;
+        use arcen_session::login_window_handover::MAX_ATTEMPTS;
+
+        let host_refused = |refusal, message: &str| {
+            session_end_for(&ConnectSmokeError::HostRefused {
+                refusal,
+                message: message.to_owned(),
+            })
+        };
+        // The sign-in screen's session closing, and a desktop not there yet.
+        for end in [
+            end(DisconnectReason::Terminal(
+                TerminalDisconnect::GracefulHostClose,
+            )),
+            end(DisconnectReason::Transient(
+                TransientTransportError::UnexpectedEof,
+            )),
+            session_end_for(&ConnectSmokeError::ClosedByHost(
+                ": the desktop session at this Mac's console has no Arcen agent running yet"
+                    .to_owned(),
+            )),
+            host_refused(
+                HostRefusal::Console(ConsoleRefusal::NoConsoleSession),
+                ConsoleRefusal::NoConsoleSession.deck_reason(),
+            ),
+        ] {
+            assert!(follows_login_window(&end), "{}", end.message);
+        }
+        // Someone else at the console (the 07:07 lab hand-over), as a refused
+        // sign-in or as the host closing: definite, never retried.
+        let other_user = "console_other_user: flame_db is signed in at this Mac; sign in as \
+                          flame_db, or switch to your account at the Mac first";
+        let mut host_closed = end(DisconnectReason::Terminal(
+            TerminalDisconnect::GracefulHostClose,
+        ));
+        host_closed.message = format!("Host closed the session: {other_user}");
+        for end in [
+            host_refused(HostRefusal::Console(ConsoleRefusal::OtherUser), other_user),
+            session_end_for(&ConnectSmokeError::ClosedByHost(format!(": {other_user}"))),
+            session_end_for(&ConnectSmokeError::AuthFailed(other_user.to_owned())),
+            host_closed,
+            // A wrong password would count against the host's throttle.
+            session_end_for(&ConnectSmokeError::AuthFailed(
+                "Authentication failed".to_owned(),
+            )),
+            end(DisconnectReason::Terminal(TerminalDisconnect::Manual)),
+            end(DisconnectReason::Terminal(TerminalDisconnect::TlsIdentity)),
+        ] {
+            assert!(!follows_login_window(&end), "{}", end.message);
+        }
+
+        // A host still busy is followed, but only as far as the schedule goes.
+        let busy = host_refused(
+            HostRefusal::Busy,
+            "another session is already using this Mac",
+        );
+        assert!(follows_login_window(&busy));
+        let mut schedule = HandoverSchedule::new();
+        let mut now = Duration::ZERO;
+        let mut retries = 0;
+        while follows_login_window(&busy)
+            && let Some(due) = schedule.session_ended(now)
+        {
+            assert!(schedule.take_due(due));
+            retries += 1;
+            now = due;
+        }
+        assert_eq!(retries, usize::from(MAX_ATTEMPTS));
     }
 
     #[test]

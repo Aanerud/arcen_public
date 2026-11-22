@@ -209,6 +209,9 @@ pub fn fitted_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Res
         .inner
 }
 
+/// The space a [`text_button`] leaves either side of its words.
+pub const TEXT_BUTTON_INSET: f32 = 4.0;
+
 /// A quiet action beside the buttons (Test connection): text in the
 /// secondary ink, no box, underlined under the pointer, as tall as the
 /// buttons so it lines up with them. `busy` keeps it from starting again.
@@ -225,12 +228,18 @@ pub fn text_button(ui: &mut egui::Ui, label: &str, busy: bool) -> egui::Response
         egui::Sense::click()
     };
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(galley.size().x + 8.0, theme::CONTROL_HEIGHT),
+        egui::vec2(
+            galley.size().x + 2.0 * TEXT_BUTTON_INSET,
+            theme::CONTROL_HEIGHT,
+        ),
         sense,
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, label));
     if ui.is_rect_visible(rect) {
-        let at = egui::pos2(rect.left() + 4.0, rect.center().y - galley.size().y / 2.0);
+        let at = egui::pos2(
+            rect.left() + TEXT_BUTTON_INSET,
+            rect.center().y - galley.size().y / 2.0,
+        );
         let underline = response.hovered() && !busy;
         let width = galley.size().x;
         let ink = if underline {

@@ -885,12 +885,30 @@ pub enum SystemShortcutRoute {
     PcKeyboardHook,
 }
 
-impl ClientSettings {
-    /// The one system-shortcuts switch: whether the system shortcuts go to
-    /// the remote computer while it has the keyboard. Off by default on a
-    /// Mac (it needs the Accessibility permission), on by default on a PC.
+/// The two stored settings behind the one system-shortcuts switch: a Mac
+/// Deck's event tap and the keyboard capture policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemShortcutCapture {
+    /// [`ClientSettings::capture_mac_system_shortcuts`].
+    pub capture_mac_system_shortcuts: bool,
+    /// [`ClientSettings::keyboard_capture`].
+    pub keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
+}
+
+impl SystemShortcutCapture {
+    /// The values `settings` holds.
     #[must_use]
-    pub fn system_shortcuts_to_host(&self, route: SystemShortcutRoute) -> bool {
+    pub const fn from_settings(settings: &ClientSettings) -> Self {
+        Self {
+            capture_mac_system_shortcuts: settings.capture_mac_system_shortcuts,
+            keyboard_capture: settings.keyboard_capture,
+        }
+    }
+
+    /// Whether the system shortcuts go to the remote computer while it has
+    /// the keyboard.
+    #[must_use]
+    pub fn to_host(self, route: SystemShortcutRoute) -> bool {
         use arcen_input::keyboard::KeyboardCapturePolicy;
         match route {
             SystemShortcutRoute::MacEventTap => {
@@ -903,9 +921,9 @@ impl ClientSettings {
         }
     }
 
-    /// Turns the system-shortcuts switch on (the remote computer, whenever a
-    /// session window has the keyboard) or off (this computer).
-    pub fn set_system_shortcuts_to_host(&mut self, route: SystemShortcutRoute, on: bool) {
+    /// Turns the switch on (the remote computer, whenever a session window
+    /// has the keyboard) or off (this computer).
+    pub fn set_to_host(&mut self, route: SystemShortcutRoute, on: bool) {
         use arcen_input::keyboard::KeyboardCapturePolicy;
         match route {
             SystemShortcutRoute::MacEventTap => {
@@ -922,6 +940,25 @@ impl ClientSettings {
                 };
             }
         }
+    }
+}
+
+impl ClientSettings {
+    /// The one system-shortcuts switch: whether the system shortcuts go to
+    /// the remote computer while it has the keyboard. Off by default on a
+    /// Mac (it needs the Accessibility permission), on by default on a PC.
+    #[must_use]
+    pub fn system_shortcuts_to_host(&self, route: SystemShortcutRoute) -> bool {
+        SystemShortcutCapture::from_settings(self).to_host(route)
+    }
+
+    /// Turns the system-shortcuts switch on (the remote computer, whenever a
+    /// session window has the keyboard) or off (this computer).
+    pub fn set_system_shortcuts_to_host(&mut self, route: SystemShortcutRoute, on: bool) {
+        let mut capture = SystemShortcutCapture::from_settings(self);
+        capture.set_to_host(route, on);
+        self.capture_mac_system_shortcuts = capture.capture_mac_system_shortcuts;
+        self.keyboard_capture = capture.keyboard_capture;
     }
 }
 

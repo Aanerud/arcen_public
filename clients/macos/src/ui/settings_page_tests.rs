@@ -201,6 +201,52 @@ fn home_scene_texts(
     scene: HomeScene,
     size: egui::Vec2,
 ) -> Vec<(String, egui::Rect, egui::Rect)> {
+    let output = home_scene_output(platform, scene, size);
+    let mut texts = Vec::new();
+    for clipped in &output.shapes {
+        text_rects(&clipped.shape, clipped.clip_rect, &mut texts);
+    }
+    texts
+}
+
+/// Every button one Home scene draws, as egui reports it to assistive
+/// technology: its label and its whole rectangle.
+fn home_scene_buttons(
+    platform: DeckPlatform,
+    scene: HomeScene,
+    size: egui::Vec2,
+) -> Vec<(String, egui::Rect)> {
+    let output = home_scene_output(platform, scene, size);
+    let update = output
+        .platform_output
+        .accesskit_update
+        .expect("accesskit is on");
+    update
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+        .filter_map(|(_, node)| {
+            let bounds = node.bounds()?;
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "egui's own coordinates, widened to f64 by accesskit"
+            )]
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+            );
+            Some((node.label()?.to_owned(), rect))
+        })
+        .collect()
+}
+
+/// One settled pass of a Home scene with the real fonts in a window `size`
+/// points (less the 36-point bar).
+fn home_scene_output(
+    platform: DeckPlatform,
+    scene: HomeScene,
+    size: egui::Vec2,
+) -> egui::FullOutput {
     use arcen_deck_core::config::{
         ConnectionKind, SavedConnectionSettings, SavedConnectionSummary, SavedTransport,
     };
@@ -273,17 +319,13 @@ fn home_scene_texts(
         screen_rect: Some(screen),
         ..egui::RawInput::default()
     };
+    ctx.enable_accesskit();
     let _ = ctx.run_ui(input(), |ui| {
         let _ = render_home(ui, &mut state);
     });
-    let output = ctx.run_ui(input(), |ui| {
+    ctx.run_ui(input(), |ui| {
         let _ = render_home(ui, &mut state);
-    });
-    let mut texts = Vec::new();
-    for clipped in &output.shapes {
-        text_rects(&clipped.shape, clipped.clip_rect, &mut texts);
-    }
-    texts
+    })
 }
 
 const ALL_HOME_SCENES: [HomeScene; 5] = [
@@ -316,39 +358,78 @@ fn no_home_text_runs_past_the_right_edge_of_the_narrowest_window() {
 }
 
 #[test]
-fn every_home_button_shows_at_the_default_window_size_without_scrolling() {
-    // Both Decks open at 1120 x 760, with no list open.
-    let size = egui::vec2(1120.0, 760.0);
-    for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
-        for (scene, buttons) in [
-            (HomeScene::Connect, &["Edit", "Connect"][..]),
-            (
-                HomeScene::New,
-                &["Test connection", "Cancel", "Add connection"][..],
-            ),
-            (HomeScene::Edit, &["Test connection", "Cancel", "Save"][..]),
-            (HomeScene::Empty, &["Add connection", "Import\u{2026}"][..]),
-        ] {
-            let texts = home_scene_texts(platform, scene, size);
-            for button in buttons {
-                let Some((_, rect, clip)) = texts.iter().find(|(text, ..)| text == button) else {
-                    panic!("{platform:?}, {scene:?}: no {button:?}");
+fn every_home_button_shows_whole_with_air_at_the_default_and_the_smallest_window() {
+    // Both Decks open at 1120 x 760 and shrink to 860 x 600, with no list
+    // open. The whole button, not only its words, is inside the window,
+    // a spacing step clear of its bottom edge: the form's buttons stay in
+    // its footer however short the window, and the form scrolls above.
+    let air = theme::SPACE_SCALE[3];
+    for size in [egui::vec2(1120.0, 760.0), egui::vec2(860.0, 600.0)] {
+        let bottom = size.y - 36.0;
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            for (scene, buttons) in [
+                (HomeScene::Connect, &["Edit", "Connect"][..]),
+                (
+                    HomeScene::New,
+                    &["Test connection", "Cancel", "Add connection"][..],
+                ),
+                (HomeScene::Edit, &["Test connection", "Cancel", "Save"][..]),
+                (
+                    HomeScene::EditOwn,
+                    &["Test connection", "Cancel", "Save"][..],
+                ),
+                (HomeScene::Empty, &["Add connection", "Import\u{2026}"][..]),
+            ] {
+                let shown = home_scene_buttons(platform, scene, size);
+                // The lowest of a name: the sidebar's ＋ is "Add connection"
+                // too.
+                let rect = |button: &str| {
+                    shown
+                        .iter()
+                        .filter(|(label, _)| label == button)
+                        .map(|(_, rect)| *rect)
+                        .max_by(|a, b| a.min.y.total_cmp(&b.min.y))
+                        .unwrap_or_else(|| {
+                            panic!("{platform:?}, {scene:?} at {size:?}: no {button:?}: {shown:?}")
+                        })
                 };
-                // Inside the window, not clipped away by the scroll area.
-                assert!(
-                    rect.max.y <= clip.max.y.min(size.y - 36.0),
-                    "{platform:?}, {scene:?}: {button:?} at {rect:?} below {clip:?}"
-                );
-                // Edit's label fits its fixed width with room either side
-                // (the other buttons are measured from their labels).
-                if *button == "Edit" {
+                for button in buttons {
+                    let rect = rect(button);
                     assert!(
-                        rect.width() <= theme::EDIT_BUTTON_WIDTH - 2.0 * 16.0,
-                        "{platform:?}: Edit is {} wide",
-                        rect.width()
+                        rect.min.y >= 0.0 && rect.max.y <= bottom - air + 0.5,
+                        "{platform:?}, {scene:?} at {size:?}: {button:?} at {rect:?}, \
+                         not {air} clear of the window's bottom at {bottom}"
+                    );
+                    assert!(
+                        rect.min.x >= 0.0 && rect.max.x <= size.x,
+                        "{platform:?}, {scene:?} at {size:?}: {button:?} at {rect:?}"
                     );
                 }
+                // Each platform's order: a Mac's default button last, a
+                // PC's first.
+                if let [_, cancel, save] = buttons {
+                    let (cancel, save) = (rect(cancel), rect(save));
+                    assert!(
+                        (cancel.center().y - save.center().y).abs() < 0.5,
+                        "{platform:?}, {scene:?} at {size:?}: {cancel:?} {save:?} {shown:?}"
+                    );
+                    match platform {
+                        DeckPlatform::Mac => assert!(cancel.max.x < save.min.x),
+                        DeckPlatform::Pc => assert!(save.max.x < cancel.min.x),
+                    }
+                }
             }
+            // Edit's label fits its fixed width with room either side (the
+            // other buttons are measured from their labels).
+            let texts = home_scene_texts(platform, HomeScene::Connect, size);
+            let Some((_, edit, _)) = texts.iter().find(|(text, ..)| text == "Edit") else {
+                panic!("{platform:?}: no Edit");
+            };
+            assert!(
+                edit.width() <= theme::EDIT_BUTTON_WIDTH - 2.0 * 16.0,
+                "{platform:?}: Edit is {} wide",
+                edit.width()
+            );
         }
     }
 }

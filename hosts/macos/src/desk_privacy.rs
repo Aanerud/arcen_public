@@ -74,6 +74,9 @@ pub struct PrivacyCounts {
 pub struct DeskPrivacy {
     stop: Arc<AtomicBool>,
     lost: Arc<AtomicBool>,
+    /// Set before `lost` when the console left the account (rather than a
+    /// display staying lit).
+    console_left: Arc<AtomicBool>,
     filter: Option<native::InputFilter>,
     watcher: Option<std::thread::JoinHandle<()>>,
     blanked: Arc<std::sync::Mutex<BTreeSet<u32>>>,
@@ -110,6 +113,7 @@ impl DeskPrivacy {
         let mut privacy = Self {
             stop: Arc::new(AtomicBool::new(false)),
             lost: Arc::new(AtomicBool::new(false)),
+            console_left: Arc::new(AtomicBool::new(false)),
             filter: Some(filter),
             watcher: None,
             blanked: Arc::clone(&blanked),
@@ -120,10 +124,19 @@ impl DeskPrivacy {
         darken_displays(&blanked)?;
         let stop = Arc::clone(&privacy.stop);
         let lost = Arc::clone(&privacy.lost);
+        let console_left = Arc::clone(&privacy.console_left);
         let filter_port = privacy.filter.as_ref().map(native::InputFilter::handle);
         privacy.watcher = std::thread::Builder::new()
             .name("arcen-desk-privacy".to_owned())
-            .spawn(move || watch(serving_uid, &blanked, filter_port.as_ref(), &stop, &lost))
+            .spawn(move || {
+                watch(
+                    serving_uid,
+                    &blanked,
+                    filter_port.as_ref(),
+                    &stop,
+                    (&lost, &console_left),
+                );
+            })
             .ok();
         if privacy.watcher.is_none() {
             return Err(DeskPrivacyRefusal::DisplaysNotDark);
@@ -142,6 +155,25 @@ impl DeskPrivacy {
     #[must_use]
     pub fn lost(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.lost)
+    }
+
+    /// Why the Deck's session must end, once [`Self::is_lost`]: the console
+    /// left the account ([`WatchVerdict::ConsoleLeft`]) or a display stayed
+    /// lit ([`WatchVerdict::PrivacyLost`]). The shared
+    /// [`WatchVerdict::deck_refusal`] says what the Deck is told.
+    ///
+    /// [`WatchVerdict::ConsoleLeft`]: desk_privacy::WatchVerdict::ConsoleLeft
+    /// [`WatchVerdict::PrivacyLost`]: desk_privacy::WatchVerdict::PrivacyLost
+    /// [`WatchVerdict::deck_refusal`]: desk_privacy::WatchVerdict::deck_refusal
+    #[must_use]
+    pub fn end_verdict(&self) -> Option<desk_privacy::WatchVerdict> {
+        if !self.is_lost() {
+            None
+        } else if self.console_left.load(Ordering::Acquire) {
+            Some(desk_privacy::WatchVerdict::ConsoleLeft)
+        } else {
+            Some(desk_privacy::WatchVerdict::PrivacyLost)
+        }
     }
 
     /// Gives the displays their own picture back (the shared hand-back
@@ -228,7 +260,7 @@ fn watch(
     blanked: &std::sync::Mutex<BTreeSet<u32>>,
     filter: Option<&native::FilterHandle>,
     stop: &AtomicBool,
-    lost: &AtomicBool,
+    (lost, console_left): (&AtomicBool, &AtomicBool),
 ) {
     use desk_privacy::{CONSOLE_CHECK, DISPLAY_CHECK, PrivacyWatch, WatchVerdict};
     let mut verdicts = PrivacyWatch::default();
@@ -250,6 +282,7 @@ fn watch(
                     handle.suspend();
                 }
                 native::restore_all_displays();
+                console_left.store(true, Ordering::Release);
                 lost.store(true, Ordering::Release);
                 tracing::warn!(
                     target: arcen_telemetry::names::target::SESSION,
@@ -571,15 +604,10 @@ mod native {
         );
         fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source: u8) -> i32;
     }
-    #[link(name = "Carbon", kind = "framework")]
-    unsafe extern "C" {
-        fn IsSecureEventInputEnabled() -> u8;
-    }
 
     /// Whether an application holds Secure Event Input.
     pub(super) fn secure_event_input() -> bool {
-        // SAFETY: no arguments, reads system state.
-        unsafe { IsSecureEventInputEnabled() != 0 }
+        crate::input::secure_event_input()
     }
 
     /// The online displays; `None` when the window server will not list

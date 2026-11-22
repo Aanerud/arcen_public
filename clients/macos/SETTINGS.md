@@ -89,13 +89,14 @@ light or dark appearance, live, from the two palettes in
 
 | Page | Group | Keys |
 | --- | --- | --- |
-| Settings › Input | Keyboard: **System shortcuts go to the remote computer** | `capture_mac_system_shortcuts` and `keyboard_capture` (on: `true` and `host`; off: `false`). Off by default on a Mac, as before; the Windows Deck's switch is `keyboard_capture` (`host` or `this_computer`), on by default. "Needs Accessibility permission." shows only while it is on without the permission. |
+| Settings › Input | Keyboard: **System shortcuts go to the remote computer** | `capture_mac_system_shortcuts` and `keyboard_capture` (on: `true` and `host`; off: `false`). Off by default on a Mac, as before; the Windows Deck's switch is `keyboard_capture` (`host` or `this_computer`), on by default. "Needs Accessibility permission." shows only while it, or any connection's own `system_shortcuts`, is on without the permission; the line under it counts the connections with their own `system_shortcuts`. |
 | | Typing: **Characters** (Recommended), **Keys only** | `typing_mode` (`auto`, `keys`); the line beside it counts the connections with their own `typing_mode`. |
 | | Clipboard: **Share the clipboard with remote computers** | `clipboard_enabled`; the line under it counts the connections with their own `clipboard_enabled`. |
 | Settings › Tablet | **Tablet support**, **Native tablet**, **Mouse only**; pen buttons under Tablet support | `tablet_mode_requested`, `pen_lower_button`/`pen_upper_button` (one barrel button on the Windows Deck) |
 | Settings › Advanced › Input | Keyboard switch; Paste as Keystrokes: **Speed**, **Ask before pasting more than** | `keyboard_switch`, `paste_chars_per_second`, `paste_confirm_above` |
 | New and Edit connection › Connection (left column) | **Address** (`host`, `host:port` or `[v6]:port`; 18444 when no port is given), **Name** (optional; empty saves as the address), **Username** (optional) | the connection's `host`, `port`, `name` and remembered username |
-| New and Edit connection › On this machine (right column, always shown; under Connection in a narrow window) | **⌘ key** (Windows Deck: **Command key on a Mac host**), **Option key** (Mac only), **Typing**, **Displays**, each a list picker | the connection's `keyboard_shortcuts`, `option_keys`, `typing_mode`, `displays_mode`; following Settings reads "App default (Characters)" |
+| New and Edit connection › On this machine (right column, always shown; under Connection in a narrow window) | **⌘ key** (Windows Deck: **Command key on a Mac host**), **Option key** (Mac only), **Typing**, **Displays**, **System shortcuts go to the remote computer** (**On**, **Off**), each a list picker | the connection's `keyboard_shortcuts`, `option_keys`, `typing_mode`, `displays_mode`, `system_shortcuts`; following Settings reads "App default (Characters)" |
+| Home, under Connect | **This connection: …** and **Use app defaults** | a summary of the connection's own values that differ from Settings; the link removes every one of them (a value only a newer Deck understands stays) |
 
 `cursor_preference` is no longer shown either: the cursor is automatic, and
 the stored value is only the request an older host still gets.
@@ -148,7 +149,9 @@ and the requested refresh is capped at 60 Hz so the synthesised mode stays insid
 pixel-clock ceiling.
 The per-connection settings container holds a connection's own values for the settings that
 depend on the host, under the same keys as `settings.json` (`typing_mode`, `option_keys`,
-`displays_mode`, `clipboard_enabled`; `keyboard_shortcuts` has no application-wide setting).
+`displays_mode`, `clipboard_enabled`; `keyboard_shortcuts` has no application-wide setting, and
+`system_shortcuts` (`true` or `false`) is the one system-shortcuts switch over
+`capture_mac_system_shortcuts` and `keyboard_capture`).
 An absent key follows Settings. `clipboard_enabled` can only turn the clipboard off for that
 connection: the user's consent in Settings is the ceiling. Unknown keys are kept.
 

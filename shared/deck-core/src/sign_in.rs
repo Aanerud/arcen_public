@@ -13,6 +13,8 @@
 //! The shells report a typed [`SignInFailure`] and render [`SignInState`];
 //! every decision and every word is made here.
 
+use arcen_session::console_session::ConsoleRefusal;
+
 use crate::connection_draft::ConnectionDraft;
 
 /// A field on the selected connection's card.
@@ -53,7 +55,106 @@ pub enum SignInFailure {
     SessionNotStarted,
     /// Anything else that ended the connection.
     ConnectionFailed,
+    /// The host refused for a reason about its own session, not the
+    /// password: someone else is signed in there, its login screen cannot
+    /// take a remote sign-in, it could not keep its screen private… A
+    /// Pier says which with a stable code
+    /// ([`ConsoleRefusal::token`]). `ended`: a running session ended for
+    /// it, rather than a sign-in.
+    ConsoleRefused {
+        refusal: ConsoleRefusal,
+        ended: bool,
+    },
+    /// The host refused without checking the password: too many failed
+    /// sign-ins recently.
+    TooManyAttempts,
+    /// The password was right, but the account may not sign in there.
+    AccountNotAllowed,
+    /// Another session already holds the host.
+    HostBusy,
+    /// The host cannot take a sign-in right now (its authentication or
+    /// remote sign-in is unavailable).
+    SignInUnavailable,
+    /// The host's notice before signing in was declined.
+    NoticeDeclined,
+    /// The host has a notice to accept, and this connection could not show
+    /// it (a command-line connection).
+    NoticeRequired,
+    /// The host refused the sign-in for a reason this Deck does not know;
+    /// the reason is under Details.
+    HostRefused,
 }
+
+/// A host's refusal about its own state, never about the credentials:
+/// another session holds it, another remote desktop holds its seat, or its
+/// console refused ([`ConsoleRefusal`]). Telemetry gives it its own reason
+/// class ([`Self::reason_class`]), and nothing treats it as a wrong
+/// password: no `SESSION_AUTH_FAIL`, no credential outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRefusal {
+    /// Another Arcen session already holds the host.
+    Busy,
+    /// Another remote desktop holds the host's X11 seat (one X11 desktop per
+    /// host, `arcen_session::x11_seat`).
+    SeatOccupied,
+    /// The host's console refused, with its stable code.
+    Console(ConsoleRefusal),
+}
+
+impl HostRefusal {
+    /// The `reason_class` of the Deck's `CLIENT_CONNECT_FAIL` and
+    /// `CLIENT_SESSION_END`: `host_busy`, `seat_occupied`, or the console
+    /// refusal's own code, as the Pier logs it.
+    #[must_use]
+    pub const fn reason_class(self) -> &'static str {
+        match self {
+            Self::Busy => "host_busy",
+            Self::SeatOccupied => "seat_occupied",
+            Self::Console(refusal) => refusal.token(),
+        }
+    }
+
+    /// What it means for sign-in. `stage`: a console refusal of a running
+    /// session (or its resume, or a hand-over) says the session ended.
+    #[must_use]
+    pub const fn sign_in_failure(self, stage: SignInStage) -> SignInFailure {
+        match self {
+            Self::Busy | Self::SeatOccupied => SignInFailure::HostBusy,
+            Self::Console(refusal) => SignInFailure::ConsoleRefused {
+                refusal,
+                ended: matches!(stage, SignInStage::Session),
+            },
+        }
+    }
+
+    /// The host refusal a host's reason states: a console code
+    /// ([`console_refusal`]), the macOS Pier's "another session is already
+    /// using this Mac", or the Linux Pier's occupied X11 seat. `None` for
+    /// anything else, a wrong password included.
+    #[cfg(feature = "runtime")]
+    #[must_use]
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        use arcen_session::x11_seat::{DECK_REASON_SEAT_OCCUPIED, DECK_REASON_SEAT_OTHER_PRODUCT};
+        if let Some(refusal) = console_refusal(reason) {
+            return Some(Self::Console(refusal));
+        }
+        let plain = reason.trim().to_ascii_lowercase();
+        if plain.starts_with(HOST_BUSY_REASON) {
+            return Some(Self::Busy);
+        }
+        // The named form of `x11_seat::deck_reason_other_product`.
+        let named_service = reason.contains("Another remote-desktop service (")
+            && reason.contains(") holds this host's display.");
+        (reason.contains(DECK_REASON_SEAT_OCCUPIED)
+            || reason.contains(DECK_REASON_SEAT_OTHER_PRODUCT)
+            || named_service)
+            .then_some(Self::SeatOccupied)
+    }
+}
+
+/// How the macOS Pier words [`HostRefusal::Busy`] (lowercased).
+#[cfg(feature = "runtime")]
+const HOST_BUSY_REASON: &str = "another session is already using";
 
 /// Whether the user was signing in or had a session when it ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,13 +171,38 @@ impl SignInFailure {
     #[must_use]
     pub const fn field(self) -> Option<SignInField> {
         match self {
-            Self::UsernameMissing => Some(SignInField::Username),
+            Self::UsernameMissing | Self::AccountNotAllowed => Some(SignInField::Username),
             Self::PasswordMissing
             | Self::PasswordRequired
             | Self::CredentialsRefused
             | Self::Unreachable
-            | Self::SessionEnded => Some(SignInField::Password),
-            Self::HostClosedConnection
+            | Self::SessionEnded
+            | Self::TooManyAttempts
+            | Self::NoticeDeclined
+            | Self::NoticeRequired
+            | Self::HostRefused => Some(SignInField::Password),
+            Self::ConsoleRefused {
+                refusal,
+                ended: false,
+            } => match refusal {
+                ConsoleRefusal::OtherUser
+                | ConsoleRefusal::OtherUserOtherProduct
+                | ConsoleRefusal::AccountDenied => Some(SignInField::Username),
+                ConsoleRefusal::SessionChanged => Some(SignInField::Password),
+                ConsoleRefusal::WaylandSession
+                | ConsoleRefusal::NoConsoleSession
+                | ConsoleRefusal::SessionsUnreadable
+                | ConsoleRefusal::SignInUnavailable
+                | ConsoleRefusal::SignInFailed
+                | ConsoleRefusal::SessionUnreachable
+                | ConsoleRefusal::PrivacyUnavailable
+                | ConsoleRefusal::InUseOtherProduct
+                | ConsoleRefusal::OtherProductStarted => None,
+            },
+            Self::ConsoleRefused { ended: true, .. }
+            | Self::HostBusy
+            | Self::SignInUnavailable
+            | Self::HostClosedConnection
             | Self::HostEndedSession
             | Self::HostRestarted
             | Self::AccountChanged
@@ -86,10 +212,90 @@ impl SignInFailure {
         }
     }
 
+    /// Whether waiting cannot change this outcome: only the person, or
+    /// someone at the host, can (a wrong password, another account at the
+    /// console, a declined notice…). A sign-in screen's hand-over
+    /// (`reconnect_flow::follows_login_window`) is not followed past one:
+    /// retrying would only repeat the refusal, and a refused
+    /// password would count against the host's sign-in throttle.
+    ///
+    /// A host that is busy, has no desktop yet or cannot reach it is not
+    /// definite: during a hand-over the sign-in screen's own session may
+    /// still hold the host, and the signed-in desktop takes a moment to
+    /// appear. The shared schedule bounds those retries.
+    #[must_use]
+    pub const fn is_definite(self) -> bool {
+        match self {
+            Self::UsernameMissing
+            | Self::PasswordMissing
+            | Self::PasswordRequired
+            | Self::CredentialsRefused
+            | Self::TooManyAttempts
+            | Self::AccountNotAllowed
+            | Self::AccountChanged
+            | Self::HostIdentityChanged
+            | Self::NoticeDeclined
+            | Self::NoticeRequired
+            | Self::HostRefused => true,
+            Self::ConsoleRefused { refusal, .. } => match refusal {
+                ConsoleRefusal::OtherUser
+                | ConsoleRefusal::OtherUserOtherProduct
+                | ConsoleRefusal::AccountDenied
+                | ConsoleRefusal::InUseOtherProduct
+                | ConsoleRefusal::OtherProductStarted
+                | ConsoleRefusal::WaylandSession
+                | ConsoleRefusal::SignInUnavailable => true,
+                ConsoleRefusal::NoConsoleSession
+                | ConsoleRefusal::SessionsUnreadable
+                | ConsoleRefusal::SignInFailed
+                | ConsoleRefusal::SessionUnreachable
+                | ConsoleRefusal::PrivacyUnavailable
+                | ConsoleRefusal::SessionChanged => false,
+            },
+            Self::Unreachable
+            | Self::SessionEnded
+            | Self::HostClosedConnection
+            | Self::HostEndedSession
+            | Self::HostRestarted
+            | Self::SessionNotStarted
+            | Self::ConnectionFailed
+            | Self::HostBusy
+            | Self::SignInUnavailable => false,
+        }
+    }
+
     /// What the user reads, naming the host where it helps.
     #[must_use]
     pub fn message(self, host: &str) -> String {
+        self.message_with(host, None)
+    }
+
+    /// [`Self::message`], with what the host said (`detail`, shown under
+    /// Details) where it names something the headline should: the account
+    /// signed in at the host.
+    #[must_use]
+    pub fn message_with(self, host: &str, detail: Option<&str>) -> String {
         match self {
+            Self::ConsoleRefused { refusal, ended } => {
+                console_message(refusal, ended, host, detail)
+            }
+            Self::TooManyAttempts => {
+                "Too many failed sign-ins. Wait a few minutes, then try again.".to_owned()
+            }
+            Self::AccountNotAllowed => format!("This account may not sign in at {host}."),
+            Self::HostBusy => format!("Another session is already using {host}."),
+            Self::SignInUnavailable => {
+                format!("{host} can\u{2019}t take a sign-in right now. Try again later.")
+            }
+            Self::NoticeDeclined => {
+                format!("You declined {host}\u{2019}s notice, so Arcen didn\u{2019}t sign in.")
+            }
+            Self::NoticeRequired => format!(
+                "{host} asks you to accept a notice before signing in. Connect from Home to read it."
+            ),
+            Self::HostRefused => {
+                format!("{host} refused the sign-in. Its reason is under Details.")
+            }
             Self::UsernameMissing => "Enter your username to connect.".to_owned(),
             Self::PasswordMissing | Self::PasswordRequired => {
                 "Enter your password to connect.".to_owned()
@@ -193,11 +399,12 @@ impl SignInState {
 
     fn show(&mut self, failure: SignInFailure, draft: &ConnectionDraft, detail: Option<String>) {
         let field = failure.field();
+        let detail = detail.filter(|detail| !detail.trim().is_empty());
         self.feedback = Some(SignInFeedback {
             failure,
             field,
-            message: failure.message(draft.display_name()),
-            detail: detail.filter(|detail| !detail.trim().is_empty()),
+            message: failure.message_with(draft.display_name(), detail.as_deref()),
+            detail,
             connection_id: draft.saved_connection_id.clone(),
         });
         self.unsaved = draft.saved_connection_id.is_none();
@@ -285,6 +492,156 @@ impl SignInState {
     }
 }
 
+/// The headline for a host's console refusal, naming the host. `ended`: it
+/// ended a running session rather than a sign-in.
+fn console_message(
+    refusal: ConsoleRefusal,
+    ended: bool,
+    host: &str,
+    detail: Option<&str>,
+) -> String {
+    let sentence = match refusal {
+        ConsoleRefusal::PrivacyUnavailable => {
+            return if ended {
+                format!("{host} couldn\u{2019}t keep its screen private, so it ended the session.")
+            } else {
+                format!(
+                    "{host} couldn\u{2019}t keep its screen private, so it didn\u{2019}t connect."
+                )
+            };
+        }
+        ConsoleRefusal::OtherUser => match detail.and_then(console_owner) {
+            Some(owner) => format!(
+                "Someone else is signed in at {host} ({owner}). Sign in as that user, or switch \
+                 to your account there first."
+            ),
+            None => format!(
+                "Someone else is signed in at {host}. Sign in as that user, or switch to your \
+                 account there first."
+            ),
+        },
+        ConsoleRefusal::OtherUserOtherProduct => {
+            format!("Someone else is using {host} through another remote-desktop app.")
+        }
+        ConsoleRefusal::WaylandSession => {
+            format!("{host} runs a desktop session Arcen can\u{2019}t join.")
+        }
+        ConsoleRefusal::NoConsoleSession => {
+            format!("Nobody is signed in at {host}, and its login screen isn\u{2019}t running.")
+        }
+        ConsoleRefusal::SessionsUnreadable => format!(
+            "{host} couldn\u{2019}t tell who is signed in, so Arcen didn\u{2019}t join a session."
+        ),
+        ConsoleRefusal::SignInUnavailable => {
+            format!("{host}\u{2019}s login screen can\u{2019}t take a remote sign-in.")
+        }
+        ConsoleRefusal::SignInFailed => {
+            format!("{host}\u{2019}s login screen didn\u{2019}t start your session.")
+        }
+        ConsoleRefusal::SessionUnreachable => {
+            format!("{host} couldn\u{2019}t open your session\u{2019}s display.")
+        }
+        ConsoleRefusal::SessionChanged => {
+            format!("Your session at {host} changed. Sign in again to join it.")
+        }
+        ConsoleRefusal::AccountDenied => {
+            format!("Your account isn\u{2019}t allowed to sign in at {host}.")
+        }
+        ConsoleRefusal::InUseOtherProduct => {
+            format!("Your desktop on {host} is in use through another remote-desktop app.")
+        }
+        ConsoleRefusal::OtherProductStarted => {
+            format!("Another remote-desktop app took over {host}.")
+        }
+    };
+    if ended {
+        format!("{host} ended your session. {sentence}")
+    } else {
+        sentence
+    }
+}
+
+/// The console refusal a host's reason leads with or carries: its stable
+/// code ([`ConsoleRefusal::token`], followed by `:` or the end), anywhere in
+/// the text, since a close frame's reason arrives behind the Deck's own
+/// words. The macOS Pier's earlier wording of `console_other_user` counts
+/// too.
+#[cfg(feature = "runtime")]
+#[must_use]
+fn console_refusal(reason: &str) -> Option<ConsoleRefusal> {
+    const MAC_NOT_CONSOLE_OWNER: &str = "this Mac\u{2019}s screen belongs to another account";
+    let coded = reason.match_indices("console_").find_map(|(at, _)| {
+        let starts_word = reason[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !(before.is_ascii_alphanumeric() || before == '_'));
+        let code: &str = reason[at..]
+            .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+            .next()
+            .unwrap_or_default();
+        starts_word
+            .then(|| {
+                ConsoleRefusal::ALL
+                    .into_iter()
+                    .find(|refusal| refusal.token() == code)
+            })
+            .flatten()
+    });
+    coded.or_else(|| {
+        let reason = reason.replace('\'', "\u{2019}");
+        reason
+            .contains(MAC_NOT_CONSOLE_OWNER)
+            .then_some(ConsoleRefusal::OtherUser)
+    })
+}
+
+/// The account a `console_other_user` refusal names (`console_other_user:
+/// alice is signed in at this Mac; …`), when it is a plain account name.
+/// Host text: anything else is left under Details.
+fn console_owner(reason: &str) -> Option<&str> {
+    const LIMIT: usize = 64;
+    let prefix = format!("{}: ", ConsoleRefusal::OtherUser.token());
+    let after = &reason[reason.find(&prefix)? + prefix.len()..];
+    let owner = &after[..after.find(" is signed in")?];
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '\\');
+    (!owner.is_empty() && owner.chars().count() <= LIMIT && owner.chars().all(plain))
+        .then_some(owner)
+}
+
+/// What the words of a refused sign-in mean, for the reasons every Pier
+/// gives in plain text (they carry no code). `None` for words this Deck
+/// does not know.
+#[cfg(feature = "runtime")]
+fn sign_in_refusal(reason: &str) -> Option<SignInFailure> {
+    let reason = reason.trim().to_ascii_lowercase();
+    if reason.contains(arcen_session::auth_throttle::THROTTLED_MESSAGE) {
+        return Some(SignInFailure::TooManyAttempts);
+    }
+    // Linux ("Authentication failed…"), Windows ("Invalid credentials"),
+    // macOS ("the username or password is…"), and a host that said
+    // nothing.
+    let credentials = reason.is_empty()
+        || reason.starts_with("authentication failed")
+        || reason.starts_with("invalid credentials")
+        || reason.starts_with("the username or password is")
+        || reason == "the host refused the sign-in";
+    if credentials {
+        return Some(SignInFailure::CredentialsRefused);
+    }
+    if reason.starts_with("this account may not sign in") {
+        return Some(SignInFailure::AccountNotAllowed);
+    }
+    if reason.starts_with(HOST_BUSY_REASON) {
+        return Some(SignInFailure::HostBusy);
+    }
+    if reason.starts_with("authentication policy is unavailable")
+        || reason.starts_with("remote sign-in is unavailable")
+    {
+        return Some(SignInFailure::SignInUnavailable);
+    }
+    None
+}
+
 /// The reason a session end gives under "Details", in plain words: a lost
 /// or unreachable transport by its typed kind (never the transport's own
 /// text), anything else as the engine words it.
@@ -314,6 +671,46 @@ pub fn end_detail(end: &crate::runtime::session::SessionEnd) -> String {
 
 #[cfg(feature = "runtime")]
 impl SignInFailure {
+    /// What a session end means for sign-in: its typed reason
+    /// ([`Self::after_end`]), made precise by what the host said where the
+    /// reason alone cannot tell (a refused sign-in is not always a wrong
+    /// password: [`console_refusal`], and the plain reasons every Pier
+    /// gives). `None` for a deliberate disconnect.
+    #[must_use]
+    pub fn from_end(end: &crate::runtime::session::SessionEnd, stage: SignInStage) -> Option<Self> {
+        use crate::runtime::session::{DisconnectReason, TerminalDisconnect};
+        let base = Self::after_end(end.reason, stage)?;
+        let DisconnectReason::Terminal(
+            kind @ (TerminalDisconnect::Authentication
+            | TerminalDisconnect::GracefulHostClose
+            | TerminalDisconnect::Configuration),
+        ) = end.reason
+        else {
+            return Some(base);
+        };
+        if let Some(refusal) = console_refusal(&end.message) {
+            return Some(Self::ConsoleRefused {
+                refusal,
+                ended: stage == SignInStage::Session,
+            });
+        }
+        if kind != TerminalDisconnect::Authentication {
+            return Some(base);
+        }
+        let message = end.message.as_str();
+        if message == crate::runtime::session::AUTH_DECLINED_TEXT {
+            return Some(Self::NoticeDeclined);
+        }
+        if message == crate::runtime::session::DISCLAIMER_REQUIRED_TEXT {
+            return Some(Self::NoticeRequired);
+        }
+        Some(match (sign_in_refusal(message), stage) {
+            (Some(Self::CredentialsRefused), _) | (None, SignInStage::Session) => base,
+            (Some(failure), _) => failure,
+            (None, SignInStage::Attempt) => Self::HostRefused,
+        })
+    }
+
     /// What a session end means for sign-in, by its typed reason (never its
     /// text). `None` for a deliberate disconnect, which needs no word.
     #[must_use]
@@ -355,6 +752,9 @@ impl SignInFailure {
             },
             DisconnectReason::Terminal(TerminalDisconnect::Configuration) => {
                 Self::SessionNotStarted
+            }
+            DisconnectReason::Terminal(TerminalDisconnect::HostRefused(refusal)) => {
+                refusal.sign_in_failure(stage)
             }
             DisconnectReason::Terminal(TerminalDisconnect::Protocol) => Self::ConnectionFailed,
         };
@@ -635,6 +1035,330 @@ mod tests {
             SignInFailure::SessionNotStarted,
         ] {
             assert_eq!(failure.field(), None, "{failure:?} is acknowledged");
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    fn refused(reason: &str) -> crate::runtime::session::SessionEnd {
+        crate::runtime::session::session_end_for(
+            &crate::runtime::session::ConnectSmokeError::AuthFailed(reason.to_owned()),
+        )
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn another_account_at_the_host_is_said_with_its_name_not_as_a_wrong_password() {
+        let end = refused(
+            "console_other_user: flame_db is signed in at this Mac; sign in as flame_db, or \
+             switch to your account at the Mac first",
+        );
+        let failure = SignInFailure::from_end(&end, SignInStage::Attempt).unwrap();
+        assert_eq!(
+            failure,
+            SignInFailure::ConsoleRefused {
+                refusal: ConsoleRefusal::OtherUser,
+                ended: false
+            }
+        );
+        let mut state = SignInState::default();
+        let _ = state.return_home(failure, selected("secret"), Some(end_detail(&end)));
+        let shown = state
+            .under_field(Some("studio"), SignInField::Username)
+            .expect("under the username");
+        assert_eq!(
+            shown.message,
+            "Someone else is signed in at studio.example.internal (flame_db). Sign in as that \
+             user, or switch to your account there first."
+        );
+        assert!(
+            shown
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("console_other_user: flame_db"))
+        );
+        assert_eq!(state.take_focus(), Some(SignInField::Username));
+        // A Pier that names nobody, or something that is not a plain name.
+        for reason in [
+            "console_other_user: another account is signed in at this workstation.",
+            "console_other_user: al ice is signed in at this Mac",
+            "console_other_user: \u{202e}alice is signed in at this Mac",
+            "this Mac\u{2019}s screen belongs to another account; sign in as the person at the \
+             console, or switch to your account at the machine first",
+        ] {
+            let failure = SignInFailure::from_end(&refused(reason), SignInStage::Attempt).unwrap();
+            assert_eq!(
+                failure.message_with("studio", Some(reason)),
+                "Someone else is signed in at studio. Sign in as that user, or switch to your \
+                 account there first.",
+                "{reason}"
+            );
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn every_console_refusal_has_its_own_headline_however_it_arrives() {
+        use crate::runtime::session::ConnectSmokeError;
+        let credentials = SignInFailure::CredentialsRefused.message("studio");
+        let mut headlines = std::collections::HashSet::new();
+        for refusal in ConsoleRefusal::ALL {
+            let reason = refusal.deck_reason();
+            let arrivals = [
+                (refused(reason), SignInStage::Attempt, false),
+                (
+                    crate::runtime::session::session_end_for(&ConnectSmokeError::ClosedByHost(
+                        format!(": {reason}"),
+                    )),
+                    SignInStage::Attempt,
+                    false,
+                ),
+                (
+                    crate::runtime::session::session_end_for(
+                        &ConnectSmokeError::SessionSetupFailed(reason.to_owned()),
+                    ),
+                    SignInStage::Attempt,
+                    false,
+                ),
+                (
+                    crate::runtime::session::SessionEnd {
+                        reason: crate::runtime::session::DisconnectReason::Terminal(
+                            crate::runtime::session::TerminalDisconnect::GracefulHostClose,
+                        ),
+                        message: format!("Host closed the session: {reason}"),
+                        observed_at: std::time::Instant::now(),
+                    },
+                    SignInStage::Session,
+                    true,
+                ),
+            ];
+            for (end, stage, ended) in arrivals {
+                let failure = SignInFailure::from_end(&end, stage).unwrap();
+                assert_eq!(
+                    failure,
+                    SignInFailure::ConsoleRefused { refusal, ended },
+                    "{}",
+                    end.message
+                );
+                let message = failure.message_with("studio", Some(&end.message));
+                assert_ne!(message, credentials, "{refusal:?}");
+                assert!(
+                    !message.contains("console_") && message.contains("studio"),
+                    "{message}"
+                );
+                if ended {
+                    assert_eq!(failure.field(), None, "a box says a session ended");
+                }
+                headlines.insert(message);
+            }
+        }
+        // One headline per refusal and per sign-in or session.
+        assert_eq!(headlines.len(), 2 * ConsoleRefusal::ALL.len());
+        // A longer code is never read as the one it starts with.
+        assert_eq!(
+            console_refusal("console_other_user_other_product: x"),
+            Some(ConsoleRefusal::OtherUserOtherProduct)
+        );
+        assert_eq!(console_refusal("not_console_other_user: x"), None);
+        assert_eq!(console_refusal("console_unknown_future: x"), None);
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn a_host_that_could_not_keep_its_screen_private_says_so_plainly() {
+        let reason = "console_privacy_unavailable: the workstation's screens, speakers and input \
+                      could not be made private.";
+        let end = crate::runtime::session::SessionEnd {
+            reason: crate::runtime::session::DisconnectReason::Terminal(
+                crate::runtime::session::TerminalDisconnect::GracefulHostClose,
+            ),
+            message: format!("Host closed the session: {reason}"),
+            observed_at: std::time::Instant::now(),
+        };
+        let failure = SignInFailure::from_end(&end, SignInStage::Session).unwrap();
+        let mut state = SignInState::default();
+        let _ = state.return_home(failure, selected(""), Some(end_detail(&end)));
+        let shown = state.acknowledgement().expect("a box");
+        assert_eq!(
+            shown.message,
+            "studio.example.internal couldn\u{2019}t keep its screen private, so it ended the \
+             session."
+        );
+        assert_eq!(
+            shown.detail.as_deref(),
+            Some(format!("Host closed the session: {reason}").as_str())
+        );
+        assert_eq!(
+            SignInFailure::from_end(&refused(reason), SignInStage::Attempt)
+                .unwrap()
+                .message("studio"),
+            "studio couldn\u{2019}t keep its screen private, so it didn\u{2019}t connect."
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn only_a_credential_refusal_says_wrong_username_or_password() {
+        use crate::runtime::session::ConnectSmokeError;
+        // Every Pier's wrong-password words, and a host that said nothing.
+        for reason in [
+            "Authentication failed",
+            "Authentication failed: wrong user name or password, or this account may not sign \
+             in at this workstation.",
+            "Invalid credentials",
+            "the username or password is incorrect",
+            "the username or password is not valid text",
+            "",
+        ] {
+            assert_eq!(
+                SignInFailure::from_end(&refused(reason), SignInStage::Attempt),
+                Some(SignInFailure::CredentialsRefused),
+                "{reason:?}"
+            );
+        }
+        let at = |end: &crate::runtime::session::SessionEnd| {
+            SignInFailure::from_end(end, SignInStage::Attempt).unwrap()
+        };
+        let session_end_for = crate::runtime::session::session_end_for;
+        for (end, failure, message) in [
+            (
+                refused(arcen_session::auth_throttle::THROTTLED_MESSAGE),
+                SignInFailure::TooManyAttempts,
+                "Too many failed sign-ins. Wait a few minutes, then try again.",
+            ),
+            (
+                refused("this account may not sign in here"),
+                SignInFailure::AccountNotAllowed,
+                "This account may not sign in at studio.",
+            ),
+            (
+                refused("another session is already using this Mac"),
+                SignInFailure::HostBusy,
+                "Another session is already using studio.",
+            ),
+            (
+                refused("authentication policy is unavailable on this host"),
+                SignInFailure::SignInUnavailable,
+                "studio can\u{2019}t take a sign-in right now. Try again later.",
+            ),
+            (
+                refused("Remote sign-in is unavailable: console takeover could not be completed."),
+                SignInFailure::SignInUnavailable,
+                "studio can\u{2019}t take a sign-in right now. Try again later.",
+            ),
+            (
+                session_end_for(&ConnectSmokeError::AuthDeclined),
+                SignInFailure::NoticeDeclined,
+                "You declined studio\u{2019}s notice, so Arcen didn\u{2019}t sign in.",
+            ),
+            (
+                session_end_for(&ConnectSmokeError::DisclaimerRequired),
+                SignInFailure::NoticeRequired,
+                "studio asks you to accept a notice before signing in. Connect from Home to read \
+                 it.",
+            ),
+            (
+                refused("display request: 9 monitors exceed this host's limit of 4"),
+                SignInFailure::HostRefused,
+                "studio refused the sign-in. Its reason is under Details.",
+            ),
+        ] {
+            assert_eq!(at(&end), failure, "{}", end.message);
+            assert_eq!(failure.message("studio"), message);
+        }
+        // A resume the host refuses for the password still asks to sign in
+        // again, as before.
+        assert_eq!(
+            SignInFailure::from_end(&refused("Authentication failed"), SignInStage::Session),
+            Some(SignInFailure::SessionEnded)
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn each_host_refusal_reason_has_its_own_class_and_none_is_a_password() {
+        for refusal in ConsoleRefusal::ALL {
+            let read = HostRefusal::from_reason(refusal.deck_reason());
+            assert_eq!(read, Some(HostRefusal::Console(refusal)));
+            assert_eq!(read.unwrap().reason_class(), refusal.token());
+        }
+        assert_eq!(
+            HostRefusal::from_reason("Another session is already using this Mac"),
+            Some(HostRefusal::Busy)
+        );
+        assert_eq!(HostRefusal::Busy.reason_class(), "host_busy");
+        for occupied in [
+            arcen_session::x11_seat::DECK_REASON_SEAT_OCCUPIED,
+            arcen_session::x11_seat::DECK_REASON_SEAT_OTHER_PRODUCT,
+            "Another remote-desktop service (labrdp) holds this host's display. Sign out of it \
+             first.",
+        ] {
+            assert_eq!(
+                HostRefusal::from_reason(occupied),
+                Some(HostRefusal::SeatOccupied),
+                "{occupied}"
+            );
+        }
+        assert_eq!(HostRefusal::SeatOccupied.reason_class(), "seat_occupied");
+        for not_the_host in [
+            "",
+            "Authentication failed",
+            "Invalid credentials",
+            "the username or password is incorrect",
+            "this account may not sign in here",
+            arcen_session::auth_throttle::THROTTLED_MESSAGE,
+            "not_console_other_user: x",
+        ] {
+            assert_eq!(
+                HostRefusal::from_reason(not_the_host),
+                None,
+                "{not_the_host:?}"
+            );
+        }
+        // What each says on Home, by stage.
+        assert_eq!(
+            HostRefusal::SeatOccupied.sign_in_failure(SignInStage::Attempt),
+            SignInFailure::HostBusy
+        );
+        assert_eq!(
+            HostRefusal::Console(ConsoleRefusal::OtherUser).sign_in_failure(SignInStage::Session),
+            SignInFailure::ConsoleRefused {
+                refusal: ConsoleRefusal::OtherUser,
+                ended: true,
+            }
+        );
+    }
+
+    #[test]
+    fn only_what_waiting_cannot_change_is_definite() {
+        let console = |refusal| SignInFailure::ConsoleRefused {
+            refusal,
+            ended: false,
+        };
+        for definite in [
+            SignInFailure::CredentialsRefused,
+            SignInFailure::TooManyAttempts,
+            SignInFailure::AccountNotAllowed,
+            SignInFailure::NoticeDeclined,
+            SignInFailure::HostRefused,
+            SignInFailure::HostIdentityChanged,
+            console(ConsoleRefusal::OtherUser),
+            console(ConsoleRefusal::OtherUserOtherProduct),
+            console(ConsoleRefusal::AccountDenied),
+            console(ConsoleRefusal::InUseOtherProduct),
+        ] {
+            assert!(definite.is_definite(), "{definite:?}");
+        }
+        for passing in [
+            SignInFailure::HostBusy,
+            SignInFailure::Unreachable,
+            SignInFailure::HostClosedConnection,
+            SignInFailure::SessionNotStarted,
+            SignInFailure::SignInUnavailable,
+            console(ConsoleRefusal::NoConsoleSession),
+            console(ConsoleRefusal::SessionUnreachable),
+            console(ConsoleRefusal::SessionChanged),
+        ] {
+            assert!(!passing.is_definite(), "{passing:?}");
         }
     }
 

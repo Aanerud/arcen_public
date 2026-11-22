@@ -19,7 +19,7 @@ use arcen_input::keyboard::{KeyboardSettings, ShortcutPreference};
 use arcen_input::text::{OptionKeyPreference, TypingMode};
 
 use crate::config::SavedConnectionSummary;
-use crate::settings::{ClientSettings, DisplaysMode};
+use crate::settings::{ClientSettings, DisplaysMode, SystemShortcutCapture, SystemShortcutRoute};
 
 /// A connection's value for one setting: the application default, or its
 /// own.
@@ -103,22 +103,29 @@ pub enum OverridableSetting {
     /// only withhold the clipboard: the user's consent in Settings is the
     /// ceiling ([`ConnectionOverrides::effective_clipboard_enabled`]).
     ClipboardEnabled,
+    /// Whether the system shortcuts go to the remote computer (Settings ›
+    /// Input › Keyboard). The Accessibility permission a Mac needs for them
+    /// stays one for the whole app.
+    SystemShortcuts,
 }
 
 impl OverridableSetting {
     /// Every overridable setting.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::TypingMode,
         Self::OptionKeys,
         Self::KeyboardShortcuts,
         Self::DisplaysMode,
         Self::ClipboardEnabled,
+        Self::SystemShortcuts,
     ];
 
     /// The key, the same in `settings.json`, in a saved connection's
     /// `settings` object and in a connection profile file.
     /// `keyboard_shortcuts` has no application-wide setting yet; its
-    /// default is [`ShortcutPreference::Automatic`].
+    /// default is [`ShortcutPreference::Automatic`]. `system_shortcuts` is
+    /// one switch over two application-wide keys
+    /// ([`SystemShortcutCapture`]), so it has a key of its own.
     #[must_use]
     pub const fn key(self) -> &'static str {
         match self {
@@ -127,6 +134,7 @@ impl OverridableSetting {
             Self::KeyboardShortcuts => "keyboard_shortcuts",
             Self::DisplaysMode => "displays_mode",
             Self::ClipboardEnabled => "clipboard_enabled",
+            Self::SystemShortcuts => "system_shortcuts",
         }
     }
 }
@@ -147,6 +155,8 @@ pub struct ConnectionOverrides {
     pub displays_mode: Override<DisplaysMode>,
     /// The clipboard; see [`Self::effective_clipboard_enabled`].
     pub clipboard_enabled: Override<bool>,
+    /// Whether the system shortcuts go to the remote computer.
+    pub system_shortcuts: Override<bool>,
 }
 
 impl ConnectionOverrides {
@@ -159,6 +169,7 @@ impl ConnectionOverrides {
             OverridableSetting::KeyboardShortcuts => self.keyboard_shortcuts.is_own(),
             OverridableSetting::DisplaysMode => self.displays_mode.is_own(),
             OverridableSetting::ClipboardEnabled => self.clipboard_enabled.is_own(),
+            OverridableSetting::SystemShortcuts => self.system_shortcuts.is_own(),
         }
     }
 
@@ -177,6 +188,9 @@ impl ConnectionOverrides {
             OverridableSetting::ClipboardEnabled => {
                 self.effective_clipboard_enabled(app.clipboard_enabled)
                     .source
+            }
+            OverridableSetting::SystemShortcuts => {
+                self.effective_system_shortcuts(app.system_shortcuts).source
             }
         }
     }
@@ -226,6 +240,28 @@ impl ConnectionOverrides {
         }
     }
 
+    /// Whether the system shortcuts go to the remote computer, given the
+    /// application-wide switch.
+    #[must_use]
+    pub fn effective_system_shortcuts(&self, app: bool) -> Effective<bool> {
+        self.system_shortcuts.resolve(app)
+    }
+
+    /// The system-shortcut settings a session applies on `route`: the
+    /// application-wide ones, with this connection's switch over them.
+    #[must_use]
+    pub fn system_shortcut_capture(
+        &self,
+        app: SystemShortcutCapture,
+        route: SystemShortcutRoute,
+    ) -> SystemShortcutCapture {
+        let mut capture = app;
+        if let Override::Own(on) = self.system_shortcuts {
+            capture.set_to_host(route, on);
+        }
+        capture
+    }
+
     /// The keyboard settings a session applies: Command from this
     /// connection, everything else the platform's.
     #[must_use]
@@ -237,7 +273,8 @@ impl ConnectionOverrides {
         }
     }
 
-    /// `app` with this connection's values in force.
+    /// `app` with this connection's values in force. The system shortcuts
+    /// depend on the Deck's route ([`Self::system_shortcut_capture`]).
     #[must_use]
     pub fn apply_to(&self, app: &ClientSettings) -> ClientSettings {
         ClientSettings {
@@ -285,12 +322,18 @@ impl ConnectionOverrides {
             OverridableSetting::ClipboardEnabled,
             serde_json::Value::as_bool,
         );
+        let system_shortcuts = take(
+            object,
+            OverridableSetting::SystemShortcuts,
+            serde_json::Value::as_bool,
+        );
         Self {
             typing_mode: typing_mode.into(),
             option_keys: option_keys.into(),
             keyboard_shortcuts: keyboard_shortcuts.into(),
             displays_mode: displays_mode.into(),
             clipboard_enabled: clipboard_enabled.into(),
+            system_shortcuts: system_shortcuts.into(),
         }
     }
 
@@ -307,6 +350,7 @@ impl ConnectionOverrides {
             OverridableSetting::ClipboardEnabled => {
                 self.clipboard_enabled != other.clipboard_enabled
             }
+            OverridableSetting::SystemShortcuts => self.system_shortcuts != other.system_shortcuts,
         }
     }
 
@@ -362,6 +406,10 @@ impl ConnectionOverrides {
             OverridableSetting::ClipboardEnabled,
             self.clipboard_enabled.own().map(serde_json::Value::Bool),
         );
+        put(
+            OverridableSetting::SystemShortcuts,
+            self.system_shortcuts.own().map(serde_json::Value::Bool),
+        );
     }
 }
 
@@ -407,24 +455,31 @@ pub struct AppDefaults {
     /// Settings › Input › Clipboard: the user's consent, which no
     /// connection can exceed.
     pub clipboard_enabled: bool,
+    /// Settings › Input › Keyboard: whether the system shortcuts go to the
+    /// remote computer on this Deck
+    /// ([`ClientSettings::system_shortcuts_to_host`]).
+    pub system_shortcuts: bool,
 }
 
 impl AppDefaults {
-    /// The defaults in `settings`.
+    /// The defaults in `settings`, on a Deck whose system shortcuts take
+    /// `route`.
     #[must_use]
-    pub const fn from_settings(settings: &ClientSettings) -> Self {
+    pub fn from_settings(settings: &ClientSettings, route: SystemShortcutRoute) -> Self {
         Self {
             typing_mode: stored_typing_mode(settings.typing_mode),
             option_keys: settings.option_key_mode,
             displays_mode: settings.displays_mode,
             clipboard_enabled: settings.clipboard_enabled,
+            system_shortcuts: settings.system_shortcuts_to_host(route),
         }
     }
 }
 
+/// A Mac Deck's defaults.
 impl Default for AppDefaults {
     fn default() -> Self {
-        Self::from_settings(&ClientSettings::default())
+        Self::from_settings(&ClientSettings::default(), SystemShortcutRoute::MacEventTap)
     }
 }
 
@@ -521,6 +576,7 @@ mod tests {
             keyboard_shortcuts: Override::Own(ShortcutPreference::WindowsApp),
             displays_mode: Override::Own(DisplaysMode::SinglePrimary),
             clipboard_enabled: Override::Own(false),
+            system_shortcuts: Override::Own(true),
         };
         let json = serde_json::to_value(overrides).unwrap();
         assert_eq!(
@@ -531,6 +587,7 @@ mod tests {
                 "keyboard_shortcuts": "windows_app",
                 "displays_mode": "single_primary",
                 "clipboard_enabled": false,
+                "system_shortcuts": true,
             })
         );
         assert_eq!(
@@ -639,6 +696,88 @@ mod tests {
     }
 
     #[test]
+    fn a_connections_system_shortcuts_switch_wins_on_each_route() {
+        use arcen_input::keyboard::KeyboardCapturePolicy;
+        let app = SystemShortcutCapture::from_settings(&ClientSettings::default());
+        let on = ConnectionOverrides {
+            system_shortcuts: Override::Own(true),
+            ..ConnectionOverrides::default()
+        };
+        let off = ConnectionOverrides {
+            system_shortcuts: Override::Own(false),
+            ..ConnectionOverrides::default()
+        };
+        let inherit = ConnectionOverrides::default();
+        for route in [
+            SystemShortcutRoute::MacEventTap,
+            SystemShortcutRoute::PcKeyboardHook,
+        ] {
+            assert!(on.system_shortcut_capture(app, route).to_host(route));
+            assert!(!off.system_shortcut_capture(app, route).to_host(route));
+            assert_eq!(inherit.system_shortcut_capture(app, route), app);
+        }
+        // Off on a Mac leaves the keyboard policy alone: only the tap goes.
+        assert_eq!(
+            off.system_shortcut_capture(app, SystemShortcutRoute::MacEventTap)
+                .keyboard_capture,
+            KeyboardCapturePolicy::Host
+        );
+        // On over Settings' "this computer" takes them for this connection.
+        let this_computer = SystemShortcutCapture {
+            capture_mac_system_shortcuts: false,
+            keyboard_capture: KeyboardCapturePolicy::ThisComputer,
+        };
+        assert!(
+            on.system_shortcut_capture(this_computer, SystemShortcutRoute::MacEventTap)
+                .to_host(SystemShortcutRoute::MacEventTap)
+        );
+        assert_eq!(
+            on.effective_system_shortcuts(false),
+            Effective {
+                value: true,
+                source: SettingSource::ThisConnection
+            }
+        );
+        let mac = AppDefaults::default();
+        assert!(!mac.system_shortcuts);
+        let pc = AppDefaults::from_settings(
+            &ClientSettings::default(),
+            SystemShortcutRoute::PcKeyboardHook,
+        );
+        assert!(pc.system_shortcuts);
+        let connection = |overrides| SavedConnectionSummary {
+            settings: crate::config::SavedConnectionSettings {
+                overrides,
+                ..crate::config::SavedConnectionSettings::default()
+            },
+            ..test_connection()
+        };
+        assert_eq!(
+            connections_with_own(
+                &[connection(on), connection(off), connection(inherit)],
+                mac,
+                OverridableSetting::SystemShortcuts
+            ),
+            2
+        );
+    }
+
+    fn test_connection() -> SavedConnectionSummary {
+        SavedConnectionSummary {
+            id: "id".to_owned(),
+            kind: crate::config::ConnectionKind::DirectMachine,
+            name: "name".to_owned(),
+            host: "203.0.113.10".to_owned(),
+            port: 18_444,
+            use_tls: true,
+            transport: crate::config::SavedTransport::Quic,
+            identity_security_mode: None,
+            settings: crate::config::SavedConnectionSettings::default(),
+            unknown: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
     fn always_characters_is_stored_as_characters() {
         let mut object = serde_json::json!({"typing_mode": "characters"})
             .as_object()
@@ -656,13 +795,16 @@ mod tests {
     }
 
     #[test]
-    fn every_key_but_the_command_key_is_a_settings_json_key() {
+    fn every_key_but_the_command_key_and_the_shortcuts_switch_is_a_settings_json_key() {
         let mut written = serde_json::Map::new();
         crate::config::write_client_settings_into(&ClientSettings::default(), &mut written);
         for setting in OverridableSetting::ALL {
             assert_eq!(
                 written.get(setting.key()).is_some(),
-                setting != OverridableSetting::KeyboardShortcuts,
+                !matches!(
+                    setting,
+                    OverridableSetting::KeyboardShortcuts | OverridableSetting::SystemShortcuts
+                ),
                 "{}",
                 setting.key()
             );

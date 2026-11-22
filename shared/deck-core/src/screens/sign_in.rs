@@ -58,24 +58,12 @@ pub fn render_disclaimer(
             });
         ui.add_space(18.0);
         ui.horizontal(|ui| {
-            if ui
-                .add_sized(
-                    [140.0, 44.0],
-                    egui::Button::new(
-                        egui::RichText::new("Accept")
-                            .color(super::theme::colours(ui).on_primary)
-                            .size(16.0),
-                    )
-                    .fill(super::theme::colours(ui).primary),
-                )
-                .clicked()
-            {
+            let width = super::widgets::button_width(ui, &["Accept", "Decline"]);
+            ui.spacing_mut().item_spacing.x = super::theme::BUTTON_GAP;
+            if super::widgets::primary_button(ui, "Accept", width).clicked() {
                 action = DisclaimerAction::Accept;
             }
-            if ui
-                .add_sized([140.0, 44.0], egui::Button::new("Decline"))
-                .clicked()
-            {
+            if super::widgets::secondary_button(ui, "Decline", width).clicked() {
                 action = DisclaimerAction::Decline;
             }
         });

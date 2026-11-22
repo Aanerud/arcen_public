@@ -25,12 +25,18 @@
 //!   (shared `lock_after_owner`).
 //! - **The attachment record**
 //!   (`~/Library/Application Support/Arcen/Pier/deck-attachment`): it names
-//!   the security session (`kCGSSessionIDKey`), the boot
+//!   the security session (`SessionGetInfo`, the audit session every
+//!   process of the login session shares), the boot
 //!   (`kern.bootsessionuuid`) and the account,
 //!   and the agent removes it after its own hand-back. An agent that starts
 //!   and finds its own session's record locks the session before it serves
 //!   anything. This covers a guard that was killed together with the agent
-//!   (an installer stopping every Arcen process) or never started.
+//!   (an installer stopping every Arcen process) or never started. It fails
+//!   closed (shared `StoredRecord`, `startup_recovery_in`): only a record
+//!   that is not there is no record, one that cannot be read locks, the
+//!   record goes only once the session is locked, and one naming another
+//!   login session of this boot and account (an agent started over SSH)
+//!   is left alone; only a new boot or account makes it stale.
 //!
 //! Not covered, between the agent's death and the lock screen (the time it
 //! takes to start the lock, well under a second): the desk's input reaches
@@ -47,7 +53,7 @@ use std::time::{Duration, Instant};
 use arcen_session::agent_relay::ConsoleHolder;
 use arcen_session::console_session::owner_death::{
     AttachmentRecord, GUARD_ARMED, GUARD_READ_LIMIT, GUARD_RELEASE, GuardEnd, OwnerGoneHost,
-    OwnerGoneOutcome, StartupRecovery, guard_end, lock_after_owner, startup_recovery,
+    OwnerGoneOutcome, StartupRecovery, guard_end, lock_after_owner, recover_record,
 };
 
 /// The agent's subcommand that runs a lock guard.
@@ -64,8 +70,8 @@ pub fn record_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/Arcen/Pier/deck-attachment"))
 }
 
-/// This process's login session as an attachment record, or `None` outside
-/// a GUI session.
+/// This process's login session as an attachment record, or `None` when
+/// the session or the boot cannot be read.
 #[must_use]
 pub fn this_session(uid: u32) -> Option<AttachmentRecord> {
     let session = crate::screen_lock::login_session_id()?;
@@ -103,10 +109,10 @@ fn boot_session() -> Option<String> {
     }
 }
 
-/// Writes the record, readable only by the account, replacing any.
-fn write_record(record: &AttachmentRecord) -> Result<PathBuf, String> {
+/// Writes the record at `path`, readable only by the account, replacing
+/// any.
+fn write_record(path: PathBuf, record: &AttachmentRecord) -> Result<PathBuf, String> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    let path = record_path().ok_or("no home directory")?;
     let directory = path.parent().ok_or("no record directory")?;
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     let staging = path.with_extension("new");
@@ -122,17 +128,6 @@ fn write_record(record: &AttachmentRecord) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?;
     std::fs::rename(&staging, &path).map_err(|error| error.to_string())?;
     Ok(path)
-}
-
-/// Reads the record, if there is one. A record larger than any record is
-/// read as unreadable (so it locks).
-fn read_record(path: &std::path::Path) -> Option<String> {
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(512)
-        .read_to_string(&mut text)
-        .map_or_else(|_| Some(String::new()), |_| Some(text))
 }
 
 /// The guard over one Deck's attachment, held by the agent from the
@@ -153,7 +148,10 @@ impl LockGuard {
     #[must_use]
     pub fn arm(uid: u32, private: bool) -> Self {
         let record = if let Some(session) = this_session(uid) {
-            match write_record(&session) {
+            match record_path()
+                .ok_or_else(|| "no home directory".to_owned())
+                .and_then(|path| write_record(path, &session))
+            {
                 Ok(path) => Some(path),
                 Err(error) => {
                     tracing::error!(
@@ -432,7 +430,7 @@ pub fn run(arguments: &[String]) -> ExitCode {
         "lock-guard: departure=agent_failed outcome={}",
         outcome_token(outcome)
     );
-    if outcome == OwnerGoneOutcome::Locked {
+    if outcome.clears_record() {
         if let Some(path) = record_path() {
             let _ = std::fs::remove_file(path);
         }
@@ -441,48 +439,42 @@ pub fn run(arguments: &[String]) -> ExitCode {
 }
 
 /// What an agent starting in a user's session does about a Deck the agent
-/// before it was serving: locks the session first when this session's
-/// record says one was attached (the desk darkened meanwhile when
-/// `private`), and removes the record. Returns what it did.
+/// before it was serving (shared `recover_record`, fail-closed): locks the
+/// session first when this session's record says one was attached, or the
+/// record cannot be read (the desk darkened meanwhile when `private`); the
+/// record goes once the session is locked, or when it is of another boot or
+/// account. Returns what it did.
 #[must_use]
 pub fn recover_at_start(uid: u32, private: bool) -> StartupRecovery {
     let Some(path) = record_path() else {
         return StartupRecovery::Nothing;
     };
-    let stored = read_record(&path);
-    let recovery = match this_session(uid) {
-        Some(current) => startup_recovery(stored.as_deref(), &current),
-        None if stored.is_some() => StartupRecovery::LockFirst,
-        None => StartupRecovery::Nothing,
-    };
-    match recovery {
-        StartupRecovery::Nothing => {}
-        StartupRecovery::Stale => {
-            let _ = std::fs::remove_file(&path);
-        }
-        StartupRecovery::LockFirst => {
-            tracing::warn!(
-                target: arcen_telemetry::names::target::SESSION,
-                departure = "agent_failed",
-                "the agent before this one ended while a Deck was attached; locking the session first"
-            );
-            let outcome = lock_after_owner(&mut MacOwnerGoneHost::new(uid, private), private);
-            if outcome == OwnerGoneOutcome::GaveBackUnlocked {
-                tracing::error!(
-                    target: arcen_telemetry::names::target::SESSION,
-                    "the session would not lock; the desk has it back unlocked"
-                );
-            } else {
-                tracing::info!(
-                    target: arcen_telemetry::names::target::SESSION,
-                    outcome = outcome_token(outcome),
-                    "the session left by the agent before this one is handed back"
-                );
-            }
-            let _ = std::fs::remove_file(&path);
-        }
+    let done = recover_record(&path, this_session(uid).as_ref(), || {
+        tracing::warn!(
+            target: arcen_telemetry::names::target::SESSION,
+            departure = "agent_failed",
+            "the agent before this one ended while a Deck was attached; locking the session first"
+        );
+        lock_after_owner(&mut MacOwnerGoneHost::new(uid, private), private)
+    });
+    match (done.recovery, done.locked) {
+        (StartupRecovery::LeaveAlone, _) => tracing::info!(
+            target: arcen_telemetry::names::target::SESSION,
+            "the Deck attachment record names another login session; it is left for that session"
+        ),
+        (_, Some(outcome)) if !done.removed => tracing::error!(
+            target: arcen_telemetry::names::target::SESSION,
+            outcome = outcome_token(outcome),
+            "the session is not locked; the Deck attachment record stays so the next start locks it"
+        ),
+        (_, Some(outcome)) => tracing::info!(
+            target: arcen_telemetry::names::target::SESSION,
+            outcome = outcome_token(outcome),
+            "the session left by the agent before this one is handed back"
+        ),
+        _ => {}
     }
-    recovery
+    done.recovery
 }
 
 #[cfg(test)]
@@ -503,6 +495,72 @@ mod tests {
         let boot = boot_session().expect("kern.bootsessionuuid");
         assert_eq!(boot_session().as_deref(), Some(boot.as_str()));
         assert!(AttachmentRecord::new("1", &boot, 1).is_some(), "{boot}");
+    }
+
+    /// A directory beside the test binary, removed by the caller.
+    fn scratch(name: &str) -> PathBuf {
+        let binary = std::env::current_exe().expect("test binary");
+        let directory = binary
+            .parent()
+            .expect("binary directory")
+            .join(format!("arcen-lock-guard-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("scratch created");
+        directory
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_agent_records_its_session_and_the_agent_after_it_locks_first() {
+        use arcen_session::console_session::owner_death::{StoredRecord, startup_recovery_in};
+        use std::os::unix::fs::PermissionsExt as _;
+        let uid = crate::service::current_uid();
+        // Read through `kCGSSessionIDKey`, which the session dictionary does
+        // not carry, this was `None` in every process and no record was
+        // ever written.
+        let session = this_session(uid).expect("this process's login session");
+        let directory = scratch("record");
+        let path = directory.join("deck-attachment");
+        assert_eq!(
+            startup_recovery_in(&StoredRecord::read(&path), Some(&session)),
+            StartupRecovery::Nothing
+        );
+
+        let written = write_record(path.clone(), &session).expect("record written");
+        assert_eq!(written, path);
+        let mode = std::fs::metadata(&path)
+            .expect("record")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // The agent launchd starts next runs in the same login session.
+        let restarted = this_session(uid).expect("the same login session");
+        assert_eq!(restarted, session);
+        assert_eq!(
+            startup_recovery_in(&StoredRecord::read(&path), Some(&restarted)),
+            StartupRecovery::LockFirst
+        );
+        std::fs::remove_dir_all(&directory).expect("scratch removed");
+    }
+
+    #[test]
+    fn a_record_behind_a_symlink_loop_locks_and_stays() {
+        use arcen_session::console_session::owner_death::StoredRecord;
+        let directory = scratch("looped");
+        let looped = directory.join("deck-attachment");
+        // Opening it fails with ELOOP, not NotFound.
+        std::os::unix::fs::symlink(&looped, &looped).expect("symlink");
+        assert_eq!(StoredRecord::read(&looped), StoredRecord::Unreadable);
+        let current = AttachmentRecord::new("100017", "6F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0", 501)
+            .expect("record");
+        let done = recover_record(&looped, Some(&current), || {
+            OwnerGoneOutcome::GaveBackUnlocked
+        });
+        assert_eq!(done.recovery, StartupRecovery::LockFirst);
+        assert!(!done.removed);
+        assert!(std::fs::symlink_metadata(&looped).is_ok());
+        std::fs::remove_dir_all(&directory).expect("scratch removed");
     }
 
     #[test]

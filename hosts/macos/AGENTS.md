@@ -170,6 +170,34 @@ commit): 337 characters in four commits, 20 key events, read back from the
 text view as exactly the string sent. Do not run that test without the
 target pid: the events go to whatever is in front.
 
+**Keys under Secure Event Input.** A key event from
+`CGEventCreateKeyboardEvent` carries the string its key code types with no
+modifier, and `CGEventSetFlags` does not change it: Shift+C carries `c`
+(measured, and pinned by `a_shifted_key_carries_the_layout_text_it_is_given`).
+Ordinary text views translate the key code and flags again and type `C`; a
+field holding Secure Event Input, such as the lock screen's password field,
+reads the string. On 0.20.7 a Deck typing "Keys only" was refused twice at
+the lab Pier's lock screen with a password it typed correctly through the
+login window's virtual HID keyboard minutes later, and Characters typing
+(the string is the text) signed in at the same lock screen. So while
+`IsSecureEventInputEnabled` reads true, a key pressed with Shift alone
+carries what the session's layout types at its Shift level when that
+differs from the unmodified level (the `keymap-watch` notice, shared
+`PostedKeyText`; the watcher now runs for every session that posts keys,
+not only for a Deck told `host_keymap`). Nothing else gets a string:
+Secure Event Input is system-wide (Secure Keyboard Entry, password
+managers), an explicit string is taken as is, and the key after a dead key
+(or an Option chord, which may be one) must be left for the system to
+compose (`¨` then `u` is `ü`). Not covered yet: Option layers at the lock
+screen (the notice describes no Option level) and Caps Lock on. The login window
+types through the virtual HID keyboard and never needed this.
+Measured after the change, on macOS 26.5: Terminal with Secure Keyboard
+Entry reads `AbC1xyZ9` exactly, but the **lock screen still rejects** a
+password with capitals typed from either Deck (every character arrives as a
+dot), while the login window accepts it. The lock screen probably reads the
+key code and the system's own Shift state and ignores the event's string;
+that is unconfirmed, and it is a known issue, not fixed.
+
 **Host health for the Deck.** Every two seconds the stream sends
 `health_stats` built from `arcen_telemetry::HostWindowTracker` and
 `assess_health`. ScreenCaptureKit is damage-driven, so the frame rate is
@@ -743,9 +771,19 @@ answered while somebody is logged in.
   darkens the desk (when the desk was private), locks, proves the lock and
   gives the displays back. The agent also writes
   `~/Library/Application Support/Arcen/Pier/deck-attachment`, naming the
-  `kCGSSessionIDKey` session, `kern.bootsessionuuid` and the uid. A
-  restarted agent that finds its own session's record locks before it
-  serves anything. Between the death and the lock screen the desk's input
+  security session (public `SessionGetInfo(callerSecuritySession)`: the
+  audit session every process of the login session shares, and the `asid`
+  of launchd's `gui/<uid>` domain a restarted agent starts in),
+  `kern.bootsessionuuid` and the uid. A restarted agent that finds its own
+  session's record locks before it serves anything (shared
+  `startup_recovery_in`). It fails closed: only a missing record is no
+  record (any other read error locks), the record is removed only once the
+  session is locked, and a record of another login session of this boot
+  and account (an agent started over SSH) is left alone; only a new boot or
+  account makes it stale. Until 0.20.8 the session was read from
+  `CGSessionCopyCurrentDictionary`'s `kCGSSessionIDKey`, which that
+  dictionary does not carry (measured on macOS 26), so no record was ever
+  written. Between the death and the lock screen the desk's input
   is not filtered, because the tap's Accessibility grant is the agent's.
 * **Awake while serving.** Every connection declares user activity first (a
   sleeping display is not an active one, and the inventory would be empty),
@@ -766,8 +804,12 @@ answered while somebody is logged in.
   ones (vendor `0x3456`), read back, re-asserted every 100 ms; a display
   lit for 2 s ends the session (shared `PrivacyWatch`). Hand-back: lock
   (retried every 5 s, at most `UNLOCKED_GRACE`), displays, sound, input; a
-  console held by another account for three readings gets the desk back and
-  ends the session; a panic locks first. Both die with the process; the
+  console that leaves the account for three readings gets the desk back and
+  ends the session with what the shared `WatchVerdict::deck_refusal` says:
+  `console_other_user` (naming the account) when another account holds it,
+  `console_session_changed` when the login window does, never
+  `console_privacy_unavailable`, which is only for a display that stayed
+  lit; a panic locks first. Both die with the process; the
   lock guard below locks the session after them. Not covered: Secure Event Input hides keystrokes
   from taps; Siri, Voice Control and dictation act through accessibility;
   DisplayLink/Sidecar/AirPlay displays are fed by capture. `probe-desk-privacy [--listen S] [--blank S

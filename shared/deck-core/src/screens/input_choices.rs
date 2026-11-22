@@ -180,11 +180,18 @@ pub const CLIPBOARD_HEADING: &str = "Clipboard";
 /// The user's consent to share the clipboard.
 pub const CLIPBOARD_TITLE: &str = "Share the clipboard with remote computers";
 
+/// The line under a switch a connection can override: how many
+/// connections keep their own, none while every one follows it.
+#[must_use]
+pub fn use_their_own_line(own: usize) -> Option<String> {
+    (own > 0).then(|| connections_use_their_own(own))
+}
+
 /// The line under the clipboard switch: how many connections keep their
 /// own (a connection profile can only withhold the clipboard).
 #[must_use]
 pub fn clipboard_line(own: usize) -> Option<String> {
-    (own > 0).then(|| connections_use_their_own(own))
+    use_their_own_line(own)
 }
 
 // ── Settings › Tablet ─────────────────────────────────────────────────────
@@ -499,6 +506,164 @@ pub fn displays_field(
         |mode| mode.label().to_owned(),
         |mode| displays_line(mode, platform).to_owned(),
     )
+}
+
+/// A system-shortcuts choice's title.
+#[must_use]
+pub const fn on_off_label(on: bool) -> &'static str {
+    if on { "On" } else { "Off" }
+}
+
+/// What the system shortcuts do when they stay on this computer.
+#[must_use]
+pub const fn system_shortcuts_off_line(platform: DeckPlatform) -> &'static str {
+    match platform {
+        DeckPlatform::Mac => "⌘Tab, Mission Control and other shortcuts act on this Mac.",
+        DeckPlatform::Pc => "Alt+Tab, the Windows key and other shortcuts act on this PC.",
+    }
+}
+
+/// The system shortcuts field: Settings › Input's switch, with its words,
+/// for this connection, and one line on what the value in force does. The
+/// Accessibility permission a Mac needs stays one for the whole app.
+#[must_use]
+pub fn system_shortcuts_field(
+    platform: DeckPlatform,
+    app: AppDefaults,
+    overrides: &ConnectionOverrides,
+) -> OverrideField<bool> {
+    override_field(
+        SYSTEM_SHORTCUTS_TITLE,
+        overrides.system_shortcuts,
+        app.system_shortcuts,
+        &[true, false],
+        |on| on_off_label(on).to_owned(),
+        |on| {
+            if on {
+                system_shortcuts_line(platform)
+            } else {
+                system_shortcuts_off_line(platform)
+            }
+            .to_owned()
+        },
+    )
+}
+
+// ── Home ──────────────────────────────────────────────────────────────────
+
+/// The link on Home that hands every one of a connection's own settings
+/// back to Settings.
+pub const USE_APP_DEFAULTS: &str = "Use app defaults";
+
+/// How a ⌘-key choice reads in Home's summary.
+const fn shortcut_phrase(preference: ShortcutPreference, platform: DeckPlatform) -> &'static str {
+    if let DeckPlatform::Pc = platform {
+        return match preference {
+            ShortcutPreference::WindowsApp => "Windows key is Command",
+            ShortcutPreference::Automatic
+            | ShortcutPreference::SwapCommandControl
+            | ShortcutPreference::CommandIsControl => "Ctrl is Command",
+        };
+    }
+    match preference {
+        ShortcutPreference::Automatic => "automatic ⌘ key",
+        ShortcutPreference::WindowsApp => "⌘ is the Windows key",
+        ShortcutPreference::SwapCommandControl => "⌘ and Control swapped",
+        ShortcutPreference::CommandIsControl => "⌘ is Control",
+    }
+}
+
+/// How an Option-key choice reads in Home's summary. A PC keyboard has no
+/// Option key; only a connection profile sets its `AltGr` there.
+const fn option_phrase(preference: OptionKeyPreference, platform: DeckPlatform) -> &'static str {
+    if let DeckPlatform::Pc = platform {
+        return "its own AltGr setting";
+    }
+    match preference {
+        OptionKeyPreference::Automatic => "automatic Option keys",
+        OptionKeyPreference::Chosen(OptionKeyMode::LeftAltRightCharacters) => "left Option is Alt",
+        OptionKeyPreference::Chosen(OptionKeyMode::BothAlt) => "both Option keys are Alt",
+        OptionKeyPreference::Chosen(OptionKeyMode::BothCharacters) => {
+            "both Option keys type characters"
+        }
+    }
+}
+
+/// How a Typing choice reads in Home's summary.
+const fn typing_phrase(mode: TypingMode) -> &'static str {
+    match mode {
+        TypingMode::Auto | TypingMode::Characters => "character typing",
+        TypingMode::Keys => "keys only typing",
+    }
+}
+
+/// How a Displays choice reads in Home's summary.
+const fn displays_phrase(mode: DisplaysMode) -> &'static str {
+    match mode {
+        DisplaysMode::MatchLayout => "matches your display layout",
+        DisplaysMode::SinglePrimary => "primary display only",
+        DisplaysMode::Windowed => "opens in a window",
+    }
+}
+
+/// How the system-shortcuts switch reads in Home's summary.
+const fn system_shortcuts_phrase(on: bool, platform: DeckPlatform) -> &'static str {
+    match (on, platform) {
+        (true, _) => "system shortcuts go to the remote computer",
+        (false, DeckPlatform::Mac) => "system shortcuts stay on this Mac",
+        (false, DeckPlatform::Pc) => "system shortcuts stay on this PC",
+    }
+}
+
+/// Home's one quiet line under Connect: every setting this connection keeps
+/// its own value for that differs from the app default ("This connection:
+/// Keys only typing, left Option is Alt."), in the form's order. `None`
+/// while there is none.
+#[must_use]
+pub fn own_settings_summary(
+    platform: DeckPlatform,
+    app: AppDefaults,
+    overrides: &ConnectionOverrides,
+) -> Option<String> {
+    fn differs<T: Copy>(
+        current: Override<T>,
+        app: T,
+        phrase: impl Fn(T) -> &'static str,
+    ) -> Option<&'static str> {
+        let own = current.own()?;
+        (phrase(own) != phrase(app)).then(|| phrase(own))
+    }
+    let mut phrases: Vec<&'static str> = [
+        differs(
+            overrides.keyboard_shortcuts,
+            ShortcutPreference::Automatic,
+            |preference| shortcut_phrase(preference, platform),
+        ),
+        differs(overrides.option_keys, app.option_keys, |preference| {
+            option_phrase(preference, platform)
+        }),
+        differs(overrides.typing_mode, app.typing_mode, typing_phrase),
+        differs(overrides.displays_mode, app.displays_mode, displays_phrase),
+        differs(overrides.system_shortcuts, app.system_shortcuts, |on| {
+            system_shortcuts_phrase(on, platform)
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let clipboard = overrides.effective_clipboard_enabled(app.clipboard_enabled);
+    if clipboard.source == SettingSource::ThisConnection && clipboard.value != app.clipboard_enabled
+    {
+        phrases.push("clipboard off");
+    }
+    let list = phrases.join(", ");
+    let mut letters = list.chars();
+    let first = letters.next()?;
+    Some(format!(
+        "This connection: {}{}.",
+        first.to_uppercase(),
+        letters.as_str()
+    ))
 }
 
 // ── Settings › Microphone ─────────────────────────────────────────────────
@@ -838,5 +1003,124 @@ mod tests {
             crate::settings::ClientSettings::default().security_mode,
             choices[1].value
         );
+    }
+
+    #[test]
+    fn the_system_shortcuts_field_follows_this_decks_switch_until_set() {
+        let inherit = ConnectionOverrides::default();
+        for (platform, app, default) in [
+            (DeckPlatform::Mac, false, "App default (Off)"),
+            (DeckPlatform::Pc, true, "App default (On)"),
+        ] {
+            let app = AppDefaults {
+                system_shortcuts: app,
+                ..AppDefaults::default()
+            };
+            let field = system_shortcuts_field(platform, app, &inherit);
+            assert_eq!(field.title, SYSTEM_SHORTCUTS_TITLE);
+            assert_eq!(
+                field.line,
+                if app.system_shortcuts {
+                    system_shortcuts_line(platform)
+                } else {
+                    system_shortcuts_off_line(platform)
+                }
+            );
+            assert_eq!(field.selected, default);
+            assert_eq!(
+                field
+                    .choices
+                    .iter()
+                    .map(|(value, label)| (*value, label.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    (Override::Inherit, default),
+                    (Override::Own(true), "On"),
+                    (Override::Own(false), "Off"),
+                ]
+            );
+            let off = ConnectionOverrides {
+                system_shortcuts: Override::Own(false),
+                ..ConnectionOverrides::default()
+            };
+            let field = system_shortcuts_field(platform, app, &off);
+            assert_eq!(field.selected, "Off");
+            assert_eq!(field.line, system_shortcuts_off_line(platform));
+        }
+    }
+
+    #[test]
+    fn home_sums_up_only_the_own_settings_that_differ_from_the_app_default() {
+        let app = AppDefaults::default();
+        assert_eq!(
+            own_settings_summary(DeckPlatform::Mac, app, &ConnectionOverrides::default()),
+            None
+        );
+        // Own values equal to the defaults say nothing.
+        let same = ConnectionOverrides {
+            typing_mode: Override::Own(app.typing_mode),
+            displays_mode: Override::Own(app.displays_mode),
+            keyboard_shortcuts: Override::Own(ShortcutPreference::Automatic),
+            system_shortcuts: Override::Own(app.system_shortcuts),
+            clipboard_enabled: Override::Own(true),
+            ..ConnectionOverrides::default()
+        };
+        assert_eq!(own_settings_summary(DeckPlatform::Mac, app, &same), None);
+        let own = ConnectionOverrides {
+            typing_mode: Override::Own(TypingMode::Keys),
+            option_keys: Override::Own(OptionKeyPreference::Chosen(
+                OptionKeyMode::LeftAltRightCharacters,
+            )),
+            ..ConnectionOverrides::default()
+        };
+        assert_eq!(
+            own_settings_summary(DeckPlatform::Mac, app, &own).as_deref(),
+            Some("This connection: Left Option is Alt, keys only typing.")
+        );
+        let every = ConnectionOverrides {
+            keyboard_shortcuts: Override::Own(ShortcutPreference::WindowsApp),
+            displays_mode: Override::Own(DisplaysMode::Windowed),
+            system_shortcuts: Override::Own(!app.system_shortcuts),
+            clipboard_enabled: Override::Own(false),
+            ..own
+        };
+        assert_eq!(
+            own_settings_summary(DeckPlatform::Mac, app, &every).as_deref(),
+            Some(
+                "This connection: ⌘ is the Windows key, left Option is Alt, keys only typing, \
+                 opens in a window, system shortcuts go to the remote computer, clipboard off."
+            )
+        );
+        let pc = AppDefaults {
+            system_shortcuts: true,
+            ..app
+        };
+        let off = ConnectionOverrides {
+            system_shortcuts: Override::Own(false),
+            ..ConnectionOverrides::default()
+        };
+        assert_eq!(
+            own_settings_summary(DeckPlatform::Pc, pc, &off).as_deref(),
+            Some("This connection: System shortcuts stay on this PC.")
+        );
+        // A clipboard a connection "allows" while Settings shares none is
+        // not in force, so it says nothing.
+        let allows = ConnectionOverrides {
+            clipboard_enabled: Override::Own(true),
+            ..ConnectionOverrides::default()
+        };
+        let not_sharing = AppDefaults {
+            clipboard_enabled: false,
+            ..app
+        };
+        assert_eq!(
+            own_settings_summary(DeckPlatform::Mac, not_sharing, &allows),
+            None
+        );
+        // Plain words: no middle dots, no setting keys.
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            let text = own_settings_summary(platform, app, &every).unwrap();
+            assert!(!text.contains('\u{b7}') && !text.contains('_'), "{text}");
+        }
     }
 }

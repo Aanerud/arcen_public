@@ -401,6 +401,91 @@ impl HostKeyPositions {
         let expected = if shift { shifted } else { base };
         Some(expected.as_deref() == Some(text))
     }
+
+    /// What a key at `position` types with Shift held or not.
+    fn level(&self, position: u32, shift: bool) -> KeyLevel<'_> {
+        match self.positions.get(&position) {
+            None => KeyLevel::Undescribed,
+            Some((base, shifted)) => match if shift { shifted } else { base }.as_deref() {
+                None => KeyLevel::Nothing,
+                Some(text) => KeyLevel::Types(text),
+            },
+        }
+    }
+}
+
+/// What one level of a described key position types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyLevel<'a> {
+    /// The notice does not describe the position.
+    Undescribed,
+    /// Nothing: a dead key, or no character.
+    Nothing,
+    /// These characters.
+    Types(&'a str),
+}
+
+/// The characters a key a host posts must carry itself, for a host whose
+/// focused field may read a posted key's stored string instead of
+/// translating the key (macOS under Secure Event Input:
+/// `CGEventCreateKeyboardEvent` stores what the key code types with no
+/// modifier, and Shift is only a flag). Feed every key edge the host posts,
+/// in order.
+///
+/// Text is given only where the stored string is wrong: a key pressed with
+/// Shift alone whose Shift level differs from its unmodified one. Never to
+/// the key after a key that typed nothing (a dead key, or an Option or
+/// `AltGr` chord that may be one): an explicit string is taken as is, so the
+/// operating system would not compose the accent (`¨` then `u` must stay
+/// `ü`). Key releases, other modifiers and undescribed positions get none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PostedKeyText {
+    /// The last printable key pressed typed nothing: the next one composes.
+    composing: bool,
+}
+
+impl PostedKeyText {
+    /// The text the key edge must carry (`secure`: the host's focused field
+    /// reads stored strings now), updating the dead-key state either way.
+    pub fn key<'a>(
+        &mut self,
+        positions: Option<&'a HostKeyPositions>,
+        qt_key: u32,
+        modifiers: u32,
+        pressed: bool,
+        secure: bool,
+    ) -> Option<&'a str> {
+        use arcen_protocol::keys::{KEY_ALT, KEY_ALTGR, KEY_CONTROL, KEY_META, KEY_SHIFT};
+        use arcen_protocol::keys::{MOD_ALT, MOD_SHIFT};
+        if !pressed
+            || matches!(
+                qt_key,
+                KEY_SHIFT | KEY_CONTROL | KEY_META | KEY_ALT | KEY_ALTGR | 0x0100_0024
+            )
+        {
+            return None;
+        }
+        let composing = std::mem::take(&mut self.composing);
+        let positions = positions?;
+        if modifiers & !MOD_SHIFT != 0 {
+            // An Option layer is undescribed and may hold dead keys; a
+            // Control or Command shortcut types nothing to compose with.
+            self.composing =
+                modifiers & MOD_ALT != 0 && positions.level(qt_key, false) != KeyLevel::Undescribed;
+            return None;
+        }
+        let shift = modifiers & MOD_SHIFT != 0;
+        let typed = match positions.level(qt_key, shift) {
+            KeyLevel::Undescribed => return None,
+            KeyLevel::Nothing => {
+                self.composing = true;
+                return None;
+            }
+            KeyLevel::Types(typed) => typed,
+        };
+        let differs = shift && positions.level(qt_key, false) != KeyLevel::Types(typed);
+        (secure && differs && !composing).then_some(typed)
+    }
 }
 
 /// The per-session keystroke policy.

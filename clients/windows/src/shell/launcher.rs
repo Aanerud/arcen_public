@@ -78,7 +78,8 @@ use arcen_deck_core::screens::statistics::{
 };
 use arcen_deck_core::screens::wording::DeckPlatform;
 use arcen_deck_core::settings::{
-    ClientConfigRepository, ClientSettings, DisplaysMode, SecurityMode,
+    ClientConfigRepository, ClientSettings, DisplaysMode, SecurityMode, SystemShortcutCapture,
+    SystemShortcutRoute,
 };
 use arcen_deck_core::sign_in::{SignInFailure, SignInStage, SignInState};
 use arcen_deck_core::trusted_pins::TrustedPinStore;
@@ -505,6 +506,12 @@ impl Launcher {
         self.notice = Some((std::time::Instant::now(), text));
     }
 
+    /// When the system shortcuts go to the host: the session's connection's
+    /// own switch over Settings'.
+    fn keyboard_capture(&self) -> arcen_input::keyboard::KeyboardCapturePolicy {
+        session_keyboard_capture(&self.session_overrides, &self.settings)
+    }
+
     /// The typing mode in force: the session's keyboard mode over the
     /// connection's Typing, else Settings'.
     fn typing_mode(&self) -> TypingMode {
@@ -832,7 +839,7 @@ impl Launcher {
     fn settings_changed(&mut self) {
         // Logs › Log level takes effect at once, as on the Mac.
         arcen_deck_core::logging::set_level(self.settings.log_level.profile());
-        let policy = self.settings.keyboard_capture;
+        let policy = self.keyboard_capture();
         self.window_input(|input| input.set_capture_policy(policy));
         if let Err(error) = save_client_settings(&self.repository, &self.settings) {
             self.status = format!("Settings were not saved: {error}");
@@ -958,7 +965,10 @@ impl Launcher {
             form_host: &mut self.form_host,
             form_username: &mut self.form_username,
             form_overrides: &mut self.form_overrides,
-            app_defaults: arcen_deck_core::overrides::AppDefaults::from_settings(&self.settings),
+            app_defaults: arcen_deck_core::overrides::AppDefaults::from_settings(
+                &self.settings,
+                SystemShortcutRoute::PcKeyboardHook,
+            ),
             sign_in: &mut self.sign_in,
             overlay_open: self.help.modal(),
             remember_username: &mut self.remember_username,
@@ -1234,7 +1244,7 @@ impl Launcher {
                         self.settings.tablet_mode_requested,
                         self.settings.pen_buttons,
                     ),
-                    self.settings.keyboard_capture,
+                    session_keyboard_capture(&self.session_overrides, &self.settings),
                 );
                 if let Err(error) = attached {
                     tracing::warn!(%error, "the session window's input was not attached");
@@ -1403,7 +1413,7 @@ impl Launcher {
         self.quit_hold = None;
         self.status = format!("Connection error: {}", end.message);
         // Whether a desktop was up decides the words (shared
-        // `SignInFailure::after_end`).
+        // `SignInFailure::from_end`).
         let stage = if matches!(
             self.screen,
             Screen::InSession | Screen::Reconnecting(..) | Screen::SigningIn
@@ -1466,9 +1476,9 @@ impl Launcher {
         // plain words: a refused resume asks to sign in again, as does
         // anything else that ends the attempt or session.
         let failure = if resuming {
-            SignInFailure::after_end(end.reason, SignInStage::Session)
+            SignInFailure::from_end(end, SignInStage::Session)
         } else {
-            SignInFailure::after_end(end.reason, stage)
+            SignInFailure::from_end(end, stage)
         };
         self.return_home(
             failure.unwrap_or(SignInFailure::SessionEnded),
@@ -1812,14 +1822,12 @@ impl Launcher {
 
     /// The Mac's `follow_login_window`: whether a closed session was a
     /// sign-in screen giving way to a desktop (then the reconnect is
-    /// scheduled).
+    /// scheduled). What is followed is shared
+    /// (`reconnect_flow::follows_login_window`): never a definite refusal
+    /// such as `console_other_user`.
     fn follow_login_window(&mut self, end: &SessionEnd) -> bool {
-        let followable = !matches!(
-            end.reason,
-            DisconnectReason::Terminal(
-                TerminalDisconnect::Manual | TerminalDisconnect::TlsIdentity
-            )
-        ) && self.active_connection.is_some();
+        let followable = arcen_deck_core::reconnect_flow::follows_login_window(end)
+            && self.active_connection.is_some();
         let now = self.reconnect_clock.observed_at(end.observed_at);
         let Some(handover) = self.login_window_handover.as_mut() else {
             return false;
@@ -2177,6 +2185,7 @@ impl Launcher {
 
     /// Gives a secondary window's input to the session.
     pub(super) fn attach_secondary_input(&mut self, hwnd: HWND, monitor: SessionMonitorId) {
+        let capture = self.keyboard_capture();
         let (keyboard, option_keys) = (
             self.session_overrides.keyboard_settings(),
             self.session_overrides
@@ -2186,13 +2195,9 @@ impl Launcher {
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
-        if let Err(error) = connection.attach_secondary_input(
-            hwnd,
-            monitor,
-            keyboard,
-            option_keys,
-            self.settings.keyboard_capture,
-        ) {
+        if let Err(error) =
+            connection.attach_secondary_input(hwnd, monitor, keyboard, option_keys, capture)
+        {
             tracing::warn!(%error, monitor = monitor.get(), "a secondary window's input was not attached");
         }
     }
@@ -2654,6 +2659,20 @@ impl Launcher {
 
 /// Reads the decoder's report once on its own thread (it may run D3D11
 /// probe decodes) and keeps it for the Settings screen.
+/// When a session's system shortcuts go to the host: its connection's own
+/// switch over Settings' (shared `ConnectionOverrides::system_shortcut_capture`).
+fn session_keyboard_capture(
+    overrides: &ConnectionOverrides,
+    settings: &ClientSettings,
+) -> arcen_input::keyboard::KeyboardCapturePolicy {
+    overrides
+        .system_shortcut_capture(
+            SystemShortcutCapture::from_settings(settings),
+            SystemShortcutRoute::PcKeyboardHook,
+        )
+        .keyboard_capture
+}
+
 fn probe_decode_report(
     services: &Arc<dyn DeckServices>,
 ) -> Arc<std::sync::OnceLock<arcen_deck_core::decode_report::DecodeReport>> {

@@ -65,12 +65,18 @@ fn overlay_text_and_disconnect(
         egui::FontId::proportional(14.0),
         egui::Color32::from_gray(200),
     );
-    // Disconnect button — bottom-center
+    // Disconnect, bottom centre: the shared secondary control.
+    let width = super::widgets::button_width(ui, &["Disconnect"]);
     let btn_rect = egui::Rect::from_center_size(
         egui::pos2(rect.center().x, rect.bottom() - 44.0),
-        egui::vec2(120.0, 34.0),
+        egui::vec2(width, super::theme::CONTROL_HEIGHT),
     );
-    if ui.put(btn_rect, egui::Button::new("Disconnect")).clicked() {
+    let clicked = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(btn_rect), |ui| {
+            super::widgets::secondary_button(ui, "Disconnect", width).clicked()
+        })
+        .inner;
+    if clicked {
         HeldFrameAction::Disconnect
     } else {
         HeldFrameAction::None

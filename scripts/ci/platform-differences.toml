@@ -553,6 +553,18 @@ code = [
 ]
 decision = "docs/adr/0014-quic-lanes-and-capture-contracts.md"
 
+[[difference]]
+id = "PD-040"
+area = "keyboard"
+products = ["hosts/macos"]
+difference = "While Secure Event Input is held (a password field, the lock screen), the macOS Pier gives a key pressed with Shift alone the characters the session's layout types at its Shift level (CGEventKeyboardSetUnicodeString) when they differ from its unmodified ones, never the key after a dead key, from the keymap-watch notice and the shared PostedKeyText. The Linux and Windows Piers inject the key and the operating system translates it."
+earned_by = "CGEventCreateKeyboardEvent stores the string the key code types with no modifier and CGEventSetFlags does not change it (Shift+C carries c, measured), and a field holding Secure Event Input reads that string instead of translating the key code and flags (0.20.7: Keys-only typing refused at a lock screen that accepted the same keys through virtual HID and the same Shift through committed text). uinput, libei and SendInput keys carry no string."
+code = [
+  { path = "hosts/macos/src/input/mod.rs", symbol = "fn secure_key_text" },
+  { path = "shared/input/src/text/policy.rs", symbol = "pub struct PostedKeyText" },
+]
+decision = "hosts/macos/AGENTS.md"
+
 # --- Open gaps (unearned) -------------------------------------------------------
 
 [[gap]]
