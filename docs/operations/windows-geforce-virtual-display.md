@@ -96,6 +96,22 @@ the `ArcenPier` service; or install the virtual display driver above and
 keep desk privacy on, and the Pier serves the virtual display and detaches
 the plug while a Deck is attached.
 
+### Applications that draw with OpenGL or CUDA on the display
+
+An application that draws its own interface on the GPU through OpenGL and
+CUDA, such as DaVinci Resolve, needs its window on a display the NVIDIA GPU
+drives itself. On a virtual (indirect) display, as in a Remote Desktop
+session, the window may not get the NVIDIA OpenGL driver, and Resolve's
+interface stays grey or black there while its video output card and
+control panel keep working (reported on a GeForce RTX 5090 Pier with no
+monitor attached; Blackmagic's forum reports the same under Remote
+Desktop). On such a
+PC keep a monitor or a dummy plug on the GeForce and serve the session on
+it: with desk privacy on, that is refused `desk_monitor_lit`, so set
+`"privacy": {"desk": "off"}` as above and accept that any monitor on the
+GeForce (in a machine room, for example) shows the session and its keyboard
+and mouse stay live while a Deck is attached.
+
 Pinned deskside protection (`platform.desktop.deskside.enabled`) requires
 the Deck's exact display, which a GeForce cannot provide: such a host is
 refused before anything changes, with a message naming the card.

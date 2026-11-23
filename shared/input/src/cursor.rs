@@ -374,6 +374,71 @@ pub enum HostCursorOutcome {
     ImageRefused(CursorImageError),
 }
 
+/// One output of a desktop whose single pointer a host reads directly, as
+/// the host's pointer coordinates see it: which [`HostCursor::set_output`]
+/// pixel space a cursor image on it belongs to, and the scale the image is
+/// drawn at so it shows at its desktop size in that output's stream.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointerOutput {
+    /// The host's number for the output (0: a single output).
+    pub output: u32,
+    /// That output's generation.
+    pub generation: u32,
+    /// Left, top, width and height in the host's pointer coordinates.
+    pub bounds: (f64, f64, f64, f64),
+    /// Stream pixels per pointer unit on this output.
+    pub pixels_per_unit: f64,
+}
+
+impl PointerOutput {
+    /// An output `bounds` wide in pointer units whose stream is
+    /// `stream_width` pixels wide. The scale is one when either is unknown.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn new(
+        output: u32,
+        generation: u32,
+        bounds: (f64, f64, f64, f64),
+        stream_width: u32,
+    ) -> Self {
+        let ratio = f64::from(stream_width) / bounds.2;
+        Self {
+            output,
+            generation,
+            bounds,
+            pixels_per_unit: if ratio.is_finite() && ratio > 0.0 {
+                ratio
+            } else {
+                1.0
+            },
+        }
+    }
+
+    /// Whether the pointer at `point` is on this output: inside its left
+    /// and top edges, short of its right and bottom ones.
+    #[must_use]
+    pub fn contains(&self, point: (f64, f64)) -> bool {
+        let (left, top, width, height) = self.bounds;
+        point.0 >= left && point.0 < left + width && point.1 >= top && point.1 < top + height
+    }
+}
+
+/// Which of `outputs` the pointer is on: the one containing `point`;
+/// otherwise the one it was last on (`previous`: a pointer read between
+/// outputs, or not read at all, has not moved to another one); otherwise
+/// the first. `None` only without outputs.
+#[must_use]
+pub fn output_under_pointer(
+    outputs: &[PointerOutput],
+    point: Option<(f64, f64)>,
+    previous: Option<usize>,
+) -> Option<usize> {
+    point
+        .and_then(|point| outputs.iter().position(|output| output.contains(point)))
+        .or_else(|| previous.filter(|index| *index < outputs.len()))
+        .or_else(|| (!outputs.is_empty()).then_some(0))
+}
+
 /// The cursor of a desktop with one pointer source, read directly from the
 /// host (X11 `XFixes`, Windows `GetCursorInfo`): every sample is the whole
 /// pointer state, so it needs none of [`CursorAggregate`]'s per-output
@@ -1020,6 +1085,41 @@ pub fn shape_for_x_cursor_name(name: &str) -> CursorShapeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_output_under_the_pointer_decides_the_scale_and_a_pointer_off_every_output_stays() {
+        // A 1440-point Retina display streamed at 2880 pixels, and a
+        // 1920-point display to its right streamed at 1920.
+        let outputs = [
+            PointerOutput::new(7, 0, (0.0, 0.0, 1440.0, 900.0), 2880),
+            PointerOutput::new(9, 0, (1440.0, 0.0, 1920.0, 1080.0), 1920),
+        ];
+        assert!((outputs[0].pixels_per_unit - 2.0).abs() < f64::EPSILON);
+        assert!((outputs[1].pixels_per_unit - 1.0).abs() < f64::EPSILON);
+        assert_eq!(
+            output_under_pointer(&outputs, Some((10.0, 10.0)), None),
+            Some(0)
+        );
+        // The shared edge belongs to the right-hand output.
+        assert_eq!(
+            output_under_pointer(&outputs, Some((1440.0, 10.0)), Some(0)),
+            Some(1)
+        );
+        // Below the shorter display, or unread: where it was.
+        assert_eq!(
+            output_under_pointer(&outputs, Some((100.0, 1000.0)), Some(1)),
+            Some(1)
+        );
+        assert_eq!(output_under_pointer(&outputs, None, Some(1)), Some(1));
+        assert_eq!(output_under_pointer(&outputs, None, None), Some(0));
+        assert_eq!(output_under_pointer(&outputs, None, Some(5)), Some(0));
+        assert_eq!(output_under_pointer(&[], Some((0.0, 0.0)), None), None);
+        // An output of unknown width draws at one pixel per unit.
+        assert!(
+            (PointerOutput::new(1, 0, (0.0, 0.0, 0.0, 0.0), 1920).pixels_per_unit - 1.0).abs()
+                < f64::EPSILON
+        );
+    }
 
     fn image(seed: u8, side: u32) -> CursorImage {
         let mut rgba = Vec::new();

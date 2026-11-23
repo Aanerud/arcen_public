@@ -6,6 +6,38 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-11-24
+
+Multi-monitor sessions run smoother on the macOS Pier (preview), and the Deck
+draws the Mac's own pointer. On Windows, shortcuts another app claims reach
+the host, and desk privacy rides out a brief display re-read.
+
+### macOS Pier (preview)
+
+- In Match My Layout, a busy display is no longer slowed by a still one:
+  with two displays, the active one rose from about 38 to about 56 fps.
+- The Deck draws the Mac's pointer in the Mac's own shapes, so it moves with
+  your hand, hides when the Mac hides it and comes back when you move the
+  mouse after typing.
+- **Stop Sharing** in the macOS menu bar ends the session, tells the Deck
+  "Sharing was stopped on the host." and locks the Mac; the Deck does not
+  reconnect.
+- If the Mac refuses to lock when a Deck leaves, the Pier asks again for up
+  to a minute and reports an error if it never locks.
+
+### Windows Pier
+
+- With desk privacy on, a brief moment when the displays cannot be read, as
+  when the NVIDIA Control Panel re-reads its connectors, no longer ends the
+  session. A lit monitor still ends it at once.
+
+### Windows Deck
+
+- Alt+G and other shortcuts that another app on the PC claims now reach the
+  host while system shortcuts go to the remote computer (the default).
+  Ctrl+Alt+Del, Windows+L and characters typed with AltGr work as
+  before.
+
 ## [0.20.8] — 2026-11-22
 
 Sign-in refusals say what happened: when a host turns a Deck away for a
@@ -4804,7 +4836,8 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.8-build2...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/Aanerud/arcen_public/compare/v0.20.8-build2...v0.21.0
 [0.20.8]: https://github.com/Aanerud/arcen_public/compare/v0.20.7...v0.20.8
 [0.20.7]: https://github.com/Aanerud/arcen_public/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/Aanerud/arcen_public/compare/v0.20.5...v0.20.6

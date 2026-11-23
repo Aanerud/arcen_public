@@ -23,11 +23,13 @@ pub mod detached_hold;
 pub mod domain_logon;
 pub mod foreign_service;
 pub mod greeter_token;
+pub mod lock_wait;
 pub mod login_screen;
 pub mod login_session;
 pub mod logind_read;
 pub mod owner_death;
 pub mod session_watch;
+pub mod stream_end;
 pub mod wayland_attach;
 pub mod wayland_join;
 
@@ -947,6 +949,9 @@ pub enum Departure {
     /// The session is no longer the one the Deck joined (signed out, locked
     /// at the desk, moved to another station or account).
     SessionChanged,
+    /// A person stopped the host's own capture (macOS's Stop Sharing), so
+    /// the attachment ended ([`stream_end::StreamEnd::CaptureStopped`]).
+    CaptureStopped,
 }
 
 impl Departure {
@@ -968,8 +973,22 @@ impl Departure {
             Self::AgentFailed => "agent_failed",
             Self::HandedOver => "handed_over",
             Self::SessionChanged => "session_changed",
+            Self::CaptureStopped => "capture_stopped",
         }
     }
+}
+
+/// Whether the console is still the session's account's when a departure
+/// decides to lock it, from two readings: whether the console user reads as
+/// the account, and whether the session's own record says it is on the
+/// console (`None`: no record, the session has ended). Fails closed: a
+/// console-user read that failed often looks like nobody (the login
+/// screen), so the session is still ours while either reading says so. A
+/// session that signed out (no record) or was switched away (not on the
+/// console) is not, and is left alone ([`Departure::SessionChanged`]).
+#[must_use]
+pub const fn console_still_ours(account_holds_console: bool, on_console: Option<bool>) -> bool {
+    account_holds_console || matches!(on_console, Some(true))
 }
 
 /// A local X display name (`:N` or `:N.S`) as its number, or `None` for a
@@ -1699,12 +1718,25 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_console_read_never_skips_the_lock_of_a_session_on_screen() {
+        // A failed console-user read looks like the login screen; the
+        // session's own record still says it is on screen.
+        assert!(console_still_ours(false, Some(true)));
+        assert!(console_still_ours(true, None));
+        assert!(console_still_ours(true, Some(false)));
+        // Signed out (no record) or switched away (not on the console).
+        assert!(!console_still_ours(false, None));
+        assert!(!console_still_ours(false, Some(false)));
+    }
+
+    #[test]
     fn only_a_successor_or_a_changed_session_leaves_it_unlocked() {
         for departure in [
             Departure::DeckLeft,
             Departure::ReconnectWindowEnded,
             Departure::HostStopping,
             Departure::AgentFailed,
+            Departure::CaptureStopped,
         ] {
             assert!(departure.locks_session(), "{}", departure.token());
         }

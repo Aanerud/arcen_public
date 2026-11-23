@@ -25,7 +25,10 @@ the component (`shared`, `protocol`, `media`, `linux`, `windows`, `macos-pier`,
 State an intentional compatibility break in the commit body and in
 `CHANGELOG.md`. The commit history informs release notes but does not replace
 review; user-visible changes go under `[Unreleased]` in `CHANGELOG.md` as they
-land.
+land. Write them, and the public release body, in the house style,
+[Thinking with Style](../style/thinking-with-style.md): one sentence per
+change from the user's side, grouped by product, at most about five items per
+product, under a headline of one or two sentences.
 
 ## Release manifest
 

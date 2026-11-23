@@ -97,8 +97,8 @@ pub const fn system_shortcuts_line(platform: DeckPlatform) -> &'static str {
              the keyboard."
         }
         DeckPlatform::Pc => {
-            "Alt+Tab, the Windows key and other shortcuts reach the remote computer while it \
-             has the keyboard."
+            "Alt+Tab, the Windows key and shortcuts other apps claim reach the remote computer \
+             in Remote."
         }
     }
 }
@@ -519,7 +519,10 @@ pub const fn on_off_label(on: bool) -> &'static str {
 pub const fn system_shortcuts_off_line(platform: DeckPlatform) -> &'static str {
     match platform {
         DeckPlatform::Mac => "⌘Tab, Mission Control and other shortcuts act on this Mac.",
-        DeckPlatform::Pc => "Alt+Tab, the Windows key and other shortcuts act on this PC.",
+        DeckPlatform::Pc => {
+            "Alt+Tab, the Windows key and other shortcuts act on this PC; an app that claims \
+             one gets it first."
+        }
     }
 }
 

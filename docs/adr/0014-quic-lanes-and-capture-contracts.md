@@ -1009,9 +1009,11 @@ are.
    (`CursorImage::from_icon_planes`). A screen-inverting pixel, which a
    client cursor cannot draw, becomes opaque black with a one-pixel white
    outline so the classic I-beam stays visible on dark and light content.
-   The macOS Pier has no public API that reports another process's cursor
-   (`hosts/macos/src/cursor_probe.rs` measures `currentSystemCursor`) and
-   keeps named shapes.
+   The macOS Pier reads `NSCursor.currentSystemCursor`, which reports the
+   desktop's cursor whichever process set it, draws its image into an sRGB
+   bitmap at the scale of the session display under the pointer, and reads
+   a hidden pointer from `CGCursorIsVisible` (ADR 0029 amendment 1;
+   `hosts/macos/src/cursor_probe.rs`).
 2. **One shared source for single-pointer hosts.** X11 and Windows feed
    `arcen_input::cursor::HostCursor`: stable per-desktop ids from the
    content-equal registry (no hash: two different images can never share an
@@ -1309,10 +1311,10 @@ Settings).
    preference as before and never a pointer in the video it did not ask
    for. An older Pier never answers `automatic` and serves the stored
    preference, so a Host choice keeps Host and a Local one keeps Local.
-5. **Piers.** The macOS Pier applies the rule. It sends no cursor images
-   (`NSCursor` reports the calling process's cursor, not the desktop's), so
-   it serves `host` and turns on `showsCursor` (single and Match My Layout
-   captures). The Linux and Windows Piers do not read the flag yet: they
+5. **Piers.** The macOS Pier applies the rule. It sends cursor images when
+   the Deck draws them and its agent can read the desktop cursor at sign-in
+   (ADR 0029 amendment 1), so it serves `local`; otherwise it serves `host`
+   and turns on `showsCursor` (single and Match My Layout captures). The Linux and Windows Piers do not read the flag yet: they
    serve the stored preference, with cursor images where their watchers run.
 6. **Decks.** The shared media worker turns a host-drawn result into a
    hidden Deck cursor (`DeckCursor::Hidden`), so a Windows Deck hides its

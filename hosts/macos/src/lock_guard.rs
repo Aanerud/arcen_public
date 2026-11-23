@@ -50,7 +50,6 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use arcen_session::agent_relay::ConsoleHolder;
 use arcen_session::console_session::owner_death::{
     AttachmentRecord, GUARD_ARMED, GUARD_READ_LIMIT, GUARD_RELEASE, GuardEnd, OwnerGoneHost,
     OwnerGoneOutcome, StartupRecovery, guard_end, lock_after_owner, recover_record,
@@ -327,7 +326,7 @@ impl MacOwnerGoneHost {
 
 impl OwnerGoneHost for MacOwnerGoneHost {
     fn console_is_ours(&mut self) -> bool {
-        crate::console::console_holder() == ConsoleHolder::User(self.uid)
+        crate::console::console_is_ours(self.uid)
     }
 
     fn keep_private(&mut self) {
@@ -382,6 +381,27 @@ fn outcome_token(outcome: OwnerGoneOutcome) -> &'static str {
     }
 }
 
+/// What an operator reads beside an outcome that did not lock: whether the
+/// desk is safe, and what to do when it is not.
+const fn outcome_explanation(outcome: OwnerGoneOutcome) -> Option<&'static str> {
+    match outcome {
+        OwnerGoneOutcome::Locked => None,
+        // The console left this account for consecutive readings while
+        // this session itself said it was no longer on screen: it signed
+        // out or was switched away, and either way nobody at the desk sees
+        // it without signing in.
+        OwnerGoneOutcome::NotOurs => Some(
+            "the session left the console (signed out, or another account switched in); \
+             nothing of it is on screen to lock",
+        ),
+        OwnerGoneOutcome::GaveBackUnlocked => Some(
+            "ERROR: the session would not lock after its agent ended: this Mac's desk is \
+             unlocked and signed in. Lock it at the desk (Control-Command-Q) and check that \
+             its lock screen is not turned off by policy",
+        ),
+    }
+}
+
 /// Runs `lock-guard --uid UID [--private]`: reports itself armed, waits for
 /// the agent's pipe to close, and locks the session unless the agent
 /// released it first.
@@ -430,6 +450,9 @@ pub fn run(arguments: &[String]) -> ExitCode {
         "lock-guard: departure=agent_failed outcome={}",
         outcome_token(outcome)
     );
+    if let Some(explanation) = outcome_explanation(outcome) {
+        eprintln!("lock-guard: {explanation}");
+    }
     if outcome.clears_record() {
         if let Some(path) = record_path() {
             let _ = std::fs::remove_file(path);

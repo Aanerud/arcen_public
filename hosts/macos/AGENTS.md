@@ -62,7 +62,7 @@ rather than time out. And a GUI killed mid-session must still leave a
 **Displays.** `single_primary` and `windowed` complete. Multi-monitor now has
 the wire path as well as capture: `AuthMultiMonitorOfferMsg`, requested topology
 admission, `ServerMultiMonitorMsg`, region video headers with nonzero monitor
-id / topology generation / stream epoch, and one capture/encoder path per
+id / topology generation / stream epoch, and one capture/encoder thread per
 admitted monitor. `platform.multi_monitor.advertise_enabled` still defaults
 off, and the host also requires more than one attached display before it
 advertises.
@@ -266,13 +266,26 @@ it owns the connection (`serve`, tests) and otherwise by the network service,
 which fills it into the agent's `health_stats` as it relays them
 (`relay.rs`, `with_service_path`).
 
-**Cursor images are not sent, by necessity.** Linux and Windows Piers send
-the application's cursor bitmap (`cursor_image_v1`); this host sends named
-shapes only (`cursor_probe.rs`). No public API reports another process's
-cursor image — `NSCursor.currentSystemCursor` returns the caller's own
-cursor, measured — and ScreenCaptureKit carries no cursor metadata. A Deck
-that wants the exact cursor uses host-cursor mode, where the compositor draws
-it into the picture.
+**Cursor images are sent, like on Linux and Windows** (ADR 0029 amendment 1).
+`NSCursor.currentSystemCursor` reports the desktop's cursor whichever process
+set it; `cursor_probe.rs` draws its image into an sRGB bitmap at the
+capture's pixels per point and hands it to the shared `HostCursor`, and the
+agent writes `CursorUpdate` records the relay puts on the input/cursor lane.
+Never name a cursor by comparing its bytes with `NSCursor`'s class cursors
+and conclude from the names: the window server's I-beam and resize cursors
+never byte-match AppKit's, which is how this host once "measured" that the
+cursor was always the arrow. Prove cursor claims with `probe-cursor`
+(`distinct_images`, `--passive`, `--pump`). The image keeps its last value while
+an application hides the pointer, so visibility is read separately
+(`desktop_cursor_visible`, `CGCursorIsVisible`, measured against typing,
+`NSCursor.hide`, `setHiddenUntilMouseMoves:` and `CGDisplayHideCursor`;
+posted motion never ends a `setHiddenUntilMouseMoves:` hide, so a pointer
+that moves while hidden with no button held is reported shown until the next
+key-down, `HiddenUntilMoved`), and
+each image is drawn at the scale of the display under the pointer (shared
+`output_under_pointer`). The handshake checks the cursor live
+(`desktop_cursor_images_readable`); a session that cannot read it keeps the
+pointer in the video (`showsCursor`).
 
 **Audio negotiates and no longer blocks the desktop.** Measured end to end:
 102 audio packets reached a client alongside 45 video frames. The current
@@ -818,7 +831,32 @@ answered while somebody is logged in.
   login window, not `serve` (it would lock the developer's own screen), and
   not a console another account took over (`Departure::SessionChanged`).
   There is no public unlock after a password check: a returning Deck signs
-  in at the streamed lock screen.
+  in at the streamed lock screen. A lock that is refused is asked again
+  every 5 s for at most `UNLOCKED_GRACE`, desk privacy or not (shared
+  `console_session::lock_wait`), and an ending that leaves the desk
+  unlocked is logged as an error. A private desk holds the session slot
+  for that wait, as before; a desk that was not private shows the session
+  anyway, so it offers the slot (`SessionAdmissionRuntime::offer_yield`)
+  and an authenticated Deck that finds it taken asks for it
+  (`request_yield`), waits up to `YIELD_WAIT`, and is served, ending the
+  wait. Whether the console is still this account's is read fail-closed
+  (`console::console_is_ours`, shared `console_still_ours`: the console
+  user, or this session's own `kCGSessionOnConsoleKey`), so a failed read
+  never skips the lock.
+* **Stop Sharing ends the attachment, never the session.** Since macOS 14
+  every `ScreenCaptureKit` stream shows the system's "Currently Sharing"
+  menu-bar item with **Stop Sharing**, which anyone at the desk or on the
+  stream can press. `stream:didStopWithError:` keeps the error's domain
+  and code (`StreamStop`), and only `SCStreamErrorDomain` -3817 (a person
+  pressed Stop Sharing; shared `stream_end::capture_stop_cause`) ends the
+  stream as `CaptureStopped`: the Deck gets the close reason
+  `DECK_REASON_SHARING_STOPPED` and does not reconnect, `SESSION_END` says
+  `capture_stopped`, and the ordinary hand-back locks for
+  `Departure::CaptureStopped` and releases the guard (`end_attachment`).
+  Never restart the capture: someone stopped sharing on purpose. Every
+  other stop (the system's own, -3821; a lost window-server connection,
+  -3805; a display gone) is a capture failure as before: no close reason,
+  the Deck may reconnect, the session is locked.
 * **An agent that dies locks too** (`lock_guard`, shared
   `console_session::owner_death`, GAP-048 closed). For each Deck attached
   to a signed-in session, the agent starts `lock-guard`: the same binary, in

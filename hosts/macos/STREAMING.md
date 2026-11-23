@@ -226,6 +226,51 @@ effective pipeline depth is two. Note that 88.8 fps already clears a 30 fps
 target — **encode was never the blocker**, which is why the current code still
 submits one at a time and spends its complexity elsewhere.
 
+### Several displays, one thread each
+
+A multi-display session used to serve every display from one loop: wait up
+to 16 ms for display A, encode synchronously, queue, then the same for display
+B. The waits and encodes added up across displays, so an idle display's
+timeout and every encode delayed the other display's frame. A two-display
+M2 Ultra session asked for 120 fps logged `fps_actual 60` (both displays
+together) and the Deck presented 30 fps per display, while one display alone
+reached ~36 fps or more.
+
+Each display now has its own capture-and-encode thread (`serve_monitors` in
+`stream.rs`): the `SCStream` stays on the producer thread that started and
+stops it, and only the display's `FrameSource` moves to its thread. Keyframe
+requests, keepalives, rate changes and the first-frame deadline are tracked
+per display, as before; a capture error on any display still ends the whole
+producer with that error. `serve_monitors` is generic over a frame source and
+an encoder, so the unit tests prove an idle display no longer caps a busy one
+without `ScreenCaptureKit`.
+
+What one encode costs, from the ignored bench
+`encode::encode_cost::one_and_two_hevc_encoders_per_frame_cost` (M4 Pro, one
+video encode engine; HEVC Main 8-bit `420v`, Auto bitrate bounds, a moving
+512×384 detailed window over a still gradient, submitted back to back and
+timed through the same wrap, submit, wait and assemble path):
+
+| Shape | One encoder, mean / p95 | Two encoders on two threads, each |
+| --- | --- | --- |
+| 1920×1080, 60 fps | 6.25 / 7.08 ms | 9.05 / 9.14 ms |
+| 1920×1080, 120 fps | 5.70 / 5.84 ms | 6.51 / 6.58 ms |
+| 2560×1440, 120 fps | 8.46 / 8.55 ms | 15.29 / 15.43 ms |
+| 3840×2160, 60 fps | 17.40 / 17.59 ms | 33.94 / 34.06 ms |
+
+Two 1080p encoders overlap partly on one engine (about 220 frames a second
+together against 160 for one); at 1440p and above they serialise, so on a
+one-engine Mac the engine, not the thread layout, is the ceiling there. Apple
+lists four video encode engines for the M2 Ultra.
+
+The same bench shows a second, separate limit: at 120 fps VideoToolbox's
+low-latency rate control dropped three frames in four (encoded 60 of 240)
+under the Auto start bitrate of 4.67 Mbps, because each frame's share of the
+budget halves at twice the rate. Dropped frames return in about a millisecond
+and are counted only in a debug line. The session's rate controller raises
+that bitrate over time; check `VideoToolbox dropped a frame` before blaming
+the thread layout for a low 120 fps rate.
+
 ### Holding capture surfaces stops capture
 
 A probe that tried to hold 60 surfaces from the eight-surface pool stopped

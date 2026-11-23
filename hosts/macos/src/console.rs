@@ -135,6 +135,20 @@ pub fn console_holder() -> arcen_session::agent_relay::ConsoleHolder {
     }
 }
 
+/// Whether the console is `uid`'s session, for the lock on a Deck's
+/// departure, read fail-closed (shared `console_still_ours`): the console
+/// user's name comes through the configuration daemon, and a failed read
+/// looks exactly like the login window ([`console_holder`]), so this
+/// session's own window-server record (`kCGSessionOnConsoleKey`) is asked
+/// as well.
+#[must_use]
+pub fn console_is_ours(uid: u32) -> bool {
+    arcen_session::console_session::console_still_ours(
+        console_holder() == arcen_session::agent_relay::ConsoleHolder::User(uid),
+        crate::screen_lock::session_on_console(),
+    )
+}
+
 /// Waits for `authenticated` to own the console, up to `timeout`.
 ///
 /// Returns immediately when they already do. This is the macOS counterpart of

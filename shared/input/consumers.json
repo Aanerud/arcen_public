@@ -186,6 +186,7 @@
       "dependency_kind": "normal",
       "contracts": [
         "crate",
+        "cursor",
         "hid_digitizer",
         "hid_reports",
         "host_pointer",
@@ -228,7 +229,8 @@
             "hosts/macos/src/input_session.rs",
             "hosts/macos/src/bridged_tablet.rs",
             "hosts/macos/src/virtual_hid.rs",
-            "hosts/macos/src/input/layout.rs"
+            "hosts/macos/src/input/layout.rs",
+            "hosts/macos/src/cursor_probe.rs"
           ],
           "build_profiles": ["macos-pier"],
           "validation": ["macos-pier-test", "macos-pier-av-input-lab"],

@@ -1007,7 +1007,7 @@ pub struct SourceCadenceSnapshot {
 /// Instance state for the stream output object.
 struct FrameSink {
     frames: SyncSender<CapturedFrame>,
-    stopped: SyncSender<String>,
+    stopped: SyncSender<StreamStop>,
     /// How often the source actually delivers, measured at the callback.
     cadence: Arc<SourceCadence>,
     /// Frames the consumer was too slow to take.
@@ -1041,11 +1041,14 @@ define_class!(
         #[unsafe(method(stream:didStopWithError:))]
         #[allow(non_snake_case)]
         unsafe fn stream_didStopWithError(&self, _stream: &SCStream, error: &NSError) {
-            drop(
-                self.ivars()
-                    .stopped
-                    .try_send(error.localizedDescription().to_string()),
-            );
+            // The domain and code say who stopped it: a person's Stop
+            // Sharing is `SCStreamErrorDomain` -3817 (shared
+            // `stream_end::capture_stop_cause`).
+            drop(self.ivars().stopped.try_send(StreamStop {
+                description: error.localizedDescription().to_string(),
+                domain: error.domain().to_string(),
+                code: i64::try_from(error.code()).unwrap_or(i64::MIN),
+            }));
         }
     }
 
@@ -1121,7 +1124,29 @@ pub enum CaptureError {
     /// The stream ended and will produce no further frames.
     StreamEnded,
     /// `ScreenCaptureKit` reported that the stream stopped.
-    StreamStopped(String),
+    StreamStopped(StreamStop),
+}
+
+/// What `ScreenCaptureKit` said when it stopped a stream
+/// (`stream:didStopWithError:`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StreamStop {
+    /// The error's localized description.
+    pub description: String,
+    /// The error's domain (`SCStreamErrorDomain` for `ScreenCaptureKit`'s own).
+    pub domain: String,
+    /// The error's code (-3817: a person pressed Stop Sharing).
+    pub code: i64,
+}
+
+impl std::fmt::Display for StreamStop {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} ({} {})",
+            self.description, self.domain, self.code
+        )
+    }
 }
 
 impl std::fmt::Display for CaptureError {
@@ -1238,12 +1263,91 @@ pub fn mean_luma(frame: &CapturedFrame) -> Option<f64> {
     Some(mean)
 }
 
+/// The receiving end of one capture stream: its frames, its stop report and
+/// its shed-frame count.
+///
+/// Separate from [`CaptureSession`] so the frames can be waited for on a
+/// thread other than the one that owns the `SCStream`. Owned, never shared:
+/// it is `Send` and deliberately not `Sync`, one waiter at a time.
+pub struct FrameSource {
+    frames: Receiver<CapturedFrame>,
+    stopped: Receiver<StreamStop>,
+    dropped: Arc<AtomicU64>,
+}
+
+// SAFETY: every `CapturedFrame` is already built on `ScreenCaptureKit`'s
+// dispatch queue and received on another thread; moving the receiving end
+// changes only which thread that is. A frame keeps one owner at a time (an
+// `IOSurface` and the `CMSampleBuffer` holding its pool lease, whose
+// retain/release are atomic and which carry no thread affinity — see
+// `StagedFrame` in `stream.rs` for the same property). The other fields are
+// `Send`. Only `Send` is asserted: `Receiver` keeps this type `!Sync`.
+#[allow(unsafe_code)]
+unsafe impl Send for FrameSource {}
+
+impl std::fmt::Debug for FrameSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FrameSource")
+            .field("dropped", &self.dropped_frames())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FrameSource {
+    /// A source whose stream has already ended: what a session keeps after
+    /// handing its real source away.
+    fn ended(dropped: Arc<AtomicU64>) -> Self {
+        let (_, frames) = sync_channel(0);
+        let (_, stopped) = sync_channel(0);
+        Self {
+            frames,
+            stopped,
+            dropped,
+        }
+    }
+
+    /// Waits for the next frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::FrameTimeout`] if no frame arrives in time,
+    /// [`CaptureError::StreamStopped`] when `ScreenCaptureKit` stopped the
+    /// stream, and [`CaptureError::StreamEnded`] once the stream is finished.
+    pub fn next_frame(&self, timeout: Duration) -> Result<CapturedFrame, CaptureError> {
+        match self.stopped.try_recv() {
+            Ok(detail) => return Err(CaptureError::StreamStopped(detail)),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => return Err(CaptureError::StreamEnded),
+        }
+        match self.frames.recv_timeout(timeout) {
+            Ok(frame) => Ok(frame),
+            Err(RecvTimeoutError::Timeout) => match self.stopped.try_recv() {
+                Ok(detail) => Err(CaptureError::StreamStopped(detail)),
+                Err(TryRecvError::Empty) => Err(CaptureError::FrameTimeout),
+                Err(TryRecvError::Disconnected) => Err(CaptureError::StreamEnded),
+            },
+            Err(RecvTimeoutError::Disconnected) => match self.stopped.try_recv() {
+                Ok(detail) => Err(CaptureError::StreamStopped(detail)),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                    Err(CaptureError::StreamEnded)
+                }
+            },
+        }
+    }
+
+    /// Frames this stream shed because its consumer was behind.
+    #[must_use]
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
 /// A running `ScreenCaptureKit` stream.
 pub struct CaptureSession {
     stream: Retained<SCStream>,
     output: Retained<StreamOutput>,
-    frames: Receiver<CapturedFrame>,
-    stopped: Receiver<String>,
+    source: FrameSource,
     config: CaptureConfig,
     dropped: Arc<AtomicU64>,
     unchanged: Arc<AtomicU64>,
@@ -1469,8 +1573,11 @@ impl CaptureSession {
         Ok(Self {
             stream,
             output,
-            frames,
-            stopped,
+            source: FrameSource {
+                frames,
+                stopped,
+                dropped: Arc::clone(&dropped),
+            },
             config,
             dropped,
             unchanged,
@@ -1490,27 +1597,23 @@ impl CaptureSession {
     /// # Errors
     ///
     /// Returns [`CaptureError::FrameTimeout`] if no frame arrives in time, and
-    /// [`CaptureError::StreamEnded`] once the stream is finished.
+    /// [`CaptureError::StreamEnded`] once the stream is finished, or once its
+    /// frames were handed elsewhere by [`Self::take_frame_source`].
     pub fn next_frame(&self, timeout: Duration) -> Result<CapturedFrame, CaptureError> {
-        match self.stopped.try_recv() {
-            Ok(detail) => return Err(CaptureError::StreamStopped(detail)),
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => return Err(CaptureError::StreamEnded),
-        }
-        match self.frames.recv_timeout(timeout) {
-            Ok(frame) => Ok(frame),
-            Err(RecvTimeoutError::Timeout) => match self.stopped.try_recv() {
-                Ok(detail) => Err(CaptureError::StreamStopped(detail)),
-                Err(TryRecvError::Empty) => Err(CaptureError::FrameTimeout),
-                Err(TryRecvError::Disconnected) => Err(CaptureError::StreamEnded),
-            },
-            Err(RecvTimeoutError::Disconnected) => match self.stopped.try_recv() {
-                Ok(detail) => Err(CaptureError::StreamStopped(detail)),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                    Err(CaptureError::StreamEnded)
-                }
-            },
-        }
+        self.source.next_frame(timeout)
+    }
+
+    /// Hands this stream's frames to whoever will wait for them, leaving the
+    /// stream object (and stopping it) here.
+    ///
+    /// The stream is an Objective-C object this thread started and keeps; its
+    /// frames are not. The multi-display producer waits on each display from
+    /// its own thread, so one idle display's timeout cannot delay another
+    /// display's frame. After this, [`Self::next_frame`] reports
+    /// [`CaptureError::StreamEnded`].
+    pub fn take_frame_source(&mut self) -> FrameSource {
+        let ended = FrameSource::ended(Arc::clone(&self.dropped));
+        std::mem::replace(&mut self.source, ended)
     }
 
     /// Stops the stream, waiting briefly for `WindowServer` to acknowledge.

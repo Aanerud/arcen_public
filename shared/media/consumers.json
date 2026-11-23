@@ -879,6 +879,7 @@
         "clipboard",
         "clipboard::image",
         "clipboard::latest",
+        "cursor",
         "crate",
         "display_color",
         "hevc_sps",

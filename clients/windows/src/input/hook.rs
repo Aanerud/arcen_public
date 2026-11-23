@@ -9,7 +9,13 @@
 //! host has the keyboard and the policy takes the system shortcuts (by
 //! default whenever a session window has focus,
 //! `KeyboardCapturePolicy::Host`), the session also takes them (Windows
-//! key, Alt+Tab, Alt+Esc, Ctrl+Esc, Print Screen). A taken key is posted to
+//! key, Alt+Tab, Alt+Esc, Ctrl+Esc, Print Screen), and every chord another
+//! program may have claimed as a hot key (`RegisterHotKey`: Gemini in
+//! Chrome's Alt+G), which Windows would hand to that program before the
+//! window sees it (shared `claimable_chord`; `AltGr` chords that type
+//! characters, every key while the window's input method composes and its
+//! on/off chords while it is on stay on the window's path). A taken key is
+//! posted to
 //! the session window as [`WM_HOOK_KEY`] and never reaches the system; a
 //! release always goes where its press went. Windows+L and Ctrl+Alt+Del
 //! cannot be taken, by design of Windows. While this PC has the keyboard
@@ -27,7 +33,9 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use arcen_input::keyboard::pc::PcKey;
 use arcen_input::keyboard::windows::WindowsKeyReader;
-use arcen_input::keyboard::{HookRoute, HookRouter, KeyboardSwitchChord};
+use arcen_input::keyboard::{
+    HookRoute, HookRouter, KeyboardSwitchChord, LocalKeyFacts, LocalTextInput,
+};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -107,6 +115,11 @@ struct HookCounts {
 static STATE: Mutex<Option<HookState>> = Mutex::new(None);
 /// The keyboard switch's chord (Settings ▸ Input ▸ Keyboard switch).
 static SWITCH: Mutex<KeyboardSwitchChord> = Mutex::new(KeyboardSwitchChord::DEFAULT);
+/// The Deck's own keyboard facts (`AltGr`, the window's input method).
+static LOCAL: Mutex<LocalKeyFacts> = Mutex::new(LocalKeyFacts {
+    altgr_is_alt: false,
+    text: LocalTextInput::Keys,
+});
 /// The hook thread's id, once it runs (`None` if it could not start).
 static THREAD: OnceLock<Option<u32>> = OnceLock::new();
 /// Posted to the hook thread: install the hook (`WM_HOOK_ON`) or remove
@@ -199,6 +212,7 @@ pub(super) fn install(hwnd: HWND, grabbed: bool, held: Vec<PcKey>) {
     } else {
         let mut router = HookRouter::default();
         router.set_switch_chord(*SWITCH.lock().unwrap_or_else(PoisonError::into_inner));
+        router.set_local(*LOCAL.lock().unwrap_or_else(PoisonError::into_inner));
         router.begin(held);
         *slot = Some(HookState {
             hwnd,
@@ -223,6 +237,20 @@ pub(super) fn set_switch_chord(switch: KeyboardSwitchChord) {
     *SWITCH.lock().unwrap_or_else(PoisonError::into_inner) = switch;
     if let Some(state) = state().as_mut() {
         state.router.set_switch_chord(switch);
+    }
+}
+
+/// The Deck's own keyboard facts now (its layout's `AltGr`, the window's
+/// input method on or composing), so the grab leaves it its keys.
+pub(super) fn set_local(local: LocalKeyFacts) {
+    let mut current = LOCAL.lock().unwrap_or_else(PoisonError::into_inner);
+    if *current == local {
+        return;
+    }
+    *current = local;
+    drop(current);
+    if let Some(state) = state().as_mut() {
+        state.router.set_local(local);
     }
 }
 

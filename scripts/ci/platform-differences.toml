@@ -543,15 +543,15 @@ decision = "docs/architecture/pen-tablet-input.md"
 id = "PD-039"
 area = "automatic cursor"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
-difference = "Who draws the pointer under the automatic cursor, which every Deck asks for. The rule is shared (arcen_input::resolve_automatic_cursor_mode; the Deck hides its pointer whenever the result is Host, CursorModeResultMsg::host_draws_pointer): cursor images from the host mean the Deck draws; none mean the host draws the pointer into the video. The macOS Pier sends no cursor images, so it serves Host and turns on ScreenCaptureKit's showsCursor; the Linux and Windows Piers do not read the flag yet and serve the Deck's stored preference, Local with cursor images from their cursor watchers."
-earned_by = "macOS gives no process the desktop pointer's image: NSCursor.currentSystemCursor reports the calling process's own cursor (measured in hosts/macos/src/cursor_probe.rs), and Apple points at SCStreamConfiguration.showsCursor instead. X11 (XFixes), Mutter's screencast cursor metadata and Windows (GetCursorInfo) give the image."
+difference = "Who draws the pointer under the automatic cursor, which every Deck asks for. The rule is shared (arcen_input::resolve_automatic_cursor_mode; the Deck hides its pointer whenever the result is Host, CursorModeResultMsg::host_draws_pointer): cursor images from the host mean the Deck draws; none mean the host draws the pointer into the video. The macOS Pier sends the desktop cursor's images, so it serves Local, when the Deck draws images and its agent can read the cursor at sign-in; otherwise it serves Host and turns on ScreenCaptureKit's showsCursor. The Linux and Windows Piers do not read the flag yet and serve the Deck's stored preference, Local with cursor images from their cursor watchers."
+earned_by = "macOS gives the desktop pointer's image only through AppKit's deprecated NSCursor.currentSystemCursor, which answers only in a process with a window-server connection (an NSApplication in an Aqua session; without one it reads NULL, measured in hosts/macos/src/cursor_probe.rs), so the macOS Pier checks it live and keeps SCStreamConfiguration.showsCursor as the fallback. X11 (XFixes), Mutter's screencast cursor metadata and Windows (GetCursorInfo) give the image unconditionally."
 code = [
-  { path = "hosts/macos/src/session.rs", symbol = "HOST_SENDS_CURSOR_IMAGES" },
-  { path = "hosts/macos/src/cursor_probe.rs", symbol = "currentSystemCursor" },
+  { path = "hosts/macos/src/session.rs", symbol = "fn host_sends_cursor_images" },
+  { path = "hosts/macos/src/cursor_probe.rs", symbol = "fn desktop_cursor_images_readable" },
   { path = "hosts/linux/src/net/server.rs", symbol = "x11_cursor_watcher" },
   { path = "hosts/windows/src/cursor_watcher.rs", symbol = "deck_draws_images" },
 ]
-decision = "docs/adr/0014-quic-lanes-and-capture-contracts.md"
+decision = "docs/adr/0029-macos-pier-draws-the-pointer-into-the-video.md"
 
 [[difference]]
 id = "PD-040"

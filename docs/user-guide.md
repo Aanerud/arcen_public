@@ -623,6 +623,7 @@ The Deck has one switch for the keyboard. Press **Ctrl+Alt+Home** (on a Mac
 | Alt+Tab, Alt+Shift+Tab | switch the remote computer's windows | switch this computer's windows |
 | The Windows key, Print Screen | open the remote launcher, reach the remote application | act on this computer |
 | On a Mac: ⌘Tab, ⌘Space, Mission Control (⌃↑, ⌃↓), ⌃←, ⌃→ | go to the remote computer, when [the ⌘Tab switch](#on-a-mac) is on | act on this Mac (app switcher, Spotlight, Spaces) |
+| On a PC: a shortcut another app claims for itself (Gemini in Chrome's Alt+G) | goes to the remote computer when the system shortcuts do | goes to that app |
 
 - **Clicking the picture** in Local also returns to Remote. That click is
   not sent, so it never paints a stroke or presses a button on the remote
@@ -642,7 +643,27 @@ The Deck has one switch for the keyboard. Press **Ctrl+Alt+Home** (on a Mac
 **Settings › Input › Keyboard › System shortcuts go to the remote
 computer** decides whether the system shortcuts follow the switch. On, in
 Remote they go there, windowed or fullscreen; off, they always stay on this
-computer, and other keys still go to the remote computer in Remote. It is
+computer, and other keys still go to the remote computer in Remote. On a
+PC the switch also covers a shortcut another app claims for itself: an app
+may claim a chord (Gemini in Chrome claims Alt+G, a chord Autodesk Flame
+uses), and Windows hands it to that app before any window sees it. On, the
+Deck takes such a chord, any key pressed with Ctrl, Alt or the Windows key,
+before that app can; off, the app gets it. Some keys stay on the PC even
+then:
+
+- Ctrl+Alt+Del and Windows+L: Windows never hands them to an app.
+- A chord typed with `AltGr` (or Ctrl+Alt, where the keyboard layout has
+  `AltGr`) types its character, unless **AltGr** is set to act as Alt.
+- While **Typing** sends characters, the PC's input method keeps its own
+  keys: Ctrl+Space and Alt+\` switch it on or off, and while it composes
+  (the underlined text before you confirm it), every key is its own.
+  Microsoft Pinyin also keeps Ctrl+. and Ctrl+Shift+F.
+- Another app whose own keyboard hook blocks a chord still keeps it: the
+  Deck is never a way around such a hook.
+
+On a Mac the Deck takes only the shortcuts listed under
+[⌘Tab, ⌘Space and Mission Control](#tab-space-and-mission-control); a
+chord another Mac app claims (Gemini in Chrome's ⌃G) goes to that app. It is
 on by default on a PC (Alt+Tab, the Windows key and Print Screen) and off by
 default on a Mac, where it needs the Accessibility permission
 ([⌘Tab, ⌘Space and Mission Control](#tab-space-and-mission-control)).
@@ -884,9 +905,10 @@ turns a button into a click, the Deck sends that click.
 Your mouse always controls the remote computer, and the pointer is
 automatic; there is no setting for it. A host that sends its pointer's
 shapes lets this Mac or PC draw the pointer, so it moves at the speed of
-your hand in the host's own shapes. A 0.20.7 Mac host cannot send them, so
-it draws the pointer into the picture, one video round trip later, and the
-Deck shows none of its own. Whenever a host draws the pointer into the
+your hand in the host's own shapes; a Mac host sends them from the next
+release. A 0.20.7 or 0.20.8 Mac host, or a newer one that cannot read its
+pointer, draws the pointer into the picture, one video round trip later, and
+the Deck shows none of its own. Whenever a host draws the pointer into the
 picture, the Deck hides its own, so you never see two. Linux and Windows
 hosts, and Mac hosts older than 0.20.7, keep the cursor choice you had
 before 0.20.7 (the Deck draws the pointer, unless you had chosen the
@@ -1183,6 +1205,7 @@ and says what to do. Then look for what you see below. Anything marked
 | "This host cannot type text sent from the Deck…" | The host cannot type characters (the Mac host, or a host older than 0.18.0). | Use physical keys; ask about updating the host. |
 | Keys stuck, or every key acting like a shortcut | The host thinks a modifier is still held. | **Connection › Release Stuck Keys**. |
 | Alt+Tab or Print Screen act on the Windows Deck's own PC | This PC has the keyboard (the menu bar says **Keyboard: this PC**), or Settings › Input keeps the system shortcuts here. | Click the picture or press Ctrl+Alt+Home; turn on **Settings › Input › System shortcuts go to the remote computer**. |
+| A shortcut such as Alt+G opens another app (an assistant such as Gemini) instead of reaching the host | That app claimed the chord. On a PC the system shortcuts stay on this PC (the switch is off, or this PC has the keyboard); a Mac Deck never takes such a chord. | On a PC, turn on **Settings › Input › System shortcuts go to the remote computer** and click the picture or press Ctrl+Alt+Home. Anywhere, change or turn off that app's shortcut (Gemini in Chrome: Chrome › Settings › AI innovations › Gemini in Chrome). |
 | ⌘Tab or ⌘Space act on the Mac, not the host | The switch is off (the default), Arcen Deck is not allowed in Accessibility, this Mac has the keyboard, or a password field elsewhere holds Secure Input. | Turn on **Settings › Input › System shortcuts go to the remote computer** and allow Accessibility; click the picture or press ⌃⌥Home. |
 | Nothing I type reaches the host (Mac Deck) | This Mac has the keyboard (the menu bar says **Keyboard: this Mac**). | Click the picture or press ⌃⌥Home. |
 | A black screen just after a Windows sign-in | Windows waits for its desktop to settle before showing it. | Wait about 25 seconds. |

@@ -386,6 +386,122 @@ pub fn desk_outputs_dark(outputs: &[DeskOutputFact]) -> Result<(), DeskPrivacyRe
     }
 }
 
+/// One output the desktop lights, as a re-proof of a dark desk reads it:
+/// `id` is the host's own name for it (on Windows, adapter and output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LitDeskOutput<K> {
+    /// Which output.
+    pub id: K,
+    /// What is behind it.
+    pub monitor: DeskMonitor,
+}
+
+/// What one re-proof of a dark desk read ([`recheck_dark_desk`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeskReading<K> {
+    /// The display topology or the devices behind it could not be read (a
+    /// topology query or a device probe failed).
+    Unreadable,
+    /// Every output the desktop lights now (empty: none).
+    Lit(Vec<LitDeskOutput<K>>),
+}
+
+/// Why a re-proof of a dark desk did not pass, and whether repeating it a
+/// moment later may pass ([`DeskWatch`], [`DESK_PROOF_SETTLE`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeskProofFailure {
+    /// The refusal that ends the session if the failure stands.
+    pub refusal: DeskPrivacyRefusal,
+    /// The desk could not be read whole, but nothing it read shows the
+    /// desktop anywhere it was not proved dark: a read failed, nothing was
+    /// lit, an output proved without a monitor could not be described
+    /// again, or only some of the proved outputs are lit (every output lit
+    /// is one the passing proof lit). A display reconfiguration (a driver
+    /// re-detecting its connectors, a mode set) passes through these.
+    pub transient: bool,
+}
+
+impl DeskProofFailure {
+    /// A failure that ends the session at once.
+    #[must_use]
+    pub const fn decided(refusal: DeskPrivacyRefusal) -> Self {
+        Self {
+            refusal,
+            transient: false,
+        }
+    }
+
+    /// A failure that may pass when the desk is read again.
+    #[must_use]
+    pub const fn transient(refusal: DeskPrivacyRefusal) -> Self {
+        Self {
+            refusal,
+            transient: true,
+        }
+    }
+}
+
+/// Proves a dark desk again against the outputs its passing proof lit
+/// (`proved`: every one of them was proved without a monitor).
+///
+/// Decided at once: a lit output with a monitor behind it
+/// ([`DeskPrivacyRefusal::DeskMonitorLit`]); an output lit now that was
+/// not lit then, whose monitor cannot be told (an output of a GPU or USB
+/// display adapter the host cannot describe:
+/// [`DeskPrivacyRefusal::DeskMonitorUnknown`]) or that has none
+/// ([`DeskPrivacyRefusal::DeskOutputsChanged`]). Transient
+/// ([`DeskProofFailure::transient`]), since fewer outputs than were proved
+/// show the desktop nowhere new: an unreadable desk, nothing lit, a proved
+/// output that cannot be described again
+/// ([`DeskPrivacyRefusal::DeskMonitorUnknown`]), or only some of the
+/// proved outputs lit ([`DeskPrivacyRefusal::DeskOutputsChanged`]).
+///
+/// # Errors
+///
+/// The failure, as above.
+pub fn recheck_dark_desk<K: Ord>(
+    proved: &std::collections::BTreeSet<K>,
+    reading: &DeskReading<K>,
+) -> Result<(), DeskProofFailure> {
+    let unreadable = DeskProofFailure::transient(DeskPrivacyRefusal::DeskMonitorUnknown);
+    let lit = match reading {
+        DeskReading::Unreadable => return Err(unreadable),
+        DeskReading::Lit(lit) if lit.is_empty() => return Err(unreadable),
+        DeskReading::Lit(lit) => lit,
+    };
+    if lit
+        .iter()
+        .any(|output| output.monitor == DeskMonitor::Present)
+    {
+        return Err(DeskProofFailure::decided(
+            DeskPrivacyRefusal::DeskMonitorLit,
+        ));
+    }
+    let mut new = lit.iter().filter(|output| !proved.contains(&output.id));
+    if let Some(first) = new.next() {
+        let undescribed = first.monitor == DeskMonitor::Unknown
+            || new.any(|output| output.monitor == DeskMonitor::Unknown);
+        return Err(DeskProofFailure::decided(if undescribed {
+            DeskPrivacyRefusal::DeskMonitorUnknown
+        } else {
+            DeskPrivacyRefusal::DeskOutputsChanged
+        }));
+    }
+    if lit
+        .iter()
+        .any(|output| output.monitor == DeskMonitor::Unknown)
+    {
+        return Err(unreadable);
+    }
+    let now: std::collections::BTreeSet<&K> = lit.iter().map(|output| &output.id).collect();
+    if now.len() != proved.len() {
+        return Err(DeskProofFailure::transient(
+            DeskPrivacyRefusal::DeskOutputsChanged,
+        ));
+    }
+    Ok(())
+}
+
 /// How often a host that cannot darken a monitor reads its display topology
 /// while the desk is kept dark: the operating system's own record of which
 /// outputs are lit and which monitors are connected, read without probing a
@@ -406,9 +522,29 @@ pub const DESK_FULL_PROOF_INTERVAL: Duration = Duration::from_secs(5);
 pub const DESK_CHECK_STALE: Duration = Duration::from_secs(4);
 
 /// How long a proof the topology made due (it changed, or could not be
-/// read) may stay in flight before the session is refused: a changed desk
-/// is not proved dark by a probe that never answers.
+/// read), or a proof being repeated while its refusal settles
+/// ([`DESK_PROOF_SETTLE`]), may stay in flight before the session is
+/// refused: a changed desk is not proved dark by a probe that never answers.
 pub const DESK_PROOF_IN_FLIGHT_LIMIT: Duration = Duration::from_secs(3);
+
+/// How long a [`DeskWatch`] repeats a proof whose failure is
+/// [transient](DeskProofFailure::transient) before that failure ends the
+/// session. A display reconfiguration (a driver re-detecting its
+/// connectors, a mode set) passes through moments in which the desk cannot
+/// be read whole; ending the session there ended it while the desk was
+/// dark. Shorter than [`DESK_PROOF_IN_FLIGHT_LIMIT`], which
+/// [`DeskWatch::verdict`] enforces meanwhile, so a desk that stays
+/// unproved is refused at that limit at the latest.
+pub const DESK_PROOF_SETTLE: Duration = Duration::from_secs(2);
+
+/// The most time one [`DeskWatch`] (one attachment) spends repeating
+/// transient failures, summed over every one: once it is spent, a
+/// transient failure ends the session at once, so displays that keep
+/// failing to read cannot keep a session going on repeats.
+pub const DESK_SETTLE_BUDGET: Duration = Duration::from_secs(6);
+
+/// The pause between two proofs while a refusal settles.
+pub const DESK_PROOF_SETTLE_RETRY: Duration = Duration::from_millis(400);
 
 /// The next check of a dark desk, as [`DeskRecheckCadence::next`] decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,8 +645,13 @@ pub struct DeskProofReport {
     pub reason: FullProofReason,
     /// Topology reads since the previous proof.
     pub topology_reads: u64,
-    /// How long the topology read and the proof took.
+    /// How long the topology read and the proof took (with every repeat).
     pub took: Duration,
+    /// Proofs made: more than one when a transient failure was repeated
+    /// ([`DESK_PROOF_SETTLE`]).
+    pub attempts: u32,
+    /// What is left of [`DESK_SETTLE_BUDGET`] after this proof.
+    pub settle_left: Duration,
     /// The proof's outcome (an `Err` ends the watch).
     pub outcome: Result<(), DeskPrivacyRefusal>,
 }
@@ -522,6 +663,10 @@ pub struct DeskProofReport {
 ///
 /// Fail closed: the first refusal is stored before anyone is told (the
 /// `report` and `alarm` callbacks run after it), and ends the thread; a
+/// [transient](DeskProofFailure::transient) failure is first proved again
+/// every [`DESK_PROOF_SETTLE_RETRY`] for up to [`DESK_PROOF_SETTLE`], while
+/// the watch's [`DESK_SETTLE_BUDGET`] lasts (a lit monitor, an output lit
+/// anew whose monitor cannot be told, or changed lit outputs never are); a
 /// thread that panics or ends for any other reason while the watch is held
 /// stores [`DeskPrivacyRefusal::DeskMonitorUnknown`] and raises the alarm.
 /// [`Self::verdict`] reads the result without waiting for a probe, and also
@@ -557,8 +702,18 @@ impl DeskWatchShared {
 struct DeskWatchState {
     last_check: Instant,
     refusal: Option<DeskPrivacyRefusal>,
-    /// A topology-triggered proof running since then.
+    /// A topology-triggered proof (or a repeat of any proof) running since
+    /// then.
     proof_in_flight_since: Option<Instant>,
+}
+
+/// What [`DeskWatchShared::prove_settling`] reached: the last proof's
+/// outcome, the topology read just before it and when.
+struct SettledProof<T> {
+    outcome: Result<(), DeskProofFailure>,
+    topology: Option<T>,
+    proved_at: Instant,
+    attempts: u32,
 }
 
 /// Ends a watcher thread fail-closed: unless the watch was stopped or the
@@ -602,7 +757,7 @@ impl DeskWatch {
     where
         T: PartialEq + Send + 'static,
         R: FnMut() -> Option<T> + Send + 'static,
-        P: FnMut() -> Result<(), DeskPrivacyRefusal> + Send + 'static,
+        P: FnMut() -> Result<(), DeskProofFailure> + Send + 'static,
         O: FnMut(&DeskProofReport) + Send + 'static,
         A: Fn() + Send + 'static,
     {
@@ -628,6 +783,7 @@ impl DeskWatch {
                 let mut cadence = DeskRecheckCadence::new();
                 cadence.proved(topology, started);
                 let mut topology_reads = 0_u64;
+                let mut settle_spent = Duration::ZERO;
                 loop {
                     drop(
                         worker
@@ -650,14 +806,25 @@ impl DeskWatch {
                             if triggered {
                                 worker.state().proof_in_flight_since = Some(now);
                             }
-                            let outcome = prove();
+                            let Some(settled) = worker.prove_settling(
+                                now,
+                                topology,
+                                &mut settle_spent,
+                                &mut read,
+                                &mut prove,
+                            ) else {
+                                return;
+                            };
+                            let outcome = settled.outcome.map_err(|failure| failure.refusal);
                             if outcome.is_ok() {
-                                cadence.proved(topology, now);
+                                cadence.proved(settled.topology, settled.proved_at);
                             }
                             let proof = DeskProofReport {
                                 reason,
                                 topology_reads,
                                 took: now.elapsed(),
+                                attempts: settled.attempts,
+                                settle_left: DESK_SETTLE_BUDGET.saturating_sub(settle_spent),
                                 outcome,
                             };
                             topology_reads = 0;
@@ -709,6 +876,60 @@ impl DeskWatch {
 }
 
 impl DeskWatchShared {
+    /// One whole proof begun at `since` right after `topology` was read,
+    /// repeated (each after a fresh read) every [`DESK_PROOF_SETTLE_RETRY`]
+    /// while its failure is [transient](DeskProofFailure::transient),
+    /// [`DESK_PROOF_SETTLE`] has not run out and `spent` leaves room in
+    /// [`DESK_SETTLE_BUDGET`]; the time repeated is added to `spent`.
+    /// Meanwhile the desk counts as a proof in flight since `since`, so
+    /// [`Self::verdict`] refuses it at [`DESK_PROOF_IN_FLIGHT_LIMIT`] whatever
+    /// the watcher is doing. `None` when the watch was stopped meanwhile.
+    fn prove_settling<T, R, P>(
+        &self,
+        since: Instant,
+        topology: Option<T>,
+        spent: &mut Duration,
+        read: &mut R,
+        prove: &mut P,
+    ) -> Option<SettledProof<T>>
+    where
+        R: FnMut() -> Option<T>,
+        P: FnMut() -> Result<(), DeskProofFailure>,
+    {
+        let mut settled = SettledProof {
+            outcome: prove(),
+            topology,
+            proved_at: since,
+            attempts: 1,
+        };
+        while let Err(failure) = settled.outcome {
+            let next = since.elapsed() + DESK_PROOF_SETTLE_RETRY;
+            if !failure.transient
+                || next >= DESK_PROOF_SETTLE
+                || spent.saturating_add(next) > DESK_SETTLE_BUDGET
+            {
+                break;
+            }
+            self.state().proof_in_flight_since.get_or_insert(since);
+            drop(
+                self.wake
+                    .wait_timeout_while(self.state(), DESK_PROOF_SETTLE_RETRY, |_| !self.stopped())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if self.stopped() {
+                return None;
+            }
+            settled.proved_at = Instant::now();
+            settled.topology = read();
+            settled.outcome = prove();
+            settled.attempts = settled.attempts.saturating_add(1);
+        }
+        if settled.attempts > 1 {
+            *spent = spent.saturating_add(since.elapsed());
+        }
+        Some(settled)
+    }
+
     fn verdict(&self, now: Instant) -> Result<(), DeskPrivacyRefusal> {
         let state = self.state();
         if let Some(refusal) = state.refusal {
@@ -1323,7 +1544,9 @@ mod tests {
             },
             move || {
                 proof_count.fetch_add(1, Ordering::SeqCst);
-                Err(DeskPrivacyRefusal::DeskMonitorLit)
+                Err(DeskProofFailure::decided(
+                    DeskPrivacyRefusal::DeskMonitorLit,
+                ))
             },
             move |report: &DeskProofReport| seen.lock().unwrap().push(*report),
             || {},
@@ -1345,10 +1568,19 @@ mod tests {
             watch.verdict(Instant::now()).is_err()
         }));
         assert!(changed.elapsed() < Duration::from_secs(1));
-        assert_eq!(proofs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            proofs.load(Ordering::SeqCst),
+            1,
+            "a lit monitor is never repeated"
+        );
+        // The verdict is stored before the report is made: wait for it.
+        assert!(wait_for(Duration::from_secs(5), || {
+            !reports.lock().unwrap().is_empty()
+        }));
         let reports = reports.lock().unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].reason, FullProofReason::TopologyChanged);
+        assert_eq!(reports[0].attempts, 1);
         assert_eq!(reports[0].outcome, Err(DeskPrivacyRefusal::DeskMonitorLit));
         assert_eq!(
             watch.verdict(Instant::now() + DESK_CHECK_STALE),
@@ -1427,6 +1659,399 @@ mod tests {
         );
     }
 
+    fn lit(outputs: &[(u32, DeskMonitor)]) -> DeskReading<u32> {
+        DeskReading::Lit(
+            outputs
+                .iter()
+                .map(|&(id, monitor)| LitDeskOutput { id, monitor })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn only_a_desk_that_could_not_be_read_whole_may_be_proved_again() {
+        use DeskMonitor::{Absent, Present, Unknown};
+        let proved: std::collections::BTreeSet<u32> = [1, 2].into_iter().collect();
+        let transient = Err(DeskProofFailure::transient(
+            DeskPrivacyRefusal::DeskMonitorUnknown,
+        ));
+        assert_eq!(
+            recheck_dark_desk(&proved, &lit(&[(1, Absent), (2, Absent)])),
+            Ok(())
+        );
+        // A driver re-detecting its displays: unreadable, nothing lit, or
+        // an output proved dark that cannot be described this moment.
+        assert_eq!(
+            recheck_dark_desk(&proved, &DeskReading::Unreadable),
+            transient
+        );
+        assert_eq!(recheck_dark_desk(&proved, &lit(&[])), transient);
+        assert_eq!(
+            recheck_dark_desk(&proved, &lit(&[(1, Absent), (2, Unknown)])),
+            transient
+        );
+        // Decided at once: a monitor, an output lit anew that cannot be
+        // described (an integrated GPU, a USB display), any other change.
+        assert_eq!(
+            recheck_dark_desk(&proved, &lit(&[(1, Absent), (2, Present)])),
+            Err(DeskProofFailure::decided(
+                DeskPrivacyRefusal::DeskMonitorLit
+            ))
+        );
+        assert_eq!(
+            recheck_dark_desk(&proved, &lit(&[(1, Absent), (2, Absent), (3, Unknown)])),
+            Err(DeskProofFailure::decided(
+                DeskPrivacyRefusal::DeskMonitorUnknown
+            ))
+        );
+        assert_eq!(
+            recheck_dark_desk(&proved, &lit(&[(1, Unknown), (3, Unknown)])),
+            Err(DeskProofFailure::decided(
+                DeskPrivacyRefusal::DeskMonitorUnknown
+            ))
+        );
+        assert_eq!(
+            recheck_dark_desk(&proved, &lit(&[(1, Absent), (3, Absent)])),
+            Err(DeskProofFailure::decided(
+                DeskPrivacyRefusal::DeskOutputsChanged
+            ))
+        );
+        // Fewer outputs than were proved show the desktop nowhere new.
+        let fewer = Err(DeskProofFailure::transient(
+            DeskPrivacyRefusal::DeskOutputsChanged,
+        ));
+        assert_eq!(recheck_dark_desk(&proved, &lit(&[(1, Absent)])), fewer);
+        assert_eq!(recheck_dark_desk(&proved, &lit(&[(1, Unknown)])), transient);
+        // ... but a new output instead of them is decided.
+        assert_eq!(
+            recheck_dark_desk(&proved, &lit(&[(3, Absent)])),
+            Err(DeskProofFailure::decided(
+                DeskPrivacyRefusal::DeskOutputsChanged
+            ))
+        );
+    }
+
+    /// Runs a watch over a desk proved with `proved` lit that reads
+    /// `readings` in turn (the last one again and again) after a topology
+    /// change; returns its verdict once it ends or after `wait`, how many
+    /// proofs it made, its first report and how long it ran.
+    fn watch_readings(
+        proved: &[u32],
+        readings: Vec<DeskReading<u32>>,
+        wait: Duration,
+    ) -> (
+        Result<(), DeskPrivacyRefusal>,
+        u32,
+        Option<DeskProofReport>,
+        Duration,
+    ) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+        let proved: std::collections::BTreeSet<u32> = proved.iter().copied().collect();
+        let proofs = Arc::new(AtomicU32::new(0));
+        let reports = Arc::new(Mutex::new(Vec::<DeskProofReport>::new()));
+        let (proof_count, seen) = (Arc::clone(&proofs), Arc::clone(&reports));
+        let started = Instant::now();
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(1_u32),
+            || Some(2),
+            move || {
+                let index = proof_count.fetch_add(1, Ordering::SeqCst) as usize;
+                recheck_dark_desk(&proved, &readings[index.min(readings.len() - 1)])
+            },
+            move |report: &DeskProofReport| seen.lock().unwrap().push(*report),
+            || {},
+        );
+        let ended = wait_for(wait, || watch.verdict(Instant::now()).is_err());
+        let elapsed = started.elapsed();
+        // An ending verdict is stored before its report is made.
+        wait_for(Duration::from_secs(5), || {
+            reports
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|report| report.outcome.is_err() == ended)
+        });
+        let verdict = watch.verdict(Instant::now());
+        let first = reports.lock().unwrap().first().copied();
+        (verdict, proofs.load(Ordering::SeqCst), first, elapsed)
+    }
+
+    #[test]
+    fn a_proved_output_dropping_out_for_a_moment_settles() {
+        use DeskMonitor::Absent;
+        let (verdict, proofs, report, _) = watch_readings(
+            &[1, 2],
+            vec![lit(&[(1, Absent)]), lit(&[(1, Absent), (2, Absent)])],
+            Duration::from_secs(2),
+        );
+        assert_eq!(verdict, Ok(()));
+        assert_eq!(proofs, 2);
+        let report = report.expect("reported");
+        assert_eq!(report.outcome, Ok(()));
+        assert_eq!(report.attempts, 2);
+    }
+
+    #[test]
+    fn fewer_outputs_then_a_new_one_ends_the_session_at_once() {
+        use DeskMonitor::Absent;
+        let (verdict, proofs, report, _) = watch_readings(
+            &[1, 2],
+            vec![lit(&[(1, Absent)]), lit(&[(1, Absent), (3, Absent)])],
+            Duration::from_secs(5),
+        );
+        assert_eq!(verdict, Err(DeskPrivacyRefusal::DeskOutputsChanged));
+        assert_eq!(proofs, 2, "the new output is not repeated");
+        assert_eq!(report.expect("reported").attempts, 2);
+    }
+
+    #[test]
+    fn a_proved_output_that_stays_undescribed_ends_the_session_once_the_settle_runs_out() {
+        use DeskMonitor::{Absent, Unknown};
+        let (verdict, proofs, report, elapsed) = watch_readings(
+            &[1, 2],
+            vec![lit(&[(1, Absent), (2, Unknown)])],
+            Duration::from_secs(10),
+        );
+        assert_eq!(verdict, Err(DeskPrivacyRefusal::DeskMonitorUnknown));
+        assert!(proofs > 1, "repeated while it settled");
+        let report = report.expect("reported");
+        assert_eq!(report.outcome, Err(DeskPrivacyRefusal::DeskMonitorUnknown));
+        assert!(
+            report.took < DESK_PROOF_SETTLE + DESK_PROOF_SETTLE_RETRY,
+            "{report:?}"
+        );
+        assert!(
+            elapsed < DESK_PROOF_IN_FLIGHT_LIMIT + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_desk_that_could_not_be_read_while_the_displays_settle_is_repeated_not_fatal() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+        let topology = Arc::new(AtomicU32::new(1));
+        let proofs = Arc::new(AtomicU32::new(0));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let (read_topology, proof_count, seen) = (
+            Arc::clone(&topology),
+            Arc::clone(&proofs),
+            Arc::clone(&reports),
+        );
+        let proved: std::collections::BTreeSet<u32> = [1].into_iter().collect();
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(1_u32),
+            move || Some(read_topology.load(Ordering::SeqCst)),
+            move || {
+                // A GPU control panel re-detects the displays: the desk
+                // reads unreadable, then with nothing lit, then whole.
+                let reading = match proof_count.fetch_add(1, Ordering::SeqCst) {
+                    0 => DeskReading::Unreadable,
+                    1 => lit(&[]),
+                    _ => lit(&[(1, DeskMonitor::Absent)]),
+                };
+                recheck_dark_desk(&proved, &reading)
+            },
+            move |report: &DeskProofReport| seen.lock().unwrap().push(*report),
+            || {},
+        );
+        topology.store(2, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(5), || {
+            !reports.lock().unwrap().is_empty()
+        }));
+        assert_eq!(watch.verdict(Instant::now()), Ok(()));
+        let report = reports.lock().unwrap()[0];
+        assert_eq!(report.reason, FullProofReason::TopologyChanged);
+        assert_eq!(report.attempts, 3);
+        assert_eq!(report.outcome, Ok(()));
+        assert!(report.took >= DESK_PROOF_SETTLE_RETRY * 2);
+        assert!(report.settle_left < DESK_SETTLE_BUDGET);
+        // The settled topology was recorded: nothing more to prove.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(proofs.load(Ordering::SeqCst), 3);
+        assert_eq!(watch.verdict(Instant::now()), Ok(()));
+    }
+
+    #[test]
+    fn an_output_lit_anew_that_cannot_be_described_ends_the_session_at_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let proofs = Arc::new(AtomicU32::new(0));
+        let proof_count = Arc::clone(&proofs);
+        let proved: std::collections::BTreeSet<u32> = [1].into_iter().collect();
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(1_u32),
+            || Some(2),
+            move || {
+                proof_count.fetch_add(1, Ordering::SeqCst);
+                // A monitor on the integrated GPU (or a USB display) lit.
+                recheck_dark_desk(
+                    &proved,
+                    &lit(&[(1, DeskMonitor::Absent), (7, DeskMonitor::Unknown)]),
+                )
+            },
+            |_| {},
+            || {},
+        );
+        let changed = Instant::now();
+        assert!(wait_for(Duration::from_secs(5), || {
+            watch.verdict(Instant::now()).is_err()
+        }));
+        assert!(
+            changed.elapsed() < DESK_PROOF_SETTLE_RETRY,
+            "{:?}",
+            changed.elapsed()
+        );
+        assert_eq!(proofs.load(Ordering::SeqCst), 1, "never repeated");
+        assert_eq!(
+            watch.verdict(Instant::now()),
+            Err(DeskPrivacyRefusal::DeskMonitorUnknown)
+        );
+    }
+
+    #[test]
+    fn a_desk_that_stays_unreadable_ends_the_session_once_the_settle_runs_out() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let proofs = Arc::new(AtomicU32::new(0));
+        let proof_count = Arc::clone(&proofs);
+        let changed = Instant::now();
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(1_u32),
+            || Some(2),
+            move || {
+                proof_count.fetch_add(1, Ordering::SeqCst);
+                Err(DeskProofFailure::transient(
+                    DeskPrivacyRefusal::DeskMonitorUnknown,
+                ))
+            },
+            |_| {},
+            || {},
+        );
+        assert!(wait_for(Duration::from_secs(10), || {
+            watch.verdict(Instant::now()).is_err()
+        }));
+        let ended = changed.elapsed();
+        assert_eq!(
+            watch.verdict(Instant::now()),
+            Err(DeskPrivacyRefusal::DeskMonitorUnknown)
+        );
+        assert!(
+            proofs.load(Ordering::SeqCst) > 1,
+            "repeated while it settled"
+        );
+        assert!(
+            ended < DESK_PROOF_IN_FLIGHT_LIMIT + Duration::from_secs(1),
+            "{ended:?}"
+        );
+        assert!(DESK_PROOF_SETTLE < DESK_PROOF_IN_FLIGHT_LIMIT);
+    }
+
+    #[test]
+    fn repeated_unreadable_desks_spend_the_budget_and_then_end_the_session() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+        let reads = Arc::new(AtomicU32::new(0));
+        let proofs = Arc::new(AtomicU32::new(0));
+        let reports = Arc::new(Mutex::new(Vec::<DeskProofReport>::new()));
+        let (read_count, proof_count, seen) = (
+            Arc::clone(&reads),
+            Arc::clone(&proofs),
+            Arc::clone(&reports),
+        );
+        // Every check reads a new topology, and every desk reading fails
+        // once, then passes on the repeat: Unknown, Ok, Unknown, Ok, ...
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(0_u32),
+            move || Some(read_count.fetch_add(1, Ordering::SeqCst) + 1),
+            move || {
+                if proof_count.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+                    Err(DeskProofFailure::transient(
+                        DeskPrivacyRefusal::DeskMonitorUnknown,
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            move |report: &DeskProofReport| seen.lock().unwrap().push(*report),
+            || {},
+        );
+        assert!(wait_for(Duration::from_secs(30), || {
+            watch.verdict(Instant::now()).is_err()
+        }));
+        assert_eq!(
+            watch.verdict(Instant::now()),
+            Err(DeskPrivacyRefusal::DeskMonitorUnknown)
+        );
+        // The verdict is stored before the report is made: wait for it.
+        assert!(wait_for(Duration::from_secs(5), || {
+            reports
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|report| report.outcome.is_err())
+        }));
+        let reports = reports.lock().unwrap();
+        let last = reports.last().expect("the ending proof is reported");
+        assert_eq!(last.outcome, Err(DeskPrivacyRefusal::DeskMonitorUnknown));
+        assert_eq!(last.attempts, 1, "not repeated once the budget is spent");
+        let settled = reports
+            .iter()
+            .filter(|report| report.outcome.is_ok())
+            .count();
+        assert!(settled >= 2, "{settled} settled before the budget ran out");
+        let spent: Duration = reports
+            .iter()
+            .filter(|report| report.attempts > 1)
+            .map(|report| report.took)
+            .sum();
+        // Each repeat starts only while it fits; it may overrun by its own
+        // proof time.
+        assert!(
+            spent <= DESK_SETTLE_BUDGET + DESK_PROOF_SETTLE_RETRY,
+            "{spent:?}"
+        );
+        assert!(
+            spent + DESK_PROOF_SETTLE_RETRY * 2 > DESK_SETTLE_BUDGET,
+            "{spent:?}: ended only once the budget was spent"
+        );
+    }
+
+    #[test]
+    fn a_settling_interval_proof_is_held_to_the_in_flight_limit() {
+        use std::sync::mpsc;
+        let (proving_tx, proving_rx) = mpsc::channel();
+        // Nothing was proved yet, so the first proof is an interval proof
+        // (no topology change made it due); it fails and is repeated, slowly:
+        // the verdict must not wait for the watcher to give up.
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            None::<u32>,
+            || Some(1),
+            move || {
+                let _ = proving_tx.send(Instant::now());
+                std::thread::sleep(Duration::from_millis(900));
+                Err(DeskProofFailure::transient(
+                    DeskPrivacyRefusal::DeskMonitorUnknown,
+                ))
+            },
+            |_| {},
+            || {},
+        );
+        let first = proving_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let _second = proving_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            watch.verdict(first + DESK_PROOF_IN_FLIGHT_LIMIT),
+            Err(DeskPrivacyRefusal::DeskMonitorUnknown)
+        );
+    }
+
     #[test]
     fn the_verdict_is_already_a_refusal_when_the_alarm_is_raised() {
         use std::sync::mpsc;
@@ -1446,7 +2071,11 @@ mod tests {
                 let _ = go_rx.recv_timeout(Duration::from_secs(5));
                 Some(2)
             },
-            || Err(DeskPrivacyRefusal::DeskMonitorLit),
+            || {
+                Err(DeskProofFailure::decided(
+                    DeskPrivacyRefusal::DeskMonitorLit,
+                ))
+            },
             |_| {},
             move || {
                 let shared = slot

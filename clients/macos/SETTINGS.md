@@ -110,8 +110,8 @@ a setting.
 ## Global settings
 
 Every connection asks for the automatic cursor (`cursor_automatic_v1`): a host that knows it
-(the macOS Pier from 0.20.7) decides (cursor images: the Deck draws them; none, as on the macOS
-Pier: the host draws the pointer into the video). `cursor_preference` (`local` by default, or
+(the macOS Pier from 0.20.7) decides (cursor images: the Deck draws them; none, as on a 0.20.7
+or 0.20.8 macOS Pier: the host draws the pointer into the video). `cursor_preference` (`local` by default, or
 `host`) is never migrated: it is sent unchanged as the request every other host serves. The Deck hides its own
 pointer whenever the host reports that it draws the pointer (`active` Host).
 

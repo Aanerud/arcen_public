@@ -101,6 +101,14 @@ impl AltGrKey {
             (Self::TypesCharacters, false) | (Self::IsAlt, _) => OptionKeyMode::BothAlt,
         })
     }
+
+    /// Whether the right Alt, and Ctrl+Alt (which Windows reads as `AltGr`
+    /// on a layout that has one), are plain Alt shortcuts rather than keys
+    /// that type the layout's characters ([`LocalKeyFacts::altgr_is_alt`]).
+    #[must_use]
+    pub const fn acts_as_alt(self, layout_has_altgr: bool) -> bool {
+        matches!(self, Self::IsAlt) || !layout_has_altgr
+    }
 }
 
 /// A connection's PC keyboard settings.
@@ -235,16 +243,21 @@ impl SystemChord {
 }
 
 /// Whether the low-level keyboard hook takes a key press for the session
-/// under the keyboard grab: the Windows keys and the system shortcuts
-/// Windows lets a hook take ([`SystemChord::grabbable`]). Every other key
-/// stays on the window's own path, where Windows' layout and input method
-/// still turn it into characters (`AltGr`, dead keys, IME), so the grab
-/// changes only what the system would have acted on.
+/// under the keyboard grab: the Windows keys, the system shortcuts Windows
+/// lets a hook take ([`SystemChord::grabbable`]), and every other shortcut
+/// chord a program on the Deck's computer may have claimed for itself
+/// ([`claimable_chord`]). Every other key stays on the window's own path,
+/// where Windows' layout and input method still turn it into characters
+/// (`AltGr`, dead keys, IME), so the grab changes only what the system or
+/// another program would have acted on.
 #[must_use]
-pub fn grab_takes(key: PcKey, held: PcModifierState) -> bool {
+pub fn grab_takes(key: PcKey, held: PcModifierState, local: LocalKeyFacts) -> bool {
     match key {
         PcKey::Modifier(PcModifier::LeftWindows | PcModifier::RightWindows) => true,
-        PcKey::Position { .. } => SystemChord::of(key, held).is_some_and(SystemChord::grabbable),
+        PcKey::Position { .. } => {
+            SystemChord::of(key, held).is_some_and(SystemChord::grabbable)
+                || claimable_chord(key, held, local)
+        }
         PcKey::Modifier(_)
         | PcKey::Lock(_)
         | PcKey::Ime(_)
@@ -253,6 +266,131 @@ pub fn grab_takes(key: PcKey, held: PcModifierState) -> bool {
         | PcKey::Synthetic
         | PcKey::Unmapped => false,
     }
+}
+
+/// What the Deck's own text input does with a chord the grab could take.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LocalTextInput {
+    /// The window's input method is off (Typing is Keys, or the host takes
+    /// no committed text): every key reaches the host as a key.
+    #[default]
+    Keys,
+    /// The window's input method is on (the session sends committed text):
+    /// its on/off chords ([`input_method_chord`]) are its own.
+    InputMethod,
+    /// The input method is composing: every key is its own until the
+    /// composition ends (Ctrl+U, Ctrl+I, Ctrl+O, Ctrl+P convert in
+    /// Microsoft IME).
+    Composing,
+}
+
+impl LocalTextInput {
+    /// From the text policy's facts: committed text in use, a composition
+    /// showing.
+    #[must_use]
+    pub const fn from_text(active: bool, composing: bool) -> Self {
+        match (active, composing) {
+            (_, true) => Self::Composing,
+            (true, false) => Self::InputMethod,
+            (false, false) => Self::Keys,
+        }
+    }
+}
+
+/// The Deck's own keyboard facts a claimable chord depends on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalKeyFacts {
+    /// [`AltGrKey::acts_as_alt`]; `false` (they type characters) until
+    /// the platform reads its layout.
+    pub altgr_is_alt: bool,
+    /// The window's input method.
+    pub text: LocalTextInput,
+}
+
+impl LocalKeyFacts {
+    /// From a PC Deck's facts: its `AltGr` setting and whether its layout
+    /// has `AltGr`, whether committed text is in use and whether a
+    /// composition is showing.
+    #[must_use]
+    pub const fn new(
+        altgr: AltGrKey,
+        layout_has_altgr: bool,
+        text_active: bool,
+        composing: bool,
+    ) -> Self {
+        Self {
+            altgr_is_alt: altgr.acts_as_alt(layout_has_altgr),
+            text: LocalTextInput::from_text(text_active, composing),
+        }
+    }
+}
+
+/// Whether a chord belongs to a Windows input method while it is on:
+/// Ctrl+Space (Chinese and Korean input methods on or off) and Alt+\`
+/// (Japanese, where a US keyboard has no Hankaku/Zenkaku key), with or
+/// without Shift; and Microsoft Pinyin's Ctrl+. (full- or half-width
+/// punctuation) and Ctrl+Shift+F (simplified or traditional characters).
+#[must_use]
+pub const fn input_method_chord(key: PcKey, held: PcModifierState) -> bool {
+    let PcKey::Position {
+        qt_key,
+        keypad: false,
+    } = key
+    else {
+        return false;
+    };
+    if held.windows || held.altgr {
+        return false;
+    }
+    match qt_key {
+        0x20 => held.control && !held.alt,
+        0x60 => held.alt && !held.control,
+        0x2E => held.control && !held.alt && !held.shift,
+        0x46 => held.control && held.shift && !held.alt,
+        _ => false,
+    }
+}
+
+/// Whether a key press is a shortcut chord any program on the Deck's
+/// computer may claim for itself: a key pressed with Control, Alt or the
+/// Windows key held.
+///
+/// Windows matches a pressed chord against every hot key a program
+/// registered (`RegisterHotKey`) and posts it to that program, so the
+/// focused window never sees it; Gemini in Chrome claims Alt+G this way,
+/// a key Autodesk Flame uses. A low-level hook sees the key first and, by
+/// taking it, keeps it from that match. Never one:
+///
+/// - Ctrl+Alt+Del and Windows+L, which Windows keeps whatever a hook does;
+/// - a key typed with `AltGr`, or with Ctrl+Alt where the layout reads them
+///   as `AltGr`, unless [`LocalKeyFacts::altgr_is_alt`]: those type
+///   characters and stay on the window's path;
+/// - a keypad key with only Alt (and Shift) held: Windows types the
+///   character an Alt code names (Alt+0169 is ©);
+/// - any key while the Deck's input method composes, and its on/off chords
+///   ([`input_method_chord`]) while it is on ([`LocalTextInput`]): the
+///   input method on the window's path has them;
+/// - Shift alone with a key (typing), a plain key, and the modifier keys.
+#[must_use]
+pub fn claimable_chord(key: PcKey, held: PcModifierState, local: LocalKeyFacts) -> bool {
+    let PcKey::Position { keypad, .. } = key else {
+        return false;
+    };
+    match local.text {
+        LocalTextInput::Composing => return false,
+        LocalTextInput::InputMethod if input_method_chord(key, held) => return false,
+        LocalTextInput::InputMethod | LocalTextInput::Keys => {}
+    }
+    if keypad && !held.control && !held.windows {
+        return false;
+    }
+    if SystemChord::of(key, held).is_some_and(|chord| !chord.grabbable()) {
+        return false;
+    }
+    if !local.altgr_is_alt && (held.altgr || (held.control && held.alt)) {
+        return false;
+    }
+    held.control || held.alt || held.altgr || held.windows
 }
 
 /// Where the low-level keyboard hook sends one key edge.
@@ -271,7 +409,9 @@ pub enum HookRoute {
 /// The low-level keyboard hook's routing, installed while the session window
 /// has focus, so a key's release always goes where its press went.
 ///
-/// With the grab on, the session takes what [`grab_takes`] allows. With it
+/// With the grab on, the session takes what [`grab_takes`] allows: the
+/// system shortcuts and any chord another program may have claimed
+/// ([`claimable_chord`]). With it
 /// off, the system keeps everything except the Deck's own chords
 /// ([`DeckShortcut`], whose Ctrl+Windows chords Windows would otherwise act
 /// on). A key whose press the system saw (it was down when routing began,
@@ -286,6 +426,8 @@ pub struct HookRouter {
     session_keys: BTreeSet<PcKey>,
     held: BTreeSet<PcModifier>,
     switch: KeyboardSwitchChord,
+    /// The Deck's own keyboard facts ([`claimable_chord`]).
+    local: LocalKeyFacts,
     /// The press the last [`HookRouter::route`] newly gave the session.
     fresh: Option<PcKey>,
 }
@@ -294,6 +436,12 @@ impl HookRouter {
     /// The keyboard switch's chord (Settings ▸ Input ▸ Keyboard switch).
     pub const fn set_switch_chord(&mut self, switch: KeyboardSwitchChord) {
         self.switch = switch;
+    }
+
+    /// The Deck's own keyboard facts now ([`LocalKeyFacts`]: `AltGr`, the
+    /// window's input method), which decide the chords the grab leaves it.
+    pub const fn set_local(&mut self, local: LocalKeyFacts) {
+        self.local = local;
     }
 
     /// Routing begins (the session window got focus, or the grab changed)
@@ -346,7 +494,7 @@ impl HookRouter {
         }
         let deck_chord = matches!(key, PcKey::Position { qt_key, .. }
             if DeckShortcut::for_pc_key_with(qt_key, before, self.switch).is_some());
-        let takes = deck_chord || (grabbed && grab_takes(key, self.modifiers()));
+        let takes = deck_chord || (grabbed && grab_takes(key, self.modifiers(), self.local));
         if !takes {
             self.system_keys.insert(key);
             return HookRoute::System;
@@ -1452,16 +1600,23 @@ mod tests {
             alt: true,
             ..none
         };
-        assert!(grab_takes(modifier(PcModifier::LeftWindows), windows));
-        assert!(grab_takes(position(0x0100_0001), alt));
-        assert!(!grab_takes(position(0x41), none));
-        assert!(!grab_takes(modifier(PcModifier::LeftAlt), none));
-        assert!(!grab_takes(modifier(PcModifier::RightAlt), none));
-        assert!(!grab_takes(position(0x4C), windows));
-        assert!(!grab_takes(position(KEY_DELETE), control_alt));
-        assert!(!grab_takes(PcKey::Lock(LockKey::Num), none));
-        assert!(!grab_takes(PcKey::Lock(LockKey::Caps), none));
-        assert!(!grab_takes(PcKey::LocalOnly, none));
+        for altgr_is_alt in [false, true] {
+            let local = LocalKeyFacts {
+                altgr_is_alt,
+                ..LocalKeyFacts::default()
+            };
+            let takes = |key, held| grab_takes(key, held, local);
+            assert!(takes(modifier(PcModifier::LeftWindows), windows));
+            assert!(takes(position(0x0100_0001), alt));
+            assert!(!takes(position(0x41), none));
+            assert!(!takes(modifier(PcModifier::LeftAlt), none));
+            assert!(!takes(modifier(PcModifier::RightAlt), none));
+            assert!(!takes(position(0x4C), windows));
+            assert!(!takes(position(KEY_DELETE), control_alt));
+            assert!(!takes(PcKey::Lock(LockKey::Num), none));
+            assert!(!takes(PcKey::Lock(LockKey::Caps), none));
+            assert!(!takes(PcKey::LocalOnly, none));
+        }
         assert_eq!(
             SystemChord::of(
                 position(0x0100_0000),
@@ -1473,6 +1628,228 @@ mod tests {
             ),
             Some(SystemChord::TaskManager)
         );
+    }
+
+    /// Field report: Alt+G, a Flame shortcut, opened Gemini in Chrome on
+    /// the Windows Deck's PC instead of reaching the host. Chrome claims it
+    /// as a hot key, and Windows hands a hot key to its program before the
+    /// focused window sees it; only the hook, which sees it first, can keep
+    /// it for the session.
+    #[test]
+    fn a_chord_another_program_claims_goes_to_the_session_under_the_grab() {
+        let alt = modifier(PcModifier::LeftAlt);
+        let control = modifier(PcModifier::LeftControl);
+        let shift = modifier(PcModifier::LeftShift);
+        let g = position(0x47);
+        let mut router = HookRouter::default();
+        router.begin([]);
+        // Alt+G: the Alt stays on the window's path, the G is the
+        // session's, press and release, so no hot key matches it.
+        assert_eq!(router.route(alt, true, true), HookRoute::System);
+        assert_eq!(router.route(g, true, true), HookRoute::Session);
+        assert_eq!(router.route(g, true, true), HookRoute::Session);
+        assert_eq!(router.route(g, false, true), HookRoute::Session);
+        // Alt+Shift+G and Ctrl+G too.
+        assert_eq!(router.route(shift, true, true), HookRoute::System);
+        assert_eq!(router.route(g, true, true), HookRoute::Session);
+        assert_eq!(router.route(g, false, true), HookRoute::Session);
+        assert_eq!(router.route(shift, false, true), HookRoute::System);
+        assert_eq!(router.route(alt, false, true), HookRoute::System);
+        assert_eq!(router.route(control, true, true), HookRoute::System);
+        assert_eq!(router.route(g, true, true), HookRoute::Session);
+        assert_eq!(router.route(g, false, true), HookRoute::Session);
+        // Ctrl+Alt+G: on a layout whose Ctrl+Alt is AltGr it may type a
+        // character, so it stays on the window's path; where it is Alt, it
+        // is the session's.
+        assert_eq!(router.route(alt, true, true), HookRoute::System);
+        assert_eq!(router.route(g, true, true), HookRoute::System);
+        assert_eq!(router.route(g, false, true), HookRoute::System);
+        router.set_local(LocalKeyFacts {
+            altgr_is_alt: true,
+            ..LocalKeyFacts::default()
+        });
+        assert_eq!(router.route(g, true, true), HookRoute::Session);
+        assert_eq!(router.route(g, false, true), HookRoute::Session);
+        // Ctrl+Alt+Del stays Windows' whatever the layout.
+        assert_eq!(
+            router.route(position(KEY_DELETE), true, true),
+            HookRoute::System
+        );
+        router.route(position(KEY_DELETE), false, true);
+        router.route(alt, false, true);
+        router.route(control, false, true);
+        // Typing is not a chord: G, Shift+G.
+        assert_eq!(router.route(g, true, true), HookRoute::System);
+        assert_eq!(router.route(g, false, true), HookRoute::System);
+        router.route(shift, true, true);
+        assert_eq!(router.route(g, true, true), HookRoute::System);
+        assert_eq!(router.route(g, false, true), HookRoute::System);
+        router.route(shift, false, true);
+        // Without the grab (the system shortcuts stay on this PC), a chord
+        // another program claims is this PC's too.
+        router.route(alt, true, false);
+        assert_eq!(router.route(g, true, false), HookRoute::System);
+        assert_eq!(router.route(g, false, false), HookRoute::System);
+        router.route(alt, false, false);
+    }
+
+    fn alt_held() -> PcModifierState {
+        PcModifierState {
+            alt: true,
+            ..PcModifierState::default()
+        }
+    }
+
+    #[test]
+    fn altgr_chords_are_claimable_only_where_altgr_is_alt() {
+        let altgr = PcModifierState {
+            altgr: true,
+            ..PcModifierState::default()
+        };
+        let keys = LocalKeyFacts::default();
+        let alt_is_alt = LocalKeyFacts {
+            altgr_is_alt: true,
+            ..keys
+        };
+        let q = position(0x51);
+        assert!(!claimable_chord(q, altgr, keys));
+        assert!(claimable_chord(q, altgr, alt_is_alt));
+        assert!(AltGrKey::IsAlt.acts_as_alt(true));
+        assert!(AltGrKey::TypesCharacters.acts_as_alt(false));
+        assert!(!AltGrKey::TypesCharacters.acts_as_alt(true));
+        // An Alt code's keypad digits type its character.
+        let keypad_zero = PcKey::Position {
+            qt_key: 0x30,
+            keypad: true,
+        };
+        assert!(!claimable_chord(keypad_zero, alt_held(), alt_is_alt));
+        assert!(claimable_chord(keypad_zero, control_held(), alt_is_alt));
+        // The modifier keys themselves never are.
+        assert!(!claimable_chord(
+            modifier(PcModifier::LeftAlt),
+            alt_held(),
+            alt_is_alt
+        ));
+    }
+
+    /// Review: the grab must not take the Deck's own input method's keys.
+    /// Its on/off chords (Ctrl+Space, Alt+\`) stay its own while it is on,
+    /// and every key while it composes (Microsoft IME converts with
+    /// Ctrl+U/I/O/P); with Typing = Keys there is no input method and the
+    /// host gets them.
+    #[test]
+    fn the_decks_input_method_keeps_its_chords() {
+        let space = position(0x20);
+        let grave = position(0x60);
+        let u = position(0x55);
+        let g = position(0x47);
+        let facts = |text| LocalKeyFacts {
+            altgr_is_alt: false,
+            text,
+        };
+        let shift_control = PcModifierState {
+            shift: true,
+            ..control_held()
+        };
+        for (key, held) in [
+            (space, control_held()),
+            (space, shift_control),
+            (grave, alt_held()),
+        ] {
+            assert!(input_method_chord(key, held), "{key:?} {held:?}");
+            assert!(claimable_chord(key, held, facts(LocalTextInput::Keys)));
+            assert!(!claimable_chord(
+                key,
+                held,
+                facts(LocalTextInput::InputMethod)
+            ));
+        }
+        // Other chords still go to the host while the input method is on.
+        assert!(!input_method_chord(g, alt_held()));
+        assert!(!input_method_chord(space, alt_held()));
+        assert!(claimable_chord(
+            g,
+            alt_held(),
+            facts(LocalTextInput::InputMethod)
+        ));
+        assert!(claimable_chord(
+            u,
+            control_held(),
+            facts(LocalTextInput::InputMethod)
+        ));
+        // Composing: none.
+        for (key, held) in [
+            (u, control_held()),
+            (g, alt_held()),
+            (space, control_held()),
+        ] {
+            assert!(!claimable_chord(
+                key,
+                held,
+                facts(LocalTextInput::Composing)
+            ));
+        }
+        assert_eq!(
+            LocalTextInput::from_text(false, false),
+            LocalTextInput::Keys
+        );
+        assert_eq!(
+            LocalTextInput::from_text(true, false),
+            LocalTextInput::InputMethod
+        );
+        assert_eq!(
+            LocalTextInput::from_text(true, true),
+            LocalTextInput::Composing
+        );
+        assert_eq!(
+            LocalKeyFacts::new(AltGrKey::TypesCharacters, true, true, false),
+            facts(LocalTextInput::InputMethod)
+        );
+        // Through the router: Ctrl+U while composing stays on the window's
+        // path, press and release; afterwards it is the session's again.
+        let control = modifier(PcModifier::LeftControl);
+        let mut router = HookRouter::default();
+        router.begin([]);
+        router.set_local(facts(LocalTextInput::Composing));
+        router.route(control, true, true);
+        assert_eq!(router.route(u, true, true), HookRoute::System);
+        assert_eq!(router.route(u, false, true), HookRoute::System);
+        router.set_local(facts(LocalTextInput::InputMethod));
+        assert_eq!(router.route(space, true, true), HookRoute::System);
+        assert_eq!(router.route(space, false, true), HookRoute::System);
+        assert_eq!(router.route(u, true, true), HookRoute::Session);
+        // A press already taken keeps its release with the session.
+        router.set_local(facts(LocalTextInput::Composing));
+        assert_eq!(router.route(u, false, true), HookRoute::Session);
+    }
+
+    #[test]
+    fn microsoft_pinyins_own_chords_stay_with_it_while_it_is_on() {
+        let period = position(0x2E);
+        let f = position(0x46);
+        let shift_control = PcModifierState {
+            shift: true,
+            ..control_held()
+        };
+        let on = LocalKeyFacts {
+            altgr_is_alt: false,
+            text: LocalTextInput::InputMethod,
+        };
+        for (key, held) in [(period, control_held()), (f, shift_control)] {
+            assert!(input_method_chord(key, held), "{key:?} {held:?}");
+            assert!(!claimable_chord(key, held, on), "{key:?} {held:?}");
+            assert!(claimable_chord(key, held, LocalKeyFacts::default()));
+        }
+        // Ctrl+F is an ordinary shortcut, the host's.
+        assert!(!input_method_chord(f, control_held()));
+        assert!(claimable_chord(f, control_held(), on));
+    }
+
+    fn control_held() -> PcModifierState {
+        PcModifierState {
+            control: true,
+            ..PcModifierState::default()
+        }
     }
 
     #[test]

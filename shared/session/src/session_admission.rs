@@ -321,10 +321,30 @@ impl Display for SessionAdmissionError {
 
 impl std::error::Error for SessionAdmissionError {}
 
+/// How long an authenticated Deck waits for a session that is only waiting
+/// for its lock screen to give the slot up
+/// ([`SessionAdmissionRuntime::request_yield`]): the holder notices within a
+/// fraction of a second, but may be inside one lock attempt (bounded at five
+/// seconds) and then hands its displays and sound back.
+pub const YIELD_WAIT: Duration = Duration::from_secs(15);
+
+/// Whether the session holding the slot will give it up to a newcomer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Yield {
+    /// No: it is serving, or a private desk waits for its lock.
+    Holding,
+    /// A desk that was not private waits for its lock and gives the slot up
+    /// to an authenticated Deck.
+    Offered,
+    /// A Deck asked for the slot.
+    Requested,
+}
+
 #[derive(Debug)]
 struct SessionAdmissionGate {
     active_token: Option<u64>,
     next_token: u64,
+    yielding: Yield,
 }
 
 impl SessionAdmissionGate {
@@ -332,6 +352,7 @@ impl SessionAdmissionGate {
         Self {
             active_token: None,
             next_token: 1,
+            yielding: Yield::Holding,
         }
     }
 
@@ -342,6 +363,7 @@ impl SessionAdmissionGate {
         let token = self.next_token;
         self.next_token = self.next_token.saturating_add(1);
         self.active_token = Some(token);
+        self.yielding = Yield::Holding;
         Ok(SessionAdmissionLease {
             token,
             reconnect_until: None,
@@ -392,10 +414,39 @@ impl SessionAdmissionGate {
     fn complete(&mut self, lease: &SessionAdmissionLease) -> Result<(), SessionAdmissionError> {
         if self.active_token == Some(lease.token) {
             self.active_token = None;
+            self.yielding = Yield::Holding;
             Ok(())
         } else {
             Err(SessionAdmissionError::ForeignLease)
         }
+    }
+
+    fn set_yield(
+        &mut self,
+        lease: &SessionAdmissionLease,
+        offered: bool,
+    ) -> Result<(), SessionAdmissionError> {
+        self.validate_lease(lease)?;
+        self.yielding = if offered {
+            Yield::Offered
+        } else {
+            Yield::Holding
+        };
+        Ok(())
+    }
+
+    fn request_yield(&mut self) -> bool {
+        match self.yielding {
+            Yield::Holding => false,
+            Yield::Offered | Yield::Requested => {
+                self.yielding = Yield::Requested;
+                true
+            }
+        }
+    }
+
+    fn yield_requested(&self, lease: &SessionAdmissionLease) -> bool {
+        self.active_token == Some(lease.token) && self.yielding == Yield::Requested
     }
 }
 
@@ -477,6 +528,44 @@ impl SessionAdmissionRuntime {
             .lock()
             .map_err(|_| SessionAdmissionError::LockPoisoned)?
             .complete(lease)
+    }
+
+    /// The session holding `lease` has ended and only waits for its lock
+    /// screen on a desk that was not private (`offered`), so it gives the
+    /// slot up to an authenticated Deck that asks
+    /// ([`Self::request_yield`]); `false` withdraws the offer.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionAdmissionError::ForeignLease`] for a lease that does not
+    /// hold the slot, or [`SessionAdmissionError::LockPoisoned`].
+    pub fn offer_yield(
+        &self,
+        lease: &SessionAdmissionLease,
+        offered: bool,
+    ) -> Result<(), SessionAdmissionError> {
+        self.gate
+            .lock()
+            .map_err(|_| SessionAdmissionError::LockPoisoned)?
+            .set_yield(lease, offered)
+    }
+
+    /// An authenticated Deck that found the slot taken asks the holder to
+    /// give it up. `true` when the holder offered to: the Deck then waits up
+    /// to [`YIELD_WAIT`] for [`Self::admit_new`] to succeed. `false` (a
+    /// session is being served, or a private desk waits for its lock): the
+    /// host is busy.
+    #[must_use]
+    pub fn request_yield(&self) -> bool {
+        self.gate.lock().is_ok_and(|mut gate| gate.request_yield())
+    }
+
+    /// Whether a Deck asked the holder of `lease` for the slot.
+    #[must_use]
+    pub fn yield_requested(&self, lease: &SessionAdmissionLease) -> bool {
+        self.gate
+            .lock()
+            .is_ok_and(|gate| gate.yield_requested(lease))
     }
 }
 
@@ -584,6 +673,39 @@ mod tests {
 
     fn address(text: &str) -> IpAddr {
         text.parse().expect("address")
+    }
+
+    #[test]
+    fn only_a_holder_that_offered_gives_its_slot_to_an_authenticated_deck() {
+        let runtime = SessionAdmissionRuntime::new();
+        let lease = runtime.admit_new().expect("first session");
+        // A session being served, or a private desk waiting for its lock:
+        // busy.
+        assert!(!runtime.request_yield());
+        assert!(!runtime.yield_requested(&lease));
+
+        runtime.offer_yield(&lease, true).expect("offered");
+        assert!(!runtime.yield_requested(&lease));
+        assert!(runtime.request_yield());
+        assert!(runtime.yield_requested(&lease));
+        // The slot is given up only when the holder completes.
+        assert_eq!(
+            runtime.admit_new().err(),
+            Some(SessionAdmissionError::SessionAlreadyActive)
+        );
+        runtime.complete(&lease).expect("completed");
+        let next = runtime.admit_new().expect("the waiting Deck");
+        assert!(!runtime.request_yield());
+        assert!(!runtime.yield_requested(&lease));
+
+        // A withdrawn offer is busy again.
+        runtime.offer_yield(&next, true).expect("offered");
+        runtime.offer_yield(&next, false).expect("withdrawn");
+        assert!(!runtime.request_yield());
+        assert_eq!(
+            runtime.offer_yield(&lease, true).err(),
+            Some(SessionAdmissionError::ForeignLease)
+        );
     }
 
     #[test]
