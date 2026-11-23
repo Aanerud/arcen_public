@@ -2738,6 +2738,7 @@ async fn a_bridged_tablet_is_published_as_hid_devices_fed_and_torn_down() {
             arcen_protocol::messages::CursorMode::Host,
             Some(&client_hello),
             &offered.native_tablet,
+            false,
         );
         assert!(
             results.native_tablet.is_some(),

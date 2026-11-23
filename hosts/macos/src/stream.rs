@@ -52,6 +52,46 @@ const FULL_FRAME_KEYFRAME_GUARD: Duration = Duration::from_millis(500);
 /// a second is fast enough that a copy feels immediate and slow enough that an
 /// idle session costs nothing.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(500);
+/// What the cursor watcher tells the Deck: the desktop cursor's images when
+/// the session promised them (`CursorModeResultMsg::cursor_images`), each
+/// drawn at the scale of the output the pointer is on; its names otherwise.
+fn cursor_report(
+    cursor_images: bool,
+    outputs: Vec<arcen_input::cursor::PointerOutput>,
+) -> crate::cursor_probe::CursorReport {
+    if cursor_images {
+        crate::cursor_probe::CursorReport::Images { outputs }
+    } else {
+        crate::cursor_probe::CursorReport::Shapes
+    }
+}
+
+/// A captured display as the cursor watcher sees it: its desktop points and
+/// its stream's width. `output` is 0 for a session's only display.
+fn pointer_output(
+    output: u32,
+    bounds: (f64, f64, f64, f64),
+    stream_width: usize,
+) -> arcen_input::cursor::PointerOutput {
+    arcen_input::cursor::PointerOutput::new(
+        output,
+        0,
+        bounds,
+        u32::try_from(stream_width).unwrap_or(u32::MAX),
+    )
+}
+
+/// Says so when a session whose Deck draws the pointer cannot read the
+/// desktop's cursor: the Deck then draws a plain arrow.
+fn warn_unreadable_cursor(unreadable: bool, cursor_mode: arcen_protocol::messages::CursorMode) {
+    if unreadable && cursor_mode == arcen_protocol::messages::CursorMode::Local {
+        tracing::warn!(
+            target: arcen_telemetry::names::target::HID,
+            "cannot read the desktop cursor; the Deck will draw a plain arrow"
+        );
+    }
+}
+
 /// How often the session picks up a cursor shape change to forward.
 const CURSOR_POLL: Duration = Duration::from_millis(60);
 const CLIPBOARD_SEND_TICK: Duration = Duration::from_millis(1);
@@ -199,6 +239,27 @@ impl std::fmt::Display for StreamError {
 }
 
 impl std::error::Error for StreamError {}
+
+impl StreamError {
+    /// Why the stream stopped, in the shared vocabulary the session end is
+    /// decided in (`arcen_session::console_session::stream_end`). Which
+    /// stop by `ScreenCaptureKit` is a person's Stop Sharing is the shared
+    /// `capture_stop_cause`'s decision, from the error's domain and code.
+    #[must_use]
+    pub fn end_cause(&self) -> arcen_session::console_session::stream_end::StreamEndCause {
+        use arcen_session::console_session::stream_end::{StreamEndCause, capture_stop_cause};
+        match self {
+            Self::Capture(CaptureError::StreamStopped(stop)) => {
+                capture_stop_cause(&stop.domain, stop.code)
+            }
+            Self::Capture(_) | Self::Encode(_) => StreamEndCause::MediaFailed,
+            Self::PeerGone(_) => StreamEndCause::PeerGone,
+            Self::WriteTimeout | Self::Input(_) | Self::Clipboard(_) | Self::Protocol(_) => {
+                StreamEndCause::Other
+            }
+        }
+    }
+}
 
 /// Describes the stream this encoder is producing, in the shared vocabulary.
 ///
@@ -1401,7 +1462,8 @@ fn spawn_producer(
     }
 }
 
-/// Spawns the multi-display capture and encode thread.
+/// Spawns the multi-display producer, which runs one capture and encode
+/// thread per display.
 struct MultiProducerConfig {
     monitors: Vec<RegionStreamPlan>,
     codec: EncoderCodec,
@@ -1412,8 +1474,10 @@ struct MultiProducerConfig {
 }
 
 fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
-    // Two per monitor, for the reason given in `spawn_producer`.
-    let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<Result<Produced, String>>(4);
+    // Two per monitor, for the reason given in `spawn_producer`. Each
+    // monitor's thread blocks on a full channel; only that monitor stalls.
+    let depth = 2 * config.monitors.len().max(2);
+    let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<Result<Produced, String>>(depth);
     let cancelled = ProducerCancel::new();
     let producer_cancel = cancelled.token();
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1426,8 +1490,8 @@ fn spawn_multi_producer(config: MultiProducerConfig) -> Producer {
     let producer_superseded = std::sync::Arc::clone(&superseded);
     let health = std::sync::Arc::new(CaptureHealthCounters::default());
     let producer_health = std::sync::Arc::clone(&health);
-    // Multi-monitor encoders keep their own rates for now; the session does
-    // not drive this one.
+    // The session's rate controller drives this; each display's thread
+    // applies it to its own encoder, clamped to that region's ceiling.
     let rate = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let producer_rate = std::sync::Arc::clone(&rate);
     // Region encoders run at the capture rate; nothing reads this.
@@ -2395,18 +2459,26 @@ pub async fn stream(
         // cursor mode the compositor already draws the real one into the
         // picture, and naming it as well would have the Deck draw a second.
         let cursor = if session_cursor_mode == arcen_protocol::messages::CursorMode::Local {
-            crate::cursor_probe::CursorWatcher::start()
+            crate::cursor_probe::CursorWatcher::start(cursor_report(
+                input_mode_results.cursor.cursor_images,
+                vec![pointer_output(
+                    0,
+                    (
+                        input_bounds.origin_x,
+                        input_bounds.origin_y,
+                        input_bounds.width,
+                        input_bounds.height,
+                    ),
+                    capture.width,
+                )],
+            ))
         } else {
             None
         };
-        if cursor.is_none() && session_cursor_mode == arcen_protocol::messages::CursorMode::Local {
-            tracing::warn!(
-                target: arcen_telemetry::names::target::HID,
-                "cannot read the desktop cursor; the Deck will draw a plain arrow"
-            );
-        }
+        warn_unreadable_cursor(cursor.is_none(), session_cursor_mode);
         let mut cursor_tick = tokio::time::interval(CURSOR_POLL);
         let mut cursor_shapes_sent = 0_u64;
+        let mut cursor_images_sent = 0_u64;
         let mut clipboard_tick = tokio::time::interval(CLIPBOARD_POLL);
         let mut clipboard_send_tick = tokio::time::interval(CLIPBOARD_SEND_TICK);
         let mut audio_tick = tokio::time::interval(AUDIO_POLL);
@@ -2849,11 +2921,21 @@ pub async fn stream(
                 _ = cursor_tick.tick(), if cursor.is_some() => {
                     // After frames: a pointer shape is worth a few
                     // milliseconds of delay and a picture is not.
-                    if let Some(message) = cursor.as_ref().and_then(
+                    match cursor.as_ref().and_then(
                         crate::cursor_probe::CursorWatcher::take_changed,
-                    ) && let Ok(text) = serde_json::to_string(&message) {
-                        enqueue(&priority, Message::Text(text)).await?;
-                        cursor_shapes_sent += 1;
+                    ) {
+                        Some(crate::cursor_probe::CursorMessage::Shape(message)) => {
+                            if let Ok(text) = serde_json::to_string(&message) {
+                                enqueue(&priority, Message::Text(text)).await?;
+                                cursor_shapes_sent += 1;
+                            }
+                        }
+                        // On the input/cursor lane, like `CursorPosition`.
+                        Some(crate::cursor_probe::CursorMessage::Record(record)) => {
+                            enqueue(&priority, Message::Binary(record)).await?;
+                            cursor_images_sent += 1;
+                        }
+                        None => {}
                     }
                     continue;
                 }
@@ -2889,15 +2971,17 @@ pub async fn stream(
             }
         }
 
-        // Reported together, because separately they mislead. Images counts
-        // what the desktop actually did; shapes counts what could be named and
-        // sent. Images climbing while shapes stays at zero means the polling
-        // works and the matching does not — which is a different bug from the
+        // Reported together, because separately they mislead. Images seen
+        // counts what the desktop actually did; the rest counts what was
+        // sent. Images climbing while nothing is sent means the polling works
+        // and what follows it does not — which is a different bug from the
         // cursor never changing at all, and the two look identical otherwise.
         if let Some(cursor) = cursor.as_ref() {
             tracing::info!(
                 target: arcen_telemetry::names::target::HID,
                 cursor_images_seen = cursor.images_seen(),
+                cursor_images_sent,
+                cursor_images_refused = cursor.images_refused(),
                 cursor_shapes_sent,
                 "cursor shape reporting"
             );
@@ -2997,6 +3081,17 @@ pub async fn stream_multi(
         .map(|monitor| monitor.capture.fps)
         .fold(0_u32, u32::saturating_add);
     let primary_capture = monitors.first().map(|monitor| monitor.capture);
+    // Every display in its own scale and pixel space, numbered by its
+    // display id: displays of different scales show the pointer at each
+    // one's own size.
+    let cursor_outputs: Vec<arcen_input::cursor::PointerOutput> = monitors
+        .iter()
+        .filter_map(|monitor| {
+            let display = monitor.capture.display_id;
+            crate::displays::point_bounds(display)
+                .map(|bounds| pointer_output(display, bounds, monitor.capture.width))
+        })
+        .collect();
     // Each display's identity and own rate, in capture order.
     let display_rates: Vec<(arcen_media::SessionMonitorId, u32)> = monitors
         .iter()
@@ -3126,18 +3221,17 @@ pub async fn stream_multi(
         // cursor mode the compositor already draws the real one into the
         // picture, and naming it as well would have the Deck draw a second.
         let cursor = if session_cursor_mode == arcen_protocol::messages::CursorMode::Local {
-            crate::cursor_probe::CursorWatcher::start()
+            crate::cursor_probe::CursorWatcher::start(cursor_report(
+                input_mode_results.cursor.cursor_images,
+                cursor_outputs.clone(),
+            ))
         } else {
             None
         };
-        if cursor.is_none() && session_cursor_mode == arcen_protocol::messages::CursorMode::Local {
-            tracing::warn!(
-                target: arcen_telemetry::names::target::HID,
-                "cannot read the desktop cursor; the Deck will draw a plain arrow"
-            );
-        }
+        warn_unreadable_cursor(cursor.is_none(), session_cursor_mode);
         let mut cursor_tick = tokio::time::interval(CURSOR_POLL);
         let mut cursor_shapes_sent = 0_u64;
+        let mut cursor_images_sent = 0_u64;
         let mut clipboard_tick = tokio::time::interval(CLIPBOARD_POLL);
         let mut clipboard_send_tick = tokio::time::interval(CLIPBOARD_SEND_TICK);
         let mut audio_tick = tokio::time::interval(AUDIO_POLL);
@@ -3482,11 +3576,21 @@ pub async fn stream_multi(
                 _ = cursor_tick.tick(), if cursor.is_some() => {
                     // After frames: a pointer shape is worth a few
                     // milliseconds of delay and a picture is not.
-                    if let Some(message) = cursor.as_ref().and_then(
+                    match cursor.as_ref().and_then(
                         crate::cursor_probe::CursorWatcher::take_changed,
-                    ) && let Ok(text) = serde_json::to_string(&message) {
-                        enqueue(&priority, Message::Text(text)).await?;
-                        cursor_shapes_sent += 1;
+                    ) {
+                        Some(crate::cursor_probe::CursorMessage::Shape(message)) => {
+                            if let Ok(text) = serde_json::to_string(&message) {
+                                enqueue(&priority, Message::Text(text)).await?;
+                                cursor_shapes_sent += 1;
+                            }
+                        }
+                        // On the input/cursor lane, like `CursorPosition`.
+                        Some(crate::cursor_probe::CursorMessage::Record(record)) => {
+                            enqueue(&priority, Message::Binary(record)).await?;
+                            cursor_images_sent += 1;
+                        }
+                        None => {}
                     }
                     continue;
                 }
@@ -3497,15 +3601,17 @@ pub async fn stream_multi(
             }
         }
 
-        // Reported together, because separately they mislead. Images counts
-        // what the desktop actually did; shapes counts what could be named and
-        // sent. Images climbing while shapes stays at zero means the polling
-        // works and the matching does not — which is a different bug from the
+        // Reported together, because separately they mislead. Images seen
+        // counts what the desktop actually did; the rest counts what was
+        // sent. Images climbing while nothing is sent means the polling works
+        // and what follows it does not — which is a different bug from the
         // cursor never changing at all, and the two look identical otherwise.
         if let Some(cursor) = cursor.as_ref() {
             tracing::info!(
                 target: arcen_telemetry::names::target::HID,
                 cursor_images_seen = cursor.images_seen(),
+                cursor_images_sent,
+                cursor_images_refused = cursor.images_refused(),
                 cursor_shapes_sent,
                 "cursor shape reporting"
             );
@@ -3579,8 +3685,10 @@ fn send_frame(
     sent_frames: &arcen_telemetry::SentFrames,
     totals: Accumulators<'_>,
 ) {
-    stats.frames_captured = frame.captured;
-    stats.frames_encoded = frame.encoded;
+    // `max`, because a multi-display session's threads queue concurrently:
+    // a display's totals may be a frame older than the one queued before it.
+    stats.frames_captured = stats.frames_captured.max(frame.captured);
+    stats.frames_encoded = stats.frames_encoded.max(frame.encoded);
     if frame.keyframe {
         stats.keyframes += 1;
     }
@@ -4870,18 +4978,12 @@ fn encode_loop(latest: &LatestFrame, context: EncodeLoopContext<'_>) -> Result<(
     Ok(())
 }
 
+/// One display's encoder, owned by that display's producer thread.
 struct RegionEncoder {
     plan: RegionStreamPlan,
     encoder: Encoder,
     applied_rate_bps: u64,
     live_max_rate_bps: u64,
-    captured: u64,
-    encoded: u64,
-    encoded_keyframe_request: u64,
-    last_frame: Option<CapturedFrame>,
-    /// When this monitor last sent a frame: a still monitor sends a
-    /// keepalive every [`KEEPALIVE`], as on the other Piers.
-    last_sent: Instant,
     /// This monitor's HDR white stage, when its capture is HDR.
     hdr_white: Option<crate::hdr_white::PqWhiteStage>,
     hdr_white_stats: HdrWhiteStats,
@@ -5016,11 +5118,6 @@ fn make_region_encoders(
                 encoder,
                 applied_rate_bps: start_bps,
                 live_max_rate_bps: live_max_bps,
-                captured: 0,
-                encoded: 0,
-                encoded_keyframe_request: 0,
-                last_frame: None,
-                last_sent: Instant::now(),
                 hdr_white: hdr_white_stage_for(&plan.capture),
                 hdr_white_stats: HdrWhiteStats::default(),
             })
@@ -5068,29 +5165,391 @@ fn reconfigure_region_encoders_for_served_pipeline(
     Ok(())
 }
 
-fn apply_rate_to_region_encoders(
-    encoders: &mut [RegionEncoder],
+fn apply_rate_to_region_encoder(
+    encoder: &mut RegionEncoder,
     target_bps: u64,
-) -> Result<usize, StreamError> {
-    let mut changed = 0;
-    for encoder in encoders {
-        let clamped =
-            arcen_media::video::clamp_live_bitrate_target(target_bps, encoder.live_max_rate_bps);
-        if clamped == 0 || clamped == encoder.applied_rate_bps {
-            continue;
-        }
-        encoder
-            .encoder
-            .set_average_bitrate(clamped)
-            .map_err(|error| StreamError::Encode(error.to_string()))?;
-        encoder.applied_rate_bps = clamped;
-        changed += 1;
+) -> Result<bool, StreamError> {
+    let clamped =
+        arcen_media::video::clamp_live_bitrate_target(target_bps, encoder.live_max_rate_bps);
+    if clamped == 0 || clamped == encoder.applied_rate_bps {
+        return Ok(false);
     }
-    Ok(changed)
+    encoder
+        .encoder
+        .set_average_bitrate(clamped)
+        .map_err(|error| StreamError::Encode(error.to_string()))?;
+    encoder.applied_rate_bps = clamped;
+    Ok(true)
 }
 
-/// Captures and encodes every monitor in one blocking producer thread.
-#[allow(clippy::too_many_lines)]
+/// One display's frames, as that display's producer thread waits for them.
+///
+/// A seam, so the per-display threading is testable without
+/// `ScreenCaptureKit`.
+trait MonitorFrames {
+    type Frame;
+    fn next_frame(&self, timeout: Duration) -> Result<Self::Frame, CaptureError>;
+    /// Frames this display's stream shed, cumulative.
+    fn dropped_frames(&self) -> u64;
+}
+
+impl MonitorFrames for crate::capture::FrameSource {
+    type Frame = CapturedFrame;
+
+    fn next_frame(&self, timeout: Duration) -> Result<CapturedFrame, CaptureError> {
+        Self::next_frame(self, timeout)
+    }
+
+    fn dropped_frames(&self) -> u64 {
+        Self::dropped_frames(self)
+    }
+}
+
+/// What one display's producer thread needs from its encoder; the other half
+/// of the [`MonitorFrames`] seam.
+trait MonitorEncoder {
+    type Frame;
+    /// Prepares a captured frame for encoding and keepalive re-encoding.
+    fn admit(&mut self, frame: Self::Frame) -> Self::Frame;
+    /// Applies the session's wanted rate; true when it changed anything.
+    fn apply_rate(&mut self, target_bps: u64) -> Result<bool, StreamError>;
+    fn encode(
+        &mut self,
+        frame: &Self::Frame,
+        force_keyframe: bool,
+    ) -> Result<Option<EncodedAccessUnit>, StreamError>;
+    fn monitor_id(&self) -> arcen_media::SessionMonitorId;
+    /// The region video payload for `unit`: header, then the access unit.
+    fn region_payload(&self, unit: &EncodedAccessUnit, timestamp_ms: u32) -> Vec<u8>;
+}
+
+impl MonitorEncoder for RegionEncoder {
+    type Frame = CapturedFrame;
+
+    fn admit(&mut self, frame: CapturedFrame) -> CapturedFrame {
+        whiten(self.hdr_white.as_ref(), frame, &mut self.hdr_white_stats)
+    }
+
+    fn apply_rate(&mut self, target_bps: u64) -> Result<bool, StreamError> {
+        apply_rate_to_region_encoder(self, target_bps)
+    }
+
+    fn encode(
+        &mut self,
+        frame: &CapturedFrame,
+        force_keyframe: bool,
+    ) -> Result<Option<EncodedAccessUnit>, StreamError> {
+        self.encoder
+            .encode_with_keyframe_request(frame, force_keyframe)
+            .map_err(|error| StreamError::Encode(error.to_string()))
+    }
+
+    fn monitor_id(&self) -> arcen_media::SessionMonitorId {
+        self.plan.monitor_id
+    }
+
+    fn region_payload(&self, unit: &EncodedAccessUnit, timestamp_ms: u32) -> Vec<u8> {
+        let mut payload = region_header_for(
+            unit,
+            self.encoder.config().codec,
+            WireShape::of(&self.plan.capture),
+            timestamp_ms,
+            self.plan.monitor_id,
+            self.plan.topology_generation,
+            self.plan.stream_epoch,
+        );
+        payload.extend_from_slice(&unit.bytes);
+        payload
+    }
+}
+
+/// What every display's producer thread shares.
+struct MultiShared<'a> {
+    frames: &'a tokio::sync::mpsc::Sender<Result<Produced, String>>,
+    /// The session's stop request.
+    cancelled: &'a std::sync::atomic::AtomicBool,
+    /// Set when any display's thread ends, for whatever reason: one display
+    /// failing, the budget spent or the client gone ends the whole producer,
+    /// as it did when every display shared one loop.
+    stop: std::sync::atomic::AtomicBool,
+    keyframe_requests: &'a std::sync::atomic::AtomicU64,
+    rate: &'a std::sync::atomic::AtomicU64,
+    dropped: &'a std::sync::atomic::AtomicU64,
+    health: &'a CaptureHealthCounters,
+    frame_budget: Option<u64>,
+    sent: std::sync::atomic::AtomicU64,
+    total_captured: std::sync::atomic::AtomicU64,
+    total_encoded: std::sync::atomic::AtomicU64,
+    idle_waits: std::sync::atomic::AtomicU64,
+    /// Served pipeline truth, owed to exactly the first message produced.
+    served_pipeline: Mutex<Option<arcen_protocol::messages::ServedPipelineMsg>>,
+    served_pipeline_owed: std::sync::atomic::AtomicBool,
+    frame_timeout: Duration,
+    first_frame_started: Instant,
+    first_frame_limit: Duration,
+}
+
+impl MultiShared<'_> {
+    fn should_stop(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
+            || self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+            || self.frame_budget.is_some_and(|budget| {
+                self.sent.load(std::sync::atomic::Ordering::Relaxed) >= budget
+            })
+    }
+
+    /// Queues one produced frame; false once the client is gone.
+    ///
+    /// The first message carries the served pipeline truth. Whoever sends it
+    /// holds the lock until it is queued, so no other display's frame can
+    /// overtake it on the channel.
+    fn send(&self, mut produced: Produced) -> bool {
+        if self
+            .served_pipeline_owed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let mut owed = self
+                .served_pipeline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            produced.served_pipeline = owed.take();
+            let queued = self.frames.blocking_send(Ok(produced)).is_ok();
+            self.served_pipeline_owed
+                .store(false, std::sync::atomic::Ordering::Release);
+            drop(owed);
+            return queued;
+        }
+        self.frames.blocking_send(Ok(produced)).is_ok()
+    }
+}
+
+/// Sets the shared stop flag when a display's thread ends, panics included,
+/// so its siblings never outlive it waiting on a scope that cannot close.
+struct StopOnExit<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Serves every display from a thread of its own and returns the first error
+/// any of them hit.
+///
+/// One thread per display, because one loop over every display coupled them:
+/// each pass waited up to the frame timeout on each display in turn and
+/// encoded synchronously, so an idle display's wait and every encode delayed
+/// the next display's frame. Measured on a two-display M2 Ultra: 120 fps
+/// requested, 30 fps presented per display.
+fn serve_monitors<S, E>(
+    monitors: Vec<(usize, S, E)>,
+    shared: &MultiShared<'_>,
+) -> Result<(), StreamError>
+where
+    S: MonitorFrames + Send,
+    E: MonitorEncoder<Frame = S::Frame> + Send,
+{
+    let first_error: Mutex<Option<StreamError>> = Mutex::new(None);
+    let record = |error: StreamError| {
+        let mut slot = first_error.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    };
+    std::thread::scope(|scope| {
+        for (index, source, encoder) in monitors {
+            let record = &record;
+            let spawned = std::thread::Builder::new()
+                .name(format!("arcen-display-{index}"))
+                .spawn_scoped(scope, move || {
+                    let _stop = StopOnExit(&shared.stop);
+                    if let Err(error) = serve_monitor(index, &source, encoder, shared) {
+                        record(error);
+                    }
+                });
+            if let Err(error) = spawned {
+                shared
+                    .stop
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                record(StreamError::Encode(format!(
+                    "start display {index} producer: {error}"
+                )));
+                break;
+            }
+        }
+    });
+    first_error
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .map_or(Ok(()), Err)
+}
+
+/// What one display's thread remembers between frames.
+struct MonitorLoop<F> {
+    index: usize,
+    captured: u64,
+    dropped_seen: u64,
+    encoded_keyframe_request: u64,
+    last_frame: Option<F>,
+    /// When this display last sent a frame: a still display sends a
+    /// keepalive every [`KEEPALIVE`], as on the other Piers.
+    last_sent: Instant,
+}
+
+/// Captures and encodes one display until the producer stops.
+fn serve_monitor<S, E>(
+    index: usize,
+    source: &S,
+    mut encoder: E,
+    shared: &MultiShared<'_>,
+) -> Result<(), StreamError>
+where
+    S: MonitorFrames,
+    E: MonitorEncoder<Frame = S::Frame>,
+{
+    let mut state = MonitorLoop {
+        index,
+        captured: 0,
+        dropped_seen: 0,
+        encoded_keyframe_request: 0,
+        last_frame: None,
+        last_sent: Instant::now(),
+    };
+    loop {
+        if shared.should_stop() {
+            return Ok(());
+        }
+        let wanted = shared.rate.load(std::sync::atomic::Ordering::Relaxed);
+        if wanted != 0
+            && let Err(error) = encoder.apply_rate(wanted)
+        {
+            tracing::warn!(
+                target: arcen_telemetry::names::target::MEDIA,
+                %error,
+                "a region encoder refused a new rate"
+            );
+        }
+        let dropped = source.dropped_frames();
+        if dropped > state.dropped_seen {
+            shared.dropped.fetch_add(
+                dropped - state.dropped_seen,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            state.dropped_seen = dropped;
+        }
+        shared
+            .health
+            .publish_offered(index, state.captured.saturating_add(dropped));
+        let wait_started = Instant::now();
+        let frame = match source.next_frame(shared.frame_timeout) {
+            Ok(frame) => frame,
+            Err(error) => {
+                let wait = classify_capture_wait(
+                    error,
+                    state.last_frame.is_some(),
+                    shared.first_frame_started.elapsed(),
+                    shared.first_frame_limit,
+                )?;
+                shared
+                    .idle_waits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if shared.frames.is_closed() {
+                    return Ok(());
+                }
+                if wait == CaptureWait::FirstFrameStillPending {
+                    continue;
+                }
+                let requested_keyframe = shared
+                    .keyframe_requests
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let keyframe_due = requested_keyframe != state.encoded_keyframe_request;
+                if state.last_frame.is_none()
+                    || (!keyframe_due && state.last_sent.elapsed() < KEEPALIVE)
+                {
+                    continue;
+                }
+                let capture_wait = wait_started.elapsed();
+                if !emit_region_frame(&mut encoder, &mut state, shared, capture_wait)? {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let capture_wait = wait_started.elapsed();
+        state.captured += 1;
+        shared
+            .total_captured
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        shared.health.publish_offered(
+            index,
+            state.captured.saturating_add(source.dropped_frames()),
+        );
+        state.last_frame = Some(encoder.admit(frame));
+        if !emit_region_frame(&mut encoder, &mut state, shared, capture_wait)? {
+            return Ok(());
+        }
+    }
+}
+
+/// Encodes the display's last frame (a keyframe when one is owed) and queues
+/// it. False once the client is gone.
+fn emit_region_frame<E: MonitorEncoder>(
+    encoder: &mut E,
+    state: &mut MonitorLoop<E::Frame>,
+    shared: &MultiShared<'_>,
+    capture_wait: Duration,
+) -> Result<bool, StreamError> {
+    let Some(frame) = state.last_frame.as_ref() else {
+        return Ok(true);
+    };
+    let frame_started = Instant::now();
+    let requested_keyframe = shared
+        .keyframe_requests
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let force_keyframe = requested_keyframe != state.encoded_keyframe_request;
+    let Some(unit) = encoder.encode(frame, force_keyframe)? else {
+        return Ok(true);
+    };
+    if force_keyframe {
+        state.encoded_keyframe_request = requested_keyframe;
+    }
+    let encode_took = frame_started.elapsed();
+    let total_encoded = shared
+        .total_encoded
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    let payload = encoder.region_payload(&unit, arcen_protocol::wire::now_wire_timestamp_ms());
+    let produced = Produced {
+        queued_at: Instant::now(),
+        payload,
+        keyframe: unit.keyframe,
+        captured: shared
+            .total_captured
+            .load(std::sync::atomic::Ordering::Relaxed),
+        encoded: total_encoded,
+        took: frame_started.elapsed(),
+        capture_wait,
+        encode_took,
+        monitor_id: Some(encoder.monitor_id()),
+        served_pipeline: None,
+        refine_before: Vec::new(),
+    };
+    if !shared.send(produced) {
+        return Ok(false);
+    }
+    state.last_sent = Instant::now();
+    shared
+        .sent
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::trace!(
+        target: "arcen::media",
+        display = state.index,
+        "region frame queued"
+    );
+    Ok(true)
+}
+
+/// Captures and encodes every monitor, one producer thread per monitor.
 fn produce_multi(
     config: MultiProducerConfig,
     frames: &tokio::sync::mpsc::Sender<Result<Produced, String>>,
@@ -5114,14 +5573,14 @@ fn produce_multi(
         rate,
         detail_fps: _,
     } = signals;
-    let capture = crate::multi_capture::MultiDisplayCapture::start_configured(
+    let mut capture = crate::multi_capture::MultiDisplayCapture::start_configured(
         monitors.iter().map(|monitor| monitor.capture).collect(),
     )
     .map_err(|error| StreamError::Capture(CaptureError::StartFailed(error.to_string())))?;
     health.register_sources(capture.unchanged_counters());
     let mut encoders =
         make_region_encoders(&monitors, codec, motion_priority, served_pipeline.as_ref())?;
-    let mut served_pipeline_update = served_pipeline_msg_for_region_encoders(
+    let served_pipeline_update = served_pipeline_msg_for_region_encoders(
         requested_pipeline,
         codec,
         motion_priority,
@@ -5130,195 +5589,43 @@ fn produce_multi(
     if let Some(message) = served_pipeline_update.as_ref() {
         reconfigure_region_encoders_for_served_pipeline(&mut encoders, &message.served)?;
     }
-    let mut sent = 0_u64;
-    let mut total_captured = 0_u64;
-    let mut total_encoded = 0_u64;
-    let mut idle_waits = 0_u64;
-    let first_frame_limit = first_frame_timeout();
-    let first_frame_started = Instant::now();
-    let frame_timeout = std::env::var(FRAME_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(Duration::from_millis(16), Duration::from_millis);
-
-    loop {
-        if frame_budget.is_some_and(|budget| sent >= budget)
-            || cancelled.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            break;
-        }
-        let wanted = rate.load(std::sync::atomic::Ordering::Relaxed);
-        if wanted != 0
-            && let Err(error) = apply_rate_to_region_encoders(&mut encoders, wanted)
-        {
-            tracing::warn!(
-                target: arcen_telemetry::names::target::MEDIA,
-                %error,
-                "a region encoder refused a new rate"
-            );
-        }
-        dropped.store(
-            capture.dropped_frames(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let mut sent_any = false;
-        for monitor in capture.monitors() {
+    // Each display's frames go to its own thread; the streams themselves stay
+    // here, where they were started and where they are stopped.
+    let mut encoders: Vec<Option<RegionEncoder>> = encoders.into_iter().map(Some).collect();
+    let workers: Vec<_> = capture
+        .monitors_mut()
+        .iter_mut()
+        .filter_map(|monitor| {
             let index = usize::from(monitor.monitor_index);
-            let Some(encoder) = encoders.get_mut(index) else {
-                continue;
-            };
-            health.publish_offered(
-                index,
-                encoder.captured.saturating_add(monitor.dropped_frames()),
-            );
-            let wait_started = Instant::now();
-            let frame = match monitor.next_frame(frame_timeout) {
-                Ok(frame) => frame,
-                Err(error) => match classify_capture_wait(
-                    error,
-                    encoder.last_frame.is_some(),
-                    first_frame_started.elapsed(),
-                    first_frame_limit,
-                )? {
-                    CaptureWait::FirstFrameStillPending => {
-                        idle_waits += 1;
-                        if frames.is_closed() {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    CaptureWait::IdleAfterFirstFrame => {
-                        idle_waits += 1;
-                        if frames.is_closed() {
-                            return Ok(());
-                        }
-                        let requested_keyframe =
-                            keyframe_requests.load(std::sync::atomic::Ordering::Relaxed);
-                        let Some(frame) = encoder.last_frame.as_ref() else {
-                            continue;
-                        };
-                        let keyframe_due = requested_keyframe != encoder.encoded_keyframe_request;
-                        if !keyframe_due && encoder.last_sent.elapsed() < KEEPALIVE {
-                            continue;
-                        }
-                        let frame_started = Instant::now();
-                        let capture_wait = wait_started.elapsed();
-                        let encode_started = Instant::now();
-                        let Some(unit) = encoder
-                            .encoder
-                            .encode_with_keyframe_request(frame, keyframe_due)
-                            .map_err(|error| StreamError::Encode(error.to_string()))?
-                        else {
-                            continue;
-                        };
-                        if keyframe_due {
-                            encoder.encoded_keyframe_request = requested_keyframe;
-                        }
-                        let encode_took = encode_started.elapsed();
-                        encoder.encoded += 1;
-                        total_encoded += 1;
-                        let timestamp_ms = arcen_protocol::wire::now_wire_timestamp_ms();
-                        let mut payload = region_header_for(
-                            &unit,
-                            codec,
-                            WireShape::of(&encoder.plan.capture),
-                            timestamp_ms,
-                            encoder.plan.monitor_id,
-                            encoder.plan.topology_generation,
-                            encoder.plan.stream_epoch,
-                        );
-                        payload.extend_from_slice(&unit.bytes);
-                        let produced = Produced {
-                            queued_at: Instant::now(),
-                            payload,
-                            keyframe: unit.keyframe,
-                            captured: total_captured,
-                            encoded: total_encoded,
-                            took: frame_started.elapsed(),
-                            capture_wait,
-                            encode_took,
-                            monitor_id: Some(encoder.plan.monitor_id),
-                            served_pipeline: served_pipeline_update.take(),
-                            refine_before: Vec::new(),
-                        };
-                        if frames.blocking_send(Ok(produced)).is_err() {
-                            return Ok(());
-                        }
-                        encoder.last_sent = Instant::now();
-                        sent += 1;
-                        sent_any = true;
-                        continue;
-                    }
-                },
-            };
-            let capture_wait = wait_started.elapsed();
-            let frame_started = Instant::now();
-            encoder.captured += 1;
-            total_captured += 1;
-            health.publish_offered(
-                index,
-                encoder.captured.saturating_add(monitor.dropped_frames()),
-            );
-            let encode_started = Instant::now();
-            let requested_keyframe = keyframe_requests.load(std::sync::atomic::Ordering::Relaxed);
-            let force_keyframe = requested_keyframe != encoder.encoded_keyframe_request;
-            encoder.last_frame = Some(whiten(
-                encoder.hdr_white.as_ref(),
-                frame,
-                &mut encoder.hdr_white_stats,
-            ));
-            let Some(frame) = encoder.last_frame.as_ref() else {
-                continue;
-            };
-            let Some(unit) = encoder
-                .encoder
-                .encode_with_keyframe_request(frame, force_keyframe)
-                .map_err(|error| StreamError::Encode(error.to_string()))?
-            else {
-                continue;
-            };
-            if force_keyframe {
-                encoder.encoded_keyframe_request = requested_keyframe;
-            }
-            let encode_took = encode_started.elapsed();
-            encoder.encoded += 1;
-            total_encoded += 1;
-            let timestamp_ms = arcen_protocol::wire::now_wire_timestamp_ms();
-            let mut payload = region_header_for(
-                &unit,
-                codec,
-                WireShape::of(&encoder.plan.capture),
-                timestamp_ms,
-                encoder.plan.monitor_id,
-                encoder.plan.topology_generation,
-                encoder.plan.stream_epoch,
-            );
-            payload.extend_from_slice(&unit.bytes);
-            let produced = Produced {
-                queued_at: Instant::now(),
-                payload,
-                keyframe: unit.keyframe,
-                captured: total_captured,
-                encoded: total_encoded,
-                took: frame_started.elapsed(),
-                capture_wait,
-                encode_took,
-                monitor_id: Some(encoder.plan.monitor_id),
-                served_pipeline: served_pipeline_update.take(),
-                refine_before: Vec::new(),
-            };
-            if frames.blocking_send(Ok(produced)).is_err() {
-                return Ok(());
-            }
-            encoder.last_sent = Instant::now();
-            sent += 1;
-            sent_any = true;
-        }
-        if !sent_any {
-            std::thread::yield_now();
-        }
-    }
+            let encoder = encoders.get_mut(index)?.take()?;
+            Some((index, monitor.take_frame_source(), encoder))
+        })
+        .collect();
+    let shared = MultiShared {
+        frames,
+        cancelled,
+        stop: std::sync::atomic::AtomicBool::new(false),
+        keyframe_requests,
+        rate,
+        dropped,
+        health,
+        frame_budget,
+        sent: std::sync::atomic::AtomicU64::new(0),
+        total_captured: std::sync::atomic::AtomicU64::new(0),
+        total_encoded: std::sync::atomic::AtomicU64::new(0),
+        idle_waits: std::sync::atomic::AtomicU64::new(0),
+        served_pipeline_owed: std::sync::atomic::AtomicBool::new(served_pipeline_update.is_some()),
+        served_pipeline: Mutex::new(served_pipeline_update),
+        frame_timeout: std::env::var(FRAME_TIMEOUT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(Duration::from_millis(16), Duration::from_millis),
+        first_frame_started: Instant::now(),
+        first_frame_limit: first_frame_timeout(),
+    };
+    let outcome = serve_monitors(workers, &shared);
     capture.stop();
+    let idle_waits = shared.idle_waits.load(std::sync::atomic::Ordering::Relaxed);
     if idle_waits > 0 {
         tracing::debug!(
             target: "arcen::media",
@@ -5326,7 +5633,7 @@ fn produce_multi(
             "multi-display capture waits that produced no frame"
         );
     }
-    Ok(())
+    outcome
 }
 
 /// What happened to a binary message from the client.
@@ -6290,17 +6597,38 @@ mod tests {
 
     #[test]
     fn capture_stop_is_terminal_not_idle() {
-        let error = classify_capture_wait(
-            CaptureError::StreamStopped("user stopped sharing".to_owned()),
-            true,
-            Duration::ZERO,
-            Duration::from_secs(10),
-        )
-        .expect_err("a native stop must end the stream");
+        use arcen_session::console_session::stream_end::{
+            SCREEN_CAPTURE_KIT_ERROR_DOMAIN, StreamEndCause,
+        };
+        let stop = |code| {
+            CaptureError::StreamStopped(crate::capture::StreamStop {
+                description: "stopped".to_owned(),
+                domain: SCREEN_CAPTURE_KIT_ERROR_DOMAIN.to_owned(),
+                code,
+            })
+        };
+        let error =
+            classify_capture_wait(stop(-3817), true, Duration::ZERO, Duration::from_secs(10))
+                .expect_err("a native stop must end the stream");
         assert!(matches!(
             error,
             StreamError::Capture(CaptureError::StreamStopped(_))
         ));
+        // A person's Stop Sharing is named as such, not as a capture failure.
+        assert_eq!(error.end_cause(), StreamEndCause::CaptureStopped);
+        // The system's own stop is a capture failure, as before.
+        let error =
+            classify_capture_wait(stop(-3821), true, Duration::ZERO, Duration::from_secs(10))
+                .expect_err("a native stop must end the stream");
+        assert_eq!(error.end_cause(), StreamEndCause::MediaFailed);
+        assert_eq!(
+            StreamError::Capture(CaptureError::StreamEnded).end_cause(),
+            StreamEndCause::MediaFailed
+        );
+        assert_eq!(
+            StreamError::PeerGone("reset".to_owned()).end_cause(),
+            StreamEndCause::PeerGone
+        );
     }
 
     #[test]
@@ -7243,5 +7571,388 @@ mod damage_policy_tests {
         );
         let summary = damage.summary();
         assert!(summary.dirty_blocks <= summary.total_blocks);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod per_display_producer_tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        CaptureHealthCounters, MonitorEncoder, MonitorFrames, MultiShared, Produced, StreamError,
+        serve_monitors,
+    };
+    use crate::capture::CaptureError;
+    use crate::encode::EncodedAccessUnit;
+
+    #[derive(Clone, Copy)]
+    enum Script {
+        /// A frame on every call, about a millisecond apart.
+        Busy,
+        /// Nothing after its first frame: every wait times out.
+        Idle,
+        /// The stream is stopped after its first frame.
+        StopsAfterFirst,
+    }
+
+    /// A display that always yields one frame first, then follows its script.
+    struct ScriptedDisplay {
+        script: Script,
+        calls: AtomicU64,
+    }
+
+    impl ScriptedDisplay {
+        const fn new(script: Script) -> Self {
+            Self {
+                script,
+                calls: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl MonitorFrames for ScriptedDisplay {
+        type Frame = u64;
+
+        fn next_frame(&self, timeout: Duration) -> Result<u64, CaptureError> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                return Ok(0);
+            }
+            match self.script {
+                Script::Busy => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    Ok(call)
+                }
+                Script::Idle => {
+                    std::thread::sleep(timeout);
+                    Err(CaptureError::FrameTimeout)
+                }
+                Script::StopsAfterFirst => {
+                    Err(CaptureError::StreamStopped(crate::capture::StreamStop {
+                        description: "display removed".to_owned(),
+                        domain: "com.apple.ScreenCaptureKit.SCStreamErrorDomain".to_owned(),
+                        code: -3815,
+                    }))
+                }
+            }
+        }
+
+        fn dropped_frames(&self) -> u64 {
+            0
+        }
+    }
+
+    /// An encoder that takes two milliseconds, like a fast media engine.
+    struct TimedEncoder {
+        monitor: arcen_media::SessionMonitorId,
+    }
+
+    impl TimedEncoder {
+        fn for_monitor(id: u16) -> Self {
+            Self {
+                monitor: arcen_media::SessionMonitorId::new(id).expect("monitor id"),
+            }
+        }
+    }
+
+    impl MonitorEncoder for TimedEncoder {
+        type Frame = u64;
+
+        fn admit(&mut self, frame: u64) -> u64 {
+            frame
+        }
+
+        fn apply_rate(&mut self, _target_bps: u64) -> Result<bool, StreamError> {
+            Ok(false)
+        }
+
+        fn encode(
+            &mut self,
+            _frame: &u64,
+            force_keyframe: bool,
+        ) -> Result<Option<EncodedAccessUnit>, StreamError> {
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(Some(EncodedAccessUnit {
+                bytes: vec![0, 0, 0, 1, 0x26],
+                keyframe: force_keyframe,
+                pts: 0,
+                timescale: 60,
+            }))
+        }
+
+        fn monitor_id(&self) -> arcen_media::SessionMonitorId {
+            self.monitor
+        }
+
+        fn region_payload(&self, unit: &EncodedAccessUnit, _timestamp_ms: u32) -> Vec<u8> {
+            unit.bytes.clone()
+        }
+    }
+
+    struct Signals {
+        cancelled: AtomicBool,
+        keyframe_requests: AtomicU64,
+        rate: AtomicU64,
+        dropped: AtomicU64,
+        health: CaptureHealthCounters,
+    }
+
+    impl Signals {
+        fn new() -> Self {
+            Self {
+                cancelled: AtomicBool::new(false),
+                keyframe_requests: AtomicU64::new(0),
+                rate: AtomicU64::new(0),
+                dropped: AtomicU64::new(0),
+                health: CaptureHealthCounters::default(),
+            }
+        }
+
+        fn shared<'a>(
+            &'a self,
+            frames: &'a tokio::sync::mpsc::Sender<Result<Produced, String>>,
+            frame_timeout: Duration,
+        ) -> MultiShared<'a> {
+            MultiShared {
+                frames,
+                cancelled: &self.cancelled,
+                stop: AtomicBool::new(false),
+                keyframe_requests: &self.keyframe_requests,
+                rate: &self.rate,
+                dropped: &self.dropped,
+                health: &self.health,
+                frame_budget: None,
+                sent: AtomicU64::new(0),
+                total_captured: AtomicU64::new(0),
+                total_encoded: AtomicU64::new(0),
+                idle_waits: AtomicU64::new(0),
+                served_pipeline: std::sync::Mutex::new(Some(
+                    arcen_protocol::messages::ServedPipelineMsg::new(
+                        arcen_protocol::messages::ServedStreamPipeline::Auto,
+                        "hardware",
+                        None,
+                    ),
+                )),
+                served_pipeline_owed: AtomicBool::new(true),
+                frame_timeout,
+                first_frame_started: Instant::now(),
+                first_frame_limit: Duration::from_secs(5),
+            }
+        }
+    }
+
+    fn drain(
+        mut frames: tokio::sync::mpsc::Receiver<Result<Produced, String>>,
+    ) -> std::thread::JoinHandle<Vec<Produced>> {
+        std::thread::spawn(move || {
+            let mut produced = Vec::new();
+            while let Some(frame) = frames.blocking_recv() {
+                produced.push(frame.expect("a produced frame"));
+            }
+            produced
+        })
+    }
+
+    fn from_monitor(produced: &[Produced], id: u16) -> Vec<&Produced> {
+        let id = arcen_media::SessionMonitorId::new(id).expect("monitor id");
+        produced
+            .iter()
+            .filter(|frame| frame.monitor_id == Some(id))
+            .collect()
+    }
+
+    #[test]
+    fn an_idle_display_does_not_hold_back_a_busy_one() {
+        // One loop over both displays waited out the idle display's timeout
+        // before every frame of the busy one: with a 50 ms timeout that caps
+        // the busy display at 20 fps, eight frames in this 400 ms window.
+        let timeout = Duration::from_millis(50);
+        let window = Duration::from_millis(400);
+        let signals = Signals::new();
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel(4);
+        let collected = drain(frames_rx);
+        let shared = signals.shared(&frames_tx, timeout);
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(window / 2);
+                signals.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(window / 2);
+                signals.cancelled.store(true, Ordering::Relaxed);
+            });
+            serve_monitors(
+                vec![
+                    (
+                        0,
+                        ScriptedDisplay::new(Script::Idle),
+                        TimedEncoder::for_monitor(1),
+                    ),
+                    (
+                        1,
+                        ScriptedDisplay::new(Script::Busy),
+                        TimedEncoder::for_monitor(2),
+                    ),
+                ],
+                &shared,
+            )
+        });
+        drop(shared);
+        drop(frames_tx);
+        outcome.expect("a cancelled producer ends cleanly");
+        let produced = collected.join().expect("drain");
+
+        let busy = from_monitor(&produced, 2);
+        assert!(
+            busy.len() >= 30,
+            "the busy display ran at the idle one's timeout: {} frames in {window:?}",
+            busy.len()
+        );
+        // Keyframe requests and keepalives stay per display: the idle display
+        // sent its first frame, then re-encoded it once as the requested
+        // keyframe, and the busy display forced exactly one keyframe too.
+        let idle = from_monitor(&produced, 1);
+        assert_eq!(idle.len(), 2, "first frame, then the requested keyframe");
+        assert!(!idle[0].keyframe && idle[1].keyframe);
+        assert_eq!(busy.iter().filter(|frame| frame.keyframe).count(), 1);
+        // The served pipeline truth rides on exactly the first message.
+        assert!(produced[0].served_pipeline.is_some());
+        assert_eq!(
+            produced
+                .iter()
+                .filter(|frame| frame.served_pipeline.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(signals.health.offered_per_display().len(), 2);
+    }
+
+    #[test]
+    fn a_failing_display_ends_every_display_with_its_error() {
+        let signals = Signals::new();
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel(4);
+        let collected = drain(frames_rx);
+        let shared = signals.shared(&frames_tx, Duration::from_millis(16));
+        let started = Instant::now();
+        let outcome = serve_monitors(
+            vec![
+                (
+                    0,
+                    ScriptedDisplay::new(Script::Busy),
+                    TimedEncoder::for_monitor(1),
+                ),
+                (
+                    1,
+                    ScriptedDisplay::new(Script::StopsAfterFirst),
+                    TimedEncoder::for_monitor(2),
+                ),
+            ],
+            &shared,
+        );
+        let ended_after = started.elapsed();
+        drop(shared);
+        drop(frames_tx);
+        collected.join().expect("drain");
+
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamError::Capture(CaptureError::StreamStopped(_)))
+            ),
+            "the stopped display's error ends the producer: {outcome:?}"
+        );
+        assert!(
+            ended_after < Duration::from_secs(2),
+            "the busy display kept running for {ended_after:?}"
+        );
+    }
+}
+
+/// How fast the multi-display producer serves two real displays on this Mac.
+///
+/// Capture and encode only: no session, no client, no input. Ignored because
+/// it needs two attached displays and Screen Recording consent. Run with
+/// `cargo test -p arcen-pier-macos --lib real_display_rate -- --ignored --nocapture`.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::cast_precision_loss)]
+mod real_display_rate {
+    use std::time::{Duration, Instant};
+
+    use super::{MultiProducerConfig, RegionStreamPlan, spawn_multi_producer};
+    use crate::capture::CaptureConfig;
+    use crate::encode::EncoderCodec;
+
+    #[test]
+    #[ignore = "needs two displays and Screen Recording consent; run by hand"]
+    fn two_displays_are_served_at_their_own_rates() {
+        let displays = crate::displays::probe().expect("displays");
+        if displays.len() < 2 {
+            println!("skipped: {} display(s)", displays.len());
+            return;
+        }
+        let window = Duration::from_secs(
+            std::env::var("ARCEN_BENCH_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(6),
+        );
+        let monitors: Vec<RegionStreamPlan> = displays
+            .iter()
+            .take(2)
+            .enumerate()
+            .map(|(index, display)| RegionStreamPlan {
+                capture: CaptureConfig::sdr(display.display_id, 1920, 1080, 120),
+                monitor_id: arcen_media::SessionMonitorId::new(
+                    u16::try_from(index + 1).expect("id"),
+                )
+                .expect("monitor"),
+                topology_generation: arcen_media::TopologyGeneration::FIRST,
+                stream_epoch: arcen_media::MediaStreamEpoch::new(1).expect("epoch"),
+            })
+            .collect();
+        let mut producer = spawn_multi_producer(MultiProducerConfig {
+            monitors,
+            codec: EncoderCodec::Hevc,
+            motion_priority: arcen_media::video::MotionPriority::Detail,
+            requested_pipeline: None,
+            served_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Auto),
+            frame_budget: None,
+        });
+        let started = Instant::now();
+        // Per monitor: frames, capture wait, encode, worst frame.
+        let mut seen: [(u64, Duration, Duration, Duration); 2] = Default::default();
+        while started.elapsed() < window {
+            let Some(frame) = producer.frames.blocking_recv() else {
+                break;
+            };
+            let frame = frame.expect("a frame");
+            let index = usize::from(frame.monitor_id.expect("region").get()) - 1;
+            let entry = &mut seen[index];
+            entry.0 += 1;
+            entry.1 += frame.capture_wait;
+            entry.2 += frame.encode_took;
+            entry.3 = entry.3.max(frame.took);
+        }
+        let elapsed = started.elapsed();
+        producer.cancelled.cancel();
+        producer.frames.close();
+        while producer.frames.try_recv().is_ok() {}
+        let outcome = producer.handle.join().expect("producer thread");
+        for (index, (frames, wait, encode, worst)) in seen.iter().enumerate() {
+            let count = (*frames).max(1) as f64;
+            println!(
+                "display {}: {frames} frames, {:.1} fps, mean capture wait {:.2} ms, \
+                 mean encode {:.2} ms, worst encode+queue {:.2} ms",
+                index + 1,
+                *frames as f64 / elapsed.as_secs_f64(),
+                wait.as_secs_f64() * 1000.0 / count,
+                encode.as_secs_f64() * 1000.0 / count,
+                worst.as_secs_f64() * 1000.0,
+            );
+        }
+        println!(
+            "dropped by ScreenCaptureKit: {}; producer ended: {outcome:?}",
+            producer.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }

@@ -2306,3 +2306,238 @@ mod tests {
         );
     }
 }
+
+/// What one real-time encode costs on this machine, and whether two displays'
+/// encoders run side by side or queue behind each other.
+///
+/// Ignored: it measures the media engine, not this code. Run with
+/// `cargo test -p arcen-pier-macos --lib encode_cost -- --ignored --nocapture`.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::cast_precision_loss)]
+mod encode_cost {
+    use super::*;
+
+    /// `420v`: what Auto/Speed capture hands the encoder.
+    const NV12_VIDEO_RANGE: u32 = 0x3432_3076;
+    const FRAMES: usize = 240;
+
+    fn nv12_surface(width: usize, height: usize) -> IOSurface {
+        let luma_row = width.next_multiple_of(64);
+        let chroma_row = width.next_multiple_of(64);
+        let luma_size = luma_row * height;
+        let chroma_size = chroma_row * height.div_ceil(2);
+        let planes = [
+            apple_cf::iosurface::PlaneProperties {
+                width,
+                height,
+                bytes_per_row: luma_row,
+                bytes_per_element: 1,
+                offset: 0,
+                size: luma_size,
+            },
+            apple_cf::iosurface::PlaneProperties {
+                width: width.div_ceil(2),
+                height: height.div_ceil(2),
+                bytes_per_row: chroma_row,
+                bytes_per_element: 2,
+                offset: luma_size,
+                size: chroma_size,
+            },
+        ];
+        IOSurface::create_with_properties(
+            width,
+            height,
+            NV12_VIDEO_RANGE,
+            1,
+            luma_row,
+            luma_size + chroma_size,
+            Some(&planes),
+        )
+        .expect("an NV12 surface")
+    }
+
+    /// Paints a desktop-like frame: a still gradient with a detailed
+    /// 512x384 "window" that moves with `frame`, so consecutive frames differ
+    /// in part, as a live desktop's do.
+    fn paint(surface: &IOSurface, frame: usize) {
+        let (width, height) = (surface.width(), surface.height());
+        let (box_x, box_y) = ((frame * 37) % (width - 512), (frame * 23) % (height - 384));
+        let mut guard = surface.lock_read_write().expect("lock");
+        let row = width.next_multiple_of(64);
+        let luma = guard.base_address_of_plane_mut(0).expect("luma");
+        for y in 0..height {
+            for x in 0..width {
+                let inside = (box_x..box_x + 512).contains(&x) && (box_y..box_y + 384).contains(&y);
+                let value = if inside {
+                    // Text-like detail: thin strokes on a light ground.
+                    if (x / 3 + y / 9 + frame) % 5 == 0 {
+                        30
+                    } else {
+                        230
+                    }
+                } else {
+                    16 + (x * 200 / width + y * 20 / height)
+                };
+                // SAFETY: inside the luma plane described above, locked.
+                unsafe {
+                    luma.add(y * row + x)
+                        .write(u8::try_from(value).unwrap_or(0));
+                }
+            }
+        }
+        let chroma = guard.base_address_of_plane_mut(1).expect("chroma");
+        for y in 0..height.div_ceil(2) {
+            for x in 0..width {
+                // SAFETY: inside the chroma plane described above, locked.
+                unsafe {
+                    chroma
+                        .add(y * row + x)
+                        .write(if x % 2 == 0 { 120 } else { 136 });
+                }
+            }
+        }
+    }
+
+    /// One encoder's run: per-frame milliseconds, frames `VideoToolbox`
+    /// dropped, and bytes produced.
+    struct Run {
+        costs: Vec<f64>,
+        dropped_costs: Vec<f64>,
+        bytes: usize,
+    }
+
+    /// Encodes `FRAMES` frames back to back through the same path a captured
+    /// frame takes (wrap, submit, wait for completion, assemble). The surfaces
+    /// are painted beforehand so only the encode is timed and nothing paces
+    /// the encoder but itself.
+    fn encode_run(width: usize, height: usize, fps: u32) -> Run {
+        // As the multi-display producer configures an Auto region encoder.
+        let served = arcen_protocol::messages::ServedStreamPipeline::Auto;
+        let (start_bps, max_bps) = arcen_media::video::operational_encoder_bitrate_bounds(
+            Some(&served),
+            u32::try_from(width).expect("width"),
+            u32::try_from(height).expect("height"),
+            fps,
+            arcen_media::ChromaSubsampling::Yuv420,
+            arcen_media::BitDepth::Eight,
+        );
+        let config = EncoderConfig::realtime_for(
+            i32::try_from(width).expect("width"),
+            i32::try_from(height).expect("height"),
+            EncoderCodec::Hevc,
+            fps,
+            arcen_media::ChromaSubsampling::Yuv420,
+            arcen_media::BitDepth::Eight,
+        )
+        .with_bitrate_bounds(
+            i32::try_from(start_bps).unwrap_or(i32::MAX),
+            i32::try_from(max_bps).unwrap_or(i32::MAX),
+        )
+        .with_keyframe_policy(arcen_media::video::operational_keyframe_policy(Some(
+            &served,
+        )));
+        let mut encoder = Encoder::new(config).expect("a real-time HEVC encoder");
+        let surfaces: Vec<_> = (0..8)
+            .map(|index| {
+                let surface = nv12_surface(width, height);
+                paint(&surface, index * 5);
+                surface
+            })
+            .collect();
+        let timescale = i32::try_from(fps).expect("fps");
+        let mut run = Run {
+            costs: Vec::with_capacity(FRAMES),
+            dropped_costs: Vec::new(),
+            bytes: 0,
+        };
+        for frame in 0..FRAMES + 10 {
+            let surface = &surfaces[frame % surfaces.len()];
+            let pts = i64::try_from(frame).expect("pts");
+            let started = Instant::now();
+            let sample = encoder
+                .encode_frame(surface, None, pts, timescale, None, "bench")
+                .expect("encodes");
+            let mut produced = 0;
+            if let Some(sample) = sample {
+                let block = sample.data_buffer().expect("data");
+                let data = block
+                    .copy_data_bytes(0, block.data_length())
+                    .expect("bytes");
+                produced = encoder
+                    .finish_access_unit(&data, sample.as_ptr().cast::<c_void>(), pts, timescale)
+                    .expect("assembles")
+                    .map_or(0, |unit| unit.bytes.len());
+            }
+            // The first frames warm the session up; a live session has long
+            // since paid for that.
+            if frame >= 10 {
+                let took = started.elapsed().as_secs_f64() * 1000.0;
+                if produced == 0 {
+                    run.dropped_costs.push(took);
+                } else {
+                    run.costs.push(took);
+                }
+                run.bytes += produced;
+            }
+        }
+        eprintln!(
+            "  encoder: hardware={:?} low_latency={} bitrate={} bps, max {} bps",
+            encoder.uses_hardware_acceleration(),
+            uses_low_latency_rate_control(config),
+            config.bitrate_bps,
+            config.max_bitrate_bps,
+        );
+        run
+    }
+
+    fn report(label: &str, mut run: Run) {
+        let encoded = run.costs.len();
+        eprintln!(
+            "  {label}: encoded {encoded}/{FRAMES}: {}; {} KiB/frame",
+            summary(&mut run.costs),
+            run.bytes / encoded.max(1) / 1024
+        );
+        if !run.dropped_costs.is_empty() {
+            eprintln!(
+                "  {label}: VideoToolbox dropped {}: {}",
+                run.dropped_costs.len(),
+                summary(&mut run.dropped_costs)
+            );
+        }
+    }
+
+    fn summary(costs: &mut [f64]) -> String {
+        if costs.is_empty() {
+            return "none".to_owned();
+        }
+        costs.sort_by(f64::total_cmp);
+        let mean = costs.iter().sum::<f64>() / costs.len() as f64;
+        let p95 = costs[(costs.len() * 95 / 100).min(costs.len() - 1)];
+        let max = costs[costs.len() - 1];
+        format!("mean {mean:.2} ms, p95 {p95:.2} ms, max {max:.2} ms")
+    }
+
+    #[test]
+    #[ignore = "measures the media engine; run by hand"]
+    fn one_and_two_hevc_encoders_per_frame_cost() {
+        for (width, height, fps) in [
+            (1920, 1080, 60),
+            (1920, 1080, 120),
+            (2560, 1440, 120),
+            (3840, 2160, 60),
+        ] {
+            eprintln!("{width}x{height} HEVC Main 8-bit, fps {fps}, {FRAMES} frames:");
+            report("one encoder           ", encode_run(width, height, fps));
+            let started = Instant::now();
+            let (a, b) = std::thread::scope(|scope| {
+                let a = scope.spawn(|| encode_run(width, height, fps));
+                let b = scope.spawn(|| encode_run(width, height, fps));
+                (a.join().expect("a"), b.join().expect("b"))
+            });
+            let wall = started.elapsed();
+            report("two encoders, thread A", a);
+            report("two encoders, thread B", b);
+            eprintln!("  two encoders, wall {wall:.2?} (painting included)");
+        }
+    }
+}

@@ -26,7 +26,9 @@
 //!   edges into the same host key edges, so a shortcut lands on the host
 //!   alike from either Deck;
 //! - [`DeckShortcut`] lists the chords both Decks keep for themselves, and
-//!   [`grab_takes`] what a PC Deck's keyboard grab takes from its system;
+//!   [`grab_takes`] what a PC Deck's keyboard grab takes from its system
+//!   (its shortcuts, and any chord another program may have claimed,
+//!   [`claimable_chord`]);
 //! - [`KeyboardCapture`] decides who has the keyboard (the host or this
 //!   computer) and [`KeyboardCapturePolicy`] when the system shortcuts go
 //!   to the host;
@@ -71,8 +73,9 @@ pub use mac_capture::{
     MacKeyCode, MacSystemChord, MacTapEvent, MacTapModifiers, MacTapRouter, TapRoute,
 };
 pub use pc_input::{
-    AltGrKey, HookRoute, HookRouter, MacHostCommandKey, PcKeyAction, PcKeyEvent, PcKeyboardInput,
-    PcKeyboardSettings, SystemChord, grab_takes, resolve_pc_keyboard_policy,
+    AltGrKey, HookRoute, HookRouter, LocalKeyFacts, LocalTextInput, MacHostCommandKey, PcKeyAction,
+    PcKeyEvent, PcKeyboardInput, PcKeyboardSettings, SystemChord, claimable_chord, grab_takes,
+    input_method_chord, resolve_pc_keyboard_policy,
 };
 pub use pro_app_chords::PRO_APP_CHORDS;
 pub use send_keys::{

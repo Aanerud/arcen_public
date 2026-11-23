@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use crate::capture::{CaptureConfig, CaptureError, CaptureSession, CapturedFrame};
+use crate::capture::{CaptureConfig, CaptureError, CaptureSession, CapturedFrame, FrameSource};
 use crate::displays::DisplaySnapshot;
 
 /// How many displays one session will drive.
@@ -59,6 +59,13 @@ impl MonitorCapture {
     #[must_use]
     pub fn dropped_frames(&self) -> u64 {
         self.session.dropped_frames()
+    }
+
+    /// Hands this display's frames to a thread of their own; the stream stays
+    /// here and is still stopped by [`Self::stop`]. Afterwards
+    /// [`Self::next_frame`] reports the stream ended.
+    pub fn take_frame_source(&mut self) -> FrameSource {
+        self.session.take_frame_source()
     }
 }
 
@@ -198,6 +205,11 @@ impl MultiDisplayCapture {
     #[must_use]
     pub fn monitors(&self) -> &[MonitorCapture] {
         &self.monitors
+    }
+
+    /// Returns the running captures, to hand their frames elsewhere.
+    pub fn monitors_mut(&mut self) -> &mut [MonitorCapture] {
+        &mut self.monitors
     }
 
     /// Returns how many displays are being captured.

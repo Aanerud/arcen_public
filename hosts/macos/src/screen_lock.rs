@@ -60,6 +60,15 @@ pub fn locked_on_console() -> Option<bool> {
     native::locked_on_console()
 }
 
+/// Whether this GUI session is the one on the console, as the window
+/// server records it (`kCGSessionOnConsoleKey`). `false` for a session in
+/// the background (another account switched in); `None` when the window
+/// server does not say (no GUI session, or one that has ended).
+#[must_use]
+pub fn session_on_console() -> Option<bool> {
+    native::session_on_console()
+}
+
 /// This process's security session id: the audit session the window
 /// server's login session runs in, as the public `SessionGetInfo` reports it
 /// for `callerSecuritySession` (Security framework, `AuthSession.h`). Unique
@@ -212,6 +221,10 @@ mod native {
             .map(|[locked, on_console]| locked && on_console)
     }
 
+    pub(super) fn session_on_console() -> Option<bool> {
+        session_flags([c"kCGSSessionOnConsoleKey"]).map(|[on_console]| on_console)
+    }
+
     pub(super) fn login_session_id() -> Option<u64> {
         let mut id = NO_SECURITY_SESSION;
         // SAFETY: `OSStatus SessionGetInfo(SecuritySessionId, SecuritySessionId
@@ -260,6 +273,10 @@ mod native {
     }
 
     pub(super) fn locked_on_console() -> Option<bool> {
+        None
+    }
+
+    pub(super) fn session_on_console() -> Option<bool> {
         None
     }
 

@@ -748,21 +748,6 @@ fn desk_monitor(
     }
 }
 
-#[cfg(windows)]
-fn lit_outputs(report: &HostCapabilityReport) -> std::collections::BTreeSet<(String, u32)> {
-    report
-        .adapters
-        .iter()
-        .flat_map(|adapter| {
-            adapter
-                .outputs
-                .iter()
-                .filter(|output| output.attached_to_desktop && output.ccd_active == Some(true))
-                .map(|output| (adapter.session_luid.clone(), output.adapter_output_index))
-        })
-        .collect()
-}
-
 /// NVAPI's `NV_VIRTUALIZATION_MODE_VGX`: a virtual GPU in a guest.
 const NVAPI_VIRTUALIZATION_VGPU_GUEST: u32 = 2;
 
@@ -792,23 +777,21 @@ fn nvidia_gpu_monitor(gpu: &crate::nvapi_inventory::GpuEntry, active_only: bool)
     }))
 }
 
-/// Classifies every output the desktop lights and returns them once no
-/// monitor at the desk is behind any (shared `desk_outputs_dark`).
+/// Reads every output the desktop lights (adapter LUID, output) and what is
+/// behind each, for the shared judgements (`desk_outputs_dark`,
+/// `recheck_dark_desk`); `Unreadable` when the probe or the display
+/// topology could not be read.
 #[cfg(windows)]
-fn dark_lit_outputs() -> Result<
-    std::collections::BTreeSet<(String, u32)>,
-    arcen_session::console_session::desk_privacy::DeskPrivacyRefusal,
-> {
-    use arcen_session::console_session::desk_privacy::{
-        desk_outputs_dark, DeskOutputFact, DeskPrivacyRefusal,
-    };
+fn read_lit_desk() -> arcen_session::console_session::desk_privacy::DeskReading<(String, u32)> {
+    use arcen_session::console_session::desk_privacy::{DeskReading, LitDeskOutput};
     // Only what the judgement needs: no D3D11 device, display-mode list,
     // Media Foundation enumeration or EDID read, which disturb a streaming
     // session's capture and encode on the same GPU.
-    let report = crate::gpu_probe::probe_at(crate::gpu_probe::ProbeDepth::DeskTopology)
-        .map_err(|_| DeskPrivacyRefusal::DeskMonitorUnknown)?;
+    let Ok(report) = crate::gpu_probe::probe_at(crate::gpu_probe::ProbeDepth::DeskTopology) else {
+        return DeskReading::Unreadable;
+    };
     if report.topology_error.is_some() {
-        return Err(DeskPrivacyRefusal::DeskMonitorUnknown);
+        return DeskReading::Unreadable;
     }
     let nvapi = crate::nvapi_inventory::desk_inventory().ok();
     let gpu_lights_a_monitor = |luid: &str| -> Option<bool> {
@@ -822,11 +805,10 @@ fn dark_lit_outputs() -> Result<
         })?;
         nvidia_gpu_monitor(gpu, true)
     };
-    let mut facts = Vec::new();
+    let mut lit = Vec::new();
     for adapter in &report.adapters {
         for output in &adapter.outputs {
-            let lit = output.attached_to_desktop && output.ccd_active == Some(true);
-            if !lit {
+            if !(output.attached_to_desktop && output.ccd_active == Some(true)) {
                 continue;
             }
             let monitor = desk_monitor(
@@ -840,11 +822,37 @@ fn dark_lit_outputs() -> Result<
                 monitor = ?monitor,
                 "desk privacy: a lit output"
             );
-            facts.push(DeskOutputFact { lit, monitor });
+            lit.push(LitDeskOutput {
+                id: (adapter.session_luid.clone(), output.adapter_output_index),
+                monitor,
+            });
         }
     }
+    DeskReading::Lit(lit)
+}
+
+/// Classifies every output the desktop lights and returns them once no
+/// monitor at the desk is behind any (shared `desk_outputs_dark`).
+#[cfg(windows)]
+fn dark_lit_outputs() -> Result<
+    std::collections::BTreeSet<(String, u32)>,
+    arcen_session::console_session::desk_privacy::DeskPrivacyRefusal,
+> {
+    use arcen_session::console_session::desk_privacy::{
+        desk_outputs_dark, DeskOutputFact, DeskPrivacyRefusal, DeskReading,
+    };
+    let DeskReading::Lit(lit) = read_lit_desk() else {
+        return Err(DeskPrivacyRefusal::DeskMonitorUnknown);
+    };
+    let facts = lit
+        .iter()
+        .map(|output| DeskOutputFact {
+            lit: true,
+            monitor: output.monitor,
+        })
+        .collect::<Vec<_>>();
     desk_outputs_dark(&facts)?;
-    Ok(lit_outputs(&report))
+    Ok(lit.into_iter().map(|output| output.id).collect())
 }
 
 /// Proves that no monitor at the desk shows the desktop: every output the
@@ -983,11 +991,15 @@ pub fn hold_dark_desk(proof: Option<DarkDeskProof>) {
             move || verify_desk_dark(&proof),
             |report| {
                 let took_ms = u64::try_from(report.took.as_millis()).unwrap_or(u64::MAX);
+                let settle_left_ms =
+                    u64::try_from(report.settle_left.as_millis()).unwrap_or(u64::MAX);
                 match report.outcome {
                     Ok(()) => tracing::info!(
                         target: crate::logging::SESSION,
                         reason = report.reason.token(),
                         topology_reads = report.topology_reads,
+                        attempts = report.attempts,
+                        settle_left_ms,
                         took_ms,
                         "desk privacy: the desk was proved dark again off the media path"
                     ),
@@ -995,6 +1007,8 @@ pub fn hold_dark_desk(proof: Option<DarkDeskProof>) {
                         target: crate::logging::SESSION,
                         reason = report.reason.token(),
                         refusal = refusal.token(),
+                        attempts = report.attempts,
+                        settle_left_ms,
                         took_ms,
                         "desk privacy: the desk is no longer proved dark; the session ends"
                     ),
@@ -1042,32 +1056,29 @@ pub fn desk_alarm() -> &'static tokio::sync::Notify {
     ALARM.get_or_init(tokio::sync::Notify::new)
 }
 
-/// Proves the desk dark again: still no monitor behind any lit output, and
-/// the desktop still lights exactly the outputs it was proved with.
+/// Proves the desk dark again against the outputs it was proved with
+/// (shared `recheck_dark_desk`: a monitor, an output lit anew whose monitor
+/// cannot be told, or changed lit outputs end the session at once; a desk
+/// that could not be read whole may be proved again).
 ///
 /// # Errors
 ///
-/// The shared refusal of [`prove_desk_dark`], or
-/// [`DeskPrivacyRefusal::DeskOutputsChanged`](arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskOutputsChanged)
-/// when the lit outputs changed.
+/// The shared failure.
 #[cfg(windows)]
 pub fn verify_desk_dark(
     proof: &DarkDeskProof,
-) -> Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
-    use arcen_session::console_session::desk_privacy::DeskPrivacyRefusal;
-    // The whole proof again (a monitor plugged into a lit head changes no
-    // lit output), and the same outputs.
-    if dark_lit_outputs()? != proof.lit {
-        return Err(DeskPrivacyRefusal::DeskOutputsChanged);
-    }
-    Ok(())
+) -> Result<(), arcen_session::console_session::desk_privacy::DeskProofFailure> {
+    arcen_session::console_session::desk_privacy::recheck_dark_desk(&proof.lit, &read_lit_desk())
 }
 
 #[cfg(not(windows))]
 pub fn verify_desk_dark(
     _proof: &DarkDeskProof,
-) -> Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
-    Err(arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskOutputsChanged)
+) -> Result<(), arcen_session::console_session::desk_privacy::DeskProofFailure> {
+    use arcen_session::console_session::desk_privacy::{DeskPrivacyRefusal, DeskProofFailure};
+    Err(DeskProofFailure::decided(
+        DeskPrivacyRefusal::DeskOutputsChanged,
+    ))
 }
 
 /// Returns the process-random marker attached to Arcen `SendInput` events.

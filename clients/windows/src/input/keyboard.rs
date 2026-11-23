@@ -210,6 +210,7 @@ impl Keyboard {
         self.local.clear();
         if released {
             let _ = self.text.plan_frame(&[DeckTextEvent::FocusLost]);
+            self.publish_local_text();
         }
         let edges = self.input.set_released(released);
         self.focus_gained(false);
@@ -284,6 +285,7 @@ impl Keyboard {
         self.down.clear();
         self.local.clear();
         let _ = self.text.plan_frame(&[DeckTextEvent::FocusLost]);
+        self.publish_local_text();
         self.input.release_all()
     }
 
@@ -573,6 +575,7 @@ impl Keyboard {
                 | DeckTextAction::SuppressKey(..) => {}
             }
         }
+        self.publish_local_text();
     }
 
     fn text_frame(&mut self, frame: &[DeckTextEvent], events: &mut Vec<InputEvent>) {
@@ -585,11 +588,24 @@ impl Keyboard {
                 _ => {}
             }
         }
+        self.publish_local_text();
     }
 
     fn configure_text(&mut self) {
         let option = self.settings.altgr.option_preference(self.layout_has_altgr);
         self.text.configure(self.typing, option);
+        self.publish_local_text();
+    }
+
+    /// Tells the hook the layout's `AltGr` and whether the window's input
+    /// method is on or composing, after anything that may change them.
+    fn publish_local_text(&self) {
+        hook::set_local(arcen_input::keyboard::LocalKeyFacts::new(
+            self.settings.altgr,
+            self.layout_has_altgr,
+            self.text.active(),
+            self.text.composing(),
+        ));
     }
 }
 

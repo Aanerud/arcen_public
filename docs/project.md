@@ -38,11 +38,6 @@ is promised or dated; each item ships when it is proven on real hardware.
 
 - **Wayland text beyond the layout.** Dead-key sequences, and characters the
   session's layout cannot type, which need libei's `ei_text` in Mutter.
-- **The macOS Pier shows cursor images.** It sends named cursor shapes: no
-  public macOS API reports another application's cursor image
-  (`NSCursor.currentSystemCursor` reports the calling process's own, measured),
-  and ScreenCaptureKit carries no cursor metadata. Host-cursor mode draws the
-  real cursor into the picture instead.
 
 **Network**
 

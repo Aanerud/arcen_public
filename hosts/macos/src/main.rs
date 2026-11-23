@@ -465,15 +465,23 @@ fn main() -> ExitCode {
     if command == "probe-desk-privacy" {
         return probe_desk_privacy(&support_args);
     }
+    // Whether this host can follow the desktop's pointer (ADR 0029). It moves
+    // the pointer in a lap and puts it back, unless `--passive`; `--pump`
+    // runs the main run loop between samples; `--seconds N` (default 6).
     if command == "probe-cursor" {
-        // Long enough for an operator to move the pointer across a text field
-        // and a window edge while it watches.
-        let report = arcen_pier_macos::cursor_probe::probe(std::time::Duration::from_secs(6));
+        let options = match cursor_probe_options(&support_args) {
+            Ok(options) => options,
+            Err(message) => {
+                eprintln!("probe-cursor: {message}");
+                return ExitCode::from(2);
+            }
+        };
+        let report = arcen_pier_macos::cursor_probe::probe(options);
         match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),
             Err(error) => eprintln!("probe-cursor: {error}"),
         }
-        return if report.shapes_known > 0 {
+        return if report.image_readable {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -920,13 +928,12 @@ async fn serve_desktop(
     let width = handshake.capture_width as usize;
     let height = handshake.capture_height as usize;
     let display_id = handshake.display_id;
-    // Host cursor means the compositor draws the pointer into the frame. It is
-    // the only way this host can show the right shape — reading the shape to
-    // send separately does not work, measured: NSCursor's system cursor does
-    // not follow another process's pointer, which is why Apple deprecated that
-    // reader and pointed at this instead. `cursor_mode` is the settled
-    // authority: a Deck that asked for the automatic cursor gets Host here,
-    // because this host sends no cursor images.
+    // Host cursor means the compositor draws the pointer into the frame.
+    // Local means the Deck draws it, with the desktop cursor's images when
+    // this session sends them (ADR 0029), so the capture leaves it out.
+    // `cursor_mode` is the settled authority: a Deck that asked for the
+    // automatic cursor gets Local when this agent could read the cursor at
+    // sign-in, and Host when it could not.
     let shows_cursor = handshake.cursor_mode == arcen_protocol::messages::CursorMode::Host;
     let capture = match handshake.plan.tier {
         arcen_media::session_plan::VideoTier::Standard => {
@@ -956,7 +963,7 @@ async fn serve_desktop(
             handshake.plan.tier
         );
     }
-    let stats = arcen_pier_macos::stream::stream(
+    let streamed = arcen_pier_macos::stream::stream(
         socket,
         arcen_pier_macos::stream::StreamSession {
             capture,
@@ -1003,8 +1010,13 @@ async fn serve_desktop(
             sent_frames,
         },
     )
-    .await?;
-
+    .await;
+    // On every ending, not only the clean one: a stream that capture or the
+    // client ended has done exactly the work someone will want to read.
+    let stats = match &streamed {
+        Ok(stats) => stats,
+        Err(ended) => &ended.stats,
+    };
     println!(
         "streamed {} frames ({} keyframes, {:.1} fps, {:.2} ms mean, {:.2} ms worst, \
          {} bytes); input applied {}, out of order {}",
@@ -1017,7 +1029,7 @@ async fn serve_desktop(
         stats.input.applied,
         stats.input.out_of_order
     );
-    Ok(stats.frames_sent)
+    streamed.map(|stats| stats.frames_sent)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1050,7 +1062,7 @@ async fn serve_multi_desktop(
             stream_epoch: epoch,
         })
         .collect();
-    let stats = arcen_pier_macos::stream::stream_multi(
+    let streamed = arcen_pier_macos::stream::stream_multi(
         socket,
         arcen_pier_macos::stream::MultiStreamSession {
             monitors,
@@ -1093,7 +1105,11 @@ async fn serve_multi_desktop(
             sent_frames,
         },
     )
-    .await?;
+    .await;
+    let stats = match &streamed {
+        Ok(stats) => stats,
+        Err(ended) => &ended.stats,
+    };
     println!(
         "streamed {} region frames across {} monitors ({:.1} fps, {} bytes)",
         stats.frames_sent,
@@ -1101,7 +1117,7 @@ async fn serve_multi_desktop(
         stats.sent_fps,
         stats.bytes_sent
     );
-    Ok(stats.frames_sent)
+    streamed.map(|stats| stats.frames_sent)
 }
 
 fn multi_capture_config(
@@ -1872,6 +1888,30 @@ fn run_agent(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         host_setup.telemetry,
         arcen_pier_macos::timezone_redirection_enabled(&host_setup.file_config),
     ))
+}
+
+/// `probe-cursor`'s options: `--passive`, `--pump`, `--seconds N`.
+fn cursor_probe_options(
+    args: &[String],
+) -> Result<arcen_pier_macos::cursor_probe::ProbeOptions, String> {
+    let mut options = arcen_pier_macos::cursor_probe::ProbeOptions::default();
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--passive" => options.sweep = false,
+            "--pump" => options.pump_run_loop = true,
+            "--seconds" => {
+                let seconds = args
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|seconds| (1..=60).contains(seconds))
+                    .ok_or_else(|| "--seconds needs a whole number from 1 to 60".to_owned())?;
+                options.sample_for = std::time::Duration::from_secs(seconds);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(options)
 }
 
 /// How long an agent that just connected is given to find its owner at the
@@ -3287,7 +3327,11 @@ async fn serve_one(
             if let Some(microphone) = session_microphone.as_mut() {
                 let _ = microphone.shutdown_wait("session_end").await;
             }
-            let (reason_class, frames_sent) = match &outcome {
+            // How the stream ended, decided once (shared `StreamEnd`): what
+            // the Deck is told, the `SESSION_END` class and the departure
+            // the hand-back locks for. `None`: the desk watch ended it and
+            // has told the Deck already.
+            let (stream_end, reason_class, frames_sent) = match &outcome {
                 Watched::WatchEnded { frames_sent } => {
                     stream_failed = true;
                     let end = arcen_session::console_session::desk_privacy::WatchSessionEnd::new(
@@ -3296,47 +3340,32 @@ async fn serve_one(
                             .and_then(arcen_pier_macos::desk_privacy::DeskPrivacy::end_verdict),
                         *frames_sent,
                     );
-                    (end.reason_class, end.frames_sent)
+                    (None, end.reason_class, end.frames_sent)
                 }
-                Watched::Stream(Ok(frames)) => ("completed", *frames),
+                Watched::Stream(Ok(frames)) => (Some(StreamEnd::Completed), "completed", *frames),
                 Watched::Stream(Err(ended)) => {
                     eprintln!("stream ended: {ended}");
-                    stream_failed = true;
-                    // A capture or encoder that never started used to close
-                    // the session with no reason at all, after the Deck had
-                    // been told it was authenticated.
-                    if ended.stats.frames_sent == 0
-                        && matches!(
-                            ended.error,
-                            arcen_pier_macos::stream::StreamError::Capture(_)
-                                | arcen_pier_macos::stream::StreamError::Encode(_)
-                        )
-                    {
-                        let _ = arcen_pier_macos::net::refuse_with_reason(
-                            socket,
-                            arcen_session::session_setup::DECK_REASON_CAPTURE_START_FAILED,
-                        )
-                        .await;
-                    }
                     // The real count, not zero. A client that vanishes after
                     // an hour is the ordinary way a remote session ends, and
                     // reporting nothing sent made it indistinguishable from a
                     // session that never produced a picture at all.
-                    //
-                    // The class separates the two causes the same way the
-                    // Linux Pier does: a transport that dropped is not the
-                    // host failing to stream.
-                    let class = if matches!(
-                        ended.error,
-                        arcen_pier_macos::stream::StreamError::PeerGone(_)
-                    ) {
-                        "transport_error"
-                    } else {
-                        "failed"
-                    };
-                    (class, ended.stats.frames_sent)
+                    let end = StreamEnd::classify(ended.error.end_cause(), ended.stats.frames_sent);
+                    if end == StreamEnd::CaptureStopped {
+                        tracing::warn!(
+                            target: arcen_telemetry::names::target::SESSION,
+                            reason_class = end.reason_class(),
+                            frames_sent = ended.stats.frames_sent,
+                            detail = %ended.error,
+                            "a person stopped screen capture with the system's Stop Sharing; the \
+                             Deck is told and the session is locked"
+                        );
+                    }
+                    (Some(end), end.reason_class(), ended.stats.frames_sent)
                 }
             };
+            if stream_end.is_some_and(StreamEnd::is_failure) {
+                stream_failed = true;
+            }
             // Frames sent is the field that separates "a client connected"
             // from "a desktop arrived"; without it a session that produced
             // nothing reads exactly like one that worked.
@@ -3356,54 +3385,18 @@ async fn serve_one(
                 arcen_telemetry::names::target::SESSION,
                 "session end",
             );
-            // The shared hand-back order: the session locked (and, for a
-            // private desk, proved locked), then its displays, then its
-            // sound, then the desk's input.
-            let mut locked = LockOutcome::NotOurs;
-            for step in arcen_session::console_session::DETACH_STEPS {
-                use arcen_session::console_session::DetachStep;
-                match step {
-                    DetachStep::LockSession => {
-                        locked = lock_on_departure(session_policy.serving_uid).await;
-                    }
-                    // `lock_on_departure` proves the lock screen; a private
-                    // desk also waits for a lock that was refused.
-                    DetachStep::AwaitLockScreen => {
-                        if desk_privacy.is_some() {
-                            keep_private_until_locked(locked, session_policy.serving_uid).await;
-                        }
-                    }
-                    DetachStep::RestoreOutputs => {
-                        if let Some(privacy) = desk_privacy.as_mut() {
-                            privacy.restore_outputs();
-                        }
-                        drop((
-                            handshake.arranged_display.take(),
-                            handshake.multi_monitor_displays.take(),
-                        ));
-                    }
-                    DetachStep::RestoreAudio => {
-                        if !release_audio(session_audio.lease.take()) {
-                            stream_failed = true;
-                        }
-                    }
-                    DetachStep::ReleaseInput => {
-                        if let Some(privacy) = desk_privacy.take() {
-                            let counts = privacy.release_input();
-                            tracing::info!(
-                                target: arcen_telemetry::names::target::SESSION,
-                                displays = counts.displays,
-                                events_dropped = counts.events_dropped,
-                                filter_reenabled = counts.filter_reenabled,
-                                "the desk has its displays and input back"
-                            );
-                        }
-                    }
-                }
-            }
-            // Handed back by this agent: the guard stands down.
-            if let Some(guard) = lock_guard {
-                guard.release();
+            let mut hand_back = MacAttachmentEnd {
+                socket,
+                serving_uid: session_policy.serving_uid,
+                desk_privacy: &mut desk_privacy,
+                handshake: &mut handshake,
+                audio: session_audio.lease.take(),
+                lock_guard,
+                audio_failed: false,
+            };
+            end_attachment(&mut hand_back, stream_end).await;
+            if hand_back.audio_failed {
+                stream_failed = true;
             }
             if stream_failed {
                 SessionOutcome::Failed
@@ -3585,79 +3578,231 @@ async fn privacy_lost_wait(lost: &std::sync::atomic::AtomicBool) {
     }
 }
 
-/// Keeps a private desk private while its session refuses to lock, asking
-/// it again every [`LOCK_RETRY`](arcen_session::console_session::desk_privacy::LOCK_RETRY),
-/// for at most `UNLOCKED_GRACE` (shared `hand_back_unlocked`): the desk
-/// never sees an unlocked desktop that a lock could still cover, and an
-/// owner whose lock screen is off by policy gets the Mac back. A console
-/// that reads as another account's is handed over only after the shared
-/// consecutive readings (`PrivacyWatch::console`): one failed reading is not
-/// a switch of account.
-async fn keep_private_until_locked(mut locked: LockOutcome, serving_uid: Option<u32>) {
-    use arcen_session::console_session::desk_privacy::{
-        CONSOLE_CHECK, LOCK_RETRY, PrivacyWatch, UnlockedHandBack, WatchVerdict, hand_back_unlocked,
-    };
-    if serving_uid.is_none() {
-        return;
-    }
+/// How often a wait for the lock screen looks for an authenticated Deck
+/// that asked for the session slot.
+const NEW_DECK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Waits for the lock screen after a refused lock (or, on a private desk,
+/// a console reading that was not this account's), deciding each step with
+/// the shared `lock_wait::LockWait`: asked again every `LOCK_RETRY` for at
+/// most `UNLOCKED_GRACE`; a console another account holds is left after
+/// consecutive readings; a desk that was not private stops waiting when
+/// `new_deck` says an authenticated Deck wants the slot. Every ending that
+/// leaves the desk unlocked is logged as an error. `None` for a hand run
+/// with no account (`serve`).
+async fn await_lock_screen(
+    mut locked: LockOutcome,
+    serving_uid: Option<u32>,
+    departure: arcen_session::console_session::Departure,
+    private: bool,
+    new_deck: impl Fn() -> bool,
+) -> Option<arcen_session::console_session::lock_wait::LockWaitEnd> {
+    use arcen_session::console_session::lock_wait::{LockWait, LockWaitEnd, LockWaitVerdict};
+    serving_uid?;
     let started = std::time::Instant::now();
-    let mut console = PrivacyWatch::default();
-    loop {
-        match locked {
-            LockOutcome::Locked => return,
-            LockOutcome::NotOurs => {
-                if console.console(false) == WatchVerdict::ConsoleLeft {
-                    return;
-                }
+    let mut wait = LockWait::new(private);
+    let end = 'wait: loop {
+        let pause = match wait.next(locked, started.elapsed()) {
+            LockWaitVerdict::Done(end) => break end,
+            LockWaitVerdict::RetryAfter(pause) => pause,
+        };
+        let until = tokio::time::Instant::now() + pause;
+        loop {
+            if new_deck()
+                && let Some(end) = wait.on_new_deck()
+            {
+                break 'wait end;
             }
-            LockOutcome::NotLocked => {
-                let _ = console.console(true);
+            let now = tokio::time::Instant::now();
+            if now >= until {
+                break;
             }
+            tokio::time::sleep(NEW_DECK_POLL.min(until - now)).await;
         }
-        if hand_back_unlocked(started.elapsed()) == UnlockedHandBack::GiveBack {
-            tracing::error!(
-                target: arcen_telemetry::names::target::SESSION,
-                "the session would not lock; the desk gets its displays and input back unlocked"
-            );
+        locked = lock_on_departure(serving_uid, departure).await;
+    };
+    match end {
+        LockWaitEnd::GraceExpired => tracing::error!(
+            target: arcen_telemetry::names::target::SESSION,
+            departure = departure.token(),
+            "the session would not lock after its Deck left: this Mac's desk is unlocked and \
+             signed in. Lock it at the desk (Control-Command-Q) and check that its lock \
+             screen is not turned off by policy"
+        ),
+        LockWaitEnd::YieldedToNewDeck => tracing::error!(
+            target: arcen_telemetry::names::target::SESSION,
+            departure = departure.token(),
+            "the session had not locked when a new Deck signed in; the wait ends so that Deck \
+             is served, and this Mac's desk is unlocked and signed in. Lock it at the desk \
+             (Control-Command-Q) and check that its lock screen is not turned off by policy"
+        ),
+        LockWaitEnd::Locked | LockWaitEnd::ConsoleLeft => {}
+    }
+    Some(end)
+}
+
+/// What ending a Deck's attachment does to this Mac, one step at a time.
+/// The order is [`end_attachment`]'s; the steps are [`MacAttachmentEnd`]'s,
+/// and a test's.
+trait AttachmentEnd {
+    /// Sends the Deck a close reason.
+    async fn tell_deck(&mut self, reason: &str);
+    /// Locks the session for `departure` and proves it.
+    async fn lock(&mut self, departure: arcen_session::console_session::Departure) -> LockOutcome;
+    /// Keeps asking a session that refused to lock.
+    async fn await_lock_screen(
+        &mut self,
+        locked: LockOutcome,
+        departure: arcen_session::console_session::Departure,
+    );
+    /// Gives the desk its displays back and drops the session's own.
+    fn restore_outputs(&mut self);
+    /// Releases the session's sound.
+    fn restore_audio(&mut self);
+    /// Gives the desk its input back.
+    fn release_input(&mut self);
+    /// The agent handed the session back itself: the lock guard stands down.
+    fn release_guard(&mut self);
+}
+
+/// Ends a Deck's attachment the one way every ending takes (ADR 0025:
+/// disconnect locks, never ends), in the shared order
+/// (`stream_end::leave_steps`): the Deck told why when it does not know,
+/// the hand-back with the lock first, the guard released last. `end` is
+/// `None` when the desk watch ended the stream (it told the Deck already).
+async fn end_attachment(
+    host: &mut impl AttachmentEnd,
+    end: Option<arcen_session::console_session::stream_end::StreamEnd>,
+) -> LockOutcome {
+    use arcen_session::console_session::DetachStep;
+    use arcen_session::console_session::stream_end::{LeaveStep, leave_departure, leave_steps};
+    let departure = leave_departure(end);
+    let mut locked = LockOutcome::NotOurs;
+    for step in leave_steps(end, &arcen_session::console_session::DETACH_STEPS) {
+        match step {
+            LeaveStep::TellDeck(reason) => host.tell_deck(reason).await,
+            LeaveStep::Detach(DetachStep::LockSession) => locked = host.lock(departure).await,
+            LeaveStep::Detach(DetachStep::AwaitLockScreen) => {
+                host.await_lock_screen(locked, departure).await;
+            }
+            LeaveStep::Detach(DetachStep::RestoreOutputs) => host.restore_outputs(),
+            LeaveStep::Detach(DetachStep::RestoreAudio) => host.restore_audio(),
+            LeaveStep::Detach(DetachStep::ReleaseInput) => host.release_input(),
+            LeaveStep::ReleaseGuard => host.release_guard(),
+        }
+    }
+    locked
+}
+
+use arcen_session::console_session::stream_end::StreamEnd;
+
+/// This Mac's hand-back of one attachment.
+struct MacAttachmentEnd<'a> {
+    socket: &'a mut arcen_pier_macos::net::PierSocket,
+    serving_uid: Option<u32>,
+    desk_privacy: &'a mut Option<arcen_pier_macos::desk_privacy::DeskPrivacy>,
+    handshake: &'a mut arcen_pier_macos::session::Handshake,
+    audio: Option<SessionAudioLease>,
+    lock_guard: Option<arcen_pier_macos::lock_guard::LockGuard>,
+    /// The sound could not be given back.
+    audio_failed: bool,
+}
+
+impl AttachmentEnd for MacAttachmentEnd<'_> {
+    async fn tell_deck(&mut self, reason: &str) {
+        if let Err(error) = arcen_pier_macos::net::refuse_with_reason(self.socket, reason).await {
+            eprintln!("the Deck was not told why its session ended: {error}");
+        }
+    }
+
+    async fn lock(&mut self, departure: arcen_session::console_session::Departure) -> LockOutcome {
+        lock_on_departure(self.serving_uid, departure).await
+    }
+
+    async fn await_lock_screen(
+        &mut self,
+        locked: LockOutcome,
+        departure: arcen_session::console_session::Departure,
+    ) {
+        let private = self.desk_privacy.is_some();
+        if !arcen_session::console_session::lock_wait::waits_for_lock(private, locked) {
             return;
         }
-        tokio::time::sleep(if locked == LockOutcome::NotOurs {
-            CONSOLE_CHECK
-        } else {
-            LOCK_RETRY
+        // A desk that was not private shows the session anyway: it gives
+        // the host's slot up to an authenticated Deck rather than holding it
+        // for the grace. A private desk keeps it until it locks.
+        let admission = self.handshake.admission.as_ref();
+        let offered = !private && admission.is_some_and(|admission| admission.offer_yield(true));
+        let _ = await_lock_screen(locked, self.serving_uid, departure, private, || {
+            offered
+                && admission.is_some_and(arcen_pier_macos::session::AdmissionGuard::yield_requested)
         })
         .await;
-        locked = lock_on_departure(serving_uid).await;
+        if offered && let Some(admission) = admission {
+            let _ = admission.offer_yield(false);
+        }
+    }
+
+    fn restore_outputs(&mut self) {
+        if let Some(privacy) = self.desk_privacy.as_mut() {
+            privacy.restore_outputs();
+        }
+        drop((
+            self.handshake.arranged_display.take(),
+            self.handshake.multi_monitor_displays.take(),
+        ));
+    }
+
+    fn restore_audio(&mut self) {
+        if !release_audio(self.audio.take()) {
+            self.audio_failed = true;
+        }
+    }
+
+    fn release_input(&mut self) {
+        if let Some(privacy) = self.desk_privacy.take() {
+            let counts = privacy.release_input();
+            tracing::info!(
+                target: arcen_telemetry::names::target::SESSION,
+                displays = counts.displays,
+                events_dropped = counts.events_dropped,
+                filter_reenabled = counts.filter_reenabled,
+                "the desk has its displays and input back"
+            );
+        }
+    }
+
+    fn release_guard(&mut self) {
+        if let Some(guard) = self.lock_guard.take() {
+            guard.release();
+        }
     }
 }
 
-/// What [`lock_on_departure`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockOutcome {
-    /// The session is locked.
-    Locked,
-    /// Not a session to lock: the login window, `serve`, or a console
-    /// another account took over.
-    NotOurs,
-    /// The lock was asked for and could not be proved.
-    NotLocked,
-}
+/// What [`lock_on_departure`] did (shared `lock_wait::LockAttempt`):
+/// `NotOurs` is the login window, `serve`, or a console another account
+/// took over.
+type LockOutcome = arcen_session::console_session::lock_wait::LockAttempt;
 
 /// Locks a signed-in user's session as its Deck leaves (ADR 0025 §4,
 /// shared [`arcen_session::console_session::Departure`]): the desk finds
 /// the lock screen, never an unlocked desktop someone else was using. Not the
 /// login window (nobody is signed in) and not `serve`, which is a hand run
 /// with no agent of its own. A console another account took over meanwhile
-/// is that account's, and is left alone.
-async fn lock_on_departure(serving_uid: Option<u32>) -> LockOutcome {
+/// is that account's, and is left alone (read fail-closed:
+/// `console::console_is_ours`). `left` is why the Deck left
+/// (`deck_left`, or `capture_stopped` when sharing was stopped on the host),
+/// as the log names it.
+async fn lock_on_departure(
+    serving_uid: Option<u32>,
+    left: arcen_session::console_session::Departure,
+) -> LockOutcome {
     use arcen_session::console_session::Departure;
     let Some(uid) = serving_uid else {
         return LockOutcome::NotOurs;
     };
-    let departure = if arcen_pier_macos::console::console_holder()
-        == arcen_session::agent_relay::ConsoleHolder::User(uid)
-    {
-        Departure::DeckLeft
+    let departure = if arcen_pier_macos::console::console_is_ours(uid) {
+        left
     } else {
         Departure::SessionChanged
     };
@@ -4176,6 +4321,7 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
                 | "register-audio-consent"
                 | "hid-injector"
         ) || command == "probe-desk-privacy"
+            || command == "probe-cursor"
             || command == "lock-guard"
             || (cfg!(feature = "lab-pen-probe") && command == "probe-pen")
             || (cfg!(feature = "lab-bridged-hid-probe") && command == "probe-bridged-hid")
@@ -4247,6 +4393,166 @@ mod tests {
     };
     use std::time::{Duration, Instant};
     use tokio_tungstenite::tungstenite::Message;
+
+    /// Records the hand-back in order; never touches this Mac.
+    struct RecordedEnd {
+        lock: super::LockOutcome,
+        steps: Vec<String>,
+    }
+
+    impl super::AttachmentEnd for RecordedEnd {
+        async fn tell_deck(&mut self, reason: &str) {
+            self.steps.push(format!("tell:{reason}"));
+        }
+        async fn lock(
+            &mut self,
+            departure: arcen_session::console_session::Departure,
+        ) -> super::LockOutcome {
+            self.steps.push(format!("lock:{}", departure.token()));
+            self.lock
+        }
+        async fn await_lock_screen(
+            &mut self,
+            locked: super::LockOutcome,
+            departure: arcen_session::console_session::Departure,
+        ) {
+            self.steps
+                .push(format!("await:{locked:?}:{}", departure.token()));
+        }
+        fn restore_outputs(&mut self) {
+            self.steps.push("outputs".to_owned());
+        }
+        fn restore_audio(&mut self) {
+            self.steps.push("audio".to_owned());
+        }
+        fn release_input(&mut self) {
+            self.steps.push("input".to_owned());
+        }
+        fn release_guard(&mut self) {
+            self.steps.push("guard".to_owned());
+        }
+    }
+
+    fn stream_ended(
+        error: &arcen_pier_macos::stream::StreamError,
+        frames_sent: u64,
+    ) -> arcen_session::console_session::stream_end::StreamEnd {
+        arcen_session::console_session::stream_end::StreamEnd::classify(
+            error.end_cause(),
+            frames_sent,
+        )
+    }
+
+    /// What `stream:didStopWithError:` reports for `code` in
+    /// `SCStreamErrorDomain` (-3817: a person pressed Stop Sharing).
+    fn stopped_by(code: i64) -> arcen_pier_macos::stream::StreamError {
+        arcen_pier_macos::stream::StreamError::Capture(
+            arcen_pier_macos::capture::CaptureError::StreamStopped(
+                arcen_pier_macos::capture::StreamStop {
+                    description: "The stream stopped.".to_owned(),
+                    domain:
+                        arcen_session::console_session::stream_end::SCREEN_CAPTURE_KIT_ERROR_DOMAIN
+                            .to_owned(),
+                    code,
+                },
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_system_stopped_is_not_told_and_still_locks() {
+        use arcen_session::console_session::stream_end::StreamEnd;
+        // The system stopped it, the window server connection was lost, a
+        // display went away: the Deck may reconnect, the session locks.
+        for code in [-3821, -3805, -3815] {
+            let end = stream_ended(&stopped_by(code), 300);
+            assert_eq!(end, StreamEnd::Failed, "{code}");
+            let mut host = RecordedEnd {
+                lock: super::LockOutcome::Locked,
+                steps: Vec::new(),
+            };
+            super::end_attachment(&mut host, Some(end)).await;
+            assert_eq!(
+                host.steps.first().map(String::as_str),
+                Some("lock:deck_left")
+            );
+            assert!(!host.steps.iter().any(|step| step.starts_with("tell:")));
+            assert_eq!(host.steps.last().map(String::as_str), Some("guard"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_sharing_tells_the_deck_then_locks_and_releases_the_guard() {
+        use arcen_session::console_session::stream_end::{DECK_REASON_SHARING_STOPPED, StreamEnd};
+        // A person pressed Stop Sharing after a session that had streamed
+        // for a while.
+        let end = stream_ended(&stopped_by(-3817), 4_200);
+        assert_eq!(end, StreamEnd::CaptureStopped);
+        assert_eq!(end.reason_class(), "capture_stopped");
+
+        let mut host = RecordedEnd {
+            lock: super::LockOutcome::Locked,
+            steps: Vec::new(),
+        };
+        let locked = super::end_attachment(&mut host, Some(end)).await;
+        assert_eq!(locked, super::LockOutcome::Locked);
+        assert_eq!(
+            host.steps,
+            [
+                format!("tell:{DECK_REASON_SHARING_STOPPED}"),
+                "lock:capture_stopped".to_owned(),
+                "await:Locked:capture_stopped".to_owned(),
+                "outputs".to_owned(),
+                "audio".to_owned(),
+                "input".to_owned(),
+                "guard".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_lock_is_awaited_before_anything_is_given_back() {
+        let end = stream_ended(&stopped_by(-3817), 0);
+        let mut host = RecordedEnd {
+            lock: super::LockOutcome::NotLocked,
+            steps: Vec::new(),
+        };
+        super::end_attachment(&mut host, Some(end)).await;
+        let position = |step: &str| host.steps.iter().position(|seen| seen == step);
+        let awaited = position("await:NotLocked:capture_stopped").expect("the lock is awaited");
+        assert!(awaited < position("outputs").expect("outputs"));
+        assert_eq!(host.steps.last().map(String::as_str), Some("guard"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_deck_is_not_told_and_still_locks() {
+        let end = stream_ended(
+            &arcen_pier_macos::stream::StreamError::PeerGone("reset".to_owned()),
+            10,
+        );
+        let mut host = RecordedEnd {
+            lock: super::LockOutcome::Locked,
+            steps: Vec::new(),
+        };
+        super::end_attachment(&mut host, Some(end)).await;
+        assert_eq!(
+            host.steps.first().map(String::as_str),
+            Some("lock:deck_left")
+        );
+        assert!(!host.steps.iter().any(|step| step.starts_with("tell:")));
+
+        // The desk watch told the Deck itself.
+        let mut host = RecordedEnd {
+            lock: super::LockOutcome::Locked,
+            steps: Vec::new(),
+        };
+        super::end_attachment(&mut host, None).await;
+        assert_eq!(
+            host.steps.first().map(String::as_str),
+            Some("lock:deck_left")
+        );
+        assert_eq!(host.steps.last().map(String::as_str), Some("guard"));
+    }
 
     #[test]
     fn a_startup_waiting_on_the_prompt_keeps_admitting_on_its_proven_mute() {

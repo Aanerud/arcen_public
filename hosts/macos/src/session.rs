@@ -336,15 +336,16 @@ pub struct Handshake {
     /// Who draws the pointer for this session.
     ///
     /// [`CursorMode::Local`] means the Deck draws its own, which moves at the
-    /// speed of the hand because nothing has to cross the link for it — but it
-    /// is always an arrow, because this host cannot read the shape the desktop
-    /// is showing. [`CursorMode::Host`] means the compositor draws it into the
+    /// speed of the hand because nothing has to cross the link for it, with
+    /// the desktop cursor's image when this session sends it
+    /// (`input_mode_results.cursor.cursor_images`) and a plain arrow
+    /// otherwise. [`CursorMode::Host`] means the compositor draws it into the
     /// captured picture, so it is always the right shape and always as late as
     /// the picture.
     ///
     /// The settled authority (`input_mode_results.cursor.active`): the
     /// person's choice, or, for a Deck that asked for the automatic cursor,
-    /// Host, because this host sends no cursor images.
+    /// Local when this session sends cursor images and Host when it cannot.
     pub cursor_mode: arcen_protocol::messages::CursorMode,
     /// Authoritative cursor/tablet negotiation results, sent before input begins.
     pub input_mode_results: crate::stream::InputModeResults,
@@ -1351,6 +1352,59 @@ pub struct AdmissionGuard {
     lease: Option<arcen_session::session_admission::SessionAdmissionLease>,
 }
 
+impl AdmissionGuard {
+    /// The session has ended and only waits for its lock screen on a desk
+    /// that was not private: an authenticated Deck may ask for the slot
+    /// (shared `SessionAdmissionRuntime::offer_yield`). `false` withdraws
+    /// the offer. Returns whether the offer stands.
+    #[must_use]
+    pub fn offer_yield(&self, offered: bool) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| self.runtime.offer_yield(lease, offered).is_ok() && offered)
+    }
+
+    /// Whether an authenticated Deck asked for the slot.
+    #[must_use]
+    pub fn yield_requested(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| self.runtime.yield_requested(lease))
+    }
+}
+
+/// Takes the host's session slot for an authenticated Deck. When a session
+/// that has ended holds it only to wait for its lock screen on a desk that
+/// was not private, that session is asked to give it up
+/// (`SessionAdmissionRuntime::request_yield`) and the Deck waits up to
+/// `YIELD_WAIT` for it, rather than being told the host is busy.
+async fn admit_after_hand_back(
+    runtime: &std::sync::Arc<arcen_session::session_admission::SessionAdmissionRuntime>,
+) -> Result<
+    arcen_session::session_admission::SessionAdmissionLease,
+    arcen_session::session_admission::SessionAdmissionError,
+> {
+    use arcen_session::session_admission::{SessionAdmissionError, YIELD_WAIT};
+    match runtime.admit_new() {
+        Err(SessionAdmissionError::SessionAlreadyActive) if runtime.request_yield() => {
+            tracing::info!(
+                target: arcen_telemetry::names::target::SESSION,
+                "the session before this one waits for its lock screen; it gives the slot up"
+            );
+            let deadline = tokio::time::Instant::now() + YIELD_WAIT;
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                match runtime.admit_new() {
+                    Err(SessionAdmissionError::SessionAlreadyActive)
+                        if tokio::time::Instant::now() < deadline => {}
+                    admitted => return admitted,
+                }
+            }
+        }
+        admitted => admitted,
+    }
+}
+
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
@@ -1390,7 +1444,7 @@ async fn perform_application_handshake(
         requested_multi_monitor,
         requested_desktop,
         client_display,
-        cursor_mode,
+        authenticated_cursor,
         authenticated_timezone,
         admission,
         deck_refine,
@@ -1609,9 +1663,13 @@ async fn perform_application_handshake(
         );
     }
     let input_mode_results = negotiate_input_modes(
-        cursor_mode,
+        authenticated_cursor.preference,
         client_hello.as_ref(),
         &advertised.native_tablet,
+        host_sends_cursor_images(
+            authenticated_cursor.draws_images,
+            crate::cursor_probe::desktop_cursor_images_readable,
+        ),
     );
     let client_audio = client_hello
         .as_ref()
@@ -1690,13 +1748,16 @@ pub fn tells_host_keymap(
 
 /// Settles the cursor and tablet modes of a session from the Deck's hello,
 /// including Native tablet (`native_tablet` is what this host's hello
-/// offered). Exactly what the handshake runs; public so the end-to-end test
-/// can drive a real client hello through it without the credential gate.
+/// offered) and `cursor_images` whether this session sends the desktop
+/// cursor's images ([`host_sends_cursor_images`]). Exactly what the
+/// handshake runs; public so the end-to-end test can drive a real client
+/// hello through it without the credential gate.
 #[must_use]
 pub fn negotiate_input_modes(
     cursor_mode: arcen_protocol::messages::CursorMode,
     client_hello: Option<&arcen_protocol::messages::ClientHelloMsg>,
     native_tablet: &Result<(), String>,
+    cursor_images: bool,
 ) -> crate::stream::InputModeResults {
     let host = host_tablet_mode_capabilities(native_tablet.is_ok());
     let mut results = client_hello.map_or_else(
@@ -1725,6 +1786,7 @@ pub fn negotiate_input_modes(
     results.cursor = cursor_result(
         cursor_mode,
         client_hello.is_some_and(|hello| hello.cursor_automatic_v1),
+        cursor_images,
     );
     results.native_tablet =
         negotiate_native_tablet(client_hello, native_tablet, &mut results.tablet);
@@ -1748,26 +1810,34 @@ pub fn negotiate_input_modes(
     results
 }
 
-/// This host sends no cursor images: it cannot read the desktop pointer's
-/// image (`NSCursor` reports the calling process's cursor, measured in
-/// `cursor_probe`), so a Deck that asks for the automatic cursor gets the
-/// pointer drawn into the video (`SCStreamConfiguration.showsCursor`).
-const HOST_SENDS_CURSOR_IMAGES: bool = false;
+/// Whether this session sends the desktop cursor's images: the Deck said at
+/// sign-in that it draws them, and this agent can read the cursor now
+/// (`readable`, the live check `cursor_probe::desktop_cursor_images_readable`
+/// in a session; asked only when the Deck draws images). Then a Deck that
+/// asks for the automatic cursor draws the pointer itself, with the
+/// desktop's shape, at the speed of the hand. Otherwise it gets the pointer
+/// drawn into the video (`SCStreamConfiguration.showsCursor`), as every
+/// macOS Pier did before the cursor could be read (ADR 0029).
+#[must_use]
+pub fn host_sends_cursor_images(deck_draws_images: bool, readable: impl FnOnce() -> bool) -> bool {
+    deck_draws_images && readable()
+}
 
 /// The cursor result for `requested`, by the shared rules: the automatic
 /// cursor (`resolve_automatic_cursor_mode`) when the Deck asked for it, which
 /// ignores the stored request, otherwise the request as it is
 /// (`resolve_cursor_mode`). This host can always draw the pointer into the
-/// video.
+/// video. Cursor images are sent only while the Deck draws the pointer.
 fn cursor_result(
     requested: arcen_protocol::messages::CursorMode,
     automatic: bool,
+    host_sends_cursor_images: bool,
 ) -> CursorModeResultMsg {
     let cursor = if automatic {
         resolve_automatic_cursor_mode(
             cursor_mode_to_input(requested),
             InputCapabilityTruth::Available,
-            HOST_SENDS_CURSOR_IMAGES,
+            host_sends_cursor_images,
         )
     } else {
         resolve_cursor_mode(
@@ -1775,12 +1845,14 @@ fn cursor_result(
             InputCapabilityTruth::Available,
         )
     };
+    let active = cursor_mode_from_input(cursor.active);
     CursorModeResultMsg {
         requested,
-        active: cursor_mode_from_input(cursor.active),
+        active,
         accepted: cursor.accepted,
         reason: CursorModeReason::try_from(cursor.reason.as_str().to_owned()).unwrap_or_default(),
-        cursor_images: HOST_SENDS_CURSOR_IMAGES,
+        cursor_images: host_sends_cursor_images
+            && active == arcen_protocol::messages::CursorMode::Local,
         automatic,
         ..CursorModeResultMsg::default()
     }
@@ -1867,7 +1939,7 @@ fn input_mode_results(
         capability_to_input(host_capabilities.usb_tablet_bridge),
     );
     crate::stream::InputModeResults {
-        cursor: cursor_result(requested_cursor, false),
+        cursor: cursor_result(requested_cursor, false, false),
         tablet: TabletModeResultMsg {
             requested: requested_tablet,
             active: tablet_mode_from_input(tablet.active),
@@ -2333,6 +2405,16 @@ fn resolve_initial_video(
     ))
 }
 
+/// The cursor the Deck asked for when it signed in.
+#[derive(Debug, Clone, Copy)]
+struct AuthenticatedCursor {
+    /// Its stored cursor preference.
+    preference: arcen_protocol::messages::CursorMode,
+    /// It draws host cursor images (`AuthResponse::cursor_image_v1`; the
+    /// authenticated value wins over the hello's echo).
+    draws_images: bool,
+}
+
 /// Extracts the credentials a client supplied, if the method is one this host
 /// offered.
 ///
@@ -2448,7 +2530,7 @@ async fn authenticate(
         Option<arcen_protocol::messages::AuthMultiMonitorRequestMsg>,
         RequestedDesktop,
         Option<arcen_protocol::messages::ClientMonitor>,
-        arcen_protocol::messages::CursorMode,
+        AuthenticatedCursor,
         Option<String>,
         Option<AdmissionGuard>,
         Option<arcen_protocol::refine::LosslessRefineCapability>,
@@ -2572,9 +2654,9 @@ async fn authenticate(
         Err(failure) => Err(failure),
     };
     // The slot, only now that the account is proved and servable.
-    let outcome = outcome.and_then(|(authenticated, video)| match admission {
-        None => Ok((authenticated, None, video)),
-        Some(runtime) => match runtime.admit_new() {
+    let outcome = match (outcome, admission) {
+        (Ok((authenticated, video)), None) => Ok((authenticated, None, video)),
+        (Ok((authenticated, video)), Some(runtime)) => match admit_after_hand_back(runtime).await {
             Ok(lease) => Ok((
                 authenticated,
                 Some(AdmissionGuard {
@@ -2585,7 +2667,8 @@ async fn authenticate(
             )),
             Err(_) => Err(crate::auth::AuthFailure::HostBusy),
         },
-    });
+        (Err(failure), _) => Err(failure),
+    };
     // Match My Layout's displays, once the slot is held and before the Deck
     // is answered, as the Linux Pier admits its topology: a layout this host
     // cannot build is refused with its reason (`multi_monitor_refused`), not
@@ -2654,7 +2737,10 @@ async fn authenticate(
                 .iter()
                 .find(|monitor| monitor.is_primary)
                 .cloned(),
-            response.cursor_preference,
+            AuthenticatedCursor {
+                preference: response.cursor_preference,
+                draws_images: response.cursor_image_v1,
+            },
             response.timezone.take(),
             admission,
             response.lossless_refine_v1.take(),
@@ -3842,11 +3928,11 @@ mod tests {
             ..ClientHelloMsg::default()
         };
         let settle = |cursor, hello: &ClientHelloMsg| {
-            negotiate_input_modes(cursor, Some(hello), &Ok(())).cursor
+            negotiate_input_modes(cursor, Some(hello), &Ok(()), false).cursor
         };
         // An Intuos5 this host reads, a Deck that follows host positions.
         let known = hello(0x0317, true);
-        let results = negotiate_input_modes(CursorMode::Local, Some(&known), &Ok(()));
+        let results = negotiate_input_modes(CursorMode::Local, Some(&known), &Ok(()), false);
         assert!(results.tablet.accepted);
         assert!(results.native_tablet.is_some());
         assert!(results.cursor.cursor_positions);
@@ -3856,9 +3942,14 @@ mod tests {
         assert!(!settle(CursorMode::Host, &known).cursor_positions);
         assert!(!settle(CursorMode::Local, &hello(0x0001, true)).cursor_positions);
         assert!(
-            !negotiate_input_modes(CursorMode::Local, Some(&known), &Err("off".to_owned()))
-                .cursor
-                .cursor_positions
+            !negotiate_input_modes(
+                CursorMode::Local,
+                Some(&known),
+                &Err("off".to_owned()),
+                false
+            )
+            .cursor
+            .cursor_positions
         );
     }
 
@@ -3868,15 +3959,15 @@ mod tests {
         let off = || Err("off".to_owned());
         // An older Deck never asks: Local, as before; the Deck draws.
         let old = ClientHelloMsg::default();
-        let result = negotiate_input_modes(CursorMode::Local, Some(&old), &off()).cursor;
+        let result = negotiate_input_modes(CursorMode::Local, Some(&old), &off(), false).cursor;
         assert_eq!(result.active, CursorMode::Local);
         assert!(!result.automatic && !result.host_draws_pointer());
-        let result = negotiate_input_modes(CursorMode::Local, None, &off()).cursor;
+        let result = negotiate_input_modes(CursorMode::Local, None, &off(), false).cursor;
         assert_eq!(result.active, CursorMode::Local);
-        // A Deck that asks: this host sends no cursor images, so the
-        // compositor draws the pointer and the result says so.
+        // A Deck that asks, in a session that cannot send cursor images:
+        // the compositor draws the pointer and the result says so.
         let new = ClientHelloMsg::default().with_cursor_automatic_v1(true);
-        let result = negotiate_input_modes(CursorMode::Local, Some(&new), &off()).cursor;
+        let result = negotiate_input_modes(CursorMode::Local, Some(&new), &off(), false).cursor;
         assert_eq!(result.requested, CursorMode::Local);
         assert_eq!(result.active, CursorMode::Host);
         assert!(result.accepted && result.automatic && !result.cursor_images);
@@ -3884,16 +3975,57 @@ mod tests {
         assert!(result.reason.as_str().contains("no cursor images"));
         // With the flag the stored request does not decide: a stored Host
         // is settled by the same rule (and echoed).
-        let result = negotiate_input_modes(CursorMode::Host, Some(&new), &off()).cursor;
+        let result = negotiate_input_modes(CursorMode::Host, Some(&new), &off(), false).cursor;
         assert_eq!(result.requested, CursorMode::Host);
         assert_eq!(result.active, CursorMode::Host);
         assert!(result.accepted && result.automatic);
         // An older Deck with a stored Host keeps Host, as before.
-        let result = negotiate_input_modes(CursorMode::Host, Some(&old), &off()).cursor;
+        let result = negotiate_input_modes(CursorMode::Host, Some(&old), &off(), false).cursor;
         assert_eq!(result.active, CursorMode::Host);
         assert!(result.accepted && !result.automatic);
         // A host-drawn pointer never asks the Deck to follow host positions.
         assert!(!result.cursor_positions);
+    }
+
+    #[test]
+    fn a_deck_that_draws_images_gets_the_pointer_locally_only_while_the_cursor_is_readable() {
+        use arcen_protocol::messages::{ClientHelloMsg, CursorMode};
+        let automatic = ClientHelloMsg::default().with_cursor_automatic_v1(true);
+        let settle = |cursor_images| {
+            negotiate_input_modes(
+                CursorMode::Host,
+                Some(&automatic),
+                &Err("off".to_owned()),
+                cursor_images,
+            )
+            .cursor
+        };
+        // Readable: the Deck draws the pointer, with the host's images.
+        let readable = host_sends_cursor_images(true, || true);
+        let result = settle(readable);
+        assert_eq!(result.active, CursorMode::Local);
+        assert!(result.accepted && result.automatic && result.cursor_images);
+        assert!(!result.host_draws_pointer());
+        // Unreadable: the pointer stays in the video, as before.
+        let result = settle(host_sends_cursor_images(true, || false));
+        assert_eq!(result.active, CursorMode::Host);
+        assert!(result.host_draws_pointer() && !result.cursor_images);
+        // A Deck that draws no images is never asked about, and never sent any.
+        let asked = std::cell::Cell::new(false);
+        assert!(!host_sends_cursor_images(false, || {
+            asked.set(true);
+            true
+        }));
+        assert!(!asked.get());
+        // A stored Local without the automatic cursor gets images too; a
+        // stored Host never does, because the compositor draws the pointer.
+        let old = ClientHelloMsg::default();
+        let local =
+            negotiate_input_modes(CursorMode::Local, Some(&old), &Err("off".to_owned()), true);
+        assert!(local.cursor.cursor_images);
+        let host =
+            negotiate_input_modes(CursorMode::Host, Some(&old), &Err("off".to_owned()), true);
+        assert!(!host.cursor.cursor_images && host.cursor.host_draws_pointer());
     }
 
     #[test]
