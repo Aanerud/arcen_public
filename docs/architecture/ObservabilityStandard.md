@@ -314,6 +314,8 @@ QosSample {
     ts_ms, fps_actual, fps_target, bandwidth_mbps,
     frames_sent, frames_dropped,            // host side
     frames_decoded, frames_presented,       // client side
+    frames_superseded,                      // client side: handled, not shown
+    frames_submitted_untimed,               // client side: reached the compositor, no timestamp
     capture_time_ms, encode_time_ms,        // host side
     decode_time_ms, display_time_ms,        // client side  (finally filled)
     rtt_ms,                                 // measured, not estimated (see 5.4)
@@ -352,9 +354,23 @@ fault. Frames the pipeline failed to keep up with (superseded, shed) count as
 content, so a backlog still trips the state. A window that sent nothing is
 judged against the target (every Pier sends a keepalive at least once a
 second), and a shortfall of one frame a second is window quantisation, not a
-fault. Client presentation (`unpresented`) allows one decoded frame in flight
-at the window boundary and is judged only on windows of at least ten decoded
-frames. Each Pier and the Deck feed `fps_content` from
+fault. A client's window is silent only when nothing reached its compositor
+(presented or returned without a timestamp, `frames_submitted_untimed`;
+frames replaced before that are no proof of life; for a client that
+predates the field, nothing decoded or presented). A window whose content is idle (at most
+`IDLE_CONTENT_FPS`, two changed frames a second: keepalives, a caret) is not
+judged for frame rate or presentation as long as it is not silent: the
+picture is the same whether a repeat reached the glass, and a macOS
+compositor returns most repeated drawables without a presentation time.
+Client presentation (`unpresented`) counts decoded frames that were neither
+presented nor superseded by a newer frame (`frames_superseded`). Drawables
+returned without a presentation time are always handled; newest-wins
+presenter drops and frames replaced before the presenter took them are
+handled only up to `NEWEST_WINS_EXCUSED_BASIS_POINTS` (3 %) of the window,
+what bunched arrivals explain, and count as lost beyond it. Whether the
+glass kept up with the content is the frame-rate rule's. It allows two decoded frames in flight at the window
+boundary and is judged only on windows of at least ten decoded frames whose
+content is not idle. Each Pier and the Deck feed `fps_content` from
 counters they already keep; a Pier that captures several monitors combines
 them with `outputs_content` (each monitor owes what its own capture
 proved, up to its own served rate) and is judged against the sum of the
@@ -369,7 +385,10 @@ interactive work; 0.5 % drops is visible in playback review.
 
 **Hysteresis:** a state transition must hold for **2 consecutive windows** before
 the 1800/1801/1802 event fires. The deterministic tracker uses caller-supplied
-monotonic timestamps and never owns a clock. No flapping alerts.
+monotonic timestamps and never owns a clock. No flapping alerts. On a Pier
+each side holds its own windows: host delivery its two-second ticks, client
+experience the Deck's five-second samples, each counted once however many
+ticks see it; the session's state is the worse of the two committed states.
 
 **Both sides compute it.** Host rollup = delivery health (capture/encode/drops).
 Client rollup = experienced health (decode/present/RTT). **Disagreement is the

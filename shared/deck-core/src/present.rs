@@ -16,6 +16,11 @@
 //! When neither dedicated presenter can show a frame, the media worker
 //! falls back to the egui path (CPU RGBA) and the Deck shows a persistent
 //! warning for a ten-bit contract.
+//!
+//! Where a window places either presenter's picture, and where its pointer
+//! lands on it, is one shared value: [`fit::PictureRect`].
+
+pub mod fit;
 
 use std::num::NonZeroU32;
 use std::time::Instant;

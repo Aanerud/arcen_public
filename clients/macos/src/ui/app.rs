@@ -1064,22 +1064,31 @@ fn shape_cursor_icon(shape: arcen_protocol::messages::CursorShapeKind) -> egui::
     }
 }
 
-fn aspect_fit_rect(container: egui::Rect, frame_size: Option<[usize; 2]>, ppp: f32) -> egui::Rect {
-    let Some([w, h]) = frame_size else {
-        return container;
-    };
-    if w == 0 || h == 0 || container.width() <= 0.0 || container.height() <= 0.0 {
-        return container;
+/// `rect` as the shared picture geometry both drawing and input read
+/// (`arcen_deck_core::present::fit`).
+#[must_use]
+pub(crate) fn picture_rect(rect: egui::Rect) -> arcen_deck_core::present::fit::PictureRect {
+    arcen_deck_core::present::fit::PictureRect {
+        left: rect.left(),
+        top: rect.top(),
+        width: rect.width(),
+        height: rect.height(),
     }
-    let snap = |v: f32| (v * ppp).round() / ppp;
-    let aspect = w as f32 / h as f32;
-    let fit_h = (container.width() / aspect).min(container.height());
-    let fit_w = fit_h * aspect;
-    let cx = container.center().x;
-    let cy = container.center().y;
-    egui::Rect::from_min_max(
-        egui::pos2(snap(cx - fit_w / 2.0), snap(cy - fit_h / 2.0)),
-        egui::pos2(snap(cx + fit_w / 2.0), snap(cy + fit_h / 2.0)),
+}
+
+pub(crate) fn aspect_fit_rect(
+    container: egui::Rect,
+    frame_size: Option<[usize; 2]>,
+    ppp: f32,
+) -> egui::Rect {
+    let fit = arcen_deck_core::present::fit::PictureRect::aspect_fit(
+        picture_rect(container),
+        frame_size,
+        ppp,
+    );
+    egui::Rect::from_min_size(
+        egui::pos2(fit.left, fit.top),
+        egui::vec2(fit.width, fit.height),
     )
 }
 
@@ -5391,8 +5400,6 @@ impl ArcenApp {
         focused: bool,
         events: &[egui::Event],
     ) {
-        use arcen_deck_core::input::viewport_pointer::PictureRect;
-
         let MultiWindowSessionState::Active {
             validated,
             attempt,
@@ -5416,12 +5423,7 @@ impl ArcenApp {
         };
         let steps = {
             let mut state = state.lock().expect("secondary viewport state poisoned");
-            let picture = state.image_rect.map(|rect| PictureRect {
-                left: rect.left(),
-                top: rect.top(),
-                width: rect.width(),
-                height: rect.height(),
-            });
+            let picture = state.image_rect.map(picture_rect);
             secondary_pointer_steps(&mut state.pointer, picture, events)
         };
         if steps.is_empty() {
@@ -10612,8 +10614,12 @@ impl ArcenApp {
         let DedicatedPresentations {
             frames_confirmed,
             presented_time_unconfirmed,
+            frames_superseded,
             confirmed_presented_at,
         } = presentations;
+        if let Some(telemetry) = &self.session_telemetry {
+            telemetry.record_presenter_superseded(frames_superseded);
+        }
         if frames_confirmed == 0 && presented_time_unconfirmed == 0 {
             return;
         }
@@ -10706,6 +10712,7 @@ impl ArcenApp {
             self.note_dedicated_presentations(DedicatedPresentations {
                 frames_confirmed: delta.frames_confirmed,
                 presented_time_unconfirmed: delta.presented_time_unconfirmed,
+                frames_superseded: 0,
                 confirmed_presented_at: delta.confirmed_presented_at.clone(),
             });
         }
@@ -11753,13 +11760,7 @@ impl ArcenApp {
     }
 
     fn viewport_local_fraction(rect: egui::Rect, pos: egui::Pos2) -> Option<(f64, f64)> {
-        if rect.width() <= 0.0 || rect.height() <= 0.0 {
-            return None;
-        }
-        Some((
-            f64::from(((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0)),
-            f64::from(((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0)),
-        ))
+        picture_rect(rect).clamped_fraction(pos.x, pos.y)
     }
 
     fn next_input_sequence(&mut self) -> u64 {
@@ -14373,14 +14374,7 @@ fn clamp_unit_fraction((x, y): (f64, f64)) -> (f64, f64) {
 /// outside `0.0..=1.0` when a held drag has left the viewport.
 #[must_use]
 fn unclamped_view_fraction(rect: egui::Rect, pos: egui::Pos2) -> Option<(f64, f64)> {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return None;
-    }
-    let fraction = (
-        f64::from((pos.x - rect.left()) / rect.width()),
-        f64::from((pos.y - rect.top()) / rect.height()),
-    );
-    (fraction.0.is_finite() && fraction.1.is_finite()).then_some(fraction)
+    picture_rect(rect).fraction(pos.x, pos.y)
 }
 
 /// A viewport's window and picture on this Mac's desktop: `window` is its

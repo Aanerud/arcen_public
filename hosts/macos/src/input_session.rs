@@ -34,7 +34,7 @@ const MOUSE_BUTTON: &str = "mouse_button";
 const KEY_EVENT: &str = "key_event";
 use serde::Serialize;
 
-use crate::input::{DesktopBounds, InputController, InputError, NativePoint};
+use crate::input::{DesktopBounds, InputController, InputError, KeyOutcome, NativePoint};
 
 /// Which input coordinate contract this stream accepts.
 #[derive(Debug, Clone)]
@@ -220,8 +220,25 @@ pub struct InputSession {
     sequence: InputSequenceTracker,
     region: Option<RegionInputPipeline<MacRegionPointMapper>>,
     stats: InputStats,
-    /// A `text_commit_result` owed to the client.
-    reply: Option<String>,
+    /// The `text_commit_result`s owed to the client, in order: draining held
+    /// input can owe several.
+    replies: std::collections::VecDeque<String>,
+    /// Input held while this session's lock screen brings its password
+    /// field up (shared `InputHold`): the key that woke it, then every
+    /// message after it, in order.
+    held: arcen_input::keyboard::InputHold<HeldInput>,
+    /// Whether input was ever held this session (the session-end summary
+    /// says only that, never how much: that would be a password's length).
+    held_any: bool,
+}
+
+/// One item of [`InputSession::held`].
+#[derive(Debug, Clone)]
+enum HeldInput {
+    /// The key that woke the lock screen, already accepted in sequence.
+    WokenKey(KeyboardEvent),
+    /// A message that arrived while input was held.
+    Message(String),
 }
 
 impl std::fmt::Debug for InputSession {
@@ -245,7 +262,9 @@ impl InputSession {
             sequence: InputSequenceTracker::default(),
             region: None,
             stats: InputStats::default(),
-            reply: None,
+            replies: std::collections::VecDeque::new(),
+            held: arcen_input::keyboard::InputHold::default(),
+            held_any: false,
         })
     }
 
@@ -269,7 +288,9 @@ impl InputSession {
                 MacRegionPointMapper::new(&region.applied_regions, &region.bounds_by_region),
             )),
             stats: InputStats::default(),
-            reply: None,
+            replies: std::collections::VecDeque::new(),
+            held: arcen_input::keyboard::InputHold::default(),
+            held_any: false,
         })
     }
 
@@ -302,9 +323,10 @@ impl InputSession {
         self.controller.set_host_keymap(notice);
     }
 
-    /// Takes the reply the last message owes the client, if any.
-    pub const fn take_reply(&mut self) -> Option<String> {
-        self.reply.take()
+    /// Takes the oldest reply owed to the client, if any. Call until it
+    /// returns `None`: [`Self::apply_held`] can owe several.
+    pub fn take_reply(&mut self) -> Option<String> {
+        self.replies.pop_front()
     }
 
     /// Applies one message.
@@ -317,6 +339,43 @@ impl InputSession {
     ///
     /// Returns [`InputError`] only when injection itself fails.
     pub fn apply(&mut self, json: &str) -> Result<(), InputError> {
+        if self.held.due().is_some() {
+            let _ = self.held.defer(HeldInput::Message(json.to_owned()));
+            return Ok(());
+        }
+        self.apply_now(json)
+    }
+
+    /// When held input is due ([`Self::apply_held`]), if any is held.
+    #[must_use]
+    pub const fn held_input_due(&self) -> Option<std::time::Instant> {
+        self.held.due()
+    }
+
+    /// Applies the input held for the lock screen once it is due at `now`,
+    /// in the order it arrived. The session loop calls this from a timer at
+    /// [`Self::held_input_due`]; nothing waits on the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError`] only when injection itself fails.
+    pub fn apply_held(&mut self, now: std::time::Instant) -> Result<(), InputError> {
+        while let Some(item) = self.held.next_due(now) {
+            match item {
+                HeldInput::WokenKey(event) => {
+                    let before_unmapped = self.controller.stats().unmapped_keys;
+                    self.controller.key_event_after_wake(&event)?;
+                    if self.controller.stats().unmapped_keys == before_unmapped {
+                        self.stats.applied += 1;
+                    }
+                }
+                HeldInput::Message(json) => self.apply_now(&json)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_now(&mut self, json: &str) -> Result<(), InputError> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
             self.stats.malformed += 1;
             return Ok(());
@@ -445,7 +504,7 @@ impl InputSession {
         };
         let report = arcen_input::text::TextDeliveryReport::refused(&message.text, reason);
         self.stats.text_refused += u64::from(report.refused_chars);
-        self.reply = serde_json::to_string(&TextCommitResultMsg {
+        let reply = serde_json::to_string(&TextCommitResultMsg {
             sequence: message.sequence,
             refused_chars: report.refused_chars,
             refused_text: report.refused_text,
@@ -453,6 +512,9 @@ impl InputSession {
             ..TextCommitResultMsg::default()
         })
         .ok();
+        if let Some(reply) = reply {
+            self.replies.push_back(reply);
+        }
     }
 
     /// Returns whether `sequence` may be applied, counting it if not.
@@ -519,7 +581,7 @@ impl InputSession {
             return Ok(());
         }
         let before_unmapped = self.controller.stats().unmapped_keys;
-        self.controller.key_event(&KeyboardEvent {
+        let event = KeyboardEvent {
             key_id: message.scan_code,
             pressed: message.pressed,
             modifiers: ModifierMask(message.modifiers),
@@ -527,7 +589,15 @@ impl InputSession {
             num_lock_on: None,
             scroll_lock_on: None,
             metadata: metadata(message.sequence, message.timestamp_ns),
-        })?;
+        };
+        if self.controller.key_event(&event)? == KeyOutcome::HoldForWake {
+            self.held.hold(
+                std::time::Instant::now() + arcen_input::keyboard::LOCK_SCREEN_WAKE_SETTLE,
+                HeldInput::WokenKey(event),
+            );
+            self.held_any = true;
+            return Ok(());
+        }
         // Only if a key was actually posted. The controller refuses a key it
         // has no macOS equivalent for, and counting that as applied made a
         // keyboard silently dropping keys indistinguishable from one that
@@ -718,6 +788,23 @@ impl InputSession {
     /// Returns the first [`InputError`] encountered, after attempting all
     /// releases.
     pub fn release_all(&mut self) -> Result<(), InputError> {
+        // Nothing held was posted, so dropping it leaves nothing down; what
+        // was posted before the hold is released below.
+        let held_dropped = self.held.clear() > 0;
+        let lock_screen = self.controller.stats();
+        // Wakes and submits are per visit to the lock screen and per
+        // attempt, never per key; whether input was held or dropped is a
+        // yes or no. Nothing here may grow with what was typed.
+        if lock_screen.lock_screen_wakes + lock_screen.lock_screen_submits > 0 {
+            tracing::info!(
+                target: arcen_telemetry::names::target::HID,
+                lock_screen_wakes = lock_screen.lock_screen_wakes,
+                submit_declarations = lock_screen.lock_screen_submits,
+                input_held = self.held_any,
+                held_dropped,
+                "lock screen typing this session"
+            );
+        }
         self.controller.release_all()
     }
 }
@@ -1024,6 +1111,30 @@ mod tests {
             .apply(&json!({"type": TEXT_COMMIT, "text": 5}).to_string())
             .expect("no panic");
         assert_eq!(session.stats().malformed, 1);
+    }
+
+    #[test]
+    fn every_refused_commit_drained_from_a_hold_gets_its_own_reply() {
+        let Some(mut session) = session() else {
+            return;
+        };
+        let commit = |sequence: u64| {
+            json!({"type": TEXT_COMMIT, "text": "a\rb", "sequence": sequence}).to_string()
+        };
+        // As a lock-screen wake leaves it: two commits arrive while held.
+        let due = std::time::Instant::now();
+        session.held.hold(due, HeldInput::Message(commit(1)));
+        session.apply(&commit(2)).expect("held");
+        assert!(session.take_reply().is_none(), "nothing applied while held");
+        session.apply_held(due).expect("drained");
+        let sequences: Vec<u64> = std::iter::from_fn(|| session.take_reply())
+            .map(|reply| {
+                serde_json::from_str::<TextCommitResultMsg>(&reply)
+                    .expect("a result")
+                    .sequence
+            })
+            .collect();
+        assert_eq!(sequences, [1, 2]);
     }
 
     #[test]

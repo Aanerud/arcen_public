@@ -404,13 +404,17 @@ impl MediaSession {
                 .send(SessionEvent::PresentationRecoveryRequested);
         }
         let pass = worker::drain_presenters(&self.shared);
-        let (mut confirmed, mut unconfirmed) = (0_u64, 0_u64);
+        let (mut confirmed, mut unconfirmed, mut superseded) = (0_u64, 0_u64, 0_u64);
         for delta in [&pass.eight_bit, &pass.ten_bit] {
             self.frames_submitted = self.frames_submitted.saturating_add(delta.frames_submitted);
             self.frames_confirmed = self.frames_confirmed.saturating_add(delta.frames_confirmed);
             confirmed = confirmed.saturating_add(delta.frames_confirmed);
             unconfirmed = unconfirmed.saturating_add(delta.presented_time_unconfirmed);
+            superseded = superseded
+                .saturating_add(delta.dropped_overflow)
+                .saturating_add(delta.dropped_stale);
         }
+        self.telemetry.record_presenter_superseded(superseded);
         // As the macOS Deck does after its presenters' pass.
         self.presented_time_reported |= confirmed > 0;
         self.telemetry.record_presenter_frames(

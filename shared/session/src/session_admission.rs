@@ -515,6 +515,69 @@ impl DetachedTakeoverRefusal {
     }
 }
 
+/// Why a Pier refused an authenticated newcomer because another session
+/// holds its desktop: the host is busy, the credentials were fine.
+///
+/// A Deck reads these words back ([`Self::from_reason`]) to say "Another
+/// session is already using ‹host›" rather than a closed connection or a
+/// failed sign-in, so a Pier sends [`Self::deck_reason`] as it is. The words
+/// are the ones each Pier sent before they were shared, so a Deck recognises
+/// those Piers too; never reword one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopBusyRefusal {
+    /// Another Deck holds the Linux Pier's capacity-one session slot.
+    AnotherDeckAttached,
+    /// Another session owns the account's persistent Linux desktop.
+    PersistentSessionOwned,
+    /// Another authenticated session owns the Windows display until it
+    /// disconnects and its resume window expires.
+    WindowsDisplayOwned,
+    /// A live Deck signed in as the same user holds the Windows display.
+    WindowsSameUserAttached,
+}
+
+impl DesktopBusyRefusal {
+    /// Every busy refusal.
+    pub const ALL: [Self; 4] = [
+        Self::AnotherDeckAttached,
+        Self::PersistentSessionOwned,
+        Self::WindowsDisplayOwned,
+        Self::WindowsSameUserAttached,
+    ];
+
+    /// What the Pier tells the Deck. The Linux reasons travel as a close
+    /// reason (at most 120 bytes); the Windows ones in an `auth_result`.
+    #[must_use]
+    pub const fn deck_reason(self) -> &'static str {
+        match self {
+            Self::AnotherDeckAttached => {
+                "shared display is busy: another Deck is attached to this desktop"
+            }
+            Self::PersistentSessionOwned => {
+                "another session owns this desktop; retry after it disconnects"
+            }
+            Self::WindowsDisplayOwned => {
+                "The Windows display is already owned by another authenticated session. It is \
+                 released when that session disconnects and its resume window \
+                 (auth.reconnect_window_secs) expires."
+            }
+            Self::WindowsSameUserAttached => {
+                "The Windows display is in use by another Deck signed in as this user. \
+                 Disconnect it first."
+            }
+        }
+    }
+
+    /// The busy refusal a host's reason states, wherever a Deck's transport
+    /// placed it in the text. `None` for any other reason.
+    #[must_use]
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|refusal| reason.contains(refusal.deck_reason()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +782,37 @@ mod tests {
                 .deck_reason()
                 .contains("Another user's remote desktop is waiting")
         );
+    }
+
+    #[test]
+    fn a_busy_refusal_is_read_back_from_where_a_deck_finds_it() {
+        for refusal in DesktopBusyRefusal::ALL {
+            let reason = refusal.deck_reason();
+            // A Linux close reason, as a Deck's transport words it.
+            let closed = format!("host closed the connection during setup: {reason}");
+            assert_eq!(
+                DesktopBusyRefusal::from_reason(&closed),
+                Some(refusal),
+                "{reason}"
+            );
+            assert!(
+                !reason.to_ascii_lowercase().contains("password"),
+                "{reason}"
+            );
+        }
+        for refusal in [
+            DesktopBusyRefusal::AnotherDeckAttached,
+            DesktopBusyRefusal::PersistentSessionOwned,
+        ] {
+            assert!(refusal.deck_reason().len() <= 120, "{refusal:?}");
+        }
+        for other in [
+            "",
+            "Authentication failed",
+            DetachedTakeoverRefusal::OwnerDidNotAnswer.deck_reason(),
+            "shared display is busy",
+        ] {
+            assert_eq!(DesktopBusyRefusal::from_reason(other), None, "{other}");
+        }
     }
 }

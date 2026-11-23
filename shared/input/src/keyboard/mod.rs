@@ -35,11 +35,15 @@
 //! - [`MacTapRouter`] decides which Mac system shortcuts (⌘Tab, ⌘Space,
 //!   Mission Control) a macOS Deck's event tap takes for the host;
 //! - [`SendKey`] is the Send Key menu, [`KeyRemapTable`] a validated remap
-//!   table, and [`PRO_APP_CHORDS`] the chords no Deck chord may take.
+//!   table, and [`PRO_APP_CHORDS`] the chords no Deck chord may take;
+//! - [`LockScreenActivity`] says when a host that posts keys into its own
+//!   lock screen must declare the user activity a person's keys would
+//!   have made.
 
 mod capture;
 mod deck_shortcuts;
 pub mod host_keys;
+mod lock_screen;
 mod mac_capture;
 pub mod pc;
 mod pc_input;
@@ -57,6 +61,10 @@ pub use capture::{
     KeyboardStatus,
 };
 pub use deck_shortcuts::{DeckShortcut, MacChord, PcChord, PcModifierState};
+pub use lock_screen::{
+    InputHold, LOCK_SCREEN_SUBMIT_DELAY, LOCK_SCREEN_WAKE_INTERVAL, LOCK_SCREEN_WAKE_SETTLE,
+    LockScreenActivity, LockScreenFacts, LockScreenStep,
+};
 pub use mac_capture::{
     MAC_KEY_3, MAC_KEY_4, MAC_KEY_5, MAC_KEY_D, MAC_KEY_DOWN, MAC_KEY_ESCAPE, MAC_KEY_GRAVE,
     MAC_KEY_HOME, MAC_KEY_LEFT, MAC_KEY_Q, MAC_KEY_RIGHT, MAC_KEY_SPACE, MAC_KEY_TAB, MAC_KEY_UP,

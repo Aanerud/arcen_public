@@ -827,6 +827,25 @@ async fn send_host_pen_pointer(
 }
 
 /// Resolves at `due` (never when `None`; the arm is disabled then).
+/// Applies the input a session held while its lock screen brought the
+/// password field up (`InputSession::apply_held`), sending any reply it owes:
+/// a timer arm of the session loop, so the picture never waits on it.
+async fn apply_held_input(
+    writer: &tokio::sync::mpsc::Sender<Message>,
+    input: Option<&mut crate::input_session::InputSession>,
+) -> Result<(), StreamError> {
+    let Some(session) = input else {
+        return Ok(());
+    };
+    session
+        .apply_held(Instant::now())
+        .map_err(|error| StreamError::Input(error.to_string()))?;
+    while let Some(reply) = session.take_reply() {
+        enqueue(writer, Message::Text(reply)).await?;
+    }
+    Ok(())
+}
+
 async fn sleep_until_due(due: Option<Instant>) {
     match due {
         Some(due) => tokio::time::sleep_until(due.into()).await,
@@ -2425,6 +2444,9 @@ pub async fn stream(
             let host_pen_pointer_due = host_pen_pointer
                 .as_ref()
                 .and_then(crate::bridged_tablet::HostPenPointer::due_at);
+            let held_input_due = input
+                .as_ref()
+                .and_then(crate::input_session::InputSession::held_input_due);
             tokio::select! {
                 biased;
                 // Input first: a keystroke waiting behind a frame is a keystroke
@@ -2482,6 +2504,9 @@ pub async fn stream(
                         None => keymap_watch = None,
                     }
                     continue;
+                }
+                () = sleep_until_due(held_input_due), if held_input_due.is_some() => {
+                    apply_held_input(&priority, input.as_mut()).await?;
                 }
                 () = sleep_until_due(host_pen_pointer_due), if host_pen_pointer_due.is_some() => {
                     if let Some(pointer) = host_pen_pointer.as_mut() {
@@ -3167,6 +3192,9 @@ pub async fn stream_multi(
         );
         let streaming = async {
         loop {
+            let held_input_due = input
+                .as_ref()
+                .and_then(crate::input_session::InputSession::held_input_due);
             tokio::select! {
                 biased;
                 message = incoming.next() => {
@@ -3221,6 +3249,10 @@ pub async fn stream_multi(
                         }
                         None => keymap_watch = None,
                     }
+                    continue;
+                }
+                () = sleep_until_due(held_input_due), if held_input_due.is_some() => {
+                    apply_held_input(&priority, input.as_mut()).await?;
                     continue;
                 }
                 _ = full_frame_tick.tick() => {

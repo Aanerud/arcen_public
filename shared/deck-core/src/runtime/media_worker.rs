@@ -2122,6 +2122,7 @@ fn handle_media_batch<M, D>(
             state.video_frames_seen,
             state.video_frames_decoded,
             state.inbox.video_dropped_packets,
+            state.presentation_superseded_frames,
             Duration::from_secs_f64((state.last_decode_ms / 1_000.0).max(0.0)),
         );
         if let Some(error) = &batch.malformed_error {
@@ -2589,16 +2590,18 @@ where
                             router.decoder_hardware_accelerated(root_id).flatten();
                     }
                 }
-                let (seen, decoded, dropped) = (
+                let (seen, decoded, dropped, superseded) = (
                     state.video_frames_seen,
                     state.video_frames_decoded,
                     state.inbox.video_dropped_packets,
+                    state.presentation_superseded_frames,
                 );
                 drop(state);
                 telemetry.record_media(
                     seen,
                     decoded,
                     dropped,
+                    superseded,
                     Duration::from_secs_f64((elapsed_ms / 1_000.0).max(0.0)),
                 );
                 repaint.request_repaint();
@@ -2943,6 +2946,7 @@ fn record_primary_decode_state<M: MediaPlatform>(
         state.video_frames_seen,
         state.video_frames_decoded,
         state.inbox.video_dropped_packets,
+        state.presentation_superseded_frames,
         Duration::from_secs_f64((decode_ms / 1_000.0).max(0.0)),
     );
 }

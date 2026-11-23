@@ -45,6 +45,32 @@ pub struct QosSample {
     pub frames_decoded: Option<u64>,
     /// Frames presented by the client.
     pub frames_presented: Option<u64>,
+    /// Decoded frames the client handed on but did not show because a newer
+    /// frame took their place: a presenter queue that keeps only the newest
+    /// frame, a frame replaced before the presenter took it, a drawable the
+    /// compositor reported without a presentation time (it showed a later
+    /// one, or the same picture was already on the glass).
+    ///
+    /// They are neither presented nor lost: the screen moved on to newer
+    /// content, or never changed. Drawables the compositor returned without
+    /// a timestamp ([`Self::frames_submitted_untimed`]) count as handled for
+    /// [`unpresented_basis_points`]; frames dropped before they reached the
+    /// compositor count as handled only up to what bunched arrivals explain
+    /// ([`NEWEST_WINS_EXCUSED_BASIS_POINTS`]). Whether the screen kept up is
+    /// the frame-rate rule's to judge, from [`Self::frames_presented`]
+    /// alone. `None` from a client that does not report them.
+    pub frames_superseded: Option<u64>,
+    /// The part of [`Self::frames_superseded`] that reached the compositor:
+    /// drawables submitted and returned without a presentation time (a
+    /// macOS compositor does this for most repeated pictures on a still
+    /// desktop).
+    ///
+    /// Only these, with [`Self::frames_presented`], prove the presenter is
+    /// alive for [`fps_expected`]: a media worker that keeps replacing frames
+    /// for a presenter that never takes them, or a pacer that keeps dropping
+    /// them, supersedes frames while nothing reaches the glass. `None` from a
+    /// client that does not report it.
+    pub frames_submitted_untimed: Option<u64>,
     /// Host capture time.
     pub capture_time_ms: Option<u32>,
     /// Host encode time.
@@ -300,8 +326,9 @@ pub enum HealthCause {
     /// host-delivery side this is real delivery loss, from
     /// `frames_sent`/`frames_dropped`. On the client-experience side
     /// [`assess_presentation_drop`] reuses it for frames that decoded fine and
-    /// were then superseded before presentation, from
-    /// `frames_decoded`/`frames_presented`. A reporter that resolves the value
+    /// then never reached the screen without a newer frame taking their
+    /// place, from `frames_decoded`/`frames_presented`/`frames_superseded`. A
+    /// reporter that resolves the value
     /// from the wrong side prints zero host loss for a real presentation
     /// problem, which reads as a network fault that does not exist.
     Loss,
@@ -408,13 +435,19 @@ impl SideAccumulator {
 /// on a still desktop (Keel's idle cadence), so silence is a stall, never
 /// idleness. Silence is judged from the window's frame count where the
 /// sample has one, not from `fps_actual`: one keepalive in a two-second
-/// window is an integer rate of zero, and is not silence.
+/// window is an integer rate of zero, and is not silence. A client's count
+/// is what its presenter put in front of the compositor: frames it presented
+/// and drawables returned without a timestamp
+/// ([`QosSample::frames_submitted_untimed`]). A macOS drawable that repeats
+/// the picture on a still desktop often comes back without a presentation
+/// time; a presenter that submitted every keepalive is not silent because
+/// the compositor did not timestamp them. Frames superseded before they
+/// reached the compositor are no proof of life: a dead presenter's worker
+/// and pacer keep replacing them.
 #[must_use]
 pub fn fps_expected(sample: &QosSample) -> Option<u32> {
     let target = sample.fps_target.filter(|target| *target != 0)?;
-    let delivered = sample.frames_sent.or(sample.frames_presented);
-    let silent = delivered.map_or(sample.fps_actual == Some(0), |frames| frames == 0);
-    if silent {
+    if silent_window(sample) {
         return Some(target);
     }
     Some(
@@ -422,6 +455,46 @@ pub fn fps_expected(sample: &QosSample) -> Option<u32> {
             .fps_content
             .map_or(target, |content| content.min(target)),
     )
+}
+
+/// Whether the window delivered nothing: no frame sent (host), none
+/// presented or submitted untimed (client), or a rate of zero where the
+/// sample counts no frames.
+///
+/// A client that predates [`QosSample::frames_submitted_untimed`] cannot say
+/// what reached its compositor; its window is silent only when nothing was
+/// decoded or presented, so its untimestamped keepalives on a still desktop
+/// do not read as a stall on a newer Pier either.
+fn silent_window(sample: &QosSample) -> bool {
+    let delivered = sample.frames_sent.or_else(|| {
+        let presented = sample.frames_presented?;
+        Some(match sample.frames_submitted_untimed {
+            Some(untimed) => presented.saturating_add(untimed),
+            None => presented.max(sample.frames_decoded.unwrap_or(0)),
+        })
+    });
+    delivered.map_or(sample.fps_actual == Some(0), |frames| frames == 0)
+}
+
+/// Changed frames per second at or below which a source is idle: a still
+/// desktop's keepalive (one a second on every Pier) and the odd changed
+/// frame of a caret or a clock.
+///
+/// A window this quiet is not judged for frame rate or presentation as long
+/// as frames still arrive and are handled (a silent window is still a
+/// stall, see [`fps_expected`]). The picture is the same whether a repeat
+/// reached the glass, so a shortfall here measures integer rates of one or
+/// two frames a window, a frame in flight at the window boundary or a
+/// compositor that does not timestamp a repeated picture, never anything a
+/// user sees; seen live, idle desktops on every Pier went critical for it.
+/// A presenter that stops is caught the moment the content moves.
+pub const IDLE_CONTENT_FPS: u32 = 2;
+
+/// Whether the window's content was idle ([`IDLE_CONTENT_FPS`]).
+fn idle_content(sample: &QosSample) -> bool {
+    sample
+        .fps_content
+        .is_some_and(|content| content <= IDLE_CONTENT_FPS)
 }
 
 /// The frame rate below which `state` applies to this sample, for reporting
@@ -457,7 +530,9 @@ fn assess_fps(sample: &QosSample, targets: &QosTargets, side: &mut SideAccumulat
     let Some(expected) = fps_expected(sample) else {
         return;
     };
-    if actual.saturating_add(FPS_QUANTISATION_SLACK) >= expected {
+    if actual.saturating_add(FPS_QUANTISATION_SLACK) >= expected
+        || (!silent_window(sample) && idle_content(sample))
+    {
         side.observe(HealthState::Ok, HealthCause::Fps);
         return;
     }
@@ -498,11 +573,13 @@ fn assess_drop(
 
 /// Decoded frames a window may leave unpresented before supersession counts.
 ///
-/// A frame decoded just before the window closed is presented just after it.
-/// On a busy stream that one frame is noise; on a still desktop sending three
-/// frames a window it read as a third of the stream lost, and raised a
-/// critical presentation alarm on sessions that presented every frame.
-const PRESENTATION_IN_FLIGHT_FRAMES: u64 = 1;
+/// A frame decoded just before the window closed is presented just after it,
+/// and a presenter on a composed display keeps a second picture in flight
+/// (`arcen_media::presentation::NewestPresentDepth`). On a busy stream those
+/// frames are noise; on a still desktop sending three frames a window one of
+/// them read as a third of the stream lost, and raised a critical
+/// presentation alarm on sessions that presented every frame.
+const PRESENTATION_IN_FLIGHT_FRAMES: u64 = 2;
 
 /// Fewest decoded frames in a window for which a presentation shortfall is
 /// judged at all: two a second over the Deck's five-second window.
@@ -516,14 +593,31 @@ const PRESENTATION_IN_FLIGHT_FRAMES: u64 = 1;
 /// presents nothing at all is still caught, by the frame-rate rule.
 const PRESENTATION_MIN_DECODED: u64 = 10;
 
-/// Decoded frames that were superseded before presentation, in basis points
-/// of the frames decoded, judged only on windows of at least
-/// [`PRESENTATION_MIN_DECODED`] frames and after allowing the one frame that is legitimately
-/// still in flight at the window boundary.
+/// Frames dropped for a newer one before they reached the compositor (a
+/// newest-wins pacer, a media-worker slot replaced) that count as handled,
+/// in basis points of the frames decoded; the rest are lost.
+///
+/// A 60 fps stream whose frames arrive bunched on a 120 Hz display has a
+/// frame replaced now and then (seen live: 8 of 300, under 3 %). A
+/// presenter that sheds a steady tenth of moving content is losing it,
+/// whatever replaced it, and reads critical as it did before supersession
+/// was counted.
+pub const NEWEST_WINS_EXCUSED_BASIS_POINTS: u64 = 300;
+
+/// Decoded frames that never reached the screen, in basis points of the
+/// frames decoded: frames lost inside the client's presentation path.
+///
+/// Drawables the compositor returned without a timestamp
+/// ([`QosSample::frames_submitted_untimed`]) are handled, not lost: the
+/// screen showed a later one or kept the same picture. Other superseded
+/// frames ([`QosSample::frames_superseded`]) are handled only up to
+/// [`NEWEST_WINS_EXCUSED_BASIS_POINTS`] of the window. Whether the screen
+/// kept up with the content is the frame-rate rule's to judge. Judged only on windows of at least [`PRESENTATION_MIN_DECODED`]
+/// frames whose content is not idle ([`IDLE_CONTENT_FPS`]), after allowing
+/// the frames legitimately still in flight at the window boundary.
 ///
 /// **This is not transport loss**, despite feeding [`HealthCause::Loss`]:
-/// every frame counted here arrived intact and decoded, and was then
-/// replaced by a newer one before the client presented it. Reporters call it
+/// every frame counted here arrived intact and decoded. Reporters call it
 /// `unpresented`; see the note on [`HealthCause::Loss`].
 #[must_use]
 pub fn unpresented_basis_points(sample: &QosSample) -> Option<u32> {
@@ -533,11 +627,18 @@ pub fn unpresented_basis_points(sample: &QosSample) -> Option<u32> {
     if decoded == 0 {
         return (presented != 0).then_some(0);
     }
-    if decoded < PRESENTATION_MIN_DECODED {
+    if decoded < PRESENTATION_MIN_DECODED || idle_content(sample) {
         return Some(0);
     }
+    let superseded = sample.frames_superseded.unwrap_or(0);
+    let untimed = sample.frames_submitted_untimed.unwrap_or(0).min(superseded);
+    let newest_wins = superseded
+        .saturating_sub(untimed)
+        .min(decoded.saturating_mul(NEWEST_WINS_EXCUSED_BASIS_POINTS) / 10_000);
     let missed = decoded
         .saturating_sub(presented)
+        .saturating_sub(untimed)
+        .saturating_sub(newest_wins)
         .saturating_sub(PRESENTATION_IN_FLIGHT_FRAMES);
     Some(u32::try_from(missed.saturating_mul(10_000) / decoded).unwrap_or(u32::MAX))
 }
@@ -1320,8 +1421,8 @@ mod tests {
         // Sixty frames, fifty-nine on screen and one about to be.
         assert_eq!(unpresented_basis_points(&sample(60, 59)), Some(0));
         assert_eq!(state(&sample(60, 59)), Some(HealthState::Ok));
-        // Ten of forty superseded is a real presentation problem.
-        assert_eq!(unpresented_basis_points(&sample(40, 30)), Some(2_250));
+        // Ten of forty lost is a real presentation problem.
+        assert_eq!(unpresented_basis_points(&sample(40, 30)), Some(2_000));
         assert_eq!(state(&sample(40, 30)), Some(HealthState::Critical));
         // A still desktop's five keepalives, three accounted on screen by the
         // window's end (the live case): accounting lag, not supersession.
@@ -1329,6 +1430,188 @@ mod tests {
         assert_eq!(state(&sample(5, 3)), Some(HealthState::Ok));
         assert_eq!(unpresented_basis_points(&sample(0, 0)), None);
         assert_eq!(unpresented_basis_points(&sample(0, 2)), Some(0));
+    }
+
+    /// A Deck's five-second window: `decoded` frames arrived at `content`
+    /// frames a second, `presented` reached the glass with a timestamp and
+    /// `superseded` were dropped for newer ones before they reached the
+    /// compositor (a newest-wins pacer, a replaced worker slot).
+    fn deck_window(decoded: u64, presented: u64, superseded: u64, content: u32) -> QosSample {
+        QosSample {
+            fps_actual: Some(u32::try_from(presented.div_ceil(5)).unwrap()),
+            fps_target: Some(60),
+            fps_content: Some(content),
+            frames_decoded: Some(decoded),
+            frames_presented: Some(presented),
+            frames_superseded: Some(superseded),
+            frames_submitted_untimed: Some(0),
+            rtt_ms: Some(10),
+            ..QosSample::default()
+        }
+    }
+
+    /// As [`deck_window`], but the `untimed` superseded frames reached the
+    /// compositor and came back without a presentation time.
+    fn untimed_window(decoded: u64, presented: u64, untimed: u64, content: u32) -> QosSample {
+        QosSample {
+            frames_submitted_untimed: Some(untimed),
+            ..deck_window(decoded, presented, untimed, content)
+        }
+    }
+
+    fn client_state(sample: &QosSample) -> (Option<HealthState>, Option<HealthCause>) {
+        let side = assess_health(sample, &QosTargets::default()).client_experience;
+        (side.state, side.dominant_cause)
+    }
+
+    #[test]
+    fn an_idle_desktop_sending_keepalives_is_healthy() {
+        // The live macOS Deck on a still Wayland desktop: five keepalives,
+        // none with a presentation time (the picture did not change).
+        // Before: "silent", judged against 60 fps, `fps 0 < 42` critical.
+        let none_timestamped = untimed_window(5, 0, 5, 1);
+        assert_eq!(fps_expected(&none_timestamped), Some(1));
+        assert_eq!(client_state(&none_timestamped).0, Some(HealthState::Ok));
+        // The live Windows-host case: eleven frames at two a second (a caret,
+        // keepalives), eight timestamped. Before: 1,818 "unpresented".
+        let caret = deck_window(11, 8, 0, 2);
+        assert_eq!(unpresented_basis_points(&caret), Some(0));
+        assert_eq!(client_state(&caret).0, Some(HealthState::Ok));
+        // Two a second, none timestamped: a rate of 0 against 2.
+        assert_eq!(
+            client_state(&untimed_window(10, 0, 10, 2)).0,
+            Some(HealthState::Ok)
+        );
+        // The Pier's view of the same Deck: integer rates over five seconds.
+        let pier_view = QosSample {
+            fps_actual: Some(0),
+            ..untimed_window(9, 2, 7, 1)
+        };
+        assert_eq!(client_state(&pier_view).0, Some(HealthState::Ok));
+        // A host whose capture proved two changed frames a second and sent
+        // one in a two-second window.
+        assert_eq!(
+            host_state(&QosSample {
+                frames_sent: Some(1),
+                ..host_sample(0, 60, Some(2))
+            }),
+            (Some(HealthState::Ok), Some(HealthCause::Fps))
+        );
+    }
+
+    #[test]
+    fn motion_at_the_full_rate_is_healthy() {
+        // Sixty frames a second, every one on the glass bar the two in
+        // flight at the window's end.
+        assert_eq!(
+            client_state(&deck_window(300, 298, 0, 60)).0,
+            Some(HealthState::Ok)
+        );
+        // A newest-wins presenter keeping up with bunched arrivals on a
+        // 120 Hz display: frames replaced by newer ones are not lost.
+        let bunched = deck_window(300, 292, 8, 60);
+        assert_eq!(unpresented_basis_points(&bunched), Some(0));
+        assert_eq!(client_state(&bunched).0, Some(HealthState::Ok));
+        // The same at 120 frames a second on a 120 Hz display.
+        let bunched_120 = QosSample {
+            fps_target: Some(120),
+            ..deck_window(600, 585, 15, 120)
+        };
+        assert_eq!(unpresented_basis_points(&bunched_120), Some(0));
+        assert_eq!(client_state(&bunched_120).0, Some(HealthState::Ok));
+        // Moving content the compositor showed later drawables of: the
+        // untimestamped ones are handled, however many.
+        assert_eq!(
+            unpresented_basis_points(&untimed_window(300, 280, 20, 60)),
+            Some(0)
+        );
+        assert_eq!(
+            host_state(&QosSample {
+                frames_sent: Some(120),
+                ..host_sample(60, 60, Some(60))
+            }),
+            (Some(HealthState::Ok), Some(HealthCause::Fps))
+        );
+    }
+
+    #[test]
+    fn real_drops_and_stalls_are_still_flagged() {
+        // Motion, one decoded frame in fifteen never shown and nothing newer
+        // in its place: lost in the presentation path.
+        assert_eq!(
+            client_state(&deck_window(300, 280, 0, 60)),
+            (Some(HealthState::Critical), Some(HealthCause::Loss))
+        );
+        // A few percent lost: degraded.
+        assert_eq!(
+            client_state(&deck_window(300, 290, 0, 60)),
+            (Some(HealthState::Degraded), Some(HealthCause::Loss))
+        );
+        // Motion the presenter hands on but the glass shows a third of:
+        // superseded frames are not lost, and the frame rate says it.
+        assert_eq!(
+            client_state(&deck_window(300, 100, 200, 60)),
+            (Some(HealthState::Critical), Some(HealthCause::Fps))
+        );
+        // A compositor that showed four in five of the drawables it got:
+        // degraded, by the frame rate.
+        assert_eq!(
+            client_state(&untimed_window(300, 240, 60, 60)),
+            (Some(HealthState::Degraded), Some(HealthCause::Fps))
+        );
+        // A newest-wins pacer shedding a steady 9 % of moving content: the
+        // frame rate passes, the loss is critical, as it was before
+        // supersession was counted.
+        let shedding = deck_window(300, 273, 27, 60);
+        assert_eq!(unpresented_basis_points(&shedding), Some(533));
+        assert_eq!(
+            client_state(&shedding),
+            (Some(HealthState::Critical), Some(HealthCause::Loss))
+        );
+        // A fifth shed that way is lost, not a frame-rate shortfall.
+        assert_eq!(
+            client_state(&deck_window(300, 240, 60, 60)),
+            (Some(HealthState::Critical), Some(HealthCause::Loss))
+        );
+        // A presenter that handles nothing while frames arrive is silent,
+        // judged against the target even on a still desktop.
+        let dead = deck_window(5, 0, 0, 1);
+        assert_eq!(fps_expected(&dead), Some(60));
+        assert_eq!(
+            client_state(&dead),
+            (Some(HealthState::Critical), Some(HealthCause::Fps))
+        );
+        // A dead presenter whose worker slot and pacer keep replacing the
+        // keepalives: superseded, but nothing reached the compositor.
+        let wedged = deck_window(5, 0, 5, 1);
+        assert_eq!(fps_expected(&wedged), Some(60));
+        assert_eq!(
+            client_state(&wedged),
+            (Some(HealthState::Critical), Some(HealthCause::Fps))
+        );
+        // A client that does not report superseded frames: its keepalives
+        // decoded is not silence, nothing decoded still is.
+        let legacy = |decoded| QosSample {
+            frames_superseded: None,
+            frames_submitted_untimed: None,
+            ..deck_window(decoded, 0, 0, 1)
+        };
+        assert_eq!(client_state(&legacy(5)).0, Some(HealthState::Ok));
+        assert_eq!(
+            client_state(&QosSample {
+                fps_content: Some(0),
+                ..legacy(0)
+            }),
+            (Some(HealthState::Critical), Some(HealthCause::Fps))
+        );
+        // Nothing sent at all from a host is a stall, whatever the content.
+        assert_eq!(
+            host_state(&QosSample {
+                frames_sent: Some(0),
+                ..host_sample(0, 60, Some(0))
+            }),
+            (Some(HealthState::Critical), Some(HealthCause::Fps))
+        );
     }
 
     #[test]

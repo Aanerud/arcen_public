@@ -234,6 +234,12 @@ impl SessionServices {
         let _ = self.ready.send(true);
     }
 
+    /// The session manager's attached-Deck switch (its idle inhibitor);
+    /// `None` without a session manager.
+    pub fn deck_attachment(&self) -> Option<watch::Sender<bool>> {
+        self.manager.as_ref().map(SessionManager::deck_attachment)
+    }
+
     /// Resolves once the user confirmed a logout inside the session; never
     /// without a session manager.
     pub fn logout_receiver(&self) -> Option<LogoutReceiver> {

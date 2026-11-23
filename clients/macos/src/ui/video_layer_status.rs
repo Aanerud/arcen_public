@@ -226,6 +226,8 @@ impl DedicatedEightBitPresentationStatus {
 pub(crate) struct DedicatedPresentations {
     pub(crate) frames_confirmed: u64,
     pub(crate) presented_time_unconfirmed: u64,
+    /// Frames the presenter's newest-wins queue dropped for a newer one.
+    pub(crate) frames_superseded: u64,
     pub(crate) confirmed_presented_at: Vec<std::time::Instant>,
 }
 

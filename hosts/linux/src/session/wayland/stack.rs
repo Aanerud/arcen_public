@@ -680,6 +680,12 @@ impl HeadlessStack {
         self.services.desktop_ready();
     }
 
+    /// The session manager's attached-Deck switch (its idle inhibitor).
+    #[must_use]
+    pub fn deck_attachment(&self) -> Option<tokio::sync::watch::Sender<bool>> {
+        self.services.deck_attachment()
+    }
+
     /// Turns true once the user confirmed a logout inside the session.
     #[must_use]
     pub fn logout_receiver(&self) -> Option<LogoutReceiver> {

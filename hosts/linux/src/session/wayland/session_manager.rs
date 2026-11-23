@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arcen_session::desktop_session::manager::{
-    timeouts, Clients, Inhibitors, LogoutMode, Presence, PresenceEvent, PresenceStatus,
-    ARCEN_SESSION_MANAGER_POLICY, INHIBIT_IDLE, INHIBIT_LOGOUT,
+    timeouts, Clients, DeckAttachedInhibit, DeckInhibitChange, Inhibitors, LogoutMode, Presence,
+    PresenceEvent, PresenceStatus, ARCEN_SESSION_MANAGER_POLICY, INHIBIT_IDLE, INHIBIT_LOGOUT,
 };
 use futures_util::StreamExt;
 use tokio::io::AsyncBufReadExt;
@@ -75,6 +75,7 @@ fn setenv_allowed(name: &str) -> bool {
 #[derive(Debug, Default)]
 struct State {
     inhibitors: Inhibitors,
+    deck: DeckAttachedInhibit,
     clients: Clients,
     presence: Option<Presence>,
     responses: BTreeMap<u32, bool>,
@@ -541,6 +542,7 @@ pub struct SessionManager {
     shared: Shared,
     environment: watch::Receiver<BTreeMap<String, String>>,
     logout: watch::Receiver<bool>,
+    deck_attached: watch::Sender<bool>,
     control: JoinHandle<()>,
 }
 
@@ -568,6 +570,7 @@ impl SessionManager {
         let (events, events_rx) = mpsc::unbounded_channel();
         let (environment_tx, environment) = watch::channel(BTreeMap::new());
         let (logout_tx, logout) = watch::channel(false);
+        let (deck_attached, deck_attached_rx) = watch::channel(false);
         connection
             .object_server()
             .at(
@@ -600,6 +603,7 @@ impl SessionManager {
             Arc::clone(&shared),
             events_rx,
             logout_tx,
+            deck_attached_rx,
             members,
         ));
         tracing::info!(
@@ -614,8 +618,17 @@ impl SessionManager {
             shared,
             environment,
             logout,
+            deck_attached,
             control,
         })
+    }
+
+    /// Set `true` while a Deck is attached (the Pier's input connection is
+    /// served): the session then holds the shared [`DeckAttachedInhibit`]
+    /// idle inhibitor, released when it is set `false` again.
+    #[must_use]
+    pub fn deck_attachment(&self) -> watch::Sender<bool> {
+        self.deck_attached.clone()
     }
 
     /// Variables components announced through `Setenv` (Mutter's
@@ -665,6 +678,7 @@ async fn control(
     shared: Shared,
     mut events: mpsc::UnboundedReceiver<Event>,
     logout: watch::Sender<bool>,
+    mut deck_attached: watch::Receiver<bool>,
     members: MemberEnvironment,
 ) {
     let idle_delay = read_idle_delay(&members)
@@ -688,8 +702,20 @@ async fn control(
     let mut shield: Option<Drained<bool>> = None;
     let mut retry = tokio::time::interval(IDLE_MONITOR_RETRY);
     let mut logout_task: Option<JoinHandle<()>> = None;
+    let mut deck_open = true;
     loop {
         tokio::select! {
+            changed = deck_attached.changed(), if deck_open => {
+                if changed.is_err() {
+                    deck_open = false;
+                    continue;
+                }
+                let attached = *deck_attached.borrow_and_update();
+                follow_deck(&connection, &shared, attached).await;
+                let inhibited = lock(&shared).inhibitors.is_inhibited(INHIBIT_IDLE);
+                apply_presence(&connection, &shared, PresenceEvent::IdleInhibited(inhibited)).await;
+                rearm(&shared, idle.as_mut()).await;
+            }
             event = events.recv() => {
                 let Some(event) = event else { break };
                 match event {
@@ -845,6 +871,66 @@ async fn next_drained<T>(drained: Option<&mut Drained<T>>) -> Option<T> {
         return std::future::pending().await;
     };
     drained.items.recv().await
+}
+
+/// Holds or releases the attached-Deck idle inhibitor and announces it as
+/// `Inhibit`/`Uninhibit` would.
+async fn follow_deck(connection: &Connection, shared: &Shared, attached: bool) {
+    let change = {
+        let mut state = lock(shared);
+        let State {
+            deck, inhibitors, ..
+        } = &mut *state;
+        deck.follow(attached, inhibitors)
+    };
+    let change = match change {
+        Ok(Some(change)) => change,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(target: target::SESSION, ?error, "the attached Deck's idle inhibitor could not be added");
+            return;
+        }
+    };
+    let server = connection.object_server();
+    let manager = server.interface::<_, ManagerIface>(MANAGER_PATH).await.ok();
+    let cookie = match change {
+        DeckInhibitChange::Added(cookie) => {
+            let _ = server
+                .at(
+                    inhibitor_path(cookie).as_str(),
+                    InhibitorIface {
+                        cookie,
+                        shared: Arc::clone(shared),
+                    },
+                )
+                .await;
+            if let (Some(manager), Ok(path)) = (&manager, owned_path(&inhibitor_path(cookie))) {
+                let _ = ManagerIface::inhibitor_added(manager.signal_emitter(), &path).await;
+            }
+            cookie
+        }
+        DeckInhibitChange::Removed(cookie) => {
+            remove_inhibitor_object(server, cookie).await;
+            if let (Some(manager), Ok(path)) = (&manager, owned_path(&inhibitor_path(cookie))) {
+                let _ = ManagerIface::inhibitor_removed(manager.signal_emitter(), &path).await;
+            }
+            cookie
+        }
+    };
+    if let Some(manager) = &manager {
+        let _ = manager
+            .get()
+            .await
+            .inhibited_actions_changed(manager.signal_emitter())
+            .await;
+    }
+    tracing::info!(
+        target: target::SESSION,
+        attached,
+        cookie,
+        "attached Deck idle inhibitor {}",
+        if attached { "held: the desktop does not go idle while a Deck shows it" } else { "released" }
+    );
 }
 
 async fn forget_owner(connection: &Connection, shared: &Shared, owner: &str) {
@@ -1239,6 +1325,75 @@ mod tests {
         Proxy::new(connection, SESSION_MANAGER_NAME, path, interface)
             .await
             .expect("proxy")
+    }
+
+    #[tokio::test]
+    async fn an_attached_deck_holds_an_idle_inhibitor_on_the_bus_until_it_detaches() {
+        let Some(bus) = TestBus::start("deck") else {
+            eprintln!("no dbus-daemon on this host; skipped");
+            return;
+        };
+        let members = MemberEnvironment::new(&bus.dir);
+        let manager = SessionManager::start(&bus.address(), members)
+            .await
+            .expect("session manager");
+        let client = zbus::connection::Builder::address(bus.address().as_str())
+            .expect("address")
+            .build()
+            .await
+            .expect("client");
+        let sm = manager_proxy(&client, MANAGER_PATH, "org.gnome.SessionManager").await;
+        let inhibited = || async {
+            sm.call::<_, _, bool>("IsInhibited", &(INHIBIT_IDLE,))
+                .await
+                .expect("is inhibited")
+        };
+        let until = |want: bool| async move {
+            for _ in 0..50 {
+                if inhibited().await == want {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        };
+        assert!(!inhibited().await);
+
+        let deck = manager.deck_attachment();
+        deck.send_replace(true);
+        assert!(until(true).await, "attaching inhibits idle");
+        let inhibitors: Vec<OwnedObjectPath> =
+            sm.call("GetInhibitors", &()).await.expect("inhibitors");
+        assert_eq!(inhibitors.len(), 1);
+        let inhibitor = Proxy::new(
+            &client,
+            SESSION_MANAGER_NAME,
+            inhibitors[0].as_str(),
+            "org.gnome.SessionManager.Inhibitor",
+        )
+        .await
+        .expect("inhibitor proxy");
+        assert_eq!(
+            inhibitor
+                .call::<_, _, String>("GetAppId", &())
+                .await
+                .expect("app"),
+            arcen_session::desktop_session::manager::DECK_ATTACHED_APP_ID
+        );
+        // No bus client can lift it.
+        let cookie = inhibitors[0]
+            .as_str()
+            .trim_start_matches(&format!("{MANAGER_PATH}/Inhibitor"))
+            .parse::<u32>()
+            .expect("cookie");
+        assert!(sm.call_method("Uninhibit", &(cookie,)).await.is_err());
+        assert!(inhibited().await);
+
+        deck.send_replace(false);
+        assert!(until(false).await, "detaching releases it");
+        let inhibitors: Vec<OwnedObjectPath> =
+            sm.call("GetInhibitors", &()).await.expect("inhibitors");
+        assert!(inhibitors.is_empty());
     }
 
     #[tokio::test]

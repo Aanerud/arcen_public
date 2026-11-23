@@ -71,6 +71,15 @@ pub struct MediaFoundationEncoderCapability {
 }
 
 impl MediaFoundationHardwareReport {
+    fn not_probed() -> Self {
+        Self {
+            label: arcen_media::video::EncoderBackend::MediaFoundationHardware.display_name(),
+            compiled: arcen_capenc::compiled_backend_features().mf_hw,
+            encoders: Vec::new(),
+            error: Some("not probed".to_string()),
+        }
+    }
+
     fn probe() -> Self {
         let label = arcen_media::video::EncoderBackend::MediaFoundationHardware.display_name();
         let compiled = arcen_capenc::compiled_backend_features().mf_hw;
@@ -291,16 +300,35 @@ impl HostCapabilityReport {
 }
 
 pub fn probe() -> Result<HostCapabilityReport, String> {
+    probe_at(ProbeDepth::Full)
+}
+
+/// How much of the host [`probe_at`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeDepth {
+    /// Everything: a D3D11 device per adapter, display modes, Media
+    /// Foundation encoders, the firmware fingerprint.
+    Full,
+    /// Only what desk privacy judges (adapters, outputs, the CCD topology):
+    /// no device is created and no encoder enumerated, so a streaming
+    /// session's capture and encode are not disturbed while it runs.
+    DeskTopology,
+}
+
+pub fn probe_at(depth: ProbeDepth) -> Result<HostCapabilityReport, String> {
     let (ccd, topology_error) = match query_ccd_targets() {
         Ok(value) => (value, None),
         Err(error) => (HashMap::new(), Some(error)),
     };
-    let nvenc_runtime_dll = nvenc_runtime_dll();
-    let mut adapters = enumerate_adapters(&ccd, nvenc_runtime_dll)?;
+    let full = depth == ProbeDepth::Full;
+    let nvenc_runtime_dll = full && nvenc_runtime_dll();
+    let mut adapters = enumerate_adapters(&ccd, nvenc_runtime_dll, depth)?;
     assign_stable_ordinals(&mut adapters);
     let recommendation = recommend(&adapters);
     let hypervisor_present = crate::deskside::cpuid_hypervisor_present();
-    let firmware_sha256 = crate::deskside::positive_firmware_fingerprint().ok();
+    let firmware_sha256 = full
+        .then(crate::deskside::positive_firmware_fingerprint)
+        .and_then(Result::ok);
     Ok(HostCapabilityReport {
         schema_version: INVENTORY_VERSION,
         topology_error,
@@ -312,8 +340,63 @@ pub fn probe() -> Result<HostCapabilityReport, String> {
         recommendation,
         hypervisor_present,
         firmware_sha256,
-        media_foundation_hardware: MediaFoundationHardwareReport::probe(),
+        media_foundation_hardware: if full {
+            MediaFoundationHardwareReport::probe()
+        } else {
+            MediaFoundationHardwareReport::not_probed()
+        },
     })
+}
+
+/// The topology desk privacy watches between proofs: every CCD path
+/// (`QDC_ALL_PATHS`, clones included) as source, target, whether it is lit and whether a
+/// monitor is connected, and the connected monitor's identity. The
+/// operating system keeps this record itself; reading it creates no device
+/// and probes no display, so it is cheap enough to read every second while
+/// a session streams.
+pub type DeskTopology = (Vec<DeskPath>, Option<NvidiaConnected>);
+
+/// The NVIDIA driver's cached connection state
+/// ([`crate::nvapi_inventory::desk_connected_cached`]).
+pub type NvidiaConnected = crate::nvapi_inventory::NvidiaConnected;
+
+/// One CCD path of a [`DeskTopology`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeskPath {
+    source: String,
+    target_adapter_path: String,
+    target_id: u32,
+    active: bool,
+    target_available: bool,
+    monitor_device_path: Option<String>,
+    edid_manufacture_id: u16,
+    edid_product_code_id: u16,
+    connector_instance: u32,
+}
+
+/// Reads [`DeskTopology`] (paths sorted), with the NVIDIA driver's cached
+/// connection state.
+///
+/// # Errors
+///
+/// When the topology cannot be read.
+pub fn desk_topology() -> Result<DeskTopology, String> {
+    let mut topology: Vec<DeskPath> = query_ccd_paths()?
+        .into_iter()
+        .map(|(source, target)| DeskPath {
+            source,
+            target_adapter_path: target.target_adapter_path.unwrap_or_default(),
+            target_id: target.target_id,
+            active: target.active,
+            target_available: target.target_available,
+            monitor_device_path: target.monitor_device_path,
+            edid_manufacture_id: target.edid_manufacture_id,
+            edid_product_code_id: target.edid_product_code_id,
+            connector_instance: target.connector_instance,
+        })
+        .collect();
+    topology.sort();
+    Ok((topology, crate::nvapi_inventory::desk_connected_cached()))
 }
 
 pub fn adapter_selection_inventory(
@@ -381,7 +464,9 @@ fn nvapi_headless_capable(
 fn enumerate_adapters(
     ccd: &HashMap<String, CcdTarget>,
     nvenc_runtime_dll: bool,
+    depth: ProbeDepth,
 ) -> Result<Vec<AdapterCapability>, String> {
+    let full = depth == ProbeDepth::Full;
     // SAFETY: windows-rs owns and releases all returned COM interfaces.
     unsafe {
         let factory: IDXGIFactory1 =
@@ -411,7 +496,11 @@ fn enumerate_adapters(
                 0,
             );
             let session_luid = format!("{:08x}:{:08x}", luid.HighPart as u32, luid.LowPart);
-            let (feature_level, video_device) = d3d11_capability(&adapter);
+            let (feature_level, video_device) = if full {
+                d3d11_capability(&adapter)
+            } else {
+                (None, false)
+            };
             let mut outputs = Vec::new();
             for output_index in 0u32.. {
                 let output = match adapter.EnumOutputs(output_index) {
@@ -445,12 +534,12 @@ fn enumerate_adapters(
                         width: rect.right.saturating_sub(rect.left),
                         height: rect.bottom.saturating_sub(rect.top),
                     },
-                    current_mode: if attached {
+                    current_mode: if attached && full {
                         current_mode(&device_name).ok()
                     } else {
                         None
                     },
-                    supported_modes: if attached {
+                    supported_modes: if attached && full {
                         supported_modes(&device_name).unwrap_or_default()
                     } else {
                         Vec::new()
@@ -665,6 +754,24 @@ fn d3d11_capability(
 }
 
 fn query_ccd_targets() -> Result<HashMap<String, CcdTarget>, String> {
+    let mut values = HashMap::new();
+    for (key, candidate) in query_ccd_paths()? {
+        match values.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry)
+                if candidate.active && !entry.get().active =>
+            {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
+    }
+    Ok(values)
+}
+
+fn query_ccd_paths() -> Result<Vec<(String, CcdTarget)>, String> {
     let flags = QUERY_DISPLAY_CONFIG_FLAGS(QDC_ALL_PATHS.0 | QDC_VIRTUAL_MODE_AWARE.0);
     for _ in 0..4 {
         let mut path_count = 0u32;
@@ -693,7 +800,7 @@ fn query_ccd_targets() -> Result<HashMap<String, CcdTarget>, String> {
         }
         win32_ok(result, "QueryDisplayConfig")?;
         paths.truncate(path_count as usize);
-        let mut values = HashMap::new();
+        let mut values = Vec::with_capacity(paths.len());
         for path in paths {
             let source = source_name(path.sourceInfo.adapterId, path.sourceInfo.id)?;
             let target = target_name(path.targetInfo.adapterId, path.targetInfo.id).ok();
@@ -718,18 +825,7 @@ fn query_ccd_targets() -> Result<HashMap<String, CcdTarget>, String> {
                     .ok()
                     .filter(|value| !value.is_empty()),
             };
-            match values.entry(key) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(candidate);
-                }
-
-                std::collections::hash_map::Entry::Occupied(mut entry)
-                    if candidate.active && !entry.get().active =>
-                {
-                    entry.insert(candidate);
-                }
-                std::collections::hash_map::Entry::Occupied(_) => {}
-            }
+            values.push((key, candidate));
         }
         return Ok(values);
     }

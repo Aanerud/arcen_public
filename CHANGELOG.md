@@ -17,8 +17,17 @@ one link back to the app defaults, and New and Edit connection keep their
 buttons in view. The macOS Pier (preview) gives Shift its text under Secure
 Event Input, reports a user switch as such rather than as a privacy
 failure, and a restarted agent now locks the session its Deck was attached
-to. A password with capital letters may still be rejected at a macOS Pier's
-lock screen (see Known issues).
+to.
+
+**Build 2 (re-issued 2026-11-23).** Every 0.20.8 download was rebuilt with the
+fixes under [Re-issued 2026-11-23 (build 2)](#re-issued-2026-11-23-build-2):
+a password typed from a Deck unlocks a macOS Pier's lock screen; with desk
+privacy on, a Windows Pier passes the Deck's mouse again and streams moving
+content without freezing; a Linux Pier's Wayland desktop no longer locks while
+a Deck watches it or ends when a Windowed Deck resizes it; a busy Linux or
+Windows Pier says so in plain words; the macOS Deck's Windowed picture sits
+where the pointer lands; and an idle desktop no longer reads as a Critical
+session. The version number stays 0.20.8.
 
 ### Added
 
@@ -65,7 +74,7 @@ lock screen (see Known issues).
   modifier, and the key after a dead key, keep the system's own
   translation, so accents still compose. Option layers and Caps Lock are
   not covered yet; Characters typing was not affected. This does not fix
-  the lock screen (see Known issues).
+  the lock screen (fixed in build 2; see below).
 - **A macOS Pier session whose console switches user is no longer a
   privacy failure.** With desk privacy on, choosing another account at the
   streamed lock screen ended the Deck's session with
@@ -122,14 +131,143 @@ lock screen (see Known issues).
   host still busy or a desktop not ready yet is still followed, within the
   same five attempts (shared `reconnect_flow::follows_login_window`).
 
-### Known issues
+### Re-issued 2026-11-23 (build 2)
 
-- **A password with capital letters may be rejected at a macOS Pier's lock
-  screen.** Typed from a Deck, every character arrives (the field shows
-  the right number of dots), but macOS turns the password down. Signing in
-  at the login window works with the same password. The cause is not yet
-  confirmed; the lock screen appears to read the key and the Mac's own
-  Shift state and ignore the text the key carries.
+Every 0.20.8 download (both Decks, the USB component and every Pier) was
+re-issued on 23 November 2026 as build 2 with these changes; the version
+number stays 0.20.8. The first 0.20.8 build stays available under its own
+tag.
+
+#### Fixed
+
+- **Windows Pier: moving content no longer freezes for about a second
+  every two seconds with desk privacy on.** Desk privacy re-proved every
+  two seconds that no monitor at the desk was lit by probing the whole host
+  (a D3D11 device per GPU, display modes, Media Foundation encoders, every
+  NVIDIA display's EDID and an uncached connection check), and the session
+  loop waited for it; the probe starved capture, so a 60 fps animation
+  arrived at 34–36 fps with 850–975 ms stalls and a window drag stuttered.
+  The desk is now proved on its own thread: a cheap read of Windows' own
+  display topology and the NVIDIA driver's cached connection state every
+  second, and the whole proof, which reads only what
+  it judges, at once when that topology changes (a monitor connected, an
+  output lit) and otherwise every five seconds, so even a monitor only that
+  proof can see is found within about five and a half seconds (before:
+  about three, at the cost of the freeze). A lit desk monitor still ends
+  the session at once (the refusal is stored before the session is woken),
+  and the session is also refused when the watcher panics, completes no
+  check for four seconds, or its proof of a changed desk does not answer
+  within three (shared `arcen_session` `DeskWatch` and
+  `DeskRecheckCadence`).
+- **Linux Pier (Wayland): a Windowed Deck no longer ends the desktop two
+  seconds after it connects.** The Deck fits the remote monitor to its
+  window right after the first frame; the Pier resized the monitor, but
+  started the new capture without the host's measured capture rate for the
+  new size, so Auto was held to 30 frames a second, the Pier saw a changed
+  picture contract and ended the attachment, and with it the GNOME session.
+  The Deck's automatic reconnect was then refused and it showed "Your
+  session ended". A resized capture now keeps that evidence (an Auto
+  session is still asked for Auto at the rate it is served at, so a resize
+  never upgrades it to Speed or raises its frame rate). If a new size
+  still cannot be served, the Pier puts the monitor back at the size it
+  streamed at, keeps streaming and tells the Deck why,
+  and refuses that size at once if it is asked for again. A desktop the
+  Pier created is no longer ended when an attachment fails on the host's
+  side; the Pier gives its session slot back and the next sign-in rejoins
+  it.
+
+- **Linux Pier (Wayland): a desktop a Deck is watching no longer locks and
+  ends after five idle minutes.** A Deck that shows the desktop without
+  being touched (a presentation, a render) sent no input, so GNOME reached
+  its idle delay and locked; on a desktop whose compositor runs on its own
+  seat GNOME Shell stops every screen cast while it is locked, and the
+  desktop ended with it. While a Deck is attached the desktop's session
+  manager now holds an idle inhibitor, as a video player does, and releases
+  it when the Deck leaves. A manual lock still locks, and the Deck's own
+  computer still locks its own screen. A desktop with no Deck attached can
+  still reach the idle lock and end; that is tracked separately.
+- **macOS Deck in a window: the picture sits below the session toolbar,
+  and clicks land where you see them.** In Windowed mode the Deck drew the
+  remote desktop 28 pt higher than where it read the mouse: the top of the
+  desktop (about 45 host pixels) was hidden under the session toolbar, a
+  black band showed at the bottom, every click landed about 45 host pixels
+  above the point under the pointer, and a browser window grabbed by its
+  title bar did not move. The Metal video layer was placed as if the
+  window's content view were unflipped; it is flipped. Where the picture
+  goes and where the pointer lands on it now come from one shared
+  rectangle (`arcen_deck_core::present::fit::PictureRect`) for both the
+  Auto/Speed and the Grading/HDR layer. Fullscreen and the Windows Deck
+  were not affected.
+- **Both Decks say "Another session is already using ‹host›" when a Linux
+  or Windows Pier is busy.** A Linux Pier that refused a newcomer because
+  another Deck was attached, or because another session owned the
+  account's desktop, closed the connection with words the Decks did not
+  know, so they showed "‹host› closed the connection before your session
+  started", kept the reason under Details and logged `reason_class: "tcp"`;
+  the Windows Pier's busy display refusals reached them as a session that
+  did not start. These refusals, and another user's desktop waiting for
+  its owner, are now worded once in shared code (`arcen_session`
+  `DesktopBusyRefusal`), sent from it by both Piers, and read by both Decks
+  as a busy host: the plain headline, `reason_class: "host_busy"`, still no
+  failed sign-in and no retry. The words are unchanged, so an updated Deck
+  also recognises a 0.20.8 Pier.
+- **Windows Pier: the pointer and mouse clicks work again with desk
+  privacy on.** Desk privacy (on by default since 0.20.3) lets through only
+  input that carries Arcen's marker, but Windows gives a low-level mouse
+  hook only the low 32 bits of that marker, so every move, click and wheel
+  from a Deck was swallowed while keys still worked. The desktop's cursor
+  never moved, Windows kept it suppressed, and the Pier told the Deck the
+  pointer was hidden. The marker now fits 32 bits, a desktop that has not
+  seen mouse input yet no longer hides the Deck's pointer, and input that is
+  not Arcen's is still blocked.
+- **Windows Pier: a single-display session gives the display's scale back.**
+  The UI scale step a session set for its display is restored when the
+  session ends, as the multi-display path already did; before, Windows kept
+  the step for that monitor identity and the next session started there.
+- **A still desktop no longer reads as a Critical session.** Every Pier
+  sends a keepalive frame a second while nothing changes, and the macOS
+  Deck's compositor returns most of those repeated pictures without a
+  presentation time; the Decks counted them as never shown, so an idle
+  desktop logged `HEALTH_CRITICAL` (`unpresented`, or `fps 0 < 42`) on the
+  Deck and on the Pier, flapped, and ended with `worst_health critical`.
+  Session health, shared by every Deck and Pier, now treats a window whose
+  content changes at most twice a second as healthy as long as frames still
+  arrive and the presenter handles them, and counts frames a newer frame
+  replaced (a newest-wins queue on bunched arrivals, a drawable shown
+  without a timestamp) as superseded rather than unpresented: drawables
+  without a timestamp always, frames dropped before the compositor only up
+  to 3 % of a window, so a presenter shedding moving content is still
+  flagged. Only drawables the compositor received count as a live
+  presenter, so a presenter that stopped on a still desktop is still a
+  stall. The Decks report those frames to the Pier (`frames_superseded`,
+  `frames_submitted_untimed`), and a Deck's
+  session summary gives as `worst_health` the worst state the session was
+  reported in (after the two-window hysteresis), not one window. A Pier
+  also counts each Deck sample once: one five-second Deck window seen on
+  two of the Pier's two-second ticks passed the two-window rule alone, so a
+  single blip committed `HEALTH_CRITICAL` on the Pier. Frames decoded
+  and never shown while the content moves, a frame rate that falls behind
+  moving content, and a presenter or host that sends nothing are still
+  Degraded or Critical.
+- **A password typed from a Deck unlocks a macOS Pier's lock screen.** Once
+  a Mac has gone idle at its lock screen, macOS 26 checks a password only
+  after it sees a person become active, and keys a program posts do not
+  count: the field showed one dot per character, macOS waited five seconds
+  and reported the password incorrect, although every key carried the right
+  code, Shift state and text (measured key by key with a diagnostic build
+  and in macOS's own lock-screen log). The characters, and British or other
+  layouts, were never the cause. The macOS Pier (preview) now tells macOS
+  that the user is active, as a person's keys would, when a Deck presses
+  Return at the session's locked lock screen, and before the first key typed
+  while the password field is hidden, which brings the field up focused
+  (that key, and what is typed after it, arrives about 1.5 seconds late, in
+  order, while the picture keeps streaming). Measured on macOS 26.5 with the
+  real password and "Keys only" typing: typed straight away, typed one key
+  every 1.3 seconds after clicking the field, and typed at speed, each
+  unlocked the session, and Terminal then read `Ab1Z9` as typed. Typing on
+  the desktop and in its own password fields is unchanged, and so is desk
+  privacy. No log names a key; the Pier logs only counts at the end of a
+  session.
 
 ## [0.20.7] — 2026-11-22
 
@@ -4666,7 +4804,7 @@ Everything below was built and tested on its target OS before release:
   verified automatically.
 - macOS Pier, Linux Deck, and Windows Deck do not exist.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.8...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.20.8-build2...HEAD
 [0.20.8]: https://github.com/Aanerud/arcen_public/compare/v0.20.7...v0.20.8
 [0.20.7]: https://github.com/Aanerud/arcen_public/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/Aanerud/arcen_public/compare/v0.20.5...v0.20.6

@@ -19,6 +19,16 @@ pub struct ClientTelemetry {
     frames_received: AtomicU64,
     frames_decoded: AtomicU64,
     frames_presented: AtomicU64,
+    /// Frames the presenters handed on without showing (see
+    /// [`arcen_telemetry::QosSample::frames_superseded`]).
+    presenter_superseded: AtomicU64,
+    /// The part of `presenter_superseded` that reached the compositor and
+    /// came back without a timestamp (see
+    /// [`arcen_telemetry::QosSample::frames_submitted_untimed`]).
+    presenter_untimed: AtomicU64,
+    /// Frames the media worker replaced before a presenter took them,
+    /// cumulative as the worker counts them.
+    worker_superseded: AtomicU64,
     frames_dropped: AtomicU64,
     decode_time_ms: AtomicU32,
     display_time_ms: AtomicU32,
@@ -45,6 +55,9 @@ impl Default for ClientTelemetry {
             frames_received: AtomicU64::new(0),
             frames_decoded: AtomicU64::new(0),
             frames_presented: AtomicU64::new(0),
+            presenter_superseded: AtomicU64::new(0),
+            presenter_untimed: AtomicU64::new(0),
+            worker_superseded: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
             decode_time_ms: AtomicU32::new(0),
             display_time_ms: AtomicU32::new(0),
@@ -69,6 +82,8 @@ pub struct TelemetryWindow {
     frames_received: u64,
     frames_decoded: u64,
     frames_presented: u64,
+    frames_superseded: u64,
+    frames_untimed: u64,
     frames_dropped: u64,
     ever_streamed: bool,
     stalled_windows: u32,
@@ -85,7 +100,17 @@ pub struct SessionTelemetrySummary {
 }
 
 impl ClientTelemetry {
-    pub fn record_media(&self, received: u64, decoded: u64, dropped: u64, decode: Duration) {
+    /// The media worker's cumulative counts: frames received and decoded,
+    /// packets dropped, and `superseded`, decoded frames a newer one
+    /// replaced before a presenter took them.
+    pub fn record_media(
+        &self,
+        received: u64,
+        decoded: u64,
+        dropped: u64,
+        superseded: u64,
+        decode: Duration,
+    ) {
         if received != 0 || decoded != 0 {
             let mut media_started = self
                 .media_started
@@ -95,6 +120,7 @@ impl ClientTelemetry {
         }
         self.frames_received.store(received, Ordering::Relaxed);
         self.frames_decoded.store(decoded, Ordering::Relaxed);
+        self.worker_superseded.store(superseded, Ordering::Relaxed);
         self.frames_dropped.store(dropped, Ordering::Relaxed);
         self.decode_time_ms
             .store(duration_ms(decode), Ordering::Relaxed);
@@ -124,6 +150,9 @@ impl ClientTelemetry {
     /// ([`arcen_media::presentation::presented_frames_for_health`]):
     /// `confirmed` frames carry a presentation timestamp, `unconfirmed` ones
     /// do not and count only until a presenter has reported a timestamp.
+    /// After that an unconfirmed frame is superseded, not lost: the
+    /// compositor showed a later drawable, or kept the same picture (a
+    /// still desktop's keepalives on macOS mostly come back this way).
     ///
     /// Call it as the outcomes are observed (every UI pass), not when they
     /// are logged: the health window compares them with frames decoded in
@@ -139,6 +168,11 @@ impl ClientTelemetry {
             unconfirmed,
             timestamp_ever_reported,
         );
+        if timestamp_ever_reported && unconfirmed != 0 {
+            self.record_presenter_superseded(unconfirmed);
+            self.presenter_untimed
+                .fetch_add(unconfirmed, Ordering::Relaxed);
+        }
         if presented == 0 {
             return;
         }
@@ -146,6 +180,19 @@ impl ClientTelemetry {
             .fetch_add(presented, Ordering::Relaxed);
         self.display_time_ms.store(0, Ordering::Relaxed);
         self.presentation_observed.store(true, Ordering::Release);
+    }
+
+    /// Frames a presenter dropped for a newer one before submitting them
+    /// (a newest-wins queue on bunched arrivals): handed on, and excused
+    /// only as far as bunching explains
+    /// ([`arcen_telemetry::NEWEST_WINS_EXCUSED_BASIS_POINTS`]); they are no
+    /// proof the presenter reached the compositor. Report them as they are
+    /// observed, like the presented frames.
+    pub fn record_presenter_superseded(&self, frames: u64) {
+        if frames != 0 {
+            self.presenter_superseded
+                .fetch_add(frames, Ordering::Relaxed);
+        }
     }
 
     pub fn record_input_send(&self, elapsed: Duration) {
@@ -215,6 +262,8 @@ impl ClientTelemetry {
             frames_received: received,
             frames_decoded: decoded,
             frames_presented: presented,
+            frames_superseded: self.superseded(),
+            frames_untimed: self.presenter_untimed.load(Ordering::Relaxed),
             frames_dropped: dropped,
             ever_streamed: decoded != 0 || presented != 0,
             stalled_windows: 0,
@@ -232,6 +281,10 @@ impl ClientTelemetry {
         let received_delta = received.saturating_sub(window.frames_received);
         let decoded_delta = decoded.saturating_sub(window.frames_decoded);
         let presented_delta = presented.saturating_sub(window.frames_presented);
+        let superseded = self.superseded();
+        let superseded_delta = superseded.saturating_sub(window.frames_superseded);
+        let untimed = self.presenter_untimed.load(Ordering::Relaxed);
+        let untimed_delta = untimed.saturating_sub(window.frames_untimed);
         let dropped_delta = dropped.saturating_sub(window.frames_dropped);
         let elapsed_ms = timestamp_ms.saturating_sub(window.timestamp_ms).max(1);
 
@@ -239,6 +292,8 @@ impl ClientTelemetry {
         window.frames_received = received;
         window.frames_decoded = decoded;
         window.frames_presented = presented;
+        window.frames_superseded = superseded;
+        window.frames_untimed = untimed;
         window.frames_dropped = dropped;
         window.ever_streamed |= decoded_delta != 0 || presented_delta != 0;
 
@@ -276,6 +331,8 @@ impl ClientTelemetry {
                 .is_some_and(|started| started.elapsed() < FPS_WARMUP),
             frames_decoded: window.ever_streamed.then_some(decoded_delta),
             frames_presented: window.ever_streamed.then_some(presented_delta),
+            frames_superseded: window.ever_streamed.then_some(superseded_delta),
+            frames_submitted_untimed: window.ever_streamed.then_some(untimed_delta),
             decode_time_ms: observed_nonzero(&self.media_observed, &self.decode_time_ms),
             display_time_ms: observed_nonzero(&self.presentation_observed, &self.display_time_ms),
             rtt_ms: observed_nonzero(&self.rtt_observed, &self.rtt_ms),
@@ -313,12 +370,13 @@ impl ClientTelemetry {
                     .max(HealthState::Degraded),
             );
         }
-        self.record_health(health.overall);
         let media_observed = self.media_observed.load(Ordering::Acquire);
         let qos = ClientQosSampleMsg {
             frames_received: media_observed.then_some(received_delta),
             frames_decoded: sample.frames_decoded,
             frames_presented: sample.frames_presented,
+            frames_superseded: sample.frames_superseded,
+            frames_submitted_untimed: sample.frames_submitted_untimed,
             frames_dropped: media_observed.then_some(dropped_delta),
             decode_time_ms: sample.decode_time_ms,
             display_time_ms: sample.display_time_ms,
@@ -373,7 +431,17 @@ impl ClientTelemetry {
         )
     }
 
-    fn record_health(&self, state: Option<HealthState>) {
+    fn superseded(&self) -> u64 {
+        self.presenter_superseded
+            .load(Ordering::Relaxed)
+            .saturating_add(self.worker_superseded.load(Ordering::Relaxed))
+    }
+
+    /// The session's committed health (after the two-window hysteresis),
+    /// for the session summary's `worst_health`: one window outside its
+    /// targets is not what the session was reported as, and the summary
+    /// says what the `HEALTH_*` events said.
+    pub fn record_committed_health(&self, state: Option<HealthState>) {
         if let Some(state) = state {
             self.worst_health
                 .fetch_max(health_code(state), Ordering::Relaxed);
@@ -443,7 +511,7 @@ mod tests {
     fn hot_path_updates_are_atomic_and_snapshot_serializes() {
         let telemetry = warmed_telemetry();
         let mut window = telemetry.window(0);
-        telemetry.record_media(10, 9, 1, Duration::from_millis(7));
+        telemetry.record_media(10, 9, 1, 0, Duration::from_millis(7));
         telemetry.record_presented(Duration::from_millis(2));
         telemetry.record_input_send(Duration::from_millis(3));
         let (snapshot, _, sample) = telemetry.snapshot(&mut window, None, 5_000, 60, 0);
@@ -497,7 +565,7 @@ mod tests {
         // every session critical with 40-89 % "unpresented".
         let telemetry = warmed_telemetry();
         let mut window = telemetry.window(0);
-        telemetry.record_media(40, 40, 0, Duration::from_millis(2));
+        telemetry.record_media(40, 40, 0, 0, Duration::from_millis(2));
         for _ in 0..20 {
             telemetry.record_presented(Duration::from_millis(1));
         }
@@ -525,9 +593,9 @@ mod tests {
         for frame in 1..=600_u64 {
             let at_ms = frame * 1_000 / 30;
             decoded += 1;
-            telemetry.record_media(decoded, decoded, 0, Duration::from_millis(2));
+            telemetry.record_media(decoded, decoded, 0, 0, Duration::from_millis(2));
             telemetry.record_presenter_frames(1, 0, true);
-            batched.record_media(decoded, decoded, 0, Duration::from_millis(2));
+            batched.record_media(decoded, decoded, 0, 0, Duration::from_millis(2));
             pending_batch += 1;
             if at_ms % 1_175 < 1_000 / 30 {
                 batched.record_presenter_frames(pending_batch, 0, true);
@@ -551,7 +619,7 @@ mod tests {
         let telemetry = warmed_telemetry();
         telemetry.record_presenter_frames(1, 0, true);
         let mut window = telemetry.window(0);
-        telemetry.record_media(150, 150, 0, Duration::from_millis(2));
+        telemetry.record_media(150, 150, 0, 0, Duration::from_millis(2));
         telemetry.record_presenter_frames(130, 0, true);
         let (_, health, sample) = telemetry.snapshot(&mut window, None, 5_000, 30, 0);
         assert_eq!(sample.frames_decoded, Some(150));
@@ -565,7 +633,7 @@ mod tests {
         let mut last = None;
         for step in 2..=4_u64 {
             decoded += 150;
-            telemetry.record_media(decoded, decoded, 0, Duration::from_millis(2));
+            telemetry.record_media(decoded, decoded, 0, 0, Duration::from_millis(2));
             telemetry.record_presenter_frames(0, 150, true);
             let (_, health, sample) = telemetry.snapshot(&mut window, None, step * 5_000, 30, 0);
             assert_eq!(sample.fps_actual, Some(0));
@@ -578,7 +646,7 @@ mod tests {
     fn startup_warmup_suppresses_client_fps_only() {
         let telemetry = ClientTelemetry::default();
         let mut window = telemetry.window(0);
-        telemetry.record_media(1, 1, 0, Duration::from_millis(2));
+        telemetry.record_media(1, 1, 0, 0, Duration::from_millis(2));
         let (_, health, sample) = telemetry.snapshot(&mut window, None, 5_000, 60, 0);
         assert!(sample.fps_warmup);
         assert_ne!(
@@ -593,7 +661,7 @@ mod tests {
         let mut window = telemetry.window(0);
         let mut tracker = arcen_telemetry::HealthTracker::default();
 
-        telemetry.record_media(300, 300, 0, Duration::from_millis(2));
+        telemetry.record_media(300, 300, 0, 0, Duration::from_millis(2));
         for _ in 0..300 {
             telemetry.record_presented(Duration::from_millis(1));
         }
@@ -603,7 +671,7 @@ mod tests {
         assert_eq!(sample.fps_actual, Some(60));
         assert!(tracker.update(5_000, &first).unwrap().is_none());
 
-        telemetry.record_media(600, 600, 0, Duration::from_millis(2));
+        telemetry.record_media(600, 600, 0, 0, Duration::from_millis(2));
         for _ in 0..300 {
             telemetry.record_presented(Duration::from_millis(1));
         }
@@ -650,7 +718,7 @@ mod tests {
         let mut received = 0;
         for step in 1..=4_u64 {
             received += 15;
-            telemetry.record_media(received, received, 0, Duration::from_millis(2));
+            telemetry.record_media(received, received, 0, 0, Duration::from_millis(2));
             for _ in 0..15 {
                 telemetry.record_presented(Duration::from_millis(1));
             }
@@ -663,7 +731,13 @@ mod tests {
             }
         }
         // Presenting far fewer than arrived is still the client's shortfall.
-        telemetry.record_media(received + 150, received + 150, 0, Duration::from_millis(2));
+        telemetry.record_media(
+            received + 150,
+            received + 150,
+            0,
+            0,
+            Duration::from_millis(2),
+        );
         for _ in 0..50 {
             telemetry.record_presented(Duration::from_millis(1));
         }
@@ -679,7 +753,7 @@ mod tests {
     fn heartbeat_sample_and_session_summary_use_real_aggregates() {
         let telemetry = ClientTelemetry::default();
         let mut window = telemetry.window(0);
-        telemetry.record_media(120, 120, 4, Duration::from_millis(2));
+        telemetry.record_media(120, 120, 4, 0, Duration::from_millis(2));
         for _ in 0..120 {
             telemetry.record_presented(Duration::from_millis(1));
         }
@@ -689,6 +763,11 @@ mod tests {
         let (_, health, sample) = telemetry.snapshot(&mut window, None, 2_000, 60, 3);
         assert_eq!(sample.heartbeat_misses, Some(3));
         assert_eq!(health.overall, Some(HealthState::Critical));
+        // One critical window is not the session's state until it commits.
+        assert_eq!(telemetry.summary(Duration::from_secs(2)).worst_health, None);
+        telemetry.record_committed_health(Some(HealthState::Ok));
+        telemetry.record_committed_health(Some(HealthState::Critical));
+        telemetry.record_committed_health(Some(HealthState::Ok));
 
         let summary = telemetry.summary(Duration::from_secs(2));
         assert_eq!(summary.frames_decoded, 120);
@@ -711,5 +790,60 @@ mod tests {
         assert_eq!(telemetry.counters().2, 50);
         assert!(telemetry.presentation_observed.load(Ordering::Acquire));
         assert!(telemetry.summary(Duration::from_secs(10)).avg_fps > 0);
+    }
+
+    /// The live macOS Deck on a still desktop: keepalives handed to the
+    /// compositor, most returned without a presentation time. They are
+    /// superseded, not lost, and the window is not a stall.
+    #[test]
+    fn untimestamped_keepalives_on_a_still_desktop_are_superseded_not_lost() {
+        let telemetry = warmed_telemetry();
+        telemetry.record_presenter_frames(1, 0, true);
+        let mut window = telemetry.window(0);
+        let mut decoded = 0;
+        for (step, confirmed) in (1..=4_u64).zip([0, 1, 0, 2]) {
+            decoded += 5;
+            telemetry.record_media(decoded, decoded, 0, 0, Duration::from_millis(2));
+            telemetry.record_presenter_frames(confirmed, 5 - confirmed, true);
+            let (snapshot, health, sample) =
+                telemetry.snapshot(&mut window, None, step * 5_000, 60, 0);
+            assert_eq!(sample.frames_superseded, Some(5 - confirmed));
+            assert_eq!(sample.frames_submitted_untimed, Some(5 - confirmed));
+            let qos = snapshot.qos.unwrap();
+            assert_eq!(qos.frames_superseded, Some(5 - confirmed));
+            assert_eq!(qos.frames_submitted_untimed, Some(5 - confirmed));
+            assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+        }
+        // A busy window on bunched arrivals: the newest-wins queue dropped
+        // eight for newer frames and the worker replaced two.
+        decoded += 300;
+        telemetry.record_media(decoded, decoded, 0, 2, Duration::from_millis(2));
+        telemetry.record_presenter_superseded(8);
+        telemetry.record_presenter_frames(288, 2, true);
+        let (_, health, sample) = telemetry.snapshot(&mut window, None, 25_000, 60, 0);
+        assert_eq!(sample.frames_superseded, Some(12));
+        assert_eq!(sample.frames_submitted_untimed, Some(2));
+        assert_eq!(arcen_telemetry::unpresented_basis_points(&sample), Some(0));
+        assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+    }
+
+    /// A presenter that stopped on a still desktop: the media worker keeps
+    /// replacing its slot with each keepalive, nothing reaches the
+    /// compositor. Replaced frames are no proof of life: the window is a
+    /// stall, critical once the stall outlasts the start-up grace.
+    #[test]
+    fn a_dead_presenter_on_a_still_desktop_is_a_stall() {
+        let telemetry = warmed_telemetry();
+        telemetry.record_presenter_frames(1, 0, true);
+        let mut window = telemetry.window(0);
+        let mut states = Vec::new();
+        for step in 1..=3_u64 {
+            telemetry.record_media(step * 5, step * 5, 0, step * 5, Duration::from_millis(2));
+            let (_, health, sample) = telemetry.snapshot(&mut window, None, step * 5_000, 60, 0);
+            assert_eq!(sample.frames_superseded, Some(5));
+            assert_eq!(sample.frames_submitted_untimed, Some(0));
+            states.push(health.client_experience.state);
+        }
+        assert_eq!(states.last(), Some(&Some(HealthState::Critical)));
     }
 }

@@ -390,7 +390,13 @@ described below — it is never a "non-sensitive facts only" channel.
   `Eq`/`PartialEq` contract: every telemetry field added by this extension is
   integer, enum, or a validated bounded newtype, never a float.
 - `ClientQosSampleMsg` fields are all `Option`: `frames_received`,
-  `frames_decoded`, `frames_presented`, `frames_dropped` (`u64`),
+  `frames_decoded`, `frames_presented`, `frames_superseded` (decoded frames
+  handed on but not shown because a newer frame took their place or the
+  compositor kept the same picture; absent from older clients),
+  `frames_submitted_untimed` (the part of `frames_superseded` the compositor
+  received and returned without a presentation time; only these and
+  presented frames prove the presenter alive; absent from older clients),
+  `frames_dropped` (`u64`),
   `decode_time_ms`, `display_time_ms`, `input_send_time_ms` (`u32` whole
   milliseconds — integral by construction, so negative/NaN timings cannot be
   represented), `client_health` (`HealthStateMsg`), `sample_window_secs`

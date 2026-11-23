@@ -95,6 +95,7 @@ fn run_watcher(tx: &watch::Sender<Option<CursorMessage>>, deck_draws_images: boo
     let mut last_shape = None;
     let mut unreadable_logged = false;
     let mut refused_logged = false;
+    let mut seen_cursor = false;
     loop {
         if tx.is_closed() {
             return;
@@ -105,7 +106,11 @@ fn run_watcher(tx: &watch::Sender<Option<CursorMessage>>, deck_draws_images: boo
         // a hide there.
         // SAFETY: GetSystemMetrics has no preconditions.
         let mouse_present = unsafe { GetSystemMetrics(SM_MOUSEPRESENT) } != 0;
-        let (showing, handle) = current_cursor(mouse_present);
+        let Some((showing, handle)) = current_cursor(mouse_present, seen_cursor) else {
+            std::thread::sleep(POLL_INTERVAL);
+            continue;
+        };
+        seen_cursor |= showing;
         let now = Instant::now();
         let mut outcome = HostCursorOutcome::Unchanged;
         if last != Some((showing, handle)) {
@@ -197,11 +202,57 @@ fn run_watcher(tx: &watch::Sender<Option<CursorMessage>>, deck_draws_images: boo
     }
 }
 
-/// Whether the desktop shows its cursor, and which one.
+/// What the desktop's cursor means for the Deck's pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopCursor {
+    /// The desktop shows this cursor.
+    Shown,
+    /// An application hid the cursor.
+    Hidden,
+    /// The desktop has named no cursor yet this session, and Windows draws
+    /// none for a reason that is not a hide: no mouse input has landed
+    /// (`CURSOR_SUPPRESSED`), or the host has no mouse. The Deck's own
+    /// pointer still moves the desktop, so it keeps what it shows.
+    Keep,
+}
+
+/// Reads one `GetCursorInfo`: `showing` and `suppressed` are its
+/// `CURSOR_SHOWING` and `CURSOR_SUPPRESSED` flags, `has_cursor` whether it
+/// named a cursor; `seen_cursor` whether the desktop has shown a cursor
+/// this session.
+///
+/// A session whose desktop has seen no mouse input yet reads suppressed
+/// with no cursor at all (measured on the lab Pier, every session until a
+/// move landed); reporting that as hidden took the pointer off the Deck.
+/// Once a cursor has been shown, no cursor is an application's hide again
+/// (`SetCursor(NULL)`: a browser's `cursor: none`, a video player), even
+/// on a host without a mouse or after pen or touch input.
+const fn desktop_cursor(
+    showing: bool,
+    suppressed: bool,
+    has_cursor: bool,
+    mouse_present: bool,
+    seen_cursor: bool,
+) -> DesktopCursor {
+    let not_hidden = showing || suppressed || !mouse_present;
+    if has_cursor && not_hidden {
+        DesktopCursor::Shown
+    } else if !showing && not_hidden && !seen_cursor {
+        DesktopCursor::Keep
+    } else {
+        DesktopCursor::Hidden
+    }
+}
+
+/// Whether the desktop shows its cursor, and which one; `None` keeps what
+/// the Deck shows.
 #[cfg(windows)]
-fn current_cursor(mouse_present: bool) -> (bool, windows::Win32::UI::WindowsAndMessaging::HCURSOR) {
+fn current_cursor(
+    mouse_present: bool,
+    seen_cursor: bool,
+) -> Option<(bool, windows::Win32::UI::WindowsAndMessaging::HCURSOR)> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorInfo, CURSORINFO, CURSOR_SHOWING, CURSOR_SUPPRESSED, HCURSOR,
+        GetCursorInfo, CURSORINFO, CURSOR_SHOWING, CURSOR_SUPPRESSED,
     };
     let mut info = CURSORINFO {
         cbSize: u32::try_from(std::mem::size_of::<CURSORINFO>()).unwrap_or(0),
@@ -211,15 +262,19 @@ fn current_cursor(mouse_present: bool) -> (bool, windows::Win32::UI::WindowsAndM
     if unsafe { GetCursorInfo(&mut info) }.is_err() {
         // The input desktop is not readable (a secure desktop): keep what
         // the Deck shows rather than guessing.
-        return (true, HCURSOR::default());
+        return None;
     }
-    // A pen or touch suppresses the drawn cursor; that is not a hide.
-    let shown_flags = CURSOR_SHOWING.0 | CURSOR_SUPPRESSED.0;
-    let hidden_by_application = mouse_present && info.flags.0 & shown_flags == 0;
-    (
-        !info.hCursor.is_invalid() && !hidden_by_application,
-        info.hCursor,
-    )
+    match desktop_cursor(
+        info.flags.0 & CURSOR_SHOWING.0 != 0,
+        info.flags.0 & CURSOR_SUPPRESSED.0 != 0,
+        !info.hCursor.is_invalid(),
+        mouse_present,
+        seen_cursor,
+    ) {
+        DesktopCursor::Shown => Some((true, info.hCursor)),
+        DesktopCursor::Hidden => Some((false, info.hCursor)),
+        DesktopCursor::Keep => None,
+    }
 }
 
 /// Copies a cursor's bitmaps into a [`arcen_media::cursor::CursorImage`].
@@ -397,3 +452,75 @@ unsafe fn read_cursor_image(
 // compiles everywhere without extra cfg gates at the call site.
 #[cfg(not(windows))]
 fn run_watcher(_tx: &watch::Sender<Option<CursorMessage>>, _deck_draws_images: bool) {}
+
+#[cfg(test)]
+mod tests {
+    use super::{desktop_cursor, DesktopCursor};
+
+    #[test]
+    fn a_desktop_that_has_shown_no_cursor_yet_keeps_the_deck_pointer() {
+        // GetCursorInfo on the lab Pier before any move landed:
+        // CURSOR_SUPPRESSED and no cursor, with a mouse present.
+        assert_eq!(
+            desktop_cursor(false, true, false, true, false),
+            DesktopCursor::Keep
+        );
+        // A host without a mouse, before any cursor.
+        assert_eq!(
+            desktop_cursor(false, false, false, false, false),
+            DesktopCursor::Keep
+        );
+        // Once a move lands it shows the arrow.
+        assert_eq!(
+            desktop_cursor(true, false, true, true, false),
+            DesktopCursor::Shown
+        );
+        assert_eq!(
+            desktop_cursor(false, true, true, true, true),
+            DesktopCursor::Shown
+        );
+        assert_eq!(
+            desktop_cursor(false, false, true, false, true),
+            DesktopCursor::Shown
+        );
+    }
+
+    #[test]
+    fn after_a_cursor_was_shown_no_cursor_is_a_hide() {
+        // SetCursor(NULL) (a browser's `cursor: none`, a video player) on a
+        // host without a mouse, and after pen or touch input suppressed
+        // the cursor.
+        assert_eq!(
+            desktop_cursor(false, false, false, false, true),
+            DesktopCursor::Hidden
+        );
+        assert_eq!(
+            desktop_cursor(false, true, false, true, true),
+            DesktopCursor::Hidden
+        );
+        assert_eq!(
+            desktop_cursor(true, false, false, false, true),
+            DesktopCursor::Hidden
+        );
+    }
+
+    #[test]
+    fn only_an_application_hides_the_pointer() {
+        for seen_cursor in [false, true] {
+            // ShowCursor(FALSE) with a mouse present.
+            assert_eq!(
+                desktop_cursor(false, false, true, true, seen_cursor),
+                DesktopCursor::Hidden
+            );
+            assert_eq!(
+                desktop_cursor(false, false, false, true, seen_cursor),
+                DesktopCursor::Hidden
+            );
+            // SetCursor(NULL) while the cursor is shown.
+            assert_eq!(
+                desktop_cursor(true, false, false, true, seen_cursor),
+                DesktopCursor::Hidden
+            );
+        }
+    }
+}

@@ -291,7 +291,7 @@ enum AuthenticationRoute {
 /// Why a same-user sign-in is refused while its own live Deck holds the
 /// display.
 const SAME_USER_LIVE_ATTACHMENT_REASON: &str =
-    "The Windows display is in use by another Deck signed in as this user. Disconnect it first.";
+    arcen_session::session_admission::DesktopBusyRefusal::WindowsSameUserAttached.deck_reason();
 
 /// Whether a same-user sign-in that found the display held may wait for it,
 /// given what proving the incumbent attachment's peer found
@@ -426,9 +426,8 @@ impl BrokerAgentLease {
             // resume window. Name the setting, so an operator who hits this on
             // a shared machine can find out and change it instead of guessing.
             .map_err(|_| {
-                "The Windows display is already owned by another authenticated session. It is \
-                 released when that session disconnects and its resume window \
-                 (auth.reconnect_window_secs) expires."
+                arcen_session::session_admission::DesktopBusyRefusal::WindowsDisplayOwned
+                    .deck_reason()
                     .to_string()
             })?;
         let admission = self
@@ -4795,6 +4794,9 @@ where
                 return Err(format!("broker-agent IPC failed while detached: {error}"))
             }
         },
+        () = crate::deskside::desk_alarm().notified() => {
+            crate::deskside::desk_watch_verdict().map_err(|refusal| refusal.deck_reason())?;
+        }
         _ = supervision.tick() => {
             verify_deskside_supervision(
                 cfg,
@@ -7659,12 +7661,10 @@ async fn verify_deskside_supervision(
         .map_err(|error| format!("deskside topology task failed: {error}"))?
         .map_err(|error| format!("deskside protected topology changed: {error}"))?;
     }
-    if let Some(proof) = crate::deskside::held_dark_desk() {
-        tokio::task::spawn_blocking(move || crate::deskside::verify_desk_dark(&proof))
-            .await
-            .map_err(|error| format!("desk privacy topology task failed: {error}"))?
-            .map_err(|refusal| refusal.deck_reason())?;
-    }
+    // The dark desk is proved on its own thread (shared `DeskWatch`):
+    // its probe stalls capture on some drivers, and the session loop must
+    // never wait for it. Its verdict is read here without waiting.
+    crate::deskside::desk_watch_verdict().map_err(|refusal| refusal.deck_reason())?;
     Ok(())
 }
 
@@ -9127,6 +9127,11 @@ where
                     None => break Ok(()),
                     Some(Ok(_)) => {}
                     Some(Err(error)) => break Err(format!("WebSocket receive failed: {error}")),
+                }
+            }
+            () = crate::deskside::desk_alarm().notified() => {
+                if let Err(refusal) = crate::deskside::desk_watch_verdict() {
+                    break Err(refusal.deck_reason());
                 }
             }
             _ = health.tick() => {

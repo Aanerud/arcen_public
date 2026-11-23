@@ -194,7 +194,19 @@ GDM. So the agent assembles the same login itself, with the decisions in
   (`loginctl unlock-session`, logged `authenticated logind session
   unlocked`). A desktop that "came back locked" after a reconnect was this
   idle lock reached during an attachment without input, not a failed
-  unlock.
+  unlock. Amended 2026-11-23: while a Deck is attached (the Pier's
+  session-bound input connection is served) the session manager holds an
+  idle inhibitor of its own (`arcen_session::desktop_session::manager::DeckAttachedInhibit`,
+  app id `arcen`, flag 8), released when that connection ends, so an
+  attached Deck without input no longer reaches the idle lock; a manual
+  lock still locks. On a desktop whose compositor runs on its own seat
+  (not `is_headless()`), GNOME Shell inhibits remote access while it is
+  locked (`main.js` `_sessionUpdated`: `inhibit_remote_access()` when the
+  session mode disallows screencasts), Mutter closes the RemoteDesktop and
+  ScreenCast sessions and removes their virtual monitor, the agent cannot
+  record the outputs again while locked and ends the desktop. Until the
+  agent waits for the unlock instead, a detached desktop that reaches the
+  idle lock ends (work package `wayland-lock-keeps-desktop`).
 - **Keyring.** `pam_gnome_keyring` would unlock a daemon on the user's systemd
   bus, not the private bus applications use. So the launcher hands the login
   password to the agent through its standard input (see
@@ -2092,7 +2104,23 @@ facts:
   generation, starts a new capenc epoch on the new hand-off, waits for its
   keyframe, moves the session-bound injector to the new generation and
   answers `display_update_result`. A refused transaction keeps the previous
-  output and answers with the reason. Every attachment reads the live
+  output and answers with the reason. The new epoch is given the host's
+  capture-rate evidence for the new size (Auto above 30 fps on a copying
+  route rests on it as much as Speed); an epoch served as Auto is asked for
+  Auto at no more than the rate it was served at, so a resize never
+  upgrades it or raises its rate, and a Speed attachment served as Auto at
+  one size resizes back to a qualified one as Auto at that rate
+  (`arcen_media::video::resized_epoch_request`).
+  An epoch that cannot take over at the new size (no stream, capture did
+  not start, the contract would change, no keyframe) puts the output back at
+  the size the attachment streamed at, streams on there and refuses the
+  `display_update` with the reason; that size is then refused at once for
+  the rest of the attachment (`resize_recovery`, `RefusedResizeSizes`). A
+  resize never ends the desktop: only a restore that fails too ends the
+  attachment; its display and the session slot are given back and the
+  desktop is kept, disconnected, for the next sign-in (ADR 0025 §10 states
+  how long a kept desktop lives). Every
+  attachment reads the live
   outputs from the agent, so a reattachment after a resize captures the
   resized output.
 - **Recovery inside an attachment.** A capture epoch that ends on its own

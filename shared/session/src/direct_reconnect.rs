@@ -613,6 +613,43 @@ impl ResumeHoldEnd {
     }
 }
 
+/// How an attachment that negotiated resume ended when it is not held for
+/// the Deck's resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAttachmentEnd {
+    /// The Deck closed the connection (an explicit disconnect).
+    ClientClosed,
+    /// The host's capture or encode could not continue (a failed capture
+    /// replacement, a resize that could not be served): nothing the user
+    /// chose, and no evidence the desktop itself is gone.
+    HostMediaFailure,
+    /// Anything else: a protocol violation, the Pier stopping, a resume
+    /// authority failure, lost input, another product taking a console.
+    Other,
+}
+
+/// What becomes of a desktop the Pier created for the account when such an
+/// attachment ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatedDesktopAfterEnd {
+    /// The desktop ends with the attachment.
+    End,
+    /// The desktop is kept, disconnected, for the account's next sign-in
+    /// (ADR 0025: a session is never ended by a host-side failure).
+    KeepForSignIn,
+}
+
+/// The fate of a created desktop after a terminal attachment end.
+#[must_use]
+pub const fn created_desktop_after_end(end: TerminalAttachmentEnd) -> CreatedDesktopAfterEnd {
+    match end {
+        TerminalAttachmentEnd::HostMediaFailure => CreatedDesktopAfterEnd::KeepForSignIn,
+        TerminalAttachmentEnd::ClientClosed | TerminalAttachmentEnd::Other => {
+            CreatedDesktopAfterEnd::End
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,5 +982,21 @@ mod tests {
             )
             .expect("RESUME_HOLD_ENDED accepts its fields");
         }
+    }
+
+    #[test]
+    fn a_host_media_failure_keeps_the_created_desktop() {
+        assert_eq!(
+            created_desktop_after_end(TerminalAttachmentEnd::HostMediaFailure),
+            CreatedDesktopAfterEnd::KeepForSignIn
+        );
+        assert_eq!(
+            created_desktop_after_end(TerminalAttachmentEnd::ClientClosed),
+            CreatedDesktopAfterEnd::End
+        );
+        assert_eq!(
+            created_desktop_after_end(TerminalAttachmentEnd::Other),
+            CreatedDesktopAfterEnd::End
+        );
     }
 }

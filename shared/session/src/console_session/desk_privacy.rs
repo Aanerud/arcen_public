@@ -386,6 +386,356 @@ pub fn desk_outputs_dark(outputs: &[DeskOutputFact]) -> Result<(), DeskPrivacyRe
     }
 }
 
+/// How often a host that cannot darken a monitor reads its display topology
+/// while the desk is kept dark: the operating system's own record of which
+/// outputs are lit and which monitors are connected, read without probing a
+/// device, off the media path.
+pub const DESK_TOPOLOGY_READ: Duration = Duration::from_secs(1);
+
+/// The longest a dark desk goes without the whole proof
+/// ([`desk_outputs_dark`] over freshly probed devices) when its topology
+/// reads unchanged: a monitor only that probe can see (the topology read
+/// shows nothing) is found within this, plus the proof's own time. The
+/// proof runs on [`DeskWatch`]'s thread, never on a session loop or the
+/// media path, and at once on any topology change.
+pub const DESK_FULL_PROOF_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a session may stream without a completed desk check before it
+/// is refused: a watcher that stalled or died proves nothing. A few
+/// [`DESK_TOPOLOGY_READ`]s, with room for one whole proof.
+pub const DESK_CHECK_STALE: Duration = Duration::from_secs(4);
+
+/// How long a proof the topology made due (it changed, or could not be
+/// read) may stay in flight before the session is refused: a changed desk
+/// is not proved dark by a probe that never answers.
+pub const DESK_PROOF_IN_FLIGHT_LIMIT: Duration = Duration::from_secs(3);
+
+/// The next check of a dark desk, as [`DeskRecheckCadence::next`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskRecheck {
+    /// The topology reads as it did at the last passing proof, and that
+    /// proof is recent: nothing more to probe.
+    Topology,
+    /// Probe again and prove the desk dark ([`desk_outputs_dark`]).
+    FullProof(FullProofReason),
+}
+
+/// Why a whole proof is due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullProofReason {
+    /// The topology could not be read (fail closed: prove instead).
+    TopologyUnreadable,
+    /// The topology differs from the one the last proof saw (a monitor
+    /// connected or removed, an output lit or detached).
+    TopologyChanged,
+    /// [`DESK_FULL_PROOF_INTERVAL`] has passed, or nothing was proved yet.
+    Interval,
+}
+
+impl FullProofReason {
+    /// Stable log token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::TopologyUnreadable => "topology_unreadable",
+            Self::TopologyChanged => "topology_changed",
+            Self::Interval => "interval",
+        }
+    }
+}
+
+/// When a dark desk is proved again: a cheap topology read every
+/// [`DESK_TOPOLOGY_READ`], the whole proof only when that read differs from
+/// the one taken just before the last passing proof, cannot be made, or
+/// [`DESK_FULL_PROOF_INTERVAL`] has passed. `T` is the platform's topology
+/// reading, compared whole (no hash that could hide a change).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeskRecheckCadence<T> {
+    proved: Option<(T, Instant)>,
+}
+
+impl<T> Default for DeskRecheckCadence<T> {
+    fn default() -> Self {
+        Self { proved: None }
+    }
+}
+
+impl<T: PartialEq> DeskRecheckCadence<T> {
+    /// A cadence that has proved nothing yet (the first check is a proof).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { proved: None }
+    }
+
+    /// Records a passing proof made at `at` right after `topology` was read
+    /// (`None`: it could not be read, so the next check proves again).
+    pub fn proved(&mut self, topology: Option<T>, at: Instant) {
+        self.proved = topology.map(|topology| (topology, at));
+    }
+
+    /// The check due at `now` for the topology just read.
+    #[must_use]
+    pub fn next(&self, topology: Option<&T>, now: Instant) -> DeskRecheck {
+        let Some(topology) = topology else {
+            return DeskRecheck::FullProof(FullProofReason::TopologyUnreadable);
+        };
+        let Some((proved, at)) = &self.proved else {
+            return DeskRecheck::FullProof(FullProofReason::Interval);
+        };
+        if proved != topology {
+            return DeskRecheck::FullProof(FullProofReason::TopologyChanged);
+        }
+        if now.saturating_duration_since(*at) >= DESK_FULL_PROOF_INTERVAL {
+            return DeskRecheck::FullProof(FullProofReason::Interval);
+        }
+        DeskRecheck::Topology
+    }
+}
+
+/// Whether a session whose desk watcher last completed a check at
+/// `last_check` must be refused at `now` ([`DESK_CHECK_STALE`]).
+#[must_use]
+pub fn desk_check_stale(last_check: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_check) >= DESK_CHECK_STALE
+}
+
+/// The name of the thread a [`DeskWatch`] proves the desk on.
+pub const DESK_WATCH_THREAD: &str = "arcen-desk-privacy";
+
+/// One whole proof a [`DeskWatch`] made, as its `report` callback sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeskProofReport {
+    /// Why the proof was due.
+    pub reason: FullProofReason,
+    /// Topology reads since the previous proof.
+    pub topology_reads: u64,
+    /// How long the topology read and the proof took.
+    pub took: Duration,
+    /// The proof's outcome (an `Err` ends the watch).
+    pub outcome: Result<(), DeskPrivacyRefusal>,
+}
+
+/// Keeps a dark desk proved while a Deck is attached, on a thread of its
+/// own ([`DESK_WATCH_THREAD`]), never on a session loop or the media path:
+/// the platform's cheap topology read every `read_every`, its whole proof
+/// when [`DeskRecheckCadence`] says so.
+///
+/// Fail closed: the first refusal is stored before anyone is told (the
+/// `report` and `alarm` callbacks run after it), and ends the thread; a
+/// thread that panics or ends for any other reason while the watch is held
+/// stores [`DeskPrivacyRefusal::DeskMonitorUnknown`] and raises the alarm.
+/// [`Self::verdict`] reads the result without waiting for a probe, and also
+/// refuses a watcher that completed no check for [`DESK_CHECK_STALE`] or
+/// whose topology-triggered proof has been in flight for
+/// [`DESK_PROOF_IN_FLIGHT_LIMIT`]. Dropping the watch stops the thread (a
+/// probe in progress finishes on its own; its result is discarded).
+#[derive(Debug)]
+pub struct DeskWatch {
+    shared: std::sync::Arc<DeskWatchShared>,
+}
+
+#[derive(Debug)]
+struct DeskWatchShared {
+    stop: std::sync::atomic::AtomicBool,
+    state: std::sync::Mutex<DeskWatchState>,
+    wake: std::sync::Condvar,
+}
+
+impl DeskWatchShared {
+    fn state(&self) -> std::sync::MutexGuard<'_, DeskWatchState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct DeskWatchState {
+    last_check: Instant,
+    refusal: Option<DeskPrivacyRefusal>,
+    /// A topology-triggered proof running since then.
+    proof_in_flight_since: Option<Instant>,
+}
+
+/// Ends a watcher thread fail-closed: unless the watch was stopped or the
+/// thread already raised its alarm, dropping this (a return or a panic)
+/// stores [`DeskPrivacyRefusal::DeskMonitorUnknown`] and raises the alarm.
+struct WatcherExit<A: Fn()> {
+    shared: std::sync::Arc<DeskWatchShared>,
+    alarm: A,
+    alarmed: bool,
+}
+
+impl<A: Fn()> Drop for WatcherExit<A> {
+    fn drop(&mut self) {
+        if self.alarmed || self.shared.stopped() {
+            return;
+        }
+        {
+            let mut state = self.shared.state();
+            if state.refusal.is_none() {
+                state.refusal = Some(DeskPrivacyRefusal::DeskMonitorUnknown);
+            }
+        }
+        (self.alarm)();
+    }
+}
+
+impl DeskWatch {
+    /// Starts watching a desk proved dark right after `topology` was read.
+    /// `report` is called on the watcher's thread after every whole proof
+    /// (to log it); `alarm` once the watch has stored a refusal (to wake the
+    /// session so it ends at once: the verdict is already a refusal then).
+    /// A thread that cannot be started leaves a watch that refuses.
+    pub fn start<T, R, P, O, A>(
+        read_every: Duration,
+        topology: Option<T>,
+        mut read: R,
+        mut prove: P,
+        mut report: O,
+        alarm: A,
+    ) -> Self
+    where
+        T: PartialEq + Send + 'static,
+        R: FnMut() -> Option<T> + Send + 'static,
+        P: FnMut() -> Result<(), DeskPrivacyRefusal> + Send + 'static,
+        O: FnMut(&DeskProofReport) + Send + 'static,
+        A: Fn() + Send + 'static,
+    {
+        let started = Instant::now();
+        let shared = std::sync::Arc::new(DeskWatchShared {
+            stop: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::Mutex::new(DeskWatchState {
+                last_check: started,
+                refusal: None,
+                proof_in_flight_since: None,
+            }),
+            wake: std::sync::Condvar::new(),
+        });
+        let worker = std::sync::Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
+            .name(DESK_WATCH_THREAD.to_string())
+            .spawn(move || {
+                let mut exit = WatcherExit {
+                    shared: std::sync::Arc::clone(&worker),
+                    alarm,
+                    alarmed: false,
+                };
+                let mut cadence = DeskRecheckCadence::new();
+                cadence.proved(topology, started);
+                let mut topology_reads = 0_u64;
+                loop {
+                    drop(
+                        worker
+                            .wake
+                            .wait_timeout_while(worker.state(), read_every, |_| !worker.stopped())
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                    if worker.stopped() {
+                        return;
+                    }
+                    let now = Instant::now();
+                    let topology = read();
+                    let (outcome, proof) = match cadence.next(topology.as_ref(), now) {
+                        DeskRecheck::Topology => {
+                            topology_reads = topology_reads.saturating_add(1);
+                            (Ok(()), None)
+                        }
+                        DeskRecheck::FullProof(reason) => {
+                            let triggered = reason != FullProofReason::Interval;
+                            if triggered {
+                                worker.state().proof_in_flight_since = Some(now);
+                            }
+                            let outcome = prove();
+                            if outcome.is_ok() {
+                                cadence.proved(topology, now);
+                            }
+                            let proof = DeskProofReport {
+                                reason,
+                                topology_reads,
+                                took: now.elapsed(),
+                                outcome,
+                            };
+                            topology_reads = 0;
+                            (outcome, Some(proof))
+                        }
+                    };
+                    if worker.stopped() {
+                        return;
+                    }
+                    // Store first: whoever the report or the alarm wakes
+                    // reads the verdict this check reached.
+                    {
+                        let mut state = worker.state();
+                        state.last_check = Instant::now();
+                        state.proof_in_flight_since = None;
+                        if let Err(refusal) = outcome {
+                            state.refusal = Some(refusal);
+                        }
+                    }
+                    if let Some(proof) = proof.as_ref() {
+                        report(proof);
+                    }
+                    if outcome.is_err() {
+                        exit.alarmed = true;
+                        if !worker.stopped() {
+                            (exit.alarm)();
+                        }
+                        return;
+                    }
+                }
+            });
+        if spawned.is_err() {
+            shared.state().refusal = Some(DeskPrivacyRefusal::DeskMonitorUnknown);
+        }
+        Self { shared }
+    }
+
+    /// The watch's verdict at `now`, never waiting for a probe.
+    ///
+    /// # Errors
+    ///
+    /// The stored refusal; or [`DeskPrivacyRefusal::DeskMonitorUnknown`]
+    /// when a topology-triggered proof has been in flight for
+    /// [`DESK_PROOF_IN_FLIGHT_LIMIT`], or the watcher completed no check
+    /// for [`DESK_CHECK_STALE`].
+    pub fn verdict(&self, now: Instant) -> Result<(), DeskPrivacyRefusal> {
+        self.shared.verdict(now)
+    }
+}
+
+impl DeskWatchShared {
+    fn verdict(&self, now: Instant) -> Result<(), DeskPrivacyRefusal> {
+        let state = self.state();
+        if let Some(refusal) = state.refusal {
+            return Err(refusal);
+        }
+        if state
+            .proof_in_flight_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= DESK_PROOF_IN_FLIGHT_LIMIT)
+        {
+            return Err(DeskPrivacyRefusal::DeskMonitorUnknown);
+        }
+        if desk_check_stale(state.last_check, now) {
+            return Err(DeskPrivacyRefusal::DeskMonitorUnknown);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DeskWatch {
+    fn drop(&mut self) {
+        self.shared
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shared.wake.notify_all();
+    }
+}
+
 /// The administrator's desk privacy choice (`privacy.desk` in the Pier
 /// configuration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -828,6 +1178,297 @@ mod tests {
         assert_eq!(
             hand_back_unlocked(super::super::UNLOCKED_GRACE),
             UnlockedHandBack::GiveBack
+        );
+    }
+
+    #[test]
+    fn a_dark_desk_is_proved_first_then_only_its_topology_is_read() {
+        let start = Instant::now();
+        let mut cadence = DeskRecheckCadence::<u32>::new();
+        assert_eq!(
+            cadence.next(Some(&1), start),
+            DeskRecheck::FullProof(FullProofReason::Interval)
+        );
+        cadence.proved(Some(1), start);
+        for millis in (500..5_000).step_by(500) {
+            assert_eq!(
+                cadence.next(Some(&1), start + Duration::from_millis(millis)),
+                DeskRecheck::Topology,
+                "{millis} ms"
+            );
+        }
+        assert_eq!(DESK_FULL_PROOF_INTERVAL, Duration::from_secs(5));
+        assert_eq!(
+            cadence.next(Some(&1), start + DESK_FULL_PROOF_INTERVAL),
+            DeskRecheck::FullProof(FullProofReason::Interval)
+        );
+    }
+
+    #[test]
+    fn a_topology_change_or_an_unreadable_topology_proves_the_desk_at_once() {
+        let start = Instant::now();
+        let mut cadence = DeskRecheckCadence::<Vec<u32>>::new();
+        cadence.proved(Some(vec![1, 2]), start);
+        let soon = start + DESK_TOPOLOGY_READ;
+        assert_eq!(
+            cadence.next(Some(&vec![1, 2, 3]), soon),
+            DeskRecheck::FullProof(FullProofReason::TopologyChanged)
+        );
+        assert_eq!(
+            cadence.next(None, soon),
+            DeskRecheck::FullProof(FullProofReason::TopologyUnreadable)
+        );
+        cadence.proved(None, soon);
+        assert_eq!(
+            cadence.next(Some(&vec![1, 2]), soon),
+            DeskRecheck::FullProof(FullProofReason::Interval),
+            "a proof whose topology was unreadable leaves nothing to compare with"
+        );
+    }
+
+    #[test]
+    fn a_watcher_that_stops_checking_refuses_the_session() {
+        let start = Instant::now();
+        assert!(!desk_check_stale(
+            start,
+            start + DESK_CHECK_STALE.saturating_sub(Duration::from_millis(1))
+        ));
+        assert!(desk_check_stale(start, start + DESK_CHECK_STALE));
+        assert!(DESK_CHECK_STALE > DESK_TOPOLOGY_READ * 2);
+        assert!(DESK_CHECK_STALE > DESK_PROOF_IN_FLIGHT_LIMIT);
+    }
+
+    fn wait_for(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    }
+
+    #[test]
+    fn the_desk_is_proved_on_its_own_thread_and_a_verdict_never_waits_for_the_probe() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+        let threads = Arc::new(Mutex::new(Vec::<String>::new()));
+        let proofs = Arc::new(AtomicU32::new(0));
+        let (read_threads, proof_threads) = (Arc::clone(&threads), Arc::clone(&threads));
+        let (reads, proof_count) = (Arc::new(AtomicU32::new(0)), Arc::clone(&proofs));
+        let here = |threads: &Mutex<Vec<String>>| {
+            threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().unwrap_or("").to_string());
+        };
+        let watch = DeskWatch::start(
+            Duration::from_millis(10),
+            Some(1_u32),
+            move || {
+                here(&read_threads);
+                // The topology changes on every read, so every check proves.
+                Some(reads.fetch_add(1, Ordering::SeqCst) + 2)
+            },
+            move || {
+                here(&proof_threads);
+                proof_count.fetch_add(1, Ordering::SeqCst);
+                // As slow as the probe that froze the picture.
+                std::thread::sleep(Duration::from_millis(400));
+                Ok(())
+            },
+            |_| {},
+            || {},
+        );
+        assert!(wait_for(Duration::from_secs(5), || {
+            proofs.load(Ordering::SeqCst) >= 1
+        }));
+        // A proof is in progress; the verdict must not wait for it.
+        for _ in 0..20 {
+            let asked = Instant::now();
+            assert_eq!(watch.verdict(Instant::now()), Ok(()));
+            assert!(asked.elapsed() < Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(watch);
+        let threads = threads.lock().unwrap();
+        assert!(!threads.is_empty());
+        assert!(
+            threads.iter().all(|name| name == DESK_WATCH_THREAD),
+            "{threads:?}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_topology_is_only_read_and_a_change_is_proved_at_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+        let topology = Arc::new(AtomicU32::new(7));
+        let proofs = Arc::new(AtomicU32::new(0));
+        let reads = Arc::new(AtomicU32::new(0));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let (read_topology, read_count, proof_count, seen) = (
+            Arc::clone(&topology),
+            Arc::clone(&reads),
+            Arc::clone(&proofs),
+            Arc::clone(&reports),
+        );
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(7_u32),
+            move || {
+                read_count.fetch_add(1, Ordering::SeqCst);
+                Some(read_topology.load(Ordering::SeqCst))
+            },
+            move || {
+                proof_count.fetch_add(1, Ordering::SeqCst);
+                Err(DeskPrivacyRefusal::DeskMonitorLit)
+            },
+            move |report: &DeskProofReport| seen.lock().unwrap().push(*report),
+            || {},
+        );
+        assert!(wait_for(Duration::from_secs(5), || {
+            reads.load(Ordering::SeqCst) >= 20
+        }));
+        assert_eq!(
+            proofs.load(Ordering::SeqCst),
+            0,
+            "no proof while nothing changed"
+        );
+        assert_eq!(watch.verdict(Instant::now()), Ok(()));
+        // A monitor connected: the topology changes, the proof runs at once
+        // and finds it lit.
+        let changed = Instant::now();
+        topology.store(8, Ordering::SeqCst);
+        assert!(wait_for(Duration::from_secs(5), || {
+            watch.verdict(Instant::now()).is_err()
+        }));
+        assert!(changed.elapsed() < Duration::from_secs(1));
+        assert_eq!(proofs.load(Ordering::SeqCst), 1);
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].reason, FullProofReason::TopologyChanged);
+        assert_eq!(reports[0].outcome, Err(DeskPrivacyRefusal::DeskMonitorLit));
+        assert_eq!(
+            watch.verdict(Instant::now() + DESK_CHECK_STALE),
+            Err(DeskPrivacyRefusal::DeskMonitorLit)
+        );
+    }
+
+    #[test]
+    fn a_watch_whose_reads_hang_refuses_once_its_last_check_is_stale() {
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(1_u32),
+            || {
+                std::thread::sleep(Duration::from_secs(60));
+                Some(1)
+            },
+            || Ok(()),
+            |_| {},
+            || {},
+        );
+        let now = Instant::now();
+        assert_eq!(watch.verdict(now), Ok(()));
+        assert_eq!(
+            watch.verdict(now + DESK_CHECK_STALE),
+            Err(DeskPrivacyRefusal::DeskMonitorUnknown)
+        );
+    }
+
+    #[test]
+    fn a_panicking_proof_refuses_and_raises_the_alarm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let alarmed = Arc::new(AtomicBool::new(false));
+        let raised = Arc::clone(&alarmed);
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(1_u32),
+            || Some(2),
+            || panic!("probe failed"),
+            |_| {},
+            move || raised.store(true, Ordering::SeqCst),
+        );
+        assert!(wait_for(Duration::from_secs(5), || alarmed.load(Ordering::SeqCst)));
+        assert_eq!(
+            watch.verdict(Instant::now()),
+            Err(DeskPrivacyRefusal::DeskMonitorUnknown)
+        );
+    }
+
+    #[test]
+    fn a_change_whose_proof_never_answers_refuses_after_the_in_flight_limit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let proving = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&proving);
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(1_u32),
+            || Some(2),
+            move || {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_secs(60));
+                Ok(())
+            },
+            |_| {},
+            || {},
+        );
+        assert!(wait_for(Duration::from_secs(5), || proving.load(Ordering::SeqCst)));
+        let now = Instant::now();
+        assert_eq!(watch.verdict(now), Ok(()));
+        assert!(DESK_PROOF_IN_FLIGHT_LIMIT < DESK_CHECK_STALE);
+        assert_eq!(
+            watch.verdict(now + DESK_PROOF_IN_FLIGHT_LIMIT),
+            Err(DeskPrivacyRefusal::DeskMonitorUnknown),
+            "refused by the in-flight limit, before the watch is stale"
+        );
+    }
+
+    #[test]
+    fn the_verdict_is_already_a_refusal_when_the_alarm_is_raised() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+        let watch_slot: Arc<Mutex<Option<std::sync::Weak<DeskWatchShared>>>> =
+            Arc::new(Mutex::new(None));
+        let seen_by_alarm = Arc::new(Mutex::new(None));
+        let (slot, seen) = (Arc::clone(&watch_slot), Arc::clone(&seen_by_alarm));
+        let (alarm_tx, alarm_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let watch = DeskWatch::start(
+            Duration::from_millis(5),
+            Some(1_u32),
+            move || {
+                // Hold the first reading until the test has published the
+                // watch, so the alarm can read its verdict.
+                let _ = go_rx.recv_timeout(Duration::from_secs(5));
+                Some(2)
+            },
+            || Err(DeskPrivacyRefusal::DeskMonitorLit),
+            |_| {},
+            move || {
+                let shared = slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                let verdict = shared.map(|shared| shared.verdict(Instant::now()));
+                *seen.lock().unwrap() = verdict;
+                let _ = alarm_tx.send(());
+            },
+        );
+        *watch_slot.lock().unwrap() = Some(std::sync::Arc::downgrade(&watch.shared));
+        go_tx.send(()).unwrap();
+        alarm_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            *seen_by_alarm.lock().unwrap(),
+            Some(Err(DeskPrivacyRefusal::DeskMonitorLit))
+        );
+        assert_eq!(
+            watch.verdict(Instant::now()),
+            Err(DeskPrivacyRefusal::DeskMonitorLit)
         );
     }
 }

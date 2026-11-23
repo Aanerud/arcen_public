@@ -175,11 +175,8 @@ target pid: the events go to whatever is in front.
 modifier, and `CGEventSetFlags` does not change it: Shift+C carries `c`
 (measured, and pinned by `a_shifted_key_carries_the_layout_text_it_is_given`).
 Ordinary text views translate the key code and flags again and type `C`; a
-field holding Secure Event Input, such as the lock screen's password field,
-reads the string. On 0.20.7 a Deck typing "Keys only" was refused twice at
-the lab Pier's lock screen with a password it typed correctly through the
-login window's virtual HID keyboard minutes later, and Characters typing
-(the string is the text) signed in at the same lock screen. So while
+field holding Secure Event Input in a signed-in desktop (Terminal's Secure
+Keyboard Entry, measured) reads the string. So while
 `IsSecureEventInputEnabled` reads true, a key pressed with Shift alone
 carries what the session's layout types at its Shift level when that
 differs from the unmodified level (the `keymap-watch` notice, shared
@@ -192,11 +189,71 @@ compose (`¨` then `u` is `ü`). Not covered yet: Option layers at the lock
 screen (the notice describes no Option level) and Caps Lock on. The login window
 types through the virtual HID keyboard and never needed this.
 Measured after the change, on macOS 26.5: Terminal with Secure Keyboard
-Entry reads `AbC1xyZ9` exactly, but the **lock screen still rejects** a
-password with capitals typed from either Deck (every character arrives as a
-dot), while the login window accepts it. The lock screen probably reads the
-key code and the system's own Shift state and ignores the event's string;
-that is unconfirmed, and it is a known issue, not fixed.
+Entry reads `AbC1xyZ9` exactly.
+
+**The lock screen waits for a person (PD-041).** It refused a password
+typed as `CGEvent`s whatever they carried, and the characters were never
+the problem. Measured on the lab Pier (macOS 26.5, 2026-11-22) with a
+temporary per-key diagnostic build (not shipped: see below): every key had
+its right code and flags,
+Shift arrived as a flags-changed event, each capital carried its layout
+text and every other key's stored string matched the layout.
+`loginwindow`'s own log (`log show --predicate 'process == "loginwindow"'`,
+as root) says why: once the Mac has gone idle at the lock screen it holds
+an *activity semaphore*, and a submitted password waits for the power
+manager to report the user active (`IOPMScheduleUserActiveChangedNotification`)
+— `activity semaphore exists, waiting for user activity before continuing
+auth...`, five seconds later `The user did not become active for
+authentication. Fail the auth` and `INCORRECT password`. Hardware input
+makes the user active; posted events do not. So the Pier declares the
+activity itself (`IOPMAssertionDeclareUserActivity`, `kIOPMUserActiveLocal`,
+shared `LockScreenActivity`): 250 ms after a Return or Enter it posted at
+its own locked console (`declare_lock_screen_activity_after_submit`), and
+before a key pressed there while no field holds Secure Event Input, once
+per 4 s (`lock_screen_step`). That key, and every message the Deck sends
+after it, is then held 1.5 s in order (`InputSession::apply`, shared
+`InputHold`) and applied from a timer arm of the session loop
+(`stream::apply_held_input`): nothing sleeps on the loop that sends the
+picture, audio and pings. A held key was never posted, so a session that
+ends while holding drops the queue and `release_all` frees what was posted
+before it. The second case
+exists because a posted key into the hidden field shows it without focus
+(`showPasswordFieldMakingFirstResponder: 0`) and the keys after it went
+nowhere; declared activity makes `loginwindow` raise the field focused. A
+field that is already up (a click put it there) is not woken again: waking
+it after a click took its focus away. Measured with the real password from
+the Mac Deck CLI, each followed by `Ab1Z9` typed into Terminal on the
+unlocked desktop and the Pier locking the session as the Deck left: typed
+straight away into a hidden field, typed one key every 1.3 s after a click
+on the field, typed at speed after that click, and after Shift and a click
+on the background. Desktop keys, and a desktop's own password fields, are
+unchanged; the declaration happens only while this session holds the
+console locked (`screen_lock::locked_on_console`).
+
+A virtual HID keyboard (the login window's `hid-injector` device) unlocked
+the lock screen too, and was tried first. It was not kept: the lock screen
+starts over at a person's first keystroke after going idle (it hides,
+empties and shows the field again, with an animation), and the device's
+keys raced that animation — a slow password after a click, and a fast one
+with no click, were lost in some runs. Desk privacy's event filter also
+cannot tell its keys from the desk's. Declared activity has neither
+problem.
+
+`CGSSessionScreenIsLocked` in `ioreg`'s `IOConsoleUsers` stayed `true`
+throughout an unlock on that Mac; prove an unlock from `loginwindow`'s log
+(`Unlock succeeded, with password`), not from `ioreg`.
+
+No log names a key, at any level (ADR 0014: text is never logged, only
+counts; `docs/operations/support-bundles.md`). A per-key line, even with
+only the key's kind under Secure Event Input, gives away a password's
+length, case and rhythm, and outside one it is a keylogger with debug on.
+The session-end line (`lock screen typing this session`) carries only
+what cannot grow with what was typed: how many times the lock screen was
+woken and a submit declared (per visit and per attempt), and whether input
+was held or dropped (yes or no). A count of keys posted with layout text
+would be the number of capitals in the passwords typed, and a count of held
+messages a password's length; neither is kept. A key-level probe, if one is ever needed again, is a lab build, not a
+log level.
 
 **Host health for the Deck.** Every two seconds the stream sends
 `health_stats` built from `arcen_telemetry::HostWindowTracker` and

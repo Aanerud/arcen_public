@@ -2397,6 +2397,9 @@ async fn run_session_correlated(
                     &health,
                     &sample,
                 );
+                options
+                    .telemetry
+                    .record_committed_health(health_tracker.current());
                 if health_sequence.is_multiple_of(CLIENT_PROOF_INTERVALS) {
                     emit_health_snapshot(
                         &session_log_id,
@@ -2420,6 +2423,7 @@ async fn run_session_correlated(
                     fps_content = sample.fps_content,
                     frames_decoded = sample.frames_decoded,
                     frames_presented = sample.frames_presented,
+                    frames_superseded = sample.frames_superseded,
                     unpresented_basis_points = arcen_telemetry::unpresented_basis_points(&sample),
                     "five-second client QoS snapshot",
                 );
@@ -7043,7 +7047,7 @@ mod tests {
     fn client_session_end_contains_complete_aggregate_summary() {
         let telemetry = ClientTelemetry::default();
         let mut window = telemetry.window(0);
-        telemetry.record_media(120, 120, 4, Duration::from_millis(2));
+        telemetry.record_media(120, 120, 4, 0, Duration::from_millis(2));
         for _ in 0..120 {
             telemetry.record_presented(Duration::from_millis(1));
         }
@@ -7051,6 +7055,7 @@ mod tests {
         telemetry.record_rtt(Duration::from_millis(40));
         telemetry.record_reconnect();
         let _ = telemetry.snapshot(&mut window, None, 2_000, 60, 3);
+        telemetry.record_committed_health(Some(HealthState::Critical));
 
         let fields = client_session_end_fields(&telemetry, Duration::from_secs(2), "user_quit");
         assert_eq!(
@@ -7638,6 +7643,7 @@ mod tests {
     fn a_host_refusing_for_its_own_state_is_never_an_authentication_failure() {
         use crate::sign_in::{HostRefusal, SignInFailure, SignInStage};
         use arcen_session::console_session::ConsoleRefusal;
+        use arcen_session::session_admission::DesktopBusyRefusal;
 
         let refused = |message: &str, setup: bool| {
             let mut result = auth_result(None, None, false);
@@ -7728,6 +7734,34 @@ mod tests {
         // A close with another reason is still a close.
         let closed = ConnectSmokeError::ClosedByHost(": too many connections".to_owned());
         assert_eq!(connect_error_class(&closed), "tcp");
+
+        // The Linux Pier's busy desktop arrives as a close during setup
+        // (field: `reason_class: "tcp"` and "closed the connection before
+        // your session started"); the Windows Pier's in a failed setup.
+        for refusal in DesktopBusyRefusal::ALL {
+            let reason = refusal.deck_reason();
+            for error in [
+                ConnectSmokeError::ClosedByHost(format!(": {reason}")),
+                refused(reason, true),
+                refused(reason, false),
+            ] {
+                assert_eq!(connect_error_class(&error), "host_busy", "{error}");
+                let end = classify_disconnect(&error);
+                assert_eq!(
+                    end.reason,
+                    DisconnectReason::Terminal(TerminalDisconnect::HostRefused(HostRefusal::Busy)),
+                    "{error}"
+                );
+                assert!(!end.transient(), "{error}");
+                assert!(end.message.contains(reason), "the host's words are kept");
+                let failure = SignInFailure::from_end(&end, SignInStage::Attempt);
+                assert_eq!(failure, Some(SignInFailure::HostBusy), "{error}");
+                assert_eq!(
+                    failure.unwrap().message("studio"),
+                    "Another session is already using studio."
+                );
+            }
+        }
 
         // A wrong password stays one.
         for message in ["", "Authentication failed", "Invalid credentials"] {

@@ -256,6 +256,26 @@ pub struct InputStats {
     pub pen_proximity_edges: u64,
     /// Committed-text characters typed.
     pub text_chars: u64,
+    /// User activity declared before a key into this session's hidden lock
+    /// screen field.
+    pub lock_screen_wakes: u64,
+    /// User activity declared after a submit at this session's lock screen.
+    pub lock_screen_submits: u64,
+}
+
+/// What became of a key edge ([`InputController::key_event`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum KeyOutcome {
+    /// Posted, or counted and dropped (unmapped).
+    Applied,
+    /// Nothing posted: user activity was declared to bring this session's
+    /// lock screen field up, and the caller holds this key and everything
+    /// after it for [`LOCK_SCREEN_WAKE_SETTLE`], then posts it with
+    /// [`InputController::key_event_after_wake`].
+    ///
+    /// [`LOCK_SCREEN_WAKE_SETTLE`]: arcen_input::keyboard::LOCK_SCREEN_WAKE_SETTLE
+    HoldForWake,
 }
 
 /// The pixel rectangle that normalized coordinates map onto.
@@ -337,6 +357,39 @@ fn key_event(
         }
     }
     Some(event)
+}
+
+/// `kVK_Return` and `kVK_ANSI_KeypadEnter`: the keys that submit a password.
+const KEY_CODE_RETURN: u16 = 0x24;
+const KEY_CODE_KEYPAD_ENTER: u16 = 0x4C;
+
+/// Declares user activity [`LOCK_SCREEN_SUBMIT_DELAY`] from now, off the
+/// input thread: an idle macOS lock screen checks a submitted password only
+/// once the power manager reports a person active (`loginwindow` waits five
+/// seconds, then fails it as `INCORRECT password`: `The user did not become
+/// active for authentication`, measured on macOS 26.5), and a posted
+/// Return is not a person's.
+///
+/// [`LOCK_SCREEN_SUBMIT_DELAY`]: arcen_input::keyboard::LOCK_SCREEN_SUBMIT_DELAY
+fn declare_lock_screen_activity_after_submit() {
+    let spawned = std::thread::Builder::new()
+        .name("arcen-lock-screen-submit".into())
+        .spawn(|| {
+            std::thread::sleep(arcen_input::keyboard::LOCK_SCREEN_SUBMIT_DELAY);
+            if !crate::power::declare_user_activity() {
+                tracing::warn!(
+                    target: arcen_telemetry::names::target::HID,
+                    "the power manager refused a user-activity declaration for the lock screen"
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(
+            target: arcen_telemetry::names::target::HID,
+            %error,
+            "could not declare user activity after a submit at the lock screen"
+        );
+    }
 }
 
 /// Translates a shared modifier mask into `CoreGraphics` event flags.
@@ -546,6 +599,9 @@ pub struct InputController {
     /// Whether the last key posted under Secure Event Input carried the
     /// layout's characters (logged on each change, never per key).
     secure_key_text: bool,
+    /// When keys posted into this session's own lock screen need the user
+    /// activity a person's keys would have made (shared).
+    lock_screen: arcen_input::keyboard::LockScreenActivity,
 }
 
 // SAFETY: a `CGEventSource` is an immutable CF object and the controller owns
@@ -659,6 +715,7 @@ impl InputController {
             host_keys: None,
             posted_text: arcen_input::text::PostedKeyText::default(),
             secure_key_text: false,
+            lock_screen: arcen_input::keyboard::LockScreenActivity::default(),
         }
     }
 
@@ -812,26 +869,47 @@ impl InputController {
     /// Returns [`InputError::EventCreationFailed`] when `CoreGraphics` refuses
     /// the event. An unmapped key is counted and ignored rather than pressing
     /// something else.
-    pub fn key_event(&mut self, event: &KeyboardEvent) -> Result<(), InputError> {
+    pub fn key_event(&mut self, event: &KeyboardEvent) -> Result<KeyOutcome, InputError> {
+        self.key_event_deciding(event, true)
+    }
+
+    /// Posts a key [`Self::key_event`] held with [`KeyOutcome::HoldForWake`],
+    /// once the lock screen has had [`LOCK_SCREEN_WAKE_SETTLE`]: as
+    /// `key_event`, without asking whether to wake it again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::key_event`].
+    ///
+    /// [`LOCK_SCREEN_WAKE_SETTLE`]: arcen_input::keyboard::LOCK_SCREEN_WAKE_SETTLE
+    pub fn key_event_after_wake(&mut self, event: &KeyboardEvent) -> Result<(), InputError> {
+        self.key_event_deciding(event, false).map(|_| ())
+    }
+
+    fn key_event_deciding(
+        &mut self,
+        event: &KeyboardEvent,
+        decide: bool,
+    ) -> Result<KeyOutcome, InputError> {
         let Some(code) = keymap::qt_key_to_macos(event.key_id, event.modifiers.0) else {
             self.stats.unmapped_keys += 1;
-            return Ok(());
+            return Ok(KeyOutcome::Applied);
         };
         if let Some(keyboard) = self.virtual_keyboard.as_mut() {
             let Some(usage) = virtual_keyboard::macos_key_to_hid_usage(code) else {
                 self.stats.unmapped_keys += 1;
-                return Ok(());
+                return Ok(KeyOutcome::Applied);
             };
             match keyboard.set(usage, event.pressed) {
                 Ok(()) => {
                     self.stats.key_events += 1;
-                    return Ok(());
+                    return Ok(KeyOutcome::Applied);
                 }
                 // A seventh held key. The key is refused, as an unmapped one
                 // is, and the device carries on.
                 Err(virtual_keyboard::VirtualKeyboardError::Rollover) => {
                     self.stats.unmapped_keys += 1;
-                    return Ok(());
+                    return Ok(KeyOutcome::Applied);
                 }
                 Err(error) if self.hid_only => return Err(self.devices_failed(&error)),
                 // The child went away. Everything it held was released when
@@ -850,16 +928,60 @@ impl InputController {
         if self.hid_only {
             return Err(InputError::VirtualHidUnavailable);
         }
+        let lock_screen = if decide {
+            self.lock_screen_step(code, event.pressed)
+        } else {
+            arcen_input::keyboard::LockScreenStep::Post
+        };
+        if lock_screen == arcen_input::keyboard::LockScreenStep::WakeThenHold {
+            return Ok(KeyOutcome::HoldForWake);
+        }
         let flags = modifier_flags(event.modifiers.0, event.caps_lock_on);
         let text = self.secure_key_text(event);
         self.post_key(code, event.pressed, flags, text.as_deref())?;
+        if lock_screen == arcen_input::keyboard::LockScreenStep::PostThenDeclare {
+            self.stats.lock_screen_submits += 1;
+            declare_lock_screen_activity_after_submit();
+        }
         if event.pressed {
             self.held_keys.insert(code);
         } else {
             self.held_keys.remove(&code);
         }
         self.stats.key_events += 1;
-        Ok(())
+        Ok(KeyOutcome::Applied)
+    }
+
+    /// What this key edge needs at the session's own lock screen (shared
+    /// `LockScreenActivity`), declaring user activity at once when it must
+    /// first be woken (the caller holds the key: nothing here waits). A
+    /// posted key is not a person's, and an idle lock screen neither focuses
+    /// its field for it nor checks a password until it sees one active.
+    fn lock_screen_step(
+        &mut self,
+        code: u16,
+        pressed: bool,
+    ) -> arcen_input::keyboard::LockScreenStep {
+        use arcen_input::keyboard::{LockScreenFacts, LockScreenStep};
+        let step = self.lock_screen.key(
+            pressed,
+            matches!(code, KEY_CODE_RETURN | KEY_CODE_KEYPAD_ENTER),
+            std::time::Instant::now(),
+            || LockScreenFacts {
+                locked_on_console: crate::screen_lock::locked_on_console() == Some(true),
+                secure_input: secure_event_input(),
+            },
+        );
+        if step == LockScreenStep::WakeThenHold {
+            self.stats.lock_screen_wakes += 1;
+            if !crate::power::declare_user_activity() {
+                tracing::warn!(
+                    target: arcen_telemetry::names::target::HID,
+                    "the power manager refused a user-activity declaration for the lock screen"
+                );
+            }
+        }
+        step
     }
 
     fn post_key(
