@@ -23,36 +23,9 @@
 //!   once it leaves the window, the window has no say in the pointer.
 
 /// Where a window shows its picture, in the window's own coordinates (the
-/// coordinates its pointer events use).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PictureRect {
-    pub left: f32,
-    pub top: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
-impl PictureRect {
-    fn contains(self, x: f32, y: f32) -> bool {
-        x >= self.left
-            && x <= self.left + self.width
-            && y >= self.top
-            && y <= self.top + self.height
-    }
-
-    /// `(x, y)` as a fraction of the picture, unclamped; `None` for an empty
-    /// picture.
-    fn fraction(self, x: f32, y: f32) -> Option<(f64, f64)> {
-        if self.width <= 0.0 || self.height <= 0.0 {
-            return None;
-        }
-        let fraction = (
-            f64::from((x - self.left) / self.width),
-            f64::from((y - self.top) / self.height),
-        );
-        (fraction.0.is_finite() && fraction.1.is_finite()).then_some(fraction)
-    }
-}
+/// coordinates its pointer events use): the same value the window draws
+/// its picture from ([`crate::present::fit`]).
+pub use crate::present::fit::PictureRect;
 
 /// One pointer event of a window, in its own coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]

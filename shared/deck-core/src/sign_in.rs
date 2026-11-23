@@ -128,18 +128,24 @@ impl HostRefusal {
     }
 
     /// The host refusal a host's reason states: a console code
-    /// ([`console_refusal`]), the macOS Pier's "another session is already
-    /// using this Mac", or the Linux Pier's occupied X11 seat. `None` for
+    /// ([`console_refusal`]), a busy desktop (the macOS Pier's "another
+    /// session is already using this Mac", the Linux and Windows Piers'
+    /// shared `DesktopBusyRefusal` words, another user's desktop waiting
+    /// for its owner), or the Linux Pier's occupied X11 seat. `None` for
     /// anything else, a wrong password included.
     #[cfg(feature = "runtime")]
     #[must_use]
     pub fn from_reason(reason: &str) -> Option<Self> {
+        use arcen_session::session_admission::{DesktopBusyRefusal, DetachedTakeoverRefusal};
         use arcen_session::x11_seat::{DECK_REASON_SEAT_OCCUPIED, DECK_REASON_SEAT_OTHER_PRODUCT};
         if let Some(refusal) = console_refusal(reason) {
             return Some(Self::Console(refusal));
         }
         let plain = reason.trim().to_ascii_lowercase();
-        if plain.starts_with(HOST_BUSY_REASON) {
+        if plain.starts_with(HOST_BUSY_REASON)
+            || DesktopBusyRefusal::from_reason(reason).is_some()
+            || reason.contains(DetachedTakeoverRefusal::AnotherUsersDesktop.deck_reason())
+        {
             return Some(Self::Busy);
         }
         // The named form of `x11_seat::deck_reason_other_product`.
@@ -1286,6 +1292,21 @@ mod tests {
             Some(HostRefusal::Busy)
         );
         assert_eq!(HostRefusal::Busy.reason_class(), "host_busy");
+        // The Linux and Windows Piers' busy desktops, in the words they send.
+        for busy in arcen_session::session_admission::DesktopBusyRefusal::ALL
+            .map(|refusal| refusal.deck_reason())
+            .into_iter()
+            .chain([
+                arcen_session::session_admission::DetachedTakeoverRefusal::AnotherUsersDesktop
+                    .deck_reason(),
+            ])
+        {
+            assert_eq!(
+                HostRefusal::from_reason(busy),
+                Some(HostRefusal::Busy),
+                "{busy}"
+            );
+        }
         for occupied in [
             arcen_session::x11_seat::DECK_REASON_SEAT_OCCUPIED,
             arcen_session::x11_seat::DECK_REASON_SEAT_OTHER_PRODUCT,
@@ -1307,6 +1328,9 @@ mod tests {
             "this account may not sign in here",
             arcen_session::auth_throttle::THROTTLED_MESSAGE,
             "not_console_other_user: x",
+            // Not another session: the desktop is finishing its last connection.
+            arcen_session::session_admission::DetachedTakeoverRefusal::OwnerDidNotAnswer
+                .deck_reason(),
         ] {
             assert_eq!(
                 HostRefusal::from_reason(not_the_host),

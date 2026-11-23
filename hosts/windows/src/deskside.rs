@@ -712,10 +712,18 @@ pub fn desk_exposure(
     arcen_session::console_session::desk_privacy::DeskExposure::PhysicalDesk
 }
 
-/// The lit outputs a dark desk was proved with (adapter LUID, output).
+/// The display topology desk privacy reads between proofs.
+#[cfg(windows)]
+type DeskTopology = crate::gpu_probe::DeskTopology;
+#[cfg(not(windows))]
+type DeskTopology = ();
+
+/// The lit outputs a dark desk was proved with (adapter LUID, output), and
+/// the topology read just before that proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DarkDeskProof {
     lit: std::collections::BTreeSet<(String, u32)>,
+    topology: Option<DeskTopology>,
 }
 
 /// What is behind one lit output: nothing for a virtual display (an
@@ -794,11 +802,15 @@ fn dark_lit_outputs() -> Result<
     use arcen_session::console_session::desk_privacy::{
         desk_outputs_dark, DeskOutputFact, DeskPrivacyRefusal,
     };
-    let report = crate::gpu_probe::probe().map_err(|_| DeskPrivacyRefusal::DeskMonitorUnknown)?;
+    // Only what the judgement needs: no D3D11 device, display-mode list,
+    // Media Foundation enumeration or EDID read, which disturb a streaming
+    // session's capture and encode on the same GPU.
+    let report = crate::gpu_probe::probe_at(crate::gpu_probe::ProbeDepth::DeskTopology)
+        .map_err(|_| DeskPrivacyRefusal::DeskMonitorUnknown)?;
     if report.topology_error.is_some() {
         return Err(DeskPrivacyRefusal::DeskMonitorUnknown);
     }
-    let nvapi = crate::nvapi_inventory::inventory().ok();
+    let nvapi = crate::nvapi_inventory::desk_inventory().ok();
     let gpu_lights_a_monitor = |luid: &str| -> Option<bool> {
         let gpu = nvapi.as_ref()?.gpus.iter().find(|gpu| {
             gpu.adapter_luid.is_some_and(|gpu_luid| {
@@ -931,7 +943,18 @@ pub fn virtual_output_instead_of(
 #[cfg(windows)]
 pub fn prove_desk_dark(
 ) -> Result<DarkDeskProof, arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
-    dark_lit_outputs().map(|lit| DarkDeskProof { lit })
+    let topology = read_desk_topology();
+    dark_lit_outputs().map(|lit| DarkDeskProof { lit, topology })
+}
+
+#[cfg(windows)]
+fn read_desk_topology() -> Option<DeskTopology> {
+    crate::gpu_probe::desk_topology().ok()
+}
+
+#[cfg(not(windows))]
+fn read_desk_topology() -> Option<DeskTopology> {
+    None
 }
 
 #[cfg(not(windows))]
@@ -940,23 +963,83 @@ pub fn prove_desk_dark(
     Err(arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskMonitorUnknown)
 }
 
-static DARK_DESK: std::sync::Mutex<Option<DarkDeskProof>> = std::sync::Mutex::new(None);
+static DARK_DESK: std::sync::Mutex<
+    Option<arcen_session::console_session::desk_privacy::DeskWatch>,
+> = std::sync::Mutex::new(None);
 
 /// Holds the proof the agent's supervision checks the desk against while
-/// the Deck is attached and held (one session per agent process).
+/// the Deck is attached and held (one session per agent process), and
+/// starts (`Some`) or stops (`None`) the shared watcher thread that keeps
+/// proving it off the session loop and the media path
+/// ([`DeskWatch`](arcen_session::console_session::desk_privacy::DeskWatch)).
 pub fn hold_dark_desk(proof: Option<DarkDeskProof>) {
-    *DARK_DESK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = proof;
+    use arcen_session::console_session::desk_privacy::{DeskWatch, DESK_TOPOLOGY_READ};
+    let watch = proof.map(|proof| {
+        let topology = proof.topology.clone();
+        DeskWatch::start(
+            DESK_TOPOLOGY_READ,
+            topology,
+            read_desk_topology,
+            move || verify_desk_dark(&proof),
+            |report| {
+                let took_ms = u64::try_from(report.took.as_millis()).unwrap_or(u64::MAX);
+                match report.outcome {
+                    Ok(()) => tracing::info!(
+                        target: crate::logging::SESSION,
+                        reason = report.reason.token(),
+                        topology_reads = report.topology_reads,
+                        took_ms,
+                        "desk privacy: the desk was proved dark again off the media path"
+                    ),
+                    Err(refusal) => tracing::error!(
+                        target: crate::logging::SESSION,
+                        reason = report.reason.token(),
+                        refusal = refusal.token(),
+                        took_ms,
+                        "desk privacy: the desk is no longer proved dark; the session ends"
+                    ),
+                }
+            },
+            // Raised after the watch stored its refusal (also when the
+            // watcher thread panicked), so the woken loop reads it.
+            || desk_alarm().notify_one(),
+        )
+    });
+    let previous = std::mem::replace(
+        &mut *DARK_DESK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        watch,
+    );
+    drop(previous);
 }
 
-/// The held proof, if the desk is kept dark by default desk privacy.
-#[must_use]
-pub fn held_dark_desk() -> Option<DarkDeskProof> {
+/// Whether the held dark desk is still proved, without waiting for any
+/// probe: `Ok` when no desk is held dark; otherwise the shared watcher's
+/// verdict (its refusal, or
+/// [`DeskMonitorUnknown`](arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskMonitorUnknown)
+/// when it completed no check within
+/// [`DESK_CHECK_STALE`](arcen_session::console_session::desk_privacy::DESK_CHECK_STALE)).
+///
+/// # Errors
+///
+/// The refusal that ends the Deck's session.
+pub fn desk_watch_verdict(
+) -> Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
     DARK_DESK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+        .as_ref()
+        .map_or(Ok(()), |watch| watch.verdict(std::time::Instant::now()))
+}
+
+/// Woken when the desk watcher refuses, so a session loop ends at once
+/// rather than at its next supervision tick (read
+/// [`desk_watch_verdict`] when it fires: a wake-up may be left over from
+/// an earlier watch).
+pub fn desk_alarm() -> &'static tokio::sync::Notify {
+    static ALARM: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    ALARM.get_or_init(tokio::sync::Notify::new)
 }
 
 /// Proves the desk dark again: still no monitor behind any lit output, and
@@ -1010,15 +1093,31 @@ fn injection_markers() -> InjectionMarkers {
     })
 }
 
+/// A marker that survives both hook channels: 32 bits, never zero.
+///
+/// A low-level mouse hook sees only the low 32 bits of a mouse event's
+/// `dwExtraInfo` (the raw mouse input carries a `ULONG`): measured on the
+/// lab Pier, a hook read `0xae5540d2` for the marker `0x9efa8cd6ae5540d2`
+/// while the keyboard hook read it whole. A wider marker made desk privacy
+/// swallow every move, button and wheel Arcen injected.
 fn marker_from_seed(seed: &[u8; 32], label: &[u8]) -> usize {
     let mut hasher = Sha256::new();
     hasher.update(seed);
     hasher.update(label);
     let digest = hasher.finalize();
-    let mut bytes = [0_u8; std::mem::size_of::<usize>()];
-    let length = bytes.len();
-    bytes.copy_from_slice(&digest[..length]);
-    usize::from_ne_bytes(bytes).max(1)
+    let mut bytes = [0_u8; 4];
+    bytes.copy_from_slice(&digest[..4]);
+    let marker = u32::from_ne_bytes(bytes).max(1);
+    usize::try_from(marker).unwrap_or(1)
+}
+
+/// The part of `dwExtraInfo` a low-level mouse hook is given (see
+/// [`marker_from_seed`]).
+const fn mouse_extra_info(extra_info: usize) -> u32 {
+    // Truncation is the point: Windows hands the mouse hook 32 bits.
+    #[allow(clippy::cast_possible_truncation)]
+    let low = extra_info as u32;
+    low
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1054,11 +1153,12 @@ const fn mouse_hook_decision(
 ) -> HookDecision {
     const INJECTED: u32 = 0x01;
     const LOWER_INTEGRITY_INJECTED: u32 = 0x02;
+    let extra = mouse_extra_info(extra_info);
     if flags & (INJECTED | LOWER_INTEGRITY_INJECTED) == 0 {
         HookDecision::Swallow
-    } else if markers.mouse_canary != 0 && extra_info == markers.mouse_canary {
+    } else if markers.mouse_canary != 0 && extra == mouse_extra_info(markers.mouse_canary) {
         HookDecision::MouseCanary
-    } else if markers.remote != 0 && extra_info == markers.remote {
+    } else if markers.remote != 0 && extra == mouse_extra_info(markers.remote) {
         HookDecision::PassRemote
     } else {
         HookDecision::Swallow
@@ -1105,10 +1205,7 @@ pub const fn swallow_mouse_event(flags: u32, extra_info: usize, marker: usize) -
 pub struct HookProof {
     active: Arc<AtomicBool>,
     /// The mouse canary must arrive too (pinned deskside). Desk privacy's
-    /// default proves the hook thread with the keyboard canary: on the lab
-    /// vGPU guest Windows never calls `WH_MOUSE_LL` for an injected move,
-    /// relative or absolute, while the keyboard hook on the same thread is
-    /// called at once.
+    /// default proves the hook thread with the keyboard canary alone.
     require_mouse: bool,
 }
 
@@ -1733,6 +1830,58 @@ mod tests {
             }],
         };
         assert!(malformed.validate().is_err());
+    }
+
+    #[test]
+    fn a_mouse_hook_given_the_low_half_of_the_marker_passes_arcen_input() {
+        // What the lab Pier's mouse hook read for the marker
+        // 0x9efa8cd6ae5540d2: Windows hands it the low 32 bits only.
+        let seed = [7_u8; 32];
+        let markers = InjectionMarkers {
+            remote: marker_from_seed(&seed, b"remote"),
+            keyboard_canary: marker_from_seed(&seed, b"keyboard-canary"),
+            mouse_canary: marker_from_seed(&seed, b"mouse-canary"),
+        };
+        for marker in [
+            markers.remote,
+            markers.keyboard_canary,
+            markers.mouse_canary,
+        ] {
+            assert_ne!(marker, 0);
+            assert!(
+                u32::try_from(marker).is_ok(),
+                "{marker:#x} must fit 32 bits"
+            );
+        }
+        let seen_by_the_mouse_hook = |marker: usize| marker & 0xffff_ffff;
+        assert_eq!(
+            mouse_hook_decision(0x01, seen_by_the_mouse_hook(markers.remote), markers),
+            HookDecision::PassRemote
+        );
+        assert_eq!(
+            mouse_hook_decision(0x01, seen_by_the_mouse_hook(markers.mouse_canary), markers),
+            HookDecision::MouseCanary
+        );
+        assert_eq!(
+            keyboard_hook_decision(0x10, markers.remote, markers),
+            HookDecision::PassRemote
+        );
+        // Even a 64-bit marker (0.20.8 made those, and its mouse hook
+        // swallowed every Arcen move, button and wheel) is recognised from
+        // the half the mouse hook is given.
+        let wide = InjectionMarkers {
+            remote: 0x9efa_8cd6_ae55_40d2_u64 as usize,
+            ..markers
+        };
+        assert_eq!(
+            mouse_hook_decision(0x01, 0xae55_40d2, wide),
+            HookDecision::PassRemote
+        );
+        // A desk mouse is never remote, marker or not.
+        assert_eq!(
+            mouse_hook_decision(0, markers.remote, markers),
+            HookDecision::Swallow
+        );
     }
 
     #[test]

@@ -3818,6 +3818,20 @@ pub struct ClientQosSampleMsg {
     pub frames_decoded: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames_presented: Option<u64>,
+    /// Decoded frames the client handed on but did not show because a newer
+    /// frame took their place, or the compositor showed the same picture
+    /// without a presentation time: handled, not lost
+    /// (`arcen_telemetry::QosSample::frames_superseded`). Absent from
+    /// clients that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames_superseded: Option<u64>,
+    /// The part of `frames_superseded` that reached the compositor:
+    /// drawables submitted and returned without a presentation time
+    /// (`arcen_telemetry::QosSample::frames_submitted_untimed`). Only these
+    /// and presented frames prove the presenter alive. Absent from clients
+    /// that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames_submitted_untimed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames_dropped: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7174,6 +7188,8 @@ mod tests {
                     frames_received: Some(150),
                     frames_decoded: Some(149),
                     frames_presented: Some(148),
+                    frames_superseded: None,
+                    frames_submitted_untimed: None,
                     frames_dropped: Some(1),
                     decode_time_ms: Some(4),
                     display_time_ms: Some(2),

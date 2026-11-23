@@ -231,6 +231,12 @@ assembly and encodes three to four times slower. Run
   run a host-scoped autostart entry (time zone, radios, sharing, USBGuard,
   modem, VM console agents). Every service is optional; none is a
   readiness step.
+- While the Pier's session-bound input connection is served (a Deck is
+  attached) the agent's session manager holds the shared
+  `DeckAttachedInhibit` idle inhibitor, released when the connection ends:
+  an attached Deck without input never reaches the idle lock. Never hold it
+  past the attachment, and never pin `idle-delay` or the lock settings
+  instead (they are the user's).
 - Every desktop, on either provider, holds a logind `sleep:idle` block
   inhibitor in the launcher (`session::sleep_inhibitor`) for its whole
   life. Deck keys must never map to host power, sleep, suspend or wake keys.
@@ -375,7 +381,12 @@ assembly and encodes three to four times slower. Run
   `ApplyMonitorsConfig` and changed only through the agent's
   `arcen-output.sock` output transaction, one output generation at a time.
   Stop every capture epoch of the session before reconfiguring it; capenc
-  always offers exactly the hand-off size. Older compositors keep fixed
+  always offers exactly the hand-off size. A resized epoch keeps the new
+  size's capture-rate evidence (Auto needs it as much as Speed; an Auto
+  epoch is asked for Auto at no more than its served rate, shared
+  `resized_epoch_request`), and one that
+  cannot take over restores the previous size and streams on
+  (`resize_recovery`): a resize never ends the desktop. Older compositors keep fixed
   `--virtual-monitor` outputs. An output count change adds streams to the
   running ScreenCast session (`ScreenCast.Stream.Start`) or stops them;
   each output is placed at the UI scale `arcen_outputs::choose_output_scale`

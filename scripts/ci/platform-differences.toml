@@ -407,7 +407,7 @@ id = "PD-027"
 area = "deskside privacy"
 products = ["hosts/linux", "hosts/windows", "hosts/macos"]
 difference = "How each Pier makes the desk private (desk privacy, on by default: privacy.desk), and which local devices the pinned deskside variants blank and grab, and how they are named."
-earned_by = "Darkening: Linux sets every CRTC's RandR gamma ramp to zero (journalled, restored byte for byte) and grabs the seat's evdev devices (EVIOCGRAB); macOS gives each display an all-zero transfer table and runs an event tap; Windows cannot (GDI's SetDeviceGammaRamp silently refuses an all-black ramp, per its documentation), so it serves the session on a virtual display or a head with nothing connected, detaches every other monitor from the desktop with SetDisplayConfig under the display lease's recovery journal, proves no lit output has a monitor physically connected behind it (NVAPI display flags, software-enumerated indirect adapters) and blocks keyboard and mouse with low-level hooks. Naming: Linux pins evdev input devices and DRM outputs (with the firmware they run); Windows pins its monitors. macOS names neither: its window server shows an event filter who posted each event (kCGEventSourceUnixProcessID), never which device made it, so the macOS Pier drops every event its own process did not post, with nothing to pin; a virtual HID keyboard cannot be told from the desk's, so input_backend virtual_hid with desk privacy on refuses every signed-in session (or the configuration, when privacy.desk is on explicitly). The policy is shared (arcen_session::deskside, arcen_session::console_session::desk_privacy)."
+earned_by = "Darkening: Linux sets every CRTC's RandR gamma ramp to zero (journalled, restored byte for byte) and grabs the seat's evdev devices (EVIOCGRAB); macOS gives each display an all-zero transfer table and runs an event tap; Windows cannot (GDI's SetDeviceGammaRamp silently refuses an all-black ramp, per its documentation), so it serves the session on a virtual display or a head with nothing connected, detaches every other monitor from the desktop with SetDisplayConfig under the display lease's recovery journal, proves no lit output has a monitor physically connected behind it (NVAPI display flags, software-enumerated indirect adapters), keeps proving it off the media path while the Deck is attached (the probe stalls capture on NVIDIA drivers, so the shared DeskWatch reads the CCD topology and NVAPI's cached connection state every second and runs the whole proof at once on a change, otherwise every 5 s) and blocks keyboard and mouse with low-level hooks. Naming: Linux pins evdev input devices and DRM outputs (with the firmware they run); Windows pins its monitors. macOS names neither: its window server shows an event filter who posted each event (kCGEventSourceUnixProcessID), never which device made it, so the macOS Pier drops every event its own process did not post, with nothing to pin; a virtual HID keyboard cannot be told from the desk's, so input_backend virtual_hid with desk privacy on refuses every signed-in session (or the configuration, when privacy.desk is on explicitly). The policy is shared (arcen_session::deskside, arcen_session::console_session::desk_privacy)."
 code = [
   { path = "hosts/linux/src/deskside.rs", symbol = "deskside" },
   { path = "hosts/windows/src/deskside.rs" },
@@ -557,11 +557,25 @@ decision = "docs/adr/0014-quic-lanes-and-capture-contracts.md"
 id = "PD-040"
 area = "keyboard"
 products = ["hosts/macos"]
-difference = "While Secure Event Input is held (a password field, the lock screen), the macOS Pier gives a key pressed with Shift alone the characters the session's layout types at its Shift level (CGEventKeyboardSetUnicodeString) when they differ from its unmodified ones, never the key after a dead key, from the keymap-watch notice and the shared PostedKeyText. The Linux and Windows Piers inject the key and the operating system translates it."
-earned_by = "CGEventCreateKeyboardEvent stores the string the key code types with no modifier and CGEventSetFlags does not change it (Shift+C carries c, measured), and a field holding Secure Event Input reads that string instead of translating the key code and flags (0.20.7: Keys-only typing refused at a lock screen that accepted the same keys through virtual HID and the same Shift through committed text). uinput, libei and SendInput keys carry no string."
+difference = "While Secure Event Input is held (a password field in a signed-in desktop; the lock screen's field is PD-041), the macOS Pier gives a key pressed with Shift alone the characters the session's layout types at its Shift level (CGEventKeyboardSetUnicodeString) when they differ from its unmodified ones, never the key after a dead key, from the keymap-watch notice and the shared PostedKeyText. The Linux and Windows Piers inject the key and the operating system translates it."
+earned_by = "CGEventCreateKeyboardEvent stores the string the key code types with no modifier and CGEventSetFlags does not change it (Shift+C carries c, measured), and a field holding Secure Event Input reads that string instead of translating the key code and flags (Terminal with Secure Keyboard Entry read Shift+C as c, and reads AbC1xyZ9 exactly with the string; macOS 26.5). uinput, libei and SendInput keys carry no string."
 code = [
   { path = "hosts/macos/src/input/mod.rs", symbol = "fn secure_key_text" },
   { path = "shared/input/src/text/policy.rs", symbol = "pub struct PostedKeyText" },
+]
+decision = "hosts/macos/AGENTS.md"
+
+[[difference]]
+id = "PD-041"
+area = "keyboard"
+products = ["hosts/macos"]
+difference = "Keys the macOS Pier posts into its own session's lock screen come with the user activity a person's keys would have made (IOPMAssertionDeclareUserActivity, kIOPMUserActiveLocal): 250 ms after a Return or Enter pressed at the locked console, and, before a key pressed there while no password field holds Secure Event Input, once per 4 s, that key and everything after it then held 1.5 s in order and applied from the session loop's timer (shared arcen_input::keyboard::LockScreenActivity, InputHold). Keys on the desktop, and in its own password fields, are posted as before. The Linux and Windows Piers inject keys the system counts as a person's."
+earned_by = "macOS 26.5 (lab Pier, 2026-11-22): once idle at the lock screen, loginwindow checks a submitted password only after the power manager reports the user active (IOPMScheduleUserActiveChangedNotification), which hardware input does and posted CGEvents do not: 'activity semaphore exists, waiting for user activity before continuing auth', then 'The user did not become active for authentication. Fail the auth' and 'INCORRECT password' for a password whose every key's code, flags, stored string and Shift flagsChanged a diagnostic build showed right. With the activity declared after the posted Return it logged 'user is active, releasing the activity semaphore' and 'Unlock succeeded, with password', the password typed slowly or at speed after a click on the field. A posted key into a hidden field shows it without focus ('showPasswordFieldMakingFirstResponder: 0') and the keys after it went nowhere. A virtual HID keyboard (the login window's) also unlocked, but its keys raced the lock screen's own wake animation; declared activity needs no device and leaves desk privacy's event filter unchanged."
+code = [
+  { path = "hosts/macos/src/input/mod.rs", symbol = "fn lock_screen_step" },
+  { path = "hosts/macos/src/input/mod.rs", symbol = "fn declare_lock_screen_activity_after_submit" },
+  { path = "hosts/macos/src/screen_lock.rs", symbol = "pub fn locked_on_console" },
+  { path = "shared/input/src/keyboard/lock_screen.rs", symbol = "pub struct LockScreenActivity" },
 ]
 decision = "hosts/macos/AGENTS.md"
 
@@ -694,10 +708,10 @@ code = [{ path = "clients/macos/src/ui/connection_test.rs", symbol = "Connection
 id = "GAP-027"
 area = "Deck present"
 products = ["clients/macos", "clients/windows"]
-difference = "Video fit rounding: the macOS Deck snaps to physical pixels, the Windows Deck rounds offsets only."
-why_open = "Two local policies for pointer-accurate letterboxing."
+difference = "Video fit rounding: the macOS Deck fits, draws and maps input through the shared arcen_deck_core::present::fit::PictureRect (edges snapped to physical pixels); the Windows Deck still fits locally (VideoFit, offsets rounded only), drawing and input from that one local value."
+why_open = "The Windows Deck has not moved onto the shared picture geometry yet."
 owner = "Shared/Architecture"
-code = [{ path = "clients/macos/src/ui/app.rs" }, { path = "clients/windows/src/present/composition.rs" }]
+code = [{ path = "shared/deck-core/src/present/fit.rs" }, { path = "clients/macos/src/ui/app.rs" }, { path = "clients/windows/src/present/composition.rs" }]
 
 [[gap]]
 id = "GAP-054"
@@ -783,7 +797,7 @@ id = "GAP-051"
 area = "deskside privacy"
 products = ["hosts/windows"]
 difference = "While a Deck is attached with desk privacy on, the Linux Pier blocks every input device a person at the desk can drive the desktop with (keyboards, mice, touchpads, tablets, touch screens: EVIOCGRAB) and the macOS Pier every event its own process did not post; the Windows Pier's low-level hooks (WH_KEYBOARD_LL, WH_MOUSE_LL) block the desk's keyboard and mouse only, so a pen tablet or touch screen at the desk still reaches the session through WM_POINTER."
-why_open = "Not implemented yet. Low-level hooks do not see pointer (pen and touch) input on Windows; the routes considered are taking the desk's HID digitizers (disable or exclusive open while attached, re-enabled on detach and by the display watchdog's recovery) or a pointer-input redirection of the console session. Neither is built; the lab Windows Pier has no desk pen or touch screen to prove either on. The mouse hook's liveness is not proved by a canary either: on the lab vGPU guest Windows never calls WH_MOUSE_LL for an injected move (relative or absolute) while the keyboard hook on the same thread is called at once, so desk privacy's default proves the hook thread with the keyboard canary (InputHookGuard::install_keyboard_proved); blocking a physical desk mouse is unit-tested, not lab-proven."
+why_open = "Not implemented yet. Low-level hooks do not see pointer (pen and touch) input on Windows; the routes considered are taking the desk's HID digitizers (disable or exclusive open while attached, re-enabled on detach and by the display watchdog's recovery) or a pointer-input redirection of the console session. Neither is built; the lab Windows Pier has no desk pen or touch screen to prove either on. Desk privacy's default proves the hook thread with the keyboard canary (InputHookGuard::install_keyboard_proved); blocking a physical desk mouse is unit-tested, not lab-proven (the lab Pier has no desk mouse). The mouse hook is given only the low 32 bits of an event's dwExtraInfo, so Arcen's injection markers are 32-bit: through 0.20.8 a 64-bit marker made the hook swallow every move, button and wheel a Deck sent (no pointer, no clicks), which an earlier note here misread as Windows never calling WH_MOUSE_LL for an injected move."
 owner = "Windows Host"
 code = [
   { path = "hosts/windows/src/deskside.rs", symbol = "InputHookGuard" },

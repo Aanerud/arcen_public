@@ -107,13 +107,14 @@ use arcen_protocol::messages::{
 use arcen_protocol::{decode_clipboard_chunk, decode_microphone_frame, AudioCodec, FrameType};
 use arcen_session::auth_throttle::{AttemptOutcome, HostAuthThrottle, THROTTLED_MESSAGE};
 use arcen_session::direct_reconnect::{
-    DirectReconnect, MonotonicMillis, ReconnectEvent, ReconnectPolicy, ReconnectState,
-    ResumeHoldEnd,
+    created_desktop_after_end, CreatedDesktopAfterEnd, DirectReconnect, MonotonicMillis,
+    ReconnectEvent, ReconnectPolicy, ReconnectState, ResumeHoldEnd, TerminalAttachmentEnd,
 };
 use arcen_session::restore_lease::IanaTimeZone;
 use arcen_session::session_admission::{
-    DetachedTakeoverRefusal, PreauthAdmission, PreauthPlace, PreauthRefusal, AUTH_RESPONSE_TIMEOUT,
-    CREDENTIAL_CHECK_TIMEOUT, HANDSHAKE_MESSAGE_TIMEOUT, INTERACTIVE_AUTH_RESPONSE_TIMEOUT,
+    DesktopBusyRefusal, DetachedTakeoverRefusal, PreauthAdmission, PreauthPlace, PreauthRefusal,
+    AUTH_RESPONSE_TIMEOUT, CREDENTIAL_CHECK_TIMEOUT, HANDSHAKE_MESSAGE_TIMEOUT,
+    INTERACTIVE_AUTH_RESPONSE_TIMEOUT,
 };
 use arcen_telemetry::{
     CorrelationId, FieldValue, LifecycleEventKind, OperationalProfile, QosSample, QosTargets,
@@ -989,8 +990,12 @@ async fn hand_over_displaced_session(
 }
 
 /// Why a newcomer was refused while another attachment holds the desktop.
-const SESSION_BUSY_REASON: &str =
-    "shared display is busy: another Deck is attached to this desktop";
+const SESSION_BUSY_REASON: &str = DesktopBusyRefusal::AnotherDeckAttached.deck_reason();
+
+/// Why an authenticated user was refused while another session owns its
+/// persistent desktop.
+const PERSISTENT_SESSION_BUSY_REASON: &str =
+    DesktopBusyRefusal::PersistentSessionOwned.deck_reason();
 
 /// Takes the capacity-one session slot for an authenticated newcomer.
 ///
@@ -4626,9 +4631,7 @@ async fn run_ws(
                         );
                         send_critical_control(
                             &mut ws,
-                            close_with_reason(
-                                "another session owns this desktop; retry after it disconnects",
-                            ),
+                            close_with_reason(PERSISTENT_SESSION_BUSY_REASON),
                             "persistent_session_busy_close",
                         )
                         .await;
@@ -5351,6 +5354,33 @@ fn multi_monitor_attachment_must_terminate_desktop(
         })
 }
 
+/// The shared class of a terminal (not resume-held) attachment end.
+fn terminal_attachment_end(reason: SessionEndReason) -> TerminalAttachmentEnd {
+    match reason {
+        SessionEndReason::ClientClosed => TerminalAttachmentEnd::ClientClosed,
+        SessionEndReason::MediaEnded => TerminalAttachmentEnd::HostMediaFailure,
+        _ => TerminalAttachmentEnd::Other,
+    }
+}
+
+/// Whether a desktop created for a resumable attachment outlives its
+/// terminal end (shared `created_desktop_after_end`), unless the end proves
+/// a freshly committed multi-monitor plan cannot be served
+/// ([`multi_monitor_attachment_must_terminate_desktop`]).
+fn created_desktop_kept_after(
+    end: AttachmentEnd,
+    ever_usable: bool,
+    committed_multi_monitor_plan: Option<&LinuxTopologyPlan>,
+) -> bool {
+    created_desktop_after_end(terminal_attachment_end(end.reason))
+        == CreatedDesktopAfterEnd::KeepForSignIn
+        && !multi_monitor_attachment_must_terminate_desktop(
+            end.reached_usable,
+            ever_usable,
+            committed_multi_monitor_plan,
+        )
+}
+
 fn attachment_requires_fresh_idr(resumed: bool) -> bool {
     resumed
 }
@@ -5556,6 +5586,8 @@ async fn run_resumable_session(
     // the hold ends if it ends without a resume (`RESUME_HOLD_ENDED`).
     let mut held_since: Option<std::time::Instant> = None;
     let mut hold_end = ResumeHoldEnd::OwnerFailed;
+    // Whether the desktop outlives a terminal end (a host media failure).
+    let mut keep_desktop = false;
     'session: loop {
         let end = run_attachment(
             ws,
@@ -5619,6 +5651,14 @@ async fn run_resumable_session(
                 ReconnectEvent::NativeSessionEnded
             };
             let _ = reconnect.apply(event, session_registry.resume().monotonic_now());
+            if end.reached_usable {
+                lease.mark_multi_monitor_ever_usable();
+            }
+            keep_desktop = created_desktop_kept_after(
+                end,
+                lease.multi_monitor_ever_usable(),
+                lease.metadata.multi_monitor_plan.as_ref(),
+            );
             break;
         }
 
@@ -5993,31 +6033,105 @@ async fn run_resumable_session(
             "terminal resume slot drain failed"
         );
     }
-    if !display_is_held {
-        if let Some(resources) = display_resources.take() {
-            if session_registry
-                .hold_display(
-                    lease.metadata.generation,
-                    &lease.metadata.username,
-                    resources,
-                )
-                .is_err()
-            {
-                warn!(
-                    target: SESSION,
-                    "terminal display cleanup transfer failed; Drop fallback remains armed"
-                );
-            }
-        }
+    let unheld = if display_is_held {
+        None
+    } else {
+        display_resources.take()
+    };
+    settle_terminal_display(
+        session_registry.as_ref(),
+        lease.metadata.generation,
+        &lease.metadata.username,
+        unheld,
+        keep_desktop,
+    )
+    .await;
+    if keep_desktop {
+        tracing::info!(
+            target: SESSION,
+            "the attachment ended on a host media failure; the desktop is kept for the next sign-in"
+        );
+        lease.disconnect();
+    } else {
+        let termination = lease.start_terminate();
+        termination.wait().await;
     }
-    let termination = lease.start_terminate();
-    termination.wait().await;
     if let Err(error) = session_registry.resume().complete_drain(&active_session_id) {
         tracing::error!(
             target: SESSION,
             ?error,
             "terminal resume slot drain completion failed"
         );
+    }
+}
+
+/// Where a terminal attachment's display resources go: the registry that
+/// keeps or ends its desktop ([`SessionRegistry`]).
+trait TerminalDisplayHolder {
+    fn hold_display(
+        &self,
+        generation: u64,
+        username: &str,
+        resources: HeldDisplayResources,
+    ) -> Result<(), LifecycleError>;
+    fn take_held_display(
+        &self,
+        generation: u64,
+        username: &str,
+    ) -> Result<HeldDisplayResources, LifecycleError>;
+}
+
+impl TerminalDisplayHolder for SessionRegistry {
+    fn hold_display(
+        &self,
+        generation: u64,
+        username: &str,
+        resources: HeldDisplayResources,
+    ) -> Result<(), LifecycleError> {
+        Self::hold_display(self, generation, username, resources)
+    }
+
+    fn take_held_display(
+        &self,
+        generation: u64,
+        username: &str,
+    ) -> Result<HeldDisplayResources, LifecycleError> {
+        Self::take_held_display(self, generation, username)
+    }
+}
+
+/// Settles a terminal resumable attachment's display resources, which carry
+/// the capacity-one session slot (`unheld`: those not already held by the
+/// registry). A desktop kept for the next sign-in gives them back now, as
+/// every other disconnect does (a non-resumable attachment, a hand-over):
+/// parked with the kept desktop they would hold the slot until the desktop
+/// ended, and every sign-in, its owner's included, would be refused as busy.
+/// A desktop that ends hands them to the registry, whose teardown restores
+/// them.
+async fn settle_terminal_display(
+    holder: &impl TerminalDisplayHolder,
+    generation: u64,
+    username: &str,
+    unheld: Option<HeldDisplayResources>,
+    keep_desktop: bool,
+) {
+    if keep_desktop {
+        let resources = unheld.or_else(|| holder.take_held_display(generation, username).ok());
+        if let Some(mut resources) = resources {
+            resources.restore().await;
+        }
+        return;
+    }
+    if let Some(resources) = unheld {
+        if holder
+            .hold_display(generation, username, resources)
+            .is_err()
+        {
+            warn!(
+                target: SESSION,
+                "terminal display cleanup transfer failed; Drop fallback remains armed"
+            );
+        }
     }
 }
 
@@ -10169,6 +10283,8 @@ async fn run_attachment(
     let attachment_clock = Instant::now();
     let mut current_plan = media_plan.clone();
     let mut last_resize_apply: Option<Instant> = None;
+    // Sizes whose resized Wayland epoch failed: refused at once from then on.
+    let mut refused_resize_sizes = arcen_media::video::RefusedResizeSizes::new();
     let mut resize_open = true;
     let mut input_status = lock_recover(&input_controller)
         .as_ref()
@@ -10661,6 +10777,17 @@ async fn run_attachment(
                 if let (true, Some(ready), Some(lease)) =
                     (wayland_resizable, wayland_now.clone(), session_lease)
                 {
+                    if refused_resize_sizes.refuses(resolution.width, resolution.height) {
+                        send_display_update_result(
+                            &ctrl_tx,
+                            request.sequence,
+                            false,
+                            current_plan.width,
+                            current_plan.height,
+                            arcen_media::video::RESIZE_SIZE_REFUSED_REASON,
+                        );
+                        continue;
+                    }
                     // What the epoch being replaced served: a resize never
                     // upgrades a served contract (Speed only from evidence
                     // at session start), and may only downgrade Speed.
@@ -10687,14 +10814,13 @@ async fn run_attachment(
                         .and_then(|outputs| outputs.first())
                         .map(|output| output.density)
                         .unwrap_or_default();
-                    let next_generation = ready.generation.saturating_add(1);
                     info!(
                         target: DISPLAY,
                         sequence = request.sequence,
                         width = resolution.width,
                         height = resolution.height,
                         refresh_hz,
-                        generation = next_generation,
+                        generation = ready.generation.saturating_add(1),
                         reason = %request.reason,
                         "mid-session Wayland output resize begin"
                     );
@@ -10709,156 +10835,199 @@ async fn run_attachment(
                     if let Some(session) = capenc.take() {
                         session.shutdown().await;
                     }
-                    let configured = crate::session::wayland::output_client::configure(
-                        &ready,
-                        lease.metadata.uid,
-                        lease.metadata.agent_pid,
-                        next_generation,
-                        vec![crate::session::wayland::OutputPlacement {
-                            width: resolution.width,
-                            height: resolution.height,
-                            refresh_hz,
-                            x: 0,
-                            y: 0,
-                            // The display a window is resized on keeps its
-                            // density (and so the output its UI scale).
-                            width_mm: resize_density.width_mm,
-                            height_mm: resize_density.height_mm,
-                            logical_width: 0,
-                        }],
-                    )
-                    .await;
-                    // A refused transaction left the previous output in
-                    // place; the replacement epoch then captures that one.
-                    // The epoch that follows captures what the agent says is
-                    // live: the resized output, or what a refused transaction
-                    // kept (its reply, or a fresh `hello` when the exchange
-                    // itself failed). Never assume the previous facts.
-                    let (epoch_ready, refusal) = match configured {
-                        Ok(reply) => (ready.with_outputs(&reply), None),
-                        Err(crate::session::wayland::output_client::OutputClientError::Refused {
-                            reason,
-                            live,
-                        }) => {
-                            warn!(target: DISPLAY, %reason, generation = live.generation, "Wayland output resize refused; the live output is kept");
-                            (ready.with_outputs(&live), Some(format!("output resize failed: {reason}")))
-                        }
-                        Err(error) => {
-                            warn!(target: DISPLAY, %error, "Wayland output resize exchange failed; reading the live output");
-                            match crate::session::wayland::output_client::current(
-                                &ready,
-                                lease.metadata.uid,
-                                lease.metadata.agent_pid,
-                            )
-                            .await
-                            {
-                                Ok(live) => (
-                                    ready.with_outputs(&live),
-                                    Some(format!("output resize failed: {error}")),
-                                ),
-                                Err(error) => {
-                                    warn!(target: DISPLAY, %error, "Wayland session outputs unreadable after a resize; ending session media");
-                                    if ctrl_tx
-                                        .send_required(
-                                            close_with_reason("the desktop's displays could not be read on the host"),
-                                            "wayland_outputs_unreadable_close",
-                                        )
-                                        .await
-                                    {
-                                        let _ = ctrl_tx.barrier().await;
+                    // A resized epoch that cannot take over puts the output
+                    // back at the size this attachment streamed at and
+                    // streams on there (shared `resize_recovery`); a resize
+                    // never ends the user's session.
+                    let previous_size = (current_plan.width, current_plan.height);
+                    let mut target = (resolution.width, resolution.height);
+                    let mut live = ready.clone();
+                    let mut restored_after: Option<arcen_media::video::ResizeFailure> = None;
+                    let outcome = loop {
+                        let configured = crate::session::wayland::output_client::configure(
+                            &live,
+                            lease.metadata.uid,
+                            lease.metadata.agent_pid,
+                            live.generation.saturating_add(1),
+                            vec![crate::session::wayland::OutputPlacement {
+                                width: target.0,
+                                height: target.1,
+                                refresh_hz,
+                                x: 0,
+                                y: 0,
+                                // The display a window is resized on keeps its
+                                // density (and so the output its UI scale).
+                                width_mm: resize_density.width_mm,
+                                height_mm: resize_density.height_mm,
+                                logical_width: 0,
+                            }],
+                        )
+                        .await;
+                        // A refused transaction left the previous output in
+                        // place; the replacement epoch then captures that one.
+                        // The epoch that follows captures what the agent says is
+                        // live: the resized output, or what a refused transaction
+                        // kept (its reply, or a fresh `hello` when the exchange
+                        // itself failed). Never assume the previous facts.
+                        let (epoch_ready, refusal) = match configured {
+                            Ok(reply) => (live.with_outputs(&reply), None),
+                            Err(crate::session::wayland::output_client::OutputClientError::Refused {
+                                reason,
+                                live: kept,
+                            }) => {
+                                warn!(target: DISPLAY, %reason, generation = kept.generation, "Wayland output resize refused; the live output is kept");
+                                (live.with_outputs(&kept), Some(format!("output resize failed: {reason}")))
+                            }
+                            Err(error) => {
+                                warn!(target: DISPLAY, %error, "Wayland output resize exchange failed; reading the live output");
+                                match crate::session::wayland::output_client::current(
+                                    &live,
+                                    lease.metadata.uid,
+                                    lease.metadata.agent_pid,
+                                )
+                                .await
+                                {
+                                    Ok(kept) => (
+                                        live.with_outputs(&kept),
+                                        Some(format!("output resize failed: {error}")),
+                                    ),
+                                    Err(error) => {
+                                        warn!(target: DISPLAY, %error, "Wayland session outputs unreadable after a resize; ending session media");
+                                        break Err("the desktop's displays could not be read on the host");
                                     }
-                                    break SessionEndReason::MediaEnded;
+                                }
+                            }
+                        };
+                        let epoch: Result<_, arcen_media::video::ResizeFailure> = 'epoch: {
+                            use arcen_media::video::ResizeFailure;
+                            let Some(stream) = epoch_ready.streams.first().cloned() else {
+                                break 'epoch Err(ResizeFailure::NoStream);
+                            };
+                            let mut resize_config = active_capenc_config.clone();
+                            let wide = wayland_wide_streams(
+                                resize_config.bit_depth == arcen_media::BitDepth::Ten,
+                                &epoch_ready,
+                                lease,
+                            )
+                            .await;
+                            if let Some(execution) = resize_config.execution.as_mut() {
+                                follow_wayland_outputs(execution, &epoch_ready, wide.as_deref());
+                            }
+                            resize_config.width = stream.width;
+                            resize_config.height = stream.height;
+                            resize_config.encoder = concrete_encoder;
+                            let rates = cfg.wayland_speed_capture_rates(
+                                resize_config.execution.as_ref(),
+                                resize_config.width,
+                                resize_config.height,
+                            );
+                            resize_config.apply_resized_epoch_evidence(
+                                served_before,
+                                current_plan.fps,
+                                rates,
+                            );
+                            let (mut session, plan) = match capenc::spawn(resize_config.clone()).await {
+                                Ok(spawned) => spawned,
+                                Err(error) => {
+                                    warn!(
+                                        target: CAPENC,
+                                        %error,
+                                        "capenc after a Wayland output resize failed"
+                                    );
+                                    break 'epoch Err(ResizeFailure::CaptureFailedToStart);
+                                }
+                            };
+                            let served_after = session
+                                .capture_admission()
+                                .and_then(|notice| notice.served()?.epoch())
+                                .map(|epoch| epoch.pipeline);
+                            let downgrade_reason = session.capture_admission().and_then(|notice| {
+                                match notice.admission {
+                                    arcen_media::video::PresetAdmission::Downgrade { reason, .. } => {
+                                        Some(reason.token())
+                                    }
+                                    _ => None,
+                                }
+                            });
+                            if plan.width != stream.width
+                                || plan.height != stream.height
+                                || !resize_keeps_contract(current_plan, plan, served_before, served_after)
+                            {
+                                session.shutdown().await;
+                                warn!(
+                                    target: CAPENC,
+                                    current_fps = current_plan.fps,
+                                    replacement_fps = plan.fps,
+                                    downgrade_reason,
+                                    "replacement READY changed geometry or active media contract"
+                                );
+                                break 'epoch Err(ResizeFailure::ContractChanged);
+                            }
+                            match pump_replacement_epoch(&mut session, plan, &queue, mux_handle.clone(), &idr).await {
+                                Ok(replacement_pump) => Ok((
+                                    session,
+                                    plan,
+                                    replacement_pump,
+                                    resize_config,
+                                    served_after,
+                                    downgrade_reason,
+                                )),
+                                Err(()) => {
+                                    session.shutdown().await;
+                                    Err(ResizeFailure::NoKeyframe)
+                                }
+                            }
+                        };
+                        match epoch {
+                            Ok(epoch) => break Ok((epoch, epoch_ready, refusal)),
+                            Err(failure) => {
+                                queue.begin_generation();
+                                refused_resize_sizes.remember(resolution.width, resolution.height);
+                                match arcen_media::video::resize_recovery(restored_after.is_some()) {
+                                    arcen_media::video::ResizeRecovery::RestorePrevious => {
+                                        warn!(
+                                            target: DISPLAY,
+                                            reason = failure.token(),
+                                            width = previous_size.0,
+                                            height = previous_size.1,
+                                            "the resized output could not be served; restoring the size this attachment streamed at"
+                                        );
+                                        restored_after = Some(failure);
+                                        target = previous_size;
+                                        live = epoch_ready;
+                                    }
+                                    arcen_media::video::ResizeRecovery::EndAttachment => {
+                                        warn!(
+                                            target: DISPLAY,
+                                            reason = failure.token(),
+                                            "the restored output could not be served either; ending the attachment (the desktop is kept)"
+                                        );
+                                        break Err(failure.deck_reason());
+                                    }
                                 }
                             }
                         }
                     };
-                    let Some(stream) = epoch_ready.streams.first().cloned() else {
-                        break SessionEndReason::MediaEnded;
-                    };
-                    let mut resize_config = active_capenc_config.clone();
-                    let wide = wayland_wide_streams(
-                        resize_config.bit_depth == arcen_media::BitDepth::Ten,
-                        &epoch_ready,
-                        lease,
-                    )
-                    .await;
-                    if let Some(execution) = resize_config.execution.as_mut() {
-                        follow_wayland_outputs(execution, &epoch_ready, wide.as_deref());
-                    }
-                    resize_config.width = stream.width;
-                    resize_config.height = stream.height;
-                    resize_config.encoder = concrete_encoder;
-                    // Speed's evidence is per size: never carry the old one,
-                    // and never let it upgrade an epoch served as Auto.
-                    resize_config.capture_rates_by_codec = resize_speed_evidence(
-                        served_before,
-                        cfg.wayland_speed_capture_rates(
-                            resize_config.execution.as_ref(),
-                            resize_config.width,
-                            resize_config.height,
-                        ),
-                    );
-                    let (mut session, plan) = match capenc::spawn(resize_config.clone()).await {
-                        Ok(spawned) => spawned,
-                        Err(error) => {
-                            warn!(
-                                target: CAPENC,
-                                %error,
-                                "capenc after a Wayland output resize failed; ending session media"
-                            );
+                    let (
+                        (session, plan, replacement_pump, resize_config, served_after, downgrade_reason),
+                        epoch_ready,
+                        refusal,
+                    ) = match outcome {
+                        Ok(served) => served,
+                        Err(reason) => {
+                            if ctrl_tx
+                                .send_required(close_with_reason(reason), "wayland_resize_close")
+                                .await
+                            {
+                                let _ = ctrl_tx.barrier().await;
+                            }
                             break SessionEndReason::MediaEnded;
                         }
                     };
-                    let served_after = session
-                        .capture_admission()
-                        .and_then(|notice| notice.served()?.epoch())
-                        .map(|epoch| epoch.pipeline);
-                    let downgrade_reason = session.capture_admission().and_then(|notice| {
-                        match notice.admission {
-                            arcen_media::video::PresetAdmission::Downgrade { reason, .. } => {
-                                Some(reason.token())
-                            }
-                            _ => None,
-                        }
-                    });
-                    if plan.width != stream.width
-                        || plan.height != stream.height
-                        || !resize_keeps_contract(current_plan, plan, served_before, served_after)
-                    {
-                        session.shutdown().await;
-                        warn!(
-                            target: CAPENC,
-                            "replacement READY changed geometry or active media contract"
-                        );
-                        break SessionEndReason::MediaEnded;
-                    }
-                    idr.retarget(&session);
-                    let frames = session
-                        .take_frames()
-                        .expect("fresh capenc frames receiver available");
-                    let (keyframe_ready, keyframe_wait) = oneshot::channel();
-                    pump = spawn_frame_pump(
-                        plan,
-                        frames,
-                        queue.clone(),
-                        Some(keyframe_ready),
-                        0,
-                        0,
-                        0,
-                        mux_handle.clone(),
-                    );
-                    idr.request();
-                    if !matches!(
-                        tokio::time::timeout(Duration::from_secs(10), keyframe_wait).await,
-                        Ok(Ok(()))
-                    ) {
-                        session.shutdown().await;
-                        warn!(target: MEDIA, "replacement media generation did not produce an IDR");
-                        break SessionEndReason::MediaEnded;
-                    }
+                    pump = replacement_pump;
                     capenc = Some(CapencHandle::Single(session));
                     follow_content_stats(&content_stats, capenc.as_ref());
-                follow_pipeline_stats(&pipeline_stats, capenc.as_ref());
+                    follow_pipeline_stats(&pipeline_stats, capenc.as_ref());
                     speed_guard = speed_guard_for(capenc.as_ref(), &resize_config);
                     if served_before != served_after {
                         // Speed at a size this host has no evidence for:
@@ -10909,6 +11078,9 @@ async fn run_attachment(
                             }
                         }
                     }
+                    let refusal = restored_after
+                        .map(|failure| failure.deck_reason().to_owned())
+                        .or(refusal);
                     let written = match refusal.as_deref() {
                         None => {
                             send_authoritative_display_update_result(
@@ -11576,20 +11748,6 @@ fn served_pipeline_contract_for_quality(
         arcen_media::video::PipelineId::from_served_wire(&served)
             .map(arcen_media::video::pipeline_contract)
     })
-}
-
-/// The Speed evidence a resized Wayland epoch may use: none when the epoch
-/// it replaces was served as Auto (a resize never upgrades a contract mid
-/// attachment), the new size's otherwise.
-fn resize_speed_evidence(
-    served_before: Option<arcen_media::video::PipelineId>,
-    rates: Vec<(String, u32, arcen_media::video::CaptureRateEvidence)>,
-) -> Vec<(String, u32, arcen_media::video::CaptureRateEvidence)> {
-    if served_before == Some(arcen_media::video::PipelineId::Auto) {
-        Vec::new()
-    } else {
-        rates
-    }
 }
 
 /// Whether a resized epoch keeps the attachment's contract: only geometry
@@ -13650,6 +13808,28 @@ mod tests {
         assert!(!frame.reason.contains("authentication"));
     }
 
+    /// A newcomer refused for a busy desktop is closed with the shared words
+    /// a Deck reads as a busy host, whole (not cut to the close limit).
+    #[test]
+    fn a_busy_desktop_closes_with_the_shared_busy_reason() {
+        for (sent, refusal) in [
+            (SESSION_BUSY_REASON, DesktopBusyRefusal::AnotherDeckAttached),
+            (
+                PERSISTENT_SESSION_BUSY_REASON,
+                DesktopBusyRefusal::PersistentSessionOwned,
+            ),
+        ] {
+            let Message::Close(Some(frame)) = close_with_reason(sent) else {
+                panic!("a close frame");
+            };
+            assert_eq!(frame.reason.as_ref(), refusal.deck_reason());
+            assert_eq!(
+                DesktopBusyRefusal::from_reason(frame.reason.as_ref()),
+                Some(refusal)
+            );
+        }
+    }
+
     /// Re-review finding #2/#1: reloaded QoS targets must publish whenever
     /// the profile/QoS state itself was committed (`SighupOutcome::
     /// state_committed`), independent of TLS or any other combined SIGHUP
@@ -14138,7 +14318,7 @@ mod tests {
 
     #[test]
     fn a_resize_may_only_downgrade_wayland_speed_never_upgrade() {
-        use arcen_media::video::{CaptureRateEvidence, PipelineId};
+        use arcen_media::video::PipelineId;
         let speed = ResolvedMediaPlan {
             fps: 60,
             ..resolved_media_plan()
@@ -14163,21 +14343,27 @@ mod tests {
             Some(PipelineId::Speed),
             Some(PipelineId::Auto)
         ));
-        // Auto never becomes Speed on a resize: its evidence is withheld,
-        // so the smaller qualified size is served as Auto again.
-        let rates = vec![("h265".to_owned(), 60, CaptureRateEvidence::Measured)];
-        assert!(resize_speed_evidence(Some(PipelineId::Auto), rates.clone()).is_empty());
-        assert_eq!(
-            resize_speed_evidence(Some(PipelineId::Speed), rates.clone()),
-            rates
-        );
-        assert_eq!(resize_speed_evidence(None, rates.clone()), rates);
+        // Auto never becomes Speed on a resize, nor faster: the capture is
+        // asked for Auto at no more than Auto's served rate (see
+        // `apply_resized_epoch_evidence` and the test below), so the smaller
+        // qualified size is served as Auto at 30 again.
         let mut auto_smaller = auto_at_bigger;
         auto_smaller.width = 1600;
         auto_smaller.height = 1000;
         assert!(resize_keeps_contract(
             auto_at_bigger,
             auto_smaller,
+            Some(PipelineId::Auto),
+            Some(PipelineId::Auto)
+        ));
+        // Served faster than before, Auto would change the contract: that is
+        // why the request is capped rather than the comparison relaxed.
+        assert!(!resize_keeps_contract(
+            auto_at_bigger,
+            ResolvedMediaPlan {
+                fps: 60,
+                ..auto_smaller
+            },
             Some(PipelineId::Auto),
             Some(PipelineId::Auto)
         ));
@@ -14198,6 +14384,124 @@ mod tests {
             None
         ));
         assert!(!resize_keeps_contract(speed, auto_at_bigger, None, None));
+    }
+
+    /// What a Wayland capture serves for `config` at `width`x`height`: the
+    /// shared selection and admission capenc runs (`WaylandPipeline::select`
+    /// from the priority, `max_fps` from the requested rate, the host copy
+    /// rate-qualified only by the `capture-rate` evidence the Pier passed).
+    fn wayland_capture_serves(
+        config: &capenc::CapencConfig,
+        attached: ResolvedMediaPlan,
+        width: u32,
+        height: u32,
+    ) -> (ResolvedMediaPlan, arcen_media::video::PipelineId) {
+        use arcen_media::video::{
+            admit_capture_source, pipeline_for_epoch, AdmissionRequest, CaptureBackend,
+            CapturePixelFormat, CaptureSourceEvidence, CopyPath, CursorEvidence, EncoderCapability,
+            GpuMatch, PipelineId, SourceColour, SourceFact, StreamingPreset,
+        };
+        let preset = match pipeline_for_epoch(
+            config.video_selection,
+            attached.video,
+            config.motion_priority,
+        ) {
+            Some(PipelineId::Speed) => StreamingPreset::Speed,
+            Some(PipelineId::Auto) => StreamingPreset::Auto,
+            other => panic!("an SDR8 request selects Auto or Speed, not {other:?}"),
+        };
+        let qualified_rate = config
+            .capture_rates_by_codec
+            .iter()
+            .find(|(codec, _, _)| codec == &config.codec)
+            .map(|(_, rate, _)| *rate);
+        let source = CaptureSourceEvidence {
+            backend: CaptureBackend::PipeWire,
+            format: CapturePixelFormat::Bgrx8,
+            colour: SourceColour::UNKNOWN,
+            sample_precision: SourceFact::Unknown,
+            output_hdr_active: SourceFact::Unknown,
+            copy_path: CopyPath::HostCopy,
+            gpu: GpuMatch::Unknown,
+            sustained_fps: qualified_rate.map_or(SourceFact::Unknown, SourceFact::Authoritative),
+            cursor: CursorEvidence::Composited,
+        };
+        let admission = admit_capture_source(
+            AdmissionRequest {
+                preset,
+                requested_codec: VideoCodec::H264,
+                width,
+                height,
+                max_fps: config.fps,
+                sdr_transfer: arcen_media::TransferCharacteristics::Bt709,
+            },
+            &source,
+            &EncoderCapability {
+                backend: EncoderBackend::NativeNvenc,
+                limits: EncoderBackend::NativeNvenc.contract(),
+            },
+        );
+        let served = admission.served().expect("a host copy serves SDR8");
+        (
+            ResolvedMediaPlan {
+                width,
+                height,
+                fps: served.fps_ceiling,
+                ..attached
+            },
+            served.pipeline,
+        )
+    }
+
+    #[test]
+    fn a_speed_attachment_served_as_auto_by_a_resize_can_resize_back_at_autos_rate() {
+        use arcen_media::video::{CaptureRateEvidence, MotionPriority, PipelineId};
+        let qualified = |config: &capenc::CapencConfig, width: u32, height: u32| {
+            // The record holds 60 fps at A (1920x1080) and nothing at B.
+            if (width, height) == (1920, 1080) {
+                vec![(config.codec.clone(), 60, CaptureRateEvidence::Measured)]
+            } else {
+                Vec::new()
+            }
+        };
+        // Speed at 60 at A, pinned as the session pins its active config.
+        let start = capenc::test_support::wayland_config(60, true);
+        let (mut current_plan, mut served) = {
+            let mut first = start.clone();
+            first.capture_rates_by_codec = qualified(&first, 1920, 1080);
+            wayland_capture_serves(&first, resolved_media_plan(), 1920, 1080)
+        };
+        assert_eq!((served, current_plan.fps), (PipelineId::Speed, 60));
+        let mut active = start.pinned_to_active_plan(
+            &current_plan,
+            EncoderRequest::NativeNvenc,
+            EncodeIntent::Interactive,
+            MotionPriority::Motion,
+        );
+        // A -> B -> A, each epoch built as the resize path builds it.
+        let mut sizes = Vec::new();
+        for (width, height) in [(2560, 1440), (1920, 1080), (2560, 1440), (1920, 1080)] {
+            let mut resize_config = active.clone();
+            resize_config.width = width;
+            resize_config.height = height;
+            let rates = qualified(&resize_config, width, height);
+            resize_config.apply_resized_epoch_evidence(Some(served), current_plan.fps, rates);
+            let (plan, served_after) =
+                wayland_capture_serves(&resize_config, current_plan, width, height);
+            assert!(
+                resize_keeps_contract(current_plan, plan, Some(served), Some(served_after)),
+                "{width}x{height}: {served:?} at {} -> {served_after:?} at {}",
+                current_plan.fps,
+                plan.fps
+            );
+            sizes.push((served_after, plan.fps));
+            current_plan = plan;
+            served = served_after;
+            active = resize_config;
+        }
+        // Served as Auto at 30 from the first resize on, never upgraded,
+        // never raised, every size accepted.
+        assert_eq!(sizes, vec![(PipelineId::Auto, 30); 4]);
     }
 
     #[test]
@@ -14780,6 +15084,41 @@ mod tests {
             false,
             false,
             Some(&virtual_outputs)
+        ));
+    }
+
+    #[test]
+    fn a_resumable_attachment_ended_by_media_keeps_its_created_desktop() {
+        let usable = |reason| AttachmentEnd {
+            reason,
+            transport_loss_observed_at: None,
+            reached_usable: true,
+        };
+        // A resize or capture replacement that could not continue ended the
+        // GNOME session with it (e2e8-wayland-windowed-resize); it is kept.
+        assert!(created_desktop_kept_after(
+            usable(SessionEndReason::MediaEnded),
+            true,
+            None
+        ));
+        // An explicit disconnect still ends a created desktop, as documented.
+        assert!(!created_desktop_kept_after(
+            usable(SessionEndReason::ClientClosed),
+            true,
+            None
+        ));
+        assert!(!created_desktop_kept_after(
+            usable(SessionEndReason::ProtocolError),
+            true,
+            None
+        ));
+        // A freshly committed Xorg multi-monitor plan that never served is
+        // still not kept: it would fail the same way on every sign-in.
+        let plan = three_head_topology_plan();
+        assert!(!created_desktop_kept_after(
+            AttachmentEnd::terminal(SessionEndReason::MediaEnded),
+            false,
+            Some(&plan)
         ));
     }
 
@@ -16053,6 +16392,63 @@ mod tests {
                 &CorrelationId::from_uuid_v4_bytes([3; 16]),
             )
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_desktop_kept_after_a_media_failure_gives_the_session_slot_back() {
+        // A registry with the desktop: it takes what it is handed and gives
+        // back what it holds, as `SessionRegistry` does for a live desktop.
+        #[derive(Default)]
+        struct Desktop(StdMutex<Option<HeldDisplayResources>>);
+        impl TerminalDisplayHolder for Desktop {
+            fn hold_display(
+                &self,
+                _generation: u64,
+                _username: &str,
+                resources: HeldDisplayResources,
+            ) -> Result<(), LifecycleError> {
+                *self.0.lock().unwrap() = Some(resources);
+                Ok(())
+            }
+            fn take_held_display(
+                &self,
+                _generation: u64,
+                _username: &str,
+            ) -> Result<HeldDisplayResources, LifecycleError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or(LifecycleError::DisplayOwnership)
+            }
+        }
+        let held = |permits: &Arc<Semaphore>| {
+            HeldDisplayResources::new(None, Some(Arc::clone(permits).try_acquire_owned().unwrap()))
+        };
+        // Kept: the slot is free for the next sign-in at once, whether the
+        // attachment still had its display or the registry held it.
+        for registry_held in [false, true] {
+            let permits = Arc::new(Semaphore::new(1));
+            let desktop = Desktop::default();
+            let unheld = if registry_held {
+                desktop.hold_display(1, "artist", held(&permits)).unwrap();
+                None
+            } else {
+                Some(held(&permits))
+            };
+            settle_terminal_display(&desktop, 1, "artist", unheld, true).await;
+            assert!(desktop.0.lock().unwrap().is_none(), "{registry_held}");
+            assert!(
+                Arc::clone(&permits).try_acquire_owned().is_ok(),
+                "{registry_held}"
+            );
+        }
+        // Ended: the registry holds them until its teardown restores them.
+        let permits = Arc::new(Semaphore::new(1));
+        let desktop = Desktop::default();
+        settle_terminal_display(&desktop, 1, "artist", Some(held(&permits)), false).await;
+        assert!(desktop.0.lock().unwrap().is_some());
+        assert!(Arc::clone(&permits).try_acquire_owned().is_err());
     }
 
     #[tokio::test]

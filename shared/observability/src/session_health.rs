@@ -27,9 +27,9 @@ use arcen_protocol::messages::{
     NetworkInterfaceKind, NetworkScopeMsg, SampleWindowSecs,
 };
 use arcen_telemetry::{
-    FieldValue, HealthAssessment, HealthCause, HealthState, HealthTracker, HealthTrackerError,
-    HostCounterTotals, HostWindowTracker, LifecycleEventKind, QosSample, QosTargets,
-    StructuredFields, assess_health,
+    FieldValue, HealthAssessment, HealthCause, HealthSide, HealthState, HealthTracker,
+    HealthTrackerError, HostCounterTotals, HostWindowTracker, LifecycleEventKind, QosSample,
+    QosTargets, StructuredFields, assess_health,
 };
 
 /// Logs a change of the rate a Pier holds a session at (the shared
@@ -168,12 +168,31 @@ pub struct HealthObservation {
     pub clock_error: Option<HealthTrackerError>,
 }
 
-/// Per-session health state: the window tracker, the hysteresis tracker and
+/// Per-session health state: the window tracker, the hysteresis trackers and
 /// the last fresh client telemetry.
+///
+/// Each side keeps its own two-window hysteresis over its own windows: the
+/// host's every tick, the client's once per client sample. A Deck reports
+/// every five seconds and a Pier ticks every two, so one client window was
+/// judged on two or three ticks and a single window outside its targets
+/// passed the two-window rule by itself (seen live: one window of a motion
+/// burst committed `HEALTH_CRITICAL` on the Pier while the Deck itself
+/// stayed Ok). The session's committed state is the worse of the two.
 #[derive(Debug)]
 pub struct SessionHealth {
     targets: QosTargets,
-    tracker: HealthTracker,
+    host_tracker: HealthTracker,
+    client_tracker: HealthTracker,
+    committed: Option<HealthState>,
+    /// Each side's window when its tracker last committed: what a
+    /// transition the side holds reports (cause, value, threshold).
+    host_evidence: Option<(HealthSide, QosSample)>,
+    client_evidence: Option<(HealthSide, QosSample)>,
+    client_generation: u64,
+    client_assessed_generation: u64,
+    /// Consecutive ticks without client telemetry; the client side's
+    /// committed state is dropped after two, as any change must hold.
+    client_absent_ticks: u8,
     window: HostWindowTracker,
     client: Option<ClientTelemetrySnapshotMsg>,
     client_received_ms: Option<u64>,
@@ -189,7 +208,14 @@ impl SessionHealth {
     pub fn new(targets: QosTargets) -> Self {
         Self {
             targets,
-            tracker: HealthTracker::default(),
+            host_tracker: HealthTracker::default(),
+            client_tracker: HealthTracker::default(),
+            committed: None,
+            host_evidence: None,
+            client_evidence: None,
+            client_generation: 0,
+            client_assessed_generation: 0,
+            client_absent_ticks: 0,
             window: HostWindowTracker::default(),
             client: None,
             client_received_ms: None,
@@ -243,6 +269,7 @@ impl SessionHealth {
         if telemetry.is_some() {
             self.client = telemetry;
             self.client_received_ms = Some(timestamp_ms);
+            self.client_generation = self.client_generation.wrapping_add(1);
         } else {
             self.client = None;
             self.client_received_ms = None;
@@ -320,11 +347,7 @@ impl SessionHealth {
             ..QosSample::default()
         };
         apply_client_sample(&mut client_sample, self.client.as_ref());
-        sample.frames_decoded = client_sample.frames_decoded;
-        sample.frames_presented = client_sample.frames_presented;
-        sample.decode_time_ms = client_sample.decode_time_ms;
-        sample.display_time_ms = client_sample.display_time_ms;
-        sample.input_latency_ms = client_sample.input_latency_ms;
+        merge_client_facts(&mut sample, &client_sample);
 
         let host = assess_health(&sample, &self.targets).host_delivery;
         let client = assess_health(&client_sample, &self.targets).client_experience;
@@ -338,26 +361,20 @@ impl SessionHealth {
             },
         };
         let mut clock_error = None;
-        let transition = match self.tracker.update(timestamp_ms, &assessment) {
-            Ok(transition) => transition.map(|transition| {
-                let kind = match transition.current {
+        let transition = match self.commit(timestamp_ms, assessment, sample, client_sample) {
+            Ok(transition) => transition.map(|committed| {
+                let kind = match committed.current {
                     HealthState::Ok => LifecycleEventKind::HealthOk,
                     HealthState::Degraded => LifecycleEventKind::HealthDegraded,
                     HealthState::Critical => LifecycleEventKind::HealthCritical,
                 };
-                let transition_sample =
-                    if assessment.client_experience.state == Some(transition.current) {
-                        &client_sample
-                    } else {
-                        &sample
-                    };
                 let fields = transition_fields(
                     kind,
-                    transition.previous,
-                    transition.current,
+                    committed.previous,
+                    committed.current,
                     timestamp_ms,
-                    transition_sample,
-                    assessment,
+                    &committed.sample,
+                    (committed.kind, committed.side),
                     &self.targets,
                     &mut self.unhealthy_since_ms,
                 );
@@ -387,6 +404,88 @@ impl SessionHealth {
             bandwidth_mbps: window.bandwidth_mbps,
             clock_error,
         }
+    }
+
+    /// Advances each side's hysteresis (the client's only on a client sample
+    /// it has not judged yet) and returns a change of the session's
+    /// committed state, the worse of the two, with the window of the side
+    /// that holds it.
+    fn commit(
+        &mut self,
+        timestamp_ms: u64,
+        assessment: HealthAssessment,
+        sample: QosSample,
+        client_sample: QosSample,
+    ) -> Result<Option<CommittedChange>, HealthTrackerError> {
+        let host = self.host_tracker.update(
+            timestamp_ms,
+            &HealthAssessment {
+                host_delivery: assessment.host_delivery,
+                overall: assessment.host_delivery.state,
+                ..HealthAssessment::default()
+            },
+        );
+        if host.is_ok_and(|transition| transition.is_some()) {
+            self.host_evidence = Some((assessment.host_delivery, sample));
+        }
+        let client = if self.client.is_none() {
+            self.client_absent_ticks = self.client_absent_ticks.saturating_add(1);
+            if self.client_absent_ticks >= 2 {
+                self.client_tracker = HealthTracker::default();
+                self.client_evidence = None;
+            }
+            Ok(None)
+        } else {
+            self.client_absent_ticks = 0;
+            if self.client_generation == self.client_assessed_generation {
+                Ok(None)
+            } else {
+                self.client_assessed_generation = self.client_generation;
+                self.client_tracker.update(
+                    timestamp_ms,
+                    &HealthAssessment {
+                        client_experience: assessment.client_experience,
+                        overall: assessment.client_experience.state,
+                        ..HealthAssessment::default()
+                    },
+                )
+            }
+        };
+        if client.is_ok_and(|transition| transition.is_some()) {
+            self.client_evidence = Some((assessment.client_experience, client_sample));
+        }
+        host?;
+        client?;
+        let client_state = self.client_tracker.current();
+        let committed = match (self.host_tracker.current(), client_state) {
+            (Some(host), Some(client)) => Some(host.max(client)),
+            (state @ Some(_), None) | (None, state @ Some(_)) => state,
+            (None, None) => None,
+        };
+        let Some(current) = committed.filter(|state| Some(*state) != self.committed) else {
+            return Ok(None);
+        };
+        let previous = self.committed.replace(current);
+        let (kind, (side, sample)) = if client_state == Some(current) {
+            (
+                HealthSideKind::ClientExperience,
+                self.client_evidence
+                    .unwrap_or((assessment.client_experience, client_sample)),
+            )
+        } else {
+            (
+                HealthSideKind::HostDelivery,
+                self.host_evidence
+                    .unwrap_or((assessment.host_delivery, sample)),
+            )
+        };
+        Ok(Some(CommittedChange {
+            previous,
+            current,
+            kind,
+            side,
+            sample,
+        }))
     }
 
     /// Builds the outbound `health_stats` for one observation.
@@ -431,12 +530,25 @@ impl SessionHealth {
     }
 }
 
+/// The client's facts the host-delivery sample carries alongside its own.
+const fn merge_client_facts(sample: &mut QosSample, client: &QosSample) {
+    sample.frames_decoded = client.frames_decoded;
+    sample.frames_presented = client.frames_presented;
+    sample.frames_superseded = client.frames_superseded;
+    sample.frames_submitted_untimed = client.frames_submitted_untimed;
+    sample.decode_time_ms = client.decode_time_ms;
+    sample.display_time_ms = client.display_time_ms;
+    sample.input_latency_ms = client.input_latency_ms;
+}
+
 fn apply_client_sample(sample: &mut QosSample, telemetry: Option<&ClientTelemetrySnapshotMsg>) {
     let Some(qos) = telemetry.and_then(|telemetry| telemetry.qos.as_ref()) else {
         return;
     };
     sample.frames_decoded = qos.frames_decoded;
     sample.frames_presented = qos.frames_presented;
+    sample.frames_superseded = qos.frames_superseded;
+    sample.frames_submitted_untimed = qos.frames_submitted_untimed;
     sample.decode_time_ms = qos.decode_time_ms;
     sample.display_time_ms = qos.display_time_ms;
     sample.input_latency_ms = qos.input_send_time_ms;
@@ -610,7 +722,7 @@ fn transition_fields(
     current: HealthState,
     timestamp_ms: u64,
     sample: &QosSample,
-    assessment: HealthAssessment,
+    (selected, side): (HealthSideKind, HealthSide),
     targets: &QosTargets,
     unhealthy_since_ms: &mut Option<u64>,
 ) -> StructuredFields {
@@ -630,14 +742,6 @@ fn transition_fields(
         return fields;
     }
     unhealthy_since_ms.get_or_insert(timestamp_ms);
-    let (side, selected) = if assessment.client_experience.state == Some(current) {
-        (
-            assessment.client_experience,
-            HealthSideKind::ClientExperience,
-        )
-    } else {
-        (assessment.host_delivery, HealthSideKind::HostDelivery)
-    };
     let cause = side.dominant_cause.unwrap_or(HealthCause::Heartbeat);
     let (value, threshold) = cause_value_threshold(cause, selected, current, sample, targets);
     // Deliberately no `dominant_side` field: `HEALTH_DEGRADED`/`HEALTH_CRITICAL`
@@ -662,6 +766,16 @@ fn transition_fields(
 /// [`HealthCause`] is shared by both sides, so the cause alone does not say
 /// which counters produced it. Losing that distinction is what once let a
 /// host print a client presentation problem using host delivery numbers.
+/// A change of a session's committed state, with the window of the side
+/// that holds the new state.
+struct CommittedChange {
+    previous: Option<HealthState>,
+    current: HealthState,
+    kind: HealthSideKind,
+    side: HealthSide,
+    sample: QosSample,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HealthSideKind {
     HostDelivery,

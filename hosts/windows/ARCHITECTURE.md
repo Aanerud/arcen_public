@@ -503,7 +503,8 @@ before streaming.
 The agent then drives `arcen-session::deskside::DesksideProtection`: a dedicated
 native thread installs `WH_KEYBOARD_LL` and `WH_MOUSE_LL`, passes injected and
 lower-integrity-injected flags only when their process-random `dwExtraInfo`
-marker matches Arcen's injector, swallows physical or foreign injected
+marker matches Arcen's injector (32 bits: the mouse hook is given only the
+low 32 bits of `dwExtraInfo`), swallows physical or foreign injected
 keyboard/mouse, and runs a real message pump. `BlockInput` is never used. Hook
 liveness is proven for keyboard and mouse separately by bounded, swallowed,
 process-random canaries; SendInput failure, missed heartbeat, hook-thread exit,

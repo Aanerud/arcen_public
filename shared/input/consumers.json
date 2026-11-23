@@ -189,6 +189,7 @@
         "hid_digitizer",
         "hid_reports",
         "host_pointer",
+        "keyboard",
         "negotiation",
         "pen_axes",
         "pen_edges",

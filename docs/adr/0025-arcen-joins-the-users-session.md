@@ -904,8 +904,32 @@ The dedicated path is fixed where it stays:
 **The headless Wayland provider** (ADR 0015, `linux-wayland-provider.md`,
 hosts without an Xorg server such as Enterprise Linux 10) still creates
 one desktop per sign-in for an account with no session at the workstation
-(never beside one, §9): it lives in the Pier's registry for the reconnect
-window (`auth.reconnect_window_secs`) and an explicit disconnect ends it.
+(never beside one, §9). How long it lives depends on how its attachment
+ends (corrected 2026-11-23: this paragraph said the desktop lives for the
+reconnect window, which holds only for the first case):
+
+- An attachment that negotiated resume (the Deck app) and lost its
+  connection holds the desktop for the reconnect window
+  (`auth.reconnect_window_secs`, 180 s by default); a resume or the same
+  account's next sign-in rejoins it, and unresumed it is ended when the
+  window closes. An explicit disconnect ends it at once.
+- A failure on the host's side (capture or encode could not continue, a
+  resize that could not be served) never ends it: the attachment ends, its
+  display and the Pier's session slot are given back, and the desktop is
+  kept, disconnected, for the account's next sign-in (amended 2026-11-23,
+  `arcen_session::direct_reconnect::created_desktop_after_end`).
+- An attachment that did not negotiate resume (the Deck CLI, older Decks)
+  keeps the desktop, disconnected, however it ends; this was already so.
+
+A desktop kept disconnected, in the last two cases, has no time limit of
+its own, exactly like an Xorg desktop: it ends when its logind session
+ends (logout, `loginctl terminate-session`, its compositor exiting) or the
+Pier stops; a dead one is cleared at the next sign-in; and only when the
+operator sets `platform.session.disconnected_idle_timeout_secs` (Linux
+only, unset by default) is it torn down at the next sign-in after being
+disconnected that long. Until then the same account's sign-in rejoins it
+and another account's is refused as busy. A bound of its own is a
+follow-up; it must not end a desktop the user still needs.
 Making it persistent per user is tracked as `wayland-persistent-session`:
 the same model applies (the user's GNOME session started through
 `gnome-session` on the user's systemd manager, owned by logind, locked

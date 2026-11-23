@@ -496,9 +496,9 @@ fn client_presentation_loss_is_reported_with_the_client_value_not_host_zero() {
         field_string(&fields, "dominant_cause").as_deref(),
         Some("unpresented")
     );
-    // 2000 decoded, 1722 presented -> 278 unpresented, one still in flight
-    // at the window boundary -> 1385 basis points.
-    assert_eq!(field_integer(&fields, "value"), Some(1_385));
+    // 2000 decoded, 1722 presented -> 278 unpresented, two still in flight
+    // at the window boundary -> 1380 basis points.
+    assert_eq!(field_integer(&fields, "value"), Some(1_380));
     assert_eq!(
         field_integer(&fields, "threshold"),
         Some(i64::from(
@@ -524,7 +524,7 @@ fn client_presentation_loss_reports_unpresented_rather_than_zero_host_loss() {
         &sample,
         &targets,
     );
-    assert_eq!(value, 2_990, "expected 30% supersession in basis points");
+    assert_eq!(value, 2_980, "expected 30% supersession in basis points");
     assert_eq!(
         threshold,
         Some(u32::from(targets.drop_degraded_basis_points()))
@@ -605,7 +605,7 @@ fn the_two_sides_read_different_counters_for_the_same_cause() {
         )
         .0
     };
-    assert_eq!(value(HealthSideKind::ClientExperience), 4_990);
+    assert_eq!(value(HealthSideKind::ClientExperience), 4_980);
     assert_eq!(value(HealthSideKind::HostDelivery), 0);
 }
 
@@ -783,4 +783,217 @@ fn a_relay_fills_the_path_into_an_agent_s_health_stats_only() {
         )
         .is_none()
     );
+}
+
+/// A Pier judges a Deck's still-desktop window as the Deck does: the live
+/// macOS Deck's keepalives came back without presentation times
+/// (`fps 0 < 42` on a Linux Pier) and a Windows host's caret window left
+/// a few frames untimestamped (`unpresented` on the Windows Pier).
+#[test]
+fn a_deck_on_a_still_desktop_is_healthy_and_a_real_stall_is_not() {
+    let client_state = |qos: ClientQosSampleMsg| {
+        let mut health = SessionHealth::new(QosTargets::default());
+        health.record_client_at(1_000, client_qos(qos));
+        health
+            .observe(2_000, 60, sent(2))
+            .assessment
+            .client_experience
+            .state
+    };
+    // `untimed` of the superseded frames reached the compositor.
+    let window = |received: u64, presented: u64, superseded: Option<u64>, untimed: Option<u64>| {
+        ClientQosSampleMsg {
+            frames_received: Some(received),
+            frames_decoded: Some(received),
+            frames_presented: Some(presented),
+            frames_superseded: superseded,
+            frames_submitted_untimed: untimed,
+            sample_window_secs: SampleWindowSecs::try_from(5).ok(),
+            ..ClientQosSampleMsg::default()
+        }
+    };
+    // Keepalives the compositor returned without a timestamp.
+    assert_eq!(
+        client_state(window(5, 0, Some(5), Some(5))),
+        Some(HealthState::Ok)
+    );
+    assert_eq!(
+        client_state(window(11, 6, Some(0), Some(0))),
+        Some(HealthState::Ok)
+    );
+    assert_eq!(
+        client_state(window(11, 6, None, None)),
+        Some(HealthState::Ok)
+    );
+    // A Deck that predates `frames_superseded`: its untimestamped keepalives.
+    assert_eq!(
+        client_state(window(5, 0, None, None)),
+        Some(HealthState::Ok)
+    );
+    // Motion at sixty a second, all on the glass.
+    assert_eq!(
+        client_state(window(300, 298, Some(0), Some(0))),
+        Some(HealthState::Ok)
+    );
+    // Bunched arrivals, a few frames replaced by newer ones.
+    assert_eq!(
+        client_state(window(300, 292, Some(8), Some(0))),
+        Some(HealthState::Ok)
+    );
+    // Motion the Deck decoded but lost: a third never shown.
+    assert_eq!(
+        client_state(window(300, 200, Some(0), Some(0))),
+        Some(HealthState::Critical)
+    );
+    // A newest-wins pacer shedding a steady 9 % of moving content.
+    assert_eq!(
+        client_state(window(300, 273, Some(27), Some(0))),
+        Some(HealthState::Critical)
+    );
+    // A presenter that handled none of the keepalives is a stall.
+    assert_eq!(
+        client_state(window(5, 0, Some(0), Some(0))),
+        Some(HealthState::Critical)
+    );
+    // Nor did one whose worker kept replacing them: nothing reached the
+    // compositor.
+    assert_eq!(
+        client_state(window(5, 0, Some(5), Some(0))),
+        Some(HealthState::Critical)
+    );
+}
+
+/// One Deck window is judged once, however many Pier ticks see it: a single
+/// window outside its targets (here a motion burst's first window, seen
+/// live as `unpresented 757` committed on a Linux Pier) does not pass the
+/// two-window rule by itself; two consecutive client windows do.
+#[test]
+fn one_client_window_is_one_window_for_the_hysteresis() {
+    let lossy = || {
+        client_qos(ClientQosSampleMsg {
+            frames_received: Some(300),
+            frames_decoded: Some(300),
+            frames_presented: Some(260),
+            frames_superseded: Some(0),
+            sample_window_secs: SampleWindowSecs::try_from(5).ok(),
+            ..ClientQosSampleMsg::default()
+        })
+    };
+    let fine = || {
+        client_qos(ClientQosSampleMsg {
+            frames_received: Some(300),
+            frames_decoded: Some(300),
+            frames_presented: Some(300),
+            frames_superseded: Some(0),
+            sample_window_secs: SampleWindowSecs::try_from(5).ok(),
+            ..ClientQosSampleMsg::default()
+        })
+    };
+    let mut health = SessionHealth::new(QosTargets::default());
+    health.record_client_at(1_000, fine());
+    let mut kinds = Vec::new();
+    let tick = |health: &mut SessionHealth, kinds: &mut Vec<_>, at: u64| {
+        let observation = health.observe(at, 60, sent(at / 1_000 * 60));
+        assert_eq!(observation.clock_error, None);
+        if let Some((kind, _)) = observation.transition {
+            kinds.push((at, kind));
+        }
+    };
+    tick(&mut health, &mut kinds, 2_000);
+    tick(&mut health, &mut kinds, 4_000);
+    // One lossy window, seen on three ticks.
+    health.record_client_at(5_000, lossy());
+    tick(&mut health, &mut kinds, 6_000);
+    tick(&mut health, &mut kinds, 8_000);
+    tick(&mut health, &mut kinds, 10_000);
+    health.record_client_at(10_500, fine());
+    tick(&mut health, &mut kinds, 12_000);
+    tick(&mut health, &mut kinds, 14_000);
+    assert_eq!(kinds, [(4_000, LifecycleEventKind::HealthOk)]);
+    // Two lossy windows in a row commit.
+    health.record_client_at(15_000, lossy());
+    tick(&mut health, &mut kinds, 16_000);
+    health.record_client_at(20_000, lossy());
+    tick(&mut health, &mut kinds, 20_000);
+    assert_eq!(
+        kinds.last(),
+        Some(&(20_000, LifecycleEventKind::HealthCritical))
+    );
+}
+
+fn deck_window(presented: u64) -> Option<ClientTelemetrySnapshotMsg> {
+    client_qos(ClientQosSampleMsg {
+        frames_received: Some(300),
+        frames_decoded: Some(300),
+        frames_presented: Some(presented),
+        frames_superseded: Some(0),
+        sample_window_secs: SampleWindowSecs::try_from(5).ok(),
+        ..ClientQosSampleMsg::default()
+    })
+}
+
+/// Client telemetry that goes missing for one tick is a change like any
+/// other: the client side's committed state holds until two ticks agree.
+#[test]
+fn one_missing_client_sample_does_not_clear_the_client_state() {
+    let mut health = SessionHealth::new(QosTargets::default());
+    let kind = |observation: HealthObservation| observation.transition.map(|(kind, _)| kind);
+    health.record_client_at(1_000, deck_window(260));
+    assert_eq!(kind(health.observe(2_000, 60, sent(120))), None);
+    health.record_client_at(5_000, deck_window(260));
+    assert_eq!(
+        kind(health.observe(6_000, 60, sent(360))),
+        Some(LifecycleEventKind::HealthCritical)
+    );
+    health.record_client_at(7_000, None);
+    assert_eq!(kind(health.observe(8_000, 60, sent(480))), None);
+    assert_eq!(
+        kind(health.observe(10_000, 60, sent(600))),
+        Some(LifecycleEventKind::HealthOk)
+    );
+}
+
+/// A state the session falls back to reports the window that committed it,
+/// not the side's latest window.
+#[test]
+fn a_transition_reports_the_window_that_committed_its_state() {
+    let mut health = SessionHealth::new(QosTargets::default());
+    let lossy_host = |at: u64, dropped: u64| HostCounters {
+        frames_sent: at / 1_000 * 60,
+        frames_dropped: dropped,
+        ..HostCounters::default()
+    };
+    health.record_client_at(1_000, deck_window(290));
+    let _ = health.observe(2_000, 60, lossy_host(2_000, 120));
+    let critical = health.observe(4_000, 60, lossy_host(4_000, 240));
+    assert_eq!(
+        critical.transition.map(|(kind, _)| kind),
+        Some(LifecycleEventKind::HealthCritical)
+    );
+    health.record_client_at(5_000, deck_window(290));
+    assert!(
+        health
+            .observe(6_000, 60, lossy_host(6_000, 360))
+            .transition
+            .is_none()
+    );
+    // The client's next window is fine (one of two); the host recovers.
+    health.record_client_at(7_000, deck_window(300));
+    assert!(
+        health
+            .observe(8_000, 60, lossy_host(8_000, 360))
+            .transition
+            .is_none()
+    );
+    let (kind, fields) = health
+        .observe(10_000, 60, lossy_host(10_000, 360))
+        .transition
+        .expect("falls back to the client's degraded state");
+    assert_eq!(kind, LifecycleEventKind::HealthDegraded);
+    assert_eq!(
+        field_string(&fields, "dominant_cause").as_deref(),
+        Some("unpresented")
+    );
+    // 300 decoded, 290 shown, two in flight: 8 of 300.
+    assert_eq!(field_integer(&fields, "value"), Some(266));
 }

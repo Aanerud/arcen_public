@@ -609,7 +609,9 @@ async fn serve(
                 // Mutter may have restored Num Lock on as its seat started.
                 .with_locks(super::LockState::at_session_start(
                     super::input::read_remembered_num_lock(),
-                )),
+                ))
+                // While a Deck is attached the desktop does not go idle.
+                .with_attachment(binding.stack_mut().deck_attachment()),
         );
         // Characters the layout lacks need the compositor's `ei_text`
         // (libei 1.6); whether it offers one is read from its EIS seat.

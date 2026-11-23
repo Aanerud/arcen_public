@@ -508,6 +508,94 @@ fn bounded(text: &str) -> String {
         .collect()
 }
 
+/// The idle inhibitor a Pier-created desktop holds while a Deck shows it.
+///
+/// A Deck that is watched but not touched (a presentation, a render) sends
+/// no input, so the desktop would reach `idle-delay` and lock; on a desktop
+/// whose compositor runs on its own seat the lock stops every screen cast
+/// with the shell's remote access, and the desktop has nothing left to show.
+/// The session's own session manager therefore holds this inhibitor from
+/// the moment the Pier's session-bound input connection is served until it
+/// ends, exactly as a video player holds one: presence stays available, the
+/// shell's screen shield does not come up on idle, and the settings daemons
+/// see `InhibitedActions` with [`INHIBIT_IDLE`]. A manual lock still locks.
+/// The Deck's own computer locks its own screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeckAttachedInhibit {
+    cookie: Option<u32>,
+}
+
+/// Application id of [`DeckAttachedInhibit`]'s inhibitor.
+pub const DECK_ATTACHED_APP_ID: &str = "arcen";
+/// Reason of [`DeckAttachedInhibit`]'s inhibitor.
+pub const DECK_ATTACHED_REASON: &str = "A Deck is showing this desktop";
+/// Owner recorded for it: not a bus name, so no peer leaving the bus and no
+/// `Uninhibit` caller can remove it; only [`DeckAttachedInhibit::follow`].
+pub const DECK_ATTACHED_OWNER: &str = "arcen-pier";
+
+/// What [`DeckAttachedInhibit::follow`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckInhibitChange {
+    /// The inhibitor was added with this cookie.
+    Added(u32),
+    /// The inhibitor with this cookie was removed.
+    Removed(u32),
+}
+
+impl DeckAttachedInhibit {
+    /// None held.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { cookie: None }
+    }
+
+    /// The cookie held, if any.
+    #[must_use]
+    pub const fn cookie(&self) -> Option<u32> {
+        self.cookie
+    }
+
+    /// Holds the inhibitor while `attached`, releases it otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`RequestError::TooMany`] when the session already holds
+    /// [`MAX_INHIBITORS`]; nothing changes.
+    pub fn follow(
+        &mut self,
+        attached: bool,
+        inhibitors: &mut Inhibitors,
+    ) -> Result<Option<DeckInhibitChange>, RequestError> {
+        match (attached, self.cookie) {
+            (true, None) => {
+                let cookie = inhibitors.add(
+                    DECK_ATTACHED_APP_ID,
+                    DECK_ATTACHED_REASON,
+                    INHIBIT_IDLE,
+                    0,
+                    DECK_ATTACHED_OWNER,
+                )?;
+                self.cookie = Some(cookie);
+                Ok(Some(DeckInhibitChange::Added(cookie)))
+            }
+            (false, Some(cookie)) => {
+                self.cookie = None;
+                let _ = inhibitors.remove(cookie, DECK_ATTACHED_OWNER);
+                Ok(Some(DeckInhibitChange::Removed(cookie)))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Whether an input connection from `peer_uid` is a Deck's attachment: the
+/// Pier connects as root; the session user's own connections (lab tools)
+/// are not.
+#[must_use]
+pub const fn input_peer_is_attachment(peer_uid: u32) -> bool {
+    peer_uid == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +760,47 @@ mod tests {
         assert!(LogoutMode::NoConfirmation.shows_dialog(true));
         assert!(!LogoutMode::Force.shows_dialog(true));
         assert_eq!(LogoutMode::from_value(3), None);
+    }
+
+    #[test]
+    fn an_attached_deck_keeps_the_desktop_from_going_idle_until_it_detaches() {
+        let mut inhibitors = Inhibitors::default();
+        let mut presence = Presence::new(300);
+        let mut deck = DeckAttachedInhibit::new();
+        assert!(input_peer_is_attachment(0));
+        assert!(!input_peer_is_attachment(1001));
+
+        let Ok(Some(DeckInhibitChange::Added(cookie))) = deck.follow(true, &mut inhibitors) else {
+            panic!("attaching adds the inhibitor");
+        };
+        assert_eq!(deck.follow(true, &mut inhibitors), Ok(None), "held once");
+        presence.apply(PresenceEvent::IdleInhibited(
+            inhibitors.is_inhibited(INHIBIT_IDLE),
+        ));
+        // No idle watch, and a watch that fired anyway is not idleness: the
+        // shell's screen shield never comes up while the Deck is attached.
+        assert_eq!(presence.idle_watch_secs(), None);
+        assert_eq!(presence.apply(PresenceEvent::IdleWatchFired), None);
+        assert_eq!(presence.status(), PresenceStatus::Available);
+        // No bus peer can take it: not by leaving, not by `Uninhibit`.
+        assert!(inhibitors.remove_owner(":1.42").is_empty());
+        assert_eq!(
+            inhibitors.remove(cookie, ":1.42"),
+            Err(RequestError::NotFound)
+        );
+
+        assert_eq!(
+            deck.follow(false, &mut inhibitors),
+            Ok(Some(DeckInhibitChange::Removed(cookie)))
+        );
+        presence.apply(PresenceEvent::IdleInhibited(
+            inhibitors.is_inhibited(INHIBIT_IDLE),
+        ));
+        assert_eq!(presence.idle_watch_secs(), Some(300));
+        assert_eq!(
+            presence.apply(PresenceEvent::IdleWatchFired),
+            Some(PresenceStatus::Idle)
+        );
+        assert_eq!(deck.follow(false, &mut inhibitors), Ok(None));
     }
 }

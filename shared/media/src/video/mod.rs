@@ -30,6 +30,7 @@ pub mod pq_white;
 pub mod present;
 mod preset;
 mod qpmap;
+mod resize_epoch;
 #[cfg(feature = "software-av1-source")]
 mod software_av1;
 #[cfg(feature = "software-h264-source")]
@@ -169,6 +170,10 @@ pub use preset::{
 pub use qpmap::{
     KEEL_BLOCK_SIZE, MAX_ABS_QP_DELTA, QpBias, QpDeltaMapBuilder, QpMapError, QpMapGeometry,
     QpMapPolicy, QpMapStats,
+};
+pub use resize_epoch::{
+    REFUSED_RESIZE_SIZES, RESIZE_SIZE_REFUSED_REASON, RefusedResizeSizes, ResizeFailure,
+    ResizeRecovery, ResizedEpochRequest, resize_recovery, resized_epoch_request,
 };
 #[cfg(feature = "software-av1-source")]
 pub use software_av1::{

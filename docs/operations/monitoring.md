@@ -93,7 +93,9 @@ The three-state health rollup (`ok` / `degraded` / `critical`) uses two
 consecutive windows of unhealthy samples before declaring `degraded` or
 `critical` (hysteresis), and two consecutive healthy windows before
 declaring `ok` again — a single bad sample does not flip the state, and a
-single good sample does not clear a degraded/critical state either. Default
+single good sample does not clear a degraded/critical state either. A
+Pier counts each Deck sample as one window, however many of its own ticks
+see it. Default
 QoS thresholds: frame delivery below 90%/70% of the expected rate, RTT above
 60ms/150ms, drop rate above 50/500 basis points, input latency above
 50ms/120ms, or 3 missed heartbeats — first number is the `degraded`

@@ -250,10 +250,12 @@ pub struct CapencConfig {
     /// from a larger qualified one (`capture-rate-evidence=inferred:WxH`,
     /// sent only then).
     pub capture_rate_evidence: arcen_media::video::CaptureRateEvidence,
-    /// The host's Wayland Speed evidence per codec token (rate and what it
-    /// rests on), used when `capture_rate` is unset: the codec a session
-    /// finally encodes with is known only after the Deck's request, so the
-    /// argv takes the entry for [`Self::codec`] at spawn time.
+    /// The host's Wayland capture-rate evidence per codec token (rate and
+    /// what it rests on: Speed's admission and Auto above the unqualified
+    /// copy rate both need it), used when `capture_rate` is unset: the
+    /// codec a session finally encodes with is known only after the Deck's
+    /// request, so the argv takes the entry for [`Self::codec`] at spawn
+    /// time.
     pub capture_rates_by_codec: Vec<(String, u32, arcen_media::video::CaptureRateEvidence)>,
     /// The runtime guard found a Speed epoch of this attachment below
     /// Speed's floor (`speed-runtime=below-floor`): a Speed request is served
@@ -290,6 +292,25 @@ pub struct CapencConfig {
 }
 
 impl CapencConfig {
+    /// Gives a resized Wayland epoch the new size's capture-rate evidence
+    /// (Auto above the unqualified copy rate rests on it as much as Speed),
+    /// and asks for Auto at no more than `served_fps` when the epoch it
+    /// replaces was served as Auto at that rate, so that evidence never
+    /// upgrades it or raises its rate (shared `resized_epoch_request`).
+    pub fn apply_resized_epoch_evidence(
+        &mut self,
+        served_before: Option<arcen_media::video::PipelineId>,
+        served_fps: u32,
+        rates: Vec<(String, u32, arcen_media::video::CaptureRateEvidence)>,
+    ) {
+        let request = arcen_media::video::resized_epoch_request(served_before, served_fps);
+        if let arcen_media::video::ResizedEpochRequest::Auto { .. } = request {
+            self.motion_priority = arcen_media::video::MotionPriority::Detail;
+        }
+        self.fps = request.requested_fps(self.fps);
+        self.capture_rates_by_codec = rates;
+    }
+
     /// Parse the product codec token into the typed vocabulary.
     fn codec_enum(&self) -> Result<VideoCodec, CapencStartError> {
         match self.codec.as_str() {
@@ -2618,6 +2639,12 @@ pub(crate) mod test_support {
     pub(crate) fn fake_bitrate(idr: &IdrRequester) -> BitrateRequester {
         BitrateRequester::new(idr)
     }
+
+    /// What the Pier asks of a Wayland session (an Auto/Speed SDR8 request
+    /// at 1920x1080 with the session's capture hand-off).
+    pub(crate) fn wayland_config(fps: u32, motion: bool) -> super::CapencConfig {
+        super::tests::wayland_config(fps, motion, super::ScreenCastCursorMode::Embedded)
+    }
 }
 
 #[cfg(test)]
@@ -3390,7 +3417,11 @@ mod tests {
 
     /// What the Pier asks of a Wayland session: an Auto/Speed SDR8 request
     /// with the session's capture hand-off in the child's environment.
-    fn wayland_config(fps: u32, motion: bool, cursor: ScreenCastCursorMode) -> CapencConfig {
+    pub(super) fn wayland_config(
+        fps: u32,
+        motion: bool,
+        cursor: ScreenCastCursorMode,
+    ) -> CapencConfig {
         let identity = crate::session::identity::UserIdentity {
             username: "artist".into(),
             uid: 1001,
@@ -3566,6 +3597,39 @@ mod tests {
             .argv()
             .iter()
             .any(|argument| argument.starts_with("capture-rate")));
+    }
+
+    #[test]
+    fn a_resized_auto_epoch_keeps_its_rate_evidence_and_asks_for_auto() {
+        use arcen_media::video::{CaptureRateEvidence, PipelineId};
+        let inferred = CaptureRateEvidence::Inferred {
+            width: 1920,
+            height: 1080,
+        };
+        let rates = vec![("h264".to_owned(), 60, inferred)];
+        // A Speed request the session start served as Auto: the resized
+        // epoch carries the new size's rate (without it Auto is clamped to
+        // the unqualified copy rate and the resize ended the session) and
+        // asks for Auto, so the evidence cannot upgrade it to Speed.
+        let mut auto = wayland_config(60, true, ScreenCastCursorMode::Embedded);
+        auto.apply_resized_epoch_evidence(Some(PipelineId::Auto), 60, rates.clone());
+        let argv = auto.argv();
+        assert!(argv.contains(&"capture-rate=60".to_owned()), "{argv:?}");
+        assert!(argv.contains(&"capture-rate-evidence=inferred:1920x1080".to_owned()));
+        assert!(!argv.contains(&"priority=motion".to_owned()), "{argv:?}");
+        assert_eq!(auto.fps, 60);
+        // Auto served below the attachment's request asks for no more than
+        // it was served at.
+        let mut slower = wayland_config(60, true, ScreenCastCursorMode::Embedded);
+        slower.apply_resized_epoch_evidence(Some(PipelineId::Auto), 30, rates.clone());
+        assert_eq!(slower.fps, 30);
+        // An epoch served as Speed keeps its request and its evidence.
+        let mut speed = wayland_config(60, true, ScreenCastCursorMode::Embedded);
+        speed.apply_resized_epoch_evidence(Some(PipelineId::Speed), 30, rates);
+        assert_eq!(speed.fps, 60);
+        let argv = speed.argv();
+        assert!(argv.contains(&"capture-rate=60".to_owned()), "{argv:?}");
+        assert!(argv.contains(&"priority=motion".to_owned()), "{argv:?}");
     }
 
     #[test]

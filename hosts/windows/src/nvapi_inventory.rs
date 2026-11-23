@@ -725,7 +725,38 @@ pub fn inventory() -> Result<NvapiInventoryReport, String> {
 
 #[cfg(windows)]
 pub fn inventory() -> Result<NvapiInventoryReport, String> {
-    probe::inventory()
+    probe::inventory(false)
+}
+
+/// The part of [`inventory`] desk privacy judges: each GPU's
+/// virtualization mode, adapter LUID and display ids with their connected
+/// (cached and uncached) and active flags. No EDID is read and nothing else
+/// is enumerated, so a streaming session is disturbed as little as the
+/// uncached connection check allows.
+#[cfg(not(windows))]
+pub fn desk_inventory() -> Result<NvapiInventoryReport, String> {
+    inventory()
+}
+
+#[cfg(windows)]
+pub fn desk_inventory() -> Result<NvapiInventoryReport, String> {
+    probe::inventory(true)
+}
+
+/// What the NVIDIA driver last recorded as connected, per GPU (adapter
+/// LUID, then each display id with its flags, sorted): the cached
+/// `NvAPI_GPU_GetConnectedDisplayIds`, which reads the driver's hot-plug
+/// state and probes no connector. Desk privacy reads it with the CCD
+/// topology every second, so a monitor plugged into a head whose EDID
+/// Arcen overrides (which Windows' own topology need not show) is proved
+/// at once. `None` when NVAPI is not loaded (no NVIDIA driver).
+/// Per GPU: its adapter LUID (high, low) and each connected display id with
+/// its flags.
+pub type NvidiaConnected = Vec<(Option<(i32, u32)>, Vec<(u32, u32)>)>;
+
+#[cfg(windows)]
+pub fn desk_connected_cached() -> Option<NvidiaConnected> {
+    probe::desk_connected_cached()
 }
 
 #[cfg(windows)]
@@ -1026,7 +1057,53 @@ mod probe {
         (entries, CallOutcome::ok(call))
     }
 
-    pub(super) fn inventory() -> Result<NvapiInventoryReport, String> {
+    pub(super) fn desk_connected_cached() -> Option<NvidiaConnected> {
+        let loader = Loader::new().ok()?;
+        let mut calls = Vec::new();
+        let enumerate = loader.resolve::<EnumPhysicalGpusFn>(ID_ENUM_PHYSICAL_GPUS)?;
+        let get_connected =
+            loader.resolve::<GetConnectedDisplayIdsFn>(ID_GPU_GET_CONNECTED_DISPLAY_IDS)?;
+        let mut handles: [NvPhysicalGpuHandle; NVAPI_MAX_PHYSICAL_GPUS] =
+            [std::ptr::null_mut(); NVAPI_MAX_PHYSICAL_GPUS];
+        let mut count = 0u32;
+        // SAFETY: the array holds the documented maximum and count is writable.
+        if unsafe { enumerate(handles.as_mut_ptr(), &mut count) } != NVAPI_OK {
+            return Some(Vec::new());
+        }
+        let mut gpus: Vec<_> = handles
+            .iter()
+            .take((count as usize).min(NVAPI_MAX_PHYSICAL_GPUS))
+            .map(|handle| {
+                let luid = adapter_luid(&loader, *handle, &mut calls)
+                    .map(|luid| (luid.high_part, luid.low_part));
+                let (entries, outcome) = display_id_list(
+                    &loader,
+                    "NvAPI_GPU_GetConnectedDisplayIds(cached)",
+                    |ptr, count| {
+                        // SAFETY: handle came from NVAPI; ptr is either null (count
+                        // query) or a versioned array of `*count` entries.
+                        unsafe { get_connected(*handle, ptr, count, 0) }
+                    },
+                );
+                let mut displays: Vec<(u32, u32)> = if outcome.succeeded() {
+                    entries
+                        .iter()
+                        .map(|entry| (entry.display_id, entry.flags))
+                        .collect()
+                } else {
+                    // A failed read is a reading of its own: it differs from
+                    // any successful one, so the whole proof runs.
+                    vec![(u32::MAX, u32::MAX)]
+                };
+                displays.sort_unstable();
+                (luid, displays)
+            })
+            .collect();
+        gpus.sort();
+        Some(gpus)
+    }
+
+    pub(super) fn inventory(desk: bool) -> Result<NvapiInventoryReport, String> {
         let mut calls = Vec::new();
         let loader = match Loader::new() {
             Ok(loader) => loader,
@@ -1053,11 +1130,29 @@ mod probe {
             }
         };
 
+        if desk {
+            let gpus = gpus(&loader, &[], true, &mut calls);
+            return Ok(NvapiInventoryReport {
+                schema_version: SCHEMA_VERSION,
+                read_only: true,
+                nvapi_loaded: true,
+                driver_version: None,
+                driver_branch: None,
+                interface_version: None,
+                gdi_primary_display_id: None,
+                gpus,
+                nvapi_display_config: Vec::new(),
+                ccd_paths: Vec::new(),
+                unattached_displays: Vec::new(),
+                findings: evaluate_spare_targets(&[], &[], &[]),
+                calls,
+            });
+        }
         let (driver_version, driver_branch) = driver_version(&loader, &mut calls);
         let interface_version = interface_version(&loader, &mut calls);
         let gdi_primary_display_id = gdi_primary_display_id(&loader, &mut calls);
         let nvapi_display_config = nvapi_display_config(&mut calls);
-        let gpus = gpus(&loader, &nvapi_display_config, &mut calls);
+        let gpus = gpus(&loader, &nvapi_display_config, false, &mut calls);
         let unattached_displays = unattached_displays(&loader, &mut calls);
         let ccd_paths = ccd_paths(&mut calls);
         let findings = evaluate_spare_targets(&gpus, &nvapi_display_config, &ccd_paths);
@@ -1178,6 +1273,7 @@ mod probe {
     fn gpus(
         loader: &Loader,
         config: &[NvapiConfigPathEntry],
+        desk: bool,
         calls: &mut Vec<CallOutcome>,
     ) -> Vec<GpuEntry> {
         let call = "NvAPI_EnumPhysicalGPUs";
@@ -1203,7 +1299,7 @@ mod probe {
             .iter()
             .take((count as usize).min(NVAPI_MAX_PHYSICAL_GPUS))
             .enumerate()
-            .map(|(index, handle)| gpu_entry(loader, index as u32, *handle, &configured))
+            .map(|(index, handle)| gpu_entry(loader, index as u32, *handle, &configured, desk))
             .collect()
     }
 
@@ -1212,6 +1308,7 @@ mod probe {
         index: u32,
         handle: NvPhysicalGpuHandle,
         configured: &[u32],
+        desk: bool,
     ) -> GpuEntry {
         let mut calls = Vec::new();
         let full_name = gpu_short_string(
@@ -1294,7 +1391,7 @@ mod probe {
             active_outputs_mask,
             &mut calls,
         );
-        let displays = displays(loader, handle, &outputs, configured, &mut calls);
+        let displays = displays(loader, handle, &outputs, configured, desk, &mut calls);
 
         GpuEntry {
             index,
@@ -1537,6 +1634,7 @@ mod probe {
         handle: NvPhysicalGpuHandle,
         outputs: &[OutputEntry],
         configured: &[u32],
+        desk: bool,
         calls: &mut Vec<CallOutcome>,
     ) -> Vec<DisplayIdEntry> {
         let mut collected: Vec<DisplayIdEntry> = Vec::new();
@@ -1596,6 +1694,9 @@ mod probe {
                     "fake",
                 ),
             ] {
+                if desk && source == DisplayIdSource::ConnectedFake {
+                    continue;
+                }
                 let call = format!("NvAPI_GPU_GetConnectedDisplayIds({label})");
                 let (entries, outcome) = display_id_list(loader, &call, |ptr, count| {
                     // SAFETY: handle came from NVAPI; ptr is either null (count query) or a
@@ -1630,8 +1731,12 @@ mod probe {
         if gpu_and_output.is_none() {
             calls.push(loader.missing("NvAPI_SYS_GetGpuAndOutputIdFromDisplayId"));
         }
-        let get_edid = loader.resolve::<GetEdidFn>(ID_GPU_GET_EDID);
-        if get_edid.is_none() {
+        let get_edid = if desk {
+            None
+        } else {
+            loader.resolve::<GetEdidFn>(ID_GPU_GET_EDID)
+        };
+        if get_edid.is_none() && !desk {
             calls.push(loader.missing("NvAPI_GPU_GetEDID"));
         }
 

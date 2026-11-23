@@ -50,6 +50,16 @@ pub fn screen_is_locked() -> Option<bool> {
     native::screen_is_locked()
 }
 
+/// Whether this GUI session holds the console with its screen locked: its
+/// lock screen is what the console's keyboard types into. `false` for a
+/// session in the background (another account switched in), whose lock
+/// state is no business of keys that reach the console. `None` when the
+/// window server does not say.
+#[must_use]
+pub fn locked_on_console() -> Option<bool> {
+    native::locked_on_console()
+}
+
 /// This process's security session id: the audit session the window
 /// server's login session runs in, as the public `SessionGetInfo` reports it
 /// for `callerSecuritySession` (Security framework, `AuthSession.h`). Unique
@@ -157,27 +167,49 @@ mod native {
         }
     }
 
-    pub(super) fn screen_is_locked() -> Option<bool> {
+    /// Reads boolean keys of this session's dictionary (an absent or
+    /// non-boolean value reads `false`); `None` outside a GUI session or
+    /// when a key string cannot be made.
+    fn session_flags<const N: usize>(keys: [&std::ffi::CStr; N]) -> Option<[bool; N]> {
         // SAFETY: no arguments; the result follows the copy rule (released
         // below) and is null outside a GUI session.
         let session = unsafe { CGSessionCopyCurrentDictionary() };
         if session.is_null() {
             return None;
         }
-        let locked = CfString::new(c"CGSSessionScreenIsLocked").map(|key| {
+        let mut flags = Some([false; N]);
+        for (index, name) in keys.into_iter().enumerate() {
+            let Some(key) = CfString::new(name) else {
+                flags = None;
+                break;
+            };
             // SAFETY: `session` is a live dictionary and `key` a live string;
             // the value is borrowed from the dictionary, read before it is
             // released, and checked to be a boolean before it is read as one.
-            unsafe {
+            let set = unsafe {
                 let value = CFDictionaryGetValue(session, key.0);
                 !value.is_null()
                     && CFGetTypeID(value) == CFBooleanGetTypeID()
                     && CFBooleanGetValue(value) != 0
+            };
+            if let Some(flags) = flags.as_mut() {
+                flags[index] = set;
             }
-        });
+        }
         // SAFETY: owned under the copy rule, released once.
         unsafe { CFRelease(session) };
-        locked
+        flags
+    }
+
+    pub(super) fn screen_is_locked() -> Option<bool> {
+        session_flags([c"CGSSessionScreenIsLocked"]).map(|[locked]| locked)
+    }
+
+    pub(super) fn locked_on_console() -> Option<bool> {
+        // `kCGSessionOnConsoleKey` is `CFSTR("kCGSSessionOnConsoleKey")`
+        // (`CGSession.h`).
+        session_flags([c"CGSSessionScreenIsLocked", c"kCGSSessionOnConsoleKey"])
+            .map(|[locked, on_console]| locked && on_console)
     }
 
     pub(super) fn login_session_id() -> Option<u64> {
@@ -224,6 +256,10 @@ mod native {
     use super::LockError;
 
     pub(super) fn screen_is_locked() -> Option<bool> {
+        None
+    }
+
+    pub(super) fn locked_on_console() -> Option<bool> {
         None
     }
 

@@ -137,6 +137,10 @@ pub struct InputService {
     uid: u32,
     text: Arc<SessionText>,
     keyboard_woken: std::sync::atomic::AtomicBool,
+    /// Whether the connection served is a Deck's attachment (the shared
+    /// `input_peer_is_attachment`): the session manager's idle inhibitor
+    /// follows it.
+    attachment: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 /// `KEY_LEFTSHIFT`: pressed alone it types nothing.
@@ -149,6 +153,7 @@ struct Connection {
     reader: BoundedLineReader<BufReader<OwnedReadHalf>>,
     writer: OwnedWriteHalf,
     number: u64,
+    peer_uid: u32,
 }
 
 impl InputService {
@@ -167,7 +172,31 @@ impl InputService {
             uid,
             text: Arc::new(SessionText::default()),
             keyboard_woken: std::sync::atomic::AtomicBool::new(false),
+            attachment: None,
         })
+    }
+
+    /// Tells `attachment` whether the connection served is a Deck's
+    /// attachment, from accept to end (the session's idle inhibitor).
+    #[must_use]
+    pub fn with_attachment(mut self, attachment: Option<tokio::sync::watch::Sender<bool>>) -> Self {
+        self.attachment = attachment;
+        self
+    }
+
+    fn mark_attachment(&self, connection: Option<&Connection>) {
+        if let Some(attachment) = &self.attachment {
+            let attached = connection.is_some_and(|connection| {
+                arcen_session::desktop_session::manager::input_peer_is_attachment(
+                    connection.peer_uid,
+                )
+            });
+            attachment.send_if_modified(|current| {
+                let changed = *current != attached;
+                *current = attached;
+                changed
+            });
+        }
     }
 
     /// Types committed text with `text`'s knowledge of the session's layout.
@@ -202,7 +231,7 @@ impl InputService {
                 continue;
             }
             *number += 1;
-            return connection(stream, *number);
+            return connection(stream, *number, peer.unwrap_or(u32::MAX));
         }
     }
 
@@ -211,6 +240,7 @@ impl InputService {
     pub async fn serve<B: CompositorInput>(&self, backend: &B, session: &SessionFacts) {
         let mut number = 0;
         let mut current = self.accept(&mut number).await;
+        self.mark_attachment(Some(&current));
         tracing::info!(target: target::INPUT, connection = current.number, "input connection accepted");
         loop {
             // Only reading races a newer connection; a command being handled
@@ -234,6 +264,7 @@ impl InputService {
                     let _ = tokio::time::timeout(NOTICE_TIMEOUT, current.writer.write_all(&notice)).await;
                     self.release_held(backend).await;
                     current = next;
+                    self.mark_attachment(Some(&current));
                     continue;
                 }
                 line = current.reader.next_bounded_line() => line,
@@ -260,7 +291,9 @@ impl InputService {
                 Ok(None) | Err(_) => {
                     tracing::info!(target: target::INPUT, connection = current.number, "input connection ended");
                     self.release_held(backend).await;
+                    self.mark_attachment(None);
                     current = self.accept(&mut number).await;
+                    self.mark_attachment(Some(&current));
                     tracing::info!(target: target::INPUT, connection = current.number, "input connection accepted");
                     continue;
                 }
@@ -276,7 +309,9 @@ impl InputService {
             if !matches!(written, Ok(Ok(()))) {
                 tracing::warn!(target: target::INPUT, connection = current.number, "input reply could not be written; closing the connection");
                 self.release_held(backend).await;
+                self.mark_attachment(None);
                 current = self.accept(&mut number).await;
+                self.mark_attachment(Some(&current));
             }
         }
     }
@@ -567,12 +602,13 @@ impl InputService {
     }
 }
 
-fn connection(stream: UnixStream, number: u64) -> Connection {
+fn connection(stream: UnixStream, number: u64, peer_uid: u32) -> Connection {
     let (reader, writer) = stream.into_split();
     Connection {
         reader: BoundedLineReader::new(BufReader::new(reader)),
         writer,
         number,
+        peer_uid,
     }
 }
 
@@ -650,6 +686,51 @@ mod tests {
                 .ok()??;
             serde_json::from_str(&line).ok()
         }
+    }
+
+    #[tokio::test]
+    async fn the_attachment_follows_the_served_connection_and_ends_with_it() {
+        let dir = std::env::current_exe()
+            .unwrap()
+            .with_file_name(format!("arcen-input-attachment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("arcen-input.sock");
+        let uid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&dir).unwrap().uid()
+        };
+        let (attachment, mut attached) = tokio::sync::watch::channel(false);
+        let service = Arc::new(
+            InputService::bind(&path, uid)
+                .unwrap()
+                .with_attachment(Some(attachment)),
+        );
+        let backend = Arc::new(Recording::default());
+        let serving = tokio::spawn({
+            let service = Arc::clone(&service);
+            let backend = Arc::clone(&backend);
+            async move { service.serve(&*backend, &facts().into()).await }
+        });
+        // The Pier connects as root; a test run as root is that case, any
+        // other user's connection is not an attachment.
+        let expected = arcen_session::desktop_session::manager::input_peer_is_attachment(uid);
+        let mut client = Client::connect(&path).await;
+        assert!(client.send(&InputCommand::Hello).await.is_some());
+        assert_eq!(*attached.borrow_and_update(), expected);
+        drop(client);
+        if expected {
+            tokio::time::timeout(Duration::from_secs(5), attached.changed())
+                .await
+                .expect("the end of the connection is announced")
+                .unwrap();
+        }
+        assert!(
+            !*attached.borrow(),
+            "no attachment once the connection ended"
+        );
+        serving.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -484,6 +484,9 @@ trait DisplayBackend {
     }
 }
 
+/// Puts back the Windows UI scale step a session gave its display.
+type UiScaleRestore = Box<dyn FnOnce() + Send>;
+
 struct DisplayTransaction<B: DisplayBackend> {
     backend: B,
     target: DisplayTarget,
@@ -491,6 +494,11 @@ struct DisplayTransaction<B: DisplayBackend> {
     original: ModeState,
     report: DisplayReport,
     restore_state: Option<Arc<Mutex<RestoreJournal>>>,
+    /// Set when the session changed the display's UI scale step. Runs before
+    /// the mode is restored (the step belongs to the session's display) and
+    /// also when the mode was never changed: the desk gets its scale back
+    /// as it was (ADR 0025).
+    ui_scale_restore: Option<UiScaleRestore>,
 }
 
 #[derive(Debug)]
@@ -576,6 +584,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
                 &target,
             ),
             restore_state,
+            ui_scale_restore: None,
         };
 
         let already_satisfied = match policy {
@@ -1193,7 +1202,14 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
         result
     }
 
+    fn restore_ui_scale(&mut self) {
+        if let Some(restore) = self.ui_scale_restore.take() {
+            restore();
+        }
+    }
+
     pub(super) fn restore(&mut self) -> Result<(), String> {
+        self.restore_ui_scale();
         if self.snapshot.is_none() {
             return Ok(());
         }
@@ -1375,7 +1391,14 @@ impl DisplayTransaction<NativeBackend> {
                 && ui_scale_change_permitted(self.backend.professional_gpu())
             {
                 match windows_backend::apply_single_display_scale(&device_name, rect, ui_scale) {
-                    Ok(served) => ui_scale = served,
+                    Ok((applied, served)) => {
+                        ui_scale = served;
+                        if let Some(applied) = applied {
+                            self.ui_scale_restore = Some(Box::new(move || {
+                                windows_backend::restore_single_display_scale(&applied);
+                            }));
+                        }
+                    }
                     Err(error) => {
                         let restore = self.restore();
                         return Err(match restore {
@@ -1402,6 +1425,7 @@ impl DisplayTransaction<NativeBackend> {
 
 impl<B: DisplayBackend> Drop for DisplayTransaction<B> {
     fn drop(&mut self) {
+        self.restore_ui_scale();
         if self.snapshot.is_none() {
             return;
         }
@@ -2993,7 +3017,7 @@ mod windows_backend {
         source_id: u32,
     }
 
-    struct AppliedDpiScale {
+    pub(super) struct AppliedDpiScale {
         source: DisplaySourceKey,
         previous_relative: i32,
         previous_percent: u16,
@@ -4754,15 +4778,18 @@ mod windows_backend {
         ))
     }
 
+    /// Gives a single-display session's display the step for `ui_scale`;
+    /// returns what to put back when the session ends
+    /// ([`restore_single_display_scale`]) and the scale served.
     pub(super) fn apply_single_display_scale(
         device_name: &str,
         rect: DesktopRect,
         ui_scale: arcen_outputs::WindowsUiScale,
-    ) -> Result<arcen_outputs::WindowsUiScale, String> {
+    ) -> Result<(Option<AppliedDpiScale>, arcen_outputs::WindowsUiScale), String> {
         let path = active_source_path(device_name)?;
         let (Some(applied), ui_scale) = change_source_scale(device_name, &path, rect, ui_scale)?
         else {
-            return Ok(ui_scale);
+            return Ok((None, ui_scale));
         };
         tracing::info!(
             target: DISPLAY,
@@ -4773,7 +4800,27 @@ mod windows_backend {
             basis = ui_scale.basis.token(),
             "Windows UI scale applied and verified for single-display session"
         );
-        Ok(ui_scale)
+        Ok((Some(applied), ui_scale))
+    }
+
+    /// Puts back the step [`apply_single_display_scale`] changed. Windows
+    /// keeps a step per monitor identity (`PerMonitorSettings`), so a step
+    /// left behind outlives the session.
+    pub(super) fn restore_single_display_scale(scale: &AppliedDpiScale) {
+        match restore_applied_dpi_scale(scale) {
+            Ok(()) => tracing::info!(
+                target: DISPLAY,
+                device = %scale.device_name,
+                restored_scale_percent = scale.previous_percent,
+                "Windows UI scale restored after single-display session"
+            ),
+            Err(error) => tracing::warn!(
+                target: DISPLAY,
+                device = %scale.device_name,
+                %error,
+                "prior Windows UI scale could not be restored after single-display session"
+            ),
+        }
     }
 
     fn apply_monitor_dpi_scale(
@@ -11032,6 +11079,7 @@ mod tests {
         Isolate,
         Restore,
         Disarm,
+        UiScaleRestore,
     }
 
     struct FakeBackend {
@@ -11305,6 +11353,48 @@ mod tests {
             *calls.lock().unwrap(),
             vec![Call::Select(3), Call::Snapshot, Call::Current]
         );
+    }
+
+    #[test]
+    fn the_ui_scale_a_session_set_is_put_back_before_the_mode_and_on_an_unchanged_mode() {
+        // An unchanged mode: the session changed only the desk display's
+        // scale step, and must give it back.
+        let backend = FakeBackend::new(size(1920, 1080));
+        let calls = Arc::clone(&backend.calls);
+        let mut transaction = DisplayTransaction::acquire(backend, 0, size(1920, 1080)).unwrap();
+        let scale_calls = Arc::clone(&calls);
+        transaction.ui_scale_restore = Some(Box::new(move || {
+            scale_calls.lock().unwrap().push(Call::UiScaleRestore);
+        }));
+        transaction.restore().unwrap();
+        transaction.restore().unwrap();
+        drop(transaction);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                Call::Select(0),
+                Call::Snapshot,
+                Call::Current,
+                Call::UiScaleRestore
+            ],
+            "the scale is put back once"
+        );
+
+        // A changed mode dropped without an explicit restore: the scale
+        // goes back first, then the mode.
+        let mut backend = FakeBackend::new(size(1680, 1050));
+        backend.applies.push_back(Ok(mode(size(1920, 1080), 0)));
+        let calls = Arc::clone(&backend.calls);
+        let mut transaction = DisplayTransaction::acquire(backend, 0, size(1920, 1080)).unwrap();
+        let before = calls.lock().unwrap().len();
+        let scale_calls = Arc::clone(&calls);
+        transaction.ui_scale_restore = Some(Box::new(move || {
+            scale_calls.lock().unwrap().push(Call::UiScaleRestore);
+        }));
+        drop(transaction);
+        let after = calls.lock().unwrap()[before..].to_vec();
+        assert_eq!(after.first(), Some(&Call::UiScaleRestore));
+        assert!(after.contains(&Call::Restore));
     }
 
     #[test]

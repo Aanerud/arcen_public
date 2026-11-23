@@ -386,6 +386,36 @@ fn log_window_presenter_state(
     );
 }
 
+/// Where a dedicated layer showing the picture the UI laid out at `rect`
+/// (egui: top-left, y-down) goes among the content view's sublayers.
+///
+/// AppKit geometry-flips a layer-backed view's layer to match the view, so
+/// sublayer frames are in the view's own coordinates: y-down in winit's
+/// flipped content view, y-up in an unflipped one. Both come from the one
+/// picture rectangle the pointer is mapped through
+/// (`arcen_deck_core::present::fit`); reading the frame as y-up in winit's
+/// view drew a windowed picture one session toolbar above where clicks
+/// landed.
+fn layer_rect_in_view(rect: egui::Rect, view_height: f64, view_flipped: bool) -> CGRect {
+    use arcen_deck_core::present::fit::ViewYAxis;
+    let y_axis = if view_flipped {
+        ViewYAxis::Down
+    } else {
+        ViewYAxis::Up
+    };
+    let frame = super::app::picture_rect(rect).layer_frame(view_height, y_axis);
+    CGRect {
+        origin: CGPoint {
+            x: frame.x,
+            y: frame.y,
+        },
+        size: CGSize {
+            width: frame.width,
+            height: frame.height,
+        },
+    }
+}
+
 /// The presenter window facts worth a log line when they change.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WindowStateKey {
@@ -2522,6 +2552,9 @@ struct DedicatedPresenterTelemetry {
     presented_time_unconfirmed: AtomicU64,
     dropped_overflow: AtomicU64,
     dropped_stale: AtomicU64,
+    /// `dropped_overflow` plus `dropped_stale`, taken for session health
+    /// with the presentations (the log takes the other two).
+    superseded_for_health: AtomicU64,
     dropped_hidden: AtomicU64,
     underruns: AtomicU64,
     queue_depth_samples: AtomicU64,
@@ -2559,16 +2592,14 @@ impl DedicatedPresenterTelemetry {
             after.frames_received.saturating_sub(before.frames_received),
             Ordering::Relaxed,
         );
-        self.dropped_overflow.fetch_add(
-            after
-                .dropped_overflow
-                .saturating_sub(before.dropped_overflow),
-            Ordering::Relaxed,
-        );
-        self.dropped_stale.fetch_add(
-            after.dropped_stale.saturating_sub(before.dropped_stale),
-            Ordering::Relaxed,
-        );
+        let overflow = after
+            .dropped_overflow
+            .saturating_sub(before.dropped_overflow);
+        let stale = after.dropped_stale.saturating_sub(before.dropped_stale);
+        self.dropped_overflow.fetch_add(overflow, Ordering::Relaxed);
+        self.dropped_stale.fetch_add(stale, Ordering::Relaxed);
+        self.superseded_for_health
+            .fetch_add(overflow.saturating_add(stale), Ordering::Relaxed);
         self.dropped_hidden.fetch_add(
             after.dropped_hidden.saturating_sub(before.dropped_hidden),
             Ordering::Relaxed,
@@ -2688,6 +2719,7 @@ impl DedicatedPresenterTelemetry {
         DedicatedPresentations {
             frames_confirmed: self.frames_confirmed.swap(0, Ordering::Relaxed),
             presented_time_unconfirmed: self.presented_time_unconfirmed.swap(0, Ordering::Relaxed),
+            frames_superseded: self.superseded_for_health.swap(0, Ordering::Relaxed),
             confirmed_presented_at: self
                 .confirmed_presented_at
                 .lock()
@@ -3872,17 +3904,7 @@ impl DedicatedEightBitVideoPresenter {
             return self.record_outcome(DedicatedLayerOutcome::NoContentView);
         };
         let display_id = display_id_for_window(&window);
-        let bounds = view.bounds();
-        let content_rect = CGRect {
-            origin: CGPoint {
-                x: f64::from(rect.left()),
-                y: bounds.size.height - f64::from(rect.bottom()),
-            },
-            size: CGSize {
-                width: f64::from(rect.width()),
-                height: f64::from(rect.height()),
-            },
-        };
+        let content_rect = layer_rect_in_view(rect, view.bounds().size.height, view.isFlipped());
         let contents_scale = window.backingScaleFactor();
         let key = WindowStateKey {
             rect: content_rect,
@@ -4149,17 +4171,7 @@ impl DedicatedVideoPresenter {
             return self.record_outcome(DedicatedLayerOutcome::NoContentView);
         };
         let display_id = display_id_for_window(&window);
-        let bounds = view.bounds();
-        let content_rect = CGRect {
-            origin: CGPoint {
-                x: f64::from(rect.left()),
-                y: bounds.size.height - f64::from(rect.bottom()),
-            },
-            size: CGSize {
-                width: f64::from(rect.width()),
-                height: f64::from(rect.height()),
-            },
-        };
+        let content_rect = layer_rect_in_view(rect, view.bounds().size.height, view.isFlipped());
         let contents_scale = window.backingScaleFactor();
         let key = WindowStateKey {
             rect: content_rect,
@@ -4308,6 +4320,59 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
     use std::thread::ThreadId;
+
+    /// A windowed session (1120 × 760 pt content, the 28-pt session toolbar
+    /// on top): the layer lands where the pointer is mapped, in winit's
+    /// flipped content view and in an unflipped one, on a Retina and a 1x
+    /// display. 0.20.8 drew it 28 pt higher in the flipped view.
+    #[test]
+    fn a_windowed_picture_is_drawn_below_the_toolbar_where_clicks_land() {
+        const VIEW_H: f64 = 760.0;
+        let container = egui::Rect::from_min_max(egui::pos2(0.0, 28.0), egui::pos2(1120.0, 760.0));
+        let host = [1800_usize, 1168];
+        for ppp in [2.0_f32, 1.0] {
+            let picture = super::super::app::aspect_fit_rect(container, Some(host), ppp);
+            assert!(picture.top() >= 28.0, "{picture:?}");
+            for flipped in [true, false] {
+                let frame = layer_rect_in_view(picture, VIEW_H, flipped);
+                // The layer's visible top edge, in egui's (window) points.
+                let shown_top = if flipped {
+                    frame.origin.y
+                } else {
+                    VIEW_H - frame.origin.y - frame.size.height
+                };
+                assert!(
+                    (shown_top - f64::from(picture.top())).abs() < 1e-4,
+                    "ppp {ppp} flipped {flipped}: layer top {shown_top}, picture {picture:?}"
+                );
+                assert!((frame.origin.x - f64::from(picture.left())).abs() < 1e-4);
+                assert!((frame.size.width - f64::from(picture.width())).abs() < 1e-4);
+                assert!((frame.size.height - f64::from(picture.height())).abs() < 1e-4);
+                // A click on host pixel (300, 300) where the layer shows it
+                // reaches host pixel (300, 300).
+                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                let (cx, cy) = (
+                    (frame.origin.x + 300.0 * frame.size.width / host[0] as f64) as f32,
+                    (shown_top + 300.0 * frame.size.height / host[1] as f64) as f32,
+                );
+                let (fx, fy) = super::super::app::picture_rect(picture)
+                    .fraction(cx, cy)
+                    .expect("a picture");
+                #[allow(clippy::cast_precision_loss)]
+                let (hx, hy) = (fx * host[0] as f64, fy * host[1] as f64);
+                assert!(
+                    (hx - 300.0).abs() <= 0.5 && (hy - 300.0).abs() <= 0.5,
+                    "ppp {ppp} flipped {flipped}: click reached ({hx}, {hy})"
+                );
+            }
+        }
+        // Fullscreen (the picture fills the view) is the same either way.
+        let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1120.0, 760.0));
+        assert_eq!(
+            layer_rect_in_view(full, VIEW_H, true),
+            layer_rect_in_view(full, VIEW_H, false)
+        );
+    }
 
     #[derive(Debug, Clone, PartialEq)]
     enum GeometryCall {
@@ -4995,10 +5060,19 @@ mod tests {
             telemetry.record_confirmed();
         }
         telemetry.record_presented_time_unconfirmed();
+        telemetry.add_pacer_delta(
+            FramePacerCounters::default(),
+            FramePacerCounters {
+                dropped_overflow: 3,
+                dropped_stale: 1,
+                ..FramePacerCounters::default()
+            },
+        );
 
         let taken = telemetry.take_presentations();
         assert_eq!(taken.frames_confirmed, 3);
         assert_eq!(taken.presented_time_unconfirmed, 1);
+        assert_eq!(taken.frames_superseded, 4);
         assert_eq!(taken.confirmed_presented_at.len(), 3);
         assert_eq!(
             telemetry.take_presentations(),
@@ -5011,6 +5085,7 @@ mod tests {
         assert_eq!(logged.presented_time_unconfirmed, 0);
         assert!(logged.confirmed_presented_at.is_empty());
         assert!(logged.latency_p50_us.is_some());
+        assert_eq!((logged.dropped_overflow, logged.dropped_stale), (3, 1));
     }
 
     #[test]
