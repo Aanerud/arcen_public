@@ -1,10 +1,9 @@
 # ADR 0021: Bridged USB tablets on their own seat; X11 desktops take them as static devices
 
-**Status:** Accepted; shipped in 0.19.0 (first proposed 2026-11-10 for lab
-builds). Implemented
-for dedicated Xorg desktops on the Linux Pier and lab-proven on Rocky Linux 9
-(Xorg 1.20, GDM greeter on `seat0`) with an emulated Wacom Intuos5, over both
-the in-tree `vhci-hcd` and the lab `usb-vhci` controller. Native-seat Wayland
+**Status:** Accepted; first proposed 2026-11-10, shipped in 0.19.0.
+Implemented for dedicated Xorg desktops on the Linux Pier (Xorg 1.20, GDM
+greeter on `seat0`), over both the in-tree `vhci-hcd` and the out-of-tree
+`usb-vhci` controller. Native-seat Wayland
 desktops use the same seat rule with their own seat
 ([ADR 0020](0020-linux-native-tablet-in-tree-vhci-hcd.md)); see the amendment
 of 2026-11-12 for their pen contact and the Deck's cursor.
@@ -22,15 +21,12 @@ security model of this record is what an administrator enables: only a
 device classified as a pen tablet is attached, only to the signed-in user's
 own desktop (X11: tagged for that X server alone; native-seat Wayland: that
 desktop's seat), never to `seat0`'s console or another user's session.
-Proven with a real Wacom Intuos5 bridged from a Mac Deck, on a Rocky Linux 9
-X11 host and a Rocky Linux 10 GNOME Wayland host: hot-plug on the first
-connection, the Deck-drawn pen dot, drawing, hand-back. Drawing in browsers
-needed `PressureRecalibration` off (see the 41 ms measurement below), first
-proven with replayed pressing landings in Firefox and Chrome. Native-seat
-Wayland is also proven
-with the emulated Intuos5 (drawing with pressure in Firefox and Chrome on
-Rocky 10 GNOME; the Pier reads the bridged pen's evdev node read-only so
-the Deck's cursor follows it). Known limits there: Mutter squares stylus
+A bridged tablet hot-plugs on the first connection, draws, shows the
+Deck-drawn pen dot and is handed back, on X11 and on native-seat GNOME
+Wayland desktops. Drawing in browsers on X11 needs `PressureRecalibration`
+off (amendment of 2026-11-11). On native-seat Wayland the Pier reads the
+bridged pen's evdev node read-only so the Deck's cursor follows it. Known
+limits there: Mutter squares stylus
 pressure on its default curve, a tablet remapped in GNOME Settings offsets
 the Deck's cursor, and a multi-output desktop reports no cursor positions.
 
@@ -65,7 +61,7 @@ Three facts constrain the fix:
    `config/udev.c check_seat`); `Xorg -seat` is not viable on the shared GPU.
 2. A static `InputDevice` section is opened when Xorg starts, and
    xf86-input-libinput looks a path up by its exact udev device node, so a
-   section cannot be pointed at a device that appears later (lab-tested:
+   section cannot be pointed at a device that appears later (tested:
    symlinks and placeholders fail with "Failed to look up path").
 3. The Deck names its tablet in its hello, which follows the Pier's hello,
    which follows the desktop's creation. The Pier therefore never knows the
@@ -77,7 +73,7 @@ Three facts constrain the fix:
    connected, the privileged helper installs a volatile rule,
    `/run/udev/rules.d/72-arcen-usb-bridge-<id>.rules`, that matches exactly
    that port's subtree by `DEVPATH` (`vhci_hcd.N` first, `usb_vhci_hcd.N` as
-   the lab fallback) and sets `ID_SEAT` to an Arcen seat, removes `uaccess`
+   the out-of-tree fallback) and sets `ID_SEAT` to an Arcen seat, removes `uaccess`
    and keeps the device powered. It also gives every event node a link that
    carries the bridge's random seat id,
    `/dev/input/arcen-bridge-usb-<id>-eventN`, which udev removes with the
@@ -261,8 +257,8 @@ Native tablet must work on an X11 desktop on the first connection.
   Rejected.
 - **`Xorg -seat` per desktop with the tablet on that seat:** a non-`seat0`
   server silently skips foreign devices, and GDM's log would not even
-  mention the tablet. But the lab's NVIDIA server failed with "No devices
-  detected", and the session's own uinput devices would have to move to that
+  mention the tablet. But an NVIDIA server tried this way failed with "No
+  devices detected", and the session's own uinput devices would have to move to that
   seat too. Not pursued now.
 - **Starting Xorg with the device present:** needs the tablet before the
   desktop, which the protocol cannot give without an authentication-time
@@ -284,19 +280,15 @@ Native tablet must work on an X11 desktop on the first connection.
 - A tablet on a desk is read every few milliseconds, so the first sample in
   proximity is a hover at zero. A bridged tablet is read once per round trip:
   Linux `usbhid` keeps one interrupt transfer in flight, and each completion
-  crosses the network (lab: one pen report every 41 ms at a 32 ms Deck-Pier
-  round trip). A pen put down at an ordinary speed then often arrives
-  already in contact.
-- Lab (Rocky 9.7, Firefox 140 ESR and Chrome 155, a uinput twin of the bridged Intuos Pro
-  L pen node replaying 36 ms samples into the desktop through the same
-  `arcen_bridge_N` class): a stroke that hovers first draws one stroke with
-  pressure about 0.47; the same stroke landing in contact reports pressure
-  0.01-0.04 and breaks into two or three short `pointerdown`/`pointerup`
-  segments. A drawing page that scales line width and opacity by pressure
-  (`hardwaretest.org/stylus-test`: width `max(0.5, 20·p)`, opacity
-  `max(0.2, p)`) shows nothing visible, while its pressure readout still
-  moves. With `PressureRecalibration` off, the landing stroke is one stroke
-  at pressure about 0.44.
+  crosses the network, so a pen report arrives about once per round trip.
+  A pen put down at an ordinary speed then often arrives already in
+  contact.
+- In browsers, a stroke that hovers first draws one stroke with its real
+  pressure; the same stroke landing in contact reports pressure near zero
+  and breaks into short `pointerdown`/`pointerup` segments, and a page that
+  scales line width and opacity by pressure shows nothing. With
+  `PressureRecalibration` off, the landing stroke is one stroke at its real
+  pressure.
 
 ### Decision
 
@@ -327,23 +319,19 @@ default, which assumes a locally sampled tablet, changes.
 ### Facts
 
 - A native-seat Wayland desktop takes the bridged tablet through libinput
-  (1.30.1 on Rocky 10.2), not xf86-input-wacom. libinput detects a pressure
+  (1.30.1), not xf86-input-wacom. libinput detects a pressure
   offset on a proximity-in only when the tool hovers at least half the
   distance range above the surface (`evdev-tablet.c`,
   `detect_pressure_offset`); a pen whose first packet already presses reports
-  distance 0, so its stroke keeps its pressure. Lab (Rocky 10.2, Mutter 49.4,
-  production Pier with `usb.native_tablet` enabled, emulated Intuos5 over
-  `vhci-hcd`, `--usb-emulate-stroke alternate`): libinput reports
-  `proximity-in` with pressure 0.50 and `TIP down` in the same frame;
-  Firefox 140 ESR and Chrome 155 (both Wayland-native) draw one stroke with
-  `pointerType` `pen` from the first packet. Nothing on the Wayland path
+  distance 0, so its stroke keeps its pressure: Wayland-native browsers draw
+  one pen stroke from the first packet. Nothing on the Wayland path
   corresponds to `PressureRecalibration`.
 - Mutter's native backend keeps each tablet tool's position apart from the
   core pointer (`meta-seat-impl.c`, `update_device_coords_in_impl`), and a
   `ScreenCast` stream's cursor metadata reports only the core pointer
   (`meta_cursor_tracker_get_pointer` → `clutter_seat_query_state` with no
-  device). Lab: zero `CursorPosition` records reached the Deck during four
-  whole emulated strokes, although `cursor_positions` was negotiated.
+  device). So no `CursorPosition` record reaches the Deck while a bridged
+  pen draws, although `cursor_positions` was negotiated.
 
 ### Decision
 
@@ -358,9 +346,8 @@ nothing is reported when the tool leaves).
 
 ### Consequences
 
-- Lab: 103 `CursorPosition` records per four strokes, at exactly the pixels
-  where the browser saw the pen (start `(442, 333)`, end `(1328, 778)` on a
-  1800×1130 output).
+- The Deck's cursor follows the pen to the pixels where applications see
+  it.
 - A tablet remapped in GNOME Settings (area, aspect, output, relative mode)
   still draws where GNOME puts it, but the Deck's cursor follows the default
   mapping. Reading the user's tablet settings is a follow-up.

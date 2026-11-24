@@ -7,21 +7,21 @@ now. Product-wide principle; first applied to the Windows Deck's decoder. Extend
 
 ## Context
 
-Arcen looks ahead whenever it has to choose between platform interfaces. D3D11 is the older Windows graphics
-API, and the Windows Deck should support D3D12.
+Where two platform interfaces can do the same job, Arcen chooses the newer
+one. On Windows, D3D11 is the older graphics API and D3D12 the newer.
 
 The Windows Deck decodes with the D3D11 video decoder API (`CreateVideoDecoder`
 in `clients/windows/src/decode/session.rs:300`). It decodes on the same D3D11
 device as the presenter (`VideoDevice::from_gpu`,
 `clients/windows/src/decode/device.rs:253`). On a vGPU, `Present` holds that
-device for 15–16 ms, which blocks decode. On a weak GPU this costs frame rate: a field Deck on an
-Intel UHD 630 driving two 2560x1600 monitors.
+device for 15–16 ms, which blocks decode. On a weak GPU this costs frame
+rate, for example on an Intel UHD 630 driving two 2560x1600 monitors.
 
 What was known on 2026-11-18:
 
-- **D3D11 with a separate decode device is the common design.** Moonlight
-  (master, 2026-11-15) uses a separate decode device, synchronised with
-  paired fences, and falls back to one device on drivers with known bugs.
+- **D3D11 with a separate decode device is the common design:** a decode
+  device of its own, synchronised with paired fences, with one device as the
+  fallback on drivers with known bugs.
 - **D3D12 decode is not yet the default anywhere.** Chromium has a D3D12
   decoder but leaves it off by default. FFmpeg's D3D12 HEVC path handles only
   Main and Main 10.
@@ -65,7 +65,6 @@ What was known on 2026-11-18:
 - The macOS Deck already uses the forward platform path (VideoToolbox and
   Metal). The principle applies to any future Deck and to Pier encode
   choices too: NVENC, Media Foundation and Vulkan Video on non-NVIDIA hosts.
-- Decision 2 shipped in 0.20.3: on the lab vGPU, two 2560x1600 windows went
-  from 26 to 60 fps each and a decode call from 13.6 ms to 0.26 ms. The
-  presenters consume only a texture handle, a fence handle and a value, so a
-  D3D12 decoder can be added later without changing them.
+- Decision 2 shipped in 0.20.3: on a vGPU, two 2560x1600 windows now run at
+  60 fps each. The presenters consume only a texture handle, a fence handle
+  and a value, so a D3D12 decoder can be added later without changing them.

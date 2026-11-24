@@ -1,34 +1,33 @@
 # ADR 0016: Lossless Refinement of Still Regions
 
-**Status:** Proposed 2026-11-08; amended 2026-11-09
-(see [Normative rules](#normative-rules-2026-11-09) — they are normative and
-replace any conflicting sentence in sections 1–12; the
-[first-slice amendments](#first-slice-amendments-2026-11-13) refine them).
-**First slice complete 2026-11-13:** Linux Xorg depth-30 Grading/HDR to the
-macOS Deck, one monitor, end to end to verification level 3, compiled into
-release builds and switched at run time only (Pier
-`video.lossless_refinement`; Deck setting **Exact still image**, default on;
-negotiated per session). **On by default from 0.19.1:** the Pier key
-defaults to `enabled`. It engages only where the shared plan allows it
-(Grading or HDR, HEVC 4:4:4 ten-bit, a CPU refine source and one monitor:
-Linux Xorg depth-30 desktops, Linux Wayland Grading and HDR on a
-compositor with wide screen sharing, Windows Grading and HDR, and macOS
-Grading and HDR); every other session reports its off-reason in the hello.
-**macOS Grading and HDR source, Y′CbCr domain, 2026-11-13** (see
-[the macOS amendments](#macos-amendments-2026-11-13)): the `xf44` surface
-VideoToolbox encodes (after the Core Image white stage for HDR) is refined
-as Y′CbCr 4:4:4 codes, composited through the presenter's own range and
-matrix, verified to level 2.
-**Windows Grading and HDR source 2026-11-13:** the FP16 scRGB capture,
-converted to the stream's own codes by the shared `ScrgbSdrTransform` /
-`ScrgbPqTransform`, mirrored exactly and checked against the capture API's
-damage; the split Pier's lane relay carries fences and tiles. **Wayland Grading and HDR source 2026-11-13** (see
-[the Wayland amendments](#wayland-amendments-2026-11-13)): the wide
-composition's host read-back is the source, in the stream's own codes
-(BT.709/sRGB SDR for Grading, PQ/BT.2020 for HDR), verified digest-exact on
-the Deck's PQ/EDR presenter too. Needs Shared/Architecture
-review (wire, lane role, plan truth) and Release/Security review (new lane,
-new native dependency, untrusted input decoded on the Deck).
+**Status:** Proposed 2026-11-08. The normative rules R1–R8 (2026-11-09)
+are part of the decision, and sections 1–12 follow them; the first-slice,
+Wayland, macOS and refinement-budget amendments (2026-11-13) refine them.
+Needs Shared/Architecture review (wire, lane role, plan truth) and
+Release/Security review (new lane, new native dependency, untrusted input
+decoded on the Deck).
+
+**In the product:** on by default since 0.19.1 (Pier
+`video.lossless_refinement`, default `enabled`; Deck setting **Exact still
+image**, default on; negotiated per session). It engages only where the
+shared plan allows it — Grading or HDR, HEVC 4:4:4 ten-bit, a CPU refine
+source and one monitor — and every other session reports its off-reason in
+the hello:
+
+- **Linux Xorg** depth-30 Grading and HDR: RGB tiles, verified to level 3.
+- **Linux Wayland** Grading and HDR on a compositor with wide screen sharing
+  ([Wayland amendments](#wayland-amendments-2026-11-13)): the wide
+  composition's host read-back in the stream's own codes (BT.709/sRGB SDR
+  for Grading, PQ/BT.2020 for HDR), verified digest-exact on the Deck's
+  PQ/EDR presenter too.
+- **Windows** Grading and HDR: the FP16 scRGB capture, converted to the
+  stream's own codes by the shared `ScrgbSdrTransform` / `ScrgbPqTransform`,
+  mirrored exactly and checked against the capture API's damage; the split
+  Pier's lane relay carries fences and tiles.
+- **macOS Pier** Grading and HDR ([macOS amendments](#macos-amendments-2026-11-13)):
+  the `xf44` surface VideoToolbox encodes (after the Core Image white stage
+  for HDR), refined as Y′CbCr 4:4:4 codes, composited through the
+  presenter's own range and matrix, verified to level 2.
 
 > Records how a Pier makes a still picture on the Deck *bit-exact* to the
 > captured source — not "visually lossless" — in the stream's own colour
@@ -43,23 +42,13 @@ encoder's approximation of the picture, and nothing on the Deck says how
 far that approximation is from the source. The more a still picture
 matters, the less a lossy codec is the right tool for it.
 
-Established remote-workstation products answer this with a *refinement
+Remote-workstation products commonly answer this with a *refinement
 layer*: once a region stops changing, it is sent again losslessly, within a
-bandwidth cap, and the client paints it over the video. Learning from them
-(not from their code):
-
-- One product refines over a 32-pixel change map, eight-bit only, with JPEG
-  or LZ4 tiles and a fixed Mbit cap on refinement traffic. It has no 10-bit,
-  PQ or BT.2020 path.
-- One product sends lossless tiles that may be 10-bit but never HDR, offers
-  a tile-colouring diagnostic overlay, and checks colour by comparing the
-  lossy video with lossless tiles on flat areas, accepting "within one code
-  on 95% of pixels".
-- One protocol progressively builds to lossless against a configurable
-  target time.
-
-None of them proves exactness: "lossless" is a claim about the tile codec,
-not a measured property of what the viewer sees.
+bandwidth cap, and the client paints it over the video. The usual designs
+refine eight-bit content only, or ten-bit content without HDR, and judge
+colour by a tolerance such as "within one code on most pixels". None proves
+exactness: "lossless" is a claim about the tile codec, not a measured
+property of what the viewer sees.
 
 Arcen already has the pieces a better design needs:
 
@@ -95,7 +84,7 @@ one *refinement source*, the last integer stage before the codec:
 
 | Pier / contract | Captured buffer | Refinement source (domain) | Why this stage |
 | --- | --- | --- | --- |
-| Linux Xorg Grading (depth 30) | XShm packed RGB10 (`WideX11Frame`, `hosts/capenc/src/linux_x11.rs:251`, read by `capture_wide_diffed`, `:685`) | R′G′B′ 10-bit codes as captured; for a declared `rec2100-pq` desktop served as SDR, the codes after `Rgb10Signal::PqBt2020ToSdrBt709` (`shared/media/src/video/convert.rs:1366`) | These are the desktop's own pixels; the encoder's Y′CbCr is a rounded function of them. Sending RGB avoids the matrix's rounding entirely. |
+| Linux Xorg Grading (depth 30) | XShm packed RGB10 (`WideX11Frame`, `hosts/capenc/src/linux_x11.rs:251`, read by `capture_wide_diffed`, `:685`) | R′G′B′ 10-bit codes as captured; for a declared `rec2100-pq` desktop served as SDR, the codes after the encoder's own PQ-to-SDR conversion (`Rgb10Signal::PqBt2020ToSdr*`, `shared/media/src/video/convert.rs`) | These are the desktop's own pixels; the encoder's Y′CbCr is a rounded function of them. Sending RGB avoids the matrix's rounding entirely. |
 | Linux Xorg HDR (operator-declared `rec2100-pq` desktop) | XShm packed RGB10 holding PQ codes | R′G′B′ PQ/BT.2020 10-bit codes as captured (`Rgb10Signal::Direct`) | The operator's declared PQ codes are the source. |
 | Windows Grading (WGC FP16) | `R16G16B16A16Float` scRGB | R′G′B′ 10-bit codes after the shared SDR transfer table (`ScrgbSdrTransform::convert_half_pixel`, `convert.rs:1216`), before the matrix | FP16 has no integer truth; the stream's quantisation of it is the truth the user grades against. |
 | Windows HDR (WGC FP16, proven HDR target) | same | R′G′B′ 10-bit PQ/BT.2020 codes after primaries conversion, white gain and `scrgb_component_to_pq_code` (`convert.rs:1078`), before the matrix | As above, in PQ. |
@@ -106,9 +95,8 @@ one *refinement source*, the last integer stage before the codec:
 So a tile has one of two domains: **RGB** (R′G′B′ codes, applied after the
 Deck's Y′CbCr→RGB step) or **YCbCr** (Y′CbCr 4:4:4 codes, applied before
 it, through the same matrix as the video). Both are at the stream's bit
-depth (10 in v1; the format reserves 12). *Amended (R1):* the two domains
-have separate, precise exactness definitions, and the first slice refines
-only RGB tiles of a negotiated 4:4:4 stream.
+depth (10 in v1; the format reserves 12). R1 defines exactness for each
+domain; a tile is refined only on a stream that negotiated 4:4:4.
 
 ### 2. When it runs
 
@@ -117,19 +105,17 @@ Per contract, resolved by one shared function
 plan, the capture backend, Pier configuration and the Deck's capability —
 platform code does not decide it:
 
-| Contract | v1 default once qualified | Notes |
+| Contract | Default | Notes |
 | --- | --- | --- |
 | Speed | **off, always** | Never touches the eight-bit fast path. |
 | Auto | off | Auto is 8-bit and presented through the ordinary SDR path. An eight-bit refinement for CPU-resident Auto captures (WGC BGRA8) is a possible later extension through the egui presenter, never NvFBC. A Software-contract Auto session to a canvas Deck carries eight-bit lossless tiles inside its canvas frames instead ([ADR 0028](0028-canvas-damage-first-software-pipeline.md)). |
 | Grading | **on** | The case this exists for. |
 | HDR | **on** | RGB domain in PQ/BT.2020, or YCbCr on the macOS Pier. |
 
-Pier configuration `video.lossless_refine` (new, in
-`arcen_session::pier_config::VideoConfig`, `shared/session/src/pier_config.rs:133`):
-`off` | `auto` (Grading and HDR) | values for `still_ms` and `max_mbps`.
-The first release that ships it defaults to **`off`** until the lab
-qualification below passes on each Pier; the following release makes `auto`
-the default. The Deck can switch it off per connection.
+Pier configuration `video.lossless_refinement`
+(`arcen_session::pier_config::VideoConfig`): `enabled` (the default) or
+`disabled`. The Deck switches it off per connection with its **Exact still
+image** setting. The hello states `still_ms` (300) and `max_mbps` (25).
 
 ### 3. Scheduling: per block, after stillness, within a budget, interrupted by motion
 
@@ -150,23 +136,20 @@ over Keel's 16×16 grid for each monitor:
    its last change has been emitted (so its invalidation has a sequence
    number, §4). Stillness is per block, not per frame: a ticking clock or a
    blinking caret does not stop the rest of the screen from refining.
-3. **Global motion gate.** While more than 2% of a monitor's blocks —
-   counted **distinct**, a block that changed every frame once — changed in
-   the last 250 ms (amended from 5%/100 ms after the first lab measurement,
-   see the first-slice report; distinct counting after code review, so a
-   1% video region at 60 fps does not stop the rest of the screen)
-   (scrolling, playback, a window drag), refinement for
-   that monitor pauses entirely, and tiles already queued are cancelled
-   (§5). The video encoder owns the link while there is motion.
+3. **Global motion gate.** While more than 2% of a monitor's blocks
+   changed in the last 250 ms (scrolling, playback, a window drag),
+   refinement for that monitor pauses entirely, and tiles already queued are
+   cancelled (§5). Blocks are counted **distinct** — a block that changed
+   every frame counts once — so a 1% video region at 60 fps does not stop
+   the rest of the screen. The video encoder owns the link while there is
+   motion.
 4. **Order.** Most recently settled blocks first (where the user just
    worked), then raster order.
-5. **Budget.** A token bucket per Pier session at
-   `min(video.lossless_refine.max_mbps (default 25), the session's current
-   video bitrate target)`: a still picture frees the bitrate the link has
-   already carried, and refinement never asks for more than that.
-   *Superseded by the refinement-budget amendment below: the rate is the
-   link's measured residual (R6); the video target is only the floor before
-   the first path sample.*
+5. **Budget.** A token bucket per Pier session at the link's measured
+   residual (R6 and the refinement-budget amendment): at most `max_mbps`
+   (25) and at most half of what the path delivers beyond interactive
+   traffic. Until the first path sample the session's video bitrate target
+   is the cap.
 6. **Grouping.** Eligible blocks are grouped into rectangles of at most
    16×4 blocks (256×64 pixels) for compression; single 16×16 tiles compress
    less than half as well (measurements below).
@@ -183,40 +166,40 @@ next motion that crosses it.
 QUIC orders bytes within a stream, never across streams. A tile must never be
 painted over content that has since changed, so:
 
-- **`RefineInvalidate`** (new binary record `0x0A`, routed to
-  `LaneRole::Video`) carries `monitor_id`, `topology_generation`,
-  `stream_epoch`, a per-monitor sequence `seq: u32` and a run-length bitmap
-  of the blocks that changed. The Pier writes it on the video lane
-  immediately **before** the access unit that encodes that change, so it can
-  never arrive after the picture it describes. It is sent when a block
-  changes that has had a tile *sent* since the monitor's refinement was last
-  cleared — whether or not that tile was delivered — so the Pier never needs
-  to know what the Deck applied to keep it from showing stale content.
-- **`RefineTiles`** (new `0x0B`, refine lane, §5) carries the same
-  `monitor_id`/`topology_generation`/`stream_epoch`, `valid_from_seq` (the
-  invalidation sequence current when the source frame was captured), the
-  domain and depth, a block rectangle, the codec and the payload.
-- The Deck keeps, per block, the sequence of the last invalidation that
-  covered it. It **applies invalidations on receipt**, in the video lane
-  reader (`video_lane_reader`, `clients/macos/src/transport/lanes.rs:366`),
-  before the frame queue — the frame queue may coalesce frames, an
-  invalidation must never be dropped. Clearing an overlay early only shows the
-  lossy picture of the same content for a frame; clearing it late would show
-  wrong content, so early is the safe side.
-- A tile applies to a block only if no invalidation newer than
-  `valid_from_seq` covered it. A tile from the future (its `valid_from_seq`
-  not yet seen on the video lane) waits in a bounded pending set (8 MiB per
-  session) until the video lane catches up; on overflow the Deck drops it and
-  asks for a resend (§7).
-- A different `topology_generation` or `stream_epoch`, a lost video or
-  refine lane, or a Deck decoder teardown clears that monitor's refinement on
-  both ends. The Pier's own cancellation of the refine lane (§5) does not: what
-  the Deck already applied stays valid under the rules above, and the Pier
-  sends the cancelled blocks again later. A keyframe does **not**: it re-encodes the same content, and the
-  overlay is about content, not about the decoder. *Amended (R2, R3):* the
-  sequence becomes a per-monitor source fence carried before every access
-  unit, and a **recovery** keyframe (decoder reset, loss) does clear: it
-  starts a new refinement generation behind an ordered reset barrier.
+- **`RefineFence`** (binary record `0x0A`, routed to `LaneRole::Video`)
+  precedes **every** access unit of a monitor while refinement is granted
+  (R2). It carries the refinement identity (`monitor_id`,
+  `topology_generation`, `stream_epoch`, `refine_generation`), the
+  monitor's source fence (a `u64`, strictly increasing within a
+  generation) and a run-length bitmap of the blocks that access unit
+  changes: the union of every capture since the previous access unit,
+  possibly none. Because the Pier writes it on the video lane immediately
+  **before** the access unit, it can never arrive after the picture it
+  describes.
+- **`RefineTiles`** (`0x0B`, refine lane, §5) carries the same identity, the
+  fence current when the source frame was captured, the domain and depth, a
+  block rectangle, the codec and the payload.
+- The Deck **applies fences on receipt**, in the video lane reader
+  (`video_lane_reader`, `clients/macos/src/transport/lanes.rs`), before the
+  frame queue: the frame queue may coalesce frames, an invalidation must
+  never be dropped. Per block it keeps only the newest invalidating fence.
+  Clearing an overlay early only shows the lossy picture of the same content
+  for a frame; clearing it late would show wrong content, so early is the
+  safe side.
+- A tile captured at fence *t* becomes visible only when the presented fence
+  is at least *t* and no received invalidation with a fence above *t*
+  covered its block (R2). A tile from the future waits in a bounded pending
+  set (R5); a tile that is still dropped leaves the digest unmatched, and
+  the digest timeout starts a new generation (first-slice amendment 4).
+- A new `stream_epoch`, a geometry, colour-contract or topology change, a
+  lost video or refine lane, a decoder reset or reconnect, and a
+  **recovery** keyframe start a new refinement generation behind an ordered
+  `RefineBarrier` (`0x0D`) on the video lane, and clear that monitor's
+  refinement on both ends (R3). A routine periodic keyframe does not: it
+  re-encodes the same content, and the overlay is about content, not about
+  the decoder. Nor does the Pier's own cancellation of the refine lane (§5):
+  what the Deck already applied stays valid under the rules above, and the
+  Pier sends the cancelled blocks again later.
 
 ### 5. A refine lane, below everything else
 
@@ -233,23 +216,20 @@ Tiles travel on a new lane role, **`refine`** (unidirectional, Pier → Deck,
   opens the next lane generation (ADR 0014 supersession), discarding the
   stale bytes instead of sending them. Records already delivered are still
   safe: §4 drops any that motion invalidated.
-- The lane is opened only when the Deck's `ClientHello` carried the
-  capability (§8), so an older Deck's lane registry never sees an unknown
-  role. The Deck's uni-stream grant
-  (`arcen_transport::lanes::DECK_LANE_STREAM_LIMITS`,
-  `shared/transport/src/lanes.rs:129`) grows from 3 to 4. *Amended (R7):*
-  the `refine` role appears in `lane_attachment.roles` only for a Deck that
-  advertised the capability, because an older Deck's grant validator refuses
-  an unknown role token and a role list as long as its own table.
+- The `refine` role appears in `lane_attachment.roles` only for a Deck that
+  advertised the capability at authentication (§8, R7), because an older
+  Deck's grant validator refuses an unknown role token and a role list as
+  long as its own table. The Deck's uni-stream grant
+  (`arcen_transport::lanes::DECK_LANE_STREAM_LIMITS`) is 4: video, audio,
+  refine and one replacement.
 
-`RefineDigest` (new `0x0C`, refine lane) states what is exact. Whenever a
-monitor's refinement settles — no tile queued and none due for 500 ms — the
-Pier sends `(monitor_id, topology_generation, stream_epoch, seq, coverage,
-digest)`: `coverage` is a run-length bitmap of the refined blocks and
-`digest` is XXH3-128 over their XXH3-128 fingerprints in raster order, each
-fingerprint taken over the block's planar little-endian `u16` codes (plane 0,
-1, 2; the block's own rows only). The Deck computes the same value from the
-tiles it applied (§7). Equal digests mean the overlay holds exactly the
+`RefineDigest` (`0x0C`, refine lane) states what is exact. Whenever a
+monitor's refinement settles — no tile queued and none due for 500 ms, and
+the covered set changed (R3) — the Pier sends the refinement identity, the
+fence, a run-length coverage bitmap of the refined blocks and the canonical
+digest of R4: XXH3-128 over the covered blocks' XXH3-128 fingerprints in
+raster order, each taken over the block's planar little-endian `u16` codes.
+The Deck computes the same value from the tiles it applied (§7). Equal digests mean the overlay holds exactly the
 source's code values for every covered block. Coverage need not be the whole
 screen: a ticking clock or a blinking caret stays live, and the verdict says
 so instead of never arriving.
@@ -263,8 +243,7 @@ PQ/BT.2020, that PQ photograph with film-like grain (σ = 2 codes), and 10-bit
 gradients. Ratio is against packed 30-bit RGB (7.78 MB a frame); encode
 speed includes the predictor, decode speed is decompression only; both are
 the slowest frame, one core, on an Apple M4 Pro (the Deck class) and on an
-AMD EPYC 7742 virtual machine (the Pier class, five of the seven frames,
-other builds running).
+AMD EPYC 7742 virtual machine (the Pier class, five of the seven frames).
 
 | Tile 256×64, RGB | UI (×3) | 10-bit gradient | photo SDR | photo PQ | PQ + grain | geo. mean | encode Mpx/s M4 / EPYC | decode Mpx/s M4 / EPYC |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -290,11 +269,13 @@ Decision:
   rectangles.
 - **Same codec in both domains.** Y′CbCr compresses photographs better and
   gradients worse; the domain is fixed by §1, not chosen for ratio.
-- **Native dependency, feature-gated.** Zstandard needs a C build, which the
-  default `arcen-media` graph forbids. The codec lives behind a new
-  `arcen-media` feature `lossless-refine` (like `software-h264-source`),
-  enabled by capenc, the macOS Pier and the Deck; the default-graph purity
-  proof is unchanged, and the library's licence notice joins
+- **Native dependency, feature-gated.** The Zstandard encoder needs a C
+  build, which the default `arcen-media` graph forbids. It lives behind the
+  `arcen-media` feature `refine-zstd-encode` (like `software-h264-source`),
+  which capenc and the macOS Pier enable through their own
+  `lossless-refine` features; the Deck decodes with the pure-Rust decoder
+  behind `refine-zstd-decode` (R8). The default-graph purity proof is
+  unchanged, and each library's licence notice is in
   `legal/THIRD_PARTY_NOTICES.md`. The codec id is negotiated, so a pure-Rust
   fallback (`delta-deflate1`, 56% more bytes) can be added without a wire
   change.
@@ -307,35 +288,38 @@ Decision:
 
 ### 7. Deck compositing and the exactness report
 
-- *Amended (R1, R2, R4):* exactness is scoped to source codes before display
-  transforms, uploads are fenced and Metal-synchronised, and verification has
-  three levels.
+Exactness is scoped to source codes before display transforms (R1), uploads
+are fenced and Metal-synchronised (R2), and verification has three levels
+(R4).
+
 - **Metal, inside the conversion pass, before display transforms.** The
-  dedicated layer gains one texture per monitor, `RGB10A2Uint` at the
+  dedicated layer has one texture per monitor, `RGB10A2Uint` at the
   source's size (33 MB at 4K): three 10-bit code channels plus a 2-bit
   "valid" flag. `fs_convert` reads it at the luma coordinate. If valid, an
   RGB-domain tile writes `code / 1023` directly (the drawable is
   `RGB10A2Unorm`, so the stored code is the tile's code), and a Y′CbCr tile
-  replaces `luma_code`/`cb_code`/`cr_code` before the matrix — no chroma
-  reconstruction for a refined pixel. PQ tagging and EDR, which Core
+  replaces `luma_code`/`cb_code`/`cr_code` before the matrix
+  (`fs_convert_refined_ycbcr`, macOS amendments) — no chroma reconstruction
+  for a refined pixel. PQ tagging and EDR, which Core
   Animation applies after the pass, are unchanged. The same change goes into
   `video_render.wgsl` only if refinement is ever extended to the egui path.
-- **Uploads only on change.** A tile writes its rectangle with
-  `replaceRegion`; an invalidation clears its blocks' valid bits. When the
+- **Uploads only on change.** A tile's rectangle is blitted from a staging
+  buffer inside the presenter's own command buffer, before the conversion
+  pass that samples it (R2); an invalidation clears its blocks' valid bits. When the
   overlay changes and no new video frame is due, the presenter re-presents
   its retained frame (`last_frame`) so a still screen visibly sharpens.
 - **CPU reference and digest.** The Deck decodes each tile on a refine
   worker of its own (never the video decode thread), computes the block
   fingerprints from the decoded codes, keeps them (16 bytes a block) and, on
-  `RefineDigest`, computes the digest of §5 over the stated coverage. It needs no CPU copy of the picture. A diagnostic mode reads the
-  overlay texture back and re-fingerprints it, which proves the GPU holds what
-  the CPU decoded.
-- **Visible to the user.** The status line shows, per monitor, *Refining
-  NN%* while tiles arrive and **Lossless ✓ bit-exact** once the digest
-  matched — with the share of the screen it covers when some blocks are live
-  ("bit-exact, 99.7%; 3 live blocks") — cleared by the next invalidation. A
-  diagnostic overlay tints blocks (exact / live / pending), so the region
-  that is exact is visible, not only a number. The colour check report
+  `RefineDigest`, computes the canonical digest (R4) over the stated
+  coverage. It needs no CPU copy of the picture. Levels 2 and 3 read the
+  overlay texture and the rendered composite back and re-fingerprint them,
+  which proves the GPU holds, and shows, what the CPU decoded.
+- **Visible to the user.** Stream Statistics shows, per monitor, how much
+  of the picture is verified ("Exact: N% of picture verified", scoped as R4
+  requires), cleared by the next invalidation. The **Lossless Tile View**
+  tints blocks (exact / live / pending), so the region that is exact is
+  visible, not only a number. The colour check report
   records the verdict — domain, depth, transfer, primaries, block count,
   digest — so a colourist's report says "the picture you judged was the
   source, code for code", not "within one code on most pixels".
@@ -346,41 +330,41 @@ Decision:
 
 All additive and serde-default; `PROTOCOL_VERSION` stays 5.
 
-- `ClientHelloMsg.lossless_refine_v1` (new): domains and codecs the Deck
-  can apply (`["rgb","ycbcr"]`, `["delta-zstd1"]`). Absent on older Decks:
-  nothing is sent.
-- `ServerHelloMsg.lossless_refine` (new, next to `active_pipeline`,
-  `shared/protocol/src/messages.rs:2378`): `state` (`on`, `off`,
-  `unavailable`), `reason` when not on (`speed_contract`, `eight_bit`,
-  `zero_copy_capture`, `deck_unsupported`, `deck_eight_bit_fallback`,
-  `operator_off`, …), and, when on,
-  `domain`, `bit_depth`, `transfer`, `primaries`, `matrix` (Y′CbCr only),
-  `range`, `codec`, `still_ms`, `max_mbps`. The Deck shows the reason, never
-  guesses.
-- capenc's READY line appends `refine=rgb10|ycbcr444-10|off`. Because
-  `parse_ready_v1` rejects unknown fields
-  (`shared/media/src/video/plan.rs:1140`), the parser learns the field in
-  the same change as the producer; capenc and the Pier ship together.
-- capenc framed-v2 (`arcen_media::capenc_stream::CapencRecordKind`,
-  `shared/media/src/capenc_stream.rs:34`) gains kinds 3 (invalidation, which
-  the Pier writes on the video lane before the next access unit) and 4/5
-  (tiles, digest, routed to the refine lane). The Pier bounds each record
-  before allocating, as for cursor records.
+- `AuthResponse.lossless_refine_v1`: domains and codecs the Deck can apply
+  (`["rgb","ycbcr"]`, `["delta-zstd1"]`). It travels at authentication,
+  because a Pier starts its encoder and grants lanes before it reads the
+  Deck's hello (first-slice amendment 1), and only while the Deck's setting
+  is on. Absent on older Decks: nothing is sent.
+- `ServerHelloMsg.lossless_refine`, next to `active_pipeline`: `state`
+  (`on`, `off`, `unavailable`), `reason` when not on (`speed_contract`,
+  `eight_bit`, `zero_copy_capture`, `deck_unsupported`,
+  `deck_eight_bit_fallback`, `operator_off`, `multi_monitor`, …), and, when
+  on, `domain`, `bit_depth`, `codec`, `still_ms`, `max_mbps`. The colour
+  contract (transfer, primaries, matrix, range, chroma) travels in each
+  generation's barrier. The Deck shows the reason, never guesses.
+- capenc is started with `refine=on`, which it accepts only with
+  `framed-v2` output on a route that writes it (R5).
+- capenc framed-v2 (`arcen_media::capenc_stream::CapencRecordKind`) carries
+  kind 3 (`RefineVideo`: fence and barrier, which the Pier writes on the
+  video lane before the next access unit) and kind 4 (`RefineLane`: tiles
+  and digest, routed to the refine lane). The Pier bounds each record before
+  allocating, as for cursor records.
 - Deck → Pier `refine_reset {monitor_id, stream_epoch, reason}` on the
   control lane: the Pier forgets what it sent for that monitor and refines
-  it again. It is how pending-set overflow, a Deck-side teardown and a digest
-  mismatch heal.
+  it again in a new generation. It is how a Deck-side teardown, a digest
+  mismatch and a broken fence heal. `refine_control` disables or re-enables
+  one monitor (R7).
 
 ### 9. Failure modes
 
 | Failure | Handling |
 | --- | --- |
-| A tile arrives after its blocks changed | Dropped by the per-block sequence check (§4). |
-| A tile arrives before its invalidation sequence | Held, bounded; overflow → drop + `refine_reset`. |
+| A tile arrives after its blocks changed | Dropped by the per-block fence check (§4, R2). |
+| A tile arrives before its fence | Held, bounded (R5); overflow → drop, and the digest timeout starts a new generation. |
 | Invalidation lost with a video lane reset | Lane reopen clears the monitor's overlay on the Deck and the sent-state on the Pier. |
 | 64-bit hash collision hides a change | Sent blocks are re-verified with XXH3-128 on the source (§3); the digest would also disagree. |
 | Pier refine queue full | Pier drops the record and tells capenc through the existing control channel; capenc sends those blocks again later and, as for any sent block, still invalidates them on change. |
-| Geometry, topology or epoch change | Both ends clear the monitor. |
+| Geometry, topology, colour-contract or epoch change | Both ends start a new generation behind a barrier (R3). |
 | Decoder teardown / reconnect | Deck clears and sends `refine_reset`; reconnect starts with nothing refined. |
 | Native 10-bit layer fails (8-bit fallback) | Refinement stops (`state=unavailable reason=deck_eight_bit_fallback`); the 8-bit path is never fed tiles. |
 | Link saturated | Budget is the link's measured residual, suspended under congestion, loss, a video backlog or rising frame age, and paused for one window before queueing is blamed on refinement (refinement-budget amendment); the refine lane has the lowest priority; motion cancels the queue. |
@@ -410,38 +394,38 @@ current coverage and the last verdict.
 - Deck: a Metal test renders a frame with an RGB and a Y′CbCr overlay through
   the production `fs_convert` and checks the read-back codes are exactly the
   tile's (as `video_metal_layer::shader_tests` already does for planes).
-- Lab, per Pier and contract: a still `arcen_media::test_pattern` frame,
+- Live, per Pier and contract: a still `arcen_media::test_pattern` frame,
   then motion, then stillness again; pass = digest match within
   `still_ms + 2 s` at 1080p, overlay cleared on the first motion frame, no
   change in Speed's frame timing with refinement enabled, and a real-screen
   screenshot of the indicator.
 
-### 12. Work list
+### 12. Where each part lives
 
 1. **Shared** (`arcen-protocol`, `arcen-media`, `arcen-transport`,
    `arcen-telemetry`, `arcen-session`): records and capability, refine lane
    role, `resolve_refine_plan`, scheduler, codec, digest, Deck-side state,
    config key, telemetry; consumers registered in each `consumers.json`.
-2. **Linux Xorg Grading** (`hosts/capenc/src/linux.rs` `run_wide_encode`,
-   `:1667`): feed the CPU frame it already has to the scheduler; write
-   framed-v2 records; the Pier routes them. The NvFBC path is untouched.
-3. **macOS Deck**: lane reader for `refine`, invalidations in the video lane
-   reader, tile decode on a refine worker, overlay texture and `fs_convert`
-   change, re-present on overlay change, indicator, colour check report field.
-4. **Windows Grading/HDR** (`hosts/capenc/src/nvenc.rs` around the CPU
-   scRGB conversions at `:975`): expose the R′G′B′ code stage as its own
-   shared function so refinement and encoding share it.
-5. **macOS Pier**: done 2026-11-13, Y′CbCr domain, over a whole-surface
-   compare of every encoded `xf44` surface (see the macOS amendments).
-6. **Wayland** Grading/HDR: done 2026-11-13 over the existing whole-frame
-   host read-back (the eligible-blocks-only GPU read-back stays a possible
-   optimisation).
+2. **Linux Xorg Grading** (`hosts/capenc/src/linux.rs` `run_wide_encode`):
+   feeds the CPU frame it already has to the scheduler and writes framed-v2
+   records; the Pier routes them. The NvFBC path is untouched.
+3. **macOS Deck**: lane reader for `refine`, fences in the video lane
+   reader, tile decode on a refine worker, overlay texture and conversion
+   pass, re-present on overlay change, Stream Statistics and the Lossless
+   Tile View.
+4. **Windows Grading/HDR**: the R′G′B′ code stage is its own shared function
+   (`ScrgbSdrTransform`, `ScrgbPqTransform`), so refinement and encoding
+   share it.
+5. **macOS Pier**: Y′CbCr domain, over a whole-surface compare of every
+   encoded `xf44` surface (macOS amendments).
+6. **Wayland** Grading/HDR: over the existing whole-frame host read-back
+   (Wayland amendments); an eligible-blocks-only GPU read-back stays a
+   possible optimisation.
 
 ## Normative rules (2026-11-09)
 
-Seven rules settle the questions the sections above leave open. They are
-normative and replace any conflicting sentence above. Shared names
-refer to the first-slice code in `arcen_media::refine` (portable, codec-free)
+These rules are normative; sections 1–12 follow them. Shared names refer
+to the first-slice code in `arcen_media::refine` (portable, codec-free)
 and `arcen_protocol::refine` (wire records).
 
 ### R1. Exactness is defined per tile domain
@@ -655,7 +639,7 @@ the indices. The cursor is never part of a tile or a digest (R8).
   decoding stays a drop-in if budgets grow. The Pier's one compression
   worker is not a bound either (benchmark `zstd_encode::bench`, 256×64
   photographic 10-bit tiles with grain, ratio 3.9): a 4K frame's 510 tiles
-  take 225 ms on the lab EPYC 7742 core (450 Mbit/s of records) and 38 ms
+  take 225 ms on an AMD EPYC 7742 core (450 Mbit/s of records) and 38 ms
   on the M4 Pro, 18 and 100 times the 25 Mbit/s ceiling, so a second
   worker is not added; a 4K photo's fill time is the link budget's.
 - **Coordinates.** Tile and block coordinates are visible source pixels of
@@ -668,22 +652,22 @@ the indices. The cursor is never part of a tile or a digest (R8).
 
 ### Minimal first slice
 
-| Part | Where | State (2026-11-13) |
-| --- | --- | --- |
-| Plan, limits, tile layout, residual transform, canonical digest, Pier scheduler (generations, fences, damage union, motion gate, busy-block back-off, token bucket), Deck state owner (fences, generations, invalidation union, revalidation, verification levels, scoped status) | `shared/media/src/refine/` (codec-free) | implemented, tested |
-| Exact source mirror and producer behind the `RefineSource` seam (packed RGB10 today; eight-bit proven in tests); capenc runtime with one compression worker, rate from the link's residual (refinement-budget amendment; the video bitrate is the floor before a path sample) | `arcen_media::refine::{source, producer, runtime}` | implemented, tested |
-| One shared entry point: `plan_for_capture`, hello status, capenc arguments, off-reason wording; forwarding carry; Deck hub with the `RefineCompositor` seam | `arcen_media::refine::{mod, carry, hub}` | implemented, tested |
-| Wire records `RefineFence` 0x0A, `RefineTiles` 0x0B, `RefineDigest` 0x0C, `RefineBarrier` 0x0D; `refine` lane role; capability DTO; gated grant | `shared/protocol` | implemented; live between a Linux Pier and the macOS Deck |
-| Zstandard encoder (Pier, native `zstd`) / decoder (Deck, pure-Rust `ruzstd`) | `arcen-media` features `refine-zstd-encode` / `refine-zstd-decode` | implemented, tested |
-| Linux Xorg depth-30 `XShm` Grading producer, one monitor | `hosts/capenc` (default feature `lossless-refine`) + `refine=on framed-v2` | implemented; live |
-| Linux Wayland Grading and HDR producer (wide read-back), one monitor | `hosts/capenc/src/wayland/pipelines/wide.rs` | implemented; live (2026-11-13) |
-| Y′CbCr 4:4:4 source (planar or biplanar, 8–12 bits), Y′CbCr plan, contract matrix, Deck domain guard | `arcen_media::refine::{ycbcr, mod}` | implemented, tested (2026-11-13) |
-| macOS Pier Grading and HDR producer (`xf44`, Y′CbCr), one monitor | `hosts/macos/src/refine.rs` (default feature `lossless-refine`) | implemented (2026-11-13) |
-| Metal Y′CbCr composite (`fs_convert_refined_ycbcr`) | `clients/macos` | implemented, shader-tested (2026-11-13) |
-| Pier negotiation and forwarding (capability, grant, capenc arguments, video/refine lane routing, `refine_reset`/`refine_control`) | `hosts/linux` | implemented; live |
-| Deck wiring (capability, refine lane reader, fences before the frame queue, decode worker, presented fences) | `clients/macos` | implemented; live |
-| Metal overlay, verification levels 2/3 | `clients/macos` (`ui/refine_overlay.rs`) | implemented; live to level 3 |
-| Stream Statistics ("Exact: N% of picture verified") and Lossless Tile View | `clients/macos`, `arcen_media::stats_overlay` | implemented; live |
+| Part | Where |
+| --- | --- |
+| Plan, limits, tile layout, residual transform, canonical digest, Pier scheduler (generations, fences, damage union, motion gate, busy-block back-off, token bucket), Deck state owner (fences, generations, invalidation union, revalidation, verification levels, scoped status) | `shared/media/src/refine/` (codec-free) |
+| Exact source mirror and producer behind the `RefineSource` seam (packed RGB10 today; eight-bit proven in tests); capenc runtime with one compression worker, rate from the link's residual (refinement-budget amendment; the video bitrate is the floor before a path sample) | `arcen_media::refine::{source, producer, runtime}` |
+| One shared entry point: `plan_for_capture`, hello status, capenc arguments, off-reason wording; forwarding carry; Deck hub with the `RefineCompositor` seam | `arcen_media::refine::{mod, carry, hub}` |
+| Wire records `RefineFence` 0x0A, `RefineTiles` 0x0B, `RefineDigest` 0x0C, `RefineBarrier` 0x0D; `refine` lane role; capability DTO; gated grant | `shared/protocol` |
+| Zstandard encoder (Pier, native `zstd`) / decoder (Deck, pure-Rust `ruzstd`) | `arcen-media` features `refine-zstd-encode` / `refine-zstd-decode` |
+| Linux Xorg depth-30 `XShm` Grading producer, one monitor | `hosts/capenc` (default feature `lossless-refine`) + `refine=on framed-v2` |
+| Linux Wayland Grading and HDR producer (wide read-back), one monitor | `hosts/capenc/src/wayland/pipelines/wide.rs` |
+| Y′CbCr 4:4:4 source (planar or biplanar, 8–12 bits), Y′CbCr plan, contract matrix, Deck domain guard | `arcen_media::refine::{ycbcr, mod}` |
+| macOS Pier Grading and HDR producer (`xf44`, Y′CbCr), one monitor | `hosts/macos/src/refine.rs` (default feature `lossless-refine`) |
+| Metal Y′CbCr composite (`fs_convert_refined_ycbcr`) | `clients/macos` |
+| Pier negotiation and forwarding (capability, grant, capenc arguments, video/refine lane routing, `refine_reset`/`refine_control`) | `hosts/linux` |
+| Deck wiring (capability, refine lane reader, fences before the frame queue, decode worker, presented fences) | `clients/macos` |
+| Metal overlay, verification levels 2/3 | `clients/macos` (`ui/refine_overlay.rs`) |
+| Stream Statistics ("Exact: N% of picture verified") and Lossless Tile View | `clients/macos`, `arcen_media::stats_overlay` |
 
 Release builds compile all of it; the three run-time switches are the only
 switches. The Deck's uni-stream grant is now 4 (video, audio, refine and one
@@ -713,13 +697,11 @@ Made while wiring the products; each is normative.
 6. **The Deck's overlay is the decoded picture's size**, never a barrier's
    claim; every upload and readback rectangle is bounds-checked, and a tile
    is accepted only for the grid it was decoded for.
-7. **Rate cap.** The refinement token bucket follows the encoder's current
-   average bitrate (capenc `BITRATE`), so refinement never exceeds the video
-   budget the path allows. *Superseded by the refinement-budget amendment:
-   the video target is the floor only until the first path sample.*
-8. **Defaults.** The Pier ships `disabled` until field evidence supports
-   turning it on; the Deck setting is on, so an operator's switch is the
-   single decision.
+7. **Rate cap.** Until the first path sample the refinement token bucket
+   follows the encoder's current average bitrate (capenc `BITRATE`); after
+   it, the link's residual (refinement-budget amendment).
+8. **Defaults.** The Pier key (`enabled` since 0.19.1) and the Deck setting
+   are both on, so either side's switch turns refinement off.
 
 ### Wayland amendments (2026-11-13)
 
@@ -777,8 +759,8 @@ normative.
    the fence naming what changed in it. Dirty rectangles keep their
    existing role in frame scheduling and are not used here. Tiles,
    compression and the digest run on the worker, bounded by the token
-   bucket (capped at the encoder's target; since the refinement-budget
-   amendment, at the link's residual) and by bounded queues; nothing
+   bucket (at the link's residual, refinement-budget amendment) and by
+   bounded queues; nothing
    of it runs on the capture or encode thread.
 3. **The contract carries the matrix and range.** A Y′CbCr plan comes from
    `RefineSourceKind::CpuYCbCr444 { matrix, range }` (the matrix the
@@ -804,25 +786,17 @@ normative.
    capability, never the credentials beside it); the agent's hello states
    the shared plan, and `refine_reset`/`refine_control` reach the worker
    through a bounded channel.
-6. **Measured** (an Apple M2 Ultra host, a macOS Deck over a wide-area link,
-   25 Mbit/s ceiling): the worker's compare costs 2–3 ms per encoded
-   1080p-class frame and 7–10 ms (worst 20 ms) per 3600×2262 frame, off the
-   encode thread; motion frame rate is unchanged (29.2 vs 29.5 fps at
-   1800×1130, 21.5 vs 21.6 fps at 3600×2262, on vs off); a 2–3 MB still
-   picture is verified in about 6 s at 1800×1130 and 7 s at 3600×2262, and
-   about 6 s after motion stops; every run had 0 digest mismatches.
 
 ### Refinement-budget amendments (2026-11-13)
 
-Made after the first wide-area measurements; each is normative and
-supersedes §3 item 5, the "Link saturated" row of §9 and first-slice
-amendment 7.
+Each is normative; §3 item 5, the "Link saturated" row of §9 and
+first-slice amendment 7 follow them.
 
 The coupling they remove: refinement was capped at the video's own bitrate
 target, the video's rate controller read the queueing that refinement
 bursts add as congestion and cut its target, and the refinement cap
-followed it down (measured over a VPN path: 4.7 → 2.3 → 1.2 Mbit/s, and a
-4K HDR photograph took 72 s). Each fed the other, and the next motion
+followed it down, so a large still picture took over a minute to refine.
+Each fed the other, and the next motion
 started from the collapsed target.
 
 1. **The rate is the link's residual (R6 as written).** Once a second the
@@ -863,8 +837,8 @@ started from the collapsed target.
    refinement for one window — the evidence on which the video controller
    itself would cut. If the queue then falls to 5 ms or to
    half, it was refinement's: the limit halves. If it stays, it is the
-   path's own (a wide-area path's RTT was measured drifting 30 ms with no
-   load at all); refinement resumes at its rate and is probed again only
+   path's own (a wide-area path's RTT can drift 30 ms with no load at
+   all); refinement resumes at its rate and is probed again only
    by a further 15 ms rise.
 5. **The video rate controller ignores self-caused delay.**
    `RateHints::refine_active` says refinement sent in the interval *and*
@@ -902,13 +876,8 @@ started from the collapsed target.
   binary record types and two hello fields. The Deck spends up to 33 MB of
   GPU memory per 4K monitor while refinement is on.
 - Bandwidth rises only while the picture is still and only up to half of
-  what the link has to spare (refinement-budget amendment; before it, up to
-  the session's own video bitrate). Measured on the first slice (one compression
-  worker, LAN): a full-screen 1080p photograph is 2.5 MB and verified in
-  about 2.4 s, a 4K one 10 MB in about 6.6 s (≈ 13 Mbit/s, bounded by the
-  single worker rather than the 25 Mbit/s budget); desktop content with
-  text and ramps at 1080p is 0.3 MB in 0.8 s. Motion frame rate and encode
-  time are unchanged (30 fps, 14.6 ms per 4K frame, on and off).
+  what the link has to spare (refinement-budget amendment). Motion frame
+  rate and encode time are unchanged with refinement on.
 - Refinement does not make motion better; it makes stillness exact.
 
 ## Alternatives rejected

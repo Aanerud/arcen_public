@@ -1034,9 +1034,11 @@ does not ship. On the Mac host (preview) it is built but not yet qualified.
   the window.
 
 A host that cannot match your layout says "Match My Layout could not be
-negotiated with this host". For that host, edit the connection and set its
-**Displays** to **Primary display only**; other connections keep the
-default.
+negotiated with this host" and offers **Use Primary Display Only**: one
+display for that session only, and the next connection asks for your
+whole layout again. To keep that host on one display, edit the connection
+and set its **Displays** to **Primary display only**; other connections
+keep the default.
 
 A connection's own **Displays** choice wins over Settings › Displays. Its
 **Edit** › **On this machine** › **Displays** shows **App default (Match

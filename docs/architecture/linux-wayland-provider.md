@@ -27,23 +27,22 @@ capture consumer, import routes (see "Capture leases and GPU import" below)
 and the Auto/Speed compositions; `wayland-provider` turns it on in the fused
 Pier, so such a build links `libpipewire-0.3`.
 
-Two unmodified compositor stacks were measured. The first,
-Rocky Linux 9 / GNOME 40 / NVIDIA GRID, is a baseline: eight-bit shared-memory
-capture and Mutter D-Bus input only, with no DMA-BUF, damage metadata, EIS,
-pen, ten-bit or HDR. The primary target,
-Rocky Linux 10 / GNOME 49 / NVIDIA GRID,
-was measured without DRM, with `nvidia-drm modeset=N` and with
-`modeset=1`: Auto is a qualified candidate on all three; Speed reaches
-60 fps only with a 120 Hz virtual monitor and an offer above 60, which a
-Speed session now gets when the host record qualifies it (the product
-qualification measured 50–54 fps of pointer motion on that host, so Speed
-there is still served as Auto); the `gpu-convert` DMA-BUF import is proven
-there ([GPU import and the paced Speed output](#gpu-import-and-the-paced-speed-output)); Grading and HDR are unavailable (eight-bit
-formats only, virtual monitors have only the default colour mode: Mutter
-49 has no HDR screen sharing, which arrived in Mutter 50 with mutter!4928;
-see [Wayland Grading and HDR](#wayland-grading-and-hdr)); EIS
-and damage metadata exist; SELinux-enforcing hosts need Arcen's policy
-module ([Linux Pier under SELinux](../security/linux-selinux.md)).
+Two unmodified compositor stacks are the reference. GNOME 40 (Rocky Linux 9,
+NVIDIA GRID) is a baseline: eight-bit shared-memory capture and Mutter D-Bus
+input only, with no DMA-BUF, damage metadata, EIS, pen, ten-bit or HDR.
+GNOME 49 (Rocky Linux 10, NVIDIA GRID) is the primary target, without DRM,
+with `nvidia-drm modeset=N` and with `modeset=1`. Auto qualifies on all
+three. Speed holds 60 fps on `RecordVirtual` remote monitors where the
+host's qualification measures it
+([Speed without operator sizes](#speed-without-operator-sizes)). The
+`gpu-convert` DMA-BUF import is proven with `modeset=1`
+([GPU import and the paced Speed output](#gpu-import-and-the-paced-speed-output)).
+Grading and HDR are unavailable on GNOME 49 (eight-bit formats only, and
+virtual monitors have only the default colour mode: Mutter 49 has no HDR
+screen sharing, which arrived in Mutter 50 with mutter!4928; see
+[Wayland Grading and HDR](#wayland-grading-and-hdr)). EIS and damage
+metadata exist. SELinux-enforcing hosts need Arcen's policy module
+([Linux Pier under SELinux](../security/linux-selinux.md)).
 
 ## Headless Mutter session adapter
 Code: `hosts/linux/src/session/wayland/` (Linux and `wayland-provider`
@@ -125,11 +124,7 @@ Pier (root) ─ session-launcher (root; PAM `login`, pam_systemd)
   `FormatsLocale` for the regional categories; a value PAM supplies is kept.
   The same applies to the dedicated Xorg desktop, whose agent also passes the
   locale to its bus and systemd user manager. Without it the whole desktop
-  ran in the `C` (ASCII) locale. Rocky Linux 10 lab: gnome-shell and the
-  private bus's services carried `LANG=en_GB.UTF-8` from the system, and
-  `LANG=nb_NO.UTF-8` after `SetLanguage nb_NO.UTF-8` through AccountsService;
-  Rocky Linux 9 dedicated Xorg: gnome-shell and the systemd user manager
-  carried the system's `LANG=en_US.UTF-8`, beside `TZ`.
+  would run in the `C` (ASCII) locale.
 - **Capacity one is unchanged.** The admission gate, grants and reconnect
   ownership are the existing ones; the launcher creates one desktop.
 
@@ -192,11 +187,11 @@ GDM. So the agent assembles the same login itself, with the decisions in
   (`loginctl unlock-session`, logged `authenticated logind session
   unlocked`). A desktop that "came back locked" after a reconnect was this
   idle lock reached during an attachment without input, not a failed
-  unlock. Amended 2026-11-23: while a Deck is attached (the Pier's
+  unlock. While a Deck is attached (the Pier's
   session-bound input connection is served) the session manager holds an
   idle inhibitor of its own (`arcen_session::desktop_session::manager::DeckAttachedInhibit`,
   app id `arcen`, flag 8), released when that connection ends, so an
-  attached Deck without input no longer reaches the idle lock; a manual
+  attached Deck without input never reaches the idle lock; a manual
   lock still locks. On a desktop whose compositor runs on its own seat
   (not `is_headless()`), GNOME Shell inhibits remote access while it is
   locked (`main.js` `_sessionUpdated`: `inhibit_remote_access()` when the
@@ -246,10 +241,9 @@ GDM. So the agent assembles the same login itself, with the decisions in
   logind `sleep:idle` block inhibitor (`systemd-inhibit --who=Arcen`). This
   also covers the GDM greeter's own `gsd-power` on the console seat.
 - **Dedicated Xorg desktop.** It shares the login-shell environment and the
-  host-sleep inhibitor. Rocky Linux 9.7 / GNOME 40 lab, 2026-10-18: during
-  a desktop, logind listed `Arcen … sleep:idle … block`, and nothing after
-  teardown. gnome-shell carried `PATH` and a licence variable from
-  `~/.bash_profile` but not the `LD_PRELOAD` set there. The rest of this
+  host-sleep inhibitor: logind lists `Arcen … sleep:idle … block` for the
+  desktop's life, and gnome-shell takes `PATH` and other variables from
+  `~/.bash_profile`, but never `LD_PRELOAD`. The rest of this
   section is Wayland-only. On X11 the desktop shares the user's systemd bus
   with any console session of the same user, so a session manager or
   settings daemons there need their own design.
@@ -414,7 +408,7 @@ Step 5 belongs to the capture consumer: capenc states the first frame
 `ADMISSION` line before `READY`, and the Pier must not announce the desktop
 to a Deck before it (`CapencSession::capture_admission`). Mutter sends one
 frame when a consumer connects, even to a still desktop, so this needs no
-damage. The lab harness proves it with `--pipeline auto|speed` (the product
+damage. The session harness proves it with `--pipeline auto|speed` (the product
 capenc through `media::capenc::spawn`), or with `gst-launch-1.0 pipewiresrc`
 without it.
 
@@ -576,10 +570,10 @@ buttons travel only when the device has a button interface. Upstream state
 Measured on Rocky Linux 10.2 / Mutter 49.4 / libei 1.5, a live session's
 hello carries `eis_offered=true`, `stylus.unavailable=stylus_not_offered`
 and seat interfaces `[ei_button]` of those announced; a `pen` command is
-refused. Against libei's own `eis-demo-server` (libei main `a9bf31da`, built
-for the lab only), `arcen-pier wayland eis-probe --socket PATH` reports
-`ei_stylus` v1 offered (`client_lacks_stylus`). A lab-only client built on a
-locally regenerated `reis` delivered a `StylusEmulator` stroke through the
+refused. Against libei's own `eis-demo-server` (libei main `a9bf31da`),
+`arcen-pier wayland eis-probe --socket PATH` reports `ei_stylus` v1 offered
+(`client_lacks_stylus`). A test client built on a locally regenerated `reis`
+delivered a `StylusEmulator` stroke through the
 same server with no protocol error: proximity, tip, pressure, tilt,
 rotation and eraser.
 
@@ -589,7 +583,7 @@ headless mode runs with `META_SEAT_NATIVE_FLAG_NO_LIBINPUT`
 (`src/backends/native/meta-backend-native.c`: "No seat assigned, running
 headlessly") and opens no input devices. Bridging into a Wayland session
 would therefore deliver the tablet to whatever runs on `seat0` instead
-(unless the lab seat pen route below is used).
+(unless the seat-pen route below is used).
 The shared `arcen_usb_bridge::admit_hard_usb_session` refuses Hard USB, and
 quarantined raw HID, for every seatless (Wayland) session. The hello does
 not offer `usb_hard_v1`, and a Native tablet request is answered with that
@@ -604,10 +598,10 @@ Routes considered for current GNOME:
   evdev node (`EVIOCGRAB`, as libei's `ei-libinput-stylus` does) and
   forwards it as EIS stylus. This has the same compositor prerequisite as
   Tablet support, and the pad and vendor-driver settings would be lost.
-- **Headless libinput on a private udev seat (lab, `wayland.lab_seat_pen`,
-  default off).** This is the route that works today. It needs a compositor
-  built with GNOME/mutter!5224 ("seat/native: Enable libinput in headless",
-  open upstream) plus the Arcen lab edit
+- **Headless libinput on a private udev seat (development option
+  `wayland.lab_seat_pen`, default off).** This route works on a patched
+  compositor. It needs one built with GNOME/mutter!5224 ("seat/native: Enable
+  libinput in headless", open upstream) plus an Arcen patch
   (`packaging/linux/tools/gnome-prefix/patch-headless-seat-51.py`):
   - The compositor runs libinput only when `ARCEN_LAB_HEADLESS_INPUT_SEAT`
     names the udev seat.
@@ -639,7 +633,7 @@ Routes considered for current GNOME:
      launcher, the agent (which accepts only `seat-arcen-pen-<id>`) and its
      own environment.
 
-  Any failed step undoes the earlier ones, and the desktop gets no lab pen
+  Any failed step undoes the earlier ones, and the desktop gets no seat pen
   (pen stays on the EIS seat). The desktop owns its pen: an attachment
   routes pen samples only to the pen of the desktop it serves
   (`SessionLease::seat_pen`), and the hello advertises the uinput tablet's
@@ -653,43 +647,20 @@ Routes considered for current GNOME:
   Physical devices stay root:input and the session cannot open them: a
   run without the ACL logged "Permission denied".
 
-  Shipping depends on upstream taking the three fixes above into !5224
-  (draft comment prepared). Release/Security must also accept the ACL on
+  Shipping depends on upstream taking the three fixes above into !5224.
+  Release/Security must also accept the ACL on
   the session's own virtual pen: `hosts/linux/AGENTS.md` forbids granting
   a compositor input access, and the intent of that rule is host devices,
   but this is still an input grant.
 
-Lab evidence for the seat pen (Rocky Linux 10.2, NVIDIA GRID V100D,
-2026-10-19):
-
-- **A plain `zwp_tablet_v2` client.** It received `tablet_added`
-  (`Arcen Lab Pen`, a2ce:00ff), `tool_added` (pen, capabilities tilt and
-  pressure), proximity, tip, a pressure ramp (501 to 34887 of 65535),
-  tilt (-21.3, 17.8) to (28.4, -7.1) and barrel buttons. This held on
-  Mutter 51.1 from the side-by-side prefix and on the distribution's
-  Mutter 49.4 with only `libmutter-17` rebuilt from Rocky's own SRPM with
-  the same edit.
-- **Stock Mutter.** It opens no input device.
-- **The real Deck GUI.** It drove the dev Pier (prefix 51.1,
-  `wayland.lab_seat_pen` on) with synthetic tablet events through the
-  real-screen harness. Firefox in the session's GNOME Shell 51.1 received
-  `pointerType: "pen"` for 987 moves and the stroke, with 33 distinct
-  pressures (0.037–0.638). The Deck's glass showed the stroke widening
-  with pressure.
-  - Deck-side latency (over the long-haul VPN link): input → host
-    event about 23 ms p50, motion-to-photon about 123 ms p50.
-  - Glass: 59.5 fps (Speed).
-- **One pen per desktop.** The same run with per-desktop pens: Firefox got
-  1033 pen moves with 35 pressures (0 to 0.638); motion-to-photon was
-  108 ms p50.
-  - The desktop's rule named only its own device and seat
-    (`seat-arcen-pen-<id>`). udev reported that seat, the devpath under
-    `/devices/virtual/input/` and `ID_INPUT_TABLET=1`.
-  - `getfacl` on the event node showed one named user, the desktop's.
-  - When the Pier stopped, the desktop's pen logged "revoked, destroyed and
-    its rule removed". The node was gone, and no rule was left.
-  - Two stale rules planted before a Pier start were swept at start
-    (`removed: 2`).
+On a patched compositor (Mutter 51.1 from the side-by-side prefix, or the
+distribution's Mutter 49.4 with only `libmutter-17` rebuilt with the same
+patch), a plain `zwp_tablet_v2` client receives the tablet, its tools,
+proximity, tip, a pressure ramp, tilt and barrel buttons, and a browser in
+the session reports `pointerType: "pen"` with pressure. Each desktop's rule
+names only its own device and seat, its event node grants only that
+desktop's user, and the Pier's stop revokes, destroys and removes all of it.
+Stock Mutter opens no input device.
 
 #### Native desktops on their own seat (`wayland.session_mode`)
 
@@ -904,26 +875,15 @@ GDM could skip seats whose master device carries a property, for example
 `GDM_IGNORE_SEAT`, in `ensure_display_for_seat`. That would remove the
 display-manager hazard.
 
-Headless libinput with a seat (mutter!5224 plus its three fixes, the lab
-seat pen above) remains the route to several pen desktops on one GPU.
+Headless libinput with a seat (mutter!5224 plus its three fixes, the seat
+pen above) remains the route to several pen desktops on one GPU.
 
-Lab evidence (Rocky Linux 10.2, stock Mutter 49.4, GRID V100D-16Q,
-2026-10-20):
-
-- **Real Deck GUI** (real-screen harness, synthetic tablet events, Speed,
-  over the VPN link):
-  - Firefox 140 and Chrome 155 (Wayland) report `pointerType: pen` for
-    every inked sample, with 32 pressure levels, tilt ±45/±36 and no
-    pointer-type flips.
-  - Input → host event: 21 / 26 ms p50 (mouse 17 ms). Motion-to-photon:
-    122 / 123 ms p50 (mouse 101 ms). Glass 54–60 fps.
-  - Exactly one cursor in every frame.
-  - hardwaretest.org shows Pen with pressure and tilt in both browsers.
-- **Capture:** capenc served Speed at 60–61 fps over DMA-BUF
-  (`gpu-convert`).
-- **Lifecycle:** an idle-expired desktop's seat was taken apart and a new
-  native desktop built in about 10 s.
-- **GDM:** its login-screen attempts on the new seats failed as designed.
+On stock Mutter 49.4 a native desktop's browsers (Firefox and Chrome on
+Wayland) report `pointerType: pen` for every inked sample, with pressure,
+tilt and no pointer-type flips; every frame shows exactly one cursor; Speed
+runs at 60 fps over `gpu-convert`; an idle-expired desktop's seat is taken
+apart and a new native desktop built in about 10 s; and GDM's login-screen
+attempts on the new seats fail as designed.
 
 #### The Pier side (`input::wayland`)
 
@@ -991,9 +951,9 @@ remember-numlock-state`), Mutter 49 turns it on as its seat starts when
 (`meta-seat-impl.c`), so the agent reads both keys from the session's
 settings when it starts (`LockState::at_session_start`). A desktop that
 pins `remember-numlock-state=false` starts with Num Lock off and needs
-nothing more. Proven on Rocky 10 (2026-10-18): with `numlock-state=true`
-the session started with Num Lock on, one `locks` turned it off (Mutter
-wrote `numlock-state=false`), and a second toggled nothing. The planner sends the Deck's lock
+nothing more. On GNOME 49 with `numlock-state=true` the session starts with
+Num Lock on, one `locks` turns it off (Mutter writes `numlock-state=false`),
+and a second toggles nothing. The planner sends the Deck's lock
 states when they differ from what it last sent, or when that is unknown:
 after a queue collapse or a reconnection, which may have dropped a lock
 command, its lock states are unknown and the next key event sends them
@@ -1060,7 +1020,7 @@ types it, and types it by keycode:
   none). The index keeps per group and character the cheapest stroke. The keyboard is requested only after the seat
   advertises the keyboard capability: asking a headless Mutter 49.4 seat for
   its keyboard earlier crashes gnome-shell (`seat_get_keyboard` →
-  `send_keymap` → `mtk_anonymous_file_open_fd`, seen in the lab).
+  `send_keymap` → `mtk_anonymous_file_open_fd`).
 - **Active group.** A single-group keymap needs nothing. Otherwise the group
   is the position of GNOME's active input source (the first `mru-sources`
   entry still in `sources`) among the keymap's groups. Mutter 49.4 compiles
@@ -1498,7 +1458,7 @@ Measured on Rocky 10.2 with Mutter 49.4 and Xwayland 24.1.9:
 A consumer that fixes no size (bare `pipewiresrc`) negotiates Mutter's
 default 1280×720 (`DEFAULT_SIZE` in `meta-screen-cast-stream-src.c`; a
 virtual source states no size of its own). That resizes the remote monitor
-in place, so every lab consumer fixes the output's size, as capenc does.
+in place, so every consumer fixes the output's size, as capenc does.
 
 The following are not provided yet:
 
@@ -1557,7 +1517,7 @@ methods.
 - **Decisions are shared.** `arcen_media::clipboard::bridge::SelectionBridge`
   decides what to read, ignore, offer and serve; the agent only moves bytes
   between Mutter's descriptors and that state machine. The rules:
-  - Our own ownership (`session-is-owner`) is never read back.
+  - Arcen's own ownership (`session-is-owner`) is never read back.
   - The newest owner change cancels an older read; Mutter refuses parallel
     reads.
   - A read is bounded at `max_bytes + 1` with a 5-second progress deadline.
@@ -1583,7 +1543,7 @@ methods.
   ends writing into full socket buffers (1 MiB chunks against a ~200 KiB
   socket buffer), and neither reads again. A helper that takes nothing for
   5 s (`BRIDGE_SEND_TIMEOUT`) turns a Wayland bridge off for the attachment.
-  The lab proved 4 MiB both ways at once on GNOME 49.
+  4 MiB transfers both ways at once on GNOME 49.
 - **Failure is local.** A bridge that is missing or lost turns the clipboard
   off for that attachment, and the session goes on. The logs record
   `clipboard_bridge_unavailable` or `clipboard_bridge_lost`. There is no wire
@@ -1596,41 +1556,15 @@ methods.
   Windows and macOS and unlike Xorg
   ([clipboard privacy](../security/clipboard-redirection.md)).
 
-#### Clipboard lab evidence (2026-10-18)
-
-The hosts:
-
-- **GNOME 49:** Rocky 10.2, Mutter 49.4, SELinux enforcing, with
-  `RecordVirtual` remote monitors.
-- **GNOME 40:** Rocky 9.7, Mutter 40.9, startup monitors.
-
-On each, a Pier with the clipboard bridge was qualified into a
-record of its own, and run beside the installed service. The "application"
-in the session was a separate `RemoteDesktop` clipboard client: a real
-`MetaSelection` owner and reader. The Deck was the macOS `media-smoke` with
-`ARCEN_MEDIA_SMOKE_CLIPBOARD_*`. Items were compared by size and equality.
-
-| Check | GNOME 49 | GNOME 40 |
-| --- | --- | --- |
-| A clipboard-only `RemoteDesktop` session, never started, carries the clipboard (spike, then the agent's proof) | yes | yes |
-| `examples/wayland_clipboard_harness` (both directions, latin-1 `STRING`, PNG, oversize refused, supersession) | 9/9 ok | 9/9 ok |
-| Deck → host text (42 B) and PNG (146 419 B), equal | yes | yes |
-| Host → Deck text (40 B) and PNG (186 892 B), equal | yes | yes |
-| Host copy of 9 MiB with an 8 MiB policy | refused, never sent; the session and later copies went on | same |
-| Clipboard across a Windowed resize to 1600×900 (Deck item after it, host item after it) | yes (resize accepted, generation 2) | resize not offered (startup monitors) |
-| A second attachment to the persisting desktop (no re-enable needed) | yes | yes |
-
-Testing found three Mutter behaviours, and the bridge handles each:
+#### Mutter behaviours the bridge handles
 
 - On GNOME 40 through 50, `DisableClipboard` cannot be followed by
   `EnableClipboard`.
 - `mime-types` arrives as the structure `(as)`.
 - A reader gets a non-blocking pipe.
-
-A further observation: when an application that owned the selection exits,
-Mutter's clipboard manager reinstalls its copy, which is a new owner. The
-same content is then sent again. Xorg with `gsd` does the same (seen in the
-GNOME 40 Xorg regression run).
+- When an application that owned the selection exits, Mutter's clipboard
+  manager reinstalls its copy, which is a new owner, so the same content is
+  sent again. Xorg with `gsd` does the same.
 
 ### Teardown
 
@@ -1667,9 +1601,9 @@ waits 60 s for a Wayland launcher (Xorg keeps 20 s). Each nested limit
 outlasts the one inside it, so the Pier never kills a launcher that is still
 inside a bounded start.
 
-The launcher now bounds its tokio runtime shutdown, so a blocking stdin read
-no longer keeps it — the logind session leader — alive after teardown; that
-had held sessions in `closing` until the Pier closed the pipe.
+The launcher bounds its tokio runtime shutdown, so a blocking stdin read never
+keeps it — the logind session leader — alive after teardown, which would hold
+the session in `closing` until the Pier closed the pipe.
 
 ### Provider selection
 
@@ -1711,39 +1645,18 @@ delivered an encoded first frame), not GPU import; `gpu_import` is reported
 and proven only by a GPU import route. Every session still proves its own
 first frame and input target; the record never stands in for them.
 
-### Lab evidence (Rocky 9.7, GNOME Shell 40.10, Mutter 40.9, PipeWire 1.0.1)
+### GNOME 40 behaviours
 
 `hosts/linux/examples/wayland_session_harness.rs` (with
 `scripts/lab/wayland-input-client.py`) authenticates a temporary local user
-through PAM and the real launcher, then checks each step:
-
-```text
-session_start: logind_session=… open_ms≈1750 compositor=gnome-shell
-logind_session: Type=wayland Class=user Seat= Service=login Active=yes
-virtual_output: Meta-0 1920x1080@60
-first_frame: node=36 format=BGRx size=1920x1080 buffers=3
-capenc_handoff: capenc parsed node=36 output=Meta-0 generation=1
-                expected_size=1920x1080 cursor_mode=metadata,
-                compositor/encoder GPU 0000:00:10.0 via renderD128 from the
-                session's environment; 30 frames host-copy, 10 NVENC
-                access units, upload 0.89 ms, read-back verified
-audio_monitor: PULSE_RUNTIME_PATH=/run/user/<uid>/pulse source=auto_null.monitor
-input_facts: hello generation=1 Meta-0 device_types=7 RemoteDesktop started,
-             eis_offered=false; keyboard, pointer, touch available, pen and
-             EIS missing; input_injection upgraded to available
-first_key / pointer / keyboard / scroll / held_release / refusals:
-             through the Pier's WaylandInjector (see Input)
-compositor_death: session ended ≈1 s after SIGKILL of gnome-shell
-logout: terminate-session ended the session ≈0.8 s, runtime directory removed
-teardown: logind session, scope, runtime directory and mounts gone; the
-          user manager stopped with the last session
-```
-
-It also runs `--slow-start` (the agent is stopped for 25 s mid-start; the
-open still succeeds after about 25.6 s) and `--stop-during-start` (the
-launcher receives SIGTERM while the agent is stopped mid-start with the
-document portal's FUSE mount present; the open fails, and the logind
-session, scope, runtime directory and mounts are gone and PAM is closed).
+through PAM and the real launcher, then checks each step: session start, the
+logind session, the virtual output, the first frame, capenc's hand-off, the
+audio monitor, the input facts, the first key, pointer, keyboard, scroll,
+held-key release and refusals through the Pier's `WaylandInjector`,
+compositor death, logout and teardown. `--slow-start` stalls the agent
+mid-start; `--stop-during-start` stops the launcher while the agent is
+stalled with the document portal's FUSE mount present, and the logind
+session, scope, runtime directory and mounts must still be gone.
 
 GNOME Shell 40 starts in the Activities overview, which takes pointer and
 keyboard until dismissed; a remote desktop must expect that. GNOME 40
@@ -1778,50 +1691,16 @@ the Escape is the key that is consumed, and the next key arrives normally
 focus change. Whether a physical keyboard on a GNOME 40 console behaves the
 same was not tested.
 
-#### Input lab evidence (2026-10-17, same host)
-
-The harness drives the Pier's `WaylandInjector` (root, real peer and `hello`
-checks) into the GTK client; every run below passed, on a first login (the
-welcome dialog: two Escapes) and on later logins (one):
-
-```text
-input_facts:  hello generation=1 Meta-0 1920x1080 device_types=7 started,
-              eis_offered=false; keyboard/pointer/touch available, pen and
-              EIS missing; proven_facts input_injection=Available
-first_key:    'a' press and release after Escape dismissal
-pointer:      absolute motion; button 1 drag with motion between press and
-              release (one wl_pointer.button each way in WAYLAND_DEBUG)
-keyboard:     Shift from the modifier mask gives 'B'; 'd' held 900 ms with
-              three Deck repeats: one injected press, 15 client repeats,
-              one release; 'æ' by keysym with layout `no` (dropped under `us`)
-scroll:       wheel up gives up, wheel right gives smooth dx>0; precise 60
-              points up gives smooth dy=-0.5
-held_release: 'e' released on reset_held (lane loss); 'f' on injector drop;
-              'g' when a newer injector superseded the old one, whose next
-              command failed (lost); 'i' when a raw connection closed
-refusals:     unknown output, stale generation (2), x beyond the stream;
-              the Pier refused a peer whose pid is not the agent's
-injector_loss: agent SIGSTOPped 6.5 s: command timeout, reconnecting, a key
-              typed meanwhile refused and counted, the connection restored
-              and proven, the next key delivered; neither the key written
-              just before the stall nor the one typed during it ever arrives
-injector_lost: agent stopped beyond every attempt: Lost(Unreachable) after
-              about 23 s, later input refused as lost; the key written before
-              the stall never arrives
-```
-
 GTK 3 reports a wheel step right as discrete `left` while its smooth delta
 is `dx=+1`; the protocol trace shows `axis_discrete(1, 1)` and `axis(1, 10)`,
 rightwards, so that is GTK's own horizontal discrete mapping.
-The test client's button handler fires twice per Wayland button event; the
-protocol trace shows one.
 
 ### Still open on GNOME 40
 
 - GPU import: no DMA-BUF exists here; the host-memory path's
   rate and copy cost are measured (see Wayland Auto and Speed).
-- Serving a Deck is done (see [Serving a Deck](#serving-a-deck));
-  it was proven end to end on the Rocky 10 host, not on this one.
+- Serving a Deck (see [Serving a Deck](#serving-a-deck)) is proven end to
+  end on GNOME 49, not on GNOME 40.
 - A Deck-drawn (local) cursor end to end: the metadata dialect is the same
   as on GNOME 49 (Mutter 40 `meta-screen-cast-monitor-stream-src.c`, and
   the empty-sprite bytes above), but no Deck has been served one here.
@@ -1998,13 +1877,7 @@ temporary account and the marker, and exits 0. A killed run's logind user
 can stay `closing` (systemd 257) until logind restarts; the account is
 removed anyway and the next one takes a UID nothing holds
 (`temporary_account_uid`), so no logind restart is ever needed. `capture.wayland_auto_requalify =
-false` restores refuse-only start-up. Proven on Rocky 10.2 / GNOME 49.4 in
-the service's own SELinux domain (`unconfined_service_t`, development record):
-a rebuilt Pier (executable digest changed) re-qualified five displays (four
-from the previous record, one a Deck had requested) at start and listened
-after about 140 s; with a PAM service that rejects the temporary account the
-attempt failed, wrote no record and its marker, and the next start refused in
-about 2 s with the failing steps, without re-running.
+false` restores refuse-only start-up.
 
 **Second trigger: a cleared X11 host precondition.** A *valid* record whose
 `x11_apps` was skipped for a host precondition (`host_precondition`, an
@@ -2165,9 +2038,9 @@ The desktop runs `gnome-shell --headless` inside the GNOME login the agent
 assembles ([GNOME login services](#gnome-login-services)).
 The dedicated Xorg desktop still runs `gnome-shell --x11 --sm-disable` without
 any of it, apart from the login-shell environment and the host-sleep
-inhibitor. What follows is measured on Rocky Linux 10.2 / gnome-shell 49.4 /
-gnome-settings-daemon 47.2 / gnome-keyring 42.1 / GDM 47. The runs were on
-2026-10-18 with a throwaway local user through the real launcher.
+inhibitor. What follows holds on Rocky Linux 10.2 with gnome-shell 49.4,
+gnome-settings-daemon 47.2, gnome-keyring 42.1 and GDM 47, measured with a
+throwaway local user through the real launcher.
 
 | Behaviour | Result | Why |
 | --- | --- | --- |
@@ -2177,71 +2050,38 @@ gnome-settings-daemon 47.2 / gnome-keyring 42.1 / GDM 47. The runs were on
 | Keyring | One `gnome-keyring-daemon --unlock` owns `org.freedesktop.secrets`. The login collection is `Locked=false`; `secret-tool store` and `lookup` work without a prompt, and the value stored in one desktop is read in the next. `ssh-add -l` reaches its agent. The password appears in no process's argv or environment (0 matches across the session, agent and launcher) | The launcher hands the password over a pipe |
 | Idle blanking, idle lock | With `idle-delay` 30 s, `lock-delay` 0: presence went `Idle` (3), `ScreenSaver.GetActive` true and `LockedHint=yes`. The password typed through the session's input socket unlocked it (presence back to 0). An idle inhibitor (`gnome-session-inhibit --inhibit idle`, `InhibitedActions=8`) kept presence available for 45 s | Presence follows Mutter's `IdleMonitor`; RemoteDesktop input resets it |
 | Suspend and blanking by `gsd-power` | None. The overlay pins `sleep-inactive-ac-type='nothing'` (not writable). An extra `gsd-power` started with the user's own `sleep-inactive-ac-type='logout'` and a 60 s timeout (overlay removed) logged `inactive, so using normal state` and `ignoring state transition to blank as inactive`; after 95 s the desktop was still there, `PowerSaveMode=0`, logind `IdleHint=no`. logind lists Arcen's `sleep:idle` block inhibitor for the desktop's life, and only delay inhibitors from the shell and the settings daemons (`gsd-media-keys` does not get its power-key inhibitor: polkit refuses it to a session without a seat, and Arcen's polkit rule keeps a native desktop's session to the same `allow_any` answers) | `SessionIsActive=false` is gsd-power's own gate; the launcher holds the inhibitor |
-| Idle lock and reattachment (2026-10-19, real Deck GUI on a Mac, dev Pier) | Throwaway user with `idle-delay` 30: attached without input, presence `Idle` at 30 s, `LockedHint=yes` at 40 s; a reattachment unlocked it (`LockedHint=no`, `GetActive` false, presence back to 0) and it stayed unlocked for 60 s without input; after input it locked again 30 s later; 2 `AddIdleWatch` calls in the whole run. A directory-backed test account (`idle-delay` 300): locked (stream black) after 300 s attached without input, unlocked by the next reattachment | Presence follows the shield and keeps one persistent idle watch (see the session manager above) |
+| Idle lock and reattachment (a real Deck) | Throwaway user with `idle-delay` 30: attached without input, presence `Idle` at 30 s, `LockedHint=yes` at 40 s; a reattachment unlocked it (`LockedHint=no`, `GetActive` false, presence back to 0) and it stayed unlocked for 60 s without input; after input it locked again 30 s later; 2 `AddIdleWatch` calls in the whole run. A directory-backed test account (`idle-delay` 300): locked (stream black) after 300 s attached without input, unlocked by the next reattachment | Presence follows the shield and keeps one persistent idle watch (see the session manager above) |
 | Manual lock (Super+L) and unlock | Super+L through the input socket locks (`GetActive` true, `LockedHint=yes`, handled by `gsd-media-keys`); `loginctl unlock-session` (what the Pier runs on every password-authenticated attachment) unlocks | GNOME Shell unlocks through GDM's reauthentication channel and deactivates on logind `Unlock`. Without GDM the shell creates no screen shield at all |
 | Time-zone redirection | Opened with `America/New_York` on a host in BST: the top-bar clock read 02:44 while the host read 07:44 | `TZ` is in gnome-shell's environment and in every service the private bus activates |
 | First login | `gnome-initial-setup --existing-user` runs (autostart) and exits at once on Rocky Linux 10: "Skipping gnome-initial-setup for existing user" (the distribution's `vendor.conf` limits existing users to language and keyboard pages, which do not apply here). The shell's welcome dialog opens as before. With `wayland.first_login_setup = "skip"` both markers are written first | GNOME's own behaviour; nothing is suppressed by default |
 | Keyring with another password | After the account password was changed without the keyring: `failed to unlock login keyring on startup`, `Locked=true`, logged `keyring locked`; the desktop runs and applications ask for the keyring password | As after a GDM login |
 | Log Out | The shell's dialog opens; Return activates its default button, Cancel (logged `logout cancelled`). Left alone, its 60 s countdown confirms: all 15 clients answered `EndSession`, the agent ended the desktop (`user_logout`) 65 s after the request, and the launcher released the scope, runtime directory and inhibitor | |
 | `wayland.first_login_setup = "skip"` | `~/.config/gnome-initial-setup-done` written (`yes`), `welcome-dialog-last-shown-version` raised to `49.4`, no initial-setup process | |
-| Start time | Open-to-ready through the launcher, three alternating runs: the installed 0.17.0 launcher 1.56–1.80 s, this build 2.04–2.11 s (the overlay compile, keyring start and login shell run before the compositor; the settings daemons and autostart start after it and are not waited for) | |
+| Start time | Open-to-ready through the launcher about 2.0–2.1 s (the overlay compile, keyring start and login shell run before the compositor; the settings daemons and autostart start after it and are not waited for) | |
 | Notifications and portals | GNOME Shell's notification service owns `org.freedesktop.Notifications` and `notify-send` works; the settings portal answers (`color-scheme`) | |
 
-### Lab evidence (2026-10-17, Rocky 10.2 / GNOME 49 / NVIDIA GRID, DRM)
+### Remote monitors, resize and recovery
 
-Rocky Linux 10.2 (kernel 6.12), gnome-shell 49.4, PipeWire 1.4.11, GRID
-V100D-16Q driver 580.105.08 with `nvidia-drm modeset=1`, Secure Boot and
-SELinux enforcing, no Xorg server installed; a debug Pier run as a
-transient systemd unit with
-`SELinuxContext=unconfined_u:unconfined_r:unconfined_t` (before the
-[SELinux fix](../security/linux-selinux.md)), a throwaway local account, the macOS Deck's `media-smoke`
-and `input-smoke` over a VPN:
+On GNOME 49 with `RecordVirtual` remote monitors:
 
-| Step | Evidence |
-| --- | --- |
-| Qualification | `qualify --write --output 1920x1080@60 --output 1800x1130@60` as `arcen-wlq`: route `host-copy`, `bgrx8` `host-shared`, ~90 access units in 3 s; input `hello` device types 7, 121 pointer motions accepted in 1 s, `eis_offered=true`; source rate 40–41 fps sustained at both sizes (Speed not qualified); PulseAudio `auto_null.monitor`; logind session, runtime directory and account removed |
-| Selection | `auto`, no record: refused naming `qualify --write`; `auto` with an Xorg executable configured: X11 (`xorg_server_installed`), record not read; `auto` with the record: Wayland (`wayland_qualified`) |
-| Renderer | the headless gnome-shell is a graphics process on the NVIDIA GPU (`nvidia-smi`, 110 MiB) with `libnvidia-eglcore` mapped, `/dev/nvidia0` and `renderD128` open; ScreenCast still delivers shared memory, encoded by host copy |
-| Auto | PAM, session at the Deck's 1800×1130 in ~1.6 s; `ADMISSION admit auto 30 fps host-copy`; hello HEVC 4:2:0 8-bit limited BT.709, `active_pipeline=auto`; VideoToolbox decoded |
-| Speed request | `downgrade … copy_path_not_rate_qualified served=auto`; hello `active_pipeline=auto` |
-| Grading / HDR request | `downgrade` `eight_bit_source` / `hdr_on_eight_bit_source`, served `hevc-420-8-limited-bt709`; the Deck's 4:4:4 quality request kept the admitted plan; decoded |
-| Audio | Opus frames from the session's PulseAudio monitor every run |
-| Microphone | negotiated Opus, 36–39 Deck frames accepted into the session's pipe source |
-| Input | `input-smoke`: 3 keys, 1 motion, buttons and scroll injected (`key_events=3 mouse_moves=1`), injector proven per attachment |
-| Reattach | every later attachment reattached to the same logind session |
-| Keyframe on demand | 27 ms on a still desktop (harness, same build and stack) |
-| Teardown | logout: logind session, runtime directory and mounts gone, user manager stopped ~10 s later; Pier stop: the same |
+- A consumer that fixes a size creates a "Virtual remote monitor" of that
+  size; it stays after the consumer leaves, and a consumer fixing another
+  size resizes it in place. `max-framerate=120/1` gives a 120 Hz mode. Two
+  streams recorded before `Start` give two monitors, which
+  `ApplyMonitorsConfig` places; a stream recorded after `Start` announces no
+  node until `ScreenCast.Stream.Start` (see [Multi-monitor](#multi-monitor)).
+  Stopping the session removes its monitors.
+- A Windowed Deck's resize is accepted in about 0.6 s as a new output
+  generation, with audio and input continuing; pointer motion during a
+  resize loses at most one motion, refused as `stale output generation`,
+  and the injector stays connected.
+- A killed capenc is replaced by a new epoch that starts with a keyframe; a
+  killed gnome-shell tells the Deck `the desktop session on the host ended`
+  and the next attachment starts a new desktop; a killed Deck's same-user
+  reattachment proves the old Deck silent in 3 s and takes the desktop over.
+- A keyframe on demand on a still desktop takes about 30 ms.
 
-Earlier the same day, with 580.105.08 and `nvidia-drm` loaded at
-`modeset=N`, the same qualification and Deck runs (Auto, Speed served as
-Auto, input, reattach, logout) passed. The no-DRM refusal is covered by
-unit tests only: this host was not returned to a driver without DRM.
-
-
-### Lab evidence: remote monitors, resize and recovery (2026-10-17, same host)
-
-Rocky Linux 10.2, gnome-shell 49.4, PipeWire 1.4.11, GRID 580.105.08 with
-`nvidia-drm modeset=1`, a debug Pier with output recovery as a transient
-unit, macOS Deck `media-smoke`/`input-smoke` over a VPN:
-
-| Step | Evidence |
-| --- | --- |
-| `RecordVirtual` behaviour | a consumer fixing 1280×800 created `Meta-1` "Virtual remote monitor" 1280×800; it stayed after the consumer left; a consumer fixing 1600×900 resized it in place; `max-framerate=120/1` gave a 120 Hz mode; two streams recorded before `Start` gave two monitors, `ApplyMonitorsConfig` placed them; a stream recorded after `Start` announced no node until it was started with `ScreenCast.Stream.Start` (found 2026-10-18, see [Multi-monitor](#multi-monitor)); stopping the session removed its monitors; absolute pointer motion on a virtual stream was accepted |
-| Qualification | remote mode, session ready in 2.0 s; capture, input and audio as before; source rate sustained **60 fps** at 1920×1080 and 1280×800 (host copy), against 40–41 fps with `--virtual-monitor` |
-| Resize | Windowed Deck, `ARCEN_MEDIA_SMOKE_RESIZE=1600x900,1280x720,1800x1130`: each accepted in about 0.6 s (generations 2, 3, 4), decoded at each size, audio packets 194 → 279 → 520 → 726 across the three resizes; `input-smoke` after the resizes injected 3 keys, motion, buttons and scroll |
-| Topology change | `configure` (root, on the output socket) generation 2 with 1600×900 + 1280×1024 at (1600, 0): `Meta-1`, `Meta-2` placed side by side in 0.4 s; back to one 1800×1130 output as generation 3; a stale generation was refused |
-| capenc killed | replacement epoch streaming with a keyframe 0.38 s later; the smoke completed (984 audio packets in 22 s) |
-| gnome-shell killed | the Deck was told `the desktop session on the host ended` 0.5 s later; the next attachment started a new desktop |
-| Deck killed | (transport) a same-user reattachment proved the old Deck silent in 3.0 s and streamed; before, it was refused `shared display is busy` |
-| Deck killed, resume negotiated | the displaced attachment handed the desktop over 0.3 s after the 3.0 s proof; the newcomer reattached to the same logind session and streamed |
-| Resize during input | pointer motion every 50 ms across three resizes: one motion refused as `stale output generation` at a switch, the injector stayed connected |
-| Speed qualification | `qualify --output 1920x1080@120` with remote monitors and the GPU route (`gpu-convert`, DMA-BUF, explicit sync): Speed admitted, source 59–60 fps every second, sustained 60, encoded 60–61 |
-
-Not injected: Mutter closing the paired session while the compositor
-runs (no client other than the agent may stop it), PipeWire daemon death
-(a stack member: the session ends), GPU-import failure (the import route
-belongs to GPU import; a capenc that exits on it is restarted by the
-same budget).
+The no-DRM refusal is covered by unit tests.
 
 ## Audio
 Code: `hosts/linux/src/session/wayland/audio.rs` (mode, drop-in, lease),
@@ -2285,29 +2125,11 @@ it (`basis = private_graph`); in a bridged graph the lease runs on the
 user's PulseAudio, as on X11. With `audible`, a private graph's session sink
 is also looped into a tunnel to the user's own default sink.
 
-### Lab evidence (2026-10-18)
-
-Host-side, through the real launcher and session agent of a development
-build (a temporary local account; the installed Pier untouched), Arcen's
-own `audiocap` recording the session's capture source while a 440 Hz test
-tone (amplitude 8000, RMS about 5660) played:
-
-| Host | Run | Evidence |
-| --- | --- | --- |
-| Rocky 10.2, GNOME 49.4, PipeWire 1.4.11, WirePlumber 0.5.10 (`private_graph`) | Wayland, `muted` | gnome-shell's environment carries `PULSE_RUNTIME_PATH=<runtime>/pulse`; the private server reports `PulseAudio (on PipeWire 1.4.11)` with `arcen_session_sink` the only sink; native `pw-play` linked to `arcen_session_sink:playback_FL/FR` by WirePlumber, `audiocap` RMS 4692 over 418 560 samples; PulseAudio `paplay` the same, RMS 4692; a microphone pipe source loaded into the session server appears as an `Audio/Source` node of the private graph, native `pw-record` RMS 4821 and PulseAudio `parecord` RMS 5477 from it; local playback `basis=private_graph`, honoured; the user's `~/.local/state/wireplumber` unchanged, the private one written; after teardown no session, runtime directory or `pipewire-pulse` left |
-| Rocky 9.7, GNOME 40, PulseAudio 15, PipeWire 1.0.1 (`bridged_to_user_pulse`) | Wayland, `muted` | the user's PulseAudio default is the lease's `arcen_session_<tag>`; the private graph has `arcen_session_sink`; native `pw-play` linked to it, `audiocap` on the lease sink's monitor RMS 5168; PulseAudio `paplay` RMS 4606; no microphone node until a pipe source becomes the default, then `arcen_session_microphone` records it, native RMS 4635 |
-| same | Wayland, `audible` | the tunnel plays into the user's default sink: native RMS 5178, PulseAudio RMS 4606, microphone RMS 4635 |
-| Rocky 9.7, GNOME 40, Xorg, PulseAudio 15 | X11, `muted` | at start the session sink is the default; a "speaker" sink loaded and made the default mid-session is muted, the default put back and a stream played straight to the speaker moved onto the session sink within 1.5 s; unmuting the speaker by hand is undone within 1 s; `audiocap` RMS 5601; native `pw-play` (before this work: "no node available", the user's PipeWire had no audio sink) RMS 5556 through the bridge; the bridged microphone RMS 4635; after the session the speaker is unmuted and no Arcen module or journal remains |
-| same | X11, agent killed with SIGKILL | the journal named the muted speaker and the loaded module; the launcher's recovery unmuted the speaker, removed the module and the journal |
-| Rocky 10.2 (as above), release development Pier on its own port, macOS Deck `media-smoke --microphone` for 61 s | Wayland, `muted`, end to end | Pier: `native audiocap started source=arcen_session_sink.monitor`, `audio_frames_captured=2899`, `audio_frames_sent=2878`, none dropped; while the Deck was attached, native `pw-play` and PulseAudio `paplay` (amplitude 6000) linked to `arcen_session_sink` and the monitor that audiocap records measured RMS 3988 and 3999; the Deck microphone source `arcen_microphone_<generation>` was the session server's default and an `Audio/Source` node of the private graph, 2033 Deck frames accepted, a native `pw-record` and a PulseAudio `parecord` both read it (the Deck's microphone was silent, RMS 0). Deck side, over the long-haul VPN link: 2866 audio packets, peak 32767 |
-| same | X11, `audible` | the user's audio server is not touched (the speaker stays the unmuted default); native and microphone bridges as above (RMS 5556, 4635) |
-
-Two findings fixed on the way: a tunnel's PulseAudio stream cannot be moved
-(`PA_STREAM_DONT_MOVE`), so the tunnels restart instead of moving; and a
-lease must never mute a stream, because PulseAudio's stream-restore and
+Two rules keep the bridge sound. A tunnel's PulseAudio stream cannot be
+moved (`PA_STREAM_DONT_MOVE`), so the tunnels restart instead of moving. A
+lease never mutes a stream, because PulseAudio's stream-restore and
 WirePlumber's `restore-stream` remember that mute for every later stream of
-the same application (a muted tunnel left the next session's native audio
-silent).
+the same application.
 
 ## Multi-monitor
 A Wayland session serves Match My Layout with the same `multi_monitor_v1`
@@ -2318,7 +2140,7 @@ differs is where the monitors come from.
 | --- | --- | --- |
 | What can be offered | NVIDIA `DFP-N` heads found by the start-up Xorg probe | the compositor's output mode (`VirtualOutputMode`, up to four) and the concurrent outputs the qualification record proved (`facts.multi_output`); no head discovery |
 | Planning | `display::topology::plan_topology` onto heads | `display::topology::plan_virtual_topology`: the shared `arcen_outputs::virtual_topology` placement (already-oriented extents, desktop at the origin, refresh and millimetres kept), then Mutter's layout rule (`validate_layout`); refused whole otherwise |
-| Rotation | per head | not offered: Mutter accepts a transform on a virtual monitor (lab, 2026-10-18), but what its stream then carries is unproven |
+| Rotation | per head | not offered: Mutter accepts a transform on a virtual monitor, but what its stream then carries is unproven |
 | Encoder | NVENC or OpenH264 by policy and measured admission | the same aggregate admission; each output's capenc measures NVENC on synthetic frames at the output's size (`admission-v1`) without consuming its stream; `auto` resolves to the encoder the Wayland compositions encode with (`Config::wayland_multi_monitor_encoder`) |
 | Desktop | multi-head Xorg from the plan | the launcher opens the plan as placed outputs, primary first; the agent's ready message must match it |
 | Capture | one capenc per NvFBC output | one capenc per output, each with its own stream's hand-off, Speed rate and import route (`MonitorCaptureBinding`); a monitor without a matching stream refuses the attachment |
@@ -2345,56 +2167,45 @@ Mutter 40 accepts several `--virtual-monitor` flags and `ApplyMonitorsConfig`
 does not exclude virtual monitors there (source, 40.0), but that is not yet
 proven on a GNOME 40 host.
 
-### Lab evidence (2026-10-18, Rocky 10.2 / GNOME 49.4 / NVIDIA GRID V100D; GNOME 40.9 baseline host)
+### Behaviour on GNOME 49
 
-All rates are host-side (capenc counters). Deck-side figures in these runs
-crossed a long-haul VPN link and are not host facts.
-
-- **Streams added to a running session (Mutter 49.4).** A `RecordVirtual`
-  stream recorded after `RemoteDesktop.Start` announces its PipeWire node
-  only after `ScreenCast.Stream.Start` on that stream; `Stream.Stop` removes
-  its virtual monitor. Transforms and the mode's scale list (`[1, 2]` for
-  1920x1080, `[1]` for 1280x720) are accepted on virtual monitors.
-- **Qualification.** `arcen-pier wayland qualify --multi-output 4` proved
-  four concurrent 1920x1080 outputs on the DMA-BUF `gpu-convert` route; each
-  output encoded about 30 fps at Auto while idle and its source delivered
-  58–60 fps while the qualification pointer visited it.
-- **Match My Layout.** Deck fixtures of two, three and four displays were
-  applied whole (desktops 3520x1080, 4800x1080 and a 2x2 3840x2160), every
-  monitor decoded, and the region input probe's eight events were accepted
-  on the output that shows each region.
-- **Reattach in place.** Successive sign-ins moved one desktop 1→2→3→4 and
-  2→1 outputs with the same `gnome-shell` process; each attach-time output
-  transaction committed in 80–420 ms before the first capture epoch.
-- **UI scale.** A 3024x1964 HiDPI stream at Automatic (the Deck advertises
-  200%) is placed at scale 2.0 with an unscaled 1920x1080 neighbour at 1.0.
-  The same display streamed in points (1512x982, 100%) stays at 1.0; its
-  mode offers only `[1]`. For comparison, a 200% HiDPI request (3600x2262)
-  to a single dedicated Xorg head on GNOME 40.9 produced a 480x300 mm EDID
-  (190.5 DPI) that Mutter 40's `> 192 DPI` rule leaves at scale 1.0.
-- **GNOME 40.** Two `--virtual-monitor` flags give `Meta-0` and `Meta-1`;
-  `ApplyMonitorsConfig` accepts stacked, left-of and scale-2 layouts in the
-  physical layout mode, and `RecordMonitor` per connector yields a node per
-  output, but consuming frames from those nodes was not proven, so the offer
-  stays withheld below Mutter 49.
+- A `RecordVirtual` stream recorded after `RemoteDesktop.Start` announces its
+  PipeWire node only after `ScreenCast.Stream.Start` on that stream;
+  `Stream.Stop` removes its virtual monitor. Transforms and the mode's scale
+  list (`[1, 2]` for 1920x1080, `[1]` for 1280x720) are accepted on virtual
+  monitors.
+- `arcen-pier wayland qualify --multi-output 4` proves four concurrent
+  1920x1080 outputs on the DMA-BUF `gpu-convert` route.
+- Match My Layout applies two, three and four displays whole, and region
+  input lands on the output that shows each region.
+- A later sign-in moves one desktop between one and four outputs in place,
+  with the same `gnome-shell`; each attach-time output transaction commits
+  before the first capture epoch.
+- A HiDPI stream at Automatic (the Deck advertises 200%) is placed at scale
+  2.0 beside an unscaled neighbour at 1.0; the same display streamed in
+  points stays at 1.0.
+- On GNOME 40, `ApplyMonitorsConfig` accepts several `--virtual-monitor`
+  outputs and `RecordMonitor` yields a node per output, but consuming frames
+  from those nodes is not proven, so the offer stays withheld below
+  Mutter 49.
 
 ## Running a newer GNOME than the distribution ships
-> **Lesson.** The headless session is Arcen's own process tree. The agent
+> **Principle.** The headless session is Arcen's own process tree. The agent
 > starts the compositor by path, gives it a private bus, a private PipeWire and
 > a private runtime directory, and proves the result before any Deck sees it.
 > The distribution's GNOME is therefore a default, not a limit.
 >
-> Sometimes the distribution is older than the capability we need:
+> Sometimes the distribution is older than a capability Arcen needs:
 >
 > - HDR screen sharing arrived in Mutter 50.
 > - Screen-cast pacing arrived in 51.
 > - A headless input seat is not released yet.
 >
-> Then we neither wait for the distribution nor replace its packages. We
-> build the compositor into a side-by-side prefix that only Arcen's sessions
-> use, prove it with the same qualification code, and remove it with one
-> `rm -rf` when the distribution catches up. "The lab runs GNOME 49" was a
-> fact about one machine, not about what Arcen can do on it.
+> Then the operator neither waits for the distribution nor replaces its
+> packages: the compositor is built into a side-by-side prefix that only
+> Arcen's sessions use, proven with the same qualification code, and removed
+> with one `rm -rf` when the distribution catches up. A host's GNOME version
+> says what that host runs, not what Arcen can do on it.
 
 ### Why a prefix, not packages
 
@@ -2482,7 +2293,7 @@ PipeWire and the GSettings schemas for the whole system:
   labels `/usr` has (`bin_t`, `lib_t`, `usr_t`). No policy module changes.
   `-d -e` reverses it.
 
-### The lab prefix
+### The prefix build
 
 `packaging/linux/tools/gnome-prefix/` builds the prefix in a
 `quay.io/rockylinux/rockylinux:10` container, the same base as the host. No
@@ -2498,7 +2309,7 @@ Pinned versions:
 - SpiderMonkey from Firefox 140.17.0esr, gjs 1.90.1;
 - Mutter 51.1, GNOME Shell 51.1.
 
-Two Mutter merge requests are applied **as lab patches only**. Each one is
+Two Mutter merge requests are applied **as development patches only**. Each one is
 recorded with its source and digest in the prefix's `PROVENANCE.md`:
 
 | Patch | Status upstream | Why |
@@ -2507,121 +2318,46 @@ recorded with its source and digest in the prefix's `PROVENANCE.md`:
 | mutter!5224 "seat/native: Enable libinput in headless", plus an Arcen seat selector (`ARCEN_LAB_HEADLESS_INPUT_SEAT`) | open | libinput in a headless compositor, for a real pen on a private udev seat ([Pen and Hard USB](#pen-and-hard-usb-in-a-wayland-session)) |
 
 Shipping depends on upstream. Until those changes are released, a prefix
-built with them is a lab prefix.
+built with them is a development prefix, not a product stack.
 
-### Lab evidence (2026-10-19, Rocky Linux 10.2 / NVIDIA GRID V100D 580.105.08)
+### What the prefix proves
 
-**Build.**
+The prefix (GNOME Shell 51.1) qualifies like the system GNOME Shell 49.4 on
+the same host: session ready in under 3 s, GPU import with explicit sync,
+Speed sustained at 60 fps for 2560x1440 and 1920x1080 with HEVC and H.264,
+Xwayland applications, the session audio monitor and two outputs. It adds
+Grading and HDR: route `force-hdr`, a `RecordMonitor` xBGR2101010 DMA-BUF,
+both ramps at 1024/1024 codes with maximum error 0, and SDR white at
+202.9 nits. Its EIS stylus reads `client_lacks_stylus`: the prefix's libei
+negotiates `ei_stylus` v1, but Mutter's seat offers no stylus device. A real
+Deck is served `hdr` and `grading` at the contract's 30 fps from it, with
+the Deck's cursor local. Mouse latency on 49 and 51 is the same within a
+link's run-to-run spread; 51's value is the pen (with the seat-pen patch)
+and the HDR route.
 
-- The build image comes from `quay.io/rockylinux/rockylinux:10` with the
-  `crb`, `devel` and source repositories, plus a meson 1.9 virtualenv.
-  EL10's meson 1.4 is older than Mutter 51 needs.
-- glycin 2.2 needs rustc ≥ 1.93, so it builds with a pinned rustup 1.96.1
-  inside the build tree. SpiderMonkey keeps EL10's rustc 1.92.
-- SpiderMonkey 140 needs an out-of-tree object directory and
-  `#define XP_UNIX` in the installed `js-config.h` (mozilla bug 1973994,
-  which Fedora patches too).
-- Wall time with 16 jobs on 24 vCPU, after the image: about 25 min, most of
-  it glycin's crates.
-- Result: 733 MB in `/opt/arcen-gnome/51`, every library resolved
-  (`finish-prefix.sh`), labelled `bin_t`/`lib_t`/`usr_t` through
-  `semanage fcontext -e /usr`. No `-devel` package and no dnf transaction
-  on the host.
+Three rules come from these runs:
 
-**Qualification.** Development records were made from the same Pier
-build (`wayland qualify --record`, three operator sizes).
-
-| | System GNOME Shell 49.4 | Prefix GNOME Shell 51.1 |
-| --- | --- | --- |
-| Session ready | 2.4–2.9 s | 2.4–2.7 s |
-| GPU import | ok, explicit sync | ok, explicit sync |
-| Speed 2560x1440@60 and 1920x1080@60, h265 and h264 | sustained 60 | sustained 60 |
-| Xwayland applications | ok | ok |
-| Session audio monitor | ok (private graph) | ok (private graph) |
-| EIS stylus | `stylus_not_offered` | `client_lacks_stylus`: the prefix's libei main negotiates `ei_stylus` v1, but Mutter's seat offers no stylus device |
-| Grading / HDR | refused: Mutter 49.4 has no HDR screen sharing | route `force-hdr`, `RecordMonitor` xBGR2101010 DMA-BUF, both ramps 1024/1024 codes with max error 0, SDR white 202.9 nits (see below) |
-| Two outputs (`--multi-output 2`) | ok: Meta-0 and Meta-1 at 1920x1080@60 side by side, GPU route | ok: same |
-
-Two qualification bugs turned up on GNOME Shell. Both are fixed:
-
-- **The ramp was measured under the Activities overview.** GNOME Shell
-  opens the overview at login, so the ramp was a scaled thumbnail: all 1024
-  codes present, max error 810. The fidelity probes had been proven under
-  bare Mutter, which has no overview. The fidelity step now leaves the
-  overview first, as the Speed steps do. After that, both ramps measure
-  max error 0.
-- **Ten-bit Wayland capture was forced to a local cursor.**
-  `apply_capture_cursor_constraint` applied the Xorg rule (an RGB10 XShm
-  capture cannot draw the host cursor) to Wayland too. A Grading/HDR capenc
-  in an embedded-cursor session was then refused by capenc's own
-  cursor-authority check. A Wayland stream now keeps the authority its
-  stream chose.
-
-**Pen on the distribution's GNOME 49.** `/opt/arcen-gnome/49` holds only:
-
-- `lib64/libmutter-17.so.0`: Rocky's `mutter-49.4-4.el10_2` SRPM rebuilt
-  with the same lab edit;
-- a `bin/gnome-shell` wrapper that runs `/usr/bin/gnome-shell` with that
-  library first on the library path.
-
-It qualified like the system GNOME (Speed 60, GPU import). With
-`wayland.lab_seat_pen` the real Deck GUI's pen reached Firefox in the system
-GNOME Shell 49.4 as `pointerType: "pen"`: 1009 moves, 33 pressure levels
-(0.037–0.638). Glass ran at 57.3 fps (Speed); motion-to-photon was 110.5 ms
-p50 over the VPN link.
-
-**Real screen.** The real Deck GUI (cursor-local build) was driven by the
-real-screen harness against a real Firefox in the session. Deck-side
-numbers were measured over the long-haul VPN link and are p50 (p95), in
-milliseconds.
-
-| Run | Glass fps / page fps | Cursor on glass | Input → host event | Motion-to-photon |
-| --- | --- | --- | --- | --- |
-| System 49, Auto, mouse | 29.9 / 59.5 | 10.1 (11.0) | 19.2 (24.9) | 118.4 (127.9) |
-| Prefix 51, Auto, mouse | 30.0 / 59.9 | 15.3 (16.3) | 23.4 (30.0) | 123.7 (140.2) |
-| System 49, Speed, mouse | 59.1 / 59.7 | 11.2 (12.1) | 19.5 (24.7) | 103.6 (120.1) |
-| Prefix 51, Speed, mouse | 59.1 / 59.6 | 12.4 (13.6) | 21.2 (27.9) | 120.8 (137.1) |
-| Prefix 51 + lab seat pen, Speed, pen | 59.5 / 60.1 | 14.7 (90.1) | 23.4 (31.2) | 123.2 (131.8) |
-| System 49 + patched libmutter-17 + lab seat pen, Speed, pen | 57.3 / 60.0 | 10.6 (85.6) | 19.2 (28.9) | 110.5 (152.1) |
-| Prefix 51, HDR (served `hdr`, `rgb10-direct`, HEVC 4:4:4 10-bit PQ), mouse, before the input fix | 29.9 / 59.7 | 13.6 (14.8) | n/a | n/a |
-| Prefix 51, Grading (served `grading`, `rgb10-pq-to-sdr`), mouse, before the input fix | 29.8 / 59.8 | 13.6 (14.7) | n/a | n/a |
-| Prefix 51, Grading, mouse, input follows the wide epoch | 29.9 / 59.6 | 14.3 (15.2) | 22.3 (28.5) | 131.7 (147.4) |
-| Prefix 51, HDR, mouse, input follows the wide epoch | 30.0 / 59.5 | 15.2 (16.3) | 23.5 (26.8) | 125.0 (140.9) |
-
-- The cursor stayed local (Deck-drawn) in every run. The Pier chose the
-  metadata cursor stream (`cursor_metadata_proven=true`).
-- 49 and 51 feel the same over this link. The differences sit inside the
-  link's run-to-run spread, so they are not a verdict.
-- 51's value today is the pen (with the lab patch) and the HDR route, not
-  mouse latency.
-- The pen run is the first real pen in a headless Wayland session (see
-  [Pen and Hard USB](#pen-and-hard-usb-in-a-wayland-session)).
-- **Grading and HDR, end to end.** After the two fixes above, the 51.1
-  host qualified Grading and HDR. The real Deck was then served `hdr` and
-  `grading` at the contract's 30 fps from a forced-HDR desktop (capenc
-  DMA-BUF import about 9 ms, convert about 8 ms, NVENC about 5.5 ms).
-- **Absolute input in a wide epoch (fixed).** In the first two Grading and
-  HDR sessions the page received clicks at (0, 0) and no pointer motion:
-  0 move events, and calibration failed. The cause was in Mutter.
-  - It applies an absolute coordinate given for a `RecordVirtual` stream
-    only while that stream is consumed (`transform_position` needs the
-    stream's source enabled). Otherwise `NotifyPointerMotionAbsolute`
-    drops it as "early".
-  - A wide epoch consumes its own `RecordMonitor` streams in a separate
-    ScreenCast session, so the virtual streams that input addressed were
-    idle.
-  - While a wide epoch runs, `MutterSessions` now addresses absolute
-    pointer and touch input to unstarted `RecordMonitor` streams of the
-    same outputs, recorded in the `RemoteDesktop`-linked session. A monitor
-    stream maps through the logical monitor's layout whether or not
-    anything consumes it.
-  - They are reused across epochs (Mutter keeps them until the session
-    ends) and released when the epoch ends. Each output keeps its own
-    target, so multi-output layouts map per connector.
-  - Afterwards: Grading 1562 moves and HDR 1525 moves. Both clicks landed
-    where the harness put them (720, 700), with 25 calibration pairs and
-    the cursor local throughout. Grading and HDR are now drawing routes on
-    this stack.
+- **The fidelity step leaves the Activities overview first**, as the Speed
+  steps do. GNOME Shell opens the overview at login, and a ramp measured
+  under it is a scaled thumbnail (all 1024 codes present, maximum error
+  810).
+- **A Wayland stream keeps the cursor authority it chose.** The Xorg rule
+  that an RGB10 XShm capture cannot draw the host cursor does not apply to
+  Wayland; applied there, it made capenc's own cursor-authority check refuse
+  a Grading/HDR capenc in an embedded-cursor session.
+- **Absolute input follows a wide epoch.** Mutter applies an absolute
+  coordinate given for a `RecordVirtual` stream only while that stream is
+  consumed (`transform_position` needs the stream's source enabled);
+  otherwise `NotifyPointerMotionAbsolute` drops it as "early". A wide epoch
+  consumes its own `RecordMonitor` streams in a separate ScreenCast session,
+  so the virtual streams input addressed would be idle. While a wide epoch
+  runs, `MutterSessions` addresses absolute pointer and touch input to
+  unstarted `RecordMonitor` streams of the same outputs, recorded in the
+  `RemoteDesktop`-linked session; a monitor stream maps through the logical
+  monitor's layout whether or not anything consumes it. They are reused
+  across epochs (Mutter keeps them until the session ends) and released when
+  the epoch ends, and each output keeps its own target, so multi-output
+  layouts map per connector.
 
 ## Public host-local API
 
@@ -2704,14 +2440,14 @@ only after it proves all of the following for the captured output:
 - capture, input/EIS, resize, teardown, and reconnect remain bound to the same
   compositor output generation.
 
-This future provider is a third Linux capture pipeline, not a replacement for
+This provider is a third Linux capture pipeline, not a replacement for
 the two proven Xorg paths. Auto/Speed must continue to use NvFBC where its
 device-to-device advantage is available, and Xorg Grading must continue to use
 depth-30 XShm. Provider selection happens from explicit session/capability
 truth; adding Wayland HDR must not route all sessions through PipeWire or add a
 host copy to the eight-bit fast path.
 
-On Wayland these facts are now implemented for compositors that have HDR
+On Wayland these facts are implemented for compositors that have HDR
 screen sharing (Mutter ≥ 50): see
 [Wayland Grading and HDR](#wayland-grading-and-hdr). Dedicated
 Xorg still resolves HDR requests to Grading Reference (HEVC 4:4:4 10-bit full-range BT.709). The Deck
@@ -2725,75 +2461,38 @@ marker and Unix socket. It deliberately leaves protocol state unknown because
 file presence or environment variables cannot prove registry, portal, or EIS
 capability.
 
-## Headless HDR spike result (2026-09-27)
+## Wide capture on stock Mutter: what can go wrong
 
-A headless GNOME 50 session delivered a bit-exact PQ / BT.2020 ten-bit
-desktop through PipeWire on the Linux lab (NVIDIA GRID V100D-16Q, driver
-570.172.08, Rocky Linux 9.5 host, no display connectors). This is evidence
-for the future provider, not a shipped pipeline.
-
-Pipeline measured:
-
-- **Session:** Mutter 50.5 (Fedora 44 container, podman with NVIDIA CDI)
-  in headless mode on the NVIDIA render node through GBM, with one virtual
-  monitor in `bt2100` colour mode (`gdctl set ... --color-mode bt2100`).
-  The host needed `nvidia-drm modeset=1`; the Xorg pipelines were
-  re-measured unchanged with it.
-- **Content:** a Wayland client presenting an `XRGB2101010` shared-memory
-  buffer tagged PQ / BT.2020 through `wp_color_management_v1`, carrying a
-  0..1023 ramp.
-- **Capture:** `org.gnome.Mutter.ScreenCast` `RecordMonitor`; the PipeWire
-  stream advertises `xRGB_210LE`, `xBGR_210LE` and `RGBA_F16`, each tagged
-  `colorPrimaries=BT2020` and `transferFunction=SMPTE2084`, as DMA-BUF and
-  shared memory; a consumer asking for ten-bit PQ negotiated `xRGB_210LE`.
-- **Result:** the captured frame held all 1024 codes, exactly, grey, and up
-  to PQ 1023 (10,000 nits), so highlights above the 203-nit SDR white
-  survive.
-
-Stock Mutter 50.5 does not get there. Four changes were needed, each small,
-and two of them are defects that label eight-bit pixels as ten-bit HDR:
+A headless Mutter 50 session can deliver a bit-exact PQ / BT.2020 ten-bit
+desktop through PipeWire: `RecordMonitor` advertises `xRGB_210LE`,
+`xBGR_210LE` and `RGBA_F16`, tagged BT.2020 and SMPTE 2084, as DMA-BUF and
+shared memory, and a ten-bit PQ ramp survives with all 1024 codes, highlights
+above the 203-nit SDR white included. Four compositor behaviours stand in
+the way, two of which label eight-bit pixels as ten-bit HDR:
 
 1. Virtual outputs declare no colour spaces or HDR transfer functions, so a
-   virtual monitor never offers `bt2100`. Declaring BT.2020 and PQ on them
-   enables it.
+   virtual monitor never offers `bt2100`.
 2. A virtual monitor composites into a default eight-bit texture, where a KMS
-   output prefers ten-bit scanout; it must composite into ten-bit.
+   output prefers ten-bit scanout.
 3. The shared-memory screencast path paints every frame as eight-bit ARGB
-   whatever format was negotiated, so an `xRGB_210LE` PQ stream carried
-   256-level pixels. It must paint in the negotiated format.
+   whatever format was negotiated, so an `xRGB_210LE` PQ stream carries
+   256-level pixels.
 4. The paint-to-buffer helper renders through a default eight-bit texture
-   before reading back; it must render at the requested precision.
+   before reading back.
 
-Arcen must not depend on a privately patched compositor: these belong
-upstream, and the product capture should use DMA-BUF (the zero-copy route
-into CUDA/NVENC), which does not pass through defects 3 and 4. KWin was not
-chosen: its virtual backend sets no HDR capability and its HDR output
-screencast change (plasma/kwin!9843) is closed unmerged. gamescope's
-PipeWire output is eight-bit only.
-
-### End to end to a Deck (2026-09-27)
-
-A lab-only lever, `ARCEN_EXPERIMENTAL_RGB10_PIPE=<fifo>` (default off, a
-systemd drop-in on the lab only), serves an HDR request from a FIFO that a
-PipeWire consumer inside the container fills with tagged PQ / BT.2020 frames
-(`capenc rgb10-pipe=`, `WideSource::ColorManagedPq`, READY capture backend
-`pipewire`). A real Deck showed HDR: `rext 4:4:4 10-bit bt2020/pq/bt2020ncl`,
-950-970 distinct luma codes, and 27.8-28 fps sustained for 120 s with no
-dropped frames. Two defects found on the way are fixed: the pipe loop never
-started the keyframe control thread (a late Deck waited forever), and the
-consumer must open its FIFO before connecting the stream, not inside a
-process callback. Input still reached Xorg, so this measures the provider's
-video path only.
-
-A host process can consume the container's PipeWire directly (host
-libpipewire 1.0.1 against the container's 1.6.9 server over a shared runtime
-directory), which is the route for in-process capture without a helper.
+Arcen does not depend on a privately patched compositor. The product route
+forces the compositor's HDR state (`force-hdr`, below) instead of patching
+virtual outputs, captures through DMA-BUF, which does not pass through
+defects 3 and 4, and proves precision per format and memory at qualification.
+Other compositors were considered: KWin's virtual backend sets no HDR
+capability and its HDR output screencast change (plasma/kwin!9843) is closed
+unmerged; gamescope's PipeWire output is eight-bit only.
 
 ## Shared capture, admission and provider-selection contracts
 
 [ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md) adds the portable
-contracts a native provider will implement. They are pure shared code; no
-Linux adapter calls them yet.
+contracts the Wayland provider implements. They are pure shared code; capenc's
+Wayland adapter calls them.
 
 - `arcen_media::video::CaptureSurface` describes each delivered buffer as
   data — output and generation, geometry, pixel format, per-plane layout,
@@ -2816,9 +2515,8 @@ Linux adapter calls them yet.
   and Speed take only eight-bit SDR capture; Grading needs authoritative
   native-wide samples and colour; HDR additionally needs an authoritatively
   active HDR output and falls back to Grading only when Grading is genuinely
-  admissible. The defects listed in the spike above — eight-bit pixels in a
-  ten-bit format — are exactly what `SamplePrecision::UpconvertedEightBit`
-  refuses.
+  admissible. The defects listed above — eight-bit pixels in a ten-bit
+  format — are exactly what `SamplePrecision::UpconvertedEightBit` refuses.
 - `arcen_session::desktop_provider` reads `capture.provider` (`auto`
   default, `xorg` and `wayland` overrides; unknown tokens fail
   configuration loading). A Linux Pier built without `wayland-provider`
@@ -2835,7 +2533,8 @@ Linux adapter calls them yet.
 ## Capture leases and GPU import
 `hosts/capenc/src/wayland/` (Cargo feature `wayland`, default off) consumes
 the `PipeWire` node the session adapter creates. The Xorg NvFBC and XShm paths
-and their eight-bit fast path are unchanged; nothing selects this code yet.
+and their eight-bit fast path are unchanged; this code runs only for a
+Wayland session's hand-off.
 
 **Hand-off.** capenc never talks D-Bus. It reads the shared hand-off
 contract described under [Capture hand-off to capenc](#capture-hand-off-to-capenc)
@@ -2920,38 +2619,15 @@ Telemetry: the worker emits `CAPTURE_PATH_SELECTED` with the ADR 0014
 fields (copy path, memory, modifier class, GPU match, source colour,
 precision, cursor) through a bounded `arcen-observability` sink.
 
-### Lab evidence (2026-10-17, GNOME 40 baseline host)
+### On GNOME 40
 
-Rocky Linux 9.7, `mutter-40.9` headless with one 1920x1080 virtual monitor,
-`pipewire-1.0.1`, GRID V100D-16Q, driver 580.65.06, as a throwaway user;
-`capenc wayland-capture-probe` (release build) with
-`scripts/lab/wayland-capture-probe.sh`:
-
-- Negotiated `BGRx` 1920x1080, stride 7680, `MemFd` shared memory, framerate
-  0/1 with the requested max framerate (60/1, or 30/1 when asked for 30).
-  Every frame validated as `host-shared` / `host-copy`; damage `unknown`
-  (full: 8160 Keel blocks); cursor as metadata, bitmap serials advancing with
-  pointer motion.
-- CUDA read-back of the host-copy upload equalled the CPU's tightly packed
-  rows on every checked frame (5/5, 3/3, 2/2, 1/1 across runs).
-- 120 frames with an animated client: 37.5 fps delivered (Mutter-limited, as
-  in the baseline), upload 0.83 ms average / 1.17 ms max, NVENC H.264 encode
-  2.82 ms average, 120 valid access units. HEVC: SPS `main 4:2:0 8-bit
-  bt709/bt709/bt709 limited`, encode 3.8 ms average.
-- Callback cost 12–14 µs average, 42 µs max; at most two leases outstanding,
-  none left at teardown; zero corrupted, refused or validation-refused
-  buffers.
-- With the DMA-BUF offer (render node matched, GPU `same`), the
-  modifier-bearing format was accepted and Mutter still delivered shared
-  memory (it disables DMA-BUF when surfaceless); EGL on `renderD128` reported
-  twelve block-linear modifiers plus external-only `LINEAR` for `XR24`.
-- Plain Mutter delivered no size-0 cursor-only buffers in these runs (pointer
-  motion rode on full frames); cursor-only handling is covered by unit tests
-  only.
-
-Not established on GNOME 40: DMA-BUF import of a real compositor buffer
-(Mutter 40 sends none), rates above Mutter 40's ~37 fps, 4K, and Deck
-end-to-end. GNOME 49 established the DMA-BUF route; see
+Mutter 40 delivers shared memory only (it disables DMA-BUF when
+surfaceless, even when the modifier-bearing format is accepted), with
+unknown damage, so every frame is full damage. The host-copy upload is about
+0.8 ms a frame at 1080p and its CUDA read-back equals the CPU's tightly
+packed rows; the process callback costs microseconds, and at most two leases
+are outstanding. Mutter 40 delivers about 37 fps of a 60 fps client. GNOME 49
+establishes the DMA-BUF route; see
 [GPU import and the paced Speed output](#gpu-import-and-the-paced-speed-output).
 
 ## GPU import and the paced Speed output
@@ -3007,75 +2683,20 @@ way for each `--output`, and records the rate per output refresh as the
 frames per second both delivered and encoded (an encoder that cannot keep
 up caps it).
 
-### Lab evidence (2026-10-17/18, Rocky 10.2 / GNOME 49.4 / NVIDIA GRID V100D 580.105.08, `modeset=1`)
+### Measured on GNOME 49 (NVIDIA 580, `modeset=1`)
 
-Raw `mutter --headless` as a throwaway local user
-(`scripts/lab/wayland-capture-probe.sh`), debug capenc, animated GTK client
-(16 ms timer) unless stated; CPU is percent of one core, GPU and encoder
-utilisation from `nvidia-smi`.
-
-| Check | Result |
-| --- | --- |
-| GPU import vs host copy, still pattern (red/blue ramps, green ramp, checkerboard), 1920x1080 | `result=ok`, 2 073 600 pixels, **0 mismatched**, discriminating, `sync=explicit` |
-| Same at 3840x2160 | `result=ok`, 8 294 400 pixels, **0 mismatched**, `sync=explicit` |
-| Explicit sync | every DMA-BUF frame carried acquire/release points (601/601 at 1080p@120, 726/726 at 4K@120); every release point signalled, 0 failures |
-
-| Run | Output | Route | Source fps | Encoded fps | Import (sync / blit / CUDA copy) ms | NVENC ms | Mutter CPU | capenc CPU | GPU / ENC % |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Speed H.264 1080p | 120 Hz | `gpu-convert` | 60–62 | **60–61** | 2.3–2.6 (0.01 / 2.3–2.5 / 0.04) | 2.5 | 26 % | 22 % | 9 / 4 |
-| Speed H.264 1080p | 120 Hz | `host-copy` | 60 | **60–61** | 0.94–0.99 upload | 2.8 | 46–48 % | 15 % | 16 / 5 |
-| Speed HEVC 4K | 120 Hz | `gpu-convert` | 60–61 | **51–52** (NVENC-bound) | 2.8–2.9 | 14.1 | 25 % | 30 % | 11 / 22 |
-| Auto H.264 1080p | 60 Hz | `gpu-convert` | 24–25 | 30–31 | 2.7–2.8 | 2.4 | 24–26 % | 9–12 % | 8 / 2 |
-| Auto H.264 1080p | 60 Hz | `host-copy` | 20 | 30 | 0.9–1.1 upload | 2.4 | 33–35 % | 5–7 % | 10 / 2 |
-| Auto H.264 1080p, moving | 120 Hz | `gpu-convert` | 25 | 30–31 | 2.6–3.0 | 2.9–3.1 | 25–26 % | 11 % | 8 / 2 |
-| Auto, still desktop | 60 Hz | `gpu-convert` | 0 | 1 (keepalive) | — | 3.4 | 0 % | 0 % | 0 / 0 |
-| Speed, still desktop | 120 Hz | `gpu-convert` | 0 | 1 (keepalive) | — | 3.3 | 0 % | 0 % | 0 / 0 |
-| Probe, 1080p, 60 fps offer | 60 Hz | `gpu-convert` | 37.7 | — | 2.5 | — | 26 % | — | 8 / 3 |
-
-Readings: the GPU route halves the compositor's CPU (Mutter no longer reads
-the frame back into shared memory) at about 2.5 ms of import per frame,
-almost all of it the blit and its fence (it hardly changes from 1080p to
-4K, so it is fixed overhead, not bandwidth); a 120 Hz output costs nothing
-on a still desktop (no frames, 0 % CPU, one keepalive a second) and nothing
-extra for a client that draws on its own timer; 60 fps needs the 120 Hz
-output either way (37.7 fps at 60 Hz). 4K Speed is bound by NVENC HEVC at
-14 ms a frame in this serial loop (51–52 fps encoded); qualification
-measures with H.264, which keeps up at 4K, and counts only frames both
-delivered and encoded.
-
-GNOME Shell (`ARCEN_LAB_COMPOSITOR=gnome-shell`, same harness, Speed on the
-`gpu-convert` route, a rate asserted only to run the encoder at 60):
-
-| Content | Output | Source fps | Encoded fps | gnome-shell CPU | capenc CPU | GPU / ENC % |
-| --- | --- | --- | --- | --- | --- | --- |
-| 60 fps GTK client | 120 Hz | **60–62** | 59–61 | 33–38 % | 23–25 % | 11 / 5 |
-| pointer every 16 ms (RemoteDesktop, embedded cursor) | 120 Hz | **60–62** | 60–61 | 9–12 % | 18–20 % | 3 / 5 |
-| 60 fps GTK client | 60 Hz | 38–40 | 60 (flushes) | 32–34 % | 17–18 % | 10 / 4 |
-
-**Product qualification and a Deck** (release Pier, `arcen-pier wayland
-qualify --write --output 1920x1080@60 --output 1800x1130@60 --output
-3840x2160@60` as the temporary `arcen-wlq` account, then the Pier serving
-the macOS Deck's `media-smoke` from a lab Mac; Pier in an `unconfined_t`
-transient unit):
-
-| Step | Result |
-| --- | --- |
-| Sessions | `gnome-shell` at 1920x1080@120, 1800x1130@120 and 3840x2160@120 (the paced Speed output for each 60 Hz display) |
-| `gpu_import` | `result=ok`, 0 of 2 073 600 / 2 034 000 / 8 294 400 pixels differ, `sync=explicit`, first attempt each |
-| `capture_route` | Auto admitted on `gpu-convert`, first frame `bgrx8` DMA-BUF, 91 access units in 3 s at each size; record: `route gpu-convert`, `gpu_import_verified_frames 1`, GPU import **proven** |
-| `speed_rate` (overview left, 60 Hz pointer motion through the session input socket) | delivered/encoded per second (50–53, 60–61) at 1080p, (51–53, 60–61) at 1800x1130, (49–53, 59–61) at 4K H.264: **sustained 52 / 52 / 50 fps, below 57: Speed not qualified** |
-| Deck Auto | `active_pipeline=auto`, HEVC 4:2:0 8-bit limited BT.709 1800x1130, decoded by VideoToolbox; capenc `copy_path=gpu-convert route=dmabuf-gl-blit`, encoded 30–31 fps, import 2.4–2.5 ms, NVENC 4.3 ms |
-| Deck Speed | visibly served as Auto (`active_pipeline=auto`); the session's output stays at the display's 60 Hz because no rate qualifies 120 Hz |
-
-So on this host the `gpu-convert` route is proven and serves Auto, and the
-capture pipeline serves Speed at 60 fps on a 120 Hz output (both
-compositors, both routes, lab), but the product's own measurement does not
-admit Speed: pointer motion that reaches the compositor through the
-session's injector at 60 Hz is recorded at 50–54 fps, against 60–62 fps for
-the same motion sent straight to RemoteDesktop every 16 ms and for a 60 fps
-client. The shortfall is in the input path's delivery cadence, not in
-capture or import; Speed stays visibly Auto until a qualification measures
-57 fps.
+- GPU import against the host copy of the same still pattern: 0 mismatched
+  pixels at 1920x1080 and 3840x2160, with explicit sync; every DMA-BUF frame
+  carries acquire and release points, and every release point is signalled.
+- The GPU route halves the compositor's CPU (Mutter no longer reads the
+  frame back into shared memory) at about 2.5 ms of import per frame, almost
+  all of it the blit and its fence; it hardly changes from 1080p to 4K, so it
+  is fixed overhead, not bandwidth.
+- A 120 Hz output costs nothing on a still desktop (no frames, one keepalive
+  a second) and nothing extra for a client that draws on its own timer.
+- With `RecordMonitor` monitors, 60 fps needs the 120 Hz output (about 38 fps
+  at 60 Hz). 4K HEVC Speed is bound by NVENC at about 14 ms a frame in the
+  serial loop; qualification counts only frames both delivered and encoded.
 
 ## Speed without operator sizes
 Code: `arcen_session::wayland_qualification` (`resolve_speed`,
@@ -3104,56 +2725,19 @@ consumer's own `maxFramerate` applies; on 50.x/51.x a virtual stream with
 explicit `modes` reports its mode's refresh, which Arcen does not use. Arcen
 does not patch compositors; every stack is measured.
 
-**E1 (2026-10-18, Rocky 10.2 / Mutter and GNOME Shell 49.4 / GRID V100D
-580.105.08, `scripts/lab/wayland-capture-probe.sh` in virtual mode with
-`ARCEN_LAB_PRE_PROBE`).** A first consumer created the `RecordVirtual`
-monitor at 60 Hz (`max-fps=60`); `gdctl` made it the only monitor; a second
-consumer of the same size recorded the animated 60 fps client with DMA-BUF.
-The monitor stayed at 60 Hz (`DisplayConfig` current mode `@60.000`) in
-every run.
-
-| Compositor | Output | Consumer `maxFramerate` | Delivered (capenc probe) |
-| --- | --- | --- | --- |
-| mutter | 1920x1080@60 | 60 | 59.6 fps |
-| mutter | 1920x1080@60 | 120 | 59.7 fps |
-| gnome-shell | 1920x1080@60 | 60 | 59.5 fps |
-| gnome-shell | 1920x1080@60 | 120 | 59.6 fps |
-| gnome-shell | 1800x1130@60 | 120 | 59.6 fps |
-| gnome-shell | 3840x2160@60 | 120 | 59.3 fps |
-| mutter, `RecordMonitor` of a `--virtual-monitor` (control) | 1920x1080@60 | 60 | 39.0 fps |
-
-**Ladder qualification, no operator sizes** (release Pier, development
-record, `wayland qualify --write --config <dev> --allow-running-service`,
-temporary account `arcen-wlq-<hex>`, GNOME Shell, `gpu-convert` route
-verified at every size, 60 Hz pointer motion through the session socket):
-
-| Display | Output | Codec | (delivered, encoded) fps per second | Sustained |
-| --- | --- | --- | --- | --- |
-| 1920x1080@60 | 60 Hz | HEVC | (59,61) (60,60) (60,61) (60,60) (60,61) (60,61) (60,61) | 60 |
-| 1920x1080@60 | 60 Hz | H.264 | (57,60) (61,61) (60,61) (60,60) (60,60) (60,61) (60,61) | 60 |
-| 2560x1600@60 | 60 Hz | HEVC | (59,61) (60,60) (60,61) (60,60) (60,61) (60,60) (60,61) | 60 |
-| 2560x1600@60 | 60 Hz | H.264 | (59,61) (58,59) (60,61) (60,60) (60,61) (60,60) (60,61) | 60 |
-| 3840x2160@60 | 60 Hz | HEVC | (59,61) (60,61) (60,60) (60,61) (60,61) (60,61) (60,60) | 60 |
-| 3840x2160@60 | 60 Hz | H.264 | (57,60) (60,61) (60,60) (60,60) (60,61) (60,61) (60,60) | 60 |
-
-Every display held Speed at its own 60 Hz, so no 120 Hz output was needed
-or measured, and every Deck display no wider than 3840 and no taller than
-2160 is covered (measured or inferred) for both codecs on this host. HEVC at
-4K kept up here (60 encoded of 60 delivered, release build), so it is
-admitted as measured; where an encoder does not keep up the measurement
-records it and the runtime guard catches a shortfall at serving time.
-
-**Serving a Deck (release dev Pier on another UDP port, 0.17.0 macOS Deck
-`media-smoke`, the animated 60 fps client running in the user's session).**
-Rates are the Pier's own capenc counts; Deck-side packet rates are over the
-long-haul VPN link and are not evidence of the host.
-
-| Run | Result |
-| --- | --- |
-| Speed at the Deck's 1800x1130@60 display, no operator sizes (the display had been noted in the requested list by an earlier unqualified request and measured by the next automatic re-qualification) | `active_pipeline=speed`, HEVC; session output 60 Hz; capenc delivered/encoded 60/60–61 fps per second; runtime guard "held its floor" |
-| Windowed Deck resized to 1600x1000 (no measurement of that size) | Speed kept, `Wayland Speed rate is inferred from a larger qualified output … evidence=inferred:1800x1168` (HEVC 60, H.264 59 measured there); capenc argv `capture-rate-evidence=inferred:1800x1168`; guard held |
-| An Auto attachment, then a Speed attachment of the same user | Auto served on a 60 Hz output; the Speed attachment was served Speed on a 60 Hz output (no 120 Hz output); the smoke opened a new desktop rather than resuming, so a same-desktop switch inside one desktop was not exercised by the CLI |
-| Speed while three other 4K HEVC Speed encodes loaded the shared NVENC | capenc delivered 60, encoded 44–45 fps; the guard tripped (`speed_runtime_below_floor`, encoded 44, delivered 60), the capture restarted as Auto at 30 fps inside the attachment with a keyframe, and the Deck printed `served-pipeline-update served=auto backend=hardware reason=speed_runtime_below_floor` and finished with `active_pipeline=auto` |
+**Measured on Mutter and GNOME Shell 49.4.** A `RecordVirtual` monitor at
+60 Hz delivers 59.3–59.7 fps of a 60 fps client at 1920x1080, 1800x1130 and
+3840x2160, whether its consumer asks for 60 or 120 fps; a `RecordMonitor`
+of a `--virtual-monitor` delivers 39 fps. A qualification with no operator
+sizes therefore holds Speed at the display's own 60 Hz from 1080p to 4K, for
+HEVC and H.264, and no 120 Hz output is needed; every Deck display no larger
+than 3840x2160 is covered, measured or inferred. A Deck display noted in the
+requested list is measured by the next qualification and then served Speed;
+a resized window takes an inferred rate from a larger measured output
+(`evidence=inferred:<W>x<H>`). When a shared encoder falls behind while
+serving, the runtime guard trips (`speed_runtime_below_floor`), the capture
+restarts as Auto inside the attachment with a keyframe, and the Deck is told
+(`served-pipeline-update served=auto … reason=speed_runtime_below_floor`).
 
 ## Wayland Auto and Speed
 Code: `hosts/capenc/src/wayland/pipelines/` (`auto.rs`, `speed.rs`, the
@@ -3334,65 +2918,35 @@ available`. Vendor-neutral hardware encode (VA-API, Vulkan Video) is not
 implemented yet; it is listed under
 [Where help is wanted](../project.md#where-help-is-wanted).
 
-### Lab evidence (2026-10-17, GNOME 40 baseline host)
+### Auto and Speed on GNOME 40
 
-Rocky Linux 9.7, gnome-shell 40.10, PipeWire 1.0.1, GRID V100D-16Q driver
-580.65.06, a throwaway user; `examples/wayland_session_harness --pipeline`
-through PAM, the real launcher and `media::capenc::spawn` (debug Pier
-build), with the GTK test client redrawing every 16 ms, then stopped:
-
-| | Auto (H.264) | Speed request (HEVC) |
-| --- | --- | --- |
-| Admission | admit, Auto 30 fps | downgrade to Auto 30 fps, `copy_path_not_rate_qualified` |
-| `READY` after spawn | 325 ms | 328 ms |
-| Source rate while moving | 22.6 fps (Auto offer, 30 fps max) | 37.5 fps average, 41 max (Speed offer) |
-| Encoded while moving | 30.0 fps, 147 kbps | 30.0 fps, 300 kbps, 8.4 superseded frames/s shed |
-| Host copy (upload) | 0.83 ms average, 1.25 max | 0.84 ms average, 1.13 max |
-| NVENC encode | 4.1 ms average (debug) | 4.2 ms average (debug) |
-| Idle (client stopped, 15 s) | 0 activity submissions, 1.00 keepalive/s, 14 access units | same |
-| Keyframe on demand while idle | 25 ms | 24 ms |
-| Stream (`ffprobe`) | H.264 High, yuv420p, tv range, BT.709 ×3, 2 I + 619 P, decodes | HEVC Main, yuv420p, tv range, BT.709 ×3, 2 I + 619 P, decodes |
-| Cursor | composited, visible in decoded frames; `cursor=host` | same |
-| Readiness | first frame `bgrx8` 1920x1080 `host-shared`, import `host-copy`; capture route proven for the session (not GPU import) | same |
-
-The release capenc under plain headless Mutter (`scripts/lab/wayland-capture-probe.sh`
-with `ARCEN_LAB_CAPENC_RUN`) measured 0.82–0.95 ms upload and 2.5 ms
-NVENC H.264 encode; a Speed request with `capture-rate=35` was admitted as
-Speed at 35 fps (`capture_rate_below_contract`) and encoded 35–36 fps at
-about 750 kbps with motion priority, while its source sustained 32 fps; an
-idle desktop delivered exactly one frame on connect and none after.
-
-Verdicts for this stack: **Auto** works end to end through capenc on the
-real hand-off with a labelled host copy. **Speed** is not available: the
-copying route has no qualified 60 fps rate (the source tops out near 35–41
-fps), so a Speed request is visibly served as Auto. In the first harness run
-of a new user, GNOME's welcome tour took focus and the RemoteDesktop input
-check failed; later runs passed.
+**Auto** works end to end through capenc on the real hand-off with a
+labelled host copy: `READY` about 0.33 s after spawn, 30 fps encoded while
+the desktop moves, one keepalive a second when it is still, and a keyframe on
+demand in about 25 ms. **Speed** is not available: the copying route has no
+qualified 60 fps rate (the source tops out near 35–41 fps), so a Speed
+request is visibly served as Auto; with a measured `capture-rate=35` it is
+served as Speed at 35 fps (`capture_rate_below_contract`). A still desktop
+delivers one frame on connect and none after. On a new user's first login,
+GNOME's welcome tour takes focus until it is dismissed.
 
 ### Qualifying Speed on another stack
 
 Speed needs, on the host being qualified: a sustained source rate at the
-contract ceiling measured on the route that will serve it (the harness or
-the capture probe on moving content), recorded as the host's
-`capture-rate`; or a qualified zero-copy import. A newer GNOME (Mutter 49 on
-the Rocky 10 host) is expected to offer DMA-BUF on the render node; that
-route stays unqualified (`dmabuf_unqualified`) until a real producer buffer
-is imported, synchronised and read back correctly, and it is `gpu-convert`,
-so it needs a rate too. Then: run the Speed harness and capture probe there,
-record the measured rate, upload/import and encode cost, and bounded
-latency; decide where the Pier gets `capture-rate` from (an installation-time
-qualification record); and verify on a Deck that `DecodeLatencyPolicy::SPEED`
-and the one-frame VBV hold at 60 fps.
+contract ceiling, measured on the route that will serve it and recorded as
+the host's `capture-rate`; or a qualified zero-copy import. A DMA-BUF route
+stays unqualified (`dmabuf_unqualified`) until a real producer buffer is
+imported, synchronised and read back correctly, and it is `gpu-convert`, so
+it needs a rate too. On the Deck, `DecodeLatencyPolicy::SPEED` and the
+one-frame VBV hold at 60 fps.
 
-On Rocky Linux 10 / Mutter 49 (see its qualification) a 60 Hz virtual
-monitor with a 60 fps offer delivers 36–41 fps whatever the driver,
-resolution or memory type, so Speed is served as Auto; with a measured
-`capture-rate=49` (llvmpipe interim stack) it was served as Speed at
-49 fps. A 120 Hz virtual monitor with a 120 fps offer delivered 59.6 fps
-(1080p) and 56.3 fps (4K, debug consumer) by host copy and about 60 fps by
-DMA-BUF. capenc's EGL-image import (`cuGraphicsEGLRegisterImage`) fails
-with `CUDA_ERROR_INVALID_VALUE` on those NVIDIA block-linear buffers; a GL
-blit into a CUDA-registered texture reads them correctly.
+On Mutter 49 a 60 Hz `--virtual-monitor` with a 60 fps offer delivers
+36–41 fps whatever the driver, resolution or memory type; a 120 Hz one with a
+120 fps offer delivers about 60 fps; `RecordVirtual` remote monitors hold
+60 fps at 60 Hz ([Speed without operator sizes](#speed-without-operator-sizes)).
+capenc's EGL-image import (`cuGraphicsEGLRegisterImage`) fails with
+`CUDA_ERROR_INVALID_VALUE` on NVIDIA block-linear buffers; a GL blit into a
+CUDA-registered texture reads them correctly.
 
 ## Wayland Grading and HDR
 Grading (HEVC 4:4:4 10-bit full-range BT.709) and HDR (HEVC 4:4:4 10-bit
@@ -3476,8 +3030,8 @@ and the NVENC staging converts with exactly that admitted conversion
 (`WideSource::AdmittedPq`), so READY, the hello and the SPS agree. An older
 Deck, HDR, a pinned variant and every eight-bit route are unchanged.
 Shared-memory wide frames are excluded because Mutter's shm screencast still
-paints through an eight-bit path (50.6, 51.1, main). On the lab they carried
-256 levels in a ten-bit container (wrong channel order) and garbage for F16.
+paints through an eight-bit path (50.6, 51.1, main). Measured, they carry 256
+levels in a ten-bit container (wrong channel order) and garbage for F16.
 Without that proof they stay `Unknown` and are refused. A shared-memory
 copy keeps the producer's own channel order (`xRGB_210LE` or `xBGR_210LE`)
 when it is staged. The DMA-BUF read-back always yields `XBGR2101010`
@@ -3508,48 +3062,23 @@ The record's `facts.fidelity` keeps the proof or the gap. Without the proof,
 the Pier serves a fallback: HDR becomes Grading if Grading is proven,
 otherwise Auto, with the gap as the reason.
 
-**Measured (host-side, 2026-10-18).**
-GRID V100D, driver 580.105.08.
-Fedora 44 and Fedora 45 headless GNOME Shell run in a podman container on
-the Rocky 10 lab host; capenc runs on the host and consumes the container's
-PipeWire. These are not product-supported stacks; they prove capture,
-import, conversion and encode only.
+**Measured on Mutter 50.6 and 51.0** (host-side, `force-hdr`; capture,
+import, conversion and encode only):
 
-- Mutter 50.6, `force-hdr`: the output colour state was BT.2020/PQ with a
-  203-nit reference.
-  - DMA-BUF `xBGR_210LE`: 1024/1024 codes, maximum error 0, import about
-    6.6 ms.
-  - DMA-BUF `RGBA_F16`: 986/1024, maximum error 1.
-  - SDR white measured 202.9 nits (PQ code 594).
-  - HDR epoch: READY BT.2020/PQ; SPS truth `rext 4:4:4 10-bit
-    bt2020/pq/bt2020ncl full`; 30 fps encoded; import about 10 ms; staging
-    3.4 ms; NVENC 5 ms.
-  - Grading epoch (F16): SPS BT.709 4:4:4 10-bit full; 30 fps; import
-    5.5 ms.
-- Mutter 51.0 (Fedora 45), the same runs:
-  - DMA-BUF `xBGR_210LE`: 1024/1024 codes, maximum error 0, import
-    6.7–7.8 ms.
-  - DMA-BUF `RGBA_F16`: 986/1024, maximum error 1.
-  - SDR white measured 202.9 nits.
-  - With an animated client, both epochs were admitted, encoded and
-    checked:
-    - HDR: `xBGR_210LE`, modifier `0x03000000004fe014`; READY and SPS truth
-      `rext 4:4:4 10-bit bt2020/pq/bt2020ncl full`; 30–31 fps encoded;
-      import 10.5 ms; staging 3.4 ms; NVENC 5.0 ms.
-    - Grading: `RGBA_F16`, `f16-pq-to-sdr`; SPS truth `rext 4:4:4 10-bit
-      bt709/bt709/bt709 full`; 30–31 fps; import 5.7–6.0 ms.
-    - The client drew about 20 fps (`source_fps`). That is the client's own
-      rate, not a compositor limit.
-  - Mutter 50.6 gave the same figures within 0.5 ms.
-- On both, the PQ-tagged picture was the measuring ramp. Shared-memory wide
-  frames are refused as described above.
-- Mutter 49.4 (the product stack, a dev record beside the installed
-  service): `arcen-pier wayland qualify` records
+- The output colour state is BT.2020/PQ with a 203-nit reference; SDR white
+  measures 202.9 nits (PQ code 594).
+- DMA-BUF `xBGR_210LE`: 1024/1024 codes, maximum error 0, import about
+  7 ms. DMA-BUF `RGBA_F16`: 986/1024, maximum error 1.
+- HDR epoch: READY and SPS truth `rext 4:4:4 10-bit bt2020/pq/bt2020ncl
+  full`, 30 fps encoded, import about 10 ms, staging 3.4 ms, NVENC 5 ms.
+- Grading epoch (F16, `f16-pq-to-sdr`): SPS truth `rext 4:4:4 10-bit
+  bt709/bt709/bt709 full`, 30 fps, import about 6 ms.
+- Mutter 49.4: `arcen-pier wayland qualify` records
   `fidelity.gap = compositor_lacks_hdr_screencast` and prints "Grading: no
   (Mutter 49.4 has no HDR screen sharing; it arrived in Mutter 50
   (mutter!4928))". Grading and HDR are then served visibly as Auto.
 
-**Honest limits.**
+**Limits.**
 
 - Grading through a PQ composition is near parity, not parity. An SDR
   ramp keeps 853 of 1024 codes through F16 PQ (445 through 10-bit PQ),
@@ -3559,8 +3088,9 @@ import, conversion and encode only.
   was not started on the route. Its agent refuses wide streams, and capenc
   fails visibly ("no wide format negotiated"). Restarting the session on the
   route is a follow-up.
-- Product qualification of the full Pier→Deck path needs a GNOME ≥ 50 host
-  with the same vGPU. The containers cannot run the Pier's logind session.
+- The full Pier→Deck path is proven on GNOME Shell 51.1 from a side-by-side
+  prefix ([Running a newer GNOME](#running-a-newer-gnome-than-the-distribution-ships)),
+  not yet on a distribution's own GNOME ≥ 50.
 
 `MUTTER_DEBUG_FORCE_HDR` is a compositor debug switch. The Pier sets it only
 in the session's own compositor environment, on the `force-hdr` route.

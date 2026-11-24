@@ -118,6 +118,24 @@ impl ConnectionTest {
         self.report.as_ref()
     }
 
+    /// The finished test's verdict in a few words, for beside Test
+    /// connection: the report's first sentence ("Ready to sign in.",
+    /// "Cannot connect."), or why the test could not start.
+    #[must_use]
+    pub fn verdict_line(&self) -> Option<(String, Verdict)> {
+        if let Some(error) = &self.input_error {
+            return Some((error.clone(), Verdict::Fail));
+        }
+        let report = self.report.as_ref()?;
+        let summary = report.summary();
+        let first = summary
+            .split_inclusive(". ")
+            .next()
+            .unwrap_or(&summary)
+            .trim_end();
+        Some((first.to_owned(), report.overall()))
+    }
+
     /// The text copied to the clipboard.
     #[must_use]
     pub fn report_text(&self) -> Option<String> {
@@ -127,7 +145,8 @@ impl ConnectionTest {
     }
 }
 
-fn verdict_colour(colours: &super::theme::Palette, verdict: Verdict) -> egui::Color32 {
+/// The ink a verdict is written in.
+pub(super) fn verdict_colour(colours: &super::theme::Palette, verdict: Verdict) -> egui::Color32 {
     match verdict {
         Verdict::Pass => colours.success,
         Verdict::Info => colours.info,
@@ -245,9 +264,65 @@ pub fn render(ui: &mut egui::Ui, test: &ConnectionTest) -> Option<ConnectionTest
     action
 }
 
+/// A finished test of `host`: the name resolves and the Pier does not
+/// answer.
+#[cfg(test)]
+pub(super) fn unanswered(host: &str) -> ConnectionTest {
+    use arcen_session::connection_diagnostics::{
+        AddressAttempt, ExpectedIdentity, HandshakeOutcome, Observations, PathObservation,
+        ResolutionObservation, RoundTripObservation, assess,
+    };
+    let mut test = ConnectionTest::start(host, "", String::new(), |target, slot| {
+        let address = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 11));
+        let observations = Observations {
+            resolution: ResolutionObservation::Resolved {
+                addresses: vec![address],
+                elapsed_ms: 4,
+            },
+            attempts: vec![AddressAttempt {
+                address: std::net::SocketAddr::new(address, target.port),
+                outcome: HandshakeOutcome::TimedOut { waited_ms: 5_000 },
+            }],
+            expected_identity: ExpectedIdentity::Unknown,
+            certificate: None,
+            greeting: None,
+            path: PathObservation {
+                interface_kind: None,
+                interface_mtu: None,
+                quic_mtu: None,
+            },
+            round_trip: RoundTripObservation::default(),
+            target,
+        };
+        slot.fill(assess(
+            &observations,
+            1_790_000_000,
+            arcen_telemetry::QosTargets::default(),
+        ));
+    });
+    test.poll();
+    test
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_verdict_line_is_the_reports_first_sentence() {
+        let test = unanswered("pier.example.internal");
+        assert!(!test.running());
+        assert_eq!(
+            test.verdict_line(),
+            Some(("Cannot connect.".to_owned(), Verdict::Fail))
+        );
+        let unreadable = ConnectionTest::start("bad host", "", String::new(), |_, _| {});
+        let (line, verdict) = unreadable.verdict_line().expect("a verdict");
+        assert_eq!(Some(line.as_str()), unreadable.input_error.as_deref());
+        assert_eq!(verdict, Verdict::Fail);
+        let running = ConnectionTest::start("pier.example.internal", "", String::new(), |_, _| {});
+        assert_eq!(running.verdict_line(), None);
+    }
 
     #[test]
     fn an_unreadable_address_reports_without_running() {

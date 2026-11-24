@@ -3,16 +3,12 @@
 **Status:** Accepted (2026-07-31) — implemented 2026-07-31; amended
 2026-11-15 (the Decks' dormant WSS connector removed)
 
-**Validation:** QUIC sessions to a Linux Pier and a Windows Pier decoded
-video and carried keyboard, mouse and scroll on UDP 18444; WSS wire markers
-are absent from all shipped binaries (verified via `strings` inspection).
-
 ## Context
 
-Arcen proved authenticated direct QUIC sessions end to end between macOS Deck
-and both Linux and Windows Pier. Matched runs showed modest latency and
-delivery improvements on some hosts, while also showing that presentation and
-audio bottlenecks remain above the transport layer.
+Authenticated direct QUIC sessions work end to end between the macOS Deck
+and both the Linux and the Windows Pier. QUIC improves latency and delivery
+modestly on some hosts; the remaining presentation and audio bottlenecks sit
+above the transport layer.
 
 Arcen uses QUIC as its forward transport for its technical position and
 future development. Shipping both WSS and QUIC would preserve

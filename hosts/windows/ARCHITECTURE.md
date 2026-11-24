@@ -11,9 +11,9 @@ per-encoder display mirroring with transactional restore, WASAPI system-audio ca
 capture/encode via the `arcen-capenc` engine — DXGI/WGC → NVENC on NVIDIA hosts,
 DXGI/WGC → GPU NV12 → a vendor's Media Foundation hardware encoder MFT (**Alpha**) on
 other GPUs that register one and pass admission, WGC → source-built OpenH264 otherwise
-(VMware SVGA, no proven hardware MFT). No Python, no ffmpeg.
+(for example a virtual display adapter with no hardware MFT). No Python, no ffmpeg.
 
-## How it's grounded
+## Design decisions
 
 - Lessons encoded:
   - **SID-bound attach plus cold first-login.** A LocalSystem SCM service does
@@ -130,7 +130,7 @@ The common Windows/Linux schema and Windows platform section are documented in
   SendInput, WASAPI, NVAPI, DXGI/WGC).
 - **Exposes:** QUIC on UDP `:18444`.
 
-## Module map (from the proven source)
+## Module map
 
 - `main.rs` — entry (broker vs agent role).
 - `config.rs` — strict JSON schema, relative-path resolution, defaults + CLI override merge.
@@ -170,7 +170,7 @@ The common Windows/Linux schema and Windows platform section are documented in
 - `clipboard.rs` — bounded transport queue plus the user-session
   `HWND_MESSAGE`/`AddClipboardFormatListener` adapter.
 - `display.rs` / `edid.rs` / `nvapi.rs` / `recovery.rs` — the physical `DisplayPolicy` transaction
-  (exact mode + topology isolation for NVENC, negotiated ladder for MF/VMware), full-snapshot
+  (exact mode + topology isolation for NVENC, negotiated ladder for MF and virtual adapters), full-snapshot
   restore, EDID generation/purge, display-recovery journal + crash watchdog. All of it exists
   because the fallback host path mutates the *physical* display and must put it back.
 - `arcen_outputs::windows_topology` (shared, no OS calls) — the pure physical
@@ -400,6 +400,13 @@ and `-ForceNewKey` is an explicit trust change. The service never issues or
 rotates. Windows certificate-store and CNG keys, runtime certificate fetch,
 mTLS, 0-RTT, and plaintext fallback are outside this boundary.
 
+Each Windows Pier needs a certificate whose SAN covers every configured
+connection name. The SMB helper, `scripts/new-host-cert.ps1`, generates a P-256
+self-signed certificate with hostname, FQDN and non-loopback IP SANs only when
+none exists, exports the PEM certificate and PKCS#8 key into
+`%ProgramData%\Arcen\tls\` with SYSTEM/Administrators-only ACLs, and writes
+whole-certificate and SPKI SHA-256 pins.
+
 ## Direct session auto-reconnect
 
 `auth.reconnect_window_secs` configures an inclusive `0..=7200` second direct
@@ -528,11 +535,9 @@ HID, pen/Wacom, unsupported input classes, or a hostile process already running
 on the same interactive desktop that can observe and replay injected-event
 metadata. The process-random marker prevents accidental/foreign injection from
 being trusted; it is not an OS access-control boundary. Process death removes hooks;
-topology restoration depends on the existing watchdog. Hot-plug, sleep/resume,
-driver-reset, and real multi-monitor privacy remain mandatory physical-lab
-release gates.
+topology restoration depends on the existing watchdog.
 
-## Lifecycle Event Log (2026-07-19)
+## Lifecycle Event Log
 
 `arcen-telemetry::LifecycleEventKind`/`ValidatedLifecycleEvent` (IDs
 1000-1404) are reported best-effort through a process-local Windows Event
@@ -619,7 +624,9 @@ The generated map is built only into `OUT_DIR` from Unicode CLDR 48.2
 licensed under the Unicode License v3 (`Unicode-3.0`):
 <https://github.com/unicode-org/cldr/blob/release-48-2/LICENSE>.
 
-## Credential Provider — connect→login (no autologon) — INSTALLER MUST BUILD THIS IN
+## Credential Provider — connect→login (no autologon)
+
+The installer must build this in.
 
 Autologon is **not** a product mechanism: it breaks account switching, dies on a cold
 boot after a crash, and **AD-joined workstations have no autologon at all**. The real
@@ -647,7 +654,7 @@ same console session by the original authenticated SID → streams.
 **Manual delivery contract (implemented in [`INSTALL.md`](INSTALL.md)):**
 1. **Build the CP for MSVC, signed for production.** `build.cmd` produces static-CRT
    `x86_64-pc-windows-msvc` artifacts with no MinGW runtime staging. `install.ps1` enforces
-   the signer; `install-test.ps1 -IUnderstandThisModifiesWinlogon` is the unsigned lab path.
+   the signer; `install-test.ps1 -IUnderstandThisModifiesWinlogon` is the unsigned path, for an isolated test machine only.
 2. **Install layout:** DLL → `%ProgramFiles%\Arcen\CredentialProvider\arcen_credential_provider.dll`.
 3. **Register (64-bit hive):**
    - `HKLM\SOFTWARE\Classes\CLSID\{2FBE34F2-9E7A-42FA-BFBF-44897694BE60}\InprocServer32` = DLL path, `ThreadingModel=Apartment`.
@@ -657,7 +664,7 @@ same console session by the original authenticated SID → streams.
    The service normally receives only `--config "%ProgramData%\Arcen\pier.json"`.
 5. **Do NOT ship autologon.** Disable `AutoAdminLogon`/`ForceAutoLogon`; the CP is the login path.
 
-## Direct cold-boot first-login — CP path proven; media retest pending
+## Direct cold-boot first-login
 
 The missing behavior was resolved without a separate logon-driver executable or undocumented
 Winlogon API:
@@ -680,17 +687,7 @@ Winlogon API:
    binding capture during the LogonUI-to-Explorer/DWM transition; any transient
    lock, identity/session change, or console change resets the stability gate.
 
-**Live evidence:** on a Windows Pier, two separate no-user reboots produced
-`GetCredentialCount(autologon=true)`, `GetSerialization(FINISHED)`,
-`ReportResult(STATUS_SUCCESS)`, Security 4624 Logon Type 2 with `Logon Process: User32`, an
-active console WTS session, and successful SID rebind/agent launch. An invalid password was
-rejected before CP handoff; the next valid attempt reached the Deck's `streaming` state.
-
-The CP/authentication path remains proven independently of media acceptance.
-Cold-login end-to-end success still requires a manual stream retest after the
-post-login capture lifecycle gate.
-
-## Exact client display mirroring — per-encoder policy (2026-07-17)
+## Exact client display mirroring — per-encoder policy
 
 The product contract is the Deck's Displays settings page: the host recreates the client's
 monitors — no ghost displays. Exactness is an encoder property, so the display transaction
@@ -737,7 +734,7 @@ in `display.rs` takes a `DisplayPolicy`:
 - **UI scale by GPU class:** the Deck's Windows UI scale step is given only
   to an output of a GPU proved a Quadro, RTX Pro or GRID
   (`ui_scale_change_permitted`), single or Match My Layout, and there it is
-  applied and put back exactly as in 0.20.5. A GeForce, any other adapter
+  applied and put back exactly. A GeForce, any other adapter
   and an unreadable class never have the Windows scale changed; the hello's
   `effective_display_scale` reports what Windows shows. No scale change arms
   a topology rollback of its own. A negotiated fallback whose nearest offered
@@ -775,11 +772,12 @@ requests are refused with `gpu_format_unsupported`
   access unit's SPS is proven again before READY; READY names
   `backend=media-foundation-hw`, `conversion=gpu`.
 - **Fallback.** A typed `UNAVAILABLE` from the live child sends Auto to
-  OpenH264, as an NVENC failure does. VMware SVGA and other adapters without
-  a hardware MFT enumerate nothing and fall through cleanly; the lab switch
-  `ARCEN_LAB_MF_HW_ENUM=none` (user environment) simulates that.
+  OpenH264, as an NVENC failure does. A virtual display adapter, or any other
+  adapter without a hardware MFT, enumerates nothing and falls through
+  cleanly; `ARCEN_LAB_MF_HW_ENUM=none` (user environment) simulates that for
+  testing.
 - **Not yet.** Multi-monitor sessions on such a host run every display on
-  OpenH264; Intel and AMD qualification by external testers is pending.
+  OpenH264, and Intel and AMD hardware is not yet qualified.
 
 For an exact isolated lease, `ServerHello.supports_display_update` is true only
 when the live display backend also proves an owned NVAPI exact-timing snapshot
@@ -805,7 +803,7 @@ Shared plumbing: `session.rs::session_display_plan` consumes `AuthResponse.displ
 + the full monitor list (`""`/`single_primary`/`windowed`/`match_layout` all plan one
 mirrored display today; multi-monitor `match_layout` degrades loudly to the client primary
 monitor and reports the degradation in `display_resolution` — the
-`SessionDisplayPlan { monitors: Vec<MonitorPlan> }` seam is where Milestone 2 loops).
+`SessionDisplayPlan { monitors: Vec<MonitorPlan> }` seam is where multi-monitor plans extend).
 Unknown mode tokens and monitor-count safety failures still reach the Deck as `auth_result`
 messages before authentication. Restore is
 unchanged mechanics: the pre-mutation full `QueryDisplayConfig` snapshot re-activates
@@ -815,86 +813,26 @@ returned to the original, and NVAPI-stage failures cannot strand the journal (se
 lesson above). `stream_session` refuses to bind the Microsoft Basic adapter for NVENC
 sessions and requires the resolved output rect to equal the session rect.
 
-**Live evidence (2026-07-17):** a GRID V100D host (NVENC/`ExactIsolated`) — exact
-1800x1168 mirror, single primary output, reconnect round-trip after the journal fix;
-a VMware SVGA guest (MF/`NegotiatedMacroblock16`) — 16-aligned 1792x1168
-stream with correct color and the idle keepalive cadence visibly dropping encode fps
-on a static desktop.
-
-**Proxmox CPU-only evidence (2026-07-24):** SPICE/QXL-compatible PCI display
-(`VEN_1B36:DEV_0100`) exposed through `Microsoft Basic Render Driver`, D3D11 feature
-level 11.0, no D3D11 video device, and the inbox MF H.264 MFT. WGC + MF produced
-canonical READY and a stable 1280x800/30 stream after the 1792x1168 custom mode was
-rejected. Adding SPICE-backed ICH9 HDA created the default render endpoint: WASAPI
-then ran 48 kHz stereo with zero host queue drops, capture errors, or restarts in the
-observed successful session. Deck reported no playback underruns. One startup
-discontinuity/underrun, one Deck audio-inbox drop, and bounded latency trims were
-observed without audible degradation. Without the emulated audio device, video
-continued but WASAPI correctly retried because no default console render endpoint
-existed.
+The OpenH264 path (`win_mf.rs`) captures with WGC only, because Desktop
+Duplication is unreliable on virtual display adapters. Its BGRA→NV12
+conversion is one fused pass, and a static desktop drops to a one-second
+keepalive. `arcen-pier diagnose-host [--json]` inventories adapter
+identity and type, D3D11/video capability, outputs and topology, installed
+encoder runtimes, and a same-adapter recommendation without changing the
+display.
 
 ## Deferred / roadmap
 
-- Obtain the production Authenticode certificate; the deployed MSVC lab artifacts are unsigned.
-- Live-test traditional AD credentials on an AD-joined host (serialization is covered).
-- Record production-signed Credential Provider acceptance; lab binaries remain
-  unsigned development artifacts.
-- Wire the EDID-purge restore fallback if not already the default.
-- Native Event Log sink readback and fleet-rule validation on a real host
-  are not yet recorded (pure formatters, fake backends, and bounded query
-  tests cover the code; see "Lifecycle Event Log").
+- Production Authenticode signing of the Pier, the Credential Provider and
+  the drivers.
+- Traditional AD credentials on an AD-joined host (serialization is covered).
+- Broader non-NVIDIA acceptance, and Intel/AMD qualification of the Media
+  Foundation hardware encoder (Alpha). These do not merge or replace the three
+  native NVENC capture pipelines documented below.
 - Forward the live session correlation id into the crash watchdog's command
-  line instead of a freshly generated one, if a low-risk seam for that
-  appears in a follow-on display-recovery change.
+  line instead of a freshly generated one.
 
-## Done since 2026-07-15
-
-- **Distinct Arcen Credential Provider CLSID** — regenerated to
-  `{2FBE34F2-9E7A-42FA-BFBF-44897694BE60}`; the shipping product no longer collides with
-  other remote-desktop software on the same fleet.
-- **OpenH264 software encoder** — the Windows Pier compiles `software-h264`
-  alongside `nvenc`. `--encoder auto` (the default) probes the NVIDIA encode API and falls
-  back to source-built OpenH264 on hosts without NVIDIA (VMware SVGA, Intel-only, etc.). Live path
-  in `hosts/capenc/src/win_mf.rs` uses WGC exclusively (DDA on VMware SVGA is unreliable).
-- **VMware SVGA live stream** — a VMware test VM proved console-only first-party
-  target binding, VMware Tools display negotiation, exact-output WGC capture,
-  MF H.264 at 30 fps, mouse/keyboard, audio, and verified restore. Explicit MF
-  aligns the desktop to complete 16×16 macroblocks (1800×1168 → 1792×1168)
-  instead of cropping encoded pixels. RDP protocol sessions are rejected before
-  display mutation. The VMware console viewer mirrors the same Windows session
-  and must keep Autofit disabled during testing.
-- **GPU diagnostics** — `arcen-pier diagnose-host [--json]` inventories adapter
-  identity/type, D3D11/video capability, outputs/topology, installed encoder
-  runtimes, and a same-adapter recommendation without mutating the display.
-- **On-host TLS cert helper** — `hosts/windows/scripts/new-host-cert.ps1`
-  generate-if-missing creates a P-256 self-signed server certificate with
-  hostname/FQDN/non-loopback IP SANs, exports PEM cert + PKCS#8 key into
-  `%ProgramData%\Arcen\tls\` with SYSTEM/Administrators-only ACLs, and writes
-  whole-certificate and SPKI SHA-256 pins. Same-key renewal and trust-changing
-  rekey are separate explicit commands.
-- **Exact per-encoder display mirroring** — `DisplayPolicy::ExactIsolated` (NVENC) /
-  `Negotiated` (MF/VMware), `SessionDisplayPlan` consuming `displays_mode` + monitors,
-  honest ServerHello layout, journal-stranding restore fix. See the mirroring section.
-- **MF hot-path perf** — fused single-pass BGRA→NV12 (each source byte read once,
-  vectorizable), no per-frame plane clone, 1 s idle keepalive cadence on static desktops,
-  cached MFT output-buffer size, reused drain scratch.
-
-## Resume pointer
-
-- **Status (2026-09-01):** the `HDRReady` release matrix is green for Auto,
-  Speed, Grading, and HDR; host/local cursor, nonzero audio, input, display
-  restore, and forced-loss credential-free resume were exercised against the
-  packaged Pier. The Windows installer upgrade path was also rerun after the
-  localized ACL fix.
-- **Next Windows work:** production Authenticode and driver signing, broader
-  non-NVIDIA physical acceptance, and Intel/AMD qualification of the Media
-  Foundation hardware encoder (Alpha). These do not merge or replace the three native NVENC capture
-  pipelines documented below.
-- **Cert note:** each Windows Pier needs a TLS certificate whose SAN covers
-  every configured connection name; enterprise PEM is administrator-managed,
-  while `scripts/new-host-cert.ps1` is the absent-only SMB bootstrap.
-
-## Separate Windows capture pipelines (2026-09-01)
+## Separate Windows capture pipelines
 
 Windows has three native NVENC pipelines. They share display/session
 supervision and the NVENC encoder wrapper, but not source format or colour
@@ -960,9 +898,8 @@ display state and then restores the original EDID/topology. A remote display
 request therefore cannot persist a new sink identity or HDR posture after the
 session ends.
 
-`NvAPI_GPU_SetEDID` currently runs in the signed-in session agent. The hardware
-matrix proves automatic headless HDR for an account in the host's local
-Administrators group. A standard local account is rejected by NVAPI with
+`NvAPI_GPU_SetEDID` currently runs in the signed-in session agent. Automatic
+headless HDR works for an account in the host's local Administrators group. A standard local account is rejected by NVAPI with
 `NVAPI_INVALID_USER_PRIVILEGE`, and the session fails before capture rather
 than continuing without the requested display contract. Moving this mutation
 behind a narrowly scoped LocalSystem broker operation is required before the

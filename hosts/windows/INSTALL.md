@@ -47,7 +47,7 @@ test/attestation-only signatures and extra contents, and verify the installed
 INF/version. Select `Arcen Microphone` in Windows sound input settings or in the
 recording application's device picker before enabling `microphone_input.enabled`.
 Arcen never changes Windows recording defaults or communications roles.
-Protected signing and physical acceptance gates remain in
+Driver signing and staging are described in
 `docs\operations\audio-input.md`.
 
 The single-file installer preserves operator settings while atomically
@@ -123,8 +123,7 @@ per session by a proven encode, `platform.media_foundation_hardware` turns it
 off) and source-built OpenH264. Auto tries them in that order.
 The software path is not VMware-specific:
 it is designed for attached Intel, AMD, VMware, and other D3D11 desktop outputs
-when Windows.Graphics.Capture and the inbox H.264 MFT are available. VMware is
-live-tested; Intel/AMD software fallback validation is still pending. It uses
+when Windows.Graphics.Capture and the inbox H.264 MFT are available. It uses
 CPU conversion + encoding; DirectX support alone does not imply hardware video
 encoding. The pier resolves the backend via `video.encoder` in `pier.json` or
 `--encoder <auto|nvenc|mf-hw|software-h264>` on the CLI. `auto` (default) probes the NVIDIA
@@ -147,16 +146,17 @@ with `"encoder": "nvenc"` and once with `"encoder": "software-h264"`; keep the c
 chroma at H.264/YUV420 for a like-for-like comparison. Pin the backend on
 mixed-GPU systems rather than relying on `auto`.
 
-### Proxmox CPU-only profile
+### A virtual machine without a GPU
 
-A validated no-passthrough Proxmox profile uses:
+A Windows guest on a QEMU/KVM hypervisor (Proxmox, for example) with no GPU
+passthrough runs the software path with:
 
 - Display: `SPICE (qxl)`;
 - Audio Device: `ich9-intel-hda` with `driver=spice`;
 - Windows `video.encoder`: `"software-h264"`, codec `"h264"`, chroma `"yuv420"`, and
   `fps: 30`; and
 - the exact interactive DXGI description in `platform.desktop.adapter`
-  (`"Microsoft Basic Render Driver"` in the validated guest), never the WMI
+  (`"Microsoft Basic Render Driver"` on such a guest), never the WMI
   device label.
 
 No shared GPU is required. Windows may still label the QXL-compatible PCI
@@ -166,8 +166,9 @@ an attached output, D3D11 feature level 11.0 or newer, and the compiled OpenH264
 software encoder. `d3d11_video_device=false` is expected for this CPU path;
 successful WGC capture plus canonical OpenH264 READY is the authoritative proof.
 
-For a 1800×1168 Deck request, this fixed-mode guest rejects custom 1792×1168
-and selects the closest supported 16-aligned mode, currently 1280×800. The
+A fixed-mode guest may reject the custom size: for a 1800×1168 Deck request it
+rejects 1792×1168, and Pier selects the closest supported 16-aligned mode (for
+example 1280×800). The
 applied size is reported honestly. Windows mid-session `display_update` remains
 disabled, so resizing/fullscreen scales the current texture rather than changing
 stream pixels.
@@ -581,7 +582,7 @@ Production requires an MSVC DLL signed by the configured Authenticode signer:
   -ExpectedSignerThumbprint '<40-HEX-THUMBPRINT>'
 ```
 
-The unsigned path is for an isolated lab only:
+The unsigned path is for an isolated test machine only:
 
 ```powershell
 .\install-test.ps1 `
@@ -653,7 +654,8 @@ service startup, and the existing file logs under
 
 ## Install the LocalSystem service
 
-Remove the old lab scheduled task if it exists:
+Remove an `ArcenPier` scheduled task left by an earlier manual install, if
+one exists:
 
 ```powershell
 Unregister-ScheduledTask -TaskName ArcenPier -Confirm:$false `
@@ -756,12 +758,11 @@ Failure retains the last good certificate while it remains valid. Once it
 expires, new TLS handshakes are refused without plaintext fallback. The
 private broker-agent control is never accepted from a Deck.
 
-A development deployment may apply a Level 2 override. Keep that override in
-the deployment's own configuration; do not change the packaged Level 0
-`pier.json` default.
+To diagnose one Pier, raise the level in that Pier's own configuration (for
+example to Level 2); do not change the packaged Level 0 `pier.json` default.
 
-For an isolated lab investigation, enable secret-safe CP lifecycle diagnostics
-before reboot:
+To investigate the Credential Provider on an isolated test machine, enable
+secret-safe CP lifecycle diagnostics before reboot:
 
 ```powershell
 New-Item -ItemType File -Force `

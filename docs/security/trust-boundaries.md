@@ -1,20 +1,24 @@
-# Trust Boundaries
+# Trust boundaries
 
-Arcen treats clients, hosts, identity-provider responses,
-network metadata, and persisted configuration as distinct trust inputs.
+Arcen treats Decks, Piers, network metadata and persisted configuration as
+separate trust inputs. This page states each boundary, what enforces it, and
+its known limits.
 
 ## Required separations
 
-- OIDC establishes user identity; Entra is the first provider profile.
-- OS-specific machine authentication establishes host identity.
-- Session authorization binds verified user, machine, and policy decisions to a
-  short-lived session.
-- Transport encryption protects a channel but does not replace authorization.
+- The host's operating system authenticates the user: PAM on Linux and on a
+  macOS Pier, the Windows logon path on Windows. Arcen keeps no user
+  database.
+- The Pier's validated TLS certificate (its SPKI) identifies the host to the
+  Deck.
+- Session authorization binds the verified user, host and policy decisions to
+  one bounded session.
+- Transport encryption protects the channel; it never replaces
+  authorization.
 
-Commercial Pier licensing was withdrawn when Arcen moved to AGPL-3.0 free
-software; see [ADR 0006](../adr/0006-offline-pier-licensing.md). The remaining
-capacity-one session gate is a physical host-resource boundary, not an
-entitlement boundary.
+Arcen has no licence enforcement ([ADR 0006](../adr/0006-offline-pier-licensing.md)).
+The one-session-per-host gate is a limit of the host's resources, not an
+entitlement.
 
 ## macOS Pier process boundary
 
@@ -46,11 +50,11 @@ process without a session is judged by its user's graphical session
 `allow_active` default — on stock systems power off, reboot, suspend,
 NetworkManager network control, udisks2 mounting and more, without a
 password. Every Linux X11 desktop is a logind session on `seat0` at VT 1
-that the launcher activates, so up to and including the first 0.17.0 build
-its remote user, and every session-less process of that user, held those
-rights. Headless Wayland desktops are seatless and were not affected.
+that the launcher activates, so without a rule its remote user, and every
+session-less process of that user, would hold those rights. Headless
+Wayland desktops are seatless.
 
-From 0.17.0 the installer installs, and the Pier rewrites at every start,
+The installer installs, and the Pier rewrites at every start,
 `/etc/polkit-1/rules.d/05-arcen-remote-session.rules`
 (`arcen_session::polkit_remote`). For a subject in a seated session that
 logind records as remote (`REMOTE=1`, from `PAM_RHOST`, which every Arcen
@@ -70,14 +74,9 @@ names no session, so sign-ins never write it.
 A process in no logind session (a systemd user service: GNOME 40 and later
 run the shell and the settings daemons that way) reaches the rule with no
 session and no seat, but `local` from its user's display session and
-`active` when any of the user's sessions is active. Up to 0.20.1 the rule
-counted every such subject as remote, so on a host with Arcen installed the
-desk user's own shell asked for an administrator to power off, and GNOME's
-colour plugin asked for a password in every session (reported from the
-field on 0.20.1; reproduced on Rocky 9, polkit 0.117: `gsd-color` in
-`user@.service` got `session=null local=true active=true`). Such a process
-may belong to any of the user's sessions, so from 0.20.2 the rule counts it
-as remote while any of them is an Arcen desktop or a seated remote session:
+`active` when any of the user's sessions is active. Such a process may
+belong to any of the user's sessions, so the rule counts it as remote while
+any of them is an Arcen desktop or a seated remote session:
 it resolves the user name to a uid with `id` (cached per name), reads
 `SESSIONS=` from logind's user record (`/run/systemd/users/<uid>`) and
 classifies each listed session as above (logind 252 on Rocky 9 leaves an
@@ -114,7 +113,7 @@ once, on any grant or missing answer (`polkit_grants_remote_session`,
 also asks polkit about a local console session, when one exists, and warns
 when the console is refused a grant its defaults promise.
 
-Residual, recorded rather than claimed fixed:
+Known limits:
 
 - polkit older than 0.106 has no JavaScript rules. There an X11 desktop is
   still served, with a `SECURITY:` error at start and on every sign-in
@@ -145,7 +144,7 @@ Residual, recorded rather than claimed fixed:
 ## Linux desktop session services
 
 A Linux desktop has no display manager, so the Pier's launcher and agent do
-what one would. Each step is reviewed as a boundary (Release/Security):
+what one would. Each step is a trust boundary:
 
 - **Login password to the keyring (headless Wayland only).** After PAM
   accepts the password, the root launcher keeps one zeroizing copy until it
@@ -161,10 +160,9 @@ what one would. Each step is reviewed as a boundary (Release/Security):
   argument, an environment variable, a file or a log. It ends up exactly
   where a GDM login puts it (`pam_gnome_keyring` hands it to the same
   user-owned daemon). If it does not open the login keyring, the keyring
-  stays locked and applications ask, as before. A second desktop of a user
-  who is also signed in at the console runs a second keyring daemon on the
-  same keyring files, as activation already did before this; gnome-keyring
-  re-reads keyring files that change.
+  stays locked and applications ask for the password. A second desktop of a
+  user who is also signed in at the console runs a second keyring daemon on
+  the same keyring files; gnome-keyring re-reads keyring files that change.
 - **Login password to the keyring (console sign-ins that start the
   session).** GDM's login screen taking a one-time token and Arcen's own
   login session on a host without a display manager never show the password
@@ -263,7 +261,7 @@ tests, and Release/Security review.
 
 ## Microphone input boundary
 
-Microphone input is disabled by default and requires independent operator policy,
+Microphone input is off on the Deck by default and requires independent operator policy,
 Deck consent, backend availability, authenticated-session binding, and additive
 microphone-v1 negotiation. It uses a distinct sequenced upstream frame and never
 reinterprets host-to-client audio. Frames before authorization, after disable,
@@ -284,9 +282,9 @@ Unreapable Windows driver I/O is fatal to the owning session-agent process, so a
 stale worker cannot survive into a new attachment. macOS permission and capture
 failures fail closed. See
 [`../architecture/audio-input.md`](../architecture/audio-input.md) and
-[`../operations/audio-input.md`](../operations/audio-input.md). Windows remains
-unavailable until the complete PortCls/WaveRT package is installed; the
-checked-in ring contract alone is not a backend.
+[`../operations/audio-input.md`](../operations/audio-input.md). A Windows Pier
+offers no microphone until the complete, signed PortCls/WaveRT package is
+installed; the checked-in ring contract alone is not a backend.
 
 ## Native video-codec boundary
 
@@ -307,8 +305,9 @@ source and distribution controls are in
 
 ## Deskside privacy boundary
 
-Deskside is an operator-enforced host policy, not a Deck request and not a wire
-capability. It is disabled by default. Enabling requires fresh positive
+Pinned deskside (`platform.deskside`, `platform.desktop.deskside`) is an
+operator-enforced host policy, not a Deck request and not a wire capability.
+It is off by default. Enabling requires fresh positive
 physical-console evidence and complete operator pins; absence of known VM
 markers is never positive evidence. Missing, unknown, virtual, remote,
 paravirtual, conflicting, stale, unpinned, or capture-overlapping resources
@@ -350,12 +349,12 @@ Resumable transport loss holds the same resources and authoritative deadline;
 it never rearms or replaces ownership. Terminal drain stops remote injection and
 media first, restores displays before releasing input, attempts every restore
 after a failure, and preserves failed recovery state. This ordering limits both
-privacy gaps and local denial of service. SAS/secure desktop, kernel HID,
-pen/tablet, physical hot-plug, sleep/resume, and driver-reset behavior are
-explicit non-claims pending physical lab evidence.
+privacy gaps and local denial of service. Pinned deskside makes no claim for
+the secure desktop (Ctrl+Alt+Del), kernel HID, pens and tablets, physical
+hot-plug, sleep and resume, or a driver reset.
 
-Desk privacy is on by default on every Pier (`privacy.desk`, ADR 0025 §5,
-amended 2026-11-18): an administrator must turn it off explicitly, every
+Desk privacy is on by default on every Pier (`privacy.desk`,
+[ADR 0025 §5](../adr/0025-arcen-joins-the-users-session.md)): an administrator must turn it off explicitly, every
 start logs the choice, and the Deck is told. A Windows Pier that cannot prove
 no desk monitor shows the session, or cannot block the desk's keyboard and
 mouse, refuses the attachment (`console_privacy_unavailable`). The Windows
@@ -365,9 +364,8 @@ display; until the detach, a few seconds after a sign-in, the desk can see
 the session (GAP-050). Desk pens and touch screens on Windows are not
 blocked (GAP-051).
 
-The macOS Pier's desk privacy (`privacy.desk`, on by default; in 0.20.3
-`platform.desktop.deskside.enabled`, off; `hosts/macos/src/desk_privacy.rs`, rules in the shared
-`arcen_session::console_session::desk_privacy`) runs in the signed-in user's
+The macOS Pier's desk privacy (`privacy.desk`, on by default; rules in the
+shared `arcen_session::console_session::desk_privacy`) runs in the signed-in user's
 session helper, never at the login window and never in `serve`. It needs no
 new privilege: the active `CGEventTap` needs the Accessibility grant keyboard
 input already holds, and the transfer tables are the session's own. The
@@ -390,21 +388,18 @@ password field the Deck focused (the pointer stays blocked and the screens
 dark); Siri, Voice Control, Switch Control, head-pointer input and
 dictation act through accessibility and input methods, not HID events; a
 display whose picture is itself a screen capture (DisplayLink, Sidecar,
-AirPlay) may show the session although its table reads back dark (not yet
-measured). Nothing about the events is logged but counts. Between a sign-in typed at the streamed login window
+AirPlay) may show the session although its table reads back dark
+(untested). Nothing about the events is logged but counts. Between a sign-in typed at the streamed login window
 and the Deck's reconnect to the signed-in user's helper (about two seconds)
 the desk is not yet private: the login window's helper never arms it.
 
 ## Linux X11 virtual input boundary
 
 A remote user's input reaches their dedicated Xorg desktop through kernel
-uinput devices. The goal is that no other input reaches it. Up to and including
-the first 0.17.0 build, the dedicated Xorg hot-added every input device on
-seat0: the physical or hypervisor console's keyboard and mice could type and
-click in a remote desktop the console cannot see, and a second dedicated Xorg
-on the same host received another session's Arcen devices.
+uinput devices. No other input may reach it: not the physical or hypervisor
+console's keyboard and mice, and not another session's Arcen devices.
 
-From 0.17.0 each dedicated Xorg ignores every input device unless it reports
+Each dedicated Xorg ignores every input device unless it reports
 vendor `a2ce` and its name carries the session token (`Arcen Virtual …
 (session :N)`). The Pier's three devices match; ordinary console keyboards,
 mice and tablets, and another session's Arcen devices, do not. The match is on
@@ -412,15 +407,15 @@ attributes a device chooses for itself, so it is a filter, not an
 authentication: see the residual list. The Pier also never emits `KEY_SYSRQ`,
 so a remote Alt+PrintScreen cannot reach the host kernel's SysRq handler.
 
-Residual, recorded rather than claimed fixed:
+Known limits:
 
 - The admission match is impersonable. Vendor id and device name are
   self-declared: a crafted USB device that reports vendor `a2ce` and a product
   string containing `(session :N)`, or a local user who can open `/dev/uinput`
   (some distributions grant this through `uaccess` rules, for example
   `steam-devices`) and creates such a device, is admitted to that session's
-  desktop. A1 stops ordinary console devices; it does not stop a deliberate
-  impersonation. The fix is part of the follow-up below: a shipped udev rule
+  desktop. The filter stops ordinary console devices; it does not stop a
+  deliberate impersonation. The planned fix: a shipped udev rule
   tags only virtual-bus devices (`id/bustype` `0006`, under
   `/devices/virtual/input`) with vendor `a2ce` through `ENV{ID_INPUT.tags}`,
   and the session's input class adds `MatchTag`, which closes the USB route.
@@ -432,7 +427,7 @@ Residual, recorded rather than claimed fixed:
   which keeps the greeter inactive in normal operation. The fix is to assign
   the devices to a per-session seat with a shipped udev rule (the same rule
   that adds the virtual-bus tag above) and have the dedicated Xorg open them
-  directly; it needs installer and Release/Security review.
+  directly. It is not implemented yet.
 - The kernel reads the Arcen keyboard like any other keyboard, whatever the
   seat. While the dedicated Xorg owns the screen the console keyboard is off,
   and the kernel acts only on SysRq (never sent) and on a secure-attention key
@@ -440,8 +435,8 @@ Residual, recorded rather than claimed fixed:
   console to a text VT during a session, remote keystrokes reach that console.
 - An experimental raw-HID device (absent from release builds) is not
   admitted by the dedicated Xorg on X11.
-- A bridged Hard USB tablet (absent from release builds) reaches only its
-  own desktop. Before its virtual port is connected, the helper installs a
+- A bridged Native tablet (`usb.native_tablet`, off unless the administrator
+  enables it) reaches only its own desktop. Before its virtual port is connected, the helper installs a
   volatile udev rule for that port's subtree without `uaccess`, so no logind
   ACL reaches it. On a native-seat Wayland desktop the rule puts it on that
   desktop's seat. For a dedicated Xorg desktop it stays on `seat0` (a `seat0`
@@ -469,8 +464,8 @@ boundary.
 
 ## Direct-QUIC resume boundary
 
-The draft SessionAutoReconnect implementation applies only to macOS Deck
-directly connected to a Windows or Linux Pier over QUIC/TLS 1.3 on UDP 18444. An
+Session resume (SessionAutoReconnect) applies to a Deck connected directly to
+a Linux or Windows Pier over QUIC/TLS 1.3 on UDP 18444. An
 opaque resume grant is a bearer secret: theft during its bounded lifetime can
 attempt to take over the one detached session. TLS confidentiality is
 necessary but not sufficient, so the grant additionally binds the validated
@@ -555,23 +550,16 @@ and a held display is proved silent through the shared
 its resume slot and tears down instead of entering the resume hold, and a
 same-user sign-in that finds a live Deck is refused at once.
 
-The trust consequence: knowledge of the user's password now continues the
+The trust consequence: knowledge of the user's password continues the
 user's own detached desktop without the Deck that held it, exactly as it
-already could after the reconnect window expired; it never reaches another
+can after the reconnect window expires; it never reaches another
 user's desktop. Holding a stolen resume grant gains nothing once the owner
 signed in again.
 
-Adversarial unit tests cover token/signature tamper, every identity binding,
-exact `2W` lifetime bounds, attached rotation, malformed/oversized tokens, one
-concurrent rotation winner, exact-predecessor terminal replay, older-token
-rejection, unauthenticated topology mismatch without attacker-triggered drain,
-successor-send failures, stale timers, redaction, and one-time crash/shutdown
-cleanup. Protocol tests cover old-peer JSON compatibility, strict in-band
-refresh shapes, and stable failure strings; Deck tests restrict retries to
-selected transient I/O and require a rotated successor before media. These
-tests do not establish an
-external audit, certification, production soak, real clock-manipulation proof,
-or completed target-OS adversarial assessment.
+Adversarial unit tests cover tampering, every identity binding, the lifetime
+bounds, rotation, replay, stale timers and redaction. They are not an
+external audit, a certification, a production soak or a completed
+adversarial assessment on each operating system.
 
 See
 [`../architecture/session-auto-reconnect.md`](../architecture/session-auto-reconnect.md)
@@ -589,19 +577,18 @@ Provider handoff, a privileged launcher, or session acquisition.
 
 The acknowledgment is operational evidence, not authorization and not proof
 that a human understood the text. It is not cryptographically bound into
-`SessionGrantClaims` v1; a signed-schema v2 rollout is deferred. After successful
+`SessionGrantClaims` v1. After successful
 OS authentication, host logs may record only locale, digest, host acceptance
 time, correlation/session identity, and success. Banner text, credentials,
 username/domain/SID/PAM account, peer data, and raw errors are excluded.
 Support bundles inherit the existing log privacy boundary and never add the
 banner source file.
 
-This behavior and operator-provided legal text require Shared/Architecture,
-affected component-owner, and Release/Security/legal review. Arcen makes no
-certification or legal-sufficiency claim for the configured wording.
+Arcen makes no certification or legal-sufficiency claim for the wording an
+operator configures.
 
-The initial scaffold makes no claim of certification, regulatory compliance,
-data residency, or completed cryptographic review.
+Arcen makes no claim of certification, regulatory compliance, data residency
+or completed cryptographic review.
 
 ## Support bundles
 
@@ -630,6 +617,5 @@ same-directory partial file. Custom
 `--out` paths are operator-selected trust boundaries and retain their existing
 directory permissions.
 
-CI runner, dependency, artifact, and release trust controls are detailed in
-[Supply-chain security](supply-chain.md). Protected hardware and signing jobs
-must remain disabled while their environment-review controls are unavailable.
+CI runner, dependency, artefact and release trust controls are in
+[Supply-chain security](supply-chain.md). CI has no hardware or signing jobs.

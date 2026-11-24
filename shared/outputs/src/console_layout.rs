@@ -121,6 +121,24 @@ pub fn is_virtual_outputs_conf(text: &str) -> bool {
     text.lines().next() == Some(VIRTUAL_OUTPUTS_MARKER)
 }
 
+/// The heads a file [`virtual_outputs_conf`] wrote forces (its
+/// `ConnectedMonitor` list), so an installer can write the same file again.
+/// `None` when `text` is not Arcen's file or its list is not valid heads.
+#[must_use]
+pub fn forced_heads(text: &str) -> Option<Vec<String>> {
+    if !is_virtual_outputs_conf(text) {
+        return None;
+    }
+    let list = text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("Option \"ConnectedMonitor\" \"")?
+            .strip_suffix('"')
+    })?;
+    let heads: Vec<String> = list.split(',').map(str::to_owned).collect();
+    (heads.len() <= MAX_VIRTUAL_OUTPUTS && heads.iter().all(|head| is_forced_head_token(head)))
+        .then_some(heads)
+}
+
 /// One video mode an output lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputMode {
@@ -1225,6 +1243,10 @@ mod tests {
             Some(())
         );
         assert_eq!(virtual_outputs_conf(&["DFP-0\"; rm".to_owned()]), None);
+        assert_eq!(forced_heads(&text), Some(heads));
+        assert_eq!(forced_heads("Section \"OutputClass\"\n"), None);
+        let edited = text.replace("DFP-0,DFP-1,DFP-2,DFP-3", "DFP-0,/etc/x");
+        assert_eq!(forced_heads(&edited), None);
         assert!(is_forced_head_token("DVI-D-1") && is_forced_head_token("DP-10"));
         assert!(
             !is_forced_head_token("DFP-")

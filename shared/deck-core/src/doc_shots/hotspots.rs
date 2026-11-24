@@ -360,8 +360,28 @@ const IMPORT_REVIEW: &[Hotspot] = &[
     ),
 ];
 
-/// Every scene's hotspots, in the manifest's order.
-pub const TABLE: [(&str, &[Hotspot]); 17] = [
+const HOME_OWN_SETTINGS: &[Hotspot] = &[
+    both(
+        1,
+        "This connection's own settings",
+        starts("This connection: "),
+    ),
+    both(
+        2,
+        "Use app defaults",
+        control(crate::screens::home::USE_APP_DEFAULTS),
+    ),
+];
+
+const SIGN_IN_REFUSED: &[Hotspot] = &[
+    both(1, "What happened", starts("Nobody is signed in at ")),
+    both(2, "Details", control("Details")),
+    both(3, "OK", control("OK")),
+];
+
+/// Every scene's hotspots, in the manifest's order, then the scenes added
+/// since.
+pub const TABLE: [(&str, &[Hotspot]); 19] = [
     ("home", HOME),
     ("home-empty", HOME_EMPTY),
     ("add-menu", ADD_MENU),
@@ -379,6 +399,8 @@ pub const TABLE: [(&str, &[Hotspot]); 17] = [
     ("verify-host", VERIFY_HOST),
     ("identity-changed", IDENTITY_CHANGED),
     ("import-review", IMPORT_REVIEW),
+    ("home-own-settings", HOME_OWN_SETTINGS),
+    ("sign-in-refused", SIGN_IN_REFUSED),
 ];
 
 /// `scene`'s hotspots.

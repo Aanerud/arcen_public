@@ -1,33 +1,32 @@
 # Colour Fidelity: 10-bit, 4:4:4 and Full Range
 
-**Status: implemented and release-validated on `HDRReady` (2026-09-01).** The
-shared vocabulary, wire, colour conversion, encoder signalling, four-preset
-Deck surface, native capture providers, and ten-bit Deck presentation are
-implemented.
-The measured Windows wide path now captures DWM's FP16 scRGB composition
-through WGC for every ten-bit stream. Grading re-encodes that source as 10-bit
-SDR with BT.709 primaries and matrix and the sRGB curve DWM linearised with,
-so a Deck that presents `srgb` (0.18.0) gets the desktop's own code values;
-an older Deck gets the BT.709 curve. HDR additionally provisions an HDR10 headless display before
-capture, enables Advanced Color, proves the output is PQ/BT.2020, converts to
-absolute BT.2020/PQ 10-bit 4:4:4, and presents the native VideoToolbox `xf44`
-result through a dedicated `RGB10A2Unorm` HDR Metal path.
-The measured Linux path now keeps ordinary eight-bit sessions on
-NvFBC→CUDA→NVENC, while every depth above eight uses MIT-SHM against the
-dedicated depth-30 Xorg screen and uploads explicitly converted P16 samples to
-NVENC. That Linux path is genuine 10-bit SDR. On Xorg, HDR requests resolve
-to Grading. The Wayland provider serves Grading and HDR from a wide
-`RecordMonitor` stream on Mutter ≥ 50 once qualification proves the route,
-precision and SDR white (`linux-wayland-provider.md`, "Wayland Grading and
-HDR"); Mutter 49 has no HDR screen sharing. Both current paths
-have been exercised through the deployed Piers and the macOS Deck.
-The manual release matrix covered all four presets on both hosts, nonzero
-audio, input, cursor authority/degradation, restore, and credential-free
-resume. Remaining platform expansion is listed under "Outstanding".
-Findings from real hardware are recorded in
-[`../testing/color-matrix-results.json`](../testing/color-matrix-results.json).
-See [`../testing/README.md`](../testing/README.md) for how to run the probe
-matrix end to end and record findings there.
+The shared vocabulary, wire, colour conversion, encoder signalling, four-preset
+Deck surface, native capture providers and ten-bit Deck presentation are
+implemented on every supported product.
+
+- **Windows Pier:** every ten-bit stream captures DWM's FP16 scRGB
+  composition through WGC. Grading re-encodes that source as 10-bit SDR with
+  BT.709 primaries and matrix and the sRGB curve DWM linearised with, so a
+  Deck that presents `srgb` gets the desktop's own code values; an older Deck
+  gets the BT.709 curve. HDR additionally provisions an HDR10 headless display
+  before capture, enables Advanced Color, proves the output is PQ/BT.2020, and
+  converts to absolute BT.2020/PQ 10-bit 4:4:4.
+- **Linux Pier, Xorg:** ordinary eight-bit sessions stay on
+  NvFBC→CUDA→NVENC, while every depth above eight uses MIT-SHM against the
+  dedicated depth-30 Xorg screen and uploads explicitly converted P16 samples
+  to NVENC. That path is genuine 10-bit SDR. HDR requests resolve to Grading.
+- **Linux Pier, Wayland:** Grading and HDR come from a wide `RecordMonitor`
+  stream on Mutter ≥ 50 once qualification proves the route, precision and
+  SDR white (`linux-wayland-provider.md`, "Wayland Grading and HDR"); Mutter 49
+  has no HDR screen sharing.
+- **macOS Deck:** presents the native VideoToolbox `xf44` result through a
+  dedicated `RGB10A2Unorm` Metal path.
+
+Open platform work is listed under "Outstanding". See
+[`../testing/README.md`](../testing/README.md) for how to run the probe
+matrix end to end, and
+[`../testing/color-matrix-results.json`](../testing/color-matrix-results.json)
+for the results template.
 
 ## Canonical pipeline map
 
@@ -46,7 +45,7 @@ through the shared NV12 conversion; source-built OpenH264 consumes checked
 BGRA/I420. Neither software path silently claims Grading or HDR.
 
 Grading's rate-control contract is deliberately asymmetric: it starts at the
-same link-capped budget used before this work, then the shared controller may
+ordinary link-capped budget, then the shared controller may
 probe as high as 250 Mbit/s when the path stays clean. NVENC sessions receive
 that value as `maxBitRate` while VBV is sized from the active target and grows
 only as the controller raises that target. The macOS Pier gives VideoToolbox the
@@ -80,19 +79,15 @@ properties matter to them, in this order:
    range spans only 16–235, discarding roughly 14% of the code values before any
    coding loss, and cannot represent superblacks or superwhites distinctly.
 
-## What was wrong before
+## What the pipeline guarantees
 
-- `capenc` wrote **no VUI at all**. Every stream it produced was untagged, so a
-  decoder had to guess its range, and a decoder that guesses limited range on
-  full-range content crushes blacks and clips whites.
-- NVENC was fed `NV_ENC_BUFFER_FORMAT_ARGB` and performed the RGB→YCbCr
-  conversion itself with an **undocumented, uncontrollable** matrix and range.
-- `convert.rs` hardcoded BT.709 limited range directly into its integer
-  expressions, so the encoder could not state what colour it produced because it
-  could not produce anything else.
-- `BitDepth` existed in the vocabulary but was hardcoded to `Eight` at every
-  call site and **explicitly rejected** by the plan resolver.
-- `ServerColorCaps.main10` existed on the wire and was hardcoded `false`.
+- Every stream carries VUI that states its range, matrix, primaries and
+  transfer, so a decoder never has to guess.
+- Arcen performs the RGB→YCbCr conversion itself, with a derived matrix and
+  range, rather than handing NVENC ARGB and accepting an undocumented
+  conversion.
+- Bit depth, range and matrix are real plan axes, resolved by the shared plan
+  resolver and advertised truthfully in `ServerColorCaps`.
 
 ## Capture precision depends on the platform and display state
 
@@ -123,10 +118,10 @@ Color mode.
   distinct Windows HDR colour mode makes DWM compose in FP16 scRGB, and WGC
   captures that surface before downstream display-link quantisation.
 
-The current NVIDIA headless path performs `NvAPI_GPU_SetEDID` in the signed-in
-session agent. Hardware validation proved the path with an account in the
-host's local Administrators group; a standard local account failed closed with
-`NVAPI_INVALID_USER_PRIVILEGE` before capture started. This is an admission
+The NVIDIA headless path performs `NvAPI_GPU_SetEDID` in the signed-in
+session agent. It works for an account in the host's local Administrators
+group; a standard local account fails closed with
+`NVAPI_INVALID_USER_PRIVILEGE` before capture starts. This is an admission
 limit on automatic headless EDID provisioning, not a requirement imposed on
 attached-display capture.
 
@@ -169,17 +164,16 @@ code comes back as its ten-bit equivalent (`code × 1023/255`, within one
 ten-bit code of FP16 rounding) and therefore as exactly the same eight-bit
 code (`every_eight_bit_srgb_code_survives_scrgb_and_the_srgb_transfer`). The
 stream is tagged `srgb` (H.273 transfer 13) and the hello says so; it is still
-Grading (`TransferCharacteristics::serves_request`). Before 0.18.0 the host
-applied the BT.709 OETF instead and tagged `bt709`: the Deck presents every
-SDR transfer as sRGB, so that moved codes by up to 16/255 in the shadows and
-crushed them on screen, which the Deck's Colour check measured on a Windows
-Grading session. A Deck that predates `srgb_transfer` still receives that
-legacy encoding, because it never claimed to present `srgb`.
+Grading (`TransferCharacteristics::serves_request`). A Deck that predates
+`srgb_transfer` receives the BT.709 OETF tagged `bt709`, because it never
+claimed to present `srgb`. The BT.709 OETF is not the right curve for a Deck
+that presents every SDR transfer as sRGB: it moves codes by up to 16/255 in
+the shadows and crushes them on screen.
 
 The Linux Xorg and macOS Pier Grading captures never re-encoded: XShm RGB10
 and the `ScreenCaptureKit` `xf44` surface (captured in `kCGColorSpaceSRGB`)
 already hold the desktop's sRGB codes, and they go to the matrix and the
-encoder untouched. Since 0.19.0 they also say so: `srgb` to a Deck that
+encoder untouched, and they say so: `srgb` to a Deck that
 claims `srgb_transfer`, `bt709` otherwise, through the one shared rule
 (`arcen_media::video::serve_sdr_desktop`). A declared Rec.2100 PQ Xorg
 desktop served as Grading is converted on the sRGB curve for such a Deck
@@ -207,12 +201,11 @@ Likewise, writing an unshifted code such as `0x0200` where NVENC expects
 `ScrgbSdrTransform`, `ScrgbPqTransform`, and the wide-conversion tests pin these
 invariants.
 
-The conversion is a CPU fallback today, but not a per-pixel `powf` path. A
+The conversion runs on the CPU, but not as a per-pixel `powf` path. A
 process-wide table stores the 1023 PQ half-code boundaries, each component uses
-a binary search, and the frame is split across up to eight row workers. On the
-Windows lab, 1800×1130 conversion fell from about 653 ms per fresh frame to
-24.99 ms (40.02 fps) while remaining byte-identical between serial and parallel
-conversion.
+a binary search, and the frame is split across up to eight row workers. An
+1800×1130 frame converts in about 25 ms (40 fps), down from about 653 ms with
+per-pixel `powf`, and serial and parallel conversion are byte-identical.
 
 ## Linux depth-30 capture and the HDR gate
 
@@ -267,8 +260,8 @@ PQ code values never reach an SDR session unconverted:
   stage. The wire does not tell Auto from Speed, so both are refused.
 
 capenc derives its conversion from the same rule
-(`conversion_for_output`) rather than restating it. Measured on the Linux lab
-with a depth-30 PQ ramp: HDR received `rext 4:4:4 10-bit bt2020/pq/bt2020ncl`,
+(`conversion_for_output`) rather than restating it. Measured with a depth-30 PQ
+ramp: HDR received `rext 4:4:4 10-bit bt2020/pq/bt2020ncl`,
 950 distinct luma codes, neutral chroma exactly 512; Grading received BT.709
 with the ramp converted (codes above the 203-nit white collapse to SDR white,
 about 605 distinct luma codes); Auto was refused with the message.
@@ -277,20 +270,14 @@ General Linux desktop HDR, where the compositor rather than one application
 owns the transfer, is reserved for the colour-managed Wayland provider
 (`linux-wayland-provider.md`).
 
-Measured on the Linux GRID V100D lab host:
-
-- Xorg reported root depth 30, 32 bpp, little-endian pixels and MIT-SHM 1.2.
-- A live frame sample contained 95,850 RGB components; 18,124 (18.9%) were
-  outside the 256-value eight-bit expansion grid, proving source precision that
-  an eight-bit capture cannot carry.
-- At 2560×1600 with continuous motion, depth-30 Grading Reference capture
-  sustained 30–31 fps through XShm, host RGB10 conversion/upload, and NVENC.
-- The deployed Pier reports `capture=xshm capture_zero_copy=false`; Deck
-  hardware-decodes the ten-bit 4:4:4 stream as `xf44` while remaining in SDR
-  presentation mode.
-- A separate deployed eight-bit smoke reported
-  `capture=nvfbc capture_zero_copy=true` and decoded `444f`, proving the fast
-  path remained independent.
+On an NVIDIA GRID host at 2560×1600 with continuous motion, depth-30 Grading
+capture sustains 30–31 fps through XShm, host RGB10 conversion and upload, and
+NVENC; about a fifth of a live frame's RGB components lie outside the
+eight-bit expansion grid, which an eight-bit capture cannot carry. The Pier
+reports `capture=xshm capture_zero_copy=false` and the Deck hardware-decodes
+the ten-bit 4:4:4 stream as `xf44` in SDR presentation mode. An eight-bit
+session on the same host reports `capture=nvfbc capture_zero_copy=true` and
+decodes `444f`: the fast path stays independent.
 
 ## The 10-bit argument, measured
 
@@ -308,15 +295,15 @@ pure-transform error, per-channel, on the 0..=255 scale:
 
 | Matrix / range / depth | Result |
 | --- | --- |
-| BT.709 limited 8-bit — *the format Arcen shipped before this work* | **never exact**; 1–2 codes on every pattern |
+| BT.709 limited 8-bit — *the legacy default* | **never exact**; 1–2 codes on every pattern |
 | BT.709 full 8-bit | exact on achromatic patterns, 1 code on chromatic |
 | **BT.709 full 10-bit — the target** | **exact (0) on all five patterns** |
 | BT.709 limited 10-bit | exact (0) |
 | Identity/GBR full 10-bit | exact (0) |
 | BT.709 full 12-bit | exact (0) |
 
-That top row is the quantified case for the whole workstream: the format the
-product shipped could not survive its own round trip.
+The top row is why Grading does not use 8-bit limited range: that format
+cannot survive its own round trip.
 
 This is why "Grading Reference" is 10-bit rather than lossless: it achieves an
 exact round trip for the sources that actually exist at a fraction of the
@@ -331,7 +318,7 @@ reported separately and must not be conflated.
 
 Negotiate-best. The Deck states a preference; the host serves the richest plan
 its backend can actually encode and reports precisely what it had to change
-through `PlanDegradation`, which now carries `bit_depth_reduced`,
+through `PlanDegradation`, which carries `bit_depth_reduced`,
 `range_changed`, `matrix_changed`, `primaries_changed`, and `transfer_changed`
 alongside the existing fields.
 `PlanDegradation::colour_degraded()` separates changes a colourist cares about
@@ -373,9 +360,8 @@ than requested, so a 12-bit request on an NVENC host lands on 10, not on 8.
 For current Decks, codec/colour selection is complete before the first encoder:
 Auto and Speed authorize host-ranked AV1 → HEVC → H.264 for their fixed
 eight-bit contract; Grading and HDR request HEVC 4:4:4 10-bit; and an explicit
-developer variant remains an exact operator pin. Linux/L40S and
-Windows/V100-to-M4 hardware runs prove the first `ServerHello` and the decoded
-frame agree for both ordinary and grading intents.
+developer variant remains an exact operator pin. The first `ServerHello` and
+the decoded frame agree for both ordinary and grading intents.
 
 ### Why the frame header, and not just the handshake
 
@@ -387,9 +373,10 @@ produced, and a reserved bit-depth encoding is **rejected** rather than read as
 eight-bit, so a newer peer can never have its deeper format silently
 misinterpreted.
 
-`PROTOCOL_VERSION` moved to 4. There is no compatibility shim: a peer that
-predates colour negotiation cannot state what colour it is producing, and
-silently assuming 8-bit limited is exactly the failure this work removes.
+Colour flags arrived with protocol version 4, and there is no compatibility
+shim for older peers: a peer that predates colour negotiation cannot state
+what colour it is producing, and silently assuming 8-bit limited is exactly
+the failure colour negotiation removes.
 
 ## Two properties the conversion enforces
 
@@ -446,13 +433,12 @@ dependency-purity proof still passes with the feature off.
 
 ## Measured on target hardware
 
-Windows NVENC host → M4 Pro Deck, 2026-08-15. Full evidence
-in [`../testing/color-matrix-results.json`](../testing/color-matrix-results.json).
-`err` is the end-to-end grey-ramp round trip, per channel, 0..=255.
+Windows NVENC host → Apple M4 Pro Deck. `err` is the end-to-end grey-ramp
+round trip, per channel, 0..=255.
 
 | Variant | Encode | Decode | HW | Delivered | err |
 | --- | --- | --- | --- | --- | --- |
-| `hevc-444-8-limited-bt709` *(previously shipped)* | ok | ok | ✅ | `444v` | **2** |
+| `hevc-444-8-limited-bt709` *(legacy default)* | ok | ok | ✅ | `444v` | **2** |
 | `hevc-444-8-full-bt709` | ok | ok | ✅ | `444f` | 0 |
 | **`hevc-444-10-full-bt709`** *(the target)* | ok | ok | ✅ | **`xf44`** | **0** |
 | `hevc-444-10-limited-bt709` | ok | ok | ✅ | `x444` | 0 |
@@ -468,19 +454,15 @@ in [`../testing/color-matrix-results.json`](../testing/color-matrix-results.json
 
 **The target format works.** HEVC Main 4:4:4 10-bit full range encodes on
 NVENC, **hardware**-decodes on an M4 Pro as `xf44`, preserves the full-range
-VUI, and round-trips a grey ramp with **zero** error. The 10-bit Rext question
-— the single highest-value unknown in this whole workstream, which Apple
-documents nowhere — is answered: **yes, and in hardware.**
+VUI, and round-trips a grey ramp with **zero** error. Apple documents nowhere
+whether a Mac decodes 10-bit Rext; it does, **in hardware**.
 
-**The old format was measurably lossy.** `hevc-444-8-limited-bt709`, the format
-the product shipped before this work, is the **only** row that loses two codes.
-That is the empirical version of the argument this work was built on, now
-observed on real silicon rather than derived in a unit test.
+**8-bit limited range is measurably lossy.** `hevc-444-8-limited-bt709` is the
+**only** row that loses two codes, on real silicon as in the unit test.
 
-**H.264 High 4:4:4 Predictive hardware-decodes on Apple silicon.** This was
-expected to fail — Apple publishes nothing about it — and it did not. It is a
-genuine finding, and it retroactively justifies opening `offered_chroma` to
-H.264 4:4:4 rather than keeping the previous HEVC-only restriction.
+**H.264 High 4:4:4 Predictive hardware-decodes on Apple silicon.** Apple
+publishes nothing about it. This is why `offered_chroma` includes H.264 4:4:4,
+not only HEVC.
 
 **Identity/GBR survives CoreVideo.** The row decodes in hardware. Its `err=1`
 is consistent with the knowingly-inaccurate BT.709 stamp Arcen is forced to
@@ -494,48 +476,30 @@ that run.
 
 
 
-## A regression worth remembering
+## Rules the decode path keeps
 
-Target testing found Media Foundation's H.264 streams rejected by VideoToolbox
-with `kVTParameterErr` (-6661), while FFmpeg's VideoToolbox path decoded the
-identical captured bytes. The stream was fine; the Deck's handling was not.
+Two failures shaped these rules; each is cheap to reintroduce.
 
-Cause: the colour-extension override recreated the `CMFormatDescription`
-through the **generic** `CMFormatDescriptionCreate`. A video format
-description's dimensions are intrinsic state, *not* an entry in its extensions
-dictionary, and that generic constructor has no width or height parameter at
-all — so the recreated description was **0x0**, and VideoToolbox rejected any
-session built from it.
-
-Two things now prevent a recurrence:
-
-1. The recreate uses the video-specific `CMVideoFormatDescriptionCreate`,
-   carrying codec type and dimensions across explicitly.
-2. A **geometry guard**: the recreate is discarded, with a logged reason, if
-   the resulting dimensions differ from the source. A colour override is a
-   colour operation and must never alter geometry, so that invariant is now
-   checked rather than assumed.
-
-Session creation additionally retries once without the destination
-pixel-format request if VideoToolbox refuses it, so an unsupported format
-degrades to VideoToolbox's native output — which the copy path already handles
-— instead of losing the session. The retry is logged at warn, because it means
-the negotiated format was not honoured exactly.
-
-The failure was in the one step that cannot be verified from a non-Apple
-machine, which is why hardware testing is a gate rather than a formality.
-
-The hardware retest is green: a software-only Windows Pier's MF H.264 stream
-delivers `420v`, decodes in hardware, and displays in Deck without `-6661`.
-
-That retest found a second regression before declaring success. Both product
-Piers still constructed `VideoHeader.flags` from the keyframe bit alone,
-despite the protocol reserving depth/range/matrix bits on every frame. A real
-Linux Rext 10-bit full-range stream therefore reached Deck as the legacy
-8-bit/limited contract and VideoToolbox delivered `444v`. Both hosts now call
-`VideoHeader::encode_flags` from their resolved media plan for every frame.
-The same live Linux stream then delivered `xf44-full`; host READY/hello truth is
-not accepted as evidence without a decoded-frame check.
+- **A colour override never changes geometry.** A video format description's
+  dimensions are intrinsic state, not an entry in its extensions dictionary,
+  and the generic `CMFormatDescriptionCreate` has no width or height
+  parameter, so a description recreated through it is 0x0 and VideoToolbox
+  rejects it with `kVTParameterErr` (-6661). The Deck recreates through the
+  video-specific `CMVideoFormatDescriptionCreate`, carrying codec type and
+  dimensions across, and discards the recreate, with a logged reason, if its
+  dimensions differ from the source.
+- **A refused destination format degrades, it does not end the session.**
+  Session creation retries once without the destination pixel-format request,
+  so VideoToolbox's native output reaches the copy path; the retry is logged
+  at warn, because the negotiated format was not honoured exactly.
+- **Every frame carries the plan's colour.** Each Pier builds
+  `VideoHeader.flags` with `VideoHeader::encode_flags` from its resolved media
+  plan on every frame, not from the keyframe bit alone; otherwise a 10-bit
+  full-range stream reaches the Deck as the legacy 8-bit limited contract.
+- **Host truth needs a decoded frame.** READY and hello truth is not accepted
+  as evidence without a decoded-frame check, and format-description handling
+  is verified on Apple hardware, because it cannot be checked from any other
+  machine.
 
 ## Deck 10-bit HDR presentation
 
@@ -570,7 +534,7 @@ Rows are defined in `shared/media/src/video/variant.rs` and selected with
 
 | Id | Answers |
 | --- | --- |
-| `hevc-444-8-limited-bt709` | Control: what Arcen ships today |
+| `hevc-444-8-limited-bt709` | Control: 8-bit limited BT.709 |
 | `hevc-444-8-full-bt709` | Does the full-range flag survive the round trip? |
 | `hevc-444-10-full-bt709` | **The target.** Does VideoToolbox decode 10-bit Rext, in hardware? |
 | `hevc-444-10-limited-bt709` | Isolates range from depth |
@@ -591,7 +555,7 @@ incoherent, because no encoder Arcen has can produce it.
   Xorg serves genuine 10-bit SDR grading, and PQ only for a desktop the
   operator declares Rec.2100 PQ (`video.desktop_encoding`). The Wayland
   Grading and HDR compositions exist and are proven host-side on Mutter 50.6
-  and 51.0 in lab containers. Each one is a separate pipeline:
+  and 51.0. Each one is a separate pipeline:
   - Capture: a wide `RecordMonitor` DMA-BUF in 10-bit PQ or F16 PQ, read
     back.
   - Grading converts BT.2020/PQ to BT.709 SDR in shared code.

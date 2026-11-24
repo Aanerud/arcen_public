@@ -219,8 +219,8 @@ impl MultiMonitorGate {
     ///
     /// Every configured head is treated as rotation-capable
     /// ([`HeadCapability::new`]): this tranche has no per-head rotation
-    /// discovery yet (pending pier-linux.example.internal hardware validation, see
-    /// `hosts/linux/AGENTS.md`), so a conservative "assume full rotation
+    /// discovery yet (a roadmap item in `hosts/linux/ARCHITECTURE.md`,
+    /// "Deferred / roadmap"), so a conservative "assume full rotation
     /// support" default is used rather than inventing an unvalidated
     /// per-head config schema this tranche cannot yet back with real
     /// discovery.

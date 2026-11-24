@@ -435,6 +435,43 @@ fn every_home_button_shows_whole_with_air_at_the_default_and_the_smallest_window
 }
 
 #[test]
+fn the_form_footer_keeps_test_connection_clear_of_its_buttons() {
+    // At the smallest window the Edit form's "Test connection" ran under
+    // Cancel ("Test connect").
+    for size in [egui::vec2(1120.0, 760.0), egui::vec2(860.0, 600.0)] {
+        for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {
+            for (scene, save) in [
+                (HomeScene::New, "Add connection"),
+                (HomeScene::Edit, "Save"),
+                (HomeScene::EditOwn, "Save"),
+            ] {
+                let shown = home_scene_buttons(platform, scene, size);
+                let lowest = |wanted: &dyn Fn(&str) -> bool| {
+                    shown
+                        .iter()
+                        .filter(|(label, _)| wanted(label))
+                        .max_by(|a, b| a.1.min.y.total_cmp(&b.1.min.y))
+                        .cloned()
+                        .unwrap_or_else(|| panic!("{platform:?}, {scene:?} at {size:?}: {shown:?}"))
+                };
+                let (label, test) = lowest(&|label| label == "Test connection" || label == "Test");
+                let (_, cancel) = lowest(&|label| label == "Cancel");
+                let (_, save) = lowest(&|label| label == save);
+                let what = format!("{platform:?}, {scene:?} at {size:?}");
+                assert!(
+                    test.max.x <= cancel.min.x.min(save.min.x),
+                    "{what}: {label:?} at {test:?}, Cancel {cancel:?}, {save:?}"
+                );
+                assert!(!cancel.intersects(save), "{what}: {cancel:?} {save:?}");
+                if size.x >= 1120.0 {
+                    assert_eq!(label, "Test connection", "{what}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn the_connection_form_s_help_never_runs_wider_than_its_fields() {
     let size = egui::vec2(1120.0, 1400.0);
     for platform in [DeckPlatform::Mac, DeckPlatform::Pc] {

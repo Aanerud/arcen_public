@@ -1,59 +1,47 @@
 # Arcen Architecture
 
-> **STATUS — target vs. current.** This document describes the *target*
-> design. **Current reality:** all eleven shared crates are live:
-> `arcen-protocol`, `arcen-transport`, `arcen-media`, `arcen-input`,
-> `arcen-outputs`, `arcen-session`, `arcen-identity`, `arcen-keel`,
-> `arcen-telemetry`, `arcen-observability` and the safe Hard USB policy/state
-> core `arcen-usb-bridge`.
-> `arcen-transport`'s opt-in QUIC feature is active in the Linux, Windows and
-> macOS Piers and the macOS Deck while its default dependency graph stays
-> Quinn-free. Shipped transport is
-> **direct QUIC only**, using the shared TLS trust lifecycle. No Deck or Pier
-> carries WSS network code (the Piers' dormant listener was removed on
-> 2026-11-18).
-> Current status is the repository `README.md`; see
-> [`observability.md`](observability.md) for the direct Pier/Deck observability
-> implementation. This is not a release claim.
-
 Arcen is divided into reusable shared crates and independently deployable
 products. Dependency direction is one way: products consume shared crates;
 shared crates never consume products; products never consume one another.
 
 ## Product topology
 
-- **Hosts:** Linux (X11, and GNOME/Mutter Wayland) and Windows workstation
-  Piers; a macOS Pier shipped as a preview
-- **Clients:** macOS desktop application
-- **Deferred:** Linux and Windows clients
+- **Piers (hosts):** Linux (X11, and GNOME/Mutter Wayland), Windows, and
+  macOS as a preview.
+- **Decks (clients):** macOS and Windows. A Linux Deck does not exist yet.
 
-The macOS Pier is a shared-first host with native boot/login feasibility gates
-and signed-package acceptance criteria ([`hosts/macos/AGENTS.md`](../../hosts/macos/AGENTS.md)).
-The logged-in Aqua host path exists, but this is not a release claim: cold-boot LoginWindow operation is still target work, and
-multi-monitor is not qualified on two-display hardware.
+The macOS Pier serves a logged-in Aqua desktop. Cold-boot LoginWindow
+operation and multi-monitor operation on two-display hardware are not yet
+qualified, so it is a preview rather than a supported host. Its pipeline is
+in [`hosts/macos/STREAMING.md`](../../hosts/macos/STREAMING.md).
 
-## Transport direction
+Twelve shared crates carry the portable logic; the products own only what an
+operating system forces on them. The repository `README.md` gives the current
+status of each product.
 
-Direct products use QUIC (Quinn + rustls TLS 1.3). Since 0.17.0 one
-authenticated connection carries isolated lanes — control, video, audio out,
-microphone, input/cursor and bulk — each on its own stream with its own worker, declared
-by a bounded lane preface (protocol v5,
-[ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md)). The Decks
-and the Piers have no WSS network code.
-The products do not use QUIC datagrams. See
-[`transport.md`](transport.md) for API usage and known gaps, and
-[`../adr/0007-quic-only-product-transport.md`](../adr/0007-quic-only-product-transport.md)
-for the current decision. Transport mechanics remain behind `arcen-transport`;
-protocol compatibility remains in `arcen-protocol`.
+## Transport
+
+Every product speaks direct QUIC (Quinn and rustls, TLS 1.3) on UDP 18444,
+with the shared TLS trust lifecycle. One authenticated connection carries
+isolated lanes — control, video, audio out, microphone, input and cursor, and
+bulk — each on its own stream with its own worker, declared by a bounded lane
+preface (protocol v5,
+[ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md)). No product
+carries WebSocket code, and none uses QUIC datagrams.
+[`transport.md`](transport.md) covers the API and known gaps;
+[ADR 0007](../adr/0007-quic-only-product-transport.md) records the decision.
+Transport mechanics stay behind `arcen-transport`; protocol compatibility stays
+in `arcen-protocol`. `arcen-transport`'s QUIC runtime is an opt-in feature, so
+its default dependency graph stays free of Quinn and Tokio.
 
 ## Identity and machine authentication
 
 User identity and OS session authentication establish who may use the host.
-The current direct Piers use their platform authentication paths; generic OIDC
-with an initial federated-identity profile remains future architecture. Host machine
+The Piers use their platform's own authentication; generic OIDC with a
+federated-identity profile is future work. Host machine
 authentication identifies the workstation independently of the user identity
-plane. Commercial product-entitlement enforcement was withdrawn when Arcen moved
-to AGPL-3.0 free software; see [ADR 0006](../adr/0006-offline-pier-licensing.md).
+plane. Arcen has no licence or entitlement enforcement; see
+[ADR 0006](../adr/0006-offline-pier-licensing.md).
 
 Conflating identity and host/session authorization would make authorization
 ambiguous and couple product availability to operating-system implementation
@@ -70,29 +58,31 @@ re-probe CCD/DXGI, and include it in the ordinary physical output-provider
 transaction. Arcen does not package, install, configure, service, or roll back a
 Windows virtual-display driver.
 
-The existing `arcen-iddcx-provider` and
-`hosts/windows/driver/arcen-iddcx` source remain dormant research evidence
-only. They are excluded from product packages, and `platform.iddcx.enabled`
-must remain false on supported installations. Any future proposal to ship an
+The `arcen-iddcx-provider` and `hosts/windows/driver/arcen-iddcx` sources are
+dormant research only. They are excluded from product packages, and
+`platform.iddcx.enabled` stays false on supported installations. Any future proposal to ship an
 Arcen driver requires a new architecture decision and Release/Security review.
 See the superseding decision in
 [`ADR 0008`](../adr/0008-virtual-display-for-windows-hosts.md).
 
 ## Shared boundaries
 
+Twelve shared crates, none of which calls the operating system:
+
 | Crate | Responsibility |
 | --- | --- |
-| `arcen-protocol` | Explicit version negotiation, bounded JSON control messages, protocol-v3 binary headers, endpoint capability exchange, and foundation-only additive `multi_monitor_v1` negotiation metadata |
+| `arcen-protocol` | Explicit version negotiation, bounded JSON control messages, binary frame headers, endpoint capability exchange, and `multi_monitor_v1` negotiation metadata |
 | `arcen-keel` | Pure 16×16 content-damage tracking and deterministic scenario corpus; consumed by Windows software selective conversion |
-| `arcen-transport` | Active shared rustls posture, certificate lifecycle, pins, reload, and transport contracts; opt-in Quinn/rustls direct QUIC carrier plus the separately unused advanced stream/datagram adapter |
-| `arcen-usb-bridge` | Active safe, OS-free exact-profile policy, descriptor parsing, attachment lifecycle, URB ledger, synthetic lab tablet, and the device-exporter engine (`UsbExporter` over a platform `CapturedUsbDevice` backend, ADR 0019) for the default-off Hard USB vertical slice |
+| `arcen-transport` | Shared rustls posture, certificate lifecycle, pins, reload and transport contracts; the opt-in Quinn/rustls direct QUIC carrier, and an advanced stream/datagram adapter no product uses |
+| `arcen-usb-bridge` | Safe, OS-free exact-profile policy, descriptor parsing, attachment lifecycle, URB ledger, a synthetic test tablet, and the device-exporter engine (`UsbExporter` over a platform `CapturedUsbDevice` backend, ADR 0019) for Hard USB, which is off by default |
 | `arcen-identity` | Provider-neutral OIDC/session-grant contracts plus bounded standalone disclaimer validation and acceptance evidence |
-| `arcen-session` | Active pure session policy: restore leases, direct reconnect, Deskside, admission, Pier configuration schema, connection diagnostics, polkit locality and the Wayland provider's qualification and session policy — see [`shared/session/ARCHITECTURE.md`](../../shared/session/ARCHITECTURE.md) |
+| `arcen-session` | Pure session policy: restore leases, direct reconnect, Deskside, admission, Pier configuration schema, connection diagnostics, polkit locality and the Wayland provider's qualification and session policy — see [`shared/session/ARCHITECTURE.md`](../../shared/session/ARCHITECTURE.md) |
 | `arcen-outputs` | Monitor lifecycle, multi-display arrangement and admission, EDID construction ([ADR 0010](../adr/0010-shared-output-provider-lifecycle.md)) |
-| `arcen-media` | Active pure clipboard policy/sequence/echo/repeated-copy, bounded PNG/DIBV5 conversion, codec/chroma truth, fixed audio policy, checked video planes/conversion, media-plan resolution, optional source-built software H.264, validated monitor topology, foundation-only multi-monitor topology/admission contracts, the Deck platform profile (`deck_platform`: Apple silicon vs Intel decisions over architecture and macOS-version facts), and the colourist's Colour check and test-pattern measurement |
-| `arcen-input` | Active pure absolute/relative pointer, cursor-authority, global sequence ordering, typed pen/tablet (`PenEvent`/`PenTool`) capability/event contracts, keyboard policy, committed text and Paste as Keystrokes, host cursor images, and the one shared region-input encode/decode (`RegionInputWireMessage`), host pipeline (`RegionInputPipeline`), and client emitter (`RegionInputEmitter`) — see [`pen-tablet-input.md`](pen-tablet-input.md) |
+| `arcen-media` | Pure clipboard policy/sequence/echo/repeated-copy, bounded PNG/DIBV5 conversion, codec/chroma truth, fixed audio policy, checked video planes/conversion, media-plan resolution, optional source-built software H.264, validated monitor topology, multi-monitor topology and admission contracts, the Deck platform profile (`deck_platform`: Apple silicon vs Intel decisions over architecture and macOS-version facts), and the colourist's Colour check and test-pattern measurement |
+| `arcen-input` | Pure absolute/relative pointer, cursor-authority, global sequence ordering, typed pen/tablet (`PenEvent`/`PenTool`) capability/event contracts, keyboard policy, committed text and Paste as Keystrokes, host cursor images, and the one shared region-input encode/decode (`RegionInputWireMessage`), host pipeline (`RegionInputPipeline`), and client emitter (`RegionInputEmitter`) — see [`pen-tablet-input.md`](pen-tablet-input.md) |
 | `arcen-telemetry` | Pure correlation IDs, stable lifecycle categories, and redaction-safe fields |
-| [`arcen-observability`](observability.md) | Active OS-free tracing and I/O abstractions for canonical routing, live profile reload, and bounded sink workers |
+| [`arcen-observability`](observability.md) | OS-free tracing and I/O abstractions for canonical routing, live profile reload, and bounded sink workers |
+| `arcen-deck-core` | The portable Deck: the platform seams (`DeckServices`, `VideoDecoderBackend`, `VideoPresenterSink`), settings and, behind features, the session runtime and shared screens |
 
 Who uses each shared crate, through which separate product path, and what each
 path must pass when that crate changes is the generated
@@ -115,14 +105,14 @@ disagree or cross-product copies grow. The Shared Adoption Index trend is in
 | [`transport.md`](transport.md) | Direct QUIC: carrier, lanes, congestion control, known gaps |
 | [`tls-certificate-lifecycle.md`](tls-certificate-lifecycle.md) | Certificate generation, validation, pinning and reload |
 | [`session-auto-reconnect.md`](session-auto-reconnect.md) | Credential-free resume after a dropped connection |
-| [`host-presence.md`](host-presence.md) | The status line on Deck Home: what feeds it today (nothing) and a future presence service |
+| [`host-presence.md`](host-presence.md) | The status line on Deck Home and a future presence service |
 | [`media-plan-resolution.md`](media-plan-resolution.md) | How a requested preset becomes a served pipeline; portable software H.264 |
 | [`color-fidelity.md`](color-fidelity.md) | Ten-bit, 4:4:4, full range, Grading and HDR from capture to the Deck |
 | [`encode-intent.md`](encode-intent.md) | Interactive versus grading encoder intent |
 | [`deck-presentation-timing.md`](deck-presentation-timing.md) | When each Deck shows a decoded frame, per pipeline; pixel-perfect fullscreen |
 | [`rate-control.md`](rate-control.md) | Live bitrate control |
 | [`qp-maps.md`](qp-maps.md) | Keel's damage grid as NVENC QP maps |
-| [`arcen-keel.md`](arcen-keel.md) | Keel, the content-adaptive engine (planning document) |
+| [`arcen-keel.md`](arcen-keel.md) | Keel, the content-adaptive engine |
 | [`nvenc-sdk13-blackwell.md`](nvenc-sdk13-blackwell.md) | NVENC SDK 13 on Blackwell: 4:2:2 and Ultra High Quality |
 | [`audio-compression.md`](audio-compression.md), [`audio-input.md`](audio-input.md) | Host audio out and the Deck's microphone in |
 | [`pen-tablet-input.md`](pen-tablet-input.md) | Typed pen and tablet input (local termination) |

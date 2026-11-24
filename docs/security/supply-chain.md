@@ -1,123 +1,133 @@
-# Supply-Chain Security
+# Supply-chain security
 
-> **STATUS (2026-07-14): CURRENT CI BOUNDARY; DEPENDENCY, SBOM, AND RELEASE GATES
-> DEFERRED.** `.github/workflows/ci.yml` currently provides per-platform builds,
-> pure-crate tests/strict Clippy, formatting, and Gitleaks. Cargo Deny,
-> dependency review, SBOM/source-provenance generation, artifact attestation,
-> and release workflows must be rebuilt after the dependency set and release
-> process are curated. The deferred controls below are requirements, not claims
-> about current automation.
+How Arcen's source, dependencies and release artefacts are kept trustworthy,
+and which controls are automated.
 
-## Hosted pull-request boundary
+## Continuous integration
 
-Pull-request code runs only on GitHub-hosted runners with read-only repository
-permissions. CI does not use `pull_request_target`, self-hosted runners,
-production environments, signing material, or deployment
-credentials. Third-party actions are pinned to full commit SHAs.
+CI (`.github/workflows/ci.yml`) runs only when started by hand
+(`workflow_dispatch`), on GitHub-hosted Linux runners, with read-only
+repository permissions. It never uses `pull_request_target`, self-hosted
+runners, production environments, signing material or deployment
+credentials. Every third-party action is pinned to a full commit SHA.
 
-Gitleaks scans the checked-out history. Cargo Deny and GitHub dependency review
-are not current CI jobs; neither may be claimed as an automated gate.
+It runs:
+
+- publication hygiene and REUSE licence compliance;
+- the documentation content guard;
+- formatting, and the tests and strict Clippy of the shared crates;
+- the dependency-purity proofs: product graphs are QUIC and TLS 1.3 only,
+  and the default graphs of `arcen-transport`, `arcen-media`,
+  `arcen-outputs` and `arcen-deck-core` stay free of optional networking,
+  native codecs and UI;
+- verification of the governed vendored sources;
+- a Gitleaks scan of the checked-out history.
+
+CI does not build the platform crates; each runs on its own operating
+system, and a pull request states what was built there. `deny.toml` holds the
+dependency policy (licences, registries, Git sources), but Cargo Deny and
+GitHub dependency review are not CI jobs, so neither is claimed as an
+automated gate.
 
 ## Dependency and action updates
 
-Dependency changes require:
+A dependency change needs:
 
 1. a reviewed `Cargo.lock` diff;
-2. formatting, the pure-crate test/strict-Clippy gates, and affected product
-   builds/tests on their target OS;
-3. review of new licenses, registries, Git sources, build scripts, and native
-   code; and
-4. an explicit Release/Security review while automated Cargo Deny, dependency
-   review, and SBOM gates remain deferred.
+2. formatting, the shared-crate tests and strict Clippy, and the affected
+   product builds and tests on their target operating system;
+3. a review of new licences, registries, Git sources, build scripts and
+   native code; and
+4. Release/Security review, because the dependency, licence and SBOM checks
+   are not automated.
 
-Action updates require reviewing the upstream release and source diff, resolving
-the release tag to its underlying commit, and recording the full 40-character
-commit in the workflow. Mutable action tags are not accepted.
+An action update needs a review of the upstream release and source diff, the
+release tag resolved to its commit, and the full 40-character commit recorded
+in the workflow. Mutable action tags are refused.
 
-## TLS lifecycle dependencies and packaging
+## TLS dependencies and packaging
 
-The active direct-QUIC lifecycle uses pinned production dependencies
-`rustls` 0.23.41 with ring 0.17.14, `x509-parser` 0.18.1 for bounded X.509
-inspection, and `subtle` 2.6.1 for constant-time typed pin comparison. Their
-lockfile entries and release notices require Release/Security review.
-`arcen-transport`'s library-only default dependency graph remains free of the
-optional Quinn/Tokio QUIC graph; product crates explicitly enable QUIC. CI
-tests the opt-in feature and proves product graphs enable no WSS networking
-(the `wss-compat` feature was removed from the Decks on 2026-11-15 and from
-the Piers, `arcen-protocol` and `arcen-transport` on 2026-11-18, taking
-`tokio-rustls`, `http`, `httparse` and `sha1` out of the lockfile).
+Direct QUIC uses `rustls` with the `ring` provider, `x509-parser` for bounded
+X.509 inspection, and `subtle` for constant-time pin comparison, each pinned
+in `Cargo.lock`; their lockfile entries and notices need Release/Security
+review. The default `arcen-transport` graph is library-only and carries no
+Quinn or Tokio; product crates enable QUIC explicitly. CI tests that feature
+and proves that no product graph carries WebSocket networking.
 
-OpenSSL is a system packaging prerequisite for the Linux SMB certificate
-helper only. It is not linked into Pier, is not invoked by the service, and is
-not a runtime certificate source. Distribution packaging must inventory the
-actual system/bundled version and notices rather than treating the helper
-prerequisite as a Rust dependency.
+OpenSSL is a system packaging prerequisite of the Linux SMB certificate
+helper only. The Pier does not link it, never invokes it, and never uses it as
+a certificate source at run time. Distribution packaging records the actual
+system or bundled version and its notices; it is not a Rust dependency.
+
+Packaging and run time are separate privilege boundaries. The
+generate-if-missing helpers refuse partial or custom pairs and write explicit
+SAN-bearing server-auth certificates with protected permissions. The Pier
+checks the SAN, key class, strength and match, validity, purpose, the opened
+files and the platform's filesystem or DACL policy itself before it listens or
+reloads. A helper's success alone never admits a certificate.
 
 ## Native media source builds
 
-`arcen-media/software-h264-source` is optional and non-default. It pins
-crates.io `openh264` and `openh264-sys2` to 0.9.7 and enables only the latter's
-bundled `source` path. The crate-supplied Cisco tree identifies commit
-`a8e04adb69c79757da014007d4694684a64c7b74`. `libloading`, runtime download, and
-Cisco's precompiled binary are not admitted.
+`arcen-media/software-h264-source` is optional and off by default. It pins
+crates.io `openh264` and `openh264-sys2` to 0.9.7 and enables only the
+latter's bundled `source` path; the bundled Cisco tree is commit
+`a8e04adb69c79757da014007d4694684a64c7b74`. `libloading`, a runtime download
+and Cisco's precompiled binary are not admitted.
 
-The enabled graph adds unsafe C/C++ codec code plus Rust and native build
-tooling. It therefore requires reviewed lockfile checksums, compiler/NASM
-preflight, target-specific tests, and package inspection. The default-media
-gate proves the codec and native build graph absent. Windows additionally
-requires MSVC, Rust `+crt-static`, C/C++ `/MT`, archive-member inspection, and
-rejection of dynamic MSVC/GNU/OpenH264 runtime dependencies. Linux and macOS
-packages reject a shared OpenH264 dependency and nested codec payload.
+The feature adds unsafe C/C++ codec code and native build tooling, so it
+needs reviewed lockfile checksums, a compiler and NASM preflight,
+target-specific tests and package inspection. The default-media check proves
+the codec and its native build graph absent.
 
-The wrapper crates declare Rust 1.85, but their exact `wide` 1.1.1 and
-`safe_arch` 1.1.0 dependencies declare 1.89. The source feature therefore has a
-Rust 1.89 floor; the dependency-light default workspace retains its 1.85 floor.
-No fork is approved to lower that requirement.
+- **Windows** also needs MSVC, Rust `+crt-static`, C/C++ `/MT`, inspection of
+  the archive members, and refuses dynamic MSVC, GNU or OpenH264 runtime
+  dependencies.
+- **Linux and macOS** packages refuse a shared OpenH264 dependency and a
+  nested codec payload.
 
-BSD-2-Clause notice compliance is separate from H.264 patent/distribution
-analysis. Arcen does not claim that Cisco's separately distributed precompiled
-binary terms or royalty arrangements cover Arcen's source-built output.
-External distribution remains subject to Release/Security/legal approval,
-target-specific SBOM and notices, and physical acceptance. See
+The wrapper crates declare Rust 1.85, but their `wide` and `safe_arch`
+dependencies declare 1.89, so the feature needs Rust 1.89; the default
+workspace keeps its 1.85 floor. No fork is approved to lower it.
+
+BSD-2-Clause notice compliance is separate from H.264 patent and distribution
+questions. Arcen does not claim that the terms or royalty arrangements of
+Cisco's separately distributed binary cover Arcen's source-built output.
+External distribution of the feature needs Release/Security and legal
+approval, a target-specific SBOM and notices, and physical acceptance. See
 [`../architecture/media-plan-resolution.md`](../architecture/media-plan-resolution.md).
-
-Packaging and runtime remain separate privilege boundaries. Generate-if-missing
-helpers refuse partial/custom pairs and publish explicit SAN-bearing,
-server-auth certificates with protected permissions. Pier independently
-revalidates SAN, key class/strength and match, validity, purpose, bounded
-opened-file snapshots, and platform filesystem/DACL policy before listen or
-reload. Helper success alone is not service admission.
 
 ## SBOM and provenance
 
-Current CI does not install `cargo-cyclonedx` or emit SBOM/provenance metadata.
-Future release automation must emit:
+CI emits no SBOM or provenance. `scripts/ci/generate-supply-chain.sh` writes
+a CycloneDX SBOM with `cargo cyclonedx` when run by hand. Release automation,
+when it exists, must emit:
 
-- a reviewed SBOM format and tool/version;
-- an in-toto statement using the SLSA provenance v1 predicate;
-- the repository, source commit, workflow identity, run ID, and lockfile digest;
-  and
+- an SBOM in a reviewed format, naming the tool and its version;
+- an in-toto statement with the SLSA provenance v1 predicate;
+- the repository, source commit, workflow identity, run ID and lockfile
+  digest; and
 - `SHA256SUMS` over every generated metadata file.
 
-Until that automation exists, `legal/ORIGINS.md` records the exact
-OpenH264 feature subset and lockfile checksums. That reviewed subset is not a
-substitute for the complete target-specific release SBOM.
+Until then, `legal/ORIGINS.md` records the exact OpenH264 feature subset and
+its lockfile checksums. That record does not replace a complete
+target-specific release SBOM.
 
-An unsigned source-provenance statement would provide structured build metadata
-but would not be an attestation or proof of runner integrity. GitHub artifact
-attestations must not be enabled or claimed until the repository account and
-reviewed release design support them.
+An unsigned source-provenance statement gives structured build metadata, but
+it is neither an attestation nor proof of runner integrity. GitHub artifact
+attestations are not enabled and not claimed.
 
 ## Release artifact boundary
 
-No staging or production workflow is currently present. Future staging must
-build version-and-commit-addressed artifacts once. Production must accept only
-a successful staging run from `main` whose commit matches the reviewed tag,
-download those exact artifacts, and never rebuild them.
+Releases are built, signed and notarised by hand; no staging or production
+workflow exists. See [Versioning and releases](../operations/versioning-and-releases.md).
 
-Future platform signing hooks and the detached release-manifest signing hook
-are mandatory and must fail closed on missing hooks or outputs. Signing keys,
-and notarization credentials belong only in
-reviewer-protected, least-privilege environments and must never be exposed to
-pull-request code. Releases are built, signed and notarised by hand until
-then; see [Versioning and releases](../operations/versioning-and-releases.md).
+Release automation must meet this contract:
+
+- Staging builds artefacts once, addressed by version and commit.
+- Production accepts only a successful staging run from `main` whose commit
+  matches the reviewed tag, downloads those exact artefacts, and never
+  rebuilds them.
+- Platform signing hooks and the detached release-manifest signing hook are
+  mandatory and fail closed when a hook or its output is missing.
+- Signing keys and notarisation credentials live only in reviewer-protected,
+  least-privilege environments and are never exposed to pull-request code.

@@ -2,9 +2,8 @@
 
 `deploy-pier.sh`, `deploy-pier-preflight.sh`, `arcen-pier.service`, and
 `arcen-xorg.conf` deploy the active fused `arcen-pier-linux` binary to a Linux
-workstation. This is a development deployment path, not a release installer.
-Package format, signing, upgrade, provenance, and uninstall behavior remain
-Release/Security work.
+workstation. This is a development deployment path; the release installer is
+described in [`installer/README.md`](installer/README.md).
 
 The fused Pier contains both native capture pipelines. Eight-bit Auto/Speed
 stay on NvFBC/CUDA/NVENC; ten-bit Grading uses the separate depth-30
@@ -25,9 +24,7 @@ support. OpenH264 is compiled from the exact crate-supplied source into the
 Pier; no
 `libopenh264.so`, downloaded/precompiled Cisco runtime, or nested codec payload
 is installed. Deployment checks the binary's dynamic dependencies and release
-tree before installation. External distribution still requires the reviewed
-H.264 posture, complete target SBOM/notices, and physical acceptance in
-`docs/architecture/media-plan-resolution.md`.
+tree before installation.
 
 Packaged services write their authoritative tracing stream to
 `/var/log/arcen/arcen-pier.log` as canonical JSON Lines using the unified
@@ -49,10 +46,9 @@ The `logging` section's canonical field is `logging.level` (an
 `OperationalProfile` discriminant, `0`–`3`); the packaged template above ships
 `0` (`Level0`/`Critical`), the production default. The legacy numeric
 `logging.verbosity` is accepted for one release as a migration path and is
-mutually exclusive with `logging.level`. A development deployment may run
-with `Level2` (`Info`) for live verification — that override is
-intentionally not baked into this packaged template; set `logging.level`
-explicitly per-deployment instead. The logrotate policy owns the fixed 32
+mutually exclusive with `logging.level`. To diagnose one Pier, set
+`logging.level` in that Pier's own `pier.json` (for example `2`, `Info`); the
+packaged template keeps `0`. The logrotate policy owns the fixed 32
 MiB/daily rotation trigger; there is no ignored runtime size field.
 
 `ARCEN_LOG` remains the highest-priority fine-grained filter. Standalone runs

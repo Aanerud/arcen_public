@@ -3,7 +3,7 @@
 **Status:** Proposed 2026-10-17; formal Shared/Architecture and
 Release/Security acceptance is still pending. The contracts shipped in 0.17.0:
 every product (Linux, Windows and macOS Piers, the macOS Deck) runs each
-session on these lanes (protocol v5, Amendment 2). Amendments 1–18 follow the
+session on these lanes (protocol v5, Amendment 2). Amendments 1–22 follow the
 decision; each records one later contract:
 
 | # | Date | Contract |
@@ -27,6 +27,9 @@ decision; each records one later contract:
 | 17 | 2026-11-08 | Cursor images from every Pier that can read them (0.18.0) |
 | 18 | 2026-11-09 | Windows Grading keeps the desktop's sRGB code values (0.18.0) |
 | 19 | 2026-11-09 | Every Pier states `srgb` for Grading; PQ-to-SDR uses the sRGB curve (0.19.0) |
+| 20 | 2026-11-09 | Wayland Grading states `srgb` and returns the desktop's codes (0.19.0) |
+| 21 | 2026-11-11 | Host pointer positions for a Deck-drawn cursor |
+| 22 | 2026-11-21 | The automatic cursor (0.20.7) |
 
 > Records the shared, portable contracts the headless Linux Wayland provider
 > and the isolated audio/input transport build on: QUIC lane roles and their
@@ -315,7 +318,7 @@ the QUIC runtime); products adopt it with the lane dispatcher.
    below 10 ms. The table in section 1 remains each role's normal priority.
 3. **Provisional bounds.** Per-role queue sizes and byte bounds
    (`LaneQueueBounds::for_role`), starvation thresholds and the burst
-   threshold above are provisional until lab qualification on real
+   threshold above are provisional until they are qualified on real
    networks; they may change without amending this ADR, and the change is
    reported with its measurements.
 
@@ -659,18 +662,16 @@ schema 3; the service re-qualifies itself; development records).
 1. **Why 60 Hz looked like 40 fps.** Mutter's ScreenCast source drops a frame
    whose timestamp lies inside one interval of the consumer's negotiated
    `maxFramerate` after the previous one (`meta-screen-cast-stream-src.c`,
-   49.4). A *monitor* stream (`RecordMonitor`, the `--virtual-monitor` lab
+   49.4). A *monitor* stream (`RecordMonitor`, the `--virtual-monitor` test
    harness and GNOME 40's startup monitors) cannot negotiate above the
    monitor refresh, so presentation jitter drops frames (36–41 fps at 60 Hz).
    A `RecordVirtual` stream on Mutter 49 reports no refresh and its own
    consumer's `maxFramerate` applies. Upstream fixes the jitter for every
    stream in MR !5358 ("Overhaul 'too early' computing", merged to `main`
    2026-10-14, milestone GNOME 51, after 51.1; not on the 49 or 50 stable
-   branches, and not in Rocky/RHEL 10.2's `mutter-49.4-4.el10_2`). Measured
-   on Rocky 10.2 / Mutter 49.4: a `RecordVirtual` output at 60 Hz delivered
-   59.3–59.7 fps of a 60 fps client at 1080p, 1800x1130 and 4K, with
-   `maxFramerate` 60 or 120, under Mutter and GNOME Shell. Arcen does not
-   patch compositors; it measures.
+   branches, and not in Rocky/RHEL 10.2's `mutter-49.4-4.el10_2`). On Mutter
+   49.4 a `RecordVirtual` output at 60 Hz holds a 60 fps client at 1080p,
+   1800x1130 and 4K. Arcen does not patch compositors; it measures.
 2. **Lowest refresh that holds Speed.** Each Speed measurement records the
    Deck display refresh, the output refresh, the codec and the route
    (record schema 3). A session created for Speed gets the lowest refresh
@@ -879,13 +880,6 @@ Recorded with the capture pacing and recovery fixes.
    cannot describe the paced timing at that size (CVT-RB pixel-clock limit,
    e.g. 4K at 120 Hz), or when the request names no preset. A reattachment
    keeps the desktop's refresh. Multi-head Xorg plans are unchanged.
-3. **Evidence** (Rocky 9.7 / GNOME 40 Xorg depth 24 / GRID V100D, the real
-   Deck GUI over the long-haul VPN, real-screen harness, Firefox page
-   on the host): before, host `emit_activity` 40–46 of 60 captured and
-   41–43 fps on glass; with the pacer on a 60 Hz head 60/60 encoded and
-   59.5–59.7 fps on glass (2–5 page frames lost per phase instead of
-   113–172); with the 120 Hz head the page ran at 120 fps, 60/60 encoded,
-   58.9–59.7 fps on glass and no pipeline flushes in motion.
 
 ## Amendment 13 (2026-10-19): pen barrel-button capability
 
@@ -1064,9 +1058,7 @@ capability bit and `TransferCharacteristics::serves_request`.
    transfer on an sRGB layer, as the Linux XShm and macOS `ScreenCaptureKit`
    Grading paths expect (both deliver the desktop's code values), so every
    Windows SDR code moved, by up to 16/255 in the shadows, and the picture
-   was darker than the desktop. The Deck's Colour check measured it on the lab
-   (mean 10.29/255 against the desktop, 0.18/255 against the desktop's sRGB
-   re-encoded as BT.709).
+   was darker than the desktop, as the Deck's Colour check showed.
 2. **Rule.** A linear-light SDR source is re-encoded with the curve the
    compositor linearised with, so code values survive:
    `arcen_media::video::linear_sdr_desktop_transfer(requested, client)` (since
@@ -1151,24 +1143,10 @@ No wire change: the `srgb_transfer` capability of Amendment 18 is reused.
    Grading and the Colour check's transfer item passing ("served srgb") on
    Linux and macOS exactly as on Windows. capenc's admission tokens gain
    `rgb10-pq-to-srgb` and `f16-pq-to-srgb` for the new conversion.
-5. **Lab evidence (Linux Xorg, NVENC, 1512×950 Grading).** A dev Pier on a
-   spare port served a depth-30 desktop showing a known pattern; the host's
-   own root code values (`XGetImage`, what XShm reads) were compared with the
-   Deck-recorded stream decoded off-line. A 0.18.0 Deck received
-   `transfer=srgb` (bitstream `iec61966-2-1`, NVENC VUI SRGB) and a 0.17.0
-   Deck `bt709`; both streams decode to the same pixels, the host's codes:
-   the ten-bit grey ramp within one ten-bit code (99 % of pixels exact at
-   eight bits, mean 0.01/255), against 41 ten-bit codes had an OETF been
-   applied. On a declared Rec.2100 PQ desktop holding an sRGB picture
-   composed at 203 nits, the 0.18.0 Deck's stream returns the sRGB greys
-   (98 % exact at eight bits, mean 0.02/255) while the 0.17.0 Deck's stream
-   is the BT.709 OETF (mean 11.8/255 from the desktop's codes), as intended
-   for an older Deck. On macOS, a real `ScreenCaptureKit` Grading stream
-   reads `bt709/srgb/bt709 full` from its own SPS (end-to-end test).
 
 ## Amendment 20 (2026-11-09): Wayland Grading states `srgb` and returns the desktop's codes
 
-Recorded with `rc/wlsrgb` (0.19.0). Closes the Wayland exception of
+Recorded with Wayland sRGB Grading (0.19.0). Closes the Wayland exception of
 Amendment 19 item 3. No wire change.
 
 1. **The admission carries the curve.** `AdmissionRequest::sdr_transfer` is
@@ -1204,19 +1182,6 @@ Amendment 19 item 3. No wire change.
    Grading still asked for PQ, so its Grading fallback keeps `bt709`. The
    2.2-power fact is inferred from the route and one compositor's
    measurement (GNOME 51.1); the qualification does not measure it yet.
-5. **Lab evidence (Rocky Linux 10, GNOME 51.1 prefix, `force-hdr`, ten-bit
-   `xBGR_210LE` DMA-BUF, NVENC, 1800×1130 Grading).** A dev Pier on a spare
-   port; a full-screen GTK window of flat eight-bit sRGB patches (256 greys,
-   R/G/B ramps, mixed colours) in the served desktop; the Deck-recorded
-   stream decoded off-line and compared with the drawn codes. 0.18.0 Deck:
-   hello `transfer=srgb`, SPS VUI transfer 13, capenc
-   `transform=rgb10-pq-to-g22`; greys mean 0.17/255, max 0.72/255, 248 of
-   256 levels decode to their own code, shadows within 0.16/255; colour
-   patches mean 0.71/255. The same stream through the piecewise sRGB curve
-   (first build of this change) left greys mean 2.0/255 and the shadows up
-   to 8.5/255 low (grey 17 decoded as 8.5), which is what identified Mutter's
-   2.2-power decode. 0.17.0 Deck: `bt709`, VUI 1, `rgb10-pq-to-sdr`, greys
-   mean 10.5/255 and up to 20.6/255 low, as intended for an older Deck.
 
 
 ## Amendment 21 (2026-11-11): host pointer positions for a Deck-drawn cursor

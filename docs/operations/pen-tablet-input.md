@@ -1,36 +1,18 @@
-# Typed pen/tablet input — operator validation
+# Pen and tablet input: operator checks
 
-**Status (2026-08-03):** Physical end-to-end validation completed. A Wacom
-Intuos5 touch L pen was physically moved, pressure-applied (range 0.0–1.0
-confirmed), tilted, and clicked through Deck's Tablet Monitor, with 1,572+
-forwarded pen events confirmed reaching both Linux (uinput path) and Windows
-(PT_PEN path) hosts. See
-[`../architecture/pen-tablet-input.md`](../architecture/pen-tablet-input.md)
-for the full design, the AppKit event gate fix (2026-08-03), and the
-confirmed capability coverage table.
+How to check, step by step, that a pen reaches the host as a pen: on the
+Deck, on each kind of Pier, and through Native tablet. The design is in
+[`../architecture/pen-tablet-input.md`](../architecture/pen-tablet-input.md).
 
-**Vendor neutrality (0.16.0):** any pen tablet whose HID report descriptor
-declares a pen is supported, whoever made it; no step below depends on the
-tablet's brand. The physical run above used one Wacom; tablets of other makes
-are covered by classifier and normalisation tests with synthetic descriptors
-(`shared/usb-bridge/src/hid_digitizer_tests.rs`,
-`shared/input/src/pen_axes.rs`) but have not yet been physically validated —
-re-run sections 1, 3 and 4 with any other tablet you have and record it.
-
-**Note for re-validation**: A critical macOS capture bug was found and fixed
-during this run (commit `1d6af87`). Tablet drivers deliver pen motion with `vendorID=0`
-on macOS; the original gate dropped all such events. Any re-test must use
-Arcen Deck build `1d6af87` or later.
+Any pen tablet whose HID report descriptor declares a pen is supported,
+whoever made it; no step below depends on the tablet's brand.
 
 ## Prerequisites
 
-- A pen tablet of any make connected to the macOS client (USB or Bluetooth),
-  with its own macOS driver installed and running if the vendor ships one
-  (physically validated so far with a Wacom `Intuos5 touch L`, `056a:0317`).
-- An Arcen Pier reachable over a direct QUIC connection: Linux
-  (`arcen-pier` on the dedicated per-session Xorg target — see
-  `hosts/linux/ARCHITECTURE.md`) or Windows (`arcen-pier.exe` as the
-  LocalSystem SCM service).
+- A pen tablet of any make connected to the macOS Deck (USB or Bluetooth),
+  with its own macOS driver installed and running if the maker ships one.
+- An Arcen Pier reachable over a direct QUIC connection: Linux, Windows
+  (`arcen-pier.exe` as the LocalSystem service) or macOS.
 - The saved connection set to **Tablet support** (the default,
   `tablet_mode_requested = local_termination`; see
   `clients/macos/SETTINGS.md`) unless a step below explicitly switches to
@@ -152,7 +134,7 @@ sudo evtest
 2. Confirm no rotation axis is advertised (`libinput list-devices` should
    not show a rotation capability for this device) — this is the documented
    `Unavailable` state, not a bug.
-3. Open **Krita** (or another approved Linux creative test application) in
+3. Open **Krita** (or another drawing application) in
    the same dedicated Xorg session and confirm a brush stroke shows varying
    width/opacity as physical pressure changes, and that tilt-sensitive
    brushes respond to physical tilt.
@@ -256,7 +238,7 @@ No entitlement and no driver on the host is needed for it.
 1. Open a pressure-aware application on the host (Krita, Photoshop, or any
    AppKit canvas) in a session with Tablet support negotiated.
 2. Draw a stroke with varying pressure; confirm the width or opacity follows
-   it. Before 0.19.0 every stroke arrived at full pressure.
+   it.
 3. Tilt and rotate the pen where the brush uses them; flip to the eraser end
    and confirm the application switches to its eraser (it is told through
    `tabletProximity:`).
@@ -268,13 +250,10 @@ No entitlement and no driver on the host is needed for it.
 as a stylus test page. Safari reports every pen on macOS as a mouse with
 pressure 0.5 whenever a button is down, whichever tablet and whatever driver
 posts the events: WebKit's macOS mouse events take no tablet subtype, pressure
-or tilt from `NSEvent`, and `WebMouseEvent::pointerType()` returns `mouse` on
-macOS (WebKit `Source/WebKit/Shared/WebMouseEvent.h` and
-`Source/WebKit/Shared/mac/WebEventFactory.mm`, main `69595416`, read
-2026-11-12). Chrome takes the pen type from the proximity event and pressure,
-tilt and rotation from each tablet-point event; measured through a macOS Pier
-in Tablet support on 2026-11-12 (Chrome 153): `pointerType` pen, pressure
-0.047–0.984, tilt X 40 to −30, rotation 0–180, eraser `buttons` 32. Chrome
+or tilt from `NSEvent`. Chrome takes the pen type from the proximity event and
+pressure, tilt and rotation from each tablet-point event; through a macOS Pier
+in Tablet support it reports `pointerType` pen, pressure, tilt, rotation, and
+the eraser as `buttons` 32. Chrome
 reports `tiltY` with the opposite sign to `-[NSEvent tilt]` (its view is not
 flipped, `components/input/web_input_event_builders_mac.mm`), so a pen
 reported tilted towards the user by AppKit reads negative there; the host
@@ -287,9 +266,9 @@ It injects real events at 40–44 % of the main display, so put a window you own
 there first, or nothing, and never run it on a desktop someone is using.
 
 `arcen-pier-macos probe-pen-hid` (a signed build with the virtual HID
-entitlement, run from the Aqua session) records why a virtual HID digitizer is
-not used: on macOS 26.7.2 it reports `pointer_max_tilt: 0.0` and
-`pointer_max_rotation: 0.0` for a pen that sent 50° and 230°.
+entitlement, run from the Aqua session) shows why a virtual HID digitizer is
+not used: it reports `pointer_max_tilt: 0.0` and `pointer_max_rotation: 0.0`
+for a pen that sent tilt and rotation.
 
 ## 5. Old-peer fallback and default-disabled raw-HID
 
@@ -307,99 +286,57 @@ not used: on macOS 26.7.2 it reports `pointer_max_tilt: 0.0` and
 3. Confirm a Windows Pier never advertises `experimental_raw_hid: true`
    under any configuration (it has no raw-HID receiver at all).
 
-## 5a. Measured status of experimental raw-HID passthrough (2026-08-12)
+## 5a. Experimental raw-HID passthrough
 
-The two halves of this feature are in very different states. Measured, not
-inferred.
+Raw-HID passthrough is off in every release build and is not a supported
+configuration. Use Tablet support or Native tablet.
 
-### Client half: works, and needs no Apple entitlement
-
-One tablet (an Intuos5 touch L, `056a:0317`) was captured with its vendor driver installed
-and running and no entitlement of any kind. Reproduce with the hardware test,
-which drives the real `HidSession` rather than a probe that re-implements it:
+**Deck side.** Capture works with the tablet maker's driver running and needs
+no Apple entitlement; Input Monitoring must be granted to whatever runs it.
+The hardware test drives the real `HidSession`:
 
 ```sh
 cargo test -p arcen-deck-macos --features experimental-raw-hid \
     --test tablet_capture_hardware -- --ignored --nocapture
 ```
 
-Observed: `PermissionGranted`, `DeviceAdded vid=0x056a pid=0x0317
-descriptor_len=234`, then live pen `Report`s. Input Monitoring must be granted
-to whatever runs it.
+It reports `PermissionGranted`, `DeviceAdded vid=… pid=… descriptor_len=…`,
+then live pen `Report`s. `kIOReturnExclusiveAccess` from `IOHIDManagerOpen`
+means another process holds the device for the moment: restart the maker's
+driver or replug the tablet. The Deck matches by digitizer usage page and the
+descriptor's own classification, never by vendor id, and the Linux host
+admits a device only through `arcen_usb_bridge::RawHidAdmission` (the
+pen-bearing interface of a device that classifies as a pen tablet).
 
-`kIOReturnExclusiveAccess` from `IOHIDManagerOpen` is **transient** — another
-process holding the device — not a structural bar. It was seen against every
-matching combination on one occasion and against none of them after the vendor
-driver was restarted. Restart the vendor driver or replug the tablet.
+**Host side.** A tablet whose Linux driver binds only USB devices
+(`wacom.ko` is one) binds nothing when it is presented through `/dev/uhid`,
+so no input device and no pen appear. Raw-HID passthrough therefore cannot deliver such a tablet on a Linux
+Pier; Native tablet presents a real USB device instead (section 5c).
 
-Since 0.16.0 the client matches by digitizer usage page and the descriptor's
-own classification, not by vendor id, and the Linux host admits a device only
-through `arcen_usb_bridge::RawHidAdmission` (pen-bearing interface of a device
-that classifies as a pen tablet). The measurement above predates that change.
+## 5b. Tilt on a Linux Pier
 
-### Host half: blocked, and by design it always was
+Tilt reaches the Linux host and its applications. The virtual tablet's tilt
+axes declare their resolution, so libinput reports the angle the Deck sent,
+and on Xorg the pen moves only through the tablet device, never a second
+time through the absolute mouse.
 
-A `/dev/uhid` device created with Wacom's vendor ID binds **no driver at all**
-on RHEL 9, so no input device appears and there is no pen. `wacom.ko` is a USB
-driver and a uhid device is not a USB device.
+Firefox on Xorg reports tilt larger than sent (45° as 64°); Chrome reports
+the degrees. xf86-input-libinput exposes tilt as a ±64 valuator (it caps Xorg
+tilt at ±64° for every tablet), GDK hands that to Firefox normalised to ±1,
+and Firefox multiplies by 90. A USB tablet shows the same; see section 5e.
 
-This is not a defect to fix here. It answers the open empirical question of
-input-only USB bridging: the design already separates the implemented typed
-path ("Light") from the native USB bridge ("Hard"), and the experimental
-raw-HID path is lab scaffolding that must not grow into the bridge. The full
-measurement, the reference's `usb-vhci` architecture, the out-of-tree kernel
-module cost, and the reopened client entitlement question are all recorded
-there — that document is authoritative; do not re-derive it from this one.
-
-Operationally, for anyone testing today: **raw-HID passthrough cannot deliver a
-working tablet whose Linux driver binds only to USB devices (as the measured
-one's does) on a Linux Pier**, so do not enable it expecting one. Use the
-typed pen path, which is the supported configuration.
-
-## 5b. Tilt reaches the Linux host but is not observed by applications
-
-Reported 2026-08-12: pen tilt works on a Windows Pier and not on a Linux Pier.
-Not investigated further; this records the measurement
-so the client side does not get re-examined needlessly.
-
-**Update 2026-10-19 (real-screen stylus tests, Firefox 140 and Chrome 155 on
-Xorg/GNOME 40 and on the Wayland lab seat pen).** Tilt does reach browsers,
-and two host-side faults distorted it; both are fixed:
-
-- The tilt axes declared no resolution, so libinput read them as a Wacom pen's
-  ±64° spread over `-90..=90`: a 45° tilt arrived as 32° (Chrome on Xorg, every
-  Wayland client). The axes now declare `TILT_UNITS_PER_RADIAN`.
-- On Xorg the pen also moved the cursor and clicked through the absolute mouse
-  device, so applications received every sample a second time from a device
-  without tilt or pressure (Chrome: 32 % of inked samples at pressure 0;
-  Firefox: a `mouse` pointerdown and pointer-type flips inside strokes). The
-  tablet device alone is the pen now.
-
-Firefox on Xorg reports tilt larger than sent (45° as 64°). This is the
-deliberate trade-off of the fix, not a remaining fault: xf86-input-libinput
-exposes tilt as a ±64 valuator (it caps Xorg tilt at ±64° for every tablet),
-GDK hands that to Firefox normalised to ±1, and Firefox multiplies by 90. A USB
-Wacom shows the same; Chrome reports the degrees.
-
-Tilt **does** arrive at the Linux host, with live varying values. From
-`/var/log/arcen/arcen-pier.log` with `ARCEN_LOG=input=trace`:
+To see what the Pier injects, set `ARCEN_LOG=input=trace` and read
+`/var/log/arcen/arcen-pier.log`:
 
 ```text
 pen_inject: ... "tilt_x":"71.71819305419922","tilt_y":"-4.218878746032715",
             "tool":"Tip","in_proximity":true,"touching":false,"source":"region"
-pen_inject: ... "tilt_x":"73.12448120117188", ...
-pen_inject: ... "tilt_x":"70.31189727783203", ...
 ```
 
-So AppKit capture, `tilt_to_degrees`, `PenEventMsg` and the host's injection
-path are all carrying tilt correctly, and `create_pen_device` declares
-`ABS_TILT_X`/`ABS_TILT_Y` with a matching `AbsInfo` range. The loss is
-**downstream of `uinput` emission** — the tablet-tool device's XI2 valuators,
-the X server's view of them, or the application. Start there, not at the client.
-
-Note the host writes these traces to `/var/log/arcen/arcen-pier.log`, **not** to
-the journal; `journalctl -u arcen-pier` shows none of them, which is misleading
-enough to have cost a diagnosis.
+The Pier writes these lines to `/var/log/arcen/arcen-pier.log`, **not** to the
+journal; `journalctl -u arcen-pier` shows none of them. If the log shows tilt
+and an application does not, the loss is after `uinput`: the tablet tool's
+XI2 valuators, the X server's view of them, or the application.
 
 ## 5c. Native tablet (USB bridged) with any tablet
 
@@ -411,21 +348,18 @@ on the Deck, and on an Intel Deck it is untested on hardware. A Linux Pier offer
 and refuses with "Native tablet is not enabled on this host…" otherwise. A
 macOS Pier offers it when signed with the virtual-HID entitlement: with
 pressure, tilt, eraser and barrel buttons for a model the Pier reads itself
-(the Wacom Intuos5 touch L; measured with an emulated Intuos5, pressure 0.059
-to 1.000, a real tablet not yet measured), buttons and proximity only for
+(the Wacom Intuos5 touch L), buttons and proximity only for
 models Arcen does not know yet
 ([ADR 0022 §14.1](../adr/0022-macos-pier-native-tablet-hid-adapter.md)).
 A Windows Pier offers it whenever the session's Windows Ink pen device exists,
 with nothing to enable or install: it reads the pen itself with the same
 readers as a macOS Pier and injects it as a Windows Ink pen, with pressure in
-Windows Ink's 1/1024 steps, tilt, barrel button, eraser and proximity
-(measured on a Windows 11 Pier in Chrome 157 and Firefox 160 with the Deck's
-emulated Intuos5 and generic pen: the ladder 0.1/0.25/0.5/0.75/1.0 reads
-0.1006/0.2500/0.5000/0.7500/1.0000 (Intuos5) and 0.0996/0.2500/0.5000/0.7500/1.0000
-(generic), tilt exact, one `pointerenter`/`pointerleave` per stroke, the eraser
-end as `buttons` 32 and the barrel as `buttons` 2; Windows reports the barrel as
-the pen's second button only while the pen touches;
-[ADR 0023 amendment](../adr/0023-one-native-tablet-pen-position-path.md)).
+Windows Ink's 1/1024 steps, tilt, barrel button, eraser and proximity. In
+Chrome and Firefox the pressure arrives within one Windows Ink step, tilt is
+exact, each stroke has one `pointerenter`/`pointerleave`, the eraser end is
+`buttons` 32 and the barrel `buttons` 2; Windows reports the barrel as the
+pen's second button only while the pen touches
+([ADR 0023 amendment](../adr/0023-one-native-tablet-pen-position-path.md)).
 Keep the Deck's cursor rendering on **Local**: the Pier reports where the
 host's pointer is and the Deck draws it there. When the session ends the
 helper hands the tablet back to macOS like an unplug and replug. The privileged
@@ -546,7 +480,7 @@ restart the Pier (or run `modprobe vhci-hcd`) before Native tablet is offered.
 
 ## 5d. Native tablet with an emulated Wacom (no pen in hand)
 
-A Deck built with the lab-only `usb-emulate-lab` feature replaces the
+A Deck built with the development-only `usb-emulate-lab` feature replaces the
 captured tablet with an emulated Wacom Intuos5 touch L (Linux names `0x0317`
 "Intuos Pro L") that plays a scripted
 pen stroke (`arcen-deck input-smoke … --usb-emulate wacom-intuos5`). The Pier
@@ -562,15 +496,16 @@ KP-501E Grip Pen's tool id, a hovering descent, a landing already pressing,
 varying pressure and a held tilt); `tilted` plays the scripted stroke with
 both tilt axes sweeping through both signs; `rest` and `hover-rest` end with
 the pen still pressing or still hovering in proximity and hold it there for
-eight seconds, so a lab can cut or end the session while the pen rests;
+eight seconds, so a test can cut or end the session while the pen rests;
 `upper-held` plays `realistic` with the upper side switch held throughout.
 None of them is a recording of a real pen: an emulated proof never stands in
-for the physical test. A lab Deck also takes these flags after `--connect
-HOST PORT`, so the GUI plays the emulated pen and its host-led cursor can be
+for the physical test. A Deck built with that feature also takes these flags
+after `--connect HOST PORT`, so the GUI plays the emulated pen and its host-led cursor can be
 checked on screen. The emulated
 smoke prints the `cursor_mode_result` and every host cursor position it
 receives (`cursor-position …`). This proves the bridge and the host driver
-without a person; it does not replace the physical test below.
+without a person; it does not replace a real pen (see
+[A real pen, last](#a-real-pen-last)).
 
 ## 5e. Browsers on a Linux Pier: what pressure and tilt to expect
 
@@ -579,8 +514,8 @@ what a local tablet on the same desktop would show. Two browser quirks on an
 Xorg desktop are left as they are, because a local tablet behaves the same
 and correcting them for one browser would break the other.
 
-**X11 (Xorg desktop, xf86-input-libinput).** Measured 2026-11-15 on Rocky 9
-with Tablet support from the macOS Deck, strokes at 0.1, 0.25, 0.33, 0.5,
+**X11 (Xorg desktop, xf86-input-libinput).** Measured with Tablet support from
+the macOS Deck, strokes at 0.1, 0.25, 0.33, 0.5,
 0.75 and 1.0 with tilts (30, −20), (0, 0), (−45, 45), (60, −60) and (10, 5):
 
 | Browser | `pointerdown` | `pointermove` |
@@ -618,14 +553,14 @@ open). Tilt is exact in Chrome and Firefox.
   compositor unchanged, so the Pier cannot correct them; on a stock GNOME 46+
   desktop the pressure is squared exactly as for a tablet plugged into that
   host.
-- **A GNOME prefix with Arcen's lab fix**
+- **A GNOME prefix with Arcen's pressure-curve fix**
   (`packaging/linux/tools/gnome-prefix/patch-pressure-curve-51.py`, see
   [the prefix README](../../packaging/linux/tools/gnome-prefix/README.md))
   applies the curve once. It records the patched library's digest in
   `share/arcen/mutter-pressure-curve`; while that digest matches, the Pier
   inverts only libinput's threshold, and a Native tablet's pressure arrives
-  as libinput reports it, as for a local tablet. Measured 2026-11-15 on
-  GNOME 51.1 with that fix, Chrome 155 and Firefox 140 identical:
+  as libinput reports it, as for a local tablet. Measured on GNOME 51.1 with
+  that fix, Chrome and Firefox identical:
 
   | Path | 0.1 | 0.25 | 0.5 | 0.75 | 1.0 |
   | --- | --- | --- | --- | --- | --- |
@@ -642,8 +577,8 @@ open). Tilt is exact in Chrome and Firefox.
 
 Native tablet means one thing on every Pier: the tablet itself is attached
 to the host, the host's driver (Linux) or the Pier's own pen reader (macOS)
-interprets it, and the Deck shows where the pen is. Since 0.19.0 there is
-one implementation of "where the pen is"
+interprets it, and the Deck shows where the pen is. There is one
+implementation of "where the pen is"
 ([ADR 0023](../adr/0023-one-native-tablet-pen-position-path.md)):
 
 | Step | Linux Pier (X11 and Wayland) | macOS Pier |
@@ -655,8 +590,7 @@ one implementation of "where the pen is"
 
 **Enabling it.** On Linux an administrator sets `usb.native_tablet` to
 `"enabled"` in `/etc/arcen/pier.json` (or runs `install-arcen-pier
---native-tablet`) and restarts the Pier; nothing else enables it (the 0.18
-`ARCEN_USB_HARD_LAB=1` service environment is no longer read). A macOS Pier
+--native-tablet`) and restarts the Pier; nothing else enables it. A macOS Pier
 offers it when its signed build holds the virtual-HID entitlement. A Windows
 Pier offers it with nothing to enable. On the Deck, choose **Native tablet
 (USB bridged)** for the connection.
@@ -688,21 +622,6 @@ double-click.
 pages `pointerType: "mouse"` and no pressure for any pen, local or remote.
 Test pen pages in Chrome (or Firefox) on a macOS Pier.
 
-### Lessons (do not forget)
-
-1. **Emulated pens passed while the real tablet failed.** In November 2026
-   every emulated Intuos5 proof passed on X11, Wayland and macOS while the
-   real Wacom failed on all three. Every pen change needs a real-tablet or
-   real-browser proof.
-2. **A hung or held side switch looks exactly like "pen but no ink".** Read
-   `BTN_STYLUS`/`BTN_STYLUS2` on the evdev node and the X button state before
-   theorising about timing or grabs.
-3. **Event-driven evdev positions beat X polling for perceived latency.**
-   The X11 dot used to follow `XQueryPointer` read every 8 ms after
-   `xf86-input-wacom` had processed the event and felt laggy, while the
-   Wayland path, which already read the pen's own reports, did not. The
-   numbers are in ADR 0023.
-
 ## 6. Teardown and logs/privacy
 
 1. During an active pen contact, force each of: focus loss, disconnect,
@@ -719,14 +638,10 @@ Test pen pages in Chrome (or Firefox) on a macOS Pier.
    host) during/after a pen session and confirm it contains no raw pen
    sample content, consistent with its existing strict allowlists.
 
-## Known human-physical test gate
+## A real pen, last
 
-Every step above can be exercised through enumeration, synthetic samples, or
-a real pen — but **completion of this feature requires an actual person
-physically moving and pressing a real pen** against the attached
-tablet, observed live through Deck's Tablet Monitor panel (section 1) and
-confirmed to reach a real remote creative application on both Linux (section
-3) and Windows (section 4). Do not report this feature as fully validated,
-and do not claim a physical end-to-end run occurred, until that exact
-physical interaction has actually happened and been recorded by whoever
-performed it.
+Enumeration, synthetic samples and the emulated tablet each prove part of
+the path; none replaces a person. Finish every check with someone moving and
+pressing a real pen on a real tablet, watching the Deck's Tablet Monitor
+(section 1), and drawing in a real application on the host (sections 3, 4
+and 4b).
