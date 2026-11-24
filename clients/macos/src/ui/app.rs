@@ -1766,6 +1766,10 @@ pub struct ArcenApp {
     /// may be unsaved, and must not be clobbered by re-reading the saved
     /// settings. Consumed by [`Self::begin_connection_flow`].
     pending_displays_override: Option<(String, DisplaysMode)>,
+    /// What the Connecting status says about this attempt's displays: one
+    /// display for this session only, after a display recovery (shared
+    /// `attempt_displays_note`). Set with the attempt's Displays mode.
+    attempt_displays_note: Option<&'static str>,
     /// Credentials preserved across a recovery choice.
     ///
     /// `drop_session_handles` clears `deferred_auth` and `submitted_auth`
@@ -2100,6 +2104,7 @@ impl ArcenApp {
         options.exact_still_image = app.exact_still_image;
         let mut draft = ConnectionDraft {
             saved_connection_id: None,
+            name: None,
             kind: ConnectionKind::DirectMachine,
             host,
             port: options.port,
@@ -2494,6 +2499,7 @@ impl ArcenApp {
             displays_mode: settings.displays_mode,
             active_displays_mode: None,
             pending_displays_override: None,
+            attempt_displays_note: None,
             recovery_auth: None,
             submitted_auth: None,
             login_window_handover: None,
@@ -7342,8 +7348,18 @@ impl ArcenApp {
             match self.config_repository.set_last_selected(&id) {
                 Ok(store) => {
                     self.reconcile_saved_connections(store);
-                    draft.username.clear();
-                    self.load_saved_username(&mut draft);
+                    // The account signing in: the one typed for this
+                    // attempt, else the one the connection remembers.
+                    match preloaded_auth
+                        .as_ref()
+                        .filter(|auth| !auth.username.trim().is_empty())
+                    {
+                        Some(auth) => draft.username.clone_from(&auth.username),
+                        None => {
+                            draft.username.clear();
+                            self.load_saved_username(&mut draft);
+                        }
+                    }
                 }
                 Err(error) => {
                     self.status = format!("Connection could not be selected: {error}");
@@ -7376,6 +7392,8 @@ impl ArcenApp {
             &endpoint,
             saved,
         );
+        self.attempt_displays_note =
+            arcen_deck_core::connect_plan::attempt_displays_note(source, resolved);
         tracing::info!(
             target: "arcen::display",
             mode = resolved.unwrap_or(self.displays_mode).as_wire(),
@@ -7650,14 +7668,10 @@ impl ArcenApp {
             );
         }
         self.connection_status_hint = None;
-        self.status = if policy.match_layout_fallback() {
-            format!(
-                "Connecting to {}... {}",
-                display_name_for_draft(&draft),
-                policy.status_note().unwrap_or_default()
-            )
-        } else {
-            format!("Connecting to {}...", display_name_for_draft(&draft))
+        let displays_note = policy.status_note().or(self.attempt_displays_note.take());
+        self.status = match displays_note {
+            Some(note) => format!("Connecting to {}... {note}", display_name_for_draft(&draft)),
+            None => format!("Connecting to {}...", display_name_for_draft(&draft)),
         };
         self.configure_reconnect(&draft, &options);
         // Atomically re-install the preserved submission immediately before
@@ -8449,8 +8463,9 @@ impl ArcenApp {
     ///
     /// The choice is pinned to this connection rather than applied globally:
     /// one capacity-limited host must not silently downgrade every other host
-    /// the user connects to. Saved connections keep the choice so the failure
-    /// does not recur on the next launch.
+    /// the user connects to. It holds for this retry only and is never saved:
+    /// the host may recover, and the next connection asks for the whole
+    /// layout again.
     fn displays_unsupported_screen(&mut self, ui: &mut egui::Ui, draft: &ConnectionDraft) {
         match render_displays_unsupported(ui, draft, &self.status) {
             DisplaysUnsupportedAction::None => {}
@@ -8469,8 +8484,8 @@ impl ArcenApp {
     /// from launching the attempt so the decision itself is directly
     /// testable.
     ///
-    /// Pins Primary-display-only for this attempt and, when the connection is
-    /// saved, persists it so the same dead end is not hit again next time.
+    /// Pins Primary-display-only for this attempt only (shared
+    /// `displays_unsupported_retry`: nothing is saved on the connection).
     fn apply_displays_unsupported_choice(&mut self, draft: &ConnectionDraft) {
         let retry =
             arcen_deck_core::connect_plan::displays_unsupported_retry(&connection_endpoint(draft));
@@ -9454,9 +9469,11 @@ impl ArcenApp {
         let followable = arcen_deck_core::reconnect_flow::follows_login_window(end)
             && self.active_connection.is_some();
         let due = if followable {
-            handover
-                .schedule
-                .session_ended(self.reconnect_clock.observed_at(end.observed_at))
+            arcen_deck_core::reconnect_flow::login_window_reconnect_due(
+                &mut handover.schedule,
+                end,
+                self.reconnect_clock.observed_at(end.observed_at),
+            )
         } else {
             None
         };
@@ -22922,6 +22939,50 @@ mod tests {
         );
     }
 
+    /// A field report: after one "Use Primary Display Only" the connection
+    /// stayed on one display once the host had recovered. The choice holds
+    /// for its retry and is never saved; the retry's Connecting status says
+    /// so.
+    #[test]
+    fn use_primary_display_only_holds_for_the_retry_and_is_never_saved() {
+        let _guard = CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = test_config_dir("arcen-primary-only-once");
+        let _ = std::fs::remove_dir_all(&dir);
+        let repository = ClientConfigRepository::at(dir.clone());
+        let saved = saved_connection("studio", "Studio", "203.0.113.10", 18444, None);
+        let store = repository.add_connection(saved.clone()).unwrap();
+        let mut app = ArcenApp {
+            config_repository: repository,
+            saved_connections: store.connections,
+            ..ArcenApp::default()
+        };
+        let draft = ConnectionDraft::new(ConnectionKind::DirectMachine).for_saved(&saved);
+
+        app.apply_displays_unsupported_choice(&draft);
+
+        let on_disk = app.config_repository.set_last_selected("studio").unwrap();
+        for connections in [&on_disk.connections, &app.saved_connections] {
+            assert_eq!(
+                connections[0].settings.overrides.displays_mode.own(),
+                None,
+                "the connection keeps following Settings › Displays",
+            );
+        }
+        assert_eq!(
+            app.resolve_attempt_displays_mode(&draft),
+            Some(DisplaysMode::SinglePrimary)
+        );
+        assert_eq!(
+            app.attempt_displays_note,
+            Some(arcen_deck_core::connect_plan::RECOVERY_ONE_DISPLAY_NOTE)
+        );
+        assert_eq!(app.resolve_attempt_displays_mode(&draft), None);
+        assert_eq!(app.attempt_displays_note, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The same one-shot must still reach the attempt it was created for,
     /// including when that connection is unsaved and so has nothing to read
     /// a preference back from.
@@ -24615,6 +24676,44 @@ mod tests {
             app.sign_in.feedback().is_none(),
             "a preloaded submission must never ask for the password",
         );
+    }
+
+    /// Connecting named the address and "user" for a saved connection with
+    /// no remembered username, although Home's Username field held the
+    /// account the attempt signs in as.
+    #[tokio::test]
+    async fn connecting_names_the_saved_connection_and_the_username_typed_on_home() {
+        let _guard = CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = test_config_dir("arcen-connecting-line");
+        let _ = std::fs::remove_dir_all(&dir);
+        let repository = ClientConfigRepository::at(dir.clone());
+        let saved = saved_connection("studio", "E2E Studio", "127.0.0.1", 18444, None);
+        let store = repository.add_connection(saved.clone()).unwrap();
+        let mut app = ArcenApp {
+            displays_mode: DisplaysMode::SinglePrimary,
+            config_repository: repository,
+            saved_connections: store.connections,
+            ..ArcenApp::default()
+        };
+        let mut typed = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        typed.username = "alice".to_string();
+        let mut draft = typed.for_saved(&saved);
+        draft.auto_reconnect = false;
+        let preloaded_auth = Some(AuthSubmission {
+            username: "alice".to_string(),
+            password: "dummy-password".to_string(),
+        });
+
+        app.begin_connection_flow(draft, preloaded_auth, &egui::Context::default());
+
+        let AppScreen::Connecting(shown) = &app.screen else {
+            panic!("a passing preflight must reach Connecting");
+        };
+        assert_eq!(shown.connecting_line(), "E2E Studio as alice");
+        app.disconnect();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

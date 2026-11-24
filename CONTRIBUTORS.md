@@ -15,7 +15,11 @@ original code.
 Contributors whose work has been accepted, in the order of the release that
 first contained it.
 
-*No external contributions yet. Yours could be the first.*
+### 0.21.2
+
+- Taylor-VN — Control+arrow switches Spaces on a macOS Pier; ⌘+ and ⌘− no
+  longer zoom the Deck (CLA Part A, public
+  pull request 31)
 
 <!--
 Add one line per contributor, under the release that first contains their

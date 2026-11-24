@@ -1,7 +1,6 @@
 # ADR 0022: Native tablet on a macOS Pier through a USB-to-HID adapter and `IOHIDUserDevice`
 
-**Status:** Accepted; shipped in 0.19.0 (first proposed 2026-11-10 for lab
-builds). A Mac Deck's bridged tablet reaches a macOS Pier as HID devices
+**Status:** Accepted; first proposed 2026-11-10, shipped in 0.19.0. A Mac Deck's bridged tablet reaches a macOS Pier as HID devices
 published with `IOHIDUserDevice`, using only the processes and the
 entitlement the Pier already has; nothing new is requested from Apple. Since
 2026-11-12 (§14) the Pier reads a known model's pen itself.
@@ -19,9 +18,8 @@ by its own report descriptor, ADR 0023 amendment), because macOS
 publishes bridged devices as virtual and the tablet maker's driver does not
 bind them (§10). A DriverKit HID driver was researched and set aside (§14).
 `probe-bridged-hid` writes the Wacom mode switch and is built only with the
-lab feature `lab-bridged-hid-probe`. Measured on the lab macOS Pier with
-the emulated Intuos5 (`NSEvent` pressure 0.059 to 1.000, 17 levels in the
-scripted stroke), then proven with a real Intuos5 bridged from a Mac Deck.
+`lab-bridged-hid-probe` feature. A real Intuos5 bridged from a Mac Deck
+draws with pressure on a macOS Pier.
 
 > Scope: the public API in `arcen-usb-bridge` (`hid_host`,
 > `hid_device_ipc`, the Intuos pen reader), superseding
@@ -249,7 +247,7 @@ nothing is created until all pass:
 2. `arcen_usb_bridge::authorize_hard_usb_tablet` — vendor-neutral
    classification as a pen tablet; joystick, gamepad and multi-axis
    collections refused; total descriptor bytes bounded. Vendor and product ids
-   are logged, never trusted. The synthetic lab tablet needs
+   are logged, never trusted. The synthetic test tablet needs
    `ARCEN_USB_HARD_SYNTHETIC=1`, as on Linux.
 3. `BridgedDeviceGuard` on every descriptor the device then serves (§3).
 
@@ -429,13 +427,13 @@ and emulated Intuos5, and the client hello a Deck sends:
 | Proof | How |
 | --- | --- |
 | devices appear with VID/PID/descriptor/transport | `ioreg -r -c IOHIDUserDevice -l` and `hidutil list` during the session |
-| reports arrive, at the expected rate | an `IOHIDManager` probe (lab subcommand) that opens the bridged pen interface, sends the Wacom mode switch through `IOHIDDeviceSetReport` (exercising the set-report path end to end) and counts input reports and their intervals |
+| reports arrive, at the expected rate | an `IOHIDManager` probe (a test subcommand) that opens the bridged pen interface, sends the Wacom mode switch through `IOHIDDeviceSetReport` (exercising the set-report path end to end) and counts input reports and their intervals |
 | teardown | the same listings after the Deck disconnects, after `SIGKILL` of the session process, and after the child is killed |
 | login window refusal | unit-tested; on a test Mac by connecting while the login window is up |
 | pressure with the vendor driver | on a Mac with Wacom's driver: an AppKit probe window under the scripted stroke logs `NSEvent` pressure |
 
-Wacom Tablet 6.4.9, whose driver names the Intuos5 family, did not bind the
-bridged devices (§13); pressure therefore comes from the Pier's own pen
+The tablet maker's driver, which names the Intuos5 family, does not bind
+the bridged devices (§13); pressure therefore comes from the Pier's own pen
 reader (§14.1), not from a vendor driver.
 
 ### 11. Security considerations
@@ -489,55 +487,66 @@ reader (§14.1), not from a vendor driver.
   (§6, §13).
 * `IOUSBHostControllerInterface` (ADR 0019 §6) is not used by the Pier.
 
-### 13. What was measured (macOS 26.7.2, 2026-11-10)
+### 13. What macOS does with a published device
 
-A Developer ID signed dev Pier app with the virtual HID entitlement, built
-with `native-tablet`; the ignored end-to-end test
+Established with the end-to-end test
 `a_bridged_tablet_is_published_as_hid_devices_fed_and_torn_down` (real Pier
-stream and QUIC lanes, the Deck's `UsbExporter` serving the emulated Intuos5,
-the real client hello, the entitled `hid-injector --bridged-usb` child) run
-from a process whose responsible app holds Accessibility; `ioreg`, `hidutil
-list` and `probe-bridged-hid` observed from outside.
+stream and QUIC lanes, the Deck's `UsbExporter` serving the emulated
+Intuos5, the entitled `hid-injector --bridged-usb` child):
 
-| Proof | Result |
-| --- | --- |
-| first connection | the hello offered `usb_hard_v1` with the probe started the same instant; the tablet was accepted (`reconnect_required: false`) |
-| devices | **one** `IOHIDUserDevice`, the pen (`0xFF0D`, 55-byte descriptor); touch (`0xFF00`) and the boot mouse withheld. `056a:0317`, version `0x0100`, "Wacom Co.,Ltd." / "Intuos5 touch L", session serials, `LocationID` `0xA2Cxxx00-01`; `Transport` reported as `"Virtual"` |
-| enumeration to polling | 0.4 s from client hello |
-| set/get report | Wacom mode switch `SET_REPORT(Feature 2) [2,2]` through `IOHIDDeviceSetReport`, read back with `GET_REPORT`: 0.7-1.0 ms round trip; the emulated tablet left mouse mode |
-| reports | 800 pen reports delivered by the Deck side per run; an `IOHIDManager` reader saw 506-583 in its ~3.6 s window (138-162 Hz, mean 6.2-7.2 ms, max 6.8-10 ms) — the pace of the scripted pen, one report per poll plus 5 ms; loss was not measured |
-| truthful result | accepted with "Native tablet is active. This Mac has the tablet maker's driver, but it is not proven to accept a bridged tablet: applications may see the pen as a pointer without pressure." |
-| bindings | no Wacom process opened any device |
-| teardown: disconnect | devices gone 14-23 ms after the session ended |
-| teardown: child `SIGKILL` | devices gone at once; the Deck got `tablet_mode_result` "Native tablet (USB bridged) ended: the device owner exited", `reconnect_required: true`; the session streamed on |
-| teardown: session `SIGKILL` | child exited on end-of-file; devices gone |
-| without Accessibility | `probe-virtual-hid` refuses ("needs … Accessibility approval for the app that started it") and `serve` advertises Native tablet unavailable with that reason |
-| console leaves the account | the e2e test hands the console away in-process (lab-only `set_console_holder_for_lab_tests`; the real reader is `console::console_holder`): to the login window and to another uid, the devices were gone within 31 ms by `probe-bridged-hid`, the Deck got the console reason with `reconnect_required: true`, and 32-33 video frames followed in the next 2 s. A real Fast User Switch was **not** performed (it needs a second account at the machine); `ConsoleWatch` and `SessionTablet`'s reaction are unit-tested with an injected console reader |
-| login window session | unit-tested only |
+- **Offered on the first connection.** The hello offers `usb_hard_v1` with
+  the probe started the same instant; the tablet is accepted with
+  `reconnect_required: false`, and the device polls within about half a
+  second of the client hello.
+- **One device.** The Pier publishes one `IOHIDUserDevice`, the pen
+  interface; touch and the boot mouse are withheld. It carries the tablet's
+  vendor and product ids, version, maker and product names, a session
+  serial and a `LocationID`. macOS reports its `Transport` as `"Virtual"`.
+- **Reports flow both ways.** Input reports arrive at the pace of the pen;
+  the Wacom mode switch (`SET_REPORT(Feature 2) [2,2]`) and its read-back
+  round-trip in about a millisecond.
+- **No vendor driver binds it.** The tablet maker's driver opens none of
+  the devices.
+- **Teardown.** The devices disappear within tens of milliseconds of a
+  disconnect; at once when the child is killed (the Deck is told the device
+  owner exited, with `reconnect_required: true`, and the session streams
+  on); when the session process dies; and when the console leaves the
+  account (the Deck is told why, with `reconnect_required: true`, and video
+  continues).
+- **Accessibility.** Without it, `probe-virtual-hid` refuses and `serve`
+  advertises Native tablet unavailable with that reason.
+- A real Fast User Switch and a login-window session are covered by unit
+  tests (`ConsoleWatch`, `SessionTablet`), not end to end.
 
 ### 14. Pressure: the host reads the pen; a DriverKit HID dext is not the route (2026-11-12)
 
 Question: does a DriverKit HID dext (`IOUserHIDDevice`, the
 `driverkit.family.hid.device` entitlement the profile carries) give a device
-Wacom's driver or macOS turns into pressure? Evidence on a Mac with
-macOS 26.7.2, Wacom Tablet 6.4.9, a real Intuos5 (`056a:0317`) attached:
+the tablet maker's driver or macOS turns into pressure?
 
-| Finding | Evidence |
-| --- | --- |
-| A dext's HID device is not forced to `"Virtual"`: `AppleUserHIDDevice::newTransportString` returns what the dext's `newDeviceDescription` set, while `IOHIDUserDevice::newTransportString` returns `"Virtual"` unless the creator is privileged and sets `HIDVirtualDevice` | IOHIDFamily-2238.100.59 source (`AppleUserHIDDevice.cpp`, `IOHIDUserDevice.cpp`); SDK `IOUserHIDDevice.iig` lists `kIOHIDTransportKey`, vendor and product ids as settable |
-| The real Intuos5's HID devices are themselves dext-backed (`AppleUserUSBHostHIDDevice`, class `AppleUserHIDDevice`, `Transport` `"USB"`), and Wacom reads the pen interface through an `IOHIDLibUserClient` on it | `ioreg` of the attached tablet |
-| Wacom also opens an `AppleUSBHostDeviceUserClient` on *every* USB device (hubs, camera, LAN, security key): libusb-style enumeration. Its HID manager needs a `LocationID` and applies a filter whose criteria are not documented | `ioreg`; imported symbol listing of `WacomTabletDriver` |
-| Wacom's own pressure reaches applications as CoreGraphics events: `com.wacom.IOManager` imports `CGEventPost`/`IOHIDPostEvent`; macOS has no generic HID-digitizer-to-pressure path (§13, `hosts/macos/AGENTS.md`) | imported symbols |
-| CoreGraphics tablet events from the shared Intuos5 reader reach `AppKit` with pressure | `probe-pen --intuos5`: proximity (mask `0x25c7`), 46 tablet points, `NSEvent` pressure 0.059 → 1.000, tip and barrel edges |
+- A dext's HID device is not forced to `"Virtual"`:
+  `AppleUserHIDDevice::newTransportString` returns what the dext's
+  `newDeviceDescription` set, while `IOHIDUserDevice::newTransportString`
+  returns `"Virtual"` unless the creator is privileged and sets
+  `HIDVirtualDevice` (IOHIDFamily source; the SDK's `IOUserHIDDevice.iig`
+  lists `kIOHIDTransportKey`, vendor and product ids as settable).
+- A real tablet's own HID devices are themselves dext-backed
+  (`AppleUserHIDDevice`, `Transport` `"USB"`).
+- Whether the maker's driver opens a given device depends on criteria it
+  does not document.
+- Pressure reaches applications as CoreGraphics tablet events; macOS has no
+  generic HID-digitizer-to-pressure path (§13, `hosts/macos/AGENTS.md`).
+  CoreGraphics tablet events posted from the shared Intuos5 reader reach
+  `AppKit` with pressure, tip and barrel edges (`probe-pen --intuos5`).
 
 So a dext could present `056a:0317` with `"USB"` and no virtual flag, but
-whether Wacom then opens it is unknowable without building, signing,
+whether the maker's driver then opens it is unknowable without building, signing,
 installing and approving one — and it needs a new App ID, the
 `com.apple.developer.driverkit` entitlement Apple grants on request, the
 System Extension capability on the Pier, a dext that matches the existing
 `IOHIDUserDevice` with `transport.hid` and re-publishes it (no user client,
 so no `userclient-access` request), and an approval click on every Pier. The
-host reading the pen itself needs none of that and is measured end to end on
+host reading the pen itself needs none of that and is proven end to end on
 the CoreGraphics side. The dext stays a researched fallback for vendor-driver
 features (ExpressKeys, per-application settings).
 
@@ -595,20 +604,6 @@ device units become a shared `PenSample`, the shared lead maps it, and the
 Deck draws the same pen dot as on Linux. The reader's fractions now use the
 same scaling as libinput and the X server (`value / (max + 1)`), so the
 injected event and the reported position land on the same pixel.
-
-**Measured, 2026-11-12, lab macOS Pier (macOS 26.5.2, M2 Ultra), notarized
-0.19.0 package, no Wacom driver on the host.** A Deck CLI on another Mac
-played the emulated Intuos5 stroke (three strokes, 168 pen reports) through
-Native tablet into the signed-in Aqua session, where an AppKit window proven
-topmost on a 7×7 grid logged what arrived: 174 tablet points with `NSEvent`
-pressure from 0.059 to 1.000 (17 levels), 6 proximity events, tip and
-barrel buttons (`buttonMask` 0x1 | 0x2). The Pier read the mode (0) before
-switching it (accepted), read 168 packets with none ignored, and sent 74
-host pointer positions; the Deck received all 74 (first 0.277, 0.295, last
-0.738, 0.688 of the stream). A real Intuos5 through a Deck was proven
-later (0.19.0). Not measured here: the eraser end and tilt (the scripted stroke carries neither; both
-are unit-tested from literal packets), and the mode restore (it runs only
-when an attachment ends with the Deck still connected).
 
 ## Consequences
 

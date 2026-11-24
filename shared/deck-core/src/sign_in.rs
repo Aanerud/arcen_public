@@ -203,7 +203,8 @@ impl SignInFailure {
                 | ConsoleRefusal::SessionUnreachable
                 | ConsoleRefusal::PrivacyUnavailable
                 | ConsoleRefusal::InUseOtherProduct
-                | ConsoleRefusal::OtherProductStarted => None,
+                | ConsoleRefusal::OtherProductStarted
+                | ConsoleRefusal::SignInOtherProduct => None,
             },
             Self::ConsoleRefused { ended: true, .. }
             | Self::HostBusy
@@ -249,6 +250,7 @@ impl SignInFailure {
                 | ConsoleRefusal::AccountDenied
                 | ConsoleRefusal::InUseOtherProduct
                 | ConsoleRefusal::OtherProductStarted
+                | ConsoleRefusal::SignInOtherProduct
                 | ConsoleRefusal::WaylandSession
                 | ConsoleRefusal::SignInUnavailable => true,
                 ConsoleRefusal::NoConsoleSession
@@ -559,6 +561,16 @@ fn console_message(
         ConsoleRefusal::OtherProductStarted => {
             format!("Another remote-desktop app took over {host}.")
         }
+        ConsoleRefusal::SignInOtherProduct => match detail.and_then(sign_in_product) {
+            Some(product) => format!(
+                "{product} runs sign-in on {host}. Sign in with {product} once, disconnect it, \
+                 then connect with Arcen."
+            ),
+            None => format!(
+                "Another remote-desktop app runs sign-in on {host}. Sign in with it once, \
+                 disconnect it, then connect with Arcen."
+            ),
+        },
     };
     if ended {
         format!("{host} ended your session. {sentence}")
@@ -612,6 +624,23 @@ fn console_owner(reason: &str) -> Option<&str> {
     let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '\\');
     (!owner.is_empty() && owner.chars().count() <= LIMIT && owner.chars().all(plain))
         .then_some(owner)
+}
+
+/// The product a `console_sign_in_other_product` refusal names
+/// (`console_sign_in_other_product: Lab Remote Product runs this workstation's
+/// sign-in; …`), when it is a plain name. Host text: anything else is left
+/// under Details.
+fn sign_in_product(reason: &str) -> Option<&str> {
+    const LIMIT: usize = 40;
+    let prefix = format!("{}: ", ConsoleRefusal::SignInOtherProduct.token());
+    let after = &reason[reason.find(&prefix)? + prefix.len()..];
+    let product = &after[..after.find(" runs this workstation")?];
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '+');
+    (!product.is_empty()
+        && product.chars().count() <= LIMIT
+        && product.chars().all(plain)
+        && !product.to_ascii_lowercase().starts_with("another "))
+    .then_some(product)
 }
 
 /// What the words of a refused sign-in mean, for the reasons every Pier
@@ -671,6 +700,9 @@ pub fn end_detail(end: &crate::runtime::session::SessionEnd) -> String {
         | TransientTransportError::BrokenPipe
         | TransientTransportError::NotConnected => "The connection closed unexpectedly.",
         TransientTransportError::TransientIo => "A network error interrupted the connection.",
+        TransientTransportError::SignInScreenClosed => {
+            crate::runtime::session::SIGN_IN_SCREEN_CLOSED_TEXT
+        }
     }
     .to_owned()
 }
@@ -1053,6 +1085,46 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
+    fn a_host_whose_sign_in_another_product_runs_says_which_to_use() {
+        use arcen_session::console_session::ConsoleNotice;
+        let reason = ConsoleNotice::sign_in_other_product(
+            Some("labproduct.service"),
+            Some("Lab Remote Product"),
+        )
+        .deck_reason();
+        let end = refused(&reason);
+        let failure = SignInFailure::from_end(&end, SignInStage::Attempt).unwrap();
+        assert_eq!(
+            failure,
+            SignInFailure::ConsoleRefused {
+                refusal: ConsoleRefusal::SignInOtherProduct,
+                ended: false
+            }
+        );
+        assert!(failure.is_definite());
+        assert_eq!(failure.field(), None, "an acknowledgement box");
+        assert_eq!(
+            failure.message_with("studio", Some(&end.message)),
+            "Lab Remote Product runs sign-in on studio. Sign in with Lab Remote Product once, \
+             disconnect it, then connect with Arcen."
+        );
+        // Unnamed, or a name that is not plain: the product is not named.
+        for reason in [
+            ConsoleRefusal::SignInOtherProduct.deck_reason(),
+            "console_sign_in_other_product: \u{202e}x runs this workstation's sign-in",
+            "console_sign_in_other_product: a (b) runs this workstation's sign-in",
+        ] {
+            let failure = SignInFailure::from_end(&refused(reason), SignInStage::Attempt).unwrap();
+            assert_eq!(
+                failure.message_with("studio", Some(reason)),
+                "Another remote-desktop app runs sign-in on studio. Sign in with it once, \
+                 disconnect it, then connect with Arcen."
+            );
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
     fn another_account_at_the_host_is_said_with_its_name_not_as_a_wrong_password() {
         let end = refused(
             "console_other_user: flame_db is signed in at this Mac; sign in as flame_db, or \
@@ -1294,7 +1366,7 @@ mod tests {
         assert_eq!(HostRefusal::Busy.reason_class(), "host_busy");
         // The Linux and Windows Piers' busy desktops, in the words they send.
         for busy in arcen_session::session_admission::DesktopBusyRefusal::ALL
-            .map(|refusal| refusal.deck_reason())
+            .map(arcen_session::session_admission::DesktopBusyRefusal::deck_reason)
             .into_iter()
             .chain([
                 arcen_session::session_admission::DetachedTakeoverRefusal::AnotherUsersDesktop

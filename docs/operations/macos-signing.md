@@ -1,17 +1,8 @@
 # Signing and notarising the macOS Deck
 
-Audience: whoever cuts a macOS release. This documents the **procedure**. It
-deliberately contains **no certificate name, notary profile name, or
-provisioning profile identifier** — see [Keep the private values out of the repository](#keep-the-private-values-out-of-the-repository).
-
-The Apple **Team ID** is deliberately *not* on that list. It is not a
-credential: `codesign -dv` reads it from any signed application, so every copy
-of the Deck already publishes it. It appears in `packaging/macos/*.entitlements`
-and in the release validator because signing cannot work without it, and
-removing it from the source while shipping it in the binary would be theatre
-rather than protection. What must stay out of the repository is anything that
-grants the ability to *sign*: certificates, private keys, and the notary
-keychain profile name.
+For anyone who signs a macOS build. This page gives the procedure. It holds
+no certificate name, notary profile name or provisioning profile identifier;
+see [Keep the private values out of the repository](#keep-the-private-values-out-of-the-repository).
 
 ## Why this matters
 
@@ -49,7 +40,7 @@ codesign -dv "Arcen Deck.app" 2>&1 | grep -E 'Signature|Authority'
 
 ## Release build
 
-All five inputs come from the environment; none are stored in the repository.
+Every input comes from the environment; none is stored in the repository.
 
 ```sh
 export ARCEN_CODESIGN_IDENTITY="Developer ID Application: <NAME> (<TEAM_ID>)"
@@ -82,6 +73,25 @@ The script then, in order:
 If step 6 or 7 is skipped, **the artefact is not releasable** — see the table
 above.
 
+### How the build checks the signing inputs
+
+`build-deck-app.sh` takes the provisioning profile, signing identity and
+notary credentials only through the environment variables above. It never
+lists, logs or copies them into the repository. Before it decodes or embeds a
+profile, it verifies the profile's CMS signature and Apple's provisioning
+trust chain, with the checked-in Security.framework verifier; the exit status
+of `security cms` alone is never taken as proof of the signer. It embeds the
+profile before hardened-runtime signing.
+
+In release mode it decodes the profile's metadata to temporary files, checks
+the team and application identity, the expiry, the authorised entitlements
+and the Developer ID Application certificate class, then deletes the
+metadata. Notarisation, stapling and a Gatekeeper assessment of the artefact
+are all required; none is optional in release mode.
+
+Adversarial tests of the CMS check use an untrusted CMS fixture kept outside
+the repository; they never generate or log profiles, certificates or keys.
+
 ### One-time notary keychain profile
 
 `notarytool` reads credentials from a named keychain profile so no secret ever
@@ -112,12 +122,9 @@ never seen the source tree, and open it.
 
 ## What must stay real in the repository
 
-There is an important distinction between *secrets* and *identifiers*.
-
-The **Team ID and bundle ID are not secrets**. They are embedded in every signed
-binary you ship and anyone can read them out of a release artefact with
-`codesign -d`. Hiding them buys nothing. More importantly, they are **functional
-build inputs**: these files must contain the real values or the build fails.
+The **Team ID and bundle ID are not secrets**. `codesign -d` reads them from
+any signed copy of the Deck, so every release already publishes them. They
+are also **build inputs**: these files must hold the real values.
 
 | File | Must contain |
 | --- | --- |
@@ -127,14 +134,14 @@ build inputs**: these files must contain the real values or the build fails.
 | `packaging/macos/tech.arcen.deck.usbhelper.plist` | real helper bundle id |
 | `packaging/macos/validate_release_inputs.py` | real `TEAM_ID` / `BUNDLE_ID` constants |
 
-Team and bundle identifiers are functional public build inputs; do not
-anonymise them. Placeholders would still compile and pass unit tests, but a
-`--release` build fails release metadata validation
+Do not replace them with placeholders. A placeholder still compiles and passes
+the unit tests, but a `--release` build then fails metadata validation
 (`provisioning profile team identifier does not match`) because the
 entitlements no longer match the provisioning profile. Treat these files as
 code, not prose.
 
-By contrast, the genuinely secret material below must never be committed.
+What must stay out of the repository is anything that grants the ability to
+*sign*: certificates, private keys and the notary keychain profile name.
 
 ## Keep the private values out of the repository
 
@@ -167,13 +174,13 @@ the way an un-notarised macOS bundle is.
 
 ## If you are not signing
 
-Publishing an unsigned macOS build is a legitimate choice for a project with no
-support commitment, but say so plainly in the release notes and tell people the
-workaround, or they will reasonably assume the download is broken:
+An unsigned macOS build is fine for your own use. If you publish one, say so
+in the release notes and give the workaround, or people will take the
+download for broken:
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/Arcen Deck.app"
 ```
 
-Better still, ship macOS as source-only and let people build it, which is what
-the AGPL expects anyway.
+Signed and notarised builds come from TUTTIFRUTTI AS; anyone may also build
+the Deck from source.

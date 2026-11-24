@@ -435,7 +435,8 @@ fn parse_args() -> Result<Options, String> {
                      \x20            the Deck leaves. Writes /etc/X11/xorg.conf.d/\n\
                      \x20            10-arcen-console-outputs.conf; read at the next X server start\n\
                      \x20            (reboot, or restart the display manager with nobody signed in).\n\
-                     --no-console-outputs  Remove that file (--uninstall does too).\n\
+                     --no-console-outputs  Remove that file (--uninstall does too, and\n\
+                     \x20            remembers its heads for the next install; --purge forgets).\n\
                      \n\
                      --extra-san  Add a DNS name or IP address to the generated TLS\n\
                      \x20            certificate. Repeatable, or comma-separated. Use this when\n\
@@ -1209,7 +1210,7 @@ fn install_logged(options: &Options, log: &mut desktop::InstallLog) -> Result<()
     install_login_session(options, log)?;
     install_domain_logon(options, log)?;
     install_xorg_bridge_ignore(options, log)?;
-    console_outputs::apply(options, options.console_outputs.as_ref(), log)?;
+    console_outputs::install(options, log)?;
     if native_tablet::apply_choice(options, options.native_tablet, log)? {
         native_tablet::ensure(options, options.no_native_tablet_modules, log);
     }

@@ -68,7 +68,7 @@ answers, and the Pier asks polkit (`pkcheck`) about each seated desktop
 before handing it over, refusing it on any grant.
 
 Details: [the Wayland provider](../architecture/linux-wayland-provider.md)
-(how each part works, with lab evidence),
+(how each part works),
 [the administration guide](../operations/pier-administration.md#which-desktop-a-linux-pier-serves)
 (choosing, qualifying, native desktops, polkit, the optional GNOME prefix),
 [ADR 0014](../adr/0014-quic-lanes-and-capture-contracts.md) (capture

@@ -1073,12 +1073,13 @@ impl Launcher {
             &endpoint,
             saved_mode,
         );
-        let mode = resolve_attempt_displays_mode(
+        let resolved = resolve_attempt_displays_mode(
             &mut self.pending_displays_override,
             &endpoint,
             saved_mode,
-        )
-        .unwrap_or(self.settings.displays_mode);
+        );
+        let displays_note = arcen_deck_core::connect_plan::attempt_displays_note(source, resolved);
+        let mode = resolved.unwrap_or(self.settings.displays_mode);
         tracing::info!(
             target: "arcen::display",
             mode = mode.as_wire(),
@@ -1128,7 +1129,10 @@ impl Launcher {
             .map(|selection| selection.topology.clone());
         self.display_fit.reset();
         self.generation = self.generation.wrapping_add(1);
-        self.status = format!("Connecting to {}...", draft.display_name());
+        self.status = match displays_note {
+            Some(note) => format!("Connecting to {}... {note}", draft.display_name()),
+            None => format!("Connecting to {}...", draft.display_name()),
+        };
         draft.display_name().clone_into(&mut self.session_title);
         self.configure_reconnect(&draft, &options);
         let holder_nonce = self
@@ -1614,7 +1618,8 @@ impl Launcher {
 
     /// Retries `draft` with a display recovery's choice (the shared
     /// `DisplaysRecoveryRetry`): the one-shot Displays mode, the desktop
-    /// replacement, the choice remembered on the saved connection.
+    /// replacement, and a choice to remember on the saved connection
+    /// should a recovery ever ask for one (none does).
     fn retry_display_recovery(
         &mut self,
         draft: ConnectionDraft,
@@ -1833,7 +1838,11 @@ impl Launcher {
             return false;
         };
         let due = if followable {
-            handover.schedule.session_ended(now)
+            arcen_deck_core::reconnect_flow::login_window_reconnect_due(
+                &mut handover.schedule,
+                end,
+                now,
+            )
         } else {
             None
         };

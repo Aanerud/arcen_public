@@ -6,6 +6,46 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.21.2] — 2026-11-24
+
+The Linux Pier no longer mistakes a Bluetooth keyboard or a desk driver for
+another remote-desktop product, and the Decks say what to do when one runs a
+workstation's sign-in. ⌘+ and ⌘− now reach the host.
+
+### Linux Pier
+
+- On a workstation whose sign-in another remote-desktop product runs, a
+  sign-in with nobody signed in now names that product and asks you to sign
+  in with it first.
+- On such a workstation, a desktop that does not lock when you leave stays
+  private until it locks.
+- Reinstalling after `--uninstall` forces the console outputs that
+  `--console-outputs` chose again, so the console keeps its extra displays.
+- Arcen no longer mistakes a Bluetooth keyboard, or the driver of a grading
+  panel, mouse or key remapper at the desk, for another remote-desktop
+  product, so it no longer refuses or ends a session because of one. The
+  driver must run as a system service from its package.
+
+### macOS Pier (preview)
+
+- Control+arrow from a Deck switches Spaces on the Mac. Thanks, Taylor-VN.
+
+### macOS Deck and Windows Deck
+
+- When another remote-desktop product runs a workstation's sign-in, the
+  Deck names it and says what to do.
+- ⌘+ and ⌘− (Ctrl+ and Ctrl− on Windows) reach the host and no longer zoom
+  the Deck's window. Thanks, Taylor-VN.
+- Connecting names the saved connection and the username you typed.
+- Test connection on the connection form shows its verdict beside the
+  button and scrolls the report into view.
+- In the smallest window, Test connection no longer runs under the
+  connection form's Cancel button.
+- Use Primary Display Only holds for that session only: the next
+  connection asks the host for your whole layout again.
+- Signing in at a host's sign-in screen no longer logs an error while the
+  Deck moves to your desktop.
+
 ## [0.21.1] — 2026-11-24
 
 A security release: every Pier should update, and every Deck too. It updates
@@ -1327,7 +1367,8 @@ exist.
   and SmartScreen prompts.
 - The macOS Pier, a Linux Deck and a Windows Deck do not exist yet.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.2...HEAD
+[0.21.2]: https://github.com/Aanerud/arcen_public/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/Aanerud/arcen_public/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/Aanerud/arcen_public/compare/v0.20.8-build2...v0.21.0
 [0.20.8]: https://github.com/Aanerud/arcen_public/compare/v0.20.7...v0.20.8

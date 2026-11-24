@@ -35,14 +35,83 @@ const DISPLAY_MANAGER_UNIT: &str = "/etc/systemd/system/display-manager.service"
 const START_TIMEOUT: Duration = Duration::from_secs(25);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// GDM's runtime settings (`gdm-runtime-config`), which answer first:
+/// `/run/gdm`, or `/run/gdm3` where GDM is packaged as `gdm3`.
+const GDM_RUNTIME_SETTINGS: &[&str] = &["/run/gdm/custom.conf", "/run/gdm3/custom.conf"];
+/// The administrator's GDM settings.
+const GDM_SETTINGS: &[&str] = &[
+    "/etc/gdm/custom.conf",
+    "/etc/gdm3/custom.conf",
+    "/etc/gdm3/daemon.conf",
+];
+/// A settings file larger than this is not GDM's: unreadable.
+const GDM_SETTINGS_MAX: u64 = 64 * 1024;
+/// GDM's daemon, which prints its version (`GDM 40.1`) and exits: `gdm`,
+/// or `gdm3` where GDM is packaged as `gdm3`.
+const GDM_BINARIES: &[&str] = &["/usr/sbin/gdm", "/usr/sbin/gdm3"];
+
 /// The unit `display-manager.service` points at (`systemctl enable gdm`
 /// links it), or `None` without one.
-fn display_manager_target() -> Option<String> {
+pub(crate) fn display_manager_target() -> Option<String> {
     std::fs::symlink_metadata(DISPLAY_MANAGER_UNIT).ok()?;
     let target = std::fs::canonicalize(DISPLAY_MANAGER_UNIT)
         .ok()
         .or_else(|| std::fs::read_link(DISPLAY_MANAGER_UNIT).ok())?;
     Some(target.file_name()?.to_string_lossy().into_owned())
+}
+
+/// What `program` prints (at most 4 KiB, trimmed), asked with a bound;
+/// `None` when it fails, prints nothing or does not answer in time.
+fn bounded_output(program: &str, args: &[&str]) -> Option<String> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut text = String::new();
+    child
+        .stdout
+        .take()?
+        .take(4096)
+        .read_to_string(&mut text)
+        .ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// How systemd describes `unit` (its `Description=`), asked with a bound;
+/// `None` when it does not answer. Only to name the product that runs the
+/// workstation's sign-in.
+pub(crate) fn unit_description(unit: &str) -> Option<String> {
+    bounded_output(
+        "/usr/bin/systemctl",
+        &["show", "--property=Description", "--value", "--", unit],
+    )
+}
+
+/// GDM's major version, from the first of `binaries` that exists, asked
+/// with a bound; `None` when it cannot be known.
+fn gdm_major_version_of(binaries: &[&Path]) -> Option<u32> {
+    let binary = binaries.iter().find(|binary| binary.is_file())?;
+    let output = bounded_output(binary.to_str()?, &["--version"])?;
+    model::local_login_screen::gdm_major_version(&output)
 }
 
 /// Whether `display-manager.service` is running, asked of systemd with a
@@ -73,19 +142,101 @@ fn display_manager_active() -> bool {
     }
 }
 
+/// One GDM settings file as read: its text, absent, or unreadable.
+enum SettingsRead {
+    Absent,
+    Read(String),
+    Unreadable,
+}
+
+impl SettingsRead {
+    fn of(path: &Path) -> Self {
+        use std::io::Read as _;
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Self::Absent,
+            Err(_) => return Self::Unreadable,
+        };
+        let mut text = String::new();
+        match file.take(GDM_SETTINGS_MAX + 1).read_to_string(&mut text) {
+            Ok(read) if (read as u64) <= GDM_SETTINGS_MAX => Self::Read(text),
+            _ => Self::Unreadable,
+        }
+    }
+
+    /// The first of `paths` that exists.
+    fn first(paths: &[&Path]) -> Self {
+        paths
+            .iter()
+            .map(|path| Self::of(path))
+            .find(|read| !matches!(read, Self::Absent))
+            .unwrap_or(Self::Absent)
+    }
+
+    fn file(&self) -> model::local_login_screen::SettingsFile<'_> {
+        use model::local_login_screen::SettingsFile;
+        match self {
+            Self::Absent => SettingsFile::Absent,
+            Self::Read(text) => SettingsFile::Read(text),
+            Self::Unreadable => SettingsFile::Unreadable,
+        }
+    }
+}
+
+/// Whether GDM (major version `gdm_major`, `None`: unknown) runs its local
+/// login screen, from its runtime settings (the first of `runtime` that
+/// exists) over the administrator's (the first of `custom`); `None` when
+/// that cannot be known (`local_login_screen::gdm_shows_local_login_screen`).
+fn gdm_shows_local_login_screen_from(
+    gdm_major: Option<u32>,
+    runtime: &[&Path],
+    custom: &[&Path],
+) -> Option<bool> {
+    let runtime = SettingsRead::first(runtime);
+    let custom = SettingsRead::first(custom);
+    model::local_login_screen::gdm_shows_local_login_screen(
+        gdm_major,
+        runtime.file(),
+        custom.file(),
+    )
+}
+
+fn gdm_shows_local_login_screen() -> Option<bool> {
+    let paths = |paths: &'static [&'static str]| -> Vec<&'static Path> {
+        paths.iter().map(Path::new).collect()
+    };
+    let gdm_major = gdm_major_version_of(&paths(GDM_BINARIES));
+    tracing::debug!(
+        target: target::SESSION,
+        gdm_major = gdm_major.unwrap_or(0),
+        "console host: GDM version (0: unknown)"
+    );
+    gdm_shows_local_login_screen_from(
+        gdm_major,
+        &paths(GDM_RUNTIME_SETTINGS),
+        &paths(GDM_SETTINGS),
+    )
+}
+
 /// The host facts a console decision needs beside logind's sessions: a
 /// display manager counts when one is configured, or when whatever is
 /// aliased as the display manager (another product's unit) is running
-/// (`ConsoleHost::from_display_manager`).
+/// (`ConsoleHost::from_display_manager`); for such a product, whether it
+/// keeps GDM's local login screen off (GDM's settings are read only then).
 pub(crate) fn console_host() -> model::ConsoleHost {
     let unit = display_manager_target();
     let active = unit.is_some() && display_manager_active();
-    let host = model::ConsoleHost::from_display_manager(unit.as_deref(), active);
+    let host = model::ConsoleHost::from_display_manager_and_gdm(
+        unit.as_deref(),
+        active,
+        gdm_shows_local_login_screen,
+    );
     tracing::debug!(
         target: target::SESSION,
         display_manager_unit = unit.as_deref().unwrap_or(""),
         display_manager_active = active,
         display_manager = host.display_manager,
+        login_screen = host.login_screen.token(),
         "console host: display manager"
     );
     host
@@ -660,5 +811,78 @@ mod tests {
             "x".repeat(MAX_DISPLAY_FACTS_BYTES + 1),
         ];
         assert!(display_facts(&long).is_err());
+    }
+
+    #[test]
+    fn gdm_settings_are_read_runtime_first_and_unknown_when_unreadable() {
+        let dir = std::env::temp_dir().join(format!("arcen-gdm-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).expect("fixture");
+            path
+        };
+        // A product's runtime settings, as it writes them, over a stock
+        // administrator's file.
+        let product = write(
+            "run-custom.conf",
+            "[daemon]\nWaylandEnable=false\n[xdmcp]\nEnable=true\nShowLocalGreeter=false\nPort=-1\n",
+        );
+        let stock = write(
+            "etc-custom.conf",
+            "[daemon]\nWaylandEnable=false\n[security]\n[xdmcp]\n[chooser]\n[debug]\n",
+        );
+        let plain_runtime = write("run-plain.conf", "[daemon]\nWaylandEnable=false\n");
+        let missing = dir.join("missing.conf");
+        let unreadable = dir.join("a-directory");
+        std::fs::create_dir_all(&unreadable).expect("fixture dir");
+        let huge = write(
+            "huge.conf",
+            &"#".repeat(usize::try_from(GDM_SETTINGS_MAX).unwrap() + 1),
+        );
+        let read = |runtime: &[&Path], custom: &[&Path]| {
+            gdm_shows_local_login_screen_from(Some(40), runtime, custom)
+        };
+        assert_eq!(read(&[&missing], &[&missing]), Some(true), "stock GDM");
+        assert_eq!(read(&[&plain_runtime], &[&stock]), Some(true));
+        assert_eq!(read(&[&product], &[&stock]), Some(false));
+        // The first runtime file that exists answers (gdm, then gdm3).
+        assert_eq!(read(&[&missing, &product], &[&stock]), Some(false));
+        assert_eq!(read(&[&plain_runtime, &product], &[&stock]), Some(true));
+        // A file that exists but cannot be read is not "absent".
+        assert_eq!(read(&[&unreadable, &product], &[&stock]), None);
+        assert_eq!(read(&[&missing], &[&huge]), None);
+        // GDM 51 reads `[daemon]`; GDM 50 has no switch; a GDM of unknown
+        // version with the switch off is unproven.
+        let gdm51 = write(
+            "run-gdm51.conf",
+            "[daemon]\nWaylandEnable=false\nShowLocalGreeter=false\n",
+        );
+        assert_eq!(
+            gdm_shows_local_login_screen_from(Some(51), &[&gdm51], &[&stock]),
+            Some(false)
+        );
+        assert_eq!(
+            gdm_shows_local_login_screen_from(Some(50), &[&product], &[&stock]),
+            Some(true)
+        );
+        assert_eq!(
+            gdm_shows_local_login_screen_from(None, &[&product], &[&stock]),
+            None
+        );
+        // The version comes from the first GDM binary that exists; none, or
+        // one that prints no version, is unknown.
+        let fake_gdm = write("gdm", "#!/bin/sh\necho \"GDM 51.0\"\n");
+        let silent_gdm = write("gdm3", "#!/bin/sh\nexit 0\n");
+        for script in [&fake_gdm, &silent_gdm] {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755))
+                .expect("fixture mode");
+        }
+        assert_eq!(gdm_major_version_of(&[&missing, &fake_gdm]), Some(51));
+        assert_eq!(gdm_major_version_of(&[&silent_gdm, &fake_gdm]), None);
+        assert_eq!(gdm_major_version_of(&[&missing]), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

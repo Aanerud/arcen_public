@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(current.wire_buttons(held), PEN_BUTTON_RIGHT_CLICK);
         // A Linux Pier from before the meaning clicks the right button for
         // BTN_STYLUS2, bit 1: the barrel must arrive there, not on BTN_STYLUS
-        // (the middle click Tim's barrel became on the Z8).
+        // (the middle click a field user's barrel became).
         let old_linux = PenButtonMap {
             host: linux(InputCapabilityAvailability::Unknown),
             ..current

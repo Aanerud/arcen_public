@@ -23,6 +23,7 @@ pub mod detached_hold;
 pub mod domain_logon;
 pub mod foreign_service;
 pub mod greeter_token;
+pub mod local_login_screen;
 pub mod lock_wait;
 pub mod login_screen;
 pub mod login_session;
@@ -34,6 +35,7 @@ pub mod wayland_attach;
 pub mod wayland_join;
 
 pub use foreign_service::{ConsoleNotice, ForeignService, other_product_holder};
+pub use local_login_screen::LoginScreen;
 pub use logind_read::{SessionRead, SessionsUnreadable};
 
 /// How a Linux Pier serves a sign-in (`platform.session.mode`).
@@ -254,12 +256,17 @@ pub struct ConsoleHost {
     /// login screen completes a remote-first sign-in, and its absence on
     /// `seat0` is a failure, not an invitation.
     pub display_manager: bool,
+    /// Whether that display manager's login screen may be on the console:
+    /// [`LoginScreen::Withheld`] when another product is the display
+    /// manager and runs GDM without its local login screen.
+    pub login_screen: LoginScreen,
 }
 
 impl Default for ConsoleHost {
     fn default() -> Self {
         Self {
             display_manager: true,
+            login_screen: LoginScreen::Shown,
         }
     }
 }
@@ -294,7 +301,25 @@ impl ConsoleHost {
             None => false,
             Some(unit) => active || DISPLAY_MANAGER_UNITS.contains(&unit),
         };
-        Self { display_manager }
+        Self {
+            display_manager,
+            login_screen: LoginScreen::Shown,
+        }
+    }
+
+    /// [`Self::from_display_manager`], with whether GDM shows its local
+    /// login screen ([`local_login_screen::gdm_shows_local_login_screen`]),
+    /// asked only when another product's running unit is the display
+    /// manager ([`LoginScreen::of`]).
+    #[must_use]
+    pub fn from_display_manager_and_gdm(
+        alias_target: Option<&str>,
+        active: bool,
+        gdm_shows_local: impl FnOnce() -> Option<bool>,
+    ) -> Self {
+        let mut host = Self::from_display_manager(alias_target, active);
+        host.login_screen = LoginScreen::of(alias_target, host.display_manager, gdm_shows_local);
+        host
     }
 }
 
@@ -316,7 +341,10 @@ pub fn decide(sessions: &[ConsoleSessionFact], uid: u32) -> ConsoleDecision {
 ///
 /// With nothing on the console seat, a host without a display manager gets
 /// Arcen's own login session for the account; one with a display manager
-/// whose login screen is missing refuses.
+/// whose login screen is missing refuses. Where another product runs the
+/// console's sign-in ([`LoginScreen::Withheld`]) nothing is signed in
+/// through a login screen, not even one left on the seat: the sign-in is
+/// refused with [`ConsoleRefusal::SignInOtherProduct`].
 #[must_use]
 pub fn decide_on(sessions: &[ConsoleSessionFact], uid: u32, host: ConsoleHost) -> ConsoleDecision {
     let desktops = || sessions.iter().filter(|s| s.is_console_desktop());
@@ -344,6 +372,9 @@ pub fn decide_on(sessions: &[ConsoleSessionFact], uid: u32, host: ConsoleHost) -
         .min_by_key(|s| (s.is_wayland(), s.state != "online"));
     if let Some(mine) = mine {
         return attach(mine, true);
+    }
+    if host.login_screen.refuses_sign_in() {
+        return ConsoleDecision::Refuse(ConsoleRefusal::SignInOtherProduct);
     }
     match sessions.iter().find(|s| s.is_console_greeter()) {
         Some(greeter) if greeter.is_wayland() => {
@@ -550,11 +581,16 @@ pub enum ConsoleRefusal {
     /// Arcen steps aside rather than fight it for the GPU and the virtual
     /// terminal; the account's Arcen desktop is not ended.
     OtherProductStarted,
+    /// Nobody is signed in, and another remote-desktop product runs the
+    /// workstation's sign-in: it is the display manager and keeps GDM's
+    /// login screen off the console ([`LoginScreen::Withheld`]). Signing
+    /// in with that product once gives the account a desktop Arcen joins.
+    SignInOtherProduct,
 }
 
 impl ConsoleRefusal {
     /// Every refusal (the error-code reference checks each has a row).
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::OtherUser,
         Self::OtherUserOtherProduct,
         Self::WaylandSession,
@@ -568,6 +604,7 @@ impl ConsoleRefusal {
         Self::AccountDenied,
         Self::InUseOtherProduct,
         Self::OtherProductStarted,
+        Self::SignInOtherProduct,
     ];
 
     /// The refusal for another account's session of `origin`.
@@ -597,6 +634,7 @@ impl ConsoleRefusal {
             Self::AccountDenied => "console_account_denied",
             Self::InUseOtherProduct => "console_in_use_other_product",
             Self::OtherProductStarted => "console_other_product_started",
+            Self::SignInOtherProduct => "console_sign_in_other_product",
         }
     }
 
@@ -644,6 +682,9 @@ impl ConsoleRefusal {
             Self::OtherProductStarted => {
                 "console_other_product_started: another remote-desktop product took over this workstation."
             }
+            Self::SignInOtherProduct => {
+                "console_sign_in_other_product: another remote-desktop product runs this workstation's sign-in; sign in with it first."
+            }
         }
     }
 }
@@ -687,15 +728,152 @@ pub struct InputDeviceFact {
 
 /// Who holds the kernel's interfaces for input devices made in user space
 /// (`/dev/uinput`, `/dev/uhid`) open. A device made through them exists
-/// only while its creator holds one.
+/// only while its creator holds one, so only the holders of the interface
+/// that made a device ([`UserSpaceInputInterface::of_device`],
+/// [`HeldInterfaces::could_make`]) are asked about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserSpaceInputCreators {
-    /// Nobody, or only Arcen's own processes.
+    /// Nobody, or only Arcen's own processes and drivers for hardware at
+    /// the desk ([`local_input_driver`]).
     ArcenOnly,
-    /// A process that is not Arcen's.
+    /// A process that is neither.
     Other,
     /// Could not be read.
     Unknown,
+}
+
+/// Executables (by file name) of system services that make devices
+/// through `/dev/uinput` or `/dev/uhid` only for hardware at the desk, and
+/// offer no other program a way to type or point through them (no
+/// injection command, no plugins). Their devices never mean another
+/// product's client is using the desktop. A tool that another program can
+/// drive (an input-automation daemon, a remapper with a text or macro
+/// command, a streaming client) is never listed: a remote product could
+/// type through it. The reasoning is ADR 0025 §8 (amended for 0.21.2).
+pub const LOCAL_INPUT_DRIVERS: [&str; 4] = [
+    // A colour-grading panel's service: the panel's own keyboard and mouse.
+    "TangentHub",
+    // BlueZ: Bluetooth keyboards and mice through uhid, always on the
+    // Bluetooth bus (src/shared/uhid.c).
+    "bluetoothd",
+    // A mouse and keyboard configuration daemon: the mouse's remapped
+    // buttons and gestures; its D-Bus interface configures, never types.
+    "logid",
+    // A key remapper: re-emits the desk's keyboard; its control socket
+    // switches modes only.
+    "xremap",
+];
+
+/// The kernel's interfaces for input devices made in user space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserSpaceInputInterface {
+    /// `/dev/uinput`: the device has no parent at all
+    /// (`/sys/devices/virtual/input/inputN`).
+    Uinput,
+    /// `/dev/uhid`: the device's parent is the uhid misc device
+    /// (`/sys/devices/virtual/misc/uhid/…`).
+    Uhid,
+}
+
+impl UserSpaceInputInterface {
+    /// Which interface could have made the input device at
+    /// `sysfs_device` (its `/sys/class/input/eventN/device`, resolved).
+    /// `None`: any of them (a parentless device elsewhere).
+    ///
+    /// A device made through one interface exists only while a process
+    /// holds that interface open, so a process holding only the other
+    /// cannot be its creator: bluetoothd holding `/dev/uhid` for the desk's
+    /// Bluetooth keyboard does not make a uinput device another product's.
+    /// A kernel driver's parentless device also has the uinput shape; it is
+    /// treated as uinput's, as before.
+    #[must_use]
+    pub fn of_device(sysfs_device: &str) -> Option<Self> {
+        if sysfs_device.starts_with("/sys/devices/virtual/misc/uhid/") {
+            return Some(Self::Uhid);
+        }
+        let node = sysfs_device.strip_prefix("/sys/devices/virtual/input/")?;
+        (node.starts_with("input") && !node.contains('/')).then_some(Self::Uinput)
+    }
+}
+
+/// Which user-space input interfaces one process holds open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HeldInterfaces {
+    pub uinput: bool,
+    pub uhid: bool,
+}
+
+impl HeldInterfaces {
+    /// Whether a process holding these could have made a device made
+    /// through `interface` (`None`: through any of them).
+    #[must_use]
+    pub const fn could_make(self, interface: Option<UserSpaceInputInterface>) -> bool {
+        match interface {
+            Some(UserSpaceInputInterface::Uinput) => self.uinput,
+            Some(UserSpaceInputInterface::Uhid) => self.uhid,
+            None => self.uinput || self.uhid,
+        }
+    }
+}
+
+/// The owner and mode of the file a process runs (as `stat` reports them
+/// for the running file itself, not for a path that may since name
+/// another).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutableOwner {
+    pub uid: u32,
+    pub gid: u32,
+    /// `st_mode`, file type bits included.
+    pub mode: u32,
+}
+
+impl ExecutableOwner {
+    /// A regular file owned by root that only root can change (no write
+    /// bit for others, and for its group only when that group is root's).
+    #[must_use]
+    pub const fn root_only(self) -> bool {
+        self.mode & 0o170_000 == 0o100_000
+            && self.uid == 0
+            && self.mode & 0o002 == 0
+            && (self.mode & 0o020 == 0 || self.gid == 0)
+    }
+}
+
+/// What the Pier read about a process holding a user-space input interface
+/// whose executable names a [`LOCAL_INPUT_DRIVERS`] entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDriverFacts {
+    /// All of its user IDs (real, effective, saved, file system) are root's.
+    pub runs_as_root: bool,
+    /// The running file's owner and mode (`None`: unreadable).
+    pub executable: Option<ExecutableOwner>,
+}
+
+/// Whether `executable_path`'s file name is a [`LOCAL_INPUT_DRIVERS`] entry
+/// (a ` (deleted)` suffix after an update ignored). Names only: the Pier
+/// reads [`LocalDriverFacts`] for such a process and asks
+/// [`local_input_driver`].
+#[must_use]
+pub fn local_input_driver_name(executable_path: &str) -> bool {
+    let path = executable_path
+        .strip_suffix(" (deleted)")
+        .unwrap_or(executable_path);
+    let name = path.rsplit('/').next().unwrap_or(path);
+    LOCAL_INPUT_DRIVERS.contains(&name)
+}
+
+/// Whether the process whose executable is `executable_path` is a driver
+/// for hardware at the desk: its file name is a [`LOCAL_INPUT_DRIVERS`]
+/// entry, it runs as root, and the file it runs is root's and writable by
+/// root only. The name alone is never enough: anyone can name a program
+/// `TangentHub`. A program the session's user started or installed (in a
+/// home directory, under a name of their choosing, open to their own
+/// programs' tracing) never counts as a driver at the desk.
+#[must_use]
+pub fn local_input_driver(executable_path: &str, facts: LocalDriverFacts) -> bool {
+    local_input_driver_name(executable_path)
+        && facts.runs_as_root
+        && facts.executable.is_some_and(ExecutableOwner::root_only)
 }
 
 impl UserSpaceInputCreators {
@@ -821,6 +999,24 @@ pub enum UnlockedHandBack {
 /// and unusable for good. A lock that only failed for a moment (a busy
 /// shell) is retried and taken well within it.
 pub const UNLOCKED_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl UnlockedHandBack {
+    /// This decision on a console whose login screen is `login_screen`: a
+    /// session that would be put behind a login screen stays private
+    /// instead where GDM may not be asked for one
+    /// ([`LoginScreen::may_ask_for_login_screen`]): such a login screen
+    /// never reaches the console and later takes the GPU from the product
+    /// that runs it.
+    #[must_use]
+    pub const fn on(self, login_screen: LoginScreen) -> Self {
+        match self {
+            Self::BehindLoginScreen if !login_screen.may_ask_for_login_screen() => {
+                Self::KeepPrivate
+            }
+            decision => decision,
+        }
+    }
+}
 
 /// What logind said about a console session.
 #[derive(Debug, Clone, Copy)]
@@ -1305,9 +1501,137 @@ mod tests {
     }
 
     #[test]
+    fn a_product_that_runs_the_sign_in_is_never_bypassed_through_a_login_screen() {
+        let gdm =
+            ConsoleHost::from_display_manager_and_gdm(Some("gdm.service"), true, || Some(false));
+        let withheld =
+            ConsoleHost::from_display_manager_and_gdm(Some("labproduct.service"), true, || {
+                Some(false)
+            });
+        let shown =
+            ConsoleHost::from_display_manager_and_gdm(Some("labproduct.service"), true, || {
+                Some(true)
+            });
+        let unproven =
+            ConsoleHost::from_display_manager_and_gdm(Some("labproduct.service"), true, || None);
+        let stopped =
+            ConsoleHost::from_display_manager_and_gdm(Some("labproduct.service"), false, || {
+                Some(false)
+            });
+        assert_eq!(gdm, ConsoleHost::default(), "GDM as the display manager");
+        assert_eq!(withheld.login_screen, LoginScreen::Withheld);
+        assert!(withheld.display_manager);
+        assert_eq!(stopped.login_screen, LoginScreen::Shown);
+        assert!(!stopped.display_manager);
+        let mut product_desktop = session("26", TIM, "user", "x11", true);
+        product_desktop.service = "labproduct-session".into();
+        let mut others = product_desktop.clone();
+        others.uid = OTHER;
+        let sign_in = ConsoleDecision::SignInThroughGreeter {
+            greeter: "c1".into(),
+        };
+        let refused = ConsoleDecision::Refuse(ConsoleRefusal::SignInOtherProduct);
+        let rows: Vec<(&str, Vec<ConsoleSessionFact>, ConsoleHost, ConsoleDecision)> = vec![
+            // GDM shows its login screen: unchanged.
+            ("gdm, greeter", vec![greeter(true)], gdm, sign_in.clone()),
+            (
+                "gdm, nothing",
+                vec![],
+                gdm,
+                ConsoleDecision::Refuse(ConsoleRefusal::NoConsoleSession),
+            ),
+            (
+                "product shows it",
+                vec![greeter(true)],
+                shown,
+                sign_in.clone(),
+            ),
+            ("product, unproven", vec![greeter(true)], unproven, sign_in),
+            (
+                "product unproven, nothing",
+                vec![],
+                unproven,
+                ConsoleDecision::Refuse(ConsoleRefusal::NoConsoleSession),
+            ),
+            (
+                "product stopped",
+                vec![],
+                stopped,
+                ConsoleDecision::StartLoginSession { vt: 7 },
+            ),
+            // The product runs the sign-in: refused, a leftover login
+            // screen (even a Wayland one) included.
+            ("withheld, nothing", vec![], withheld, refused.clone()),
+            (
+                "withheld, leftover",
+                vec![greeter(true)],
+                withheld,
+                refused.clone(),
+            ),
+            (
+                "withheld, leftover Wayland",
+                vec![{
+                    let mut wayland = greeter(false);
+                    wayland.session_type = "wayland".into();
+                    wayland
+                }],
+                withheld,
+                refused,
+            ),
+            // The account's desktop in the product is joined as before.
+            (
+                "withheld, own desktop",
+                vec![greeter(false), product_desktop],
+                withheld,
+                ConsoleDecision::Attach {
+                    session: "26".into(),
+                    activate: false,
+                    origin: ConsoleOrigin::OtherProduct,
+                },
+            ),
+            (
+                "withheld, another account",
+                vec![others],
+                withheld,
+                ConsoleDecision::Refuse(ConsoleRefusal::OtherUserOtherProduct),
+            ),
+        ];
+        for (row, sessions, host, expected) in rows {
+            assert_eq!(decide_on(&sessions, TIM, host), expected, "{row}");
+        }
+    }
+
+    #[test]
+    fn a_session_that_did_not_lock_is_kept_private_where_gdm_may_not_be_asked() {
+        let front = session("26", TIM, "user", "x11", true);
+        let behind = unlocked_hand_back(SessionLookup::Known {
+            fact: &front,
+            display_alive: true,
+        });
+        assert_eq!(behind, UnlockedHandBack::BehindLoginScreen);
+        assert_eq!(behind.on(LoginScreen::Shown), behind, "GDM's own host");
+        assert_eq!(
+            behind.on(LoginScreen::Withheld),
+            UnlockedHandBack::KeepPrivate
+        );
+        assert_eq!(
+            behind.on(LoginScreen::Unproven),
+            UnlockedHandBack::KeepPrivate
+        );
+        for other in [
+            UnlockedHandBack::Gone,
+            UnlockedHandBack::InBackground,
+            UnlockedHandBack::KeepPrivate,
+        ] {
+            assert_eq!(other.on(LoginScreen::Withheld), other);
+        }
+    }
+
+    #[test]
     fn a_host_without_a_display_manager_gets_a_real_login_session_once_per_account() {
         let no_dm = ConsoleHost {
             display_manager: false,
+            login_screen: LoginScreen::Shown,
         };
         assert_eq!(
             decide_on(&[], TIM, no_dm),
@@ -1549,6 +1873,115 @@ mod tests {
         keyboard_or_pointer: true,
         bus: 0,
     };
+
+    /// A root service running a packaged file (`-rwxr-xr-x root root`).
+    const ROOT_SERVICE: LocalDriverFacts = LocalDriverFacts {
+        runs_as_root: true,
+        executable: Some(ExecutableOwner {
+            uid: 0,
+            gid: 0,
+            mode: 0o100_755,
+        }),
+    };
+
+    #[test]
+    fn a_driver_at_the_desk_is_not_a_remote_product() {
+        for driver in [
+            "/opt/Tangent/bin/TangentHub",
+            "/opt/Tangent/bin/TangentHub (deleted)",
+            "/usr/libexec/bluetooth/bluetoothd",
+            "/usr/lib/bluetooth/bluetoothd",
+            "/usr/bin/logid",
+            "/usr/local/bin/xremap",
+        ] {
+            assert!(local_input_driver(driver, ROOT_SERVICE), "{driver}");
+        }
+        // Tools another program can type through are never drivers at the
+        // desk, however they are installed.
+        for tool in [
+            "/usr/lib/remote-product/server",
+            "/opt/evil/TangentHub-fake",
+            "/usr/bin/ydotoold",
+            "/usr/bin/dotoold",
+            "/usr/bin/keyd",
+            "/usr/bin/kanata",
+            "/usr/bin/uinput",
+            "",
+        ] {
+            assert!(!local_input_driver(tool, ROOT_SERVICE), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_drivers_name_alone_never_makes_one() {
+        const PANEL: &str = "/opt/Tangent/bin/TangentHub";
+        let owned = |uid, gid, mode| LocalDriverFacts {
+            executable: Some(ExecutableOwner { uid, gid, mode }),
+            ..ROOT_SERVICE
+        };
+        // Another product's program renamed by the session's user: their
+        // own file, or run by them.
+        for facts in [
+            owned(1000, 1000, 0o100_755),
+            LocalDriverFacts {
+                runs_as_root: false,
+                ..ROOT_SERVICE
+            },
+            LocalDriverFacts {
+                executable: None,
+                ..ROOT_SERVICE
+            },
+            // Root's file that anyone, or a group other than root's, may
+            // rewrite.
+            owned(0, 0, 0o100_777),
+            owned(0, 100, 0o100_775),
+            // Not a regular file.
+            owned(0, 0, 0o040_755),
+        ] {
+            assert!(!local_input_driver(PANEL, facts), "{facts:?}");
+        }
+        // Writable by root's own group only is still root's alone.
+        assert!(local_input_driver(PANEL, owned(0, 0, 0o100_775)));
+        // The field's panel service file is set-user-ID root (4755): still
+        // root's alone. A user who runs it keeps their real user ID, so the
+        // process is not root's (`runs_as_root` false, above).
+        assert!(local_input_driver(PANEL, owned(0, 0, 0o104_755)));
+    }
+
+    #[test]
+    fn a_device_is_attributed_to_the_interface_that_made_it() {
+        use UserSpaceInputInterface::{Uhid, Uinput};
+        assert_eq!(
+            UserSpaceInputInterface::of_device("/sys/devices/virtual/input/input213"),
+            Some(Uinput)
+        );
+        assert_eq!(
+            UserSpaceInputInterface::of_device(
+                "/sys/devices/virtual/misc/uhid/0005:046D:B35B.0004/input/input21"
+            ),
+            Some(Uhid)
+        );
+        assert_eq!(
+            UserSpaceInputInterface::of_device("/sys/devices/virtual/other/input/input9"),
+            None
+        );
+        let uhid_only = HeldInterfaces {
+            uinput: false,
+            uhid: true,
+        };
+        // bluetoothd holding uhid for the desk's Bluetooth keyboard cannot
+        // have made a uinput device.
+        assert!(!uhid_only.could_make(Some(Uinput)));
+        assert!(uhid_only.could_make(Some(Uhid)));
+        assert!(uhid_only.could_make(None));
+        let uinput_only = HeldInterfaces {
+            uinput: true,
+            uhid: false,
+        };
+        assert!(uinput_only.could_make(Some(Uinput)));
+        assert!(!uinput_only.could_make(Some(Uhid)));
+        assert!(!HeldInterfaces::default().could_make(None));
+    }
 
     #[test]
     fn another_products_client_shows_as_its_software_input() {

@@ -554,7 +554,8 @@ The codes and what an administrator does about them are in
 `console_other_user`, `console_other_user_other_product`,
 `console_wayland_session`, `console_no_session`, `console_sessions_unreadable`,
 `console_sign_in_unavailable`, `console_sign_in_failed`,
-`console_session_unreachable`, `console_privacy_unavailable`. A sign-in of
+`console_session_unreachable`, `console_privacy_unavailable`,
+`console_sign_in_other_product` (§8). A sign-in of
 another account while a joined console waits for its Deck's resume gets the
 same `console_other_user*` refusal.
 
@@ -639,7 +640,27 @@ product owned):*
   Arcen's" also took a firmware driver's device; a field workstation's
   `HP WMI hotkeys` (hp-wmi registers it without a parent, on `BUS_HOST`,
   with a few keys and switches) refused every join with no client
-  connected. When another product starts a desktop of
+  connected.
+  *Amended for 0.21.2 (field report):* a colour-grading panel's service
+  holding `/dev/uinput` for the panel's own keyboard and mouse refused every
+  join and ended live attachments. Two rules narrow "a process outside
+  Arcen" without letting a remote product hide. (1) Only a holder of the
+  interface that made the device counts (shared
+  `UserSpaceInputInterface::of_device`, `HeldInterfaces::could_make`): a
+  uinput device has no parent, a uhid device sits under the uhid misc
+  device, and each lives only while its interface is held; so bluetoothd,
+  holding `/dev/uhid` for the desk's Bluetooth keyboard, no longer makes the
+  panel's uinput keyboard another product's. (2) Drivers for hardware at
+  the desk (`LOCAL_INPUT_DRIVERS`: the panel service, bluetoothd, a mouse
+  configuration daemon and a key remapper) are not creators, but only when
+  the name matches exactly, every user ID of the process is root's, and the
+  running file (`statx` through `/proc/<pid>/exe`) is a regular file root
+  owns and only root can change (shared `local_input_driver`). A tool other
+  programs can type through (input-automation daemons, remappers with a
+  text or macro command, a game client with remote streaming), a driver
+  that loads user plugins, and an interpreted daemon (its executable is the
+  interpreter) are never listed. The research is in the 0.21.2 pull request.
+  When another product starts a desktop of
   its own while a Deck is attached to any other console session, the
   attachment ends with `console_other_product_started`.
 - **Input devices on any console display.** A joined console's display may
@@ -654,6 +675,49 @@ product owned):*
   exit before the stream starts records `SESSION_INTERRUPTED` (stage
   `setup`, the close the Deck was sent as reason class) at every profile
   (`net/setup_watch.rs`), and every close carries a reason.
+
+*Amended 2026-11-24 (from a field workstation whose display manager was
+another product running GDM headless):*
+
+- **A product that runs the sign-in.** A product that is the running
+  display manager may run GDM with XDMCP on and its local login screen off
+  (`xdmcp/Enable` true, `xdmcp/ShowLocalGreeter` false, set in GDM's runtime
+  settings while the product runs). GDM 40 then never starts its local
+  display factory (`gdm-manager.c`: the factory starts only when XDMCP is
+  off or `ShowLocalGreeter` is on): no login screen on `seat0` after boot or
+  after a session ends. The Pier reads GDM's effective settings
+  (`/run/gdm/custom.conf` per key over `/etc/gdm/custom.conf`, GDM's
+  defaults beneath; `gdm3` paths too) only while another product's unit is
+  the running display manager (shared
+  `console_session::local_login_screen`, `ConsoleHost::login_screen`). A
+  display manager's own alias (`gdm.service`…) is never affected.
+- **Which switch counts depends on GDM's version**, which the Pier asks
+  of GDM itself (`gdm --version`, or `gdm3`, bounded) on the same path.
+  GDM 49 and earlier: the `[xdmcp]` rule above. GDM 50 removed XDMCP and
+  `ShowLocalGreeter`, so its local login screen always runs and an old
+  `[xdmcp]` pair withholds nothing. GDM 51 and later read
+  `[daemon]` `ShowLocalGreeter` (default true) alone. When the version is
+  unknown, `ShowLocalGreeter=false` in either group is treated as unproven
+  (below); without it the login screen counts as shown.
+- **Refused with the product named.** With nobody signed in such a sign-in
+  is refused `console_sign_in_other_product`, naming the product as the
+  host describes it (the display-manager unit's `Description=` when it is
+  plain words, else the unit), never `console_no_session`. A login screen left on that
+  console is never signed in through. The account's own desktop in the
+  product is joined as before (guest mode), so signing in with the product
+  once and disconnecting it gives Arcen that desktop.
+- **No login screen is asked of that GDM.** A transient login screen
+  (`CreateTransientDisplay`) of a factory that never started waits for
+  virtual terminal 1 until the product's X server leaves its terminal, then
+  every waiting one starts an X server at once and the survivor takes the
+  GPU from the product's next X server. So a joined session that does not
+  lock is kept private (monitors blank, the desk's input disabled) and its
+  lock retried, never put behind a GDM login screen
+  (`UnlockedHandBack::on`); the failure is recorded once at error level per
+  session, not on every retry. Where GDM's settings cannot be read on such
+  a host, or GDM's version is unknown and a `ShowLocalGreeter=false`
+  appears, a sign-in is decided as before but no login screen is asked of
+  GDM either.
 
 ### 9. Wayland GDM sessions
 
@@ -789,18 +853,8 @@ acts (`hosts/linux/src/session/wayland/join.rs`, `launcher.rs`
   remote id on reauthentication only for GDM's own remote displays
   (`gdm-manager.c`), and `CreateUserDisplay` exists from GDM 50 only.
 
-Lab proof (2026-11-20, Rocky 10.2, GNOME Shell and Mutter 49.4, PipeWire
-1.4.11): a task-owned account's GNOME Wayland session on `seat0` (a PAM
-`login` session on virtual terminal 8 running `gnome-shell --headless` on
-its own systemd user bus; the vGPU has no display connector and GDM shows
-no login screen, so the physical-monitor and greeter paths are not
-exercised there) was joined from a Mac Deck: capture showed the session's
-own application, typed text reached it, disconnect locked the session with
-its applications and compositor unchanged, a locked session was unlocked
-and joined again, and a second Deck (another account, and the same one)
-was refused while the first was attached. Persistent per-user Wayland
-sessions (S4c), the resume hold and a desk with physical monitors remain
-GAP-042.
+Persistent per-user Wayland sessions, the resume hold and a desk with
+physical monitors remain open (GAP-042).
 
 ### 10. Hosts without a display manager: a real login session
 
@@ -961,28 +1015,13 @@ records its log tail and keeps its logs.
 | Desk private while attached | Yes, by default (amended 2026-11-18, `privacy.desk`, §5): served on a virtual display or a head with nothing connected, the desk's monitors detached from the desktop (`DisplayLease::detach_desk_monitors`) and proved dark (`hosts/windows/src/deskside.rs` `prove_desk_dark`), the desk's keyboard and mouse blocked by low-level hooks; the pinned `platform.desktop.deskside` remains for bare-metal pinning. Desk pens and touch screens are not blocked (GAP-051) | Yes, by default (amended 2026-11-18, `privacy.desk`; before, `platform.desktop.deskside.enabled`, off): every display but the Pier's virtual ones dark through an all-zero transfer table, read back; an active HID event tap passes only the Pier's own events (`hosts/macos/src/desk_privacy.rs`, shared `console_session::desk_privacy`); handed back in `DETACH_STEPS` order; dies with the process, after which the agent's lock guard darkens the displays again and locks the session (`hosts/macos/src/lock_guard.rs`, shared `console_session::owner_death`; GAP-048 closed 2026-11-18) |
 | No leftovers | Display journal and console recovery (`hosts/windows/src/console_recovery.rs:1-20`); window repatriation caveat (PD-032) | Virtual displays live in a child process and die with it (`hosts/macos/src/virtual_display.rs:58`, `:125`) |
 
-Follow-ups (not in this change): `windows-lock-on-detach` (landed
-2026-11-18, except the held-for-resume case, GAP-044),
-`windows-deskside-default` (landed 2026-11-18 with desk privacy on by
-default on every Pier, §5; GAP-049 closed, GAP-050 and GAP-051 open),
-`macos-lock-on-detach` (landed 2026-11-18),
-`macos-deskside` (landed 2026-11-18, opt-in like Windows; its lab proof
-that capture reads before the transfer table is
-`arcen-pier-macos probe-desk-privacy --blank 2 --capture`). Each should adopt `console_session::DETACH_STEPS` and
+The open differences against the principle are ledger gaps GAP-042
+(Linux: a Wayland login screen, the resume hold across a lock, and a desk
+with physical monitors), GAP-044 (Windows: a session held for a resume stays
+unlocked), GAP-050 (Windows: the desk's monitors show the session until they
+are detached) and GAP-051 (Windows: desk pens and touch screens are not
+blocked). New Pier work adopts `console_session::DETACH_STEPS` and
 `disables_while_attached`.
-
-Audit 2026-11-18 (every Pier, after the day's merges): the open differences
-against the principle are ledger gaps GAP-042 (Linux: Wayland consoles are
-refused), GAP-044 (Windows: a session held for resume stays unlocked),
-GAP-047 (Windows service that dies while attached: nothing locks the session
-afterwards) and GAP-049 (Windows: the desk's input stays live unless deskside
-is enabled; closed later on 2026-11-18 by desk privacy on by default, §5). Closed the same day: GAP-046 (a Linux console's windows go back
-after the Deck's layout, `console_windows`) and GAP-048 (a macOS agent that
-dies is followed by its lock guard, and a restarted agent locks first,
-`console_session::owner_death`). Closed 2026-11-20: GAP-047 (a Windows broker that dies
-is followed by its session guard, and a starting broker locks the recorded
-session first; `hosts/windows/src/owner_guard.rs`, the same shared
-`owner_death` decisions).
 
 ## Consequences
 
@@ -996,25 +1035,3 @@ session first; `hosts/windows/src/owner_guard.rs`, the same shared
   release build through `wayland-provider`).
 - An upgraded host with a display manager switches to joining the console;
   the administration guide says how to keep `dedicated`.
-
-## Lab proof (2026-11-16, Rocky 9.7, GDM 40.1, GNOME Shell 40.10, GRID vGPU)
-
-With the Pier installed by the release installer built from this change,
-default configuration (`platform.session.mode` absent, so `console`), log
-profile `critical`, a macOS Deck over the network. A "desk sign-in" is
-keyboard events typed into the login screen's X server (XTest); a second
-desktop "of another product" is a root Xorg on another VT with a logind
-session opened by a non-GDM PAM service (`su-l`). Neither is a person at a
-physical keyboard; the input grab itself was proved separately with a
-stand-in evdev keyboard.
-
-| Scenario | Result |
-| --- | --- |
-| Desk sign-in, then Deck sign-in of the same account | Joined the same logind session and Xorg (2560x1600, NvFBC → NVENC); a test application stayed open; during the attachment the desk's ramps were zero and the session unlocked; after disconnect it was locked, ramps restored, the journal removed. A second Deck sign-in while locked unlocked it again only after the desk was private |
-| Nobody signed in, Deck sign-in | `pam_arcen_greeter: one-time Arcen sign-in accepted`; GDM started `Service=gdm-ovirtcred`; streamed; after disconnect locked; a desk unlock at the lock screen, and a desk sign-in at a "switch user" login screen, each resumed the same session (same Xorg, `gnome-shell` and application processes) |
-| Another account signed in at the desk | Refused `console_other_user` on the Deck; `SESSION_AUTH_FAIL` stage `desktop` in the `critical` log |
-| Another account's desktop of another product, active and in the background | Refused `console_other_user_other_product`, also for a Deck whose own session was held for its resume |
-| The account's own desktop of another product | Joined and streamed; it has no lock screen, so on disconnect GDM's login screen was put in front of it |
-| Two monitors, 2560x1600 and 1920x1200 at a vertical offset (screen 4480x1600) | One picture: Auto (H.264) at 4096x1462, Speed (H.265) at 4480x1600 |
-| Speed on a 60 Hz Deck | 60 fps contract (`SESSION_STREAM_START fps=60`); 44 packets per second measured with a scrolling terminal over a VPN, including start-up. Auto is 30 fps by its contract |
-| Gamma blanking | NvFBC frames identical with and without the blank; a stand-in desk keyboard delivered 4 key presses before the grab and 0 while grabbed |

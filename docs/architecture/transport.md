@@ -1,16 +1,13 @@
 # Transport: Direct QUIC
 
-> **STATUS:** The Linux and Windows Piers and the macOS Deck use
-> direct QUIC exclusively, normally on UDP 18444. Every
-> product (Linux, Windows and macOS Piers, the
-> macOS Deck) runs every session on isolated QUIC lanes (protocol v5, see
-> "QUIC lanes" below); a released single-stream peer is refused with the
-> shared "update the Deck and the Pier to the same release" message. The
-> Decks have no WSS code at all (removed 2026-11-15); a connection an older
-> Deck saved as WSS opens over QUIC. The Piers' dormant WSS listener and the
-> `wss-compat` features were removed on 2026-11-18. `arcen-transport` remains
-> dependency-light by default; product
-> crates opt into its Quinn feature.
+Every product — the Linux, Windows and macOS Piers and the macOS and Windows
+Decks — speaks direct QUIC only, normally on UDP 18444, and runs every session
+on isolated QUIC lanes (protocol v5, see "QUIC lanes" below). A single-stream
+peer from an older release is refused with the shared "update the Deck and the
+Pier to the same release" message. No product carries a WSS (WebSocket over
+TLS and TCP) transport; a connection an older Deck saved as WSS opens over
+QUIC. `arcen-transport`
+stays dependency-light by default; product crates opt into its Quinn feature.
 
 **Owner:** Shared/Architecture. See
 [`../adr/0007-quic-only-product-transport.md`](../adr/0007-quic-only-product-transport.md)
@@ -23,8 +20,8 @@ certificate validation, typed certificate/SPKI pins, atomic reload resolver,
 and product-neutral contract: payload caps, reliability classes, delivery
 mechanisms, bounded queues, and lifecycle events. QUIC is its only transport
 profile. The opt-in `arcen_transport::quic` module
-supplies both the active direct carrier and a richer stream/datagram adapter
-that direct sessions do not yet use.
+supplies both the direct carrier and a richer stream/datagram adapter that
+direct sessions do not use.
 
 The shared direct-transport certificate behavior is documented in
 [`tls-certificate-lifecycle.md`](tls-certificate-lifecycle.md).
@@ -34,10 +31,10 @@ in [`session-auto-reconnect.md`](session-auto-reconnect.md).
 
 ## Direct product QUIC profile
 
-The single-stream profile below is what pre-v5 releases serve.
-Every current product has replaced it with the lane layout in "QUIC
-lanes"; everything about TLS, ALPN, certificates and the compatibility MTU
-still applies to them.
+Every session runs on the lane layout in "QUIC lanes". The rules below for
+TLS, ALPN, certificates, feedback and the compatibility MTU apply to every
+connection; the single ordered stream they describe is the layout releases
+before protocol v5 used, and the one a current Pier refuses.
 
 - Pier and Deck negotiate TLS 1.3 with ALPN `arcen-quic-v1` over Quinn.
 - Both Piers use the shared reloadable certificate resolver. Deck reuses
@@ -66,8 +63,8 @@ still applies to them.
   minimum and, by default, does not search above it.
   `ARCEN_QUIC_MTU_DISCOVERY=on` (`MtuDiscovery`) enables Quinn's path MTU
   discovery (RFC 8899) up to 1452 bytes with black-hole fallback to 1200 and
-  a 60-second cooldown. It stays off because of what it did on the VPN path
-  the Deck is tested over (a 1280-byte IPsec tunnel): the tunnel fragmented
+  a 60-second cooldown. It stays off because of what it does on a VPN path
+  through a 1280-byte IPsec tunnel: the tunnel fragmented
   oversize packets rather than dropping them, so a 1452-byte probe from the
   Pier was acknowledged; at full rate the fragments were lost in bursts
   (130-1,000 packets per episode), black-hole detection returned the
@@ -78,10 +75,10 @@ still applies to them.
   reports the MTU in use in `HealthStatsMsg.path.mtu_bytes` and the Deck's
   connection test reports the size its own connection reached.
 
-This baseline intentionally retains WebSocket framing and one reliable ordered
-stream. It therefore does not yet claim independent loss domains for media and
-control, datagram latency gains, or removal of TCP-like stream head-of-line
-blocking within the application flow.
+One reliable ordered stream has no independent loss domains for media and
+control and keeps TCP-like head-of-line blocking within the application flow;
+the lanes remove that between roles. Neither layout claims datagram latency
+gains.
 
 ## Advanced QUIC adapter (not used by direct sessions)
 
@@ -137,11 +134,9 @@ inbound and outbound queues are bounded by both message count and bytes.
 
 ## Direct-monitor stream foundation (Carrier B, not product-selected)
 
-The multi-monitor plan's Carrier A/B comparison (see the session plan's
-"Carrier abstraction and QUIC A/B" section) requires a safe, additive
+The multi-monitor Carrier A/B comparison (ADR 0009) requires a safe, additive
 foundation for a per-monitor reliable stream shape before either carrier can
-be measured or selected. `arcen_transport::quic` implements that foundation
-today. It is **not** wired into any product path, does not change the direct
+be measured or selected. `arcen_transport::quic` implements that foundation. It is **not** wired into any product path, does not change the direct
 carrier's default behavior, and does not enable datagram media:
 
 - `MonitorStreamIdentity` is a validated, bounded preface/identity: a
@@ -299,8 +294,8 @@ reaches a lane Pier, both end with the shared mismatch message.
   `keep_send_window_interactive`; lanes share congestion control, so a real
   network outage still interrupts every lane.
 - The queue sizes (`LaneQueueBounds::for_role`), starvation bounds and the
-  64 KiB / 100 ms interactive burst threshold are provisional pending lab
-  qualification on real networks.
+  64 KiB / 100 ms interactive burst threshold are provisional until qualified
+  on real networks.
 - `LaneConnection::status` returns a bounded per-role snapshot (state, queue
   depth and oldest age, writer wait, sent/received counts, failures, resets,
   supersessions, refusals, starvation episodes, priority demotions and drops
@@ -931,46 +926,39 @@ advertised as a product default.
 
 ## Congestion control, host backlog and the path indicator
 
-Measured end to end over a real WAN path (Wi-Fi, a VPN, a Linux Pier in
-another country; ~33 ms RTT, ~36 Mbit/s available) with the Deck CLI
-`media-smoke` (`ARCEN_MEDIA_SMOKE_STATS` per-frame records) against a
-Pier serving Speed with continuous full-screen motion. Impairments were
-applied only to that Pier's own UDP port on the host. Each configuration
-ran at least three alternating 95-second runs; the method is reproducible
-with `media-smoke` and `ARCEN_MEDIA_SMOKE_STATS`.
+The figures below come from end-to-end runs over a real WAN path (Wi-Fi and a
+VPN; ~33 ms RTT, ~36 Mbit/s available), with the Deck CLI `media-smoke`
+(`ARCEN_MEDIA_SMOKE_STATS` per-frame records) against a Pier serving Speed with
+continuous full-screen motion, impairments applied only to that Pier's UDP
+port, and at least three alternating 95-second runs per configuration. The
+method is reproducible with those two tools.
 
 - **Congestion controller** (`CongestionControl`, `ARCEN_QUIC_CONGESTION`):
-  `bbr` (default), `bbr-guarded` (opt-in experiment), `cubic`, `newreno`.
-  `bbr-guarded` is not the default: its
-  app-limited gate keeps the ceiling from engaging when an app-limited
-  sender still overshoots a slow bottleneck, the case it exists for, so the
-  bottleneck figure below is from its first version. On a clean path all four
-  are equal (frame age p50 ≈ 19.5 ms). Under 1 % random loss the loss-based
-  controllers collapse (Cubic 6 Mbit/s and ~675 ms frame age, NewReno 7
-  Mbit/s and ~575 ms) while BBR and `bbr-guarded` keep 16 Mbit/s and ~19 ms.
-  Against a shallow-buffered 8 Mbit/s bottleneck (100 ms `tbf`) plain BBR
-  overshoots to twice the link rate, loses 54 % of its packets and ages
-  frames to ~1.35 s; `bbr-guarded` loses 11 % at ~0.77 s; Cubic and NewReno
-  lose 0.1 % at ~0.66 s. `bbr-guarded` (`quic/loss_guard.rs`) is BBR under a
-  loss-bounded window ceiling. A round lasts at least one smoothed RTT and
-  until 12 kB have been resolved (at most 8 RTTs); it is lossy when it lost
-  at least three packets and more than 5 % of its bytes. After two
-  consecutive lossy rounds the window is capped at three quarters of the
-  lower of the current cap and what that round delivered, never below
-  24 kB. Since 0.19.0 whether the sender was application-limited no longer
-  matters: Quinn marks a connection application-limited whenever its send
-  buffer was empty at its last poll, which a video sender's is between
-  frames, so the 0.18.0 gate kept the cap from ever engaging. A clean round
-  relaxes the cap by an eighth while the round's largest bytes in flight
-  reached half of it; a clean round, or a quiet loss-free stretch, whose
-  largest bytes in flight stayed below half the cap removes it. Random loss
-  below 5 % or a single unlucky round never engages it, and the cap can only
-  lower BBR's own window. Re-measured with the 0.19.0 rule (three
-  alternating runs each, 8 Mbit/s `tbf`): plain BBR loses 54 % at frame age
-  p50 1.36 s / p95 1.89 s; `bbr-guarded` loses 12 % at p50 0.77 s / p95
-  1.06 s with the same delivered video rate. Under 1 % random loss the two
-  are indistinguishable (16-17 Mbit/s, p50 ~18-19 ms) and the cap does not
-  engage. `bbr` stays the default until a release cycle of field use.
+  `bbr` (default), `bbr-guarded` (opt-in experiment), `cubic`, `newreno`. On a
+  clean path all four are equal (frame age p50 ≈ 19.5 ms). Under 1 % random
+  loss the loss-based controllers collapse (Cubic 6 Mbit/s and ~675 ms frame
+  age, NewReno 7 Mbit/s and ~575 ms) while BBR and `bbr-guarded` keep
+  16 Mbit/s and ~19 ms. Against a shallow-buffered 8 Mbit/s bottleneck
+  (100 ms `tbf`) plain BBR overshoots to twice the link rate, loses 54 % of
+  its packets and ages frames to p50 1.36 s / p95 1.89 s; `bbr-guarded` loses
+  12 % at p50 0.77 s / p95 1.06 s with the same delivered video rate; Cubic
+  and NewReno lose 0.1 % at ~0.66 s.
+  `bbr-guarded` (`quic/loss_guard.rs`) is BBR under a loss-bounded window
+  ceiling. A round lasts at least one smoothed RTT and until 12 kB have been
+  resolved (at most 8 RTTs); it is lossy when it lost at least three packets
+  and more than 5 % of its bytes. After two consecutive lossy rounds the
+  window is capped at three quarters of the lower of the current cap and what
+  that round delivered, never below 24 kB. Whether the sender was
+  application-limited does not matter: Quinn marks a connection
+  application-limited whenever its send buffer was empty at its last poll,
+  which a video sender's is between frames, so such a gate would keep the cap
+  from ever engaging. A clean round relaxes the cap by an eighth while the
+  round's largest bytes in flight reached half of it; a clean round, or a
+  quiet loss-free stretch, whose largest bytes in flight stayed below half the
+  cap removes it. Random loss below 5 % or a single unlucky round never
+  engages it (under 1 % random loss `bbr` and `bbr-guarded` are
+  indistinguishable), and the cap can only lower BBR's own window. `bbr` stays
+  the default until `bbr-guarded` has a release cycle of field use.
 - **Host backlog** (`arcen_media::video::video_backlog_budget`,
   `ARCEN_VIDEO_BACKLOG=legacy` to disable): once two encoded frames wait for
   the writer and the oldest has waited two contract frame periods (20-100
@@ -979,43 +967,39 @@ with `media-smoke` and `ARCEN_MEDIA_SMOKE_STATS`.
   encoded frame is dropped by the rule. The capenc→pump channel is one frame
   deep, and the wire timestamp is taken when the Pier reads the frame from
   capenc, so the Deck's frame age includes every host-side wait. At the
-  8 Mbit/s bottleneck this cut frame age p50 from ~1.09 s
-  (`ARCEN_VIDEO_BACKLOG=legacy`) to ~0.76 s and raised the delivered frame
+  8 Mbit/s bottleneck this cuts frame age p50 from ~1.09 s
+  (`ARCEN_VIDEO_BACKLOG=legacy`) to ~0.76 s and raises the delivered frame
   rate from ~23 to ~26 fps.
 - **Frames in flight on a split Pier** (`arcen_media::video::RelayedVideoWindow`):
   the Windows Pier's agent hands video to the broker's lane relay
-  (`PierLaneRelay`) over a local socket, and the relay's own backlog (16
-  frames, plus the lane's queue) used to hold a slow path's frames where no
-  budget saw them, then drop them and ask for a keyframe. The relay now counts
-  every video frame it is done with (`PierLaneRelay::video_released`: sent into
-  the lane's queue, or dropped by its policy), the broker reports that running
-  count to the agent (`ServiceMessage::VideoReleased`, broker-agent vocabulary
-  in `arcen-session`), and the agent keeps at most one frame unreleased
-  (`RELAYED_VIDEO_FRAMES_IN_FLIGHT`): in flight is always the frames it handed
-  over minus the relay's count, both counted from the start of the
-  attachment. Older frames wait in the agent's
-  per-monitor shared queues under the same budget; the frame router waits
-  (`VIDEO_ROOM_WAIT`, 500 ms) before taking a delta frame, and the engine
-  reader waits instead of dropping (one-frame queue), so the engine stalls on
-  its pipe. Keyframes never wait; the wire timestamp is still taken when the
-  agent reads the frame from capenc. A relay that releases nothing for a
-  second (a large keyframe at a low bitrate, a QUIC stall) gets one more frame
-  per second, still counted, so the backlog returns to one frame once the
-  lane drains. `ARCEN_VIDEO_BACKLOG=legacy` in the service's environment stops
-  the reports, and the broker hands the choice to the agent in its start
-  packet (the agent runs with the signed-in user's environment), which then
-  uses the old four-frame engine queue, drops instead of waiting, and applies
-  no budget. Measured on a Windows Pier at
-  8 Mbit/s (alternating ×3 against that full legacy, Speed, full-screen
-  random text): frame age p50 unchanged on average (~1.28 s both; legacy
-  1.04–1.48 s run to run, because it sheds load by dropping and re-keying),
-  p95 ~1.58 → ~1.34 s, delivered fps equal (~41), stutters ~259 → ~37 per
-  minute and keyframe requests ~116 → 0 per run; a clean link is unchanged
-  (~15 ms). Most of the remaining ~1.2 s is above the socket (the control
-  lane's ping/pong RTT stayed ~115 ms): the video lane's own queue and QUIC's
-  send buffer, still to pace. The cap there was a Windows QoS throttle, not a
-  router queue, so these figures are not comparable with the Linux ones
-  above.
+  (`PierLaneRelay`) over a local socket. Without a budget, the relay's own
+  backlog (16 frames, plus the lane's queue) would hold a slow path's frames
+  where no budget saw them, then drop them and ask for a keyframe. The relay
+  counts every video frame it is done with (`PierLaneRelay::video_released`:
+  sent into the lane's queue, or dropped by its policy), the broker reports
+  that running count to the agent (`ServiceMessage::VideoReleased`,
+  broker-agent vocabulary in `arcen-session`), and the agent keeps at most one
+  frame unreleased (`RELAYED_VIDEO_FRAMES_IN_FLIGHT`): in flight is always the
+  frames it handed over minus the relay's count, both counted from the start
+  of the attachment. Older frames wait in the agent's per-monitor shared
+  queues under the same budget; the frame router waits (`VIDEO_ROOM_WAIT`,
+  500 ms) before taking a delta frame, and the engine reader waits instead of
+  dropping (one-frame queue), so the engine stalls on its pipe. Keyframes
+  never wait; the wire timestamp is still taken when the agent reads the
+  frame from capenc. A relay that releases nothing for a second (a large
+  keyframe at a low bitrate, a QUIC stall) gets one more frame per second,
+  still counted, so the backlog returns to one frame once the lane drains.
+  `ARCEN_VIDEO_BACKLOG=legacy` in the service's environment stops the
+  reports, and the broker hands the choice to the agent in its start packet
+  (the agent runs with the signed-in user's environment), which then uses a
+  four-frame engine queue, drops instead of waiting, and applies no budget.
+  At 8 Mbit/s on a Windows Pier, against that legacy mode, frame age p50 is
+  unchanged on average (~1.28 s), p95 falls from ~1.58 to ~1.34 s, delivered
+  fps is equal (~41), stutters fall from ~259 to ~37 per minute and keyframe
+  requests from ~116 to 0 per run; a clean link is unchanged (~15 ms). Most of
+  the remaining ~1.2 s is above the socket — the video lane's own queue and
+  QUIC's send buffer, still to pace. That cap was a Windows QoS throttle, not
+  a router queue, so these figures are not comparable with the Linux ones.
 - **Path indicator**: every `health_stats` from the Linux, Windows and macOS
   Piers carries `path` (`PathQualityMsg`, see `shared/protocol/WIRE.md`): the
   controller, smoothed and minimum RTT, cwnd, packets sent and declared lost,
@@ -1026,26 +1010,24 @@ with `media-smoke` and `ARCEN_MEDIA_SMOKE_STATS`.
   (`arcen_observability::health_stats_with_path`). The Deck's
   Session → Connection Health overlay shows it as one `Path:` row with a
   good/fair/poor grade (`PathGrade`: RTT 80/150 ms, queueing 30/100 ms,
-  loss 0.5 %/2 %), formatted by `path_quality_summary` so a future Deck
+  loss 0.5 %/2 %), formatted by `path_quality_summary` so every Deck
   shows the same words.
 - **No FEC.** Every lane is a reliable QUIC stream and QUIC already repairs
-  loss by retransmission. Loss measured on the real link was 0 % (clean runs)
-  and FEC would not have helped the bottleneck case, where loss is caused by
-  sending too much. Revisit only with datagram video and measured residual
-  loss after `bbr-guarded`.
+  loss by retransmission. Loss on the measured link was 0 % (clean runs) and
+  FEC would not help the bottleneck case, where loss is caused by sending too
+  much. Revisit only with datagram video and measured residual loss after
+  `bbr-guarded`.
 
 ## Known gaps and non-claims
 
 The following must not be inferred from the direct carrier or advanced-adapter
 tests:
 
-- **No multi-stream/datagram product optimization.** Direct sessions currently
-  use one reliable bidirectional stream and retain WebSocket framing. The lane
-  contract and shared lane runtime above are implemented and tested on
-  loopback but no product uses them yet. The
-  advanced adapter's independent streams and datagrams are not product
-  traffic, and the direct-monitor stream foundation above is an unselected,
-  unwired building block, not a shipped Carrier B.
+- **No datagram product optimization.** Sessions run on the reliable lane
+  streams above; no product sends QUIC datagrams. The advanced adapter's
+  independent streams and datagrams are not product traffic, and the
+  direct-monitor stream foundation above is an unselected, unwired building
+  block, not a shipped Carrier B.
 - **No 0-RTT.** This adapter does not enable 0-RTT connection establishment.
   If a future revision adds it, that requires its own reviewed ADR and
   threat-model update (0-RTT data is replayable).
@@ -1057,10 +1039,10 @@ tests:
   in-process model of loss/reorder/duplication/lateness — not a live
   `tc`/`netem`, namespace, or hardware network test. It validates contract
   semantics, not real-world network behavior on any specific OS or NIC.
-- **No broad performance claim.** Two matched fleet runs established that QUIC
-  works end to end and can modestly improve latency/delivery on some hosts, but
-  Deck presentation and audio bottlenecks dominate the operator experience.
-  Product direction is not evidence of a universal throughput or FPS gain.
+- **No broad performance claim.** QUIC works end to end and can modestly
+  improve latency and delivery on some hosts, but Deck presentation and audio
+  bottlenecks dominate the operator experience. Product direction is not
+  evidence of a universal throughput or FPS gain.
 - **Migration relies entirely on Quinn.** This crate does not implement or
   control QUIC path migration; it only observes address/MTU changes that
   Quinn's own connection-migration logic already performed and reports them

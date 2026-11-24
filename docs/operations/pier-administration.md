@@ -21,15 +21,15 @@ QUIC datagrams, federated identity, MFA, a Linux Deck, and web account managemen
 
 ### Linux
 
-Current verified deployment is a development deployment script, not a release installer:
+Install with the Linux installer; see [Install the Pier](../install.md#the-host-pier). From a source checkout, `packaging/linux/deploy-pier.sh` builds on the target and installs the same files, for development:
 
 ```sh
 HOST=root@host packaging/linux/deploy-pier.sh
 ```
 
-The script builds on the target, installs runtime files, validates `/etc/arcen/pier.json`, installs systemd, enables the service, and starts the unit.
+Both install the runtime files, validate `/etc/arcen/pier.json`, install the systemd unit, enable the service and start it.
 
-| Item | Verified current path |
+| Item | Path |
 | --- | --- |
 | Pier binary | `/opt/arcen/bin/arcen-pier` |
 | Helper model | **One binary.** `arcen-pier` is multi-call: `capenc`, `audiocap`, `input-helper`, `session-agent`, `session-launcher` and `new-host-cert` are subcommands of the same executable. There are no separate helper files. |
@@ -41,7 +41,7 @@ The script builds on the target, installs runtime files, validates `/etc/arcen/p
 | X11 socket directory kept out of `/tmp` ageing | `/etc/tmpfiles.d/arcen-pier.conf` |
 | Support bundles | `/var/lib/arcen/support` |
 
-The script creates `/opt/arcen/bin`, `/usr/share/doc/arcen`, `/etc/arcen`, `/var/log/arcen`, and `/var/lib/arcen/support`. It installs `/etc/systemd/system/arcen-pier.service` with `User=root`, `Restart=on-failure` bounded by `StartLimitBurst=10` over ten minutes, ordering after `time-sync.target`, and `ExecReload=/bin/kill -HUP $MAINPID`.
+They create `/opt/arcen/bin`, `/usr/share/doc/arcen`, `/etc/arcen`, `/var/log/arcen`, and `/var/lib/arcen/support`. It installs `/etc/systemd/system/arcen-pier.service` with `User=root`, `Restart=on-failure` bounded by `StartLimitBurst=10` over ten minutes, ordering after `time-sync.target`, and `ExecReload=/bin/kill -HUP $MAINPID`.
 
 #### SELinux
 
@@ -275,6 +275,7 @@ session.
 | The account's session that Arcen started | joins it (same desktop, same applications) |
 | Another account's session that Arcen started | refused, `console_other_user` (one account at a time without a display manager) |
 | A display manager is configured but its login screen is not running | refused, `console_no_session` |
+| Another remote-desktop product is the running display manager and keeps GDM's login screen off the console (GDM 49 and earlier: `[xdmcp]` `Enable=true` with `ShowLocalGreeter=false`; GDM 51 and later: `[daemon]` `ShowLocalGreeter=false`; GDM 50 always shows it), nobody signed in | refused, `console_sign_in_other_product`: sign in with that product once and disconnect it; Arcen then joins that desktop. Arcen never signs in through a login screen left on such a console |
 | logind's sessions cannot be read (`loginctl` fails, times out, or answers incompletely) | refused, `console_sessions_unreadable`: whether the account already has a session is unknown, so Arcen neither joins nor starts one |
 | `display-manager.service` points at another remote-desktop product's unit, and that unit is stopped | nothing will show a login screen: served like a host without a display manager (Arcen's real login session) |
 
@@ -374,7 +375,10 @@ while nobody is signed in. Unused forced outputs are hidden from the desktop
 (RandR `non-desktop`) while a Deck is attached. `--no-console-outputs` and
 `--uninstall` remove the file (only Arcen's); nothing else in the host's
 display configuration is changed. This changes what the host's X server
-sees, so it is never done without the flag.
+sees, so it is never done without the flag. `--uninstall` without `--purge`
+remembers the heads in `/var/lib/arcen/console-outputs`, and the next
+install forces them again and says so, unless it is given
+`--console-outputs` or `--no-console-outputs`; `--purge` forgets them.
 
 `--console-outputs` next to another remote-desktop product: the file is an
 `OutputClass`, so every X server on the GPU reads it, the other product's
@@ -511,6 +515,8 @@ workstation; one of them serves the console at a time.
 | The product's client connects while a Deck is attached to that desktop | ends the Deck's attachment with `console_in_use_other_product`; the session is locked as on every disconnect |
 | The product is the host's display manager (`display-manager.service` points at its unit) and is stopped; GDM is not running | starts the account's real login session (a host without a display manager); a reconnect joins the same session |
 | The product starts again while a Deck is attached to Arcen's session | ends the attachment with `console_other_product_started`; Arcen's session is not ended by Arcen |
+| The product is the running display manager and keeps GDM's login screen off the console; nobody is signed in | refuses `console_sign_in_other_product`, naming the product as its system service describes itself (else by its unit) |
+| The same, and the joined desktop does not lock when the Deck leaves | keeps the desk private (monitors blank, its input disabled) and retries the lock; it never asks GDM for a login screen there |
 
 GNOME runs one graphical session per account: two desktops of the same
 account (Arcen's login session and the product's) share the account's
@@ -834,10 +840,10 @@ Arcen session:
   started in the session keep the system's libraries.
 
 **1. Build the prefix in a container that matches the host.** No development
-package is installed on the host. The lab recipe is in
+package is installed on the host. The recipe is in
 `packaging/linux/tools/gnome-prefix/`. It pins versions, applies two
 GNOME/mutter merge requests and Arcen's fix for GNOME/mutter#5077 (squared
-tablet pressure) as lab patches and records them in `PROVENANCE.md` inside the
+tablet pressure) as patches, and records them in `PROVENANCE.md` inside the
 prefix.
 
 ```sh
@@ -922,21 +928,20 @@ qualification proves each capability before a Deck is offered it.
 | GNOME 49 (EL10's own) | Auto and Speed, the GPU import route, remote monitors (Windowed resize, multi-monitor), clipboard, audio |
 | GNOME 50 | HDR and wide (10-bit) screen sharing (mutter!4928), so Grading and HDR become qualifiable; fewer screen-cast buffers and damage-limited redraws |
 | GNOME 51 | Screen-cast painting without redundant stage paints and with fewer copies (mutter!5046) |
-| Lab patches (prefix only, not shipped) | 60 Hz screen-cast pacing (mutter!5358, merged after 51.1); libinput in a headless compositor (mutter!5224, open, plus the Arcen seat edit), which lets `wayland.lab_seat_pen` give the session a real pen with pressure and tilt |
+| Prefix patches (not shipped) | 60 Hz screen-cast pacing (mutter!5358, merged after 51.1); libinput in a headless compositor (mutter!5224, open, plus the Arcen seat edit), which lets `wayland.lab_seat_pen` give the session a real pen with pressure and tilt |
 
-On the Rocky Linux 10.2 lab, GNOME Shell 51.1 from the prefix qualified the
-same as the system's 49.4: GPU import, Speed at 60 fps, Xwayland applications
-and audio all passed. It also qualified Grading and HDR, which EL10's GNOME 49 cannot offer. A Deck
-was served both from the forced-HDR desktop. Pointer motion in those sessions
-is an open follow-up. See the provider documentation's lab evidence.
+GNOME Shell 51.1 from the prefix qualifies on Rocky Linux 10 as the
+system's 49.4 does (GPU import, Speed at 60 fps, Xwayland applications,
+audio), and also qualifies Grading and HDR, which EL10's GNOME 49 cannot
+offer. Pointer motion in a forced-HDR session from the prefix is not yet verified.
 
-The smallest lab prefix is `/opt/arcen-gnome/49`: the distribution's GNOME
+The smallest prefix is `/opt/arcen-gnome/49`: the distribution's GNOME
 Shell 49 with one rebuilt library (`build-patched-mutter-49.sh`, then
 `make-prefix-49.sh`). It gives `wayland.lab_seat_pen` a real pen on EL10's own
 GNOME without any GNOME upgrade.
 
-`wayland.lab_seat_pen` (default `false`) is a lab key. It works only with a
-prefix built with the headless-input lab patch. Each Wayland desktop gets
+`wayland.lab_seat_pen` (default `false`) is a development key. It works only
+with a prefix built with the headless-input patch. Each Wayland desktop gets
 its own virtual tablet on its own udev seat (`seat-arcen-pen-<id>`), a
 volatile rule for that device alone under `/run/udev/rules.d/`, and an ACL
 for that desktop's user alone. When the desktop ends, the grant is revoked,

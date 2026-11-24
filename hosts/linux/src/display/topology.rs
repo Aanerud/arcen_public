@@ -7,10 +7,10 @@
 //! drawn from this session's configured NVIDIA head inventory, plus the
 //! virtual framebuffer size that Xorg screen must declare. This module is
 //! pure planning logic only — no RandR/`nvidia-settings`/process I/O happens
-//! here, and it never touches an X server. Real available-head/CRTC discovery
-//! on the target GPU profile remains a pier-linux.example.internal lab gate (see
-//! `hosts/linux/AGENTS.md`); production callers feed in the
-//! operator-configured, already-verified head roster.
+//! here, and it never touches an X server. Head discovery happens once at
+//! start-up (`display::nvidia_discovery`, see `hosts/linux/ARCHITECTURE.md`,
+//! "Multi-monitor"); production callers feed in that discovered or
+//! operator-configured head roster.
 //!
 //! Coordinates stay in exactly one unit throughout: host RandR/Xorg screen
 //! pixels. A requested monitor's `logical_*` fields (client points) are used

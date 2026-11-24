@@ -1,10 +1,7 @@
 # Observability Standard — unified logging, QoS telemetry, and monitoring integration
 
-**Status: implemented.** This document defines the observability schema and
-platform adapters; the implemented architecture record is
-[`../architecture/observability.md`](../architecture/observability.md).
-Native Windows execution and Linux operational coverage are validated on
-their target platforms.
+This document defines the observability schema and the platform adapters;
+the architecture record is [`observability.md`](observability.md).
 
 **Structure:** the pure vocabulary lives in `arcen-telemetry`, the tracing
 runtime in `arcen-observability`, additive wire fields in `arcen-protocol`;
@@ -15,18 +12,14 @@ Shared/Architecture changes; the identity-in-logs policy (§9) and default
 support-bundle pseudonymization are Release/Security changes.
 
 > Scope note: unlike the other docs in this folder, this standard spans **clients as
-> well as hosts** — logging is a product-wide platform capability. The template's
-> Windows/Linux host sections are extended with a macOS Deck section and a
-> forward-conformance section for future apps.
->
-> The acceptance boxes below are the design's checklist; an unchecked box
-> means the item is not separately certified, not that it is missing.
+> well as hosts** — logging is a product-wide platform capability. The
+> conformance checklist (§10) applies to every future product.
 
 ---
 
 ## 1. Context — the M&E sysadmin story
 
-Arcen sells into Media & Entertainment. The people who operate it are studio
+Arcen serves Media & Entertainment. The people who operate it are studio
 sysadmins, and the complaints they receive are always the same shape:
 
 - *"This is slow." "It's lagging." "I can't work."*
@@ -52,60 +45,25 @@ what the user experience actually was**, from either end of the connection:
    input paths. Blocking is banned; silent loss is banned; **counted loss** is the
    only allowed failure mode.
 
-Today each active app solves logging on its own. The macOS client and both hosts
-have three diverging stacks. This document defines the single standard and the
-migration to it.
+Every product follows this one standard rather than a logging stack of its own.
 
 ---
 
-## 2. Current state — what exists, what diverges, what is missing
+## 2. Canonical log targets
 
-### 2.1 Inventory (verified against source, 2026-07-22)
+Every product logs under the same `tracing` targets:
 
-| Capability | macOS Deck | Linux Pier | Windows Pier | shared |
-|---|---|---|---|---|
-| Framework | `tracing` | `tracing` | `tracing` | — |
-| Init module | `clients/macos/src/logging/mod.rs` | `hosts/linux/src/logging/mod.rs` | `hosts/windows/src/logging.rs` | — |
-| Log file | `~/Library/Logs/Arcen/arcen-client.log` (daily) | `/var/log/arcen/arcen-pier.log` (SIGHUP reopen + logrotate) | `%ProgramData%\Arcen\logs\arcen-pier.log` + per-session `sessions\<sid>.log` | retention contract in `arcen-telemetry` |
-| OS event sink | **none** | journald native (`ARCEN_EVENT_ID`, `ARCEN_FIELD_*`) + `/dev/log` fallback — `hosts/linux/src/eventlog.rs` | Windows Event Log, provider `ArcenPier`, bounded 64-slot non-blocking worker — `hosts/windows/src/eventlog.rs` | `ValidatedLifecycleEvent` |
-| Lifecycle events (1000–1404) | **not emitted** | emitted | emitted | vocabulary + schemas in `shared/telemetry/src/lifecycle.rs` |
-| Session-end summary | **none** | `SessionEnd` 1103: reason_class, duration_ms, frames_sent/dropped, audio counters | same vocabulary | `StructuredFields` |
-| Correlation | generates `session_log_id` (UUID), sends in `AuthResponse` | records as `sid` span field | records as `sid` span field | `CorrelationId` |
-| Periodic QoS logging | **none** | none logged (2 s HealthPong is liveness only) | `HealthStatsMsg` → client every 2 s; capenc stats at INFO | `HealthStatsMsg` contract |
-| Client-side timing (decode/display/RTT) | **not measured** | n/a | n/a | fields exist in `HealthStatsMsg` but are never filled |
-| Network interface truth | LAN/WAN classification of *destination* only (`diagnostics.rs`) | none | none | — |
-| HID / HoIP logging | **zero** (`clients/macos/src/hid/`) | uhid create/remove not evented | n/a yet | — |
-| Permission/entitlement state | **invisible** (TCC, sustained-execution) | n/a | n/a | — |
-| Runtime verbosity reload | UI "Log level" live reload | unified `pier.json` + SIGHUP | SCM control codes 200/201/202 | `VerbosityTier` → `LevelSpec` |
-| JSON output | none | none | none | — |
-| Hot-path discipline | good (no per-frame logs) | good (frame pump silent) | good (per-AU logs only first 3 + keyframes, DEBUG) | — |
+| Concept | Canonical target |
+|---|---|
+| network | `arcen::net` |
+| video pipeline | `arcen::media` (pipeline) + `arcen::capenc` (host encode) |
+| peripherals | `arcen::hid` |
+| auth | `arcen::auth` |
+| health | `arcen::health` |
 
-### 2.2 Target-name divergence (must converge)
-
-| Concept | macOS Deck | Linux Pier | Windows Pier | **Canonical (this standard)** |
-|---|---|---|---|---|
-| network | `arcen::transport` | `arcen::net` | `arcen::net` | `arcen::net` |
-| video pipeline | `arcen::video` | `arcen::media` + `arcen::capenc` | `arcen::capenc` | `arcen::media` (pipeline) + `arcen::capenc` (host encode) |
-| peripherals | `arcen::usb` | — | — | `arcen::hid` |
-| auth | (in session) | `arcen::auth` | `arcen::auth` | `arcen::auth` |
-| health | — | `arcen::health` | (in session) | `arcen::health` |
-
-Platform-only extras stay allowed and documented: `arcen::cppipe`, `arcen::eventlog`
-(Windows), `arcen::display` (hosts), `arcen::ui` (clients).
-
-### 2.3 The gap map
-
-1. **macOS Deck is the big gap**: no lifecycle events, no session summary, no QoS
-   heartbeat, no client timing measurement, silent HoIP, invisible permissions.
-2. **No client-side network truth anywhere** — the single most requested sysadmin
-   feature (the WiFi story) does not exist on any platform.
-3. **`HealthStatsMsg` round trip is half-wired**: host → client only;
-   `decode_time_ms` / `display_time_ms` (`shared/protocol/src/messages.rs`) are dead
-   fields; no echo sequence, so no true application-level RTT.
-4. **No JSON option** in any product.
-5. **No three-state rollup** anywhere; a sysadmin must read raw lines and guess.
-6. **No monitoring recipes**: journald fields and Event Log IDs exist on the hosts but
-   are undocumented for Zabbix/collector consumption.
+Platform-only extras are allowed and documented in the product's
+`ARCHITECTURE.md`: `arcen::cppipe`, `arcen::eventlog` (Windows),
+`arcen::display` (hosts), `arcen::ui` (clients).
 
 ---
 
@@ -143,9 +101,9 @@ Follows the `arcen-keel` pattern: a pure brain, a shared runtime, thin adapters.
 **Why a second shared crate instead of extending `arcen-telemetry`:**
 `arcen-telemetry`'s no-I/O purity is what makes the vocabulary, redaction, and
 retention logic deterministic and golden-testable — it must not grow a `tracing`
-dependency. But "contracts only, stack per app" has already failed empirically: three
-apps hold three diverging target lists and the client emits no events at all.
-Requirement "no one-offs" needs a crate every app links, not a convention.
+dependency. But "contracts only, stack per app" drifts: separate stacks grow
+separate target lists and separate gaps. "No one-offs" needs a crate every app
+links, not a convention.
 
 **Why not put the runtime per-app:** the reload handle, the JSON line shape, the
 bounded-sink discipline, and the heartbeat cadence are exactly the things that must be
@@ -176,7 +134,7 @@ control surfaces, and `NetworkTruthProbe` implementations (NWPathMonitor /
   serde-only dependencies. Event IDs are **append-only forever** (golden test).
 - `arcen-observability` is OS-free: `tracing`, `tracing-subscriber`,
   `tracing-appender`, `arcen-telemetry` only. All OS FFI lives in the apps.
-- Wire types live in `arcen-protocol` only; all changes additive under protocol v3.
+- Wire types live in `arcen-protocol` only; all changes are additive.
 - Lifecycle emission is fire-and-forget: failing to record an event never fails
   the operation it describes (existing Windows discipline, promoted to standard).
 
@@ -192,9 +150,8 @@ profile includes every lower-numbered profile:
 | **2 Info** | Level 1 plus normal lifecycle, negotiation, network/device changes, and aggregated QoS. |
 | **3 Debug** | Level 2 plus bounded state-machine, protocol-stage, queue, and counter diagnostics; never per-frame, packet, HID report, or input event. |
 
-Production and built-in defaults are Level 0. Current development/lab
-deployments are explicitly configured to Level 2; this does not alter the
-production default. `trace!` is not an operator profile: it remains only an
+Production and built-in defaults are Level 0. A development deployment may
+configure Level 2; that does not alter the production default. `trace!` is not an operator profile: it remains only an
 explicit `ARCEN_LOG` developer escape and cannot suppress mandatory Level-0
 records.
 
@@ -277,8 +234,8 @@ heartbeat reports it here and resets its counter. 1806 is the mandatory compact
 
 `permission` ∈ `input_monitoring`, `screen_recording`, `accessibility`, `microphone`,
 `sustained_execution`, `location_for_ssid` (extensible string, lowercase snake).
-Answers "is the entitlement actually in effect?" — today invisible. The macOS TCC
-input-monitoring prompt outcome (HoIP prerequisite) becomes an auditable event.
+Answers "is the entitlement actually in effect?". The macOS TCC
+input-monitoring prompt outcome (HoIP prerequisite) is an auditable event.
 
 ---
 
@@ -317,7 +274,7 @@ QosSample {
     frames_superseded,                      // client side: handled, not shown
     frames_submitted_untimed,               // client side: reached the compositor, no timestamp
     capture_time_ms, encode_time_ms,        // host side
-    decode_time_ms, display_time_ms,        // client side  (finally filled)
+    decode_time_ms, display_time_ms,        // client side
     rtt_ms,                                 // measured, not estimated (see 5.4)
     input_latency_ms, input_events,
     heartbeat_misses,
@@ -395,7 +352,7 @@ Client rollup = experienced health (decode/present/RTT). **Disagreement is the
 diagnosis**: host `Ok` + client `Degraded` ⇒ the network is the problem — precisely
 the "artist on 5G claims 1 GB fibre" case, provable from either log.
 
-### 5.4 Completing the wire round trip (additive, protocol v3)
+### 5.4 Completing the wire round trip (additive)
 
 - Reuse the existing `HealthPingMsg.sequence` / echoed
   `HealthPongMsg.sequence` for true application RTT; do not add a duplicate
@@ -427,10 +384,11 @@ NetworkSnapshot {
 }
 ```
 
-The LAN/WAN classifier in `clients/macos/src/logging/diagnostics.rs`
-(`network_scope()`) moves into the shared crate with its existing unit tests.
+The LAN/WAN classifier is shared (`arcen_telemetry::network::classify_ip`).
 
-### 6.2 Probe trait (`arcen-observability`) and per-app implementations
+### 6.2 The probe and per-app implementations
+
+Each app supplies a probe of this shape:
 
 ```
 trait NetworkTruthProbe {
@@ -441,9 +399,9 @@ trait NetworkTruthProbe {
 
 | App | Mechanism | Location |
 |---|---|---|
-| macOS Deck | `NWPathMonitor` (kind, changes) + `SCNetworkInterface`/CoreWLAN FFI (link rate, SSID, RSSI). SSID requires location permission: if denied, log `ssid="unavailable(permission)"` and emit **1901 once** — the gap itself is visible. | `clients/macos/src/netinfo/` (new) |
-| Linux Pier | `/sys/class/net/<if>/{type,speed}`, `wireless/` presence, netlink for changes | `hosts/linux/src/netinfo.rs` (new) |
-| Windows Pier | `GetAdaptersAddresses` (kind, speed) + `WlanQueryInterface` (SSID/RSSI) | `hosts/windows/src/netinfo.rs` (new) |
+| macOS Deck | `NWPathMonitor` (kind, changes) + `SCNetworkInterface`/CoreWLAN FFI (link rate, SSID, RSSI). SSID requires location permission: if denied, log `ssid="unavailable(permission)"` and emit **1901 once** — the gap itself is visible. | `clients/macos/src/netinfo.rs` |
+| Linux Pier | `/sys/class/net/<if>/{type,speed}`, `wireless/` presence, netlink for changes | `hosts/linux/src/netinfo.rs` |
+| Windows Pier | `GetAdaptersAddresses` (kind, speed) + `WlanQueryInterface` (SSID/RSSI) | `hosts/windows/src/netinfo.rs` |
 
 ### 6.3 Emission
 
@@ -462,14 +420,13 @@ trait NetworkTruthProbe {
 
 1. **No `tracing` call in per-frame / per-packet / per-input-event loops.** Hot paths
    increment registered atomics; `HeartbeatSampler` turns them into log lines at
-   cadence. (Existing good behavior in all three apps becomes a written rule.)
+   cadence.
 2. **Every OS sink goes through `BoundedSink`**: fixed-capacity queue, `try_send`
    only, dedicated worker, atomic drop counter. Generalizes the proven
    `hosts/windows/src/eventlog.rs` worker (64-slot, never blocks session work).
 3. **File writers are non-blocking lossy** (`tracing-appender` non-blocking, lossy) —
-   a slow disk must never backpressure a session thread. (This flips the macOS
-   client's current synchronous file writer; durability moves to an explicit flush on
-   clean shutdown.)
+   a slow disk must never backpressure a session thread. Durability comes from an
+   explicit flush on clean shutdown.
 4. **Drops are observable**: any sink with `dropped > 0` since the last heartbeat
    emits `TelemetryDropped` (1804) and resets. Silent loss banned, blocking banned;
    counted loss is the only allowed failure mode.
@@ -502,20 +459,20 @@ frozen by a golden fixture:
   `platform` or `display_backend`, never alternate schemas.
 - True `severity` remains independent from `profile_level`.
 
-### 8.2 OS-native channels (kept, now documented)
+### 8.2 OS-native channels
 
-- **Linux:** journald native protocol remains primary (`ARCEN_EVENT_ID`,
-  `ARCEN_EVENT_NAME`, `ARCEN_CORRELATION_ID`, `ARCEN_FIELD_*` — already correct);
-  RFC 3164 `/dev/log` fallback kept. RFC 5424 structured-data is explicitly **out of
+- **Linux:** journald native protocol is primary (`ARCEN_EVENT_ID`,
+  `ARCEN_EVENT_NAME`, `ARCEN_CORRELATION_ID`, `ARCEN_FIELD_*`), with an
+  RFC 3164 `/dev/log` fallback. RFC 5424 structured-data is explicitly **out of
   scope v1** (journald + JSON file cover the need).
-- **Windows:** Event Log provider `ArcenPier`, Application channel; message table
-  extended for the new IDs so Event Viewer shows readable text.
+- **Windows:** Event Log provider `ArcenPier`, Application channel; the message
+  table covers every ID so Event Viewer shows readable text.
 - **macOS client:** canonical JSON file is primary; an os_log sink is optional
   follow-up, not v1.
 
 ### 8.3 Standard logging config (all apps)
 
-The Linux `logging` section in unified `pier.json` becomes the cross-app schema:
+The `logging` section of `pier.json` is the cross-app schema:
 
 ```json
 { "level": 0, "retention_days": 30,
@@ -525,8 +482,7 @@ The Linux `logging` section in unified `pier.json` becomes the cross-app schema:
 `logging.level` is canonical. For one migration release,
 `logging.verbosity` retains its old meaning and maps
 `0→level 1`, `1→level 2`, `2→level 3`, `3→level 3`; specifying both is an
-error. Retention bounds remain unchanged. Built-in/package policy defaults to
-Level 0, while named development/lab deployments are configured to Level 2.
+error. Built-in and package policy defaults to Level 0.
 
 Reload without restart, per platform: SIGHUP (Linux), SCM 200/201/202 (Windows),
 UI dial + file-watch (macOS Deck). All three drive the same
@@ -581,20 +537,21 @@ tracing, including trace, but cannot filter Level-0 structured records.
 ### QUIC feedback
 
 The QUIC `FeedbackSnapshot` → `QosSample` bridge
-(`shared/transport/src/quic/feedback.rs` already exposes rtt/loss/congestion)
-feeds the same rollup.
+(`shared/transport/src/quic/feedback.rs` exposes rtt/loss/congestion) feeds the
+same rollup.
 
 ---
 
-## Key existing code this standard builds on
+## Key code
 
 | What | Where |
 |---|---|
-| Event vocabulary + schemas (extend) | `shared/telemetry/src/lifecycle.rs` |
-| Redaction-safe fields (extend allowed keys) | `shared/telemetry/src/lib.rs` |
+| Event vocabulary + schemas | `shared/telemetry/src/lifecycle.rs` |
+| Redaction-safe fields | `shared/telemetry/src/lib.rs` |
 | Operational profile/retention contracts | `shared/telemetry/src/log_policy.rs` |
-| Bounded non-blocking sink pattern (generalize) | `hosts/windows/src/eventlog.rs` |
-| journald native sink (retain, feed via BoundedSink) | `hosts/linux/src/eventlog.rs` |
-| HealthPing/HealthStats wire contract (complete) | `shared/protocol/src/messages.rs` |
-| LAN/WAN classifier + connect diagnostics (promote) | `clients/macos/src/logging/diagnostics.rs` |
-| Runtime reload surfaces (standardize behind `ObservabilityHandle`) | Linux SIGHUP `hosts/linux/src/logging/mod.rs` · Windows SCM `hosts/windows/src/service.rs` · macOS UI `clients/macos/src/logging/mod.rs` |
+| Bounded non-blocking sink pattern | `hosts/windows/src/eventlog.rs` |
+| journald native sink (fed via `BoundedSink`) | `hosts/linux/src/eventlog.rs` |
+| HealthPing/HealthStats wire contract | `shared/protocol/src/messages.rs` |
+| LAN/WAN classifier | `shared/telemetry/src/network.rs` |
+| Connect diagnostics (macOS Deck) | `clients/macos/src/logging/diagnostics.rs` |
+| Runtime reload surfaces (behind `ObservabilityHandle`) | Linux SIGHUP `hosts/linux/src/logging/mod.rs` · Windows SCM `hosts/windows/src/service.rs` · macOS UI `clients/macos/src/logging/mod.rs` |

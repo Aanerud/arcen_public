@@ -54,17 +54,9 @@ pub fn render_connecting(
         );
         ui.add_space(18.0);
         ui.label(
-            egui::RichText::new(format!(
-                "{} as {}",
-                draft.display_name(),
-                if draft.username.is_empty() {
-                    "user"
-                } else {
-                    draft.username.as_str()
-                }
-            ))
-            .color(super::theme::colours(ui).text2)
-            .size(17.0),
+            egui::RichText::new(draft.connecting_line())
+                .color(super::theme::colours(ui).text2)
+                .size(17.0),
         );
         ui.add_space(12.0);
         ui.label(
@@ -185,8 +177,8 @@ pub fn render_displays_unsupported(
         ui.add_space(16.0);
         ui.label(
             egui::RichText::new(
-                "This is remembered for this connection only. Your other \
-                 connections keep matching your layout.",
+                "For this session only: the next connection asks for your \
+                 whole layout again.",
             )
             .color(super::theme::colours(ui).text2)
             .size(13.0),

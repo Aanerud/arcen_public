@@ -76,6 +76,7 @@ a `reason_class` — look it up in [Error codes](error-codes.md). Common cases:
 | "Another remote desktop is active on this host (one X11 desktop per host)" (`seat_occupied`) | Another X11 desktop holds `seat0` (another user, or a desktop still closing). `loginctl list-sessions` shows it. | Sign out of it or let it reach its idle timeout. Earlier Piers said `session launcher protocol failed`. |
 | "The host refused this desktop: it could not keep it from local administrator rights (polkit)" | `polkit_rule_missing`, `polkit_grants_remote_session` or `polkit_unverified`. | `arcen-pier polkit-rule status`; `arcen-pier polkit-rule install` and restart the Pier. See "polkit" in the [administration guide](pier-administration.md). |
 | "The host could not mute its own speakers" | `audio.local_playback` is `muted` and the host cannot prove its speakers silent (macOS: System Audio Recording not granted; Windows: an output device refused to mute, see the Pier log's `local playback` lines). | Grant the permission (macOS) or fix the user's audio server (Linux); or set `audio.local_playback` to `audible`. |
+| Linux: `console_in_use_other_product` with no other remote-desktop client connected | A local program made a keyboard or pointer through `/dev/uinput` or `/dev/uhid`. The Pier log line `another remote-desktop product's client is using this desktop` names the device and its creator. | Run a driver for hardware at the desk as a system service from its package; a user's own copy of a driver, or a tool other programs can type through, counts as another product. See `console_in_use_other_product` in [Error codes](error-codes.md). |
 | The waiting desktop belongs to another user | `another_users_desktop`. | Wait for `auth.reconnect_window_secs` to pass or for that user to sign out. |
 | A notice must be accepted first | `auth.disclaimer.enabled` is on. | Read and accept it in the Deck; the command-line smokes stop here by design. |
 | Windows: sign-in works but lands on the wrong session or a lock screen | Session topology (RDP, a console user, account switching). | See "Sessions, RDP and account switching (Windows)" in the [administration guide](pier-administration.md). |
@@ -156,8 +157,8 @@ Validation steps per host are in [Pen and tablet input](pen-tablet-input.md).
 
 Clipboard sharing reaches the signed-in desktop, not a sign-in, lock or
 elevation screen, a virtual-machine console or a firmware-style application.
-Use **Connection › Paste as Keystrokes** (⌃⌥⌘V): it types the Mac clipboard's
-plain text there.
+Use **Connection › Paste as Keystrokes** (a menu item; ⌃⌥⌘V goes to the
+host): it types the Mac clipboard's plain text there.
 
 | Cause | How to tell | Fix |
 | --- | --- | --- |

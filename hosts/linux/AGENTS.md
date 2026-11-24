@@ -19,6 +19,9 @@ NVIDIA GPU and driver on the build/test host. The software encoder also needs
 assembly and encodes three to four times slower. Run
 `scripts/verify-openh264-assembly.sh target/release` on every release build.
 
+These are the rules. Why each holds, and how the code meets it, is in
+[`ARCHITECTURE.md`](ARCHITECTURE.md), "Design behind the Linux Pier's rules".
+
 ## Capture pipeline boundaries
 
 - Eight-bit sessions use NvFBC → CUDA → NVENC. Preserve this as the
@@ -41,14 +44,10 @@ assembly and encodes three to four times slower. Run
   and HLG requests must resolve to Grading BT.709 SDR until a color-managed
   Wayland provider proves transfer, primaries, metadata, and capture format.
 - Grading passes the depth-30 desktop's sRGB codes to the matrix untouched
-  (`Rgb10Signal::Direct`); `Config::apply_initial_video_request` states them
-  `srgb` for a Deck that claims `srgb_transfer` through the shared
-  `DesktopPlan::serving_sdr_desktop` (a declared PQ desktop then converts on
-  the sRGB curve). A Wayland Grading epoch gets the same `transfer=srgb`;
-  capenc passes it to the shared admission (`AdmissionRequest::sdr_transfer`),
-  which converts the compositor's PQ with the inverse of Mutter's 2.2-power
-  SDR decode (`SourceColour::sdr_content`) and states `srgb`. Never assume
-  the piecewise sRGB curve for a compositor's SDR content: measure it.
+  (`Rgb10Signal::Direct`). The transfer a Deck is told comes only from the
+  shared `DesktopPlan::serving_sdr_desktop` (Xorg) and
+  `AdmissionRequest::sdr_transfer` (Wayland); never state it locally. Never
+  assume the piecewise sRGB curve for a compositor's SDR content: measure it.
 - XShm cannot composite the host cursor. Resolve Host to Local before native
   preflight and live spawn; keep Host unchanged on the eight-bit NvFBC path.
 - READY and session truth must identify `capture=nvfbc
@@ -75,6 +74,10 @@ assembly and encodes three to four times slower. Run
   sender loop.
 - Bitrate is the shared `link_capped_average_bitrate_bps`; do not size NVENC
   from a local formula.
+- capenc's READY line must carry `cursor=` (`parse_ready_line` requires it);
+  keep READY and the stdout framing in step with
+  `arcen_media::capenc_stream` (ARCHITECTURE.md, "capenc READY line and
+  stdout framing").
 
 ## X11 virtual input
 
@@ -82,58 +85,24 @@ assembly and encodes three to four times slower. Run
   with `arcen_input::virtual_device::SessionInputIdentity` and keep the
   launcher's `with_session_input_isolation` classes on every rendered
   configuration. Never add another input device to a session's X server, and
-  never let console devices reach a remote desktop. The one exception is a
-  lab Native tablet (ADR 0021): it stays on `seat0`, its nodes tagged for
-  Xorg by the helper's per-port rule before the port connects
-  (`ID_INPUT.tags=arcen_bridge,arcen_bridge_<display>`,
-  `LIBINPUT_IGNORE_DEVICE=1`, no `uaccess`, no logind `seat` tag); the installed
-  `/etc/X11/xorg.conf.d/90-arcen-bridged-usb.conf` makes every X server
-  ignore `arcen_bridge`, and the launcher appends, last and after the
-  isolation classes, a class ignoring every `arcen_bridge` again (the
-  session class admits by name and VID, which a bridged device can imitate)
-  and the one class that re-admits this display's own tag
+  never let console devices reach a remote desktop.
+- The one exception is a Native tablet (ADR 0021). It stays on `seat0`,
+  tagged for one display only; the launcher appends, last and after the
+  isolation classes, a class ignoring every `arcen_bridge` again and the one
+  class that re-admits this display's own tag
   (`arcen_usb_bridge::bridge_seat::xorg_session_bridge_class`). Nothing may
   follow them. Never admit
   a bridged device by name, VID or a wider tag, never start a bridge before
   `usb_bridge::seat::x11_isolation` proves every running X server keeps it
   out, and never tell a user to sign out for it.
-- A joined console's X server (ADR 0025) is not one Arcen configures, and
-  every X server on `seat0` would add the session's uinput devices. On a
-  joined console each device is admitted only while the shared proof
-  (`arcen_input::joined_input`) holds over the facts `input/joined_devices.rs`
-  reads, through the gate every injection passes (`uinput.rs` `GatedDevice`);
-  `net/joined_input.rs` proves them before the hello (an unproved keyboard or
-  pointer refuses the attachment, an unproved pen is released), again as soon
-  as the watch starts and then every two seconds, and the session's place in
-  front every 250 ms; every injection also checks that the session's own
-  terminal is in front, and a Deck's Ctrl+Alt+F-key (an X server's terminal
-  switch) is not passed on. A lapse shuts the gate at once (nothing is
-  written, not even releases; key state changes only once written); the
-  shared `JoinedInputGuard` decides when held input is released and input
-  resumes, or the attachment ends; a withdrawn pen's device is destroyed.
+- A joined console's X server (ADR 0025) is not one Arcen configures. Each
+  device is admitted there only while the shared proof
+  (`arcen_input::joined_input`) holds, through the gate every injection
+  passes (`uinput.rs` `GatedDevice`); the shared `JoinedInputGuard` decides
+  when held input is released and input resumes, or the attachment ends.
   Never inject on a joined console around the gate. Who may read a device
-  is the shared `classify_reader`; Linux reads only the facts (each
-  reader's uid, its login from the root-owned `user-<uid>.slice` and
-  `session-<id>.scope` levels of its cgroup, its namespaces, whether its
-  descriptors were readable). A reader is matched by the device number
-  (`st_rdev`, `statx` with `AT_STATX_DONT_SYNC` through
-  `/proc/<pid>/fd/<n>`) of what it holds, never by path: a bind-mounted,
-  hard-linked or second `mknod` node is the same device, and path text
-  alone (a `/dev/input/…` file in a user's own namespace) never counts. A
-  descriptor is a reader only when its `fdinfo` (read first) and the
-  `statx` describe the same open file (inode and mount) and it is not
-  `O_PATH`; one that disagrees in three reads is an unstable handle (an
-  `O_PATH` handle, which needs no read permission, swapped in a loop),
-  not a reader, so an account that cannot read the node cannot stop the
-  session with it. Below kernel 5.14 (no `ino` in `fdinfo`) such a handle
-  could still stop it (fail closed). Root, the `input` group and `uaccess` ACL
-  holders can still read the devices unseen (`SCM_RIGHTS` in flight,
-  io_uring fixed files, a thread's own descriptor table) and can stop a
-  joined session by holding a node; the proof is against other sessions
-  and display servers, not the host's administrators. System services (`acpid`, `thd`, `gpm`,
-  `brltty`) and the joined session's own processes are allowed and logged
-  once per attachment; another session, a login screen, another display
-  server, another account and a known input bridge are not. Never widen
+  is the shared `classify_reader`; Linux reads only the facts. A reader is
+  matched by the device number of what it holds, never by path. Never widen
   this by process name.
 - Never emit `KEY_SYSRQ` from a kernel virtual keyboard
   (`input/keymap.rs::kernel_safe_key`), the committed-text path included
@@ -147,21 +116,15 @@ assembly and encodes three to four times slower. Run
 - Keys outside the main block come from the shared
   `arcen_input::keyboard::host_keys` table; F13–F24 and Menu are pressed as
   keys and never borrowed for committed text (`BORROWABLE_EVDEV`).
-- The Xorg session's layout reaches a Deck that types committed text as a
-  `host_keymap` notice (source `x11_core_keymap`), as on Wayland: the
-  committed-text connection (`input/x11_text.rs`) reads the core keyboard
-  mapping, the active group and `_XKB_RULES_NAMES`, at attach and every
-  second, and sends a notice only when what the layout types changed. Both
-  providers build it with `input/keymap.rs::host_keymap_msg`, a thin
-  evdev wrapper over the shared `arcen_input::text::host_layout` builder
-  every Pier uses (positions, validation, `HostKeymapNotices`); main-block
-  evdev codes come from the shared `set1_position` table.
+- The session's layout reaches the Deck as a `host_keymap` notice, built on
+  both providers with `input/keymap.rs::host_keymap_msg` over the shared
+  `arcen_input::text::host_layout` builder; never build it another way.
 
 ## Native tablet: one path
 
-- `usb.native_tablet = "enabled"` is the only switch (the `usb-hard-lab`
-  feature and `ARCEN_USB_HARD_LAB` are gone; the feature is
-  `native-tablet`, default).
+- `usb.native_tablet = "enabled"` is the only switch (the feature is
+  `native-tablet`, default); never add a lab feature or environment
+  variable that turns it on.
 - Where the bridged pen points is ADR 0023's one path, for X11 and Wayland
   alike: `usb_bridge::tablet_pointer` reads the pen's own evdev node
   (read-only, never grabbed, `O_NOFOLLOW`, device number and seat rule
@@ -172,24 +135,13 @@ assembly and encodes three to four times slower. Run
   lead (application warps, a remapped tablet, sessions without a bridged
   pen), and proves the mapping once a second from the pen's
   `xf86-input-wacom` devices (`x11_wacom_mapping`).
-- `xf86-input-wacom` averages raw samples ("Wacom Sample and Suppress" 2, 4
-  by default); with one report per network round trip that made the X
-  pointer and application ink trail the bridged pen by about one and a half
-  reports. The desktop's bridge class therefore sets `RawSample` 1
+- The desktop's bridge class sets `RawSample` 1
   (`bridge_seat::XORG_BRIDGE_RAW_SAMPLE`); keep it, and keep `Suppress` at
   the driver's default.
 - A joined console (ADR 0025) never takes the raw bridge: its X server is
   not one Arcen starts. It takes the host-decoded route
-  (`net/joined_pen.rs`): the Pier reads the pen with the shared reader
-  (`HidPublishPolicy::Nothing`) and posts it through the session's typed
-  uinput pen, which is kept, not released. The route is offered only while
-  the shared `joined_pen` proof holds over the facts
-  `input/joined_devices.rs` reads (the joined X server, found by its
-  listening `/tmp/.X11-unix` socket, has the event node open; no node is
-  open in another session, display server, account or input bridge, as
-  `classify_reader` judges it; the session is logind's active one), and the
-  proof is repeated every two seconds; a gap ends Native tablet without
-  another event. Never relabel a joined console as an X11 desktop, edit or
+  (`net/joined_pen.rs`), offered only while the shared `joined_pen` proof
+  holds. Never relabel a joined console as an X11 desktop, edit or
   restart its X server, or weaken the ignore classes to admit the raw bridge.
 - Prove pen changes with a real tablet or a real browser, not only the
   emulated Intuos5; read `BTN_STYLUS*` before blaming timing ("pen but no
@@ -209,9 +161,7 @@ assembly and encodes three to four times slower. Run
 - The compositor, private D-Bus bus, PipeWire and WirePlumber run as the
   session user in `/run/user/<uid>/arcen-wayland-<session>`. WirePlumber
   never opens hardware and keeps its state there. The session's audio is its
-  own graph (`session/wayland/audio.rs`): a session sink from an
-  `XDG_CONFIG_HOME` drop-in plus a private `pipewire-pulse`, or, on a
-  PulseAudio host, pulse tunnels into the user's server; the choice is
+  own graph (`session/wayland/audio.rs`), chosen only by
   `arcen_session::local_playback::resolve_wayland_audio` from host facts.
 - `audio.local_playback` is a session-long lease held by the session agent
   (`media/local_playback.rs`); decisions and evidence are
@@ -221,30 +171,21 @@ assembly and encodes three to four times slower. Run
   "work": no `/dev/dri` permission changes, no group additions, no
   SELinux/Secure Boot/kernel changes. GNOME 40 runs surfaceless.
 - The agent assembles the GNOME login itself (`session::wayland::session_services`,
-  policy in `arcen_session::desktop_session`): it serves
-  `org.gnome.SessionManager` on the private bus with `SessionIsActive=false`,
-  `CanShutdown=false` and no logind `IdleHint`, unlocks the keyring with
-  the login password handed through the agent's stdin (never argv, env or
-  a file), and runs the settings daemons and XDG autostart as optional
-  members. Do not start `gnome-session` (GNOME 49 runs it only under the
-  user's systemd manager, outside the scope and private bus), and never
-  run a host-scoped autostart entry (time zone, radios, sharing, USBGuard,
-  modem, VM console agents). Every service is optional; none is a
-  readiness step.
+  policy in `arcen_session::desktop_session`). It hands the login password
+  to the keyring only through the agent's stdin (never argv, env or a
+  file). Do not start `gnome-session`, and never run a host-scoped
+  autostart entry (time zone, radios, sharing, USBGuard, modem, VM console
+  agents). Every service is optional; none is a readiness step.
 - While the Pier's session-bound input connection is served (a Deck is
   attached) the agent's session manager holds the shared
-  `DeckAttachedInhibit` idle inhibitor, released when the connection ends:
-  an attached Deck without input never reaches the idle lock. Never hold it
-  past the attachment, and never pin `idle-delay` or the lock settings
-  instead (they are the user's).
+  `DeckAttachedInhibit` idle inhibitor, released when the connection ends.
+  Never hold it past the attachment, and never pin `idle-delay` or the lock
+  settings instead (they are the user's).
 - Every desktop, on either provider, holds a logind `sleep:idle` block
   inhibitor in the launcher (`session::sleep_inhibitor`) for its whole
   life. Deck keys must never map to host power, sleep, suspend or wake keys.
-- The input probe also creates the session's keyboard (`MutterSessions::prime_keyboard`,
-  a `KEY_RESERVED` press Mutter turns into no event): Mutter 42+ creates a
-  `RemoteDesktop` keyboard only at its first key press, and a headless or
-  native seat has no other, so without it every session's first key reached
-  applications as a lone release. Keep it ahead of readiness.
+- The input probe also creates the session's keyboard
+  (`MutterSessions::prime_keyboard`). Keep it ahead of readiness.
 - Readiness is outputs + stream + input target + a real frame
   (`arcen_session::wayland_session`), never a socket or a running process.
 - The capture hand-off is `arcen_media::video::capture_handoff`; do not add
@@ -263,68 +204,50 @@ assembly and encodes three to four times slower. Run
   only when that hand-off is in its environment; `wayland-provider` turns on
   `arcen-capenc/wayland` (links `libpipewire-0.3`).
 - Pen in a Wayland session is only an emulated stylus on the compositor's
-  EIS seat (libei `ei_stylus`), probed by the agent at start
-  (`session::wayland::eis`, pure-Rust `reis`) and reported in the input
-  `hello` as `StylusFacts`; advertise pen only from a bound stylus, and
-  plan its frames with the shared `arcen_input::pen_emulation`. The one
-  exception is the lab seat pen (`wayland.lab_seat_pen`, default off,
-  `input::seat_pen`, shared `arcen_input::seat_pen`). It is one uinput
-  tablet per desktop on that desktop's own udev seat, never seat0, for a
-  compositor built with the headless-input lab patch. Owned by the desktop:
-  never share one device, seat or grant between desktops, route pen samples
-  only to the attachment's own desktop, and revoke, destroy and remove the
-  rule when it ends. Its per-desktop-user ACL on that one node is pending
-  Release/Security review against the input-access rule above; never enable
-  it by default. Hard USB
+  EIS seat (libei `ei_stylus`, `session::wayland::eis`); advertise pen only
+  from a bound stylus, and plan its frames with the shared
+  `arcen_input::pen_emulation`. The one exception is the seat pen
+  (`wayland.lab_seat_pen`, default off, `input::seat_pen`, shared
+  `arcen_input::seat_pen`): one uinput tablet per desktop on that desktop's
+  own udev seat, never seat0. Never share one device, seat or grant between
+  desktops, route pen samples only to the attachment's own desktop, and
+  revoke, destroy and remove the rule when it ends. Its per-desktop-user
+  ACL on that one node is pending Release/Security review against the
+  input-access rule above; never enable it by default. Hard USB
   and raw HID are refused for every Wayland session
   (`arcen_usb_bridge::admit_hard_usb_session`): a headless compositor opens
   no input devices, so a bridged device would reach `seat0`.
-- A seat pen's pressure is written so applications see the Deck's pressure:
-  the compositor's libinput normalises from its 1 % lower threshold and
-  Mutter 46+ multiplies its curve by the pressure (squares it with GNOME's
-  default curve, GNOME/mutter#5077). The shared
+- A seat pen's pressure goes through the shared
   `arcen_input::compositor_pressure::SeatPenPressure`, chosen from the
-  qualified compositor version, inverts both; never write a seat pen's
-  pressure linearly. A prefix whose Mutter carries the lab fix
-  (`patch-pressure-curve-51.py`) says so in
-  `share/arcen/mutter-pressure-curve`, bound to the library's SHA-256;
-  `input::pressure_curve::SeatPenPressurePlan::resolve` reads it each time a
-  seat pen is built and then inverts libinput's threshold only. Never turn the
-  inverse off by version or configuration alone: a restored stock library
-  must bring it back by itself.
+  qualified compositor version, and
+  `input::pressure_curve::SeatPenPressurePlan::resolve`; never write a seat
+  pen's pressure linearly. Never turn the inverse off by version or
+  configuration alone: a restored stock library must bring it back by
+  itself.
 - Committed text into a Wayland session is typed only where the session
-  proves it: the agent reads its compositor's keymap as a Wayland client
-  (request `wl_keyboard` only after the seat advertises the keyboard
-  capability; earlier crashes headless Mutter 49.4), indexes it with
-  libxkbcommon loaded at run time, and types by proven keycode strokes
-  (Shift and AltGr held by their own keys, every stroke replayed on the
-  compositor's keymap first) only what the keymap proves; with several
-  differing groups, only strokes every group agrees on unless the live group
-  is known. Never type through Mutter's `NotifyKeyboardKeysym`: it presses the
-  first key listing a keysym and drops higher-level modifiers. The rest goes
-  through the compositor's `ei_text` when its EIS seat offers it, or is
-  refused and reported to the Deck. Never log committed text, only counts. The agent keeps one
-  long-lived EIS connection for text (`session/wayland/eis_text.rs`); the
-  stylus probe (`session/wayland/eis.rs`) is short-lived, and a bound
-  stylus should share the text connection rather than open another.
+  proves it. Request `wl_keyboard` only after the seat advertises the
+  keyboard capability. Never type through Mutter's `NotifyKeyboardKeysym`:
+  it presses the first key listing a keysym and drops higher-level
+  modifiers. What the keymap cannot prove goes through the compositor's
+  `ei_text` when its EIS seat offers it, or is refused and reported to the
+  Deck. Never log committed text, only counts. Keep one long-lived EIS
+  connection for text (`session/wayland/eis_text.rs`); a bound stylus
+  should share it rather than open another.
 - A Wayland capenc states its admission (`[capenc] ADMISSION …`, the shared
   `CaptureAdmissionNotice`) before `READY`; the Pier accepts a lower-rate
   `READY` only through that notice, and takes the first-frame readiness
   step from it. Speed on a copying route without a qualified rate is
   visibly served as Auto.
 - DMA-BUF reaches capenc only on the verified `gpu-convert` route
-  (`hosts/capenc/src/wayland/gpu_convert.rs`: EGL image → GL blit into a
-  CUDA-registered texture → CUDA copy; same GPU only; `PipeWire` explicit
-  sync honoured). The Pier passes `gpu-import=verified` only when the
-  qualification record proves it with frames read back equal to a host
-  copy; never classify it as zero-copy, and never hand capenc a DMA-BUF
-  route the record has not verified.
-- A session created for Speed runs its virtual output at the lowest refresh
-  the record holds Speed at (the display's own on Mutter 49's virtual
-  outputs; the shared `paced_output_refresh_hz` only where that alone holds);
-  Auto keeps the Deck's refresh. Speed is decided only by the shared
-  `resolve_speed` (measured, or `inferred` from a larger output of the same
-  refresh, codec and route — say so); never assume a rate.
+  (`hosts/capenc/src/wayland/gpu_convert.rs`). The Pier passes
+  `gpu-import=verified` only when the qualification record proves it with
+  frames read back equal to a host copy; never classify it as zero-copy,
+  and never hand capenc a DMA-BUF route the record has not verified.
+- Speed is decided only by the shared `resolve_speed` (measured, or
+  `inferred` from a larger output of the same refresh, codec and route —
+  say so); never assume a rate. A session created for Speed runs its
+  virtual output at the lowest refresh the record holds Speed at; Auto
+  keeps the Deck's refresh.
 - Every served Wayland Speed epoch is watched by the shared
   `SpeedRuntimeGuard` on capenc's own delivered/encoded counts; a shortfall
   re-serves the attachment as Auto (`speed_runtime_below_floor`). Never judge
@@ -337,19 +260,9 @@ assembly and encodes three to four times slower. Run
   never refusing start, outcome typed (`X11RequalifyOutcome`). Never add
   another trigger without a shared decision and its own hold-off.
 - A desktop fixes its streams' `cursor-mode` when it opens
-  (`resolve_stream_cursor_mode`, kept through every reconfiguration):
-  `metadata` for a Deck that wants a local cursor and declared
-  `cursor_image_v1` on a host whose record proves `cursor_metadata`,
-  `hidden` (`cursor=local`, the Deck's own pointer) for any other Deck that
-  wants a local cursor, `embedded` (`cursor=host`) only for a host-cursor
-  request. Never composite a cursor the Deck also draws. A metadata desktop's capenc writes
-  framed-v2 cursor events; the Pier keeps the desktop's cursor
-  (`media::wayland_cursor`, outliving attachments because Mutter sends a
-  sprite only when it changes) and sends `CursorUpdate` images on the input
-  lane. Never start the X11 cursor watcher for a Wayland session; on an
-  Xorg desktop that watcher (`cursor_watcher.rs`) feeds the shared
-  `HostCursor` with XFixes images and names, through the same `CursorFeed`. The Pier
-  sets `cursor=` from the hand-off.
+  (`resolve_stream_cursor_mode`, kept through every reconfiguration).
+  Never composite a cursor the Deck also draws. Never start the X11 cursor
+  watcher for a Wayland session. The Pier sets `cursor=` from the hand-off.
 - The provider is chosen at start from facts (`capture.provider = auto`):
   an installed Xorg server keeps X11 and is never migrated; without Xorg,
   Wayland needs a DRM render node and a valid qualification record
@@ -363,41 +276,20 @@ assembly and encodes three to four times slower. Run
   back to a proven Grading, else Auto, visibly, never failed. Precision is
   proven by a read-back ramp per format and memory, never assumed from an
   offered wide format (Mutter's shm screencast paints eight-bit).
-- A Wayland host without a usable NVENC still streams: `encoder=software-h264`
-  runs capenc's separate `linux-wayland-software` composition (shared memory
-  only, the shared software loop `arcen_media::canvas::CanvasEncodeLoop`
-  with `PipeWire`'s damage regions, no CUDA).
-  Selection never requires NVIDIA, only a render node a session can open;
-  the qualification probes the native encoder and records
-  `facts.encoder.native`, and a host without one sizes each session's
-  output to OpenH264's limits before it exists and asks for software
-  directly; on such a host a `display_update` is fitted too, and an attach
-  fits an oversize resizable output before capture. A native host's runtime
+- A Wayland host without a usable NVENC still streams through capenc's
+  separate `linux-wayland-software` composition. Selection never requires
+  NVIDIA, only a render node a session can open. A native host's runtime
   software fallback never resizes the output under it: it refuses an
   oversize one by name.
-- Outputs follow the compositor's version (`wayland_outputs::VirtualOutputMode`):
-  Mutter 49+ uses `RecordVirtual` monitors created by negotiating their
-  exact size (`arcen_capenc::materialise_virtual_output`), placed with
-  `ApplyMonitorsConfig` and changed only through the agent's
-  `arcen-output.sock` output transaction, one output generation at a time.
-  Stop every capture epoch of the session before reconfiguring it; capenc
-  always offers exactly the hand-off size. A resized epoch keeps the new
-  size's capture-rate evidence (Auto needs it as much as Speed; an Auto
-  epoch is asked for Auto at no more than its served rate, shared
-  `resized_epoch_request`), and one that
-  cannot take over restores the previous size and streams on
-  (`resize_recovery`): a resize never ends the desktop. Older compositors keep fixed
-  `--virtual-monitor` outputs. An output count change adds streams to the
-  running ScreenCast session (`ScreenCast.Stream.Start`) or stops them;
-  each output is placed at the UI scale `arcen_outputs::choose_output_scale`
-  picks from the client display's density.
+- Outputs follow the compositor's version (`wayland_outputs::VirtualOutputMode`)
+  and change only through the agent's `arcen-output.sock` output
+  transaction, one output generation at a time. Stop every capture epoch
+  of the session before reconfiguring it; capenc always offers exactly the
+  hand-off size. A resize never ends the desktop (`resize_recovery`).
 - Multi-monitor on Wayland is offered from the compositor's output mode and
   the record's proven concurrent outputs (`facts.multi_output`), never from
   NVIDIA heads; topologies are planned with the shared
-  `arcen_outputs::virtual_topology`, each output gets its own capenc and
-  stream hand-off (`MonitorCaptureBinding`), region input lands on the
-  output that shows the region, and a reattach with another layout moves
-  the outputs in place before the first capture epoch.
+  `arcen_outputs::virtual_topology`.
 - A capture epoch that ends on its own is restarted inside the attachment
   (`CaptureRestartBudget`); never end the session for it, and never loop
   past the budget.
@@ -410,7 +302,7 @@ assembly and encodes three to four times slower. Run
   removed only through `xwayland::remove_session_artifacts` (directory
   descriptor, `fstatat` without following, the session's own displays and
   compositor pid), never by path.
-- Lab proof: `examples/wayland_session_harness.rs` (`--x11-client`,
+- Proof harness: `examples/wayland_session_harness.rs` (`--x11-client`,
   `--x11-glx` for Xwayland); see
   `docs/architecture/linux-wayland-provider.md`.
 
@@ -463,74 +355,44 @@ older deployments may be removed from `/opt/arcen/bin/`.
 
 ### Session admission
 
-A Pier drives **one physical desktop session at a time**. That is a hardware
-constraint, not a policy one: a second concurrent session would fight the first
-over the same display, input devices, and encoder. The Pier therefore holds a
-capacity-one session admission gate, and keeps the slot reserved for a bounded
-reconnect window (`auth.reconnect_window_secs`, 180 s by default, at most two
-hours) so a dropped Deck can resume rather than lose
-the session. Do not remove or widen that gate without understanding what it
-protects.
-
-The host's X11 seat is a second, host-wide limit: one X11 desktop per host.
-A dedicated Xorg desktop is a logind session on `seat0` at VT 1, and logind
-refuses a second one ("already occupied", which `pam_systemd` turns into a
-PAM success without `XDG_SESSION_ID`). The launcher probes the occupant
-(shared `arcen_session::x11_seat`) and answers `seat_occupied`; the Pier
-closes with `DECK_REASON_SEAT_OCCUPIED`. Every launcher failure after
-authentication must write a response status; exiting without one surfaces
-as the misleading "session launcher protocol failed".
-
-A host without a display manager gets the account's real login session,
-not a per-connection desktop (ADR 0025 §10, `session/login_session.rs`,
-shared `console_session::login_session`): systemd runs `arcen-pier
-login-session` as its own unit, which opens PAM `arcen-login` on `seat0` at a
-free VT, starts a console-seat X server (`XorgSeat::Console`) and the user's
-X session entry through `Xsession`, and lives until the user logs out. The
-console path joins it like any console session. Never tie its lifetime to
-a connection or to the Pier's process tree, and never authenticate with
-`arcen-login` (its stack denies `auth`). Only a complete read of logind's
-sessions proves the account has none (`console::read_sessions` returns a
-shared `console_session::SessionRead`): never turn a `loginctl` failure,
-timeout or partial answer into an empty list; decide with the `*_read`
-decisions, which refuse `console_sessions_unreadable`. Likewise one
-unanswered `show-session` is not a logout: a joined launcher watches its
-session through `console::watch_joined` (shared
-`console_session::session_watch`), never through `session_fact(..).is_none()`.
-
-The account's own GNOME Wayland console session is joined, never
-replaced (ADR 0025 section 9, S4b): the console agent's `--wayland-join`
-mode (`session/wayland/join.rs`) runs as the account on the session's own
-user bus and re-checks the proven compositor before it uses the bus; it
-starts no bus, compositor or PipeWire and never changes the session's
-monitors. Every decision (outputs, desk privacy, the proved route, lock,
-departure) is shared `console_session::wayland_attach`; keep the launcher's
-`run_wayland_join` an adapter. A joined Wayland session is never held for a
-resume.
-
-A seated desktop is local to polkit (it never reads logind's `Remote`), so
-Arcen's rule `05-arcen-remote-session.rules` (shared
-`arcen_session::polkit_remote`, adapter `session/polkit_remote.rs`) gives
-remote seated sessions polkit's `allow_any` answers, keyed on `REMOTE=1`,
-`TTY=arcen` and `seat-arcen-pen-…` — keep `set_rhost` and `set_tty("arcen")`
-on every launcher path. A seated desktop without the rule is refused before
-launch; every desktop is proved with `pkcheck` before hand-over and refused
-(`LauncherError::PolkitUnprotected`) on a grant (a seated one also when
-polkit does not answer). A native Wayland desktop is seated
-(`DesktopSeat::ArcenSeat`, `polkit_remote::desktop_seat(provider,
-native_seat)`), never seatless; its seat is not built unless
-`native_seat::polkit_blocker` passes. Never add a second polkit rule or
-module for one product path. Site restrictions must sort before `05-`.
-
-### capenc READY line
-
-capenc emits `[capenc] READY version=1 backend=... codec=... cursor=local|host ...`
-on stderr. The pier's `parse_ready_line` requires the `cursor=` field. The
-`cursor=` value echoes the `cursor=local|host` argv the pier passes. Old capenc
-binaries did not emit this field and will fail with
-`capenc READY protocol error: missing cursor`.
-
-stdout is framed-v1 (`u32_be length || access unit`) unless the Pier passes
-`framed-v2` (a Wayland metadata-cursor capture): then every record is
-`u32_be length || u8 kind || body`, kind 1 an access unit and kind 2 a
-cursor event (`arcen_media::capenc_stream`, bounded before allocation).
+- The Pier holds a capacity-one session admission gate and keeps the slot
+  reserved for the reconnect window (`auth.reconnect_window_secs`, 180 s by
+  default, at most two hours). Do not remove or widen that gate without
+  understanding what it protects.
+- One X11 desktop per host: the launcher probes the seat's occupant (shared
+  `arcen_session::x11_seat`) and answers `seat_occupied`; the Pier closes
+  with `DECK_REASON_SEAT_OCCUPIED`. Every launcher failure after
+  authentication must write a response status; exiting without one surfaces
+  as the misleading "session launcher protocol failed".
+- A host without a display manager gets the account's real login session
+  (ADR 0025 §10, `session/login_session.rs`, shared
+  `console_session::login_session`). Never tie its lifetime to
+  a connection or to the Pier's process tree, and never authenticate with
+  `arcen-login` (its stack denies `auth`). Only a complete read of logind's
+  sessions proves the account has none (`console::read_sessions` returns a
+  shared `console_session::SessionRead`): never turn a `loginctl` failure,
+  timeout or partial answer into an empty list; decide with the `*_read`
+  decisions, which refuse `console_sessions_unreadable`. Likewise one
+  unanswered `show-session` is not a logout: a joined launcher watches its
+  session through `console::watch_joined` (shared
+  `console_session::session_watch`), never through `session_fact(..).is_none()`.
+- The account's own GNOME Wayland console session is joined, never
+  replaced (ADR 0025 section 9, S4b): the console agent's `--wayland-join`
+  mode (`session/wayland/join.rs`) starts no bus, compositor or PipeWire and
+  never changes the session's monitors. Every decision (outputs, desk
+  privacy, the proved route, lock, departure) is shared
+  `console_session::wayland_attach`; keep the launcher's
+  `run_wayland_join` an adapter. A joined Wayland session is never held for a
+  resume.
+- Remote seated sessions get polkit's `allow_any` answers only through
+  Arcen's rule `05-arcen-remote-session.rules` (shared
+  `arcen_session::polkit_remote`, adapter `session/polkit_remote.rs`) — keep
+  `set_rhost` and `set_tty("arcen")` on every launcher path. A seated
+  desktop without the rule is refused before launch; every desktop is
+  proved with `pkcheck` before hand-over and refused
+  (`LauncherError::PolkitUnprotected`) on a grant (a seated one also when
+  polkit does not answer). A native Wayland desktop is seated
+  (`DesktopSeat::ArcenSeat`, `polkit_remote::desktop_seat(provider,
+  native_seat)`), never seatless; its seat is not built unless
+  `native_seat::polkit_blocker` passes. Never add a second polkit rule or
+  module for one product path. Site restrictions must sort before `05-`.

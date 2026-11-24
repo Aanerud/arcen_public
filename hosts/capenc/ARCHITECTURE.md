@@ -26,30 +26,29 @@ wide path must not add a readback to Linux's eight-bit NvFBC fast path, and an
 8-bit BGRA source must never be accepted as a ten-bit WGC/XShm source merely
 because the destination buffer is wider.
 
-## How it's grounded
+## Design decisions
 
-  Provenance in `legal/ORIGINS.md`.
+Provenance is in `legal/ORIGINS.md`.
+
 - Lessons encoded (critical):
   - **NvFBC captures the PHYSICAL GPU head, not the X server's logical framebuffer.** Two X
-    servers on the same head capture identical pixels. Proven live: `:10` on DFP-0 grabbed
-    `:0`'s pixels; moving it to DFP-1 + `--monitor 1` grabbed the real per-user desktop.
+    servers on the same head capture identical pixels: `:10` on DFP-0 captures `:0`'s
+    pixels, and only on DFP-1 with `--monitor 1` does it capture the per-user desktop.
     Therefore each independently-captured screen needs its own head (DVI-D-0..3, ≤4).
   - **`--monitor N` → output index N-1.** `nvFBCGetStatus` enumerates the `$DISPLAY` server's
     RandR outputs; `TRACKING_OUTPUT` on `outputs[N-1].dwId`, else `TRACKING_SCREEN`. One head
     per Xorg ⇒ `--monitor 1` (index 0).
-  - **YUV444 pitch/stride bug (known, real).** The YUV444 path sets `pitch = width` and
-    `stage()` does one contiguous `cuMemcpyDtoD` of `w*h*3`, assuming NvFBC's
-    `BUFFER_FORMAT_YUV444P` output is tightly packed. NvFBC returns rows at an **aligned**
-    pitch; where pitch ≠ width, every row shears (1920 clean, 2560 sheared green). BGRA
-    (pitch `w*4`) is unaffected. **Fix:** copy plane rows at NvFBC's real pitch
-    (`FrameGrabInfo.dwByteSize` reveals padding), or register the NVENC input at that pitch.
-    Add a regression test at a non-aligned width (2560/3600); the 4K path may hit it latently.
+  - **NvFBC's YUV444P rows are padded.** NvFBC returns `BUFFER_FORMAT_YUV444P` rows at an
+    **aligned** pitch; where pitch ≠ width, a tightly packed copy shears every row (2560
+    wide comes out sheared green). capenc derives the real pitch from
+    `FrameGrabInfo.dwByteSize` (`frame_pitch` in `linux.rs`, tested at 2560 wide) and
+    copies plane rows at that pitch. BGRA (pitch `w*4`) is unaffected.
   - **Linux backend is feature-gated behind `--features nvenc`.** Building without it yields
     "no backend for this platform/feature combination" and the Pier disconnects at once.
     Always build the Linux engine with `--features nvenc`.
   - Buffer formats: NvFBC `BUFFER_FORMAT_YUV444P = 3` (planar `w*h*3`); NVENC
     `NV_ENC_BUFFER_FORMAT_YUV444`.
-  - **Depth 30 does not imply one packed ordering.** The live GRID Xorg visual
+  - **Depth 30 does not imply one packed ordering.** An NVIDIA GRID Xorg visual
     exposes red in bits 0–9 and blue in 20–29 (`XBGR2101010`). Derive shifts
     from the root visual masks; never cast depth-30 bytes to `BgraFrame` or
     assume `XRGB2101010`.
@@ -58,7 +57,7 @@ because the destination buffer is wider.
 
 1. Standalone binary. Emits Annex-B to stdout; framing/FEC stays in the Pier (Python-era
    guardrail: keep media relay-able — no client identity/routing baked into capenc output).
-2. `unsafe` FFI is expected here (~1200 sites: NvFBC/CUDA/NVENC/DXGI/WGC/D3D11). This is why
+2. `unsafe` FFI is expected here (NvFBC/CUDA/NVENC/DXGI/WGC/D3D11). This is why
    the workspace `unsafe_code` lint is `warn`, not `forbid`.
 3. Linux eight-bit NvFBC keeps its device-to-device behavior. Linux depth-30,
    Windows BGRA/FP16 conversion, MF and OpenH264 are explicit bounded
@@ -129,13 +128,13 @@ because the destination buffer is wider.
   only wake a region the activity scheduler had suppressed and never suppresses,
   delays, or downgrades a keyframe, a refresh deadline, or an admitted frame.
 
-## Module map (from the proven source)
+## Module map
 
 - `main.rs` — argv parse, backend selection, run loop, selftest.
 - `linux.rs` — NvFBC capture including startup `bWithCursor`, idle submission
   cadence, INFO pipeline stats, and checked NvFBC 1.7 ToCuda ABI plus
   READY/UNAVAILABLE startup records.
-- `nvenc_cuda.rs` — Linux CUDA↔NVENC staging (**the YUV444 pitch bug lives here**).
+- `nvenc_cuda.rs` — Linux CUDA↔NVENC staging, at the source's real plane pitch.
 - `win.rs` — Windows capture selection. Eight-bit probes DDA before WGC;
   every ten-bit contract requires WGC FP16; HDR additionally verifies the
   bound output's PQ/BT.2020 DXGI state.
@@ -153,9 +152,9 @@ because the destination buffer is wider.
   (up to 98 % of reads); NvFBC needs no such copy.
 - `wayland/` (feature `wayland`, default off) — Wayland provider capture: the
   session hand-off, a `PipeWire` consumer with bounded, revocable buffer
-  leases, the `host-copy` route into the NVENC CUDA slot (proven on GNOME 40
-  shared memory), an unqualified DMA-BUF EGL/CUDA route, capture-path
-  telemetry, and the `wayland-capture-probe` lab harness. See
+  leases, the `host-copy` route into the NVENC CUDA slot, the `gpu-convert`
+  DMA-BUF EGL/CUDA route (used only where the qualification record verifies
+  it), capture-path telemetry, and the `wayland-capture-probe` harness. See
   `docs/architecture/linux-wayland-provider.md`.
 - `nvenc.rs` + `nvenc_sys/{mod,guid,version}.rs` — Windows NVENC FFI and
   staging, including separate FP16-scRGB-to-SDR and FP16-scRGB-to-PQ row
@@ -167,29 +166,8 @@ because the destination buffer is wider.
 
 ## Deferred / roadmap
 
-- **Fix the YUV444 pitch bug** with a non-aligned-width regression test (top capenc fix).
 - Fine Linux damage needs a supported producer. Public NvFBC 1.7/1.9 ToCuda has
   no diff-map fields; use a separately reviewed ToSys/ToGL design or an original
   CUDA comparison kernel rather than guessing ToCuda ABI fields.
 - Reference Frame Invalidation (loss recovery).
-- Intel/AMD hardware Media Foundation encoder discovery, adapter binding, and async MFT loop.
 - True multi-monitor Windows recreation/capture; the current host consumes the client's primary.
-- OpenH264 physical fallback, 1080p30 performance/allocation, one-hour soak,
-  and package distribution acceptance. No such results are claimed by the
-  implementation.
-
-## Resume pointer
-
-- **Status:** ✅ MIGRATED + WINDOWS MF FALLBACK PROVEN. Built with
-  `--features nvenc`; NVENC selftest passed (3840×2160 IDR, CUDA ready). On a
-  VMware SVGA Windows guest, exact-output WGC + MF software H.264 streamed at
-  30 fps with working input; low-latency CBR, two-second GOP, zero B-frames,
-  real force-IDR, and light agent logging were smooth in use.
-  Current MF negotiation maps a 1800×1168 client request to a 1792×1168
-  macroblock-aligned Windows desktop rather than cropping encoded pixels.
-  Linux Keel cadence and INFO stats are implemented offline; live GRID validation
-  remains open.
-- **Original next step (done):** copy `server/capenc/src` + `Cargo.toml` into `hosts/capenc`, rename crate/bin
-  → `arcen-capenc`, keep the `nvenc` feature, wire into the workspace, and embed
-  it in each Pier. Build the fused Pier on the target OS, run `capenc selftest`
-  through that executable, then have the Pier spawn its own `capenc` subcommand.

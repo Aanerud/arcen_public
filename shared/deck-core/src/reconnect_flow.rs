@@ -217,6 +217,29 @@ pub fn follows_login_window(end: &SessionEnd) -> bool {
     SignInFailure::from_end(end, SignInStage::Attempt).is_none_or(|failure| !failure.is_definite())
 }
 
+/// When to reconnect after a followed end (`follows_login_window`) observed
+/// at `now`, by the hand-over's `schedule`.
+///
+/// `None` once every attempt is used: no desktop replaced the sign-in screen,
+/// and that is logged as the failure it is. Each end before it is the
+/// expected hand-over, which the session engine logs as information.
+pub fn login_window_reconnect_due(
+    schedule: &mut HandoverSchedule,
+    end: &SessionEnd,
+    now: Duration,
+) -> Option<Duration> {
+    let due = schedule.session_ended(now);
+    if due.is_none() {
+        tracing::error!(
+            target: crate::log_target::SESSION,
+            attempts = schedule.attempts_made(),
+            reason = %end.message,
+            "no desktop replaced the host's sign-in screen; the hand-over stopped",
+        );
+    }
+    due
+}
+
 /// What [`next_resume_launch`] decided.
 #[derive(Debug)]
 pub enum ResumeLaunch {

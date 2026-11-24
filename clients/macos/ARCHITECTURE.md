@@ -11,10 +11,10 @@ settings), QUIC/TLS 1.3 transport to an Arcen Pier, a decode pipeline (VideoTool
 → frame queue → render), audio playback (cpal), input capture forwarded to the Pier, and
 HID device passthrough (HoIP) — physical pen-tablet HID reports (any make) forwarded verbatim over
 the session wire so the remote host sees a virtual pen tablet with full pressure/tilt.
-It is deliberately separate from any future Windows/Linux Deck so each stays optimized for
-its platform's decode/render path.
+Only the macOS parts live here: decode, presentation, the window and the platform
+services. The portable Deck is `shared/deck-core`, which the Windows Deck shares.
 
-## How it's grounded
+## Design decisions
 
 - Lessons encoded:
   - **Production presets are complete contracts.** Auto is 30 fps adaptive
@@ -110,7 +110,7 @@ The profile is not on the wire. The Pier sees the Deck's real capability flags
 and `decoder_backend` (`videotoolbox-hw`/`-sw`), which already carry what it
 needs to negotiate.
 
-## Module map (from the proven source)
+## Module map
 
 - `main.rs` / `lib.rs` — entry + crate root. `arcen-deck platform-report`
   prints the platform profile and the real decode probe without a window;
@@ -249,7 +249,7 @@ fields. TCC granted/denied lifecycle records are deduplicated once per process.
 `ClientTelemetry` is caller-owned and lock-free. Decode, presentation, input
 handoff, drop, and RTT paths update atomics only; no frame, packet, report, or
 input-event log formatting occurs on a hot path. The existing health ping/pong
-sequence measures application RTT. A five-second Level 2 snapshot carries PR3
+sequence measures application RTT. A five-second Level 2 snapshot carries
 integer client QoS and health to the Pier, a sixty-second Level 0 snapshot is
 proof-of-life. Health uses decoded/presented deltas and freshness from the
 actual five-second window, with shared two-window hysteresis; cumulative totals
@@ -421,26 +421,14 @@ debuggable Development profile, which a Developer ID distribution profile
 must not carry), and a `--dev-sign` build requires `get-task-allow: true` so
 a Developer ID profile cannot silently be reused in development mode either.
 
-## Deferred / roadmap
+## Transport and host notes
 
 - Product message framing remains local. The active dependency-light
   `arcen-transport` default supplies shared TLS lifecycle and pin contracts,
   while its Quinn surface supplies the direct QUIC stream carrier. The Deck has
-  no WSS networking (removed 2026-11-15, with its `wss-compat` feature; the
-  Piers' dormant listener followed on 2026-11-18); a
-  connection saved as WSS by an older Deck loads as QUIC.
-- Windows Pier pen: shipped as a Windows Ink pen from typed pen events
-  (`InjectSyntheticPointerInput`); raw HID reports and Native tablet are not
-  offered on Windows hosts
-  ([ADR 0017](../../docs/adr/0017-forward-only-pen-input.md)).
-- macOS Pier: `IOHIDUserDeviceCreate` + `IOHIDUserDeviceHandleReport` (pending Apple
-  entitlement approval).
-
-## Resume pointer
-
-- **Status:** ✅ MIGRATED + LIVE-VERIFIED (updated 2026-07-31). `Arcen Deck.app` streams both a Linux Pier (H.265 4:4:4) and a Windows Pier over direct QUIC/TLS 1.3 on UDP 18444. Includes the **Retina effective-stream-resolution** fix and the **TOFU certificate trust fix** (QUIC cert capture now correctly promotes to `CertificateUntrusted` for explicit Deck trust). The connections list shows only QUIC entries. See [`docs/adr/0007-quic-only-product-transport.md`](../../docs/adr/0007-quic-only-product-transport.md).
-- **Original next step (done):** establish `clients/macos` as crate
-  `arcen-deck-macos`, lib `arcen_deck`, bin `arcen-deck`, using
-  `arcen_protocol` via `../../shared/protocol`; the historical migration
-  default port was 18443 and the current QUIC product default is 18444,
-  `cargo build --release` + `cargo test`, then package `Arcen Deck.app`.
+  no WSS networking; a connection saved as WSS by an older Deck loads as QUIC.
+- A Windows Pier turns typed pen events into a Windows Ink pen
+  (`InjectSyntheticPointerInput`). With Native tablet it reads the bridged pen
+  itself and injects it the same way; it publishes no HID device
+  ([ADR 0017](../../docs/adr/0017-forward-only-pen-input.md),
+  [ADR 0023](../../docs/adr/0023-one-native-tablet-pen-position-path.md)).

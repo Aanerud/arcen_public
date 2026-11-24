@@ -1,43 +1,37 @@
-# Arcen Keel — the content-adaptive streaming engine (planning document)
+# Arcen Keel — the content-adaptive streaming engine
 
-**Status: PHASES 0–1 IMPLEMENTED; LINUX IDLE PARITY IMPLEMENTED —
-PHASES 2–4 REMAIN ROADMAP.** `arcen-keel` (the keel is the structural backbone
-under the pier) is the pure shared damage engine, with Windows software-H.264 selective
-conversion and Linux NvFBC frame-level idle cadence. Written 2026-07-17; implementation status updated 2026-07-18.
+`arcen-keel` (the keel is the structural backbone under the pier) is the pure
+shared damage engine beneath every Pier. It tracks which 16×16 blocks of a
+captured frame changed and turns that into decisions for capture, conversion
+and encode adapters: Windows software-H.264 selective conversion, the
+submission cadence of the NVENC paths, damage-driven QP maps, and the canvas
+building blocks of the Software contract (§11). §9 lists what is implemented
+and what is planned.
 
 ## 1. Why this component should exist
 
-Arcen now has two encode paths that both treat every frame as a full, opaque rectangle:
+Without Keel, both encode paths treat every frame as a full, opaque rectangle:
 
 - **NVENC hosts** encode the full frame every capture tick. The GPU hides most of the
   cost, but bandwidth still spikes on keyframes (partially tamed by intra-refresh) and
   nothing distinguishes "4K parked on a file manager" from "4K full-screen playback".
-- **Software H.264 hosts** CPU-convert and CPU-encode the full frame. An earlier optimisation removed the
-  gross waste (single-pass convert, no clones, idle keepalive), but a *single changed
+- **Software H.264 hosts** CPU-convert and CPU-encode the full frame. Single-pass
+  conversion and an idle keepalive remove the gross waste, but a *single changed
   pixel* still costs a full-frame convert + a full-frame software H.264 encode.
 
-Reference observations from a mature remote-desktop engine show what such systems do
-differently, and none of it is encoder-specific — it is a layer of **content
-intelligence between capture and encode**:
-
-| Reference evidence (strings/config) | Technique |
-|---|---|
-| 8×8–128×128 block change-maps, `verify_changemap` | damage maps drive everything: only touched pixels cost anything |
-| `"Frame encode took Xms so far. Dropping down the quality"`, `fps_estimator_algo` | measure encode time, degrade fps first, quality second — never stutter |
-| `enable_build_to_lossless`, `build_to_lossless_target_sec`, quality floor 40 → lossless | changed regions start cheap and refine while static |
-| `enable_tile_based_image_caching`, `temporal_cache_hits`, vertical-offset variant | the client never receives the same tile twice (even scrolled) |
-| CPU-offload mode: AVX2 required both ends, auto-switch to GPU above ~10 MPPS | know the limits of software encode and gate on them |
-
-This is the productization of two standing roadmap items ([reference-adaptation
-roadmap]: dirty-rects #1, RFI #2) plus the Media Foundation follow-ups parked at
-the time. Building it **once, as a pure shared crate**, is what
-makes it pay on all hosts instead of becoming three divergent hacks.
+None of the remedy is encoder-specific. It is a layer of **content intelligence
+between capture and encode**: damage maps so that only touched pixels cost
+anything; encode-time measurement that lowers frame rate first and quality
+second, so the stream never stutters; changed regions that start cheap and
+refine while they stay still; a client that never receives the same tile
+twice, even scrolled; and a known ceiling on what software encode can do.
+Building it **once, as a pure shared crate**, makes it pay on every host
+instead of becoming three divergent hacks.
 
 **The product thesis:** for Arcen's market (VFX workstations — static, detail-dense
 UIs with bursts of playback), perceived quality is dominated by (a) razor-sharp static
 UI, (b) no stutter under load, (c) instant response to small changes. A damage-driven
-engine optimizes exactly those three, and it is the part of the stack competitors
-can't copy out of an ffmpeg flag.
+engine optimizes exactly those three.
 
 ## 2. What the component is (and is not)
 
@@ -58,11 +52,10 @@ inside the existing host crates.
                        └────────────────────────────────────────────┘       FrameMeta
 ```
 
-**Roadmap scope:** block hashing/damage tracking, frame classification (idle /
-sparse-UI / scroll / video), the pacing governor, the quality/refinement ladder,
-tile-cache ledger logic, and capability gating. **Implemented scope in Phases
-0–1:** checked 16×16 damage tracking plus Windows software selective conversion,
-external damage ingestion, and Linux frame-level idle cadence.
+**Scope:** block hashing and damage tracking, frame and block classification
+(idle, sparse UI, scroll, video), the pacing governor, the quality and
+refinement ladder, tile-cache ledger logic, and capability gating. §9 says
+which of these exist.
 Future wire types such as `FrameMeta` and `TileRef` are defined and versioned by
 `arcen-protocol`; Keel does not own or export wire contracts.
 
@@ -72,8 +65,8 @@ at fps 24"; it *tells* the NVENC adapter "emphasis-map these MBs, invalidate ref
 it never touches an API itself.
 
 **Invariants (design-first, per repo rule):**
-1. `#![forbid(unsafe_code)]`, zero platform deps — tests and benches run on the
-   macOS dev box and in every CI lane.
+1. `#![forbid(unsafe_code)]`, zero platform deps — tests and benches run on any
+   developer machine and in every CI lane.
 2. Deterministic: same frame sequence + same feedback ⇒ same decisions (golden tests).
 3. Zero allocation on the per-frame path after warm-up (grids and scratch reused).
 4. Wire-visible types are versioned in `arcen-protocol`, not in keel.
@@ -129,23 +122,24 @@ One abstraction, three producers, four consumers.
 2. **Pacing governor:** changed-MPPS is the load signal (§4).
 3. **NVENC hints:** per-MB emphasis/QP-delta maps (NVENC exposes these) so static
    regions spend fewer bits and changed regions get them; pairs with the already
-   shipped intra-refresh. Reference Frame Invalidation (roadmap #2) uses the same
+   shipped intra-refresh. Reference Frame Invalidation (planned, §9) uses the same
    feedback plumbing when loss reports arrive.
 4. **Tile ledger (§6):** block hashes are exactly the cache keys.
 
-**Honesty note:** with a stock MF H.264 MFT we cannot encode partial frames — the
-encoder always sees the full picture. The MF wins come from (a) skipping conversion
+**Limit:** a stock MF H.264 MFT cannot encode partial frames — the encoder
+always sees the full picture. The MF wins come from (a) skipping conversion
 of clean blocks, (b) frame-level skip/cadence (shipped), (c) governor decisions. The
 *encoder-level* payoff of damage maps lands on NVENC (emphasis maps, RFI) — the same
-map, more leverage. If we ever want true region encoding on CPU, that is the Phase-4
-hybrid-codec decision (§7), not a patch on the MFT.
+map, more leverage. True region encoding on the CPU is the hybrid-codec
+question (§9), not a patch on the MFT; the canvas pipeline (§11) answers it for
+the Software contract.
 
 **Narrowed hashing.** Where the OS reports damage (DDA dirty and move rects,
 WGC dirty regions, PipeWire damage metadata, ScreenCaptureKit dirty rects),
 `DamageTracker::update_within(frame, os_damage)` hashes only the reported
 blocks plus a rotating audit stripe of whole block rows, so hashing cost
-follows the reported damage instead of the frame size (4K typing: 1.83 ms
-full, 83 µs narrowed on the review machine). The result equals a full update
+follows the reported damage instead of the frame size (4K typing on an Apple
+M4 Pro: 1.83 ms full, 83 µs narrowed). The result equals a full update
 whenever the report is a superset of the real change; a change the OS never
 reported is found when the stripe reaches it, within `audit_period` narrowed
 updates (default 30). Without a baseline, and whenever the report is
@@ -190,13 +184,13 @@ class + ladder position so live QA can see it.
 **Decided:** every governor constant (fps floors and steps, ladder thresholds,
 refinement window, viability ceiling, hysteresis) ships as a tunable `keel` section
 in `pier.json` with calibrated defaults — same pattern as the existing
-`desktop`/`video` sections, validated by `validate-config`. Defaults get calibrated
-on real Linux and Windows hosts during Phase 2, not adopted blindly.
+`desktop`/`video` sections, validated by `validate-config`. Defaults are
+calibrated on real Linux and Windows hosts, not adopted blindly.
 
 ## 5. Progressive refinement — build-to-lossless, approximated in H.264
 
-Comparable remote-desktop engines re-encode settled regions at increasing quality until perceptually lossless.
-Stock-H.264 approximation, in order of payoff:
+Build-to-lossless re-encodes settled regions at increasing quality until they
+are perceptually lossless. The stock-H.264 approximation, in order of payoff:
 1. **Frame-level QP ramp (cheap, both encoders):** when the damage map goes quiet,
    schedule 2–4 "refinement ticks" at stepped-up quality (MF: temporarily raised
    bitrate/lowered QP; NVENC: qpDelta relaxation on recently-changed MBs), then
@@ -205,15 +199,14 @@ Stock-H.264 approximation, in order of payoff:
 2. **NVENC emphasis inversion:** during refinement ticks, invert the emphasis map —
    spend bits on the *recently changed, now static* blocks.
 3. **Intra-refresh everywhere it exists:** replaces the periodic-IDR bandwidth spike
-   with a rolling intra column — proven on NVENC in prior measurements (3.2× static-detail
-   peak reduction, −29% avg bitrate). Verify the arcen-capenc lift carries it on the
-   NVENC path; probe the MF MFT's `ICodecAPI` intra-refresh knobs at runtime
-   (`IsSupported`, fail-open to GOP keyframes). Bandwidth smoothing + loss-recovery
-   only — it does not change pixel fidelity and does not compete with §10's
-   static-content options.
-4. True per-tile lossless build is the Phase-4 hybrid question (§7).
+   with a rolling intra column — on NVENC, a 3.2× lower static-detail peak and
+   29% lower average bitrate. The MF MFT's `ICodecAPI` intra-refresh knobs are
+   probed at runtime (`IsSupported`, fail-open to GOP keyframes). This smooths
+   bandwidth and helps loss recovery only — it does not change pixel fidelity
+   and does not compete with §10's static-content options.
+4. True per-tile lossless build is the hybrid-codec question (§9).
 
-## 6. Tile ledger + client cache — the Deck side (bigger, staged last among the core)
+## 6. Tile ledger + client cache — the Deck side
 
 Keel keeps a `TileLedger`: block hash → cache-slot state, mirrored with the client
 via acks. When a "new" block's hash matches a slot the client already holds, the wire
@@ -222,12 +215,12 @@ catches scrolling (tracked as zero-offset/offset-tile cache hits). Requires:
 - `arcen-protocol`: `FrameMeta`/`TileRef` messages + cache-ack channel (versioned,
   additive; harmless to the current QUIC stream).
 - Deck: a bounded tile store (**decided: 100 MB default**, configurable in Deck
-  settings) + compositor step — this is the largest client change and the reason the
-  ledger ships after §3–§5.
+  settings) + compositor step — the largest client change, so it follows
+  §3–§5.
 - Eviction is ledger-driven (LRU + explicit invalidate), and the ack channel is the
   same feedback path RFI and QUIC loss reports use — one plumbing job, three tenants.
 
-**Implemented (Keel side):** `TileLedger` keys exact tiles by a 128-bit XXH3
+**Keel side:** `TileLedger` keys exact tiles by a 128-bit XXH3
 of their shape and pixels (`TileKey::of`), and the Pier assigns the receiver
 slots. On an ordered lane the receiver therefore needs no acknowledgement for
 the ledger to be correct; acknowledgements remain a throttling signal. The
@@ -256,94 +249,63 @@ map cleanly later — with zero behavior change on today's QUIC single stream:
 ## 8. Maintainability — how this stays healthy across three hosts
 
 - **Placement:** `shared/keel` next to `shared/protocol`; same design-first
-  discipline (its `ARCHITECTURE.md` is this document, refined at build time).
+  discipline (its `ARCHITECTURE.md` distils this document).
   Dependency rule: hosts → keel; keel → (nothing but std + a hash crate);
-  future wire types remain owned by protocol; neither shared crate depends on the
-  other in Phases 0–1.
+  wire types are owned by protocol; neither shared crate depends on the other.
 - **Testing:** golden decision tests (synthetic frame scripts → expected
   damage sequences); property tests exercise representative pixel changes at
   block/tail/stride boundaries and compare both kernels' decisions. These tests
-  establish implementation sensitivity, not collision impossibility. Governor,
-  refinement, and ledger tests land with those phases.
+  establish implementation sensitivity, not collision impossibility. Governor
+  and refinement tests arrive with those parts.
 - **Benchmark corpus:** deterministic **synthetic** scenario generators (idle
   desktop, terminal typing, window drag, scroll, full-screen video — procedurally
   drawn, seeded, no binary fixtures in the repo) replayed through criterion on every
   change. Recorded real-capture fixtures are a later task on real hosts and never a
   prerequisite. This corpus
   is the honesty check for every claim in this document.
-- **SIMD policy:** safe Rust with `chunks_exact` first (the optimizer proved good
-  enough in the earlier convert optimisation); hand-SIMD (`std::arch` behind runtime feature detection) only
+- **SIMD policy:** safe Rust with `chunks_exact` first (the optimizer is good
+  enough for conversion); hand-SIMD (`std::arch` behind runtime feature detection) only
   for the hash kernel and only if the corpus shows it matters. No nightly features.
 - **Adapters stay thin:** if an adapter grows logic that a second host could want,
   it moves down into keel — that is the review rule that keeps hosts symmetric.
 
-## 9. Phasing, prerequisites, and acceptance criteria
+## 9. Status and planned work
 
-Already shipped (baseline — do not re-plan): fused single-pass convert, clone
-removal, idle keepalive, MFT buffer-size cache, drain-scratch reuse.
+**Implemented:**
 
-**Phase 0 — debts + instrumentation (implemented)**
-Input `IMFSample`/`IMFMediaBuffer` reuse investigation (MFT may hold buffers —
-verify with the SW MFT before trusting it); DXGI-factory reuse across the
-session-start readiness polls; promote the per-second stats into a structured
-`PipelineStats` that Phase-2 consumes. *Accept:* no per-frame COM allocation on the
-happy path; session start does ≤3 factory creations; stats visible in agent log.
+- **Damage tracking** (§3): checked 16×16 damage maps, both hash kernels,
+  narrowed hashing, move vectors, and external damage ingestion of pixel
+  rectangles and one-byte source-block maps, with no allocation after
+  warm-up.
+- **Windows software selective conversion:** the Media Foundation adapter
+  converts only dirty block rows. On a 2-vCPU-class VM at 1792×1168, typing
+  converts under 3% of block rows and takes about half the time of a full
+  conversion; the full-damage bypass costs under 5%. The H.264 MFT reuses one
+  input and one output sample after warm-up, and the display lease caches one
+  `IDXGIFactory1`.
+- **Submission cadence:** NvFBC's `bIsNewFrame` on Linux, and DDA and WGC
+  damage on Windows, drive the shared first/activity/IDR/keepalive cadence
+  without changing CUDA restaging or NVENC configuration. Structured pipeline
+  stats are visible at INFO.
+- **Damage-driven QP maps** on NVENC, off by default
+  ([`qp-maps.md`](qp-maps.md)).
+- **Canvas building blocks** and the `TileLedger` (§6, §11).
 
-The inbox synchronous H.264 MFT reports that it does not hold input buffers.
-Arcen now reuses one input and one caller-owned output sample/buffer pair after
-warm-up and reports allocations/reuses. The display lease caches one
-`IDXGIFactory1`, recreating it only when stale or after topology mutation.
+**Planned:**
 
-**Phase 1 — keel crate + damage maps on the MF path (implemented)**
-Create `arcen-keel` (grid, hashes, DamageTracker, golden tests, corpus harness).
-MF adapter: hash-compare pass + dirty-block-row-only conversion.
-*Accept (corpus, 2-vCPU class VM):* terminal-typing scenario converts <10% of
-block rows; combined hash+conversion time ≥40% below the full-conversion
-baseline; steady full-damage bypass/probe overhead <5%.
+- **Pacing governor** (§4) for both Windows encoders: under CPU starvation the
+  software path walks 30→15 fps with no frame gap over 150 ms, and the NVENC
+  path is unchanged when unloaded.
+- **Refinement ticks and NVENC emphasis inversion** (§5), and Reference Frame
+  Invalidation once loss reports arrive.
+- **Equivalent damage on Linux and Windows** for the same scripted scene,
+  through a supported Linux damage producer.
+- **The hybrid-codec decision:** whether Arcen builds its own lossless
+  text/tile codec for static content composited with H.264 for motion,
+  decided with corpus data on how far H.264 plus refinement gets.
 
-Measured at 1792×1168 on a test VM: typing converted 2/73 block
-rows (2.74%) and took 2.486 ms versus 4.922 ms full conversion (49.5% lower).
-Sixteen bypass frames plus one probe cost 70.065 ms versus 67.845 ms for 17
-baseline full conversions (3.3% overhead).
-
-**Linux parity groundwork (implemented)**
-NvFBC `bIsNewFrame` now drives the same first/activity/IDR/one-second keepalive
-cadence, without changing CUDA restaging or NVENC configuration. Structured
-pipeline stats are INFO-visible. Keel accepts conservative external pixel rects
-and one-byte source-block maps with zero allocation after warm-up.
-
-**Phase 2 — pacing governor (both Windows encoders)**
-Ladders, classes, viability gate, hysteresis; wired into MF loop and the NVENC
-run_encode loop.
-*Accept:* under synthetic CPU starvation the MF path shows no frame gap >150 ms and
-walks 30→15 fps gracefully; class + ladder position visible in stats; NVENC path
-unchanged when unloaded.
-
-**Phase 3 — NVENC damage integration (Windows DDA + Linux producer)**
-DDA dirty/move rects and a supported Linux damage producer both feed the same
-grid; emphasis/QP-delta maps on changed vs static MBs; refinement ticks (§5);
-intra-refresh verified/ported on NVENC and probed on MF (§5.3); groundwork for RFI
-(feedback plumbing; actual RFI lands with loss reports).
-*Accept:* static-detail corpus bitrate ≥30% below today at equal PSNR on changed
-regions (methodology per the intra-refresh A/B: mandelbrot still + moving overlay);
-Linux and Windows produce equivalent DamageMaps for the same scripted scene.
-
-**Phase 4 — decision gate, then the wire: tile cache + QUIC-shaped metadata**
-Ship `FrameMeta`/`TileRef` in protocol; Deck tile store + compositor; scroll-offset
-probe. Separately, the **hybrid-codec decision**: whether Arcen builds its own
-lossless-text/tile codec for static content composited with H.264 for motion (the
-true differentiator) — decide *after* Phases 1–3 ship, with corpus data on how
-far H.264 + refinement actually gets us.
-*Accept (cache):* scripted scroll + menu scenario ≥30% wire-bytes reduction; cache
-disable flag ships (fail-open to plain AUs).
-
-Ordering rationale: 1→2 are host-side only and immediately visible on the VMware
-box; 3 reuses 1's abstraction where the hardware already helps; 4 is the only phase
-that touches protocol + Deck and therefore rides behind everything provable
-server-side. Multi-monitor M2 is orthogonal (per-monitor pipelines each own a keel
-instance) and neither blocks nor is blocked by this plan.
-
-Acceptance criteria that name absolute CPU or bitrate numbers are verified on
+Multi-monitor is orthogonal: each per-monitor pipeline owns its own Keel
+instance. Criteria that name absolute CPU or bitrate numbers are verified on
 real hosts; unit and offline tests cover the rest.
 
 ## 10. Design choices
@@ -437,7 +399,7 @@ full-frame video becomes one region that never resizes. The synthetic `Typing`
 scenario, a 12-row band moving 16 rows every frame, is a sweep, not typing,
 and does become motion.
 
-Criterion on the review machine (Apple M4 Pro, release, 3840x2160): a full
+Criterion on an Apple M4 Pro (release, 3840x2160): a full
 hash costs 1.35 ms plain and 1.8 to 2.4 ms with row retention; motion search
 on a whole-viewport scroll 1.45 to 1.8 ms; classes and regions on full-frame
 video 0.2 ms; a tile ledger insert at a full 100 MB budget 13 ns; a 64x64

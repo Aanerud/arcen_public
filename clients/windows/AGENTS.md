@@ -55,13 +55,12 @@ an empty program. There is no single-platform `--workspace` build.
   `arcen_deck_core::decode::decode_device_split` or the format probe
   refuses (no extended resource sharing or shareable fences, AMD before
   Vega, NVIDIA before 471.11, any other vendor), the decoder and every
-  window share the root window's device, as before. This replaces the
-  earlier one-device rule (changed 2026-11-18 to remove the contention
-  measured in
-  [Deck presentation timing](../../docs/architecture/deck-presentation-timing.md));
-  established streaming clients decode on a separate device too,
-  Moonlight with fences and the same vendor gate. No FFmpeg and no Media
-  Foundation decoder in the product.
+  window share the root window's device. This replaces the earlier
+  one-device rule, to remove the contention described in
+  [Deck presentation timing](../../docs/architecture/deck-presentation-timing.md);
+  established streaming clients also decode on a separate device, with
+  fences and the same vendor gate. No FFmpeg and no Media Foundation
+  decoder in the product.
 - Reconnect creates a fresh decoder and waits for a fresh keyframe.
   Teardown discards queued frames.
 - **The canvas (ADR 0028)** is the eight-bit sink's executor of the shared
@@ -88,9 +87,9 @@ an empty program. There is no single-platform `--workspace` build.
   tearing switch or environment toggle: change the shared contract.
 - **Sync interval.** At interval 1 a flip-model present waits for a vsync
   before DWM may compose it: one refresh later than at interval 0, even
-  composed (lab, phase-swept: 25.9 → 12.2 ms present to glass). At
-  interval 0 a frame whose GPU work finishes late can be replaced before
-  it is shown (lab: 0–6 % of frames, depending on phase).
+  composed (measured across refresh phase: 25.9 → 12.2 ms present to
+  glass). At interval 0 a frame whose GPU work finishes late can be
+  replaced before it is shown (0–6 % of frames, depending on phase).
 - **Fullscreen draws nothing over the video, for every preset**, except
   the keyboard switch's 2.5-second notice right after the user flips it
   (shared `keyboard_help::render_keyboard_toast`). The
@@ -115,9 +114,9 @@ an empty program. There is no single-platform `--workspace` build.
   origin (stream size = monitor size), opaque, nothing drawn over it. Then
   it may flip it directly (PresentMon "Hardware: Independent Flip") or
   scan it from an overlay plane ("Hardware Composed: Independent Flip");
-  whether it does is the driver's and DWM's call (the Windows lab's
-  virtual GPU never does: `CheckHardwareCompositionSupport` 0, even a
-  textbook fullscreen HWND swapchain is "Composed: Flip"). Keep the
+  whether it does is the driver's and DWM's call (a virtual GPU may
+  never do it: with `CheckHardwareCompositionSupport` 0, even a textbook
+  fullscreen HWND swapchain is "Composed: Flip"). Keep the
   fullscreen arrangement eligible (`present/flip.rs`). The Deck log names
   both sides: "video arrangement: …", "video presentation timing: …" and
   "video presentation path: …" (DXGI's reading). A frame tears only where

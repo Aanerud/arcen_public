@@ -13,15 +13,14 @@ mode, and under `DisplayPolicy::ExactIsolated` makes the target the only active
 output at (0,0). Because that is destructive, it writes a recovery journal
 first, arms a watchdog, and restores on the way out.
 
-That machinery is `display.rs` (6,532 lines), `recovery.rs` (1,540) and
-`nvapi.rs` (3,778) — 11,850 lines, with 247 references to `restore` in
-`display.rs` alone. It is also where the failures come from. On 2026-08-05 a
-sign-out stranded a journal, and every later session was refused with an
-instruction to run `arcen-pier restore-display` — a command that needs an
-interactive desktop and therefore cannot be run on a host reachable only through
-the product that had just refused. Fixed by restoring
-automatically and setting an unapplicable journal aside, but the class of problem
-is structural: we break something global and promise to put it back.
+That machinery (`display.rs`, `recovery.rs` and `nvapi.rs`) is the largest
+part of the Windows Pier, and it is where the failures come from. A sign-out
+once stranded a journal, and every later session was refused with an
+instruction to run `arcen-pier restore-display`, a command that needs an
+interactive desktop and so cannot run on a host reachable only through the
+product that refused. Restoring automatically and setting an unapplicable
+journal aside fixed that case, but the class of problem is structural: the
+Pier breaks something global and promises to put it back.
 
 An indirect display driver (IddCx) inverts that. The host presents a *virtual*
 monitor at exactly the client's geometry and captures it. Nothing global is
@@ -36,13 +35,12 @@ takeover and the credential-provider scenario handling
 remain necessary and unaffected. Multi-session means Windows Server with the RDS
 role, or Azure Virtual Desktop.
 
-**The industry has converged on IddCx.** Citrix moved HDX to an Indirect Display
-Adapter in 2212 (2022); Amazon DCV moved from a custom virtual display driver to
-IDD in 2023.1; Parsec has shipped an IddCx driver since inception. Sunshine ships
-no driver and tells headless users to install one. Three of the closest
-comparable products independently chose the same mechanism.
+**Comparable products have converged on IddCx.** Remote-workstation products
+have moved from custom virtual display drivers to indirect display drivers, or
+shipped one from the start; others ship no driver and ask headless users to
+install one.
 
-**Signing is the real cost, and we already owe it.** An IddCx UMDF driver can be
+**Signing is the real cost, and Arcen already owes it.** An IddCx UMDF driver can be
 *attestation* signed (EV certificate + Partner Center, 1–3 days) for Windows
 10/11 desktop, but attestation is blocked on Windows Server, which needs WHQL.
 `arcen-microphone` already needs that same pipeline and lists "protected
@@ -59,18 +57,18 @@ Rejected as a *shipping* path for three reasons:
 - **Provenance.** `arcen-microphone` is deliberately independently authored and
   states it does not derive from SysVAD, WDK samples, virtual cable projects or
   third-party drivers. Shipping a forked community driver would abandon the
-  standard we set for our only other driver, and would need clearance and a
-  `legal/ORIGINS.md` intake under `legal/ORIGINS.md`.
+  standard set for Arcen's only other driver, and would need clearance and an
+  intake under `legal/ORIGINS.md`.
 - **No dynamic control.** VDD reads its monitor count at startup and exposes no
-  documented IOCTL for adding or removing a monitor at runtime. Parsec's driver
-  does. We need a monitor created per session at the client's geometry, which is
-  exactly the capability VDD lacks.
-- **RDP is its weak point and our main path.** VDD is a console-session IDD, not
+  documented IOCTL for adding or removing a monitor at runtime. Arcen needs a
+  monitor created per session at the client's geometry, which is exactly the
+  capability VDD lacks.
+- **RDP is its weak point and Arcen's main path.** VDD is a console-session IDD, not
   a remote-session driver (`IDDCX_ADAPTER_FLAGS_REMOTE_SESSION_DRIVER`), and
   session transitions are a reported instability trigger. Users arriving over
   RDP is the case this product must handle.
 
-### 2. Write our own IddCx driver
+### 2. Write an original IddCx driver
 
 Use only Microsoft's public WDK/IddCx headers and API documentation, with
 original Arcen implementation. Do not copy Microsoft samples, community
@@ -101,37 +99,29 @@ writes only the missing EDIDs, re-probes CCD/DXGI, and admits the request only
 after the requested targets are active. The EDID changes then commit or roll
 back with the physical output-provider transaction.
 
-A Windows host with two NVIDIA vGPUs showed four native display IDs each: two
-active targets and six empty targets. A guarded spare target became connected,
-active, and CCD-available in 1.561 seconds and returned to the exact empty
-baseline in 0.995 seconds. On a host with more than one adapter, one is
-selected as Arcen's sole display/capture/NVENC adapter; the same combined
-transaction must pass on that selected adapter before release closure.
+On a host with more than one adapter, one is selected as Arcen's sole
+display/capture/NVENC adapter, and the transaction runs on that adapter.
 
-### Current ongoing work: combined Windows rollback
+### Native NVIDIA provisioning and its rollback
 
-The native-NVIDIA product path is **default-off, uncommitted to a release, and
-not deployed**. The single-output EDID mechanism and its scoped rollback are
-proven, but the complete V100D three-output physical-provider transaction has
-not passed its final strict acceptance test.
+`platform.multi_monitor.nvidia_headless_enabled` unset lets startup enable
+native NVIDIA provisioning for a GRID/Quadro-class adapter; `false` turns it
+off and `true` forces it.
 
-Earlier V100D runs exposed a Windows recovery bug: after native display hotplug,
-CCD regenerates boot-local source, clone-group, and desktop-image identifiers.
-The generic recovery path either rejected the regenerated topology or restored
-the visible desktop while leaving Arcen-authored EDIDs connected but inactive.
-The current source checkpoint combines all selected V100D EDIDs with the
-physical topology journal and restores exact modes before removing synthetic
-EDIDs, but that latest sequence still requires one clean
-provision→apply→verify→rollback run proving:
+After a native display hotplug, CCD regenerates boot-local source,
+clone-group and desktop-image identifiers, so generic topology recovery
+alone can reject the regenerated topology or leave Arcen-written EDIDs
+connected but inactive. The rollback therefore combines every Arcen-written
+EDID with the physical topology journal and restores exact modes before it
+removes the synthetic EDIDs. It removes the recovery journal only after it
+has verified that:
 
-- the original V100D EDID hash and mode return;
+- the original EDID and mode are back;
 - every added display ID is disconnected with no EDID;
-- the original active paths, geometry, rotation, and primary output return;
-- the recovery journal is removed only after those checks pass.
+- the original active paths, geometry, rotation and primary output are back.
 
-Until that evidence exists, keep
-`platform.multi_monitor.nvidia_headless_enabled` false in deployed
-configurations.
+The Pier refuses three or more headless NVIDIA displays: applying that
+topology can block `SetDisplayConfig` without a safe way to interrupt it.
 
 The existing first-party IddCx source and provider contracts remain
 non-product research evidence only. They are excluded from packages and do not
@@ -145,9 +135,8 @@ This also means:
 - RDP's Microsoft Remote Display Adapter belongs to an RDP session and is not a
   reusable display provider for Arcen's console/direct session.
 - A headless Windows operator may separately use a reputable signed
-  virtual-display driver (as is common in some Sunshine/Moonlight setups), but
-  its trust, Secure-Boot compatibility, servicing, and recovery are outside
-  Arcen.
+  virtual-display driver, but its trust, Secure-Boot compatibility,
+  servicing and recovery are outside Arcen.
 - Native NVIDIA provisioning is default-off and requires exactly one explicit
   display/stream adapter. Capture and NVENC stay on that adapter; other GPUs
   remain outside Arcen's allowed set for application compute.
@@ -177,9 +166,6 @@ The first tranche now provides:
 4. source-only manifests, portable lifecycle tests, and an unsigned WDK build
    path that never signs, installs, or deploys.
 
-WDK 10.0.26100 compiles and links the x64 Release project with zero warnings
-and passes INF signability/catalog generation.
-
 Shipping remains sequenced behind Release/Security-owned EV certificate,
 Partner Center attestation, and the Windows Server WHQL/HLK decision. Physical
 display mutation remains the default fallback while the IddCx gate is off.
@@ -190,7 +176,7 @@ display mutation remains the default fallback while the IddCx gate is off.
   become a fallback rather than the primary path. `nvapi.rs` mode and timing
   fixups exist to make a *physical* vGPU head accept a client geometry, and lose
   most of their reason to exist.
-- We take on a second driver, with the servicing, HVCI, Driver Verifier and
+- Arcen takes on a second driver, with the servicing, HVCI, Driver Verifier and
   rollback obligations `arcen-microphone` already documents.
 - The control device remains SYSTEM/Administrators-only. The broker opens one
   inheritable handle and grants the session agent only that handle; the device

@@ -96,9 +96,9 @@ Rust on both ends, as it does today.
 ### 2. Scope limited to control and interrupt transfers
 
 Hard USB v1 carries control and interrupt only. Isochronous is explicitly out:
-the reference supports it on Windows for webcams, but it is a materially harder
-contract (bandwidth reservation, no retries, deadline delivery) and no Arcen
-requirement asks for it. A tablet needs neither.
+it is a materially harder contract (bandwidth reservation, no retries,
+deadline delivery) and no Arcen requirement asks for it. A tablet needs
+neither.
 
 Bulk is likewise out of v1. `usb_auto_forward_non_hid` remains the answer for
 mass storage, and remains separate from tablet mode.
@@ -125,11 +125,8 @@ of that pipeline; `arcen-microphone` is.
 
 ## Sequencing
 
-**The gate on this ADR has cleared.** It previously said no work should start
-until the physical Linux pen retest passed. It passed on 2026-08-25: a live GUI
-session against a Linux Pier bridged the real `056a:0317` and the pen drove
-the pointer, with the host log showing the typed device released and one
-tablet on the seat.
+**The gate on this ADR has cleared.** No work was to start until a physical
+pen bridged to a Linux Pier drove the pointer. It did on 2026-08-25.
 
 That removes the reason to defer the *decision*. It does not by itself justify
 starting the *work*, for two remaining reasons:
@@ -148,7 +145,7 @@ starting the *work*, for two remaining reasons:
 | Alternative | Why rejected |
 | --- | --- |
 | Extend the existing typed path to cover Native tablet | Different guarantee entirely. The point of Native is that the *host's own vendor driver* owns the device, giving tablet buttons and finger touch. A synthetic pointer cannot provide that however it is extended. |
-| A virtual HID driver, as the reference uses for local termination | Solves the mode Arcen already solves without a driver, and does not solve bridging. It would trade a working user-mode path for a signed kernel one and gain nothing. |
+| A virtual HID driver for local termination | Solves the mode Arcen already solves without a driver, and does not solve bridging. It would trade a working user-mode path for a signed kernel one and gain nothing. |
 | USB/IP client on Windows | Reverses the direction: it consumes a remote device over TCP, whereas Arcen already carries URBs over its own authenticated QUIC session. Adding a second transport and trust boundary for the same bytes is strictly worse. |
 | A user-mode driver (UMDF) | UDE client drivers are KMDF. There is no supported user-mode route to presenting a virtual USB host controller. |
 | Ship a third-party virtual USB bus driver | Provenance and servicing. Arcen would inherit an unaudited kernel component into a signed package, which `legal/ORIGINS.md` does not permit and Release/Security would have to own forever. |

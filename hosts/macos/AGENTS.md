@@ -23,10 +23,9 @@ cargo test --locked -p arcen-pier-macos
 cargo build --locked --release -p arcen-pier-macos
 ```
 
-## What has been qualified against a real Deck
+## What each preset encodes
 
-Measured from a Deck on another Mac against the installed Pier, not inferred
-from code:
+What the installed Pier sends, read from the SPS at both ends:
 
 | Preset | Encoded (read from the SPS at both ends) | Deck decoded |
 | --- | --- | --- |
@@ -82,7 +81,7 @@ package whatever it found. A signature that verifies, an installer that
 succeeds and launchd restarting the agent on the new file say nothing about
 whether that file contains the change.
 
-When something you just fixed still misbehaves on a test host, confirm the
+When something you just fixed still misbehaves on a Pier, confirm the
 artefact before you re-read the code:
 
 ```sh
@@ -94,15 +93,16 @@ change.
 
 ## Audio, end to end
 
-Proven after a clean uninstall and install, with sound playing:
+With sound playing on the host, `media-smoke` must report non-zero samples
+and a non-zero peak, for example:
 
 ```
 media-smoke complete
 audio_packets=6 audio_nonzero_samples=8903 audio_peak=1610
 ```
 
-Non-zero samples and a non-zero peak: sound that was playing on the host
-arriving at the client, not a channel that merely opened. A silent host still
+That is sound that was playing on the host arriving at the client, not a
+channel that merely opened. A silent host still
 completes in about four seconds, because a Core Audio tap delivers silence
 buffers continuously rather than going quiet.
 
@@ -117,13 +117,12 @@ A host holding only the first streams video and captures silence. No public
 call reports the second, so the session attempts the tap and degrades rather
 than preflighting.
 
-Four things had to be true at once, and each hid the next: audio had to be
-advertised (it deadlocked), the tap had to start without blocking the desktop
-(`AudioDeviceStart` took sixty seconds waiting on a prompt), the tap had to
-actually deliver (starting is not delivering — wait for the first callback),
-and the capture had to reach the streamer. That last one was `serve_desktop`
-being called with `None`, which alone would have kept every packet count at
-zero however well the other three worked.
+Four conditions must hold together, and each can hide the next: audio is
+advertised; the tap starts without blocking the desktop (`AudioDeviceStart`
+can wait sixty seconds on a consent prompt); the tap delivers (starting is
+not delivering: wait for the first callback); and the capture reaches the
+streamer (`serve_desktop` gets the capture, never `None`). Check all four
+before you trust a packet count.
 
 ## Nothing can grant a permission that was never asked for
 
@@ -199,12 +198,9 @@ transaction order here. A running service or `serve` reloads its material on
 `SIGHUP` (`tls_material::spawn_watch`) through the shared
 `HostTlsMaterial::reload`, and emits the shared certificate events.
 
-Four things this has already caught, none of which a unit test would have:
-keyframe detection that read every H.264 frame as a keyframe because the NAL
-headers alias with HEVC; absolute pointer placement drifting because the HID
-tap applies pointer acceleration; a permission report claiming input was
-unavailable on a machine where it demonstrably worked; and keyboard injection
-turning out to need Accessibility while pointer injection does not.
+Probes catch what unit tests cannot: H.264 and HEVC NAL headers alias, the
+HID tap applies pointer acceleration to absolute placement, and keyboard
+injection needs Accessibility while pointer injection does not.
 
 Requesting HDR is not proof of HDR. A ten-bit surface only shows bit depth. The
 Pier creates an HDR virtual panel for an HDR request, and claims HDR only when
@@ -232,6 +228,17 @@ a plausible belief that is false:
   0.05 ms per frame against 25.84 ms recorded on a real link.
 - A development machine has **no idle desktop**. The terminal running the
   tests is what is animating the screen.
+
+## Keep install targets clean
+
+Installer qualification asks whether the shipped package installs, runs and
+uninstalls on a Mac that never built it. Run no developer tool there: no
+`xcrun`, `cargo`, `clang` or `python3`, no toolchain install, no scratch
+probe compiled in `/tmp`. Each can raise the Command Line Tools installer on
+the console and leaves the Mac no longer clean. Build and compile on a
+development Mac, copy the finished artefact across, and use `grep`, `sed`
+and `awk` on the target. If something can only be measured by compiling on
+the target, say so.
 
 ## Packaging and install traps live in PACKAGING.md
 
@@ -270,9 +277,8 @@ symbols in `IOKit.tbd`, available since macOS 10.15 and carrying no deprecation
 in the current SDK. It needs no DriverKit extension, no system extension, no
 user approval dialog and no reboot.
 
-It needs `com.apple.developer.hid.virtual.device`, and that requirement was
-measured rather than read. On a macOS 26.5.2 test host, a probe carrying no
-entitlement:
+It needs `com.apple.developer.hid.virtual.device`. Without it, creation fails
+silently (macOS 26.5.2, a probe carrying no entitlement):
 
 | Run | `IOHIDUserDeviceCreateWithProperties` | `errno` |
 | --- | --- | --- |
@@ -372,7 +378,7 @@ host driver (`arcen_usb_bridge::HidHostAdapter`) over the Deck's bridged
 tablet and the existing `hid-injector` child, started as
 `hid-injector --bridged-usb`, presents one `IOHIDUserDevice` per HID
 interface. `bridged_tablet.rs` is the session side, `input/bridged_hid.rs`
-the child. Since 0.19.0 release Piers carry it and offer it when signed
+the child. Release Piers carry it and offer it when signed
 `--with-virtual-hid` (the entitlement is the gate). Every tablet's pen is
 read by the Pier and posted as CoreGraphics tablet events with pressure: a
 known model (Intuos5 touch L) by its dedicated reader (ADR 0022 §14.1), any
@@ -385,7 +391,7 @@ only with `--features lab-bridged-hid-probe`.
   waits (≤ 3 s) for a capability probe still running instead of refusing.
   Keep all three: a hello that says "still checking" is a lost first
   connection.
-- **Creation needs the responsible app's Accessibility**, measured again: the
+- **Creation needs the responsible app's Accessibility**: the
   same signed binary creates devices when started from a terminal that holds
   it, and is refused as its own launchd job on a Mac where the app has no
   grant. In the product the responsible app is the Agent Helper.
@@ -401,8 +407,7 @@ only with `--features lab-bridged-hid-probe`.
 - **macOS rewrites `Transport` to `"Virtual"`** for an unprivileged creator,
   and the tablet maker's driver (Wacom Tablet 6.4.9) does not open the
   bridged devices, so pressure comes only from the Pier's own reader below.
-- **Pressure: the Pier reads a known pen itself (2026-11-12;
-  ADR 0022 §14).** Part of Native tablet, no extra feature. For a
+- **Pressure: the Pier reads a known pen itself (ADR 0022 §14).** Part of Native tablet, no extra feature. For a
   model the shared reader knows (`arcen_usb_bridge::IntuosPenReader`,
   `HOST_DECODED_INTUOS_MODELS`, today the Intuos5 touch L only) the session
   reads the pen's Wacom mode (`GET_REPORT(Feature 2)`), switches it
@@ -422,9 +427,8 @@ only with `--features lab-bridged-hid-probe`.
   wins) as `CursorPosition` records; the Deck draws its cursor there until
   its own mouse moves. `cursor_mode_result.cursor_positions` says so.
   The daemon relays them through the shared `CursorPositionRelay`
-  (`PierLaneRelay`). Multi-display sessions report none yet. Measured with
-  the emulated stroke: `NSEvent` pressure 0.059 → 1.000
-  in an AppKit window, 74 of 74 positions at the Deck (ADR 0022 §14.1).
+  (`PierLaneRelay`). Multi-display sessions report none yet (ADR 0022
+  §14.1).
 - The ignored end-to-end tests drive the emulated Intuos5: with the host pen
   reader they **post pen events with pressure on the Mac that runs them**.
   Never run them on a Mac someone is using; `probe-pen --intuos5` presses
@@ -498,7 +502,7 @@ answered while somebody is logged in.
   every 5 s for at most `UNLOCKED_GRACE`, desk privacy or not (shared
   `console_session::lock_wait`), and an ending that leaves the desk
   unlocked is logged as an error. A private desk holds the session slot
-  for that wait, as before; a desk that was not private shows the session
+  for that wait; a desk that was not private shows the session
   anyway, so it offers the slot (`SessionAdmissionRuntime::offer_yield`)
   and an authenticated Deck that finds it taken asks for it
   (`request_yield`), waits up to `YIELD_WAIT`, and is served, ending the
@@ -518,10 +522,10 @@ answered while somebody is logged in.
   `Departure::CaptureStopped` and releases the guard (`end_attachment`).
   Never restart the capture: someone stopped sharing on purpose. Every
   other stop (the system's own, -3821; a lost window-server connection,
-  -3805; a display gone) is a capture failure as before: no close reason,
+  -3805; a display gone) is a capture failure: no close reason,
   the Deck may reconnect, the session is locked.
 * **An agent that dies locks too** (`lock_guard`, shared
-  `console_session::owner_death`, GAP-048 closed). For each Deck attached
+  `console_session::owner_death`). For each Deck attached
   to a signed-in session, the agent starts `lock-guard`: the same binary, in
   its own process group. launchd sends `SIGTERM` to a dead agent's process
   group and only that group; this was measured with a `KeepAlive` agent
@@ -538,10 +542,9 @@ answered while somebody is logged in.
   record (any other read error locks), the record is removed only once the
   session is locked, and a record of another login session of this boot
   and account (an agent started over SSH) is left alone; only a new boot or
-  account makes it stale. Until 0.20.8 the session was read from
-  `CGSessionCopyCurrentDictionary`'s `kCGSSessionIDKey`, which that
-  dictionary does not carry (measured on macOS 26), so no record was ever
-  written. Between the death and the lock screen the desk's input
+  account makes it stale. Never read the session from
+  `CGSessionCopyCurrentDictionary`'s `kCGSSessionIDKey`: that dictionary
+  does not carry it (macOS 26), and no record would be written. Between the death and the lock screen the desk's input
   is not filtered, because the tap's Accessibility grant is the agent's.
 * **Awake while serving.** Every connection declares user activity first (a
   sleeping display is not an active one, and the inventory would be empty),
@@ -571,10 +574,9 @@ answered while somebody is logged in.
   lock guard below locks the session after them. Not covered: Secure Event Input hides keystrokes
   from taps; Siri, Voice Control and dictation act through accessibility;
   DisplayLink/Sidecar/AirPlay displays are fed by capture. `probe-desk-privacy [--listen S] [--blank S
-  --capture]` measures it from the Aqua session (measured here: the
-  owner's hardware events read pid 0, the probe's own post its pid);
-  whether `ScreenCaptureKit` reads before the table is the `--capture`
-  proof still to run.
+  --capture]` measures it from the Aqua session: hardware events read pid
+  0, the probe's own posts read its pid, and `--capture` shows whether
+  `ScreenCaptureKit` reads before the table.
 
 **Apple publishes no contract that third-party code may capture the login
 window.** Every piece above is documented on its own, but the combination is

@@ -305,6 +305,20 @@ pub(crate) fn notice_for(refusal: ConsoleRefusal, read: &SessionRead, uid: u32) 
             return refusal.into();
         }
     };
+    if refusal == ConsoleRefusal::SignInOtherProduct {
+        let unit = super::login_session::display_manager_target();
+        let description = unit
+            .as_deref()
+            .and_then(super::login_session::unit_description);
+        tracing::warn!(
+            target: target::SESSION,
+            reason_class = refusal.token(),
+            display_manager_unit = unit.as_deref().unwrap_or("unknown"),
+            display_manager_description = description.as_deref().unwrap_or("unknown"),
+            "another remote-desktop product is the display manager and keeps GDM's login screen off the console; sign in with it first"
+        );
+        return ConsoleNotice::sign_in_other_product(unit.as_deref(), description.as_deref());
+    }
     if refusal != ConsoleRefusal::OtherUserOtherProduct {
         return refusal.into();
     }
@@ -1069,7 +1083,10 @@ fn arcen_input_device(event: &str) -> bool {
 
 /// The kernel's interfaces for input devices made in user space, by their
 /// node names and fixed misc-device numbers (`UINPUT_MINOR`, `UHID_MINOR`).
-const USER_SPACE_INPUT_NODES: [(&str, u32, u32); 2] = [("uinput", 10, 223), ("uhid", 10, 239)];
+const USER_SPACE_INPUT_NODES: [(&str, u32, u32, model::UserSpaceInputInterface); 2] = [
+    ("uinput", 10, 223, model::UserSpaceInputInterface::Uinput),
+    ("uhid", 10, 239, model::UserSpaceInputInterface::Uhid),
+];
 
 /// A process holding a user-space input interface open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1079,6 +1096,11 @@ struct InputCreator {
     /// `/proc/<pid>/exe` as the link reads (`… (deleted)` after an update
     /// replaced the file); `None` when unreadable.
     exe: Option<String>,
+    /// Which interfaces it holds.
+    holds: model::HeldInterfaces,
+    /// What was read about it when its executable names a driver at the
+    /// desk (shared `local_input_driver_name`); `None` otherwise.
+    driver: Option<model::LocalDriverFacts>,
 }
 
 /// An executable path without the kernel's ` (deleted)` suffix.
@@ -1097,15 +1119,37 @@ fn arcen_creator(creator: &InputCreator, own_exe: Option<&str>) -> bool {
     )
 }
 
-/// Who holds the user-space input interfaces open, from the processes
-/// found holding one (`None`: they could not all be read).
+/// Whether `creator` is a driver for hardware at the desk (shared
+/// `local_input_driver`: its name, run by root from root's file).
+fn local_driver(creator: &InputCreator) -> bool {
+    match (creator.exe.as_deref(), creator.driver) {
+        (Some(exe), Some(facts)) => model::local_input_driver(exe, facts),
+        _ => false,
+    }
+}
+
+/// Whether `creator` cannot be another remote-desktop product's: Arcen's
+/// own process, or a driver for hardware at the desk.
+fn not_a_remote_product(creator: &InputCreator, own_exe: Option<&str>) -> bool {
+    arcen_creator(creator, own_exe) || local_driver(creator)
+}
+
+/// Who among the processes found holding a user-space input interface
+/// (`None`: they could not all be read) could have made a device made
+/// through `interface` (`None`: any of them).
 fn creators_from(
     holders: Option<&[InputCreator]>,
     own_exe: Option<&str>,
+    interface: Option<model::UserSpaceInputInterface>,
 ) -> model::UserSpaceInputCreators {
     match holders {
         None => model::UserSpaceInputCreators::Unknown,
-        Some(holders) if holders.iter().all(|holder| arcen_creator(holder, own_exe)) => {
+        Some(holders)
+            if holders
+                .iter()
+                .filter(|holder| holder.holds.could_make(interface))
+                .all(|holder| not_a_remote_product(holder, own_exe)) =>
+        {
             model::UserSpaceInputCreators::ArcenOnly
         }
         Some(_) => model::UserSpaceInputCreators::Other,
@@ -1127,33 +1171,78 @@ const fn device_major_minor(rdev: u64) -> (u32, u32) {
     (major, minor)
 }
 
-/// Whether descriptor `fd` (a `/proc/<pid>/fd/<n>` link reading `target`)
-/// is open on uinput or uhid: by the node's name, then proved by its device
-/// number (`rdev`, of the opened file), so a node elsewhere (a chroot) still
-/// counts and nothing else is ever stat'ed.
-fn holds_user_space_input(
+/// Which user-space input interface descriptor `fd` (a `/proc/<pid>/fd/<n>`
+/// link reading `target`) is open on, if any: by the node's name, then
+/// proved by its device number (`rdev`, of the opened file), so a node
+/// elsewhere (a chroot) still counts and nothing else is ever stat'ed.
+fn held_user_space_input(
     fd: &Path,
     target: &Path,
     rdev: &dyn Fn(&Path) -> std::io::Result<u64>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<Option<model::UserSpaceInputInterface>> {
     let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
-        return Ok(false);
+        return Ok(None);
     };
-    let Some(&(_, major, minor)) = USER_SPACE_INPUT_NODES
+    let Some(&(_, major, minor, interface)) = USER_SPACE_INPUT_NODES
         .iter()
-        .find(|(node, _, _)| *node == name)
+        .find(|(node, _, _, _)| *node == name)
     else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(device_major_minor(rdev(fd)?) == (major, minor))
+    Ok((device_major_minor(rdev(fd)?) == (major, minor)).then_some(interface))
+}
+
+/// What a process at `/proc/<pid>` (`base`) is, for shared
+/// `local_input_driver`: whether all its user IDs are root's (its
+/// `status`), and the owner and mode of the file it runs, through
+/// `/proc/<pid>/exe` itself (the running file, also after an update
+/// deleted it; never a path that may since name another). `statx` with
+/// `AT_STATX_DONT_SYNC`: a file on a stalled network mount is answered from
+/// the cache, so the check cannot hang on it.
+fn driver_facts(base: &Path) -> model::LocalDriverFacts {
+    use rustix::fs::{statx, AtFlags, StatxFlags, CWD};
+    let runs_as_root = std::fs::read_to_string(base.join("status"))
+        .ok()
+        .is_some_and(|status| root_user_ids(&status));
+    let executable = statx(
+        CWD,
+        base.join("exe"),
+        AtFlags::STATX_DONT_SYNC,
+        StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID | StatxFlags::GID,
+    )
+    .ok()
+    .map(|stat| model::ExecutableOwner {
+        uid: stat.stx_uid,
+        gid: stat.stx_gid,
+        mode: u32::from(stat.stx_mode),
+    });
+    model::LocalDriverFacts {
+        runs_as_root,
+        executable,
+    }
+}
+
+/// Whether a `/proc/<pid>/status` names root for all four user IDs (real,
+/// effective, saved, file system).
+fn root_user_ids(status: &str) -> bool {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .is_some_and(|ids| {
+            let ids: Vec<&str> = ids.split_whitespace().collect();
+            ids.len() == 4 && ids.iter().all(|id| *id == "0")
+        })
 }
 
 /// Every process under `proc_root` holding `/dev/uinput` or `/dev/uhid`
 /// open; `None` when a process's descriptors could not be read (a process
-/// or descriptor that ended meanwhile is skipped).
+/// or descriptor that ended meanwhile is skipped). `driver` reads what
+/// shared `local_input_driver` needs, only for a process whose executable
+/// names a driver at the desk.
 fn user_space_input_holders(
     proc_root: &Path,
     rdev: &dyn Fn(&Path) -> std::io::Result<u64>,
+    driver: &dyn Fn(&Path) -> model::LocalDriverFacts,
 ) -> Option<Vec<InputCreator>> {
     let gone = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
     let mut holders = Vec::new();
@@ -1171,7 +1260,7 @@ fn user_space_input_holders(
             Err(error) if gone(&error) => continue,
             Err(_) => return None,
         };
-        let mut holds = false;
+        let mut holds = model::HeldInterfaces::default();
         for descriptor in descriptors {
             let fd = match descriptor {
                 Ok(descriptor) => descriptor.path(),
@@ -1179,18 +1268,19 @@ fn user_space_input_holders(
                 Err(_) => return None,
             };
             match std::fs::read_link(&fd)
-                .and_then(|target| holds_user_space_input(&fd, &target, rdev))
+                .and_then(|target| held_user_space_input(&fd, &target, rdev))
             {
-                Ok(true) => {
-                    holds = true;
-                    break;
-                }
-                Ok(false) => {}
+                Ok(Some(model::UserSpaceInputInterface::Uinput)) => holds.uinput = true,
+                Ok(Some(model::UserSpaceInputInterface::Uhid)) => holds.uhid = true,
+                Ok(None) => {}
                 Err(error) if gone(&error) => {}
                 Err(_) => return None,
             }
+            if holds.uinput && holds.uhid {
+                break;
+            }
         }
-        if !holds {
+        if !holds.could_make(None) {
             continue;
         }
         let exe = std::fs::read_link(base.join("exe"))
@@ -1199,32 +1289,71 @@ fn user_space_input_holders(
         let comm = std::fs::read_to_string(base.join("comm"))
             .map(|comm| comm.trim().to_owned())
             .unwrap_or_default();
-        holders.push(InputCreator { pid, comm, exe });
+        let driver = exe
+            .as_deref()
+            .filter(|exe| model::local_input_driver_name(exe))
+            .map(|_| driver(&base));
+        holders.push(InputCreator {
+            pid,
+            comm,
+            exe,
+            holds,
+            driver,
+        });
     }
     holders.sort_by_key(|holder| holder.pid);
     Some(holders)
 }
 
-/// A short account of the user-space input creators outside Arcen, for
-/// the log (`pcomm[pid]`, or that they could not be read).
-fn outside_creators(holders: Option<&[InputCreator]>, own_exe: Option<&str>) -> String {
+/// A short account of the user-space input creators outside Arcen that
+/// could have made a device made through `interface`, for the log
+/// (`comm[pid]`, or that they could not be read). One named like a driver
+/// at the desk that is not one (not run by root from root's file)
+/// says so, so the log shows why it still counts.
+fn outside_creators(
+    holders: Option<&[InputCreator]>,
+    own_exe: Option<&str>,
+    interface: Option<model::UserSpaceInputInterface>,
+) -> String {
     let Some(holders) = holders else {
         return "user-space input creators unreadable".to_owned();
     };
     let names: Vec<String> = holders
         .iter()
-        .filter(|holder| !arcen_creator(holder, own_exe))
-        .map(|holder| format!("{}[{}]", holder.comm, holder.pid))
+        .filter(|holder| holder.holds.could_make(interface))
+        .filter(|holder| !not_a_remote_product(holder, own_exe))
+        .map(|holder| {
+            let note = if holder.driver.is_some() {
+                " (named like a driver at the desk, but not run by root from root's file)"
+            } else {
+                ""
+            };
+            format!("{}[{}]{note}", holder.comm, holder.pid)
+        })
         .collect();
-    format!("created through uinput/uhid by {}", names.join(", "))
+    let through = match interface {
+        Some(model::UserSpaceInputInterface::Uinput) => "uinput",
+        Some(model::UserSpaceInputInterface::Uhid) => "uhid",
+        None => "uinput/uhid",
+    };
+    format!("created through {through} by {}", names.join(", "))
+}
+
+/// Which user-space input interface could have made `event`'s device
+/// (shared `UserSpaceInputInterface::of_device`, from its sysfs path).
+fn device_interface(event: &str) -> Option<model::UserSpaceInputInterface> {
+    let device =
+        std::fs::canonicalize(Path::new("/sys/class/input").join(event).join("device")).ok()?;
+    model::UserSpaceInputInterface::of_device(device.to_str()?)
 }
 
 /// The name of a keyboard or pointer of another remote-desktop product's
 /// connected client, if one exists (shared `another_products_client_input`):
 /// a parentless keyboard or pointer that is not Arcen's, not a firmware
-/// device, while a process outside Arcen holds `/dev/uinput` or `/dev/uhid`.
-/// Only asked about a desktop another product owns: there, that product's
-/// client is using it now.
+/// device, while a process outside Arcen and the desk's drivers holds the
+/// interface that made it (`/dev/uinput` or `/dev/uhid`). Only asked about
+/// a desktop another product owns: there, that product's client is using
+/// it now.
 fn another_products_client_now() -> Option<String> {
     let entries = std::fs::read_dir("/sys/class/input").ok()?;
     let mut creators: Option<(Option<Vec<InputCreator>>, Option<String>)> = None;
@@ -1244,15 +1373,18 @@ fn another_products_client_now() -> Option<String> {
         }
         let (holders, own_exe) = creators.get_or_insert_with(|| {
             (
-                user_space_input_holders(Path::new("/proc"), &|fd| {
-                    std::fs::metadata(fd).map(|metadata| metadata.rdev())
-                }),
+                user_space_input_holders(
+                    Path::new("/proc"),
+                    &|fd| std::fs::metadata(fd).map(|metadata| metadata.rdev()),
+                    &driver_facts,
+                ),
                 std::fs::read_link("/proc/self/exe")
                     .ok()
                     .map(|link| link.to_string_lossy().into_owned()),
             )
         });
-        let who = creators_from(holders.as_deref(), own_exe.as_deref());
+        let interface = device_interface(event);
+        let who = creators_from(holders.as_deref(), own_exe.as_deref(), interface);
         if model::another_products_client_input(fact, arcen, who) {
             let device_name = std::fs::read_to_string(entry.path().join("device/name"))
                 .map(|name| name.trim().to_owned())
@@ -1260,7 +1392,7 @@ fn another_products_client_now() -> Option<String> {
             return Some(format!(
                 "{event} ({device_name}; bus {:#06x}; {})",
                 fact.bus,
-                outside_creators(holders.as_deref(), own_exe.as_deref())
+                outside_creators(holders.as_deref(), own_exe.as_deref(), interface)
             ));
         }
     }
@@ -1934,12 +2066,14 @@ async fn session_display_alive(logind: &Logind<'_>, session_id: &str) -> bool {
 pub(crate) async fn secure_session(session_id: &str) -> bool {
     if lock_session(session_id).await {
         UnlockedSince::clear();
+        forget_kept_private_report();
         return true;
     }
     let unlocked_for = UnlockedSince::of(session_id);
     let secured = secure_unlocked(session_id, unlocked_for).await;
     if secured {
         UnlockedSince::clear();
+        forget_kept_private_report();
     }
     secured
 }
@@ -1986,21 +2120,89 @@ impl UnlockedSince {
     }
 }
 
+/// What securing a session that did not lock needs of the console
+/// ([`secure_unlocked_with`]); the live one is [`LiveUnlocked`].
+trait UnlockedConsole {
+    async fn hand_back(
+        &mut self,
+        session_id: &str,
+        unlocked_for: Duration,
+    ) -> model::UnlockedHandBack;
+    /// Whether GDM may be asked for a login screen on this host.
+    fn login_screen(&mut self) -> model::LoginScreen;
+    async fn switch_to_login_screen(&mut self) -> bool;
+}
+
+/// The console itself: logind, systemd, GDM.
+struct LiveUnlocked;
+
+impl UnlockedConsole for LiveUnlocked {
+    async fn hand_back(
+        &mut self,
+        session_id: &str,
+        unlocked_for: Duration,
+    ) -> model::UnlockedHandBack {
+        session_state(session_id)
+            .await
+            .hand_back_after(unlocked_for)
+    }
+
+    fn login_screen(&mut self) -> model::LoginScreen {
+        super::login_session::console_host().login_screen
+    }
+
+    async fn switch_to_login_screen(&mut self) -> bool {
+        switch_to_login_screen().await
+    }
+}
+
+/// The session whose lock failure on a host where GDM may not be asked for
+/// a login screen was last reported: recorded once, not on every retry.
+static KEPT_PRIVATE_REPORTED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// A later lock failure is reported again.
+fn forget_kept_private_report() {
+    *KEPT_PRIVATE_REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 async fn secure_unlocked(session_id: &str, unlocked_for: Duration) -> bool {
-    match session_state(session_id)
-        .await
-        .hand_back_after(unlocked_for)
-    {
+    secure_unlocked_with(&mut LiveUnlocked, session_id, unlocked_for).await
+}
+
+async fn secure_unlocked_with(
+    console: &mut impl UnlockedConsole,
+    session_id: &str,
+    unlocked_for: Duration,
+) -> bool {
+    match console.hand_back(session_id, unlocked_for).await {
         model::UnlockedHandBack::Gone | model::UnlockedHandBack::InBackground => return true,
         model::UnlockedHandBack::KeepPrivate => return false,
         model::UnlockedHandBack::BehindLoginScreen => {}
     }
-    if switch_to_login_screen().await {
+    // Asked only now: a session that would be put behind a login screen.
+    let login_screen = console.login_screen();
+    if model::UnlockedHandBack::BehindLoginScreen.on(login_screen)
+        != model::UnlockedHandBack::BehindLoginScreen
+    {
+        let mut reported = KEPT_PRIVATE_REPORTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reported.as_deref() != Some(session_id) {
+            *reported = Some(session_id.to_owned());
+            tracing::error!(
+                target: target::SESSION,
+                session_id,
+                login_screen = login_screen.token(),
+                "the console session did not lock, and another remote-desktop product runs this workstation's sign-in, so GDM is not asked for a login screen; the desk stays private and the lock is retried"
+            );
+        }
+        return false;
+    }
+    if console.switch_to_login_screen().await {
         for _ in 0..20 {
-            match session_state(session_id)
-                .await
-                .hand_back_after(unlocked_for)
-            {
+            match console.hand_back(session_id, unlocked_for).await {
                 model::UnlockedHandBack::Gone | model::UnlockedHandBack::InBackground => {
                     tracing::warn!(
                         target: target::SESSION,
@@ -3342,6 +3544,71 @@ impl ConsoleDesk for LiveDesk<'_> {
 mod tests {
     use super::*;
 
+    /// A session that did not lock, in front, on a host whose login screen
+    /// is `login_screen`: records each request for a login screen.
+    struct UnlockedInFront {
+        login_screen: model::LoginScreen,
+        switches: u32,
+        login_screen_asked: u32,
+    }
+
+    impl UnlockedConsole for UnlockedInFront {
+        async fn hand_back(
+            &mut self,
+            _session_id: &str,
+            _unlocked_for: Duration,
+        ) -> model::UnlockedHandBack {
+            if self.switches == 0 {
+                model::UnlockedHandBack::BehindLoginScreen
+            } else {
+                model::UnlockedHandBack::InBackground
+            }
+        }
+
+        fn login_screen(&mut self) -> model::LoginScreen {
+            self.login_screen_asked += 1;
+            self.login_screen
+        }
+
+        async fn switch_to_login_screen(&mut self) -> bool {
+            self.switches += 1;
+            true
+        }
+    }
+
+    fn secure_unlocked_on(login_screen: model::LoginScreen) -> (bool, UnlockedInFront) {
+        let mut console = UnlockedInFront {
+            login_screen,
+            switches: 0,
+            login_screen_asked: 0,
+        };
+        let secured = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+            .block_on(secure_unlocked_with(&mut console, "26", Duration::ZERO));
+        (secured, console)
+    }
+
+    #[test]
+    fn a_session_that_did_not_lock_gets_no_gdm_login_screen_where_another_product_runs_sign_in() {
+        // GDM's own login screen: asked for one, as before.
+        let (secured, console) = secure_unlocked_on(model::LoginScreen::Shown);
+        assert!(secured);
+        assert_eq!(console.switches, 1);
+        // Another product runs the sign-in (or that cannot be ruled out):
+        // never asked; the desk stays private and the lock is retried.
+        for login_screen in [model::LoginScreen::Withheld, model::LoginScreen::Unproven] {
+            for _retry in 0..3 {
+                let (secured, console) = secure_unlocked_on(login_screen);
+                assert!(!secured, "{login_screen:?}");
+                assert_eq!(console.switches, 0, "{login_screen:?}");
+                assert_eq!(console.login_screen_asked, 1);
+            }
+        }
+        forget_kept_private_report();
+    }
+
     /// A console left behind by a launcher that died (killed, crashed):
     /// records what recovery does to it, in order.
     struct DeadLauncherConsole {
@@ -3838,11 +4105,30 @@ mod tests {
         assert!(!model::remote_client_input_candidate(keyboard, false));
     }
 
+    /// Root's service running root's packaged file.
+    const ROOT_SERVICE: model::LocalDriverFacts = model::LocalDriverFacts {
+        runs_as_root: true,
+        executable: Some(model::ExecutableOwner {
+            uid: 0,
+            gid: 0,
+            mode: 0o100_755,
+        }),
+    };
+
+    /// A process holding both interfaces; one named like a driver at the
+    /// desk is root's service running root's file.
     fn creator(pid: u32, exe: Option<&str>) -> InputCreator {
         InputCreator {
             pid,
             comm: format!("p{pid}"),
             exe: exe.map(str::to_owned),
+            holds: model::HeldInterfaces {
+                uinput: true,
+                uhid: true,
+            },
+            driver: exe
+                .filter(|exe| model::local_input_driver_name(exe))
+                .map(|_| ROOT_SERVICE),
         }
     }
 
@@ -3850,29 +4136,137 @@ mod tests {
     fn only_arcen_holding_uinput_rules_out_another_products_devices() {
         use model::UserSpaceInputCreators::{ArcenOnly, Other, Unknown};
         const OURS: &str = "/opt/arcen/bin/arcen-pier";
-        assert_eq!(creators_from(Some(&[]), Some(OURS)), ArcenOnly);
+        assert_eq!(creators_from(Some(&[]), Some(OURS), None), ArcenOnly);
         let arcen = [
             creator(10, Some(OURS)),
             // A helper of a session that outlived an update of the file.
             creator(11, Some("/opt/arcen/bin/arcen-pier (deleted)")),
         ];
-        assert_eq!(creators_from(Some(&arcen), Some(OURS)), ArcenOnly);
+        assert_eq!(creators_from(Some(&arcen), Some(OURS), None), ArcenOnly);
         assert_eq!(
-            creators_from(Some(&arcen), Some("/opt/arcen/bin/arcen-pier (deleted)")),
+            creators_from(
+                Some(&arcen),
+                Some("/opt/arcen/bin/arcen-pier (deleted)"),
+                None
+            ),
             ArcenOnly
         );
         let mut both = arcen.to_vec();
         both.push(creator(20, Some("/usr/lib/remote-product/server")));
-        assert_eq!(creators_from(Some(&both), Some(OURS)), Other);
+        assert_eq!(creators_from(Some(&both), Some(OURS), None), Other);
         assert_eq!(
-            outside_creators(Some(&both), Some(OURS)),
+            outside_creators(Some(&both), Some(OURS), None),
             "created through uinput/uhid by p20[20]"
         );
         // An unreadable executable is not Arcen's, nor is anyone when this
         // Pier's own could not be read.
-        assert_eq!(creators_from(Some(&[creator(21, None)]), Some(OURS)), Other);
-        assert_eq!(creators_from(Some(&arcen), None), Other);
-        assert_eq!(creators_from(None, Some(OURS)), Unknown);
+        assert_eq!(
+            creators_from(Some(&[creator(21, None)]), Some(OURS), None),
+            Other
+        );
+        assert_eq!(creators_from(Some(&arcen), None, None), Other);
+        assert_eq!(creators_from(None, Some(OURS), None), Unknown);
+    }
+
+    #[test]
+    fn the_desks_own_drivers_are_not_another_products_creators() {
+        use model::UserSpaceInputCreators::{ArcenOnly, Other};
+        use model::UserSpaceInputInterface::{Uhid, Uinput};
+        const OURS: &str = "/opt/arcen/bin/arcen-pier";
+        // A grading panel's service, the Bluetooth daemon, a mouse daemon
+        // and a key remapper, each root's service: none is another
+        // product's client.
+        let mut desk = vec![creator(10, Some(OURS))];
+        for (pid, driver) in [
+            (30, "/opt/Tangent/bin/TangentHub"),
+            (31, "/usr/libexec/bluetooth/bluetoothd"),
+            (32, "/usr/bin/logid"),
+            (33, "/usr/bin/xremap"),
+        ] {
+            desk.push(creator(pid, Some(driver)));
+        }
+        for interface in [None, Some(Uinput), Some(Uhid)] {
+            assert_eq!(creators_from(Some(&desk), Some(OURS), interface), ArcenOnly);
+        }
+        // Another product's server beside them still counts.
+        let mut product = desk.clone();
+        product.push(creator(40, Some("/usr/lib/remote-product/server")));
+        assert_eq!(creators_from(Some(&product), Some(OURS), None), Other);
+        assert_eq!(
+            outside_creators(Some(&product), Some(OURS), Some(Uinput)),
+            "created through uinput by p40[40]"
+        );
+        // An input-automation daemon anything can type through is never
+        // the desk's.
+        let mut automation = desk.clone();
+        automation.push(creator(41, Some("/usr/bin/ydotoold")));
+        assert_eq!(creators_from(Some(&automation), Some(OURS), None), Other);
+        // Another product's program renamed to a driver's name by the
+        // session's user (their file, run by them) still counts, and the
+        // log says why.
+        let mut renamed = desk.clone();
+        let mut lookalike = creator(42, Some("/home/artist/.local/bin/TangentHub"));
+        lookalike.driver = Some(model::LocalDriverFacts {
+            runs_as_root: false,
+            executable: Some(model::ExecutableOwner {
+                uid: 1000,
+                gid: 1000,
+                mode: 0o100_755,
+            }),
+        });
+        renamed.push(lookalike);
+        assert_eq!(creators_from(Some(&renamed), Some(OURS), None), Other);
+        assert_eq!(
+            outside_creators(Some(&renamed), Some(OURS), None),
+            "created through uinput/uhid by p42[42] (named like a driver at the desk, \
+             but not run by root from root's file)"
+        );
+    }
+
+    #[test]
+    fn a_holder_of_the_other_interface_did_not_make_the_device() {
+        use model::UserSpaceInputCreators::{ArcenOnly, Other};
+        use model::UserSpaceInputInterface::{Uhid, Uinput};
+        const OURS: &str = "/opt/arcen/bin/arcen-pier";
+        let holding = |pid, exe, uinput, uhid| InputCreator {
+            holds: model::HeldInterfaces { uinput, uhid },
+            ..creator(pid, Some(exe))
+        };
+        // A process outside Arcen holding only uhid cannot have made a
+        // uinput keyboard, such as a grading panel's.
+        let holders = [
+            holding(10, OURS, true, true),
+            holding(20, "/usr/bin/hid-replay", false, true),
+        ];
+        assert_eq!(
+            creators_from(Some(&holders), Some(OURS), Some(Uinput)),
+            ArcenOnly
+        );
+        assert_eq!(creators_from(Some(&holders), Some(OURS), Some(Uhid)), Other);
+        // A parentless device elsewhere may be either's.
+        assert_eq!(creators_from(Some(&holders), Some(OURS), None), Other);
+        // The other way round: a uinput holder never made a uhid device.
+        let holders = [holding(21, "/usr/lib/remote-product/server", true, false)];
+        assert_eq!(
+            creators_from(Some(&holders), Some(OURS), Some(Uhid)),
+            ArcenOnly
+        );
+        assert_eq!(
+            creators_from(Some(&holders), Some(OURS), Some(Uinput)),
+            Other
+        );
+    }
+
+    #[test]
+    fn root_is_read_from_every_user_id() {
+        let status =
+            |uid: &str| format!("Name:\tTangentHub\nUmask:\t0022\nUid:\t{uid}\nGid:\t0\t0\t0\t0\n");
+        assert!(root_user_ids(&status("0\t0\t0\t0")));
+        // A set-user-ID program a user started keeps their real ID.
+        assert!(!root_user_ids(&status("1000\t0\t0\t0")));
+        assert!(!root_user_ids(&status("0\t0\t0\t1000")));
+        assert!(!root_user_ids(&status("0")));
+        assert!(!root_user_ids("Name:\tx\n"));
     }
 
     #[test]
@@ -3924,6 +4318,8 @@ mod tests {
         // Through a chroot, and a node named uinput that is something else.
         process(400, "/usr/lib/remote-product/hid", &["/srv/jail/dev/uhid"]);
         process(500, "/usr/bin/impostor", &["/home/u/uinput"]);
+        // The desk's Bluetooth daemon, holding uhid for a Bluetooth keyboard.
+        process(700, "/usr/libexec/bluetooth/bluetoothd", &["/dev/uhid"]);
         // A process that ended between listing and reading.
         std::fs::create_dir_all(root.join("600")).unwrap();
         // The fixture's descriptors stand in for device nodes: their device
@@ -3937,29 +4333,60 @@ mod tests {
             })
         };
 
-        let holders = user_space_input_holders(&root, &rdev).unwrap();
+        // Facts are read only for a process named like a driver at the desk.
+        let driver = |base: &Path| -> model::LocalDriverFacts {
+            assert!(base.ends_with("700"), "{base:?}");
+            ROOT_SERVICE
+        };
+
+        let holders = user_space_input_holders(&root, &rdev, &driver).unwrap();
         assert_eq!(
             holders.iter().map(|holder| holder.pid).collect::<Vec<_>>(),
-            [100, 200, 400]
+            [100, 200, 400, 700]
         );
         assert_eq!(
             holders[0].exe.as_deref(),
             Some("/usr/lib/remote-product/server")
         );
+        let held = |uinput, uhid| model::HeldInterfaces { uinput, uhid };
+        assert_eq!(
+            holders
+                .iter()
+                .map(|holder| holder.holds)
+                .collect::<Vec<_>>(),
+            [
+                held(true, false),
+                held(true, true),
+                held(false, true),
+                held(false, true)
+            ]
+        );
+        assert_eq!(holders[3].driver, Some(ROOT_SERVICE));
+        assert!(holders[..3].iter().all(|holder| holder.driver.is_none()));
         const OURS: Option<&str> = Some("/opt/arcen/bin/arcen-pier");
         assert_eq!(
-            creators_from(Some(&holders), OURS),
+            creators_from(Some(&holders), OURS, None),
             model::UserSpaceInputCreators::Other
         );
         assert_eq!(
-            creators_from(Some(&holders[1..2]), OURS),
+            creators_from(Some(&holders[1..2]), OURS, None),
+            model::UserSpaceInputCreators::ArcenOnly
+        );
+        // Arcen and the Bluetooth daemon only: a uhid device is not another
+        // product's.
+        assert_eq!(
+            creators_from(
+                Some(&[holders[1].clone(), holders[3].clone()]),
+                OURS,
+                Some(model::UserSpaceInputInterface::Uhid)
+            ),
             model::UserSpaceInputCreators::ArcenOnly
         );
         // A descriptor that cannot be read makes the answer unknown.
         let unreadable = |_: &Path| -> std::io::Result<u64> {
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         };
-        assert!(user_space_input_holders(&root, &unreadable).is_none());
+        assert!(user_space_input_holders(&root, &unreadable, &driver).is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4059,6 +4486,7 @@ esac
                 uid,
                 model::ConsoleHost {
                     display_manager: false,
+                    login_screen: model::LoginScreen::Shown,
                 },
             )
         }

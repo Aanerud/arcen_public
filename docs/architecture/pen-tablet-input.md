@@ -1,6 +1,6 @@
 # Typed pen/tablet input (local termination)
 
-**Vendor neutrality (0.16.0).** Pen and tablet support is not tied to any
+**Vendor neutrality.** Pen and tablet support is not tied to any
 tablet maker. Every decision about *whether* a device is a pen tablet is made
 from its HID report descriptor by shared code
 (`arcen_usb_bridge::classify_pen_tablet`, see
@@ -8,51 +8,37 @@ from its HID report descriptor by shared code
 every pressure, tilt and rotation conversion goes through one shared,
 vendor-neutral contract (`arcen_input::pen_axes`, see
 [Axis normalisation](#axis-normalisation-vendor-neutral)). Vendor ids are
-logged for readability and never used as a gate. The validation history
-below names the tablet that was physically tested; that is a record of what
-was measured, not a list of what is supported.
+logged for readability and never used as a gate. Where this page names a
+tablet, it is the one physically tested, not a list of what is supported.
 
-**Status (2026-08-03):** Wire contract, macOS capture, Linux and Windows
-injection backends, and the raw-HID quarantine described below are
-implemented and unit/portable-tested — see
-[`legal/ORIGINS.md`](../../legal/ORIGINS.md) 2026-07-25
-and 2026-07-28 intakes. **Live human hardware validation completed 2026-08-03:
-a Wacom Intuos5 touch L pen was physically moved, pressure-applied, tilted,
-and clicked through Deck's Tablet Monitor, with 1,572+ forwarded pen events
-(including pressure 0.0–1.0 and tilt) reaching both a Linux (Xorg uinput
-path) and a Windows (PT_PEN path) host. See
-[capability coverage](#capability-coverage-and-improvement-boundaries) for
-the confirmed supported subset, known limits, and what requires USB
-redirect.**
+**Status.** The wire contract, macOS capture, the Linux and Windows injection
+backends and the raw-HID quarantine described below are implemented; their
+provenance is in [`legal/ORIGINS.md`](../../legal/ORIGINS.md). A physical
+pen's motion, pressure (0.0–1.0), tilt and clicks pass through the Deck's
+Tablet Monitor to both a Linux (Xorg uinput) and a Windows (PT_PEN) Pier. See
+[capability coverage](#capability-coverage-and-improvement-boundaries) for the
+confirmed supported subset, known limits, and what requires USB redirect.
 
-### macOS AppKit event gate — root cause and fix (2026-08-03)
+### macOS AppKit event gate
 
-During validation a critical capture bug was found and fixed: tablet drivers
-on macOS (measured with a Wacom) deliver pen motion as **mouse/drag events
-with a `TabletPoint` subtype**,
-not as standalone `NSTabletPoint` events. For these events `vendorID()` and
-`pointingDeviceType()` both return **0**. The original gate in
-`clients/macos/src/tablet/monitor.rs` dropped every event where `vendor_id =
-0`, so only proximity enter/leave reached the host — all position, pressure,
-tilt, and button events were silently discarded.
+Tablet drivers on macOS deliver pen motion as **mouse/drag events with a
+`TabletPoint` subtype**, not as standalone `NSTabletPoint` events, and for
+those events `vendorID()` and `pointingDeviceType()` both return **0**. A gate
+that dropped `vendor_id = 0` would therefore pass only proximity enter/leave
+and silently discard every position, pressure, tilt and button event.
 
-Fix (`clients/macos` commit `1d6af87`): the gate now blocks only
-`vendor_id = 0x05AC` (Apple — the sole source of false-positive
-tablet-shaped events from trackpads) and promotes everything else that passed
-the `effective_kind` gate to `Pen`. The old vendor-allowlist approach was
-inverted: rather than requiring a known vendor, it now requires only the
-absence of the known-bad vendor. Since 0.16.0 the test-only vendor list that
-remained in `monitor.rs` is gone too.
+The gate in `clients/macos/src/tablet/monitor.rs` blocks only
+`vendor_id = 0x05AC` (Apple — the sole source of false-positive tablet-shaped
+events, from trackpads) and promotes everything else that passed the
+`effective_kind` gate to `Pen`. It requires the absence of the known-bad
+vendor, never a known good one; there is no vendor allowlist.
 
 ## Problem and scope
 
-Arcen Deck previously shipped a partial raw-HID-over-IP path (`clients/macos/src/hid/`,
-Linux `/dev/uhid` admission) alongside documentation implying full Wacom
-passthrough. The implementation could not substantiate that claim: it had no
-host-to-client control/feature/output/USB transfer channel, forwarded every
-Wacom interface (including the plain USB mouse interface) by vendor ID alone,
-and accepted client-supplied HID descriptors at the host's kernel-facing
-parser boundary. That path is now quarantined (see
+A partial raw-HID-over-IP path (`clients/macos/src/hid/`, Linux `/dev/uhid`
+admission) cannot provide full tablet passthrough: it has no host-to-client
+control/feature/output/USB transfer channel, and it hands client-supplied HID
+descriptors to the host's kernel-facing parser. That path is quarantined (see
 ["Experimental raw-HID passthrough (quarantined)"](#experimental-raw-hid-passthrough-quarantined)
 below) and is not part of default builds.
 
@@ -64,12 +50,11 @@ protocol, and each active Pier injects a native virtual pen device that any
 ordinary Linux or Windows creative application already understands. Neither
 host runs, needs, or requires a tablet vendor's driver.
 
-**True USB bridging** — a future feature where a host owns the physical
-device and full bidirectional USB semantics traverse the network — is a
-different feature, driver, latency, and security boundary. It is **not**
-implemented, is **not** what the raw-HID quarantine or its future removal
-enables, and is described only as a scoped-out future decision boundary
-below (["Future true USB bridge (not implemented)"](#earlier-plan-for-a-true-usb-bridge-now-native-tablet)).
+**True USB bridging** — Native tablet (USB bridged), where the host owns the
+physical device and bidirectional USB semantics traverse the network — is a
+different feature, driver, latency, and security boundary. It is **not** what
+the raw-HID quarantine enables; see
+["Native tablet: where each piece lives"](#native-tablet-where-each-piece-lives).
 
 ## Data path
 
@@ -229,7 +214,7 @@ conversion into or out of it is shared:
   (`shared/input/src/hid_digitizer.rs`, presented through `IOHIDUserDevice`)
   was measured as the alternative and rejected: macOS 26.7 delivers its
   proximity but no pressure, tilt or rotation to applications
-  (`arcen-pier-macos probe-pen-hid`; `hosts/macos/AGENTS.md`).
+  (`arcen-pier-macos probe-pen-hid` shows it).
 
 In Native tablet (USB bridged) mode no conversion happens at all: the host
 kernel reads the device's own report descriptor, so the pen's native pressure
@@ -291,13 +276,12 @@ Full field-level contract: [`shared/protocol/WIRE.md`](../../shared/protocol/WIR
 
 ## Barrel buttons
 
-Field case (2026-11-19): a Windows Deck's Wacom barrel button, which Windows
-Ink reports as Windows' right click (`PEN_FLAG_BARREL`), reached a Linux Pier
-as bit 0, `BTN_STYLUS`, which X and every Linux desktop make a **middle**
-click; and a side switch the Wacom driver performs as a mouse click (Middle
-Click, Right Click) was dropped by the Deck while the pen hovered. Before the
-fix the Piers disagreed on bit 0: right click on macOS and Windows, middle
-click on Linux.
+A barrel button means different things on each system: Windows Ink reports
+it as Windows' right click (`PEN_FLAG_BARREL`), while `BTN_STYLUS` on Linux is
+a **middle** click in X and every Linux desktop; and a tablet driver may
+perform a side switch as a mouse click (Middle Click, Right Click) while the
+pen hovers. Without one shared meaning, a Windows Deck's barrel arrives on a
+Linux Pier as a middle click and a driver-performed click is lost.
 
 **One meaning, shared** (`arcen_input::pen_buttons`):
 
@@ -305,8 +289,8 @@ click on Linux.
   that gives them that meaning says `pen_button_actions = available` in its
   hello. A Linux Pier that predates the field pressed `BTN_STYLUS` for bit 0;
   a Deck swaps the two bits for it (`HostPenButtons::LinuxLegacy`), so a new
-  Deck right-clicks on an old Pier too (the Z8 needs no Pier update). Older
-  macOS and Windows Piers already right-clicked for bit 0.
+  Deck right-clicks on an old Pier too. Older macOS and Windows Piers already
+  right-clicked for bit 0.
 - **The tablet driver's mapping is honoured as it arrives.** A Windows Ink
   barrel is the button the driver set to Right Click. A click the driver
   performs as a mouse click while the pen is in range is that click on the
@@ -339,7 +323,7 @@ click on Linux.
 
 ## Tablet mode contract (requested vs active)
 
-Deck now carries an explicit per-connection tablet mode request in
+The Deck carries an explicit per-connection tablet mode request in
 `ClientHelloMsg.tablet_mode_requested` and both peers advertise
 `tablet_mode_capabilities`. The host answers with `tablet_mode_result`, so the
 client can show the effective mode and reason.
@@ -394,10 +378,10 @@ pen-capability parts of `clients/macos/src/transport/websocket.rs`.
   (`PenInput`) maps, classifies and sends a sample in the same AppKit
   callback that delivered it, stamped with the event's own time. The UI pass
   only publishes routing (video `image_rect`, multi-window targets, region
-  viewports) and session state. Measured before this: a Deck on a 30 Hz panel
-  forwarded pen samples every 33 ms, because AppKit coalesced the digitizer's
-  reports while the main thread waited for vsync and samples left only on the
-  next UI pass. Now:
+  viewports) and session state. Otherwise a Deck on a 30 Hz panel would
+  forward pen samples only every 33 ms, because AppKit coalesces the
+  digitizer's reports while the main thread waits for vsync and samples would
+  leave only on the next UI pass. So:
   - AppKit mouse-event coalescing (`NSEvent.isMouseCoalescingEnabled`, which
     covers tablet events) is turned off while a session window is active and
     restored on deactivate and quit, so every digitizer report arrives;
@@ -500,11 +484,11 @@ unit-testable off Linux) and `hosts/linux/src/input/uinput.rs`
   `xinput list`), which moves the cursor and presses button 1 for the tip,
   button 3 for the right click (`BTN_STYLUS2`) and button 2 for the middle
   click (`BTN_STYLUS`), as with a USB tablet.
-  Until 0.17.0 the pen also moved the cursor and clicked through the
-  absolute mouse device, so X clients received each sample twice from two
-  source devices: Firefox began every stroke with a `mouse` pointerdown and
-  switched pointer type and id inside strokes, and pages that end a stroke on
-  `pointerleave` lost ink. Without a tablet device (creation failed, or Hard
+  The pen does not also drive the absolute mouse device: X clients would
+  receive each sample twice from two source devices, a browser would begin
+  every stroke with a `mouse` pointerdown and switch pointer type and id
+  inside strokes, and pages that end a stroke on `pointerleave` would lose
+  ink. Without a tablet device (creation failed, or Hard
   USB released it) the pen falls back to cursor and clicks on the absolute
   device, without pressure or tilt, with the same buttons (tip = left, right
   click = right, middle click = middle).
@@ -517,7 +501,7 @@ unit-testable off Linux) and `hosts/linux/src/input/uinput.rs`
   threshold in contact (`arcen_input::virtual_device::contact_pressure`). The
   Xorg tablet's quirk sets the thresholds to `AttrPressureRange=2:1`
   (`virtual_device::PRESSURE_CONTACT_UPPER`/`LOWER`), so the floor is 2 of
-  65535 there; the Wayland lab seat pen is read by the compositor's libinput
+  65535 there; a pen on a native Wayland seat is read by the compositor's libinput
   with the system quirks only, so its floor is libinput's default threshold
   plus one (3278, `libinput_default_contact_pressure`): its lightest contact
   reads about 4 %. Without readable system quirks the session keeps
@@ -565,12 +549,12 @@ unit-testable off Linux) and `hosts/linux/src/input/uinput.rs`
   (`FORCED_PROXOUT_TIMEOUT`, `evdev-tablet.c`; libinput 1.19, 1.30, 1.31). A
   pen held still above the Deck's tablet sends nothing, so a jump to a new
   point arrived only as a fresh proximity-in that applications did not see as
-  motion (measured on the Wayland lab seat pen: no host event for 16 pen
+  motion (measured on a native Wayland seat: no host event for 16 pen
   jumps). The first time a tool enters proximity on a virtual tablet, the
   Pier injects one genuine pen-tool in/out before the real sample, even when
   the eraser approaches first (libinput disarms only on a `BTN_TOOL_PEN` release)
   (`arcen_input::virtual_device::ProximityTimeoutDisarm`; the uinput tablet
-  here and the lab seat pen).
+  here and a native-seat pen).
 - Parse/validate every `PenEventMsg` through the existing globally sequenced
   input dispatcher before mapping or emitting.
 
@@ -583,15 +567,15 @@ the compositor's EIS server: libei's `ei_stylus` interface, merged for
 libei 1.7 (libinput/libei!400). The session agent probes for it at start.
 The hello advertises each axis only from what the stylus bound
 (`arcen_input::pen_emulation::PenCapabilityTruth`), so rotation can be
-available there although the uinput tool never offers it. The new
+available there although the uinput tool never offers it. The
 `pen_barrel_buttons` capability says whether barrel buttons reach the
 desktop.
 
 `arcen_input::pen_emulation::StylusEmulator` turns samples into
 protocol-valid frames on top of the shared `plan_pen_edges`. It is tested
 exhaustively against a model of the protocol, and was driven through
-libei's `eis-demo-server` without a protocol error. Today no GNOME release
-offers an EIS stylus. A Wayland session therefore refuses Tablet support
+libei's `eis-demo-server` without a protocol error. No GNOME release offers an
+EIS stylus yet. A Wayland session therefore refuses Tablet support
 with the evidence (`stylus_not_offered`, or `no_emulated_input` on
 GNOME 40), and it refuses Native tablet (Hard USB), which would reach
 `seat0`. See
@@ -655,9 +639,9 @@ Module: `hosts/windows/src/input.rs` (`PenInjector`, `PenPointerState`,
 
 ## Capability coverage and improvement boundaries
 
-Confirmed by physical validation with one tablet (a Wacom Intuos5 touch L,
-2026-08-03). The Linux pressure range has since moved from 8191 to the
-vendor-neutral 65535; no tablet of another make has been physically tested.
+Confirmed with one physical tablet (a Wacom Intuos5 touch L). Linux pressure
+uses the vendor-neutral 65535 range; no tablet of another make has been
+physically tested.
 
 ### Supported (end-to-end confirmed)
 
@@ -704,8 +688,8 @@ handshake.
 ### Where to draw the line — USB redirect
 
 The following capabilities **cannot be provided by local termination** and
-require the future true USB bridge (see
-["Future true USB bridge (not implemented)"](#earlier-plan-for-a-true-usb-bridge-now-native-tablet)).
+require the USB bridge (see
+["Native tablet: where each piece lives"](#native-tablet-where-each-piece-lives)).
 A Windows host takes Native tablet without attaching the device (it reads
 the pen and injects Windows Ink, ADR 0023 amendment), so on Windows they stay
 unavailable, as do more than 1,025 pressure steps and Wintab
@@ -733,7 +717,7 @@ unavailable, as do more than 1,025 pressure steps and Wintab
 Full wire detail: [`shared/protocol/WIRE.md`](../../shared/protocol/WIRE.md)
 ("Experimental raw-HID passthrough"). This is the pre-existing partial
 IOHID/`/dev/uhid` path, not the typed-pen backend above, and it is **not**
-the future USB bridge described below.
+the USB bridge (Native tablet) described below.
 
 - **Default builds fully disable this path.** Admission requires **all** of:
   (1) the peer's own compile-time `experimental-raw-hid` Cargo feature
@@ -759,13 +743,12 @@ the future USB bridge described below.
   count (`MAX_EXPERIMENTAL_RAW_HID_DEVICES = 8`) and admits a device only
   through `arcen_usb_bridge::RawHidAdmission`: a `/dev/uhid` device is created
   only for an interface whose descriptor declares a pen, of a device whose
-  interfaces classify as a pen tablet. No vendor id is consulted (the 0.15
-  five-vendor allowlist is gone).
+  interfaces classify as a pen tablet. No vendor id is consulted.
 - **This is not USB bridging.** It carries only raw IOHID *input* reports
   one direction (client to host); it has no control, feature, output, or USB
   transfer channel, and it cannot satisfy a vendor host driver's bidirectional
-  protocol. Extending this quarantined path is explicitly out of scope; the
-  true future bridge (below) is a different design, not a graduation of this
+  protocol. Extending this quarantined path is explicitly out of scope;
+  Native tablet (below) is a different design, not a graduation of this
   feature flag.
 - A hostile/buggy old or unknown peer that never advertises
   `experimental_raw_hid` is never admitted, regardless of local
@@ -774,8 +757,8 @@ the future USB bridge described below.
 ## Native tablet: where each piece lives
 
 Native tablet (USB bridged) is the true USB bridge: the Deck's physical
-tablet is attached to the host, and since 0.19.0 there is one path for where
-its pen points (ADR 0023). Each piece has one home:
+tablet is attached to the host, and there is one path for where its pen
+points (ADR 0023). Each piece has one home:
 
 | Piece | Owning crate and module | What it is |
 | --- | --- | --- |
@@ -796,7 +779,7 @@ its pen points (ADR 0023). Each piece has one home:
 | Pen readers (macOS and Windows Piers) | `arcen-usb-bridge` `generic_pen` (`GenericPenLayout`, `GenericPenReader`), `wacom_intuos_pen` (`IntuosPenReader`, `HOST_DECODED_INTUOS_MODELS`), `host_pen::host_pen_route` | Any tablet's pen by its own report descriptor; a dedicated reader only where it adds features (a vendor packet format) |
 | Host-read attachment (macOS and Windows Piers) | `arcen-usb-bridge` `host_pen_bridge::HostPenBridge`; `arcen-input` `bridged_pen` (`authorize`, `tablet_result`, `NativeTabletAttachment`, `BridgedPenSession`, `host_pen_event`, `HostPenPointer`) | One attachment for a Pier that reads the pen itself: enumeration over the URB bridge, the pen interface polled for the Pier (published or not; `HidPublishPolicy::Nothing` publishes no device), the Intuos mode switch and its restore, the proximity release on the end, wire frames, the same `PenEventMsg` a Deck sends in Tablet support, and the host pointer the pen moves |
 | Route on a joined desktop (Linux) | `arcen-usb-bridge` `joined_pen` (`native_tablet_route`, `JoinedPenRefusal`); `arcen-input` `joined_input` (`prove_joined_device_confinement`, `JoinedInputGuard`) and `bridged_pen` (`host_decoded_capabilities`, `host_decoded_notice`, `host_decoded_tablet_result`) | A desktop Arcen did not start (a joined console, ADR 0025) never takes the raw bridge; it takes the host-decoded route: the Pier reads the pen (`HidPublishPolicy::Nothing`) and posts it through its own typed pen device, only while that device is proved to reach the joined desktop's display server alone (its event node held by that server, no node held by another login session, another display server, another account's process or an input bridge, the session in front; system services such as `acpid` or `gpm` may read: `classify_reader`); the Deck is told exactly what is decoded and carried |
-| Lab emulation | `arcen-usb-bridge` `wacom_intuos5` | An emulated Intuos5 with scripted strokes, for tests and lab proofs |
+| Emulated tablet | `arcen-usb-bridge` `wacom_intuos5` | An emulated Intuos5 with scripted strokes, for tests |
 
 Platform adapters only read devices and publish: the Linux Pier's
 `hosts/linux/src/usb_bridge/tablet_pointer.rs` (the bridged pen's evdev node,
@@ -811,44 +794,19 @@ mechanism.** A new Pier adds an adapter that produces `PenSample`s; a
 tablet model on a macOS Pier needs nothing when its descriptor states its
 pen, and a dedicated reader only for a vendor packet format.
 
-## Earlier plan for a true USB bridge (now Native tablet)
+## Requirements a USB bridge meets
 
-> Superseded by Native tablet (see the section above, and ADRs 0019 to
-> 0023). Kept as the original boundary.
-
-Recorded here as a decision boundary, not a design in progress. A true USB
-bridge — where a host owns the physical tablet's full logical USB identity
-over the network — is a **separate, future, separately approved** feature
-requiring all of:
-
-- **Exclusive client device ownership**, relinquished to the host for the
-  bridge's duration, with explicit user consent and an allowlist of bridged
-  devices.
-- **Complete bidirectional USB semantics**: control transfers, feature
-  reports, interrupt/output reports, and full USB lifecycle/error signaling
-  in both directions — not the one-directional input-only quarantined path
-  above.
-- **The tablet's driver installed on the host**, not consumed locally by the
-  client while bridged — the opposite placement from local termination.
-- **A reviewed Linux USB virtualization backend** (e.g. USB/IP-class
-  kernel or userspace virtualization) — not `/dev/uhid`, which cannot carry
-  control/feature/output transfers.
-- **A production-signed Windows virtual USB/HID driver** — a synthetic
-  pointer device (this document's Windows backend) cannot present full USB
-  device semantics. Not funded
-  ([ADR 0017](../adr/0017-forward-only-pen-input.md)); a Windows host takes
-  Native tablet by reading the pen itself instead (ADR 0023 amendment).
-- **An explicit low-latency network policy/warning**: USB bridging is
-  latency-sensitive in a way local termination is not, and a bridge over a
-  lossy or high-latency network needs its own documented warning and
-  possibly a lossy-report tolerance mode.
-- **Device allowlisting, kernel attack-surface review, and a separate
-  Release/Security approval** before any implementation begins — this is a
-  new kernel-facing trust boundary on both host platforms, distinct from the
-  quarantined raw-HID passthrough's already-bounded, input-only surface.
-
-None of the code, wire messages, or feature flags described elsewhere in
-this document implement, enable, or are a step toward this bridge.
+Native tablet (ADRs 0019 to 0023) meets the boundary drawn before any bridge
+existed: exclusive device ownership for the bridge's duration with user
+consent; complete bidirectional USB semantics (control, feature,
+interrupt/output reports and lifecycle errors), never `/dev/uhid`; a reviewed
+USB virtualization backend on the host; a warning for lossy or high-latency
+networks; and device admission, kernel attack-surface review and
+Release/Security approval as a new kernel-facing trust boundary. A Windows
+host does not take a virtual USB device
+([ADR 0017](../adr/0017-forward-only-pen-input.md)); it takes Native tablet by
+reading the pen itself (ADR 0023 amendment). Nothing in the typed-pen path or
+the raw-HID quarantine is a step toward the bridge.
 
 ## Behavioral notes
 
@@ -857,15 +815,14 @@ pen-vs-eraser, contact, and proximity handling plus an earlier Linux uinput tabl
 shape. All Rust code, types, FFI usage, bounded-queue/state-machine design, and
 unit conversions are original Arcen work — no external source line, string, or
 structure was copied, ported, or transliterated. The Windows backend is wholly
-original Arcen work; older behavior downgraded pen input to mouse input and
-never implemented native pressure.
+original Arcen work.
 
 ## Operator validation
 
 See [`../operations/pen-tablet-input.md`](../operations/pen-tablet-input.md)
 for the concrete Tablet Monitor, macOS signed dev/release-mode, Linux
 `libinput`/`evtest`/Krita, Windows Ink, old-peer fallback, teardown, and
-logs/privacy checklist, plus the outstanding human-physical test gate.
+logs/privacy checklist.
 
 ## Cross-references
 

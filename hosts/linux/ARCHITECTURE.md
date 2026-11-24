@@ -8,22 +8,19 @@ session-agent subcommands.
 
 The native Rust control plane for a Linux workstation host: a QUIC/TLS 1.3 server, PAM/SSSD
 authentication, per-user graphical session management, input injection (uinput), display
-management, and supervision of the `arcen-capenc` capture+encode subprocess. Replaces the
-old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path.
+management, and supervision of the `arcen-capenc` capture+encode subprocess. No Python,
+no ffmpeg in the app path.
 
-## How it's grounded
+## Design decisions
 
 - Lessons encoded (the important ones):
   - **Dedicated Xorg per session on its own GPU head + logind seat activation** is the
-    correct per-user model (matches the established per-session launcher model:
-    launch a dedicated Xorg config with `OutputClass` + `ActivateSessionOnSeat`). The
-    "gnome-session on the shared root-owned `:0`" path is **wrong** — the user's logind session is
-    `Active=no`, mutter fails `meta_later_add: assertion 'display' failed`, GNOME crash-loops
-    ("Oh no…"). Proven live: a dedicated `:10` on head DVI-D-1 streamed a real
-    per-user desktop. **This is the top Linux Pier follow-up** — earlier analysis captured it as the
-    `LINUX_SESSION_MODEL_SPEC` finding, not fully coded.
-  - **GPU head ↔ display ↔ capenc output-index rule:** up to 4 concurrent sessions/screens,
-    each pinned to its own head (DVI-D-0..3); capenc `--monitor N` selects output index N-1.
+    per-user model: the launcher starts a dedicated Xorg configuration with `OutputClass` +
+    `ActivateSessionOnSeat`. A GNOME session on the shared root-owned `:0` does not work:
+    the user's logind session is `Active=no`, Mutter fails
+    `meta_later_add: assertion 'display' failed`, and GNOME crash-loops ("Oh no…").
+  - **GPU head ↔ display ↔ capenc output-index rule:** up to four screens, each pinned to
+    its own head (DVI-D-0..3); capenc `--monitor N` selects output index N-1.
     See `hosts/capenc/ARCHITECTURE.md`.
   - **Identity drop is ordered:** `setgroups → setgid → setuid`, then PDEATHSIG re-armed.
     Credentials travel over a private stdin pipe as `Zeroizing` bytes; PAM owned by the root
@@ -50,8 +47,8 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
    `arcen-session`, and `arcen-telemetry`; spawns `current_exe() capenc` as a
    subprocess. Never depends on the Windows Pier.
 2. Linux-only deps (`pam-client2`, `evdev`, `nix`, `x11rb`) stay behind
-   `cfg(target_os = "linux")` so protocol/transport unit tests still run on the macOS dev box.
-3. `unsafe` allowed (~49 sites: uinput, nvctrl, identity syscalls) but scoped.
+   `cfg(target_os = "linux")` so protocol/transport unit tests still run on other operating systems.
+3. `unsafe` is allowed (uinput, nvctrl, identity syscalls) but scoped.
 4. Must not disturb other co-resident remote-desktop services on the box; own UDP port `18444`, own
    install prefix `/opt/arcen/bin/`, own systemd unit `arcen-pier.service`.
 5. QUIC/TLS via Quinn and rustls. Tungstenite remains only as the bounded
@@ -88,7 +85,7 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
   uinput.
 - **Exposes:** QUIC on UDP `:18444`.
 
-## Module map (from the proven source)
+## Module map
 
 - `main.rs` / `lib.rs` / `cli.rs` — entry, crate root, CLI (host, port, display, flags).
 - `logging/` — canonical `logging.level`/one-release legacy `logging.verbosity`
@@ -151,10 +148,10 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
   Xorg screen has no negative space).
 - `session/launcher.rs` and `session/agent.rs` — multicall subcommands of
   `arcen-pier`; the launcher owns PAM and dedicated Xorg.
-- Fused helper modes: `arcen-pier audiocap` (from `server/audiocap`) and
-  `arcen-pier input-helper` (from `server/input_helper`).
-- The first Wayland provider tranche is API/model-only. Dedicated Xorg remains
-  the default and only wired output/input session path. See
+- Fused helper modes: `arcen-pier audiocap` and `arcen-pier input-helper`.
+- `session/wayland/` — the Wayland provider (`wayland-provider` feature) for a
+  GNOME/Mutter desktop on a host without Xorg; the provider is chosen at start
+  from facts. See
   [`../../docs/architecture/linux-wayland-provider.md`](../../docs/architecture/linux-wayland-provider.md).
 - Audiocap monitor inactivity may mean PulseAudio suspended an idle
   `auto_null.monitor`. Pier preserves the in-flight 3,840-byte read and reports
@@ -198,11 +195,7 @@ to I420 in shared safe Rust and encoded by the shared source-built OpenH264
 wrapper. READY follows the first successful encoded access unit. The software
 cap is even H.264/YUV420 local-cursor geometry through 1920x1080 at 30 fps.
 Idle cadence remains one-second keepalive. Selective retained conversion is not
-enabled.
-
-The implementation has offline unit/CI coverage but no claimed physical
-non-NVIDIA fallback, Deck decode, 1080p30 performance/allocation, modeset,
-one-hour soak, or restore result. Those remain release gates in
+enabled. Resolution rules are in
 [`../../docs/architecture/media-plan-resolution.md`](../../docs/architecture/media-plan-resolution.md).
 
 ## Relative input and cursor capture
@@ -298,9 +291,9 @@ Input reaches a dedicated Xorg desktop through three kernel uinput devices
 created per attachment by `input/uinput.rs`: the keyboard plus absolute pointer
 (`a2ce:0001`), the relative pointer (`a2ce:0002`) and the tablet pen
 (`a2ce:0003`). The kernel and udev offer every input device to every X server
-on the seat, and the dedicated Xorg hot-adds devices, so before 0.17.0 it also
-took the console's own keyboard and mice and any other dedicated Xorg's Arcen
-devices.
+on the seat, and the dedicated Xorg hot-adds devices, so without isolation it
+would also take the console's own keyboard and mice and any other dedicated
+Xorg's Arcen devices.
 
 `arcen_input::virtual_device::SessionInputIdentity` names the devices for the
 session's display: `Arcen Virtual Tablet Pen (session :58)`.
@@ -316,8 +309,8 @@ The match is on attributes a device declares itself, so it filters ordinary
 console devices but does not authenticate: a crafted USB device or a local
 user with `/dev/uinput` access can claim vendor `a2ce` and the session token.
 The devices are also still seat0 devices: a greeter or console session that
-is active on seat0 while an attachment exists can still open them. The
-follow-up closes both with one shipped udev rule: it tags only virtual-bus
+is active on seat0 while an attachment exists can still open them. A planned
+udev rule closes both: it tags only virtual-bus
 devices (`id/bustype` `0006`, `/devices/virtual/input`) with vendor `a2ce`
 through `ENV{ID_INPUT.tags}`, which `arcen-session-input` then requires with
 `MatchTag`, and gives them a seat of their own (`ID_SEAT` keyed on a
@@ -369,13 +362,13 @@ layout and before each press, and gives them their symbols back when the
 attachment ends (`input/x11_text.rs::pin_function_keys`). It is done ahead
 of the first press because a desktop grabs keys by keycode and moves its
 grabs only once it has read the new mapping: changed at its own press, F13
-reached GNOME's `XF86Tools` grab and F20 its mic-mute grab (measured on the
-lab's GNOME 40). On a joined console the desk's own F13–F24 type F13–F24
+reached GNOME's `XF86Tools` grab and F20 its mic-mute grab (measured on
+GNOME 40). On a joined console the desk's own F13–F24 type F13–F24
 too while a Deck is attached. A Wayland session uses the
 compositor's keymap; xkeyboard-config 2.43 and later offer
 `fkeys:basic_13-24` for F13–F24 keysyms there.
 
-## Committed text on Xorg (0.18.0)
+## Committed text on Xorg
 
 The Pier advertises `text_commit` for an Xorg session, so the Deck's input
 method, its Characters mode and Paste as Keystrokes reach it as characters
@@ -397,8 +390,8 @@ active group:
 
 Caps Lock is turned off around a commit with cased characters and back on
 after. The text is never logged, only counts. A Wayland session types
-committed text through its own route (`hosts/linux/AGENTS.md`, "Headless
-Wayland session").
+committed text through its own route ("Committed text in a Wayland session",
+below).
 
 ## Clipboard redirection
 
@@ -549,8 +542,6 @@ This surface adds no OIDC, entitlement, licensing, mTLS, 0-RTT,
 host-address binding, persistence, network fetch, or protocol-version bump. The
 owning contract and complete ordering are in
 [`../../docs/architecture/session-auto-reconnect.md`](../../docs/architecture/session-auto-reconnect.md).
-Graduation requires Shared/Architecture, Release/Security, macOS Client,
-Windows Host, and Linux Host review.
 
 ## Deskside physical-console privacy
 
@@ -602,8 +593,7 @@ startup recovery remains the process-death fallback.
 
 Unknown buses/connectors, missing EDID, unpinned hot-plug devices, overlap, and
 journal permission/corruption all fail closed. Pen/tablet classes are unsupported
-and cannot be requested. Physical evdev, DPMS, hot-plug, sleep/resume, GPU reset,
-and forced-crash behavior remain mandatory physical-lab release gates.
+and cannot be requested.
 
 ## Log rotation and runtime verbosity
 
@@ -733,7 +723,7 @@ safe fields (`stage`, `reason_class`, counts, health/network facts, etc.).
   `InputStats` — never a fabricated value.
   `HealthStatsMsg` (real `HostCounters`) is broadcast to the client every
   tick; the host in turn consumes `HealthPingMsg::client_telemetry`
-  (`ClientTelemetrySnapshotMsg`/`ClientQosSampleMsg`, PR3) so
+  (`ClientTelemetrySnapshotMsg`/`ClientQosSampleMsg`) so
   **client-experience health** reflects what the client actually observed,
   not just what the host sent. An old/legacy client that never reports
   telemetry leaves `SessionHealth::client()` as absent — treated as
@@ -790,44 +780,258 @@ recorded; bounded TLS lifecycle metadata can appear only through
 already-sanitized logs/events. Neither archive names nor manifests contain the
 hostname.
 
+## Design behind the Linux Pier's rules
+
+[`AGENTS.md`](AGENTS.md) lists the rules a change here must keep. This
+section explains them: what each mechanism does, and why.
+
+### Grading's transfer
+
+Grading passes the depth-30 desktop's sRGB codes to the matrix untouched
+(`Rgb10Signal::Direct`); `Config::apply_initial_video_request` states them
+`srgb` for a Deck that claims `srgb_transfer` through the shared
+`DesktopPlan::serving_sdr_desktop` (a declared PQ desktop then converts on
+the sRGB curve). A Wayland Grading epoch gets the same `transfer=srgb`;
+capenc passes it to the shared admission (`AdmissionRequest::sdr_transfer`),
+which converts the compositor's PQ with the inverse of Mutter's 2.2-power
+SDR decode (`SourceColour::sdr_content`) and states `srgb`. A compositor's
+SDR content is measured, never assumed to follow the piecewise sRGB curve.
+
+### capenc READY line and stdout framing
+
+capenc emits `[capenc] READY version=1 backend=... codec=... cursor=local|host ...`
+on stderr. The Pier's `parse_ready_line` requires the `cursor=` field. The
+`cursor=` value echoes the `cursor=local|host` argv the Pier passes. A capenc
+that does not emit the field fails with
+`capenc READY protocol error: missing cursor`.
+
+stdout is framed-v1 (`u32_be length || access unit`) unless the Pier passes
+`framed-v2` (a Wayland metadata-cursor capture): then every record is
+`u32_be length || u8 kind || body`, kind 1 an access unit and kind 2 a
+cursor event (`arcen_media::capenc_stream`, bounded before allocation).
+
+### A Native tablet on an Xorg desktop
+
+`usb.native_tablet = "enabled"` is the only switch; no lab feature or
+environment variable turns Native tablet on.
+
+A Native tablet (ADR 0021) is the one device a dedicated Xorg admits beside
+its own session's uinput devices. It stays on `seat0`, its nodes tagged for
+Xorg by the helper's per-port rule before the port connects
+(`ID_INPUT.tags=arcen_bridge,arcen_bridge_<display>`,
+`LIBINPUT_IGNORE_DEVICE=1`, no `uaccess`, no logind `seat` tag); the
+installed `/etc/X11/xorg.conf.d/90-arcen-bridged-usb.conf` makes every X
+server ignore `arcen_bridge`, and the launcher appends, last and after the
+isolation classes, a class ignoring every `arcen_bridge` again (the session
+class admits by name and VID, which a bridged device can imitate) and the
+one class that re-admits this display's own tag
+(`arcen_usb_bridge::bridge_seat::xorg_session_bridge_class`).
+
+`xf86-input-wacom` averages raw samples ("Wacom Sample and Suppress" 2, 4
+by default); with one report per network round trip that made the X
+pointer and application ink trail the bridged pen by about one and a half
+reports. The desktop's bridge class therefore sets `RawSample` 1
+(`bridge_seat::XORG_BRIDGE_RAW_SAMPLE`) and leaves `Suppress` at the
+driver's default.
+
+### Input on a joined console
+
+A joined console's X server (ADR 0025) is not one Arcen configures, and
+every X server on `seat0` would add the session's uinput devices. On a
+joined console each device is admitted only while the shared proof
+(`arcen_input::joined_input`) holds over the facts `input/joined_devices.rs`
+reads, through the gate every injection passes (`uinput.rs` `GatedDevice`);
+`net/joined_input.rs` proves them before the hello (an unproved keyboard or
+pointer refuses the attachment, an unproved pen is released), again as soon
+as the watch starts and then every two seconds, and the session's place in
+front every 250 ms; every injection also checks that the session's own
+terminal is in front, and a Deck's Ctrl+Alt+F-key (an X server's terminal
+switch) is not passed on. A lapse shuts the gate at once (nothing is
+written, not even releases; key state changes only once written); the
+shared `JoinedInputGuard` decides when held input is released and input
+resumes, or the attachment ends; a withdrawn pen's device is destroyed.
+
+Who may read a device is the shared `classify_reader`; Linux reads only the
+facts (each reader's uid, its login from the root-owned `user-<uid>.slice`
+and `session-<id>.scope` levels of its cgroup, its namespaces, whether its
+descriptors were readable). A reader is matched by the device number
+(`st_rdev`, `statx` with `AT_STATX_DONT_SYNC` through
+`/proc/<pid>/fd/<n>`) of what it holds, never by path: a bind-mounted,
+hard-linked or second `mknod` node is the same device, and path text
+alone (a `/dev/input/…` file in a user's own namespace) never counts. A
+descriptor is a reader only when its `fdinfo` (read first) and the
+`statx` describe the same open file (inode and mount) and it is not
+`O_PATH`; one that disagrees in three reads is an unstable handle (an
+`O_PATH` handle, which needs no read permission, swapped in a loop),
+not a reader, so an account that cannot read the node cannot stop the
+session with it. Below kernel 5.14 (no `ino` in `fdinfo`) such a handle
+could still stop it (fail closed). Root, the `input` group and `uaccess` ACL
+holders can still read the devices unseen (`SCM_RIGHTS` in flight,
+io_uring fixed files, a thread's own descriptor table) and can stop a
+joined session by holding a node; the proof is against other sessions
+and display servers, not the host's administrators. System services (`acpid`, `thd`, `gpm`,
+`brltty`) and the joined session's own processes are allowed and logged
+once per attachment; another session, a login screen, another display
+server, another account and a known input bridge are not.
+
+A joined console takes a bridged pen by the host-decoded route
+(`net/joined_pen.rs`): the Pier reads the pen with the shared reader
+(`HidPublishPolicy::Nothing`) and posts it through the session's typed
+uinput pen, which is kept, not released. The route is offered only while
+the shared `joined_pen` proof holds over the facts
+`input/joined_devices.rs` reads (the joined X server, found by its
+listening `/tmp/.X11-unix` socket, has the event node open; no node is
+open in another session, display server, account or input bridge, as
+`classify_reader` judges it; the session is logind's active one), and the
+proof is repeated every two seconds; a gap ends Native tablet without
+another event.
+
+### The session's layout reaches the Deck
+
+The Xorg session's layout reaches a Deck that types committed text as a
+`host_keymap` notice (source `x11_core_keymap`), as on Wayland: the
+committed-text connection (`input/x11_text.rs`) reads the core keyboard
+mapping, the active group and `_XKB_RULES_NAMES`, at attach and every
+second, and sends a notice only when what the layout types changed. Both
+providers build it with `input/keymap.rs::host_keymap_msg`, a thin
+evdev wrapper over the shared `arcen_input::text::host_layout` builder
+every Pier uses (positions, validation, `HostKeymapNotices`); main-block
+evdev codes come from the shared `set1_position` table.
+
+### Headless Wayland session
+
+- **Audio.** The session's audio is its own graph
+  (`session/wayland/audio.rs`): a session sink from an `XDG_CONFIG_HOME`
+  drop-in plus a private `pipewire-pulse`, or, on a PulseAudio host, pulse
+  tunnels into the user's server; the choice is
+  `arcen_session::local_playback::resolve_wayland_audio` from host facts.
+- **The GNOME login.** The agent serves `org.gnome.SessionManager` on the
+  private bus with `SessionIsActive=false`, `CanShutdown=false` and no
+  logind `IdleHint`, unlocks the keyring with the login password handed
+  through the agent's stdin, and runs the settings daemons and XDG
+  autostart as optional members. `gnome-session` is not started: GNOME 49
+  runs it only under the user's systemd manager, outside the scope and
+  private bus.
+- **Idle.** The `DeckAttachedInhibit` idle inhibitor means an attached Deck
+  without input never reaches the idle lock.
+- **The first key.** The input probe creates the session's keyboard
+  (`MutterSessions::prime_keyboard`, a `KEY_RESERVED` press Mutter turns
+  into no event): Mutter 42+ creates a `RemoteDesktop` keyboard only at its
+  first key press, and a headless or native seat has no other, so without
+  it every session's first key reached applications as a lone release.
+- **Pen.** The agent probes the compositor's EIS seat for an emulated
+  stylus at start (`session::wayland::eis`, pure-Rust `reis`) and reports
+  it in the input `hello` as `StylusFacts`. The seat pen
+  (`wayland.lab_seat_pen`) is for a compositor built with the
+  headless-input patch, and is owned by the desktop.
+- **Seat pen pressure.** The compositor's libinput normalises from its 1 %
+  lower threshold and Mutter 46+ multiplies its curve by the pressure
+  (squares it with GNOME's default curve, GNOME/mutter#5077).
+  `SeatPenPressure` inverts both. A prefix whose Mutter carries the fix
+  (`patch-pressure-curve-51.py`) says so in
+  `share/arcen/mutter-pressure-curve`, bound to the library's SHA-256;
+  `input::pressure_curve::SeatPenPressurePlan::resolve` reads it each time a
+  seat pen is built and then inverts libinput's threshold only.
+- **Committed text in a Wayland session.** The agent reads its compositor's
+  keymap as a Wayland client (requesting `wl_keyboard` before the seat
+  advertises the keyboard capability crashes headless Mutter 49.4),
+  indexes it with libxkbcommon loaded at run time, and types by proven
+  keycode strokes (Shift and AltGr held by their own keys, every stroke
+  replayed on the compositor's keymap first) only what the keymap proves;
+  with several differing groups, only strokes every group agrees on unless
+  the live group is known. The text connection
+  (`session/wayland/eis_text.rs`) is long-lived; the stylus probe
+  (`session/wayland/eis.rs`) is short-lived.
+- **DMA-BUF.** The verified `gpu-convert` route is EGL image → GL blit into
+  a CUDA-registered texture → CUDA copy; same GPU only; `PipeWire` explicit
+  sync honoured.
+- **Speed's refresh.** A session created for Speed runs its virtual output
+  at the display's own refresh on Mutter 49's virtual outputs, and at the
+  shared `paced_output_refresh_hz` only where that alone holds.
+- **Cursor mode.** `metadata` for a Deck that wants a local cursor and
+  declared `cursor_image_v1` on a host whose record proves
+  `cursor_metadata`, `hidden` (`cursor=local`, the Deck's own pointer) for
+  any other Deck that wants a local cursor, `embedded` (`cursor=host`) only
+  for a host-cursor request. A metadata desktop's capenc writes framed-v2
+  cursor events; the Pier keeps the desktop's cursor
+  (`media::wayland_cursor`, outliving attachments because Mutter sends a
+  sprite only when it changes) and sends `CursorUpdate` images on the input
+  lane. On an Xorg desktop the cursor watcher (`cursor_watcher.rs`) feeds
+  the shared `HostCursor` with XFixes images and names, through the same
+  `CursorFeed`.
+- **Software encoding.** `encoder=software-h264` runs capenc's separate
+  `linux-wayland-software` composition (shared memory only, the shared
+  software loop `arcen_media::canvas::CanvasEncodeLoop` with `PipeWire`'s
+  damage regions, no CUDA). The qualification probes the native encoder
+  and records `facts.encoder.native`, and a host without one sizes each
+  session's output to OpenH264's limits before it exists and asks for
+  software directly; on such a host a `display_update` is fitted too, and
+  an attach fits an oversize resizable output before capture.
+- **Outputs.** Mutter 49+ uses `RecordVirtual` monitors created by
+  negotiating their exact size (`arcen_capenc::materialise_virtual_output`)
+  and placed with `ApplyMonitorsConfig`. A resized epoch keeps the new
+  size's capture-rate evidence (Auto needs it as much as Speed; an Auto
+  epoch is asked for Auto at no more than its served rate, shared
+  `resized_epoch_request`), and one that cannot take over restores the
+  previous size and streams on (`resize_recovery`). Older compositors keep
+  fixed `--virtual-monitor` outputs. An output count change adds streams
+  to the running ScreenCast session (`ScreenCast.Stream.Start`) or stops
+  them; each output is placed at the UI scale
+  `arcen_outputs::choose_output_scale` picks from the client display's
+  density.
+- **Multi-monitor.** Each output gets its own capenc and stream hand-off
+  (`MonitorCaptureBinding`), region input lands on the output that shows
+  the region, and a reattach with another layout moves the outputs in
+  place before the first capture epoch.
+
+### Session admission and the seat
+
+A Pier drives **one physical desktop session at a time**. That is a hardware
+constraint, not a policy one: a second concurrent session would fight the first
+over the same display, input devices, and encoder. The Pier therefore holds a
+capacity-one session admission gate, and keeps the slot reserved for a bounded
+reconnect window so a dropped Deck can resume rather than lose the session.
+
+The host's X11 seat is a second, host-wide limit: one X11 desktop per host.
+A dedicated Xorg desktop is a logind session on `seat0` at VT 1, and logind
+refuses a second one ("already occupied", which `pam_systemd` turns into a
+PAM success without `XDG_SESSION_ID`).
+
+A host without a display manager gets the account's real login session,
+not a per-connection desktop: systemd runs `arcen-pier login-session` as its
+own unit, which opens PAM `arcen-login` on `seat0` at a free VT, starts a
+console-seat X server (`XorgSeat::Console`) and the user's X session entry
+through `Xsession`, and lives until the user logs out. The console path
+joins it like any console session.
+
+To join the account's own GNOME Wayland console session, the console
+agent's `--wayland-join` mode runs as the account on the session's own user
+bus and re-checks the proven compositor before it uses the bus.
+
+A seated desktop is local to polkit (it never reads logind's `Remote`), so
+Arcen's rule `05-arcen-remote-session.rules` gives remote seated sessions
+polkit's `allow_any` answers, keyed on `REMOTE=1`, `TTY=arcen` and
+`seat-arcen-pen-…`.
+
+## Multi-monitor
+
+Multi-monitor (up to 4 NVIDIA heads) is wired end-to-end. By default the
+Pier discovers the driver's `DFP-N` roster from a short startup Xorg probe,
+ranks heads by maximum pixel clock, and advertises only when discovery
+succeeds. `platform.multi_monitor.heads` remains an ordered override;
+`platform.multi_monitor.advertise_enabled: false` is the off switch.
+
 ## Deferred / roadmap
 
-- **Implement the dedicated-Xorg-per-session launcher** (lesson above) to replace the
-  shared-`:0` path and the `--unsafe-allow-shared-display` flags.
-- Multi-monitor (up to 4 NVIDIA heads) is wired end-to-end. By default the
-  Pier discovers the driver's `DFP-N` roster from a short startup Xorg probe,
-  ranks heads by maximum pixel clock, and advertises only when discovery
-  succeeds. `platform.multi_monitor.heads` remains an ordered override;
-  `platform.multi_monitor.advertise_enabled: false` is the off switch.
+- Per-head rotation discovery. Every configured NVIDIA head is treated as
+  rotation-capable (`HeadCapability::new`) until per-head discovery is built
+  and validated on NVIDIA hardware.
 - Fine-grained NvFBC damage. Shared-CUDA ToCuda exposes only frame-level
   `bIsNewFrame`; public NvFBC 1.7/1.9 diff maps are ToSys/ToGL-only. A future
   producer must preserve zero-copy through an approved design or use an original
   CUDA comparison kernel.
-- Complete and record the portable software physical-lab and distribution
-  acceptance gates.
 
-## Resume pointer
-
-- **Status:** ✅ MIGRATED + DEPLOYED + LIVE-VERIFIED (`18444/udp`,
-  `arcen-pier.service`). The **dedicated-Xorg-per-session model**
-  was migrated and deployed: `--session-gpu-head DFP-2 /
-  :11`, `/etc/arcen/xorg.conf` template, `/run/arcen/sessions`, `--desktop-session gnome`.
-  **User logged in as `artist` and streamed a real per-user GNOME desktop end-to-end.** Earlier
-  shared-`:0` proof also passed (TLS 1.3, WS 101, `frames_sent=7`, NvFBC→NVENC). Remaining:
-  multi-monitor (up to 4 heads) end-to-end. Linux Keel idle cadence and
-  structured INFO telemetry are implemented; a live GRID idle/4K60/modeset
-  measurement has not been recorded. The source-built software fallback is
-  implemented; physical dedicated-Xorg fallback, performance/allocation and
-  soak measurements have not been recorded and are not inferred from the
-  earlier NVENC evidence.
-- **Original next step (done):** copy `hosts/linux/src` + `Cargo.toml` into `hosts/linux`, rename crate →
-  `arcen-pier-linux`, lib `arcen_pier_linux`, bin `arcen-pier` (+ session-launcher/agent),
-  fold audiocap/input_helper bins, imports → `arcen_protocol`; the historical
-  migration port was 18443 and the current QUIC product port is 18444. Build on
-  the Linux host: `cargo build --release -p arcen-pier-linux`. Deploy to
-  `/opt/arcen/bin/` + `arcen-pier.service`.
-
-## Capture colour depth and the two native paths (2026-08-30)
+## Capture colour depth and the two native paths
 
 NvFBC's Linux capture ceiling is 8 bits per component. The Linux Pier therefore
 has two separate capture paths rather than widening the existing one.
@@ -887,7 +1091,7 @@ For every depth above eight, `linux_capture_backend` selects XShm before NvFBC
 is opened. `linux_x11` reads the authenticated dedicated Xorg root through
 MIT-SHM 1.2, requires depth 30/32 bpp/TrueColor, derives component shifts from
 the actual visual masks, and passes those packed RGB10 words to the CUDA NVENC
-encoder. The measured GRID visual is `XBGR2101010`
+encoder. An NVIDIA GRID depth-30 visual is `XBGR2101010`
 (`R=0x000003ff/G=0x000ffc00/B=0x3ff00000`), demonstrating why a fixed
 `A2R10G10B10` assumption is unsafe.
 
@@ -900,12 +1104,12 @@ edges up to 8192 (`arcen_media::video::host_converted_capture_fits`) — not a
 ten-bit session's geometry to that budget before it arms the display, on
 connect and on a live resize (`fit_to_capture_limits`, `resize_target`), and
 capenc's no-frame native probe, which runs before that modeset, probes a
-budget-sized part of a desktop that is still larger. A 2560×1600 continuous-motion
-Grading Reference run held 30–31 fps on the lab host. Sampling the live source
-found 18,124 of 95,850 RGB components outside the eight-bit expansion grid.
+budget-sized part of a desktop that is still larger.
 
 Xorg does not define an HDR composition space, and Resolve's Linux viewer does
 not provide one. The Xorg provider therefore fails closed on PQ/HLG at capenc
 and the Pier resolves an HDR request to HEVC 4:4:4 10-bit full-range BT.709.
-The Deck reports matrix/primaries/transfer degradation and stays in SDR.
-Actual Linux desktop HDR belongs to the future color-managed Wayland provider.
+The Deck reports matrix/primaries/transfer degradation and stays in SDR. An
+operator-declared Rec.2100 PQ desktop (`video.desktop_encoding`) is the one
+Xorg exception. Linux desktop HDR is otherwise served by the Wayland provider
+on Mutter 50 or newer.

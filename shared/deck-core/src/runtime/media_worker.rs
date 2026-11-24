@@ -1494,6 +1494,9 @@ fn session_end_worker_error(end: &SessionEnd) -> Option<String> {
     match end.reason {
         DisconnectReason::Terminal(
             TerminalDisconnect::Manual | TerminalDisconnect::GracefulHostClose,
+        )
+        | DisconnectReason::Transient(
+            crate::runtime::session::TransientTransportError::SignInScreenClosed,
         ) => None,
         _ => Some(end.message.clone()),
     }
@@ -3973,6 +3976,18 @@ mod tests {
         let end = SessionEnd {
             reason: DisconnectReason::Terminal(TerminalDisconnect::Manual),
             message: "Disconnected".to_string(),
+            observed_at: Instant::now(),
+        };
+        assert_eq!(session_end_worker_error(&end), None);
+    }
+
+    #[test]
+    fn a_sign_in_screen_closing_is_not_a_media_worker_error() {
+        let end = SessionEnd {
+            reason: DisconnectReason::Transient(
+                crate::runtime::session::TransientTransportError::SignInScreenClosed,
+            ),
+            message: crate::runtime::session::SIGN_IN_SCREEN_CLOSED_TEXT.to_string(),
             observed_at: Instant::now(),
         };
         assert_eq!(session_end_worker_error(&end), None);

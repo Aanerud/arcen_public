@@ -1343,7 +1343,16 @@ pub enum TransientTransportError {
     BrokenPipe,
     NotConnected,
     TransientIo,
+    /// The host ended a session that served its sign-in screen
+    /// (`ServerHelloMsg::login_window`): someone signed in, and the desktop
+    /// that replaces it is a new session. Expected, not a lost connection;
+    /// transient so that every path that follows a lost transport follows it.
+    SignInScreenClosed,
 }
+
+/// How a [`TransientTransportError::SignInScreenClosed`] end reads.
+pub const SIGN_IN_SCREEN_CLOSED_TEXT: &str =
+    "The host's sign-in screen closed when someone signed in.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalDisconnect {
@@ -1891,6 +1900,7 @@ async fn run_session(
         span.record("previous_sid", attempt.previous_sid.as_str());
     }
     async move {
+        let mut sign_in_screen = false;
         let result = run_session_correlated(
             options,
             auth,
@@ -1903,13 +1913,56 @@ async fn run_session(
             close_receiver,
             resume_deadline,
             session_log_id.clone(),
+            &mut sign_in_screen,
         )
         .await;
+        let result = sign_in_screen_end(result, sign_in_screen);
         emit_session_result(&session_log_id, identity, &telemetry, auth_method, &result);
         publish_session_result(result, &tx);
     }
     .instrument(span)
     .await;
+}
+
+/// Reads the end of a session that served the host's sign-in screen.
+///
+/// Signing in there ends that session: the host lets its sign-in screen go
+/// and serves the signed-in desktop as a new session, so the connection
+/// simply stops. That is the hand-over the shells follow
+/// (`reconnect_flow::follows_login_window`), not a lost connection, and it is
+/// reported as such. A timeout or an unreachable network is still a network
+/// failure, and a failed reconnect is reported by its own attempt.
+fn sign_in_screen_end(
+    result: Result<SessionEnd, ConnectSmokeError>,
+    sign_in_screen: bool,
+) -> Result<SessionEnd, ConnectSmokeError> {
+    if !sign_in_screen {
+        return result;
+    }
+    let end = match &result {
+        Ok(end) => end.clone(),
+        Err(error) => classify_disconnect(error),
+    };
+    let DisconnectReason::Transient(
+        TransientTransportError::UnexpectedEof
+        | TransientTransportError::ConnectionReset
+        | TransientTransportError::ConnectionAborted
+        | TransientTransportError::BrokenPipe
+        | TransientTransportError::NotConnected,
+    ) = end.reason
+    else {
+        return result;
+    };
+    tracing::info!(
+        target: crate::log_target::SESSION,
+        transport = %end.message,
+        "the host's sign-in screen closed when someone signed in; its desktop is a new session",
+    );
+    Ok(SessionEnd {
+        reason: DisconnectReason::Transient(TransientTransportError::SignInScreenClosed),
+        message: SIGN_IN_SCREEN_CLOSED_TEXT.to_owned(),
+        observed_at: end.observed_at,
+    })
 }
 
 fn publish_session_result(
@@ -1956,6 +2009,7 @@ async fn run_session_correlated(
     mut close_receiver: watch::Receiver<bool>,
     resume_deadline: Option<Instant>,
     session_log_id: CorrelationId,
+    sign_in_screen: &mut bool,
 ) -> Result<SessionEnd, ConnectSmokeError> {
     let (mut ws, _uri, mut fsm) = cancellable_setup(
         open_websocket(&options, Some(&tx), &session_log_id),
@@ -2187,6 +2241,7 @@ async fn run_session_correlated(
             {
                 host_experimental_raw_hid = server_hello.experimental_raw_hid;
             }
+            *sign_in_screen = server_hello.login_window;
             let _ = tx.send(SessionEvent::ServerHello(server_hello));
         }
         other => return Err(ConnectSmokeError::UnexpectedFirstMessage(other.to_string())),
@@ -5201,6 +5256,9 @@ fn disconnect_reason_class(reason: DisconnectReason) -> &'static str {
         DisconnectReason::Terminal(TerminalDisconnect::Authentication) => "auth",
         DisconnectReason::Terminal(TerminalDisconnect::TlsIdentity) => "tls",
         DisconnectReason::Transient(TransientTransportError::TimedOut) => "timeout",
+        DisconnectReason::Transient(TransientTransportError::SignInScreenClosed) => {
+            "sign_in_handover"
+        }
         DisconnectReason::Transient(_) => "network",
         DisconnectReason::Terminal(TerminalDisconnect::Resume(_)) => "reconnect_failed",
         DisconnectReason::Terminal(TerminalDisconnect::Configuration) => "configuration",
@@ -8279,6 +8337,35 @@ mod tests {
             DisconnectReason::Transient(TransientTransportError::UnexpectedEof)
         );
         assert_eq!(end.observed_at, observed_at);
+    }
+
+    #[test]
+    fn a_sign_in_screen_closing_is_the_hand_over_not_a_lost_connection() {
+        let end = sign_in_screen_end(Err(ConnectSmokeError::UnexpectedEof), true)
+            .expect("the sign-in screen's end is the hand-over");
+        assert_eq!(
+            end.reason,
+            DisconnectReason::Transient(TransientTransportError::SignInScreenClosed)
+        );
+        assert_eq!(end.message, SIGN_IN_SCREEN_CLOSED_TEXT);
+        assert_eq!(disconnect_reason_class(end.reason), "sign_in_handover");
+        assert!(crate::reconnect_flow::follows_login_window(&end));
+
+        // A signed-in desktop's lost connection, and a sign-in screen's
+        // network failure, stay what they were.
+        assert!(matches!(
+            sign_in_screen_end(Err(ConnectSmokeError::UnexpectedEof), false),
+            Err(ConnectSmokeError::UnexpectedEof)
+        ));
+        assert!(matches!(
+            sign_in_screen_end(Err(ConnectSmokeError::Timeout), true),
+            Err(ConnectSmokeError::Timeout)
+        ));
+        let manual = sign_in_screen_end(Ok(SessionEnd::manual()), true).expect("manual end");
+        assert_eq!(
+            manual.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::Manual)
+        );
     }
 
     #[test]

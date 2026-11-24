@@ -89,7 +89,7 @@ product caps or thresholds.
   driving is needed to log in; credentials go to the Deck on stdin.
 - On the test host: ssh as an administrator (the harness installs its page and
   reads the Pier log), `python3`, `firefox`, and a Pier whose session will
-  belong to the account you log in with. A dev Pier started from an ssh
+  belong to the account you log in with. A Pier started by hand from an ssh
   shell must run outside that shell's logind session (for example under
   `systemd-run`), or the session launcher fails with "pam_systemd did not
   create the required logind session".
@@ -150,6 +150,6 @@ brackets) across finished runs.
   background; a cursor theme without both colours or content with them
   (notifications) can confuse it. Static blobs are ignored.
 - Synthetic tablet events exercise the Deck's AppKit tablet path; they come
-  from no real HID tablet, so Hard (USB) tablet mode is not covered, and they
+  from no real HID tablet, so Native tablet (USB bridged) is not covered, and they
   carry no barrel buttons. Their tablet fields (tilt included) must be set
   after the tablet subtype, which clears them.

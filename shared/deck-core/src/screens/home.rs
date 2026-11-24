@@ -34,6 +34,8 @@ const FORM_STACK_BELOW: f32 = 760.0;
 const FORM_FOOTER_AIR: f32 = super::theme::SPACE_SCALE[4];
 /// The form's footer: its row and the air either side of it.
 const FORM_FOOTER_HEIGHT: f32 = 2.0 * FORM_FOOTER_AIR + super::theme::PRIMARY_HEIGHT;
+/// The least room the footer gives the connection test's verdict.
+const FOOTER_VERDICT_MIN: f32 = 48.0;
 
 // ── Validate a username string (mirrors the app-level rule) ──────────────────
 fn validate_username(username: &str) -> Option<String> {
@@ -1373,14 +1375,39 @@ fn quiet_option(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Respo
     .inner
 }
 
-/// The connection test's report, when there is one.
+/// How much of the report's top [`test_report`] brings into view: its
+/// heading, buttons and verdict.
+const REPORT_HEAD: f32 = 120.0;
+
+/// The connection test's report, when there is one. When a test starts or
+/// finishes, its top scrolls into view: on the form the report draws below
+/// the fields, often under the window's edge.
 fn test_report(
     ui: &mut egui::Ui,
     test: Option<&super::connection_test::ConnectionTest>,
 ) -> Option<super::connection_test::ConnectionTestAction> {
-    let test = test?;
+    let seen_id = egui::Id::new("connection_test_report_seen");
+    let Some(test) = test else {
+        ui.data_mut(|data| data.remove::<(String, bool)>(seen_id));
+        return None;
+    };
     ui.add_space(super::theme::SPACE_SCALE[3]);
-    super::connection_test::render(ui, test)
+    let shown = ui.scope(|ui| super::connection_test::render(ui, test));
+    let state = (test.target_label.clone(), test.running());
+    if ui
+        .data(|data| data.get_temp::<(String, bool)>(seen_id))
+        .as_ref()
+        != Some(&state)
+    {
+        ui.data_mut(|data| data.insert_temp(seen_id, state));
+        let panel = shown.response.rect;
+        let head = egui::Rect::from_min_size(
+            panel.min,
+            egui::vec2(panel.width(), panel.height().min(REPORT_HEAD)),
+        );
+        ui.scroll_to_rect(head, None);
+    }
+    shown.inner
 }
 
 pub use super::input_choices::USE_APP_DEFAULTS;
@@ -1698,17 +1725,36 @@ fn connection_form(
         }
     });
 
-    // Test connection, a quiet text action, on the left; Cancel and Save,
-    // one width, on the right in the platform's order, ending on the
-    // form's right edge.
-    let button_w = super::widgets::button_width(ui, &["Add connection", "Cancel", "Save"]);
+    // Test connection, a quiet text action, on the left; Cancel and Save
+    // on the right in the platform's order, ending on the form's right
+    // edge ([`footer_fit`] when the row is narrow).
+    let save_label = if is_edit { "Save" } else { "Add connection" };
+    let verdict = state
+        .connection_test
+        .and_then(super::connection_test::ConnectionTest::verdict_line);
     footer_row(ui, footer, form_width, |ui| {
         ui.spacing_mut().item_spacing.x = theme::BUTTON_GAP;
-        ui.spacing_mut().item_spacing.x = theme::BUTTON_GAP;
-        let label = if test_running {
-            "Testing\u{2026}"
+        let (test_full, test_short) = if test_running {
+            ("Testing\u{2026}", "Testing\u{2026}")
         } else {
-            "Test connection"
+            ("Test connection", "Test")
+        };
+        let fit = footer_fit(
+            ui.available_width(),
+            [
+                super::widgets::text_button_width(ui, test_full),
+                super::widgets::text_button_width(ui, test_short),
+            ],
+            [
+                super::widgets::button_width(ui, &[save_label]),
+                super::widgets::button_width(ui, &["Cancel"]),
+            ],
+            super::widgets::button_width(ui, &["Add connection", "Cancel", "Save"]),
+        );
+        let label = if fit.short_test {
+            test_short
+        } else {
+            test_full
         };
         if super::widgets::text_button(ui, label, test_running)
             .on_hover_text(TEST_CONNECTION_TIP)
@@ -1716,18 +1762,32 @@ fn connection_form(
         {
             test = true;
         }
+        // The finished test's verdict beside it, while the row has room:
+        // the report itself is below the form.
+        let room = fit.free - theme::BUTTON_GAP;
+        if let Some((line, verdict)) = &verdict
+            && room >= FOOTER_VERDICT_MIN
+        {
+            let ink = super::connection_test::verdict_colour(&theme::colours(ui), *verdict);
+            ui.allocate_ui(egui::vec2(room, theme::CONTROL_HEIGHT), |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(line).color(ink).size(theme::TEXT_LABEL))
+                        .truncate(),
+                );
+            });
+        }
+        let [save_w, cancel_w] = fit.widths;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Right to left: the last button is laid out first.
             for button in form_button_order(platform).into_iter().rev() {
                 match button {
                     FormButton::Save => {
-                        let label = if is_edit { "Save" } else { "Add connection" };
-                        if super::widgets::primary_button(ui, label, button_w).clicked() {
+                        if super::widgets::primary_button(ui, save_label, save_w).clicked() {
                             submit = true;
                         }
                     }
                     FormButton::Cancel => {
-                        if super::widgets::secondary_button(ui, "Cancel", button_w).clicked() {
+                        if super::widgets::secondary_button(ui, "Cancel", cancel_w).clicked() {
                             action = Some(HomeAction::CancelForm);
                         }
                     }
@@ -1877,6 +1937,41 @@ fn footer_row(ui: &mut egui::Ui, footer: Footer, max: f32, add: impl FnOnce(&mut
             add(ui);
         },
     );
+}
+
+/// How the form's footer fits its row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FooterFit {
+    /// Test connection shows its short label ("Test").
+    short_test: bool,
+    /// Save's and Cancel's widths.
+    widths: [f32; 2],
+    /// What the row has left over (negative: it does not fit).
+    free: f32,
+}
+
+/// The footer in a row `row` wide: Test connection (`test`: its full and
+/// short label's widths) and the two buttons (`own`: Save's and Cancel's
+/// own widths), one gap apart. Both buttons take the one width `one` while
+/// it fits; a narrower row (the smallest window, a stacked form) gives
+/// each button its own width, then shortens Test connection, so nothing
+/// is cut or runs under a button.
+fn footer_fit(row: f32, test: [f32; 2], own: [f32; 2], one: f32) -> FooterFit {
+    let gap = super::theme::BUTTON_GAP;
+    let options = [(false, [one, one]), (false, own), (true, own)];
+    let fit = |(short_test, widths): (bool, [f32; 2])| {
+        let used = test[usize::from(short_test)] + gap + widths[0] + gap + widths[1];
+        FooterFit {
+            short_test,
+            widths,
+            free: row - used,
+        }
+    };
+    options
+        .into_iter()
+        .map(fit)
+        .find(|fit| fit.free >= 0.0)
+        .unwrap_or_else(|| fit(options[2]))
 }
 
 /// What is wrong with a field, under it, wrapped to its width.
@@ -3579,6 +3674,90 @@ mod tests {
         );
         assert!(pickers[0].top() > fields.last().expect("fields").bottom());
     }
+
+    #[test]
+    fn a_finished_test_shows_its_verdict_and_its_report_in_view() {
+        // A window short enough that the report starts below the form.
+        let size = egui::vec2(1120.0, 420.0);
+        let test = super::super::connection_test::unanswered("pier.example.internal");
+        let ctx = themed(false);
+        let mut home = HomeFixture::new();
+        let _ = home.apply(HomeAction::Edit(0));
+        let mut texts = Vec::new();
+        // A second a pass, so the scroll's animation ends.
+        for second in 0..4 {
+            let mut state = home.state();
+            state.connection_test = Some(&test);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(f64::from(second)),
+                    ..egui::RawInput::default()
+                },
+                |ui| {
+                    let _ = render_home(ui, &mut state);
+                },
+            );
+            texts.clear();
+            for clipped in output.shapes {
+                if let egui::Shape::Text(text) = clipped.shape {
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    if clipped.clip_rect.intersects(rect) {
+                        texts.push((text.galley.job.text.clone(), rect));
+                    }
+                }
+            }
+        }
+        let shown = |wanted: &str| {
+            texts
+                .iter()
+                .find(|(text, _)| text.starts_with(wanted))
+                .map_or_else(
+                    || panic!("{wanted:?} not in view: {texts:?}"),
+                    |(_, rect)| *rect,
+                )
+        };
+        let heading = shown("Connection test \u{2014} ");
+        assert!(heading.top() >= 0.0 && heading.bottom() <= size.y - FORM_FOOTER_HEIGHT);
+        // The verdict sits in the footer beside Test connection.
+        let verdict = texts
+            .iter()
+            .find(|(text, _)| text == "Cannot connect.")
+            .map_or_else(
+                || panic!("no verdict in the footer: {texts:?}"),
+                |(_, rect)| *rect,
+            );
+        assert!(verdict.top() >= size.y - FORM_FOOTER_HEIGHT, "{verdict:?}");
+        assert!(shown("Test connection").right() <= verdict.left());
+    }
+
+    #[test]
+    fn the_form_footer_fits_its_row_before_it_shortens_test_connection() {
+        let gap = super::super::theme::BUTTON_GAP;
+        // Test connection and Test, Add connection and Cancel, the one width.
+        let (test, own, one) = ([118.0, 40.0], [155.0, 90.0], 155.0);
+        let need = |test: f32, widths: [f32; 2]| test + gap + widths[0] + gap + widths[1];
+        // Side by side (the default window): one width, the whole label.
+        let wide = footer_fit(720.0, test, own, one);
+        assert_eq!((wide.short_test, wide.widths), (false, [one, one]));
+        assert!((wide.free - (720.0 - need(118.0, [one, one]))).abs() < 0.01);
+        // The smallest window's stacked form (420 points): each button its
+        // own width, Test connection whole.
+        let stacked = footer_fit(COLUMN_MAX_ROW, test, own, one);
+        assert_eq!((stacked.short_test, stacked.widths), (false, own));
+        assert!(stacked.free >= 0.0);
+        // Narrower still: Test.
+        let narrow = footer_fit(need(118.0, own) - 1.0, test, own, one);
+        assert_eq!((narrow.short_test, narrow.widths), (true, own));
+        assert!(narrow.free >= 0.0);
+        // Nothing fits: the narrowest footer, which says so.
+        let none = footer_fit(100.0, test, own, one);
+        assert_eq!((none.short_test, none.widths), (true, own));
+        assert!(none.free < 0.0);
+    }
+
+    /// The form's row in the smallest window, where the form stacks.
+    const COLUMN_MAX_ROW: f32 = super::super::theme::COLUMN_MAX;
 
     #[test]
     fn no_disclosure_remains_on_the_form() {

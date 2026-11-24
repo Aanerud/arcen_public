@@ -41,8 +41,8 @@ use crate::sign_in::{SignInFailure, SignInStage, SignInState};
 use crate::trusted_pins::{StoredPin, TrustedPinStore};
 
 /// Every scene of the manual (`deck-shots/manifest.json`, release 0.20.7),
-/// in its order.
-pub const SCENE_IDS: [&str; 17] = [
+/// in its order, then the scenes added since (not in the manifest yet).
+pub const SCENE_IDS: [&str; 19] = [
     "home",
     "home-empty",
     "add-menu",
@@ -60,6 +60,8 @@ pub const SCENE_IDS: [&str; 17] = [
     "verify-host",
     "identity-changed",
     "import-review",
+    "home-own-settings",
+    "sign-in-refused",
 ];
 
 /// The first machine: Grade 1.
@@ -73,6 +75,10 @@ pub const STUDIO_HOST: &str = "203.0.113.10";
 pub const GRADE_ADDRESS: &str = "203.0.113.11";
 /// The user.
 pub const USER: &str = "alice";
+/// What a Pier answers a sign-in with when nobody is signed in at its
+/// desk and its login screen is not running (the sign-in-refused scene).
+pub const CONSOLE_REFUSAL: arcen_session::console_session::ConsoleRefusal =
+    arcen_session::console_session::ConsoleRefusal::NoConsoleSession;
 /// What a Linux Pier answers a wrong password with (its own words reach
 /// the Deck's "Details").
 pub const PIER_REFUSAL: &str = "Authentication failed: wrong user name or password, or this \
@@ -181,6 +187,8 @@ pub struct Scene {
     repository: ClientConfigRepository,
     services: Arc<DocShotServices>,
     script: Vec<Click>,
+    /// What the Pier answers Connect with.
+    pier_answer: &'static str,
 }
 
 impl std::fmt::Debug for Scene {
@@ -205,6 +213,18 @@ impl Scene {
         match id {
             "home" | "connection-test" | "sign-in-error" | "add-menu" | "row-menu" => {
                 scene.select_first();
+            }
+            "home-own-settings" => {
+                // Grade 1 keeps two values of its own: Home's summary line
+                // under Connect names them.
+                let overrides = &mut scene.home.saved[0].settings.overrides;
+                overrides.typing_mode = Override::Own(arcen_input::text::TypingMode::Keys);
+                overrides.displays_mode = Override::Own(DisplaysMode::Windowed);
+                scene.select_first();
+            }
+            "sign-in-refused" => {
+                scene.select_first();
+                scene.pier_answer = CONSOLE_REFUSAL.deck_reason();
             }
             "home-empty" => scene.home = HomeModel::new(Vec::new()),
             "connection-new" => {
@@ -253,10 +273,13 @@ impl Scene {
             _ => {}
         }
         // The state as the user leaves it.
-        if matches!(id, "home" | "sign-in-error") {
+        if matches!(
+            id,
+            "home" | "sign-in-error" | "home-own-settings" | "sign-in-refused"
+        ) {
             USER.clone_into(&mut scene.home.direct.username);
         }
-        if id == "sign-in-error" {
+        if matches!(id, "sign-in-error" | "sign-in-refused") {
             // A password that the Pier refuses, typed; Connect takes it.
             "not-the-password".clone_into(&mut scene.home.direct.password);
         }
@@ -269,7 +292,7 @@ impl Scene {
                 click(Name::Control("Test connection")),
             ],
             "settings-logs" => vec![click(Name::Control("Create support bundle\u{2026}"))],
-            "sign-in-error" => vec![click(Name::Control("Connect"))],
+            "sign-in-error" | "sign-in-refused" => vec![click(Name::Control("Connect"))],
             _ => Vec::new(),
         };
         Some(scene)
@@ -292,6 +315,7 @@ impl Scene {
             repository: ClientConfigRepository::new(None),
             services: Arc::new(DocShotServices(platform)),
             script: Vec::new(),
+            pier_answer: PIER_REFUSAL,
         }
     }
 
@@ -374,11 +398,12 @@ impl Scene {
         }
     }
 
-    /// The attempt ends as the engine ends one the Pier refused: the
-    /// engine's session end, the shared sign-in mapping, Home again.
+    /// The attempt ends as the engine ends one the Pier refused with
+    /// [`Self::pier_answer`]: the engine's session end, the shared sign-in
+    /// mapping, Home again.
     fn refused(&mut self, draft: ConnectionDraft) {
         use crate::runtime::session::{ConnectSmokeError, session_end_for};
-        let end = session_end_for(&ConnectSmokeError::AuthFailed(PIER_REFUSAL.to_owned()));
+        let end = session_end_for(&ConnectSmokeError::AuthFailed(self.pier_answer.to_owned()));
         let detail = crate::sign_in::end_detail(&end);
         let failure = SignInFailure::from_end(&end, SignInStage::Attempt)
             .unwrap_or(SignInFailure::SessionEnded);

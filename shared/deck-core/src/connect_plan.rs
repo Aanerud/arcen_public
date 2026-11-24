@@ -872,7 +872,9 @@ pub struct DisplaysRecoveryRetry {
     pub replace_desktop: bool,
     /// A one-shot Displays mode for this endpoint's next attempt.
     pub displays_override: Option<(String, DisplaysMode)>,
-    /// Persist this mode on the saved connection.
+    /// Persist this mode on the saved connection. Neither recovery sets
+    /// it: a host's failure decides one retry, never the connection's
+    /// later sessions (a host that recovers gets the whole layout again).
     pub remember: Option<DisplaysMode>,
     pub status: &'static str,
 }
@@ -901,16 +903,31 @@ pub fn topology_conflict_retry(endpoint: &str, replace: bool) -> DisplaysRecover
 }
 
 /// "Use Primary Display Only" for a host that cannot serve the whole
-/// layout: pinned for this attempt and remembered on the saved connection,
-/// so the same dead end is not hit next time.
+/// layout: pinned for this retry only and never saved on the connection.
+/// The host's failure may pass (more outputs connected, a restarted
+/// display manager), and a saved choice kept the connection on one
+/// display after it had.
 #[must_use]
 pub fn displays_unsupported_retry(endpoint: &str) -> DisplaysRecoveryRetry {
     DisplaysRecoveryRetry {
         replace_desktop: false,
         displays_override: Some((endpoint.to_owned(), DisplaysMode::SinglePrimary)),
-        remember: Some(DisplaysMode::SinglePrimary),
-        status: "Connecting with this host's single display…",
+        remember: None,
+        status: "Connecting with one display for this session\u{2026}",
     }
+}
+
+/// What the Connecting status adds while a display recovery's one-shot
+/// ([`displays_mode_source`] "recovery") holds the attempt to one display.
+pub const RECOVERY_ONE_DISPLAY_NOTE: &str = "One display, for this session only.";
+
+/// The note for an attempt whose Displays mode came from `source` and is
+/// `mode`: [`RECOVERY_ONE_DISPLAY_NOTE`] for a recovery's one display,
+/// otherwise none.
+#[must_use]
+pub fn attempt_displays_note(source: &str, mode: Option<DisplaysMode>) -> Option<&'static str> {
+    (source == "recovery" && mode == Some(DisplaysMode::SinglePrimary))
+        .then_some(RECOVERY_ONE_DISPLAY_NOTE)
 }
 
 /// Writes the streaming preset's wire profile (codec, chroma, depth, range,
@@ -1097,6 +1114,38 @@ mod tests {
         assert_eq!(
             connection_displays_line(Override::Inherit, DisplaysMode::MatchLayout),
             ("App default (Match my layout)".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn a_display_recovery_holds_one_retry_and_is_never_saved() {
+        let endpoint = "pier.example:18444";
+        let unsupported = displays_unsupported_retry(endpoint);
+        assert_eq!(
+            unsupported.displays_override,
+            Some((endpoint.to_owned(), DisplaysMode::SinglePrimary))
+        );
+        assert_eq!(unsupported.remember, None);
+        for replace in [false, true] {
+            assert_eq!(topology_conflict_retry(endpoint, replace).remember, None);
+        }
+        // The retry consumes it; the next attempt reads the connection's
+        // own choice (or Settings) again.
+        let mut pending = unsupported.displays_override;
+        let source = displays_mode_source(pending.as_ref(), endpoint, None);
+        let mode = resolve_attempt_displays_mode(&mut pending, endpoint, None);
+        assert_eq!(
+            attempt_displays_note(source, mode),
+            Some(RECOVERY_ONE_DISPLAY_NOTE)
+        );
+        let source = displays_mode_source(pending.as_ref(), endpoint, None);
+        let mode = resolve_attempt_displays_mode(&mut pending, endpoint, None);
+        assert_eq!((source, mode), ("settings", None));
+        assert_eq!(attempt_displays_note(source, mode), None);
+        // A connection that chose one display itself needs no note.
+        assert_eq!(
+            attempt_displays_note("connection", Some(DisplaysMode::SinglePrimary)),
+            None
         );
     }
 

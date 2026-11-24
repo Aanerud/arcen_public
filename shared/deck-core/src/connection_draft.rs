@@ -10,6 +10,8 @@ use crate::config::{ConnectionKind, SavedConnectionSummary, normalized_connectio
 #[derive(Clone)]
 pub struct ConnectionDraft {
     pub saved_connection_id: Option<String>,
+    /// The saved connection's name, when the draft is one.
+    pub name: Option<String>,
     pub kind: ConnectionKind,
     pub host: String,
     pub port: u16,
@@ -31,6 +33,7 @@ impl std::fmt::Debug for ConnectionDraft {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = formatter.debug_struct("ConnectionDraft");
         debug
+            .field("name", &self.name)
             .field("kind", &self.kind)
             .field("host", &self.host)
             .field("port", &self.port)
@@ -54,6 +57,7 @@ impl ConnectionDraft {
     pub fn new(kind: ConnectionKind) -> Self {
         Self {
             saved_connection_id: None,
+            name: None,
             kind,
             host: String::new(),
             port: kind.default_port(),
@@ -95,6 +99,7 @@ impl ConnectionDraft {
             self.auto_reconnect = auto_reconnect;
         }
         self.saved_connection_id = Some(saved.id.clone());
+        self.name = Some(saved.name.clone());
         self.kind = saved.kind;
         self.host.clone_from(&saved.host);
         self.port = saved_port(saved);
@@ -119,6 +124,7 @@ impl ConnectionDraft {
             draft.forget_endpoint_trust();
         }
         draft.saved_connection_id = Some(saved.id.clone());
+        draft.name = Some(saved.name.clone());
         draft.kind = saved.kind;
         draft.host.clone_from(&saved.host);
         draft.port = saved_port(saved);
@@ -148,6 +154,7 @@ impl ConnectionDraft {
         )?;
         let connection = &saved[index];
         self.saved_connection_id = Some(connection.id.clone());
+        self.name = Some(connection.name.clone());
         self.port = saved_port(connection);
         self.use_tls = connection.use_tls;
         Some(index)
@@ -169,6 +176,23 @@ impl ConnectionDraft {
             "Pier"
         } else {
             self.host.as_str()
+        }
+    }
+
+    /// What the Connecting screen says is under way: the saved
+    /// connection's name (else [`Self::display_name`]) and the account
+    /// signing in, when one was typed or remembered.
+    #[must_use]
+    pub fn connecting_line(&self) -> String {
+        let name = self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.display_name());
+        match self.username.trim() {
+            "" => name.to_owned(),
+            username => format!("{name} as {username}"),
         }
     }
 }
@@ -228,6 +252,27 @@ mod tests {
         draft.host = "studio.example.internal".to_owned();
         assert_eq!(draft.match_saved(&twice, SecurityMode::Medium), None);
         assert_eq!(draft.saved_connection_id, None);
+    }
+
+    #[test]
+    fn connecting_names_the_saved_connection_and_the_account_typed_for_it() {
+        let mut studio = saved("studio", "203.0.113.11");
+        "E2E Studio".clone_into(&mut studio.name);
+        // Home's card: the username typed there, no username remembered.
+        let mut typed = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        "alice".clone_into(&mut typed.username);
+        let draft = typed.for_saved(&studio);
+        assert_eq!(draft.connecting_line(), "E2E Studio as alice");
+        // Selected with nothing remembered and nothing typed: no made-up
+        // account.
+        let mut selected = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        selected.select_saved(&studio);
+        assert_eq!(selected.connecting_line(), "E2E Studio");
+        // A quick connection has no name: its address.
+        let mut quick = ConnectionDraft::new(ConnectionKind::DirectMachine);
+        "203.0.113.12".clone_into(&mut quick.host);
+        "bob".clone_into(&mut quick.username);
+        assert_eq!(quick.connecting_line(), "203.0.113.12 as bob");
     }
 
     #[test]

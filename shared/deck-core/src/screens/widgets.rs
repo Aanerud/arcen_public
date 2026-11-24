@@ -212,6 +212,19 @@ pub fn fitted_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Res
 /// The space a [`text_button`] leaves either side of its words.
 pub const TEXT_BUTTON_INSET: f32 = 4.0;
 
+/// How wide a [`text_button`] with `label` is.
+#[must_use]
+pub fn text_button_width(ui: &egui::Ui, label: &str) -> f32 {
+    let font = egui::FontId::proportional(super::theme::BUTTON_TEXT);
+    let words = ui.ctx().fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    });
+    words + 2.0 * TEXT_BUTTON_INSET
+}
+
 /// A quiet action beside the buttons (Test connection): text in the
 /// secondary ink, no box, underlined under the pointer, as tall as the
 /// buttons so it lines up with them. `busy` keeps it from starting again.
