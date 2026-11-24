@@ -439,6 +439,10 @@ pub fn motion_seconds(ctx: &egui::Context, seconds: f32) -> f32 {
 /// system's light or dark appearance (live: when the system switches, the
 /// next pass draws in the other palette), the scroll bars drawn from the
 /// palette rather than the text colour, and the symbol font.
+///
+/// egui's own keyboard zoom is turned off: at the end of every pass it acts
+/// on ⌘+, ⌘− and ⌘0 (Control on Windows), so in a session those chords,
+/// meant for the host's application, also scaled the Deck's whole window.
 pub fn apply(ctx: &egui::Context) {
     for (theme, palette) in [
         (egui::Theme::Light, Palette::light()),
@@ -453,7 +457,10 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::System);
     // Until the window system has said which appearance it has (a shell
     // passes it from the first pass), the light palette.
-    ctx.options_mut(|options| options.fallback_theme = egui::Theme::Light);
+    ctx.options_mut(|options| {
+        options.fallback_theme = egui::Theme::Light;
+        options.zoom_with_keyboard = false;
+    });
     ctx.set_fonts(fonts_with_symbol_fallback());
 }
 
@@ -674,6 +681,38 @@ pub(crate) mod checks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_plus_and_minus_never_zoom_the_deck() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        // One chord a pass: egui reads ⌘0 first and would undo the others.
+        for chord in [egui::Key::Equals, egui::Key::Plus, egui::Key::Minus] {
+            let input = egui::RawInput {
+                events: vec![key(chord)],
+                ..Default::default()
+            };
+            let mut seen = 0;
+            let _ = ctx.run_ui(input, |ui| {
+                seen = ui.input(|input| input.events.len());
+            });
+            assert_eq!(seen, 1, "{chord:?} is the Deck's to forward");
+            // egui zooms at the end of a pass, effective from the next one.
+            let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+            assert!(
+                (ctx.zoom_factor() - 1.0).abs() < f32::EPSILON,
+                "{chord:?} zoomed the Deck to {}",
+                ctx.zoom_factor()
+            );
+        }
+    }
 
     #[test]
     fn the_type_scale_steps_by_about_1_2() {
