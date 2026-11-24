@@ -45,10 +45,9 @@ what it answers) and run on real hardware. A row that **fails** is a
 recorded finding. A row left **untested** is an assumption, which is exactly
 what this matrix exists to eliminate.
 
-## 2. Current state of the loop (verified 2026-08-14)
+## 2. Current state of the loop
 
-Both matrix-walking tools are implemented and were run on real hardware with a
-development build:
+Both matrix-walking tools are implemented:
 
 - `arcen-capenc probe-matrix` walks all 11 rows, performs real encoder
   initialisation, emits host JSON, and can write one deterministic Annex-B
@@ -93,7 +92,7 @@ printf '%s\n%s\n' "$ARCEN_TEST_USERNAME" "$ARCEN_TEST_PASSWORD" |
 ```
 
 Do not replace the explicit trust option with
-`--insecure-skip-verify` outside an isolated lab.
+`--insecure-skip-verify` outside an isolated test network.
 
 `media-smoke --video-only` skips only the completion requirement for an audio
 packet. Use it when validating video on a deliberately silent source; it does

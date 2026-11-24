@@ -3,9 +3,8 @@
 **Status (2026-08-03):** Physical end-to-end validation completed. A Wacom
 Intuos5 touch L pen was physically moved, pressure-applied (range 0.0–1.0
 confirmed), tilted, and clicked through Deck's Tablet Monitor, with 1,572+
-forwarded pen events confirmed reaching both Linux (pier-linux.example.internal, uinput path)
-and Windows (pier-windows.example.internal, PT_PEN path) hosts. The human-physical test gate
-below is now cleared. See
+forwarded pen events confirmed reaching both Linux (uinput path) and Windows
+(PT_PEN path) hosts. See
 [`../architecture/pen-tablet-input.md`](../architecture/pen-tablet-input.md)
 for the full design, the AppKit event gate fix (2026-08-03), and the
 confirmed capability coverage table.

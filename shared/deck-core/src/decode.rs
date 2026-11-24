@@ -497,7 +497,7 @@ pub fn nvidia_release(version: [u16; 4]) -> u32 {
 /// only adapters where it is known to work: Intel; NVIDIA from driver
 /// 471.11; AMD from Vega (16-bit minimum precision). Pre-Vega AMD corrupts
 /// pictures, older NVIDIA drivers and Qualcomm and Moore Threads drivers
-/// break shared decode textures (reference clients' measured exclusions,
+/// break shared decode textures (known exclusions,
 /// `docs/architecture/deck-presentation-timing.md`). Unknown vendors
 /// share one device.
 ///

@@ -23,7 +23,7 @@ Arcen Agent Helper.app/
 # Support bundles copied from hosts hold logs, configuration and host
 # identity. Never commit.
 /support/
-# Provisioning profiles contain sensitive team credentials — store outside git or in AppleCerts/
+# Provisioning profiles contain sensitive team credentials — store them outside the repository
 # The rule is deliberately unanchored: the Pier has its own profile now, and a
 # path-specific pattern only protects the one directory someone thought of.
 *.provisionprofile

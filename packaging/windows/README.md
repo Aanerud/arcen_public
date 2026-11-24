@@ -14,8 +14,8 @@ it as `%ProgramData%\Arcen\pier.json` after selecting platform values; its
 common sections match Linux `/etc/arcen/pier.json`. See
 [`docs/operations/pier-configuration.md`](../../docs/operations/pier-configuration.md).
 The package ships `logging.level: 0` plus shared QoS defaults. Development
-overrides (currently Level 2 on pier-windows.example.internal) belong in deployment configuration,
-never in this production template.
+overrides (such as Level 2) belong in deployment configuration, never in this
+production template.
 
 Windows multi-display is automatic in the production template:
 `platform.multi_monitor.advertise_enabled` is `true`, `allowed_adapters` is

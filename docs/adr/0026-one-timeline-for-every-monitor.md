@@ -19,8 +19,7 @@ monitor into one canvas: one encoder, one decoder, one timeline. That
 keeps the monitors in step for free, but it costs pixels (an L-shaped
 layout's bounding box), refuses rotated monitors, makes every monitor
 pay for the largest one's latency, and cannot follow the layout of a
-desk with mixed sizes and offsets. The reference products we studied
-encode per head, too.
+desk with mixed sizes and offsets.
 
 ## Decision
 

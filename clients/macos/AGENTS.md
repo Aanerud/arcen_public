@@ -142,7 +142,7 @@ every pen as a mouse).
 A host that serves its operating system's sign-in screen says so in its hello
 (`ServerHelloMsg::login_window`). Signing in there ends that session by
 design. The Deck therefore treats that close as a hand-over, not a lost
-connection. This behaviour is agreed and measured on the lab Mac: about 4.5 s
+connection. This behaviour is agreed and measured: about 4.5 s
 from sign-in to the new desktop's hello. Keep it:
 
 - Credentials outlive the hello **only** for a sign-in screen

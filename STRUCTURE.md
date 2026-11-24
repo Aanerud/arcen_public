@@ -128,13 +128,11 @@ in [`docs/architecture/platform-differences.md`](docs/architecture/platform-diff
 | Path | Holds |
 | --- | --- |
 | `user-guide.md` | The Deck user guide for artists and editors, task by task. Each section names the source files it was checked against. |
-| `architecture/` | How each part works and why, including the Wayland qualification records. |
+| `architecture/` | How each part works and why. |
 | `adr/` | Architecture decision records, including withdrawn ones. |
 | `operations/` | Running, configuring, signing and releasing, including the configuration reference, error codes, troubleshooting and the colour check guide. |
 | `security/` | Trust boundaries, process models, SELinux, clipboard and supply chain. |
 | `testing/` | How to run the colour probe matrix and the real-screen harness. |
-| `style/` | Thinking with Style: the house style for release notes, the changelog and Deck UI strings. |
-| `DOC-STANDARD.md` | The house format for `ARCHITECTURE.md` and `AGENTS.md`. |
 
 ### `scripts/` — gates and harnesses
 

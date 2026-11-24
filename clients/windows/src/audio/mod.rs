@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Audio (owner: `platform` stream).
+//! Audio.
 //!
 //! WASAPI shared-mode render through cpal (the macOS Deck's audio library)
 //! with the shared playout policy (`arcen_media::audio::playback_queue`),

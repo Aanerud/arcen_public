@@ -535,7 +535,7 @@ reason.
 ## Legal and provenance boundary
 
 This ADR introduces no source intake. The implementation it authorises must be
-original Arcen code. It must not access, copy, port, or derive from
-a local reference corpus, and it adds no third-party dependency. Any future source reuse
+original Arcen code. It must not copy, port, or derive from another
+product's source or binaries, and it adds no third-party dependency. Any future source reuse
 remains governed by [`../../legal/ORIGINS.md`](../../legal/ORIGINS.md)
 and must be recorded in [`../../legal/ORIGINS.md`](../../legal/ORIGINS.md).

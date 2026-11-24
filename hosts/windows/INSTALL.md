@@ -147,9 +147,9 @@ with `"encoder": "nvenc"` and once with `"encoder": "software-h264"`; keep the c
 chroma at H.264/YUV420 for a like-for-like comparison. Pin the backend on
 mixed-GPU systems rather than relying on `auto`.
 
-### Proxmox CPU-only lab profile
+### Proxmox CPU-only profile
 
-A validated no-passthrough Proxmox lab profile uses:
+A validated no-passthrough Proxmox profile uses:
 
 - Display: `SPICE (qxl)`;
 - Audio Device: `ich9-intel-hda` with `driver=spice`;
@@ -756,9 +756,9 @@ Failure retains the last good certificate while it remains valid. Once it
 expires, new TLS handshakes are refused without plaintext fallback. The
 private broker-agent control is never accepted from a Deck.
 
-The pier-windows.example.internal development deployment currently applies a Level 2 override.
-Keep that override in development deployment configuration only; do not change
-the packaged Level 0 `pier.json` default.
+A development deployment may apply a Level 2 override. Keep that override in
+the deployment's own configuration; do not change the packaged Level 0
+`pier.json` default.
 
 For an isolated lab investigation, enable secret-safe CP lifecycle diagnostics
 before reboot:

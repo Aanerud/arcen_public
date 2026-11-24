@@ -924,7 +924,7 @@ already requires Shared/Architecture to record the single-monitor baseline
 and pass/fail thresholds separately, and this tool does not do that on its
 own. **No production carrier default may be selected from this tool's
 localhost output alone.** Carrier selection requires, at minimum, the same
-comparison run end-to-end against real hardware (pier-linux.example.internal and an actual
+comparison run end-to-end against real hardware (a Linux Pier and an actual
 Deck client) with real capture/encode/decode/presentation in the loop, per
 ADR 0009's performance gate, before either carrier is wired into Deck/Pier or
 advertised as a product default.
@@ -1081,6 +1081,6 @@ tests:
   localhost, single-process measurement tool over real Quinn connections, not
   a glass-to-glass measurement and not evidence of real network, capture,
   encode, decode, or presentation behavior. See "Carrier A/B benchmark
-  diagnostic" above; real hardware (pier-linux.example.internal/Deck) end-to-end validation
+  diagnostic" above; real hardware (Pier/Deck) end-to-end validation
   against ADR 0009's recorded baseline and thresholds is required before any
   production carrier default is selected.

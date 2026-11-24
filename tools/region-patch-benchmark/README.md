@@ -7,8 +7,8 @@ carrier. The current full-picture region wire/default remains unchanged.
 The harness treats `RegionActivityGrid::damage_map()` as the region-owned
 activity map and derives all copies from its 16x16 dirty blocks. It reuses
 Keel's seeded synthetic `idle`, `typing`, `drag`, `scroll`, `video`, and `burst`
-scenarios. No recorded corpus, a local reference corpus content, compression library, or
-platform API is used.
+scenarios. No recorded corpus, compression library, or platform API is
+used.
 
 ## Compared models
 

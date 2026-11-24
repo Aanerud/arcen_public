@@ -15,21 +15,15 @@ outbox and release rules and host devices
 mouse or grading panel would each repeat that work.
 
 The direction: send a device's properties the way a game controller
-announces itself, as Moonlight does, and aim to support anything.
+announces itself, and aim to support anything.
 
-What prior art shows (studied for mechanism only; no code is used):
-
-- **Moonlight and Sunshine** announce a controller with an *arrival* record:
-  number, a fixed type (Xbox, PlayStation, Nintendo), a capability bitmask
-  (analogue triggers, rumble, trigger rumble, touchpad, accelerometer,
-  gyroscope, battery, RGB LED) and its buttons. The host picks a matching
-  virtual device or falls back. State, touchpad, motion and battery are
-  separate records; rumble, LED colour and "send motion at N Hz" flow back.
-  Same-type records queued together are merged. Windows uses a virtual
-  gamepad bus (ViGEmBus); Linux uses uinput or uhid.
-- **Amazon DCV** makes uinput gamepads through a helper with a rumble pipe
-  back, and ships a rebranded ViGEmBus on Windows; **Reemo** uses ViGEmBus or
-  its own signed USB driver.
+A common design announces a controller with an *arrival* record: number, a
+fixed type (Xbox, PlayStation, Nintendo), a capability bitmask (analogue
+triggers, rumble, trigger rumble, touchpad, accelerometer, gyroscope,
+battery, RGB LED) and its buttons. The host picks a matching virtual device
+or falls back. State, touchpad, motion and battery are separate records;
+rumble, LED colour and "send motion at N Hz" flow back. Windows offers a
+virtual gamepad bus (ViGEmBus); Linux offers uinput or uhid.
 
 The closed type list is the weakness: a device that is not one of three
 controller families has no way to say what it is.

@@ -8,7 +8,6 @@
 # installs the arcen-pier systemd unit and starts QUIC on UDP 18444.
 #
 # Usage: HOST=root@<your-pier-host> packaging/linux/deploy-pier.sh
-#   (pier-linux.example.internal = root@<your-pier-host>, key ~/.ssh/id_ecdsa)
 set -euo pipefail
 
 usage() {

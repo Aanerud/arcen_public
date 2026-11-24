@@ -22,8 +22,8 @@ bitrate target when the change is worth reconfiguring for.
     threshold, or the stream's own load just grew (a raised target it spends,
     or delivery up by a tenth and 0.25 Mbit/s). A level is never absorbed,
     only a slope: a standing queue the stream builds stays visible for the
-    whole window, and a queue growing 10 ms/s or more is never followed. The
-    lab VPN drifts 2–3 ms/s for 15–20 s and falls back (a sawtooth 15–30 ms
+    whole window, and a queue growing 10 ms/s or more is never followed. A
+    measured VPN path drifts 2–3 ms/s for 15–20 s and falls back (a sawtooth 15–30 ms
     above its minimum, with no load), which cut idle and loaded streams
     alike before; recorded traces are unit tests.
   - **An idle stream does not answer a queue.** When the busiest pipeline
@@ -94,7 +94,7 @@ instead.
 
 ### Why
 
-On the Xorg lab host, a Grading stream over a home-Wi-Fi VPN sent about 40
+On an Xorg Pier, a Grading stream over Wi-Fi and a VPN sent about 40
 packets a second. Per-second loss read 27–471 ‰, and IDR bursts showed
 113–303 ms of queue delay. Together they held capenc at 8–14 fps for most of
 a session while the screen and the encoder could do 30. Capenc's own

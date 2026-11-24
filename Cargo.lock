@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-audiocap"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-telemetry",
  "libpulse-binding",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-capenc"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-cp-ipc"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "ring",
  "serde",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-credential-provider"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-cp-ipc",
  "windows 0.58.0",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-deck-core"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-input",
  "arcen-media",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-deck-macos"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "apple-cf",
  "arcen-deck-core",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-deck-windows"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-deck-core",
  "arcen-input",
@@ -350,14 +350,14 @@ dependencies = [
 
 [[package]]
 name = "arcen-iddcx-provider"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-outputs",
 ]
 
 [[package]]
 name = "arcen-identity"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-input"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-media",
  "arcen-protocol",
@@ -379,11 +379,11 @@ dependencies = [
 
 [[package]]
 name = "arcen-input-helper"
-version = "0.21.0"
+version = "0.21.1"
 
 [[package]]
 name = "arcen-keel"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "crc32c",
  "criterion",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-media"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-keel",
  "arcen-protocol",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-microphone-driver"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "libc",
  "mach2",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-observability"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-protocol",
  "arcen-telemetry",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-outputs"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-media",
  "arcen-telemetry",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pam-greeter"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-session",
  "libc",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-audiocap",
  "arcen-capenc",
@@ -471,7 +471,7 @@ dependencies = [
  "evdev",
  "futures-util",
  "getrandom 0.2.17",
- "nix",
+ "nix 0.29.0",
  "pam-client2",
  "quinn",
  "rcgen",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-linux-installer"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-outputs",
  "arcen-session",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-macos"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "apple-cf",
  "arcen-input",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-capenc",
  "arcen-cp-ipc",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-pier-windows-installer"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-session",
  "arcen-transport",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-protocol"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-usb-bridge",
  "getrandom 0.2.17",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-region-patch-benchmark"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-keel",
  "arcen-media",
@@ -631,14 +631,14 @@ dependencies = [
 
 [[package]]
 name = "arcen-secure-dir"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "rustix 1.1.4",
 ]
 
 [[package]]
 name = "arcen-session"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-telemetry",
  "serde",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-telemetry"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-transport"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-identity",
  "arcen-observability",
@@ -683,14 +683,14 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-bridge"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "arcen-usb-client"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-deck-core",
  "arcen-input",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-helper"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-protocol",
  "arcen-secure-dir",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-iousbhost"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-secure-dir",
  "arcen-usb-bridge",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-prepare"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-usb-bridge",
  "windows 0.58.0",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "arcen-usb-service"
-version = "0.21.0"
+version = "0.21.1"
 dependencies = [
  "arcen-protocol",
  "arcen-usb-bridge",
@@ -1935,7 +1935,7 @@ dependencies = [
  "bitvec",
  "cfg-if",
  "libc",
- "nix",
+ "nix 0.29.0",
 ]
 
 [[package]]
@@ -2052,9 +2052,9 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -3106,6 +3106,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "no_std_io2"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3166,9 +3178,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.1.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51d515d32fb182ee37cda2ccdcb92950d6a3c2893aa280e540671c2cd0f3b1d9"
+checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "num-derive"
@@ -4150,9 +4162,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -4172,9 +4184,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -4600,9 +4612,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -5122,9 +5134,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.45"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd"
+checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
  "itoa",
@@ -5137,15 +5149,15 @@ dependencies = [
 
 [[package]]
 name = "time-core"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b36ee98fd31ec7426d599183e8fe26932a8dc1fb76ddb6214d05493377d34ca"
+checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
 name = "time-macros"
-version = "0.2.25"
+version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e552d1249bf61ac2a52db88179fd0673def1e1ad8243a00d9ec9ed71fee3dd"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
@@ -5444,9 +5456,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -6892,14 +6904,15 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.3.0"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "268bf6f9ceb991e07155234071501490bb41fd1e39c6a588106dad10ae2a5804"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "crc32fast",
  "flate2",
  "indexmap",
  "memchr",
+ "nix 0.31.4",
  "typed-path",
 ]
 

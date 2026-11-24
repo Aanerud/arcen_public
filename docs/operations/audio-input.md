@@ -1,4 +1,4 @@
-# Audio Input Operations and Release Gates
+# Audio Input Operations
 
 Microphone input is off in the Deck until the user turns it on, and on the
 host it follows `microphone_input.enabled` in `pier.json`. That key is
@@ -80,69 +80,13 @@ driver I/O cancellation that cannot be reaped before the single lifecycle
 deadline is fatal to the session-agent process; reattachment is forbidden
 rather than continuing with a detached feeder.
 
-Every candidate still requires its own native WDK build and InfVerif run.
-Remaining protected evidence requires EV/Partner Center and WHCP/HLK dashboard
-signing, HVCI, Driver Verifier, signed-package servicing/rollback lab runs, and
-physical x64 Windows 10 1809+/11 Pro or Enterprise and Server 2022+ multi-WTS
-isolation. Stop `ArcenPier` before install, uninstall, upgrade, or rollback so
-no feeder handle crosses PnP removal. Unsigned or test-signed binaries are never
+Stop `ArcenPier` before install, uninstall, upgrade, or rollback so no feeder
+handle crosses PnP removal. Unsigned or test-signed binaries are never
 production artifacts.
 
-Hosted jobs that fail before runner assignment or report zero executed steps are
-not validation. Native macOS, Linux audio-server, Windows WDK, protected signing,
-and physical cross-host claims require their real target environments.
+## Lifecycle events
 
-The 2026-07-24 validation ran the shared strict gates, native Deck tests and
-unsigned bundle assembly, Linux host tests/release builds plus a real
-PulseAudio `module-pipe-source` create/idle-pressure/restore cycle, Windows host
-tests/full release build, portable ring tests, WDK 10.0.26100 compilation,
-catalog generation, and InfVerif. Exact binaries were deployed through the
-documented `arcen-pier.service` and `ArcenPier` paths with microphone policy
-left off. This does not claim protected Apple signing/notarization, a
-production-signed Windows driver installation, authenticated product-session
-audio, or physical cross-host acceptance.
-
-## Manual direct-connection test
-
-Run this checklist only on rights-cleared source and test accounts. Do not attach
-profiles, certificates, keys, SIDs, audio payloads, or customer data to a test
-report.
-
-1. For pre-merge validation, check out the exact reviewed head and verify the
-   recorded SHA with `git rev-parse HEAD`. For post-merge validation, use
-   `git switch main && git pull --ff-only` and record the resulting exact main
-   SHA. State which mode was tested; neither result substitutes for the other.
-   Then build Deck with
-   `cargo build --locked --release -p arcen-deck-macos` and
-   `packaging/macos/build-deck-app.sh`. Build the fused Linux Pier with
-   `cargo build --locked --release -p arcen-pier-linux`. Build Windows Pier
-   with `hosts\windows\build.cmd`.
-2. Use Debug verbosity or `ARCEN_LOG=arcen::audio=debug,arcen::video=debug,
-   arcen::capenc=debug,arcen::session=info`. Deck writes
-   `~/Library/Logs/Arcen/arcen-client.log.*`; packaged Linux writes
-   `/var/log/arcen/arcen-pier.log` (or the configured `ARCEN_LOG_DIR`); Windows
-   writes broker and correlated session logs under
-   `%ProgramData%\Arcen\logs`.
-3. Enable microphone input in exactly one Pier and opt in with Deck's launch-only
-   toggle. On Windows, first verify that **Arcen Microphone** is installed, then
-   select it in Windows Sound input settings or in the receiving application.
-   Arcen does not select it or change any default recording role.
-4. Play a YouTube video in the Pier session and confirm ordinary host-to-Deck
-   audio while speaking into the Deck microphone. Exercise normal Opus, then
-   keep microphone input parked unless its platform prerequisite is available.
-   Toggle the microphone off/on only when that policy is intentionally enabled,
-   resize the Deck window, disconnect/reconnect, and stop the Pier while audio
-   is active.
-5. Confirm capture stops immediately on disable/disconnect, old-generation
-   frames are rejected, and silence is limited to either gap fill (at most nine
-   missing frames per accepted gap, counted by `silence_frames` but not
-   `underflow_frames`) or actual empty-jitter playout (counted by both fields).
-   Persistent underflow or any larger ordering gap fails the run. Confirm no
-   stale voice resumes after reconnect, Linux restores and removes its
-   session-user source, and Windows stops/zeros its feeder without changing user
-   defaults.
-
-The stable lifecycle events to correlate by `sid` are:
+The stable microphone lifecycle events to correlate by `sid` are:
 
 | Surface | Event names |
 | --- | --- |
@@ -169,15 +113,7 @@ and feeder timeouts. Windows does not claim ring overrun/underrun values until
 the native driver contract exposes a verified signal; mailbox pressure and
 generic device failures remain separate. Persistent growth in drops,
 underflow, timeouts, resets, fallback events, telemetry loss, or unverified
-restore/cleanup is a failed run, not a warning to ignore.
-
-This manual run does not replace native release evidence. A production Deck
-still requires the external provisioning, Developer ID, hardened-runtime,
-notarization, stapling, and Gatekeeper gates above. A production Windows
-endpoint still requires the WDK, WHCP/HLK, EV/Partner Center, signed package,
-HVCI, Driver Verifier, servicing, and physical multi-WTS gates. Linux source
-creation/restoration must be exercised against its real session-user audio
-server; a fake `pactl` test is not native evidence.
+restore/cleanup points to a fault, not a warning to ignore.
 
 The shared gate includes both default media and the microphone Opus feature:
 

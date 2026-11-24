@@ -380,7 +380,7 @@ sees, so it is never done without the flag.
 `OutputClass`, so every X server on the GPU reads it, the other product's
 too. NVIDIA takes `ConnectedMonitor` and `MetaModes` from a server's own
 `Device` section first: a product that sets its own heads (as such products
-do) keeps them, and the file changes nothing there (lab: the product's
+do) keeps them, and the file changes nothing there (observed: the product's
 server logs "Applying OutputClass "arcen-console-outputs"" and still runs its
 own heads and layout). A product that sets no heads of its own would get
 these. Use the GPU's real head names (`--console-outputs DFP-0,DFP-2,DFP-4,DFP-6`
@@ -514,7 +514,7 @@ workstation; one of them serves the console at a time.
 
 GNOME runs one graphical session per account: two desktops of the same
 account (Arcen's login session and the product's) share the account's
-systemd user manager and its GNOME services. On the lab host, the account's
+systemd user manager and its GNOME services. When measured, the account's
 Arcen login session ended when the product's desktop of the same account
 ended. Treat the account's desktop as belonging to one product at a time.
 
@@ -1104,7 +1104,7 @@ update see [Native tablet after a kernel update](#8-upgrade-and-rollback).
 - The bridge ends with the attachment; a starting Pier removes rules a
   crashed one left.
 
-**0.18 lab hosts.** The 0.18 lab switch, `Environment=ARCEN_USB_HARD_LAB=1`
+**Upgrading from 0.18.** The 0.18 switch, `Environment=ARCEN_USB_HARD_LAB=1`
 in a service drop-in, is no longer read (since 0.19.0): `usb.native_tablet`
 is the only switch. Before upgrading such a host, run the installer with
 `--native-tablet`, then remove the drop-in and `systemctl daemon-reload`.
@@ -1840,7 +1840,9 @@ Interpretation: service started, TLS material loaded, OS authentication succeede
 
 Symptoms, causes and fixes — cannot connect, sign-in refused, black screen,
 lag, colours, pen, keyboard, audio, clipboard, USB, displays, and a Pier that
-will not start — are in [Troubleshooting](troubleshooting.md). Every code the
+will not start — are in [Troubleshooting](troubleshooting.md). Its
+[macOS Pier section](troubleshooting.md#macos-pier-preview) says where each
+macOS Pier log is and how to read it. Every code the
 Pier logs or sends a Deck is explained in [Error codes](error-codes.md).
 
 The fastest first step for any connection problem needs no password: on the
@@ -1958,7 +1960,7 @@ leaving it unlocked at the desk; the session itself keeps running (see
 
 | Area | Current posture |
 | --- | --- |
-| Network | Direct QUIC UDP 18444 inbound to Pier. No Span, mTLS, OIDC, or MFA in current product scope. Restrict it to trusted client networks. Legacy TCP 18443 must remain closed. |
+| Network | Direct QUIC UDP 18444 inbound to Pier. No mTLS, OIDC, or MFA in current product scope. Restrict it to trusted client networks. Legacy TCP 18443 must remain closed. |
 | Linux privilege | `arcen-pier.service` runs as root for PAM/logind/session launch, Xorg ownership, uinput, and helper supervision. User desktop work moves into the authenticated user session. |
 | Linux polkit | A remote desktop gets polkit's remote (`allow_any`) answers, never the console's (`allow_active`): Arcen's rule `/etc/polkit-1/rules.d/05-arcen-remote-session.rules`, checked with `pkcheck` before every desktop is handed over. polkit older than 0.106 cannot be given the rule; X11 desktops there keep the console's polkit rights (logged as `SECURITY:`). |
 | Linux SELinux | The Pier and its launcher run as `unconfined_service_t`; the session user's desktop runs in the context `pam_selinux` assigns (by default `unconfined_t`). The installer's `arcen` module adds the one transition that needs; see [Linux Pier under SELinux](../security/linux-selinux.md). |
@@ -2090,7 +2092,7 @@ account signing in again takes over a detached session at once, and proves a
 silent but still open Deck connection gone within about 3 s (the Deck process
 was killed, or its network vanished) instead of waiting out the resume
 window. The new sign-in then starts its own session agent on the same Windows
-desktop; on the lab host the first picture arrives about 18 s after the old
+desktop; on a measured host the first picture arrives about 18 s after the old
 Deck died, against about 11.5 s for an ordinary sign-in. A still-connected
 Deck of the same account keeps the display, and another account is refused.
 
@@ -2270,8 +2272,8 @@ reserve heads for another workload on the same GPU.
 Each provisioned head becomes its own RandR output. NVIDIA names RandR outputs
 after the connector (`DVI-D-0`..`DVI-D-3`), not after the `DFP-N` token used in
 `ConnectedMonitor`/`MetaModes`; the same index identifies the same head, and
-`session::randr_verify` matches them by that index. Verified on pier-linux.example.internal
-(`GRID V100D-16Q`, driver `570.172.08`) for one, two, three, and four
+`session::randr_verify` matches them by that index. Verified on a
+`GRID V100D-16Q` vGPU (driver `570.172.08`) for one, two, three, and four
 simultaneous heads, including a real three-display Mac layout:
 
 ```text
@@ -2373,10 +2375,9 @@ What matters per adapter:
 | `primary=false` | Non-primary outputs rank ahead of the primary. |
 
 `Recommended:` is a generic display/VRAM ranking, not an application compute
-policy. Override it whenever the workstation role disagrees. On
-pier-windows.example.internal, another local workload owns the stronger
-`GRID RTX6000-8Q`; Arcen uses `GRID V100D-16Q` for headless displays, capture,
-and NVENC. The DXGI config name includes the vendor prefix even though NVAPI's
+policy. Override it whenever the workstation role disagrees. For example, on
+a host where another local workload owns the stronger `GRID RTX6000-8Q`,
+Arcen uses `GRID V100D-16Q` for headless displays, capture, and NVENC. The DXGI config name includes the vendor prefix even though NVAPI's
 diagnostic name does not.
 
 ### 2. Name the adapter in the config

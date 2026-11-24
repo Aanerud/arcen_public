@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Clipboard (owner: `platform` stream).
+//! Clipboard.
 //!
 //! [`WindowsClipboard`] is `arcen_deck_core::clipboard::PlatformClipboard`
 //! on a message-only window of the UI thread: `CF_UNICODETEXT` for text, a

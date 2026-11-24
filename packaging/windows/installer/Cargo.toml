@@ -22,7 +22,7 @@ serde_json.workspace = true
 zeroize.workspace = true
 # The clock the provisioning decision reads. Already in the graph through
 # the shared issuer (rcgen).
-time = "=0.3.45"
+time = "=0.3.47"
 
 [target.'cfg(windows)'.dependencies]
 # Creates the TLS directories and staged key files with their protected DACL

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Ten bits at the glass are measured, not assumed (DRAFT §3.4).
+//! Ten bits at the glass are measured, not assumed.
 //!
 //! A ten-bit swapchain is necessary but not sufficient. DWM composes a
 //! windowed swapchain at the desktop's depth unless Windows advanced colour

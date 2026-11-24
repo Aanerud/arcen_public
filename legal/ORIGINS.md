@@ -14,9 +14,8 @@ pixel-streaming systems — the general shape of the problem, the vocabulary of
 the field, and the performance bar those systems set. That influence is at the
 level of ideas, protocol concepts, and prior art.
 
-No third-party source code, proprietary SDK payload, decompiled binary,
-reference corpus, or vendor implementation was copied, ported, or derived into
-this repository.
+No third-party source code, proprietary SDK payload, decompiled binary, or
+vendor implementation was copied, ported, or derived into this repository.
 
 ## Protocol implementations
 

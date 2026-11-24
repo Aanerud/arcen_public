@@ -177,8 +177,7 @@ pub struct MacOsDesksideConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputBackendChoice {
-    /// `CGEvent` in a logged-in session, virtual HID at the login window — the
-    /// split the reference product uses.
+    /// `CGEvent` in a logged-in session, virtual HID at the login window.
     #[default]
     Auto,
     /// `CGEvent` in a logged-in session.

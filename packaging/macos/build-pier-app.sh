@@ -212,9 +212,7 @@ done
 # read the screen and synthesise input.
 #
 # Splitting them means the session helper carries the consent and the control
-# plane does not. The reference implementation grants Screen Recording and
-# Accessibility to its user agent rather than to one combined application,
-# which is the same conclusion.
+# plane does not.
 #
 # The helper is a SIBLING bundle, not nested inside the Pier app. Nesting it
 # was tried and TCC attributed the request to the container: the consent

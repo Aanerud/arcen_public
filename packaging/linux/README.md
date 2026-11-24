@@ -49,9 +49,9 @@ The `logging` section's canonical field is `logging.level` (an
 `OperationalProfile` discriminant, `0`–`3`); the packaged template above ships
 `0` (`Level0`/`Critical`), the production default. The legacy numeric
 `logging.verbosity` is accepted for one release as a migration path and is
-mutually exclusive with `logging.level`. The current `pier-linux.example.internal` development
-deployment runs with `Level2` (`Info`) for live verification — that override
-is intentionally not baked into this packaged template; set `logging.level`
+mutually exclusive with `logging.level`. A development deployment may run
+with `Level2` (`Info`) for live verification — that override is
+intentionally not baked into this packaged template; set `logging.level`
 explicitly per-deployment instead. The logrotate policy owns the fixed 32
 MiB/daily rotation trigger; there is no ignored runtime size field.
 

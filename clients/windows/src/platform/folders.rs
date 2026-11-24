@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! The Deck's folders: `%APPDATA%\Arcen\Deck` for configuration,
-//! `%LOCALAPPDATA%\Arcen\Deck\Logs` for logs (`DRAFT.md` §3.7), named by
+//! `%LOCALAPPDATA%\Arcen\Deck\Logs` for logs, named by
 //! the shell's known folders rather than environment variables, which a
 //! process can inherit wrong.
 
@@ -17,7 +17,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::GUID;
 
 /// The configuration folder under the roaming application data: the Deck
-/// stores no secret, so roaming is acceptable (`DRAFT.md` §3.7).
+/// stores no secret, so roaming is acceptable.
 #[must_use]
 pub fn config_dir_in(roaming_app_data: &Path) -> PathBuf {
     roaming_app_data.join("Arcen").join("Deck")

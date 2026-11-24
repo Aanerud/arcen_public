@@ -17,8 +17,8 @@ duplicate:
   [`support-bundles.md`](support-bundles.md).
 - Trust boundaries between Pier, Deck, and the network — see
   [`../security/trust-boundaries.md`](../security/trust-boundaries.md).
-- The full observability design rationale and PR decomposition — see the
-  approved plan, [`../architecture/ObservabilityStandard.md`](../architecture/ObservabilityStandard.md)
+- The full observability design rationale — see
+  [`../architecture/ObservabilityStandard.md`](../architecture/ObservabilityStandard.md)
   (design reference; this document describes what has actually shipped).
 
 ## 1. Operational profiles and severity

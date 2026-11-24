@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Video decode (owner: `decoder` stream).
+//! Video decode.
 //!
 //! Arcen's own D3D11 video decoder: `ID3D11VideoDecoder` filled from DXVA
 //! picture parameters for H.264 and HEVC, including HEVC `RExt` 4:4:4 10-bit

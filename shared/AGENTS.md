@@ -154,11 +154,9 @@ states none never makes its Deck advertise `canvas_v1`,
   `arcen-transport/quic` (session engine, lanes, media worker); `egui` adds
   egui only (shared screens); `wgpu-presenter` adds egui-wgpu and wgpu at
   the versions eframe already resolves. CI proves the default graph pure.
-- Changing a seam trait changes four streams' work: describe the change in
-  the trait's docs and tell the owners of `clients/macos` and
-  `clients/windows`.
-- Seams are traits only until extraction steps 4-5 move the session engine
-  and media worker here; never add an OS call or `cfg(target_os)` branch.
+- Changing a seam trait changes every Deck: describe the change in the
+  trait's docs and tell the owners of `clients/macos` and `clients/windows`.
+- Seams are traits only; never add an OS call or `cfg(target_os)` branch.
 
 ## Shared consumer register
 

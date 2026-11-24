@@ -43,326 +43,6 @@ Grading is precision and chroma resolution, not a wider gamut. HDR is a
 different transfer, and is claimed only when the captured display reports
 headroom above SDR white. See `STREAMING.md`, "Four pipelines".
 
-Per-stage latency from one such session: capture-wait 6.94 ms, encode 9.02 ms,
-send 0.02 ms, worst frame 32.83 ms, 49 frames.
-
-**A full interactive session.** The Deck GUI, driven by hand rather than by a
-smoke command: select the host, authenticate as the console owner, and the
-remote desktop appears and keeps streaming — 3.5 minutes continuous, and a
-25-second run repeated after every later change. Clipboard was proven live in
-both directions during that session: a marker copied on the host arrived on the
-client, and one copied on the client arrived on the host.
-
-GUI tests must cover what smoke commands cannot. Every smoke command
-authenticates as whoever owns the console, so none of them can produce a
-console mismatch; the GUI, connecting as a different account, must be told so
-rather than time out. And a GUI killed mid-session must still leave a
-`SESSION_END` with the nonzero `frames_sent` it streamed. Run the GUI.
-
-**Displays.** `single_primary` and `windowed` complete. Multi-monitor now has
-the wire path as well as capture: `AuthMultiMonitorOfferMsg`, requested topology
-admission, `ServerMultiMonitorMsg`, region video headers with nonzero monitor
-id / topology generation / stream epoch, and one capture/encoder thread per
-admitted monitor. `platform.multi_monitor.advertise_enabled` still defaults
-off, and the host also requires more than one attached display before it
-advertises.
-
-This is implemented, not qualified: physical multi-display qualification
-remains outstanding. The multi-display capture test skips on a Mac with one
-display, and no real Deck has drawn a two-display macOS Pier session yet. Do
-not call `match_layout` proven until a Mac with two attached displays
-captures, negotiates, sends region frames, and the Deck presents both.
-
-Capture is one session per display, deliberately separate from the
-single-display path. Most sessions are one screen, that is the path whose cost
-matters, and making it carry a vector and a per-frame monitor identity to serve
-the minority is how a fast path stops being fast.
-
-**Input.** `input_applied` is non-zero with Accessibility refused, which
-settles a recurring question: **pointer and scroll injection do not need
-Accessibility; keyboard does.** The counter records what the host posted, not
-what an application received, and those are different claims.
-
-Keyboard is proven where the grant exists — `probe-keyboard` reports
-`press_observed` and `release_observed` true, read back from HID system key
-state rather than inferred from the injection returning. On a machine without
-the grant the same probe fails, which is the correct and visible outcome.
-
-Pen is proven end to end, and the proof is what an application received, not
-what the host counted. The ignored end-to-end test
-`pen_samples_sent_by_a_client_are_injected_as_tablet_events` sends a stroke,
-a barrel click and an eraser pass as a Deck sends them in Tablet support mode;
-run with an AppKit window under the stroke that logs its `NSEvent`s, it
-showed tablet proximity for pen and eraser (capability mask `0x25c7`),
-pressure 0.247/0.898 and eraser 0.498, tilt (0.333, -0.167), rotation 12 and a
-right-button barrel click. The counters had read "6 samples, 2 proximity
-edges, 0 rejected" while every stroke reached applications at
-pressure 1.0 and no application saw the pen arrive — `-[NSEvent pressure]`
-reads `kCGMouseEventPressure`, and a proximity edge must be its own
-`kCGEventTabletProximity` event. Counting what was posted is not evidence.
-
-One behaviour of macOS is visible in that log and is not a host bug: when two
-pen drags are queued before the window server delivers them, it merges them
-into one event at the newer position that keeps the older tablet fields
-(measured: the 0.42 position carried the 0.41 sample's pressure). Real tablet
-drivers' events are merged the same way.
-
-The same log showed `buttonMask=0` on every tip-down drag and `0x1` (the tip
-bit) on a barrel click: `-[NSEvent buttonMask]` returns
-`kCGTabletEventPointButtons` verbatim and uses AppKit's layout (tip bit 0,
-barrel buttons bits 1 and 2), not the wire's (barrel buttons from bit 0).
-`pen::tablet_button_mask` converts. `arcen-pier-macos probe-pen` (lab builds
-only: `--features lab-pen-probe`, which no packaging script enables, because
-inside the Agent Helper it posts clicks under the agent's Accessibility
-approval) re-measures all of it — proximity, capability mask, pen and eraser,
-tilt, rotation, and with `--strokes` pressure and the button mask — from a
-global `NSEvent` monitor, through the same `InputSession::apply` a session
-uses. Run it as the installed agent's identity in the Aqua session: posted
-from a process whose responsible app holds no Accessibility approval (anything
-started over SSH), the pointer still moves — the pen path warps it — and no
-application receives a single event. Measured on a macOS 26.5.2 test host with
-the console user's screen locked, a dev package's `arcen-agent-helper
-probe-pen --strokes` as a one-shot launchd job in that user's `gui/<uid>`
-domain: proximity for pen and eraser with mask `0x25c7`, tilt 0.444 (40°),
-rotation 90, pressure 0.098 → 1.0 and `buttonMask` `0x1` (tip), `0x2` (first
-barrel, a right click) and `0x4` (second barrel, button 2), confirmed by a
-separate AppKit app's global monitor. A locked screen delivers to
-`loginwindow`, so that is global-monitor evidence, not a window drawing; the
-window path is the loopback run above.
-
-**The session's layout (`host_keymap`).** A Deck that types committed text
-is told what the current input source types at each printable position
-(the shared `arcen_input::text::host_layout` notice), at attach and on every
-change, so its Automatic typing sends `æ` as text to a host whose layout
-puts `'` there. Text Input Sources must run on a main thread and the agent's
-belongs to its runtime, so the session starts `keymap-watch`, a child of
-this executable that observes the input source on its own main thread
-(`kTISNotifySelectedKeyboardInputSourceChanged` plus a read every second,
-`UCKeyTranslate` per position) and writes one JSON notice per change; it
-exits when its input closes (`input/layout.rs`). `probe-keymap` prints the
-notice this Mac would send. Measured on the lab Pier: `gb(mac)`, 48
-positions, generation 1.
-
-**Pen axes AppKit reads differently.** Tablet drivers report AppKit tilt Y
-positive away from the user (Chromium and Qt reverse it), and the window
-server keeps a mouse event's pressure in 8 bits, truncating
-`kCGMouseEventPressure`. The pen path posts through the shared
-`pen_axes::appkit_tilt_y_unit` and `appkit_mouse_pressure` (the middle of
-the nearest of 255 steps): measured in Chrome, the 0.1/0.25/0.5/0.75/1.0
-ladder reads 0.1020/0.2510/0.5020/0.7490/1.0 and tilt arrives as sent (it
-read 0.0980/0.2471/0.4980/0.7490 with tilt Y reversed before). 1/255 is
-the OS's resolution for what applications read.
-
-**Committed text.** A Deck's `text_commit` (input method, Characters mode,
-Paste as Keystrokes) is typed as Unicode key events: a key-down and key-up
-whose `CGEventKeyboardSetUnicodeString` carries at most 20 UTF-16 units
-(`arcen_input::text::utf16_chunks` keeps surrogate pairs, emoji sequences,
-flags and combining marks whole), keycode 0, no modifier flags (a held
-Command must not turn text into a shortcut), posted at the HID tap like every
-key. Applications read the string, not the keycode, so the Mac's layout does
-not matter. It needs what keys need — Accessibility — and cannot exist at the
-login window (no `CGEvent` may be created there), so the hello advertises
-`text_commit`/`text_commit_unicode` from exactly that (`text_input` in
-`AdvertisedCapabilities`). Proven with the ignored end-to-end test
-`committed_text_is_typed_and_health_stats_carry_the_path`, run with a probe
-app's text view frontmost (the harness checks the frontmost pid before every
-commit): 337 characters in four commits, 20 key events, read back from the
-text view as exactly the string sent. Do not run that test without the
-target pid: the events go to whatever is in front.
-
-**Keys under Secure Event Input.** A key event from
-`CGEventCreateKeyboardEvent` carries the string its key code types with no
-modifier, and `CGEventSetFlags` does not change it: Shift+C carries `c`
-(measured, and pinned by `a_shifted_key_carries_the_layout_text_it_is_given`).
-Ordinary text views translate the key code and flags again and type `C`; a
-field holding Secure Event Input in a signed-in desktop (Terminal's Secure
-Keyboard Entry, measured) reads the string. So while
-`IsSecureEventInputEnabled` reads true, a key pressed with Shift alone
-carries what the session's layout types at its Shift level when that
-differs from the unmodified level (the `keymap-watch` notice, shared
-`PostedKeyText`; the watcher now runs for every session that posts keys,
-not only for a Deck told `host_keymap`). Nothing else gets a string:
-Secure Event Input is system-wide (Secure Keyboard Entry, password
-managers), an explicit string is taken as is, and the key after a dead key
-(or an Option chord, which may be one) must be left for the system to
-compose (`¨` then `u` is `ü`). Not covered yet: Option layers at the lock
-screen (the notice describes no Option level) and Caps Lock on. The login window
-types through the virtual HID keyboard and never needed this.
-Measured after the change, on macOS 26.5: Terminal with Secure Keyboard
-Entry reads `AbC1xyZ9` exactly.
-
-**The lock screen waits for a person (PD-041).** It refused a password
-typed as `CGEvent`s whatever they carried, and the characters were never
-the problem. Measured on the lab Pier (macOS 26.5, 2026-11-22) with a
-temporary per-key diagnostic build (not shipped: see below): every key had
-its right code and flags,
-Shift arrived as a flags-changed event, each capital carried its layout
-text and every other key's stored string matched the layout.
-`loginwindow`'s own log (`log show --predicate 'process == "loginwindow"'`,
-as root) says why: once the Mac has gone idle at the lock screen it holds
-an *activity semaphore*, and a submitted password waits for the power
-manager to report the user active (`IOPMScheduleUserActiveChangedNotification`)
-— `activity semaphore exists, waiting for user activity before continuing
-auth...`, five seconds later `The user did not become active for
-authentication. Fail the auth` and `INCORRECT password`. Hardware input
-makes the user active; posted events do not. So the Pier declares the
-activity itself (`IOPMAssertionDeclareUserActivity`, `kIOPMUserActiveLocal`,
-shared `LockScreenActivity`): 250 ms after a Return or Enter it posted at
-its own locked console (`declare_lock_screen_activity_after_submit`), and
-before a key pressed there while no field holds Secure Event Input, once
-per 4 s (`lock_screen_step`). That key, and every message the Deck sends
-after it, is then held 1.5 s in order (`InputSession::apply`, shared
-`InputHold`) and applied from a timer arm of the session loop
-(`stream::apply_held_input`): nothing sleeps on the loop that sends the
-picture, audio and pings. A held key was never posted, so a session that
-ends while holding drops the queue and `release_all` frees what was posted
-before it. The second case
-exists because a posted key into the hidden field shows it without focus
-(`showPasswordFieldMakingFirstResponder: 0`) and the keys after it went
-nowhere; declared activity makes `loginwindow` raise the field focused. A
-field that is already up (a click put it there) is not woken again: waking
-it after a click took its focus away. Measured with the real password from
-the Mac Deck CLI, each followed by `Ab1Z9` typed into Terminal on the
-unlocked desktop and the Pier locking the session as the Deck left: typed
-straight away into a hidden field, typed one key every 1.3 s after a click
-on the field, typed at speed after that click, and after Shift and a click
-on the background. Desktop keys, and a desktop's own password fields, are
-unchanged; the declaration happens only while this session holds the
-console locked (`screen_lock::locked_on_console`).
-
-A virtual HID keyboard (the login window's `hid-injector` device) unlocked
-the lock screen too, and was tried first. It was not kept: the lock screen
-starts over at a person's first keystroke after going idle (it hides,
-empties and shows the field again, with an animation), and the device's
-keys raced that animation — a slow password after a click, and a fast one
-with no click, were lost in some runs. Desk privacy's event filter also
-cannot tell its keys from the desk's. Declared activity has neither
-problem.
-
-`CGSSessionScreenIsLocked` in `ioreg`'s `IOConsoleUsers` stayed `true`
-throughout an unlock on that Mac; prove an unlock from `loginwindow`'s log
-(`Unlock succeeded, with password`), not from `ioreg`.
-
-No log names a key, at any level (ADR 0014: text is never logged, only
-counts; `docs/operations/support-bundles.md`). A per-key line, even with
-only the key's kind under Secure Event Input, gives away a password's
-length, case and rhythm, and outside one it is a keylogger with debug on.
-The session-end line (`lock screen typing this session`) carries only
-what cannot grow with what was typed: how many times the lock screen was
-woken and a submit declared (per visit and per attempt), and whether input
-was held or dropped (yes or no). A count of keys posted with layout text
-would be the number of capitals in the passwords typed, and a count of held
-messages a password's length; neither is kept. A key-level probe, if one is ever needed again, is a lab build, not a
-log level.
-
-**Host health for the Deck.** Every two seconds the stream sends
-`health_stats` built from `arcen_telemetry::HostWindowTracker` and
-`assess_health`. ScreenCaptureKit is damage-driven, so the frame rate is
-judged against what capture offered (a still desktop is not a fault); a
-window in which nothing was sent at all, keepalive included, is judged
-against the full target and reads as critical. The `path` is measured on the
-QUIC connection by `arcen_transport::PathQualityTracker`: by the stream when
-it owns the connection (`serve`, tests) and otherwise by the network service,
-which fills it into the agent's `health_stats` as it relays them
-(`relay.rs`, `with_service_path`).
-
-**Cursor images are sent, like on Linux and Windows** (ADR 0029 amendment 1).
-`NSCursor.currentSystemCursor` reports the desktop's cursor whichever process
-set it; `cursor_probe.rs` draws its image into an sRGB bitmap at the
-capture's pixels per point and hands it to the shared `HostCursor`, and the
-agent writes `CursorUpdate` records the relay puts on the input/cursor lane.
-Never name a cursor by comparing its bytes with `NSCursor`'s class cursors
-and conclude from the names: the window server's I-beam and resize cursors
-never byte-match AppKit's, which is how this host once "measured" that the
-cursor was always the arrow. Prove cursor claims with `probe-cursor`
-(`distinct_images`, `--passive`, `--pump`). The image keeps its last value while
-an application hides the pointer, so visibility is read separately
-(`desktop_cursor_visible`, `CGCursorIsVisible`, measured against typing,
-`NSCursor.hide`, `setHiddenUntilMouseMoves:` and `CGDisplayHideCursor`;
-posted motion never ends a `setHiddenUntilMouseMoves:` hide, so a pointer
-that moves while hidden with no button held is reported shown until the next
-key-down, `HiddenUntilMoved`), and
-each image is drawn at the scale of the display under the pointer (shared
-`output_under_pointer`). The handshake checks the cursor live
-(`desktop_cursor_images_readable`); a session that cannot read it keeps the
-pointer in the video (`showsCursor`).
-
-**Audio negotiates and no longer blocks the desktop.** Measured end to end:
-102 audio packets reached a client alongside 45 video frames. The current
-end-to-end test `host_audio_reaches_the_client_when_capture_is_available`
-asserts both sides of that claim: the host counted packets and the client
-received audio frames.
-
-Two things about it are not obvious:
-
-* Apple raises the **system audio recording consent prompt inside**
-  `AudioDeviceCreateIOProcIDWithBlock`, and the call does not return until it
-  is answered. Measured: telemetry reached `stage=ioproc` and then
-  `stage=device_start` sixty seconds later, `AudioDeviceStart` waiting on the prompt.
-  Capture therefore starts on its own thread under a 1500 ms budget and is
-  collected only if it arrives in time. **Audio must never gate the desktop.**
-* `supports_audio` is now advertised from the Screen Recording consent grant,
-  because macOS gates system audio behind the same "Screen & System Audio
-  Recording" approval. The host publishes `audio_output` capabilities in
-  `server_hello`, resolves against the Deck's `audio_output`, sends
-  `audio_stream_result` once it knows what this session will carry, and starts
-  no tap for a session that did not negotiate audio. Without consent the host
-  reports `CaptureUnavailable` and keeps streaming video without sound.
-
-Do not infer audio from a tap that constructed: on a machine with capture
-denied, a tap creates, reports a valid format, honours a mute request and then
-delivers nothing. Read `audio_observed` from `probe-audio`.
-
-Do not infer the capture rate from the tap either. The IO proc runs on the
-aggregate device, which is clocked by the default output device and resamples
-the tap to it. Measured with AirPods in call mode as the output: the tap
-reported 48 kHz stereo, the aggregate's nominal rate was 24 kHz, and the IO
-proc delivered 480 frames every 20 ms, which audio-v1 framed as 48 kHz. The
-recorder reads the aggregate's `kAudioDevicePropertyNominalSampleRate` and
-resamples that clock to 48 kHz with the shared
-`arcen_media::audio::resample::PcmResampler` on the drain thread, never in the
-IO proc. It re-reads the clock every 100 ms with a range check that builds
-nothing (`PcmResampler::accepts`), and builds a filter only when the rate
-actually changes (`follow_clock`): the old rate's held-back frames are
-flushed first and the new rate starts from its first frame, so a change
-loses no audio and does not fade in. Within the filter's reach of the join
-(about 1.3 ms) the outputs that needed input past it are made from the last
-frame held. Audio drained in the up to 100 ms before a change is noticed is
-converted at the old ratio. A clock outside 8-384 kHz is refused at start and
-discarded during capture (`clock_mismatches`).
-
-The resampler's latency is `latency_frames` input frames: 32 when upsampling
-(4 ms at 8 kHz, 1.3 ms at 24 kHz); when downsampling, widened to
-32 × source / 48000 (64 at 96 kHz, 256 at 384 kHz), about 32 output frames or
-0.67 ms; none at 48 kHz.
-
-A tap-only aggregate (no sub-device, no clock device) also ran at 48 kHz with
-the headset in call mode, and 10/10 lifecycle cycles, mute readback and a
-10-second rate held. It is not the shipped topology. Device switches and a Mac
-with no output device could not be qualified without changing a workstation's
-audio settings, and it would still need a resampler for a tap that reports
-another rate.
-
-Two more, both from package installs on the lab Mac:
-
-* **A Core Audio connection opened while Core Audio restarts can go stale.**
-  The postinstall restarts `coreaudiod` to load the microphone driver. When
-  it went on at once, the login-window agent launchd started next created
-  taps (status 0) whose every property read then failed with `'!obj'`, so
-  the mute could not be proved and every session was refused until the Mac
-  restarted; restarting only the agent got past it. So the postinstall
-  waits for the old `coreaudiod` to exit and for `core-audio-ready` (a
-  fresh process per question) before it starts anything, the agent opens no
-  Core Audio connection before a Deck connects, and an agent that sees
-  `'!obj'` on its own tap (`audio::core_audio_connection_stale`) exits with
-  75 so launchd starts a fresh one.
-* **The prompt blocks after the mute exists.** A capture start blocked on
-  the System Audio Recording prompt (the tap and its mute already proved)
-  serves the session without sound instead of refusing it; the waiting
-  worker keeps the Mac muted until the prompt is answered and then releases
-  its tap. Refusing there left the only person who could answer the prompt
-  (the one connecting) unable to see it.
-
 ## Structured logging is how latency is proven
 
 The Pier emits the same schema-validated lifecycle records the Linux host does,
@@ -414,7 +94,7 @@ change.
 
 ## Audio, end to end
 
-Proven on a test Mac after a clean uninstall and install, with sound playing:
+Proven after a clean uninstall and install, with sound playing:
 
 ```
 media-smoke complete
@@ -582,23 +262,6 @@ make "it installed fine and the client times out", are written up in
   its own side channel and from there onto the audio lane. Do not route media
   onto the control lane or reintroduce a single Deck stream.
 
-## Validate installers on a clean target
-
-Installer qualification answers one question: does the shipped package
-install, run and uninstall on a machine that never built it. That is only
-worth anything while the target stays a machine that never built it.
-
-So nothing developer-side runs there. No `xcrun`, no `cargo`, no `clang`, no
-toolchain install, no compiling a scratch probe in `/tmp`. Invoking `xcrun`
-alone is enough to raise the Command Line Tools installer on the console,
-which both interrupts whoever is sitting there and quietly turns the clean
-machine into a dirty one.
-
-Build and compile probes on a development Mac. Copy the finished artefact
-across and run it. If something can only be measured by compiling on the
-target, say so rather than working around it, because it usually means the
-test is measuring the toolchain rather than the product.
-
 ## Virtual HID, and what it gates
 
 `IOHIDUserDevice` is how a macOS host presents an input device it did not
@@ -759,8 +422,8 @@ only with `--features lab-bridged-hid-probe`.
   wins) as `CursorPosition` records; the Deck draws its cursor there until
   its own mouse moves. `cursor_mode_result.cursor_positions` says so.
   The daemon relays them through the shared `CursorPositionRelay`
-  (`PierLaneRelay`). Multi-display sessions report none yet. Measured on
-  the lab Pier with the emulated stroke: `NSEvent` pressure 0.059 → 1.000
+  (`PierLaneRelay`). Multi-display sessions report none yet. Measured with
+  the emulated stroke: `NSEvent` pressure 0.059 → 1.000
   in an AppKit window, 74 of 74 positions at the Deck (ADR 0022 §14.1).
 - The ignored end-to-end tests drive the emulated Intuos5: with the host pen
   reader they **post pen events with pressure on the Mac that runs them**.
@@ -769,7 +432,7 @@ only with `--features lab-bridged-hid-probe`.
   half of the main display.
 - Prove it with the ignored end-to-end test
   `a_bridged_tablet_is_published_as_hid_devices_fed_and_torn_down`
-  (`ARCEN_E2E_PIER_PROGRAM=<signed lab Pier binary>`, run from a terminal
+  (`ARCEN_E2E_PIER_PROGRAM=<signed Pier binary>`, run from a terminal
   with Accessibility; `ARCEN_E2E_TABLET_HOLD=1` holds the devices for 60 s;
   `ARCEN_E2E_TABLET_CONSOLE=login-window|other-user` then hands the console
   away in-process and asserts the devices go)
@@ -793,7 +456,7 @@ takes four things together:
 2. **The privileged daemon** it attaches to over the agent socket
    (`agent_relay`).
 3. **Virtual HID for all input: keyboard and pointer, never `CGEvent`.** This
-   was measured on the lab. The first `CGEventCreateMouseEvent` the root agent
+   was measured. The first `CGEventCreateMouseEvent` the root agent
    made there never returned: a stack sample showed `SLEventCreate →
    CGSEventSourceForID → CGSEventSourceShutdown` waiting on a mutex no other
    thread held. It froze the whole session, not only input. The login window's
@@ -911,7 +574,7 @@ answered while somebody is logged in.
   --capture]` measures it from the Aqua session (measured here: the
   owner's hardware events read pid 0, the probe's own post its pid);
   whether `ScreenCaptureKit` reads before the table is the `--capture`
-  proof still to run on the lab Mac.
+  proof still to run.
 
 **Apple publishes no contract that third-party code may capture the login
 window.** Every piece above is documented on its own, but the combination is

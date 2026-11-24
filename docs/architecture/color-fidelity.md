@@ -525,7 +525,7 @@ the negotiated format was not honoured exactly.
 The failure was in the one step that cannot be verified from a non-Apple
 machine, which is why hardware testing is a gate rather than a formality.
 
-The hardware retest is green: pier-windows-software.example.internal's MF H.264 stream
+The hardware retest is green: a software-only Windows Pier's MF H.264 stream
 delivers `420v`, decodes in hardware, and displays in Deck without `-6661`.
 
 That retest found a second regression before declaring success. Both product

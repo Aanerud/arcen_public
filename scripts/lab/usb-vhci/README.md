@@ -10,7 +10,7 @@ the **Hard USB bridge lab only**.
   contains GPL-2.0)
 
 No source, patch, binary, or payload is taken from commercial remote-desktop
-products or a local reference corpus. The public upstream is fetched directly and the small Arcen
+products. The public upstream is fetched directly and the small Arcen
 compatibility patch series is applied independently.
 
 `install.sh` builds and installs the two modules through DKMS:
@@ -18,9 +18,9 @@ compatibility patch series is applied independently.
 - `usb-vhci-hcd`
 - `usb-vhci-iocifc`
 
-The current patch set is validated only on pier-linux.example.internal's
+The current patch set is validated only on the Rocky Linux 9
 `5.14.0-503.14.1.el9_5.x86_64` kernel. It is not a production support claim.
-Run `uninstall.sh` to remove the exact lab module and modules-load entry.
+Run `uninstall.sh` to remove the exact module and modules-load entry.
 
 The installer deliberately exposes no USB/IP daemon or TCP listener. Pier's
 privileged helper consumes `/dev/usb-vhci`; all remote traffic remains inside

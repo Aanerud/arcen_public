@@ -19,7 +19,7 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
     launch a dedicated Xorg config with `OutputClass` + `ActivateSessionOnSeat`). The
     "gnome-session on the shared root-owned `:0`" path is **wrong** — the user's logind session is
     `Active=no`, mutter fails `meta_later_add: assertion 'display' failed`, GNOME crash-loops
-    ("Oh no…"). Proven live on pier-linux.example.internal: a dedicated `:10` on head DVI-D-1 streamed a real
+    ("Oh no…"). Proven live: a dedicated `:10` on head DVI-D-1 streamed a real
     per-user desktop. **This is the top Linux Pier follow-up** — earlier analysis captured it as the
     `LINUX_SESSION_MODEL_SPEC` finding, not fully coded.
   - **GPU head ↔ display ↔ capenc output-index rule:** up to 4 concurrent sessions/screens,
@@ -76,7 +76,7 @@ old Python `server/*.py` on the Linux path. No Python, no ffmpeg in the app path
 9. Mandatory direct QUIC on UDP `:18444` uses the operator-managed PEM. The
    process validates and reloads material but never
    issues, renews, rotates, fetches, or persists trust. There is no mTLS,
-   0-RTT, OIDC, Span, or commercial licensing dependency.
+   0-RTT, OIDC, or commercial licensing dependency.
 10. Linux `auto` resolves NVENC then source-built OpenH264 only after typed
     native unavailability. Software limits are selected before display mutation;
     malformed READY or runtime failure closes rather than switching codec.
@@ -617,9 +617,9 @@ common logging section's canonical field is `logging.level`
 `Level0` (`Critical`, i.e. lifecycle/critical-only). The legacy numeric
 `logging.verbosity` (`0..=3`) is accepted as a one-release migration
 (`arcen-session::pier_config::LoggingConfig::resolved_profile`) and is
-mutually exclusive with `logging.level` — configuring both is rejected. The
-current `pier-linux.example.internal` development deployment overrides this to `Level2`
-(`Info`) for live verification; that override is **not** baked into the
+mutually exclusive with `logging.level` — configuring both is rejected. A
+deployment may raise this (for example to `Level2`, `Info`) for live
+verification; that override is **not** baked into the
 packaged default and must be set explicitly per-deployment. Retention days is
 unchanged and still normalized to 7–100 days; the packaged logrotate policy
 still owns the 32 MiB/daily rotation trigger. The canonical file is JSON
@@ -808,8 +808,8 @@ hostname.
 
 ## Resume pointer
 
-- **Status:** ✅ MIGRATED + DEPLOYED + LIVE-VERIFIED on pier-linux.example.internal
-  (`203.0.113.10:18444/udp`, `arcen-pier.service`). The **dedicated-Xorg-per-session model**
+- **Status:** ✅ MIGRATED + DEPLOYED + LIVE-VERIFIED (`18444/udp`,
+  `arcen-pier.service`). The **dedicated-Xorg-per-session model**
   was migrated and deployed: `--session-gpu-head DFP-2 /
   :11`, `/etc/arcen/xorg.conf` template, `/run/arcen/sessions`, `--desktop-session gnome`.
   **User logged in as `artist` and streamed a real per-user GNOME desktop end-to-end.** Earlier
@@ -824,7 +824,7 @@ hostname.
   `arcen-pier-linux`, lib `arcen_pier_linux`, bin `arcen-pier` (+ session-launcher/agent),
   fold audiocap/input_helper bins, imports → `arcen_protocol`; the historical
   migration port was 18443 and the current QUIC product port is 18444. Build on
-  `pier-linux.example.internal` (`root@<your-pier-host>`): `cargo build --release -p arcen-pier-linux`. Deploy to
+  the Linux host: `cargo build --release -p arcen-pier-linux`. Deploy to
   `/opt/arcen/bin/` + `arcen-pier.service`.
 
 ## Capture colour depth and the two native paths (2026-08-30)

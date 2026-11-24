@@ -2,7 +2,7 @@
 
 Audience: whoever cuts a macOS release. This documents the **procedure**. It
 deliberately contains **no certificate name, notary profile name, or
-provisioning profile identifier** — see [Where the private values live](#where-the-private-values-live).
+provisioning profile identifier** — see [Keep the private values out of the repository](#keep-the-private-values-out-of-the-repository).
 
 The Apple **Team ID** is deliberately *not* on that list. It is not a
 credential: `codesign -dv` reads it from any signed application, so every copy
@@ -136,23 +136,21 @@ code, not prose.
 
 By contrast, the genuinely secret material below must never be committed.
 
-## Where the private values live
+## Keep the private values out of the repository
 
 Nothing secret belongs in this repository. It is public, and
 `scripts/ci/check-publication-hygiene.sh` fails the build on key material.
 
-| Item | Where it lives |
+| Item | Where to keep it |
 | --- | --- |
-| Developer ID certificate + private key | login keychain (and a secure backup) |
-| Apple Team ID, certificate common name | password manager |
-| App-specific password | password manager; stored in the notary keychain profile |
-| Notary keychain profile name | password manager |
-| `.provisionprofile` files | outside the repository (for example an `AppleCerts/` directory alongside it) |
-| Test-host inventory, lab addresses | outside the source tree |
+| Developer ID certificate + private key | your login keychain, with a secure backup |
+| Apple Team ID, certificate common name | a secure store of your choice |
+| App-specific password | the notary keychain profile (`xcrun notarytool store-credentials`) |
+| Notary keychain profile name | a secure store of your choice |
+| `.provisionprofile` files | a directory outside the repository |
 
 `*.provisionprofile` (anywhere in the tree) is in `.gitignore`, but ignored is
-not the same as absent: keep profiles and machine inventories out of the
-repository entirely.
+not the same as absent: keep profiles out of the repository entirely.
 Do not `git add -f` either.
 
 Because those locations are deliberately outside version control, they are
