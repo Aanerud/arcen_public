@@ -162,7 +162,7 @@ hand it to a shared type, act on what comes back.
   placeholders such as `/home/artist` and `alice@corp.example`. Contributors
   are credited only in `CONTRIBUTORS.md` and release notes, as they choose.
 - **Never import uncleared third-party source.** No proprietary payloads, no
-  vendor SDK material, no decompiled binaries, no local reference corpus.
+  vendor SDK material, no decompiled binaries, no code from other products.
   Dependencies must be open source, and anything shipping in a release artefact
   needs its full notice in
   [`legal/THIRD_PARTY_NOTICES.md`](legal/THIRD_PARTY_NOTICES.md), which is
@@ -185,7 +185,7 @@ you propose a change.
 You are expected to search and research before you declare a capability
 unavailable, and to keep working on it. Use web search, upstream repositories,
 merge requests, mailing lists, release notes and maintainers' blogs as normal
-tools. A probe on one lab machine shows what *that* stack does today; it does
+tools. A probe on one machine shows what *that* stack does today; it does
 not show what Arcen can do.
 
 When something looks blocked:
@@ -209,7 +209,7 @@ When something looks blocked:
    it) and a tracked follow-up. "Not implemented yet" and "not possible" are
    different statements; never write the second when you mean the first.
 
-Reference projects remain learn-only: research them, never copy from them.
+Other projects are for learning only: research them, never copy from them.
 
 ---
 

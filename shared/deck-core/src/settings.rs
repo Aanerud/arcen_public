@@ -19,7 +19,7 @@ use arcen_protocol::messages::{CursorMode, TabletModeMsg};
 
 use crate::config::{SavedConnectionSummary, load_saved_connections, write_saved_connections};
 
-/// Log verbosity, matching the reference client's Level 0..3 scale.
+/// Log verbosity on the Level 0..3 scale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Critical,

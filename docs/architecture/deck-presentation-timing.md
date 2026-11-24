@@ -17,9 +17,9 @@ onto its display API and nothing else.
 | Auto, Speed (and Software, custom, unknown) | `Newest` | Present each frame the moment it is decoded, without tearing: the newest frame wins at the next refresh or composition; an older one still waiting there is discarded. |
 | Grading, HDR | `Vsync` | Wait for the refresh. Every frame is shown whole and none is skipped: a fidelity contract shows exactly what was encoded. |
 
-No preset tears. Speed presented with tearing until 2026-11-18; the owner
-decided that Speed keeps its low latency (60 fps floor, 1-frame encoder
-buffer, motion kept on a weak link) without tearing. It cost about 3 ms on
+No preset tears. Speed presented with tearing until 2026-11-18; since then
+Speed keeps its low latency (60 fps floor, 1-frame encoder buffer, motion
+kept on a weak link) without tearing. It cost about 3 ms on
 average (Mac fullscreen 7.3 vs 4.3 ms, table below). The `Tearing` timing
 and both presenters' tearing paths were then removed. The measurements
 below that mention Speed's tearing are history.
@@ -56,10 +56,10 @@ again (render → decode). Nothing waits on the CPU; a full pool drops the
 newest picture rather than waiting. The split is used only where the
 shared rule `arcen_deck_core::decode::decode_device_split` qualifies the
 driver (extended resource sharing, shareable fences; Intel, NVIDIA from
-driver 471.11, AMD from Vega: other streaming clients found shared decode
-textures corrupt on pre-Vega AMD, older NVIDIA, Qualcomm and Moore
+driver 471.11, AMD from Vega: shared decode textures are known to corrupt
+on pre-Vega AMD, older NVIDIA, Qualcomm and Moore
 Threads drivers) and, per output format, a real keyframe handed over reads
-back sample-exact on the presenter's device. On the lab's virtual GPU
+back sample-exact on the presenter's device. On one virtual GPU,
 NV12 and P010 do and `Y410` does not (it opens, but reads differently), so
 there a connection that asks for 4:4:4 (Grading, HDR) decodes on the
 window's device as before; Auto and Speed get the split. Everything else

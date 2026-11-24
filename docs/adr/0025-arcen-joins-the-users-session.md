@@ -79,15 +79,6 @@ Read from upstream source and confirmed on a Rocky 9.7 lab workstation
 - **Automatic login** happens once per boot and needs a GDM restart to
   trigger again; timed login likewise reads its configuration at start.
 
-### What other products do
-
-Reference study only (learn-only, nothing copied): a console-mode remote
-desktop product completes remote logins through the same greeter hook, blanks
-the console with zero gamma ramps and disables local input devices while a
-client is attached, and locks the session when the last client leaves;
-another runs its own display manager and X server (its own PAM service, its
-own Xorg on `:100`/VT 7) and so cannot be resumed by GDM at all.
-
 ## Decision
 
 ### 1. One model for every Pier

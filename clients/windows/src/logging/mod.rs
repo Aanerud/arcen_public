@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Logging (owner: `platform` stream).
+//! Logging.
 //!
 //! Log files through `arcen-observability` into the `DeckServices` log
 //! directory (`%LOCALAPPDATA%\Arcen\Deck\Logs`, `ARCEN_LOG_DIR` honoured),
@@ -34,7 +34,7 @@ use crate::platform::registry::{Hive, RegistryValue, read_dword, write_values};
 pub const WER_LOCAL_DUMPS_KEY: &str =
     r"Software\Microsoft\Windows\Windows Error Reporting\LocalDumps";
 /// Minidumps only (`DumpType` 1): a full dump could hold a password still
-/// in memory between typing and zeroising (`DRAFT.md` §3.7).
+/// in memory between typing and zeroising.
 pub const WER_DUMP_TYPE_MINI: u32 = 1;
 /// How many dumps WER keeps before replacing the oldest.
 pub const WER_DUMP_COUNT: u32 = 5;

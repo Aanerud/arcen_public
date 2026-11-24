@@ -973,7 +973,7 @@ Do not edit this section by hand; regenerate it.
 
 Every package below is reachable from a release artefact through a `normal` or `build` dependency edge on that artefact's target triple, with build-script and proc-macro dependencies resolved for the machine the release is built on (macOS on Apple silicon, Linux x86-64, Windows x86-64 MSVC). Dev-dependencies are excluded because they are not redistributed. The *Artefacts* column records which builds carry the package.
 
-429 third-party packages across 32 distinct licence expressions.
+430 third-party packages across 32 distinct licence expressions.
 
 ### (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0
 
@@ -1143,7 +1143,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | Package | Version | Artefacts | Source |
 | --- | --- | --- | --- |
 | `libloading` | 0.8.9 | macOS, Windows, Linux | https://github.com/nagisa/rust_libloading/ |
-| `rustls-webpki` | 0.103.15 | macOS, Windows, Linux | https://github.com/rustls/webpki |
+| `rustls-webpki` | 0.103.16 | macOS, Windows, Linux | https://github.com/rustls/webpki |
 | `untrusted` | 0.9.0 | macOS, Windows, Linux | https://github.com/briansmith/untrusted |
 
 ### MIT
@@ -1173,6 +1173,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `memoffset` | 0.9.1 | Linux | https://github.com/Gilnaa/memoffset |
 | `mio` | 1.2.2 | macOS, Windows, Linux | https://github.com/tokio-rs/mio |
 | `nix` | 0.29.0 | Linux | https://github.com/nix-rust/nix |
+| `nix` | 0.31.4 | macOS | https://github.com/nix-rust/nix |
 | `nom` | 7.1.3 | macOS, Windows, Linux | https://github.com/Geal/nom |
 | `nom` | 8.0.0 | Linux | https://github.com/rust-bakery/nom |
 | `nu-ansi-term` | 0.50.3 | macOS, Windows, Linux | https://github.com/nushell/nu-ansi-term |
@@ -1217,7 +1218,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `zbus` | 5.13.2 | Linux | https://github.com/z-galaxy/zbus/ |
 | `zbus_macros` | 5.13.2 | Linux | https://github.com/z-galaxy/zbus/ |
 | `zbus_names` | 4.3.1 | Linux | https://github.com/z-galaxy/zbus/ |
-| `zip` | 7.3.0 | macOS, Windows, Linux | https://github.com/zip-rs/zip2.git |
+| `zip` | 9.0.5 | macOS, Windows, Linux | https://github.com/zip-rs/zip2 |
 | `zmij` | 1.0.23 | macOS, Windows, Linux | https://github.com/dtolnay/zmij |
 | `zvariant` | 5.9.2 | Linux | https://github.com/z-galaxy/zbus/ |
 | `zvariant_derive` | 5.9.2 | Linux | https://github.com/z-galaxy/zbus/ |
@@ -1290,7 +1291,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `find-msvc-tools` | 0.1.9 | macOS, Windows, Linux | https://github.com/rust-lang/cc-rs |
 | `flate2` | 1.1.9 | macOS, Windows, Linux | https://github.com/rust-lang/flate2-rs |
 | `font-types` | 0.11.3 | macOS, Windows | https://github.com/googlefonts/fontations |
-| `form_urlencoded` | 1.2.2 | macOS, Windows | https://github.com/servo/rust-url |
+| `form_urlencoded` | 1.2.3 | macOS, Windows | https://github.com/servo/rust-url |
 | `futures-core` | 0.3.33 | macOS, Windows, Linux | https://github.com/rust-lang/futures-rs |
 | `futures-io` | 0.3.34 | Linux | https://github.com/rust-lang/futures-rs |
 | `futures-macro` | 0.3.33 | macOS, Windows, Linux | https://github.com/rust-lang/futures-rs |
@@ -1324,7 +1325,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `naga` | 29.0.4 | macOS, Windows | https://github.com/gfx-rs/wgpu |
 | `nasm-rs` | 0.3.2 | Windows, Linux | https://github.com/medek/nasm-rs |
 | `num-bigint` | 0.4.8 | macOS, Windows, Linux | https://github.com/rust-num/num-bigint |
-| `num-conv` | 0.1.0 | macOS, Windows, Linux | https://github.com/jhpratt/num-conv |
+| `num-conv` | 0.2.2 | macOS, Windows, Linux | https://github.com/jhpratt/num-conv |
 | `num-derive` | 0.4.2 | Linux | https://github.com/rust-num/num-derive |
 | `num-integer` | 0.1.46 | macOS, Windows, Linux | https://github.com/rust-num/num-integer |
 | `num-traits` | 0.2.19 | macOS, Windows, Linux | https://github.com/rust-num/num-traits |
@@ -1345,8 +1346,8 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `proc-macro2` | 1.0.107 | macOS, Windows, Linux | https://github.com/dtolnay/proc-macro2 |
 | `profiling` | 1.0.18 | macOS, Windows | https://github.com/aclysma/profiling |
 | `quinn` | 0.11.11 | macOS, Windows, Linux | https://github.com/quinn-rs/quinn |
-| `quinn-proto` | 0.11.16 | macOS, Windows, Linux | https://github.com/quinn-rs/quinn |
-| `quinn-udp` | 0.5.15 | macOS, Windows, Linux | https://github.com/quinn-rs/quinn |
+| `quinn-proto` | 0.11.19 | macOS, Windows, Linux | https://github.com/quinn-rs/quinn |
+| `quinn-udp` | 0.5.16 | macOS, Windows, Linux | https://github.com/quinn-rs/quinn |
 | `quote` | 1.0.47 | macOS, Windows, Linux | https://github.com/dtolnay/quote |
 | `rand` | 0.10.2 | macOS, Windows, Linux | https://github.com/rust-random/rand |
 | `rand` | 0.8.7 | macOS, Windows, Linux | https://github.com/rust-random/rand |
@@ -1393,9 +1394,9 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `thiserror-impl` | 1.0.69 | macOS, Windows, Linux | https://github.com/dtolnay/thiserror |
 | `thiserror-impl` | 2.0.19 | macOS, Windows, Linux | https://github.com/dtolnay/thiserror |
 | `thread_local` | 1.1.10 | macOS, Windows, Linux | https://github.com/Amanieu/thread_local-rs |
-| `time` | 0.3.45 | macOS, Windows, Linux | https://github.com/time-rs/time |
-| `time-core` | 0.1.7 | macOS, Windows, Linux | https://github.com/time-rs/time |
-| `time-macros` | 0.2.25 | macOS, Windows, Linux | https://github.com/time-rs/time |
+| `time` | 0.3.47 | macOS, Windows, Linux | https://github.com/time-rs/time |
+| `time-core` | 0.1.8 | macOS, Windows, Linux | https://github.com/time-rs/time |
+| `time-macros` | 0.2.27 | macOS, Windows, Linux | https://github.com/time-rs/time |
 | `toml` | 1.1.8+spec-1.1.0 | Linux | https://github.com/toml-rs/toml |
 | `toml_datetime` | 1.1.2+spec-1.1.0 | Linux | https://github.com/toml-rs/toml |
 | `toml_edit` | 0.25.13+spec-1.1.0 | Linux | https://github.com/toml-rs/toml |
@@ -1405,7 +1406,7 @@ Every package below is reachable from a release artefact through a `normal` or `
 | `typenum` | 1.20.1 | macOS, Windows, Linux | https://github.com/paholg/typenum |
 | `unicode-segmentation` | 1.13.3 | macOS, Windows | https://github.com/unicode-rs/unicode-segmentation |
 | `unicode-width` | 0.2.2 | macOS, Windows, Linux | https://github.com/unicode-rs/unicode-width |
-| `url` | 2.5.8 | macOS, Windows | https://github.com/servo/rust-url |
+| `url` | 2.5.9 | macOS, Windows | https://github.com/servo/rust-url |
 | `utf-8` | 0.7.6 | macOS, Windows, Linux | https://github.com/SimonSapin/rust-utf8 |
 | `videotoolbox` | 0.18.1 | macOS | https://github.com/doom-fish/videotoolbox-rs |
 | `web-time` | 1.1.0 | macOS, Windows | https://github.com/daxpedda/web-time |
@@ -1570,7 +1571,7 @@ The tables above are an inventory. MIT, BSD and Apache-2.0 all require the copyr
 
 #### Notice 1 — applies to 103 package(s)
 
-`ahash 0.8.12`, `arrayvec 0.7.8`, `asn1-rs 0.7.2`, `asn1-rs-derive 0.6.0`, `atomic-waker 1.1.2`, `autocfg 1.5.1`, `base64 0.22.1`, `bitflags 1.3.2`, `bitflags 2.13.1`, `cc 1.4.0`, `cexpr 0.6.0`, `cfg-if 1.0.4`, `cmake 0.1.58`, `core-foundation 0.10.1`, `core-foundation 0.9.4`, `core-foundation-sys 0.8.7`, `core-graphics 0.23.2`, `core-graphics 0.25.0`, `core-graphics-types 0.1.3`, `core-graphics-types 0.2.0`, `coreaudio-rs 0.11.3`, `crossbeam-channel 0.5.16`, `crossbeam-queue 0.3.13`, `crossbeam-utils 0.8.22`, `der-parser 10.0.0`, `displaydoc 0.2.7`, `either 1.17.0`, `equivalent 1.0.2`, `errno 0.3.14`, `euclid 0.22.14`, `event-listener 5.4.2`, `event-listener-strategy 0.5.4`, `fastrand 2.5.0`, `find-msvc-tools 0.1.9`, `flate2 1.1.9`, `form_urlencoded 1.2.2`, `futures-lite 2.6.1`, `gethostname 1.1.0`, `glob 0.3.4`, `hashbrown 0.16.1`, `hashbrown 0.17.1`, `heck 0.5.0`, `idna 1.1.0`, `idna_adapter 1.2.1`, `indexmap 2.14.0`, `itertools 0.13.0`, `itertools 0.14.0`, `jobserver 0.1.35`, `lazy_static 1.5.0`, `libpulse-binding 2.30.1`, `libpulse-simple-binding 2.29.0`, `libpulse-simple-sys 1.22.0`, `libpulse-sys 1.23.0`, `linux-raw-sys 0.12.1`, `lock_api 0.4.14`, `log 0.4.33`, `nasm-rs 0.3.2`, `num-bigint 0.4.8`, `num-derive 0.4.2`, `num-integer 0.1.46`, `num-traits 0.2.19`, `nusb 0.1.14`, `oid-registry 0.8.1`, `once_cell 1.21.4`, `ordered-stream 0.2.0`, `parking 2.2.1`, `parking_lot 0.12.5`, `parking_lot_core 0.9.12`, `percent-encoding 2.3.2`, `pkg-config 0.3.33`, `png 0.18.1`, `pollster 0.4.0`, `regex 1.13.1`, `regex-automata 0.4.16`, `regex-syntax 0.8.11`, `renderdoc-sys 1.1.0`, `rustc-hash 1.1.0`, `rustc_version 0.4.1`, `rusticata-macros 4.1.0`, `rustix 1.1.4`, `rustls 0.23.46`, `rustls-native-certs 0.8.4`, `rustls-pemfile 2.2.0`, `scopeguard 1.2.0`, `security-framework 3.7.0`, `security-framework-sys 2.17.0`, `signal-hook-registry 1.4.8`, `smallvec 1.15.2`, `smol_str 0.2.2`, `socket2 0.6.5`, `stable_deref_trait 1.2.1`, `symlink 0.1.0`, `system-deps 7.0.8`, `thread_local 1.1.10`, `tungstenite 0.24.0`, `unicode-segmentation 1.13.3`, `unicode-width 0.2.2`, `url 2.5.8`, `uuid 1.24.0`, `version_check 0.9.5`, `weezl 0.1.12`, `x509-parser 0.18.1`, `yasna 0.6.0`
+`ahash 0.8.12`, `arrayvec 0.7.8`, `asn1-rs 0.7.2`, `asn1-rs-derive 0.6.0`, `atomic-waker 1.1.2`, `autocfg 1.5.1`, `base64 0.22.1`, `bitflags 1.3.2`, `bitflags 2.13.1`, `cc 1.4.0`, `cexpr 0.6.0`, `cfg-if 1.0.4`, `cmake 0.1.58`, `core-foundation 0.10.1`, `core-foundation 0.9.4`, `core-foundation-sys 0.8.7`, `core-graphics 0.23.2`, `core-graphics 0.25.0`, `core-graphics-types 0.1.3`, `core-graphics-types 0.2.0`, `coreaudio-rs 0.11.3`, `crossbeam-channel 0.5.16`, `crossbeam-queue 0.3.13`, `crossbeam-utils 0.8.22`, `der-parser 10.0.0`, `displaydoc 0.2.7`, `either 1.17.0`, `equivalent 1.0.2`, `errno 0.3.14`, `euclid 0.22.14`, `event-listener 5.4.2`, `event-listener-strategy 0.5.4`, `fastrand 2.5.0`, `find-msvc-tools 0.1.9`, `flate2 1.1.9`, `form_urlencoded 1.2.3`, `futures-lite 2.6.1`, `gethostname 1.1.0`, `glob 0.3.4`, `hashbrown 0.16.1`, `hashbrown 0.17.1`, `heck 0.5.0`, `idna 1.1.0`, `idna_adapter 1.2.1`, `indexmap 2.14.0`, `itertools 0.13.0`, `itertools 0.14.0`, `jobserver 0.1.35`, `lazy_static 1.5.0`, `libpulse-binding 2.30.1`, `libpulse-simple-binding 2.29.0`, `libpulse-simple-sys 1.22.0`, `libpulse-sys 1.23.0`, `linux-raw-sys 0.12.1`, `lock_api 0.4.14`, `log 0.4.33`, `nasm-rs 0.3.2`, `num-bigint 0.4.8`, `num-derive 0.4.2`, `num-integer 0.1.46`, `num-traits 0.2.19`, `nusb 0.1.14`, `oid-registry 0.8.1`, `once_cell 1.21.4`, `ordered-stream 0.2.0`, `parking 2.2.1`, `parking_lot 0.12.5`, `parking_lot_core 0.9.12`, `percent-encoding 2.3.2`, `pkg-config 0.3.33`, `png 0.18.1`, `pollster 0.4.0`, `regex 1.13.1`, `regex-automata 0.4.16`, `regex-syntax 0.8.11`, `renderdoc-sys 1.1.0`, `rustc-hash 1.1.0`, `rustc_version 0.4.1`, `rusticata-macros 4.1.0`, `rustix 1.1.4`, `rustls 0.23.46`, `rustls-native-certs 0.8.4`, `rustls-pemfile 2.2.0`, `scopeguard 1.2.0`, `security-framework 3.7.0`, `security-framework-sys 2.17.0`, `signal-hook-registry 1.4.8`, `smallvec 1.15.2`, `smol_str 0.2.2`, `socket2 0.6.5`, `stable_deref_trait 1.2.1`, `symlink 0.1.0`, `system-deps 7.0.8`, `thread_local 1.1.10`, `tungstenite 0.24.0`, `unicode-segmentation 1.13.3`, `unicode-width 0.2.2`, `url 2.5.9`, `uuid 1.24.0`, `version_check 0.9.5`, `weezl 0.1.12`, `x509-parser 0.18.1`, `yasna 0.6.0`
 
 ```text
 Apache License
@@ -2019,7 +2020,7 @@ END OF TERMS AND CONDITIONS
 
 #### Notice 5 — applies to 22 package(s)
 
-`apple-cf 0.9.3`, `clang-sys 1.9.1`, `codespan-reporting 0.13.1`, `cpal 0.15.3`, `doom-fish-utils 0.3.3`, `kurbo 0.13.1`, `lru-slab 0.1.2`, `nohash-hasher 0.2.0`, `peniko 0.6.1`, `polycool 0.4.0`, `quinn 0.11.11`, `quinn-proto 0.11.16`, `quinn-udp 0.5.15`, `raw-window-metal 1.1.0`, `self_cell 1.3.0`, `static_assertions 1.1.0`, `utf8_iter 1.0.4`, `videotoolbox 0.18.1`, `x11rb 0.13.2`, `x11rb-protocol 0.13.2`, `zeroize 1.9.0`, `zeroize_derive 1.5.0`
+`apple-cf 0.9.3`, `clang-sys 1.9.1`, `codespan-reporting 0.13.1`, `cpal 0.15.3`, `doom-fish-utils 0.3.3`, `kurbo 0.13.1`, `lru-slab 0.1.2`, `nohash-hasher 0.2.0`, `peniko 0.6.1`, `polycool 0.4.0`, `quinn 0.11.11`, `quinn-proto 0.11.19`, `quinn-udp 0.5.16`, `raw-window-metal 1.1.0`, `self_cell 1.3.0`, `static_assertions 1.1.0`, `utf8_iter 1.0.4`, `videotoolbox 0.18.1`, `x11rb 0.13.2`, `x11rb-protocol 0.13.2`, `zeroize 1.9.0`, `zeroize_derive 1.5.0`
 
 ```text
 Apache License
@@ -2278,7 +2279,190 @@ Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 ```
 
-#### Notice 7 — applies to 12 package(s)
+#### Notice 7 — applies to 13 package(s)
+
+`color 0.3.3`, `fdeflate 0.3.7`, `fearless_simd 0.4.1`, `half 2.7.1`, `image 0.25.9`, `linebender_resource_handle 0.1.1`, `num-conv 0.2.2`, `pin-project-lite 0.2.17`, `time 0.3.47`, `time-core 0.1.8`, `time-macros 0.2.27`, `vello_common 0.0.9`, `vello_cpu 0.0.9`
+
+```text
+Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+```
+
+#### Notice 8 — applies to 12 package(s)
 
 `annotate-snippets 0.11.5`, `anstyle 1.0.14`, `crc32fast 1.5.0`, `dpi 0.1.2`, `foreign-types 0.5.0`, `foreign-types-macros 0.2.4`, `foreign-types-shared 0.3.1`, `hex 0.4.3`, `quick-error 2.0.1`, `toml_edit 0.25.13+spec-1.1.0`, `unicode-general-category 1.1.0`, `winit 0.30.13`
 
@@ -2484,189 +2668,6 @@ Apache License
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
-```
-
-#### Notice 8 — applies to 12 package(s)
-
-`color 0.3.3`, `fdeflate 0.3.7`, `fearless_simd 0.4.1`, `half 2.7.1`, `image 0.25.9`, `linebender_resource_handle 0.1.1`, `pin-project-lite 0.2.17`, `time 0.3.45`, `time-core 0.1.7`, `time-macros 0.2.25`, `vello_common 0.0.9`, `vello_cpu 0.0.9`
-
-```text
-Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
-
-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
-   1. Definitions.
-
-      "License" shall mean the terms and conditions for use, reproduction,
-      and distribution as defined by Sections 1 through 9 of this document.
-
-      "Licensor" shall mean the copyright owner or entity authorized by
-      the copyright owner that is granting the License.
-
-      "Legal Entity" shall mean the union of the acting entity and all
-      other entities that control, are controlled by, or are under common
-      control with that entity. For the purposes of this definition,
-      "control" means (i) the power, direct or indirect, to cause the
-      direction or management of such entity, whether by contract or
-      otherwise, or (ii) ownership of fifty percent (50%) or more of the
-      outstanding shares, or (iii) beneficial ownership of such entity.
-
-      "You" (or "Your") shall mean an individual or Legal Entity
-      exercising permissions granted by this License.
-
-      "Source" form shall mean the preferred form for making modifications,
-      including but not limited to software source code, documentation
-      source, and configuration files.
-
-      "Object" form shall mean any form resulting from mechanical
-      transformation or translation of a Source form, including but
-      not limited to compiled object code, generated documentation,
-      and conversions to other media types.
-
-      "Work" shall mean the work of authorship, whether in Source or
-      Object form, made available under the License, as indicated by a
-      copyright notice that is included in or attached to the work
-      (an example is provided in the Appendix below).
-
-      "Derivative Works" shall mean any work, whether in Source or Object
-      form, that is based on (or derived from) the Work and for which the
-      editorial revisions, annotations, elaborations, or other modifications
-      represent, as a whole, an original work of authorship. For the purposes
-      of this License, Derivative Works shall not include works that remain
-      separable from, or merely link (or bind by name) to the interfaces of,
-      the Work and Derivative Works thereof.
-
-      "Contribution" shall mean any work of authorship, including
-      the original version of the Work and any modifications or additions
-      to that Work or Derivative Works thereof, that is intentionally
-      submitted to Licensor for inclusion in the Work by the copyright owner
-      or by an individual or Legal Entity authorized to submit on behalf of
-      the copyright owner. For the purposes of this definition, "submitted"
-      means any form of electronic, verbal, or written communication sent
-      to the Licensor or its representatives, including but not limited to
-      communication on electronic mailing lists, source code control systems,
-      and issue tracking systems that are managed by, or on behalf of, the
-      Licensor for the purpose of discussing and improving the Work, but
-      excluding communication that is conspicuously marked or otherwise
-      designated in writing by the copyright owner as "Not a Contribution."
-
-      "Contributor" shall mean Licensor and any individual or Legal Entity
-      on behalf of whom a Contribution has been received by Licensor and
-      subsequently incorporated within the Work.
-
-   2. Grant of Copyright License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      copyright license to reproduce, prepare Derivative Works of,
-      publicly display, publicly perform, sublicense, and distribute the
-      Work and such Derivative Works in Source or Object form.
-
-   3. Grant of Patent License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      (except as stated in this section) patent license to make, have made,
-      use, offer to sell, sell, import, and otherwise transfer the Work,
-      where such license applies only to those patent claims licensable
-      by such Contributor that are necessarily infringed by their
-      Contribution(s) alone or by combination of their Contribution(s)
-      with the Work to which such Contribution(s) was submitted. If You
-      institute patent litigation against any entity (including a
-      cross-claim or counterclaim in a lawsuit) alleging that the Work
-      or a Contribution incorporated within the Work constitutes direct
-      or contributory patent infringement, then any patent licenses
-      granted to You under this License for that Work shall terminate
-      as of the date such litigation is filed.
-
-   4. Redistribution. You may reproduce and distribute copies of the
-      Work or Derivative Works thereof in any medium, with or without
-      modifications, and in Source or Object form, provided that You
-      meet the following conditions:
-
-      (a) You must give any other recipients of the Work or
-          Derivative Works a copy of this License; and
-
-      (b) You must cause any modified files to carry prominent notices
-          stating that You changed the files; and
-
-      (c) You must retain, in the Source form of any Derivative Works
-          that You distribute, all copyright, patent, trademark, and
-          attribution notices from the Source form of the Work,
-          excluding those notices that do not pertain to any part of
-          the Derivative Works; and
-
-      (d) If the Work includes a "NOTICE" text file as part of its
-          distribution, then any Derivative Works that You distribute must
-          include a readable copy of the attribution notices contained
-          within such NOTICE file, excluding those notices that do not
-          pertain to any part of the Derivative Works, in at least one
-          of the following places: within a NOTICE text file distributed
-          as part of the Derivative Works; within the Source form or
-          documentation, if provided along with the Derivative Works; or,
-          within a display generated by the Derivative Works, if and
-          wherever such third-party notices normally appear. The contents
-          of the NOTICE file are for informational purposes only and
-          do not modify the License. You may add Your own attribution
-          notices within Derivative Works that You distribute, alongside
-          or as an addendum to the NOTICE text from the Work, provided
-          that such additional attribution notices cannot be construed
-          as modifying the License.
-
-      You may add Your own copyright statement to Your modifications and
-      may provide additional or different license terms and conditions
-      for use, reproduction, or distribution of Your modifications, or
-      for any such Derivative Works as a whole, provided Your use,
-      reproduction, and distribution of the Work otherwise complies with
-      the conditions stated in this License.
-
-   5. Submission of Contributions. Unless You explicitly state otherwise,
-      any Contribution intentionally submitted for inclusion in the Work
-      by You to the Licensor shall be under the terms and conditions of
-      this License, without any additional terms or conditions.
-      Notwithstanding the above, nothing herein shall supersede or modify
-      the terms of any separate license agreement you may have executed
-      with Licensor regarding such Contributions.
-
-   6. Trademarks. This License does not grant permission to use the trade
-      names, trademarks, service marks, or product names of the Licensor,
-      except as required for reasonable and customary use in describing the
-      origin of the Work and reproducing the content of the NOTICE file.
-
-   7. Disclaimer of Warranty. Unless required by applicable law or
-      agreed to in writing, Licensor provides the Work (and each
-      Contributor provides its Contributions) on an "AS IS" BASIS,
-      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-      implied, including, without limitation, any warranties or conditions
-      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-      PARTICULAR PURPOSE. You are solely responsible for determining the
-      appropriateness of using or redistributing the Work and assume any
-      risks associated with Your exercise of permissions under this License.
-
-   8. Limitation of Liability. In no event and under no legal theory,
-      whether in tort (including negligence), contract, or otherwise,
-      unless required by applicable law (such as deliberate and grossly
-      negligent acts) or agreed to in writing, shall any Contributor be
-      liable to You for damages, including any direct, indirect, special,
-      incidental, or consequential damages of any character arising as a
-      result of this License or out of the use or inability to use the
-      Work (including but not limited to damages for loss of goodwill,
-      work stoppage, computer failure or malfunction, or any and all
-      other commercial damages or losses), even if such Contributor
-      has been advised of the possibility of such damages.
-
-   9. Accepting Warranty or Additional Liability. While redistributing
-      the Work or Derivative Works thereof, You may choose to offer,
-      and charge a fee for, acceptance of support, warranty, indemnity,
-      or other liability obligations and/or rights consistent with this
-      License. However, in accepting such obligations, You may act only
-      on Your own behalf and on Your sole responsibility, not on behalf
-      of any other Contributor, and only if You agree to indemnify,
-      defend, and hold each Contributor harmless for any liability
-      incurred by, or claims asserted against, such Contributor by reason
-      of your accepting any such warranty or additional liability.
-
-   END OF TERMS AND CONDITIONS
 ```
 
 #### Notice 9 — applies to 11 package(s)
@@ -4466,7 +4467,7 @@ DEALINGS IN THE SOFTWARE.
 
 #### Notice 38 — applies to 3 package(s)
 
-`idna 1.1.0`, `percent-encoding 2.3.2`, `url 2.5.8`
+`idna 1.1.0`, `percent-encoding 2.3.2`, `url 2.5.9`
 
 ```text
 Copyright (c) 2013-2025 The rust-url developers
@@ -4498,7 +4499,7 @@ DEALINGS IN THE SOFTWARE.
 
 #### Notice 39 — applies to 3 package(s)
 
-`quinn 0.11.11`, `quinn-proto 0.11.16`, `quinn-udp 0.5.15`
+`quinn 0.11.11`, `quinn-proto 0.11.19`, `quinn-udp 0.5.16`
 
 ```text
 Copyright (c) 2018 The quinn Developers
@@ -4738,7 +4739,7 @@ DEALINGS IN THE SOFTWARE.
 
 #### Notice 42 — applies to 3 package(s)
 
-`time 0.3.45`, `time-core 0.1.7`, `time-macros 0.2.25`
+`time 0.3.47`, `time-core 0.1.8`, `time-macros 0.2.27`
 
 ```text
 Copyright (c) Jacob Pratt et al.
@@ -5370,6 +5371,34 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #### Notice 56 — applies to 2 package(s)
 
+`nix 0.29.0`, `nix 0.31.4`
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2015 Carl Lerche + nix-rust Authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+#### Notice 57 — applies to 2 package(s)
+
 `nom 7.1.3`, `nom 8.0.0`
 
 ```text
@@ -5395,7 +5424,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 57 — applies to 2 package(s)
+#### Notice 58 — applies to 2 package(s)
 
 `rand 0.10.2`, `rand 0.8.7`
 
@@ -5578,7 +5607,7 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 END OF TERMS AND CONDITIONS
 ```
 
-#### Notice 58 — applies to 2 package(s)
+#### Notice 59 — applies to 2 package(s)
 
 `same-file 1.0.6`, `winapi-util 0.1.11`
 
@@ -5606,7 +5635,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Notice 59 — applies to 2 package(s)
+#### Notice 60 — applies to 2 package(s)
 
 `security-framework 3.7.0`, `security-framework-sys 2.17.0`
 
@@ -5633,7 +5662,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 60 — applies to 2 package(s)
+#### Notice 61 — applies to 2 package(s)
 
 `shlex 1.3.0`, `shlex 2.0.1`
 
@@ -5661,7 +5690,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Notice 61 — applies to 2 package(s)
+#### Notice 62 — applies to 2 package(s)
 
 `shlex 1.3.0`, `shlex 2.0.1`
 
@@ -5681,7 +5710,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 62 — applies to 2 package(s)
+#### Notice 63 — applies to 2 package(s)
 
 `tokio 1.53.1`, `tokio-util 0.7.19`
 
@@ -5709,7 +5738,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 63 — applies to 2 package(s)
+#### Notice 64 — applies to 2 package(s)
 
 `vello_common 0.0.9`, `vello_cpu 0.0.9`
 
@@ -5741,7 +5770,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 64 — applies to 2 package(s)
+#### Notice 65 — applies to 2 package(s)
 
 `winnow 0.7.15`, `winnow 1.0.4`
 
@@ -5766,7 +5795,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 65 — applies to 2 package(s)
+#### Notice 66 — applies to 2 package(s)
 
 `x11rb 0.13.2`, `x11rb-protocol 0.13.2`
 
@@ -5798,7 +5827,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 66 — applies to 2 package(s)
+#### Notice 67 — applies to 2 package(s)
 
 `zerocopy 0.8.55`, `zerocopy-derive 0.8.55`
 
@@ -5830,7 +5859,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 67 — applies to 2 package(s)
+#### Notice 68 — applies to 2 package(s)
 
 `zerocopy 0.8.55`, `zerocopy-derive 0.8.55`
 
@@ -6038,7 +6067,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 68 — applies to 1 package(s)
+#### Notice 69 — applies to 1 package(s)
 
 `ahash 0.8.12`
 
@@ -6070,7 +6099,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 69 — applies to 1 package(s)
+#### Notice 70 — applies to 1 package(s)
 
 `arrayvec 0.7.8`
 
@@ -6102,7 +6131,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 70 — applies to 1 package(s)
+#### Notice 71 — applies to 1 package(s)
 
 `async-broadcast 0.7.2`
 
@@ -6130,7 +6159,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 71 — applies to 1 package(s)
+#### Notice 72 — applies to 1 package(s)
 
 `async-broadcast 0.7.2`
 
@@ -6327,7 +6356,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 72 — applies to 1 package(s)
+#### Notice 73 — applies to 1 package(s)
 
 `autocfg 1.5.1`
 
@@ -6359,7 +6388,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 73 — applies to 1 package(s)
+#### Notice 74 — applies to 1 package(s)
 
 `base64 0.22.1`
 
@@ -6387,7 +6416,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Notice 74 — applies to 1 package(s)
+#### Notice 75 — applies to 1 package(s)
 
 `bindgen 0.72.1`
 
@@ -6423,7 +6452,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-#### Notice 75 — applies to 1 package(s)
+#### Notice 76 — applies to 1 package(s)
 
 `bit-set 0.9.1`
 
@@ -6455,7 +6484,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 76 — applies to 1 package(s)
+#### Notice 77 — applies to 1 package(s)
 
 `bit-vec 0.9.1`
 
@@ -6487,7 +6516,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 77 — applies to 1 package(s)
+#### Notice 78 — applies to 1 package(s)
 
 `block-buffer 0.10.4`
 
@@ -6519,7 +6548,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 78 — applies to 1 package(s)
+#### Notice 79 — applies to 1 package(s)
 
 `bytes 1.12.1`
 
@@ -6551,7 +6580,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 79 — applies to 1 package(s)
+#### Notice 80 — applies to 1 package(s)
 
 `cexpr 0.6.0`
 
@@ -6583,7 +6612,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 80 — applies to 1 package(s)
+#### Notice 81 — applies to 1 package(s)
 
 `cfg_aliases 0.2.2`
 
@@ -6599,7 +6628,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 81 — applies to 1 package(s)
+#### Notice 82 — applies to 1 package(s)
 
 `crc32fast 1.5.0`
 
@@ -6627,7 +6656,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 82 — applies to 1 package(s)
+#### Notice 83 — applies to 1 package(s)
 
 `crypto-common 0.1.7`
 
@@ -6659,7 +6688,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 83 — applies to 1 package(s)
+#### Notice 84 — applies to 1 package(s)
 
 `cursor-icon 1.2.0`
 
@@ -6685,7 +6714,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 84 — applies to 1 package(s)
+#### Notice 85 — applies to 1 package(s)
 
 `cursor-icon 1.2.0`
 
@@ -6893,7 +6922,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 85 — applies to 1 package(s)
+#### Notice 86 — applies to 1 package(s)
 
 `data-encoding 2.11.0`
 
@@ -6922,7 +6951,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 86 — applies to 1 package(s)
+#### Notice 87 — applies to 1 package(s)
 
 `deranged 0.5.8`
 
@@ -6948,7 +6977,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 87 — applies to 1 package(s)
+#### Notice 88 — applies to 1 package(s)
 
 `deranged 0.5.8`
 
@@ -7156,7 +7185,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 88 — applies to 1 package(s)
+#### Notice 89 — applies to 1 package(s)
 
 `digest 0.10.7`
 
@@ -7188,7 +7217,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 89 — applies to 1 package(s)
+#### Notice 90 — applies to 1 package(s)
 
 `dlib 0.5.3`
 
@@ -7214,7 +7243,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Notice 90 — applies to 1 package(s)
+#### Notice 91 — applies to 1 package(s)
 
 `document-features 0.2.12`
 
@@ -7240,7 +7269,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 91 — applies to 1 package(s)
+#### Notice 92 — applies to 1 package(s)
 
 `document-features 0.2.12`
 
@@ -7320,7 +7349,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 92 — applies to 1 package(s)
+#### Notice 93 — applies to 1 package(s)
 
 `enumflags2 0.7.12`
 
@@ -7352,7 +7381,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 93 — applies to 1 package(s)
+#### Notice 94 — applies to 1 package(s)
 
 `enumflags2 0.7.12`
 
@@ -7427,7 +7456,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 94 — applies to 1 package(s)
+#### Notice 95 — applies to 1 package(s)
 
 `enumflags2_derive 0.7.12`
 
@@ -7459,7 +7488,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 95 — applies to 1 package(s)
+#### Notice 96 — applies to 1 package(s)
 
 `enumflags2_derive 0.7.12`
 
@@ -7534,7 +7563,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 96 — applies to 1 package(s)
+#### Notice 97 — applies to 1 package(s)
 
 `equivalent 1.0.2`
 
@@ -7566,7 +7595,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 97 — applies to 1 package(s)
+#### Notice 98 — applies to 1 package(s)
 
 `errno 0.3.14`
 
@@ -7598,7 +7627,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 98 — applies to 1 package(s)
+#### Notice 99 — applies to 1 package(s)
 
 `fax 0.2.7`
 
@@ -7612,7 +7641,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 99 — applies to 1 package(s)
+#### Notice 100 — applies to 1 package(s)
 
 `flate2 1.1.9`
 
@@ -7644,7 +7673,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 100 — applies to 1 package(s)
+#### Notice 101 — applies to 1 package(s)
 
 `foldhash 0.2.0`
 
@@ -7670,9 +7699,9 @@ the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-#### Notice 101 — applies to 1 package(s)
+#### Notice 102 — applies to 1 package(s)
 
-`form_urlencoded 1.2.2`
+`form_urlencoded 1.2.3`
 
 ```text
 Copyright (c) 2013-2016 The rust-url developers
@@ -7702,7 +7731,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 102 — applies to 1 package(s)
+#### Notice 103 — applies to 1 package(s)
 
 `funty 2.0.0`
 
@@ -7730,7 +7759,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 103 — applies to 1 package(s)
+#### Notice 104 — applies to 1 package(s)
 
 `generic-array 0.14.7`
 
@@ -7758,7 +7787,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 104 — applies to 1 package(s)
+#### Notice 105 — applies to 1 package(s)
 
 `getrandom 0.2.17`
 
@@ -7791,7 +7820,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 105 — applies to 1 package(s)
+#### Notice 106 — applies to 1 package(s)
 
 `getrandom 0.4.3`
 
@@ -7824,7 +7853,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 106 — applies to 1 package(s)
+#### Notice 107 — applies to 1 package(s)
 
 `gpu-allocator 0.28.0`
 
@@ -7838,7 +7867,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 107 — applies to 1 package(s)
+#### Notice 108 — applies to 1 package(s)
 
 `gpu-allocator 0.28.0`
 
@@ -8046,7 +8075,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 108 — applies to 1 package(s)
+#### Notice 109 — applies to 1 package(s)
 
 `guillotiere 0.7.0`
 
@@ -8073,7 +8102,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 109 — applies to 1 package(s)
+#### Notice 110 — applies to 1 package(s)
 
 `guillotiere 0.7.0`
 
@@ -8093,7 +8122,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 110 — applies to 1 package(s)
+#### Notice 111 — applies to 1 package(s)
 
 `harfrust 0.7.0`
 
@@ -8101,7 +8130,7 @@ limitations under the License.
 ../LICENSE
 ```
 
-#### Notice 111 — applies to 1 package(s)
+#### Notice 112 — applies to 1 package(s)
 
 `hex 0.4.3`
 
@@ -8128,7 +8157,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 112 — applies to 1 package(s)
+#### Notice 113 — applies to 1 package(s)
 
 `idna_adapter 1.2.1`
 
@@ -8160,7 +8189,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 113 — applies to 1 package(s)
+#### Notice 114 — applies to 1 package(s)
 
 `indexmap 2.14.0`
 
@@ -8192,7 +8221,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 114 — applies to 1 package(s)
+#### Notice 115 — applies to 1 package(s)
 
 `io-kit-sys 0.4.1`
 
@@ -8206,7 +8235,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 115 — applies to 1 package(s)
+#### Notice 116 — applies to 1 package(s)
 
 `io-kit-sys 0.4.1`
 
@@ -8415,7 +8444,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 116 — applies to 1 package(s)
+#### Notice 117 — applies to 1 package(s)
 
 `lazy_static 1.5.0`
 
@@ -8447,7 +8476,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 117 — applies to 1 package(s)
+#### Notice 118 — applies to 1 package(s)
 
 `libc 0.2.189`
 
@@ -8479,7 +8508,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 118 — applies to 1 package(s)
+#### Notice 119 — applies to 1 package(s)
 
 `libloading 0.8.9`
 
@@ -8498,7 +8527,7 @@ NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE US
 THIS SOFTWARE.
 ```
 
-#### Notice 119 — applies to 1 package(s)
+#### Notice 120 — applies to 1 package(s)
 
 `libm 0.2.16`
 
@@ -8763,7 +8792,7 @@ have been licensed under extremely permissive terms.
 Copyright notices are retained in src/* files where relevant.
 ```
 
-#### Notice 120 — applies to 1 package(s)
+#### Notice 121 — applies to 1 package(s)
 
 `litrs 1.0.0`
 
@@ -8795,7 +8824,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 121 — applies to 1 package(s)
+#### Notice 122 — applies to 1 package(s)
 
 `lru-slab 0.1.2`
 
@@ -8809,7 +8838,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 122 — applies to 1 package(s)
+#### Notice 123 — applies to 1 package(s)
 
 `mach2 0.4.3`
 
@@ -8841,7 +8870,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 123 — applies to 1 package(s)
+#### Notice 124 — applies to 1 package(s)
 
 `matchers 0.2.0`
 
@@ -8867,7 +8896,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 124 — applies to 1 package(s)
+#### Notice 125 — applies to 1 package(s)
 
 `memoffset 0.9.1`
 
@@ -8893,7 +8922,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 125 — applies to 1 package(s)
+#### Notice 126 — applies to 1 package(s)
 
 `minimal-lexical 0.2.1`
 
@@ -8937,7 +8966,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-#### Notice 126 — applies to 1 package(s)
+#### Notice 127 — applies to 1 package(s)
 
 `miniz_oxide 0.8.9`
 
@@ -8969,40 +8998,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 127 — applies to 1 package(s)
+#### Notice 128 — applies to 1 package(s)
 
 `mio 1.2.2`
 
 ```text
 Copyright (c) 2014 Carl Lerche and other MIO contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-```
-
-#### Notice 128 — applies to 1 package(s)
-
-`nix 0.29.0`
-
-```text
-The MIT License (MIT)
-
-Copyright (c) 2015 Carl Lerche + nix-rust Authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9079,10 +9080,10 @@ SOFTWARE.
 
 #### Notice 131 — applies to 1 package(s)
 
-`num-conv 0.1.0`
+`num-conv 0.2.2`
 
 ```text
-Copyright (c) 2023 Jacob Pratt
+Copyright (c) Jacob Pratt
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9104,214 +9105,6 @@ SOFTWARE.
 ```
 
 #### Notice 132 — applies to 1 package(s)
-
-`num-conv 0.1.0`
-
-```text
-Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
-
-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-
-   1. Definitions.
-
-      "License" shall mean the terms and conditions for use, reproduction,
-      and distribution as defined by Sections 1 through 9 of this document.
-
-      "Licensor" shall mean the copyright owner or entity authorized by
-      the copyright owner that is granting the License.
-
-      "Legal Entity" shall mean the union of the acting entity and all
-      other entities that control, are controlled by, or are under common
-      control with that entity. For the purposes of this definition,
-      "control" means (i) the power, direct or indirect, to cause the
-      direction or management of such entity, whether by contract or
-      otherwise, or (ii) ownership of fifty percent (50%) or more of the
-      outstanding shares, or (iii) beneficial ownership of such entity.
-
-      "You" (or "Your") shall mean an individual or Legal Entity
-      exercising permissions granted by this License.
-
-      "Source" form shall mean the preferred form for making modifications,
-      including but not limited to software source code, documentation
-      source, and configuration files.
-
-      "Object" form shall mean any form resulting from mechanical
-      transformation or translation of a Source form, including but
-      not limited to compiled object code, generated documentation,
-      and conversions to other media types.
-
-      "Work" shall mean the work of authorship, whether in Source or
-      Object form, made available under the License, as indicated by a
-      copyright notice that is included in or attached to the work
-      (an example is provided in the Appendix below).
-
-      "Derivative Works" shall mean any work, whether in Source or Object
-      form, that is based on (or derived from) the Work and for which the
-      editorial revisions, annotations, elaborations, or other modifications
-      represent, as a whole, an original work of authorship. For the purposes
-      of this License, Derivative Works shall not include works that remain
-      separable from, or merely link (or bind by name) to the interfaces of,
-      the Work and Derivative Works thereof.
-
-      "Contribution" shall mean any work of authorship, including
-      the original version of the Work and any modifications or additions
-      to that Work or Derivative Works thereof, that is intentionally
-      submitted to Licensor for inclusion in the Work by the copyright owner
-      or by an individual or Legal Entity authorized to submit on behalf of
-      the copyright owner. For the purposes of this definition, "submitted"
-      means any form of electronic, verbal, or written communication sent
-      to the Licensor or its representatives, including but not limited to
-      communication on electronic mailing lists, source code control systems,
-      and issue tracking systems that are managed by, or on behalf of, the
-      Licensor for the purpose of discussing and improving the Work, but
-      excluding communication that is conspicuously marked or otherwise
-      designated in writing by the copyright owner as "Not a Contribution."
-
-      "Contributor" shall mean Licensor and any individual or Legal Entity
-      on behalf of whom a Contribution has been received by Licensor and
-      subsequently incorporated within the Work.
-
-   2. Grant of Copyright License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      copyright license to reproduce, prepare Derivative Works of,
-      publicly display, publicly perform, sublicense, and distribute the
-      Work and such Derivative Works in Source or Object form.
-
-   3. Grant of Patent License. Subject to the terms and conditions of
-      this License, each Contributor hereby grants to You a perpetual,
-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
-      (except as stated in this section) patent license to make, have made,
-      use, offer to sell, sell, import, and otherwise transfer the Work,
-      where such license applies only to those patent claims licensable
-      by such Contributor that are necessarily infringed by their
-      Contribution(s) alone or by combination of their Contribution(s)
-      with the Work to which such Contribution(s) was submitted. If You
-      institute patent litigation against any entity (including a
-      cross-claim or counterclaim in a lawsuit) alleging that the Work
-      or a Contribution incorporated within the Work constitutes direct
-      or contributory patent infringement, then any patent licenses
-      granted to You under this License for that Work shall terminate
-      as of the date such litigation is filed.
-
-   4. Redistribution. You may reproduce and distribute copies of the
-      Work or Derivative Works thereof in any medium, with or without
-      modifications, and in Source or Object form, provided that You
-      meet the following conditions:
-
-      (a) You must give any other recipients of the Work or
-          Derivative Works a copy of this License; and
-
-      (b) You must cause any modified files to carry prominent notices
-          stating that You changed the files; and
-
-      (c) You must retain, in the Source form of any Derivative Works
-          that You distribute, all copyright, patent, trademark, and
-          attribution notices from the Source form of the Work,
-          excluding those notices that do not pertain to any part of
-          the Derivative Works; and
-
-      (d) If the Work includes a "NOTICE" text file as part of its
-          distribution, then any Derivative Works that You distribute must
-          include a readable copy of the attribution notices contained
-          within such NOTICE file, excluding those notices that do not
-          pertain to any part of the Derivative Works, in at least one
-          of the following places: within a NOTICE text file distributed
-          as part of the Derivative Works; within the Source form or
-          documentation, if provided along with the Derivative Works; or,
-          within a display generated by the Derivative Works, if and
-          wherever such third-party notices normally appear. The contents
-          of the NOTICE file are for informational purposes only and
-          do not modify the License. You may add Your own attribution
-          notices within Derivative Works that You distribute, alongside
-          or as an addendum to the NOTICE text from the Work, provided
-          that such additional attribution notices cannot be construed
-          as modifying the License.
-
-      You may add Your own copyright statement to Your modifications and
-      may provide additional or different license terms and conditions
-      for use, reproduction, or distribution of Your modifications, or
-      for any such Derivative Works as a whole, provided Your use,
-      reproduction, and distribution of the Work otherwise complies with
-      the conditions stated in this License.
-
-   5. Submission of Contributions. Unless You explicitly state otherwise,
-      any Contribution intentionally submitted for inclusion in the Work
-      by You to the Licensor shall be under the terms and conditions of
-      this License, without any additional terms or conditions.
-      Notwithstanding the above, nothing herein shall supersede or modify
-      the terms of any separate license agreement you may have executed
-      with Licensor regarding such Contributions.
-
-   6. Trademarks. This License does not grant permission to use the trade
-      names, trademarks, service marks, or product names of the Licensor,
-      except as required for reasonable and customary use in describing the
-      origin of the Work and reproducing the content of the NOTICE file.
-
-   7. Disclaimer of Warranty. Unless required by applicable law or
-      agreed to in writing, Licensor provides the Work (and each
-      Contributor provides its Contributions) on an "AS IS" BASIS,
-      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
-      implied, including, without limitation, any warranties or conditions
-      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
-      PARTICULAR PURPOSE. You are solely responsible for determining the
-      appropriateness of using or redistributing the Work and assume any
-      risks associated with Your exercise of permissions under this License.
-
-   8. Limitation of Liability. In no event and under no legal theory,
-      whether in tort (including negligence), contract, or otherwise,
-      unless required by applicable law (such as deliberate and grossly
-      negligent acts) or agreed to in writing, shall any Contributor be
-      liable to You for damages, including any direct, indirect, special,
-      incidental, or consequential damages of any character arising as a
-      result of this License or out of the use or inability to use the
-      Work (including but not limited to damages for loss of goodwill,
-      work stoppage, computer failure or malfunction, or any and all
-      other commercial damages or losses), even if such Contributor
-      has been advised of the possibility of such damages.
-
-   9. Accepting Warranty or Additional Liability. While redistributing
-      the Work or Derivative Works thereof, You may choose to offer,
-      and charge a fee for, acceptance of support, warranty, indemnity,
-      or other liability obligations and/or rights consistent with this
-      License. However, in accepting such obligations, You may act only
-      on Your own behalf and on Your sole responsibility, not on behalf
-      of any other Contributor, and only if You agree to indemnify,
-      defend, and hold each Contributor harmless for any liability
-      incurred by, or claims asserted against, such Contributor by reason
-      of your accepting any such warranty or additional liability.
-
-   END OF TERMS AND CONDITIONS
-
-   APPENDIX: How to apply the Apache License to your work.
-
-      To apply the Apache License to your work, attach the following
-      boilerplate notice, with the fields enclosed by brackets "[]"
-      replaced with your own identifying information. (Don't include
-      the brackets!)  The text should be enclosed in the appropriate
-      comment syntax for the file format. We also recommend that a
-      file or class name and description of purpose be included on the
-      same "printed page" as the copyright notice for easier
-      identification within third-party archives.
-
-   Copyright 2023 Jacob Pratt
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-```
-
-#### Notice 133 — applies to 1 package(s)
 
 `opusic-c 1.6.1`
 
@@ -9346,7 +9139,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-#### Notice 134 — applies to 1 package(s)
+#### Notice 133 — applies to 1 package(s)
 
 `opusic-sys 0.7.3`
 
@@ -9397,7 +9190,7 @@ Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
 ```
 
-#### Notice 135 — applies to 1 package(s)
+#### Notice 134 — applies to 1 package(s)
 
 `ordered-float 5.3.0`
 
@@ -9429,7 +9222,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 136 — applies to 1 package(s)
+#### Notice 135 — applies to 1 package(s)
 
 `pam-client2 0.5.5`
 
@@ -9809,7 +9602,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 ```
 
-#### Notice 137 — applies to 1 package(s)
+#### Notice 136 — applies to 1 package(s)
 
 `pam-sys2 1.0.2`
 
@@ -9835,7 +9628,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 138 — applies to 1 package(s)
+#### Notice 137 — applies to 1 package(s)
 
 `pam-sys2 1.0.2`
 
@@ -10032,7 +9825,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 139 — applies to 1 package(s)
+#### Notice 138 — applies to 1 package(s)
 
 `pem 3.0.6`
 
@@ -10060,7 +9853,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 140 — applies to 1 package(s)
+#### Notice 139 — applies to 1 package(s)
 
 `png 0.18.1`
 
@@ -10092,7 +9885,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 141 — applies to 1 package(s)
+#### Notice 140 — applies to 1 package(s)
 
 `pollster 0.4.0`
 
@@ -10124,7 +9917,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 142 — applies to 1 package(s)
+#### Notice 141 — applies to 1 package(s)
 
 `powerfmt 0.2.0`
 
@@ -10150,7 +9943,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 143 — applies to 1 package(s)
+#### Notice 142 — applies to 1 package(s)
 
 `powerfmt 0.2.0`
 
@@ -10358,7 +10151,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 144 — applies to 1 package(s)
+#### Notice 143 — applies to 1 package(s)
 
 `ppv-lite86 0.2.21`
 
@@ -10390,7 +10183,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 145 — applies to 1 package(s)
+#### Notice 144 — applies to 1 package(s)
 
 `ppv-lite86 0.2.21`
 
@@ -10598,7 +10391,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 146 — applies to 1 package(s)
+#### Notice 145 — applies to 1 package(s)
 
 `quick-error 2.0.1`
 
@@ -10624,7 +10417,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 147 — applies to 1 package(s)
+#### Notice 146 — applies to 1 package(s)
 
 `radium 0.7.0`
 
@@ -10652,7 +10445,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 148 — applies to 1 package(s)
+#### Notice 147 — applies to 1 package(s)
 
 `rand_core 0.10.1`
 
@@ -10684,7 +10477,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 149 — applies to 1 package(s)
+#### Notice 148 — applies to 1 package(s)
 
 `rand_pcg 0.10.2`
 
@@ -10717,7 +10510,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 150 — applies to 1 package(s)
+#### Notice 149 — applies to 1 package(s)
 
 `raw-window-metal 1.1.0`
 
@@ -10741,7 +10534,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 151 — applies to 1 package(s)
+#### Notice 150 — applies to 1 package(s)
 
 `rcgen 0.14.8`
 
@@ -10962,7 +10755,7 @@ Apache License, version 2.0
    END OF TERMS AND CONDITIONS
 ```
 
-#### Notice 152 — applies to 1 package(s)
+#### Notice 151 — applies to 1 package(s)
 
 `renderdoc-sys 1.1.0`
 
@@ -10994,7 +10787,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 153 — applies to 1 package(s)
+#### Notice 152 — applies to 1 package(s)
 
 `ring 0.17.14`
 
@@ -11010,7 +10803,7 @@ See src/polyfill/once_cell/LICENSE-APACHE and src/polyfill/once_cell/LICENSE-MIT
 for the license to code that was sourced from the once_cell project.
 ```
 
-#### Notice 154 — applies to 1 package(s)
+#### Notice 153 — applies to 1 package(s)
 
 `rustls-native-certs 0.8.4`
 
@@ -11026,7 +10819,7 @@ respectively.  You may use this software under the terms of any
 of these licenses, at your option.
 ```
 
-#### Notice 155 — applies to 1 package(s)
+#### Notice 154 — applies to 1 package(s)
 
 `rustls-pemfile 2.2.0`
 
@@ -11042,7 +10835,7 @@ respectively.  You may use this software under the terms of any
 of these licenses, at your option.
 ```
 
-#### Notice 156 — applies to 1 package(s)
+#### Notice 155 — applies to 1 package(s)
 
 `rustls-pki-types 1.15.1`
 
@@ -11074,7 +10867,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 157 — applies to 1 package(s)
+#### Notice 156 — applies to 1 package(s)
 
 `rustls-pki-types 1.15.1`
 
@@ -11282,9 +11075,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 158 — applies to 1 package(s)
+#### Notice 157 — applies to 1 package(s)
 
-`rustls-webpki 0.103.15`
+`rustls-webpki 0.103.16`
 
 ```text
 Except as otherwise noted, this project is licensed under the following
@@ -11308,7 +11101,7 @@ The files under third-party/chromium are licensed as described in
 third-party/chromium/LICENSE.
 ```
 
-#### Notice 159 — applies to 1 package(s)
+#### Notice 158 — applies to 1 package(s)
 
 `ruzstd 0.9.1`
 
@@ -11336,7 +11129,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 160 — applies to 1 package(s)
+#### Notice 159 — applies to 1 package(s)
 
 `schannel 0.1.29`
 
@@ -11350,7 +11143,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 161 — applies to 1 package(s)
+#### Notice 160 — applies to 1 package(s)
 
 `scopeguard 1.2.0`
 
@@ -11382,7 +11175,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 162 — applies to 1 package(s)
+#### Notice 161 — applies to 1 package(s)
 
 `sha2 0.10.9`
 
@@ -11416,7 +11209,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 163 — applies to 1 package(s)
+#### Notice 162 — applies to 1 package(s)
 
 `sharded-slab 0.1.7`
 
@@ -11442,7 +11235,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Notice 164 — applies to 1 package(s)
+#### Notice 163 — applies to 1 package(s)
 
 `signal-hook-registry 1.4.8`
 
@@ -11474,7 +11267,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 165 — applies to 1 package(s)
+#### Notice 164 — applies to 1 package(s)
 
 `simd-adler32 0.3.10`
 
@@ -11502,7 +11295,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 166 — applies to 1 package(s)
+#### Notice 165 — applies to 1 package(s)
 
 `slab 0.4.12`
 
@@ -11534,7 +11327,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 167 — applies to 1 package(s)
+#### Notice 166 — applies to 1 package(s)
 
 `smallvec 1.15.2`
 
@@ -11566,7 +11359,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 168 — applies to 1 package(s)
+#### Notice 167 — applies to 1 package(s)
 
 `stable_deref_trait 1.2.1`
 
@@ -11598,7 +11391,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 169 — applies to 1 package(s)
+#### Notice 168 — applies to 1 package(s)
 
 `static_assertions 1.1.0`
 
@@ -11626,7 +11419,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 170 — applies to 1 package(s)
+#### Notice 169 — applies to 1 package(s)
 
 `subtle 2.6.1`
 
@@ -11662,7 +11455,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-#### Notice 171 — applies to 1 package(s)
+#### Notice 170 — applies to 1 package(s)
 
 `symlink 0.1.0`
 
@@ -11694,7 +11487,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 172 — applies to 1 package(s)
+#### Notice 171 — applies to 1 package(s)
 
 `synstructure 0.13.2`
 
@@ -11708,7 +11501,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 173 — applies to 1 package(s)
+#### Notice 172 — applies to 1 package(s)
 
 `tap 1.0.1`
 
@@ -11736,7 +11529,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 174 — applies to 1 package(s)
+#### Notice 173 — applies to 1 package(s)
 
 `target-lexicon 0.13.5`
 
@@ -11961,7 +11754,7 @@ the License, but only in their entirety and only with respect to the Combined
 Software.
 ```
 
-#### Notice 175 — applies to 1 package(s)
+#### Notice 174 — applies to 1 package(s)
 
 `tiff 0.10.3`
 
@@ -11989,7 +11782,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 176 — applies to 1 package(s)
+#### Notice 175 — applies to 1 package(s)
 
 `tokio-macros 2.7.2`
 
@@ -12018,7 +11811,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 177 — applies to 1 package(s)
+#### Notice 176 — applies to 1 package(s)
 
 `tokio-tungstenite 0.24.0`
 
@@ -12045,7 +11838,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Notice 178 — applies to 1 package(s)
+#### Notice 177 — applies to 1 package(s)
 
 `tungstenite 0.24.0`
 
@@ -12072,7 +11865,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### Notice 179 — applies to 1 package(s)
+#### Notice 178 — applies to 1 package(s)
 
 `type-map 0.5.1`
 
@@ -12158,7 +11951,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 180 — applies to 1 package(s)
+#### Notice 179 — applies to 1 package(s)
 
 `type-map 0.5.1`
 
@@ -12570,7 +12363,7 @@ limitations under the License.
    limitations under the License.
 ```
 
-#### Notice 181 — applies to 1 package(s)
+#### Notice 180 — applies to 1 package(s)
 
 `typenum 1.20.1`
 
@@ -12578,7 +12371,7 @@ limitations under the License.
 MIT OR Apache-2.0
 ```
 
-#### Notice 182 — applies to 1 package(s)
+#### Notice 181 — applies to 1 package(s)
 
 `typenum 1.20.1`
 
@@ -12606,7 +12399,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 183 — applies to 1 package(s)
+#### Notice 182 — applies to 1 package(s)
 
 `typenum 1.20.1`
 
@@ -12814,7 +12607,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 184 — applies to 1 package(s)
+#### Notice 183 — applies to 1 package(s)
 
 `untrusted 0.9.0`
 
@@ -12834,7 +12627,7 @@ limitations under the License.
 // OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
-#### Notice 185 — applies to 1 package(s)
+#### Notice 184 — applies to 1 package(s)
 
 `utf8_iter 1.0.4`
 
@@ -12866,7 +12659,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 186 — applies to 1 package(s)
+#### Notice 185 — applies to 1 package(s)
 
 `uuid 1.24.0`
 
@@ -12899,7 +12692,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 187 — applies to 1 package(s)
+#### Notice 186 — applies to 1 package(s)
 
 `version-compare 0.2.1`
 
@@ -12925,7 +12718,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 188 — applies to 1 package(s)
+#### Notice 187 — applies to 1 package(s)
 
 `version_check 0.9.5`
 
@@ -12951,7 +12744,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 189 — applies to 1 package(s)
+#### Notice 188 — applies to 1 package(s)
 
 `web-time 1.1.0`
 
@@ -12979,7 +12772,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 190 — applies to 1 package(s)
+#### Notice 189 — applies to 1 package(s)
 
 `web-time 1.1.0`
 
@@ -13187,7 +12980,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 191 — applies to 1 package(s)
+#### Notice 190 — applies to 1 package(s)
 
 `webbrowser 1.2.2`
 
@@ -13221,7 +13014,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 192 — applies to 1 package(s)
+#### Notice 191 — applies to 1 package(s)
 
 `webbrowser 1.2.2`
 
@@ -13418,7 +13211,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### Notice 193 — applies to 1 package(s)
+#### Notice 192 — applies to 1 package(s)
 
 `weezl 0.1.12`
 
@@ -13446,7 +13239,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 194 — applies to 1 package(s)
+#### Notice 193 — applies to 1 package(s)
 
 `xkbcommon-dl 0.4.2`
 
@@ -13474,7 +13267,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 195 — applies to 1 package(s)
+#### Notice 194 — applies to 1 package(s)
 
 `xkeysym 0.2.1`
 
@@ -13500,7 +13293,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Notice 196 — applies to 1 package(s)
+#### Notice 195 — applies to 1 package(s)
 
 `xkeysym 0.2.1`
 
@@ -13708,7 +13501,7 @@ Apache License
    limitations under the License.
 ```
 
-#### Notice 197 — applies to 1 package(s)
+#### Notice 196 — applies to 1 package(s)
 
 `yasna 0.6.0`
 
@@ -13722,7 +13515,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 198 — applies to 1 package(s)
+#### Notice 197 — applies to 1 package(s)
 
 `zeroize 1.9.0`
 
@@ -13754,9 +13547,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### Notice 199 — applies to 1 package(s)
+#### Notice 198 — applies to 1 package(s)
 
-`zip 7.3.0`
+`zip 9.0.5`
 
 ```text
 The MIT License (MIT)
@@ -13780,12 +13573,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-Some files in the "tests/data" subdirectory of this repository are under other
-licences; see files named LICENSE.*.txt for details.
 ```
 
-#### Notice 200 — applies to 1 package(s)
+#### Notice 199 — applies to 1 package(s)
 
 `zlib-rs 0.6.6`
 

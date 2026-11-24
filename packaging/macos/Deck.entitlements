@@ -51,7 +51,7 @@
            Profile authorizes: packet-tunnel-provider-systemextension,
            app-proxy-provider-systemextension, content-filter-provider-systemextension,
            dns-proxy-systemextension, dns-settings, relay, url-filter-provider,
-           hotspot-provider. Add when Span Network Extension bundle ships.
+           hotspot-provider. Add when a Network Extension bundle ships.
 
          com.apple.developer.networking.vpn.api (allow-vpn)
            Companion to networkextension. Add together with above.

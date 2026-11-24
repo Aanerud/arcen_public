@@ -112,7 +112,6 @@ disagree or cross-product copies grow. The Shared Adoption Index trend is in
 
 | Document | Covers |
 | --- | --- |
-| [`LEXICON.md`](LEXICON.md) | The canonical vocabulary |
 | [`transport.md`](transport.md) | Direct QUIC: carrier, lanes, congestion control, known gaps |
 | [`tls-certificate-lifecycle.md`](tls-certificate-lifecycle.md) | Certificate generation, validation, pinning and reload |
 | [`session-auto-reconnect.md`](session-auto-reconnect.md) | Credential-free resume after a dropped connection |
@@ -125,10 +124,9 @@ disagree or cross-product copies grow. The Shared Adoption Index trend is in
 | [`qp-maps.md`](qp-maps.md) | Keel's damage grid as NVENC QP maps |
 | [`arcen-keel.md`](arcen-keel.md) | Keel, the content-adaptive engine (planning document) |
 | [`nvenc-sdk13-blackwell.md`](nvenc-sdk13-blackwell.md) | NVENC SDK 13 on Blackwell: 4:2:2 and Ultra High Quality |
-| [`codec-royalties.md`](codec-royalties.md) | What the public record says about codec royalties and AV1 |
 | [`audio-compression.md`](audio-compression.md), [`audio-input.md`](audio-input.md) | Host audio out and the Deck's microphone in |
 | [`pen-tablet-input.md`](pen-tablet-input.md) | Typed pen and tablet input (local termination) |
-| [`linux-wayland-provider.md`](linux-wayland-provider.md) | The Linux Wayland provider, with lab evidence; qualification records in [`wayland-qualification/`](wayland-qualification) |
+| [`linux-wayland-provider.md`](linux-wayland-provider.md) | The Linux Wayland provider: desktops, capture, input and host qualification |
 | [`windows-console-policy.md`](windows-console-policy.md) | What the Windows Pier does with the physical console |
 | [`display-lifecycle.md`](display-lifecycle.md) | What a session leaves behind: displays removed or restored, stranded windows moved back |
 | [`timezone-redirection.md`](timezone-redirection.md) | The session following the Deck's time zone |

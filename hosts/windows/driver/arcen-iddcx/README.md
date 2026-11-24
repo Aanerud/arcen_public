@@ -3,7 +3,7 @@
 This directory is original, independently authored Arcen source using only
 Microsoft's public UMDF 2, WDF, DXGI/D3D11, and IddCx 1.4 API surface. It does
 not copy or derive from Microsoft driver samples, community virtual-display
-drivers, third-party source, proprietary SDK payloads, or a local reference corpus.
+drivers, third-party source, or proprietary SDK payloads.
 
 The driver exposes one root-enumerated indirect adapter and accepts a fixed
 versioned buffered-I/O contract from Arcen Pier. One exclusive control handle
@@ -67,8 +67,8 @@ all verify. The LocalSystem broker opens the protected control device and
 passes only that inherited handle to the session agent.
 
 `arcen-iddcx.vcxproj` targets x64 UMDF 2.33 and IddCx 1.4 (Windows 10 1903+).
-WDK 10.0.26100 on pier-windows.example.internal compiled and linked Release/x64 with no warnings;
-INF signability and catalog generation also passed. No driver was installed.
+WDK 10.0.26100 compiles and links Release/x64 with no warnings; INF
+signability and catalog generation also pass.
 An unsigned WDK build is development evidence only. Do not install, sign,
 stage, or deploy this driver without Release/Security-approved certificate and
 Microsoft signing inputs. Windows Server distribution remains blocked on an

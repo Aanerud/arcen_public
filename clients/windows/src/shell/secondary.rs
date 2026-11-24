@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Match My Layout's further windows (owner: `ui` stream): one borderless
+//! Match My Layout's further windows: one borderless
 //! fullscreen window per negotiated monitor beyond the one the root window
 //! shows, as the macOS Deck opens one native fullscreen window per display.
 //!

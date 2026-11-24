@@ -121,7 +121,7 @@
       "roundtrip_pattern": "grey_ramp",
       "sustained_fps": 42.40198200541952,
       "bitrate_mbps": 16.55084496891593,
-      "notes": "Target row succeeded in a required-hardware VideoToolbox session and delivered xf44. Five-pattern maxima: grey_ramp=0, shadow_highlight_wedge=1, saturated_primaries=0, chroma_detail=1, full_gamut_noise=252. A live pier-windows.example.internal session on its configured GRID V100D-16Q also logged variant=hevc-444-10-full-bt709, full-range VUI and READY bit_depth=10 range=full; Deck displayed the desktop and reported negotiated exactly as requested. Retest on pier-linux.example.internal's GRID V100D-16Q: the Linux matrix initialised both HEVC 4:4:4 and 4:2:0 10-bit rows; ffprobe reported Rext yuv444p10le full-range BT.709; the corrected per-frame wire flags made Deck receive xf44-full, decode 1800x1130 in hardware, and report negotiated exactly as requested."
+      "notes": "Target row succeeded in a required-hardware VideoToolbox session and delivered xf44. Five-pattern maxima: grey_ramp=0, shadow_highlight_wedge=1, saturated_primaries=0, chroma_detail=1, full_gamut_noise=252. A live Windows Pier session on a GRID V100D-16Q also logged variant=hevc-444-10-full-bt709, full-range VUI and READY bit_depth=10 range=full; Deck displayed the desktop and reported negotiated exactly as requested. Retest on a Linux Pier's GRID V100D-16Q: the Linux matrix initialised both HEVC 4:4:4 and 4:2:0 10-bit rows; ffprobe reported Rext yuv444p10le full-range BT.709; the corrected per-frame wire flags made Deck receive xf44-full, decode 1800x1130 in hardware, and report negotiated exactly as requested."
     },
     {
       "variant": "hevc-444-10-limited-bt709",

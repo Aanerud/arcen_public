@@ -864,10 +864,8 @@ enum Pending {
 
 /// Watches the desktop cursor and reports its changes.
 ///
-/// Polls, because nothing notifies. The reference implementation this was
-/// checked against does the same — its own log vocabulary has "cursor polling
-/// resumed" and "cursor polling suspended" — and it reads exactly these
-/// properties: `currentSystemCursor`, its `image`, and its `hotSpot`.
+/// Polls, because nothing notifies. It reads `currentSystemCursor`, its
+/// `image`, and its `hotSpot`.
 ///
 /// With [`CursorReport::Images`] a hidden pointer, and every new image drawn
 /// at the scale of the output under the pointer, go through the shared

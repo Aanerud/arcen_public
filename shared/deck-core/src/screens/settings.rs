@@ -27,7 +27,7 @@ use crate::settings::{
     effective_color_fidelity_variant,
 };
 
-/// Which settings panel is showing. Mirrors the reference client's left nav.
+/// Which settings panel is showing in the left navigation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SettingsTab {
     #[default]

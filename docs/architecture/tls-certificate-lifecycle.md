@@ -3,8 +3,7 @@
 > **Status (2026-07-31): implemented for direct QUIC.** The shared policy and
 > Windows/Linux Pier adapters serve QUIC on UDP 18444. The default
 > `arcen-transport` build remains a
-> dependency-light TLS lifecycle core; product crates opt into Quinn. Arcen
-> Span remains dormant.
+> dependency-light TLS lifecycle core; product crates opt into Quinn.
 
 **Owners:** Shared/Architecture, Release/Security, Linux Host, Windows Host, and
 macOS Client.

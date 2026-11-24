@@ -8,12 +8,13 @@ Runs the real Arcen Deck GUI against a real Pier, opens the latency page in a
 real browser inside the host desktop, drives the Deck window with real macOS
 input (realscreen-driver), and reports what reached the glass and when.
 
-  realscreen.py run --ssh root@HOST --port 18444 --pin-file host.pin \
+  realscreen.py run --ssh ADMIN@HOST --port 18444 --pin-file host.pin \
       --deck-app "/path/Arcen Deck.app" --pipeline auto --device mouse \
       --label x11-prod-auto-mouse --out results/
   realscreen.py analyze <run-dir>      # re-analyse a finished run
 
-Credentials come from a local file (default ~/.arcen-nightly.env) holding a
+Credentials come from a local file (default ~/.arcen-realscreen.env, or
+$ARCEN_REALSCREEN_CREDENTIALS) holding a
 line "<label> : <user> / <password>"; they go to the Deck on stdin
 (--credentials-stdin) and are never written anywhere. See
 docs/testing/realscreen.md.
@@ -756,7 +757,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     run = sub.add_parser("run")
-    run.add_argument("--ssh", required=True, help="root@host used to place the page and read logs")
+    run.add_argument("--ssh", required=True, help="administrator@host used to place the page and read logs")
     run.add_argument("--connect-host", help="address the Deck connects to (default: the ssh host)")
     run.add_argument("--port", type=int, default=18444)
     run.add_argument("--pin", help="certificate SHA-256 (colon hex)")
@@ -781,7 +782,8 @@ def main():
     run.add_argument("--region", help="stylus phase: canvas box as window fractions x0,y0,x1,y1")
     run.add_argument("--settle", type=float, default=3, help="seconds after the page is up before driving")
     run.add_argument("--escape-first", action="store_true", help="press Escape first (GNOME overview)")
-    run.add_argument("--credentials", default="~/.arcen-nightly.env")
+    run.add_argument("--credentials",
+                     default=os.environ.get("ARCEN_REALSCREEN_CREDENTIALS", "~/.arcen-realscreen.env"))
     run.add_argument("--cred-label", default="Shared AD user")
     run.add_argument("--host-user", help="host account owning the desktop (default: credential user)")
     run.add_argument("--host-dir", default="/opt/arcen-build/realscreen")

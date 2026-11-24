@@ -2,7 +2,7 @@
 
 Audio Input is an opt-in microphone-v1 subprotocol on the unchanged global
 protocol v3. It applies only to direct macOS Deck connections to Linux and
-Windows Piers. Span and Windows Deck remain dormant.
+Windows Piers.
 
 Deck advertises microphone-v1 only after the user enables its launch-only local
 toggle. Microphone consent is never restored from persisted settings, so every

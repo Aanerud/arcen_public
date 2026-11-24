@@ -136,8 +136,8 @@ any current product can yet stream more than one monitor.
 
 ## Legal and provenance boundary
 
-- The implementation and later product work must not access, copy, port, or
-  derive from a local reference corpus.
+- The implementation and later product work must not copy, port, or derive
+  from another product's source or binaries.
 - Any future source reuse remains governed by
   `legal/ORIGINS.md` and must be recorded in
   `legal/ORIGINS.md`.

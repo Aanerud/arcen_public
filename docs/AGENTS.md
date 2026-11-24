@@ -16,8 +16,7 @@ copy boundary, encoder format, negotiated transfer/primaries, Deck
 presentation, and any truthful degradation.
 
 Write user-facing text (release notes, `CHANGELOG.md` entries under
-`[Unreleased]`, public GitHub release bodies and Deck UI strings) in the house
-style, [Thinking with Style](style/thinking-with-style.md): one plain sentence
+`[Unreleased]`, public GitHub release bodies and Deck UI strings) plainly: one sentence
 per change from the user's side, grouped by product, with no internal causes,
 file names, PR numbers or ADRs. That detail stays in commits and pull requests.
 

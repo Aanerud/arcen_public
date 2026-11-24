@@ -74,7 +74,7 @@ Rejected as a *shipping* path for three reasons:
 
 Use only Microsoft's public WDK/IddCx headers and API documentation, with
 original Arcen implementation. Do not copy Microsoft samples, community
-drivers, proprietary SDK payloads, or a local reference corpus. This gives a clean vendor
+drivers, proprietary SDK payloads, or another product's code. This gives a clean vendor
 namespace, a bounded IOCTL interface designed for the LocalSystem broker, and
 explicit render-adapter LUID selection.
 
@@ -101,13 +101,12 @@ writes only the missing EDIDs, re-probes CCD/DXGI, and admits the request only
 after the requested targets are active. The EDID changes then commit or roll
 back with the physical output-provider transaction.
 
-pier-windows.example.internal evidence on 2026-08-11 found two NVIDIA vGPUs with four native
-display IDs each: two active targets and six empty targets. A guarded RTX spare
-target became connected, active, and CCD-available in 1.561 seconds and returned
-to the exact empty baseline in 0.995 seconds. Product policy reserves the
-RTX6000-8Q for DaVinci Resolve compute/rendering and selects the V100D-16Q as
-Arcen's sole display/capture/NVENC adapter; the same combined transaction must
-pass on that selected adapter before release closure.
+A Windows host with two NVIDIA vGPUs showed four native display IDs each: two
+active targets and six empty targets. A guarded spare target became connected,
+active, and CCD-available in 1.561 seconds and returned to the exact empty
+baseline in 0.995 seconds. On a host with more than one adapter, one is
+selected as Arcen's sole display/capture/NVENC adapter; the same combined
+transaction must pass on that selected adapter before release closure.
 
 ### Current ongoing work: combined Windows rollback
 
@@ -178,9 +177,8 @@ The first tranche now provides:
 4. source-only manifests, portable lifecycle tests, and an unsigned WDK build
    path that never signs, installs, or deploys.
 
-On pier-windows.example.internal, WDK 10.0.26100 compiled and linked the x64 Release project with
-zero warnings and passed INF signability/catalog generation. No driver was
-installed.
+WDK 10.0.26100 compiles and links the x64 Release project with zero warnings
+and passes INF signability/catalog generation.
 
 Shipping remains sequenced behind Release/Security-owned EV certificate,
 Partner Center attestation, and the Windows Server WHQL/HLK decision. Physical

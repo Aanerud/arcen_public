@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! The Deck's displays in a connection (owner: `ui` stream), by the macOS
+//! The Deck's displays in a connection, by the macOS
 //! Deck's rules, which live in `arcen_deck_core`: the Displays mode an
 //! attempt uses (`connect_plan::resolve_attempt_displays_mode`), Match My
 //! Layout's preflight and requested topology (`connect_plan::

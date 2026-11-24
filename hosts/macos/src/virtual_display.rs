@@ -10,8 +10,7 @@
 //! up, which is soft in a way no amount of bitrate fixes.
 //!
 //! The way out is to add a display. `CGVirtualDisplay` and its three companion
-//! classes do that, and the reference agent this was checked against depends
-//! on exactly them.
+//! classes do that.
 //!
 //! # These classes are private
 //!

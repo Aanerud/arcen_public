@@ -14,8 +14,8 @@
 //!   -> retained BGRA frame -> NVENC (ARGB input) as on the host-copy route
 //! ```
 //!
-//! Why this shape (measured on NVIDIA 580 with `nvidia-drm modeset=1`,
-//! `docs/architecture/wayland-qualification/rocky10-gnome49-nvidia-grid-nodrm.md`):
+//! Why this shape (measured on NVIDIA 580 with `nvidia-drm modeset=1` on
+//! Rocky Linux 10, GNOME 49):
 //! `cuGraphicsEGLRegisterImage` refuses block-linear EGL images
 //! (`CUDA_ERROR_INVALID_VALUE`), and so does `cuGraphicsGLRegisterImage` on a
 //! texture backed by the image; a GL blit from it into an ordinary texture

@@ -36,26 +36,23 @@ module. The bridged device enumerates on a virtual bus and the vendor driver
 (`wacom.ko`) binds to it exactly as it would to physical hardware. Windows has
 no equivalent in the box, and that single missing piece is the whole gap.
 
-### What prior art establishes
+### What shapes the design
 
-These observations come from publicly observable packaging and driver-class
-behaviour of incumbent commercial remote-desktop products. **No code, binary, or
-payload from any third party is used, and none is proposed here** — only the
-mechanism and its requirements. See
+**No third-party code, binary, or payload is used, and none is proposed
+here** — only the mechanism and its requirements. See
 [`legal/ORIGINS.md`](../../legal/ORIGINS.md).
 
 Three facts are worth having:
 
-1. **Bridged Wacom on Windows is a solved problem elsewhere**, with the
-   same low-latency caveat as Linux — it is not blocked by anything intrinsic
-   to Windows.
-2. **The two tablet modes are served by two entirely different drivers.**
-   Locally terminated termination uses a KMDF *virtual HID* driver on the
-   standard Windows `HIDClass`; bridging ships as a wholly separate USB driver.
-   Nothing in that design tries to serve both modes from one mechanism, which
-   corroborates Arcen's own split between the typed path and the USB bridge.
-3. **The usual local-termination approach is one Arcen does not need.** It
-   relies on a signed kernel HID driver; `InjectSyntheticPointerInput` (Windows
+1. **Bridging a Wacom tablet on Windows is possible**, with the same
+   low-latency caveat as Linux — nothing intrinsic to Windows blocks it.
+2. **The two tablet modes need two entirely different drivers.** Local
+   termination fits a KMDF *virtual HID* driver on the standard Windows
+   `HIDClass`; bridging needs a wholly separate USB driver. Serving both
+   modes from one mechanism does not fit, which is Arcen's own split between
+   the typed path and the USB bridge.
+3. **Local termination does not need a kernel HID driver.** A signed kernel
+   HID driver is the usual approach; `InjectSyntheticPointerInput` (Windows
    10 1809, October 2018) delivers real `PT_PEN` pressure, tilt and rotation
    from user mode, and that is what `hosts/windows/src/input.rs` already uses.
    Arcen's Windows Light path therefore requires **no driver, no EV certificate
@@ -130,9 +127,9 @@ of that pipeline; `arcen-microphone` is.
 
 **The gate on this ADR has cleared.** It previously said no work should start
 until the physical Linux pen retest passed. It passed on 2026-08-25: a live GUI
-session against pier-linux.example.internal bridged the real `056a:0317` and the operator confirmed
-the pen drives the pointer, with the host log showing the typed device released
-and one tablet on the seat. (The lab record itself is not published.)
+session against a Linux Pier bridged the real `056a:0317` and the pen drove
+the pointer, with the host log showing the typed device released and one
+tablet on the seat.
 
 That removes the reason to defer the *decision*. It does not by itself justify
 starting the *work*, for two remaining reasons:

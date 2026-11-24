@@ -38,6 +38,8 @@ collects the logs.
 - [USB devices](#usb-devices)
 - [More than one display](#more-than-one-display)
 - [The Pier will not start](#the-pier-will-not-start)
+- [macOS Pier (preview)](#macos-pier-preview): where each log is, and the
+  common surprises
 
 ## Cannot connect
 
@@ -216,3 +218,72 @@ See [Clipboard redirection](../security/clipboard-redirection.md) for the policy
 | Linux: `DESKTOP_PROVIDER_UNAVAILABLE` (2005) | No desktop provider it can serve (no Xorg, Wayland not qualified). | See [Wayland provider blockers](error-codes.md#wayland-provider-blockers). |
 | Capture or encode fails at the first session | The capenc READY line and `SESSION_STREAM_START` (1102) fields. `not_built` means the backend was not compiled in; `capenc READY protocol error: missing cursor` means an old Pier binary. | Reinstall the matching Pier build. Exact codec or `video.variant` pins refuse substitution by design. |
 | The health snapshot says `overall_state: unavailable` during a working session | `HEALTH_SNAPSHOT` (1806). | Known: do not alert on `overall_state` yet; use `SESSION_STREAM_START` and the QoS fields. |
+
+## macOS Pier (preview)
+
+A macOS Pier runs in two parts: a network service (`arcen-pier-macos
+daemon`, under the hidden `_arcen` account) that takes connections and
+sign-ins, and a desktop agent (`arcen-agent-helper agent`) in each signed-in
+user's session that captures the screen, the sound and the input. Most
+answers are in the agent's log.
+
+### Where the logs are
+
+| Log | Where | Shows |
+| --- | --- | --- |
+| Install | `grep 'Arcen Pier:' /var/log/install.log` | What the installer did. A good install ends with `desktop agent running for uid <n>`, one line per signed-in user. |
+| Service | `/Library/Logs/Arcen/Pier/service.log` | The network service: start, certificate and port errors. |
+| Service records | `/Library/Logs/Arcen/Pier/arcen-pier-macos.jsonl` | The service's JSON records (`SERVICE_START`, certificate events), and the sessions served at the login window. |
+| Agent | `~/Library/Logs/Arcen/Pier/agent.log`, in each user's home | That user's sessions in plain text: stream start, sound, pointer, why a session ended. |
+| Agent records | `~/Library/Logs/Arcen/Pier/arcen-pier-macos.jsonl`, in each user's home | That user's JSON records: `SESSION_AUTH_OK`, `SESSION_AUTH_FAIL`, `SESSION_STREAM_START`, `HEALTH_SNAPSHOT`, `SESSION_END`. |
+| Mac Deck | `~/Library/Logs/Arcen/arcen-client.log.<date>`, on the Deck's Mac | What the Deck asked for and got: display refresh, pointer, health. |
+| Lock screen | `sudo log show --last 15m --predicate 'process == "loginwindow"'` | Whether the Mac took a password: `Unlock succeeded, with password` or `INCORRECT password`. |
+
+Administrators read the files under `/Library/Logs/Arcen/Pier` without
+`sudo`. No log records which keys were typed.
+
+**More detail.** Packages log at `logging.level` 0, lifecycle events only.
+To reproduce a problem, set `"level": 2` (Info) or `3` (Debug) under
+`logging` in `/Library/Application Support/Arcen/pier.json`, then restart
+the service and the agent:
+
+```sh
+sudo launchctl kickstart -k system/pier.arcen.tech.service
+launchctl kickstart -k gui/$(id -u)/pier.arcen.tech.agent   # as the user; ends and locks a running session
+```
+
+On the Deck, choose **Settings › Logs › Log level: Info**. Set both back
+to 0 when you are done. The Deck's display-refresh and pointer lines, and
+the agent's pointer line, in the table below appear only at Info.
+
+**Is it running?**
+
+```sh
+pgrep -fl 'pier-macos daemon|agent-helper'   # the service, and one agent per signed-in user
+grep 'session stream start' ~/Library/Logs/Arcen/Pier/agent.log | tail -1
+grep HEALTH_SNAPSHOT ~/Library/Logs/Arcen/Pier/arcen-pier-macos.jsonl | tail -3
+```
+
+**Reading `HEALTH_SNAPSHOT`.** `fps_target` is the rate the session
+promised, `fps_actual` the frames the Pier sent each second, and
+`fps_content` the frames each second in which something on the screen
+changed. The Pier sends only what changes, so low `fps_content` and
+`fps_actual` mean a still screen, which is normal. A problem shows as
+`fps_actual` well below `fps_content`: the screen changed faster than the
+Pier sent it.
+
+### Symptoms
+
+| You see | What to check | Fix |
+| --- | --- | --- |
+| No sound in a user's first session | The agent log says `host audio did not start within 1500 ms`. macOS asks each user once to allow System Audio Recording for **Arcen Agent Helper**; until someone answers, the session serves without sound. | Answer the prompt at the Mac, or allow **Arcen Agent Helper** under System Settings › Privacy & Security › System Audio Recording. The next session has sound. A virtual default output, such as another remote-desktop product's speakers, works. |
+| The pointer moves but keys do nothing | **Arcen Agent Helper** lacks Accessibility; pointer input does not need it, keys do. | Allow it under System Settings › Privacy & Security › Accessibility, in that user's session. |
+| The lock screen rejects a password you know is right | The lock-screen log says `INCORRECT password`. With **Keys only** typing the Deck sends each key's position, and the Mac's active input source decides which character it types: a Mac set to another layout than your keyboard types other characters. | Switch the Mac's input source to your keyboard's layout, or your own keyboard to the Mac's, and type again. |
+| Typing at the lock screen does not register | Known issue: after a Deck session ends and the Mac locks, macOS can keep the hidden password field active, and the first key is lost. | Click the password field, then type the password. |
+| The stream stays at 30 fps | The Deck asks for the refresh rate of its own display. Stream Statistics says "your 30 Hz display"; the Deck log has `root display refresh period` with `refresh_period_us` 33333. | Set that display to 60 Hz or more (System Settings › Displays › Refresh rate), or move the Deck window to a faster display, and connect again. |
+| The pointer disappears | Since 0.21.0 the Deck draws the Mac's pointer in the Mac's own shapes, and hides it when the Mac does (an app hides it while you type). The Deck log has `cursor authority result applied` with `active` `Local`; the agent log has `cursor authority for this session` with `host_draws_pointer` false. | Move the mouse: it comes back. If `host_draws_pointer` is true, the pointer is part of the picture instead, because the Pier could not read it or the Deck did not ask to draw it. |
+| "Currently Sharing" in the Mac's menu bar | macOS shows it for every app that captures the screen, Arcen included. | Leave it. **Stop Sharing** ends the session: the Deck says "Sharing was stopped on the host.", does not reconnect, and the Mac locks. |
+| "Someone else is signed in at …" (Details: "this Mac's screen belongs to another account") | The Pier serves only the user whose session is on the Mac's screen. | Sign in as that user, or switch to your own account at the Mac first. |
+| Another remote-desktop product is installed | It adds virtual audio devices and displays of its own, and may make its speakers the default output. | Leave its devices alone. Arcen never changes the default output, and adds and removes only its own virtual displays. |
+| Nothing serves right after an install | `pgrep` (above) lists the service and an agent per signed-in user, and the install log ends with `desktop agent running`. The agent can take a few minutes after an install to serve its first session. | Wait, then connect again; `session stream start` in the agent log means it served. If no agent is listed for a user, that user signs out and in again. |
+| The Deck reports Critical health, cause `unpresented`, while its window is covered or in the background | The Deck counts frames it decoded but could not show; a covered window shows none. The Deck log has `HEALTH_CRITICAL` with `dominant_cause` `unpresented`. | Nothing to fix on the host. Bring the Deck window to the front. |

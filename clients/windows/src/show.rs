@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! `arcen-deck show`: connect and show the host's desktop in a plain window
-//! (owner: `core` stream; DRAFT §6 M1 "show ... decoding into a window").
+//! `arcen-deck show`: connect and show the host's desktop in a plain window.
 //!
-//! The lab proof of the Windows media composition without the GUI shell:
+//! The proof of the Windows media composition without the GUI shell:
 //! the session engine, Arcen's D3D11 decoder on the window's adapter, the
 //! swapchain presenters in the window's composition tree and the shared
 //! media worker, exactly as [`crate::media`] composes them for the shell.

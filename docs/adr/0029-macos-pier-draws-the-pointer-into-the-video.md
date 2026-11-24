@@ -39,9 +39,7 @@ and it moved with the video.
    the desktop pointer's image. Apple's own direction for capture is
    `showsCursor`.
 2. **Private CoreGraphics calls**, such as `CGSGetGlobalCursorData`,
-   `CGSGetCurrentCursorLocation` and the cursor seed. One reference product
-   reads the desktop pointer this way on Mac hosts and draws it on the
-   client. These calls are undocumented, can change or vanish with any
+   `CGSGetCurrentCursorLocation` and the cursor seed. These calls are undocumented, can change or vanish with any
    macOS update, and have no qualification or permission contract.
 3. **A hybrid.** Draw the standard arrow locally and fall back to the
    in-video pointer for every other shape. This is a guess about which shape
@@ -49,8 +47,7 @@ and it moved with the video.
 4. **The pointer in the video** (`showsCursor`). Public API under the Screen
    Recording permission the Pier already needs. The shape is always exact.
    The pointer moves with the video, so it can trail the hand by the
-   stream's latency. Another reference product's macOS agent documents the
-   same trade-off as its host-rendered cursor mode.
+   stream's latency.
 
 ## Decision
 

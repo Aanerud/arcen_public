@@ -27,13 +27,11 @@ capture consumer, import routes (see "Capture leases and GPU import" below)
 and the Auto/Speed compositions; `wayland-provider` turns it on in the fused
 Pier, so such a build links `libpipewire-0.3`.
 
-Qualification evidence for unmodified compositor stacks is kept in
-`wayland-qualification/`. The first entry,
-[Rocky Linux 9 / GNOME 40 / NVIDIA GRID](wayland-qualification/rocky9-gnome40-nvidia-grid.md),
-is a baseline: eight-bit shared-memory
+Two unmodified compositor stacks were measured. The first,
+Rocky Linux 9 / GNOME 40 / NVIDIA GRID, is a baseline: eight-bit shared-memory
 capture and Mutter D-Bus input only, with no DMA-BUF, damage metadata, EIS,
 pen, ten-bit or HDR. The primary target,
-[Rocky Linux 10 / GNOME 49 / NVIDIA GRID](wayland-qualification/rocky10-gnome49-nvidia-grid-nodrm.md),
+Rocky Linux 10 / GNOME 49 / NVIDIA GRID,
 was measured without DRM, with `nvidia-drm modeset=N` and with
 `modeset=1`: Auto is a qualified candidate on all three; Speed reaches
 60 fps only with a 120 Hz virtual monitor and an offer above 60, which a
@@ -678,7 +676,7 @@ Lab evidence for the seat pen (Rocky Linux 10.2, NVIDIA GRID V100D,
   `pointerType: "pen"` for 987 moves and the stroke, with 33 distinct
   pressures (0.037–0.638). The Deck's glass showed the stroke widening
   with pressure.
-  - Deck-side latency (over the Norway→London VPN link): input → host
+  - Deck-side latency (over the long-haul VPN link): input → host
     event about 23 ms p50, motion-to-photon about 123 ms p50.
   - Glass: 59.5 fps (Speed).
 - **One pen per desktop.** The same run with per-desktop pens: Firefox got
@@ -2301,7 +2299,7 @@ tone (amplitude 8000, RMS about 5660) played:
 | same | Wayland, `audible` | the tunnel plays into the user's default sink: native RMS 5178, PulseAudio RMS 4606, microphone RMS 4635 |
 | Rocky 9.7, GNOME 40, Xorg, PulseAudio 15 | X11, `muted` | at start the session sink is the default; a "speaker" sink loaded and made the default mid-session is muted, the default put back and a stream played straight to the speaker moved onto the session sink within 1.5 s; unmuting the speaker by hand is undone within 1 s; `audiocap` RMS 5601; native `pw-play` (before this work: "no node available", the user's PipeWire had no audio sink) RMS 5556 through the bridge; the bridged microphone RMS 4635; after the session the speaker is unmuted and no Arcen module or journal remains |
 | same | X11, agent killed with SIGKILL | the journal named the muted speaker and the loaded module; the launcher's recovery unmuted the speaker, removed the module and the journal |
-| Rocky 10.2 (as above), release development Pier on its own port, macOS Deck `media-smoke --microphone` for 61 s | Wayland, `muted`, end to end | Pier: `native audiocap started source=arcen_session_sink.monitor`, `audio_frames_captured=2899`, `audio_frames_sent=2878`, none dropped; while the Deck was attached, native `pw-play` and PulseAudio `paplay` (amplitude 6000) linked to `arcen_session_sink` and the monitor that audiocap records measured RMS 3988 and 3999; the Deck microphone source `arcen_microphone_<generation>` was the session server's default and an `Audio/Source` node of the private graph, 2033 Deck frames accepted, a native `pw-record` and a PulseAudio `parecord` both read it (the Deck's microphone was silent, RMS 0). Deck side, over the Norway→London VPN link: 2866 audio packets, peak 32767 |
+| Rocky 10.2 (as above), release development Pier on its own port, macOS Deck `media-smoke --microphone` for 61 s | Wayland, `muted`, end to end | Pier: `native audiocap started source=arcen_session_sink.monitor`, `audio_frames_captured=2899`, `audio_frames_sent=2878`, none dropped; while the Deck was attached, native `pw-play` and PulseAudio `paplay` (amplitude 6000) linked to `arcen_session_sink` and the monitor that audiocap records measured RMS 3988 and 3999; the Deck microphone source `arcen_microphone_<generation>` was the session server's default and an `Audio/Source` node of the private graph, 2033 Deck frames accepted, a native `pw-record` and a PulseAudio `parecord` both read it (the Deck's microphone was silent, RMS 0). Deck side, over the long-haul VPN link: 2866 audio packets, peak 32767 |
 | same | X11, `audible` | the user's audio server is not touched (the speaker stays the unmuted default); native and microphone bridges as above (RMS 5556, 4635) |
 
 Two findings fixed on the way: a tunnel's PulseAudio stream cannot be moved
@@ -2574,7 +2572,7 @@ p50 over the VPN link.
 
 **Real screen.** The real Deck GUI (cursor-local build) was driven by the
 real-screen harness against a real Firefox in the session. Deck-side
-numbers were measured over the Norway→London VPN link and are p50 (p95), in
+numbers were measured over the long-haul VPN link and are p50 (p95), in
 milliseconds.
 
 | Run | Glass fps / page fps | Cursor on glass | Input → host event | Motion-to-photon |
@@ -3148,7 +3146,7 @@ records it and the runtime guard catches a shortfall at serving time.
 **Serving a Deck (release dev Pier on another UDP port, 0.17.0 macOS Deck
 `media-smoke`, the animated 60 fps client running in the user's session).**
 Rates are the Pier's own capenc counts; Deck-side packet rates are over the
-Norway→London VPN link and are not evidence of the host.
+long-haul VPN link and are not evidence of the host.
 
 | Run | Result |
 | --- | --- |
@@ -3510,8 +3508,7 @@ The record's `facts.fidelity` keeps the proof or the gap. Without the proof,
 the Pier serves a fallback: HDR becomes Grading if Grading is proven,
 otherwise Auto, with the gap as the reason.
 
-**Measured (host-side, 2026-10-18;
-[evidence](wayland-qualification/fedora-gnome50-51-fidelity-container.md)).**
+**Measured (host-side, 2026-10-18).**
 GRID V100D, driver 580.105.08.
 Fedora 44 and Fedora 45 headless GNOME Shell run in a podman container on
 the Rocky 10 lab host; capenc runs on the host and consumes the container's

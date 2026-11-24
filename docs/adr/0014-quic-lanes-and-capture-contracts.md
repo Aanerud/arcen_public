@@ -880,7 +880,7 @@ Recorded with the capture pacing and recovery fixes.
    e.g. 4K at 120 Hz), or when the request names no preset. A reattachment
    keeps the desktop's refresh. Multi-head Xorg plans are unchanged.
 3. **Evidence** (Rocky 9.7 / GNOME 40 Xorg depth 24 / GRID V100D, the real
-   Deck GUI over the Norway→London VPN, real-screen harness, Firefox page
+   Deck GUI over the long-haul VPN, real-screen harness, Firefox page
    on the host): before, host `emit_activity` 40–46 of 60 captured and
    41–43 fps on glass; with the pacer on a 60 Hz head 60/60 encoded and
    59.5–59.7 fps on glass (2–5 page frames lost per phase instead of

@@ -66,7 +66,7 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   sentence when the GPU's cause is known.
 - Bitrate starts at the shared `link_capped_average_bitrate_bps` (capenc
   `rate_control_sizing`); 22.9 Mbps uncapped HDR made sessions sluggish and
-  starved audio on the lab link. The shared controller then moves it live:
+  starved audio on a long-haul link. The shared controller then moves it live:
   Auto/Speed climb to the shape budget on a clear path and past it, up to
   `PROVEN_PATH_HEADROOM` times, only with per-interval delivery evidence.
 - FP16 scRGB conversion uses up to 16 threads (14.6 ms at 1800x1130 on the

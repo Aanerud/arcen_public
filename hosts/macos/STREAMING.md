@@ -400,13 +400,6 @@ Note the per-record `profile_name` field is **not** the filter. It is the level
 that record requires, so a log full of `"critical"` records says nothing about
 what is being filtered out.
 
-## Do not run developer tools on a clean test Mac
-
-On a Mac without developer tools, `python3` raises the Command Line Tools
-installer on its console, the same way `xcrun` does. Run installer
-qualification on clean systems, use `grep`, `sed` and `awk` there, and build
-diagnostics on a development system.
-
 ## A faster source does not help a slow writer
 
 Measured, in both directions. `minimumFrameInterval` genuinely is a floor, so

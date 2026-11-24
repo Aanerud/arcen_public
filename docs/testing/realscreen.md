@@ -87,7 +87,8 @@ product caps or thresholds.
   the three preflight results.
 - The Deck `.app` to test. `--connect` quick-connect is used, so no UI
   driving is needed to log in; credentials go to the Deck on stdin.
-- On the host: root ssh, `python3`, `firefox`, and a Pier whose session will
+- On the test host: ssh as an administrator (the harness installs its page and
+  reads the Pier log), `python3`, `firefox`, and a Pier whose session will
   belong to the account you log in with. A dev Pier started from an ssh
   shell must run outside that shell's logind session (for example under
   `systemd-run`), or the session launcher fails with "pam_systemd did not
@@ -95,7 +96,8 @@ product caps or thresholds.
 - A host browser that renders in software (an Xorg desktop at depth 30 can
   do that to Firefox) paints a few frames a second and dominates every
   number; check `page fps` before reading anything else.
-- A local credentials file (default `~/.arcen-nightly.env`, mode 0600)
+- A local credentials file (default `~/.arcen-realscreen.env`, or
+  `ARCEN_REALSCREEN_CREDENTIALS`, mode 0600)
   containing a line `<label> : <user> / <password>`; `--cred-label` picks the
   line. Never commit it.
 
@@ -103,7 +105,7 @@ product caps or thresholds.
 
 ```sh
 python3 scripts/lab/realscreen/realscreen.py run \
-  --ssh root@pier.example.internal --port 18444 \
+  --ssh admin@test-host.example.internal --port 18444 \
   --pin-file host.cert-sha256 \
   --deck-app "/Applications/Arcen Deck.app" \
   --pipeline auto --tablet-mode light --device mouse \

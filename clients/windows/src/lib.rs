@@ -4,22 +4,21 @@
 //! [`arcen_deck_core`].
 //!
 //! Everything portable lives in `arcen-deck-core` and the other shared
-//! crates; this crate only does what Windows forces on it, and each module
-//! is owned by one work stream:
+//! crates; this crate only does what Windows forces on it:
 //!
-//! | Module | Owner | Implements |
-//! | --- | --- | --- |
-//! | [`decode`] | `decoder` | `VideoDecoderBackend` on `ID3D11VideoDecoder` (DXVA) |
-//! | [`present`] | `present` | `VideoPresenterSink` on `DirectComposition` + flip-model swapchains, `RefineCompositor` |
-//! | [`input`] | `input` | raw input mouse, keyboard grab, IME/TSF, `WM_POINTER` pen, cursors |
-//! | [`audio`] | `platform` | WASAPI render and microphone (`DeckServices::start_microphone`) |
-//! | [`clipboard`] | `platform` | `PlatformClipboard` on a clipboard-listener window |
-//! | [`display`] | `platform` | monitors, Per-Monitor-V2 DPI, colour facts |
-//! | [`platform`] | `platform` | `DeckServices`: folders, build identity, network, time zone, WER |
-//! | [`media`] | `core` | one connection's media: the decoder, the sinks and the shared worker |
-//! | [`show`] | `core` | `arcen-deck show`: connect and show a desktop in a plain window (lab) |
-//! | [`logging`] | `platform` | log files and WER crash dumps (the support bundle's facts: `platform::support`) |
-//! | [`shell`] | `ui` | the window: egui-winit + egui-wgpu over the video visual |
+//! | Module | Implements |
+//! | --- | --- |
+//! | [`decode`] | `VideoDecoderBackend` on `ID3D11VideoDecoder` (DXVA) |
+//! | [`present`] | `VideoPresenterSink` on `DirectComposition` + flip-model swapchains, `RefineCompositor` |
+//! | [`input`] | raw input mouse, keyboard grab, IME/TSF, `WM_POINTER` pen, cursors |
+//! | [`audio`] | WASAPI render and microphone (`DeckServices::start_microphone`) |
+//! | [`clipboard`] | `PlatformClipboard` on a clipboard-listener window |
+//! | [`display`] | monitors, Per-Monitor-V2 DPI, colour facts |
+//! | [`platform`] | `DeckServices`: folders, build identity, network, time zone, WER |
+//! | [`media`] | one connection's media: the decoder, the sinks and the shared worker |
+//! | [`show`] | `arcen-deck show`: connect and show a desktop in a plain window (a development tool) |
+//! | [`logging`] | log files and WER crash dumps (the support bundle's facts: `platform::support`) |
+//! | [`shell`] | the window: egui-winit + egui-wgpu over the video visual |
 //!
 //! Off Windows the crate compiles to nothing, so the workspace still checks
 //! on a Mac; Windows code is type-checked there with

@@ -2192,7 +2192,7 @@ mod tests {
         ))
     }
 
-    /// Dev Pier on the Xorg lab host over the Norway-to-London VPN (2026-10-18, run 2): a
+    /// A dev Pier on an Xorg host over a long-haul VPN (2026-10-18, run 2): a
     /// Grading stream of 0.3-1 Mbps sends about 40 packets a second, so one
     /// lost packet read as 2.5-47 % "congestion" and held the encoder at
     /// 8-14 fps for about 50 s. Pooled to 200 packets, the same losses are a

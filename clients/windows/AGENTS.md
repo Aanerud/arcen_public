@@ -186,12 +186,7 @@ logs in `%LOCALAPPDATA%\Arcen\Deck\Logs\`; `ARCEN_CONFIG_DIR` and
 `ARCEN_LOG_DIR` override both. WER crash dumps are minidumps only. A CLI
 password file must pass an owner/ACL check before it is read.
 
-## Parallel work
-
-The Windows Deck is built by parallel work streams with strict file
-ownership; read the build coordination page before changing anything.
-`Cargo.toml`, `src/lib.rs` and `src/main.rs` belong to the `core` stream:
-ask there for a dependency or Win32 feature.
+## Escalation
 
 Escalate shared API or protocol changes to Shared/Architecture; signing,
 installer, privilege (the USB service) and release changes to

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! One connection's media on the Windows Deck (owner: `core` stream).
+//! One connection's media on the Windows Deck.
 //!
 //! The composition the macOS Deck's `ui/media_worker.rs` makes for
 //! `VideoToolbox` and Metal, made here for Windows: Arcen's own D3D11 decoder

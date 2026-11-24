@@ -180,15 +180,15 @@ because the destination buffer is wider.
 
 ## Resume pointer
 
-- **Status:** ✅ MIGRATED + WINDOWS MF FALLBACK PROVEN. Built on pier-linux.example.internal with
-  `--features nvenc`; NVENC selftest passed (3840×2160 IDR, CUDA ready). On
-  `development workstation`, exact-output WGC + MF software H.264 streamed VMware SVGA at
+- **Status:** ✅ MIGRATED + WINDOWS MF FALLBACK PROVEN. Built with
+  `--features nvenc`; NVENC selftest passed (3840×2160 IDR, CUDA ready). On a
+  VMware SVGA Windows guest, exact-output WGC + MF software H.264 streamed at
   30 fps with working input; low-latency CBR, two-second GOP, zero B-frames,
-  real force-IDR, and light agent logging passed user QA as smooth enough.
+  real force-IDR, and light agent logging were smooth in use.
   Current MF negotiation maps a 1800×1168 client request to a 1792×1168
   macroblock-aligned Windows desktop rather than cropping encoded pixels.
   Linux Keel cadence and INFO stats are implemented offline; live GRID validation
-  remains reviewer-owned.
+  remains open.
 - **Original next step (done):** copy `server/capenc/src` + `Cargo.toml` into `hosts/capenc`, rename crate/bin
   → `arcen-capenc`, keep the `nvenc` feature, wire into the workspace, and embed
   it in each Pier. Build the fused Pier on the target OS, run `capenc selftest`

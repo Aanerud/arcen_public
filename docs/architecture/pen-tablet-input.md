@@ -19,8 +19,8 @@ implemented and unit/portable-tested — see
 and 2026-07-28 intakes. **Live human hardware validation completed 2026-08-03:
 a Wacom Intuos5 touch L pen was physically moved, pressure-applied, tilted,
 and clicked through Deck's Tablet Monitor, with 1,572+ forwarded pen events
-(including pressure 0.0–1.0 and tilt) reaching both a Linux (pier-linux.example.internal, Xorg
-uinput path) and Windows (pier-windows.example.internal, PT_PEN path) host. See
+(including pressure 0.0–1.0 and tilt) reaching both a Linux (Xorg uinput
+path) and a Windows (PT_PEN path) host. See
 [capability coverage](#capability-coverage-and-improvement-boundaries) for
 the confirmed supported subset, known limits, and what requires USB
 redirect.**

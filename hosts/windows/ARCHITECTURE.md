@@ -375,9 +375,9 @@ Absent legacy-client telemetry remains unavailable. `GetAdaptersAddresses`
 supplies normalized ethernet/wifi/vpn/loopback/other link rate and MTU facts;
 SSID is not collected without a future explicit local disclosure policy.
 
-The pier-windows.example.internal development deployment currently overrides the package default
-to Level 2 for diagnosis. That is an environment-specific deployment setting,
-not a production default and is not baked into `pier.json`.
+A deployment may raise the package default (for example to Level 2) for
+diagnosis. That is an environment-specific deployment setting, not a
+production default, and is not baked into `pier.json`.
 
 ## TLS lifecycle
 
@@ -680,7 +680,7 @@ Winlogon API:
    binding capture during the LogonUI-to-Explorer/DWM transition; any transient
    lock, identity/session change, or console change resets the stability gate.
 
-**Live evidence on `pier-windows.example.internal`:** two separate no-user reboots produced
+**Live evidence:** on a Windows Pier, two separate no-user reboots produced
 `GetCredentialCount(autologon=true)`, `GetSerialization(FINISHED)`,
 `ReportResult(STATUS_SUCCESS)`, Security 4624 Logon Type 2 with `Logon Process: User32`, an
 active console WTS session, and successful SID rebind/agent launch. An invalid password was
@@ -815,9 +815,9 @@ returned to the original, and NVAPI-stage failures cannot strand the journal (se
 lesson above). `stream_session` refuses to bind the Microsoft Basic adapter for NVENC
 sessions and requires the resolved output rect to equal the session rect.
 
-**Live evidence (2026-07-17):** pier-windows.example.internal (GRID V100D, NVENC/`ExactIsolated`) — exact
+**Live evidence (2026-07-17):** a GRID V100D host (NVENC/`ExactIsolated`) — exact
 1800x1168 mirror, single primary output, reconnect round-trip after the journal fix;
-development workstation (VMware SVGA, MF/`NegotiatedMacroblock16`) — 16-aligned 1792x1168
+a VMware SVGA guest (MF/`NegotiatedMacroblock16`) — 16-aligned 1792x1168
 stream with correct color and the idle keepalive cadence visibly dropping encode fps
 on a static desktop.
 

@@ -1166,8 +1166,7 @@ async fn restore_journal(journal: &LayoutJournal) -> bool {
 
 /// How long a desktop that is still starting may take before the layout
 /// is applied: GNOME Shell applies its own monitor configuration once while
-/// it starts and would undo one applied under it (the reference product
-/// that serves a console delays its layout on GNOME for the same reason).
+/// it starts and would undo one applied under it.
 const DESKTOP_START_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long the shell must have been running.
 const DESKTOP_SETTLED_AFTER: std::time::Duration = std::time::Duration::from_secs(4);

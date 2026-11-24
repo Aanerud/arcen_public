@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
-//! Displays (owner: `platform` stream).
+//! Displays.
 //!
 //! The Deck's monitors as protocol [`ClientMonitor`]s, the same roster the
 //! macOS Deck builds from `CGDisplay`/`NSScreen`: primary first, then left

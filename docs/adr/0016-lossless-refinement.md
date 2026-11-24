@@ -1,7 +1,7 @@
 # ADR 0016: Lossless Refinement of Still Regions
 
-**Status:** Proposed 2026-11-08; amended after design review 2026-11-09
-(see [Review 2026-11-09](#review-2026-11-09) — its rules are normative and
+**Status:** Proposed 2026-11-08; amended 2026-11-09
+(see [Normative rules](#normative-rules-2026-11-09) — they are normative and
 replace any conflicting sentence in sections 1–12; the
 [first-slice amendments](#first-slice-amendments-2026-11-13) refine them).
 **First slice complete 2026-11-13:** Linux Xorg depth-30 Grading/HDR to the
@@ -262,10 +262,9 @@ replication), a 10-bit SDR photograph, the same photograph converted to
 PQ/BT.2020, that PQ photograph with film-like grain (σ = 2 codes), and 10-bit
 gradients. Ratio is against packed 30-bit RGB (7.78 MB a frame); encode
 speed includes the predictor, decode speed is decompression only; both are
-the slowest frame, one core, on an Apple M4 Pro (the Deck class) and on the
-lab's AMD EPYC 7742 virtual machine (the Pier class, five of the seven
-frames, other builds running). The harness and raw results are kept with the
-design review evidence, not in the repository.
+the slowest frame, one core, on an Apple M4 Pro (the Deck class) and on an
+AMD EPYC 7742 virtual machine (the Pier class, five of the seven frames,
+other builds running).
 
 | Tile 256×64, RGB | UI (×3) | 10-bit gradient | photo SDR | photo PQ | PQ + grain | geo. mean | encode Mpx/s M4 / EPYC | decode Mpx/s M4 / EPYC |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -438,10 +437,10 @@ current coverage and the last verdict.
    host read-back (the eligible-blocks-only GPU read-back stays a possible
    optimisation).
 
-## Review 2026-11-09
+## Normative rules (2026-11-09)
 
-A design review found seven blocking issues. Each is resolved below; these
-rules are normative and replace any conflicting sentence above. Shared names
+Seven rules settle the questions the sections above leave open. They are
+normative and replace any conflicting sentence above. Shared names
 refer to the first-slice code in `arcen_media::refine` (portable, codec-free)
 and `arcen_protocol::refine` (wire records).
 
@@ -528,7 +527,7 @@ displayed picture in general. The two domains have different claims:
 - **Recovery keyframes do not inherit validity.** A keyframe the Deck asked
   for after loss, or after a decoder reset, is preceded by a barrier; a
   routine periodic keyframe is not, and keeps the overlay (same content).
-- **Fail safe (code review 2026-11-09).** A barrier on the ordered video
+- **Fail safe (2026-11-09).** A barrier on the ordered video
   lane is authoritative: the Deck starts over on *every* barrier, whatever
   generation it names — newer, older or identical — because nothing
   reorders that lane and a restarted producer may repeat an identity. A

@@ -1,8 +1,6 @@
-# Deskside recovery and physical acceptance
+# Deskside recovery
 
-Deskside is disabled by default and is implementation-complete but not released:
-the Windows and Linux physical matrices are unrun mandatory gates. VM results
-prove refusal and orchestration only.
+Deskside is disabled by default and not released yet.
 
 ## Recovery
 
@@ -48,17 +46,8 @@ facts. Linux operators compute the normalized DMI/chassis pin described in the
 host architecture and configure the expected active local console UID. Never
 copy these pins between hosts.
 
-## Mandatory release gates
+## Limits
 
-Windows must prove physical/injected keyboard and mouse separation, every pinned
-monitor blank/restore, distinct capture output, reconnect hold/resume/expiry,
-hot-plug, sleep/resume, driver reset, and agent/broker/service crash recovery.
-
-Linux must prove complete physical evdev enumeration and grabs without affecting
-Arcen uinput, every pinned DRM output blank/restore while dedicated Xorg capture
-continues, reconnect hold/resume/expiry, hot-plug, sleep/resume, GPU reset, and
-launcher/broker/service crash recovery.
-
-Neither matrix may claim SAS/secure desktop, kernel HID, pen/tablet, unsupported
+Deskside does not cover SAS/secure desktop, kernel HID, pen/tablet, unsupported
 connector/input classes, or isolation from a hostile process already running on
 the Windows interactive desktop.

@@ -7,8 +7,7 @@ now. Product-wide principle; first applied to the Windows Deck's decoder. Extend
 
 ## Context
 
-The owner's direction is that Arcen should look ahead whenever it has to
-choose between platform interfaces. D3D11 is the older Windows graphics
+Arcen looks ahead whenever it has to choose between platform interfaces. D3D11 is the older Windows graphics
 API, and the Windows Deck should support D3D12.
 
 The Windows Deck decodes with the D3D11 video decoder API (`CreateVideoDecoder`
@@ -18,13 +17,11 @@ device as the presenter (`VideoDevice::from_gpu`,
 device for 15–16 ms, which blocks decode. On a weak GPU this costs frame rate: a field Deck on an
 Intel UHD 630 driving two 2560x1600 monitors.
 
-Research done on 2026-11-18, recorded in the internal research notes:
+What was known on 2026-11-18:
 
-- **No reference client decodes with D3D12.** The two commercial clients
-  studied decode through D3D11 on a separate decode device and share
-  textures with a keyed mutex. Moonlight (master, 2026-11-15) also uses a separate decode
-  device, synchronised with paired fences, and falls back to one device on
-  drivers with known bugs.
+- **D3D11 with a separate decode device is the common design.** Moonlight
+  (master, 2026-11-15) uses a separate decode device, synchronised with
+  paired fences, and falls back to one device on drivers with known bugs.
 - **D3D12 decode is not yet the default anywhere.** Chromium has a D3D12
   decoder but leaves it off by default. FFmpeg's D3D12 HEVC path handles only
   Main and Main 10.
@@ -55,8 +52,8 @@ Research done on 2026-11-18, recorded in the internal research notes:
    stays as the automatic fallback.
 4. **Not chosen for the Windows Deck:** Media Foundation, vendor SDKs, and
    Vulkan Video. Vulkan Video's decode extensions are absent on the UHD 630
-   Windows driver. These stay learn-only unless a probe shows a gap that
-   only they fill.
+   Windows driver. These stay out unless a probe shows a gap that only
+   they fill.
 
 ## Consequences
 

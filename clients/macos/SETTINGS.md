@@ -8,7 +8,7 @@ Deck stores user configuration under `~/Library/Application Support/Arcen` on ma
 `connections.json` version 2 contains stable saved-connection IDs and a versioned settings
 container per connection:
 
-A clean installation creates no saved connections and contains no Arcen lab
+A clean installation creates no saved connections and contains no
 hostnames or addresses. The first screen shows **No saved connections yet**
 until the user adds a Pier.
 
@@ -19,8 +19,8 @@ until the user adds a Pier.
   "connections": [{
     "id": "connection-…",
     "kind": "direct",
-    "name": "pier-windows.example.internal",
-    "host": "pier-windows.example.internal",
+    "name": "workstation.example.internal",
+    "host": "workstation.example.internal",
     "port": 18444,
     "transport": "quic",
     "security_mode": "medium",

@@ -16,9 +16,7 @@ rate, whether the compositor's cursor metadata, Xwayland and the precision
 needed for Grading and HDR are there, and whether a native desktop works.
 The service re-qualifies when the Pier, GNOME, PipeWire or the GPU driver
 changes. A capability the record does not prove is never assumed: the
-session is served at the level that was proven and the Deck shows why. The
-lab hosts' evidence is in
-[`docs/architecture/wayland-qualification/`](../architecture/wayland-qualification).
+session is served at the level that was proven and the Deck shows why.
 
 **Each sign-in gets a whole GNOME session of its own** — a logind session, a
 private D-Bus bus, PipeWire and WirePlumber, then GNOME Shell with the

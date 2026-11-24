@@ -115,7 +115,7 @@ Follows the `arcen-keel` pattern: a pure brain, a shared runtime, thin adapters.
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│  arcen-telemetry (pure, no I/O, #![forbid(unsafe_code)])  — PR1       │
+│  arcen-telemetry (pure, no I/O, #![forbid(unsafe_code)])              │
 │  vocabulary: event kinds 1000–1999 · CorrelationId · StructuredFields │
 │  names: canonical targets + field keys · QosSample/QosTargets         │
 │  HealthState + HealthAssessment + caller-clocked hysteresis           │
@@ -123,7 +123,7 @@ Follows the `arcen-keel` pattern: a pure brain, a shared runtime, thin adapters.
 └───────────────▲───────────────────────────────────────────────────────┘
                 │ contracts only
 ┌───────────────┴───────────────────────────────────────────────────────┐
-│  arcen-observability (tracing-dependent, OS-free)  — PR2  (NEW crate) │
+│  arcen-observability (tracing-dependent, OS-free)                     │
 │  ObservabilityBuilder (one init: text|json, EnvFilter, live reload)   │
 │  canonical JSON-lines formatter · ObservabilityHandle                 │
 │  BoundedSink<T> (bounded queue + worker + drop counter)               │
@@ -474,7 +474,7 @@ trait NetworkTruthProbe {
    emits `TelemetryDropped` (1804) and resets. Silent loss banned, blocking banned;
    counted loss is the only allowed failure mode.
 5. **Lifecycle emission is fire-and-forget** — never fails the described operation.
-6. Conformance checklist (§11) carries a hot-path review item; CI adds a grep gate
+6. Conformance checklist (§10) carries a hot-path review item; CI adds a grep gate
    for `tracing::` inside modules listed as hot-path (frame pump, decode loop,
    HID report callback, input injection).
 
@@ -487,7 +487,7 @@ trait NetworkTruthProbe {
 Packaged service/file output is UTF-8 canonical JSON Lines with no ANSI and one
 schema-v1 object per line. Human text is only for interactive console/development
 output. Key order, field bounds, enum values, and sorted dynamic `fields` are
-frozen by the PR1 golden fixture:
+frozen by a golden fixture:
 
 ```json
 {"schema_version":1,"timestamp":"2026-07-24T16:00:00.000000Z","sequence":42,"profile_level":0,"profile_name":"critical","severity":"info","role":"host","component":"pier","platform":"windows","target":"arcen::session","event_id":1100,"event_name":"SESSION_AUTH_OK","category":"machine_authentication","outcome":"succeeded","sid":"canonical-session-correlation-id","user":"DOMAIN\\artist","host":"pier-01","peer_addr":"192.0.2.10:54000","health_state":"ok","message":"session authentication succeeded","fields":{"auth_method":"password","display_backend":"dxgi"}}
@@ -507,7 +507,7 @@ frozen by the PR1 golden fixture:
 - **Linux:** journald native protocol remains primary (`ARCEN_EVENT_ID`,
   `ARCEN_EVENT_NAME`, `ARCEN_CORRELATION_ID`, `ARCEN_FIELD_*` — already correct);
   RFC 3164 `/dev/log` fallback kept. RFC 5424 structured-data is explicitly **out of
-  scope v1** (journald + JSON file cover the need); noted as a future Span concern.
+  scope v1** (journald + JSON file cover the need).
 - **Windows:** Event Log provider `ArcenPier`, Application channel; message table
   extended for the new IDs so Event Viewer shows readable text.
 - **macOS client:** canonical JSON file is primary; an os_log sink is optional
@@ -533,7 +533,7 @@ UI dial + file-watch (macOS Deck). All three drive the same
 `ObservabilityHandle::reload()` contract. `ARCEN_LOG` may refine diagnostic
 tracing, including trace, but cannot filter Level-0 structured records.
 
-### 8.4 Monitoring recipes → `docs/operations/monitoring.md` (ships in PR7)
+### 8.4 Monitoring recipes → `docs/operations/monitoring.md`
 
 - Vendor-neutral file-tail, JSONPath/regex, journald, and Windows Event Log
   examples keyed on event ID, health state, and severity.
@@ -558,165 +558,12 @@ tracing, including trace, but cannot filter Level-0 structured records.
   identity export requires an explicit protected operator action.
 - Malformed canonical lines are excluded with a typed manifest notice, never
   copied raw through a fallback path.
-- Any future off-box aggregation (Span) defaults to hashed identities unless the
+- Any future off-box aggregation defaults to hashed identities unless the
   operator opts in.
 
 ---
 
-## 10. PR decomposition, acceptance criteria, end-to-end tests
-
-Seven shared-first PRs. Each is independently landable and reviewable; each states
-what a sysadmin can do after it lands.
-
-### PR1 — `arcen-telemetry` pure extensions
-
-New event kinds 1500–1903 plus `EFFECTIVE_PROFILE` and the 60-second
-`HEALTH_SNAPSHOT`; `OperationalProfile`; `QosSample`/validated `QosTargets`;
-`HealthState`/`HealthAssessment` + caller-clocked hysteresis; `NetworkSnapshot`
-+ classifier; canonical names/value objects; and the pure canonical schema-v1
-record with exact JSON fixture. `arcen-session` gains the one-release config
-migration contract.
-
-**Acceptance criteria**
-- [ ] Separate golden tables freeze existing IDs 1000–1404 and every new ID.
-- [ ] Hysteresis unit tests: flapping input around a threshold yields exactly one
-      transition per sustained change; 2-window rule verified.
-- [ ] `assess_health()` covers all threshold bands and the missed-heartbeat path.
-- [ ] Crate remains no-I/O, serde-only deps, `#![forbid(unsafe_code)]`.
-- [ ] Existing host consumers compile through the deliberate legacy
-      `VerbosityTier` path; old numeric meanings are never silently reinterpreted.
-
-**Sysadmin story:** none visible yet — the vocabulary is published and documented.
-
-### PR2 — new crate `shared/observability` (`arcen-observability`)
-
-Builder, JSON formatter, `ObservabilityHandle`, `BoundedSink`,
-`HeartbeatSampler`, `NetworkTruthProbe` trait, and lifecycle→tracing bridge.
-No product adoption occurs in this step.
-
-**Acceptance criteria**
-- [ ] Capture-subscriber tests assert the exact JSON line shape (§8.1) byte-for-byte
-      against fixtures.
-- [ ] `BoundedSink` test: full queue → `try_send` returns immediately, drop counter
-      increments, worker drains, no deadlock under load test.
-- [ ] `ObservabilityHandle::reload()` changes filtering live in a test subscriber.
-- [ ] Formatter output is byte-identical to the PR1 frozen fixture.
-- [ ] Crate has no OS-specific dependencies.
-
-**Sysadmin story:** the shared runtime is ready for product adapters.
-
-### PR3 — `arcen-protocol` additive wire fields *(escalation: Shared/Architecture)*
-
-Extend the existing health exchange with a bounded optional client telemetry
-snapshot and client `NetworkSnapshot` metadata. Reuse the existing
-`HealthPingMsg.sequence`/`HealthPongMsg.sequence` RTT mechanism. `WIRE.md`
-explicitly prohibits remote profile control.
-
-**Acceptance criteria**
-- [ ] Serde round-trip tests for all new fields.
-- [ ] Compat both directions: old client ↔ new host and new client ↔ old host
-      (missing fields default, nothing breaks) — `PROTOCOL_VERSION` stays 3.
-- [ ] `WIRE.md` documents every field as additive with defaults.
-
-**Sysadmin story:** none yet; the wire is ready.
-
-### PR4 — macOS Deck adoption (the big one)
-
-Lifecycle emission (1500s/1600s/1700s/1800s/1900s); decode/present atomic counters +
-`HeartbeatSampler` QoS line at 5 s; true RTT via the existing ping/pong sequence;
-`CLIENT_SESSION_END` 1505 with a bounded summary; `NWPathMonitor` probe + 1700/1701; HID logging throughout
-`clients/macos/src/hid/` (1600–1604, plus report counters in the heartbeat — never
-per-report logs); TCC permission events 1900s (input-monitoring at HID start,
-microphone when used); canonical JSON file output; targets renamed to canonical set
-(`arcen::transport`→`arcen::net`, `arcen::video`→`arcen::media`,
-`arcen::usb`→`arcen::hid`); file writer switched to non-blocking lossy with
-clean-shutdown flush.
-
-**Acceptance criteria**
-- [ ] A scripted connect→work→disconnect run produces, in order, with one sid:
-      1500 → 1502 → 1503 → 1700 → (QoS lines every 5 s) → 1505 → 1501.
-- [ ] The 1505 line alone answers: who, host, when, how long, frames, avg fps/rtt,
-      worst health state, why it ended.
-- [ ] Toggling WiFi→Ethernet mid-session emits 1701 with old/new kind and rates.
-- [ ] Suspending the host stream flips the rollup Ok→Degraded→Critical with correct
-      hysteresis timing; restoring emits 1800 with `degraded_duration_ms`.
-- [ ] Plugging/unplugging a Wacom emits 1600/1601; an active session adds 1602/1603
-      with `reports_forwarded` > 0; TCC denial emits 1901 exactly once.
-- [ ] Instruments/profiling shows **zero** log-formatting work on decode/present/HID
-      threads during steady state.
-- [ ] UI log-level dial still live-reloads; `ARCEN_LOG` still overrides.
-
-**Sysadmin story:** one client log proves *"you were on WiFi at 54 Mbps with 140 ms
-RTT; decode and display were healthy; the product was not the problem."*
-
-### PR5 — Linux Pier adoption
-
-Migrate init to `ObservabilityBuilder` (journald/syslog sinks retained, now fed via
-`BoundedSink`); host QoS line at 10 s + rollup events 1800s; `/sys/class/net` probe +
-1700/1701 for the host side; record client `NetworkSnapshot` from the wire into
-session spans and `SESSION_END`; canonical JSON file output; uhid inject failures → 1604;
-the unified `pier.json` logging schema extended per §8.3.
-
-**Acceptance criteria**
-- [ ] journald carries new event IDs with the existing `ARCEN_*` field convention;
-      `journalctl ARCEN_EVENT_ID=1801` filters correctly.
-- [ ] SIGHUP reload still reopens the file and now also reloads `qos_targets`.
-- [ ] Host `SessionEnd`/QoS lines include the client's network snapshot fields.
-- [ ] In the lab (Deck → pier-linux.example.internal): the same sid appears in client and host logs;
-      timelines align.
-- [ ] A Zabbix (or `journalctl`-simulated) trigger on 1801/1802 fires during an
-      induced degradation.
-
-**Sysadmin story:** cross-machine correlation by sid; host log alone shows the
-artist's network truth; alerting demo works.
-
-### PR6 — Windows Pier adoption
-
-Same as PR5 via SCM: init through `ObservabilityBuilder`; Event Log message table
-extended for all new stable IDs; eventlog worker refactored onto shared `BoundedSink`
-(identical drop semantics — regression-tested); per-session agent logs gain QoS
-lines + rollup; `GetAdaptersAddresses`/WLAN probe; pier.json logging section extended
-per §8.3; SCM 200/201/202 behavior unchanged.
-
-**Acceptance criteria**
-- [ ] Event Viewer shows 1801 with a readable rendered message.
-- [ ] SCM 200/201/202 reload verified unchanged; new `qos_targets` picked up on 201.
-- [ ] `BoundedSink` refactor: existing eventlog worker tests pass unchanged.
-- [ ] Broker log and per-session agent log both carry canonical targets and sid.
-- [ ] Lab (Deck → pier-windows.example.internal): same-sid correlation, health disagreement visible
-      when the network (not the host) is degraded.
-
-**Sysadmin story:** full parity — any host OS, same event IDs, same line shape,
-same alerting recipe.
-
-### PR7 — monitoring docs, conformance checklist, support-bundle QoS history
-
-`docs/operations/monitoring.md` (§8.4 vendor-neutral recipes + alarm-ID table);
-the conformance checklist (§11) added to this doc's graduated home; support-bundle
-export gains default identity pseudonymization and bounded QoS/session summaries
-*(escalation: Release/Security)*.
-
-**Acceptance criteria**
-- [ ] Every recipe executed verbatim against real output from PRs 4–6 (paste-tested,
-      not theoretical).
-- [ ] Bundle stays within the bounded-manifest contract (entry/size caps).
-- [ ] Default pseudonymization maps each identity consistently across one bundle.
-- [ ] Alarm-ID table covers every event a monitoring system should page on.
-
-**Sysadmin story:** documented path from zero to a Zabbix dashboard with alerts.
-
-### Cross-host end-to-end lab (closes the feature)
-
-Scripted run in `tests/`: Deck → Pier session with induced network degradation
-(traffic shaping). Asserts: (a) identical sid in both logs; (b) event sequence
-1503 → 1102 → 1700 → 1801 → 1800 → 1103/1505; (c) client and host summaries
-agree on duration and frame counts within tolerance; (d) JSON lines from both ends
-parse against one schema fixture; (e) host log contains the client's network
-snapshot.
-
----
-
-## 11. Future-proofing — conformance checklist
+## 10. Future-proofing — conformance checklist
 
 ### Conformance checklist (every future active product)
 

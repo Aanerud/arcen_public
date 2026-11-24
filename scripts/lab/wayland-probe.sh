@@ -3,8 +3,7 @@
 # Copyright (C) 2026 TUTTIFRUTTI AS
 # Read-only Wayland provider qualification probe for a Linux Pier candidate.
 #
-# Gathers the facts recorded in
-# docs/architecture/wayland-qualification/: compositor, PipeWire,
+# Gathers the facts a Wayland qualification needs: compositor, PipeWire,
 # portal, libei, NVIDIA/DRM, EGL/GBM/CUDA/Vulkan and audio-server state.
 #
 # It changes nothing: no packages, services, users, sessions, modules or

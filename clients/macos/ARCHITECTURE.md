@@ -438,7 +438,7 @@ a Developer ID profile cannot silently be reused in development mode either.
 
 ## Resume pointer
 
-- **Status:** ✅ MIGRATED + LIVE-VERIFIED (updated 2026-07-31). 339 unit tests pass; `Arcen Deck.app` built and used live to stream both Linux Pier (pier-linux.example.internal, 8,881 frames, H.265 4:4:4) and Windows Pier (pier-windows.example.internal, 7,172 frames) over direct QUIC/TLS 1.3 on UDP 18444. Includes the **Retina effective-stream-resolution** fix and the **TOFU certificate trust fix** (QUIC cert capture now correctly promotes to `CertificateUntrusted` for explicit Deck trust). Connections list shows only clean QUIC-only entries; the full-width card button fix lands in this PR. See [`docs/adr/0007-quic-only-product-transport.md`](../../docs/adr/0007-quic-only-product-transport.md).
+- **Status:** ✅ MIGRATED + LIVE-VERIFIED (updated 2026-07-31). `Arcen Deck.app` streams both a Linux Pier (H.265 4:4:4) and a Windows Pier over direct QUIC/TLS 1.3 on UDP 18444. Includes the **Retina effective-stream-resolution** fix and the **TOFU certificate trust fix** (QUIC cert capture now correctly promotes to `CertificateUntrusted` for explicit Deck trust). The connections list shows only QUIC entries. See [`docs/adr/0007-quic-only-product-transport.md`](../../docs/adr/0007-quic-only-product-transport.md).
 - **Original next step (done):** establish `clients/macos` as crate
   `arcen-deck-macos`, lib `arcen_deck`, bin `arcen-deck`, using
   `arcen_protocol` via `../../shared/protocol`; the historical migration
