@@ -109,6 +109,7 @@ const K_CG_EVENT_FLAG_MASK_CONTROL: u64 = 0x0004_0000;
 const K_CG_EVENT_FLAG_MASK_ALTERNATE: u64 = 0x0008_0000;
 const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 const K_CG_EVENT_FLAG_MASK_NUMERIC_PAD: u64 = 0x0020_0000;
+const K_CG_EVENT_FLAG_MASK_SECONDARY_FN: u64 = 0x0080_0000;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -415,6 +416,28 @@ pub const fn modifier_flags(modifiers: u32, caps_lock_on: Option<bool>) -> u64 {
         flags |= K_CG_EVENT_FLAG_MASK_ALPHA_SHIFT;
     }
     flags
+}
+
+/// The flags a Mac keyboard puts on a key's own events whatever is held:
+/// Fn (`kCGEventFlagMaskSecondaryFn`) on the arrows, the navigation cluster
+/// and F1-F12, and numeric pad on the arrows. The system's own shortcuts
+/// are matched against them: macOS stores "Move left/right a space" and
+/// Mission Control (`com.apple.symbolichotkeys`, ids 79, 81, 32, 33) as
+/// Control + Fn + the arrow, so a posted ⌃→ that carries only Control is
+/// an ordinary key to the frontmost application and never changes Space.
+#[must_use]
+pub const fn key_own_flags(code: u16) -> u64 {
+    match code {
+        // Left, Right, Down, Up.
+        0x7B..=0x7E => K_CG_EVENT_FLAG_MASK_NUMERIC_PAD | K_CG_EVENT_FLAG_MASK_SECONDARY_FN,
+        // Home, Page Up, Forward Delete, End, Page Down.
+        0x73 | 0x74 | 0x75 | 0x77 | 0x79 => K_CG_EVENT_FLAG_MASK_SECONDARY_FN,
+        // F1-F12.
+        0x7A | 0x78 | 0x63 | 0x76 | 0x60 | 0x61 | 0x62 | 0x64 | 0x65 | 0x6D | 0x67 | 0x6F => {
+            K_CG_EVENT_FLAG_MASK_SECONDARY_FN
+        }
+        _ => 0,
+    }
 }
 
 /// Maps a shared pointer button to a `CoreGraphics` button number.
@@ -936,7 +959,7 @@ impl InputController {
         if lock_screen == arcen_input::keyboard::LockScreenStep::WakeThenHold {
             return Ok(KeyOutcome::HoldForWake);
         }
-        let flags = modifier_flags(event.modifiers.0, event.caps_lock_on);
+        let flags = modifier_flags(event.modifiers.0, event.caps_lock_on) | key_own_flags(code);
         let text = self.secure_key_text(event);
         self.post_key(code, event.pressed, flags, text.as_deref())?;
         if lock_screen == arcen_input::keyboard::LockScreenStep::PostThenDeclare {
@@ -1802,7 +1825,7 @@ impl InputController {
 
         let keys: Vec<u16> = self.held_keys.iter().copied().collect();
         for code in keys {
-            if let Err(error) = self.post_key(code, false, 0, None) {
+            if let Err(error) = self.post_key(code, false, key_own_flags(code), None) {
                 first_error.get_or_insert(error);
             }
         }
@@ -2372,6 +2395,34 @@ mod tests {
             K_CG_EVENT_FLAG_MASK_COMMAND
         );
         assert_eq!(flags & K_CG_EVENT_FLAG_MASK_CONTROL, 0);
+    }
+
+    #[test]
+    fn arrows_and_function_keys_carry_the_flags_a_mac_keyboard_gives_them() {
+        // ⌃→ as the Spaces shortcut is stored: Control + Fn on the arrow.
+        let control_right = modifier_flags(keymap::MOD_CTRL, None) | key_own_flags(0x7C);
+        assert_eq!(
+            control_right & (K_CG_EVENT_FLAG_MASK_CONTROL | K_CG_EVENT_FLAG_MASK_SECONDARY_FN),
+            K_CG_EVENT_FLAG_MASK_CONTROL | K_CG_EVENT_FLAG_MASK_SECONDARY_FN
+        );
+        for arrow in 0x7B..=0x7E {
+            assert_eq!(
+                key_own_flags(arrow),
+                K_CG_EVENT_FLAG_MASK_NUMERIC_PAD | K_CG_EVENT_FLAG_MASK_SECONDARY_FN,
+                "{arrow:#x}"
+            );
+        }
+        for fn_key in [0x73, 0x74, 0x75, 0x77, 0x79, 0x7A, 0x60, 0x6F] {
+            assert_eq!(
+                key_own_flags(fn_key),
+                K_CG_EVENT_FLAG_MASK_SECONDARY_FN,
+                "{fn_key:#x}"
+            );
+        }
+        // Letters, Return and the modifier keys themselves carry nothing.
+        for plain in [0x00, 0x08, 0x24, 0x31, 0x38, 0x3B, 0x37] {
+            assert_eq!(key_own_flags(plain), 0, "{plain:#x}");
+        }
     }
 
     #[test]
