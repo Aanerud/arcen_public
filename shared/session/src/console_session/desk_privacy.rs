@@ -23,10 +23,13 @@
 //!   stays private, retried, for at most [`super::UNLOCKED_GRACE`]
 //!   ([`hand_back_unlocked`]).
 //!
-//! The policy every Pier shares is here too: desk privacy is on unless the
-//! administrator sets `privacy.desk = "off"` ([`DeskPrivacyPolicy`]), it
-//! applies to every desktop the desk's monitors show ([`DeskExposure`]),
-//! and the Deck is told the desk's state ([`DeskPrivacyStatus`]).
+//! The policy every Pier shares is here too: the Deck's user chooses desk
+//! privacy (private by default), kept as far as the host can, unless the
+//! administrator sets `privacy.desk = "required"` (always private, fail
+//! closed) or `"off"` ([`DeskPrivacyPolicy`], [`DeckDeskPrivacy`]); it
+//! applies to every desktop the desk's monitors show ([`DeskExposure`]);
+//! one table decides what a shortfall does ([`DeskPrivacyState`]); and the
+//! Deck is told the desk's state ([`DeskPrivacyStatus`]).
 
 use std::time::{Duration, Instant};
 
@@ -147,14 +150,44 @@ impl DeskPrivacyRefusal {
         }
     }
 
+    /// Every refusal.
+    pub const ALL: [Self; 8] = [
+        Self::VirtualHidInput,
+        Self::InputFilterUnavailable,
+        Self::DisplaysNotDark,
+        Self::DeskMonitorLit,
+        Self::DeskMonitorUnknown,
+        Self::DeskOutputsChanged,
+        Self::InputBlockUnavailable,
+        Self::DeskDetachFailed,
+    ];
+
+    /// The refusal [`Self::token`] names (a Pier's own processes pass it
+    /// along); `None` for an unknown token.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|refusal| refusal.token() == token)
+    }
+
     /// What the Deck is told (a close reason: at most 120 bytes), led by
-    /// the shared `console_privacy_unavailable` code, then this cause.
+    /// the shared `console_privacy_unavailable` code, then this cause. Only
+    /// a Pier whose administrator requires desk privacy refuses
+    /// ([`DeskPrivacyPlan::Required`]), so the reason says so, and names
+    /// what to look for at the desk.
     #[must_use]
     pub fn deck_reason(self) -> String {
         format!(
-            "{}: {}: the host's screens or input could not be made private",
+            "{}: {}: {}",
             super::ConsoleRefusal::PrivacyUnavailable.token(),
-            self.token()
+            self.token(),
+            match self.part() {
+                DeskPart::Screens => {
+                    "desk privacy is required; a screen or dummy plug cannot be darkened"
+                }
+                DeskPart::Input => "desk privacy is required; the desk's input cannot be blocked",
+            }
         )
     }
 }
@@ -354,6 +387,64 @@ pub struct DeskOutputFact {
     pub lit: bool,
     /// What is behind it.
     pub monitor: DeskMonitor,
+}
+
+/// What an output is to the attached session, as desk privacy must know it
+/// before it acts on the desk (ADR 0025 §5, amended 2026-11-24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskOutputRole {
+    /// The served topology is captured from it: the single served display,
+    /// or, with Match My Layout, each Deck display's output (with dummy
+    /// plugs on an NVIDIA GPU, each plug carries a stream). It is the
+    /// session's own.
+    Served,
+    /// Any other output the desktop lights.
+    Other,
+}
+
+/// What desk privacy does to one output ([`desk_output_measure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskOutputMeasure {
+    /// Never detached, disabled or powered down, nor changed in any way
+    /// capture reads. Darkened only by what capture never reads (a zero
+    /// gamma ramp or transfer table: Linux, macOS); where a host has no such
+    /// means (Windows), a monitor behind it is the session's known shortfall
+    /// ([`DeskPrivacyRefusal::DeskMonitorLit`]: `screens_visible` under best
+    /// effort, a refusal when privacy is required).
+    KeepServed,
+    /// Darkened, or taken off the desktop (Windows detaches it).
+    Hide,
+}
+
+/// What desk privacy may do to an output in `role`: it acts only on outputs
+/// the session is not served from.
+#[must_use]
+pub const fn desk_output_measure(role: DeskOutputRole) -> DeskOutputMeasure {
+    match role {
+        DeskOutputRole::Served => DeskOutputMeasure::KeepServed,
+        DeskOutputRole::Other => DeskOutputMeasure::Hide,
+    }
+}
+
+/// The lit outputs desk privacy may take off the desktop: every one not in
+/// `served`, in `lit`'s order. Empty when nothing but the session's own
+/// outputs is lit, so nothing is detached.
+#[must_use]
+pub fn desk_outputs_to_hide<K: Ord + Clone>(
+    lit: &[K],
+    served: &std::collections::BTreeSet<K>,
+) -> Vec<K> {
+    lit.iter()
+        .filter(|output| {
+            let role = if served.contains(output) {
+                DeskOutputRole::Served
+            } else {
+                DeskOutputRole::Other
+            };
+            desk_output_measure(role) == DeskOutputMeasure::Hide
+        })
+        .cloned()
+        .collect()
 }
 
 /// Whether the desk sees nothing of the desktop on a host that cannot
@@ -740,13 +831,58 @@ impl<A: Fn()> Drop for WatcherExit<A> {
     }
 }
 
+/// What a [`DeskWatch`] does once it has stored a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskWatchOnRefusal {
+    /// Stop watching: the refusal stands and ends the session
+    /// ([`DeskPrivacyPlan::Required`]).
+    End,
+    /// Keep proving, at most once every [`DESK_FULL_PROOF_INTERVAL`], and
+    /// clear the refusal (raising the alarm again) once a proof passes:
+    /// a best-effort session reports the shortfall and its recovery
+    /// ([`DeskPrivacyPlan::BestEffort`], [`DeskPrivacyState::watched`]).
+    Keep,
+}
+
 impl DeskWatch {
+    /// Starts watching a desk proved dark right after `topology` was read,
+    /// ending at the first refusal ([`DeskWatchOnRefusal::End`]); see
+    /// [`Self::start_with`].
+    pub fn start<T, R, P, O, A>(
+        read_every: Duration,
+        topology: Option<T>,
+        read: R,
+        prove: P,
+        report: O,
+        alarm: A,
+    ) -> Self
+    where
+        T: PartialEq + Send + 'static,
+        R: FnMut() -> Option<T> + Send + 'static,
+        P: FnMut() -> Result<(), DeskProofFailure> + Send + 'static,
+        O: FnMut(&DeskProofReport) + Send + 'static,
+        A: Fn() + Send + 'static,
+    {
+        Self::start_with(
+            DeskWatchOnRefusal::End,
+            read_every,
+            topology,
+            read,
+            prove,
+            report,
+            alarm,
+        )
+    }
+
     /// Starts watching a desk proved dark right after `topology` was read.
     /// `report` is called on the watcher's thread after every whole proof
     /// (to log it); `alarm` once the watch has stored a refusal (to wake the
-    /// session so it ends at once: the verdict is already a refusal then).
-    /// A thread that cannot be started leaves a watch that refuses.
-    pub fn start<T, R, P, O, A>(
+    /// session so it ends at once: the verdict is already a refusal then),
+    /// and, under [`DeskWatchOnRefusal::Keep`], again once a later proof
+    /// cleared it. A thread that cannot be started leaves a watch that
+    /// refuses.
+    pub fn start_with<T, R, P, O, A>(
+        on_refusal: DeskWatchOnRefusal,
         read_every: Duration,
         topology: Option<T>,
         mut read: R,
@@ -784,26 +920,31 @@ impl DeskWatch {
                 cadence.proved(topology, started);
                 let mut topology_reads = 0_u64;
                 let mut settle_spent = Duration::ZERO;
+                // Under `Keep`, when the last proof failed: the next proof
+                // waits for the interval, and a pass clears the refusal.
+                let mut failed_at: Option<Instant> = None;
                 loop {
-                    drop(
-                        worker
-                            .wake
-                            .wait_timeout_while(worker.state(), read_every, |_| !worker.stopped())
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    );
-                    if worker.stopped() {
+                    if worker.sleep(read_every) {
                         return;
                     }
                     let now = Instant::now();
+                    if failed_at.is_some_and(|at| {
+                        now.saturating_duration_since(at) < DESK_FULL_PROOF_INTERVAL
+                    }) {
+                        continue;
+                    }
                     let topology = read();
-                    let (outcome, proof) = match cadence.next(topology.as_ref(), now) {
+                    let due = match failed_at {
+                        Some(_) => DeskRecheck::FullProof(FullProofReason::Interval),
+                        None => cadence.next(topology.as_ref(), now),
+                    };
+                    let (outcome, proof) = match due {
                         DeskRecheck::Topology => {
                             topology_reads = topology_reads.saturating_add(1);
                             (Ok(()), None)
                         }
                         DeskRecheck::FullProof(reason) => {
-                            let triggered = reason != FullProofReason::Interval;
-                            if triggered {
+                            if reason != FullProofReason::Interval {
                                 worker.state().proof_in_flight_since = Some(now);
                             }
                             let Some(settled) = worker.prove_settling(
@@ -836,23 +977,22 @@ impl DeskWatch {
                     }
                     // Store first: whoever the report or the alarm wakes
                     // reads the verdict this check reached.
-                    {
-                        let mut state = worker.state();
-                        state.last_check = Instant::now();
-                        state.proof_in_flight_since = None;
-                        if let Err(refusal) = outcome {
-                            state.refusal = Some(refusal);
-                        }
-                    }
+                    let recovered = failed_at.is_some() && outcome.is_ok();
+                    worker.store_check(outcome, recovered);
                     if let Some(proof) = proof.as_ref() {
                         report(proof);
                     }
-                    if outcome.is_err() {
+                    if outcome.is_err() && on_refusal == DeskWatchOnRefusal::End {
                         exit.alarmed = true;
                         if !worker.stopped() {
                             (exit.alarm)();
                         }
                         return;
+                    }
+                    let changed = recovered || (outcome.is_err() && failed_at.is_none());
+                    failed_at = outcome.is_err().then(Instant::now);
+                    if changed && !worker.stopped() {
+                        (exit.alarm)();
                     }
                 }
             });
@@ -876,6 +1016,29 @@ impl DeskWatch {
 }
 
 impl DeskWatchShared {
+    /// Waits `period` (or until the watch is stopped); whether it was.
+    fn sleep(&self, period: Duration) -> bool {
+        drop(
+            self.wake
+                .wait_timeout_while(self.state(), period, |_| !self.stopped())
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        self.stopped()
+    }
+
+    /// Stores one completed check: its refusal, or, when `recovered`, the
+    /// end of the refusal a failed proof left.
+    fn store_check(&self, outcome: Result<(), DeskPrivacyRefusal>, recovered: bool) {
+        let mut state = self.state();
+        state.last_check = Instant::now();
+        state.proof_in_flight_since = None;
+        match outcome {
+            Err(refusal) => state.refusal = Some(refusal),
+            Ok(()) if recovered => state.refusal = None,
+            Ok(()) => {}
+        }
+    }
+
     /// One whole proof begun at `since` right after `topology` was read,
     /// repeated (each after a fresh read) every [`DESK_PROOF_SETTLE_RETRY`]
     /// while its failure is [transient](DeskProofFailure::transient),
@@ -962,10 +1125,15 @@ impl Drop for DeskWatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeskPrivacySetting {
-    /// The desk is kept private while a Deck is attached (the default).
+    /// Each Deck's user chooses (private unless they turn it off); a desk
+    /// that cannot be made fully private is reported, never refused. What
+    /// every installer ships.
     On,
     /// The desk's monitors and input stay live while a Deck is attached.
     Off,
+    /// Always private, whatever the Deck asks; a desk that cannot be made
+    /// private refuses the attachment, or ends it.
+    Required,
 }
 
 /// Where the effective desk privacy decision came from.
@@ -977,8 +1145,22 @@ pub enum DeskPrivacySource {
     Default,
 }
 
-/// The effective desk privacy policy of one Pier: on unless the
-/// administrator turned it off (ADR 0025 §5, amended 2026-11-18).
+/// What the administrator's `privacy.desk` leaves to each attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskPrivacyMode {
+    /// `"on"` or absent: the Deck's user chooses ([`DeckDeskPrivacy`]),
+    /// private by default, kept as far as the host can
+    /// ([`DeskPrivacyPlan::BestEffort`]).
+    FollowDeck,
+    /// `"required"`: always private, fail closed
+    /// ([`DeskPrivacyPlan::Required`]).
+    Required,
+    /// `"off"`: never private.
+    Off,
+}
+
+/// The effective desk privacy policy of one Pier (ADR 0025 §5, amended
+/// 2026-11-18 and 2026-11-24).
 ///
 /// Every Pier resolves it the same way and applies it to every session
 /// whose picture is on the desk's own monitors
@@ -986,8 +1168,8 @@ pub enum DeskPrivacySource {
 /// has nothing to keep private.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeskPrivacyPolicy {
-    /// The desk is kept private while a Deck is attached.
-    pub enabled: bool,
+    /// What `privacy.desk` leaves to each attachment.
+    pub mode: DeskPrivacyMode,
     /// Where the decision came from.
     pub source: DeskPrivacySource,
 }
@@ -1004,43 +1186,120 @@ impl DeskPrivacyPolicy {
     pub const fn resolve(setting: Option<DeskPrivacySetting>) -> Self {
         match setting {
             Some(setting) => Self {
-                enabled: matches!(setting, DeskPrivacySetting::On),
+                mode: match setting {
+                    DeskPrivacySetting::On => DeskPrivacyMode::FollowDeck,
+                    DeskPrivacySetting::Off => DeskPrivacyMode::Off,
+                    DeskPrivacySetting::Required => DeskPrivacyMode::Required,
+                },
                 source: DeskPrivacySource::Config,
             },
             None => Self {
-                enabled: true,
+                mode: DeskPrivacyMode::FollowDeck,
                 source: DeskPrivacySource::Default,
             },
         }
     }
 
+    /// Whether any attachment may be kept private: the administrator did
+    /// not turn desk privacy off.
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        !matches!(self.mode, DeskPrivacyMode::Off)
+    }
+
+    /// Whether every attachment must be private, failing closed.
+    #[must_use]
+    pub const fn required(self) -> bool {
+        matches!(self.mode, DeskPrivacyMode::Required)
+    }
+
     /// The line every Pier logs at start, so the administrator sees the
-    /// effective choice and where it came from.
+    /// effective choice and where it came from (a warning when off).
     #[must_use]
     pub const fn startup_line(self) -> &'static str {
-        match (self.enabled, self.source) {
-            (true, DeskPrivacySource::Default) => {
-                "desk privacy: on (default): while a Deck is attached the desk's monitors are \
-                 blanked and its input is blocked; privacy.desk = \"off\" turns it off"
+        match (self.mode, self.source) {
+            (DeskPrivacyMode::FollowDeck, DeskPrivacySource::Default) => {
+                "desk privacy: on (default): each Deck's user chooses, private unless they turn \
+                 it off; while a private Deck is attached the desk's monitors are blanked and its \
+                 input is blocked as far as this host can, and what it cannot do (a dummy plug, \
+                 a monitor that cannot be darkened) is reported, not refused; privacy.desk = \
+                 \"required\" refuses instead, \"off\" turns it off"
             }
-            (true, DeskPrivacySource::Config) => {
-                "desk privacy: on (privacy.desk): while a Deck is attached the desk's monitors \
-                 are blanked and its input is blocked"
+            (DeskPrivacyMode::FollowDeck, DeskPrivacySource::Config) => {
+                "desk privacy: on (privacy.desk): each Deck's user chooses, private unless they \
+                 turn it off; while a private Deck is attached the desk's monitors are blanked \
+                 and its input is blocked as far as this host can, and what it cannot do (a \
+                 dummy plug, a monitor that cannot be darkened) is reported, not refused"
             }
-            (false, _) => {
+            (DeskPrivacyMode::Required, _) => {
+                "desk privacy: REQUIRED (privacy.desk = \"required\"): every Deck's session is \
+                 private whatever the Deck asks; a desk that cannot be made private (a dummy \
+                 plug, a monitor that cannot be darkened) refuses the session, or ends it"
+            }
+            (DeskPrivacyMode::Off, _) => {
                 "desk privacy: OFF (privacy.desk = \"off\"): while a Deck is attached anyone at \
                  the desk sees the session and can use its keyboard and mouse"
             }
         }
     }
 
-    /// What to do for one attachment whose desktop has `exposure`.
+    /// What to do for one attachment whose desktop has `exposure`, for a
+    /// Deck that asked `deck`.
     #[must_use]
-    pub const fn plan(self, exposure: DeskExposure) -> DeskPrivacyPlan {
-        match (exposure, self.enabled) {
-            (DeskExposure::NotShown, _) => DeskPrivacyPlan::NotShown,
-            (DeskExposure::PhysicalDesk, true) => DeskPrivacyPlan::Protect,
-            (DeskExposure::PhysicalDesk, false) => DeskPrivacyPlan::OperatorOff,
+    pub const fn plan(self, exposure: DeskExposure, deck: DeckDeskPrivacy) -> DeskPrivacyPlan {
+        match (exposure, self.mode, deck) {
+            (DeskExposure::NotShown, _, _) => DeskPrivacyPlan::NotShown,
+            (DeskExposure::PhysicalDesk, DeskPrivacyMode::Off, _) => DeskPrivacyPlan::OperatorOff,
+            (DeskExposure::PhysicalDesk, DeskPrivacyMode::Required, _) => DeskPrivacyPlan::Required,
+            (DeskExposure::PhysicalDesk, DeskPrivacyMode::FollowDeck, DeckDeskPrivacy::Private) => {
+                DeskPrivacyPlan::BestEffort
+            }
+            (DeskExposure::PhysicalDesk, DeskPrivacyMode::FollowDeck, DeckDeskPrivacy::Visible) => {
+                DeskPrivacyPlan::DeckVisible
+            }
+        }
+    }
+}
+
+/// What the Deck's user asked for the host's desk
+/// (`AuthResponse.desk_privacy_request`). Absent (an older Deck) and any
+/// token this build does not know are [`Self::Private`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DeckDeskPrivacy {
+    /// Keep the host's desk private while attached (the Deck's default).
+    #[default]
+    Private,
+    /// The user turned desk privacy off: the desk may see the session.
+    Visible,
+}
+
+impl DeckDeskPrivacy {
+    /// Wire token.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Visible => "visible",
+        }
+    }
+
+    /// The Deck's request as a Pier reads it: only `visible` turns privacy
+    /// off; absent and unknown tokens keep the desk private.
+    #[must_use]
+    pub fn from_request(token: Option<&str>) -> Self {
+        match token {
+            Some("visible") => Self::Visible,
+            _ => Self::Private,
+        }
+    }
+
+    /// The request for the Deck's setting "Keep the host's desk private".
+    #[must_use]
+    pub const fn from_setting(keep_private: bool) -> Self {
+        if keep_private {
+            Self::Private
+        } else {
+            Self::Visible
         }
     }
 }
@@ -1061,10 +1320,17 @@ pub enum DeskExposure {
 /// What a Pier does about the desk for one attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeskPrivacyPlan {
-    /// Blank the desk's monitors and block its input before the Deck sees
-    /// anything; a desk that cannot be made private refuses the attachment
-    /// (`console_privacy_unavailable`), never streams it unprotected.
-    Protect,
+    /// The administrator requires privacy (`"required"`): blank the desk's
+    /// monitors and block its input before the Deck sees anything; a desk
+    /// that cannot be made private refuses the attachment, and one that
+    /// stops being private ends it (`console_privacy_unavailable`).
+    Required,
+    /// The Deck's user asked for privacy: apply every measure the host can
+    /// and report what it could not ([`DeskPrivacyState`]); never refuse or
+    /// end the attachment for it.
+    BestEffort,
+    /// The Deck's user turned desk privacy off: the desk stays live.
+    DeckVisible,
     /// The administrator turned desk privacy off: the desk stays live, and
     /// the Deck is told.
     OperatorOff,
@@ -1073,59 +1339,362 @@ pub enum DeskPrivacyPlan {
 }
 
 impl DeskPrivacyPlan {
-    /// The status a Pier reports to the Deck for an attachment it serves
-    /// under this plan (a [`Self::Protect`] attachment is served only once
-    /// the desk is private).
+    /// Whether the Pier makes the desk private for this attachment.
+    #[must_use]
+    pub const fn protects(self) -> bool {
+        matches!(self, Self::Required | Self::BestEffort)
+    }
+
+    /// Whether a desk that cannot be made private refuses (or ends) the
+    /// attachment.
+    #[must_use]
+    pub const fn fails_closed(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// The status a Pier reports for an attachment served under this plan
+    /// with every measure in place (a shortfall is
+    /// [`DeskPrivacyState::status`]'s to report).
     #[must_use]
     pub const fn status(self) -> DeskPrivacyStatus {
         match self {
-            Self::Protect => DeskPrivacyStatus::Blanked,
+            Self::Required => DeskPrivacyStatus::Required,
+            Self::BestEffort => DeskPrivacyStatus::Blanked,
+            Self::DeckVisible => DeskPrivacyStatus::Visible,
             Self::OperatorOff => DeskPrivacyStatus::Off,
             Self::NotShown => DeskPrivacyStatus::NotShown,
         }
     }
 }
 
+/// Which part of the desk a [`DeskPrivacyRefusal`] left unprotected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskPart {
+    /// Its monitors: one shows, or may show, the session.
+    Screens,
+    /// Its keyboard and mouse: they reach the session.
+    Input,
+}
+
+impl DeskPrivacyRefusal {
+    /// Which part of the desk this leaves unprotected.
+    #[must_use]
+    pub const fn part(self) -> DeskPart {
+        match self {
+            Self::VirtualHidInput | Self::InputFilterUnavailable | Self::InputBlockUnavailable => {
+                DeskPart::Input
+            }
+            Self::DisplaysNotDark
+            | Self::DeskMonitorLit
+            | Self::DeskMonitorUnknown
+            | Self::DeskOutputsChanged
+            | Self::DeskDetachFailed => DeskPart::Screens,
+        }
+    }
+}
+
+/// What could not be made private, part by part (the first cause of each).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeskShortfall {
+    /// Why the screens are not all dark.
+    pub screens: Option<DeskPrivacyRefusal>,
+    /// Why the input is not blocked.
+    pub input: Option<DeskPrivacyRefusal>,
+}
+
+impl DeskShortfall {
+    /// Records `refusal` against its part (the first cause stays).
+    pub fn record(&mut self, refusal: DeskPrivacyRefusal) {
+        let slot = match refusal.part() {
+            DeskPart::Screens => &mut self.screens,
+            DeskPart::Input => &mut self.input,
+        };
+        slot.get_or_insert(refusal);
+    }
+
+    /// Nothing is missing.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.screens.is_none() && self.input.is_none()
+    }
+
+    /// Both shortfalls together.
+    #[must_use]
+    pub const fn with(self, other: Self) -> Self {
+        Self {
+            screens: match self.screens {
+                Some(refusal) => Some(refusal),
+                None => other.screens,
+            },
+            input: match self.input {
+                Some(refusal) => Some(refusal),
+                None => other.input,
+            },
+        }
+    }
+
+    /// The status of a private desk with this shortfall.
+    #[must_use]
+    pub const fn status(self) -> DeskPrivacyStatus {
+        match (self.screens, self.input) {
+            (None, None) => DeskPrivacyStatus::Blanked,
+            (Some(_), None) => DeskPrivacyStatus::ScreensVisible,
+            (None, Some(_)) => DeskPrivacyStatus::InputLive,
+            (Some(_), Some(_)) => DeskPrivacyStatus::NotPrivate,
+        }
+    }
+}
+
+/// The desk privacy of one attachment, from its plan to every shortfall
+/// met while it is attached: the one table every Pier decides by.
+///
+/// | Plan | A measure fails at attach | A re-proof fails mid-session |
+/// | --- | --- | --- |
+/// | [`DeskPrivacyPlan::Required`] | refuse (`console_privacy_unavailable`) | end the session |
+/// | [`DeskPrivacyPlan::BestEffort`] | keep the rest, warn, report it | keep the session, warn, report it; report the recovery |
+/// | [`DeskPrivacyPlan::DeckVisible`], [`DeskPrivacyPlan::OperatorOff`], [`DeskPrivacyPlan::NotShown`] | nothing is applied | nothing is watched |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeskPrivacyState {
+    plan: DeskPrivacyPlan,
+    attach: DeskShortfall,
+    watch: DeskShortfall,
+    told: Option<DeskPrivacyStatus>,
+}
+
+impl DeskPrivacyState {
+    /// An attachment about to be served under `plan`, nothing yet missing.
+    #[must_use]
+    pub const fn new(plan: DeskPrivacyPlan) -> Self {
+        Self {
+            plan,
+            attach: DeskShortfall {
+                screens: None,
+                input: None,
+            },
+            watch: DeskShortfall {
+                screens: None,
+                input: None,
+            },
+            told: None,
+        }
+    }
+
+    /// The plan.
+    #[must_use]
+    pub const fn plan(&self) -> DeskPrivacyPlan {
+        self.plan
+    }
+
+    /// One measure could not be applied while the desk was being made
+    /// private. Under [`DeskPrivacyPlan::BestEffort`] it is recorded and the
+    /// attachment goes on; a plan that does not protect ignores it.
+    ///
+    /// # Errors
+    ///
+    /// `refusal` under [`DeskPrivacyPlan::Required`]: the attachment is
+    /// refused.
+    pub fn attach_failed(&mut self, refusal: DeskPrivacyRefusal) -> Result<(), DeskPrivacyRefusal> {
+        match self.plan {
+            DeskPrivacyPlan::Required => Err(refusal),
+            DeskPrivacyPlan::BestEffort => {
+                self.attach.record(refusal);
+                Ok(())
+            }
+            DeskPrivacyPlan::DeckVisible
+            | DeskPrivacyPlan::OperatorOff
+            | DeskPrivacyPlan::NotShown => Ok(()),
+        }
+    }
+
+    /// One mid-session verdict on the desk (a [`DeskWatch`] verdict, a
+    /// display watch): a failure is recorded until a verdict passes again.
+    ///
+    /// # Errors
+    ///
+    /// The refusal under [`DeskPrivacyPlan::Required`]: the session ends.
+    pub fn watched(
+        &mut self,
+        verdict: Result<(), DeskPrivacyRefusal>,
+    ) -> Result<(), DeskPrivacyRefusal> {
+        match (self.plan, verdict) {
+            (DeskPrivacyPlan::Required, Err(refusal)) => Err(refusal),
+            (DeskPrivacyPlan::BestEffort, Err(refusal)) => {
+                self.watch = DeskShortfall::default();
+                self.watch.record(refusal);
+                Ok(())
+            }
+            (_, Ok(())) => {
+                self.watch = DeskShortfall::default();
+                Ok(())
+            }
+            (_, Err(_)) => Ok(()),
+        }
+    }
+
+    /// One verdict on one part of the desk, kept until that part's next
+    /// verdict (a host that re-asserts its screens and its input apart,
+    /// every second: the Linux console): a failure is recorded for `part`,
+    /// a pass clears it.
+    ///
+    /// # Errors
+    ///
+    /// The refusal under [`DeskPrivacyPlan::Required`].
+    pub fn watched_part(
+        &mut self,
+        part: DeskPart,
+        verdict: Result<(), DeskPrivacyRefusal>,
+    ) -> Result<(), DeskPrivacyRefusal> {
+        let slot = match part {
+            DeskPart::Screens => &mut self.watch.screens,
+            DeskPart::Input => &mut self.watch.input,
+        };
+        match (self.plan, verdict) {
+            (DeskPrivacyPlan::Required, Err(refusal)) => Err(refusal),
+            (DeskPrivacyPlan::BestEffort, Err(refusal)) => {
+                *slot = Some(refusal);
+                Ok(())
+            }
+            (_, Ok(())) => {
+                *slot = None;
+                Ok(())
+            }
+            (_, Err(_)) => Ok(()),
+        }
+    }
+
+    /// Everything missing now: what failed at attach and what the last
+    /// mid-session verdicts found.
+    #[must_use]
+    pub fn shortfall(&self) -> DeskShortfall {
+        self.attach.with(self.watch)
+    }
+
+    /// The desk's status now.
+    #[must_use]
+    pub fn status(&self) -> DeskPrivacyStatus {
+        match self.plan {
+            DeskPrivacyPlan::BestEffort => self.shortfall().status(),
+            plan => plan.status(),
+        }
+    }
+
+    /// The status a (re)attaching Deck's hello carries, which later updates
+    /// are measured against.
+    pub fn hello_status(&mut self) -> DeskPrivacyStatus {
+        let status = self.status();
+        self.told = Some(status);
+        status
+    }
+
+    /// The status to tell the Deck, when it differs from the last one told
+    /// (the first call always tells): the Pier sends it (the hello's
+    /// `desk_privacy`, then `desk_privacy_update`) and logs it once.
+    /// Marks it told at once; a Pier whose send can fail uses
+    /// [`Self::pending`] and [`Self::mark_told`] instead.
+    pub fn tell(&mut self) -> Option<DeskPrivacyStatus> {
+        let status = self.pending()?;
+        self.mark_told(status);
+        Some(status)
+    }
+
+    /// The status the Deck has not been told yet, without marking it told:
+    /// it stays pending until [`Self::mark_told`], so a send that failed (a
+    /// full queue) is tried again.
+    #[must_use]
+    pub fn pending(&self) -> Option<DeskPrivacyStatus> {
+        let status = self.status();
+        (self.told != Some(status)).then_some(status)
+    }
+
+    /// Records that `status` reached the Deck.
+    pub fn mark_told(&mut self, status: DeskPrivacyStatus) {
+        self.told = Some(status);
+    }
+}
+
 /// The desk's state as the Pier reports it to the Deck (the hello's
-/// `desk_privacy`).
+/// `desk_privacy`, and `desk_privacy_update` when it changes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeskPrivacyStatus {
     /// The desk's monitors are blank and its input blocked.
     Blanked,
+    /// As [`Self::Blanked`], because the administrator requires it: the
+    /// Deck's own choice was not asked.
+    Required,
     /// The administrator turned desk privacy off: the desk shows the
     /// session.
     Off,
+    /// The Deck's user turned desk privacy off: the desk shows the session.
+    Visible,
     /// No monitor at the desk shows this desktop.
     NotShown,
+    /// Private, but not every screen at the desk could be darkened (a dummy
+    /// plug, a monitor that cannot be darkened): its input is blocked.
+    ScreensVisible,
+    /// Private, but the desk's keyboard and mouse could not be blocked: its
+    /// screens are dark.
+    InputLive,
+    /// Neither the screens nor the input could be made private.
+    NotPrivate,
 }
 
 /// What the Deck shows while the desk is private.
 pub const DESK_BLANKED_NOTE: &str = "Host screens are blanked for privacy";
 
+/// What the Deck shows when the host requires desk privacy.
+pub const DESK_REQUIRED_NOTE: &str = "Host screens are blanked: this host requires desk privacy";
+
 /// What the Deck shows when the administrator turned desk privacy off.
 pub const DESK_VISIBLE_NOTE: &str =
     "Host screens are not blanked: desk privacy is turned off on this host";
 
+/// What the Deck shows when its user turned desk privacy off.
+pub const DESK_DECK_VISIBLE_NOTE: &str = "Host screens are visible: you turned desk privacy off.";
+
+/// What the Deck shows when a screen at the host could not be darkened.
+pub const DESK_SCREENS_VISIBLE_NOTE: &str = "Host screens could not be blanked (a dummy plug or a \
+     monitor that cannot be darkened). People at the host may see this session.";
+
+/// What the Deck shows when the host's input could not be blocked.
+pub const DESK_INPUT_LIVE_NOTE: &str = "The host's keyboard and mouse could not be blocked. \
+     People at the host may use this session.";
+
+/// What the Deck shows when neither could be made private.
+pub const DESK_NOT_PRIVATE_NOTE: &str = "Host screens could not be blanked and its keyboard and \
+     mouse could not be blocked. People at the host may see and use this session.";
+
 impl DeskPrivacyStatus {
+    /// Every status, for exhaustive checks.
+    pub const ALL: [Self; 8] = [
+        Self::Blanked,
+        Self::Required,
+        Self::Off,
+        Self::Visible,
+        Self::NotShown,
+        Self::ScreensVisible,
+        Self::InputLive,
+        Self::NotPrivate,
+    ];
+
     /// Wire token.
     #[must_use]
     pub const fn token(self) -> &'static str {
         match self {
             Self::Blanked => "blanked",
+            Self::Required => "required",
             Self::Off => "off",
+            Self::Visible => "visible",
             Self::NotShown => "not_shown",
+            Self::ScreensVisible => "screens_visible",
+            Self::InputLive => "input_live",
+            Self::NotPrivate => "not_private",
         }
     }
 
     /// Parses a wire token; `None` for a token this build does not know.
     #[must_use]
     pub fn from_token(token: &str) -> Option<Self> {
-        match token {
-            "blanked" => Some(Self::Blanked),
-            "off" => Some(Self::Off),
-            "not_shown" => Some(Self::NotShown),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|status| status.token() == token)
     }
 
     /// The one line the Deck shows for this status, if any.
@@ -1133,9 +1702,24 @@ impl DeskPrivacyStatus {
     pub const fn deck_note(self) -> Option<&'static str> {
         match self {
             Self::Blanked => Some(DESK_BLANKED_NOTE),
+            Self::Required => Some(DESK_REQUIRED_NOTE),
             Self::Off => Some(DESK_VISIBLE_NOTE),
+            Self::Visible => Some(DESK_DECK_VISIBLE_NOTE),
             Self::NotShown => None,
+            Self::ScreensVisible => Some(DESK_SCREENS_VISIBLE_NOTE),
+            Self::InputLive => Some(DESK_INPUT_LIVE_NOTE),
+            Self::NotPrivate => Some(DESK_NOT_PRIVATE_NOTE),
         }
+    }
+
+    /// Privacy was asked for and is not whole: people at the host may see
+    /// or use the session. The Deck shows it as a warning.
+    #[must_use]
+    pub const fn is_warning(self) -> bool {
+        matches!(
+            self,
+            Self::ScreensVisible | Self::InputLive | Self::NotPrivate
+        )
     }
 }
 
@@ -1164,40 +1748,184 @@ mod tests {
     }
 
     #[test]
-    fn desk_privacy_is_on_unless_the_administrator_turns_it_off() {
+    fn desk_privacy_follows_the_deck_unless_the_administrator_requires_or_turns_it_off() {
         let default = DeskPrivacyPolicy::resolve(None);
-        assert!(default.enabled);
+        assert_eq!(default.mode, DeskPrivacyMode::FollowDeck);
+        assert!(default.enabled() && !default.required());
         assert_eq!(default.source, DeskPrivacySource::Default);
         assert_eq!(DeskPrivacyPolicy::default(), default);
         assert!(default.startup_line().contains("on (default)"));
-
-        let off = DeskPrivacyPolicy::resolve(Some(DeskPrivacySetting::Off));
-        assert!(!off.enabled);
-        assert_eq!(off.source, DeskPrivacySource::Config);
-        assert!(off.startup_line().contains("OFF"));
+        assert!(default.startup_line().contains("not refused"));
 
         let on = DeskPrivacyPolicy::resolve(Some(DeskPrivacySetting::On));
-        assert!(on.enabled);
+        assert_eq!(on.mode, DeskPrivacyMode::FollowDeck);
         assert_eq!(on.source, DeskPrivacySource::Config);
+
+        let off = DeskPrivacyPolicy::resolve(Some(DeskPrivacySetting::Off));
+        assert!(!off.enabled() && !off.required());
+        assert!(off.startup_line().contains("OFF"));
+
+        let required = DeskPrivacyPolicy::resolve(Some(DeskPrivacySetting::Required));
+        assert!(required.enabled() && required.required());
+        assert!(required.startup_line().contains("REQUIRED"));
+        assert!(required.startup_line().contains("dummy plug"));
+    }
+
+    #[test]
+    fn the_deck_asks_private_unless_it_says_visible() {
+        assert_eq!(
+            DeckDeskPrivacy::from_request(None),
+            DeckDeskPrivacy::Private
+        );
+        assert_eq!(
+            DeckDeskPrivacy::from_request(Some("private")),
+            DeckDeskPrivacy::Private
+        );
+        assert_eq!(
+            DeckDeskPrivacy::from_request(Some("visible")),
+            DeckDeskPrivacy::Visible
+        );
+        for unknown in ["", "VISIBLE", "off", "dimmed"] {
+            assert_eq!(
+                DeckDeskPrivacy::from_request(Some(unknown)),
+                DeckDeskPrivacy::Private,
+                "{unknown:?}"
+            );
+        }
+        for deck in [DeckDeskPrivacy::Private, DeckDeskPrivacy::Visible] {
+            assert_eq!(DeckDeskPrivacy::from_request(Some(deck.token())), deck);
+        }
+        assert_eq!(
+            DeckDeskPrivacy::from_setting(true),
+            DeckDeskPrivacy::Private
+        );
+        assert_eq!(
+            DeckDeskPrivacy::from_setting(false),
+            DeckDeskPrivacy::Visible
+        );
+        assert_eq!(DeckDeskPrivacy::default(), DeckDeskPrivacy::Private);
+    }
+
+    /// The whole decision table: `privacy.desk` x the Deck's choice x the
+    /// desktop's exposure x what happens at attach and mid-session.
+    #[test]
+    fn every_choice_config_and_outcome_is_decided_by_one_table() {
+        use DeskPrivacyPlan as Plan;
+        use DeskPrivacyStatus as Status;
+        let screens = DeskPrivacyRefusal::DeskMonitorLit;
+        let input = DeskPrivacyRefusal::InputBlockUnavailable;
+        let settings = [
+            None,
+            Some(DeskPrivacySetting::On),
+            Some(DeskPrivacySetting::Required),
+            Some(DeskPrivacySetting::Off),
+        ];
+        for setting in settings {
+            let policy = DeskPrivacyPolicy::resolve(setting);
+            for deck in [DeckDeskPrivacy::Private, DeckDeskPrivacy::Visible] {
+                assert_eq!(
+                    policy.plan(DeskExposure::NotShown, deck),
+                    Plan::NotShown,
+                    "{setting:?} {deck:?}"
+                );
+                let plan = policy.plan(DeskExposure::PhysicalDesk, deck);
+                let expected = match (setting, deck) {
+                    (Some(DeskPrivacySetting::Off), _) => Plan::OperatorOff,
+                    (Some(DeskPrivacySetting::Required), _) => Plan::Required,
+                    (_, DeckDeskPrivacy::Private) => Plan::BestEffort,
+                    (_, DeckDeskPrivacy::Visible) => Plan::DeckVisible,
+                };
+                assert_eq!(plan, expected, "{setting:?} {deck:?}");
+            }
+        }
+
+        // Everything in place: each plan's own status.
+        for (plan, status) in [
+            (Plan::Required, Status::Required),
+            (Plan::BestEffort, Status::Blanked),
+            (Plan::DeckVisible, Status::Visible),
+            (Plan::OperatorOff, Status::Off),
+            (Plan::NotShown, Status::NotShown),
+        ] {
+            assert_eq!(plan.status(), status);
+            assert_eq!(DeskPrivacyState::new(plan).status(), status, "{plan:?}");
+            assert_eq!(
+                plan.protects(),
+                matches!(plan, Plan::Required | Plan::BestEffort)
+            );
+            assert_eq!(plan.fails_closed(), plan == Plan::Required);
+        }
+
+        // At attach: required refuses; best effort keeps the session and
+        // says which part is missing; the rest apply nothing.
+        for refusal in [screens, input] {
+            let mut required = DeskPrivacyState::new(Plan::Required);
+            assert_eq!(required.attach_failed(refusal), Err(refusal));
+            for plan in [Plan::DeckVisible, Plan::OperatorOff, Plan::NotShown] {
+                let mut state = DeskPrivacyState::new(plan);
+                assert_eq!(state.attach_failed(refusal), Ok(()));
+                assert_eq!(state.status(), plan.status());
+            }
+        }
+        let best = |failures: &[DeskPrivacyRefusal]| {
+            let mut state = DeskPrivacyState::new(Plan::BestEffort);
+            for refusal in failures {
+                assert_eq!(state.attach_failed(*refusal), Ok(()));
+            }
+            state.status()
+        };
+        assert_eq!(best(&[]), Status::Blanked);
+        assert_eq!(best(&[screens]), Status::ScreensVisible);
+        assert_eq!(best(&[input]), Status::InputLive);
+        assert_eq!(best(&[input, screens]), Status::NotPrivate);
+        assert_eq!(
+            best(&[
+                DeskPrivacyRefusal::VirtualHidInput,
+                DeskPrivacyRefusal::DisplaysNotDark
+            ]),
+            Status::NotPrivate
+        );
+
+        // Mid-session: required ends; best effort warns, then recovers.
+        let mut required = DeskPrivacyState::new(Plan::Required);
+        assert_eq!(required.watched(Ok(())), Ok(()));
+        assert_eq!(required.watched(Err(screens)), Err(screens));
+        let mut state = DeskPrivacyState::new(Plan::BestEffort);
+        assert_eq!(state.hello_status(), Status::Blanked);
+        assert_eq!(state.tell(), None, "the hello told it");
+        assert_eq!(state.watched(Ok(())), Ok(()));
+        assert_eq!(state.tell(), None, "unchanged is not told again");
+        assert_eq!(state.watched(Err(screens)), Ok(()));
+        assert_eq!(state.tell(), Some(Status::ScreensVisible));
+        assert_eq!(state.watched(Err(screens)), Ok(()));
+        assert_eq!(state.tell(), None, "a failure is told (and logged) once");
+        assert_eq!(state.watched(Ok(())), Ok(()));
+        assert_eq!(state.tell(), Some(Status::Blanked), "the recovery is told");
+        // A shortfall from the attach stays when the watch recovers.
+        let mut partial = DeskPrivacyState::new(Plan::BestEffort);
+        assert_eq!(partial.attach_failed(input), Ok(()));
+        assert_eq!(partial.watched(Err(screens)), Ok(()));
+        assert_eq!(partial.status(), Status::NotPrivate);
+        assert_eq!(partial.watched(Ok(())), Ok(()));
+        assert_eq!(partial.status(), Status::InputLive);
+        // Plans that protect nothing never end or change.
+        for plan in [Plan::DeckVisible, Plan::OperatorOff, Plan::NotShown] {
+            let mut state = DeskPrivacyState::new(plan);
+            assert_eq!(state.watched(Err(screens)), Ok(()));
+            assert_eq!(state.status(), plan.status());
+        }
     }
 
     #[test]
     fn only_a_desktop_on_the_desk_is_protected_and_the_deck_is_told() {
         let on = DeskPrivacyPolicy::default();
-        let off = DeskPrivacyPolicy::resolve(Some(DeskPrivacySetting::Off));
+        let private = DeckDeskPrivacy::Private;
         assert_eq!(
-            on.plan(DeskExposure::PhysicalDesk),
-            DeskPrivacyPlan::Protect
+            on.plan(DeskExposure::PhysicalDesk, private),
+            DeskPrivacyPlan::BestEffort
         );
         assert_eq!(
-            off.plan(DeskExposure::PhysicalDesk),
-            DeskPrivacyPlan::OperatorOff
-        );
-        assert_eq!(on.plan(DeskExposure::NotShown), DeskPrivacyPlan::NotShown);
-        assert_eq!(off.plan(DeskExposure::NotShown), DeskPrivacyPlan::NotShown);
-
-        assert_eq!(
-            DeskPrivacyPlan::Protect.status().deck_note(),
+            DeskPrivacyPlan::BestEffort.status().deck_note(),
             Some("Host screens are blanked for privacy")
         );
         assert!(
@@ -1206,7 +1934,36 @@ mod tests {
                 .deck_note()
                 .is_some_and(|note| note.contains("not blanked"))
         );
+        assert!(
+            DeskPrivacyPlan::DeckVisible
+                .status()
+                .deck_note()
+                .is_some_and(|note| note.contains("you turned desk privacy off"))
+        );
+        assert!(
+            DeskPrivacyPlan::Required
+                .status()
+                .deck_note()
+                .is_some_and(|note| note.contains("requires"))
+        );
+        assert!(
+            DeskPrivacyStatus::ScreensVisible
+                .deck_note()
+                .is_some_and(|note| note.contains("dummy plug"))
+        );
         assert_eq!(DeskPrivacyPlan::NotShown.status().deck_note(), None);
+        for status in DeskPrivacyStatus::ALL {
+            assert_eq!(
+                status.is_warning(),
+                matches!(
+                    status,
+                    DeskPrivacyStatus::ScreensVisible
+                        | DeskPrivacyStatus::InputLive
+                        | DeskPrivacyStatus::NotPrivate
+                ),
+                "{status:?}"
+            );
+        }
     }
 
     #[test]
@@ -1239,15 +1996,21 @@ mod tests {
             desk_outputs_dark(&[]),
             Err(DeskPrivacyRefusal::DeskMonitorUnknown)
         );
-        for refusal in [
-            DeskPrivacyRefusal::DeskMonitorUnknown,
-            DeskPrivacyRefusal::DeskOutputsChanged,
-            DeskPrivacyRefusal::InputBlockUnavailable,
-            DeskPrivacyRefusal::DeskDetachFailed,
-        ] {
+        assert_eq!(DeskPrivacyRefusal::from_token("dark_enough"), None);
+        for refusal in DeskPrivacyRefusal::ALL {
+            assert_eq!(
+                DeskPrivacyRefusal::from_token(refusal.token()),
+                Some(refusal)
+            );
             let reason = refusal.deck_reason();
             assert!(
                 reason.starts_with("console_privacy_unavailable: "),
+                "{reason}"
+            );
+            assert!(reason.contains("desk privacy is required"), "{reason}");
+            assert_eq!(
+                reason.contains("dummy plug"),
+                refusal.part() == DeskPart::Screens,
                 "{reason}"
             );
             assert!(reason.len() <= 120, "{reason}");
@@ -1256,11 +2019,7 @@ mod tests {
 
     #[test]
     fn desk_privacy_status_round_trips_and_ignores_unknown_tokens() {
-        for status in [
-            DeskPrivacyStatus::Blanked,
-            DeskPrivacyStatus::Off,
-            DeskPrivacyStatus::NotShown,
-        ] {
+        for status in DeskPrivacyStatus::ALL {
             assert_eq!(DeskPrivacyStatus::from_token(status.token()), Some(status));
         }
         assert_eq!(DeskPrivacyStatus::from_token("dimmed"), None);
@@ -2098,6 +2857,130 @@ mod tests {
         assert_eq!(
             watch.verdict(Instant::now()),
             Err(DeskPrivacyRefusal::DeskMonitorLit)
+        );
+    }
+
+    #[test]
+    fn a_best_effort_watch_keeps_proving_after_a_refusal_and_reports_the_recovery() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::{Arc, mpsc};
+        let lit = Arc::new(AtomicBool::new(true));
+        let proofs = Arc::new(AtomicU32::new(0));
+        let (lit_now, proof_count) = (Arc::clone(&lit), Arc::clone(&proofs));
+        let (alarm_tx, alarm_rx) = mpsc::channel();
+        let watch = DeskWatch::start_with(
+            DeskWatchOnRefusal::Keep,
+            Duration::from_millis(5),
+            Some(1_u32),
+            || Some(2),
+            move || {
+                proof_count.fetch_add(1, Ordering::SeqCst);
+                if lit_now.load(Ordering::SeqCst) {
+                    Err(DeskProofFailure::decided(
+                        DeskPrivacyRefusal::DeskMonitorLit,
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+            move || {
+                let _ = alarm_tx.send(());
+            },
+        );
+        alarm_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            watch.verdict(Instant::now()),
+            Err(DeskPrivacyRefusal::DeskMonitorLit)
+        );
+        // Still watching, but not proving faster than the interval.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(proofs.load(Ordering::SeqCst), 1);
+        lit.store(false, Ordering::SeqCst);
+        alarm_rx
+            .recv_timeout(DESK_FULL_PROOF_INTERVAL + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(watch.verdict(Instant::now()), Ok(()));
+        assert_eq!(proofs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn desk_privacy_never_takes_a_served_output_away() {
+        use std::collections::BTreeSet;
+        assert_eq!(
+            desk_output_measure(DeskOutputRole::Served),
+            DeskOutputMeasure::KeepServed
+        );
+        assert_eq!(
+            desk_output_measure(DeskOutputRole::Other),
+            DeskOutputMeasure::Hide
+        );
+        // Match My Layout on a GeForce with two dummy plugs: both plugs carry
+        // a stream, so nothing is detached.
+        let served: BTreeSet<&str> = ["DISPLAY1", "DISPLAY2"].into_iter().collect();
+        assert!(desk_outputs_to_hide(&["DISPLAY1", "DISPLAY2"], &served).is_empty());
+        // One served display: only the other lit outputs are hidden.
+        let single: BTreeSet<&str> = ["DISPLAY2"].into_iter().collect();
+        assert_eq!(
+            desk_outputs_to_hide(&["DISPLAY1", "DISPLAY2", "DISPLAY3"], &single),
+            vec!["DISPLAY1", "DISPLAY3"]
+        );
+        // A served output with a monitor behind it stays lit: the desk is
+        // not dark, which best effort reports and required refuses.
+        let lit_served = [DeskOutputFact {
+            lit: true,
+            monitor: DeskMonitor::Present,
+        }];
+        assert_eq!(
+            desk_outputs_dark(&lit_served),
+            Err(DeskPrivacyRefusal::DeskMonitorLit)
+        );
+        let mut best = DeskPrivacyState::new(DeskPrivacyPlan::BestEffort);
+        assert_eq!(
+            best.attach_failed(DeskPrivacyRefusal::DeskMonitorLit),
+            Ok(())
+        );
+        assert_eq!(best.status(), DeskPrivacyStatus::ScreensVisible);
+        let mut required = DeskPrivacyState::new(DeskPrivacyPlan::Required);
+        assert_eq!(
+            required.attach_failed(DeskPrivacyRefusal::DeskMonitorLit),
+            Err(DeskPrivacyRefusal::DeskMonitorLit)
+        );
+    }
+
+    #[test]
+    fn a_status_the_deck_was_not_sent_stays_pending_until_it_is() {
+        let mut state = DeskPrivacyState::new(DeskPrivacyPlan::BestEffort);
+        assert_eq!(state.hello_status(), DeskPrivacyStatus::Blanked);
+        assert_eq!(state.pending(), None);
+        assert_eq!(
+            state.watched(Err(DeskPrivacyRefusal::DeskMonitorLit)),
+            Ok(())
+        );
+        // The send failed (a full queue): nothing is marked, so it is
+        // still pending at the next try.
+        assert_eq!(state.pending(), Some(DeskPrivacyStatus::ScreensVisible));
+        assert_eq!(state.pending(), Some(DeskPrivacyStatus::ScreensVisible));
+        state.mark_told(DeskPrivacyStatus::ScreensVisible);
+        assert_eq!(state.pending(), None);
+    }
+
+    #[test]
+    fn screens_and_input_are_watched_apart_and_each_recovers_alone() {
+        let mut state = DeskPrivacyState::new(DeskPrivacyPlan::BestEffort);
+        let screens = DeskPrivacyRefusal::DisplaysNotDark;
+        let input = DeskPrivacyRefusal::InputBlockUnavailable;
+        assert_eq!(state.watched_part(DeskPart::Screens, Err(screens)), Ok(()));
+        assert_eq!(state.watched_part(DeskPart::Input, Err(input)), Ok(()));
+        assert_eq!(state.status(), DeskPrivacyStatus::NotPrivate);
+        assert_eq!(state.watched_part(DeskPart::Input, Ok(())), Ok(()));
+        assert_eq!(state.status(), DeskPrivacyStatus::ScreensVisible);
+        assert_eq!(state.watched_part(DeskPart::Screens, Ok(())), Ok(()));
+        assert_eq!(state.status(), DeskPrivacyStatus::Blanked);
+        let mut required = DeskPrivacyState::new(DeskPrivacyPlan::Required);
+        assert_eq!(
+            required.watched_part(DeskPart::Input, Err(input)),
+            Err(input)
         );
     }
 }

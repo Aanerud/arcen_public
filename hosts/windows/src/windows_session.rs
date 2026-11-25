@@ -129,6 +129,9 @@ pub struct AgentConfig {
     /// `privacy.desk = "off"`; absent keeps the desk private.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     desk_privacy_off: bool,
+    /// `privacy.desk = "required"`; absent follows each Deck's choice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    desk_privacy_required: bool,
     #[serde(default)]
     iddcx: crate::config::WindowsIddCxConfig,
     #[serde(default)]
@@ -209,7 +212,8 @@ impl AgentConfig {
             qos_targets: config.qos_targets,
             debug_diagnostics: config.debug_diagnostics,
             deskside: config.deskside.clone(),
-            desk_privacy_off: !config.desk_privacy.enabled,
+            desk_privacy_off: !config.desk_privacy.enabled(),
+            desk_privacy_required: config.desk_privacy.required(),
             iddcx: config.iddcx.clone(),
             multi_monitor: config.multi_monitor.clone(),
         }
@@ -331,11 +335,18 @@ impl AgentConfig {
             qos_targets: self.qos_targets,
             debug_diagnostics: self.debug_diagnostics,
             deskside: self.deskside,
-            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::resolve(
-                self.desk_privacy_off.then_some(
-                    arcen_session::console_session::desk_privacy::DeskPrivacySetting::Off,
-                ),
-            ),
+            desk_privacy: {
+                use arcen_session::console_session::desk_privacy::{
+                    DeskPrivacyPolicy, DeskPrivacySetting,
+                };
+                DeskPrivacyPolicy::resolve(if self.desk_privacy_off {
+                    Some(DeskPrivacySetting::Off)
+                } else if self.desk_privacy_required {
+                    Some(DeskPrivacySetting::Required)
+                } else {
+                    None
+                })
+            },
             iddcx: self.iddcx,
             multi_monitor: self.multi_monitor,
             lossless_refinement: self.lossless_refinement,
@@ -2928,6 +2939,7 @@ mod tests {
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             desk_privacy_off: false,
+            desk_privacy_required: false,
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
         };
@@ -4093,6 +4105,7 @@ mod tests {
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             desk_privacy_off: false,
+            desk_privacy_required: false,
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
         };
@@ -4133,6 +4146,7 @@ mod tests {
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             desk_privacy_off: false,
+            desk_privacy_required: false,
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
         };
@@ -4173,6 +4187,7 @@ mod tests {
             debug_diagnostics: false,
             deskside: crate::deskside::DesksideConfig::default(),
             desk_privacy_off: false,
+            desk_privacy_required: false,
             iddcx: crate::config::WindowsIddCxConfig::default(),
             multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
         };
@@ -4180,5 +4195,60 @@ mod tests {
             software.into_host().unwrap().encoder,
             arcen_media::video::EncoderRequest::SoftwareH264
         );
+    }
+
+    /// The agent applies the administrator's `privacy.desk` exactly as the
+    /// service read it: `required` must not arrive as the Deck's choice.
+    #[test]
+    fn agent_config_carries_required_desk_privacy() {
+        use arcen_session::console_session::desk_privacy::DeskPrivacyMode;
+        let base = || AgentConfig {
+            capenc_bin: "capenc".to_string(),
+            global_output_index: Some(0),
+            adapter_name: None,
+            adapter_output_index: None,
+            codec: "h264".to_string(),
+            chroma: "yuv420".to_string(),
+            bit_depth: default_bit_depth(),
+            color_range: default_color_range(),
+            color_matrix: default_color_matrix(),
+            color_policy: default_color_policy(),
+            qp_map: default_qp_map(),
+            qp_map_config: None,
+            video_selection: VideoSelectionIntent::Exact,
+            codec_pinned: false,
+            variant_pinned: false,
+            auth_video_request: None,
+            fps: 30,
+            fps_ceiling: None,
+            encoder: Some("software-h264".to_string()),
+            audio_enabled: true,
+            audio_compressed: false,
+            microphone_input_enabled: false,
+            lossless_refinement: true,
+            clipboard_policy: arcen_media::clipboard::ClipboardPolicy::default(),
+            timezone_redirection: false,
+            font_smoothing: Default::default(),
+            media_foundation_hardware: true,
+            qos_targets: arcen_telemetry::QosTargets::default(),
+            debug_diagnostics: false,
+            deskside: crate::deskside::DesksideConfig::default(),
+            desk_privacy_off: false,
+            desk_privacy_required: false,
+            iddcx: crate::config::WindowsIddCxConfig::default(),
+            multi_monitor: crate::config::WindowsMultiMonitorConfig::default(),
+        };
+        let mode = |config: AgentConfig| {
+            let decoded: AgentConfig =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            decoded.into_host().unwrap().desk_privacy.mode
+        };
+        assert_eq!(mode(base()), DeskPrivacyMode::FollowDeck);
+        let mut required = base();
+        required.desk_privacy_required = true;
+        assert_eq!(mode(required), DeskPrivacyMode::Required);
+        let mut off = base();
+        off.desk_privacy_off = true;
+        assert_eq!(mode(off), DeskPrivacyMode::Off);
     }
 }

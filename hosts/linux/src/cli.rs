@@ -1852,7 +1852,7 @@ pub fn parse(args: &[String]) -> Result<Config, String> {
         &cfg.session_display,
         &cfg.session_gpu_head,
     )?;
-    if cfg.deskside.enabled && !cfg.desk_privacy.enabled {
+    if cfg.deskside.enabled && !cfg.desk_privacy.enabled() {
         return Err(
             "platform.deskside (pinned physical-console privacy) contradicts privacy.desk = \"off\""
                 .to_string(),
@@ -3907,12 +3907,15 @@ mod tests {
             .expect("config")
         };
         let mut cfg = Config::default();
-        assert!(cfg.desk_privacy.enabled);
+        assert!(cfg.desk_privacy.enabled());
         apply_file_config(&mut cfg, file_with("")).expect("apply file config");
-        assert!(cfg.desk_privacy.enabled);
+        assert!(cfg.desk_privacy.enabled());
         apply_file_config(&mut cfg, file_with(r#""privacy":{"desk":"off"},"#))
             .expect("apply file config");
-        assert!(!cfg.desk_privacy.enabled);
+        assert!(!cfg.desk_privacy.enabled());
+        apply_file_config(&mut cfg, file_with(r#""privacy":{"desk":"required"},"#))
+            .expect("apply file config");
+        assert!(cfg.desk_privacy.enabled() && cfg.desk_privacy.required());
     }
 
     #[test]

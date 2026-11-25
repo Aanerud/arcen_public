@@ -317,6 +317,7 @@ mod tests {
             tablet_mode_requested: ClientSettings::default().tablet_mode_requested,
             telemetry: Arc::new(arcen_deck_core::client_telemetry::ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
         }
     }

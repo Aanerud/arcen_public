@@ -1100,6 +1100,28 @@ async fn next_keymap_notice(
     Some((json, notice))
 }
 
+/// The next change of the desk's privacy (`None` once nobody sends any).
+async fn next_desk_privacy(
+    updates: Option<&mut crate::desk_privacy::DeskPrivacyUpdates>,
+) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+    match updates {
+        Some(updates) => updates.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Tells the Deck the desk's privacy changed (`desk_privacy_update`).
+async fn send_desk_privacy(
+    priority: &tokio::sync::mpsc::Sender<Message>,
+    status: arcen_session::console_session::desk_privacy::DeskPrivacyStatus,
+) -> Result<(), StreamError> {
+    let json = serde_json::to_string(&arcen_protocol::messages::DeskPrivacyUpdateMsg::new(
+        status.token(),
+    ))
+    .map_err(|error| StreamError::Protocol(format!("desk_privacy_update: {error}")))?;
+    enqueue(priority, Message::Text(json)).await
+}
+
 /// Hands a layout notice to the session's input, and to the Deck when it
 /// was told `host_keymap`.
 async fn take_keymap_notice(
@@ -2118,6 +2140,9 @@ pub struct StreamSession<'a> {
     pub refine: arcen_media::refine::RefinePlan,
     /// Tell the Deck this session's keyboard layout (`host_keymap`).
     pub host_keymap: bool,
+    /// The desk's privacy as it changes, told to the Deck as
+    /// `desk_privacy_update` (`DeskPrivacy::take_updates`).
+    pub desk_privacy: Option<crate::desk_privacy::DeskPrivacyUpdates>,
     /// Counts each frame written, for a session that drops the stream.
     pub sent_frames: arcen_telemetry::SentFrames,
 }
@@ -2226,6 +2251,9 @@ pub struct MultiStreamSession<'a> {
     pub path_signal_connection: Option<quinn::Connection>,
     /// Tell the Deck this session's keyboard layout (`host_keymap`).
     pub host_keymap: bool,
+    /// The desk's privacy as it changes, told to the Deck as
+    /// `desk_privacy_update` (`DeskPrivacy::take_updates`).
+    pub desk_privacy: Option<crate::desk_privacy::DeskPrivacyUpdates>,
     /// Counts each frame written, for a session that drops the stream.
     pub sent_frames: arcen_telemetry::SentFrames,
 }
@@ -2284,6 +2312,7 @@ pub async fn stream(
         served_pipeline,
         refine: refine_plan,
         host_keymap,
+        mut desk_privacy,
         sent_frames,
     } = session;
     let operational_motion_priority =
@@ -2574,6 +2603,13 @@ pub async fn stream(
                             take_keymap_notice(&priority, host_keymap, input.as_mut(), notice).await?;
                         }
                         None => keymap_watch = None,
+                    }
+                    continue;
+                }
+                status = next_desk_privacy(desk_privacy.as_mut()), if desk_privacy.is_some() => {
+                    match status {
+                        Some(status) => send_desk_privacy(&priority, status).await?,
+                        None => desk_privacy = None,
                     }
                     continue;
                 }
@@ -3070,6 +3106,7 @@ pub async fn stream_multi(
         audio_encoding,
         path_signal_connection,
         host_keymap,
+        mut desk_privacy,
         sent_frames,
     } = session;
     let mut audio_encoder = AudioPacketEncoder::new(audio_encoding);
@@ -3342,6 +3379,13 @@ pub async fn stream_multi(
                             take_keymap_notice(&priority, host_keymap, input.as_mut(), notice).await?;
                         }
                         None => keymap_watch = None,
+                    }
+                    continue;
+                }
+                status = next_desk_privacy(desk_privacy.as_mut()), if desk_privacy.is_some() => {
+                    match status {
+                        Some(status) => send_desk_privacy(&priority, status).await?,
+                        None => desk_privacy = None,
                     }
                     continue;
                 }

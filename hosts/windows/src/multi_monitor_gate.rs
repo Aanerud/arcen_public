@@ -45,8 +45,9 @@ use arcen_media::{
     TopologyGeneration, MAX_MULTI_MONITOR_COUNT,
 };
 use arcen_outputs::admission::{
-    admit_regions, offer_max_monitors, AdmissionGates, AdmissionOutcome, DegradeReason, GateClosed,
-    OfferEncoder, OfferPolicy, RegionAdmissionPolicy,
+    admit_regions, offer_max_monitors, preauth_outputs_verdict, AdmissionGates, AdmissionOutcome,
+    DegradeReason, GateClosed, OfferEncoder, OfferPolicy, PreauthOutputs, PreauthOutputsVerdict,
+    RegionAdmissionPolicy,
 };
 use arcen_outputs::applied::{
     assemble_applied_regions, AppliedRegion, AppliedRegionAssembler, OriginTranslation,
@@ -242,6 +243,137 @@ pub fn build_offer(gate: &MultiMonitorGate) -> Option<AuthMultiMonitorOfferMsg> 
     .ok()
 }
 
+/// Why this host's live output inventory could not be produced
+/// (`gpu_probe::read_physical_output_inventory`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputInventoryError {
+    /// The topology was read and has no attached output on the selected
+    /// adapter.
+    NoOutputs(String),
+    /// The outputs could not be read from this process: the topology was
+    /// refused (session 0 at the sign-in or lock screen), the probe failed,
+    /// or an output's facts were missing.
+    Unreadable(String),
+}
+
+impl OutputInventoryError {
+    /// What the shared pre-authentication policy learns from this failure.
+    #[must_use]
+    pub const fn preauth_outputs(&self) -> PreauthOutputs {
+        match self {
+            Self::NoOutputs(_) => PreauthOutputs::Read(0),
+            Self::Unreadable(_) => PreauthOutputs::Unreadable,
+        }
+    }
+}
+
+impl std::fmt::Display for OutputInventoryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoOutputs(message) | Self::Unreadable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+/// The gate this connection advertises with, after the session-0 output
+/// read (`creates_outputs`: the NVIDIA headless provider makes its own).
+/// Only a topology read and found empty closes it; one that could not be read
+/// keeps the operator's gate, and the signed-in session reads the outputs.
+#[must_use]
+pub fn gate_after_preauth_read(
+    gate: MultiMonitorGate,
+    read: Result<&PhysicalOutputInventory, &OutputInventoryError>,
+    creates_outputs: bool,
+) -> (MultiMonitorGate, PreauthOutputsVerdict) {
+    let outputs = match read {
+        Ok(inventory) => PreauthOutputs::Read(inventory.len()),
+        Err(error) => error.preauth_outputs(),
+    };
+    let verdict = preauth_outputs_verdict(outputs, creates_outputs);
+    match verdict {
+        PreauthOutputsVerdict::Withhold => (MultiMonitorGate::disabled(), verdict),
+        PreauthOutputsVerdict::Advertise | PreauthOutputsVerdict::AdvertiseReadAfterSignIn => {
+            (gate, verdict)
+        }
+    }
+}
+
+/// How the signed-in session serves a Deck's requested layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServedTopology {
+    /// No layout was requested.
+    NotRequested,
+    /// Every requested monitor is applied exactly.
+    Exact {
+        plan: WindowsTopologyPlan,
+        carrier: MultiMonitorCarrierMsg,
+    },
+    /// The layout could not be applied exactly; this host's outputs show as
+    /// many of the Deck's monitors as it has, each at its own mode, one
+    /// stream each (the Deck names any monitor left out).
+    Shown {
+        plan: WindowsTopologyPlan,
+        carrier: MultiMonitorCarrierMsg,
+        exact_refusal: WindowsTopologyError,
+    },
+    /// No output could be planned: the session is refused with
+    /// [`ServedTopology::deck_reason`] behind the shared `multi_monitor_refused`
+    /// code, and the Deck offers Primary Display Only. A Deck that asked for
+    /// its layout refuses a session served without one (it requires region
+    /// input), so the primary is never served silently.
+    Refused(MultiMonitorDegradeReason),
+}
+
+impl ServedTopology {
+    /// The words a refused layout reaches the Deck with, after its own
+    /// "Match My Layout could not be negotiated with this host:".
+    #[must_use]
+    pub fn deck_reason(reason: &MultiMonitorDegradeReason) -> String {
+        match reason {
+            MultiMonitorDegradeReason::NoInventoryAvailable => {
+                "the PC's monitors could not be read after sign-in".to_owned()
+            }
+            MultiMonitorDegradeReason::PlanningFailed(WindowsTopologyError::EmptyInventory) => {
+                "the PC has no monitor to show your displays on".to_owned()
+            }
+            other => other.to_string(),
+        }
+    }
+}
+
+/// Decides how the signed-in session serves the request on attached physical
+/// outputs (`inventory`: this session's own read). A layout this host cannot
+/// apply exactly is shown on the outputs it has, at least the Deck's
+/// primary; only a session with no output to show it on (its inventory
+/// unreadable) is refused, with the reason.
+#[must_use]
+pub fn serve_on_attached_outputs(
+    gate: &MultiMonitorGate,
+    inventory: Option<&PhysicalOutputInventory>,
+    offer: Option<&AuthMultiMonitorOfferMsg>,
+    requested: Option<&AuthMultiMonitorRequestMsg>,
+) -> ServedTopology {
+    let exact_refusal = match admit_requested_topology(gate, inventory, offer, requested) {
+        MultiMonitorOutcome::NotRequested => return ServedTopology::NotRequested,
+        MultiMonitorOutcome::Planned { plan, carrier } => {
+            return ServedTopology::Exact { plan, carrier }
+        }
+        MultiMonitorOutcome::Degraded(MultiMonitorDegradeReason::PlanningFailed(error)) => error,
+        MultiMonitorOutcome::Degraded(reason) => return ServedTopology::Refused(reason),
+    };
+    match admit(gate, inventory, offer, requested, WindowsPlanner::Shown) {
+        MultiMonitorOutcome::Planned { plan, carrier } => ServedTopology::Shown {
+            plan,
+            carrier,
+            exact_refusal,
+        },
+        MultiMonitorOutcome::Degraded(MultiMonitorDegradeReason::PlanningFailed(error)) => {
+            ServedTopology::Refused(MultiMonitorDegradeReason::PlanningFailed(error))
+        }
+        _ => ServedTopology::Refused(MultiMonitorDegradeReason::PlanningFailed(exact_refusal)),
+    }
+}
+
 /// Admits (or degrades) an authenticated client's optional requested
 /// `multi_monitor_v1` topology.
 ///
@@ -305,6 +437,9 @@ enum WindowsPlanner {
     Requested,
     /// Maps the request onto the rectangles Windows has already applied.
     Current,
+    /// Maps as many requested monitors as there are outputs onto the
+    /// rectangles Windows has already applied.
+    Shown,
 }
 
 /// This host's implementation of the shared multi-region admission steps.
@@ -405,6 +540,9 @@ impl RegionAdmissionPolicy for WindowsRegionAdmission<'_> {
             }
             WindowsPlanner::Current => {
                 windows_topology::plan_current_topology(topology, generation, inventory)
+            }
+            WindowsPlanner::Shown => {
+                windows_topology::plan_shown_topology(topology, generation, inventory)
             }
         }
         .map_err(MultiMonitorDegradeReason::PlanningFailed)
@@ -1303,6 +1441,158 @@ mod tests {
             })
         ));
     }
+
+    fn row_request(count: u32) -> AuthMultiMonitorRequestMsg {
+        let monitors = (0..count)
+            .map(|index| {
+                descriptor(
+                    &format!("deck-{index}"),
+                    index + 1,
+                    (i32::try_from(index).expect("index") * 2_560, 0),
+                    (2_560, 1_440),
+                    index == 0,
+                    RotationMsg::Degrees0,
+                )
+            })
+            .collect();
+        request(monitors, vec![MultiMonitorCarrierMsg::MuxedReliableStream])
+    }
+
+    fn full_offer() -> AuthMultiMonitorOfferMsg {
+        AuthMultiMonitorOfferMsg::new(4, RotationMsg::ALL.to_vec(), OFFERED_CARRIERS.to_vec())
+            .expect("offer")
+    }
+
+    /// Session 0 at the sign-in or lock screen cannot read the topology
+    /// (`QueryDisplayConfig` access denied): the offer stands.
+    #[test]
+    fn an_unreadable_preauth_topology_keeps_the_offer() {
+        let unreadable = OutputInventoryError::Unreadable(
+            "CCD topology probe failed: QueryDisplayConfig returned Win32 error 5".to_owned(),
+        );
+        for creates_outputs in [false, true] {
+            let (gate, verdict) =
+                gate_after_preauth_read(enabled_gate(), Err(&unreadable), creates_outputs);
+            assert_eq!(verdict, PreauthOutputsVerdict::AdvertiseReadAfterSignIn);
+            assert!(build_offer(&gate).is_some(), "{creates_outputs}");
+        }
+        let (gate, verdict) = gate_after_preauth_read(enabled_gate(), Ok(&inventory(2)), false);
+        assert_eq!(verdict, PreauthOutputsVerdict::Advertise);
+        assert!(build_offer(&gate).is_some());
+    }
+
+    /// A topology that was read and has no output withholds the offer, unless
+    /// the NVIDIA headless provider creates the outputs.
+    #[test]
+    fn a_preauth_topology_read_without_outputs_withholds_the_offer() {
+        let none = OutputInventoryError::NoOutputs(
+            "no attached capture-capable outputs matched adapter filter []".to_owned(),
+        );
+        let (gate, verdict) = gate_after_preauth_read(enabled_gate(), Err(&none), false);
+        assert_eq!(verdict, PreauthOutputsVerdict::Withhold);
+        assert_eq!(build_offer(&gate), None);
+        let (gate, _) = gate_after_preauth_read(enabled_gate(), Err(&none), true);
+        assert!(build_offer(&gate).is_some());
+    }
+
+    /// Three Deck monitors on a host with two outputs: one stream for each
+    /// output, the Deck's primary first, the third left out; never a failed
+    /// session.
+    #[test]
+    fn more_monitors_than_outputs_are_shown_on_the_outputs_the_host_has() {
+        let served = serve_on_attached_outputs(
+            &enabled_gate(),
+            Some(&inventory(2)),
+            Some(&full_offer()),
+            Some(&row_request(3)),
+        );
+        let ServedTopology::Shown {
+            plan,
+            exact_refusal,
+            ..
+        } = served
+        else {
+            panic!("expected a shown layout, got {served:?}");
+        };
+        assert_eq!(
+            exact_refusal,
+            WindowsTopologyError::InsufficientOutputs {
+                requested: 3,
+                available: 2,
+            }
+        );
+        let shown = plan
+            .monitors
+            .iter()
+            .map(|monitor| (monitor.client_display_id.as_str(), monitor.primary))
+            .collect::<Vec<_>>();
+        assert_eq!(shown, vec![("deck-0", true), ("deck-1", false)]);
+    }
+
+    /// One output for two Deck monitors: the Deck's primary is shown on it,
+    /// one stream, and the Deck names the display left out.
+    #[test]
+    fn a_layout_one_output_cannot_carry_shows_the_primary_on_it() {
+        let served = serve_on_attached_outputs(
+            &enabled_gate(),
+            Some(&inventory(1)),
+            Some(&full_offer()),
+            Some(&row_request(2)),
+        );
+        let ServedTopology::Shown {
+            plan,
+            exact_refusal,
+            ..
+        } = served
+        else {
+            panic!("expected a shown layout, got {served:?}");
+        };
+        assert_eq!(
+            exact_refusal,
+            WindowsTopologyError::InsufficientOutputs {
+                requested: 2,
+                available: 1,
+            }
+        );
+        assert_eq!(plan.monitors.len(), 1);
+        assert_eq!(plan.monitors[0].client_display_id, "deck-0");
+        assert!(plan.monitors[0].primary);
+    }
+
+    /// The signed-in session could not read its outputs either: a refusal
+    /// the Deck words and recovers from (Primary Display Only), never a bare
+    /// failed session.
+    #[test]
+    fn an_unreadable_signed_in_inventory_is_refused_with_a_reason() {
+        let served = serve_on_attached_outputs(
+            &enabled_gate(),
+            None,
+            Some(&full_offer()),
+            Some(&row_request(2)),
+        );
+        assert_eq!(
+            served,
+            ServedTopology::Refused(MultiMonitorDegradeReason::NoInventoryAvailable)
+        );
+        assert_eq!(
+            ServedTopology::deck_reason(&MultiMonitorDegradeReason::NoInventoryAvailable),
+            "the PC's monitors could not be read after sign-in"
+        );
+    }
+
+    #[test]
+    fn a_layout_the_outputs_carry_is_applied_exactly() {
+        assert!(matches!(
+            serve_on_attached_outputs(
+                &enabled_gate(),
+                Some(&inventory(2)),
+                Some(&full_offer()),
+                Some(&row_request(2)),
+            ),
+            ServedTopology::Exact { .. }
+        ));
+    }
+
     /// The negotiated roster this session's encoder set was admitted with,
     /// built the same way `encoder_admission` builds it for this exact plan
     /// (one region per planned monitor, at the planned geometry).

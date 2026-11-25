@@ -1077,6 +1077,49 @@ async fn admit_after_slot(
 
 /// Close frame carrying a human-readable reason so the client can surface WHY
 /// the host aborted (a bare `Close(None)` reads as a cryptic protocol error).
+/// The desk privacy a joined console's hello says: the desk as it is when
+/// the stream subscribed to its changes (marked seen, so only a later
+/// change wakes the stream). A loss already waiting is left for the stream
+/// to end the attachment on.
+fn desk_for_hello(
+    updates: Option<&mut crate::session::launcher::ConsoleDeskUpdates>,
+) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+    let updates = updates?;
+    let now = *updates.borrow_and_update();
+    if now.lost.is_some() {
+        updates.mark_changed();
+    }
+    now.status
+}
+
+/// What a change of a joined console's desk means for its Deck.
+#[derive(Debug, PartialEq, Eq)]
+enum DeskChange {
+    /// Nothing the Deck has not been told.
+    Unchanged,
+    /// The desk keeps a different part private: `desk_privacy_update`.
+    Tell(arcen_session::console_session::desk_privacy::DeskPrivacyStatus),
+    /// A required desk is no longer private: the attachment ends with the
+    /// shared reason.
+    End(arcen_session::console_session::desk_privacy::DeskPrivacyRefusal),
+}
+
+fn desk_change(
+    now: crate::session::launcher::ConsoleDeskNow,
+    told: &mut Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
+) -> DeskChange {
+    if let Some(cause) = now.lost {
+        return DeskChange::End(cause);
+    }
+    match now.status {
+        Some(status) if *told != Some(status) => {
+            *told = Some(status);
+            DeskChange::Tell(status)
+        }
+        _ => DeskChange::Unchanged,
+    }
+}
+
 fn close_with_reason(reason: &str) -> Message {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -2581,6 +2624,11 @@ where
                 }
             }
             launcher.set_timezone(validated_requested_timezone(cfg, &response));
+            launcher.set_deck_desk_privacy(
+                arcen_session::console_session::desk_privacy::DeckDeskPrivacy::from_request(
+                    response.desk_privacy_request.as_deref(),
+                ),
+            );
             info!(
                 target: AUTH,
                 username = %launcher.identity.username,
@@ -2711,6 +2759,9 @@ enum SessionEndReason {
     /// The joined desktop belongs to another remote-desktop product whose
     /// own client connected: one remote product at a time (ADR 0025 §8).
     ConsoleTakenOver,
+    /// The administrator requires desk privacy and the joined console's
+    /// desk is no longer private (ADR 0025 §5).
+    DeskPrivacyLost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2761,6 +2812,7 @@ impl SessionEndReason {
             Self::ResumeAuthorityFailure => "resume_authority",
             Self::InputLost => "input",
             Self::ConsoleTakenOver => "console",
+            Self::DeskPrivacyLost => "desk_privacy",
         }
     }
 
@@ -2776,6 +2828,7 @@ impl SessionEndReason {
             Self::ResumeAuthorityFailure => "resume_authority_failure",
             Self::InputLost => "input_lost",
             Self::ConsoleTakenOver => "console_taken_over",
+            Self::DeskPrivacyLost => "desk_privacy_lost",
         }
     }
 }
@@ -4231,13 +4284,19 @@ async fn run_ws(
                 &session_log_id,
             );
             clear_resume_secrets(&mut response);
+            // The returning Deck plans its own attachment's desk privacy.
+            let deck_desk_privacy =
+                arcen_session::console_session::desk_privacy::DeckDeskPrivacy::from_request(
+                    response.desk_privacy_request.as_deref(),
+                );
             match prepared {
                 Ok(permit) => {
-                    if let Err((socket, rejection)) =
-                        session_registry
-                            .resume()
-                            .handoff(permit, ws, session_log_id)
-                    {
+                    if let Err((socket, rejection)) = session_registry.resume().handoff(
+                        permit,
+                        ws,
+                        session_log_id,
+                        deck_desk_privacy,
+                    ) {
                         let mut socket = *socket;
                         rejection.notify_terminal_owner();
                         send_resume_rejection(&mut socket, rejection.message, rejection.code).await;
@@ -5559,7 +5618,7 @@ async fn run_resumable_session(
     cfg: Arc<Config>,
     emitter: LifecycleEmitter,
     session_registry: Arc<SessionRegistry>,
-    lease: SessionLease,
+    mut lease: SessionLease,
     display_resources: HeldDisplayResources,
     commands: &mut mpsc::UnboundedReceiver<OwnerCommand>,
     mut session_log_id: CorrelationId,
@@ -5780,6 +5839,7 @@ async fn run_resumable_session(
                 command = commands.recv() => match command {
                     Some(OwnerCommand::Resume(handoff)) => {
                         let mut handoff = *handoff;
+                        let deck_desk_privacy = handoff.deck_desk_privacy;
                         let resume_now = session_registry.resume().monotonic_now();
                         if resume_now >= deadline {
                             send_resume_rejection(
@@ -5873,14 +5933,20 @@ async fn run_resumable_session(
                         {
                             incumbent.replace_connection(connection);
                         }
-                        // A joined console is made private again and
-                        // unlocked before anything is streamed; a refusal
-                        // reaches the Deck as its typed reason.
-                        if let Some(answer) = session_registry.console_attach(&lease.metadata) {
+                        // A joined console is made private again (as the
+                        // returning Deck chose) and unlocked before anything
+                        // is streamed; its hello says what was kept, and a
+                        // refusal reaches the Deck as its typed reason.
+                        if let Some(answer) =
+                            session_registry.console_attach(&lease.metadata, deck_desk_privacy)
+                        {
                             let outcome = answer.await.unwrap_or_else(|_| {
                                 Err(arcen_session::console_session::ConsoleRefusal::SessionUnreachable
                                     .into())
                             });
+                            if let Ok(status) = outcome {
+                                lease.metadata.console_desk_privacy = Some(status);
+                            }
                             if let Err(notice) = outcome {
                                 let service = notice.service();
                                 tracing::error!(
@@ -7043,6 +7109,11 @@ async fn run_attachment(
                 .map(|source| &source.plan),
         ),
     );
+    // A joined console's desk privacy changes are subscribed before the
+    // hello is built, and the hello says the desk as it is then: a change
+    // after it is never missed (`desk_privacy_update`).
+    let mut desk_updates = session_lease.and_then(SessionLease::console_desk_updates);
+    let hello_desk = desk_for_hello(desk_updates.as_mut());
     let mut hello = build_server_hello(
         &cfg,
         &media_plan,
@@ -7053,6 +7124,10 @@ async fn run_attachment(
         pen_capabilities,
         region_input_available,
     );
+    if let Some(status) = hello_desk {
+        hello.desk_privacy = Some(status.token().to_owned());
+    }
+    let mut desk_told = hello_desk;
     // The hello names what is served: a capture source that decided
     // admission itself (the Wayland provider) serves its admitted contract,
     // so a Speed request served as Auto is announced as Auto.
@@ -10318,6 +10393,51 @@ async fn run_attachment(
     guest_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let end_reason = loop {
         tokio::select! {
+            changed = async {
+                match desk_updates.as_mut() {
+                    Some(updates) => updates.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let now = match (changed, desk_updates.as_mut()) {
+                    (Ok(()), Some(updates)) => *updates.borrow_and_update(),
+                    _ => {
+                        desk_updates = None;
+                        continue;
+                    }
+                };
+                let status = match desk_change(now, &mut desk_told) {
+                    DeskChange::Unchanged => continue,
+                    DeskChange::Tell(status) => status,
+                    DeskChange::End(cause) => {
+                        error!(
+                            target: SESSION,
+                            cause = cause.token(),
+                            "desk privacy is required (privacy.desk) and the joined console's desk is no longer private; the attachment ends and the console is handed back locked"
+                        );
+                        if ctrl_tx
+                            .send_required(
+                                close_with_reason(&cause.deck_reason()),
+                                "desk_privacy_lost_close",
+                            )
+                            .await
+                        {
+                            let _ = ctrl_tx.barrier().await;
+                        }
+                        break SessionEndReason::DeskPrivacyLost;
+                    }
+                };
+                if let Ok(json) = serde_json::to_string(
+                    &arcen_protocol::messages::DeskPrivacyUpdateMsg::new(status.token()),
+                ) {
+                    let _ = ctrl_tx
+                        .send_required(
+                            Message::Text(json.into()),
+                            arcen_protocol::messages::DESK_PRIVACY_UPDATE,
+                        )
+                        .await;
+                }
+            }
             _ = guest_check.tick(), if console_joined.is_some() => {
                 use arcen_session::console_session::{other_product_started, ConsoleRefusal};
                 let refusal = if console_guest {
@@ -13810,6 +13930,44 @@ mod tests {
 
     /// A newcomer refused for a busy desktop is closed with the shared words
     /// a Deck reads as a busy host, whole (not cut to the close limit).
+    #[test]
+    fn a_joined_console_s_desk_is_told_from_the_hello_on_and_a_required_loss_ends_it() {
+        use crate::session::launcher::ConsoleDeskNow;
+        use arcen_session::console_session::desk_privacy::{DeskPrivacyRefusal, DeskPrivacyStatus};
+        let (desk, _) = tokio::sync::watch::channel(ConsoleDeskNow {
+            status: Some(DeskPrivacyStatus::Blanked),
+            lost: None,
+        });
+        // Subscribed before the hello: the hello says the desk now, and a
+        // change made after it (before the stream's loop) still wakes it.
+        let mut updates = desk.subscribe();
+        let mut told = desk_for_hello(Some(&mut updates));
+        assert_eq!(told, Some(DeskPrivacyStatus::Blanked));
+        assert!(!updates.has_changed().unwrap());
+        desk.send_modify(|now| now.status = Some(DeskPrivacyStatus::ScreensVisible));
+        assert!(updates.has_changed().unwrap());
+        assert_eq!(
+            desk_change(*updates.borrow_and_update(), &mut told),
+            DeskChange::Tell(DeskPrivacyStatus::ScreensVisible)
+        );
+        // The same status again is not told twice.
+        assert_eq!(
+            desk_change(*updates.borrow(), &mut told),
+            DeskChange::Unchanged
+        );
+        // A required desk lost ends the attachment with the shared reason.
+        desk.send_modify(|now| now.lost = Some(DeskPrivacyRefusal::DisplaysNotDark));
+        assert_eq!(
+            desk_change(*updates.borrow_and_update(), &mut told),
+            DeskChange::End(DeskPrivacyRefusal::DisplaysNotDark)
+        );
+        // A loss already waiting when the stream subscribes still wakes it.
+        let mut late = desk.subscribe();
+        let _ = desk_for_hello(Some(&mut late));
+        assert!(late.has_changed().unwrap());
+        assert_eq!(desk_for_hello(None), None);
+    }
+
     #[test]
     fn a_busy_desktop_closes_with_the_shared_busy_reason() {
         for (sent, refusal) in [

@@ -83,6 +83,11 @@ pub struct SessionMetadata {
     /// The RandR outputs such a console's monitors are captured from, in
     /// the committed plan's order; `None` when outputs follow the plan.
     pub console_shown_outputs: Option<Vec<String>>,
+    /// What a joined console's desk shows while the Deck is attached, as
+    /// its sign-in settled it (ADR 0025 §5); `None` for a desktop Arcen
+    /// created.
+    pub console_desk_privacy:
+        Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
 }
 
 #[derive(Debug, Error)]
@@ -351,6 +356,7 @@ impl DesktopSession {
             console: self.launcher.is_console(),
             console_guest: self.launcher.is_console_guest(),
             console_shown_outputs: self.launcher.console_shown_outputs(),
+            console_desk_privacy: self.launcher.console_desk_privacy(),
         }
     }
 
@@ -652,9 +658,15 @@ impl SessionRegistry {
                                         existing.disconnected_since = None;
                                         // A joined console was handed back
                                         // locked when the Deck left: make it
-                                        // private again before it is shown,
-                                        // and hear whether it could be.
-                                        let attach = existing.launcher.console_attach();
+                                        // private again (as this sign-in's
+                                        // Deck chose) before it is shown,
+                                        // and hear how far it could be.
+                                        let attach = existing.launcher.console_attach(
+                                            pending
+                                                .as_ref()
+                                                .expect("pending launcher")
+                                                .deck_desk_privacy(),
+                                        );
                                         let replacement = pending
                                             .as_ref()
                                             .expect("pending launcher")
@@ -725,7 +737,7 @@ impl SessionRegistry {
                     self.wait_for_cleanup().await;
                 }
                 ExistingDecision::Reconnect(reconnect) => {
-                    let (metadata, execution, session_log_id, previous_session_log_id, attach) =
+                    let (mut metadata, execution, session_log_id, previous_session_log_id, attach) =
                         *reconnect;
                     pending.take().expect("pending launcher").discard().await;
                     if let Some(answer) = attach {
@@ -735,6 +747,11 @@ impl SessionRegistry {
                                     .into(),
                             )
                         });
+                        // This Deck's hello says what its own attachment
+                        // kept private.
+                        if let Ok(status) = outcome {
+                            metadata.console_desk_privacy = Some(status);
+                        }
                         if let Err(notice) = outcome {
                             tracing::warn!(
                                 target: crate::logging::target::SESSION,
@@ -1070,6 +1087,7 @@ impl SessionRegistry {
     pub(crate) fn console_attach(
         &self,
         metadata: &SessionMetadata,
+        deck: arcen_session::console_session::desk_privacy::DeckDeskPrivacy,
     ) -> Option<tokio::sync::oneshot::Receiver<super::launcher::ConsoleAttachOutcome>> {
         let guard = self.inner.lock().unwrap();
         guard
@@ -1079,7 +1097,24 @@ impl SessionRegistry {
                 session.generation == metadata.generation
                     && session.launcher.identity.username == metadata.username
             })
-            .and_then(|session| session.launcher.console_attach())
+            .and_then(|session| session.launcher.console_attach(deck))
+    }
+
+    /// Every change of a joined console's desk privacy while its Deck is
+    /// attached; `None` for a created desktop (or another generation).
+    fn console_desk_updates(
+        &self,
+        metadata: &SessionMetadata,
+    ) -> Option<super::launcher::ConsoleDeskUpdates> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .session
+            .as_ref()
+            .filter(|session| {
+                session.generation == metadata.generation
+                    && session.launcher.identity.username == metadata.username
+            })
+            .and_then(|session| session.launcher.console_desk_updates())
     }
 
     /// Ends Arcen's hold on a joined console session whose returning Deck
@@ -1579,6 +1614,15 @@ impl SessionLease {
 
     pub fn disconnect(mut self) {
         self.release();
+    }
+
+    /// Every change of this joined console's desk privacy, for the stream
+    /// to tell its Deck (`desk_privacy_update`); `None` for a created
+    /// desktop.
+    pub(crate) fn console_desk_updates(&self) -> Option<super::launcher::ConsoleDeskUpdates> {
+        self.registry
+            .upgrade()?
+            .console_desk_updates(&self.metadata)
     }
 
     pub async fn terminate(self) {

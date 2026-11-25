@@ -643,6 +643,7 @@ mod tests {
             tablet_mode_requested: arcen_protocol::messages::TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
         }
     }

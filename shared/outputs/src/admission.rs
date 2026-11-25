@@ -655,6 +655,55 @@ pub fn offer_max_monitors(policy: &OfferPolicy) -> Result<u8, OfferWithheld> {
     Ok(max)
 }
 
+/// What a Pier that reads its outputs live learned about them before
+/// authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreauthOutputs {
+    /// The outputs could not be read where the offer is built. The Windows
+    /// Pier's service cannot read the display topology while Windows shows
+    /// its sign-in or lock screen (`QueryDisplayConfig` is refused with
+    /// access denied), which is exactly when a remote-first sign-in arrives.
+    Unreadable,
+    /// The topology was read and lists this many outputs the Pier could
+    /// serve.
+    Read(usize),
+}
+
+/// What a Pier does with its multi-monitor offer, from [`PreauthOutputs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreauthOutputsVerdict {
+    /// The outputs were read and there are some: the offer stands.
+    Advertise,
+    /// The outputs are not known yet: they could not be read, or the Pier
+    /// creates them for the session. The offer stands; the signed-in
+    /// session reads them and admission degrades visibly when they cannot
+    /// carry the requested layout.
+    AdvertiseReadAfterSignIn,
+    /// The topology was read and has no output this Pier could serve or
+    /// create: the offer is withheld.
+    Withhold,
+}
+
+/// Whether a Pier's pre-authentication output read lets its offer stand.
+///
+/// Only a topology that was read and found empty withholds the offer. A
+/// read that failed says nothing about the outputs, so it must not cost
+/// every remote-first sign-in its layout. `creates_outputs` is a Pier that
+/// provisions its own outputs per session (an NVIDIA headless provider).
+#[must_use]
+pub const fn preauth_outputs_verdict(
+    outputs: PreauthOutputs,
+    creates_outputs: bool,
+) -> PreauthOutputsVerdict {
+    match outputs {
+        PreauthOutputs::Read(0) if !creates_outputs => PreauthOutputsVerdict::Withhold,
+        PreauthOutputs::Read(0) | PreauthOutputs::Unreadable => {
+            PreauthOutputsVerdict::AdvertiseReadAfterSignIn
+        }
+        PreauthOutputs::Read(_) => PreauthOutputsVerdict::Advertise,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1017,6 +1066,30 @@ mod offer_tests {
                 "{capacity:?} {operator:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_topology_read_and_found_empty_withholds_the_offer() {
+        use super::{PreauthOutputs, PreauthOutputsVerdict, preauth_outputs_verdict};
+        for creates_outputs in [false, true] {
+            assert_eq!(
+                preauth_outputs_verdict(PreauthOutputs::Unreadable, creates_outputs),
+                PreauthOutputsVerdict::AdvertiseReadAfterSignIn,
+                "an unreadable topology never withholds ({creates_outputs})"
+            );
+            assert_eq!(
+                preauth_outputs_verdict(PreauthOutputs::Read(2), creates_outputs),
+                PreauthOutputsVerdict::Advertise
+            );
+        }
+        assert_eq!(
+            preauth_outputs_verdict(PreauthOutputs::Read(0), false),
+            PreauthOutputsVerdict::Withhold
+        );
+        assert_eq!(
+            preauth_outputs_verdict(PreauthOutputs::Read(0), true),
+            PreauthOutputsVerdict::AdvertiseReadAfterSignIn
+        );
     }
 }
 

@@ -846,15 +846,6 @@ fn client_display_id_of(applied: &AppliedMonitor) -> Result<String, WindowsTopol
 ///
 /// Returns a typed rejection when the inventory cannot cover the requested
 /// roster with current outputs, or an applied-topology invariant is violated.
-///
-/// # Panics
-///
-/// Never in practice: every requested monitor is given one current output
-/// before the plan is assembled.
-#[allow(
-    clippy::expect_used,
-    reason = "every requested monitor is assigned one current output before assembly"
-)]
 pub fn plan_current_topology(
     requested: &RequestedMonitorTopology,
     generation: TopologyGeneration,
@@ -867,25 +858,286 @@ pub fn plan_current_topology(
             available: inventory.len(),
         });
     }
+    plan_current_monitors(
+        requested,
+        &assignment_order(requested),
+        generation,
+        inventory,
+    )
+}
 
-    let primary_index = requested_monitors
+/// Shows a requested layout on the outputs this host has when it cannot be
+/// applied exactly: the Deck's primary on the first output, then the Deck's
+/// other monitors in roster order on the remaining outputs, each at the mode
+/// its output offers that best fits the Deck monitor ([`fitted_mode`]: an
+/// even size, the closest shape, the largest that is not bigger than the
+/// Deck's). A fixed-mode output (a dummy plug on a consumer GPU) is never
+/// asked for a mode it does not list, and an odd-sized desktop it happens to
+/// run (2560x1439) is never streamed: 4:2:0 video needs even sizes. The
+/// primary sits at the desktop origin and every other monitor beside the
+/// shown ones, on the side the Deck has it ([`place_beside`]). Deck monitors
+/// beyond the host's outputs are left out of the plan (the Deck shows them
+/// as not shown). Nothing is invented: a host with one output shows the
+/// Deck's primary only.
+///
+/// # Errors
+///
+/// Returns a typed rejection when the inventory is empty, an output offers
+/// no even mode or cannot take the monitor's rotation, or an applied-topology
+/// invariant is violated.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass that fits, places and describes every shown monitor"
+)]
+pub fn plan_shown_topology(
+    requested: &RequestedMonitorTopology,
+    generation: TopologyGeneration,
+    inventory: &PhysicalOutputInventory,
+) -> Result<WindowsTopologyPlan, WindowsTopologyError> {
+    if inventory.is_empty() {
+        return Err(WindowsTopologyError::EmptyInventory);
+    }
+    let requested_monitors = requested.monitors();
+    let mut order = assignment_order(requested);
+    order.truncate(inventory.len());
+    let mut plans = Vec::with_capacity(order.len());
+    let mut rects: Vec<LayoutRect> = Vec::with_capacity(order.len());
+    let mut requires_custom_timing = false;
+    let primary_centre = requested_centre(requested.primary().monitor());
+    for (&monitor_index, output) in order.iter().zip(inventory.outputs()) {
+        let monitor = requested_monitors[monitor_index].monitor();
+        if !output.supported_rotations.contains(&monitor.rotation) {
+            return Err(WindowsTopologyError::UnsupportedRotation {
+                client_display_id: monitor.identity.id.clone(),
+                rotation: monitor.rotation,
+            });
+        }
+        let mode =
+            fitted_mode(output, monitor).ok_or_else(|| WindowsTopologyError::NoMatchingMode {
+                client_display_id: monitor.identity.id.clone(),
+                width: monitor.width_px,
+                height: monitor.height_px,
+                refresh_hz: monitor.refresh_hz,
+            })?;
+        let (width, height) = match monitor.rotation {
+            Rotation::Degrees90 | Rotation::Degrees270 => (mode.height, mode.width),
+            Rotation::Degrees0 | Rotation::Degrees180 => (mode.width, mode.height),
+        };
+        let (x, y) = if rects.is_empty() {
+            (0, 0)
+        } else {
+            let centre = requested_centre(monitor);
+            place_beside(
+                &rects,
+                (centre.0 - primary_centre.0, centre.1 - primary_centre.1),
+                (width, height),
+            )?
+        };
+        let rect = LayoutRect::new(x, y, width, height)?;
+        let ccd_mode = crate::windows_multi_monitor::windows_ccd_mode_plan(
+            width,
+            height,
+            monitor.rotation,
+            output.ccd_output_kind,
+        );
+        let raw_id =
+            u16::try_from(monitor_index + 1).map_err(|_| MediaContractError::CoordinateOverflow)?;
+        let session_monitor_id =
+            SessionMonitorId::new(raw_id).map_err(WindowsTopologyError::from)?;
+        rects.push(rect);
+        requires_custom_timing |= output.mode_capability.requires_custom_timing();
+        plans.push((
+            monitor_index,
+            WindowsMonitorPlan {
+                session_monitor_id,
+                client_display_id: monitor.identity.id.clone(),
+                adapter_luid: output.adapter_luid,
+                target_id: output.target_id,
+                adapter_output_index: output.adapter_output_index,
+                adapter_name: output.adapter_name.clone(),
+                global_index: output.global_index,
+                device_name: output.device_name.clone(),
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                mode_width: ccd_mode.target_width,
+                mode_height: ccd_mode.target_height,
+                logical_rect: region_logical_rect(&requested_monitors[monitor_index])?,
+                scale: region_scale(&monitor.identity.id, monitor.scale)?,
+                ui_scale: monitor_ui_scale(monitor),
+                refresh_hz: mode.refresh_hz.max(1),
+                rotation: ccd_mode.target_rotation,
+                primary: monitor.primary,
+                custom_timing: output.mode_capability.requires_custom_timing(),
+                color: monitor
+                    .color
+                    .as_ref()
+                    .map(arcen_media::display_color::DisplayColor::from_msg),
+            },
+        ));
+    }
+    let bounds = signed_desktop_bounds(rects)?;
+    if bounds.width > MAX_VIRTUAL_DESKTOP_DIMENSION_PX
+        || bounds.height > MAX_VIRTUAL_DESKTOP_DIMENSION_PX
+    {
+        return Err(WindowsTopologyError::DesktopTooLarge {
+            width: bounds.width,
+            height: bounds.height,
+        });
+    }
+    plans.sort_by_key(|(monitor_index, _)| *monitor_index);
+    Ok(WindowsTopologyPlan {
+        generation,
+        desktop_x: bounds.x,
+        desktop_y: bounds.y,
+        desktop_width: bounds.width,
+        desktop_height: bounds.height,
+        monitors: plans.into_iter().map(|(_, plan)| plan).collect(),
+        requires_custom_timing,
+    })
+}
+
+/// The mode (in the output's native orientation, as the Deck states its
+/// monitor) that best shows `monitor` on `output`: the Deck's own size when
+/// the output can drive it; otherwise, of the even-sized modes it lists, the
+/// closest shape, then the largest that is not bigger than the Deck's (the
+/// smallest bigger one when none fits), then the refresh nearest the Deck's.
+/// `None` when the output lists no even mode.
+#[must_use]
+pub fn fitted_mode(output: &AvailableOutput, monitor: &arcen_media::Monitor) -> Option<OutputMode> {
+    let wanted = OutputMode {
+        width: monitor.width_px,
+        height: monitor.height_px,
+        refresh_hz: monitor.refresh_hz,
+    };
+    if output.mode_capability.supports(wanted) {
+        return Some(wanted);
+    }
+    let modes: Vec<OutputMode> = match &output.mode_capability {
+        OutputModeCapability::FixedModes(modes) => modes.clone(),
+        OutputModeCapability::CustomTimingCapable { .. } => vec![OutputMode {
+            width: output.current_width,
+            height: output.current_height,
+            refresh_hz: output.current_refresh_hz,
+        }],
+    };
+    let wanted_area = u64::from(wanted.width) * u64::from(wanted.height);
+    modes
+        .into_iter()
+        .filter(|mode| mode.width > 0 && mode.height > 0)
+        .filter(|mode| mode.width % 2 == 0 && mode.height % 2 == 0)
+        .min_by_key(|mode| {
+            // The shapes' difference in whole percent: within 1 % is the
+            // same shape.
+            let across = u64::from(mode.width) * u64::from(wanted.height);
+            let down = u64::from(wanted.width) * u64::from(mode.height);
+            let shape_cost = across.abs_diff(down) * 100 / down.max(1);
+            let area = u64::from(mode.width) * u64::from(mode.height);
+            let (bigger, size_cost) = if area <= wanted_area {
+                (0, wanted_area - area)
+            } else {
+                (1, area - wanted_area)
+            };
+            (
+                shape_cost,
+                bigger,
+                size_cost,
+                mode.refresh_hz.abs_diff(wanted.refresh_hz),
+                u32::MAX - mode.refresh_hz,
+            )
+        })
+}
+
+fn requested_centre(monitor: &arcen_media::Monitor) -> (i64, i64) {
+    let (width, height) = match monitor.rotation {
+        Rotation::Degrees90 | Rotation::Degrees270 => (monitor.height_px, monitor.width_px),
+        Rotation::Degrees0 | Rotation::Degrees180 => (monitor.width_px, monitor.height_px),
+    };
+    (
+        i64::from(monitor.x) * 2 + i64::from(width),
+        i64::from(monitor.y) * 2 + i64::from(height),
+    )
+}
+
+/// Where a monitor of `size` goes beside the monitors already `placed`, on
+/// the side its Deck monitor is on relative to the Deck's primary (`offset`,
+/// centre to centre, the larger axis deciding): its other edge aligned with
+/// the primary's (the primary is at the origin), and flush against the
+/// outermost placed monitor it would otherwise overlap on that side. Only
+/// the monitors in its own row (left/right) or column (above/below) count,
+/// so a tall or wide monitor on another side never pushes it away into a
+/// gap: the primary is always in that row or column, so the new monitor
+/// shares an edge with a placed one and the layout stays connected.
+fn place_beside(
+    placed: &[LayoutRect],
+    offset: (i64, i64),
+    (width, height): (u32, u32),
+) -> Result<(i32, i32), WindowsTopologyError> {
+    let (width, height) = (i64::from(width), i64::from(height));
+    let spans = |start: i64, extent: u32, end: i64| start < end && start + i64::from(extent) > 0;
+    let in_row = || {
+        placed
+            .iter()
+            .filter(move |rect| spans(i64::from(rect.y), rect.height, height))
+    };
+    let in_column = || {
+        placed
+            .iter()
+            .filter(move |rect| spans(i64::from(rect.x), rect.width, width))
+    };
+    let (x, y) = if offset.0.abs() >= offset.1.abs() {
+        if offset.0 < 0 {
+            let left = in_row().map(|rect| i64::from(rect.x)).min().unwrap_or(0);
+            (left - width, 0)
+        } else {
+            let right = in_row()
+                .map(|rect| i64::from(rect.x) + i64::from(rect.width))
+                .max()
+                .unwrap_or(0);
+            (right, 0)
+        }
+    } else if offset.1 < 0 {
+        let top = in_column().map(|rect| i64::from(rect.y)).min().unwrap_or(0);
+        (0, top - height)
+    } else {
+        let bottom = in_column()
+            .map(|rect| i64::from(rect.y) + i64::from(rect.height))
+            .max()
+            .unwrap_or(0);
+        (0, bottom)
+    };
+    let fit = |value: i64| i32::try_from(value).map_err(|_| MediaContractError::CoordinateOverflow);
+    Ok((fit(x)?, fit(y)?))
+}
+
+/// The Deck's primary first, then its other monitors in roster order: the
+/// order monitors take this host's outputs in.
+fn assignment_order(requested: &RequestedMonitorTopology) -> Vec<usize> {
+    let monitors = requested.monitors();
+    let primary_index = monitors
         .iter()
         .position(|monitor| monitor.monitor().primary)
         .unwrap_or(0);
-    let mut assignment_order = Vec::with_capacity(requested_monitors.len());
-    assignment_order.push(primary_index);
-    for index in 0..requested_monitors.len() {
-        if index != primary_index {
-            assignment_order.push(index);
-        }
-    }
+    std::iter::once(primary_index)
+        .chain((0..monitors.len()).filter(|index| *index != primary_index))
+        .collect()
+}
 
-    let mut plans: Vec<Option<WindowsMonitorPlan>> = vec![None; requested_monitors.len()];
-    let mut rects = Vec::with_capacity(requested_monitors.len());
+/// Plans the requested monitors at `selected` (in output order) onto the
+/// outputs' current rectangles; the plan keeps roster order.
+fn plan_current_monitors(
+    requested: &RequestedMonitorTopology,
+    selected: &[usize],
+    generation: TopologyGeneration,
+    inventory: &PhysicalOutputInventory,
+) -> Result<WindowsTopologyPlan, WindowsTopologyError> {
+    let requested_monitors = requested.monitors();
+    let mut plans = Vec::with_capacity(selected.len());
+    let mut rects = Vec::with_capacity(selected.len());
     let mut requires_custom_timing = false;
-    for (output_slot, monitor_index) in assignment_order.into_iter().enumerate() {
+    for (&monitor_index, output) in selected.iter().zip(inventory.outputs()) {
         let monitor = requested_monitors[monitor_index].monitor();
-        let output = &inventory.outputs()[output_slot];
         if !output.supported_rotations.contains(&monitor.rotation) {
             return Err(WindowsTopologyError::UnsupportedRotation {
                 client_display_id: monitor.identity.id.clone(),
@@ -910,33 +1162,36 @@ pub fn plan_current_topology(
         );
         rects.push(rect);
         requires_custom_timing |= output.mode_capability.requires_custom_timing();
-        plans[monitor_index] = Some(WindowsMonitorPlan {
-            session_monitor_id,
-            client_display_id: monitor.identity.id.clone(),
-            adapter_luid: output.adapter_luid,
-            target_id: output.target_id,
-            adapter_output_index: output.adapter_output_index,
-            adapter_name: output.adapter_name.clone(),
-            global_index: output.global_index,
-            device_name: output.device_name.clone(),
-            x: rect.x,
-            y: rect.y,
-            width: rect.width,
-            height: rect.height,
-            mode_width: ccd_mode.target_width,
-            mode_height: ccd_mode.target_height,
-            logical_rect: region_logical_rect(&requested_monitors[monitor_index])?,
-            scale: region_scale(&monitor.identity.id, monitor.scale)?,
-            ui_scale: monitor_ui_scale(monitor),
-            refresh_hz: output.current_refresh_hz.max(1),
-            rotation: ccd_mode.target_rotation,
-            primary: monitor.primary,
-            custom_timing: output.mode_capability.requires_custom_timing(),
-            color: monitor
-                .color
-                .as_ref()
-                .map(arcen_media::display_color::DisplayColor::from_msg),
-        });
+        plans.push((
+            monitor_index,
+            WindowsMonitorPlan {
+                session_monitor_id,
+                client_display_id: monitor.identity.id.clone(),
+                adapter_luid: output.adapter_luid,
+                target_id: output.target_id,
+                adapter_output_index: output.adapter_output_index,
+                adapter_name: output.adapter_name.clone(),
+                global_index: output.global_index,
+                device_name: output.device_name.clone(),
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                mode_width: ccd_mode.target_width,
+                mode_height: ccd_mode.target_height,
+                logical_rect: region_logical_rect(&requested_monitors[monitor_index])?,
+                scale: region_scale(&monitor.identity.id, monitor.scale)?,
+                ui_scale: monitor_ui_scale(monitor),
+                refresh_hz: output.current_refresh_hz.max(1),
+                rotation: ccd_mode.target_rotation,
+                primary: monitor.primary,
+                custom_timing: output.mode_capability.requires_custom_timing(),
+                color: monitor
+                    .color
+                    .as_ref()
+                    .map(arcen_media::display_color::DisplayColor::from_msg),
+            },
+        ));
     }
     let bounds = signed_desktop_bounds(rects)?;
     if bounds.width > MAX_VIRTUAL_DESKTOP_DIMENSION_PX
@@ -947,16 +1202,14 @@ pub fn plan_current_topology(
             height: bounds.height,
         });
     }
+    plans.sort_by_key(|(monitor_index, _)| *monitor_index);
     Ok(WindowsTopologyPlan {
         generation,
         desktop_x: bounds.x,
         desktop_y: bounds.y,
         desktop_width: bounds.width,
         desktop_height: bounds.height,
-        monitors: plans
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .expect("every requested monitor receives one current output"),
+        monitors: plans.into_iter().map(|(_, plan)| plan).collect(),
         requires_custom_timing,
     })
 }
@@ -3007,5 +3260,349 @@ mod tests {
         let plan = plan_current_topology(&requested, generation(), &inventory).expect("plans");
         assert!(!plan.requires_custom_timing);
         assert_eq!(plan.monitors[0].refresh_hz, 64);
+    }
+
+    fn dummy_plug(target_id: u32) -> AvailableOutput {
+        fixed_mode_output(
+            luid(1),
+            target_id,
+            vec![OutputMode {
+                width: 1_920,
+                height: 1_080,
+                refresh_hz: 60,
+            }],
+        )
+    }
+
+    /// Three Deck monitors on a host with two fixed-mode outputs: the exact
+    /// planner refuses, the shown planner gives the Deck's primary and its
+    /// next monitor one output each, at the outputs' own modes, and leaves
+    /// the third out.
+    #[test]
+    fn shown_topology_serves_as_many_monitors_as_the_host_has_outputs() {
+        let inventory =
+            PhysicalOutputInventory::new(vec![dummy_plug(0), dummy_plug(1)]).expect("inventory");
+        let requested = RequestedMonitorTopology::new(vec![
+            monitor(
+                "left",
+                (-2_560, 0),
+                (2_560, 1_440),
+                false,
+                Rotation::Degrees0,
+            ),
+            monitor("main", (0, 0), (3_024, 1_964), true, Rotation::Degrees0),
+            monitor(
+                "right",
+                (3_024, 0),
+                (2_560, 1_440),
+                false,
+                Rotation::Degrees0,
+            ),
+        ])
+        .expect("requested topology");
+        assert_eq!(
+            plan_topology(&requested, generation(), &inventory),
+            Err(WindowsTopologyError::InsufficientOutputs {
+                requested: 3,
+                available: 2,
+            })
+        );
+        let plan = plan_shown_topology(&requested, generation(), &inventory).expect("plans");
+        let shown = plan
+            .monitors
+            .iter()
+            .map(|monitor| {
+                (
+                    monitor.client_display_id.as_str(),
+                    monitor.session_monitor_id.get(),
+                    monitor.target_id,
+                    monitor.width,
+                    monitor.height,
+                    monitor.primary,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            vec![
+                ("left", 1, 1, 1_920, 1_080, false),
+                ("main", 2, 0, 1_920, 1_080, true),
+            ]
+        );
+    }
+
+    /// A mode a fixed-mode output does not list is not a reason to refuse:
+    /// the output is shown at the mode it has.
+    #[test]
+    fn shown_topology_keeps_a_fixed_mode_output_at_its_own_mode() {
+        let inventory =
+            PhysicalOutputInventory::new(vec![dummy_plug(0), dummy_plug(1)]).expect("inventory");
+        let requested = RequestedMonitorTopology::new(vec![
+            monitor("main", (0, 0), (3_024, 1_964), true, Rotation::Degrees0),
+            monitor(
+                "side",
+                (3_024, 0),
+                (2_560, 1_440),
+                false,
+                Rotation::Degrees0,
+            ),
+        ])
+        .expect("requested topology");
+        assert!(matches!(
+            plan_topology(&requested, generation(), &inventory),
+            Err(WindowsTopologyError::NoMatchingMode { .. })
+        ));
+        let plan = plan_shown_topology(&requested, generation(), &inventory).expect("plans");
+        assert_eq!(plan.monitors.len(), 2);
+        assert!(
+            plan.monitors
+                .iter()
+                .all(|monitor| (monitor.mode_width, monitor.mode_height) == (1_920, 1_080))
+        );
+        assert_eq!((plan.desktop_width, plan.desktop_height), (3_840, 1_080));
+    }
+
+    /// Every shown monitor shares an edge (of positive length) with the
+    /// primary or with one that does, and no two overlap.
+    fn assert_connected_without_overlap(plan: &WindowsTopologyPlan) {
+        let rects = plan
+            .monitors
+            .iter()
+            .map(|monitor| {
+                (
+                    i64::from(monitor.x),
+                    i64::from(monitor.y),
+                    i64::from(monitor.x) + i64::from(monitor.width),
+                    i64::from(monitor.y) + i64::from(monitor.height),
+                )
+            })
+            .collect::<Vec<_>>();
+        let overlap = |a0: i64, a1: i64, b0: i64, b1: i64| a0.max(b0) < a1.min(b1);
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                assert!(
+                    !(overlap(a.0, a.2, b.0, b.2) && overlap(a.1, a.3, b.1, b.3)),
+                    "{a:?} overlaps {b:?}"
+                );
+            }
+        }
+        let touches = |a: &(i64, i64, i64, i64), b: &(i64, i64, i64, i64)| {
+            ((a.2 == b.0 || b.2 == a.0) && overlap(a.1, a.3, b.1, b.3))
+                || ((a.3 == b.1 || b.3 == a.1) && overlap(a.0, a.2, b.0, b.2))
+        };
+        let primary = plan
+            .monitors
+            .iter()
+            .position(|monitor| monitor.primary)
+            .expect("a primary");
+        let mut reached = vec![false; rects.len()];
+        reached[primary] = true;
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for i in 0..rects.len() {
+                if !reached[i]
+                    && (0..rects.len()).any(|j| reached[j] && touches(&rects[i], &rects[j]))
+                {
+                    reached[i] = true;
+                    grew = true;
+                }
+            }
+        }
+        assert!(
+            reached.iter().all(|r| *r),
+            "a shown monitor is an island: {rects:?}"
+        );
+    }
+
+    fn any_mode_output(target_id: u32) -> AvailableOutput {
+        fixed_mode_output(
+            luid(1),
+            target_id,
+            [
+                (1_920, 1_080),
+                (1_080, 1_920),
+                (1_920, 1_200),
+                (3_840, 1_080),
+            ]
+            .into_iter()
+            .map(|(width, height)| OutputMode {
+                width,
+                height,
+                refresh_hz: 60,
+            })
+            .collect(),
+        )
+    }
+
+    fn shown_rects(monitors: Vec<RequestedMonitor>) -> WindowsTopologyPlan {
+        let inventory =
+            PhysicalOutputInventory::new((0..monitors.len() as u32).map(any_mode_output).collect())
+                .expect("inventory");
+        let requested = RequestedMonitorTopology::new(monitors).expect("requested topology");
+        let plan = plan_shown_topology(&requested, generation(), &inventory).expect("plans");
+        assert_connected_without_overlap(&plan);
+        plan
+    }
+
+    fn rect_of<'a>(plan: &'a WindowsTopologyPlan, id: &str) -> (i32, i32, u32, u32) {
+        let monitor = plan
+            .monitors
+            .iter()
+            .find(|monitor| monitor.client_display_id == id)
+            .expect("shown");
+        (monitor.x, monitor.y, monitor.width, monitor.height)
+    }
+
+    /// A tall monitor on the left must not push a monitor below the
+    /// primary down past its own bottom.
+    #[test]
+    fn a_tall_left_monitor_does_not_push_one_below_into_a_gap() {
+        let plan = shown_rects(vec![
+            monitor("main", (0, 0), (1_920, 1_080), true, Rotation::Degrees0),
+            monitor(
+                "tall",
+                (-1_080, -420),
+                (1_080, 1_920),
+                false,
+                Rotation::Degrees0,
+            ),
+            monitor(
+                "below",
+                (0, 1_080),
+                (1_920, 1_080),
+                false,
+                Rotation::Degrees0,
+            ),
+        ]);
+        assert_eq!(rect_of(&plan, "tall"), (-1_080, 0, 1_080, 1_920));
+        assert_eq!(rect_of(&plan, "below"), (0, 1_080, 1_920, 1_080));
+    }
+
+    /// A 1920x1200 monitor beside a 1920x1080 primary, then one below.
+    #[test]
+    fn a_taller_side_monitor_does_not_push_one_below_into_a_gap() {
+        let plan = shown_rects(vec![
+            monitor("main", (0, 0), (1_920, 1_080), true, Rotation::Degrees0),
+            monitor(
+                "left",
+                (-1_920, 0),
+                (1_920, 1_200),
+                false,
+                Rotation::Degrees0,
+            ),
+            monitor(
+                "below",
+                (0, 1_080),
+                (1_920, 1_080),
+                false,
+                Rotation::Degrees0,
+            ),
+        ]);
+        assert_eq!(rect_of(&plan, "below"), (0, 1_080, 1_920, 1_080));
+    }
+
+    /// Four monitors: a wide one above must not push the one on the right
+    /// away, nor a tall one on the left the one below.
+    #[test]
+    fn four_shown_monitors_stay_connected_around_the_primary() {
+        let plan = shown_rects(vec![
+            monitor("main", (0, 0), (1_920, 1_080), true, Rotation::Degrees0),
+            monitor(
+                "above",
+                (-960, -1_080),
+                (3_840, 1_080),
+                false,
+                Rotation::Degrees0,
+            ),
+            monitor(
+                "right",
+                (1_920, 0),
+                (1_920, 1_080),
+                false,
+                Rotation::Degrees0,
+            ),
+            monitor(
+                "tall",
+                (-1_080, -420),
+                (1_080, 1_920),
+                false,
+                Rotation::Degrees0,
+            ),
+        ]);
+        assert_eq!(rect_of(&plan, "above"), (0, -1_080, 3_840, 1_080));
+        assert_eq!(rect_of(&plan, "right"), (1_920, 0, 1_920, 1_080));
+        assert_eq!(rect_of(&plan, "tall"), (-1_080, 0, 1_080, 1_920));
+    }
+
+    /// The field host's plugs run an odd 2560x1439 desktop and list 1080p
+    /// and a few smaller modes. A 5K main display and a 3:2 laptop panel are
+    /// shown at the even modes that fit them best, the laptop on the left as
+    /// on the Deck; the odd desktop is never planned.
+    #[test]
+    fn shown_topology_fits_each_monitor_to_an_even_mode_the_output_lists() {
+        let modes = vec![
+            OutputMode {
+                width: 2_560,
+                height: 1_439,
+                refresh_hz: 60,
+            },
+            OutputMode {
+                width: 1_920,
+                height: 1_080,
+                refresh_hz: 60,
+            },
+            OutputMode {
+                width: 1_680,
+                height: 1_050,
+                refresh_hz: 60,
+            },
+            OutputMode {
+                width: 1_280,
+                height: 720,
+                refresh_hz: 60,
+            },
+        ];
+        let inventory = PhysicalOutputInventory::new(vec![
+            fixed_mode_output(luid(1), 0, modes.clone()),
+            fixed_mode_output(luid(1), 1, modes),
+        ])
+        .expect("inventory");
+        let requested = RequestedMonitorTopology::new(vec![
+            monitor("studio", (0, 0), (5_120, 2_880), true, Rotation::Degrees0),
+            monitor(
+                "laptop",
+                (-3_024, 916),
+                (3_024, 1_964),
+                false,
+                Rotation::Degrees0,
+            ),
+        ])
+        .expect("requested topology");
+        let plan = plan_shown_topology(&requested, generation(), &inventory).expect("plans");
+        let shown = plan
+            .monitors
+            .iter()
+            .map(|monitor| {
+                (
+                    monitor.client_display_id.as_str(),
+                    monitor.x,
+                    monitor.y,
+                    monitor.width,
+                    monitor.height,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            vec![
+                ("studio", 0, 0, 1_920, 1_080),
+                ("laptop", -1_680, 0, 1_680, 1_050),
+            ]
+        );
+        assert_eq!(
+            (plan.desktop_x, plan.desktop_width, plan.desktop_height),
+            (-1_680, 3_600, 1_080)
+        );
     }
 }

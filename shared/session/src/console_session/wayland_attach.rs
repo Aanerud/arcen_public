@@ -131,10 +131,12 @@ pub fn joined_outputs(monitors: &[JoinMonitor]) -> Result<Vec<JoinedOutput>, Con
 /// for an X11 session. Its monitors are another matter: blanking them
 /// would change the user's compositor (its power-save mode or its colour
 /// state), which a joined session never is, and Mutter stops painting a
-/// monitor it powered down. So while desk privacy is required
-/// (`desk_private`), a session showing on a monitor at the desk is refused
-/// `console_privacy_unavailable`; one whose monitors are all the
-/// compositor's own (a headless session) shows nothing at the desk.
+/// monitor it powered down. So while the administrator requires desk
+/// privacy (`desk_private`: `privacy.desk = "required"`), a session showing
+/// on a monitor at the desk is refused `console_privacy_unavailable`; one
+/// whose monitors are all the compositor's own (a headless session) shows
+/// nothing at the desk. A best-effort desk is served and its screens
+/// reported visible (`DeskPrivacyStatus::ScreensVisible`).
 ///
 /// `at_desk`: a recorded monitor is shown at the desk ([`shown_at_desk`]).
 ///

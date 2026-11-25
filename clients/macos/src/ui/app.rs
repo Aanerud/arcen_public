@@ -1946,6 +1946,8 @@ pub struct ArcenApp {
     tablet_input_enabled: bool,
     /// `ClientSettings::exact_still_image`: asked for on the next connection.
     exact_still_image: bool,
+    /// `ClientSettings::keep_desk_private`: asked for on the next connection.
+    keep_desk_private: bool,
     /// `ClientSettings::canvas` and `canvas_cache_mib`: asked for on the next
     /// connection where the eight-bit presenter executes canvas work.
     canvas: bool,
@@ -2102,6 +2104,7 @@ impl ArcenApp {
         options.clipboard_enabled = app.clipboard_enabled;
         options.microphone_enabled = app.microphone_enabled;
         options.exact_still_image = app.exact_still_image;
+        options.keep_desk_private = app.keep_desk_private;
         let mut draft = ConnectionDraft {
             saved_connection_id: None,
             name: None,
@@ -2576,6 +2579,7 @@ impl ArcenApp {
             stated_display_refresh: None,
             tablet_input_enabled: tablet_mode_allows_typed_pen(tablet_mode_requested),
             exact_still_image: settings.exact_still_image,
+            keep_desk_private: settings.keep_desk_private,
             canvas: settings.canvas,
             canvas_cache_mib: settings.canvas_cache_mib,
             pen_buttons: settings.pen_buttons,
@@ -3283,6 +3287,7 @@ impl ArcenApp {
             pending_host_cursor,
             pending_host_pointer,
             served_pipeline,
+            desk_privacy_update,
             connection_status_hint,
             generation,
         ) = {
@@ -3393,6 +3398,7 @@ impl ArcenApp {
                 state.pending_host_cursor.take(),
                 state.pending_host_pointer.take(),
                 state.served_pipeline.take(),
+                state.desk_privacy_update.take(),
                 state.connection_status_hint.clone(),
                 state.generation,
             )
@@ -3469,7 +3475,13 @@ impl ArcenApp {
             self.note_hello_desktop(hello.login_window);
             self.desk_note = arcen_deck_core::session_truth::desk_privacy_note(&hello);
             if let Some(note) = self.desk_note {
-                tracing::info!(target: "arcen::session", note, "host desk privacy");
+                if arcen_deck_core::session_truth::desk_privacy_status_now(&hello, None)
+                    .is_some_and(arcen_deck_core::session_truth::DeskPrivacyStatus::is_warning)
+                {
+                    tracing::warn!(target: "arcen::session", note, "host desk privacy");
+                } else {
+                    tracing::info!(target: "arcen::session", note, "host desk privacy");
+                }
                 self.text_input.notify(note.to_owned());
             }
             self.session_hello_handled = true;
@@ -3821,6 +3833,20 @@ impl ArcenApp {
             }
             if let Some(host) = self.colour_check_host.as_mut() {
                 host.apply_served(&served);
+            }
+        }
+        // The host's desk changed during the session (a screen it could no
+        // longer keep dark, or dark again): the notice and the Stream
+        // Statistics line follow it.
+        if let Some(status) = desk_privacy_update {
+            self.desk_note = status.deck_note();
+            if status.is_warning() {
+                tracing::warn!(target: "arcen::session", status = status.token(), "host desk privacy changed");
+            } else {
+                tracing::info!(target: "arcen::session", status = status.token(), "host desk privacy changed");
+            }
+            if let Some(note) = self.desk_note {
+                self.text_input.notify(note.to_owned());
             }
         }
         // Apply the authoritative host result after ServerHello. The media
@@ -8614,6 +8640,7 @@ impl ArcenApp {
             tablet_mode_requested: self.tablet_mode_requested,
             pen_buttons: self.pen_buttons,
             exact_still_image: self.exact_still_image,
+            keep_desk_private: self.keep_desk_private,
             canvas: self.canvas,
             keyboard_capture: self.keyboard_capture,
             capture_mac_system_shortcuts: self.capture_mac_system_shortcuts,
@@ -8641,6 +8668,7 @@ impl ArcenApp {
             tablet_mode_requested,
             pen_buttons,
             exact_still_image,
+            keep_desk_private,
             canvas,
             keyboard_capture,
             capture_mac_system_shortcuts,
@@ -8709,6 +8737,7 @@ impl ArcenApp {
             || clipboard_enabled != self.clipboard_enabled
             || microphone_enabled != self.microphone_enabled
             || exact_still_image != self.exact_still_image
+            || keep_desk_private != self.keep_desk_private
             || canvas != self.canvas
             || keyboard_capture != self.keyboard_capture
             || capture_mac_system_shortcuts != self.capture_mac_system_shortcuts
@@ -8742,6 +8771,7 @@ impl ArcenApp {
         self.clipboard_enabled = clipboard_enabled;
         self.microphone_enabled = microphone_enabled;
         self.exact_still_image = exact_still_image;
+        self.keep_desk_private = keep_desk_private;
         self.canvas = canvas;
         self.keyboard_capture = keyboard_capture;
         self.keyboard_owner.set_policy(keyboard_capture);
@@ -9037,6 +9067,7 @@ impl ArcenApp {
                 tablet_mode_requested: self.tablet_mode_requested,
                 pen_buttons: self.pen_buttons,
                 exact_still_image: self.exact_still_image,
+                keep_desk_private: self.keep_desk_private,
                 canvas: self.canvas,
                 canvas_cache_mib: self.canvas_cache_mib,
                 color_fidelity: self.color_fidelity,
@@ -9197,6 +9228,7 @@ impl ArcenApp {
         options.tablet_input_enabled = self.tablet_input_enabled;
         options.tablet_mode_requested = self.tablet_mode_requested;
         options.exact_still_image = self.exact_still_image;
+        options.keep_desk_private = self.keep_desk_private;
         options.canvas = connection_canvas_request(
             self.canvas,
             self.canvas_cache_mib,
@@ -14670,6 +14702,7 @@ fn connect_options_from_draft(draft: &ConnectionDraft) -> ConnectOptions {
         tablet_mode_requested: TabletModeMsg::LocalTermination,
         telemetry: Arc::new(ClientTelemetry::default()),
         exact_still_image: false,
+        keep_desk_private: true,
         canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
     }
 }
@@ -25450,6 +25483,7 @@ mod tests {
                 tablet_mode_requested: TabletModeMsg::DisabledMouseCompat,
                 pen_buttons: arcen_input::pen_buttons::PenButtonSettings::default(),
                 exact_still_image: false,
+                keep_desk_private: false,
                 canvas: false,
                 canvas_cache_mib: 32,
                 color_fidelity: ColorFidelitySettings {

@@ -605,6 +605,7 @@ mod tests {
             console: true,
             console_guest: false,
             console_shown_outputs: None,
+            console_desk_privacy: None,
         }
     }
 

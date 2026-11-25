@@ -52,23 +52,30 @@ const fn input_availability(
 /// attachment owns the shared region adapter for a committed Match My Layout
 /// session.
 /// What the desk shows while this Deck is attached: a joined console's
-/// desk is blanked unless the administrator turned desk privacy off; a
-/// headless Wayland desktop is on no desk monitor. A dedicated X11 desktop
-/// says nothing.
+/// desk as its sign-in settled it (`privacy.desk`, the Deck's choice and
+/// what the launcher could keep private); a headless Wayland desktop is on
+/// no desk monitor. A dedicated X11 desktop says nothing.
 fn desk_privacy_status(
     cfg: &Config,
     session: Option<&SessionMetadata>,
 ) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
-    use arcen_session::console_session::desk_privacy::DeskExposure;
+    use arcen_session::console_session::desk_privacy::{DeckDeskPrivacy, DeskExposure};
     let session = session?;
-    let exposure = if session.console {
-        DeskExposure::PhysicalDesk
+    if session.console {
+        Some(session.console_desk_privacy.unwrap_or_else(|| {
+            cfg.desk_privacy
+                .plan(DeskExposure::PhysicalDesk, DeckDeskPrivacy::Private)
+                .status()
+        }))
     } else if session.wayland.is_some() {
-        DeskExposure::NotShown
+        Some(
+            cfg.desk_privacy
+                .plan(DeskExposure::NotShown, DeckDeskPrivacy::Private)
+                .status(),
+        )
     } else {
-        return None;
-    };
-    Some(cfg.desk_privacy.plan(exposure).status())
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -752,6 +759,7 @@ mod tests {
             console: false,
             console_guest: false,
             console_shown_outputs: None,
+            console_desk_privacy: None,
         };
         let plan = native_plan(VideoCodec::H264, false);
         let hello = build_server_hello(
@@ -800,6 +808,21 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(hello_for(&off, &console).as_deref(), Some("off"));
+        // What the sign-in settled is what the Deck is told: a desk whose
+        // screens could not all be blanked, or one the Deck asked to see.
+        for status in [
+            arcen_session::console_session::desk_privacy::DeskPrivacyStatus::ScreensVisible,
+            arcen_session::console_session::desk_privacy::DeskPrivacyStatus::Visible,
+        ] {
+            let settled = SessionMetadata {
+                console_desk_privacy: Some(status),
+                ..console.clone()
+            };
+            assert_eq!(
+                hello_for(&Config::default(), &settled).as_deref(),
+                Some(status.token())
+            );
+        }
     }
 
     #[test]

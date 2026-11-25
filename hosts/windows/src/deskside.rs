@@ -901,6 +901,45 @@ fn software_enumerated_adapter(path: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(r"\\?\ROOT#"))
 }
 
+/// The lit outputs desk privacy may detach from the desktop: every lit
+/// output (`\\.\DISPLAYn`) but the ones the session is served from
+/// (`served`: the single display, or every Match My Layout monitor), by the
+/// shared rule (`desk_outputs_to_hide`). Device names compare without case.
+pub fn desk_outputs_to_hide_among(lit: &[String], served: &[String]) -> Vec<String> {
+    let served = served
+        .iter()
+        .map(|name| name.to_ascii_uppercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let lit = lit
+        .iter()
+        .map(|name| name.to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    arcen_session::console_session::desk_privacy::desk_outputs_to_hide(&lit, &served)
+}
+
+/// [`desk_outputs_to_hide_among`] the outputs the desktop lights now;
+/// `None` when the topology cannot be read.
+#[cfg(windows)]
+pub fn desk_outputs_to_hide(served: &[String]) -> Option<Vec<String>> {
+    let report = crate::gpu_probe::probe_at(crate::gpu_probe::ProbeDepth::DeskTopology).ok()?;
+    if report.topology_error.is_some() {
+        return None;
+    }
+    let lit = report
+        .adapters
+        .iter()
+        .flat_map(|adapter| &adapter.outputs)
+        .filter(|output| output.attached_to_desktop && output.ccd_active == Some(true))
+        .map(|output| output.device_name.clone())
+        .collect::<Vec<_>>();
+    Some(desk_outputs_to_hide_among(&lit, served))
+}
+
+#[cfg(not(windows))]
+pub fn desk_outputs_to_hide(_served: &[String]) -> Option<Vec<String>> {
+    None
+}
+
 /// The output to serve a desk-private session on when the configured one
 /// shows on a monitor at the desk: the first virtual display on the same
 /// adapter, whose encoder was already chosen (`None`: keep the configured
@@ -975,25 +1014,119 @@ static DARK_DESK: std::sync::Mutex<
     Option<arcen_session::console_session::desk_privacy::DeskWatch>,
 > = std::sync::Mutex::new(None);
 
+/// This agent's desk privacy (one session per agent process): its plan and
+/// every shortfall, decided by the shared
+/// [`DeskPrivacyState`](arcen_session::console_session::desk_privacy::DeskPrivacyState).
+static DESK_PRIVACY: std::sync::Mutex<
+    Option<arcen_session::console_session::desk_privacy::DeskPrivacyState>,
+> = std::sync::Mutex::new(None);
+
+fn desk_privacy_state() -> std::sync::MutexGuard<
+    'static,
+    Option<arcen_session::console_session::desk_privacy::DeskPrivacyState>,
+> {
+    DESK_PRIVACY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Starts this agent's desk privacy under `plan` (`None`: pinned deskside
+/// or no plan; nothing is decided here).
+pub fn begin_desk_privacy(
+    plan: Option<arcen_session::console_session::desk_privacy::DeskPrivacyPlan>,
+) {
+    *desk_privacy_state() =
+        plan.map(arcen_session::console_session::desk_privacy::DeskPrivacyState::new);
+}
+
+/// One privacy measure that could not be applied at attach: recorded and
+/// warned about under best effort.
+///
+/// # Errors
+///
+/// `refusal` when the administrator requires desk privacy (or no plan was
+/// begun: fail closed): the attachment is refused.
+pub fn desk_privacy_shortfall(
+    refusal: arcen_session::console_session::desk_privacy::DeskPrivacyRefusal,
+) -> Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
+    desk_privacy_state()
+        .as_mut()
+        .map_or(Err(refusal), |state| state.attach_failed(refusal))
+}
+
+/// What the hello says about the desk (the state later updates are told
+/// against); `None` when no plan was begun.
+pub fn desk_privacy_hello_status(
+) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+    desk_privacy_state()
+        .as_mut()
+        .map(arcen_session::console_session::desk_privacy::DeskPrivacyState::hello_status)
+}
+
+/// Whether this agent's best-effort desk already fell short on input (its
+/// hooks did not install or stopped proving live): there is nothing left to
+/// probe.
+pub fn desk_input_fell_short() -> bool {
+    desk_privacy_state()
+        .as_ref()
+        .is_some_and(|state| state.shortfall().input.is_some())
+}
+
+/// The desk's state when it changed since the Deck was last told (a re-proof
+/// that failed, or passed again), for `desk_privacy_update`. It stays
+/// pending until [`desk_privacy_told`] records that it was sent.
+pub fn desk_privacy_pending(
+) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+    desk_privacy_state()
+        .as_ref()
+        .and_then(arcen_session::console_session::desk_privacy::DeskPrivacyState::pending)
+}
+
+/// Records that `status` was queued for the Deck.
+pub fn desk_privacy_told(status: arcen_session::console_session::desk_privacy::DeskPrivacyStatus) {
+    if let Some(state) = desk_privacy_state().as_mut() {
+        state.mark_told(status);
+    }
+}
+
 /// Holds the proof the agent's supervision checks the desk against while
 /// the Deck is attached and held (one session per agent process), and
 /// starts (`Some`) or stops (`None`) the shared watcher thread that keeps
 /// proving it off the session loop and the media path
 /// ([`DeskWatch`](arcen_session::console_session::desk_privacy::DeskWatch)).
-pub fn hold_dark_desk(proof: Option<DarkDeskProof>) {
-    use arcen_session::console_session::desk_privacy::{DeskWatch, DESK_TOPOLOGY_READ};
+/// A watch whose refusal must end the session (`required`) stops at it; a
+/// best-effort one keeps proving, so the Deck hears of the recovery too.
+pub fn hold_dark_desk(
+    proof: Option<DarkDeskProof>,
+    on_refusal: arcen_session::console_session::desk_privacy::DeskWatchOnRefusal,
+) {
+    use arcen_session::console_session::desk_privacy::{
+        DeskWatch, DeskWatchOnRefusal, DESK_TOPOLOGY_READ,
+    };
     let watch = proof.map(|proof| {
         let topology = proof.topology.clone();
-        DeskWatch::start(
+        // A best-effort watch logs a failing desk once, not at every proof.
+        let mut failing = false;
+        DeskWatch::start_with(
+            on_refusal,
             DESK_TOPOLOGY_READ,
             topology,
             read_desk_topology,
             move || verify_desk_dark(&proof),
-            |report| {
+            move |report| {
                 let took_ms = u64::try_from(report.took.as_millis()).unwrap_or(u64::MAX);
                 let settle_left_ms =
                     u64::try_from(report.settle_left.as_millis()).unwrap_or(u64::MAX);
                 match report.outcome {
+                    Ok(()) if failing => {
+                        failing = false;
+                        tracing::info!(
+                            target: crate::logging::SESSION,
+                            reason = report.reason.token(),
+                            took_ms,
+                            "desk privacy: the desk is proved dark again"
+                        );
+                    }
                     Ok(()) => tracing::info!(
                         target: crate::logging::SESSION,
                         reason = report.reason.token(),
@@ -1003,6 +1136,19 @@ pub fn hold_dark_desk(proof: Option<DarkDeskProof>) {
                         took_ms,
                         "desk privacy: the desk was proved dark again off the media path"
                     ),
+                    Err(_) if failing => {}
+                    Err(refusal) if on_refusal == DeskWatchOnRefusal::Keep => {
+                        failing = true;
+                        tracing::warn!(
+                            target: crate::logging::SESSION,
+                            reason = report.reason.token(),
+                            refusal = refusal.token(),
+                            attempts = report.attempts,
+                            settle_left_ms,
+                            took_ms,
+                            "desk privacy: the desk is no longer proved dark; the session continues and the Deck is told (privacy.desk = \"required\" ends it instead)"
+                        );
+                    }
                     Err(refusal) => tracing::error!(
                         target: crate::logging::SESSION,
                         reason = report.reason.token(),
@@ -1010,7 +1156,7 @@ pub fn hold_dark_desk(proof: Option<DarkDeskProof>) {
                         attempts = report.attempts,
                         settle_left_ms,
                         took_ms,
-                        "desk privacy: the desk is no longer proved dark; the session ends"
+                        "desk privacy: the desk is no longer proved dark and the administrator requires it; the session ends"
                     ),
                 }
             },
@@ -1033,24 +1179,30 @@ pub fn hold_dark_desk(proof: Option<DarkDeskProof>) {
 /// verdict (its refusal, or
 /// [`DeskMonitorUnknown`](arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskMonitorUnknown)
 /// when it completed no check within
-/// [`DESK_CHECK_STALE`](arcen_session::console_session::desk_privacy::DESK_CHECK_STALE)).
+/// [`DESK_CHECK_STALE`](arcen_session::console_session::desk_privacy::DESK_CHECK_STALE)),
+/// judged by this agent's plan: only a required desk ends the session; a
+/// best-effort one records it for [`desk_privacy_update`].
 ///
 /// # Errors
 ///
 /// The refusal that ends the Deck's session.
 pub fn desk_watch_verdict(
 ) -> Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
-    DARK_DESK
+    let verdict = DARK_DESK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .map_or(Ok(()), |watch| watch.verdict(std::time::Instant::now()))
+        .map_or(Ok(()), |watch| watch.verdict(std::time::Instant::now()));
+    match desk_privacy_state().as_mut() {
+        Some(state) => state.watched(verdict),
+        None => verdict,
+    }
 }
 
-/// Woken when the desk watcher refuses, so a session loop ends at once
-/// rather than at its next supervision tick (read
-/// [`desk_watch_verdict`] when it fires: a wake-up may be left over from
-/// an earlier watch).
+/// Woken when the desk watcher refuses (or, best effort, proves the desk
+/// dark again), so a session loop ends or tells the Deck at once rather
+/// than at its next supervision tick (read [`desk_watch_verdict`] when it
+/// fires: a wake-up may be left over from an earlier watch).
 pub fn desk_alarm() -> &'static tokio::sync::Notify {
     static ALARM: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
     ALARM.get_or_init(tokio::sync::Notify::new)
@@ -1673,6 +1825,31 @@ unsafe extern "system" fn mouse_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desk_privacy_detaches_no_output_the_session_is_served_from() {
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        // Match My Layout on a GeForce with two dummy plugs: both carry a
+        // stream, so nothing is detached.
+        assert!(desk_outputs_to_hide_among(
+            &names(&[r"\\.\DISPLAY1", r"\\.\DISPLAY2"]),
+            &names(&[r"\\.\display2", r"\\.\DISPLAY1"]),
+        )
+        .is_empty());
+        // A single served display: only the other plug may be detached.
+        assert_eq!(
+            desk_outputs_to_hide_among(
+                &names(&[r"\\.\DISPLAY1", r"\\.\DISPLAY2"]),
+                &names(&[r"\\.\DISPLAY1"]),
+            ),
+            names(&[r"\\.\DISPLAY2"])
+        );
+    }
 
     #[test]
     fn only_a_software_enumerated_indirect_display_is_virtual() {

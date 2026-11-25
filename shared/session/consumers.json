@@ -478,6 +478,7 @@
       "contracts": [
         "agent_relay",
         "auth_throttle",
+        "console_session",
         "desktop_provider",
         "direct_reconnect",
         "host_lifecycle",

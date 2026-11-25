@@ -902,6 +902,7 @@ async fn serve_desktop(
     >,
     audio: Option<&mut arcen_pier_macos::audio::AudioCaptureSession>,
     audio_channel: Option<tokio::net::UnixStream>,
+    desk_privacy: Option<arcen_pier_macos::desk_privacy::DeskPrivacyUpdates>,
     sent_frames: arcen_telemetry::SentFrames,
 ) -> Result<u64, Box<arcen_pier_macos::stream::StreamEnded>> {
     if let Some(multi_monitor) = handshake.multi_monitor.as_ref() {
@@ -913,6 +914,7 @@ async fn serve_desktop(
             telemetry,
             session_id,
             audio,
+            desk_privacy,
             sent_frames,
         )
         .await;
@@ -1007,6 +1009,7 @@ async fn serve_desktop(
             path_signal_connection: socket.get_ref().path_signal_connection(),
             refine: handshake.refine,
             host_keymap: handshake.host_keymap,
+            desk_privacy,
             sent_frames,
         },
     )
@@ -1041,6 +1044,7 @@ async fn serve_multi_desktop(
     telemetry: arcen_pier_macos::observability::HostTelemetry,
     session_id: arcen_telemetry::CorrelationId,
     audio: Option<&mut arcen_pier_macos::audio::AudioCaptureSession>,
+    desk_privacy: Option<arcen_pier_macos::desk_privacy::DeskPrivacyUpdates>,
     sent_frames: arcen_telemetry::SentFrames,
 ) -> Result<u64, Box<arcen_pier_macos::stream::StreamEnded>> {
     let epoch =
@@ -1102,6 +1106,7 @@ async fn serve_multi_desktop(
             audio,
             path_signal_connection: socket.get_ref().path_signal_connection(),
             host_keymap: handshake.host_keymap,
+            desk_privacy,
             sent_frames,
         },
     )
@@ -1866,7 +1871,10 @@ fn run_agent(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         .serving_uid
         .filter(|_| !session_policy.login_window)
     {
-        let _ = arcen_pier_macos::lock_guard::recover_at_start(uid, session_policy.desk_privacy);
+        let _ = arcen_pier_macos::lock_guard::recover_at_start(
+            uid,
+            session_policy.desk_privacy.enabled(),
+        );
     }
     if arcen_pier_macos::timezone::supported_in_this_process(session_policy.login_window) {
         restore_stale_agent_timezone("startup");
@@ -3125,26 +3133,29 @@ async fn serve_one(
             // Before anything of the session is shown: if this agent dies
             // while the Deck is attached, the session is still locked
             // (GAP-048).
-            let lock_guard = arm_lock_guard(&session_policy).await;
+            let lock_guard = arm_lock_guard(&session_policy, handshake.desk_privacy).await;
             // The desk goes private before anything of the session is shown
-            // (ADR 0025 §5), or the session is refused.
-            let mut desk_privacy = match arm_desk_privacy(&session_policy).await {
+            // (ADR 0025 §5), as far as this Mac can make it; only a required
+            // desk that cannot be made private refuses the session.
+            let mut desk_privacy = match arm_desk_privacy(&session_policy, handshake.desk_privacy)
+                .await
+            {
                 Ok(privacy) => privacy,
                 Err(refusal) => {
                     tracing::error!(
                         target: arcen_telemetry::names::target::SESSION,
                         reason = refusal.token(),
-                        "refusing the session: the desk could not be made private"
+                        "refusing the session: the administrator requires desk privacy and the desk could not be made private"
                     );
-                    let _ = arcen_pier_macos::net::refuse_with_reason(
-                        socket,
-                        arcen_session::console_session::ConsoleRefusal::PrivacyUnavailable
-                            .deck_reason(),
-                    )
-                    .await;
+                    let _ =
+                        arcen_pier_macos::net::refuse_with_reason(socket, &refusal.deck_reason())
+                            .await;
                     return SessionOutcome::Refused;
                 }
             };
+            let desk_updates = desk_privacy
+                .as_mut()
+                .and_then(arcen_pier_macos::desk_privacy::DeskPrivacy::take_updates);
 
             let mut session_audio = match start_session_audio(&handshake, local_playback).await {
                 Ok(audio) => audio,
@@ -3306,6 +3317,7 @@ async fn serve_one(
                             None
                         },
                         audio_channel,
+                        desk_updates,
                         sent_frames,
                     )
                 },
@@ -3438,9 +3450,12 @@ static LOCK_GUARD_SLOT: arcen_pier_macos::blocking::BlockingSlot =
 /// `serve`.
 async fn arm_lock_guard(
     policy: &arcen_pier_macos::session::SessionPolicy,
+    plan: Option<arcen_session::console_session::desk_privacy::DeskPrivacyPlan>,
 ) -> Option<arcen_pier_macos::lock_guard::LockGuard> {
     let uid = policy.serving_uid.filter(|_| !policy.login_window)?;
-    let private = policy.desk_privacy;
+    // The desk the agent keeps private is kept dark by the guard too.
+    let private =
+        plan.is_some_and(arcen_session::console_session::desk_privacy::DeskPrivacyPlan::protects);
     match arcen_pier_macos::blocking::run_exclusive(
         "arcen-macos-lock-guard",
         &LOCK_GUARD_SLOT,
@@ -3464,42 +3479,57 @@ async fn arm_lock_guard(
 static DESK_PRIVACY_SLOT: arcen_pier_macos::blocking::BlockingSlot =
     arcen_pier_macos::blocking::BlockingSlot::new();
 
-/// Makes the desk private for a signed-in user's session unless the
-/// administrator turned it off (`privacy.desk = "off"`): never at the login
-/// window (nothing private is shown, and its only input is virtual HID,
-/// which an event filter cannot tell from the desk's) nor in `serve`.
+/// Makes the desk private for a signed-in user's session when this
+/// session's plan protects it (`privacy.desk` and the Deck's choice, ADR
+/// 0025 §5): never at the login window (nothing private is shown, and its
+/// only input is virtual HID, which an event filter cannot tell from the
+/// desk's) nor in `serve`. A best-effort plan keeps what it can and tells
+/// the Deck the rest; only a required plan refuses.
 async fn arm_desk_privacy(
     policy: &arcen_pier_macos::session::SessionPolicy,
+    plan: Option<arcen_session::console_session::desk_privacy::DeskPrivacyPlan>,
 ) -> Result<
     Option<arcen_pier_macos::desk_privacy::DeskPrivacy>,
     arcen_session::console_session::desk_privacy::DeskPrivacyRefusal,
 > {
     use arcen_session::console_session::desk_privacy::{
-        DeckInputRoute, DeskPrivacyRefusal, admits_input_route,
+        DeckInputRoute, DeskPrivacyRefusal, DeskPrivacyState,
     };
-    let Some(uid) = policy
+    let Some((uid, plan)) = policy
         .serving_uid
-        .filter(|_| policy.desk_privacy && !policy.login_window)
+        .zip(plan)
+        .filter(|(_, plan)| plan.protects() && !policy.login_window)
     else {
+        if let Some(plan) = plan {
+            tracing::info!(
+                target: arcen_telemetry::names::target::SESSION,
+                plan = ?plan,
+                "the desk stays live while the Deck is attached"
+            );
+        }
         return Ok(None);
     };
-    admits_input_route(match arcen_pier_macos::input::input_backend() {
+    let route = match arcen_pier_macos::input::input_backend() {
         arcen_pier_macos::input::InputBackend::CoreGraphics => DeckInputRoute::PostedEvents,
         arcen_pier_macos::input::InputBackend::VirtualKeyboard(_)
         | arcen_pier_macos::input::InputBackend::VirtualHidOnly(_) => {
             DeckInputRoute::VirtualHidDevices
         }
-    })?;
+    };
+    let mut state = DeskPrivacyState::new(plan);
+    // The hello told the plan's own status.
+    let _ = state.hello_status();
     let privacy = arcen_pier_macos::blocking::run_exclusive(
         "arcen-macos-desk-privacy",
         &DESK_PRIVACY_SLOT,
         |_| DeskPrivacyRefusal::InputFilterUnavailable,
-        move || arcen_pier_macos::desk_privacy::DeskPrivacy::arm(uid),
+        move || arcen_pier_macos::desk_privacy::DeskPrivacy::arm(uid, state, route),
     )
     .await??;
     tracing::info!(
         target: arcen_telemetry::names::target::SESSION,
-        "the desk is private while the Deck is attached"
+        plan = ?plan,
+        "the desk is private while the Deck is attached, as far as this Mac can make it"
     );
     Ok(Some(privacy))
 }

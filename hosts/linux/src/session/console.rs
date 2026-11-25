@@ -1416,9 +1416,14 @@ pub(crate) async fn another_products_client() -> Option<String> {
 impl GrabbedInput {
     /// Grabs every device of the desk not grabbed yet; returns how many it
     /// grabbed now.
+    ///
+    /// # Errors
+    ///
+    /// Every device it could not open or grab (each other one is grabbed).
     fn grab_new(&mut self) -> Result<usize, String> {
         let entries = std::fs::read_dir("/dev/input").map_err(|error| error.to_string())?;
         let mut grabbed = 0;
+        let mut failures = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str().filter(|name| name.starts_with("event")) else {
@@ -1442,11 +1447,18 @@ impl GrabbedInput {
             if !input_device_fact(name).is_some_and(model::disables_while_attached) {
                 continue;
             }
-            let mut device = evdev::Device::open(&path)
-                .map_err(|error| format!("open {}: {error}", path.display()))?;
-            device
-                .grab()
-                .map_err(|error| format!("grab {}: {error}", path.display()))?;
+            // One device that cannot be grabbed never stops the others.
+            let mut device = match evdev::Device::open(&path) {
+                Ok(device) => device,
+                Err(error) => {
+                    failures.push(format!("open {}: {error}", path.display()));
+                    continue;
+                }
+            };
+            if let Err(error) = device.grab() {
+                failures.push(format!("grab {}: {error}", path.display()));
+                continue;
+            }
             tracing::info!(
                 target: target::INPUT,
                 device = %path.display(),
@@ -1460,7 +1472,11 @@ impl GrabbedInput {
         self.devices.retain(|(path, rdev, _)| {
             std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.rdev() == *rdev)
         });
-        Ok(grabbed)
+        if failures.is_empty() {
+            Ok(grabbed)
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     fn release(&mut self) {
@@ -1503,9 +1519,116 @@ pub(crate) struct ConsolePrivacy {
     /// is attached ([`Self::show_desk`]). Anything that makes the desk
     /// private again (a hand-back, a resume, a failure) ends it.
     desk_live: bool,
+    /// This attachment's desk privacy (ADR 0025 §5, shared
+    /// `DeskPrivacyState`): a measure that fails refuses the attachment
+    /// only when the administrator requires privacy (or no plan was given:
+    /// recovery and the guards fail closed); otherwise the rest goes on and
+    /// the shortfall is reported ([`Self::desk_status`]).
+    plan: Option<arcen_session::console_session::desk_privacy::DeskPrivacyState>,
+    /// Made private for an attached Deck ([`Self::arm`]), however much of
+    /// it held: its departure hands the console back (locked) even when no
+    /// monitor could be blanked.
+    attached: bool,
+    /// What a required desk could no longer keep private while the Deck
+    /// is attached ([`Self::enforce`]): the attachment ends
+    /// ([`Self::required_lost`]).
+    lost: Option<arcen_session::console_session::desk_privacy::DeskPrivacyRefusal>,
 }
 
 impl ConsolePrivacy {
+    /// The console's privacy for one attachment: `desk_live` when desk
+    /// privacy is off for it (the administrator's or the Deck's choice),
+    /// `desk_required` when the administrator requires it.
+    pub(crate) fn for_attachment(desk_live: bool, desk_required: bool) -> Self {
+        let mut privacy = Self::default();
+        privacy.replan(desk_live, desk_required);
+        privacy
+    }
+
+    /// Plans the desk's privacy afresh for a returning Deck, whose own
+    /// choice may differ from the last one's: what fell short before is
+    /// forgotten (the reattachment makes the desk private again and records
+    /// anew).
+    pub(crate) fn replan(&mut self, desk_live: bool, desk_required: bool) {
+        use arcen_session::console_session::desk_privacy::{DeskPrivacyPlan, DeskPrivacyState};
+        let plan = if desk_required {
+            DeskPrivacyPlan::Required
+        } else if desk_live {
+            DeskPrivacyPlan::DeckVisible
+        } else {
+            DeskPrivacyPlan::BestEffort
+        };
+        self.plan = Some(DeskPrivacyState::new(plan));
+        self.lost = None;
+    }
+
+    /// What a required desk could not keep private since this attachment
+    /// was planned: the Deck's attachment ends with its reason (shared
+    /// `DeskPrivacyRefusal::deck_reason`) and the console is handed back
+    /// locked, as on Windows and macOS (ADR 0025 §5).
+    pub(crate) fn required_lost(
+        &self,
+    ) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
+        self.lost
+    }
+
+    /// One measure that could not be applied: recorded for a best-effort
+    /// desk (logged once per change) until the measure holds again
+    /// ([`Self::enforce`] retries it every second), refused otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`ConsoleRefusal::PrivacyUnavailable`] when privacy is required, or
+    /// no plan was given.
+    pub(crate) fn fell_short(
+        &mut self,
+        refusal: arcen_session::console_session::desk_privacy::DeskPrivacyRefusal,
+    ) -> Result<(), ConsoleRefusal> {
+        self.watched(refusal.part(), Err(refusal))
+            .map_err(|_| ConsoleRefusal::PrivacyUnavailable)
+    }
+
+    /// One verdict on one part of the desk (shared
+    /// `DeskPrivacyState::watched_part`), logged when it changes the desk's
+    /// status.
+    fn watched(
+        &mut self,
+        part: arcen_session::console_session::desk_privacy::DeskPart,
+        verdict: Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal>,
+    ) -> Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal> {
+        let Some(plan) = self.plan.as_mut() else {
+            return verdict;
+        };
+        let before = plan.status();
+        let outcome = plan.watched_part(part, verdict);
+        let after = plan.status();
+        if outcome.is_ok() && after != before {
+            if after.is_warning() {
+                tracing::warn!(
+                    target: target::SESSION,
+                    status = after.token(),
+                    "desk privacy: part of the desk could not be made private; the session continues and the Deck is told (privacy.desk = \"required\" refuses instead)"
+                );
+            } else {
+                tracing::info!(
+                    target: target::SESSION,
+                    status = after.token(),
+                    "desk privacy: the desk is private again"
+                );
+            }
+        }
+        outcome
+    }
+
+    /// What this attachment's desk kept private, for the Deck.
+    pub(crate) fn desk_status(
+        &self,
+    ) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+        self.plan
+            .as_ref()
+            .map(arcen_session::console_session::desk_privacy::DeskPrivacyState::status)
+    }
+
     /// For an administrator who turned desk privacy off: once the session
     /// is joined (and after each resume), the desk gets its monitors (their
     /// own ramps, exactly as journalled) and input back. The session stays
@@ -1534,10 +1657,21 @@ impl ConsolePrivacy {
     /// start).
     pub(crate) fn disable_input(&mut self) -> Result<(), ConsoleRefusal> {
         self.desk_live = false;
-        self.input.grab_new().map(drop).map_err(|error| {
-            tracing::error!(target: target::SESSION, %error, "the desk's input could not be disabled");
-            ConsoleRefusal::PrivacyUnavailable
-        })
+        match self.input.grab_new() {
+            Ok(_) => {
+                let _ = self.watched(
+                    arcen_session::console_session::desk_privacy::DeskPart::Input,
+                    Ok(()),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(target: target::SESSION, %error, "the desk's input could not be disabled");
+                self.fell_short(
+                    arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::InputBlockUnavailable,
+                )
+            }
+        }
     }
 
     /// Makes the console private: input disabled, monitors blank. A Deck
@@ -1548,6 +1682,7 @@ impl ConsolePrivacy {
         display: &SessionDisplay,
         session_id: &str,
     ) -> Result<(), ConsoleRefusal> {
+        self.attached = true;
         self.disable_input()?;
         self.blank(display, session_id)?;
         UnlockedSince::clear();
@@ -1561,47 +1696,88 @@ impl ConsolePrivacy {
         display: &SessionDisplay,
         session_id: &str,
     ) -> Result<(), ConsoleRefusal> {
+        use arcen_session::console_session::desk_privacy::DeskPrivacyRefusal;
         self.desk_live = false;
         if let Some(outputs) = self.outputs.as_mut() {
             // Already blank: prove it again (a VT switch, a monitor that
             // came back).
-            outputs.enforce().map_err(|error| {
-                tracing::error!(target: target::SESSION, %error, "the desk's monitors could not be kept blank");
-                ConsoleRefusal::PrivacyUnavailable
-            })?;
+            if let Err(error) = outputs.enforce() {
+                tracing::warn!(target: target::SESSION, %error, "the desk's monitors could not be kept blank");
+                return self.fell_short(DeskPrivacyRefusal::DisplaysNotDark);
+            }
         } else {
-            let outputs = BlankedOutputs::blank(display, session_id).map_err(|error| {
-                tracing::error!(target: target::SESSION, %error, "the desk's monitors could not be blanked");
-                ConsoleRefusal::PrivacyUnavailable
-            })?;
-            self.outputs = Some(outputs);
+            match BlankedOutputs::blank(display, session_id) {
+                Ok(outputs) => self.outputs = Some(outputs),
+                Err(error) => {
+                    tracing::warn!(target: target::SESSION, %error, "the desk's monitors could not be blanked");
+                    return self.fell_short(DeskPrivacyRefusal::DisplaysNotDark);
+                }
+            }
         }
+        let _ = self.watched(
+            arcen_session::console_session::desk_privacy::DeskPart::Screens,
+            Ok(()),
+        );
         Ok(())
     }
 
     /// Keeps it private: a monitor turned on, a colour daemon that reset a
     /// ramp, a keyboard plugged in.
+    /// Each part's outcome is recorded ([`Self::desk_status`]): a part that
+    /// fails is reported, and reported again once it holds. A required desk
+    /// that fails here is kept as [`Self::required_lost`], which ends the
+    /// attachment.
     pub(crate) fn enforce(&mut self) {
+        use arcen_session::console_session::desk_privacy::{DeskPart, DeskPrivacyRefusal};
         if self.desk_live {
             return;
         }
         if let Some(outputs) = self.outputs.as_mut() {
-            match outputs.enforce() {
-                Ok(0) => {}
-                Ok(count) => tracing::warn!(
-                    target: target::SESSION,
-                    crtcs = count,
-                    "a desk monitor came back on while a Deck is attached; blanked again"
-                ),
-                Err(error) => tracing::error!(
-                    target: target::SESSION,
-                    %error,
-                    "the desk's monitors could not be kept blank"
-                ),
-            }
+            let screens = match outputs.enforce() {
+                Ok(0) => Ok(()),
+                Ok(count) => {
+                    tracing::warn!(
+                        target: target::SESSION,
+                        crtcs = count,
+                        "a desk monitor came back on while a Deck is attached; blanked again"
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: target::SESSION,
+                        %error,
+                        "the desk's monitors could not be kept blank"
+                    );
+                    Err(DeskPrivacyRefusal::DisplaysNotDark)
+                }
+            };
+            let screens = self.watched(DeskPart::Screens, screens);
+            self.keep_lost(screens);
         }
-        if let Err(error) = self.input.grab_new() {
-            tracing::error!(target: target::SESSION, %error, "a new desk input device could not be disabled");
+        let input = self.input.grab_new().map(drop).map_err(|error| {
+            tracing::error!(target: target::SESSION, %error, "a desk input device could not be disabled");
+            DeskPrivacyRefusal::InputBlockUnavailable
+        });
+        let input = self.watched(DeskPart::Input, input);
+        self.keep_lost(input);
+    }
+
+    /// Keeps the first part a planned (required) desk lost; with no plan
+    /// (recovery, the guards) nothing is attached to end.
+    fn keep_lost(
+        &mut self,
+        verdict: Result<(), arcen_session::console_session::desk_privacy::DeskPrivacyRefusal>,
+    ) {
+        if let Err(refusal) = verdict {
+            if self.plan.is_some() && self.lost.is_none() {
+                tracing::error!(
+                    target: target::SESSION,
+                    cause = refusal.token(),
+                    "desk privacy is required (privacy.desk) and the desk is no longer private; the Deck's attachment ends and the console is handed back locked"
+                );
+                self.lost = Some(refusal);
+            }
         }
     }
 
@@ -1770,7 +1946,7 @@ impl ConsolePrivacy {
     }
 
     pub(crate) fn is_armed(&self) -> bool {
-        self.outputs.is_some()
+        self.outputs.is_some() || self.attached
     }
 
     /// Whether any desk input device is still grabbed (an attachment that
@@ -2319,6 +2495,7 @@ pub(crate) async fn hand_back(privacy: &mut ConsolePrivacy, session_id: &str) ->
         }
     }
     privacy.brought_forward = false;
+    privacy.attached = false;
     tracing::info!(
         target: target::SESSION,
         session_id,
@@ -3442,8 +3619,10 @@ pub(crate) async fn reattach<D: ConsoleDesk>(
             desk.hand_back(session_id).await;
             return Err(refusal);
         }
-        // Best effort: blank on the inactive VT, before it is shown (the
-        // input is already disabled, and that part is never best effort).
+        // Blank on the inactive VT too, before it is shown, as far as Xorg
+        // allows; a failure here is retried below once the session is in
+        // front. (Under best-effort desk privacy a desk input that could not
+        // be disabled was recorded and reported rather than refused.)
         let blanked_first = desk.blank().is_ok();
         if !blanked_first {
             tracing::warn!(
@@ -3821,6 +4000,86 @@ mod tests {
 
     fn greeter() -> ConsoleSessionFact {
         fact("Id=c3\nUser=42\nSeat=seat0\nVTNr=1\nClass=greeter\nType=x11\nState=active\nActive=yes\nService=gdm-launch-environment\n")
+    }
+
+    #[test]
+    fn a_best_effort_desk_reports_what_it_could_not_keep_private_and_a_required_one_refuses() {
+        use arcen_session::console_session::desk_privacy::{DeskPrivacyRefusal, DeskPrivacyStatus};
+        let screens = DeskPrivacyRefusal::DisplaysNotDark;
+        let input = DeskPrivacyRefusal::InputBlockUnavailable;
+        let mut best = ConsolePrivacy::for_attachment(false, false);
+        assert_eq!(best.desk_status(), Some(DeskPrivacyStatus::Blanked));
+        assert_eq!(best.fell_short(screens), Ok(()));
+        assert_eq!(best.desk_status(), Some(DeskPrivacyStatus::ScreensVisible));
+        assert_eq!(best.fell_short(input), Ok(()));
+        assert_eq!(best.desk_status(), Some(DeskPrivacyStatus::NotPrivate));
+        let mut required = ConsolePrivacy::for_attachment(false, true);
+        assert_eq!(
+            required.fell_short(screens),
+            Err(ConsoleRefusal::PrivacyUnavailable)
+        );
+        // A desk left live has nothing to fall short of.
+        let mut live = ConsolePrivacy::for_attachment(true, false);
+        assert_eq!(live.fell_short(input), Ok(()));
+        // Recovery and the guards give no plan: they fail closed.
+        assert_eq!(
+            ConsolePrivacy::default().fell_short(input),
+            Err(ConsoleRefusal::PrivacyUnavailable)
+        );
+        // A part that holds again (enforce's next pass) is private again.
+        let mut recovering = ConsolePrivacy::for_attachment(false, false);
+        assert_eq!(recovering.fell_short(input), Ok(()));
+        assert_eq!(
+            recovering.watched(
+                arcen_session::console_session::desk_privacy::DeskPart::Input,
+                Ok(())
+            ),
+            Ok(())
+        );
+        assert_eq!(recovering.desk_status(), Some(DeskPrivacyStatus::Blanked));
+        // A returning Deck's own choice replaces the last one's.
+        let mut returning = ConsolePrivacy::for_attachment(false, false);
+        assert_eq!(returning.fell_short(screens), Ok(()));
+        returning.replan(true, false);
+        assert_eq!(returning.desk_status(), Some(DeskPrivacyStatus::Visible));
+        returning.replan(false, false);
+        assert_eq!(returning.desk_status(), Some(DeskPrivacyStatus::Blanked));
+        returning.replan(false, true);
+        assert_eq!(returning.desk_status(), Some(DeskPrivacyStatus::Required));
+    }
+
+    #[test]
+    fn a_required_desk_that_stops_being_private_mid_session_ends_the_attachment() {
+        use arcen_session::console_session::desk_privacy::{
+            DeskPart, DeskPrivacyRefusal, DeskPrivacyStatus,
+        };
+        let screens = DeskPrivacyRefusal::DisplaysNotDark;
+        let input = DeskPrivacyRefusal::InputBlockUnavailable;
+        // What `enforce` does with one pass's verdicts.
+        let pass = |privacy: &mut ConsolePrivacy, part, verdict| {
+            let verdict = privacy.watched(part, verdict);
+            privacy.keep_lost(verdict);
+        };
+        let mut required = ConsolePrivacy::for_attachment(false, true);
+        pass(&mut required, DeskPart::Screens, Ok(()));
+        assert_eq!(required.required_lost(), None);
+        pass(&mut required, DeskPart::Input, Err(input));
+        assert_eq!(required.required_lost(), Some(input));
+        // The first loss is the reason; a later one does not replace it.
+        pass(&mut required, DeskPart::Screens, Err(screens));
+        assert_eq!(required.required_lost(), Some(input));
+        // A returning Deck's attachment starts afresh.
+        required.replan(false, true);
+        assert_eq!(required.required_lost(), None);
+        // Best effort keeps the session and reports the part instead.
+        let mut best = ConsolePrivacy::for_attachment(false, false);
+        pass(&mut best, DeskPart::Screens, Err(screens));
+        assert_eq!(best.required_lost(), None);
+        assert_eq!(best.desk_status(), Some(DeskPrivacyStatus::ScreensVisible));
+        // Recovery and the guards have no attachment to end.
+        let mut unplanned = ConsolePrivacy::default();
+        pass(&mut unplanned, DeskPart::Input, Err(input));
+        assert_eq!(unplanned.required_lost(), None);
     }
 
     #[derive(Default)]

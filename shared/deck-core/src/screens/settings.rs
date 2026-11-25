@@ -34,6 +34,8 @@ pub enum SettingsTab {
     Language,
     Streaming,
     Displays,
+    /// The host's desk while connected (desk privacy, ADR 0025 §5).
+    Privacy,
     Microphone,
     Input,
     /// The tablet mode, one choice for every connection (0.20.7), directly
@@ -50,6 +52,7 @@ impl SettingsTab {
             Self::Language => "Language",
             Self::Streaming => "Streaming",
             Self::Displays => "Displays",
+            Self::Privacy => "Privacy",
             Self::Microphone => "Microphone",
             Self::Input => "Input",
             Self::Tablet => "Tablet",
@@ -64,6 +67,14 @@ impl SettingsTab {
 pub const EXACT_STILL_IMAGE_DESCRIPTION: &str = "When the picture stops moving, the host sends its \
 exact pixels, losslessly, and the Deck checks them. Grading and HDR only, when the host offers \
 it; uses spare bandwidth only while the picture is still. Applies from the next connection.";
+
+/// Settings › Privacy: the desk privacy switch.
+pub const KEEP_DESK_PRIVATE_LABEL: &str = "Keep the host\u{2019}s desk private";
+
+/// What the desk privacy switch does, in the user's terms.
+pub const KEEP_DESK_PRIVATE_DESCRIPTION: &str = "While you are connected, the host\u{2019}s \
+monitors are blanked and its keyboard and mouse blocked, so nobody at the host sees or uses your \
+session. A host that requires this does it whatever you choose. Applies from the next connection.";
 
 /// What the Canvas screen updates switch does (ADR 0028).
 pub const CANVAS_DESCRIPTION: &str = "With a host that encodes in software, this Deck keeps the \
@@ -113,6 +124,7 @@ pub struct SettingsValues {
     pub tablet_mode_requested: TabletModeMsg,
     pub pen_buttons: PenButtonSettings,
     pub exact_still_image: bool,
+    pub keep_desk_private: bool,
     pub canvas: bool,
     pub keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy,
     pub capture_mac_system_shortcuts: bool,
@@ -147,6 +159,7 @@ impl SettingsValues {
             tablet_mode_requested: settings.tablet_mode_requested,
             pen_buttons: settings.pen_buttons,
             exact_still_image: settings.exact_still_image,
+            keep_desk_private: settings.keep_desk_private,
             canvas: settings.canvas,
             keyboard_capture: settings.keyboard_capture,
             capture_mac_system_shortcuts: settings.capture_mac_system_shortcuts,
@@ -185,6 +198,7 @@ impl SettingsValues {
         settings.tablet_input_enabled = tablet_input_enabled;
         settings.pen_buttons = self.pen_buttons;
         settings.exact_still_image = self.exact_still_image;
+        settings.keep_desk_private = self.keep_desk_private;
         settings.canvas = self.canvas;
         settings.keyboard_capture = self.keyboard_capture;
         settings.capture_mac_system_shortcuts = self.capture_mac_system_shortcuts;
@@ -502,6 +516,7 @@ pub fn render_settings(
         mut tablet_mode_requested,
         mut pen_buttons,
         mut exact_still_image,
+        mut keep_desk_private,
         mut canvas,
         mut keyboard_capture,
         mut capture_mac_system_shortcuts,
@@ -558,6 +573,7 @@ pub fn render_settings(
                         SettingsTab::Language,
                         SettingsTab::Streaming,
                         SettingsTab::Displays,
+                        SettingsTab::Privacy,
                     ] {
                         if settings_nav_item(ui, item.label(), item == tab) {
                             tab = item;
@@ -969,6 +985,11 @@ pub fn render_settings(
                                     ui.add_space(6.0);
                                 }
                             }
+                        }
+                        SettingsTab::Privacy => {
+                            page_title(ui, "Privacy");
+                            ui.checkbox(&mut keep_desk_private, KEEP_DESK_PRIVATE_LABEL);
+                            checkbox_help(ui, KEEP_DESK_PRIVATE_DESCRIPTION, Ink::Quiet);
                         }
                         SettingsTab::Microphone => {
                             page_title(ui, "Microphone");
@@ -1449,6 +1470,7 @@ pub fn render_settings(
         tablet_mode_requested,
         pen_buttons,
         exact_still_image,
+        keep_desk_private,
         canvas,
         keyboard_capture,
         capture_mac_system_shortcuts,
@@ -2017,6 +2039,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             pen_buttons: PenButtonSettings::default(),
             exact_still_image: true,
+            keep_desk_private: true,
             canvas: true,
             keyboard_capture: arcen_input::keyboard::KeyboardCapturePolicy::Host,
             capture_mac_system_shortcuts: false,
@@ -2036,8 +2059,10 @@ mod tests {
 
         values.tablet_mode_requested = TabletModeMsg::DisabledMouseCompat;
         values.exact_still_image = !saved.exact_still_image;
+        values.keep_desk_private = !saved.keep_desk_private;
         values.canvas = !saved.canvas;
         assert!(values.apply_to(&mut written));
+        assert!(!written.keep_desk_private);
         assert_eq!(
             written.tablet_mode_requested,
             TabletModeMsg::DisabledMouseCompat
@@ -2091,10 +2116,11 @@ mod tests {
         }
     }
 
-    const ALL_TABS: [SettingsTab; 8] = [
+    const ALL_TABS: [SettingsTab; 9] = [
         SettingsTab::Language,
         SettingsTab::Streaming,
         SettingsTab::Displays,
+        SettingsTab::Privacy,
         SettingsTab::Microphone,
         SettingsTab::Input,
         SettingsTab::Tablet,

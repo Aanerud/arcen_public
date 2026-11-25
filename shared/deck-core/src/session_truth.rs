@@ -438,9 +438,11 @@ pub fn served_max_fps(
 
 /// The one line the Deck shows about the desk at the host
 /// (`server_hello.desk_privacy`): "Host screens are blanked for privacy"
-/// while they are, a warning when the host's administrator turned desk
-/// privacy off, nothing for a desktop no desk monitor shows, an unknown
-/// token, or a host that does not say.
+/// while they are, why they are not when desk privacy is off (the host's
+/// administrator, or this Deck's user) or could not be kept whole (a
+/// warning: `DeskPrivacyStatus::is_warning`), that the host requires it;
+/// nothing for a desktop no desk monitor shows, an unknown token, or a host
+/// that does not say.
 #[must_use]
 pub fn desk_privacy_note(hello: &ServerHelloMsg) -> Option<&'static str> {
     use arcen_session::console_session::desk_privacy::DeskPrivacyStatus;
@@ -449,6 +451,50 @@ pub fn desk_privacy_note(hello: &ServerHelloMsg) -> Option<&'static str> {
         .as_deref()
         .and_then(DeskPrivacyStatus::from_token)
         .and_then(DeskPrivacyStatus::deck_note)
+}
+
+/// The desk's state at the host, as a Pier reports it (re-exported so a
+/// Deck reads it without depending on the session crate).
+pub use arcen_session::console_session::desk_privacy::DeskPrivacyStatus;
+
+/// The desk's state a `desk_privacy_update` message carries; `None` for a
+/// message that does not parse or a token this build does not know (the
+/// last known state stands).
+#[must_use]
+pub fn desk_privacy_update(
+    message: &serde_json::Value,
+) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+    use arcen_session::console_session::desk_privacy::DeskPrivacyStatus;
+    serde_json::from_value::<arcen_protocol::messages::DeskPrivacyUpdateMsg>(message.clone())
+        .ok()
+        .and_then(|update| DeskPrivacyStatus::from_token(&update.desk_privacy))
+}
+
+/// The desk's state now: the host's latest `desk_privacy_update`, else its
+/// hello's (`None` when neither says one this build knows).
+#[must_use]
+pub fn desk_privacy_status_now(
+    hello: &ServerHelloMsg,
+    update: Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
+) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+    use arcen_session::console_session::desk_privacy::DeskPrivacyStatus;
+    update.or_else(|| {
+        hello
+            .desk_privacy
+            .as_deref()
+            .and_then(DeskPrivacyStatus::from_token)
+    })
+}
+
+/// [`desk_privacy_note`] for the desk's state now (an update supersedes the
+/// hello).
+#[must_use]
+pub fn desk_privacy_note_now(
+    hello: &ServerHelloMsg,
+    update: Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
+) -> Option<&'static str> {
+    desk_privacy_status_now(hello, update)
+        .and_then(arcen_session::console_session::desk_privacy::DeskPrivacyStatus::deck_note)
 }
 
 #[cfg(test)]
@@ -476,6 +522,50 @@ mod tests {
         assert_eq!(desk_privacy_note(&hello(Some("not_shown"))), None);
         assert_eq!(desk_privacy_note(&hello(Some("dimmed"))), None);
         assert_eq!(desk_privacy_note(&hello(None)), None);
+        assert!(
+            desk_privacy_note(&hello(Some("screens_visible")))
+                .is_some_and(|note| note.contains("dummy plug"))
+        );
+        assert!(
+            desk_privacy_note(&hello(Some("visible")))
+                .is_some_and(|note| note.contains("you turned desk privacy off"))
+        );
+    }
+
+    #[test]
+    fn a_desk_privacy_update_supersedes_the_hello_unless_this_deck_does_not_know_it() {
+        use arcen_session::console_session::desk_privacy::DeskPrivacyStatus;
+        let hello: ServerHelloMsg = serde_json::from_value(
+            serde_json::json!({"type": "server_hello", "desk_privacy": "blanked"}),
+        )
+        .expect("server_hello parses");
+        let update = |token: &str| {
+            desk_privacy_update(&serde_json::json!({
+                "type": "desk_privacy_update",
+                "desk_privacy": token,
+            }))
+        };
+        assert_eq!(
+            update("screens_visible"),
+            Some(DeskPrivacyStatus::ScreensVisible)
+        );
+        assert_eq!(update("dimmed"), None);
+        assert_eq!(
+            desk_privacy_update(&serde_json::json!({"type": "desk_privacy_update"})),
+            None
+        );
+        assert_eq!(
+            desk_privacy_note_now(&hello, None),
+            Some("Host screens are blanked for privacy")
+        );
+        assert!(
+            desk_privacy_note_now(&hello, update("screens_visible"))
+                .is_some_and(|note| note.contains("People at the host may see"))
+        );
+        assert_eq!(
+            desk_privacy_note_now(&hello, update("blanked")),
+            Some("Host screens are blanked for privacy")
+        );
     }
 
     fn hello_with_color_caps(color_caps: serde_json::Value, codec: &str) -> ServerHelloMsg {

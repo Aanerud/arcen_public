@@ -756,6 +756,11 @@ pub struct ClientSettings {
     /// send still pictures' exact pixels. On by default; the host decides
     /// whether it offers it.
     pub exact_still_image: bool,
+    /// Keep the host's desk private while connected: ask the host to blank
+    /// its monitors and block its keyboard and mouse (ADR 0025 §5). On by
+    /// default; a host whose administrator requires privacy, or turned it
+    /// off, decides regardless. Applies from the next connection.
+    pub keep_desk_private: bool,
     /// Canvas screen updates (ADR 0028): with a host that encodes in
     /// software, keep the picture on this Deck and receive only what
     /// changed. On by default; asked for only where this Deck's presenter
@@ -858,6 +863,7 @@ impl Default for ClientSettings {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             pen_buttons: arcen_input::pen_buttons::PenButtonSettings::default(),
             exact_still_image: true,
+            keep_desk_private: true,
             canvas: true,
             canvas_cache_mib: crate::canvas::DEFAULT_CACHE_MIB,
             color_fidelity: ColorFidelitySettings::default(),

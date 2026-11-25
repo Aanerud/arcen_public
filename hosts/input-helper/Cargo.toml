@@ -3,7 +3,7 @@
 
 [package]
 name = "arcen-input-helper"
-version = "0.21.2"
+version = "0.21.3"
 edition = "2021"
 description = "Arcen Linux input helper."
 publish.workspace = true

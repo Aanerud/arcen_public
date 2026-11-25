@@ -269,7 +269,7 @@ session.
 | The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it as a guest: its screens are streamed as they are and never changed (below); the other product is never stopped or reconfigured |
 | The same, while that product's own client is connected | refused, `console_in_use_other_product`: one remote-desktop product at a time |
 | Another account is signed in (or holds the console through another product) | refused, `console_other_user` or `console_other_user_other_product` |
-| The account is signed in to GNOME on Wayland | joins that session: its own monitors and applications, nothing of it changed; locked when the Deck leaves. Refused `console_privacy_unavailable` while desk privacy is on and the session shows on a monitor at the desk (a Wayland desk cannot be blanked); a disconnected Deck signs in again rather than resuming |
+| The account is signed in to GNOME on Wayland | joins that session: its own monitors and applications, nothing of it changed; locked when the Deck leaves. A session that shows on a monitor at the desk cannot be blanked (a Wayland desk cannot be): with desk privacy `on` it is served with the desk's input disabled and the Deck is told its screens are visible; refused `console_privacy_unavailable` when desk privacy is `required`. A disconnected Deck signs in again rather than resuming |
 | GDM's login screen is Wayland, nobody signed in | refused, `console_wayland_session`: set `WaylandEnable=false` in `/etc/gdm/custom.conf` and restart GDM while nobody is signed in |
 | No display manager on the host, nobody signed in | starts the account's real login session (below), then joins it |
 | The account's session that Arcen started | joins it (same desktop, same applications) |
@@ -285,7 +285,9 @@ keyboards, mice and tablets are disabled (Arcen's own virtual devices keep
 working) and its speakers are muted. When the Deck leaves, the Pier locks the
 session first, then gives the monitors and input back: the person at the
 desk sees the lock screen and unlocks it with their password. The session
-keeps running until the user logs out.
+keeps running until the user logs out. Desk privacy is the Deck user's
+choice unless the administrator requires it or turned it off; see
+[Desk privacy](#desk-privacy).
 
 **Monitors: the Deck's layout while it is attached.** A Deck that matches its
 layout (Match my layout, two or more displays) gets one stream per monitor
@@ -1340,6 +1342,45 @@ Windows and macOS `platform` sections — is the
 [Pier configuration reference](config-reference.md). It is checked against the
 configuration types on every change, so it is never behind the Pier. This
 section explains the policies behind the keys.
+
+### Desk privacy
+
+`privacy.desk` decides what the desk at the host shows while a Deck is
+attached to a desktop its monitors show (ADR 0025 §5). Every installer ships
+`"desk": "on"`.
+
+| `privacy.desk` | The Deck's **Keep the host's desk private** | What the Pier does | When part of the desk cannot be made private |
+| --- | --- | --- | --- |
+| `on`, or absent | on (the default) | blanks the desk's monitors and blocks its keyboard and mouse, as far as it can | keeps every measure it could apply, logs one warning, tells the Deck which part is not private (for example a dummy plug or a monitor Windows cannot darken), and keeps the session; also when a check during the session fails, and the Deck hears when the desk is private again |
+| `on`, or absent | off | leaves the desk live; the Deck is told | not applicable |
+| `required` | either | blanks the desk and blocks its input, whatever the Deck asks | refuses the session, or ends it, with `console_privacy_unavailable` and a reason that names the requirement; for sites whose security rules demand it |
+| `off` | either | leaves the desk live; a warning at every start and on the Deck | not applicable |
+
+The start line says which applies (`desk privacy: on`, `REQUIRED` or `OFF`),
+and `validate-config` refuses any other value. How each Pier keeps the desk
+dark, and what it reports when it cannot:
+
+- **Windows** serves the session on a display no monitor at the desk shows
+  and detaches the others. It never detaches an output the session is
+  served from: with Match My Layout every Deck display's output (each dummy
+  plug carrying a stream) stays. A dummy plug or a monitor behind a served
+  output is reported as screens visible (`desk_monitor_lit`); hooks that do
+  not install, or stop proving live, as input live.
+- **Linux** zeroes each monitor's gamma ramp and grabs the desk's input
+  devices on a joined X11 console; a joined GNOME Wayland session shown at
+  the desk cannot be blanked and is reported as screens visible. A Linux
+  Pier re-blanks and re-grabs every second and tells the Deck when part of
+  the desk stops being, or is again, private (with `required` the session
+  ends instead, the console handed back locked); one input device it cannot
+  grab never stops it grabbing the others.
+- **macOS** zeroes each display's transfer table and filters input with an
+  event tap. Without the Accessibility grant, or with
+  `input_backend` `virtual_hid`, the input is reported live; a display that
+  stays lit for two seconds is reported, and reported again once it is dark.
+
+On Windows a resumed session keeps the choice its sign-in made, and a
+changed Deck setting applies from the next sign-in; on Linux each returning
+Deck's own choice applies, also to a session held for its resume.
 
 ### Automatic Deck policy and administrator overrides
 

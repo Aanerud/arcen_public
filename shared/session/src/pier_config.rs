@@ -46,11 +46,13 @@ pub struct PierConfig<P> {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivacyConfig {
-    /// `on`, or absent: while a Deck is attached to a desktop the desk's
-    /// monitors show, those monitors are blanked and the desk's keyboard
-    /// and mouse blocked, on every Pier; a desk that cannot be made private
-    /// refuses the attachment. `off`: the desk stays live (logged at start
-    /// and shown on the Deck). See
+    /// `on`, or absent: each Deck's user chooses (private by default);
+    /// while a private Deck is attached to a desktop the desk's monitors
+    /// show, those monitors are blanked and the desk's keyboard and mouse
+    /// blocked as far as the Pier can, and what it cannot do is reported to
+    /// the Deck, never refused. `required`: always private, and a desk that
+    /// cannot be made private refuses the attachment (or ends it). `off`:
+    /// the desk stays live (logged at start and shown on the Deck). See
     /// [`crate::console_session::desk_privacy::DeskPrivacyPolicy`].
     pub desk: Option<crate::console_session::desk_privacy::DeskPrivacySetting>,
 }
@@ -693,20 +695,32 @@ mod tests {
     }
 
     #[test]
-    fn desk_privacy_is_on_by_default_and_only_on_or_off_parse() {
+    fn desk_privacy_is_on_by_default_and_only_on_off_or_required_parse() {
+        use crate::console_session::desk_privacy::DeskPrivacyMode;
         let base = r#""audio":{"enabled":false,"compressed":false},
             "microphone_input":{"enabled":false},"platform":{"name":"test"}"#;
         let default: PierConfig<TestPlatform> =
             serde_json::from_str(&format!("{{{base}}}")).expect("config without privacy");
-        assert!(default.privacy.desk_policy().enabled);
-        let off: PierConfig<TestPlatform> =
-            serde_json::from_str(&format!(r#"{{"privacy":{{"desk":"off"}},{base}}}"#))
-                .expect("privacy off");
-        assert!(!off.privacy.desk_policy().enabled);
+        assert_eq!(
+            default.privacy.desk_policy().mode,
+            DeskPrivacyMode::FollowDeck
+        );
+        for (token, mode) in [
+            ("on", DeskPrivacyMode::FollowDeck),
+            ("off", DeskPrivacyMode::Off),
+            ("required", DeskPrivacyMode::Required),
+        ] {
+            let parsed: PierConfig<TestPlatform> =
+                serde_json::from_str(&format!(r#"{{"privacy":{{"desk":"{token}"}},{base}}}"#))
+                    .expect(token);
+            assert_eq!(parsed.privacy.desk_policy().mode, mode, "{token}");
+        }
         for bad in [
             r#"{"desk":"false"}"#,
             r#"{"desk":false}"#,
             r#"{"desk":"dim"}"#,
+            r#"{"desk":"Required"}"#,
+            r#"{"desk":"strict"}"#,
             r#"{"monitors":"off"}"#,
         ] {
             assert!(
