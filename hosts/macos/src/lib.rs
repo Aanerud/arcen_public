@@ -471,9 +471,10 @@ pub fn parse_config(bytes: &[u8], path: &Path) -> Result<PierFileConfig, ConfigE
 }
 
 /// Contradictions in what the administrator wrote about desk privacy. A
-/// virtual HID keyboard with desk privacy left at its default is not one: the
-/// Pier starts, says so, and refuses each signed-in session
-/// (`console_privacy_unavailable`) rather than show it unprotected.
+/// virtual HID keyboard with desk privacy `on` (or absent) is not one: the
+/// desk's input cannot be blocked, so each private session keeps its
+/// displays dark and the Deck is told its input is live (said at start).
+/// Required privacy cannot be kept with it at all.
 fn validate_desk_privacy(config: &PierFileConfig) -> Result<(), &'static str> {
     use arcen_session::console_session::desk_privacy::DeskPrivacySetting;
     let legacy = config.platform.desktop.deskside.enabled;
@@ -481,11 +482,11 @@ fn validate_desk_privacy(config: &PierFileConfig) -> Result<(), &'static str> {
         (Some(DeskPrivacySetting::Off), Some(true)) => Err(
             "platform.desktop.deskside.enabled = true contradicts privacy.desk = \"off\": remove platform.desktop.deskside",
         ),
-        (Some(DeskPrivacySetting::On), _) | (None, Some(true))
+        (Some(DeskPrivacySetting::Required), _)
             if config.platform.input_backend == InputBackendChoice::VirtualHid =>
         {
             Err(
-                "desk privacy cannot tell a virtual HID keyboard from the desk's: use input_backend auto or coregraphics, or privacy.desk = \"off\"",
+                "privacy.desk = \"required\" cannot be kept with input_backend virtual_hid (the desk's keyboard cannot be told from a virtual one): use input_backend auto or coregraphics, or privacy.desk = \"on\"",
             )
         }
         _ => Ok(()),
@@ -504,14 +505,14 @@ pub fn desk_privacy_startup_notes(config: &PierFileConfig) -> (bool, Vec<&'stati
              privacy off; set privacy.desk = \"off\" to turn it off",
         );
     }
-    if policy.enabled && config.platform.input_backend == InputBackendChoice::VirtualHid {
+    if policy.enabled() && config.platform.input_backend == InputBackendChoice::VirtualHid {
         notes.push(
-            "input_backend virtual_hid: the desk cannot be made private, so every signed-in \
-             session is refused (console_privacy_unavailable); use input_backend auto or \
-             coregraphics, or privacy.desk = \"off\"",
+            "input_backend virtual_hid: the desk's keyboard and mouse cannot be blocked, so a \
+             private session keeps the desk's displays dark and the Deck is told its input is \
+             live; use input_backend auto or coregraphics to block it",
         );
     }
-    (policy.enabled, notes)
+    (policy.enabled(), notes)
 }
 
 /// Returns the validated host-authoritative clipboard policy.
@@ -844,7 +845,8 @@ mod tests {
     }
 
     #[test]
-    fn desk_privacy_is_on_unless_turned_off_and_refuses_a_virtual_hid_keyboard() {
+    fn desk_privacy_is_on_unless_turned_off_and_a_virtual_hid_keyboard_is_refused_only_when_required()
+     {
         let path = std::path::Path::new("/tmp/arcen-deskside.json");
         let parse = |privacy: &str, platform: &str| {
             parse_config(
@@ -856,12 +858,16 @@ mod tests {
             )
         };
         let default = parse("", "{}").expect("parses");
-        assert!(default.privacy.desk_policy().enabled);
-        assert!(crate::session::SessionPolicy::default().desk_privacy);
+        assert!(default.privacy.desk_policy().enabled());
+        assert!(
+            crate::session::SessionPolicy::default()
+                .desk_privacy
+                .enabled()
+        );
         // The 0.20 package's `false` no longer turns it off, and says so.
         let legacy_off =
             parse("", r#"{"desktop":{"deskside":{"enabled":false}}}"#).expect("parses");
-        assert!(legacy_off.privacy.desk_policy().enabled);
+        assert!(legacy_off.privacy.desk_policy().enabled());
         let (enabled, notes) = desk_privacy_startup_notes(&legacy_off);
         assert!(enabled);
         assert!(
@@ -869,7 +875,7 @@ mod tests {
             "{notes:?}"
         );
         let off = parse(r#""privacy":{"desk":"off"},"#, "{}").expect("parses");
-        assert!(!off.privacy.desk_policy().enabled);
+        assert!(!off.privacy.desk_policy().enabled());
         assert!(desk_privacy_startup_notes(&off).1[0].contains("OFF"));
         assert!(
             parse(
@@ -879,21 +885,25 @@ mod tests {
             .is_err(),
             "a contradiction is refused, not resolved silently"
         );
-        // A virtual HID keyboard: refused at load when privacy was asked for
-        // explicitly, refused per session (and said at start) by default.
+        // A virtual HID keyboard: refused at load only when privacy is
+        // required; with "on" (or by default) the desk's input stays live,
+        // said at start and told to each Deck.
         let refused = parse(
-            r#""privacy":{"desk":"on"},"#,
+            r#""privacy":{"desk":"required"},"#,
             r#"{"input_backend":"virtual_hid"}"#,
         )
-        .expect_err("a virtual HID keyboard cannot be told from the desk's");
-        assert!(refused.to_string().contains("virtual HID"), "{refused}");
-        let default_hid = parse("", r#"{"input_backend":"virtual_hid"}"#).expect("parses");
-        assert!(
-            desk_privacy_startup_notes(&default_hid)
-                .1
-                .iter()
-                .any(|note| note.contains("console_privacy_unavailable"))
-        );
+        .expect_err("required privacy cannot block a virtual HID keyboard");
+        assert!(refused.to_string().contains("virtual_hid"), "{refused}");
+        for privacy in ["", r#""privacy":{"desk":"on"},"#] {
+            let hid = parse(privacy, r#"{"input_backend":"virtual_hid"}"#).expect("parses");
+            assert!(
+                desk_privacy_startup_notes(&hid)
+                    .1
+                    .iter()
+                    .any(|note| note.contains("input is live")),
+                "{privacy}"
+            );
+        }
         assert!(
             parse(
                 r#""privacy":{"desk":"off"},"#,

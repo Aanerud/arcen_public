@@ -484,6 +484,9 @@ pub struct ConnectOptions {
     /// The user's **Exact still image** switch (lossless refinement, ADR
     /// 0016). Off: the Deck does not ask for it and the host sends nothing.
     pub exact_still_image: bool,
+    /// The user's **Keep the host's desk private** switch: sent as
+    /// `AuthResponse.desk_privacy_request` (`private` or `visible`).
+    pub keep_desk_private: bool,
     /// The canvas this connection asks for (ADR 0028): built from the
     /// sink's canvas executor and the user's switch
     /// ([`crate::canvas::CanvasRequest::for_sink`]), so a Deck without an
@@ -558,6 +561,7 @@ impl ConnectOptions {
             tablet_mode_requested: self.tablet_mode_requested,
             telemetry: Arc::clone(&self.telemetry),
             exact_still_image: self.exact_still_image,
+            keep_desk_private: self.keep_desk_private,
             canvas: self.canvas.clone(),
             display_refresh: self.display_refresh.clone(),
             services: Arc::clone(&self.services),
@@ -4291,6 +4295,15 @@ fn auth_response_with_metadata(response: AuthResponse, options: &ConnectOptions)
     // Canvas: only a Deck whose sink executes canvas work, with the switch
     // on (ADR 0028).
     response.canvas_v1 = options.canvas.capability().cloned();
+    // The host's desk: the user's choice, which the host's administrator may
+    // override (`privacy.desk`).
+    response.desk_privacy_request = Some(
+        arcen_session::console_session::desk_privacy::DeckDeskPrivacy::from_setting(
+            options.keep_desk_private,
+        )
+        .token()
+        .to_owned(),
+    );
     response
 }
 
@@ -6098,6 +6111,25 @@ mod tests {
         assert!(capability.accepts(arcen_protocol::refine::RefineDomain::Rgb));
     }
 
+    #[test]
+    fn the_desk_privacy_request_follows_the_setting() {
+        let mut options = transport_test_options();
+        assert!(options.keep_desk_private);
+        assert_eq!(
+            auth_response_with_metadata(AuthResponse::none(), &options)
+                .desk_privacy_request
+                .as_deref(),
+            Some("private")
+        );
+        options.keep_desk_private = false;
+        assert_eq!(
+            auth_response_with_metadata(AuthResponse::none(), &options)
+                .desk_privacy_request
+                .as_deref(),
+            Some("visible")
+        );
+    }
+
     /// `canvas_v1` is sent exactly when the request carries it: never for a
     /// Deck without a canvas executor or with the switch off.
     #[test]
@@ -6230,6 +6262,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         }
     }
@@ -6385,6 +6418,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let started = Instant::now();
@@ -7269,6 +7303,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let mut ws = open_quic_socket(&options, None, None).await.unwrap();
@@ -8393,6 +8428,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let debug = format!("{options:?}");
@@ -8556,6 +8592,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let auth = auth_response_with_metadata(AuthResponse::none(), &options);
@@ -8620,6 +8657,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         };
         let hello =
@@ -8978,6 +9016,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         })
         .await
@@ -9034,6 +9073,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         });
 
@@ -9125,6 +9165,7 @@ mod tests {
                 tablet_mode_requested: TabletModeMsg::LocalTermination,
                 telemetry: Arc::new(ClientTelemetry::default()),
                 exact_still_image: false,
+                keep_desk_private: true,
                 canvas: crate::canvas::CanvasRequest::Unavailable,
             },
             "03".repeat(32),
@@ -9254,6 +9295,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         });
         let auth_request = next_session_event(&mut handle).await;
@@ -9333,6 +9375,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         });
         assert!(matches!(
@@ -9395,6 +9438,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         })
         .await
@@ -9464,6 +9508,7 @@ mod tests {
             tablet_mode_requested: TabletModeMsg::LocalTermination,
             telemetry: Arc::new(ClientTelemetry::default()),
             exact_still_image: false,
+            keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
         });
         let _ = next_session_event(&mut handle).await;

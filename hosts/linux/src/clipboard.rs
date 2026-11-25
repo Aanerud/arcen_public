@@ -1152,6 +1152,7 @@ mod tests {
             console: false,
             console_guest: false,
             console_shown_outputs: None,
+            console_desk_privacy: None,
         }
     }
 

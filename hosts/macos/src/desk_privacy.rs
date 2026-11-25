@@ -13,13 +13,17 @@
 //!   own table back, so the desk may glimpse up to 100 ms) and given back
 //!   with `CGDisplayRestoreColorSyncSettings`. A display that stays lit for
 //!   two seconds, or a display list that cannot be read, ends the Deck's
-//!   session (locked first). `ScreenCaptureKit` reads the composited desktop
+//!   session (locked first) when the administrator requires desk privacy;
+//!   otherwise the session goes on and the Deck is told
+//!   (`desk_privacy_update`), and told again once every display is dark. `ScreenCaptureKit` reads the composited desktop
 //!   before the table (prove it with `probe-desk-privacy --capture`).
 //! - **Input:** an active `CGEventTap` at the HID tap point drops every
 //!   keyboard, pointer, scroll, tablet, gesture and system-key event the
 //!   window server did not record as posted by this process
 //!   (`kCGEventSourceUnixProcessID`). It needs the Accessibility grant
-//!   keyboard input already needs.
+//!   keyboard input already needs. Where it cannot run (no grant, or a Deck
+//!   whose input goes through virtual HID devices, which it would drop too),
+//!   a best-effort desk keeps its displays dark and reports its input live.
 //! - **Hand-back:** the session is locked first; a panic locks it before the
 //!   displays come back. When the agent dies, the window server restores the
 //!   tables and removes the tap at once. The agent's lock guard then darkens
@@ -38,8 +42,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arcen_session::console_session::desk_privacy::{
-    self, DeskDisplayFact, DeskPrivacyRefusal, EventPoster,
+    self, DeckInputRoute, DeskDisplayFact, DeskPrivacyRefusal, DeskPrivacyState, DeskPrivacyStatus,
+    EventPoster,
 };
+
+/// The desk's privacy as it changes while held, for the stream to tell the
+/// Deck (`desk_privacy_update`).
+pub type DeskPrivacyUpdates = tokio::sync::mpsc::UnboundedReceiver<DeskPrivacyStatus>;
 
 /// The vendor id every virtual display this Pier creates carries.
 pub const PIER_VIRTUAL_VENDOR: u32 = 0x3456;
@@ -81,6 +90,8 @@ pub struct DeskPrivacy {
     watcher: Option<std::thread::JoinHandle<()>>,
     blanked: Arc<std::sync::Mutex<BTreeSet<u32>>>,
     outputs_restored: bool,
+    /// Changes the Deck has not been told yet, until the stream takes them.
+    updates: Option<DeskPrivacyUpdates>,
 }
 
 impl std::fmt::Debug for DeskPrivacy {
@@ -95,33 +106,62 @@ impl std::fmt::Debug for DeskPrivacy {
 
 impl DeskPrivacy {
     /// Drops the desk's input, then darkens its displays, each proved, for
-    /// the session of `serving_uid`. Anything that fails gives back what was
-    /// taken before returning. While held, the displays are proved dark
-    /// every [`DISPLAY_CHECK`](desk_privacy::DISPLAY_CHECK); a display that
-    /// stays lit, or a console that another account holds, is reported
-    /// through [`Self::lost`] so that the Deck's session ends. A console
-    /// that another account holds gets the desk at once: its displays and
+    /// the session of `serving_uid`, under `state`'s plan (the hello already
+    /// told its status, `DeskPrivacyState::hello_status`). The input filter
+    /// runs only for a Deck whose input the Pier posts itself (`route`).
+    /// What cannot be done is recorded in `state` and, unless the plan
+    /// requires privacy, the rest goes on and the change is queued for the
+    /// Deck ([`Self::take_updates`]). Anything that fails a required plan
+    /// gives back what was taken before returning. While held, the displays
+    /// are proved dark every [`DISPLAY_CHECK`](desk_privacy::DISPLAY_CHECK);
+    /// a display that stays lit ends the Deck's session through
+    /// [`Self::lost`] only when privacy is required (otherwise the Deck is
+    /// told, and told again when it is dark), and a console that another
+    /// account holds always does: it gets the desk at once, its displays and
     /// input belong to whoever is at the console now.
     ///
     /// # Errors
     ///
-    /// [`DeskPrivacyRefusal`] naming what could not be made private.
-    pub fn arm(serving_uid: u32) -> Result<Self, DeskPrivacyRefusal> {
-        let filter = native::InputFilter::start(FILTER_START)
-            .ok_or(DeskPrivacyRefusal::InputFilterUnavailable)?;
+    /// [`DeskPrivacyRefusal`] naming what could not be made private, under a
+    /// required plan.
+    pub fn arm(
+        serving_uid: u32,
+        mut state: DeskPrivacyState,
+        route: DeckInputRoute,
+    ) -> Result<Self, DeskPrivacyRefusal> {
+        let filter = match desk_privacy::admits_input_route(route) {
+            Ok(()) => match native::InputFilter::start(FILTER_START) {
+                Some(filter) => Some(filter),
+                None => {
+                    state.attach_failed(DeskPrivacyRefusal::InputFilterUnavailable)?;
+                    None
+                }
+            },
+            Err(refusal) => {
+                state.attach_failed(refusal)?;
+                None
+            }
+        };
         let blanked = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+        let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
         let mut privacy = Self {
             stop: Arc::new(AtomicBool::new(false)),
             lost: Arc::new(AtomicBool::new(false)),
             console_left: Arc::new(AtomicBool::new(false)),
-            filter: Some(filter),
+            filter,
             watcher: None,
             blanked: Arc::clone(&blanked),
             outputs_restored: false,
+            updates: Some(updates),
         };
         // On failure `privacy` drops here and gives back the filter and any
-        // display already darkened.
-        darken_displays(&blanked)?;
+        // display already darkened. A best-effort desk keeps trying: the
+        // watch darkens every display again each check and reports it dark
+        // once it is.
+        if let Err(refusal) = darken_displays(&blanked) {
+            state.watched(Err(refusal))?;
+        }
+        tell(&mut state, &updates_tx);
         let stop = Arc::clone(&privacy.stop);
         let lost = Arc::clone(&privacy.lost);
         let console_left = Arc::clone(&privacy.console_left);
@@ -135,6 +175,7 @@ impl DeskPrivacy {
                     filter_port.as_ref(),
                     &stop,
                     (&lost, &console_left),
+                    (state, &updates_tx),
                 );
             })
             .ok();
@@ -142,6 +183,12 @@ impl DeskPrivacy {
             return Err(DeskPrivacyRefusal::DisplaysNotDark);
         }
         Ok(privacy)
+    }
+
+    /// The desk's privacy changes for the Deck: what arming could not do,
+    /// then each change the watch finds. Taken once, by the stream.
+    pub fn take_updates(&mut self) -> Option<DeskPrivacyUpdates> {
+        self.updates.take()
     }
 
     /// Whether the desk could not be kept private (a display stayed lit, or
@@ -261,6 +308,10 @@ fn watch(
     filter: Option<&native::FilterHandle>,
     stop: &AtomicBool,
     (lost, console_left): (&AtomicBool, &AtomicBool),
+    (mut state, updates): (
+        DeskPrivacyState,
+        &tokio::sync::mpsc::UnboundedSender<DeskPrivacyStatus>,
+    ),
 ) {
     use desk_privacy::{CONSOLE_CHECK, DISPLAY_CHECK, PrivacyWatch, WatchVerdict};
     let mut verdicts = PrivacyWatch::default();
@@ -303,7 +354,7 @@ fn watch(
         if let Err(refusal) = dark {
             if !not_dark_logged {
                 not_dark_logged = true;
-                tracing::error!(
+                tracing::warn!(
                     target: arcen_telemetry::names::target::SESSION,
                     reason = refusal.token(),
                     "a desk display could not be kept dark; retrying"
@@ -312,18 +363,52 @@ fn watch(
         } else {
             not_dark_logged = false;
         }
-        if verdicts.displays(dark.is_ok(), now) == WatchVerdict::PrivacyLost
+        // A display that stays lit past the limit ends a required desk's
+        // session; a best-effort desk reports it, and its recovery.
+        let verdict = match verdicts.displays(dark.is_ok(), now) {
+            WatchVerdict::PrivacyLost => Some(Err(DeskPrivacyRefusal::DisplaysNotDark)),
+            _ if dark.is_ok() => Some(Ok(())),
+            // Lit, within the limit: nothing decided yet.
+            _ => None,
+        };
+        if verdict.is_some_and(|verdict| state.watched(verdict).is_err())
             && !lost.swap(true, Ordering::AcqRel)
         {
             tracing::error!(
                 target: arcen_telemetry::names::target::SESSION,
-                "a desk display stayed lit; the Deck's session ends"
+                "a desk display stayed lit and the administrator requires desk privacy; the Deck's session ends"
             );
         }
+        tell(&mut state, updates);
         if let Some(handle) = filter {
             handle.keep_enabled();
         }
     }
+}
+
+/// Queues the desk's status for the Deck when it changed since it was last
+/// told, logging the change once.
+fn tell(
+    state: &mut DeskPrivacyState,
+    updates: &tokio::sync::mpsc::UnboundedSender<DeskPrivacyStatus>,
+) {
+    let Some(status) = state.tell() else {
+        return;
+    };
+    if status.is_warning() {
+        tracing::warn!(
+            target: arcen_telemetry::names::target::SESSION,
+            status = status.token(),
+            "desk privacy: the desk is not fully private; the session continues and the Deck is told (privacy.desk = \"required\" refuses instead)"
+        );
+    } else {
+        tracing::info!(
+            target: arcen_telemetry::names::target::SESSION,
+            status = status.token(),
+            "desk privacy: the Deck is told the desk's state"
+        );
+    }
+    let _ = updates.send(status);
 }
 
 /// Darkens every display that goes dark while attached and is not yet,

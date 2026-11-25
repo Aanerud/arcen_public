@@ -86,15 +86,17 @@ session first sets the display's own mode nearest to the Deck's size, then
 turns HDR on for that display, and is served as HDR only when Windows shows
 HDR there. The Deck is told the refresh the display runs at.
 
-Desk privacy (`privacy.desk`, on by default) serves a session only on a
-display no monitor at the desk shows. Windows reports a dummy plug as a
-physically connected monitor, so on a PC whose only display is a dummy plug
-the session is refused `console_privacy_unavailable: desk_monitor_lit`. On
-such a PC, where no one at the desk can see the screen, set
-`"privacy": {"desk": "off"}` in `C:\ProgramData\Arcen\pier.json` and restart
-the `ArcenPier` service; or install the virtual display driver above and
-keep desk privacy on, and the Pier serves the virtual display and detaches
-the plug while a Deck is attached.
+Dummy plugs work. Desk privacy (`privacy.desk`, `on` by default) prefers a
+display no monitor at the desk shows, but Windows reports a dummy plug as a
+physically connected monitor, so the Pier cannot prove the plug dark. With
+`on` it keeps the session, blocks the desk's keyboard and mouse, and tells
+the Deck: *Host screens could not be blanked (a dummy plug or a monitor that
+cannot be darkened). People at the host may see this session.* Nothing more
+is needed where nobody can see the plug's output. To keep the screens
+private as well, install the virtual display driver above: the Pier serves
+the virtual display and detaches the plug while a Deck is attached. Only
+`"privacy": {"desk": "required"}`, for sites whose rules demand it, refuses
+such a PC (`console_privacy_unavailable: desk_monitor_lit`).
 
 ### Applications that draw with OpenGL or CUDA on the display
 
@@ -107,10 +109,10 @@ control panel keep working (reported on a GeForce RTX 5090 Pier with no
 monitor attached; Blackmagic's forum reports the same under Remote
 Desktop). On such a
 PC keep a monitor or a dummy plug on the GeForce and serve the session on
-it: with desk privacy on, that is refused `desk_monitor_lit`, so set
-`"privacy": {"desk": "off"}` as above and accept that any monitor on the
-GeForce (in a machine room, for example) shows the session and its keyboard
-and mouse stay live while a Deck is attached.
+it. With desk privacy `on` the session goes on and the Deck is told that
+the host's screens are visible; any monitor on the GeForce (in a machine
+room, for example) shows the session, while the desk's keyboard and mouse
+stay blocked.
 
 Pinned deskside protection (`platform.desktop.deskside.enabled`) requires
 the Deck's exact display, which a GeForce cannot provide: such a host is

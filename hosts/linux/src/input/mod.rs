@@ -532,6 +532,7 @@ mod backend_choice_tests {
             console: false,
             console_guest: false,
             console_shown_outputs: None,
+            console_desk_privacy: None,
             wayland: wayland.then(|| WaylandAgentReady {
                 compositor: "gnome-shell".into(),
                 input_socket: runtime_dir.join(INPUT_SOCKET_NAME),

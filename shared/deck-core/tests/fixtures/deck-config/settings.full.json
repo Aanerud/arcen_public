@@ -18,6 +18,7 @@
   "fullscreen_uses_notch_area": true,
   "hidpi_display_mask": 2,
   "hidpi_streaming": true,
+  "keep_desk_private": false,
   "keyboard_capture": "this_computer",
   "keyboard_switch": "Ctrl+Alt+Shift+Z",
   "log_level": 3,

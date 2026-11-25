@@ -2802,13 +2802,46 @@ fn requested_ui_scale_from_request(
     ))
 }
 
+/// The `targetInfo` mode-index bitfield (`desktopModeInfoIdx` in the low 16
+/// bits, `targetModeInfoIdx` in the high 16, `QDC_VIRTUAL_MODE_AWARE`) for a
+/// path whose source mode becomes `source`, shown on its output at `target`.
+///
+/// The output's current timing and desktop image are kept only when they
+/// already show exactly that: the timing's active size is `target` and the
+/// desktop image (when the path has one) scales from a source of `source`.
+/// Otherwise both indices are left invalid (`0xffff`), and `SetDisplayConfig`
+/// with `SDC_ALLOW_CHANGES` chooses a timing and desktop image that fit the
+/// new source. A source resized under a timing or desktop image of another
+/// size is a configuration Windows refuses with `ERROR_INVALID_PARAMETER`:
+/// a dummy plug running a 2560x1440 desktop, asked for a 1920x1080 source
+/// under its old timing and desktop image, returned 87.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn retargeted_mode_bits(
+    bits: u32,
+    target_active: Option<(u32, u32)>,
+    desktop_source: Option<(u32, u32)>,
+    source: (u32, u32),
+    target: (u32, u32),
+) -> u32 {
+    const INVALID: u32 = 0xFFFF;
+    let has_target = bits >> 16 != INVALID;
+    let has_desktop = bits & 0xFFFF != INVALID;
+    let timing_fits = has_target && target_active == Some(target);
+    let desktop_fits = !has_desktop || desktop_source == Some(source);
+    if timing_fits && desktop_fits {
+        bits
+    } else {
+        u32::MAX
+    }
+}
+
 #[cfg(windows)]
 mod windows_backend {
     use super::{
         display_scale_matches_requested, effective_scale_percent_from_dpi, nvapi_exact_available,
-        report, require_nvapi_exact_retarget, take_nvapi_active_after_stage, DesktopRect,
-        DisplayBackend, DisplayReport, DisplayScaleReport, DisplaySize, DisplayTarget, ModeState,
-        NativeBackend, OutputSelector,
+        report, require_nvapi_exact_retarget, retargeted_mode_bits, take_nvapi_active_after_stage,
+        DesktopRect, DisplayBackend, DisplayReport, DisplayScaleReport, DisplaySize, DisplayTarget,
+        ModeState, NativeBackend, OutputSelector,
     };
     use crate::logging::DISPLAY;
     use crate::nvapi;
@@ -2823,7 +2856,8 @@ mod windows_backend {
         QueryDisplayConfig, SetDisplayConfig, DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
         DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
         DISPLAYCONFIG_DEVICE_INFO_TYPE, DISPLAYCONFIG_MODE_INFO,
-        DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_ROTATION,
+        DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
+        DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_ROTATION,
         DISPLAYCONFIG_ROTATION_IDENTITY, DISPLAYCONFIG_ROTATION_ROTATE180,
         DISPLAYCONFIG_ROTATION_ROTATE270, DISPLAYCONFIG_ROTATION_ROTATE90,
         DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ALL_PATHS,
@@ -3860,6 +3894,44 @@ mod windows_backend {
                     x: monitor.x,
                     y: monitor.y,
                 };
+                // SAFETY: the working topology was queried with
+                // QDC_VIRTUAL_MODE_AWARE, so the union carries the bitfield.
+                let target_bits = unsafe { path.targetInfo.Anonymous.Anonymous._bitfield };
+                let target_active = modes
+                    .get((target_bits >> 16) as usize)
+                    .filter(|mode| mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+                    // SAFETY: the info type says this union holds a target mode.
+                    .map(|mode| unsafe {
+                        let size = mode.Anonymous.targetMode.targetVideoSignalInfo.activeSize;
+                        (size.cx, size.cy)
+                    });
+                let desktop_source = modes
+                    .get((target_bits & 0xFFFF) as usize)
+                    .filter(|mode| mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE)
+                    // SAFETY: the info type says this union holds a desktop image.
+                    .and_then(|mode| unsafe {
+                        let size = mode.Anonymous.desktopImageInfo.PathSourceSize;
+                        Some((u32::try_from(size.x).ok()?, u32::try_from(size.y).ok()?))
+                    });
+                let retargeted = retargeted_mode_bits(
+                    target_bits,
+                    target_active,
+                    desktop_source,
+                    (monitor.width, monitor.height),
+                    (monitor.mode_width, monitor.mode_height),
+                );
+                if retargeted != target_bits {
+                    tracing::debug!(
+                        target: DISPLAY,
+                        device = %monitor.device_name,
+                        ?target_active,
+                        ?desktop_source,
+                        source_width = monitor.width,
+                        source_height = monitor.height,
+                        "output timing and desktop image left to Windows for the planned source"
+                    );
+                }
+                path.targetInfo.Anonymous.Anonymous._bitfield = retargeted;
                 path.targetInfo.rotation = rotation_to_display_config(monitor.rotation);
                 path.flags |= PATH_ACTIVE_FLAG;
             }
@@ -9518,6 +9590,32 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    /// A dummy plug running a 2560x1440 desktop scaled onto its 1080p
+    /// timing, planned at 1920x1080: the old desktop image no longer fits the
+    /// source, so both indices go to Windows. A path whose timing and image
+    /// already show the plan keeps them, and one whose timing differs gives
+    /// both up.
+    #[test]
+    fn a_resized_source_leaves_timing_and_desktop_image_to_windows_unless_they_fit() {
+        let bits = (3 << 16) | 4;
+        let plan = ((1_920, 1_080), (1_920, 1_080));
+        let keep =
+            |target, desktop| retargeted_mode_bits(bits, target, desktop, plan.0, plan.1) == bits;
+        assert!(!keep(Some((1_920, 1_080)), Some((2_560, 1_440))));
+        assert!(keep(Some((1_920, 1_080)), Some((1_920, 1_080))));
+        assert!(!keep(Some((2_560, 1_440)), Some((1_920, 1_080))));
+        assert!(!keep(None, None));
+        assert_eq!(
+            retargeted_mode_bits(bits, Some((2_560, 1_440)), None, plan.0, plan.1),
+            u32::MAX
+        );
+        let no_image = (3 << 16) | 0xFFFF;
+        assert_eq!(
+            retargeted_mode_bits(no_image, Some((1_920, 1_080)), None, plan.0, plan.1),
+            no_image
+        );
+    }
 
     /// `Scale120` is the plan's canonical scale; `EdidRequest::scale` wants a
     /// plain ratio. A wrong conversion here is invisible in logs and shows up

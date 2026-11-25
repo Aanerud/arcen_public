@@ -28,9 +28,9 @@ Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
 ### Steps
 
 1. **Download** from [Releases](https://github.com/Aanerud/arcen_public/releases):
-   the Deck — `Arcen-Deck-0.21.2-macOS.zip` on an Apple silicon Mac,
-   `Arcen-Deck-Intel-0.21.2-macOS.zip` on an Intel Mac (Apple menu → About
-   This Mac shows which), `Arcen-Deck-0.21.2-windows-x64.msi` on Windows 11 —
+   the Deck — `Arcen-Deck-0.21.3-macOS.zip` on an Apple silicon Mac,
+   `Arcen-Deck-Intel-0.21.3-macOS.zip` on an Intel Mac (Apple menu → About
+   This Mac shows which), `Arcen-Deck-0.21.3-windows-x64.msi` on Windows 11 —
    and the Pier installer for your host. Check them
    against the release's `SHA256SUMS.txt`:
    `shasum -a 256 -c SHA256SUMS.txt --ignore-missing`.
@@ -38,16 +38,16 @@ Free software under **AGPL-3.0-only** ([licence](#contributing-and-licence)).
    TLS identity and the firewall opening, and starts the Pier):
    - Linux, as root:
      ```sh
-     chmod +x install-arcen-pier-0.21.2-linux-x86_64
-     sudo ./install-arcen-pier-0.21.2-linux-x86_64
+     chmod +x install-arcen-pier-0.21.3-linux-x86_64
+     sudo ./install-arcen-pier-0.21.3-linux-x86_64
      ```
      `--check` first shows what it found and would do, and changes nothing.
    - Windows, in **PowerShell as Administrator**, then **reboot** (Windows
      loads Arcen's sign-in provider only at boot):
      ```powershell
-     .\install-arcen-pier-0.21.2-windows-x64.exe
+     .\install-arcen-pier-0.21.3-windows-x64.exe
      ```
-   - macOS: open `ArcenPier-0.21.2.pkg` in **Installer.app** on that Mac
+   - macOS: open `ArcenPier-0.21.3.pkg` in **Installer.app** on that Mac
      (not the `installer` command), then, signed in as the account that will
      be served, approve **Screen & System Audio Recording** and
      **Accessibility** for **Arcen Agent Helper**, and **System Audio
@@ -91,11 +91,11 @@ password and says what to fix. Then see
   plugged into the host, with the host's own tablet driver. A Mac Deck needs
   **macOS 13 or later** (on Intel Macs it has not been tested with a real
   tablet); a Windows Deck needs the optional
-  `Arcen-USB-Component-0.21.2-windows-x64.msi`. Linux, macOS and Windows
+  `Arcen-USB-Component-0.21.3-windows-x64.msi`. Linux, macOS and Windows
   hosts offer it. On a Linux host it is off until you enable it, which restarts the
   running Pier:
   ```sh
-  sudo ./install-arcen-pier-0.21.2-linux-x86_64 --native-tablet --restart
+  sudo ./install-arcen-pier-0.21.3-linux-x86_64 --native-tablet --restart
   ```
   On an X11 host, also restart the display manager once while nobody is
   signed in at the console (`sudo systemctl restart gdm`), or reboot.
@@ -125,7 +125,7 @@ lacks (Ctrl+Alt+Del, Print Screen, F13–F24) are in **Connection › Send Key**
 and **Help › Keyboard Shortcuts** lists the few keys the Deck keeps.
 [User guide: Keyboard](docs/user-guide.md#6-keyboard).
 
-## Status (0.21.2)
+## Status (0.21.3)
 
 | Platform | State |
 | --- | --- |

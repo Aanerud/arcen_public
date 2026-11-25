@@ -1192,6 +1192,14 @@ impl Launcher {
         };
         match connection.poll() {
             SessionNews::Quiet => {}
+            SessionNews::DeskPrivacy { note, warning } => {
+                if warning {
+                    tracing::warn!(target: "arcen::session", note, "host desk privacy changed");
+                } else {
+                    tracing::info!(target: "arcen::session", note, "host desk privacy changed");
+                }
+                self.notify(note.to_owned());
+            }
             SessionNews::Authenticated(authentication) => {
                 self.handle_authentication(authentication);
             }

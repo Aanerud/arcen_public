@@ -6,6 +6,51 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.21.3] — 2026-11-25
+
+Desk privacy is now a Deck setting, and a Pier keeps your session when the
+desk cannot be made fully private instead of ending it. On a Windows Pier,
+Match My Layout works from the sign-in screen.
+
+### Windows Pier
+
+- Match My Layout works when you sign in remotely at the sign-in or lock
+  screen.
+- When the PC's monitors cannot take your layout (fewer of them, or sizes
+  they do not offer), Match My Layout opens on the monitors it has, each at
+  its own size, instead of ending the session.
+- With dummy plugs, or a monitor it cannot darken, the Pier now keeps your
+  session, blocks the desk's keyboard and mouse, and tells the Deck that
+  its screens may show the session, instead of refusing or disconnecting.
+- Desk privacy follows each Deck's choice; `privacy.desk = "required"`
+  keeps the desk private whatever the Deck asks, and refuses a session that
+  cannot be.
+
+### Linux Pier
+
+- A joined desk that cannot be made fully private, such as a GNOME Wayland
+  session shown on a desk monitor, now keeps your session and tells the
+  Deck, during the session too.
+- Desk privacy follows each Deck's choice, including a Deck that returns to
+  a session; `privacy.desk = "required"` keeps the desk private whatever the
+  Deck asks, and refuses a session that cannot be.
+
+### macOS Pier (preview)
+
+- A desk that cannot be made fully private no longer refuses or ends your
+  session; the Deck is told instead.
+- Desk privacy follows each Deck's choice; `privacy.desk = "required"`
+  keeps the desk private whatever the Deck asks, and refuses a session that
+  cannot be.
+
+### macOS Deck and Windows Deck
+
+- Settings › Privacy › Keep the host's desk private: on by default; turn it
+  off to let people at the host see your session. It applies from the next
+  connection.
+- The Deck says when the host's screens could not be blanked or its input
+  could not be blocked, and again when that changes during the session.
+
 ## [0.21.2] — 2026-11-24
 
 The Linux Pier no longer mistakes a Bluetooth keyboard or a desk driver for
@@ -1367,7 +1412,8 @@ exist.
   and SmartScreen prompts.
 - The macOS Pier, a Linux Deck and a Windows Deck do not exist yet.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.2...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.3...HEAD
+[0.21.3]: https://github.com/Aanerud/arcen_public/compare/v0.21.2...v0.21.3
 [0.21.2]: https://github.com/Aanerud/arcen_public/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/Aanerud/arcen_public/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/Aanerud/arcen_public/compare/v0.20.8-build2...v0.21.0

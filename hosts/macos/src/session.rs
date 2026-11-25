@@ -103,7 +103,7 @@ pub struct AdvertisedCapabilities {
     /// Whether Native tablet is offered (ADR 0022), or why not.
     pub native_tablet: Result<(), String>,
     /// What the desk shows while this Deck is attached, as the hello tells
-    /// it (`SessionPolicy::desk_privacy_status`).
+    /// it (`SessionPolicy::desk_privacy_plan`).
     pub desk_privacy: Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
 }
 
@@ -158,9 +158,9 @@ pub struct SessionPolicy {
     pub lossless_refinement: bool,
     /// `video.fps`: the administrator's frame-rate ceiling, when configured.
     pub fps_ceiling: Option<u32>,
-    /// `privacy.desk` (on unless turned off): keep the desk private while a
+    /// `privacy.desk`: whether, and how, the desk is kept private while a
     /// Deck is attached to a signed-in user's session (`desk_privacy`).
-    pub desk_privacy: bool,
+    pub desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy,
 }
 
 impl SessionPolicy {
@@ -190,27 +190,24 @@ impl SessionPolicy {
                 config.video.lossless_refinement,
             ),
             fps_ceiling: config.video.fps,
-            desk_privacy: config.privacy.desk_policy().enabled,
+            desk_privacy: config.privacy.desk_policy(),
         })
     }
 
-    /// What the hello tells the Deck about the desk: blanked for a signed-in
-    /// user's session the Pier makes private before anything is shown (or
-    /// refuses), `off` when the administrator turned it off; nothing at the
-    /// login window (nobody's desktop is shown) nor in `serve`.
+    /// What this session does about the desk, for a Deck that asked `deck`:
+    /// the console owner's Aqua session is on the desk's own displays;
+    /// `None` at the login window (nobody's desktop is shown) and in
+    /// `serve`.
     #[must_use]
-    pub fn desk_privacy_status(
+    pub fn desk_privacy_plan(
         &self,
-    ) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
-        use arcen_session::console_session::desk_privacy::{DeskExposure, DeskPrivacyPolicy};
+        deck: arcen_session::console_session::desk_privacy::DeckDeskPrivacy,
+    ) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyPlan> {
+        use arcen_session::console_session::desk_privacy::DeskExposure;
         if self.login_window || self.serving_uid.is_none() {
             return None;
         }
-        let policy = DeskPrivacyPolicy {
-            enabled: self.desk_privacy,
-            source: arcen_session::console_session::desk_privacy::DeskPrivacySource::Config,
-        };
-        Some(policy.plan(DeskExposure::PhysicalDesk).status())
+        Some(self.desk_privacy.plan(DeskExposure::PhysicalDesk, deck))
     }
 }
 
@@ -228,7 +225,8 @@ impl Default for SessionPolicy {
             login_window: false,
             lossless_refinement: true,
             fps_ceiling: None,
-            desk_privacy: true,
+            desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
+            ),
         }
     }
 }
@@ -354,6 +352,10 @@ pub struct Handshake {
     /// Exact still image: the shared plan the hello stated, which the
     /// stream carries out (ADR 0016).
     pub refine: arcen_media::refine::RefinePlan,
+    /// What this session does about the desk: the administrator's
+    /// `privacy.desk` and the Deck's choice (ADR 0025 §5); `None` at the
+    /// login window and in `serve`, where nobody's desktop is shown.
+    pub desk_privacy: Option<arcen_session::console_session::desk_privacy::DeskPrivacyPlan>,
 }
 
 /// The desktop size the Deck asked to be sent.
@@ -722,7 +724,8 @@ pub fn advertise_with_config(
             crate::bridged_tablet::refresh_probe();
             crate::bridged_tablet::availability(policy.login_window)
         },
-        desk_privacy: policy.desk_privacy_status(),
+        // Set once the Deck's choice is known (`perform_application_handshake`).
+        desk_privacy: None,
     })
 }
 
@@ -1450,6 +1453,7 @@ async fn perform_application_handshake(
         deck_refine,
         admitted_video,
         multi_monitor,
+        deck_desk_privacy,
     ) = authenticate(
         socket,
         &advertised,
@@ -1585,6 +1589,11 @@ async fn perform_application_handshake(
         crate::bridged_tablet::PROBE_WAIT,
     )
     .await;
+    // The hello states the plan's own status; what arming the desk cannot
+    // do follows as `desk_privacy_update` (`DeskPrivacy::arm`).
+    advertised.desk_privacy = policy
+        .desk_privacy_plan(deck_desk_privacy)
+        .map(arcen_session::console_session::desk_privacy::DeskPrivacyPlan::status);
 
     let refine = lossless_refine_plan(
         deck_refine.as_ref(),
@@ -1730,6 +1739,7 @@ async fn perform_application_handshake(
         login_window: policy.login_window,
         authenticated_timezone,
         refine,
+        desk_privacy: policy.desk_privacy_plan(deck_desk_privacy),
     })
 }
 
@@ -2536,6 +2546,7 @@ async fn authenticate(
         Option<arcen_protocol::refine::LosslessRefineCapability>,
         AdmittedInitialVideo,
         AdmittedMultiMonitor,
+        arcen_session::console_session::desk_privacy::DeckDeskPrivacy,
     ),
     HandshakeError,
 > {
@@ -2746,6 +2757,9 @@ async fn authenticate(
             response.lossless_refine_v1.take(),
             video,
             multi_monitor,
+            arcen_session::console_session::desk_privacy::DeckDeskPrivacy::from_request(
+                response.desk_privacy_request.as_deref(),
+            ),
         )),
         Err(failure) => Err(HandshakeError::Rejected(failure)),
     }

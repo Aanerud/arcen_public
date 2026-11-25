@@ -220,6 +220,7 @@
         "runtime",
         "screens",
         "services",
+        "session_truth",
         "settings",
         "support_bundle",
         "ui_pacing"

@@ -88,6 +88,7 @@ fn every_field_changed() -> ClientSettings {
             upper: arcen_input::pen_buttons::PenButtonAction::RightClick,
         },
         exact_still_image: false,
+        keep_desk_private: false,
         canvas: false,
         canvas_cache_mib: 32,
         color_fidelity: ColorFidelitySettings {

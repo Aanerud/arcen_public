@@ -365,6 +365,9 @@ pub(crate) struct ResumeHandoff {
     pub(crate) previous_session_log_id: String,
     pub(crate) successor_grant: DirectResumeGrantToken,
     pub(crate) window_secs: u32,
+    /// The returning Deck's desk privacy choice (its resume response's
+    /// `desk_privacy_request`).
+    pub(crate) deck_desk_privacy: arcen_session::console_session::desk_privacy::DeckDeskPrivacy,
 }
 
 pub(crate) struct GrantRefresh {
@@ -411,6 +414,7 @@ impl fmt::Debug for ResumeHandoff {
             .field("previous_session_log_id", &self.previous_session_log_id)
             .field("successor_grant", &"<redacted>")
             .field("window_secs", &self.window_secs)
+            .field("deck_desk_privacy", &self.deck_desk_privacy)
             .finish()
     }
 }
@@ -1004,6 +1008,7 @@ impl ResumeRegistry {
         permit: ResumePermit,
         socket: DirectSessionSocket,
         session_log_id: arcen_telemetry::CorrelationId,
+        deck_desk_privacy: arcen_session::console_session::desk_privacy::DeckDeskPrivacy,
     ) -> Result<(), (Box<DirectSessionSocket>, ResumeRejection)> {
         let command = OwnerCommand::Resume(Box::new(ResumeHandoff {
             socket,
@@ -1011,6 +1016,7 @@ impl ResumeRegistry {
             previous_session_log_id: permit.previous_session_log_id,
             successor_grant: permit.successor_grant,
             window_secs: permit.window_secs,
+            deck_desk_privacy,
         }));
         let active_session_id = permit.active_session_id.clone();
         permit.owner.send(command).map_err(|error| {

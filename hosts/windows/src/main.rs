@@ -122,6 +122,17 @@ mod gpu_probe {
         Err("Windows GPU probing is unavailable on this platform".to_owned())
     }
 
+    pub fn read_physical_output_inventory(
+        _allowed_adapters: &[String],
+    ) -> Result<
+        arcen_outputs::windows_topology::PhysicalOutputInventory,
+        crate::multi_monitor_gate::OutputInventoryError,
+    > {
+        Err(crate::multi_monitor_gate::OutputInventoryError::Unreadable(
+            "Windows GPU probing is unavailable on this platform".to_owned(),
+        ))
+    }
+
     pub const fn nvenc_runtime_dll() -> bool {
         false
     }
@@ -1893,7 +1904,7 @@ where
         }
         desktop.deskside.validate()?;
         deskside = desktop.deskside.clone();
-        if deskside.enabled && !desk_privacy.enabled {
+        if deskside.enabled && !desk_privacy.enabled() {
             return Err(
                 "platform.desktop.deskside (pinned deskside) contradicts privacy.desk = \"off\""
                     .to_string(),
@@ -3305,10 +3316,11 @@ where
     console_display_recovery.request(arcen_outputs::display_lease::DisplayLeaseEvent::PierStarted);
     let mut console_display_recovery_tick = tokio::time::interval(Duration::from_secs(5));
     console_display_recovery_tick.tick().await;
-    // Desk privacy is on unless the administrator turned it off
-    // (`privacy.desk`); the effective choice is said once, at start (off at
-    // error level, so every log profile records it).
-    if args.config.desk_privacy.enabled {
+    // Desk privacy follows each Deck's choice unless the administrator
+    // requires it or turned it off (`privacy.desk`); the effective choice is
+    // said once, at start (off at error level, so every log profile records
+    // it).
+    if args.config.desk_privacy.enabled() {
         tracing::info!(target: crate::logging::SESSION, "{}", args.config.desk_privacy.startup_line());
     } else {
         tracing::error!(target: crate::logging::SESSION, "{}", args.config.desk_privacy.startup_line());

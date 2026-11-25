@@ -270,7 +270,7 @@ fn main() -> ExitCode {
     // Desk privacy is on unless the administrator turned it off
     // (`privacy.desk`); the effective choice is said once, at start (off at
     // error level, so every log profile records it).
-    if config.desk_privacy.enabled {
+    if config.desk_privacy.enabled() {
         tracing::info!(target: target::SESSION, "{}", config.desk_privacy.startup_line());
     } else {
         tracing::error!(target: target::SESSION, "{}", config.desk_privacy.startup_line());

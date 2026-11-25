@@ -250,11 +250,18 @@ struct OpenRequest {
     /// (`platform.session.mode = console`, ADR 0025).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     console: bool,
-    /// The administrator turned desk privacy off (`privacy.desk = "off"`):
-    /// a joined console's desk is given its monitors and input once the
-    /// session is joined, and again after each resume. Absent is private.
+    /// Desk privacy is off for this attachment (`privacy.desk = "off"`, or
+    /// the Deck's user turned it off): a joined console's desk is given its
+    /// monitors and input once the session is joined, and again after each
+    /// resume. Absent is private.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     desk_live: bool,
+    /// The administrator requires desk privacy (`privacy.desk =
+    /// "required"`): a desk that cannot be made private refuses the
+    /// attachment. Absent: kept private as far as the launcher can, and
+    /// what it cannot do is reported (`LauncherResponse::desk_privacy`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    desk_required: bool,
 }
 
 /// A served Deck display's facts, carried to the privileged launcher.
@@ -565,6 +572,7 @@ impl OpenRequest {
             x11_desktop_depth: None,
             console: false,
             desk_live: false,
+            desk_required: false,
         }
     }
 
@@ -703,6 +711,12 @@ struct LauncherResponse {
     /// keeps the configured desktop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     console_desktop: Option<String>,
+    /// What of a private desk the joined console kept private
+    /// (`DeskPrivacyStatus` token: `blanked`, `screens_visible`,
+    /// `input_live`, `not_private`); absent for a desk left live and for a
+    /// desktop the launcher created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desk_privacy: Option<String>,
 }
 
 /// The helper environment that pins capture to the dedicated X server's GPU.
@@ -768,6 +782,7 @@ impl LauncherResponse {
             console_shown: None,
             console_default_desktop: None,
             console_desktop: None,
+            desk_privacy: None,
         }
     }
 
@@ -783,6 +798,36 @@ impl LauncherResponse {
 
     fn console_refusal(notice: &arcen_session::console_session::ConsoleNotice) -> Self {
         Self::error_naming(notice.token(), notice.service())
+    }
+
+    /// A returning Deck is attached, with what its desk kept private.
+    fn attached(
+        desk: Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
+    ) -> Self {
+        let mut response = Self::error(CONSOLE_ATTACHED);
+        response.desk_privacy = desk.map(|status| status.token().to_owned());
+        response
+    }
+
+    /// The desk's privacy changed while the Deck is attached (a monitor or
+    /// an input device that could not be kept private, or could again).
+    fn desk_privacy_changed(
+        desk: Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
+    ) -> Self {
+        let mut response = Self::error(CONSOLE_DESK_PRIVACY);
+        response.desk_privacy = desk.map(|status| status.token().to_owned());
+        response
+    }
+
+    /// A required desk is no longer private while the Deck is attached
+    /// (`cause`): the attachment ends and the console is handed back
+    /// locked.
+    fn desk_privacy_lost(
+        cause: arcen_session::console_session::desk_privacy::DeskPrivacyRefusal,
+    ) -> Self {
+        let mut response = Self::error(CONSOLE_DESK_PRIVACY_LOST);
+        response.desk_privacy = Some(cause.token().to_owned());
+        response
     }
 
     fn authenticated(identity: &UserIdentity) -> Self {
@@ -837,6 +882,7 @@ impl LauncherResponse {
             console_shown: None,
             console_default_desktop: None,
             console_desktop: None,
+            desk_privacy: None,
         }
     }
 
@@ -868,6 +914,8 @@ pub struct AuthenticatedLauncher {
     timezone: Option<IanaTimeZone>,
     deskside: crate::deskside::LinuxDesksideConfig,
     desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy,
+    /// The Deck user's desk privacy choice (`AuthResponse.desk_privacy_request`).
+    deck_desk_privacy: arcen_session::console_session::desk_privacy::DeckDeskPrivacy,
     multi_monitor_plan: Option<MultiHeadPlanMsg>,
     session_display: Option<SessionDisplayMsg>,
     stream_cursor: Option<super::wayland::StreamCursorMode>,
@@ -910,6 +958,31 @@ impl AuthenticatedLauncher {
 
     pub fn set_timezone(&mut self, timezone: Option<IanaTimeZone>) {
         self.timezone = timezone;
+    }
+
+    /// The Deck user's desk privacy choice (`set_deck_desk_privacy`).
+    pub(crate) const fn deck_desk_privacy(
+        &self,
+    ) -> arcen_session::console_session::desk_privacy::DeckDeskPrivacy {
+        self.deck_desk_privacy
+    }
+
+    /// The Deck user's desk privacy choice for a joined console, which
+    /// `privacy.desk` decides whether to ask (ADR 0025 §5). Must be called
+    /// before [`AuthenticatedLauncher::open`] to take effect.
+    pub(crate) fn set_deck_desk_privacy(
+        &mut self,
+        deck: arcen_session::console_session::desk_privacy::DeckDeskPrivacy,
+    ) {
+        self.deck_desk_privacy = deck;
+    }
+
+    /// What a joined console does about the desk for this attachment.
+    fn console_desk_plan(&self) -> arcen_session::console_session::desk_privacy::DeskPrivacyPlan {
+        self.desk_privacy.plan(
+            arcen_session::console_session::desk_privacy::DeskExposure::PhysicalDesk,
+            self.deck_desk_privacy,
+        )
     }
 
     /// Attaches (or clears) the committed `multi_monitor_v1` topology this
@@ -1124,6 +1197,8 @@ impl AuthenticatedLauncher {
                 timezone: None,
                 deskside: config.deskside.clone(),
                 desk_privacy: config.desk_privacy,
+                deck_desk_privacy:
+                    arcen_session::console_session::desk_privacy::DeckDeskPrivacy::Private,
                 multi_monitor_plan: None,
                 session_display: None,
                 stream_cursor: None,
@@ -1280,6 +1355,7 @@ impl AuthenticatedLauncher {
             self.console_gate = Some(gate);
             super::console_layout::attachment_starting();
         }
+        let desk_plan = self.console_desk_plan();
         let stdin = self.stdin.as_mut().ok_or(LauncherError::Protocol)?;
         // The committed plan travels too: the console lays it on its own
         // outputs while the Deck is attached (ADR 0025 §6).
@@ -1292,7 +1368,8 @@ impl AuthenticatedLauncher {
             None,
         );
         request.console = true;
-        request.desk_live = !self.desk_privacy.enabled;
+        request.desk_live = !desk_plan.protects();
+        request.desk_required = desk_plan.fails_closed();
         // A joined Wayland session's streams report the cursor as the
         // Deck asked.
         request.stream_cursor = self.stream_cursor;
@@ -1384,10 +1461,15 @@ impl AuthenticatedLauncher {
             "joined the user's console session"
         );
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let desk = ConsoleDesk::new(
+            desk_plan,
+            console_desk_status(desk_plan, response.desk_privacy.as_deref()),
+        );
         let writer = tokio::spawn(write_console_commands(
             self.stdin.take().ok_or(LauncherError::Protocol)?,
             self.stdout.take().ok_or(LauncherError::Protocol)?,
             receiver,
+            desk.clone(),
         ));
         Ok(SessionLauncher {
             identity: self.identity.clone(),
@@ -1422,6 +1504,8 @@ impl AuthenticatedLauncher {
                 .console_shown
                 .clone()
                 .filter(|_| response.console_layout.as_deref() == Some(CONSOLE_LAYOUT_SHOWN)),
+            console_desk: Some(desk),
+            desk_privacy: self.desk_privacy,
         })
     }
 
@@ -1677,6 +1761,8 @@ impl AuthenticatedLauncher {
             console_shown_outputs: None,
             #[cfg(target_os = "linux")]
             console_shown: None,
+            console_desk: None,
+            desk_privacy: self.desk_privacy,
         })
     }
 
@@ -1766,6 +1852,115 @@ pub struct SessionLauncher {
     /// outputs it shows ([`Self::fit_committed_plan`]).
     #[cfg(target_os = "linux")]
     console_shown: Option<super::console_layout::GuestLayout>,
+    /// What the joined console's desk shows while the Deck is attached
+    /// (its sign-in, then each reattachment and each change the launcher
+    /// reports); `None` for a desktop the launcher created.
+    console_desk: Option<ConsoleDesk>,
+    /// `privacy.desk`, which plans each returning Deck's attachment.
+    desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy,
+}
+
+/// A joined console's desk privacy, shared by the launcher's link (which
+/// plans each attachment and hears every change) and whoever streams it.
+#[derive(Clone)]
+pub(crate) struct ConsoleDesk {
+    /// The current attachment's plan.
+    plan: Arc<Mutex<arcen_session::console_session::desk_privacy::DeskPrivacyPlan>>,
+    /// The desk now; a stream subscribes to tell its Deck.
+    status: Arc<tokio::sync::watch::Sender<ConsoleDeskNow>>,
+}
+
+/// A joined console's desk as the stream tells its Deck.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConsoleDeskNow {
+    /// What the desk keeps private.
+    pub(crate) status: Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
+    /// A required desk that is no longer private: the attachment ends with
+    /// this cause.
+    pub(crate) lost: Option<arcen_session::console_session::desk_privacy::DeskPrivacyRefusal>,
+}
+
+/// Every change of a joined console's desk ([`ConsoleDeskNow`]).
+pub(crate) type ConsoleDeskUpdates = tokio::sync::watch::Receiver<ConsoleDeskNow>;
+
+impl ConsoleDesk {
+    fn new(
+        plan: arcen_session::console_session::desk_privacy::DeskPrivacyPlan,
+        status: arcen_session::console_session::desk_privacy::DeskPrivacyStatus,
+    ) -> Self {
+        Self {
+            plan: Arc::new(Mutex::new(plan)),
+            status: Arc::new(tokio::sync::watch::Sender::new(ConsoleDeskNow {
+                status: Some(status),
+                lost: None,
+            })),
+        }
+    }
+
+    fn plan(&self) -> arcen_session::console_session::desk_privacy::DeskPrivacyPlan {
+        *self
+            .plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_plan(&self, plan: arcen_session::console_session::desk_privacy::DeskPrivacyPlan) {
+        *self
+            .plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = plan;
+    }
+
+    /// Records what the launcher reported (`reported`, its token) under the
+    /// current plan; returns the status.
+    fn heard(
+        &self,
+        reported: Option<&str>,
+    ) -> arcen_session::console_session::desk_privacy::DeskPrivacyStatus {
+        let status = console_desk_status(self.plan(), reported);
+        self.status.send_modify(|now| now.status = Some(status));
+        status
+    }
+
+    /// A returning Deck is attached with what its desk kept (`reported`):
+    /// nothing earlier was lost for it.
+    fn attached(
+        &self,
+        reported: Option<&str>,
+    ) -> arcen_session::console_session::desk_privacy::DeskPrivacyStatus {
+        let status = console_desk_status(self.plan(), reported);
+        self.status.send_replace(ConsoleDeskNow {
+            status: Some(status),
+            lost: None,
+        });
+        status
+    }
+
+    /// A required desk is no longer private (`cause`, its token; an
+    /// unknown one is still a loss).
+    fn lost(&self, cause: Option<&str>) {
+        use arcen_session::console_session::desk_privacy::DeskPrivacyRefusal;
+        let cause = cause
+            .and_then(DeskPrivacyRefusal::from_token)
+            .unwrap_or(DeskPrivacyRefusal::DisplaysNotDark);
+        self.status.send_modify(|now| now.lost = Some(cause));
+    }
+}
+
+/// The desk's status a joined console's Deck is told: the plan's own, or,
+/// for a best-effort desk, what the launcher reported it kept private
+/// (fully private when it reported no shortfall).
+fn console_desk_status(
+    plan: arcen_session::console_session::desk_privacy::DeskPrivacyPlan,
+    reported: Option<&str>,
+) -> arcen_session::console_session::desk_privacy::DeskPrivacyStatus {
+    use arcen_session::console_session::desk_privacy::{DeskPrivacyPlan, DeskPrivacyStatus};
+    match plan {
+        DeskPrivacyPlan::BestEffort => reported
+            .and_then(DeskPrivacyStatus::from_token)
+            .unwrap_or(DeskPrivacyStatus::Blanked),
+        plan => plan.status(),
+    }
 }
 
 /// [`LauncherResponse::console_layout`] when the console took the layout.
@@ -1801,6 +1996,56 @@ fn console_layout_requests(
     })
 }
 
+/// A console launcher's answer that a returning Deck is attached.
+const CONSOLE_ATTACHED: &str = "attached";
+
+/// A console launcher's own line that the desk's privacy changed (not an
+/// answer to any command).
+const CONSOLE_DESK_PRIVACY: &str = "desk_privacy";
+
+/// A console launcher's own line that a required desk is no longer private
+/// (its cause): the Deck's attachment ends.
+const CONSOLE_DESK_PRIVACY_LOST: &str = "desk_privacy_lost";
+
+/// Desk privacy for a returning Deck, as its `attach` command carries it:
+/// `desk_live` when it is off for this attachment, `desk_required` when the
+/// administrator requires it. Absent flags keep the desk private, best
+/// effort.
+fn attach_desk_flags(command: Option<&serde_json::Value>) -> (bool, bool) {
+    let flag = |name: &str| {
+        command
+            .and_then(|command| command.get(name))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    (flag("desk_live"), flag("desk_required"))
+}
+
+/// Tells the broker the desk's privacy when it changed since the broker
+/// last heard it, while a Deck is attached.
+#[cfg(target_os = "linux")]
+fn report_desk_privacy(
+    privacy: &super::console::ConsolePrivacy,
+    reported: &mut Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
+) {
+    let now = privacy.desk_status();
+    if now != *reported && write_response(&LauncherResponse::desk_privacy_changed(now)).is_ok() {
+        *reported = now;
+    }
+}
+
+/// Whether a required desk is no longer private while the Deck is
+/// attached: the broker is told (it ends the Deck's attachment with the
+/// shared reason) and the launcher leaves, handing the console back locked.
+#[cfg(target_os = "linux")]
+fn desk_privacy_lost(privacy: &super::console::ConsolePrivacy) -> bool {
+    let Some(cause) = privacy.required_lost() else {
+        return false;
+    };
+    let _ = write_response(&LauncherResponse::desk_privacy_lost(cause));
+    true
+}
+
 /// What the broker tells a console launcher while the session is joined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConsoleCommand {
@@ -1826,13 +2071,34 @@ impl ConsoleCommand {
 /// screen 4 s) come first.
 const CONSOLE_ATTACH_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// What a returning Deck's console attachment came to: attached, or the
-/// typed refusal the Deck is shown.
-pub(crate) type ConsoleAttachOutcome = Result<(), arcen_session::console_session::ConsoleNotice>;
+/// What a returning Deck's console attachment came to: attached, with what
+/// its desk shows (desk privacy as this Deck's choice and `privacy.desk`
+/// planned it, and what the launcher kept), or the typed refusal the Deck
+/// is shown.
+pub(crate) type ConsoleAttachOutcome = Result<
+    arcen_session::console_session::desk_privacy::DeskPrivacyStatus,
+    arcen_session::console_session::ConsoleNotice,
+>;
 
 struct ConsoleRequest {
     command: ConsoleCommand,
+    /// For `attach`: the returning Deck's desk privacy plan.
+    plan: Option<arcen_session::console_session::desk_privacy::DeskPrivacyPlan>,
     reply: Option<tokio::sync::oneshot::Sender<ConsoleAttachOutcome>>,
+}
+
+/// The line that carries `command` to the launcher: `attach` with the
+/// returning Deck's desk privacy (`attach_desk_flags` reads it).
+fn console_command_line(
+    command: ConsoleCommand,
+    plan: Option<arcen_session::console_session::desk_privacy::DeskPrivacyPlan>,
+) -> String {
+    let mut line = serde_json::json!({ "command": command.token() });
+    if let Some(plan) = plan {
+        line["desk_live"] = serde_json::Value::Bool(!plan.protects());
+        line["desk_required"] = serde_json::Value::Bool(plan.fails_closed());
+    }
+    format!("{line}\n")
 }
 
 struct ConsoleLink {
@@ -1844,11 +2110,13 @@ struct ConsoleLink {
 /// console refusal (naming the service when another one holds the
 /// workstation). Anything else, silence or a closed pipe is a session
 /// that could not be reached.
-fn console_attach_outcome(line: Option<&str>) -> ConsoleAttachOutcome {
+fn console_attach_outcome(line: Option<&str>, desk: &ConsoleDesk) -> ConsoleAttachOutcome {
     use arcen_session::console_session::{ConsoleNotice, ConsoleRefusal};
     let response = line.and_then(|line| serde_json::from_str::<LauncherResponse>(line).ok());
     match response {
-        Some(response) if response.status == "attached" => Ok(()),
+        Some(response) if response.status == CONSOLE_ATTACHED => {
+            Ok(desk.attached(response.desk_privacy.as_deref()))
+        }
         Some(response) => Err(ConsoleNotice::from_status(
             &response.status,
             response.console_service,
@@ -1860,41 +2128,113 @@ fn console_attach_outcome(line: Option<&str>) -> ConsoleAttachOutcome {
 
 /// Writes console commands to the launcher and reads its answer to each
 /// `attach`; when the broker lets go of the link it says `close`, which
-/// hands the console back and ends the launcher (never the session).
+/// hands the console back and ends the launcher (never the session). The
+/// launcher's own `desk_privacy` lines (a change while the Deck is
+/// attached) update `desk` whenever they come.
 async fn write_console_commands(
     mut stdin: ChildStdin,
-    mut stdout: Lines<BufReader<ChildStdout>>,
+    stdout: Lines<BufReader<ChildStdout>>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<ConsoleRequest>,
+    desk: ConsoleDesk,
 ) {
+    let (answer_tx, mut answers) = tokio::sync::mpsc::unbounded_channel();
+    let reader = tokio::spawn(read_console_lines(stdout, answer_tx, desk.clone()));
     // After an answer that never came, a late one must not be taken for
     // the next attachment's: every later attachment is refused.
     let mut answers_lost = false;
-    while let Some(ConsoleRequest { command, reply }) = commands.recv().await {
-        let line = format!("{{\"command\":\"{}\"}}\n", command.token());
+    while let Some(ConsoleRequest {
+        command,
+        plan,
+        reply,
+    }) = commands.recv().await
+    {
+        if let Some(plan) = plan {
+            desk.set_plan(plan);
+        }
+        let line = console_command_line(command, plan);
         if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
             if let Some(reply) = reply {
-                let _ = reply.send(console_attach_outcome(None));
+                let _ = reply.send(console_attach_outcome(None, &desk));
             }
+            reader.abort();
             return;
         }
         let Some(reply) = reply else {
             continue;
         };
         let outcome = if answers_lost {
-            console_attach_outcome(None)
+            console_attach_outcome(None, &desk)
         } else {
-            match tokio::time::timeout(CONSOLE_ATTACH_TIMEOUT, stdout.next_line()).await {
-                Ok(Ok(line)) => console_attach_outcome(line.as_deref()),
-                Ok(Err(_)) | Err(_) => {
+            match tokio::time::timeout(CONSOLE_ATTACH_TIMEOUT, answers.recv()).await {
+                Ok(Some(line)) => console_attach_outcome(Some(&line), &desk),
+                Ok(None) | Err(_) => {
                     answers_lost = true;
-                    console_attach_outcome(None)
+                    console_attach_outcome(None, &desk)
                 }
             }
         };
         let _ = reply.send(outcome);
     }
+    reader.abort();
     let _ = stdin.write_all(b"{\"command\":\"close\"}\n").await;
     let _ = stdin.shutdown().await;
+}
+
+/// Reads a console launcher's lines: its `desk_privacy` changes go to
+/// `desk` at once, every other line is an answer to the last command.
+async fn read_console_lines(
+    mut stdout: Lines<BufReader<ChildStdout>>,
+    answers: tokio::sync::mpsc::UnboundedSender<String>,
+    desk: ConsoleDesk,
+) {
+    while let Ok(Some(line)) = stdout.next_line().await {
+        match console_line(&line) {
+            ConsoleLine::DeskPrivacy(reported) => {
+                let status = desk.heard(reported.as_deref());
+                tracing::info!(
+                    target: target::SESSION,
+                    status = status.token(),
+                    "desk privacy: the joined console's desk changed"
+                );
+            }
+            ConsoleLine::DeskPrivacyLost(cause) => {
+                desk.lost(cause.as_deref());
+                tracing::error!(
+                    target: target::SESSION,
+                    cause = cause.as_deref().unwrap_or("unknown"),
+                    "desk privacy: the joined console's required desk is no longer private; the attachment ends"
+                );
+            }
+            ConsoleLine::Answer => {
+                if answers.send(line).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// One line from a console launcher while the session is joined.
+#[derive(Debug, PartialEq, Eq)]
+enum ConsoleLine {
+    /// The desk's privacy changed (its status token).
+    DeskPrivacy(Option<String>),
+    /// A required desk is no longer private (the cause's token).
+    DeskPrivacyLost(Option<String>),
+    /// The answer to the last command.
+    Answer,
+}
+
+fn console_line(line: &str) -> ConsoleLine {
+    match serde_json::from_str::<LauncherResponse>(line) {
+        Ok(response) if response.status == CONSOLE_DESK_PRIVACY => {
+            ConsoleLine::DeskPrivacy(response.desk_privacy)
+        }
+        Ok(response) if response.status == CONSOLE_DESK_PRIVACY_LOST => {
+            ConsoleLine::DeskPrivacyLost(response.desk_privacy)
+        }
+        _ => ConsoleLine::Answer,
+    }
 }
 
 impl SessionLauncher {
@@ -1919,6 +2259,23 @@ impl SessionLauncher {
     /// The outputs a console shown as it is captures, in plan order.
     pub(crate) fn console_shown_outputs(&self) -> Option<Vec<String>> {
         self.console_shown_outputs.clone()
+    }
+
+    /// What the joined console's desk shows now.
+    pub(crate) fn console_desk_privacy(
+        &self,
+    ) -> Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus> {
+        self.console_desk
+            .as_ref()
+            .and_then(|desk| desk.status.borrow().status)
+    }
+
+    /// Every change of the joined console's desk privacy, for the stream to
+    /// tell its Deck (`desk_privacy_update`); `None` for a created desktop.
+    pub(crate) fn console_desk_updates(&self) -> Option<ConsoleDeskUpdates> {
+        self.console_desk
+            .as_ref()
+            .map(|desk| desk.status.subscribe())
     }
 
     /// The committed plan as the joined console serves it: unchanged,
@@ -1995,13 +2352,19 @@ impl SessionLauncher {
     /// desktop the launcher created.
     pub(crate) fn console_attach(
         &self,
+        deck: arcen_session::console_session::desk_privacy::DeckDeskPrivacy,
     ) -> Option<tokio::sync::oneshot::Receiver<ConsoleAttachOutcome>> {
         let link = self.console.as_ref()?;
+        let plan = self.desk_privacy.plan(
+            arcen_session::console_session::desk_privacy::DeskExposure::PhysicalDesk,
+            deck,
+        );
         let (reply, answer) = tokio::sync::oneshot::channel();
         if link
             .commands
             .send(ConsoleRequest {
                 command: ConsoleCommand::Attach,
+                plan: Some(plan),
                 reply: Some(reply),
             })
             .is_err()
@@ -2022,6 +2385,7 @@ impl SessionLauncher {
                 .commands
                 .send(ConsoleRequest {
                     command,
+                    plan: None,
                     reply: None,
                 })
                 .is_err()
@@ -3082,7 +3446,7 @@ async fn run_console(
         );
         return Err(refuse(ConsoleRefusal::SessionChanged.into()));
     }
-    let mut privacy = console::ConsolePrivacy::default();
+    let mut privacy = console::ConsolePrivacy::for_attachment(open.desk_live, open.desk_required);
     let mut signed_in_through: Option<String> = None;
     // What `platform.session.default_desktop` did for a sign-in that
     // starts the account's session (ADR 0025); none for a joined session.
@@ -3461,6 +3825,9 @@ async fn run_console(
     ready.console_layout = console_layout.clone();
     ready.console_outputs = console_outputs;
     ready.console_shown = console_shown;
+    ready.desk_privacy = privacy
+        .desk_status()
+        .map(|status| status.token().to_owned());
     if let Err(error) = write_response(&ready) {
         agent.shutdown().await;
         secure_before_leaving(&mut privacy, Some(&session_display), &session_id).await;
@@ -3475,6 +3842,8 @@ async fn run_console(
         desk_private = !open.desk_live,
         "the console session is joined"
     );
+    // What the broker last heard of the desk's privacy (the ready answer).
+    let mut reported = privacy.desk_status();
 
     // Installed once: a stop that arrives while a command or a hand-back is
     // being handled is kept for the next wait, never lost.
@@ -3489,12 +3858,13 @@ async fn run_console(
     loop {
         tokio::select! {
             line = commands.next_line() => {
-                let command = match line {
-                    Ok(Some(line)) => serde_json::from_str::<serde_json::Value>(&line)
-                        .ok()
-                        .and_then(|value| value.get("command").and_then(|c| c.as_str()).map(str::to_owned)),
+                let request = match line {
+                    Ok(Some(line)) => serde_json::from_str::<serde_json::Value>(&line).ok(),
                     _ => None,
                 };
+                let command = request
+                    .as_ref()
+                    .and_then(|value| value.get("command").and_then(|c| c.as_str()).map(str::to_owned));
                 match command.as_deref() {
                     Some("detach") => {
                         attached = false;
@@ -3545,6 +3915,10 @@ async fn run_console(
                             break;
                         }
                         attached = true;
+                        // The returning Deck's own choice, as the broker
+                        // planned it from privacy.desk.
+                        let (desk_live, desk_required) = attach_desk_flags(request.as_ref());
+                        privacy.replan(desk_live, desk_required);
                         let mut desk = console::LiveDesk {
                             privacy: &mut privacy,
                             display: &session_display,
@@ -3575,10 +3949,11 @@ async fn run_console(
                                 break;
                             }
                             Ok(()) => {
-                                if open.desk_live {
+                                if desk_live {
                                     privacy.show_desk();
                                 }
-                                let _ = write_response(&LauncherResponse::error("attached"));
+                                reported = privacy.desk_status();
+                                let _ = write_response(&LauncherResponse::attached(reported));
                             }
                             Err(refusal) => {
                                 let notice = console::notice_for(
@@ -3603,11 +3978,17 @@ async fn run_console(
                 ticks = ticks.wrapping_add(1);
                 if privacy.is_armed() {
                     privacy.enforce();
+                    if attached && desk_privacy_lost(&privacy) {
+                        break;
+                    }
                     // A hand-back whose lock failed keeps the desk private
                     // and tries again.
                     if !attached && ticks.is_multiple_of(5) {
                         console::hand_back(&mut privacy, &session_id).await;
                     }
+                }
+                if attached {
+                    report_desk_privacy(&privacy, &mut reported);
                 }
                 if ticks & 1 == 0 {
                     match console::watch_joined(&mut watch, &session_id).await {
@@ -3715,10 +4096,15 @@ async fn run_wayland_join(
     };
     // Desk privacy is decided before anything of the session is brought
     // forward or unlocked: a session that shows on a monitor at the desk is
-    // never put on it for a join that would be refused.
+    // never put on it for a join that would be refused (required privacy);
+    // a best-effort desk is served with its screens reported visible.
+    let mut screens_shown = None;
     if !open.desk_live {
+        use arcen_session::console_session::desk_privacy::DeskPrivacyRefusal;
         let shown = super::console_wayland::desk_shows_session(target, identity.gid).await;
-        if let Err(refusal) = wayland_attach::desk_privacy(shown.unwrap_or(true), !open.desk_live) {
+        if let Err(refusal) =
+            wayland_attach::desk_privacy(shown.unwrap_or(true), open.desk_required)
+        {
             tracing::error!(
                 target: target::SESSION,
                 session_id = %session_id,
@@ -3727,6 +4113,11 @@ async fn run_wayland_join(
             );
             return Err(refuse(refusal.into()));
         }
+        screens_shown = match shown {
+            Some(false) => None,
+            Some(true) => Some(DeskPrivacyRefusal::DeskMonitorLit),
+            None => Some(DeskPrivacyRefusal::DeskMonitorUnknown),
+        };
     }
     // Journalled before anything of the session is touched: a Pier that
     // loses this launcher locks the session (`console::recover_console`).
@@ -3734,7 +4125,16 @@ async fn run_wayland_join(
         tracing::error!(target: target::SESSION, session_id = %session_id, %error, "the joined Wayland session could not be journalled; it is not touched");
         return Err(refuse(ConsoleRefusal::SessionUnreachable.into()));
     }
-    let mut privacy = console::ConsolePrivacy::default();
+    let mut privacy = console::ConsolePrivacy::for_attachment(open.desk_live, open.desk_required);
+    // A Wayland desk cannot be blanked from outside its compositor: a
+    // session shown at the desk is served with its screens reported
+    // visible.
+    if let Some(refusal) = screens_shown {
+        if let Err(refusal) = privacy.fell_short(refusal) {
+            console::forget_wayland_join();
+            return Err(refuse(refusal.into()));
+        }
+    }
     // Nobody at the desk may use the session while it is shown remotely.
     if let Err(refusal) = privacy.disable_input() {
         console::forget_wayland_join();
@@ -3812,10 +4212,16 @@ async fn run_wayland_join(
         |joined| wayland_attach::decide_serve(joined.proof()),
     );
     let private = joined.as_ref().map_or(Ok(()), |joined| {
-        wayland_attach::desk_privacy(joined.at_desk, !open.desk_live).inspect_err(|_| {
+        wayland_attach::desk_privacy(joined.at_desk, open.desk_required).inspect_err(|_| {
             tracing::error!(target: target::SESSION, session_id = %session_id, "the joined Wayland session shows on a monitor at the desk, and desk privacy is required: a Wayland desk cannot be blanked without changing the user's compositor, so the Deck is not served");
         })
     });
+    if joined.as_ref().is_some_and(|joined| joined.at_desk) && !open.desk_live {
+        // Best effort (required refused above): recorded, not refused.
+        let _ = privacy.fell_short(
+            arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskMonitorLit,
+        );
+    }
     if let Err(refusal) = served
         .map_err(|(refusal, gap)| {
             tracing::error!(target: target::SESSION, session_id = %session_id, gap = gap.token(), "the joined Wayland session's route is not proved; the Deck is not served");
@@ -3832,6 +4238,9 @@ async fn run_wayland_join(
     let mut ready = LauncherResponse::ready(identity, &environment, &agent.ready, None, None);
     ready.console_origin = Some(target.origin.token().to_owned());
     ready.console_desktop = Some(target.desktop.clone()).filter(|desktop| !desktop.is_empty());
+    ready.desk_privacy = privacy
+        .desk_status()
+        .map(|status| status.token().to_owned());
     if let Err(error) = write_response(&ready) {
         agent.shutdown().await;
         leave_unserved(&mut privacy, &session_id).await;
@@ -3848,6 +4257,7 @@ async fn run_wayland_join(
         desk_private = !open.desk_live,
         "the account's Wayland session is joined"
     );
+    let mut reported = privacy.desk_status();
     let mut stop = StopSignals::install()?;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3884,6 +4294,10 @@ async fn run_wayland_join(
             _ = tick.tick() => {
                 ticks = ticks.wrapping_add(1);
                 privacy.enforce();
+                if desk_privacy_lost(&privacy) {
+                    break;
+                }
+                report_desk_privacy(&privacy, &mut reported);
                 if ticks & 1 == 0 {
                     match console::watch_joined(&mut watch, &session_id).await {
                         model::session_watch::WatchStep::Hold => {}
@@ -6823,14 +7237,16 @@ mod tests {
         assert_eq!(received, notice);
         assert!(received.deck_reason().contains("labrdp-session"));
         // The broker's reading of a returning Deck's attachment.
+        use arcen_session::console_session::desk_privacy::{DeskPrivacyPlan, DeskPrivacyStatus};
+        let desk = ConsoleDesk::new(DeskPrivacyPlan::BestEffort, DeskPrivacyStatus::Blanked);
         assert_eq!(
-            console_attach_outcome(Some(r#"{"status":"attached"}"#)),
-            Ok(())
+            console_attach_outcome(Some(r#"{"status":"attached"}"#), &desk),
+            Ok(DeskPrivacyStatus::Blanked)
         );
-        assert_eq!(console_attach_outcome(Some(&line)), Err(notice));
+        assert_eq!(console_attach_outcome(Some(&line), &desk), Err(notice));
         for silent in [None, Some("garbage"), Some(r#"{"status":"agent_error"}"#)] {
             assert_eq!(
-                console_attach_outcome(silent),
+                console_attach_outcome(silent, &desk),
                 Err(ConsoleRefusal::SessionUnreachable.into()),
                 "{silent:?}"
             );
@@ -6845,6 +7261,156 @@ mod tests {
             open_response_error(&seat.status, seat.console_service),
             LauncherError::SeatOccupiedOtherProduct(Some(service)) if service.pam_service() == Some("labrdp-session")
         ));
+    }
+
+    #[test]
+    fn a_joined_console_s_desk_status_follows_the_plan_and_what_the_launcher_kept() {
+        use arcen_session::console_session::desk_privacy::{DeskPrivacyPlan, DeskPrivacyStatus};
+        assert_eq!(
+            console_desk_status(DeskPrivacyPlan::BestEffort, None),
+            DeskPrivacyStatus::Blanked
+        );
+        assert_eq!(
+            console_desk_status(DeskPrivacyPlan::BestEffort, Some("screens_visible")),
+            DeskPrivacyStatus::ScreensVisible
+        );
+        // A plan that protects nothing, or requires everything, says its own
+        // status whatever the launcher reported.
+        for (plan, status) in [
+            (DeskPrivacyPlan::DeckVisible, DeskPrivacyStatus::Visible),
+            (DeskPrivacyPlan::OperatorOff, DeskPrivacyStatus::Off),
+            (DeskPrivacyPlan::Required, DeskPrivacyStatus::Required),
+        ] {
+            assert_eq!(console_desk_status(plan, Some("visible")), status);
+        }
+        // The launcher's report and the open request cross the boundary.
+        let mut ready = LauncherResponse::error("ready");
+        ready.desk_privacy = Some("input_live".to_owned());
+        let ready: LauncherResponse =
+            serde_json::from_str(&serde_json::to_string(&ready).unwrap()).unwrap();
+        assert_eq!(ready.desk_privacy.as_deref(), Some("input_live"));
+        let mut request = OpenRequest::new(
+            None,
+            crate::deskside::LinuxDesksideConfig::default(),
+            None,
+            None,
+            &crate::session::agent::AgentAudioArguments::default(),
+            None,
+        );
+        request.desk_required = true;
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["desk_required"], true);
+        assert!(json.get("desk_live").is_none());
+    }
+
+    /// A returning Deck's own desk privacy choice reaches the launcher with
+    /// `attach`, and what the reattachment kept comes back to the broker,
+    /// which also hears every later change while the Deck is attached.
+    #[test]
+    fn a_returning_deck_s_choice_and_its_desk_s_status_cross_the_console_link() {
+        use arcen_session::console_session::desk_privacy::{
+            DeckDeskPrivacy, DeskExposure, DeskPrivacyPolicy, DeskPrivacyStatus,
+        };
+        let policy = DeskPrivacyPolicy::default();
+        let visible = policy.plan(DeskExposure::PhysicalDesk, DeckDeskPrivacy::Visible);
+        let private = policy.plan(DeskExposure::PhysicalDesk, DeckDeskPrivacy::Private);
+        let line = |plan| {
+            serde_json::from_str::<serde_json::Value>(&console_command_line(
+                ConsoleCommand::Attach,
+                Some(plan),
+            ))
+            .unwrap()
+        };
+        assert_eq!(attach_desk_flags(Some(&line(visible))), (true, false));
+        assert_eq!(attach_desk_flags(Some(&line(private))), (false, false));
+        let required = DeskPrivacyPolicy::resolve(Some(
+            arcen_session::console_session::desk_privacy::DeskPrivacySetting::Required,
+        ))
+        .plan(DeskExposure::PhysicalDesk, DeckDeskPrivacy::Visible);
+        assert_eq!(attach_desk_flags(Some(&line(required))), (false, true));
+        // An attach without flags keeps the desk private.
+        assert_eq!(attach_desk_flags(None), (false, false));
+        assert_eq!(
+            console_command_line(ConsoleCommand::Detach, None),
+            "{\"command\":\"detach\"}\n"
+        );
+
+        // The first Deck asked to see the desk; the returning one keeps it
+        // private, and its reattachment could not block the desk's input.
+        let desk = ConsoleDesk::new(visible, DeskPrivacyStatus::Visible);
+        let mut updates = desk.status.subscribe();
+        desk.set_plan(private);
+        let attached = serde_json::to_string(&LauncherResponse::attached(Some(
+            DeskPrivacyStatus::InputLive,
+        )))
+        .unwrap();
+        assert_eq!(
+            console_attach_outcome(Some(&attached), &desk),
+            Ok(DeskPrivacyStatus::InputLive)
+        );
+        assert!(updates.has_changed().unwrap());
+        assert_eq!(
+            updates.borrow_and_update().status,
+            Some(DeskPrivacyStatus::InputLive)
+        );
+        // A change the launcher reports on its own while the Deck is
+        // attached is not an answer, and reaches the stream.
+        let changed = serde_json::to_string(&LauncherResponse::desk_privacy_changed(Some(
+            DeskPrivacyStatus::Blanked,
+        )))
+        .unwrap();
+        assert_eq!(
+            console_line(&changed),
+            ConsoleLine::DeskPrivacy(Some("blanked".to_owned()))
+        );
+        assert_eq!(console_line(&attached), ConsoleLine::Answer);
+        assert_eq!(desk.heard(Some("blanked")), DeskPrivacyStatus::Blanked);
+        assert_eq!(
+            updates.borrow_and_update().status,
+            Some(DeskPrivacyStatus::Blanked)
+        );
+    }
+
+    #[test]
+    fn a_required_desk_lost_mid_session_reaches_the_stream_with_its_cause() {
+        use arcen_session::console_session::desk_privacy::{
+            DeckDeskPrivacy, DeskExposure, DeskPrivacyPolicy, DeskPrivacyRefusal,
+            DeskPrivacySetting, DeskPrivacyStatus,
+        };
+        let required = DeskPrivacyPolicy::resolve(Some(DeskPrivacySetting::Required))
+            .plan(DeskExposure::PhysicalDesk, DeckDeskPrivacy::Private);
+        let desk = ConsoleDesk::new(required, DeskPrivacyStatus::Required);
+        let mut updates = desk.status.subscribe();
+        let lost = serde_json::to_string(&LauncherResponse::desk_privacy_lost(
+            DeskPrivacyRefusal::InputBlockUnavailable,
+        ))
+        .unwrap();
+        // Not an answer to a command: the launcher says it on its own.
+        let ConsoleLine::DeskPrivacyLost(cause) = console_line(&lost) else {
+            panic!("{lost} is not a desk privacy loss");
+        };
+        desk.lost(cause.as_deref());
+        assert!(updates.has_changed().unwrap());
+        assert_eq!(
+            *updates.borrow_and_update(),
+            ConsoleDeskNow {
+                status: Some(DeskPrivacyStatus::Required),
+                lost: Some(DeskPrivacyRefusal::InputBlockUnavailable),
+            }
+        );
+        // An unknown cause is still a loss.
+        desk.lost(Some("dark_enough"));
+        assert!(updates.borrow_and_update().lost.is_some());
+        // A returning Deck's attachment starts with nothing lost.
+        let attached = serde_json::to_string(&LauncherResponse::attached(Some(
+            DeskPrivacyStatus::Required,
+        )))
+        .unwrap();
+        assert_eq!(
+            console_attach_outcome(Some(&attached), &desk),
+            Ok(DeskPrivacyStatus::Required)
+        );
+        assert_eq!(updates.borrow_and_update().lost, None);
     }
 
     #[test]

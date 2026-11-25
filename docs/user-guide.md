@@ -156,9 +156,9 @@ without sliding or fading.
 ### Settings
 
 Open **Settings** with the gear at the right of the orange bar. Its
-sections are on the left: **General** (Language, Streaming, Displays),
-**Input and devices** (Microphone, Input, Tablet) and **System** (Logs,
-Advanced). Each page is one centred column: a title, short groups with a
+sections are on the left: **General** (Language, Streaming, Displays,
+Privacy), **Input and devices** (Microphone, Input, Tablet) and **System**
+(Logs, Advanced). Each page is one centred column: a title, short groups with a
 plain heading, a list for each choice from a short list (see **Choosing
 from a list** above), a tick box for each switch with its explanation in
 small grey text under it, and buttons the same size and shape as on Home.
@@ -432,6 +432,35 @@ request. More detail: the [colour check guide](operations/colour-check.md).
 For the best match, use a reference preset on your Mac's display (System
 Settings › Displays › Preset) or a calibrated display, and turn off True
 Tone and automatic brightness.
+
+### Keep the host's desk private
+
+<!-- source: docs/adr/0025-arcen-joins-the-users-session.md §5; shared/session/src/console_session/desk_privacy.rs; shared/deck-core/src/screens/settings.rs (Settings › Privacy); shared/deck-core/src/session_truth.rs -->
+
+While you are connected, the host blanks its own monitors and blocks its
+keyboard and mouse, so nobody at the host sees or uses your session.
+
+- **On by default.** Turn it off in **Settings › Privacy › Keep the host's
+  desk private** when you want people at the host to see your work. It
+  applies from the next connection.
+- **The host's administrator decides last.** A host that requires desk
+  privacy blanks its desk whatever you choose; a host whose administrator
+  turned it off never does.
+- **The Deck says what the host did**, when the session starts and in
+  **Stream Statistics**, and again if it changes during the session:
+
+  | You see | What it means |
+  | --- | --- |
+  | Host screens are blanked for privacy | The host's monitors are blank and its keyboard and mouse blocked. |
+  | Host screens are blanked: this host requires desk privacy | The same; the host does it whatever you choose. |
+  | Host screens are visible: you turned desk privacy off. | Your setting is off. |
+  | Host screens are not blanked: desk privacy is turned off on this host | The host's administrator turned it off. |
+  | Host screens could not be blanked (a dummy plug or a monitor that cannot be darkened). People at the host may see this session. | The host kept its keyboard and mouse blocked and your session running, but a screen there may show it. |
+  | The host's keyboard and mouse could not be blocked. People at the host may use this session. | Its screens are blank, but its input is live. |
+  | Host screens could not be blanked and its keyboard and mouse could not be blocked. People at the host may see and use this session. | Neither could be done. |
+
+  A host that cannot keep its desk private keeps your session running and
+  tells you; only a host that requires desk privacy refuses instead.
 
 ### Exact still image
 
@@ -1186,7 +1215,7 @@ and says what to do. Then look for what you see below. Anything marked
 | **Couldn't reach ‹host›. Check that it's on and that Arcen is running there.** | Nothing answered the connection: the host is off, Arcen is not running there, or the network is in the way. | Run **Test connection**; check your network or VPN; otherwise ask your administrator. |
 | **Wrong username or password.** | Wrong account or password, or the account is locked out. | Check the account; wait out a lockout. Arcen never checks passwords itself. |
 | **Someone else is signed in at ‹host› (‹account›).** | Your password was right, but another account holds that computer's screen (`console_other_user`). | Sign in as that account, or switch to yours at the computer first. |
-| **‹host› couldn't keep its screen private, so it ended the session.** | The host could not blank its own screens, speakers and input for you (`console_privacy_unavailable`), so it would not stream. | Ask your administrator; **Details** has the host's reason. |
+| **‹host› couldn't keep its screen private, so it ended the session.** | The host requires desk privacy and could not blank its own screens, speakers or input for you (`console_privacy_unavailable`; a dummy plug or a monitor that cannot be darkened is the usual cause), so it would not stream. | Ask your administrator; **Details** has the host's reason. |
 | **Too many failed sign-ins. Wait a few minutes, then try again.** | The host refuses sign-ins from you for a while after several wrong passwords. | Wait a few minutes; check the password. |
 | **Couldn't start a session on ‹host›.** | Your password was right, but the desktop did not start. **Details** in the box gives the host's reason. | Ask your administrator; the host's log names the cause. |
 | "Another remote desktop is active on this host (one X11 desktop per host)" | Someone, possibly you elsewhere, has a desktop open on this Linux host. | They (or you) sign out there, or wait for it to time out. |

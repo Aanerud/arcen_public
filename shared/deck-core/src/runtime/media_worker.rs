@@ -67,10 +67,10 @@ use arcen_media::{PresentationWindow, TransferCharacteristics, classify_presenta
 use arcen_protocol::VideoHeader;
 use arcen_protocol::messages::{
     AUDIO_STREAM_RESULT, AuthRequest, CURSOR_MODE_RESULT, CURSOR_SHAPE, CursorModeResultMsg,
-    CursorShapeMsg, DISPLAY_UPDATE_RESULT, DisplayUpdateResultMsg, HEALTH_PONG, HEALTH_STATS,
-    HOST_KEYMAP, HealthPongMsg, HealthStatsMsg, HostKeymapMsg, SERVED_PIPELINE, ServedPipelineMsg,
-    ServerHelloMsg, TABLET_MODE_RESULT, TEXT_COMMIT_RESULT, TabletModeResultMsg,
-    TextCommitResultMsg, msg_type,
+    CursorShapeMsg, DESK_PRIVACY_UPDATE, DISPLAY_UPDATE_RESULT, DisplayUpdateResultMsg,
+    HEALTH_PONG, HEALTH_STATS, HOST_KEYMAP, HealthPongMsg, HealthStatsMsg, HostKeymapMsg,
+    SERVED_PIPELINE, ServedPipelineMsg, ServerHelloMsg, TABLET_MODE_RESULT, TEXT_COMMIT_RESULT,
+    TabletModeResultMsg, TextCommitResultMsg, msg_type,
 };
 use arcen_telemetry::{WireDelayEstimator, rounded_percentiles_ms};
 
@@ -424,6 +424,11 @@ pub struct SharedMediaState<M: MediaPlatform> {
     pub decoder_hardware_accelerated: Option<bool>,
     pub server_hello: Option<ServerHelloMsg>,
     pub served_pipeline: Option<ServedPipelineMsg>,
+    /// The desk's state from the host's latest `desk_privacy_update`, which
+    /// supersedes the hello's (`session_truth::desk_privacy_note_now`); a
+    /// token this build does not know is ignored.
+    pub desk_privacy_update:
+        Option<arcen_session::console_session::desk_privacy::DeskPrivacyStatus>,
     pub served_source_fps: Option<u32>,
     pub cursor_mode_result: Option<CursorModeResultMsg>,
     pub tablet_mode_result: Option<TabletModeResultMsg>,
@@ -643,6 +648,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             decoder_hardware_accelerated: Default::default(),
             server_hello: Default::default(),
             served_pipeline: Default::default(),
+            desk_privacy_update: Default::default(),
             served_source_fps: Default::default(),
             cursor_mode_result: Default::default(),
             tablet_mode_result: Default::default(),
@@ -1164,6 +1170,12 @@ pub fn spawn_media_worker<M, F>(
                                     serde_json::from_value::<ServedPipelineMsg>(value)
                                 {
                                     state.served_pipeline = Some(message);
+                                }
+                            }
+                            Some(DESK_PRIVACY_UPDATE) => {
+                                match crate::session_truth::desk_privacy_update(&value) {
+                                    Some(status) => state.desk_privacy_update = Some(status),
+                                    None => wake = false,
                                 }
                             }
                             _ => wake = false,

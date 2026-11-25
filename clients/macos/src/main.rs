@@ -1284,6 +1284,8 @@ fn connect_options_from_parts_with_monitors(
         tablet_mode_requested,
         telemetry: std::sync::Arc::new(arcen_deck::observability::ClientTelemetry::default()),
         exact_still_image: false,
+        // `--desk-visible`: ask the host to leave its desk live.
+        keep_desk_private: !args.iter().any(|arg| arg == "--desk-visible"),
         // The command-line smokes present nothing: no canvas executor.
         canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
     })
@@ -3191,6 +3193,11 @@ async fn media_smoke(
                     hello.supports_yuv444,
                     hello.supports_av1
                 );
+                println!(
+                    "desk-privacy hello={} note={:?}",
+                    hello.desk_privacy.as_deref().unwrap_or("absent"),
+                    arcen_deck_core::session_truth::desk_privacy_note(&hello)
+                );
                 match hello.build_identity() {
                     Ok(Some(identity)) => println!(
                         "host-build product={} version={} build_id={} revision={} profile={} features={} artifact_sha256={} signing={}",
@@ -3784,6 +3791,13 @@ async fn media_smoke(
                         input_probe_confirmed |= confirmed_now;
                     }
                     last_health = Some(value);
+                } else if msg_type(&value) == Some(arcen_protocol::messages::DESK_PRIVACY_UPDATE) {
+                    let status = arcen_deck_core::session_truth::desk_privacy_update(&value);
+                    println!(
+                        "desk-privacy-update status={} note={:?}",
+                        status.map_or("unknown", |status| status.token()),
+                        status.and_then(|status| status.deck_note())
+                    );
                 } else if msg_type(&value) == Some(arcen_protocol::messages::SERVED_PIPELINE) {
                     // The host's authoritative served identity once its real
                     // encoder is known; it supersedes the hello's value.

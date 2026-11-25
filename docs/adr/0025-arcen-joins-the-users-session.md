@@ -1,6 +1,6 @@
 # ADR 0025: Arcen joins the user's session
 
-**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`). Product-wide; the Linux Pier is its main
+**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`); amended 2026-11-24 (§5: desk privacy is the Deck user's choice, best effort unless the administrator sets `privacy.desk = "required"`). Product-wide; the Linux Pier is its main
 part. Builds on [ADR 0005](0005-direct-transport-resume-authority.md)
 (resume), [ADR 0008](0008-virtual-display-for-windows-hosts.md) and
 [ADR 0014](0014-quic-lanes-and-capture-contracts.md); changes the Linux
@@ -393,7 +393,9 @@ common configuration key `privacy.desk`):
   (`DeskPrivacyPolicy::startup_line`, a warning when off). A desktop no desk
   monitor shows (a headless Wayland desktop) has nothing to protect
   (`DeskExposure::NotShown`).
-- **Fail closed and visible.** A desk that cannot be made private refuses
+- **Fail closed and visible.** *(Since 2026-11-24 only with
+  `privacy.desk = "required"`; see the amendment at the end of this
+  section.)* A desk that cannot be made private refuses
   the attachment with the shared `console_privacy_unavailable` code (and the
   cause, `DeskPrivacyRefusal::deck_reason`), never streams it unprotected.
 - **The Deck is told.** The hello carries `desk_privacy` (`blanked`, `off`,
@@ -459,7 +461,8 @@ common configuration key `privacy.desk`):
   `await_display_restore`); if the service dies, the journal is replayed by
   the next session's acquire or by `console_recovery` at service start and
   on the next console change (`arcen-pier restore-display --console` as
-  LocalSystem on the console's input desktop). A desk is refused only where
+  LocalSystem on the console's input desktop). With `"required"` (since
+  2026-11-24; best effort otherwise) a desk is refused only where
   detaching fails (`desk_detach_failed`, rolled back) or a monitor at the
   desk would still show the session (`desk_monitor_lit`, `desk_monitor_unknown`:
   no virtual display and the NVIDIA head is a desk monitor, or another
@@ -469,6 +472,89 @@ common configuration key `privacy.desk`):
   agent's start and display lease, a few seconds) the desk's monitors show
   the session; on an agent crash the restored monitors show it unlocked
   until the broker's lock.
+
+*Amended 2026-11-24 (0.21.3): desk privacy is the Deck
+user's choice, kept as far as the host can, and fail-closed only where the
+administrator requires it.* A Windows Pier on a GeForce that needs DisplayPort
+dummy plugs (the standard way to run such a card headless) refused every
+connection: NVAPI reports the plug as a physically connected display, so the
+desk could never be proved dark (`desk_monitor_lit`), and a session that did
+start was ended when a re-proof failed. Dummy plugs must work, and a Pier that
+cannot darken a display must not disconnect people for it. This supersedes
+the two bullets above ("On unless turned off", "Fail closed and visible")
+where they differ:
+
+- **Three administrator values** (`DeskPrivacySetting`, resolved by
+  `DeskPrivacyPolicy::resolve` into a `DeskPrivacyMode`):
+  - `"on"` or absent (`FollowDeck`; every installer ships `"on"`): each
+    Deck's user chooses. The Deck sends its choice at authentication
+    (`AuthResponse.desk_privacy_request`: `private` or `visible`; absent, as
+    from an older Deck, or unknown is `private`). Private is the Deck's
+    default.
+  - `"required"` (`Required`): always private whatever the Deck asks, and
+    fail-closed exactly as before this amendment: a desk that cannot be made
+    private refuses the attachment, and a re-proof that fails ends it, with
+    `console_privacy_unavailable` and a reason that names the administrator's
+    requirement and the likely cause (a dummy plug or a monitor that cannot be
+    darkened). For sites whose security rules demand it.
+  - `"off"` (`Off`): never private, as before.
+  Any other value fails `validate-config`.
+- **The plan** (`DeskPrivacyPolicy::plan(exposure, deck)`): a desktop no desk
+  monitor shows is `NotShown`; otherwise `"off"` is `OperatorOff`,
+  `"required"` is `Required`, and `"on"` is `BestEffort` when the Deck asked
+  for privacy and `DeckVisible` when it did not.
+- **Best effort.** Under `BestEffort` the Pier applies every measure it can
+  (blocks the desk's input, darkens or detaches every display it can) and
+  records what it could not (`DeskPrivacyState::attach_failed`, split into
+  screens and input by `DeskPrivacyRefusal::part`). A shortfall is a warning,
+  never a refusal, a disconnect or a crash. Mid-session re-proofs (the
+  Windows `DeskWatch`, the macOS display watch) downgrade the same way
+  (`DeskPrivacyState::watched`): the session continues, the Pier logs one
+  warning per change, and a desk proved dark again is reported as recovered
+  (the Windows watch keeps proving after a failure, `DeskWatchOnRefusal::Keep`,
+  at most once per `DESK_FULL_PROOF_INTERVAL`). A console that another
+  account took over still ends the attachment: that is not a privacy failure
+  (§4).
+- **The Deck is told precisely.** The hello's `desk_privacy` gains
+  `required`, `visible` (the Deck's user turned it off), `screens_visible`
+  (the screens could not all be darkened), `input_live` (the desk's input
+  could not be blocked) and `not_private` (neither); a change during the
+  session is sent as `desk_privacy_update`. Older Decks ignore tokens and
+  messages they do not know.
+- **The session's own outputs are never taken away.** Every output the
+  served topology is captured from (the single served display, or each
+  Match My Layout monitor: on a GeForce with dummy plugs, each plug carries
+  a stream) is the session's own (`DeskOutputRole::Served`,
+  `desk_output_measure`): desk privacy never detaches, disables or powers it
+  down, and acts only on the other outputs (`desk_outputs_to_hide`; the
+  Windows Pier supplies the served device names and detaches nothing when
+  only they are lit). A monitor behind a served output is the known
+  shortfall (`desk_monitor_lit`: `screens_visible`, a refusal when
+  required). Linux and macOS darken a served output only through its gamma
+  ramp or transfer table, which capture reads before, so the stream is
+  untouched.
+- **Each Pier's adapter stays thin.** Windows keeps the hooks and the detach
+  when the proof fails; macOS runs without its event tap when the tap cannot
+  be installed or would drop the Deck's own virtual HID input, and keeps
+  darkening every display it can; a joined Linux X11 console keeps whatever
+  of its grab and gamma blank succeeded; a joined Wayland session shown on a
+  desk monitor is served with `screens_visible` (a Wayland desk still cannot
+  be blanked from outside its compositor). A joined Linux console re-asserts
+  its blank and grab every second; each part's outcome is recorded
+  (`DeskPrivacyState::watched_part`), the launcher reports a change on its
+  console link (`desk_privacy` line) and the stream tells the Deck
+  (`desk_privacy_update`). Under best effort a failure there keeps the
+  session; under `required` it ends the attachment as on Windows and macOS:
+  the launcher says `desk_privacy_lost` with the cause, hands the console
+  back locked, and the stream closes with the shared reason
+  (`DeskPrivacyRefusal::deck_reason`). A stream subscribes to these changes
+  before its hello is built, so a change between the two is never missed.
+  A grab that fails on one input device still grabs every other one. Each
+  returning Linux Deck (a resume, or a new sign-in to the held session)
+  sends its own choice with `attach`; the launcher re-plans the console
+  (`ConsolePrivacy::replan`), makes it private again if this Deck asks, and
+  answers with the status its hello carries. A resumed Windows attachment
+  keeps the choice its sign-in made.
 
 ### 6. Displays and layout
 

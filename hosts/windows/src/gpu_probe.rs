@@ -848,15 +848,69 @@ fn query_ccd_paths() -> Result<Vec<(String, CcdTarget)>, String> {
 pub fn physical_output_inventory(
     allowed_adapters: &[String],
 ) -> Result<arcen_outputs::windows_topology::PhysicalOutputInventory, String> {
-    use arcen_media::Rotation;
-    use arcen_outputs::windows_topology::{
-        AvailableOutput, OutputMode, OutputModeCapability, PhysicalOutputInventory,
-    };
+    read_physical_output_inventory(allowed_adapters).map_err(|error| error.to_string())
+}
 
-    let report = probe()?;
-    if let Some(error) = report.topology_error {
-        return Err(format!("CCD topology probe failed: {error}"));
+/// [`physical_output_inventory`], telling a topology this process could not
+/// read from one that was read and has no output to serve. Session 0 cannot
+/// read the topology while Windows shows its sign-in or lock screen
+/// (`QueryDisplayConfig` returns `ERROR_ACCESS_DENIED`); that says nothing
+/// about the outputs the user's session will have.
+pub fn read_physical_output_inventory(
+    allowed_adapters: &[String],
+) -> Result<
+    arcen_outputs::windows_topology::PhysicalOutputInventory,
+    crate::multi_monitor_gate::OutputInventoryError,
+> {
+    use crate::multi_monitor_gate::OutputInventoryError;
+
+    let report = probe().map_err(OutputInventoryError::Unreadable)?;
+    if let Some(error) = report.topology_error.as_deref() {
+        return Err(OutputInventoryError::Unreadable(format!(
+            "CCD topology probe failed: {error}"
+        )));
     }
+    let attached_anywhere = report
+        .adapters
+        .iter()
+        .flat_map(|adapter| &adapter.outputs)
+        .any(|output| output.attached_to_desktop);
+    let outputs =
+        inventory_outputs(report, allowed_adapters).map_err(OutputInventoryError::Unreadable)?;
+    if outputs.is_empty() {
+        let message = format!(
+            "no attached capture-capable outputs matched adapter filter {allowed_adapters:?}"
+        );
+        // The topology was read, but DXGI shows no attached output on any
+        // adapter while CCD lists active paths: this process cannot see the
+        // desktop, which is not the same as a host without outputs.
+        let active_paths = if attached_anywhere {
+            0
+        } else {
+            query_ccd_paths()
+                .map(|paths| paths.iter().filter(|(_, target)| target.active).count())
+                .unwrap_or(0)
+        };
+        return Err(if active_paths > 0 {
+            OutputInventoryError::Unreadable(format!(
+                "{message}: DXGI lists no attached output while the display topology has \
+                 {active_paths} active path(s)"
+            ))
+        } else {
+            OutputInventoryError::NoOutputs(message)
+        });
+    }
+    arcen_outputs::windows_topology::PhysicalOutputInventory::new(outputs)
+        .map_err(|error| OutputInventoryError::Unreadable(error.to_string()))
+}
+
+fn inventory_outputs(
+    report: HostCapabilityReport,
+    allowed_adapters: &[String],
+) -> Result<Vec<arcen_outputs::windows_topology::AvailableOutput>, String> {
+    use arcen_media::Rotation;
+    use arcen_outputs::windows_topology::{AvailableOutput, OutputMode, OutputModeCapability};
+
     // A custom timing comes with an EDID write, which NVIDIA permits only on
     // Quadro, RTX Pro and GRID GPUs: any other NVIDIA GPU (a GeForce) is
     // planned at the modes its outputs offer, as every other vendor's is.
@@ -962,13 +1016,8 @@ pub fn physical_output_inventory(
             });
         }
     }
-    if outputs.is_empty() {
-        return Err(format!(
-            "no attached capture-capable outputs matched adapter filter {allowed_adapters:?}"
-        ));
-    }
     outputs.sort_by_key(|output| (!output.primary, output.global_index));
-    PhysicalOutputInventory::new(outputs).map_err(|error| error.to_string())
+    Ok(outputs)
 }
 
 fn parse_session_luid(value: &str) -> Result<crate::nvapi::AdapterLuid, String> {

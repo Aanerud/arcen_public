@@ -871,6 +871,12 @@ pub fn parse_client_settings(
     {
         settings.exact_still_image = enabled;
     }
+    if let Some(enabled) = value
+        .get("keep_desk_private")
+        .and_then(serde_json::Value::as_bool)
+    {
+        settings.keep_desk_private = enabled;
+    }
     if let Some(enabled) = value.get("canvas").and_then(serde_json::Value::as_bool) {
         settings.canvas = enabled;
     }
@@ -1162,6 +1168,10 @@ pub fn write_client_settings_into(
     value.insert(
         "exact_still_image".to_string(),
         settings.exact_still_image.into(),
+    );
+    value.insert(
+        "keep_desk_private".to_string(),
+        settings.keep_desk_private.into(),
     );
     value.insert("canvas".to_string(), settings.canvas.into());
     value.insert(

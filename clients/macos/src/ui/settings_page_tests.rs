@@ -82,6 +82,7 @@ fn no_settings_text_runs_past_the_right_edge_of_a_narrow_window() {
             SettingsTab::Advanced,
             SettingsTab::Microphone,
             SettingsTab::Displays,
+            SettingsTab::Privacy,
         ] {
             let ctx = themed_context(platform);
             let settings = arcen_deck_core::settings::ClientSettings::default();

@@ -15,6 +15,7 @@
   },
   "hidpi_display_mask": 0,
   "hidpi_streaming": true,
+  "keep_desk_private": true,
   "keyboard_capture": "this_computer",
   "keyboard_grab": "never",
   "keyboard_switch": "Ctrl+Alt+Home",

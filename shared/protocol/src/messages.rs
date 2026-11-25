@@ -49,6 +49,9 @@ pub const HEALTH_PING: &str = "health_ping";
 pub const HEALTH_PONG: &str = "health_pong";
 pub const HEALTH_STATS: &str = "health_stats";
 pub const SERVED_PIPELINE: &str = "served_pipeline";
+/// Pier notice that the desk's privacy changed during the session. See
+/// [`DeskPrivacyUpdateMsg`].
+pub const DESK_PRIVACY_UPDATE: &str = "desk_privacy_update";
 pub const MOUSE_SCROLL: &str = "mouse_scroll";
 pub const GESTURE_MAGNIFY: &str = "gesture_magnify";
 pub const GESTURE_ROTATE: &str = "gesture_rotate";
@@ -1254,6 +1257,16 @@ pub struct AuthResponse {
     /// then follows the requested mode's refresh, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_refresh_v1: Option<DeckDisplayRefreshMsg>,
+    /// What the Deck's user asked for the host's desk while attached:
+    /// `private` (its monitors blanked and its input blocked, the Deck's
+    /// default) or `visible` (they turned desk privacy off). Sent at
+    /// authentication because a Pier makes the desk private before it
+    /// sends its hello. A free-form token: a Pier reads absent (an older
+    /// Deck) and anything it does not know as `private`
+    /// (`arcen_session::console_session::desk_privacy::DeckDeskPrivacy`),
+    /// and the administrator's `privacy.desk` decides whether it is asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desk_privacy_request: Option<String>,
 }
 
 /// The most displays [`DeckDisplayRefreshMsg::displays`] is read for; any
@@ -1344,6 +1357,7 @@ impl std::fmt::Debug for AuthResponse {
             .field("lossless_refine_v1", &self.lossless_refine_v1)
             .field("canvas_v1", &self.canvas_v1)
             .field("display_refresh_v1", &self.display_refresh_v1)
+            .field("desk_privacy_request", &self.desk_privacy_request)
             .finish()
     }
 }
@@ -1395,6 +1409,7 @@ impl AuthResponse {
             lossless_refine_v1: None,
             canvas_v1: None,
             display_refresh_v1: None,
+            desk_privacy_request: None,
         }
     }
 
@@ -1424,6 +1439,7 @@ impl AuthResponse {
             lossless_refine_v1: None,
             canvas_v1: None,
             display_refresh_v1: None,
+            desk_privacy_request: None,
         }
     }
 
@@ -1453,6 +1469,7 @@ impl AuthResponse {
             lossless_refine_v1: None,
             canvas_v1: None,
             display_refresh_v1: None,
+            desk_privacy_request: None,
         }
     }
 
@@ -1483,6 +1500,7 @@ impl AuthResponse {
             lossless_refine_v1: None,
             canvas_v1: None,
             display_refresh_v1: None,
+            desk_privacy_request: None,
         }
     }
 
@@ -2888,11 +2906,15 @@ pub struct ServerHelloMsg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canvas: Option<crate::canvas::CanvasStatusMsg>,
     /// What the desk at the host shows while this Deck is attached:
-    /// `blanked` (its monitors are blank and its input blocked), `off` (the
-    /// administrator turned desk privacy off; the desk shows the session) or
-    /// `not_shown` (no monitor at the desk shows this desktop). A free-form
-    /// token so a newer host's state never fails an older Deck's hello;
-    /// absent from hosts that predate it. `arcen_session::console_session::
+    /// `blanked` (its monitors are blank and its input blocked), `required`
+    /// (blanked because the administrator requires it), `off` (the
+    /// administrator turned desk privacy off), `visible` (the Deck's user
+    /// turned it off), `not_shown` (no monitor at the desk shows this
+    /// desktop), or what of a private desk could not be made private:
+    /// `screens_visible`, `input_live`, `not_private`. A change during the
+    /// session arrives as [`DeskPrivacyUpdateMsg`]. A free-form token so a
+    /// newer host's state never fails an older Deck's hello; absent from
+    /// hosts that predate it. `arcen_session::console_session::
     /// desk_privacy::DeskPrivacyStatus` reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desk_privacy: Option<String>,
@@ -5079,6 +5101,29 @@ impl TextRefusalReason {
 /// Most refused characters a [`TextCommitResultMsg`] echoes back.
 pub const MAX_REFUSED_TEXT_CHARS: usize = 64;
 
+/// Pier notice that what the desk at the host shows changed during the
+/// session (a screen that could no longer be proved dark, or one proved
+/// dark again): the same token as [`ServerHelloMsg::desk_privacy`], which
+/// it supersedes. Sent only when the state changes; a Deck that does not
+/// know the message or the token ignores it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeskPrivacyUpdateMsg {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// The desk's state now (`ServerHelloMsg::desk_privacy`'s tokens).
+    pub desk_privacy: String,
+}
+
+impl DeskPrivacyUpdateMsg {
+    #[must_use]
+    pub fn new(desk_privacy: impl Into<String>) -> Self {
+        Self {
+            msg_type: DESK_PRIVACY_UPDATE.to_owned(),
+            desk_privacy: desk_privacy.into(),
+        }
+    }
+}
+
 /// Host notice for one `text_commit` that was not fully typed, or typed
 /// without proof that the session's layout has every character. Sent only
 /// to a client that advertised `text_commit`, and only when there is
@@ -5394,6 +5439,31 @@ mod tests {
         let round_trip: AuthResponse =
             serde_json::from_value(serde_json::to_value(&stated).expect("json")).expect("parse");
         assert_eq!(round_trip.display_refresh_v1, stated.display_refresh_v1);
+    }
+
+    #[test]
+    fn the_deck_s_desk_privacy_request_is_optional_and_free_form() {
+        let legacy = AuthResponse::pam("artist", "password");
+        let json = serde_json::to_value(&legacy).expect("json");
+        assert!(json.get("desk_privacy_request").is_none());
+        let mut visible = AuthResponse::pam("artist", "password");
+        visible.desk_privacy_request = Some("visible".to_owned());
+        let round_trip: AuthResponse =
+            serde_json::from_value(serde_json::to_value(&visible).expect("json")).expect("parse");
+        assert_eq!(round_trip.desk_privacy_request.as_deref(), Some("visible"));
+        let mut future = serde_json::to_value(&legacy).expect("json");
+        future["desk_privacy_request"] = serde_json::json!("dimmed");
+        let parsed: AuthResponse = serde_json::from_value(future).expect("an unknown token parses");
+        assert_eq!(parsed.desk_privacy_request.as_deref(), Some("dimmed"));
+
+        let update = DeskPrivacyUpdateMsg::new("screens_visible");
+        let json = serde_json::to_value(&update).expect("json");
+        assert_eq!(json["type"], DESK_PRIVACY_UPDATE);
+        assert_eq!(json["desk_privacy"], "screens_visible");
+        assert_eq!(
+            crate::lanes::lane_for_message_type(DESK_PRIVACY_UPDATE),
+            crate::lanes::LaneRole::Control
+        );
     }
 
     #[test]

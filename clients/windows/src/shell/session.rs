@@ -76,6 +76,9 @@ pub(super) enum SessionNews {
     /// The desktop is up; `login_window` when it is the host's sign-in
     /// screen.
     Streaming { login_window: bool },
+    /// The host's desk changed during the session: the note to show, and
+    /// whether people at the host may see or use the session.
+    DeskPrivacy { note: &'static str, warning: bool },
     /// The session ended, with why.
     Ended(SessionEnd),
 }
@@ -199,6 +202,8 @@ pub(super) struct Connection {
     /// the pen settings), for every window's input.
     pen_buttons: arcen_input::pen_buttons::PenButtonMap,
     streaming: bool,
+    /// The host's last `desk_privacy_update` this window was told of.
+    desk_update_seen: Option<arcen_deck_core::session_truth::DeskPrivacyStatus>,
     /// When frames reached the glass in the last second, and how many.
     presented: std::collections::VecDeque<(std::time::Instant, u64)>,
     /// When frames were submitted in the last second, and how many: the
@@ -292,6 +297,7 @@ pub(super) fn connect_options(
         tablet_mode_requested: settings.tablet_mode_requested,
         telemetry: Arc::clone(telemetry),
         exact_still_image: settings.exact_still_image,
+        keep_desk_private: settings.keep_desk_private,
         // From the eight-bit presenter's canvas executor: nothing is
         // advertised until it has one (ADR 0028).
         canvas: arcen_deck_core::canvas::CanvasRequest::for_sink::<crate::media::WindowSink>(
@@ -374,6 +380,7 @@ impl Connection {
             host_facts: None,
             pen_buttons: arcen_input::pen_buttons::PenButtonMap::default(),
             streaming: false,
+            desk_update_seen: None,
             presented: std::collections::VecDeque::new(),
             submitted: std::collections::VecDeque::new(),
             last_frame_at: None,
@@ -473,6 +480,18 @@ impl Connection {
             return SessionNews::Streaming {
                 login_window: hello.login_window,
             };
+        }
+        if self.streaming
+            && state.desk_privacy_update.is_some()
+            && state.desk_privacy_update != self.desk_update_seen
+        {
+            self.desk_update_seen = state.desk_privacy_update;
+            if let Some((note, warning)) = state
+                .desk_privacy_update
+                .and_then(|status| status.deck_note().map(|note| (note, status.is_warning())))
+            {
+                return SessionNews::DeskPrivacy { note, warning };
+            }
         }
         SessionNews::Quiet
     }
@@ -1012,10 +1031,9 @@ impl Connection {
         let display_note = state.server_hello.as_ref().and_then(|hello| {
             arcen_deck_core::display_note::display_negotiation_note(&hello.device_capabilities)
         });
-        let desk_note = state
-            .server_hello
-            .as_ref()
-            .and_then(arcen_deck_core::session_truth::desk_privacy_note);
+        let desk_note = state.server_hello.as_ref().and_then(|hello| {
+            arcen_deck_core::session_truth::desk_privacy_note_now(hello, state.desk_privacy_update)
+        });
         drop(state);
         if let Some(text) = self.monitor_fps_text() {
             lines.push(format!("Displays fps: {text}"));
@@ -1054,10 +1072,9 @@ impl Connection {
             .shared()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        state
-            .server_hello
-            .as_ref()
-            .and_then(arcen_deck_core::session_truth::desk_privacy_note)
+        state.server_hello.as_ref().and_then(|hello| {
+            arcen_deck_core::session_truth::desk_privacy_note_now(hello, state.desk_privacy_update)
+        })
     }
 
     /// Minimised or occluded: no presents.

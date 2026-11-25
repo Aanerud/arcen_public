@@ -732,6 +732,26 @@ fn rejected_bind_message(
     }
 }
 
+/// Session 0 cannot read the outputs while Windows shows its sign-in or lock
+/// screen; the offer stands and the user's session reads them. Said once at
+/// info, then at debug: it recurs on every sign-in at that screen.
+fn log_outputs_read_after_sign_in(
+    error: &crate::multi_monitor_gate::OutputInventoryError,
+    nvidia_headless: bool,
+) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let message = if nvidia_headless {
+        "Windows multi-monitor offered without attached outputs before sign-in; NVIDIA headless provisioning creates them in the user's session"
+    } else {
+        "Windows multi-monitor offered although the outputs cannot be read before sign-in; the user's session reads them and serves what they can show"
+    };
+    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!(target: DISPLAY, %error, "{message}");
+    } else {
+        tracing::info!(target: DISPLAY, %error, "{message}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_broker(
     mut ws: crate::resume::DirectSessionSocket,
@@ -766,38 +786,36 @@ async fn run_broker(
     }
     if cfg.multi_monitor.advertise_enabled && !cfg.iddcx.enabled {
         let allowed = cfg.multi_monitor.allowed_adapters.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::gpu_probe::physical_output_inventory(&allowed)
+        let read = tokio::task::spawn_blocking(move || {
+            crate::gpu_probe::read_physical_output_inventory(&allowed)
         })
         .await
-        .map_err(|error| format!("join multi-monitor inventory probe: {error}"))?
-        {
-            Ok(inventory) => {
-                if inventory.is_empty() {
-                    multi_monitor_gate = crate::multi_monitor_gate::MultiMonitorGate::disabled();
-                    cfg.multi_monitor.advertise_enabled = false;
-                    tracing::warn!(
-                        target: DISPLAY,
-                        "Windows multi-monitor advertisement withheld: selected adapter has no attached or provisionable outputs; single-display sessions remain available"
-                    );
-                }
-            }
-            Err(error) if !cfg.multi_monitor.nvidia_headless_effective() => {
-                multi_monitor_gate = crate::multi_monitor_gate::MultiMonitorGate::disabled();
+        .map_err(|error| format!("join multi-monitor inventory probe: {error}"))?;
+        let (gate, verdict) = crate::multi_monitor_gate::gate_after_preauth_read(
+            multi_monitor_gate,
+            read.as_ref(),
+            cfg.multi_monitor.nvidia_headless_effective(),
+        );
+        multi_monitor_gate = gate;
+        match (verdict, read.as_ref().err()) {
+            (arcen_outputs::admission::PreauthOutputsVerdict::Withhold, error) => {
                 cfg.multi_monitor.advertise_enabled = false;
                 tracing::warn!(
                     target: DISPLAY,
-                    %error,
-                    "Windows multi-monitor advertisement withheld by output inventory; single-display sessions remain available"
+                    error = ?error.map(ToString::to_string),
+                    "Windows multi-monitor advertisement withheld: selected adapter has no attached or provisionable outputs; single-display sessions remain available"
                 );
             }
-            Err(error) => {
-                tracing::info!(
-                    target: DISPLAY,
-                    %error,
-                    "Windows multi-monitor startup has no attached physical inventory yet; NVIDIA headless provisioning remains available"
+            (
+                arcen_outputs::admission::PreauthOutputsVerdict::AdvertiseReadAfterSignIn,
+                Some(error),
+            ) => {
+                log_outputs_read_after_sign_in(
+                    error,
+                    cfg.multi_monitor.nvidia_headless_effective(),
                 );
             }
+            _ => {}
         }
     }
     let multi_monitor_offer = crate::multi_monitor_gate::build_offer(&multi_monitor_gate);
@@ -2795,6 +2813,12 @@ where
     // while its setting is on; the shared plan decides per capture.
     cfg.deck_refine = response.lossless_refine_v1.clone();
     cfg.deck_canvas = response.canvas_v1.clone();
+    // The Deck user's desk privacy choice (ADR 0025 §5, amended 2026-11-24);
+    // the administrator's `privacy.desk` decides whether it is asked.
+    let deck_desk_privacy =
+        arcen_session::console_session::desk_privacy::DeckDeskPrivacy::from_request(
+            response.desk_privacy_request.as_deref(),
+        );
     let authoritative_timezone = response.timezone.clone();
     let authoritative_cursor = response.cursor_preference;
     let authoritative_cursor_images = response.cursor_image_v1;
@@ -2931,63 +2955,77 @@ where
             let lease = or_report!(ws, lease);
             nvidia_headless_planning = Some(lease);
         }
-        let inventory = match if cfg.iddcx.enabled {
-            crate::iddcx::planning_inventory(&cfg.iddcx)
-        } else if cfg.multi_monitor.nvidia_headless_effective() {
-            wait_for_previous_physical_topology_settle(
-                cfg.multi_monitor.allowed_adapters.clone(),
-                requested_multi_monitor
-                    .requested_topology()
-                    .monitors()
-                    .len(),
-            )
-            .await
-        } else {
-            crate::gpu_probe::physical_output_inventory(&cfg.multi_monitor.allowed_adapters)
-        } {
-            Ok(inventory) => inventory,
-            Err(error) => {
-                let error = format!("probe multi-monitor outputs: {error}");
-                send_agent_failure(&mut ws, &error).await;
-                return Err(error);
-            }
-        };
-        match crate::multi_monitor_gate::admit_requested_topology(
-            &multi_monitor_gate,
-            Some(&inventory),
-            multi_monitor_offer.as_ref(),
-            served_multi_monitor.as_ref(),
-        ) {
-            crate::multi_monitor_gate::MultiMonitorOutcome::Planned { plan, carrier } => {
-                if cfg.iddcx.enabled {
-                    let adapter = or_report!(
-                        ws,
-                        plan.monitors
-                            .first()
-                            .map(|monitor| monitor.adapter_name.clone())
-                            .ok_or_else(|| "IddCx plan contains no monitors".to_string())
-                    );
-                    cfg.multi_monitor.allowed_adapters = vec![adapter];
+        if cfg.iddcx.enabled || cfg.multi_monitor.nvidia_headless_effective() {
+            // These providers create the outputs they plan on: a plan that
+            // fails there is a fault, not a host with fewer outputs.
+            let inventory = match if cfg.iddcx.enabled {
+                crate::iddcx::planning_inventory(&cfg.iddcx)
+            } else {
+                wait_for_previous_physical_topology_settle(
+                    cfg.multi_monitor.allowed_adapters.clone(),
+                    requested_multi_monitor
+                        .requested_topology()
+                        .monitors()
+                        .len(),
+                )
+                .await
+            } {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    let error = format!("probe multi-monitor outputs: {error}");
+                    send_agent_failure(&mut ws, &error).await;
+                    return Err(error);
                 }
-                tracing::info!(
+            };
+            match crate::multi_monitor_gate::admit_requested_topology(
+                &multi_monitor_gate,
+                Some(&inventory),
+                multi_monitor_offer.as_ref(),
+                served_multi_monitor.as_ref(),
+            ) {
+                crate::multi_monitor_gate::MultiMonitorOutcome::Planned { plan, carrier } => {
+                    if cfg.iddcx.enabled {
+                        let adapter = or_report!(
+                            ws,
+                            plan.monitors
+                                .first()
+                                .map(|monitor| monitor.adapter_name.clone())
+                                .ok_or_else(|| "IddCx plan contains no monitors".to_string())
+                        );
+                        cfg.multi_monitor.allowed_adapters = vec![adapter];
+                    }
+                    log_admitted_topology(&plan, carrier, cfg.iddcx.enabled);
+                    Some((plan, carrier))
+                }
+                crate::multi_monitor_gate::MultiMonitorOutcome::Degraded(reason) => {
+                    let error = format!("multi-monitor topology admission failed: {reason}");
+                    send_agent_failure(&mut ws, &error).await;
+                    return Err(error);
+                }
+                crate::multi_monitor_gate::MultiMonitorOutcome::NotRequested => None,
+            }
+        } else {
+            let inventory =
+                read_signed_in_outputs(cfg.multi_monitor.allowed_adapters.clone()).await;
+            if let Err(error) = &inventory {
+                tracing::warn!(
                     target: DISPLAY,
-                    monitors = plan.monitors.len(),
-                    desktop_x = plan.desktop_x,
-                    desktop_y = plan.desktop_y,
-                    desktop_width = plan.desktop_width,
-                    desktop_height = plan.desktop_height,
-                    %carrier,
-                    provider = if cfg.iddcx.enabled { "iddcx" } else { "physical" },
-                    "multi_monitor_v1 exact topology admitted"
+                    %error,
+                    "the signed-in session could not read its outputs for Match My Layout"
                 );
-                Some((plan, carrier))
             }
-            crate::multi_monitor_gate::MultiMonitorOutcome::Degraded(reason) => {
-                let error = format!("multi-monitor topology admission failed: {reason}");
-                send_agent_failure(&mut ws, &error).await;
-                return Err(error);
+            match serve_admitted_topology(crate::multi_monitor_gate::serve_on_attached_outputs(
+                &multi_monitor_gate,
+                inventory.as_ref().ok(),
+                multi_monitor_offer.as_ref(),
+                served_multi_monitor.as_ref(),
+            )) {
+                Ok(served) => served,
+                Err(error) => {
+                    send_agent_failure(&mut ws, &error).await;
+                    return Err(error);
+                }
             }
-            crate::multi_monitor_gate::MultiMonitorOutcome::NotRequested => None,
         }
     } else {
         None
@@ -3137,16 +3175,33 @@ where
             request.refresh_hz = refresh_hz;
         }
     }
-    // Desk privacy by default (ADR 0025 §5): on the console's own desk the
-    // session is served on a display no monitor at the desk shows, and every
-    // other monitor is detached from the desktop while the Deck is attached
-    // (Windows cannot darken one). Pinned deskside, when configured, does its
-    // own isolation.
-    let desk_dark_required = !cfg.deskside.enabled
-        && cfg
-            .desk_privacy
-            .plan(crate::deskside::desk_exposure(&windows_session))
-            == arcen_session::console_session::desk_privacy::DeskPrivacyPlan::Protect;
+    // Desk privacy (ADR 0025 §5, amended 2026-11-24): the Deck's choice
+    // unless the administrator requires it or turned it off. On the
+    // console's own desk the session is served on a display no monitor at
+    // the desk shows, and every other monitor is detached from the desktop
+    // while the Deck is attached (Windows cannot darken one). What cannot be
+    // done is a warning the Deck is told, unless privacy is required.
+    // Pinned deskside, when configured, does its own isolation.
+    let desk_plan = cfg.desk_privacy.plan(
+        crate::deskside::desk_exposure(&windows_session),
+        deck_desk_privacy,
+    );
+    crate::deskside::begin_desk_privacy((!cfg.deskside.enabled).then_some(desk_plan));
+    let desk_dark_required = !cfg.deskside.enabled && desk_plan.protects();
+    let desk_watch_on_refusal = if desk_plan.fails_closed() {
+        arcen_session::console_session::desk_privacy::DeskWatchOnRefusal::End
+    } else {
+        arcen_session::console_session::desk_privacy::DeskWatchOnRefusal::Keep
+    };
+    if !cfg.deskside.enabled {
+        tracing::info!(
+            target: SESSION,
+            sid = %session_log_id,
+            plan = ?desk_plan,
+            deck = deck_desk_privacy.token(),
+            "desk privacy plan for this session"
+        );
+    }
     if desk_dark_required && multi_monitor_committed.is_none() {
         let configured = cfg.output_selector.clone();
         if let Some(virtual_output) = tokio::task::spawn_blocking(move || {
@@ -3418,27 +3473,33 @@ where
         {
             Ok(Ok(hooks)) => Some(hooks),
             Ok(Err(error)) => {
-                tracing::error!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the desk's input could not be blocked");
+                tracing::warn!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the desk's input could not be blocked");
                 None
             }
             Err(error) => {
-                tracing::error!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the input hook task failed");
+                tracing::warn!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the input hook task failed");
                 None
             }
         };
-        let Some(hooks) = hooks else {
-            let error = DeskPrivacyRefusal::InputBlockUnavailable.deck_reason();
+        if let Some(hooks) = hooks {
+            // Proved live once the display lease holds (below), by the
+            // keyboard canary (`deskside::HookProof`).
+            tracing::info!(
+                target: SESSION,
+                sid = %session_log_id,
+                "desk privacy: the desk's keyboard and mouse are blocked while the Deck is attached"
+            );
+            deskside_hooks = Some(hooks);
+        } else if let Err(refusal) =
+            crate::deskside::desk_privacy_shortfall(DeskPrivacyRefusal::InputBlockUnavailable)
+        {
+            tracing::error!(target: SESSION, sid = %session_log_id, "desk privacy is required and the desk's input could not be blocked; refused");
+            let error = refusal.deck_reason();
             send_agent_failure(&mut ws, &error).await;
             return Err(error);
-        };
-        // Proved live once the display lease holds (below), by the keyboard
-        // canary (`deskside::HookProof`).
-        tracing::info!(
-            target: SESSION,
-            sid = %session_log_id,
-            "desk privacy: the desk's keyboard and mouse are blocked while the Deck is attached"
-        );
-        deskside_hooks = Some(hooks);
+        } else {
+            tracing::warn!(target: SESSION, sid = %session_log_id, "desk privacy: the session continues with the desk's keyboard and mouse live, and the Deck is told (privacy.desk = \"required\" refuses instead)");
+        }
     }
     // A console display Windows powered off for idle makes DWM compose a few
     // frames a second until something wakes it; capenc's keep-awake only holds
@@ -3608,11 +3669,23 @@ where
         }
     }
     if desk_dark_required {
-        // A multi-monitor session lights the Deck's displays only; the proof
-        // below refuses any desk monitor it left lit.
-        let detached = display
-            .single_mut()
-            .map_or(Ok(false), DisplayLease::detach_desk_monitors);
+        use arcen_session::console_session::desk_privacy::DeskPrivacyRefusal;
+        // Desk privacy never detaches an output the session is served from
+        // (shared `desk_outputs_to_hide`): with Match My Layout every Deck
+        // display's output is the session's own, and a single display keeps
+        // only its own. The proof below finds a monitor behind any of them.
+        let served = display.device_names();
+        let hide =
+            tokio::task::spawn_blocking(move || crate::deskside::desk_outputs_to_hide(&served))
+                .await
+                .ok()
+                .flatten();
+        let detached = match hide.as_deref() {
+            Some([]) => Ok(false),
+            _ => display
+                .single_mut()
+                .map_or(Ok(false), DisplayLease::detach_desk_monitors),
+        };
         match detached {
             Ok(true) => tracing::info!(
                 target: SESSION,
@@ -3621,20 +3694,26 @@ where
             ),
             Ok(false) => {}
             Err(error) => {
-                tracing::error!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the desk's monitors could not be detached");
-                let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
-                lock_then_release_desk(&mut deskside_hooks, &session_log_id);
-                let error = arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskDetachFailed
-                    .deck_reason();
-                send_agent_failure(&mut ws, &error).await;
-                return Err(error);
+                tracing::warn!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the desk's monitors could not be detached");
+                if let Err(refusal) =
+                    crate::deskside::desk_privacy_shortfall(DeskPrivacyRefusal::DeskDetachFailed)
+                {
+                    tracing::error!(target: SESSION, sid = %session_log_id, "desk privacy is required and the desk's monitors could not be detached; refused");
+                    let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
+                    lock_then_release_desk(&mut deskside_hooks, &session_log_id);
+                    let error = refusal.deck_reason();
+                    send_agent_failure(&mut ws, &error).await;
+                    return Err(error);
+                }
             }
         }
-        let proof = deskside_hooks
+        // The hooks installed above are proved live; without hooks the
+        // shortfall is already recorded.
+        if let Some(proof) = deskside_hooks
             .as_ref()
-            .map(crate::deskside::InputHookGuard::proof);
-        let live = match proof {
-            Some(proof) => tokio::task::spawn_blocking(move || {
+            .map(crate::deskside::InputHookGuard::proof)
+        {
+            let live = tokio::task::spawn_blocking(move || {
                 let mut outcome = proof.probe();
                 for _ in 1..3 {
                     if outcome.is_ok() {
@@ -3646,17 +3725,20 @@ where
                 outcome
             })
             .await
-            .unwrap_or_else(|error| Err(format!("hook proof task failed: {error}"))),
-            None => Err("no input hooks".to_string()),
-        };
-        if let Err(error) = live {
-            tracing::error!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the input hooks did not prove live");
-            let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
-            lock_then_release_desk(&mut deskside_hooks, &session_log_id);
-            let error = arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::InputBlockUnavailable
-                .deck_reason();
-            send_agent_failure(&mut ws, &error).await;
-            return Err(error);
+            .unwrap_or_else(|error| Err(format!("hook proof task failed: {error}")));
+            if let Err(error) = live {
+                tracing::warn!(target: SESSION, sid = %session_log_id, %error, "desk privacy: the input hooks did not prove live");
+                if let Err(refusal) = crate::deskside::desk_privacy_shortfall(
+                    DeskPrivacyRefusal::InputBlockUnavailable,
+                ) {
+                    tracing::error!(target: SESSION, sid = %session_log_id, "desk privacy is required and the desk's input could not be proved blocked; refused");
+                    let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
+                    lock_then_release_desk(&mut deskside_hooks, &session_log_id);
+                    let error = refusal.deck_reason();
+                    send_agent_failure(&mut ws, &error).await;
+                    return Err(error);
+                }
+            }
         }
         match tokio::task::spawn_blocking(crate::deskside::prove_desk_dark).await {
             Ok(Ok(proof)) => {
@@ -3665,24 +3747,33 @@ where
                     sid = %session_log_id,
                     "desk privacy: no monitor at the desk shows the desktop"
                 );
-                crate::deskside::hold_dark_desk(Some(proof));
+                crate::deskside::hold_dark_desk(Some(proof), desk_watch_on_refusal);
             }
             outcome => {
                 let refusal = match outcome {
                     Ok(Err(refusal)) => refusal,
-                    _ => arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::DeskMonitorUnknown,
+                    _ => DeskPrivacyRefusal::DeskMonitorUnknown,
                 };
-                tracing::error!(
+                if let Err(refusal) = crate::deskside::desk_privacy_shortfall(refusal) {
+                    tracing::error!(
+                        target: SESSION,
+                        sid = %session_log_id,
+                        reason = refusal.token(),
+                        "desk privacy: a monitor at the desk (or a dummy plug) would show the session and the administrator requires desk privacy; refused"
+                    );
+                    let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
+                    lock_then_release_desk(&mut deskside_hooks, &session_log_id);
+                    let error = refusal.deck_reason();
+                    send_agent_failure(&mut ws, &error).await;
+                    return Err(error);
+                }
+                tracing::warn!(
                     target: SESSION,
                     sid = %session_log_id,
                     reason = refusal.token(),
-                    "desk privacy: a monitor at the desk would show the session; refused (privacy.desk = \"off\" allows it)"
+                    input_blocked = deskside_hooks.is_some(),
+                    "desk privacy: a screen at the desk may show the session (a dummy plug, or a monitor that cannot be darkened); the session continues and the Deck is told (privacy.desk = \"required\" refuses instead)"
                 );
-                let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
-                lock_then_release_desk(&mut deskside_hooks, &session_log_id);
-                let error = refusal.deck_reason();
-                send_agent_failure(&mut ws, &error).await;
-                return Err(error);
             }
         }
     }
@@ -4045,7 +4136,11 @@ where
         };
         let _ = protection.apply(display_event);
     }
-    crate::deskside::hold_dark_desk(None);
+    crate::deskside::hold_dark_desk(
+        None,
+        arcen_session::console_session::desk_privacy::DeskWatchOnRefusal::End,
+    );
+    crate::deskside::begin_desk_privacy(None);
     let input_restore = if let Some(hooks) = deskside_hooks.as_mut() {
         hooks.shutdown()
     } else {
@@ -5021,6 +5116,97 @@ struct DisplayPlanDegradation {
     served_mode: &'static str,
     reason: &'static str,
     explanation: &'static str,
+}
+
+/// How long the signed-in session keeps reading outputs it cannot read yet:
+/// the sign-in screen may still be handing the console over.
+const SIGNED_IN_OUTPUT_READ_WINDOW: Duration = Duration::from_secs(3);
+
+async fn read_signed_in_outputs(
+    allowed_adapters: Vec<String>,
+) -> Result<arcen_outputs::windows_topology::PhysicalOutputInventory, String> {
+    let deadline = Instant::now() + SIGNED_IN_OUTPUT_READ_WINDOW;
+    loop {
+        let allowed = allowed_adapters.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            crate::gpu_probe::read_physical_output_inventory(&allowed)
+        })
+        .await
+        .map_err(|error| format!("join multi-monitor inventory probe: {error}"))?;
+        match read {
+            Err(crate::multi_monitor_gate::OutputInventoryError::Unreadable(_))
+                if Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            read => return read.map_err(|error| error.to_string()),
+        }
+    }
+}
+
+fn log_admitted_topology(
+    plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
+    carrier: MultiMonitorCarrierMsg,
+    iddcx: bool,
+) {
+    tracing::info!(
+        target: DISPLAY,
+        monitors = plan.monitors.len(),
+        desktop_x = plan.desktop_x,
+        desktop_y = plan.desktop_y,
+        desktop_width = plan.desktop_width,
+        desktop_height = plan.desktop_height,
+        %carrier,
+        provider = if iddcx { "iddcx" } else { "physical" },
+        "multi_monitor_v1 exact topology admitted"
+    );
+}
+
+/// The plan this session commits for Match My Layout on attached outputs,
+/// or `None` when no layout was requested. A layout this host cannot apply
+/// exactly is shown on the outputs it has (logged with the reason); one with
+/// no output to show it on is refused with the shared `multi_monitor_refused`
+/// code and the reason, which the Deck words and offers Primary Display Only
+/// for.
+fn serve_admitted_topology(
+    served: crate::multi_monitor_gate::ServedTopology,
+) -> Result<
+    Option<(
+        arcen_outputs::windows_topology::WindowsTopologyPlan,
+        MultiMonitorCarrierMsg,
+    )>,
+    String,
+> {
+    use crate::multi_monitor_gate::ServedTopology;
+    match served {
+        ServedTopology::NotRequested => Ok(None),
+        ServedTopology::Exact { plan, carrier } => {
+            log_admitted_topology(&plan, carrier, false);
+            Ok(Some((plan, carrier)))
+        }
+        ServedTopology::Shown {
+            plan,
+            carrier,
+            exact_refusal,
+        } => {
+            tracing::warn!(
+                target: DISPLAY,
+                monitors = plan.monitors.len(),
+                %exact_refusal,
+                %carrier,
+                "Match My Layout shown on this host's outputs at their own modes; the layout could not be applied exactly"
+            );
+            Ok(Some((plan, carrier)))
+        }
+        ServedTopology::Refused(reason) => {
+            tracing::warn!(
+                target: DISPLAY,
+                %reason,
+                "Match My Layout refused: this host has no output to show it on"
+            );
+            Err(SetupRefusal::multi_monitor(ServedTopology::deck_reason(&reason)).message())
+        }
+    }
 }
 
 fn session_display_plan(response: &AuthResponse) -> Result<SessionDisplayPlan, String> {
@@ -6037,18 +6223,14 @@ fn build_server_hello_with_aggregate(
         negotiated_transport: None, // set from the active socket before transmission
         lossless_refine: None,
         canvas: None,
-        // A desk that could not be made private refused the attachment
-        // before this hello (pinned deskside, or desk privacy's default).
+        // Pinned deskside refused any desk it could not make private before
+        // this hello; desk privacy's state says what was kept and what fell
+        // short (shared `DeskPrivacyState`).
         desk_privacy: Some(
-            if cfg.deskside.enabled {
-                arcen_session::console_session::desk_privacy::DeskPrivacyStatus::Blanked
-            } else {
-                cfg.desk_privacy
-                    .plan(crate::deskside::desk_exposure(windows_session))
-                    .status()
-            }
-            .token()
-            .to_owned(),
+            crate::deskside::desk_privacy_hello_status()
+                .unwrap_or(arcen_session::console_session::desk_privacy::DeskPrivacyStatus::Blanked)
+                .token()
+                .to_owned(),
         ),
         // This host takes wheel notches only, and always serves a signed-in
         // desktop: never a login window that sign-in replaces.
@@ -6457,6 +6639,35 @@ async fn send_served_pipeline_update(
     .map_err(|_| "timed out queueing served_pipeline".to_string())?
     .map_err(|_| "outbound writer closed before served_pipeline".to_string())?;
     writer_audio_barrier(control).await
+}
+
+/// Tells the Deck the desk's privacy when it changed since it was last
+/// told (`desk_privacy_update`), logging the change once: a best-effort
+/// desk that fell short, or was proved private again. A status the full
+/// writer queue did not take stays pending and is sent at the next try
+/// (the next alarm or health tick).
+fn tell_desk_privacy(control: &mpsc::Sender<WriterControl>) {
+    let Some(status) = crate::deskside::desk_privacy_pending() else {
+        return;
+    };
+    let Ok(text) = serde_json::to_string(&arcen_protocol::messages::DeskPrivacyUpdateMsg::new(
+        status.token(),
+    )) else {
+        return;
+    };
+    if control
+        .try_send(WriterControl::Message(Message::Text(text.into())))
+        .is_err()
+    {
+        tracing::debug!(target: SESSION, status = status.token(), "desk_privacy_update not queued; retried at the next tick");
+        return;
+    }
+    crate::deskside::desk_privacy_told(status);
+    if status.is_warning() {
+        tracing::warn!(target: SESSION, status = status.token(), "desk privacy: the desk is no longer fully private; the Deck is told");
+    } else {
+        tracing::info!(target: SESSION, status = status.token(), "desk privacy: the Deck is told the desk's state");
+    }
 }
 
 async fn writer_audio_result_barrier(
@@ -7644,12 +7855,22 @@ async fn verify_deskside_supervision(
     hook_proof: Option<&crate::deskside::HookProof>,
     capture_binding: Option<StateFingerprint>,
 ) -> Result<(), String> {
-    if let Some(proof) = hook_proof {
+    // A best-effort desk whose input already fell short is not probed again
+    // (each failed probe waits out the canary's deadline).
+    if let Some(proof) = hook_proof.filter(|_| !crate::deskside::desk_input_fell_short()) {
         let proof = proof.clone();
-        tokio::task::spawn_blocking(move || proof.probe())
+        let live = tokio::task::spawn_blocking(move || proof.probe())
             .await
-            .map_err(|error| format!("deskside hook liveness task failed: {error}"))?
-            .map_err(|error| format!("deskside hook liveness failed: {error}"))?;
+            .map_err(|error| format!("deskside hook liveness task failed: {error}"))?;
+        if let Err(error) = live {
+            // Pinned deskside and required desk privacy end the session; best
+            // effort records it and the Deck is told.
+            crate::deskside::desk_privacy_shortfall(
+                arcen_session::console_session::desk_privacy::DeskPrivacyRefusal::InputBlockUnavailable,
+            )
+            .map_err(|_| format!("deskside hook liveness failed: {error}"))?;
+            tracing::warn!(target: SESSION, %error, "desk privacy: the desk's input hooks stopped proving live; the session continues and the Deck is told");
+        }
     }
     if let Some(binding) = capture_binding {
         let config = cfg.deskside.clone();
@@ -9133,6 +9354,7 @@ where
                 if let Err(refusal) = crate::deskside::desk_watch_verdict() {
                     break Err(refusal.deck_reason());
                 }
+                tell_desk_privacy(&control_tx);
             }
             _ = health.tick() => {
                 if let Err(error) = verify_deskside_supervision(
@@ -9144,6 +9366,7 @@ where
                 {
                     break Err(error);
                 }
+                tell_desk_privacy(&control_tx);
                 if let Some(reassembler) = clipboard_reassembler.as_mut() {
                     let _ = reassembler.expire(std::time::Instant::now());
                 }
@@ -17661,6 +17884,46 @@ mod held_input_release_tests {
         };
         assert!(!releases_all_held_input(&deck));
         assert!(!releases_all_held_input(&KeyResetModifiersMsg::default()));
+    }
+}
+
+#[cfg(test)]
+mod desk_privacy_tests {
+    use super::*;
+    use arcen_session::console_session::desk_privacy::{
+        DeskPrivacyPlan, DeskPrivacyRefusal, DeskPrivacyStatus,
+    };
+
+    /// A desk that stops being private while the writer queue is full is
+    /// told once the queue has room, never dropped.
+    #[test]
+    fn a_desk_privacy_update_the_full_queue_refused_is_sent_at_the_next_try() {
+        crate::deskside::begin_desk_privacy(Some(DeskPrivacyPlan::BestEffort));
+        assert_eq!(
+            crate::deskside::desk_privacy_hello_status(),
+            Some(DeskPrivacyStatus::Blanked)
+        );
+        assert_eq!(
+            crate::deskside::desk_privacy_shortfall(DeskPrivacyRefusal::DeskMonitorLit),
+            Ok(())
+        );
+        let (control, mut writer) = mpsc::channel(1);
+        control
+            .try_send(WriterControl::Message(Message::Text("busy".into())))
+            .unwrap();
+        tell_desk_privacy(&control);
+        assert_eq!(
+            crate::deskside::desk_privacy_pending(),
+            Some(DeskPrivacyStatus::ScreensVisible)
+        );
+        drop(writer.try_recv().unwrap());
+        tell_desk_privacy(&control);
+        assert_eq!(crate::deskside::desk_privacy_pending(), None);
+        let Ok(WriterControl::Message(Message::Text(text))) = writer.try_recv() else {
+            panic!("the update was not queued");
+        };
+        assert!(text.as_str().contains("screens_visible"), "{text}");
+        crate::deskside::begin_desk_privacy(None);
     }
 }
 

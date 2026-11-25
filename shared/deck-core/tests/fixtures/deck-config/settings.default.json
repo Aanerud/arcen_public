@@ -12,6 +12,7 @@
   "fullscreen_uses_notch_area": false,
   "hidpi_display_mask": 0,
   "hidpi_streaming": false,
+  "keep_desk_private": true,
   "keyboard_capture": "host",
   "keyboard_switch": "Ctrl+Alt+Home",
   "log_level": 2,

@@ -354,10 +354,17 @@ the secure desktop (Ctrl+Alt+Del), kernel HID, pens and tablets, physical
 hot-plug, sleep and resume, or a driver reset.
 
 Desk privacy is on by default on every Pier (`privacy.desk`,
-[ADR 0025 §5](../adr/0025-arcen-joins-the-users-session.md)): an administrator must turn it off explicitly, every
-start logs the choice, and the Deck is told. A Windows Pier that cannot prove
-no desk monitor shows the session, or cannot block the desk's keyboard and
-mouse, refuses the attachment (`console_privacy_unavailable`). The Windows
+[ADR 0025 §5](../adr/0025-arcen-joins-the-users-session.md)): the Deck's
+user may turn it off for their own connections, an administrator may turn it
+off or require it, every start logs the choice, and the Deck is told. Since
+0.21.3 it is best effort unless required: a Pier that cannot prove no desk
+monitor shows the session (a dummy plug on a GeForce, for example), or
+cannot block the desk's keyboard and mouse, keeps every other measure,
+logs a warning and tells the Deck that people at the desk may see or use
+the session, also when a check fails during the session. Only with
+`privacy.desk = "required"` does it refuse the attachment, or end it
+(`console_privacy_unavailable`), as every Pier did before; sites whose
+rules require a private desk must set it. The Windows
 Pier detaches the desk's monitors from the desktop (SetDisplayConfig under
 the display lease's recovery journal) and serves the session on a virtual
 display; until the detach, a few seconds after a sign-in, the desk can see
@@ -377,7 +384,8 @@ Windows marker). A display counts as dark when its table reads back dark;
 the tables are re-asserted every 100 ms, so a display reconfiguration or
 wake that resets them shows the desk the session for up to 100 ms. A display
 that stays lit for two seconds, or a display list that cannot be read, ends
-the Deck's session, locked first. A console held by another account for
+the Deck's session, locked first, when desk privacy is required; otherwise
+the Deck is told and the session goes on. A console held by another account for
 three consecutive readings (one a second) gets the desk back and ends the
 Deck's session. A panic locks the session before the displays come back; a
 crash does not: the tap's port dies with the process and the window server
