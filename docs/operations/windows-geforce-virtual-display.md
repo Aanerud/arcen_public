@@ -7,9 +7,9 @@ below. Capture used Desktop Duplication and NVENC encoded AV1 at about 2–3 ms
 a frame. It is not yet tested on other GeForce models or driver versions.
 
 A GeForce card gives the Pier NVENC hardware encoding, but not everything a
-professional NVIDIA card does. In particular, NVIDIA lets software write a
-display's EDID only on Quadro, RTX Pro and GRID GPUs, which is how the Pier
-creates a display of exactly the Deck's size on those cards. On a GeForce
+professional NVIDIA card does. NVIDIA's API for writing a display's EDID
+does not support GeForce cards. On Quadro, RTX Pro and GRID GPUs the Pier uses
+it to create a display of exactly the Deck's size. On a GeForce
 with no monitor attached there is no display to capture, so a virtual display
 driver has to provide one.
 
@@ -82,9 +82,10 @@ for a monitor, a dummy plug or a virtual display driver.
 The Pier does not change the Windows display scale of that display: the desk
 keeps its own, and when it is not the Deck's Remote UI scale the Deck shows
 the scale Windows uses, so it can be set in Windows Display settings. An HDR
-session first sets the display's own mode nearest to the Deck's size, then
-turns HDR on for that display, and is served as HDR only when Windows shows
-HDR there. The Deck is told the refresh the display runs at.
+session first sets the display's mode as above, then turns HDR on for that
+display, and is served as HDR only when Windows shows HDR there. When Windows
+reports that the display has no HDR, the Pier serves Grading instead and
+tells the Deck why. The Deck is told the refresh the display runs at.
 
 Dummy plugs work. Desk privacy (`privacy.desk`, `on` by default) prefers a
 display no monitor at the desk shows, but Windows reports a dummy plug as a
@@ -97,6 +98,30 @@ private as well, install the virtual display driver above: the Pier serves
 the virtual display and detaches the plug while a Deck is attached. Only
 `"privacy": {"desk": "required"}`, for sites whose rules demand it, refuses
 such a PC (`console_privacy_unavailable: desk_monitor_lit`).
+
+### Choosing a dummy plug
+
+The plug's EDID tells Windows which modes to offer, and the GPU, driver,
+adapters and cable can narrow that list. On a GeForce the Pier serves only
+modes Windows offers, so check them for the layout you want:
+
+- **Resolution and refresh.** Check each size at the refresh you want: a plug
+  can list 2560x1440 at 30 Hz without listing it at 60 Hz. A display Windows
+  runs at 30 Hz streams at most 30 frames a second. When Windows cannot set
+  the Deck's size, the Pier tries the nearest sizes Windows offers and the
+  Deck says which one it serves.
+- **Several displays.** Match My Layout gives each Deck display its own stream,
+  up to four, one plug per display. With fewer plugs than Deck displays, the
+  Pier shows the layout on the plugs it has and the Deck names the displays it
+  left out.
+- **HDR.** Choose a plug whose EDID advertises HDR, and check that Windows
+  can switch HDR on for it (Settings › Display). The plug's claim alone does
+  not prove that HDR reaches the Deck. When Windows reports that the plug has
+  no HDR, an HDR request is served as Grading, and the Deck shows that it
+  asked for HDR and got Grading, and why. Grading is 10-bit SDR, not HDR, and
+  needs a GPU encoder that can encode it; without one the session is refused.
+- **Sign-in screen.** Match My Layout works from the Windows sign-in screen:
+  the Pier signs you in and then lays out your displays on the plugs.
 
 ### Applications that draw with OpenGL or CUDA on the display
 

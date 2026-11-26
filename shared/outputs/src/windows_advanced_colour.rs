@@ -17,6 +17,8 @@
 //! state; every admission and restoration decision is made here, without OS
 //! calls, so it is tested on every OS.
 
+use std::time::Duration;
+
 /// The composition mode Windows reports for a display target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositionMode {
@@ -159,6 +161,70 @@ pub struct TargetObservation {
     pub reading: ColourReading,
     /// Arcen changed this target's HDR toggle earlier in this setup.
     pub arcen_toggled: bool,
+    /// Arcen gave this target an HDR-capable display identity this session
+    /// ([`DisplayIdentity::may_gain_hdr`]). Windows may then take most of the
+    /// setup budget to publish HDR support, so an HDR session keeps waiting
+    /// for it. Without that, the target's own EDID decides and "no HDR
+    /// support" is final.
+    pub arcen_display_identity: bool,
+}
+
+/// Where a session display's identity (its EDID) came from this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayIdentity {
+    /// The display's own EDID: a monitor or a dummy plug Arcen did not write.
+    Own,
+    /// Arcen wrote an SDR EDID for an exact timing (the multi-display
+    /// NVIDIA exact path). It claims no HDR, so it is final like the
+    /// display's own.
+    ArcenSdrEdid,
+    /// Arcen wrote an HDR EDID (an NVIDIA headless output, or an exact timing
+    /// written for an HDR request).
+    ArcenHdrEdid,
+    /// Arcen created the display (`IddCx`).
+    ArcenCreated,
+}
+
+impl DisplayIdentity {
+    /// Whether Windows may still publish HDR support for the display during
+    /// setup, so an HDR session waits for it instead of serving Grading.
+    #[must_use]
+    pub const fn may_gain_hdr(self) -> bool {
+        matches!(self, Self::ArcenHdrEdid | Self::ArcenCreated)
+    }
+}
+
+/// How long an HDR session reads "no HDR support" on a target whose display
+/// identity Arcen did not write before treating it as final: long enough to
+/// ride out a report taken mid mode change, short of the setup budget.
+pub const HDR_SUPPORT_SETTLE: Duration = Duration::from_secs(2);
+
+/// The required targets (indices) an HDR session cannot be served on: an
+/// HDR session that has waited [`HDR_SUPPORT_SETTLE`] and reads targets
+/// whose own display (not an EDID Arcen wrote) offers no HDR. Empty when
+/// the session is SDR, still settling, or every target can still become HDR.
+///
+/// A dummy plug or an SDR monitor never offers HDR, so waiting the whole
+/// setup budget for it and refusing the session (`hdr_not_activated`) helps
+/// no one: the caller serves Grading instead, with the reason.
+#[must_use]
+pub fn hdr_unsupported_targets(
+    desired_hdr: bool,
+    observations: &[Option<TargetObservation>],
+    waited: Duration,
+) -> Vec<usize> {
+    if !desired_hdr || waited < HDR_SUPPORT_SETTLE {
+        return Vec::new();
+    }
+    observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, seen)| {
+            seen.as_ref()
+                .filter(|seen| !seen.reading.hdr_supported && !seen.arcen_display_identity)
+                .map(|_| index)
+        })
+        .collect()
 }
 
 /// The outcome of one setup poll over every required target.
@@ -235,6 +301,27 @@ pub fn restore_toggle(reading: ColourReading, original_hdr_enabled: bool) -> Opt
 mod tests {
     use super::*;
 
+    // The lab regression: a Match My Layout display on the multi-display
+    // NVIDIA exact path got an SDR EDID from Arcen, was counted as an Arcen
+    // identity, and an HDR session waited the whole budget and was refused
+    // (`hdr_not_activated`) instead of serving Grading.
+    #[test]
+    fn only_an_hdr_identity_arcen_gave_keeps_an_hdr_session_waiting() {
+        assert!(!DisplayIdentity::Own.may_gain_hdr());
+        assert!(!DisplayIdentity::ArcenSdrEdid.may_gain_hdr());
+        assert!(DisplayIdentity::ArcenHdrEdid.may_gain_hdr());
+        assert!(DisplayIdentity::ArcenCreated.may_gain_hdr());
+        let sdr_edid = TargetObservation {
+            reading: reading(false, false, false, false, CompositionMode::Sdr),
+            arcen_toggled: false,
+            arcen_display_identity: DisplayIdentity::ArcenSdrEdid.may_gain_hdr(),
+        };
+        assert_eq!(
+            hdr_unsupported_targets(true, &[Some(sdr_edid)], HDR_SUPPORT_SETTLE),
+            vec![0]
+        );
+    }
+
     // The Windows Pier's budget is 25 s polled every 250 ms.
     const BUDGET_POLLS: usize = 100;
 
@@ -279,6 +366,7 @@ mod tests {
         Some(TargetObservation {
             reading,
             arcen_toggled,
+            arcen_display_identity: false,
         })
     }
 
@@ -542,5 +630,44 @@ mod tests {
         assert_eq!(CompositionMode::from_raw(1), CompositionMode::Wcg);
         assert_eq!(CompositionMode::from_raw(2), CompositionMode::Hdr);
         assert_eq!(CompositionMode::from_raw(7), CompositionMode::Unknown);
+    }
+
+    fn no_hdr_display() -> ColourReading {
+        reading(false, false, false, false, CompositionMode::Sdr)
+    }
+
+    /// A dummy plug offers no HDR: once settled, an HDR session stops
+    /// waiting for it, instead of spending the setup budget and refusing.
+    #[test]
+    fn a_display_without_hdr_support_is_final_once_settled() {
+        let observations = [seen(sdr_display(), false), seen(no_hdr_display(), false)];
+        assert_eq!(
+            hdr_unsupported_targets(true, &observations, HDR_SUPPORT_SETTLE),
+            vec![1]
+        );
+        assert!(
+            hdr_unsupported_targets(true, &observations, Duration::from_millis(500)).is_empty(),
+            "a report read mid mode change is not final"
+        );
+        assert!(
+            hdr_unsupported_targets(false, &observations, HDR_SUPPORT_SETTLE).is_empty(),
+            "an SDR session never asks"
+        );
+    }
+
+    /// A target whose EDID Arcen wrote may still publish HDR support: the
+    /// session keeps waiting for it, as before.
+    #[test]
+    fn a_display_whose_edid_arcen_wrote_keeps_waiting_for_hdr_support() {
+        let written = Some(TargetObservation {
+            reading: no_hdr_display(),
+            arcen_toggled: false,
+            arcen_display_identity: true,
+        });
+        assert!(hdr_unsupported_targets(true, &[written], Duration::from_secs(20)).is_empty());
+        assert_eq!(
+            setup_poll(true, Ok(&[written])),
+            SetupPoll::Pending { toggles: vec![] }
+        );
     }
 }

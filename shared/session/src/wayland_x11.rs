@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn the_xwayland_command_line_names_display_and_authority() {
-        let mutter49 = b"/usr/bin/Xwayland\0:0\0-rootless\0-noreset\0-accessx\0-core\0-auth\0/run/user/1003/arcen-wayland-5/.mutter-Xwaylandauth.F8GGX3\0-listenfd\04\0-listenfd\05\0-displayfd\06\0-initfd\07\0-byteswappedclients\0-enable-ei-portal\0";
+        let mutter49 = b"/usr/bin/Xwayland\0:0\0-rootless\0-noreset\0-accessx\0-core\0-auth\0/run/user/1003/arcen-wayland-5/.mutter-Xwaylandauth.F8GGX3\0-listenfd\x004\0-listenfd\x005\0-displayfd\x006\0-initfd\x007\0-byteswappedclients\0-enable-ei-portal\0";
         assert_eq!(
             parse_xwayland_cmdline(mutter49),
             Some(XwaylandArgs {
@@ -899,7 +899,7 @@ mod tests {
                 auth: PathBuf::from("/run/user/1003/arcen-wayland-5/.mutter-Xwaylandauth.F8GGX3"),
             })
         );
-        let mutter40 = b"/usr/bin/Xwayland\0:2\0-rootless\0-noreset\0-accessx\0-core\0-auth\0/run/user/1000/.mutter-Xwaylandauth.ABC123\0-listen\04\0-listen\05\0-displayfd\06\0-listen\07\0";
+        let mutter40 = b"/usr/bin/Xwayland\0:2\0-rootless\0-noreset\0-accessx\0-core\0-auth\0/run/user/1000/.mutter-Xwaylandauth.ABC123\0-listen\x004\0-listen\x005\0-displayfd\x006\0-listen\x007\0";
         assert_eq!(
             parse_xwayland_cmdline(mutter40).map(|args| args.display),
             Some(2)

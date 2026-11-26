@@ -20,7 +20,9 @@
 //! Where a window places either presenter's picture, and where its pointer
 //! lands on it, is one shared value: [`fit::PictureRect`].
 
+pub mod confirmation;
 pub mod fit;
+pub mod rate;
 
 use std::num::NonZeroU32;
 use std::time::Instant;

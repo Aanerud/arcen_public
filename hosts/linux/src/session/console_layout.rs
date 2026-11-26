@@ -16,15 +16,30 @@
 //! journal also holds the session's windows before the layout and once it
 //! settled, and the restore moves back the windows the layout moved
 //! (`console_windows`, GAP-046).
+//!
+//! Another product's desktop laid out to the Deck (shared
+//! `console_session::guest_layout`, ADR 0025 §8) is journalled the same
+//! way, and once the layout is proved and settled its journal says the
+//! Deck's layout stays (`LayoutDeparture::LeaveDecks`; until then it says
+//! the console's own comes back): the hand-back and the recovery keep the
+//! layout and move the journal to `/run/arcen/console-layout-before-deck.json`
+//! as the record of what the desktop showed before. A layout that fails or
+//! cannot be proved is still put back. Such a desktop is never scaled
+//! (shared `HeadScaling::NativeOnly`): a size an output does not list is
+//! added as a mode of that size (`RRCreateMode`, `RRAddOutputMode`, kept on
+//! the X server as the product keeps its own), every head states an
+//! identity transform, and the proof reads each CRTC's transform back.
 
 use std::path::Path;
 
 use arcen_media::Rotation;
 use arcen_outputs::console_layout::{
-    console_monitor_capacity, match_shown_layout, plan_console_layout, takes_a_monitor,
-    ConsoleHeadRequest, ConsoleLayoutPlan, ConsoleOutput, OutputMode, ShownLayoutMatch,
-    ShownOutput,
+    console_monitor_capacity, match_shown_layout, missing_native_modes, plan_console_layout,
+    plan_native_console_layout, shown_size, takes_a_monitor, ConsoleHeadRequest,
+    ConsoleLayoutError, ConsoleLayoutPlan, ConsoleOutput, HeadScaling, ModeTiming, NativeModeNeed,
+    OutputMode, ShownLayoutMatch, ShownOutput,
 };
+use arcen_session::console_session::guest_layout::LayoutDeparture;
 use serde::{Deserialize, Serialize};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::randr::{self, ConnectionExt as _};
@@ -36,6 +51,10 @@ use crate::display::nv_control;
 use crate::logging::target;
 
 const LAYOUT_JOURNAL: &str = "/run/arcen/console-layout.json";
+/// What another product's desktop showed before the Deck's layout, which
+/// stayed when the Deck left: a record for the administrator, never
+/// restored.
+const LEFT_LAYOUT_RECORD: &str = "/run/arcen/console-layout-before-deck.json";
 
 /// The installer's forced virtual outputs (a headless console): their
 /// presence means the console's connected heads are Arcen's, so unused
@@ -65,6 +84,10 @@ struct LayoutJournal {
     /// Its windows once the Deck's layout had settled; `None` until then.
     #[serde(default)]
     windows_after: Option<Vec<super::console_windows::SavedWindow>>,
+    /// What happens to the layout when the Deck leaves; absent (an older
+    /// journal) restores the console's own.
+    #[serde(default)]
+    departure: LayoutDeparture,
 }
 
 impl LayoutJournal {
@@ -106,6 +129,11 @@ impl LayoutFailure {
 pub(crate) struct AppliedLayout {
     journal: LayoutJournal,
     plan: ConsoleLayoutPlan,
+    /// What the layout's departure is once it is proved and settled
+    /// ([`Self::note_proven`]); until then the journal restores the
+    /// console's own, so a layout that fails, or a launcher that dies
+    /// before it is proved, leaves the Pier's recovery to put it back.
+    departure: LayoutDeparture,
 }
 
 impl AppliedLayout {
@@ -115,8 +143,44 @@ impl AppliedLayout {
     }
 
     /// Restores the journalled layout; `false` leaves the journal for the
+    /// Pier's recovery. Puts the console back whatever its departure says:
+    /// for a layout that failed or could not be proved.
+    pub(crate) async fn restore(mut self) -> bool {
+        // A restore that fails keeps the journal for the Pier's recovery,
+        // which must then put it back too, not leave it.
+        if prove_departure(&mut self.journal, LayoutDeparture::RestoreOwn) {
+            if let Err(error) = self.journal.write() {
+                tracing::warn!(target: target::SESSION, %error, "the console layout journal could not be marked for restore");
+            }
+        }
+        restore_journal(&self.journal).await
+    }
+
+    /// The layout is proved and settled: from now on the journal says what
+    /// happens when the Deck leaves (another product's desktop keeps the
+    /// Deck's layout).
+    pub(crate) fn note_proven(&mut self) {
+        if prove_departure(&mut self.journal, self.departure) {
+            if let Err(error) = self.journal.write() {
+                tracing::warn!(target: target::SESSION, %error, "the console layout journal could not record its departure; the Pier's recovery would put the console's own layout back");
+            }
+        }
+    }
+
+    /// Whether the Deck's layout stays when the Deck leaves.
+    pub(crate) fn leaves_decks(&self) -> bool {
+        self.journal.departure == LayoutDeparture::LeaveDecks
+    }
+
+    /// The Deck leaves: the console's own layout is restored, or, for a
+    /// desktop whose journal keeps the Deck's layout, the layout stays and
+    /// the journal becomes the record. `false` leaves the journal for the
     /// Pier's recovery.
-    pub(crate) async fn restore(self) -> bool {
+    pub(crate) async fn depart(self) -> bool {
+        if self.leaves_decks() {
+            leave_journal(&self.journal);
+            return true;
+        }
         restore_journal(&self.journal).await
     }
 
@@ -236,10 +300,20 @@ fn read_shown(
         } else {
             Rotation::Degrees0
         };
+        let (width, height) = shown_size((u32::from(crtc.width), u32::from(crtc.height)), rotation);
+        if (width, height) != (u32::from(mode.width), u32::from(mode.height)) {
+            tracing::warn!(
+                target: target::SESSION,
+                output = %fact.name,
+                mode = %format!("{}x{}", mode.width, mode.height),
+                shows = %format!("{width}x{height}"),
+                "an output of this desktop is scaled (a RandR transform): it is captured as the area it shows, not its mode"
+            );
+        }
         shown.push(ShownOutput {
             name: fact.name.clone(),
-            width: u32::from(mode.width),
-            height: u32::from(mode.height),
+            width,
+            height,
             x: i32::from(crtc.x),
             y: i32::from(crtc.y),
             rotation,
@@ -786,6 +860,22 @@ struct OutputFacts {
     crtc: randr::Crtc,
 }
 
+/// Each mode's name, in the order of `resources.modes` (the names are
+/// packed one after another, each `name_len` bytes).
+fn mode_names(resources: &randr::GetScreenResourcesCurrentReply) -> Vec<String> {
+    let mut names = resources.names.as_slice();
+    resources
+        .modes
+        .iter()
+        .map(|mode| {
+            let length = usize::from(mode.name_len).min(names.len());
+            let (name, rest) = names.split_at(length);
+            names = rest;
+            String::from_utf8_lossy(name).into_owned()
+        })
+        .collect()
+}
+
 /// The console's outputs in RandR order, with their modes.
 fn read_outputs(
     connection: &RustConnection,
@@ -796,6 +886,7 @@ fn read_outputs(
         .map_err(|error| format!("request RandR resources: {error}"))?
         .reply()
         .map_err(|error| format!("RandR resources: {error}"))?;
+    let names = mode_names(&resources);
     let mut outputs = Vec::new();
     let mut facts = Vec::new();
     for output in &resources.outputs {
@@ -805,21 +896,30 @@ fn read_outputs(
             .reply()
             .map_err(|error| format!("RandR output: {error}"))?;
         let name = String::from_utf8_lossy(&info.name).into_owned();
-        let modes: Vec<OutputMode> = info
+        let (modes, mode_names): (Vec<OutputMode>, Vec<String>) = info
             .modes
             .iter()
-            .filter_map(|id| resources.modes.iter().find(|mode| mode.id == *id))
-            .map(|mode| OutputMode {
-                width: u32::from(mode.width),
-                height: u32::from(mode.height),
-                refresh_mhz: refresh_mhz(mode),
+            .filter_map(|id| {
+                let index = resources.modes.iter().position(|mode| mode.id == *id)?;
+                Some((&resources.modes[index], names[index].clone()))
             })
-            .collect();
+            .map(|(mode, name)| {
+                (
+                    OutputMode {
+                        width: u32::from(mode.width),
+                        height: u32::from(mode.height),
+                        refresh_mhz: refresh_mhz(mode),
+                    },
+                    name,
+                )
+            })
+            .unzip();
         let preferred = (info.num_preferred > 0 && !modes.is_empty()).then_some(0);
         outputs.push(ConsoleOutput {
             name: name.clone(),
             connected: info.connection == randr::Connection::CONNECTED,
             modes,
+            mode_names,
             preferred,
         });
         facts.push(OutputFacts {
@@ -962,6 +1062,20 @@ fn verify(
                 | randr::Rotation::ROTATE90
                 | randr::Rotation::ROTATE180
                 | randr::Rotation::ROTATE270);
+        if plan.scaling == HeadScaling::NativeOnly {
+            let transform = connection
+                .randr_get_crtc_transform(fact.crtc)
+                .map_err(|error| error.to_string())?
+                .reply()
+                .map_err(|error| error.to_string())?
+                .current_transform;
+            if !is_identity(&transform) {
+                return Err(format!(
+                    "{} keeps a scaling transform ({:?}); another product's desktop is never scaled",
+                    head.output, transform
+                ));
+            }
+        }
         if i32::from(crtc.x) != head.x
             || i32::from(crtc.y) != head.y
             || u32::from(crtc.width) != width
@@ -985,6 +1099,167 @@ fn verify(
     Ok(())
 }
 
+/// Whether a CRTC's `RandR` transform is the identity (16.16 fixed point).
+fn is_identity(transform: &x11rb::protocol::render::Transform) -> bool {
+    const ONE: i32 = 1 << 16;
+    [
+        transform.matrix11,
+        transform.matrix12,
+        transform.matrix13,
+        transform.matrix21,
+        transform.matrix22,
+        transform.matrix23,
+        transform.matrix31,
+        transform.matrix32,
+        transform.matrix33,
+    ] == [ONE, 0, 0, 0, ONE, 0, 0, 0, ONE]
+}
+
+/// How a console's heads may show the Deck's monitors: another product's
+/// desktop, whose Deck layout stays, only in modes of their own sizes
+/// (ADR 0025 §8); a console Arcen puts back may scale (§6).
+fn head_scaling(departure: LayoutDeparture) -> HeadScaling {
+    match departure {
+        LayoutDeparture::LeaveDecks => HeadScaling::NativeOnly,
+        LayoutDeparture::RestoreOwn => HeadScaling::ViewPortIn,
+    }
+}
+
+/// The `RandR` mode for `timing` under its own name.
+fn mode_info(timing: &ModeTiming, name: &str) -> Option<randr::ModeInfo> {
+    let short = |value: u32| u16::try_from(value).ok();
+    Some(randr::ModeInfo {
+        id: 0,
+        width: short(timing.width)?,
+        height: short(timing.height)?,
+        dot_clock: timing.dot_clock_khz.checked_mul(1000)?,
+        hsync_start: short(timing.hsync_start)?,
+        hsync_end: short(timing.hsync_end)?,
+        htotal: short(timing.htotal)?,
+        hskew: 0,
+        vsync_start: short(timing.vsync_start)?,
+        vsync_end: short(timing.vsync_end)?,
+        vtotal: short(timing.vtotal)?,
+        name_len: u16::try_from(name.len()).ok()?,
+        mode_flags: randr::ModeFlag::HSYNC_POSITIVE | randr::ModeFlag::VSYNC_NEGATIVE,
+    })
+}
+
+/// Adds each needed mode to its output (`RRCreateMode`, or the mode of
+/// that name an earlier attachment made, then `RRAddOutputMode`). The
+/// driver may still refuse to list one; the caller plans again from what
+/// the outputs list now. Returns what could not be added.
+fn add_native_modes(
+    connection: &RustConnection,
+    root: xproto::Window,
+    facts: &[OutputFacts],
+    needs: &[NativeModeNeed],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut existing = match connection
+        .randr_get_screen_resources_current(root)
+        .map_err(|error| error.to_string())
+        .and_then(|cookie| cookie.reply().map_err(|error| error.to_string()))
+    {
+        Ok(resources) => mode_names(&resources)
+            .into_iter()
+            .zip(resources.modes.iter().map(|mode| mode.id))
+            .collect::<Vec<_>>(),
+        Err(error) => return vec![format!("RandR resources: {error}")],
+    };
+    for need in needs {
+        let name = need.timing.name();
+        let Some(output) = facts.iter().find(|fact| fact.name == need.output) else {
+            failures.push(format!("{}: output gone", need.output));
+            continue;
+        };
+        let mode = match existing.iter().find(|(known, _)| *known == name) {
+            Some((_, id)) => *id,
+            None => {
+                let Some(info) = mode_info(&need.timing, &name) else {
+                    failures.push(format!("{name}: timing out of range"));
+                    continue;
+                };
+                match connection
+                    .randr_create_mode(root, info, name.as_bytes())
+                    .map_err(|error| error.to_string())
+                    .and_then(|cookie| cookie.reply().map_err(|error| error.to_string()))
+                {
+                    // Two outputs may need the same mode: the second finds
+                    // it (RandR refuses a second mode of one name).
+                    Ok(reply) => {
+                        existing.push((name.clone(), reply.mode));
+                        reply.mode
+                    }
+                    Err(error) => {
+                        failures.push(format!("create {name}: {error}"));
+                        continue;
+                    }
+                }
+            }
+        };
+        match connection
+            .randr_add_output_mode(output.id, mode)
+            .map_err(|error| error.to_string())
+            .and_then(|cookie| cookie.check().map_err(|error| error.to_string()))
+        {
+            Ok(()) => tracing::info!(
+                target: target::SESSION,
+                output = %need.output,
+                mode = %name,
+                dot_clock_khz = need.timing.dot_clock_khz,
+                "a mode of the Deck monitor's own size is added to another product's output"
+            ),
+            Err(error) => failures.push(format!("add {name} to {}: {error}", need.output)),
+        }
+    }
+    failures
+}
+
+/// Plans `requests` on the console's outputs as `scaling` allows; for a
+/// native layout, adds the modes of the Deck monitors' sizes the outputs
+/// lack and plans again from what they list then.
+fn plan_on(
+    connection: &RustConnection,
+    root: xproto::Window,
+    requests: &[ConsoleHeadRequest],
+    scaling: HeadScaling,
+) -> Result<(ConsoleLayoutPlan, Vec<OutputFacts>), LayoutFailure> {
+    let read = || {
+        read_outputs(connection, root)
+            .map_err(|error| LayoutFailure::new("console_randr_failed", error))
+    };
+    let (outputs, facts) = read()?;
+    let planned = match scaling {
+        HeadScaling::ViewPortIn => plan_console_layout(requests, &outputs),
+        HeadScaling::NativeOnly => plan_native_console_layout(requests, &outputs),
+    };
+    let failure = |error: ConsoleLayoutError| LayoutFailure::new(error.token(), error.to_string());
+    match planned {
+        Ok(plan) => Ok((plan, facts)),
+        Err(ConsoleLayoutError::NoNativeMode { .. }) => {
+            let refused = add_native_modes(
+                connection,
+                root,
+                &facts,
+                &missing_native_modes(requests, &outputs),
+            );
+            let (outputs, facts) = read()?;
+            match plan_native_console_layout(requests, &outputs) {
+                Ok(plan) => Ok((plan, facts)),
+                Err(error) => {
+                    let mut failure = failure(error);
+                    if !refused.is_empty() {
+                        failure.detail = format!("{}; {}", failure.detail, refused.join("; "));
+                    }
+                    Err(failure)
+                }
+            }
+        }
+        Err(error) => Err(failure(error)),
+    }
+}
+
 /// Lays the console out for the Deck: journals what it showed, applies the
 /// plan, makes the Deck's primary primary, hides unused forced heads, and
 /// proves it. A failure after the change puts the console back.
@@ -992,15 +1267,13 @@ pub(crate) async fn apply(
     display: &SessionDisplay,
     session_id: &str,
     requests: &[ConsoleHeadRequest],
+    departure: LayoutDeparture,
 ) -> Result<AppliedLayout, LayoutFailure> {
     let connection = connect(display)
         .map_err(|error| LayoutFailure::new("console_display_unreachable", error))?;
     let root = root_of(&connection)
         .map_err(|error| LayoutFailure::new("console_display_unreachable", error))?;
-    let (outputs, facts) = read_outputs(&connection, root)
-        .map_err(|error| LayoutFailure::new("console_randr_failed", error))?;
-    let plan = plan_console_layout(requests, &outputs)
-        .map_err(|error| LayoutFailure::new(error.token(), error.to_string()))?;
+    let (plan, facts) = plan_on(&connection, root, requests, head_scaling(departure))?;
     let (max_width, max_height) = screen_maximum(&connection, root)
         .map_err(|error| LayoutFailure::new("console_randr_failed", error))?;
     if !plan.fits_screen(max_width, max_height) {
@@ -1016,6 +1289,7 @@ pub(crate) async fn apply(
         // Its windows settle afresh in this layout.
         Some(journal) if journal.display == *display => LayoutJournal {
             windows_after: None,
+            departure: LayoutDeparture::RestoreOwn,
             ..journal
         },
         _ => LayoutJournal {
@@ -1028,6 +1302,7 @@ pub(crate) async fn apply(
             hidden: Vec::new(),
             windows_before: read_windows(&connection, root, session_id),
             windows_after: None,
+            departure: LayoutDeparture::RestoreOwn,
         },
     };
     journal
@@ -1051,9 +1326,15 @@ pub(crate) async fn apply(
         primary = plan.primary_output().unwrap_or(""),
         hidden = ?journal.hidden,
         scaled = plan.heads.iter().filter(|head| head.scaled).count(),
+        before = %journal.metamode,
+        departure = ?departure,
         "the console takes the Deck's layout"
     );
-    Ok(AppliedLayout { journal, plan })
+    Ok(AppliedLayout {
+        journal,
+        plan,
+        departure,
+    })
 }
 
 fn finish_apply(
@@ -1066,7 +1347,10 @@ fn finish_apply(
     if let Some(primary) = plan.primary_output() {
         set_primary(connection, root, &facts, primary)?;
     }
-    if virtual_outputs_installed() {
+    // Only Arcen's own forced heads are hidden: another product's outputs
+    // keep their properties (the MetaMode already switched them off), as
+    // its desktop keeps the Deck's layout after the Deck.
+    if virtual_outputs_installed() && plan.scaling == HeadScaling::ViewPortIn {
         for name in &plan.unused {
             let Some(fact) = facts.iter().find(|fact| &fact.name == name) else {
                 continue;
@@ -1080,6 +1364,35 @@ fn finish_apply(
     }
     connection.flush().map_err(|error| error.to_string())?;
     verify(connection, root, plan)
+}
+
+/// Sets `journal`'s departure; whether it changed (and is to be written).
+fn prove_departure(journal: &mut LayoutJournal, departure: LayoutDeparture) -> bool {
+    let changed = journal.departure != departure;
+    journal.departure = departure;
+    changed
+}
+
+/// The Deck's layout stays on a console whose journal says so: the journal
+/// becomes the record of the layout before it ([`LEFT_LAYOUT_RECORD`]),
+/// and nothing of the console is changed.
+fn leave_journal(journal: &LayoutJournal) {
+    if let Err(error) = std::fs::rename(LAYOUT_JOURNAL, LEFT_LAYOUT_RECORD) {
+        tracing::warn!(
+            target: target::SESSION,
+            %error,
+            "the layout record could not be kept; the journal is dropped"
+        );
+        LayoutJournal::remove();
+    }
+    tracing::info!(
+        target: target::SESSION,
+        session_id = %journal.session_id,
+        before = %journal.metamode,
+        primary_before = journal.primary.as_deref().unwrap_or(""),
+        record = LEFT_LAYOUT_RECORD,
+        "the Deck's layout stays on another product's desktop, as that product leaves its own; the layout before it is recorded"
+    );
 }
 
 /// Puts the console back as `journal` recorded it, then forgets the
@@ -1357,6 +1670,12 @@ async fn try_recover(announce: bool) -> bool {
     let Some(journal) = LayoutJournal::read() else {
         return true;
     };
+    // A launcher that died leaves a proved Deck layout as any departure
+    // does; one not yet proved is journalled to be put back.
+    if journal.departure == LayoutDeparture::LeaveDecks {
+        leave_journal(&journal);
+        return true;
+    }
     match super::console::session_fact(&journal.session_id).await {
         Some(fact) if fact.state != "closing" && fact.active => {}
         Some(fact) if fact.state != "closing" => {
@@ -1443,6 +1762,78 @@ fn restore_when_shown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_journal_says_whether_the_decks_layout_stays_and_an_older_one_restores() {
+        let older = r#"{"session_id":"7","display":{"display":":100","number":100,"xauthority":"/run/user/1000/xauth"},"metamode":"DPY-0: 3840x2160 @3840x2160 +0+0","primary":"DP-0","hidden":[]}"#;
+        let journal: LayoutJournal = serde_json::from_str(older).expect("older journal");
+        assert_eq!(journal.departure, LayoutDeparture::RestoreOwn);
+        // Applied but not yet proved: a recovery would put it back.
+        let mut applied = AppliedLayout {
+            journal,
+            plan: ConsoleLayoutPlan {
+                heads: Vec::new(),
+                unused: Vec::new(),
+                scaling: HeadScaling::NativeOnly,
+            },
+            departure: LayoutDeparture::LeaveDecks,
+        };
+        assert!(!applied.leaves_decks());
+        assert!(prove_departure(
+            &mut applied.journal,
+            LayoutDeparture::LeaveDecks
+        ));
+        assert!(applied.leaves_decks());
+        assert!(!prove_departure(
+            &mut applied.journal,
+            LayoutDeparture::LeaveDecks
+        ));
+        let written = serde_json::to_string(&applied.journal).expect("journal");
+        let read: LayoutJournal = serde_json::from_str(&written).expect("read back");
+        assert_eq!(read.departure, LayoutDeparture::LeaveDecks);
+    }
+
+    #[test]
+    fn a_crtc_left_scaled_is_not_proved_native_and_added_modes_carry_their_timing() {
+        use x11rb::protocol::render::Transform;
+        let identity = Transform {
+            matrix11: 1 << 16,
+            matrix12: 0,
+            matrix13: 0,
+            matrix21: 0,
+            matrix22: 1 << 16,
+            matrix23: 0,
+            matrix31: 0,
+            matrix32: 0,
+            matrix33: 1 << 16,
+        };
+        assert!(is_identity(&identity));
+        // The field's stale transform: 0.666656 by 0.740738.
+        let left_scaled = Transform {
+            matrix11: 43_690,
+            matrix22: 48_545,
+            ..identity
+        };
+        assert!(!is_identity(&left_scaled));
+        assert_eq!(
+            head_scaling(LayoutDeparture::LeaveDecks),
+            HeadScaling::NativeOnly
+        );
+        assert_eq!(
+            head_scaling(LayoutDeparture::RestoreOwn),
+            HeadScaling::ViewPortIn
+        );
+        let timing =
+            arcen_outputs::console_layout::cvt_reduced_blanking(2560, 1600, 60).expect("timing");
+        let name = timing.name();
+        let info = mode_info(&timing, &name).expect("mode");
+        assert_eq!(
+            (info.width, info.height, info.dot_clock),
+            (2560, 1600, 268_500_000)
+        );
+        assert_eq!((info.htotal, info.vtotal), (2720, 1646));
+        assert_eq!(usize::from(info.name_len), name.len());
+    }
 
     #[test]
     fn a_starting_shell_is_waited_for_and_no_shell_is_not() {

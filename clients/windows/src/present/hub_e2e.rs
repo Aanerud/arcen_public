@@ -288,7 +288,7 @@ pub fn run(gpu: &Gpu, domain: RefineDomain, width: u32, height: u32) -> Result<H
         composer.draw(gpu, &scenario.frame(fence), &rtv, OutputKind::Codes)?;
         composer.submitted(gpu, None)?;
         gpu.flush_and_wait()?;
-        composer.poll(gpu, |_| crate::present::compose::Confirmation::Unconfirmed);
+        composer.poll(gpu, || None);
         frames += 1;
         Ok(())
     };

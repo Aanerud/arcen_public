@@ -338,6 +338,11 @@ enum Yield {
     Offered,
     /// A Deck asked for the slot.
     Requested,
+    /// No: a private desk under `privacy.desk = "required"` is held because
+    /// its session refuses to lock
+    /// (`console_session::lock_wait::LockWaitVerdict::HoldPrivate`); a Deck
+    /// that finds the slot taken is told so.
+    LockRefused,
 }
 
 #[derive(Debug)]
@@ -435,9 +440,23 @@ impl SessionAdmissionGate {
         Ok(())
     }
 
+    fn set_lock_refused(
+        &mut self,
+        lease: &SessionAdmissionLease,
+        refused: bool,
+    ) -> Result<(), SessionAdmissionError> {
+        self.validate_lease(lease)?;
+        self.yielding = if refused {
+            Yield::LockRefused
+        } else {
+            Yield::Holding
+        };
+        Ok(())
+    }
+
     fn request_yield(&mut self) -> bool {
         match self.yielding {
-            Yield::Holding => false,
+            Yield::Holding | Yield::LockRefused => false,
             Yield::Offered | Yield::Requested => {
                 self.yielding = Yield::Requested;
                 true
@@ -566,6 +585,36 @@ impl SessionAdmissionRuntime {
         self.gate
             .lock()
             .is_ok_and(|gate| gate.yield_requested(lease))
+    }
+
+    /// The session holding `lease` has ended, and its private desk is held
+    /// because the session refuses to lock under `privacy.desk =
+    /// "required"` (`refused`); it never gives the slot up for it. `false`
+    /// clears it. A Deck that finds the slot taken reads it with
+    /// [`Self::holder_lock_refused`] to say why the host is busy.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionAdmissionError::ForeignLease`] for a lease that does not
+    /// hold the slot, or [`SessionAdmissionError::LockPoisoned`].
+    pub fn set_lock_refused(
+        &self,
+        lease: &SessionAdmissionLease,
+        refused: bool,
+    ) -> Result<(), SessionAdmissionError> {
+        self.gate
+            .lock()
+            .map_err(|_| SessionAdmissionError::LockPoisoned)?
+            .set_lock_refused(lease, refused)
+    }
+
+    /// Whether the slot is held by a session whose private desk waits for a
+    /// lock it refuses ([`Self::set_lock_refused`]).
+    #[must_use]
+    pub fn holder_lock_refused(&self) -> bool {
+        self.gate
+            .lock()
+            .is_ok_and(|gate| gate.active_token.is_some() && gate.yielding == Yield::LockRefused)
     }
 }
 
@@ -704,6 +753,33 @@ mod tests {
         assert!(!runtime.request_yield());
         assert_eq!(
             runtime.offer_yield(&lease, true).err(),
+            Some(SessionAdmissionError::ForeignLease)
+        );
+    }
+
+    #[test]
+    fn a_slot_held_for_a_refused_lock_is_never_given_up_and_says_why() {
+        let runtime = SessionAdmissionRuntime::new();
+        let lease = runtime.admit_new().expect("first session");
+        assert!(!runtime.holder_lock_refused());
+        runtime.set_lock_refused(&lease, true).expect("held");
+        assert!(runtime.holder_lock_refused());
+        assert!(!runtime.request_yield());
+        assert!(!runtime.yield_requested(&lease));
+        assert_eq!(
+            runtime.admit_new().err(),
+            Some(SessionAdmissionError::SessionAlreadyActive)
+        );
+        // It locked: busy for the ordinary reason until the slot is free.
+        runtime.set_lock_refused(&lease, false).expect("cleared");
+        assert!(!runtime.holder_lock_refused());
+        runtime.set_lock_refused(&lease, true).expect("held again");
+        runtime.complete(&lease).expect("completed");
+        assert!(!runtime.holder_lock_refused());
+        let _next = runtime.admit_new().expect("the next Deck");
+        assert!(!runtime.holder_lock_refused());
+        assert_eq!(
+            runtime.set_lock_refused(&lease, true).err(),
             Some(SessionAdmissionError::ForeignLease)
         );
     }

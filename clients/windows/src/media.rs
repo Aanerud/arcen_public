@@ -215,8 +215,11 @@ pub struct MediaSession {
     /// The connection's telemetry: the presenters' frames count as
     /// presented for health, the session summary and the support bundle.
     telemetry: Arc<ClientTelemetry>,
-    /// Whether a presenter has confirmed a frame on glass yet.
-    presented_time_reported: bool,
+    /// Whether the presenters' frame statistics are live: an unconfirmed
+    /// frame here was shown with its time unknown (DXGI had no statistics
+    /// for it), never replaced, so it counts as superseded only while the
+    /// statistics keep confirming the frames around it.
+    statistics_live: arcen_deck_core::present::confirmation::PresentStatisticsLive,
     /// The decoder has a device of its own: pictures can be presented on
     /// any device of the adapter.
     own_decode_device: bool,
@@ -339,7 +342,8 @@ impl MediaSession {
             frames_submitted: 0,
             frames_confirmed: 0,
             telemetry: start.telemetry,
-            presented_time_reported: false,
+            statistics_live: arcen_deck_core::present::confirmation::PresentStatisticsLive::default(
+            ),
             own_decode_device,
             decode_device_line,
         })
@@ -360,9 +364,11 @@ impl MediaSession {
         &self.decode_device_line
     }
 
-    /// Frames a further window of a multi-window session presented: they
-    /// count for session health as the root window's do.
-    pub fn record_secondary_presented(&self, frames: u64) {
+    /// Frames a further window of a multi-window session presented, and
+    /// those its presenters replaced before a present: they count for
+    /// session health as the root window's do.
+    pub fn record_secondary_presented(&self, frames: u64, superseded: u64) {
+        self.telemetry.record_presenter_superseded(superseded);
         self.telemetry.record_frames_presented(frames);
     }
 
@@ -415,13 +421,11 @@ impl MediaSession {
                 .saturating_add(delta.dropped_stale);
         }
         self.telemetry.record_presenter_superseded(superseded);
-        // As the macOS Deck does after its presenters' pass.
-        self.presented_time_reported |= confirmed > 0;
-        self.telemetry.record_presenter_frames(
-            confirmed,
-            unconfirmed,
-            self.presented_time_reported,
-        );
+        // As the macOS Deck does after its presenters' pass, while the
+        // statistics are live.
+        let statistics_live = self.statistics_live.observe(confirmed, unconfirmed);
+        self.telemetry
+            .record_presenter_frames(confirmed, unconfirmed, statistics_live);
         let refine_offered = {
             let mut state = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
             worker::mirror_audio_playback(&mut state);

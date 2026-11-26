@@ -28,6 +28,7 @@ use arcen_deck_core::multi_window::runtime::{
 use arcen_deck_core::multi_window::session::{
     choose_root_monitor, monitor_fps_text, reorder_for_root_monitor,
 };
+use arcen_deck_core::present::rate::PresentedRate;
 use arcen_deck_core::reconnect::ResumeAttempt;
 use arcen_deck_core::runtime::multi_monitor::{
     RequestedMultiMonitorSelection, deck_supported_carriers,
@@ -204,12 +205,12 @@ pub(super) struct Connection {
     streaming: bool,
     /// The host's last `desk_privacy_update` this window was told of.
     desk_update_seen: Option<arcen_deck_core::session_truth::DeskPrivacyStatus>,
-    /// When frames reached the glass in the last second, and how many.
-    presented: std::collections::VecDeque<(std::time::Instant, u64)>,
-    /// When frames were submitted in the last second, and how many: the
-    /// estimate Stream Statistics shows when DWM confirms nothing (as the
-    /// Mac's `presented_frame_times_estimated`).
-    submitted: std::collections::VecDeque<(std::time::Instant, u64)>,
+    /// Frames confirmed on glass, as each UI pass saw them.
+    presented: PresentedRate,
+    /// Frames submitted, as each UI pass saw them: the estimate Stream
+    /// Statistics shows when DWM confirms nothing (as the Mac's
+    /// `presented_frame_times_estimated`).
+    submitted: PresentedRate,
     /// When the presenters last took a frame.
     last_frame_at: Option<std::time::Instant>,
     max_fps: u32,
@@ -230,14 +231,9 @@ pub(super) struct Connection {
     /// The host showed some Deck displays at another size or not at all
     /// (`arcen_deck_core::multi_window::layout_note`).
     layout_note: Option<String>,
-    /// When each monitor's window presented frames in the last second
-    /// (per-display rates of a multi-window session).
-    monitor_presents: Mutex<
-        std::collections::BTreeMap<
-            SessionMonitorId,
-            std::collections::VecDeque<std::time::Instant>,
-        >,
-    >,
+    /// The frames each monitor's window presented, as each UI pass saw
+    /// them (per-display rates of a multi-window session).
+    monitor_presents: Mutex<std::collections::BTreeMap<SessionMonitorId, PresentedRate>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -381,8 +377,8 @@ impl Connection {
             pen_buttons: arcen_input::pen_buttons::PenButtonMap::default(),
             streaming: false,
             desk_update_seen: None,
-            presented: std::collections::VecDeque::new(),
-            submitted: std::collections::VecDeque::new(),
+            presented: PresentedRate::default(),
+            submitted: PresentedRate::default(),
             last_frame_at: None,
             max_fps,
             exact_requested,
@@ -418,13 +414,9 @@ impl Connection {
         let pass = self.media.poll();
         let now = std::time::Instant::now();
         let confirmed = pass.eight_bit.frames_confirmed + pass.ten_bit.frames_confirmed;
-        if confirmed > 0 {
-            self.presented.push_back((now, confirmed));
-        }
+        self.presented.record(now, confirmed);
         let submitted = pass.eight_bit.frames_submitted + pass.ten_bit.frames_submitted;
-        if submitted > 0 {
-            self.submitted.push_back((now, submitted));
-        }
+        self.submitted.record(now, submitted);
         if confirmed > 0 || submitted > 0 {
             self.last_frame_at = Some(now);
         }
@@ -436,14 +428,6 @@ impl Connection {
             let new_frames =
                 pass.eight_bit.new_frames_submitted() + pass.ten_bit.new_frames_submitted();
             self.note_presented(root, new_frames);
-        }
-        for window in [&mut self.presented, &mut self.submitted] {
-            while window
-                .front()
-                .is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_secs(1))
-            {
-                window.pop_front();
-            }
         }
         let mut state = self
             .media
@@ -783,11 +767,17 @@ impl Connection {
             .collect()
     }
 
-    /// Counts new frames a secondary window's presenters submitted: the
-    /// per-display statistics and the session's presented frames (the
-    /// decoded count covers every monitor).
-    pub(super) fn note_secondary_presented(&self, monitor: SessionMonitorId, frames: u64) {
-        self.media.record_secondary_presented(frames);
+    /// Counts new frames a secondary window's presenters submitted, and
+    /// those they replaced before a present: the per-display statistics
+    /// and the session's presented frames (the decoded count covers every
+    /// monitor).
+    pub(super) fn note_secondary_presented(
+        &self,
+        monitor: SessionMonitorId,
+        frames: u64,
+        superseded: u64,
+    ) {
+        self.media.record_secondary_presented(frames, superseded);
         self.note_presented(monitor, frames);
     }
 
@@ -807,16 +797,7 @@ impl Connection {
             .monitor_presents
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let times = presents.entry(monitor).or_default();
-        for _ in 0..frames.min(240) {
-            times.push_back(now);
-        }
-        while times
-            .front()
-            .is_some_and(|at| now.duration_since(*at) > Duration::from_secs(1))
-        {
-            times.pop_front();
-        }
+        presents.entry(monitor).or_default().record(now, frames);
     }
 
     /// The per-display frame rates of a committed multi-window session
@@ -837,14 +818,7 @@ impl Connection {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let text = monitor_fps_text(validated, |monitor| {
-            presents.get(&monitor).map(|times| {
-                #[allow(clippy::cast_precision_loss, reason = "frames in one second")]
-                let count = times
-                    .iter()
-                    .filter(|at| now.duration_since(**at) <= Duration::from_secs(1))
-                    .count() as f64;
-                count
-            })
+            presents.get(&monitor).map(|rate| rate.rate(now))
         });
         (!text.is_empty()).then_some(text)
     }
@@ -942,18 +916,20 @@ impl Connection {
 
     /// Stream Statistics' lines, from the same shared inputs as the Mac's,
     /// plus the decoder's refusal when it refused the stream.
-    pub(super) fn stream_stats_lines(&self) -> Vec<String> {
-        // Confirmed presents, else submitted ones, as the Mac does.
-        let in_last_second = |window: &std::collections::VecDeque<(std::time::Instant, u64)>| {
-            window.iter().map(|(_, count)| *count).sum::<u64>()
-        };
-        let confirmed = in_last_second(&self.presented);
-        #[allow(clippy::cast_precision_loss, reason = "frames presented in one second")]
-        let presented_fps = if confirmed > 0 {
+    ///
+    /// `displays_note` is the launcher's word on this session's displays
+    /// (shared `SessionDisplaysOrigin::session_note`), shown beside the
+    /// host's own layout line.
+    pub(super) fn stream_stats_lines(&self, displays_note: Option<&str>) -> Vec<String> {
+        // Confirmed presents, else submitted ones, as the Mac does: frames
+        // over the real time they were seen in, each counted once.
+        let now = std::time::Instant::now();
+        let confirmed = self.presented.rate(now);
+        let presented_fps = if confirmed > 0.0 {
             confirmed
         } else {
-            in_last_second(&self.submitted)
-        } as f64;
+            self.submitted.rate(now)
+        };
         let state = self
             .media
             .shared()
@@ -1039,6 +1015,7 @@ impl Connection {
             lines.push(format!("Displays fps: {text}"));
         }
         lines.extend(self.layout_note.clone());
+        lines.extend(displays_note.map(str::to_owned));
         lines.extend(display_note);
         lines.extend(desk_note.map(str::to_owned));
         lines.extend(host_displays);

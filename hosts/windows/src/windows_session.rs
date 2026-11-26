@@ -313,6 +313,7 @@ impl AgentConfig {
             codec_pinned: self.codec_pinned,
             variant_pinned: self.variant_pinned,
             auth_video_request: self.auth_video_request,
+            hdr_served_as_grading: false,
             requested_pipeline: None,
             active_pipeline: None,
             fps: self.fps,
@@ -504,6 +505,42 @@ impl AgentStreamingReady {
             })
             .as_deref()
             == Some(Self::TYPE)
+    }
+}
+
+/// The session agent's committed health, sent to the broker on every health
+/// tick while it streams, for the service's minute `HEALTH_SNAPSHOT`
+/// (`arcen_observability::ServiceHealth`). The broker keeps it; it never
+/// reaches the Deck, and a Deck may not send it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentHealth {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// `None` until the session first settles on a state.
+    pub committed: Option<arcen_telemetry::HealthState>,
+}
+
+impl AgentHealth {
+    pub const TYPE: &'static str = "arcen_private_agent_health";
+
+    pub fn new(committed: Option<arcen_telemetry::HealthState>) -> Self {
+        Self {
+            msg_type: Self::TYPE.to_string(),
+            committed,
+        }
+    }
+
+    /// The report `text` carries, or `None` when it is another message. A
+    /// malformed report of this type reads as one that has not settled.
+    pub fn decode(text: &str) -> Option<Self> {
+        if !text.contains(Self::TYPE) {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        if value.get("type").and_then(serde_json::Value::as_str) != Some(Self::TYPE) {
+            return None;
+        }
+        Some(serde_json::from_value(value).unwrap_or_else(|_| Self::new(None)))
     }
 }
 
@@ -734,6 +771,18 @@ fn is_unlocked_bound_candidate(candidate: &SessionCandidate) -> bool {
 
 fn is_active_resumable_candidate(candidate: &SessionCandidate) -> bool {
     candidate.state == SessionState::Active && candidate.unlocked
+}
+
+/// Whether a held session in `state` is secured (`Some(true)`: locked, or
+/// taken off the console to the sign-in screen, as `lock_session` does when
+/// it will not lock), open (`Some(false)`), or no longer one the hold keeps
+/// (`None`).
+fn held_session_locked(state: SessionState, unlocked: bool) -> Option<bool> {
+    match state {
+        SessionState::Active => Some(!unlocked),
+        SessionState::Disconnected => Some(true),
+        _ => None,
+    }
 }
 
 fn is_known_local_wts_extra(candidate: &SessionCandidate, relation: AccountMatch) -> bool {
@@ -1011,6 +1060,56 @@ pub(crate) fn lock_session(session_id: u32, expected_sid: &str) -> Result<LockOu
 /// `expected_sid`, as Windows reports it now (`false` when it cannot tell).
 pub(crate) fn still_unlocked_session_of(session_id: u32, expected_sid: &str) -> bool {
     platform::still_unlocked_session_of(session_id, expected_sid)
+}
+
+impl LockOutcome {
+    /// The shared lock wait's reading of this outcome: a session locked, or
+    /// taken off the console to the sign-in screen, is secured; one that is
+    /// no longer this account's on the console is not ours to lock.
+    pub(crate) const fn attempt(self) -> arcen_session::console_session::lock_wait::LockAttempt {
+        use arcen_session::console_session::lock_wait::LockAttempt;
+        match self {
+            Self::Locked | Self::AlreadySecured | Self::Disconnected => LockAttempt::Locked,
+            Self::Elsewhere => LockAttempt::NotOurs,
+        }
+    }
+}
+
+/// The session held for its Deck's resume, read now (ADR 0025 §4, shared
+/// `console_session::held_lock`): still the Deck's (same account, session
+/// and SID, active on the console), locked or not, or changed. A read that
+/// fails is a change: the hold ends and the session is handed back.
+pub(crate) fn observe_held(
+    identity: &WindowsSessionIdentity,
+    expected_sid: &str,
+) -> arcen_session::console_session::held_lock::HeldReading {
+    use arcen_session::console_session::held_lock::HeldReading;
+    match platform::observe_held_session(identity, expected_sid) {
+        Ok(locked) => HeldReading::Ours { locked },
+        Err(error) => {
+            tracing::info!(
+                target: crate::logging::SESSION,
+                windows_session_id = identity.session_id,
+                %error,
+                "the held session is no longer the Deck's"
+            );
+            HeldReading::Changed
+        }
+    }
+}
+
+/// Locks this process's own session and confirms it (`LockWorkStation`,
+/// then Windows' lock flag; taken off the console if it will not lock
+/// within five seconds): `Ok(true)` once it is secured.
+pub(crate) fn lock_own_session() -> Result<bool, String> {
+    platform::lock_own_session()
+}
+
+/// Whether this process's own session is locked (`None` when Windows does
+/// not say): a held session agent stops proving the desk's input hooks
+/// behind a lock screen (shared `held_lock::DeskInputProof`).
+pub(crate) fn own_session_locked() -> Option<bool> {
+    platform::own_session_locked()
 }
 
 /// Who a WTS session belongs to: the account and its logon. A session id
@@ -2217,11 +2316,96 @@ mod platform {
     }
 
     pub fn reset_session_log_access(path: &Path) -> Result<(), String> {
+        // `icacls /reset` is a process per file, and every Pier start passes
+        // every inactive session log through here: with ~700 logs that was
+        // ~30 s before the service reported running. Skip a file already in
+        // the state a reset leaves; reset whenever that is not proven.
+        if matches!(access_is_inherited_only(path), Ok(true)) {
+            return Ok(());
+        }
         run_icacls(
             path,
             &[std::ffi::OsString::from("/reset")],
             "reset inactive session log access",
         )
+    }
+
+    /// Whether `path`'s DACL is what `icacls /reset` leaves: present, not
+    /// protected, not empty, and made only of inherited entries (no explicit
+    /// grant such as a session user's left behind by a broker that died).
+    fn access_is_inherited_only(path: &Path) -> Result<bool, String> {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows::Win32::Security::{
+            GetAce, GetSecurityDescriptorControl, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION,
+            INHERITED_ACE, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        };
+
+        struct Descriptor(PSECURITY_DESCRIPTOR);
+        impl Drop for Descriptor {
+            fn drop(&mut self) {
+                if !self.0 .0.is_null() {
+                    // SAFETY: GetNamedSecurityInfoW allocated it with LocalAlloc.
+                    let _ = unsafe { LocalFree(HLOCAL(self.0 .0)) };
+                }
+            }
+        }
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `wide` is NUL-terminated and outlives the call; the out
+        // pointers refer to live locals.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&raw mut dacl),
+                None,
+                &raw mut descriptor,
+            )
+        };
+        let descriptor = Descriptor(descriptor);
+        if status.0 != 0 || descriptor.0 .0.is_null() {
+            return Err(format!("read the DACL of {}: {status:?}", path.display()));
+        }
+        if dacl.is_null() {
+            return Ok(false);
+        }
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        // SAFETY: the descriptor is live and both out pointers are valid.
+        unsafe { GetSecurityDescriptorControl(descriptor.0, &raw mut control, &raw mut revision) }
+            .map_err(|error| format!("read the DACL of {}: {error}", path.display()))?;
+        if control & SE_DACL_PROTECTED.0 != 0 {
+            return Ok(false);
+        }
+        // SAFETY: `dacl` points into the live descriptor.
+        let count = u32::from(unsafe { (*dacl).AceCount });
+        // An empty DACL grants nobody anything; a reset gives it the
+        // inherited entries.
+        if count == 0 {
+            return Ok(false);
+        }
+        for index in 0..count {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: `index` is below AceCount and `dacl` is live.
+            unsafe { GetAce(dacl, index, &raw mut ace) }
+                .map_err(|error| format!("read the DACL of {}: {error}", path.display()))?;
+            if ace.is_null() {
+                return Ok(false);
+            }
+            // SAFETY: GetAce returns a pointer to an ACE beginning with ACE_HEADER.
+            let flags = unsafe { (*ace.cast::<ACE_HEADER>()).AceFlags };
+            if u32::from(flags) & INHERITED_ACE.0 == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn run_icacls(
@@ -2368,6 +2552,17 @@ mod platform {
     }
 
     pub fn observe_session(identity: &WindowsSessionIdentity) -> Result<(), String> {
+        observe_session_account(identity)?;
+        if !query_session_unlocked(identity.session_id)? {
+            return Err(format!(
+                "Windows session {} locked; secure-desktop capture and input are unsupported",
+                identity.session_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn observe_session_account(identity: &WindowsSessionIdentity) -> Result<(), String> {
         let user = query_session_string(identity.session_id, WTSUserName)?;
         let domain = query_session_string(identity.session_id, WTSDomainName)?;
         if user.is_empty() {
@@ -2388,12 +2583,6 @@ mod platform {
                 } else {
                     format!(r"{domain}\{user}")
                 }
-            ));
-        }
-        if !query_session_unlocked(identity.session_id)? {
-            return Err(format!(
-                "Windows session {} locked; secure-desktop capture and input are unsupported",
-                identity.session_id
             ));
         }
         Ok(())
@@ -2623,6 +2812,73 @@ mod platform {
             return Err("Windows resumable session is no longer active and unlocked".to_string());
         }
         observe_bound_sid(identity, expected_sid)
+    }
+
+    /// The held session's account, session and SID unchanged and active on
+    /// the console: `Ok(locked)`.
+    pub fn observe_held_session(
+        identity: &WindowsSessionIdentity,
+        expected_sid: &str,
+    ) -> Result<bool, String> {
+        observe_session_account(identity)?;
+        let candidate = enumerate_sessions()?
+            .into_iter()
+            .find(|candidate| candidate.id == identity.session_id)
+            .ok_or_else(|| format!("Windows session {} is gone", identity.session_id))?;
+        let locked =
+            super::held_session_locked(candidate.state, candidate.unlocked).ok_or_else(|| {
+                format!(
+                    "Windows session {} is neither active nor disconnected",
+                    identity.session_id
+                )
+            })?;
+        observe_bound_sid(identity, expected_sid)?;
+        Ok(locked)
+    }
+
+    pub fn lock_own_session() -> Result<bool, String> {
+        let mut session_id = 0u32;
+        // SAFETY: the out-parameter is valid; the id names this process.
+        unsafe {
+            windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                std::process::id(),
+                &mut session_id,
+            )
+        }
+        .map_err(|error| format!("ProcessIdToSessionId: {error}"))?;
+        if !query_session_unlocked(session_id)? {
+            return Ok(true);
+        }
+        if let Err(error) = lock_workstation() {
+            tracing::warn!(target: crate::logging::SESSION, %error, "LockWorkStation refused");
+        }
+        let deadline = std::time::Instant::now() + LOCK_SCREEN_TIMEOUT;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !query_session_unlocked(session_id)? {
+                return Ok(true);
+            }
+        }
+        // It would not lock: take it off the console, as the broker does.
+        // SAFETY: plain WTS call on this process's own session.
+        unsafe { WTSDisconnectSession(WTS_CURRENT_SERVER_HANDLE, session_id, true) }
+            .map_err(|error| format!("WTSDisconnectSession({session_id}): {error}"))?;
+        Ok(true)
+    }
+
+    pub fn own_session_locked() -> Option<bool> {
+        let mut session_id = 0u32;
+        // SAFETY: the out-parameter is valid; the id names this process.
+        unsafe {
+            windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                std::process::id(),
+                &mut session_id,
+            )
+        }
+        .ok()?;
+        query_session_unlocked(session_id)
+            .ok()
+            .map(|unlocked| !unlocked)
     }
 
     fn observe_bound_sid(
@@ -2862,6 +3118,21 @@ mod platform {
         false
     }
 
+    pub fn observe_held_session(
+        _identity: &WindowsSessionIdentity,
+        _expected_sid: &str,
+    ) -> Result<bool, String> {
+        Err("Windows WTS sessions are unavailable on this platform".to_string())
+    }
+
+    pub fn own_session_locked() -> Option<bool> {
+        None
+    }
+
+    pub fn lock_own_session() -> Result<bool, String> {
+        Err("LockWorkStation is only available on Windows".to_string())
+    }
+
     pub fn session_owner(_session_id: u32) -> Result<Option<super::SessionOwner>, String> {
         Err("Windows WTS sessions are unavailable on this platform".to_string())
     }
@@ -2870,6 +3141,19 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_session_taken_off_the_console_is_still_held_and_secured() {
+        // `lock_session` disconnects a session that will not lock: the hold
+        // keeps it, and a resume is asked to sign in again.
+        assert_eq!(
+            held_session_locked(SessionState::Disconnected, true),
+            Some(true)
+        );
+        assert_eq!(held_session_locked(SessionState::Active, false), Some(true));
+        assert_eq!(held_session_locked(SessionState::Active, true), Some(false));
+        assert_eq!(held_session_locked(SessionState::Connected, true), None);
+    }
 
     #[test]
     fn exact_bind_log_deduper_allows_first_observation_and_changes_only() {

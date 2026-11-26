@@ -1766,10 +1766,12 @@ pub struct ArcenApp {
     /// may be unsaved, and must not be clobbered by re-reading the saved
     /// settings. Consumed by [`Self::begin_connection_flow`].
     pending_displays_override: Option<(String, DisplaysMode)>,
-    /// What the Connecting status says about this attempt's displays: one
-    /// display for this session only, after a display recovery (shared
-    /// `attempt_displays_note`). Set with the attempt's Displays mode.
-    attempt_displays_note: Option<&'static str>,
+    /// Why this attempt, and the session it starts, shows the displays it
+    /// does (shared `SessionDisplaysOrigin`): the Connecting status and the
+    /// running session say "one display, for this session only" after a
+    /// display recovery. Set with the attempt's Displays mode, so the next
+    /// ordinary connection resets it; never saved.
+    displays_origin: arcen_deck_core::connect_plan::SessionDisplaysOrigin,
     /// Credentials preserved across a recovery choice.
     ///
     /// `drop_session_handles` clears `deferred_auth` and `submitted_auth`
@@ -2502,7 +2504,7 @@ impl ArcenApp {
             displays_mode: settings.displays_mode,
             active_displays_mode: None,
             pending_displays_override: None,
-            attempt_displays_note: None,
+            displays_origin: arcen_deck_core::connect_plan::SessionDisplaysOrigin::Chosen,
             recovery_auth: None,
             submitted_auth: None,
             login_window_handover: None,
@@ -3482,7 +3484,14 @@ impl ArcenApp {
                 } else {
                     tracing::info!(target: "arcen::session", note, "host desk privacy");
                 }
-                self.text_input.notify(note.to_owned());
+            }
+            let displays_note = self.displays_origin.session_note();
+            if let Some(note) = displays_note {
+                tracing::info!(target: "arcen::display", note, "display recovery holds one display");
+            }
+            let notes: Vec<&str> = self.desk_note.into_iter().chain(displays_note).collect();
+            if !notes.is_empty() {
+                self.text_input.notify(notes.join(" "));
             }
             self.session_hello_handled = true;
             // A current Pier serves Auto and Speed at this Deck display's
@@ -7418,8 +7427,8 @@ impl ArcenApp {
             &endpoint,
             saved,
         );
-        self.attempt_displays_note =
-            arcen_deck_core::connect_plan::attempt_displays_note(source, resolved);
+        self.displays_origin =
+            arcen_deck_core::connect_plan::SessionDisplaysOrigin::for_attempt(source, resolved);
         tracing::info!(
             target: "arcen::display",
             mode = resolved.unwrap_or(self.displays_mode).as_wire(),
@@ -7694,11 +7703,10 @@ impl ArcenApp {
             );
         }
         self.connection_status_hint = None;
-        let displays_note = policy.status_note().or(self.attempt_displays_note.take());
-        self.status = match displays_note {
-            Some(note) => format!("Connecting to {}... {note}", display_name_for_draft(&draft)),
-            None => format!("Connecting to {}...", display_name_for_draft(&draft)),
-        };
+        let displays_note = policy
+            .status_note()
+            .or(self.displays_origin.connecting_note());
+        self.status = arcen_deck_core::connect_plan::connecting_status(&draft, displays_note);
         self.configure_reconnect(&draft, &options);
         // Atomically re-install the preserved submission immediately before
         // the network launch (see this function's own doc above): no
@@ -8516,36 +8524,11 @@ impl ArcenApp {
         let retry =
             arcen_deck_core::connect_plan::displays_unsupported_retry(&connection_endpoint(draft));
         self.pending_displays_override = retry.displays_override;
-        if let Some(mode) = retry.remember {
-            self.remember_displays_mode_for(draft, mode);
-        }
         self.status = retry.status.to_string();
         tracing::info!(
             target: crate::logging::target::SESSION,
             "user accepted Primary Display Only for a host that cannot serve the complete layout",
         );
-    }
-
-    /// Persists a Displays choice onto the saved connection this draft came
-    /// from, if any.
-    ///
-    /// Quick/unsaved connections have no `saved_connection_id`, so the choice
-    /// applies to the current attempt only — there is nowhere to record it,
-    /// and inventing an entry would be a surprising side effect of clicking
-    /// through an error.
-    fn remember_displays_mode_for(&mut self, draft: &ConnectionDraft, mode: DisplaysMode) {
-        let Some(id) = draft.saved_connection_id.clone() else {
-            return;
-        };
-        match self.config_repository.set_displays_mode(&id, Some(mode)) {
-            Ok(store) => self.reconcile_saved_connections(store),
-            Err(error) => tracing::warn!(
-                target: crate::logging::target::SESSION,
-                %error,
-                "could not persist the Displays choice for this connection; \
-                 it still applies to this attempt",
-            ),
-        }
     }
 
     fn launching_screen(&mut self, ui: &mut egui::Ui, draft: &ConnectionDraft) {
@@ -8945,6 +8928,7 @@ impl ArcenApp {
         // following the application default. Never written back into
         // `self.displays_mode`, which stays the app-wide default.
         self.active_displays_mode = saved.settings.overrides.displays_mode.own();
+        self.displays_origin = arcen_deck_core::connect_plan::SessionDisplaysOrigin::Chosen;
         options.clipboard_enabled = saved
             .settings
             .overrides
@@ -10119,6 +10103,7 @@ impl ArcenApp {
         .to_vec();
         lines.extend(self.decoder_behind.line());
         lines.extend(self.layout_note.clone());
+        lines.extend(self.displays_origin.session_note().map(str::to_owned));
         lines.extend(self.media.as_ref().and_then(|media| {
             media
                 .lock()
@@ -11762,21 +11747,10 @@ impl ArcenApp {
         }
     }
 
+    /// Frames per second over single-frame samples, by the rule the Windows
+    /// Deck applies to its batches.
     fn instant_rate(samples: &VecDeque<Instant>) -> f64 {
-        if samples.len() < 2 {
-            return 0.0;
-        }
-        let Some(first) = samples.front() else {
-            return 0.0;
-        };
-        let Some(last) = samples.back() else {
-            return 0.0;
-        };
-        let elapsed = last.duration_since(*first).as_secs_f64();
-        rate_per_second(
-            samples.len().saturating_sub(1) as u64,
-            Duration::from_secs_f64(elapsed),
-        )
+        arcen_deck_core::present::rate::presented_rate(samples.iter().map(|at| (*at, 1)))
     }
 
     fn push_ms_sample(samples: &mut VecDeque<f64>, value: f64) {
@@ -23008,11 +22982,21 @@ mod tests {
             Some(DisplaysMode::SinglePrimary)
         );
         assert_eq!(
-            app.attempt_displays_note,
+            app.displays_origin.connecting_note(),
             Some(arcen_deck_core::connect_plan::RECOVERY_ONE_DISPLAY_NOTE)
         );
+        // The running session says so too, in Stream Statistics.
+        assert!(app
+            .stream_stats_lines()
+            .iter()
+            .any(|line| line == arcen_deck_core::connect_plan::RECOVERY_ONE_DISPLAY_SESSION_NOTE));
+        // The next ordinary connection resets it.
         assert_eq!(app.resolve_attempt_displays_mode(&draft), None);
-        assert_eq!(app.attempt_displays_note, None);
+        assert_eq!(app.displays_origin.session_note(), None);
+        assert!(!app
+            .stream_stats_lines()
+            .iter()
+            .any(|line| line == arcen_deck_core::connect_plan::RECOVERY_ONE_DISPLAY_SESSION_NOTE));
         let _ = std::fs::remove_dir_all(dir);
     }
 

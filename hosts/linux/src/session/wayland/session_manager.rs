@@ -1037,6 +1037,12 @@ async fn next_watch(monitor: Option<&mut IdleMonitor>) -> Option<u32> {
 /// The shell's `org.gnome.ScreenSaver.ActiveChanged` signals and its
 /// current state, once the shell owns the name.
 async fn connect_shield(connection: &Connection) -> Option<(Drained<bool>, bool)> {
+    let (proxy, stream) = shield_proxy(connection).await?;
+    let active = proxy.call::<_, _, bool>("GetActive", &()).await.ok()?;
+    Some((stream, active))
+}
+
+async fn shield_proxy(connection: &Connection) -> Option<(Proxy<'static>, Drained<bool>)> {
     let bus = zbus::fdo::DBusProxy::new(connection).await.ok()?;
     let name = zbus::names::BusName::try_from(SCREENSAVER_NAME).ok()?;
     if !bus.name_has_owner(name).await.unwrap_or(false) {
@@ -1054,8 +1060,46 @@ async fn connect_shield(connection: &Connection) -> Option<(Drained<bool>, bool)
         proxy.receive_signal("ActiveChanged").await.ok()?,
         |message| message.body().deserialize::<bool>().ok(),
     );
-    let active = proxy.call::<_, _, bool>("GetActive", &()).await.ok()?;
-    Some((stream, active))
+    Some((proxy, stream))
+}
+
+/// The shell's screen shield for the agent's stream lifetime: whether it is
+/// up now and when it changes.
+pub struct ShieldWatch {
+    proxy: Proxy<'static>,
+    changes: Drained<bool>,
+}
+
+impl std::fmt::Debug for ShieldWatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShieldWatch")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShieldWatch {
+    /// Follows the shield once the shell owns `org.gnome.ScreenSaver`.
+    pub async fn connect(connection: &Connection) -> Option<Self> {
+        let (proxy, changes) = shield_proxy(connection).await?;
+        Some(Self { proxy, changes })
+    }
+
+    /// Whether the shield is up now; `None` when the shell does not answer.
+    pub async fn active(&self) -> Option<bool> {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            self.proxy.call::<_, _, bool>("GetActive", &()),
+        )
+        .await
+        .ok()?
+        .ok()
+    }
+
+    /// The next change; `None` once the signal stream ended.
+    pub async fn changed(&mut self) -> Option<bool> {
+        self.changes.items.recv().await
+    }
 }
 
 /// Keeps the compositor's watches matching presence: one persistent idle

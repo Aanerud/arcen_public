@@ -197,9 +197,17 @@ mod service {
     pub(crate) async fn next_control_request() -> ServiceControlRequest {
         std::future::pending::<ServiceControlRequest>().await
     }
+    pub(crate) fn report_start_progress() {}
+    pub(crate) fn stop_cause() -> Option<arcen_session::host_shutdown::StopCause> {
+        None
+    }
+    pub(crate) async fn host_shutdown() {
+        std::future::pending::<()>().await;
+    }
 }
 mod session;
 mod session_admission;
+mod session_end;
 #[cfg(windows)]
 mod support_bundle;
 mod timezone;
@@ -221,6 +229,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::logging::NET;
+use arcen_session::host_shutdown::{DrainDeadline, StopCause};
 use arcen_session::session_admission::{PreauthAdmission, PreauthRefusal};
 
 /// Canonical location of the corresponding source, surfaced in the startup
@@ -387,6 +396,10 @@ pub struct HostConfig {
     pub codec_pinned: bool,
     pub variant_pinned: bool,
     pub auth_video_request: Option<InitialVideoRequestMsg>,
+    /// The Deck asked for HDR and this session's displays offer none (a
+    /// dummy plug, an SDR monitor): it is served as Grading, and the Deck is
+    /// told why (`hdr_display_unsupported`).
+    pub hdr_served_as_grading: bool,
     pub requested_pipeline: Option<arcen_media::video::PipelineId>,
     pub active_pipeline: Option<arcen_protocol::messages::ServedStreamPipeline>,
     pub fps: u32,
@@ -2211,6 +2224,7 @@ where
         codec_pinned,
         variant_pinned,
         auth_video_request: None,
+        hdr_served_as_grading: false,
         requested_pipeline: None,
         active_pipeline: None,
         fps,
@@ -3251,6 +3265,7 @@ where
         tls::TlsLifecycle::load(args.tls.clone())
             .map_err(|error| format!("tls configuration failed: {error}"))?,
     );
+    service::report_start_progress();
     tls_lifecycle.emit_startup(&emitter);
     let quic_bind =
         arcen_transport::quic::resolve_pier_bind_address(&args.host, args.direct_quic_port())
@@ -3298,7 +3313,9 @@ where
     let (session_shutdown, _) = watch::channel(false);
     let mut sessions = JoinSet::new();
     tokio::pin!(shutdown);
+    service::report_start_progress();
     run_log_maintenance(args.log_policy, &agent_lease).await;
+    service::report_start_progress();
     let mut log_maintenance_interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
     log_maintenance_interval.tick().await;
     let mut tls_health_interval = tokio::time::interval(Duration::from_secs(60));
@@ -3435,7 +3452,7 @@ where
             }
             _ = tls_health_interval.tick() => {
                 tls_lifecycle.check_and_emit_status(&emitter);
-                emit_service_health_snapshot(&emitter);
+                emit_service_health_snapshot(&emitter, agent_lease.service_health());
                 continue;
             }
             _ = log_maintenance_interval.tick() => {
@@ -3651,13 +3668,34 @@ where
         }
     }
 
+    // On a Windows shutdown the departures fit the shared budget, so the
+    // service's stop record is written before Windows ends the process.
+    let stop_cause = service::stop_cause().unwrap_or(StopCause::Requested);
+    let drain = DrainDeadline::new(
+        std::time::Instant::now(),
+        stop_cause,
+        SESSION_SHUTDOWN_TIMEOUT,
+    );
+    let shutdown_deadline = tokio::time::Instant::from_std(drain.at());
+    tracing::info!(
+        target: NET,
+        cause = stop_cause.token(),
+        sessions = sessions.len(),
+        drain_ms = u64::try_from(stop_cause.drain_limit(SESSION_SHUTDOWN_TIMEOUT).as_millis())
+            .unwrap_or(u64::MAX),
+        "the Pier is stopping"
+    );
     quic_endpoint.close(0u32.into(), b"host shutdown");
-    quic_endpoint.wait_idle().await;
+    if tokio::time::timeout_at(shutdown_deadline, quic_endpoint.wait_idle())
+        .await
+        .is_err()
+    {
+        tracing::warn!(target: NET, "QUIC connections were still closing at the shutdown deadline");
+    }
     let _ = session_shutdown.send(true);
     if let Err(error) = resume_registry.shutdown() {
         tracing::error!(target: NET, ?error, "resume registry shutdown failed closed");
     }
-    let shutdown_deadline = tokio::time::Instant::now() + SESSION_SHUTDOWN_TIMEOUT;
     while !sessions.is_empty() {
         match tokio::time::timeout_at(shutdown_deadline, sessions.join_next()).await {
             Ok(Some(Ok(()))) => {}
@@ -3721,18 +3759,19 @@ fn emit_effective_profile(
     );
 }
 
-fn emit_service_health_snapshot(emitter: &LifecycleEmitter) {
+/// The service's minute `HEALTH_SNAPSHOT`: the worst state an attachment
+/// committed since the last one, as its agent reported it, by the shared
+/// rule (`arcen_observability::ServiceHealth`).
+fn emit_service_health_snapshot(
+    emitter: &LifecycleEmitter,
+    service_health: &arcen_observability::ServiceHealth,
+) {
     let sid = random_correlation_id();
-    let mut fields = arcen_telemetry::StructuredFields::default();
-    let _ = fields.insert(
-        "overall_state",
-        arcen_telemetry::FieldValue::String("unavailable".to_owned()),
-    );
     emit_lifecycle_event(
         emitter,
         arcen_telemetry::LifecycleEventKind::HealthSnapshot,
         sid.clone(),
-        fields,
+        service_health.take_snapshot_fields(),
     );
     emitter.emit_drop_notices(arcen_observability::LifecycleContext {
         sid,
@@ -4608,6 +4647,52 @@ mod tests {
         )
         .unwrap()
         .config
+    }
+
+    /// An HDR request on displays that offer no HDR is served as Grading:
+    /// ten-bit SDR in the desktop's own codes, named Grading, and marked so
+    /// the Deck is told why.
+    #[test]
+    fn an_hdr_request_on_displays_without_hdr_is_served_as_grading() {
+        let mut hdr = grading_request(true);
+        hdr.pipeline = Some(arcen_protocol::messages::StreamPipeline::Hdr);
+        hdr.quality.transfer = "pq".to_string();
+        hdr.quality.color_primaries = "bt2020".to_string();
+        hdr.quality.color_matrix = "bt2020ncl".to_string();
+        hdr.capabilities.bt2020_ncl_matrix = true;
+        let mut config = unpinned_config();
+        config.apply_initial_video_request(&hdr).unwrap();
+        assert_eq!(config.transfer, arcen_media::TransferCharacteristics::Pq);
+        crate::session::serve_hdr_request_as_grading(
+            &mut config,
+            arcen_media::video::EncoderRequest::NativeNvenc,
+        )
+        .expect("served as Grading");
+        assert!(config.hdr_served_as_grading);
+        assert_eq!(config.bit_depth, BitDepth::Ten);
+        assert_eq!(config.transfer, arcen_media::TransferCharacteristics::Srgb);
+        assert_eq!(config.color_primaries, arcen_media::ColorPrimaries::Bt709);
+        assert_eq!(config.color_matrix, arcen_media::ColorMatrix::Bt709);
+        assert_eq!(config.chroma, ChromaSubsampling::Yuv444);
+        assert_eq!(
+            config.active_pipeline,
+            Some(arcen_protocol::messages::ServedStreamPipeline::Grading)
+        );
+        // The Deck then attaches echoing the HDR request it authenticated
+        // with; the handshake must accept that echo, not refuse the session.
+        assert_eq!(config.auth_video_request.as_ref(), Some(&hdr));
+        crate::session::check_setup_request_echo(
+            &config,
+            Some(&hdr.capabilities),
+            Some(&hdr.quality),
+        )
+        .expect("the Deck's echoed HDR request matches what it authenticated with");
+        let grading = arcen_media::video::hdr_request_as_grading(&hdr);
+        assert!(
+            crate::session::check_setup_request_echo(&config, None, Some(&grading.quality))
+                .is_err(),
+            "the echo is checked against the Deck's request, not the one served"
+        );
     }
 
     /// Ten-bit Windows capture is linear scRGB, so a Deck that presents

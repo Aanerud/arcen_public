@@ -12,10 +12,14 @@ use super::handover::SharedReads;
 use super::picture::D3d11Picture;
 use super::refine::{D3d11RefineOverlay, PendingReadback};
 pub use arcen_deck_core::present::RefineFrameTag;
+use arcen_deck_core::present::confirmation::{
+    PresentConfirmation, PresentStatistics, confirm_present,
+};
 use arcen_media::refine::compositor::{OverlayWork, composites_over, inside, needs_composite};
 use arcen_media::refine::tile::RefineGrid;
 use arcen_media::video::present::{VideoColorContract, VideoUniform};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -42,21 +46,11 @@ impl DecodedFrame {
     }
 }
 
-/// Whether the present that showed a frame is known to be on screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Confirmation {
-    /// DXGI frame statistics count it as displayed.
-    Displayed,
-    /// Not yet.
-    Pending,
-    /// Statistics are unavailable (DWM reported them disjoint); the GPU
-    /// finished the frame and the swapchain's latency-1 wait released it.
-    Unconfirmed,
-}
-
 struct InFlight {
     query: Option<ID3D11Query>,
     present_id: Option<u32>,
+    /// When it was presented ([`FrameComposer::submitted`]).
+    presented_at: Option<Instant>,
     tag: Option<RefineFrameTag>,
     readbacks: Vec<PendingReadback>,
     _keep: Vec<ID3D11Texture2D>,
@@ -231,6 +225,7 @@ impl FrameComposer {
         self.in_flight.push_back(InFlight {
             query: None,
             present_id: None,
+            presented_at: None,
             tag: tag.cloned(),
             readbacks,
             _keep: keep,
@@ -249,16 +244,25 @@ impl FrameComposer {
             unsafe { gpu.context.End(&query) };
             last.query = Some(query);
             last.present_id = present_id;
+            last.presented_at = Some(Instant::now());
         }
         Ok(())
     }
 
     /// Reports frames that reached the screen: `presented`, then their
-    /// readbacks. `confirm` says whether a present number is displayed.
-    /// Returns `(confirmed, unconfirmed)` counts.
-    pub fn poll(&mut self, gpu: &Gpu, confirm: impl Fn(u32) -> Confirmation) -> (u64, u64) {
+    /// readbacks. `statistics` reads the swapchain's frame statistics
+    /// (`None` off a swapchain, or while DXGI has none); a present they
+    /// never reach resolves unconfirmed within the shared deadline
+    /// ([`confirm_present`]) instead of holding every later one. Returns
+    /// `(confirmed, unconfirmed)` counts.
+    pub fn poll(
+        &mut self,
+        gpu: &Gpu,
+        statistics: impl Fn() -> Option<PresentStatistics>,
+    ) -> (u64, u64) {
         let mut confirmed = 0;
         let mut unconfirmed = 0;
+        let mut reading = None;
         while let Some(front) = self.in_flight.front() {
             let Some(query) = front.query.as_ref() else {
                 break;
@@ -266,10 +270,18 @@ impl FrameComposer {
             if !gpu.query_done(query) {
                 break;
             }
-            match front.present_id.map_or(Confirmation::Unconfirmed, &confirm) {
-                Confirmation::Pending => break,
-                Confirmation::Displayed => confirmed += 1,
-                Confirmation::Unconfirmed => unconfirmed += 1,
+            let outcome = match front.present_id {
+                Some(id) => confirm_present(
+                    *reading.get_or_insert_with(&statistics),
+                    id,
+                    front.presented_at.map_or(Duration::ZERO, |at| at.elapsed()),
+                ),
+                None => PresentConfirmation::Unconfirmed,
+            };
+            match outcome {
+                PresentConfirmation::Pending => break,
+                PresentConfirmation::Displayed => confirmed += 1,
+                PresentConfirmation::Unconfirmed => unconfirmed += 1,
             }
             let Some(done) = self.in_flight.pop_front() else {
                 break;

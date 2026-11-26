@@ -251,6 +251,17 @@ pub fn whole_millimetres(value: f32) -> u32 {
 mod tests {
     use super::*;
 
+    /// A chosen scale is copied from the supported set, never computed, so
+    /// it must equal the expected one exactly.
+    #[track_caller]
+    fn assert_scale(actual: f64, expected: f64) {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "scale {actual}, expected {expected}"
+        );
+    }
+
     const INTEGER: [f64; 2] = [1.0, 2.0];
 
     fn facts(width_px: u32, height_px: u32, width_mm: u32, height_mm: u32) -> OutputScaleFacts {
@@ -285,7 +296,7 @@ mod tests {
         // A 3024x1964 backing-pixel stream at Automatic: the Deck doubles
         // 100% to 200% (400x260 mm, 192 DPI).
         let choice = choose_output_scale(&deck(3024, 1964, 200), &INTEGER);
-        assert_eq!(choice.scale, 2.0);
+        assert_scale(choice.scale, 2.0);
         assert_eq!(choice.basis, ScaleBasis::RequestedDensity);
         assert!((choice.ideal - 2.0).abs() < 0.01);
     }
@@ -294,13 +305,13 @@ mod tests {
     fn a_point_stream_at_automatic_stays_unscaled() {
         // The same panel streamed in points, or the backing pixels at an
         // explicit 100%: 96 DPI.
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(1512, 982, 100), &INTEGER).scale,
-            1.0
+            1.0,
         );
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(3024, 1964, 100), &INTEGER).scale,
-            1.0
+            1.0,
         );
     }
 
@@ -315,7 +326,7 @@ mod tests {
             },
             &INTEGER,
         );
-        assert_eq!(choice.scale, 1.0);
+        assert_scale(choice.scale, 1.0);
         assert_eq!(choice.basis, ScaleBasis::RequestedDensity);
     }
 
@@ -328,7 +339,7 @@ mod tests {
             },
             &INTEGER,
         );
-        assert_eq!(choice.scale, 2.0);
+        assert_scale(choice.scale, 2.0);
         assert_eq!(choice.basis, ScaleBasis::BackingPixels);
         assert!((choice.ideal - 2.0).abs() < 1e-9);
     }
@@ -336,26 +347,26 @@ mod tests {
     #[test]
     fn a_requested_percentage_takes_the_nearest_supported_scale() {
         let fractional = [1.0, 1.25, 1.5, 1.75, 2.0];
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(2560, 1440, 150), &fractional).scale,
-            1.5
+            1.5,
         );
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(2560, 1440, 175), &fractional).scale,
-            1.75
+            1.75,
         );
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(2560, 1440, 300), &[1.0, 2.0, 3.0]).scale,
-            3.0
+            3.0,
         );
         // Integer-only: 125% is nearer 1, 175% nearer 2.
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(2560, 1440, 125), &INTEGER).scale,
-            1.0
+            1.0,
         );
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(2560, 1440, 175), &INTEGER).scale,
-            2.0
+            2.0,
         );
     }
 
@@ -364,30 +375,33 @@ mod tests {
         // 150% with only 100% and 200%: millimetre rounding must not tip it.
         for (width, height) in [(1920, 1080), (2560, 1440), (3024, 1964), (1366, 768)] {
             assert_eq!(
-                choose_output_scale(&deck(width, height, 150), &INTEGER).scale,
-                1.0,
+                choose_output_scale(&deck(width, height, 150), &INTEGER)
+                    .scale
+                    .to_bits(),
+                1.0_f64.to_bits(),
                 "{width}x{height}"
             );
         }
         // The supported set's order does not matter.
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(1920, 1080, 150), &[2.0, 1.0]).scale,
-            1.0
+            1.0,
         );
     }
 
     #[test]
     fn unknown_size_or_an_output_without_scales_is_unscaled() {
         let choice = choose_output_scale(&facts(3840, 2160, 0, 0), &INTEGER);
-        assert_eq!((choice.scale, choice.basis), (1.0, ScaleBasis::Unknown));
-        assert_eq!(choose_output_scale(&deck(3024, 1964, 200), &[]).scale, 1.0);
-        assert_eq!(
+        assert_scale(choice.scale, 1.0);
+        assert_eq!(choice.basis, ScaleBasis::Unknown);
+        assert_scale(choose_output_scale(&deck(3024, 1964, 200), &[]).scale, 1.0);
+        assert_scale(
             choose_output_scale(&deck(3024, 1964, 200), &[1.0]).scale,
-            1.0
+            1.0,
         );
-        assert_eq!(
+        assert_scale(
             choose_output_scale(&deck(3024, 1964, 200), &[f64::NAN, 0.0]).scale,
-            1.0
+            1.0,
         );
     }
 

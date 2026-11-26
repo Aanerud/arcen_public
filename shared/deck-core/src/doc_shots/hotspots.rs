@@ -296,6 +296,15 @@ const SETTINGS_ADVANCED: &[Hotspot] = &[
     both(3, "Paste as Keystrokes", is("Paste as Keystrokes")),
 ];
 
+const SETTINGS_PRIVACY: &[Hotspot] = &[
+    both(
+        1,
+        "Keep the host\u{2019}s desk private",
+        is("Keep the host\u{2019}s desk private"),
+    ),
+    both(2, "What it does", starts("While you are connected")),
+];
+
 const SIGN_IN_ERROR: &[Hotspot] = &[
     both(1, "The field to fix", under("Password")),
     both(2, "What happened", is("Wrong username or password.")),
@@ -379,9 +388,18 @@ const SIGN_IN_REFUSED: &[Hotspot] = &[
     both(3, "OK", control("OK")),
 ];
 
+const CONNECTING_ONE_DISPLAY: &[Hotspot] = &[
+    both(
+        1,
+        "One display, for this session only",
+        starts("Connecting to "),
+    ),
+    both(2, "Cancel", control("Cancel")),
+];
+
 /// Every scene's hotspots, in the manifest's order, then the scenes added
 /// since.
-pub const TABLE: [(&str, &[Hotspot]); 19] = [
+pub const TABLE: [(&str, &[Hotspot]); 21] = [
     ("home", HOME),
     ("home-empty", HOME_EMPTY),
     ("add-menu", ADD_MENU),
@@ -401,6 +419,8 @@ pub const TABLE: [(&str, &[Hotspot]); 19] = [
     ("import-review", IMPORT_REVIEW),
     ("home-own-settings", HOME_OWN_SETTINGS),
     ("sign-in-refused", SIGN_IN_REFUSED),
+    ("settings-privacy", SETTINGS_PRIVACY),
+    ("connecting-one-display", CONNECTING_ONE_DISPLAY),
 ];
 
 /// `scene`'s hotspots.

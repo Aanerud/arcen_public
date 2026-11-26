@@ -3617,24 +3617,52 @@ const NEW_DECK_POLL: std::time::Duration = std::time::Duration::from_millis(100)
 /// the shared `lock_wait::LockWait`: asked again every `LOCK_RETRY` for at
 /// most `UNLOCKED_GRACE`; a console another account holds is left after
 /// consecutive readings; a desk that was not private stops waiting when
-/// `new_deck` says an authenticated Deck wants the slot. Every ending that
-/// leaves the desk unlocked is logged as an error. `None` for a hand run
-/// with no account (`serve`).
-async fn await_lock_screen(
+/// `new_deck` says an authenticated Deck wants the slot. A desk private
+/// under `privacy.desk = "required"` is never given back unlocked: past the
+/// grace it stays private, `held(true)` marks the slot so a Deck is told
+/// why, the refusal is logged as an error once, and the lock is asked for
+/// every `HELD_LOCK_RETRY` until the session locks or the console leaves
+/// the account (`held(false)` then). Every ending that leaves the desk
+/// unlocked is logged as an error. `relock` asks for the lock again
+/// ([`lock_on_departure`]), told whether the desk is held (each refusal of
+/// a held desk is not an error of its own). `None` for a hand run with no
+/// account (`serve`).
+async fn await_lock_screen<F>(
     mut locked: LockOutcome,
     serving_uid: Option<u32>,
     departure: arcen_session::console_session::Departure,
-    private: bool,
+    desk: arcen_session::console_session::lock_wait::WaitingDesk,
+    mut relock: impl FnMut(bool) -> F,
     new_deck: impl Fn() -> bool,
-) -> Option<arcen_session::console_session::lock_wait::LockWaitEnd> {
+    held: impl Fn(bool),
+) -> Option<arcen_session::console_session::lock_wait::LockWaitEnd>
+where
+    F: std::future::Future<Output = LockOutcome>,
+{
     use arcen_session::console_session::lock_wait::{LockWait, LockWaitEnd, LockWaitVerdict};
     serving_uid?;
-    let started = std::time::Instant::now();
-    let mut wait = LockWait::new(private);
+    let started = tokio::time::Instant::now();
+    let mut wait = LockWait::for_desk(desk);
     let end = 'wait: loop {
         let pause = match wait.next(locked, started.elapsed()) {
             LockWaitVerdict::Done(end) => break end,
             LockWaitVerdict::RetryAfter(pause) => pause,
+            LockWaitVerdict::HoldPrivate { retry_after, first } => {
+                if first {
+                    held(true);
+                    tracing::error!(
+                        target: arcen_telemetry::names::target::SESSION,
+                        departure = departure.token(),
+                        unlocked_secs = started.elapsed().as_secs(),
+                        "the session would not lock after its Deck left; privacy.desk is \
+                         \"required\", so this Mac's desk stays dark with its input blocked and \
+                         no Deck is admitted until it locks. The lock is asked for again every \
+                         {} s. Check that its lock screen is not turned off by policy",
+                        arcen_session::console_session::lock_wait::HELD_LOCK_RETRY.as_secs()
+                    );
+                }
+                retry_after
+            }
         };
         let until = tokio::time::Instant::now() + pause;
         loop {
@@ -3649,8 +3677,19 @@ async fn await_lock_screen(
             }
             tokio::time::sleep(NEW_DECK_POLL.min(until - now)).await;
         }
-        locked = lock_on_departure(serving_uid, departure).await;
+        locked = relock(wait.held()).await;
     };
+    if wait.held() {
+        held(false);
+        tracing::warn!(
+            target: arcen_telemetry::names::target::SESSION,
+            departure = departure.token(),
+            end = ?end,
+            held_secs = started.elapsed().as_secs(),
+            "the desk held private for a session that would not lock is given back: the \
+             session locked, or the console left its account"
+        );
+    }
     match end {
         LockWaitEnd::GraceExpired => tracing::error!(
             target: arcen_telemetry::names::target::SESSION,
@@ -3746,7 +3785,7 @@ impl AttachmentEnd for MacAttachmentEnd<'_> {
     }
 
     async fn lock(&mut self, departure: arcen_session::console_session::Departure) -> LockOutcome {
-        lock_on_departure(self.serving_uid, departure).await
+        lock_on_departure(self.serving_uid, departure, false).await
     }
 
     async fn await_lock_screen(
@@ -3754,19 +3793,35 @@ impl AttachmentEnd for MacAttachmentEnd<'_> {
         locked: LockOutcome,
         departure: arcen_session::console_session::Departure,
     ) {
+        use arcen_session::console_session::lock_wait::{WaitingDesk, waits_for_lock};
         let private = self.desk_privacy.is_some();
-        if !arcen_session::console_session::lock_wait::waits_for_lock(private, locked) {
+        if !waits_for_lock(private, locked) {
             return;
         }
+        let desk = WaitingDesk::new(private, self.handshake.desk_privacy);
         // A desk that was not private shows the session anyway: it gives
         // the host's slot up to an authenticated Deck rather than holding it
         // for the grace. A private desk keeps it until it locks.
         let admission = self.handshake.admission.as_ref();
         let offered = !private && admission.is_some_and(|admission| admission.offer_yield(true));
-        let _ = await_lock_screen(locked, self.serving_uid, departure, private, || {
-            offered
-                && admission.is_some_and(arcen_pier_macos::session::AdmissionGuard::yield_requested)
-        })
+        let serving_uid = self.serving_uid;
+        let _ = await_lock_screen(
+            locked,
+            serving_uid,
+            departure,
+            desk,
+            |held| lock_on_departure(serving_uid, departure, held),
+            || {
+                offered
+                    && admission
+                        .is_some_and(arcen_pier_macos::session::AdmissionGuard::yield_requested)
+            },
+            |held| {
+                if let Some(admission) = admission {
+                    admission.set_lock_refused(held);
+                }
+            },
+        )
         .await;
         if offered && let Some(admission) = admission {
             let _ = admission.offer_yield(false);
@@ -3822,10 +3877,13 @@ type LockOutcome = arcen_session::console_session::lock_wait::LockAttempt;
 /// is that account's, and is left alone (read fail-closed:
 /// `console::console_is_ours`). `left` is why the Deck left
 /// (`deck_left`, or `capture_stopped` when sharing was stopped on the host),
-/// as the log names it.
+/// as the log names it. `held`: the desk is held private for a session that
+/// keeps refusing (`await_lock_screen` reported it once), so a refusal is
+/// only a debug line.
 async fn lock_on_departure(
     serving_uid: Option<u32>,
     left: arcen_session::console_session::Departure,
+    held: bool,
 ) -> LockOutcome {
     use arcen_session::console_session::Departure;
     let Some(uid) = serving_uid else {
@@ -3865,6 +3923,15 @@ async fn lock_on_departure(
                 "locked the session as its Deck left"
             );
             LockOutcome::Locked
+        }
+        Err(error) if held => {
+            tracing::debug!(
+                target: arcen_telemetry::names::target::SESSION,
+                departure = departure.token(),
+                %error,
+                "the held session refused the lock again"
+            );
+            LockOutcome::NotLocked
         }
         Err(error) => {
             tracing::error!(
@@ -4582,6 +4649,86 @@ mod tests {
             Some("lock:deck_left")
         );
         assert_eq!(host.steps.last().map(String::as_str), Some("guard"));
+    }
+
+    /// Waits as the hand-back does for a session that refused its first
+    /// lock and refuses every ask again (or locks once `lock_after` asks
+    /// were refused), for at most `limit` of this runtime's paused clock; a
+    /// Deck asks for the slot all along. Returns how it ended (`None`: still
+    /// waiting), the slot marks, the asks and how many of them were told the
+    /// desk was held.
+    async fn wait_refused(
+        desk: arcen_session::console_session::lock_wait::WaitingDesk,
+        lock_after: Option<u32>,
+        limit: Duration,
+    ) -> (
+        Option<arcen_session::console_session::lock_wait::LockWaitEnd>,
+        Vec<bool>,
+        u32,
+        u32,
+    ) {
+        let asks = std::cell::Cell::new(0_u32);
+        let held_asks = std::cell::Cell::new(0_u32);
+        let held = std::cell::RefCell::new(Vec::new());
+        let wait = super::await_lock_screen(
+            super::LockOutcome::NotLocked,
+            Some(501),
+            arcen_session::console_session::Departure::DeckLeft,
+            desk,
+            |held| {
+                asks.set(asks.get() + 1);
+                held_asks.set(held_asks.get() + u32::from(held));
+                std::future::ready(if lock_after.is_some_and(|after| asks.get() > after) {
+                    super::LockOutcome::Locked
+                } else {
+                    super::LockOutcome::NotLocked
+                })
+            },
+            || true,
+            |mark| held.borrow_mut().push(mark),
+        );
+        let end = tokio::time::timeout(limit, wait).await.ok().flatten();
+        (end, held.into_inner(), asks.get(), held_asks.get())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_required_desk_stays_private_past_the_grace_and_marks_its_slot() {
+        use arcen_session::console_session::lock_wait::WaitingDesk;
+        // A lock screen off by policy: an hour on, the desk is still held,
+        // the newcomer never ended the wait, and the asks stay bounded
+        // (every 5 s for the grace, then every 30 s).
+        let (end, held, asks, held_asks) =
+            wait_refused(WaitingDesk::Required, None, Duration::from_secs(3_600)).await;
+        assert_eq!(end, None);
+        assert_eq!(held, [true]);
+        assert!((120..=135).contains(&asks), "{asks}");
+        // Asks within the grace are errors of their own; held ones are not.
+        assert_eq!(asks - held_asks, 12);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_desk_is_given_back_once_its_session_locks() {
+        use arcen_session::console_session::lock_wait::{LockWaitEnd, WaitingDesk};
+        let (end, held, _, _) =
+            wait_refused(WaitingDesk::Required, Some(20), Duration::from_secs(3_600)).await;
+        assert_eq!(end, Some(LockWaitEnd::Locked));
+        assert_eq!(held, [true, false]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_and_off_keep_the_grace_and_the_yield() {
+        use arcen_session::console_session::lock_wait::{LockWaitEnd, WaitingDesk};
+        // privacy.desk "on", the Deck asked for privacy: given back after
+        // the grace, unlocked and reported.
+        let (end, held, _, _) =
+            wait_refused(WaitingDesk::Private, None, Duration::from_secs(3_600)).await;
+        assert_eq!(end, Some(LockWaitEnd::GraceExpired));
+        assert!(held.is_empty());
+        // A desk that was not private gives the slot to the waiting Deck.
+        let (end, held, _, _) =
+            wait_refused(WaitingDesk::Live, None, Duration::from_secs(3_600)).await;
+        assert_eq!(end, Some(LockWaitEnd::YieldedToNewDeck));
+        assert!(held.is_empty());
     }
 
     #[test]

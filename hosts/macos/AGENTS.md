@@ -501,7 +501,13 @@ answered while somebody is logged in.
   in at the streamed lock screen. A lock that is refused is asked again
   every 5 s for at most `UNLOCKED_GRACE`, desk privacy or not (shared
   `console_session::lock_wait`), and an ending that leaves the desk
-  unlocked is logged as an error. A private desk holds the session slot
+  unlocked is logged as an error. Under `privacy.desk = "required"` a
+  private desk is never given back unlocked (`WaitingDesk::Required`):
+  past the grace it stays dark with its input blocked, the refusal is
+  logged once as an error (later refusals are debug lines), the slot is marked (`set_lock_refused`) so a
+  Deck that signs in is refused `HostLockRefused` (worded as busy), and
+  the lock is asked for every `HELD_LOCK_RETRY` (30 s) until it comes or
+  the console leaves the account. A private desk holds the session slot
   for that wait; a desk that was not private shows the session
   anyway, so it offers the slot (`SessionAdmissionRuntime::offer_yield`)
   and an authenticated Deck that finds it taken asks for it
@@ -564,9 +570,11 @@ answered while somebody is logged in.
   `CGSetDisplayTransferByTable` on every display but the Pier's own virtual
   ones (vendor `0x3456`), read back, re-asserted every 100 ms; a display
   lit for 2 s ends the session (shared `PrivacyWatch`). Hand-back: lock
-  (retried every 5 s, at most `UNLOCKED_GRACE`), displays, sound, input; a
+  (retried every 5 s, at most `UNLOCKED_GRACE`; under `required`, until
+  it locks), displays, sound, input; a
   console that leaves the account for three readings gets the desk back and
-  ends the session with what the shared `WatchVerdict::deck_refusal` says:
+  ends the session with what the shared `WatchVerdict::deck_refusal` says
+  (read fail-closed, `console::console_is_ours`, as the lock reads it):
   `console_other_user` (naming the account) when another account holds it,
   `console_session_changed` when the login window does, never
   `console_privacy_unavailable`, which is only for a display that stayed

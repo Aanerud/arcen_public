@@ -123,7 +123,7 @@ mod tests {
             } else {
                 RETRY_DELAY
             };
-            assert_eq!(due - now, expected);
+            assert_eq!(due.checked_sub(now), Some(expected));
             assert!(schedule.take_due(due));
             now = due + at(300);
         }

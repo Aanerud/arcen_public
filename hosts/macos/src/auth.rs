@@ -250,6 +250,11 @@ pub enum AuthFailure {
     TooManyAttempts,
     /// The account is valid, but another session already holds this host.
     HostBusy,
+    /// The account is valid, but the session before holds this host: it
+    /// would not lock as its Deck left, and `privacy.desk = "required"`
+    /// keeps the desk private until it does (shared `lock_wait`). Worded as
+    /// [`Self::HostBusy`] first, so every Deck reads it as busy.
+    HostLockRefused,
 }
 
 impl AuthFailure {
@@ -264,6 +269,7 @@ impl AuthFailure {
             Self::NotConsoleOwner => "not_console_owner",
             Self::TooManyAttempts => "too_many_attempts",
             Self::HostBusy => "host_busy",
+            Self::HostLockRefused => "host_lock_refused",
         }
     }
 }
@@ -282,6 +288,12 @@ impl std::fmt::Display for AuthFailure {
             }
             Self::TooManyAttempts => arcen_session::auth_throttle::THROTTLED_MESSAGE,
             Self::HostBusy => "another session is already using this Mac",
+            Self::HostLockRefused => {
+                "another session is already using this Mac: the last one would not lock when its \
+                 Deck left, so its desk stays dark with its input blocked until it locks \
+                 (privacy.desk = \"required\"). Ask this Mac's administrator to check that its \
+                 lock screen is not turned off by policy"
+            }
         })
     }
 }
@@ -472,6 +484,7 @@ mod tests {
             AuthFailure::NotConsoleOwner,
             AuthFailure::TooManyAttempts,
             AuthFailure::HostBusy,
+            AuthFailure::HostLockRefused,
         ] {
             assert!(!failure.as_str().is_empty());
             let message = failure.to_string();
@@ -480,5 +493,11 @@ mod tests {
             assert!(!message.contains("username is"));
             assert!(!message.contains("no such"));
         }
+        // Every Deck reads a held slot as busy (deck-core matches the start).
+        assert!(
+            AuthFailure::HostLockRefused
+                .to_string()
+                .starts_with(&AuthFailure::HostBusy.to_string())
+        );
     }
 }

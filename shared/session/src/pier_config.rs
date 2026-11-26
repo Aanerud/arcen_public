@@ -1060,7 +1060,10 @@ mod tests {
             let config: LoggingConfig =
                 serde_json::from_str(&format!(r#"{{"verbosity":{legacy}}}"#))
                     .expect("legacy logging config");
-            assert_eq!(config.verbosity, Some(legacy as u8));
+            assert_eq!(
+                config.verbosity,
+                Some(u8::try_from(legacy).expect("a legacy level"))
+            );
             assert_eq!(
                 config.resolved_profile(),
                 Ok(ResolvedLoggingProfile {

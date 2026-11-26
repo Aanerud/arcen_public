@@ -46,7 +46,6 @@ const DCONF: &str = "/usr/bin/dconf";
 const GSETTINGS: &str = "/usr/bin/gsettings";
 const OVERLAY_DIR: &str = "dconf";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const GDM_TIMEOUT: Duration = Duration::from_secs(2);
 /// GNOME Shell's own `XDG_CURRENT_DESKTOP` for a `gnome` session.
 const CURRENT_DESKTOP: &str = "GNOME";
 
@@ -125,7 +124,7 @@ impl SessionServices {
         members.set("XDG_MENU_PREFIX", "gnome-");
         members.set("GNOME_DESKTOP_SESSION_ID", "this-is-deprecated");
         let lock = LockPolicy::resolve(&LockFacts {
-            gdm_version: gdm_version().await,
+            gdm_version: crate::session::launcher::gdm_version().await,
         });
         tracing::info!(
             target: target::SESSION,
@@ -279,25 +278,6 @@ impl LogoutReceiver {
             }
         }
     }
-}
-
-/// GDM's version on the system bus, as GNOME Shell's `canLock` asks it.
-async fn gdm_version() -> Option<String> {
-    tokio::time::timeout(GDM_TIMEOUT, async {
-        let connection = zbus::Connection::system().await.ok()?;
-        let proxy = zbus::Proxy::new(
-            &connection,
-            "org.gnome.DisplayManager",
-            "/org/gnome/DisplayManager/Manager",
-            "org.gnome.DisplayManager.Manager",
-        )
-        .await
-        .ok()?;
-        proxy.get_property::<String>("Version").await.ok()
-    })
-    .await
-    .ok()
-    .flatten()
 }
 
 /// Writes and compiles the session's dconf database and profile; returns

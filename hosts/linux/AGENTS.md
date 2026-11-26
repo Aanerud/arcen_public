@@ -293,6 +293,16 @@ These are the rules. Why each holds, and how the code meets it, is in
 - A capture epoch that ends on its own is restarted inside the attachment
   (`CaptureRestartBudget`); never end the session for it, and never loop
   past the budget.
+- A lock never ends a desktop. When the shell inhibits remote access (its
+  shield is up on a compositor that is not `--headless`), Mutter closes
+  every RemoteDesktop/ScreenCast session; the agent keeps the desktop and
+  suspends capture and input as the shared
+  `desktop_session::remote_access::StreamsLifetime` decides, and records
+  the outputs again (new clipboard session, EIS text reconnected) once
+  Mutter allows it. Never end a desktop on a refusal Mutter attributes to
+  the inhibition, and never capture a `hello` that says
+  `streams_unavailable`: attachments wait through
+  `output_client::current_live` (`attach_wait`).
 - X11 applications run through the compositor's own Xwayland
   (`platform.session.wayland_x11_apps`, resolved once at start by the shared
   `resolve_x11_apps`): never start an X server, never put `DISPLAY` or
@@ -384,6 +394,21 @@ older deployments may be removed from `/opt/arcen/bin/`.
   `console_session::wayland_attach`; keep the launcher's
   `run_wayland_join` an adapter. A joined Wayland session is never held for a
   resume.
+- Another product's X11 desktop (ADR 0025 §8) takes the Deck's layout only
+  when the shared `console_session::guest_layout::guest_layout_policy` says
+  `ApplyOnAttach` (its client proved absent just before, `platform.session.guest_layout`
+  not `keep`); an attached or unknown client is `Shown`. Lay it out only in
+  modes of the Deck monitors' own sizes with identity transforms (shared
+  `plan_native_console_layout`; add a missing mode, never `ViewPortIn`
+  scaling), and leave it when the Deck goes (`LayoutDeparture::LeaveDecks`:
+  the hand-back and the recovery keep it; a failed or unproved layout is
+  still put back and the desktop shown as it is).
+- Whoever connects gets their own layout (ADR 0025 §6): which layout a
+  console is asked to take is the shared `connect_layout::console_layout_ask`
+  (a one-display Deck that matches its layout too, on another product's
+  desktop). A sign-in joins a console afresh (the takeover hands a held
+  one back); never reattach a held console, or lay a journalled layout,
+  for another Deck.
 - Remote seated sessions get polkit's `allow_any` answers only through
   Arcen's rule `05-arcen-remote-session.rules` (shared
   `arcen_session::polkit_remote`, adapter `session/polkit_remote.rs`) — keep

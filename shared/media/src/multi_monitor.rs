@@ -1177,6 +1177,72 @@ impl AggregateMediaPlan {
     }
 }
 
+/// Why a display's own chroma request is refused under the session's
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayChromaRefusal {
+    /// The display asked for 4:2:0 ([`MonitorQualityIntentMsg::BandwidthOptimized`])
+    /// in a ten-bit 4:4:4 contract (Grading, HDR). Those contracts are 4:4:4
+    /// on every display; ten-bit 4:2:0 is no part of them.
+    OutsideFullColorContract,
+}
+
+impl DisplayChromaRefusal {
+    /// The stable token a Pier publishes on the display's applied media plan.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::OutsideFullColorContract => "chroma_420_outside_full_color_contract",
+        }
+    }
+}
+
+/// The chroma one display of a multi-monitor session is served in, and the
+/// typed refusal when the display's own request does not fit the contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionChroma {
+    /// The display's chroma layout.
+    pub chroma: crate::ChromaSubsampling,
+    /// Set when the display's request was refused and it takes the
+    /// contract's chroma instead.
+    pub refusal: Option<DisplayChromaRefusal>,
+}
+
+/// Validates one display's quality intent against the session's contract
+/// (`contract_chroma` at `contract_bit_depth`) and gives the chroma the
+/// display is served in.
+///
+/// A ten-bit 4:4:4 contract (Grading, HDR) is 4:4:4 on every display: a
+/// display that asks for 4:2:0 is refused with
+/// [`DisplayChromaRefusal::OutsideFullColorContract`] and served 4:4:4, and
+/// the session goes on. Any other contract serves a
+/// [`MonitorQualityIntentMsg::BandwidthOptimized`] display in 4:2:0.
+#[must_use]
+pub fn region_chroma(
+    intent: MonitorQualityIntentMsg,
+    contract_chroma: crate::ChromaSubsampling,
+    contract_bit_depth: crate::BitDepth,
+) -> RegionChroma {
+    let full_color_contract = contract_bit_depth == crate::BitDepth::Ten
+        && contract_chroma == crate::ChromaSubsampling::Yuv444;
+    match intent {
+        MonitorQualityIntentMsg::BandwidthOptimized if full_color_contract => RegionChroma {
+            chroma: contract_chroma,
+            refusal: Some(DisplayChromaRefusal::OutsideFullColorContract),
+        },
+        MonitorQualityIntentMsg::BandwidthOptimized => RegionChroma {
+            chroma: crate::ChromaSubsampling::Yuv420,
+            refusal: None,
+        },
+        MonitorQualityIntentMsg::HostDefault | MonitorQualityIntentMsg::FullColorRequired => {
+            RegionChroma {
+                chroma: contract_chroma,
+                refusal: None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2069,5 +2135,49 @@ mod tests {
         .expect("plan");
         assert_eq!(plan.bitrate_budget, budget);
         assert_eq!(plan.applied_bitrate_kbps(), 12_345);
+    }
+
+    #[test]
+    fn a_420_display_in_a_ten_bit_444_contract_is_refused_and_served_444() {
+        // The lab regression: a Grading or HDR display sent as 4:2:0 was
+        // planned as ten-bit 4:2:0, and the whole session ended.
+        let served = region_chroma(
+            MonitorQualityIntentMsg::BandwidthOptimized,
+            ChromaSubsampling::Yuv444,
+            crate::BitDepth::Ten,
+        );
+        assert_eq!(served.chroma, ChromaSubsampling::Yuv444);
+        assert_eq!(
+            served.refusal,
+            Some(DisplayChromaRefusal::OutsideFullColorContract)
+        );
+        assert_eq!(
+            DisplayChromaRefusal::OutsideFullColorContract.token(),
+            "chroma_420_outside_full_color_contract"
+        );
+    }
+
+    #[test]
+    fn a_420_display_in_any_other_contract_gets_420() {
+        for (chroma, bit_depth) in [
+            (ChromaSubsampling::Yuv444, crate::BitDepth::Eight),
+            (ChromaSubsampling::Yuv420, crate::BitDepth::Eight),
+        ] {
+            let served = region_chroma(
+                MonitorQualityIntentMsg::BandwidthOptimized,
+                chroma,
+                bit_depth,
+            );
+            assert_eq!(served.chroma, ChromaSubsampling::Yuv420);
+            assert_eq!(served.refusal, None);
+        }
+        for intent in [
+            MonitorQualityIntentMsg::HostDefault,
+            MonitorQualityIntentMsg::FullColorRequired,
+        ] {
+            let served = region_chroma(intent, ChromaSubsampling::Yuv444, crate::BitDepth::Ten);
+            assert_eq!(served.chroma, ChromaSubsampling::Yuv444);
+            assert_eq!(served.refusal, None);
+        }
     }
 }

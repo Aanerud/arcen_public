@@ -88,10 +88,27 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   (`HdrSetupRefusal`, documented in `docs/operations/error-codes.md`); never
   let a setup wait outlast the broker, which terminates the agent and leaves
   the crash watchdog to restore the display.
+- A session display whose own EDID claims no HDR (an SDR monitor, a dummy
+  plug) and whose EDID Arcen did not write never becomes HDR: after the
+  shared `HDR_SUPPORT_SETTLE` the agent stops waiting and serves the HDR
+  request as Grading (`hdr_request_as_grading`), and the Deck is told why
+  (`served_pipeline` reason `hdr_display_unsupported`). Only a display Arcen
+  gave an HDR identity (shared `DisplayIdentity::may_gain_hdr`: an HDR EDID
+  from the single-display NVAPI exact path or NVIDIA headless, or an IddCx
+  display) keeps the full wait and `hdr_not_activated`. The multi-display
+  NVAPI exact path writes an SDR EDID, which counts as the display's own.
+  Degrade, never fail.
 - HDR additionally requires the final HDR EDID/topology, Windows 11
   `activeColorMode=HDR`, and DXGI
   `RGB_FULL_G2084_NONE_P2020` on the exact session-bound display target.
   Never count or mutate unrelated active outputs.
+- Switching a session display's HDR state can make Windows lay the desktop
+  out again and turn back on a display the multi-display plan turned off
+  (the desk's own). After the colour step the agent reads the desktop back
+  (shared `windows_topology::topology_drift`), applies the bound plan once
+  more (`drift_response`), and proves the colour state held by adapter LUID
+  and target id, since `\\.\DISPLAYn` names can change. Never start input or
+  capture on a desktop the plan does not describe.
 - Keep pre-provision NVIDIA EDID recovery armed for the complete display lease
   and restore it after normal attachment teardown. A remote request must not
   leave persistent display identity or HDR state behind.
@@ -113,6 +130,28 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   shared `Departure::locks_session`: never on a same-account takeover
   (`OwnerCommand::TakenOver`, displaced incumbent) or a changed session.
   Keep every relay exit setting its `Departure`.
+- Lock first when the desk must not see the session (shared
+  `console_session::hand_back_order`): under `privacy.desk = "required"`, or
+  for a session already locked, `lock_before_agent_exit` detaches the agent
+  (it stays, the desk dark and its input hooked) and locks before the agent
+  exits; a refused lock follows the shared `lock_wait` (`WaitingDesk::Required`
+  never gives the desk back; the slot says why through
+  `set_lock_refused`). The displays the locked session cannot restore are
+  replayed by `console_recovery::restore_behind_lock` (`restore-display
+  --console`, LocalSystem on the secure desktop). A stop or shutdown asks once.
+  The agent's attachments run in one block (`attachments`): on every way out
+  (`?`, a desk-watch refusal, a closed broker channel) a lock-first agent runs
+  `hold_desk_until_locked` (`windows_session::lock_own_session`, shared
+  `lock_wait`) before it restores the desk or shuts the hooks; and a hand-back
+  whose agent had already gone keeps asking under `required`
+  (`keep_locking_required`).
+- A lost transport's hold (`relay_resumable_client_and_agent`) runs the shared
+  `held_lock::HOLD_STEPS`: detach the agent, lock the session, then watch it
+  with `observe_held` (locked or not, still the Deck's). A resume of a locked
+  held session is refused with `HeldResume::SignInAgain` (code `unsupported`)
+  and the hold continues for the password sign-in, which unlocks through the
+  credential provider and takes the hold over. A held agent skips the hook
+  canary while its own session is locked (`held_lock::DeskInputProof`).
 - A broker that dies while attached (ADR 0025 §4, shared
   `console_session::owner_death`): `owner_guard::OwnerGuard` is armed for
   every attachment and released only after `hand_back_session`. It starts
@@ -124,6 +163,20 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   starting broker locks first (`recover_at_start`, before the speakers and
   displays). Never lock a session a record or guard does not name exactly,
   and never release a guard before the hand-back.
+- Windows shutting down or restarting (shared `arcen_session::host_shutdown`):
+  the service accepts PRESHUTDOWN (and SHUTDOWN) as `StopCause::HostShutdown`.
+  The installer sets the service's preshutdown timeout to `SHUTDOWN_GRANT`
+  on every install and upgrade (`set_preshutdown_timeout`, read back), and
+  `INSTALL.md` does the same for the manual path; the service never writes
+  its own configuration. `run_host` then drains within `DEPARTURE_BUDGET`, the hand-back neither
+  waits for the display journal (replayed at the next start) nor for a lock
+  Windows overtakes by signing the session out, and `SERVICE_STOP` says
+  `host_shutdown`. Windows ends the agent as it signs the session out,
+  before any service hears of the shutdown: its hidden top-level window
+  (`session_end.rs`; a message-only window is not told, and a process that
+  loads user32 gets no console logoff event) writes `SESSION_END`
+  (`signed_out` or `host_shutdown`) on `WM_ENDSESSION`. The shared
+  `SessionTally` keeps it to one end record per session.
 - `audio.local_playback` is the broker's endpoint-mute lease
   (`local_playback.rs`, shared `local_playback::endpoint_*`): every active
   render endpoint muted (loopback still carries the mix), journalled in

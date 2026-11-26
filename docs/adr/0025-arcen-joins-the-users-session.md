@@ -1,6 +1,6 @@
 # ADR 0025: Arcen joins the user's session
 
-**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`); amended 2026-11-24 (§5: desk privacy is the Deck user's choice, best effort unless the administrator sets `privacy.desk = "required"`). Product-wide; the Linux Pier is its main
+**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`); amended 2026-11-24 (§5: desk privacy is the Deck user's choice, best effort unless the administrator sets `privacy.desk = "required"`); amended 2026-11-25 (§8: another product's desktop takes the Deck's monitors on attach while that product has no client attached, and keeps them when the Deck leaves; §4 and §12: under `privacy.desk = "required"` a desk whose session will not lock stays private until it locks; §4 and §12 again: the Windows Pier locks a session held for its Deck's resume at once, and locks first under `required`). Product-wide; the Linux Pier is its main
 part. Builds on [ADR 0005](0005-direct-transport-resume-authority.md)
 (resume), [ADR 0008](0008-virtual-display-for-windows-hosts.md) and
 [ADR 0014](0014-quic-lanes-and-capture-contracts.md); changes the Linux
@@ -352,7 +352,88 @@ guest console), for at most `auth.reconnect_window_secs`, and the hold is
 watched every 2 s (`detached_hold::DetachedHold`): the other product's
 client (a guest console), the other product's own new desktop, a session
 unlocked again after the hand-back locked it, or another desktop in front
-and unlocked, end it at once.
+and unlocked, end it at once. *Amended 2026-11-25 (§8):* a guest console
+laid out to the Deck keeps the Deck's layout through the hold and after it,
+as every departure from it does.
+
+*Amended 2026-11-25 (`required` fails closed when the lock fails):* a
+private desk whose session refused to lock was given back unlocked after
+`UNLOCKED_GRACE` on the macOS Pier whatever `privacy.desk` said, so
+`required` did not fail closed at the moment it matters most. The decision
+is shared (`console_session::lock_wait`, `WaitingDesk::Required`): under
+`required`, a desk the Pier made private is never given back unlocked.
+Past the grace it stays dark with its input blocked, the Pier's session
+slot stays held (`SessionAdmissionRuntime::set_lock_refused`, so a Deck
+that signs in meanwhile is told why the host is busy rather than only that
+it is), the hold is logged once at error level (the asks that follow are not errors of their own), and the lock is asked
+for again every `HELD_LOCK_RETRY` (30 s), with no end, until the session
+locks or the console leaves the account; the desk watch reads the console
+fail-closed as the lock does (`console::console_is_ours`), so a failed
+read is not a departure of the account. `"on"` keeps the grace (the
+Deck's user chose privacy; the owner at the desk must get the session
+back), and `"off"` has no private desk to hold. Recovery is the
+administrator's: turn the lock screen back on (the next ask locks), or
+sign the session out. A Pier process that dies during the hold is the lock
+guard's (§12): it locks, and gives the desk back after the grace without
+the input filter, which is the agent's. The macOS Pier adopts it, and so
+does the Windows Pier (below). The Linux console's own wait already keeps
+a desk private until
+it locks, for every mode, except a display manager's session it put behind
+a login screen, which is given back there after the grace; whether
+`required` holds that one too is open.
+
+*Amended 2026-11-25 (Windows: a held session locks at once; `required`
+locks first):* the Windows Pier left a session held for its Deck's resume
+unlocked for `auth.reconnect_window_secs` (GAP-044), and gave the desk its
+outputs and input back before it locked (PD-033), so under `required` a
+refused lock left the desk live. Both are decided in shared code now
+(`console_session::held_lock`, `console_session::hand_back_order`).
+
+When a Deck's transport is lost, the hold runs `HOLD_STEPS`: the session
+agent stops streaming and stays, keeping the desk as private as the
+attachment had it; the session is locked (`LockWorkStation`, or taken off
+the console if it will not lock), as `desktop_session::lock::DetachLock`
+locks a desktop the Linux Pier created (§10); then the hold is watched. A session that
+is still the Deck's keeps the hold, whether it is locked, taken off the console or open, and a held agent stops
+proving the desk's input hooks while its lock screen is up
+(`DeskInputProof`). Windows has no unlock without the owner's password,
+and a resume carries none (`UnlockAuthority::OwnersPassword`), so a
+returning Deck that finds its session locked is refused (resume code
+`unsupported`, "The session was locked when the connection dropped. Sign
+in again to unlock it.", `HeldResume::SignInAgain`) and the hold
+continues. The Deck asks its user for the password, and that sign-in
+unlocks the same session through the credential provider and takes the
+held desktop over, as a same-account sign-in always has: the session, its
+applications and its windows are as they were, and the new attachment
+gets a resume grant of its own. A Deck that comes back to a Windows Pier
+after a lost connection therefore asks for the password; a Linux Pier
+unlocks the console on resume. Taking the held session off the console
+instead, so that a resume could put it back without a password, remains
+GAP-044's route.
+
+Under `privacy.desk = "required"`, and for a session that is already
+locked when its Deck leaves, the hand-back locks first (`hand_back_order`
+gives `DETACH_STEPS`): the agent stops streaming and stays, keeping the
+desk dark with its input blocked, until the session is locked; only then
+does it exit, and the displays Windows does not let a locked session
+restore are restored behind the lock screen by `restore-display
+--console`, LocalSystem on the console's input desktop (the secure
+desktop). A refused lock follows the shared wait (`WaitingDesk::Required`):
+asked again every `LOCK_RETRY` for `UNLOCKED_GRACE`, then every
+`HELD_LOCK_RETRY`, with no end. The desk is never given back unlocked; the
+first refusal is a warning and the hold an error at every log level, and a
+Deck that signs in meanwhile is told why the PC is busy. The agent holds
+to the same rule on every other way out (a desk check that refused the desk
+while streaming, an error, a broker that went away): it locks its own
+session and confirms the lock before it restores the desk or releases the
+hooks, on the same schedule. A hand-back whose agent had already gone keeps
+asking too. Ctrl+Alt+Delete still reaches Windows, so a person at a dark
+desk locks the session there (Lock) and signs in again as usual. A Pier that
+stops, or a Windows that shuts down, asks once and does not wait (the
+shutdown budget); the session guard then locks after the displays come
+back. An agent that has failed cannot hold the desk: its watchdog restores
+the displays and the session is locked after, as before. `"on"` and
+`"off"` keep the outputs-first order (PD-033).
 
 ### 5. Privacy while a Deck is attached
 
@@ -410,7 +491,7 @@ common configuration key `privacy.desk`):
   hand-back).
 - **How each OS makes the desk dark is earned (PD-027).** Linux zeroes every
   CRTC's RandR gamma ramp (journalled, restored byte for byte, also on
-  another product's desktop, whose layout is never changed) and grabs the
+  another product's desktop) and grabs the
   seat's evdev devices. macOS zeroes each display's transfer table and runs
   an event tap that passes only the Pier's own events. Windows cannot show
   a black ramp (GDI's `SetDeviceGammaRamp` silently refuses ramps that would
@@ -631,6 +712,38 @@ is never done without the flag (Release/Security review).
 another account is refused as in §7, so the owner's layout is the one
 applied.
 
+**Whoever connects gets their own layout.** *Amended 2026-11-25.* A Deck
+that matches its layout is laid out to its own monitors on every
+connection, whatever an earlier connection left, on every Pier: a fresh
+sign-in, a sign-in that finds the account's session held for an earlier
+Deck, the sign-in hand-over, a console Arcen owns and one another product
+owns (§8). Native modes only on another product's desktop, never
+while its client is attached, and the Windows Pier still puts the desk's
+own layout back when the Deck leaves (PD-043).
+
+Which layout a console is asked to take is shared
+(`console_session::connect_layout::console_layout_ask`): several monitors
+always; one display on the installer's forced heads (above) and, for a
+Deck that matches its layout, on another product's desktop, which an
+earlier client or Deck left in its own layout. Before, a one-display Deck
+there was shown the output its primary mapped to, at the earlier layout's
+size. A console at a desk keeps its own layout for one display, as it has
+after every earlier Deck.
+
+Nothing an earlier connection left decides it. A sign-in never reattaches
+a console held for an earlier Deck: the same account's sign-in takes the
+held session over (`direct_reconnect::fresh_sign_in`), which hands the
+console back (`detached_hold::after_deck_left`), and the sign-in joins it
+afresh. A resume is the attachment it resumes: its grant is bound to the
+whole layout request (each Pier's resume `TopologyBinding`), so a Deck
+whose layout changed signs in afresh. A layout journal only records what
+to put back. The Windows Pier gives every sign-in an agent of its own,
+planned from that sign-in's request; a same-account sign-in drains a held
+one first, and a stale display journal is replayed before anything
+changes. The macOS Pier creates each connection's displays and has no
+resume. A joined GNOME Wayland console (§9) is not laid out to a Deck yet
+(GAP-042).
+
 ### 7. Refusals
 
 The Deck shows the code first, then the reason; the Pier logs the code as
@@ -711,6 +824,96 @@ product owned):*
   name at its own size, its absolute pointer and pen placed on that output
   of the whole screen (`ShownOutput::screen_point`); the whole screen in one
   picture only when one output is shown (amended 2026-11-18, field report).
+- **The Deck's layout on another product's desktop.** *Amended 2026-11-25
+  (field: a workstation whose desktop another product owned; customer
+  decision).* The product lays the desktop out for its own client at each
+  connect and leaves that layout when the client goes. A Deck that attached
+  later was mapped onto the last client's layout: a user working from home
+  on 16:10 monitors (2560×1600 and 1920×1200 on its left) found the office
+  layout (3840×2160 and 2560×1440) and got black bars on both monitors.
+  Arcen now does what the product does:
+  1. **On attach, while the product has no client attached**, a Deck that
+     matches its layout lays the desktop out to its monitors with the §6
+     route (one NVIDIA MetaMode over NV-CONTROL, the Deck's primary as
+     RandR primary, proved through RandR), journalled first in
+     `/run/arcen/console-layout.json`, but **never scaled**
+     (`arcen_outputs::console_layout::plan_native_console_layout`,
+     `HeadScaling::NativeOnly`): each head drives a mode of exactly its
+     Deck monitor's size, one the output lists (the product's own
+     client-sized modes included) or one Arcen adds (a VESA CVT
+     reduced-blanking timing at the Deck's refresh, at most 60 Hz,
+     `RRCreateMode` named `<W>x<H>_<Hz>_arcen` and `RRAddOutputMode`; kept
+     on the X server as the product keeps its own); every head states an
+     identity `Transform` in the MetaMode, and the proof reads each CRTC's
+     transform back. Outputs the layout does not use are switched off by
+     the MetaMode and never hidden (`non-desktop` is set only on the
+     installer's own forced heads of a console Arcen puts back). *Field,
+     2026-11-25:* a hand-applied scaled head
+     (`ViewPortIn` 2560×1600 in a 3840×2160 mode, a RandR transform of
+     0.667 by 0.741) made the guest mapping read the output at its mode
+     size and refuse the Deck, and the product kept that transform on the
+     CRTC when it next laid the desktop out (a 1920×1200 monitor shown in
+     1280×889). The mapping by arrangement now reads each output as the
+     area its CRTC covers in the X screen (`shown_size`: RandR's CRTC
+     size, after any transform), which is what its capture delivers, so a
+     desktop someone else scaled is shown rather than refused (the Deck
+     was told "its console cannot take this layout", and Primary Display
+     Only failed with "capture/encoder initialization failed", because the
+     output's mode reached past the screen's edge). The decision is shared
+     (`console_session::guest_layout::guest_layout_policy`) from three
+     facts: the console's owner (`ConsoleOrigin::OtherProduct`), whether
+     the product's client is attached (`ForeignClient`: Attached, Absent,
+     Unknown; on Linux the user-space input rule below, looked at again
+     just before the layout) and `platform.session.guest_layout` (`deck`,
+     the default, or `keep`). Only a proved absent client and `deck` give
+     `ApplyOnAttach`; Attached or Unknown give `Shown` whatever the
+     setting. A resume lays it again under the same rule (the returning
+     Deck is refused while the client is attached).
+  2. **Never while that client is attached, or when Arcen cannot tell.**
+     The desktop is then shown as it is (the mapping by arrangement
+     above). In practice the join is already refused
+     `console_in_use_other_product` then; the second look narrows the
+     window between the join and the layout.
+  3. **Disconnect leaves the layout**, as the product does
+     (`console_session::guest_layout::layout_departure` is `LeaveDecks`
+     for another product's desktop, `RestoreOwn` for every other console).
+     The hand-back still locks the session first, gives the monitors their
+     ramps, the sound and the input back, and never ends the session. The
+     journal becomes the record of the layout before
+     (`/run/arcen/console-layout-before-deck.json`: MetaMode, primary;
+     the Pier logs the join with `layout=applied`); nothing restores it.
+     A launcher that dies leaves the same: the Pier's recovery locks the
+     session and keeps the layout. The journal says the layout stays only
+     once it is proved and settled; until then, and when putting it back
+     fails, the recovery puts the layout before back. Putting the old
+     layout back would undo what the user just had and, while the
+     product's client connects, fight that product's own layout.
+  4. **A desktop that cannot take it is put back and shown.** Too few
+     outputs, an output that will not take a mode of the Deck's size
+     (`console_layout_no_native_mode`, naming the output and the mode the
+     driver refused), a MetaMode refused or not proved (a transform left
+     on a head included): the journal is restored at once (as §6), the
+     reason is logged, and the Deck is served by the mapping above rather
+     than refused.
+  5. **What stays shown as it is:** `platform.session.guest_layout =
+     "keep"`, a single-display Deck that does not match its layout
+     (Primary Display Only, windowed; the console's own §6 rule for one
+     picture is unchanged), and a desktop another product started from a
+     text console (`startx`, also `OtherProduct`) only through the
+     setting. A one-display Deck that matches its layout is laid out to
+     that display (§6, "Whoever connects gets their own layout").
+  Routes considered: keep "shown as it is" and let the Deck fit (the
+  field's black bars); apply and restore on departure (the previous
+  attempt, 0.20.2: restoring under a product client that is connecting
+  fights its layout, and a user who comes back through Arcen finds the
+  other layout again); per-Deck virtual outputs added to the product's X
+  server (NVIDIA cannot add heads to a running X server Arcen does not
+  configure); detecting the product's client from its own session files
+  or ports (product-specific; the kernel-grounded input rule below
+  already holds for every product and fails closed). The Windows Pier
+  lays out the console session's displays and puts them back when the
+  Deck leaves, and another product's client there holds a session of its
+  own; the macOS Pier adds displays of its own (PD-043).
 - **One remote product at a time.** While that product's client is connected
   the sign-in is refused `console_in_use_other_product`; when it connects
   during an attachment the attachment ends with that code. A connected
@@ -1075,6 +1278,29 @@ only, unset by default) is it torn down at the next sign-in after being
 disconnected that long. Until then the same account's sign-in rejoins it
 and another account's is refused as busy. A bound of its own is a
 follow-up; it must not end a desktop the user still needs.
+
+*Amended 2026-11-25 (a created desktop locks when its Deck leaves):* a
+desktop the Pier created, Xorg or Wayland, used to stay unlocked after its
+Deck left until the user's own idle lock (about 310 s on GNOME's
+defaults), or for the whole of a resume hold. Every departure that leaves
+it running now locks it at once, as a joined console is locked: kept for
+the next sign-in, held for a resume, or kept after a host-side failure
+(shared `desktop_session::lock::DetachLock::on_detach`). The Pier asks
+logind (`loginctl lock-session`) and confirms `LockedHint=yes` while the
+session slot is still the departing attachment's, so a newcomer's
+authenticated unlock always comes after it. A same-account takeover is
+locked too (the newcomer may yet be refused before its own unlock), and a
+desktop that ends has nothing to lock. A session without a
+lock screen (no GDM to unlock through, `LockPolicy::Disabled`) is not
+locked: a lock there would be a lockout; that is logged as a warning. A
+lock that is not confirmed is logged at error level with its reason
+(`lock_refused`, `no_lock_screen`) and the desktop keeps running: a
+created desktop has no desk to keep private, so `privacy.desk` does not
+apply, and the next attachment still needs the account's password or a
+resume grant. A resume unlocks the desktop again, as a sign-in does; on
+Wayland the lock closes the sharing and the streams are recorded again
+after the unlock (`desktop_session::remote_access`).
+
 Making it persistent per user is tracked as `wayland-persistent-session`:
 the same model applies (the user's GNOME session started through
 `gnome-session` on the user's systemd manager, owned by logind, locked
@@ -1097,14 +1323,14 @@ records its log tail and keeps its logs.
 | Joins the user's session | Yes: binds the account's WTS session against `WTSGetActiveConsoleSessionId` (`hosts/windows/src/windows_session.rs:1253-1262`) and moves the account's disconnected session onto the console (`:1671`, `WTSConnectSessionW`) | Yes: serves the console owner's Aqua session (`hosts/macos/src/console.rs:86-113`, `wait_for_console_owner` `:128`) |
 | Remote-first creates the OS's real session | Yes: Credential Provider logon; Winlogon creates the console session the desk later sees (`windows_session.rs:1430-1446`, `first_login.rs:24`) | Yes, interactively: the login window is streamed and the user signs in there; cold boot with FileVault is not served (open, README) |
 | Another account at the console | Refused, typed with the shared codes (`console_other_user`; `console_other_user_other_product` naming the session's WinStation listener and protocol when another remote-desktop service is attached; `windows_session::console_refusal`, `docs/architecture/windows-console-policy.md`) | Refused at once, led by the shared `console_other_user` code and naming the account at the console (`console::other_user_refusal`; `console.rs` tests `a_different_account_at_the_screen_is_refused_at_once_not_waited_out`) |
-| Disconnect locks, never ends | Yes (amended 2026-11-18): a Deck that leaves for good gets the session locked (`LockWorkStation` as the user in that session, then disconnected from the console if it would not lock), outputs first (`DETACH_STEPS_OUTPUTS_FIRST`, PD-033), speakers last; a same-account takeover and a changed session are not locked (shared `Departure`). **Gap** GAP-044: while held for a resume the session stays unlocked | Yes (amended 2026-11-18): a signed-in user's session is locked as its Deck leaves (the system's Lock Screen, `SACLockScreenImmediate` found with `dlsym`, proved from `CGSessionCopyCurrentDictionary`), then its displays and sound are given back (`DETACH_STEPS`); a console another account took over is left alone (shared `Departure`). The macOS Pier has no resume hold, so every departure is final. A person's **Stop Sharing** (macOS 14, `SCStreamErrorDomain` -3817; amended 2026-11-23) ends the attachment the same way, never restarted, and the Deck is told `capture_stopped` (shared `console_session::stream_end`, `Departure::CaptureStopped`); any other capture stop stays a capture failure. A refused lock is asked again for `UNLOCKED_GRACE` with or without desk privacy (shared `console_session::lock_wait`; a desk that was not private gives the slot to an authenticated Deck), and a failed console read never skips it Joining a locked session does not unlock it: the Deck signs in at the streamed lock screen (no public unlock after a password check) |
+| Disconnect locks, never ends | Yes (amended 2026-11-18): a Deck that leaves for good gets the session locked (`LockWorkStation` as the user in that session, then disconnected from the console if it would not lock), outputs first (`DETACH_STEPS_OUTPUTS_FIRST`, PD-033), speakers last; a same-account takeover and a changed session are not locked (shared `Departure`). Amended 2026-11-25: a session held for its Deck's resume is locked at once (shared `held_lock::HOLD_STEPS`), and a returning Deck signs in again with its password, which unlocks the same session (GAP-044); under `privacy.desk = "required"`, or for a session already locked, the lock comes first and the displays come back behind the lock screen (shared `hand_back_order`, `lock_wait`) | Yes (amended 2026-11-18): a signed-in user's session is locked as its Deck leaves (the system's Lock Screen, `SACLockScreenImmediate` found with `dlsym`, proved from `CGSessionCopyCurrentDictionary`), then its displays and sound are given back (`DETACH_STEPS`); a console another account took over is left alone (shared `Departure`). The macOS Pier has no resume hold, so every departure is final. A person's **Stop Sharing** (macOS 14, `SCStreamErrorDomain` -3817; amended 2026-11-23) ends the attachment the same way, never restarted, and the Deck is told `capture_stopped` (shared `console_session::stream_end`, `Departure::CaptureStopped`); any other capture stop stays a capture failure. A refused lock is asked again for `UNLOCKED_GRACE` with or without desk privacy (shared `console_session::lock_wait`; a desk that was not private gives the slot to an authenticated Deck), and a failed console read never skips it. Under `privacy.desk = "required"` (amended 2026-11-25, §4) the desk stays private past the grace until the session locks, asked again every 30 s, and a Deck that signs in meanwhile is told why the host is busy Joining a locked session does not unlock it: the Deck signs in at the streamed lock screen (no public unlock after a password check) |
 | Desk private while attached | Yes, by default (amended 2026-11-18, `privacy.desk`, §5): served on a virtual display or a head with nothing connected, the desk's monitors detached from the desktop (`DisplayLease::detach_desk_monitors`) and proved dark (`hosts/windows/src/deskside.rs` `prove_desk_dark`), the desk's keyboard and mouse blocked by low-level hooks; the pinned `platform.desktop.deskside` remains for bare-metal pinning. Desk pens and touch screens are not blocked (GAP-051) | Yes, by default (amended 2026-11-18, `privacy.desk`; before, `platform.desktop.deskside.enabled`, off): every display but the Pier's virtual ones dark through an all-zero transfer table, read back; an active HID event tap passes only the Pier's own events (`hosts/macos/src/desk_privacy.rs`, shared `console_session::desk_privacy`); handed back in `DETACH_STEPS` order; dies with the process, after which the agent's lock guard darkens the displays again and locks the session (`hosts/macos/src/lock_guard.rs`, shared `console_session::owner_death`; GAP-048 closed 2026-11-18) |
 | No leftovers | Display journal and console recovery (`hosts/windows/src/console_recovery.rs:1-20`); window repatriation caveat (PD-032) | Virtual displays live in a child process and die with it (`hosts/macos/src/virtual_display.rs:58`, `:125`) |
 
 The open differences against the principle are ledger gaps GAP-042
 (Linux: a Wayland login screen, the resume hold across a lock, and a desk
-with physical monitors), GAP-044 (Windows: a session held for a resume stays
-unlocked), GAP-050 (Windows: the desk's monitors show the session until they
+with physical monitors), GAP-044 (Windows: a session held for a resume is
+locked, so a returning Deck signs in again with its password), GAP-050 (Windows: the desk's monitors show the session until they
 are detached) and GAP-051 (Windows: desk pens and touch screens are not
 blocked). New Pier work adopts `console_session::DETACH_STEPS` and
 `disables_while_attached`.

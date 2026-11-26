@@ -280,6 +280,9 @@ pub struct Config {
     /// `platform.session.mode`: join the user's console session (default,
     /// ADR 0025) or create a dedicated desktop per sign-in.
     pub desktop_mode: arcen_session::console_session::DesktopMode,
+    /// `platform.session.guest_layout`: whether another product's desktop
+    /// takes the Deck's monitors on attach (default) or keeps its layout.
+    pub guest_layout: arcen_session::console_session::guest_layout::GuestLayoutSetting,
     /// `wayland.lab_seat_pen` (lab, default off): a virtual tablet on a
     /// private udev seat for a headless compositor with the lab input patch.
     pub wayland_lab_seat_pen: bool,
@@ -1463,6 +1466,7 @@ impl Default for Config {
                 arcen_session::wayland_qualification::QualificationTarget::production(),
             first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup::Run,
             desktop_mode: arcen_session::console_session::DesktopMode::Console,
+            guest_layout: arcen_session::console_session::guest_layout::GuestLayoutSetting::Deck,
             wayland_lab_seat_pen: false,
             wayland_session_mode: arcen_session::native_seat::SessionMode::Auto,
             wayland_auto_requalify: true,
@@ -2325,6 +2329,9 @@ fn apply_file_config(cfg: &mut Config, file: crate::config::PierFileConfig) -> R
     }
     if let Some(value) = platform.session.wayland_x11_apps {
         cfg.wayland_x11_apps = value;
+    }
+    if let Some(value) = platform.session.guest_layout {
+        cfg.guest_layout = value;
     }
     if let Some(value) = platform.session.xorg_config_template {
         cfg.xorg_config_template = PathBuf::from(value);
@@ -4036,6 +4043,31 @@ mod tests {
         assert!(!cfg.wayland_x11_apps_enabled());
         cfg.wayland_x11_plan = Some(X11AppsPlan::Enabled);
         assert!(cfg.wayland_x11_apps_enabled());
+    }
+
+    #[test]
+    fn another_products_desktop_takes_the_decks_layout_unless_the_administrator_keeps_it() {
+        use arcen_session::console_session::guest_layout::GuestLayoutSetting;
+        let file_with = |session: &str| {
+            serde_json::from_str::<crate::config::PierFileConfig>(&format!(
+                r#"{{
+                    "audio":{{"enabled":true,"compressed":false}},
+                    "microphone_input":{{"enabled":false}},
+                    "platform":{{"session":{session}}}
+                }}"#
+            ))
+        };
+        let mut cfg = Config::default();
+        apply_file_config(&mut cfg, file_with("{}").expect("config")).expect("apply");
+        assert_eq!(cfg.guest_layout, GuestLayoutSetting::Deck);
+        let mut cfg = Config::default();
+        apply_file_config(
+            &mut cfg,
+            file_with(r#"{"guest_layout":"keep"}"#).expect("config"),
+        )
+        .expect("apply");
+        assert_eq!(cfg.guest_layout, GuestLayoutSetting::Keep);
+        assert!(file_with(r#"{"guest_layout":"apply"}"#).is_err());
     }
 
     #[test]

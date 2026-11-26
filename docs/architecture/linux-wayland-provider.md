@@ -192,14 +192,39 @@ GDM. So the agent assembles the same login itself, with the decisions in
   idle inhibitor of its own (`arcen_session::desktop_session::manager::DeckAttachedInhibit`,
   app id `arcen`, flag 8), released when that connection ends, so an
   attached Deck without input never reaches the idle lock; a manual
-  lock still locks. On a desktop whose compositor runs on its own seat
-  (not `is_headless()`), GNOME Shell inhibits remote access while it is
-  locked (`main.js` `_sessionUpdated`: `inhibit_remote_access()` when the
-  session mode disallows screencasts), Mutter closes the RemoteDesktop and
-  ScreenCast sessions and removes their virtual monitor, the agent cannot
-  record the outputs again while locked and ends the desktop. Until the
-  agent waits for the unlock instead, a detached desktop that reaches the
-  idle lock ends (work package `wayland-lock-keeps-desktop`).
+  lock still locks. When the Deck leaves and the desktop stays (kept for
+  the next sign-in or held for a resume), the Pier locks it at once
+  through logind and confirms `LockedHint` (shared
+  `desktop_session::lock::DetachLock::on_detach`, ADR 0025 §10); a resume
+  unlocks it, as a sign-in does. A failed lock is logged at error level. On a desktop whose compositor runs on its own seat
+  (not `is_headless()`), GNOME Shell inhibits remote access whenever its
+  screen shield is up (`main.js` `_sessionUpdated`: `inhibit_remote_access()`
+  when the `unlock-dialog` session mode disallows screencasts; the shield
+  pushes that mode for an idle blank too), Mutter closes every
+  RemoteDesktop and ScreenCast session (`meta_dbus_session_manager_inhibit`)
+  and removes their virtual monitors, and it refuses new sessions with
+  "Session creation inhibited" until the shell pops the mode as the shield
+  goes down. Mutter publishes no D-Bus signal for this; its refusal is the
+  fact, and the shell's `ScreenSaver.ActiveChanged(false)` and logind's
+  `LockedHint=no` come after the uninhibit, when the shield's hide
+  animation completes. The desktop's lifetime is therefore kept apart from
+  its streams (shared `desktop_session::remote_access::StreamsLifetime`):
+  the agent records closed streams again at once; a refusal Mutter
+  attributes to the inhibition, or any refusal while the shield is up,
+  suspends capture and input and keeps the desktop, its applications, its
+  audio lease and its private services. The output socket's `hello` then
+  answers `streams_unavailable`, and output changes are refused. The agent
+  asks Mutter again when the shield goes down and every
+  `SUSPENDED_PROBE_INTERVAL` (2 s); once the outputs are recorded again
+  (the next output generation) it also creates a new clipboard session and
+  reconnects its EIS text device, because the lock closed those too. A
+  reattachment unlocks the desktop as before and waits for the new
+  generation (`attach_wait`, at most `ATTACH_RESUME_WAIT`, 20 s) before it
+  captures; an attachment whose desktop locks under it waits the same way
+  and then ends with `the desktop on the host stayed locked`, leaving the
+  desktop running. Only a logout, a compositor that exits, an orderly stop,
+  or streams that cannot be recorded again three times while nothing
+  inhibits remote access end the desktop.
 - **Keyring.** `pam_gnome_keyring` would unlock a daemon on the user's systemd
   bus, not the private bus applications use. So the launcher hands the login
   password to the agent through its standard input (see
@@ -2080,6 +2105,17 @@ On GNOME 49 with `RecordVirtual` remote monitors:
   and the next attachment starts a new desktop; a killed Deck's same-user
   reattachment proves the old Deck silent in 3 s and takes the desktop over.
 - A keyframe on demand on a still desktop takes about 30 ms.
+- A native-seat desktop on GNOME Shell 51.1 (Mutter 51) that idle-locks 310 s
+  after its Deck left (`idle-delay` 300 plus the shield fade) loses its
+  virtual monitor and falls back to the seat's `vkms` head; the shield's
+  `ActiveChanged(true)` reached the agent 2 ms before it saw the streams
+  close, so it suspended without asking Mutter. The same desktop,
+  its shell and applications keep their process ids through the lock; a
+  password reattachment unlocks it, the shield goes down
+  (`ActiveChanged(false)`), the outputs are recorded again about 0.25 s later
+  as the next generation, and the attachment streams with input. A
+  `loginctl lock-session` behaves the same, and a logout through the
+  session manager still ends the desktop.
 
 The no-DRM refusal is covered by unit tests.
 

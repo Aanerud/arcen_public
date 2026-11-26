@@ -643,6 +643,7 @@ pub fn build_applied_capability(
     media: &[(SessionMonitorId, ResolvedMediaPlan)],
     negotiated: &RegionMediaRoster,
     degradation_reason: Option<&'static str>,
+    region_reasons: &[RegionReason],
 ) -> Result<ServerMultiMonitorMsg, AppliedCapabilityError> {
     // Unlike a dedicated server-side topology, Windows describes the physical
     // desktop as the interactive session already laid it out, so its origin
@@ -650,7 +651,10 @@ pub fn build_applied_capability(
     // shift that normalises it.
     let translation = OriginTranslation::to_origin(plan.desktop_x, plan.desktop_y);
     let descriptors = assemble_applied_regions(
-        &WindowsAppliedRegions { degradation_reason },
+        &WindowsAppliedRegions {
+            degradation_reason,
+            region_reasons,
+        },
         &plan.monitors,
         media,
         negotiated,
@@ -698,11 +702,24 @@ fn monitor_translation_overflow() -> AppliedCapabilityError {
 /// Everything here is wire glue this crate owns: the protocol descriptor
 /// shape, the `client_display_id` re-validation, this host's real
 /// per-monitor `refresh_hz`, and its own coordinate-overflow evidence.
-struct WindowsAppliedRegions {
+struct WindowsAppliedRegions<'a> {
+    /// The session's degradation, published on every display.
     degradation_reason: Option<&'static str>,
+    /// Each display's own reason where the session has none.
+    region_reasons: &'a [RegionReason],
 }
 
-impl AppliedRegionAssembler for WindowsAppliedRegions {
+/// One display's own reason on its applied media plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionReason {
+    pub session_monitor_id: SessionMonitorId,
+    pub reason: &'static str,
+    /// A degradation (moved to OpenH264 by encoder admission), or a choice
+    /// that is not one (a 4:2:0 request outside a 4:4:4 contract).
+    pub degraded: bool,
+}
+
+impl AppliedRegionAssembler for WindowsAppliedRegions<'_> {
     type Region = WindowsMonitorPlan;
     type Resolved = ResolvedMediaPlan;
     type Descriptor = AppliedMonitorDescriptorMsg;
@@ -722,6 +739,10 @@ impl AppliedRegionAssembler for WindowsAppliedRegions {
     ) -> Result<AppliedMonitorDescriptorMsg, AppliedCapabilityError> {
         let monitor = region.region;
         let resolved = region.resolved;
+        let own_reasons = self
+            .region_reasons
+            .iter()
+            .filter(|reason| reason.session_monitor_id == monitor.session_monitor_id);
         let client_display_id =
             ClientDisplayId::new(monitor.client_display_id.clone()).map_err(|error| {
                 AppliedCapabilityError::InvalidClientDisplayId(
@@ -760,8 +781,19 @@ impl AppliedRegionAssembler for WindowsAppliedRegions {
                 // here, so plan and wire cannot diverge.
                 bitrate_kbps: region.bitrate_kbps(),
                 cursor_mode: resolved.cursor_mode,
-                degraded: self.degradation_reason.is_some(),
-                degradation_reason: self.degradation_reason.unwrap_or_default().to_owned(),
+                degraded: self.degradation_reason.is_some()
+                    || own_reasons.clone().any(|reason| reason.degraded),
+                degradation_reason: self
+                    .degradation_reason
+                    .or_else(|| {
+                        own_reasons
+                            .clone()
+                            .find(|reason| reason.degraded)
+                            .or_else(|| own_reasons.clone().next())
+                            .map(|reason| reason.reason)
+                    })
+                    .unwrap_or_default()
+                    .to_owned(),
             },
         })
     }
@@ -1693,7 +1725,7 @@ mod tests {
         }
         let negotiated = negotiated_roster(&plan, budget);
 
-        let capability = build_applied_capability(&plan, carrier, &media, &negotiated, None)
+        let capability = build_applied_capability(&plan, carrier, &media, &negotiated, None, &[])
             .expect("applied capability must build");
         let applied = capability
             .applied_topology()
@@ -1712,6 +1744,61 @@ mod tests {
                 .all(|monitor| monitor.media_plan.stream_epoch == plan.generation.get()),
             "every applied region carries the negotiated stream epoch"
         );
+    }
+
+    #[test]
+    fn each_display_publishes_its_own_reason_and_only_a_degradation_is_degraded() {
+        let (plan, carrier) = planned_two_monitor_topology();
+        let media: Vec<(SessionMonitorId, ResolvedMediaPlan)> = plan
+            .monitors
+            .iter()
+            .map(|monitor| {
+                (
+                    monitor.session_monitor_id,
+                    resolved_plan(monitor.width, monitor.height),
+                )
+            })
+            .collect();
+        let negotiated =
+            negotiated_roster(&plan, arcen_media::BitrateBudgetKbps::NOMINAL_FLOOR_KBPS);
+        let first = plan.monitors[0].session_monitor_id;
+        let second = plan.monitors[1].session_monitor_id;
+        let capability = build_applied_capability(
+            &plan,
+            carrier,
+            &media,
+            &negotiated,
+            None,
+            &[
+                RegionReason {
+                    session_monitor_id: first,
+                    reason: arcen_media::ENCODER_CAPACITY_REASSIGN_DEGRADATION_REASON,
+                    degraded: true,
+                },
+                RegionReason {
+                    session_monitor_id: second,
+                    reason: arcen_media::DisplayChromaRefusal::OutsideFullColorContract.token(),
+                    degraded: false,
+                },
+            ],
+        )
+        .expect("applied capability must build");
+        let applied = capability.applied_topology().expect("applied topology");
+        for monitor in applied.monitors() {
+            let (degraded, reason) = if monitor.session_monitor_id == first.get() {
+                (
+                    true,
+                    arcen_media::ENCODER_CAPACITY_REASSIGN_DEGRADATION_REASON,
+                )
+            } else {
+                (
+                    false,
+                    arcen_media::DisplayChromaRefusal::OutsideFullColorContract.token(),
+                )
+            };
+            assert_eq!(monitor.media_plan.degraded, degraded);
+            assert_eq!(monitor.media_plan.degradation_reason, reason);
+        }
     }
 
     #[test]
@@ -1735,7 +1822,7 @@ mod tests {
         let negotiated =
             negotiated_roster(&plan, arcen_media::BitrateBudgetKbps::NOMINAL_FLOOR_KBPS);
 
-        let capability = build_applied_capability(&plan, carrier, &media, &negotiated, None)
+        let capability = build_applied_capability(&plan, carrier, &media, &negotiated, None, &[])
             .expect("applied capability must build");
         let applied = capability
             .applied_topology()
@@ -1757,7 +1844,7 @@ mod tests {
         let negotiated =
             negotiated_roster(&plan, arcen_media::BitrateBudgetKbps::NOMINAL_FLOOR_KBPS);
 
-        let error = build_applied_capability(&plan, carrier, &media, &negotiated, None)
+        let error = build_applied_capability(&plan, carrier, &media, &negotiated, None, &[])
             .expect_err("must fail when a monitor's media plan is missing");
         assert!(matches!(error, AppliedCapabilityError::MissingMediaPlan(_)));
     }

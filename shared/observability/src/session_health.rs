@@ -158,6 +158,11 @@ pub struct HealthObservation {
     pub assessment: HealthAssessment,
     /// A committed state change and its event fields.
     pub transition: Option<(LifecycleEventKind, StructuredFields)>,
+    /// The session's committed state after this tick, the one its last
+    /// transition reported; `None` until it first settles. What the
+    /// service snapshot reads ([`crate::ServiceHealth`]), never
+    /// [`HealthAssessment::overall`], which is one tick's.
+    pub committed: Option<HealthState>,
     /// Whether a `HEALTH_SNAPSHOT` is due on this tick.
     pub snapshot_due: bool,
     /// Media bytes sent over the window, in megabits per second.
@@ -400,6 +405,7 @@ impl SessionHealth {
             sample,
             assessment,
             transition,
+            committed: self.committed,
             snapshot_due,
             bandwidth_mbps: window.bandwidth_mbps,
             clock_error,

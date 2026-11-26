@@ -93,6 +93,7 @@ pub mod services;
 pub mod session_truth;
 pub mod settings;
 pub mod sign_in;
+pub mod smoke_contract;
 pub mod support_bundle;
 pub mod trusted_pins;
 pub mod ui_pacing;

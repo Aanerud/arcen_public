@@ -62,16 +62,45 @@ screen and the account's next sign-in reconnects the same session. Windows
 refuses display changes from a locked session, which is why the displays are
 restored before the lock (`console_session::DETACH_STEPS_OUTPUTS_FIRST`).
 
+With `privacy.desk = "required"`, and for a session that is already locked when
+its Deck leaves, the lock comes first (`console_session::hand_back_order`): the
+session agent stays, keeping the desk dark with its keyboard and mouse blocked,
+until the session is locked or disconnected; then it exits, and the displays it
+can no longer restore from the locked session are restored behind the lock
+screen by `restore-display --console`, which runs as LocalSystem on the
+console's input desktop. A session that refuses both is asked again every 5
+seconds for a minute and then every 30 seconds, and its desk stays dark and
+blocked meanwhile: `required` never gives the desk back unlocked. The session
+agent applies the same rule however its attachment ends (a desk check that
+refused the desk, an error, the broker gone): it locks its own session and
+confirms the lock before it gives the desk anything back. Ctrl+Alt+Delete still
+reaches Windows, so a person at the dark desk can choose Lock there and sign in
+again. The refusal
+is logged at error level, and a Deck that signs in meanwhile is told why the PC
+is busy. A Pier that stops, or a Windows that shuts down, does not wait for it.
+
 The session is not locked when a sign-in of the same account takes it over
 (including one that waits while the departing Deck's session is handed back),
 or when it is no longer the session the Deck joined (signed out, locked or
 taken over at the desk). A sign-in refused after it unlocked or signed the
 session in, or took it over, leaves it locked. If the departing broker locked
 it just before a same-account sign-in took it over, that sign-in is refused
-with `console_session_changed`, and signing in again unlocks it. While a Deck's session is held for its resume it stays
-unlocked: Windows cannot unlock it again without the user's password, and a
-resume carries none (tracked as GAP-044). A returning Deck whose session
-changed meanwhile is refused with `console_session_changed`.
+with `console_session_changed`, and signing in again unlocks it.
+
+A Deck whose connection drops is held for its resume (`auth.reconnect_window_secs`),
+and its session is locked at once, while the session agent keeps the desk as
+private as the attachment had it. Windows cannot unlock a session without the
+user's password, and a resume carries none, so a returning Deck that finds its
+session locked is asked to sign in again (resume code `unsupported`, reason
+"The session was locked when the connection dropped. Sign in again to unlock
+it."). The hold continues for that sign-in: it unlocks the same session through
+the credential provider and takes the held desktop over, with its applications
+and windows as they were. The user therefore sees a password prompt when a Deck
+comes back after a lost connection. A session unlocked at the desk meanwhile is
+resumed without one. A returning Deck whose session changed meanwhile (signed
+out, another account) is refused with `console_session_changed`. Putting the
+held session back without a password, by taking it off the console while held,
+is tracked as GAP-044.
 
 ## Takeover configuration
 

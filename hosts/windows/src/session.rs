@@ -49,6 +49,12 @@ use arcen_protocol::{
     sanitize_transport_capabilities, AudioCodec, AudioHeader, ChromaSubsampling, FrameType,
     VideoCodec, VideoHeader, CAPABILITY_TRANSPORT_QUIC,
 };
+use arcen_session::console_session::held_lock::{
+    held_resume, HeldReading, HeldResume, HoldStep, UnlockAuthority, HOLD_STEPS,
+};
+use arcen_session::console_session::lock_wait::{
+    LockAttempt, LockWait, LockWaitEnd, LockWaitVerdict, WaitingDesk, HELD_LOCK_RETRY,
+};
 use arcen_session::console_session::{ConsoleRefusal, Departure, DetachStep};
 use arcen_session::deskside::{
     DesksideControl, DesksideEffect, DesksideEvent, DesksideLeaseSpec, DesksideProtection,
@@ -84,7 +90,7 @@ use crate::logging::{AUDIO, CAPENC, DISPLAY, INPUT, SESSION};
 use crate::multi_monitor_input::RegionInputAdapter;
 use crate::windows_session::{
     AgentAttachmentAction, AgentAttachmentCommand, AgentAttachmentState, AgentAttachmentStatus,
-    AgentControl, AgentReady, AgentStart, AgentStreamingReady, WindowsSessionIdentity,
+    AgentControl, AgentHealth, AgentReady, AgentStart, AgentStreamingReady, WindowsSessionIdentity,
 };
 use crate::{HostConfig, LifecycleEmitter};
 use arcen_session::session_admission::{
@@ -161,6 +167,10 @@ pub struct BrokerAgentLease {
     /// departing broker hands the session back: that broker leaves the
     /// session unlocked for them instead of locking it under them.
     successors: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The worst committed health of the attachments since the service's
+    /// last minute `HEALTH_SNAPSHOT`, reported by their agents
+    /// ([`AgentHealth`]).
+    service_health: arcen_observability::ServiceHealth,
 }
 
 /// A same-account sign-in waiting to take the session over; withdrawn when
@@ -191,6 +201,25 @@ impl std::fmt::Debug for BrokerAgentPermit {
         formatter.write_str("BrokerAgentPermit(<redacted>)")
     }
 }
+
+impl BrokerAgentPermit {
+    /// Marks the slot as held for a desk kept private because its session
+    /// refuses to lock (`privacy.desk = "required"`): a Deck that finds the
+    /// Pier busy meanwhile is told why ([`DESK_HELD_LOCK_REFUSED`]).
+    fn set_lock_refused(&self, refused: bool) {
+        if let Some(lease) = self.admission.as_ref() {
+            let _ = self.admission_runtime.set_lock_refused(lease, refused);
+        }
+    }
+}
+
+/// Why a Deck finds the Pier busy while the last session's desk is held
+/// private for a lock it refuses (shared `lock_wait::WaitingDesk::Required`).
+/// It starts as every busy refusal does, so a Deck reads it as one.
+const DESK_HELD_LOCK_REFUSED: &str = "Another session is already using this PC: the last one \
+     would not lock when its Deck left, so its desk stays dark with its input blocked until \
+     it locks (privacy.desk = \"required\"). Ask this PC's administrator to check that its \
+     lock screen is not turned off by policy.";
 
 impl Drop for BrokerAgentPermit {
     fn drop(&mut self) {
@@ -375,7 +404,13 @@ impl BrokerAgentLease {
             active_log: RwLock::new(None),
             incumbent: Arc::new(arcen_transport::quic::IncumbentAttachment::new()),
             successors: Arc::new(std::sync::Mutex::new(Vec::new())),
+            service_health: arcen_observability::ServiceHealth::new(),
         }
+    }
+
+    /// What the service's minute `HEALTH_SNAPSHOT` reads.
+    pub fn service_health(&self) -> &arcen_observability::ServiceHealth {
+        &self.service_health
     }
 
     /// Records that a fresh sign-in of `user_sid` waits to take its session
@@ -426,9 +461,13 @@ impl BrokerAgentLease {
             // resume window. Name the setting, so an operator who hits this on
             // a shared machine can find out and change it instead of guessing.
             .map_err(|_| {
-                arcen_session::session_admission::DesktopBusyRefusal::WindowsDisplayOwned
-                    .deck_reason()
-                    .to_string()
+                if self.admission.holder_lock_refused() {
+                    DESK_HELD_LOCK_REFUSED.to_string()
+                } else {
+                    arcen_session::session_admission::DesktopBusyRefusal::WindowsDisplayOwned
+                        .deck_reason()
+                        .to_string()
+                }
             })?;
         let admission = self
             .admission
@@ -448,6 +487,9 @@ impl BrokerAgentLease {
         let display = tokio::time::timeout(timeout, self.slot.clone().acquire_owned())
             .await
             .map_err(|_| {
+                if self.admission.holder_lock_refused() {
+                    return DESK_HELD_LOCK_REFUSED.to_string();
+                }
                 format!(
                     "same-user detached-session takeover did not finish display restoration \
                      within {} seconds",
@@ -1244,7 +1286,7 @@ async fn run_correlated_broker(
         wts_session_id: identity.session_id,
     };
     let mut took_over = false;
-    let _agent_lease = match resume_registry
+    let agent_permit = match resume_registry
         .fresh_authentication_decision(&native_principal)
         .map_err(|error| format!("resume registry unavailable: {error:?}"))?
     {
@@ -1490,6 +1532,17 @@ async fn run_correlated_broker(
     };
     let hand_back_session_id = identity.session_id;
     let hand_back_sid = native_user_sid.clone();
+    // The plan the agent applies to the desk (`privacy.desk`, ADR 0025 §5):
+    // a required one is never handed back before the lock.
+    let hand_back_desk_plan = (!cfg.deskside.enabled).then(|| {
+        cfg.desk_privacy.plan(
+            crate::deskside::desk_exposure(&identity),
+            arcen_session::console_session::desk_privacy::DeckDeskPrivacy::from_request(
+                response.desk_privacy_request.as_deref(),
+            ),
+        )
+    });
+    let mut locked_first = false;
     early_lock.armed = false;
     owner_guard.set_lock_on_drop(true);
     // A Deck that fails before streaming leaves the desk as a Deck that
@@ -1628,6 +1681,7 @@ async fn run_correlated_broker(
                 &mut session_shutdown,
                 incumbent.as_ref(),
                 refine_grant,
+                agent_lease.service_health(),
                 &mut departure,
                 &mut hold,
             )
@@ -1649,6 +1703,7 @@ async fn run_correlated_broker(
                 lanes,
                 path_signal_connection,
                 refine_grant,
+                agent_lease.service_health(),
                 &mut departure,
             )
             .await;
@@ -1660,6 +1715,43 @@ async fn run_correlated_broker(
             }
             result
         };
+        departure = resolve_departure(
+            departure,
+            hand_back_session_id,
+            &hand_back_sid,
+            &agent_lease,
+        )
+        .await;
+        if departure.locks_session() {
+            // The lock comes first when the desk must not get anything
+            // back before the lock screen (shared `hand_back_order`): the
+            // agent, still alive, keeps the desk private meanwhile.
+            let windows_session_id = hand_back_session_id;
+            let sid = hand_back_sid.clone();
+            let locked = tokio::task::spawn_blocking(move || {
+                !crate::windows_session::still_unlocked_session_of(windows_session_id, &sid)
+            })
+            .await
+            .unwrap_or(true);
+            let order = arcen_session::console_session::hand_back_order(
+                arcen_session::console_session::DETACH_STEPS_OUTPUTS_FIRST,
+                hand_back_desk_plan,
+                locked,
+            );
+            if order[0] == DetachStep::LockSession {
+                locked_first = lock_before_agent_exit(
+                    &mut agent_ws,
+                    hand_back_session_id,
+                    WaitingDesk::new(true, hand_back_desk_plan),
+                    departure,
+                    &mut session_shutdown,
+                    || lock_session_task(hand_back_session_id, &hand_back_sid),
+                    |held| agent_permit.set_lock_refused(held),
+                    1,
+                )
+                .await;
+            }
+        }
         let _ = send_ws_with_timeout(&mut agent_ws, Message::Close(None), WS_WRITE_TIMEOUT).await;
         let _ = tokio::time::timeout(WS_WRITE_TIMEOUT, agent_ws.close(None)).await;
         result
@@ -1672,6 +1764,8 @@ async fn run_correlated_broker(
         .await;
     hand_back_session(
         departure,
+        locked_first,
+        WaitingDesk::new(true, hand_back_desk_plan),
         hand_back_session_id,
         hand_back_sid,
         &agent_lease,
@@ -1730,27 +1824,405 @@ async fn finish_agent_resources(
     .await;
 }
 
-/// Gives the desk its session back after the Deck's agent has ended, in the
-/// order Windows allows (`DETACH_STEPS_OUTPUTS_FIRST`): the agent's exit
-/// already restored the outputs and released the desk's input, because a
-/// locked session's processes may not change its displays; then the session
-/// is locked (ADR 0025, "disconnect locks") unless `departure` hands it to
-/// a successor or it is no longer the Deck's; the desk's speakers come back
-/// last. Nothing ends the session.
-async fn hand_back_session(
+/// The reason class logged when a returning Deck finds its held session
+/// locked (shared `held_lock::HeldResume::SignInAgain`).
+const HELD_SESSION_LOCKED: &str = "held_session_locked";
+
+/// What a returning Deck is told when its held session is locked: only the
+/// password unlocks it, and a resume carries none. A Deck reads the code
+/// (any code but a changed identity or a gone session) as "sign in again",
+/// with the password field, and that sign-in takes the held desktop over.
+const HELD_SESSION_LOCKED_REASON: &str =
+    "The session was locked when the connection dropped. Sign in again to unlock it.";
+
+/// The resume code for [`HELD_SESSION_LOCKED_REASON`]: this host cannot
+/// resume a locked session without the password.
+const HELD_SESSION_LOCKED_CODE: ResumeErrorCode = ResumeErrorCode::Unsupported;
+
+/// Under `privacy.desk = "required"`, a hand-back whose lock was refused
+/// after its agent had already gone keeps asking on the shared wait's
+/// schedule (`WaitingDesk::Required`) until the session locks, the console
+/// leaves the account, or the Pier stops; it never settles for one attempt.
+async fn keep_locking_required(windows_session_id: u32, user_sid: &str, departure: Departure) {
+    let mut wait = LockWait::for_desk(WaitingDesk::Required);
+    let refused = Instant::now();
+    let mut attempt = LockAttempt::NotLocked;
+    loop {
+        let pause = match wait.next(attempt, refused.elapsed()) {
+            LockWaitVerdict::RetryAfter(pause) => pause,
+            LockWaitVerdict::HoldPrivate { retry_after, first } => {
+                if first {
+                    tracing::error!(
+                        target: SESSION,
+                        windows_session_id,
+                        departure = departure.token(),
+                        reason_class = "lock_refused_desk_held",
+                        "privacy.desk is required and the session will not lock; the lock is asked for again every 30 seconds"
+                    );
+                }
+                retry_after
+            }
+            LockWaitVerdict::Done(_) => return,
+        };
+        if crate::service::stop_cause().is_some() {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(pause) => {}
+            () = crate::service::host_shutdown() => return,
+        }
+        match lock_session_task(windows_session_id, user_sid).await {
+            Ok(outcome) if outcome.attempt() == LockAttempt::Locked => {
+                tracing::info!(
+                    target: SESSION,
+                    windows_session_id,
+                    departure = departure.token(),
+                    outcome = outcome.token(),
+                    "the session is locked at last"
+                );
+                return;
+            }
+            Ok(outcome) => attempt = outcome.attempt(),
+            Err(_) => attempt = LockAttempt::NotLocked,
+        }
+    }
+}
+
+/// The agent's side of the lock-first hand-back (`privacy.desk =
+/// "required"`, shared `hand_back_order`): however its attachments ended (the
+/// Deck left, a desk check refused the desk, the broker went away), the
+/// agent gives the desk back only once its own session is locked. It locks
+/// the session itself and confirms it (`lock` is `lock_own_session`), asked
+/// again on the shared wait's schedule (`WaitingDesk::Required`: every
+/// `LOCK_RETRY` for `UNLOCKED_GRACE`, then every `HELD_LOCK_RETRY`) with no
+/// end; the desk stays dark with its input blocked meanwhile. Ctrl+Alt+Delete
+/// still reaches Windows, so a person at the desk can lock the session there
+/// and sign in again as usual. `pace` as in [`lock_before_agent_exit`].
+async fn hold_desk_until_locked<L, F>(mut lock: L, pace: u32)
+where
+    L: FnMut() -> F,
+    F: std::future::Future<Output = Result<bool, String>>,
+{
+    let mut wait = LockWait::for_desk(WaitingDesk::Required);
+    let mut first_refusal: Option<Instant> = None;
+    loop {
+        let outcome = lock().await;
+        if matches!(outcome, Ok(true)) {
+            if first_refusal.is_some() {
+                tracing::info!(
+                    target: SESSION,
+                    "the session is locked; the desk gets its displays and input back"
+                );
+            }
+            return;
+        }
+        if first_refusal.is_none() {
+            tracing::warn!(
+                target: SESSION,
+                error = %outcome.as_ref().err().map_or("", String::as_str),
+                "the session is not locked yet; privacy.desk is required, so the desk stays dark with its input blocked until it is"
+            );
+        }
+        let refused_for = first_refusal
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .saturating_mul(pace);
+        let pause = match wait.next(LockAttempt::NotLocked, refused_for) {
+            LockWaitVerdict::RetryAfter(pause) => pause,
+            LockWaitVerdict::HoldPrivate { retry_after, first } => {
+                if first {
+                    tracing::error!(
+                        target: SESSION,
+                        reason_class = "lock_refused_desk_held",
+                        "privacy.desk is required and the session will not lock: the desk stays dark with its input blocked, and the lock is asked for again every 30 seconds"
+                    );
+                }
+                retry_after
+            }
+            // A required desk is never given back unlocked.
+            LockWaitVerdict::Done(_) => HELD_LOCK_RETRY,
+        };
+        tokio::time::sleep(pause / pace).await;
+    }
+}
+
+/// Locks a session held for its Deck's resume as soon as the transport is
+/// lost (ADR 0025 §4, GAP-044 amended 2026-11-25): the session agent stays,
+/// idle, keeping the desk private behind the lock. Windows signs the session
+/// out itself when it shuts down, so a shutdown does not wait for the lock.
+async fn lock_held_session<L, F>(windows_session_id: u32, lock: L) -> bool
+where
+    L: FnOnce() -> F,
+    F: std::future::Future<Output = Result<crate::windows_session::LockOutcome, String>>,
+{
+    let outcome = tokio::select! {
+        biased;
+        outcome = lock() => outcome,
+        () = crate::service::host_shutdown() => return false,
+    };
+    match outcome {
+        Ok(outcome) if outcome.attempt() == LockAttempt::Locked => {
+            tracing::info!(
+                target: SESSION,
+                windows_session_id,
+                outcome = outcome.token(),
+                "the Deck's connection dropped; its session is locked while it is held for the Deck's resume"
+            );
+            true
+        }
+        Ok(outcome) => {
+            tracing::info!(
+                target: SESSION,
+                windows_session_id,
+                outcome = outcome.token(),
+                "the Deck's connection dropped; its session is no longer on the console to lock"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::error!(
+                target: SESSION,
+                windows_session_id,
+                %error,
+                "the Deck's connection dropped and its session could not be locked; it is held for the Deck's resume with the desk kept private"
+            );
+            false
+        }
+    }
+}
+
+/// `lock_session` for `windows_session_id` and `user_sid`, off the runtime.
+fn lock_session_task(
+    windows_session_id: u32,
+    user_sid: &str,
+) -> impl std::future::Future<Output = Result<crate::windows_session::LockOutcome, String>> {
+    let sid = user_sid.to_string();
+    async move {
+        tokio::task::spawn_blocking(move || {
+            crate::windows_session::lock_session(windows_session_id, &sid)
+        })
+        .await
+        .map_err(|_| "session lock task failed".to_string())
+        .and_then(|outcome| outcome)
+    }
+}
+
+/// The lock-first hand-back (ADR 0025 §4, amended 2026-11-25; shared
+/// `console_session::hand_back_order`): the session agent stops streaming
+/// and stays, keeping the desk dark with its input blocked, while the
+/// session is locked; only then does it exit. Under `privacy.desk =
+/// "required"` (`desk` [`WaitingDesk::Required`]) a refused lock is asked
+/// for again, every five seconds for a minute and then every 30 seconds
+/// (shared `lock_wait`), and the desk is never given back unlocked; the
+/// refusal is an error at every log level. Any other desk is asked once.
+///
+/// Returns whether the session was secured with the agent still holding
+/// the desk: the caller then lets the agent exit and restores the desk's
+/// displays behind the lock screen. `false`: the agent could not hold the
+/// desk (it had failed), the console left the account, the Pier is
+/// stopping, or Windows is shutting down; the hand-back goes on in the
+/// host's own order.
+///
+/// `lock` asks for the lock once; `held` is told when the desk is held
+/// private past the grace, and when that ends; `pace` divides the shared wait's pauses
+/// and multiplies the time it has refused (1 in production; tests run the
+/// same schedule faster).
+#[allow(clippy::too_many_arguments)]
+async fn lock_before_agent_exit<A, L, F>(
+    agent: &mut WebSocketStream<A>,
+    windows_session_id: u32,
+    desk: WaitingDesk,
+    departure: Departure,
+    session_shutdown: &mut watch::Receiver<bool>,
+    mut lock: L,
+    mut held: impl FnMut(bool),
+    pace: u32,
+) -> bool
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    L: FnMut() -> F,
+    F: std::future::Future<Output = Result<crate::windows_session::LockOutcome, String>>,
+{
+    // A held agent is detached already, and says so again.
+    if send_json(
+        agent,
+        &AgentAttachmentCommand::detach(),
+        AgentAttachmentCommand::TYPE,
+    )
+    .await
+    .is_err()
+        || await_agent_attachment_status(
+            agent,
+            AgentAttachmentState::Detached,
+            AGENT_ATTACHMENT_TIMEOUT,
+        )
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            target: SESSION,
+            windows_session_id,
+            departure = departure.token(),
+            "the session agent cannot hold the desk while the session locks; the desk is handed back in the usual order"
+        );
+        return false;
+    }
+    let mut wait = LockWait::for_desk(desk);
+    let mut first_refusal: Option<Instant> = None;
+    loop {
+        let outcome = tokio::select! {
+            biased;
+            outcome = lock() => outcome,
+            () = crate::service::host_shutdown() => {
+                tracing::info!(
+                    target: SESSION,
+                    windows_session_id,
+                    departure = departure.token(),
+                    "the Deck left as Windows shuts down; Windows ends the session"
+                );
+                return false;
+            }
+        };
+        let attempt = outcome
+            .as_ref()
+            .map_or(LockAttempt::NotLocked, |outcome| outcome.attempt());
+        if attempt == LockAttempt::Locked {
+            if wait.held() {
+                held(false);
+            }
+            tracing::info!(
+                target: SESSION,
+                windows_session_id,
+                departure = departure.token(),
+                outcome = outcome.as_ref().map_or("", |outcome| outcome.token()),
+                "the Deck left; the session is locked before the desk gets its displays and input back"
+            );
+            return true;
+        }
+        if first_refusal.is_none() && desk == WaitingDesk::Required {
+            tracing::warn!(
+                target: SESSION,
+                windows_session_id,
+                departure = departure.token(),
+                error = %outcome.as_ref().err().map_or("", String::as_str),
+                "the Deck left and the session did not lock; privacy.desk is required, so the desk stays dark with its input blocked while the lock is asked for again"
+            );
+        }
+        if desk != WaitingDesk::Required && attempt == LockAttempt::NotOurs {
+            tracing::info!(
+                target: SESSION,
+                windows_session_id,
+                departure = departure.token(),
+                "the Deck left; the console is no longer this account's, nothing to lock"
+            );
+            return false;
+        }
+        let refused_for = first_refusal
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .saturating_mul(pace);
+        let pause = match (desk, wait.next(attempt, refused_for)) {
+            (_, LockWaitVerdict::Done(end)) => {
+                if end == LockWaitEnd::ConsoleLeft {
+                    tracing::info!(
+                        target: SESSION,
+                        windows_session_id,
+                        departure = departure.token(),
+                        "the Deck left; the console is no longer this account's, nothing to lock"
+                    );
+                } else {
+                    tracing::error!(
+                        target: SESSION,
+                        windows_session_id,
+                        departure = departure.token(),
+                        end = ?end,
+                        "the Deck left but the session could not be locked"
+                    );
+                }
+                return false;
+            }
+            (WaitingDesk::Required, LockWaitVerdict::RetryAfter(pause)) => pause,
+            (WaitingDesk::Required, LockWaitVerdict::HoldPrivate { retry_after, first }) => {
+                if first {
+                    held(true);
+                    tracing::error!(
+                        target: SESSION,
+                        windows_session_id,
+                        departure = departure.token(),
+                        error = %outcome.as_ref().err().map_or("", String::as_str),
+                        reason_class = "lock_refused_desk_held",
+                        "privacy.desk is required and the session will not lock: the desk stays dark with its input blocked, and the lock is asked for again every 30 seconds"
+                    );
+                }
+                retry_after
+            }
+            (_, _) => {
+                tracing::error!(
+                    target: SESSION,
+                    windows_session_id,
+                    departure = departure.token(),
+                    error = %outcome.as_ref().err().map_or("", String::as_str),
+                    "the Deck left but the session could not be locked"
+                );
+                return false;
+            }
+        };
+        if departure == Departure::HostStopping || *session_shutdown.borrow() {
+            tracing::error!(
+                target: SESSION,
+                windows_session_id,
+                departure = departure.token(),
+                "the Pier is stopping while privacy.desk is required and the session will not lock; its session guard locks it after the displays come back"
+            );
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + pause / pace;
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => break,
+                () = crate::service::host_shutdown() => return false,
+                changed = session_shutdown.changed() => {
+                    if changed.is_err() || *session_shutdown.borrow() {
+                        tracing::error!(
+                            target: SESSION,
+                            windows_session_id,
+                            "the Pier is stopping while privacy.desk is required and the session will not lock; its session guard locks it after the displays come back"
+                        );
+                        return false;
+                    }
+                }
+                message = agent.next() => match message {
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = send_ws_with_timeout(agent, Message::Pong(payload), WS_WRITE_TIMEOUT).await;
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        tracing::error!(
+                            target: SESSION,
+                            windows_session_id,
+                            "the session agent ended while it kept the desk private for a lock that was refused; the desk has its displays and input back unlocked"
+                        );
+                        return false;
+                    }
+                    Some(Ok(_)) => {}
+                },
+            }
+        }
+    }
+}
+
+/// What a departure is once seen from the session itself: a "changed"
+/// session that is still the Deck's, active and unlocked, did not change
+/// (the observation that ended the attachment failed) and is locked like
+/// any other; one whose own account's sign-in waits for it is handed over.
+async fn resolve_departure(
     departure: Departure,
     windows_session_id: u32,
-    user_sid: String,
+    user_sid: &str,
     agent_lease: &BrokerAgentLease,
-    local_playback_lease: Option<crate::local_playback::LocalPlaybackLease>,
-) {
-    let mut local_playback_lease = local_playback_lease;
+) -> Departure {
     let mut departure = departure;
     if departure == Departure::SessionChanged {
-        // Only a change that is seen counts: a session that is still the
-        // Deck's, active and unlocked, did not change (the observation that
-        // ended the attachment failed), and is locked like any other.
-        let sid = user_sid.clone();
+        let sid = user_sid.to_string();
         let unchanged = tokio::task::spawn_blocking(move || {
             crate::windows_session::still_unlocked_session_of(windows_session_id, &sid)
         })
@@ -1760,27 +2232,83 @@ async fn hand_back_session(
             departure = Departure::AgentFailed;
         }
     }
-    if departure.locks_session() && agent_lease.successor_waiting(&user_sid) {
+    if departure.locks_session() && agent_lease.successor_waiting(user_sid) {
         departure = Departure::HandedOver;
     }
-    for step in arcen_session::console_session::DETACH_STEPS_OUTPUTS_FIRST {
+    departure
+}
+
+/// Gives the desk its session back after the Deck's agent has ended.
+///
+/// In the order Windows allows (`DETACH_STEPS_OUTPUTS_FIRST`): the agent's
+/// exit already restored the outputs and released the desk's input, because
+/// a locked session's processes may not change its displays; then the
+/// session is locked (ADR 0025, "disconnect locks") unless `departure` hands
+/// it to a successor or it is no longer the Deck's; the desk's speakers come
+/// back last. Nothing ends the session.
+///
+/// `locked_first`: the session was locked while the agent still held the
+/// desk ([`lock_before_agent_exit`], shared `hand_back_order`): the order is
+/// `DETACH_STEPS`, and the displays the agent could not restore behind the
+/// lock screen are restored there by the console recovery.
+async fn hand_back_session(
+    departure: Departure,
+    locked_first: bool,
+    desk: WaitingDesk,
+    windows_session_id: u32,
+    user_sid: String,
+    agent_lease: &BrokerAgentLease,
+    local_playback_lease: Option<crate::local_playback::LocalPlaybackLease>,
+) {
+    let mut local_playback_lease = local_playback_lease;
+    let departure = resolve_departure(departure, windows_session_id, &user_sid, agent_lease).await;
+    let order = if locked_first {
+        arcen_session::console_session::DETACH_STEPS
+    } else {
+        arcen_session::console_session::DETACH_STEPS_OUTPUTS_FIRST
+    };
+    for step in order {
         match step {
+            DetachStep::RestoreOutputs if locked_first => {
+                let awaits_restore = crate::service::stop_cause()
+                    .is_none_or(arcen_session::host_shutdown::StopCause::awaits_display_restore);
+                if awaits_restore {
+                    restore_displays_behind_lock(windows_session_id).await;
+                }
+            }
+            DetachStep::LockSession if locked_first => {}
             // The agent's exit restored them; a killed agent's watchdog
             // restores the displays, and Windows refuses that once locked.
             DetachStep::RestoreOutputs => {
-                if departure.locks_session() {
+                let awaits_restore = crate::service::stop_cause()
+                    .is_none_or(arcen_session::host_shutdown::StopCause::awaits_display_restore);
+                if departure.locks_session() && awaits_restore {
                     await_display_restore().await;
                 }
             }
             DetachStep::ReleaseInput => {}
             DetachStep::LockSession if departure.locks_session() => {
                 let sid = user_sid.clone();
-                let outcome = tokio::task::spawn_blocking(move || {
+                let lock = tokio::task::spawn_blocking(move || {
                     crate::windows_session::lock_session(windows_session_id, &sid)
-                })
-                .await
-                .map_err(|_| "session lock task failed".to_string())
-                .and_then(|outcome| outcome);
+                });
+                // Windows signs the session out itself once it shuts down;
+                // the stop record must not wait for a lock it overtakes.
+                let outcome = tokio::select! {
+                    biased;
+                    outcome = lock => outcome
+                        .map_err(|_| "session lock task failed".to_string())
+                        .and_then(|outcome| outcome),
+                    () = crate::service::host_shutdown() => {
+                        tracing::info!(
+                            target: SESSION,
+                            windows_session_id,
+                            departure = departure.token(),
+                            "the Deck left as Windows shuts down; Windows ends the session"
+                        );
+                        continue;
+                    }
+                };
                 match outcome {
                     Ok(outcome) => tracing::info!(
                         target: SESSION,
@@ -1789,13 +2317,19 @@ async fn hand_back_session(
                         outcome = outcome.token(),
                         "the Deck left; the session is locked, not ended"
                     ),
-                    Err(error) => tracing::error!(
-                        target: SESSION,
-                        windows_session_id,
-                        departure = departure.token(),
-                        %error,
-                        "the Deck left but the session could not be locked"
-                    ),
+                    Err(error) => {
+                        tracing::error!(
+                            target: SESSION,
+                            windows_session_id,
+                            departure = departure.token(),
+                            %error,
+                            "the Deck left but the session could not be locked"
+                        );
+                        // `required` never stops asking (shared `lock_wait`).
+                        if desk == WaitingDesk::Required {
+                            keep_locking_required(windows_session_id, &user_sid, departure).await;
+                        }
+                    }
                 }
             }
             DetachStep::LockSession => tracing::info!(
@@ -1812,6 +2346,37 @@ async fn hand_back_session(
                 }
             }
         }
+    }
+}
+
+/// The lock-first hand-back's display step: the agent has exited behind
+/// the lock screen, where Windows refused its own restore, so a journal it
+/// left is replayed now as LocalSystem on the secure desktop.
+async fn restore_displays_behind_lock(windows_session_id: u32) {
+    use crate::console_recovery::BehindLock;
+    match crate::console_recovery::restore_behind_lock(crate::recovery::default_path()).await {
+        BehindLock::NothingLeft => tracing::info!(
+            target: SESSION,
+            windows_session_id,
+            "the session is locked; the desk has its displays back"
+        ),
+        BehindLock::Restored => tracing::info!(
+            target: SESSION,
+            windows_session_id,
+            "the session is locked; the desk's displays were restored behind the lock screen"
+        ),
+        BehindLock::NotRestored(code) => tracing::warn!(
+            target: SESSION,
+            windows_session_id,
+            exit_code = code,
+            "the session is locked; its displays could not be restored behind the lock screen and are restored at the next unlock"
+        ),
+        BehindLock::Failed(error) => tracing::warn!(
+            target: SESSION,
+            windows_session_id,
+            %error,
+            "the session is locked; its displays could not be restored behind the lock screen and are restored at the next unlock"
+        ),
     }
 }
 
@@ -1862,16 +2427,26 @@ pub(crate) const DISPLAY_RESTORE_WAIT: Duration = Duration::from_secs(15);
 async fn await_display_restore() {
     let journal = crate::recovery::default_path();
     let deadline = tokio::time::Instant::now() + DISPLAY_RESTORE_WAIT;
-    while journal.exists() {
-        if tokio::time::Instant::now() >= deadline {
-            tracing::warn!(
-                target: SESSION,
-                journal = %journal.display(),
-                "the display journal is still there; the session is locked and its displays are restored at the next unlock"
-            );
-            return;
+    let wait = async {
+        while journal.exists() {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    target: SESSION,
+                    journal = %journal.display(),
+                    "the display journal is still there; the session is locked and its displays are restored at the next unlock"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    tokio::select! {
+        () = wait => {}
+        () = crate::service::host_shutdown() => tracing::info!(
+            target: SESSION,
+            journal = %journal.display(),
+            "Windows is shutting down; the display journal is replayed when the Pier next starts"
+        ),
     }
 }
 
@@ -2534,6 +3109,52 @@ impl ActiveDisplayLease {
         }
     }
 
+    /// Per display in [`Self::device_names`] order: whether Windows may still
+    /// publish HDR support for it (shared `DisplayIdentity::may_gain_hdr`).
+    /// Arcen created it (`created_outputs`: `IddCx`, NVIDIA headless), or a
+    /// single display's NVAPI exact timing wrote an HDR EDID for an HDR
+    /// request. A multi-display exact timing writes an SDR EDID, which claims
+    /// no HDR, so that display's "no HDR support" is final.
+    fn arcen_display_identity(&self, created_outputs: bool) -> Vec<bool> {
+        use arcen_outputs::windows_advanced_colour::DisplayIdentity;
+        let identities = match self {
+            Self::Single(display) => vec![if created_outputs {
+                DisplayIdentity::ArcenCreated
+            } else if display.report().retarget_capable {
+                DisplayIdentity::ArcenHdrEdid
+            } else {
+                DisplayIdentity::Own
+            }],
+            Self::Multi(display) => display.applied_plan().map_or_else(
+                || {
+                    vec![if created_outputs {
+                        DisplayIdentity::ArcenCreated
+                    } else {
+                        DisplayIdentity::Own
+                    }]
+                },
+                |plan| {
+                    plan.monitors
+                        .iter()
+                        .map(|monitor| {
+                            if created_outputs {
+                                DisplayIdentity::ArcenCreated
+                            } else if monitor.custom_timing {
+                                DisplayIdentity::ArcenSdrEdid
+                            } else {
+                                DisplayIdentity::Own
+                            }
+                        })
+                        .collect()
+                },
+            ),
+        };
+        identities
+            .into_iter()
+            .map(DisplayIdentity::may_gain_hdr)
+            .collect()
+    }
+
     fn restore(&mut self) -> Result<(), String> {
         match self {
             Self::Single(display) => display.restore(),
@@ -3188,6 +3809,14 @@ where
     );
     crate::deskside::begin_desk_privacy((!cfg.deskside.enabled).then_some(desk_plan));
     let desk_dark_required = !cfg.deskside.enabled && desk_plan.protects();
+    // Whether the broker locks the session before this agent gives the desk
+    // back when the Deck leaves (ADR 0025 §4, shared `hand_back_order`).
+    let desk_locks_first = !cfg.deskside.enabled
+        && arcen_session::console_session::hand_back_order(
+            arcen_session::console_session::DETACH_STEPS_OUTPUTS_FIRST,
+            Some(desk_plan),
+            false,
+        )[0] == DetachStep::LockSession;
     let desk_watch_on_refusal = if desk_plan.fails_closed() {
         arcen_session::console_session::desk_privacy::DeskWatchOnRefusal::End
     } else {
@@ -3609,23 +4238,17 @@ where
                 "Windows Advanced Color was applied inside the exact display transaction"
             );
         } else {
+            let identity = display.arcen_display_identity(
+                cfg.iddcx.enabled || cfg.multi_monitor.nvidia_headless_effective(),
+            );
             let session_log_id_for_advanced_color = session_log_id.clone();
+            let names = device_names.clone();
+            let marks = identity.clone();
             let advanced_color = tokio::task::spawn_blocking(move || {
-                let targets = match crate::advanced_color::targets_for_device_names(&device_names) {
-                    Ok(targets) => targets,
-                    Err(error) if !desired_hdr => {
-                        tracing::warn!(
-                            target: DISPLAY,
-                            %error,
-                            "continuing SDR session after failing to resolve Windows HDR targets"
-                        );
-                        return Ok(crate::advanced_color::AdvancedColorSessionGuard::empty());
-                    }
-                    Err(error) => return Err(error),
-                };
-                crate::advanced_color::apply_for_session(
-                    &targets,
+                advanced_color_for_session(
+                    &names,
                     desired_hdr,
+                    &marks,
                     &session_log_id_for_advanced_color,
                 )
             })
@@ -3634,6 +4257,54 @@ where
                 Ok(Ok(guard)) => {
                     if !guard.is_empty() {
                         advanced_color_guard = Some(guard);
+                    }
+                }
+                Ok(Err(crate::advanced_color::AdvancedColorSetupError::HdrUnsupported(reason)))
+                    if desired_hdr =>
+                {
+                    // Degrade, never fail: the displays can never show HDR,
+                    // so the session runs the Grading contract and says so.
+                    if let Err(error) = serve_hdr_request_as_grading(&mut cfg, display_encoder) {
+                        let _ = display.restore_with_advanced_color(&mut advanced_color_guard);
+                        let error = format!("serve HDR request as Grading: {error}");
+                        send_agent_failure(&mut ws, &error).await;
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        target: DISPLAY,
+                        %reason,
+                        reason_token = arcen_media::video::AdmissionReason::HdrDisplayUnsupported.token(),
+                        transfer = cfg.transfer.token(),
+                        bit_depth = cfg.bit_depth.token(),
+                        "HDR requested on displays without HDR support; serving Grading"
+                    );
+                    let session_log_id_for_advanced_color = session_log_id.clone();
+                    let names = device_names.clone();
+                    let sdr = tokio::task::spawn_blocking(move || {
+                        advanced_color_for_session(
+                            &names,
+                            false,
+                            &identity,
+                            &session_log_id_for_advanced_color,
+                        )
+                    })
+                    .await;
+                    match sdr {
+                        Ok(Ok(guard)) => {
+                            if !guard.is_empty() {
+                                advanced_color_guard = Some(guard);
+                            }
+                        }
+                        Ok(Err(error)) => tracing::warn!(
+                            target: DISPLAY,
+                            %error,
+                            "continuing Grading session after failing to settle Windows SDR"
+                        ),
+                        Err(error) => tracing::warn!(
+                            target: DISPLAY,
+                            %error,
+                            "continuing Grading session after the SDR settle task failed"
+                        ),
                     }
                 }
                 Ok(Err(error)) if !desired_hdr => {
@@ -3667,6 +4338,20 @@ where
                 }
             }
         }
+    }
+    // Switching a session display's HDR state can make Windows lay the
+    // desktop out again and bring back a display the plan turned off (the
+    // desk's own), so the desktop the session's input and capture describe is
+    // proved, and put back, before either starts.
+    #[cfg(windows)]
+    if let Err(error) = hold_multi_display_layout(&mut display, resolved_display_hdr_intent(&cfg)) {
+        let restore = display.restore_with_advanced_color(&mut advanced_color_guard);
+        let error = match restore {
+            Ok(()) => error,
+            Err(restore_error) => format!("{error}; display restore failed: {restore_error}"),
+        };
+        send_agent_failure(&mut ws, &error).await;
+        return Err(error);
     }
     if desk_dark_required {
         use arcen_session::console_session::desk_privacy::DeskPrivacyRefusal;
@@ -3903,9 +4588,15 @@ where
     AGENT_SETUP.end();
     let mut initial_media = Some(initial_media);
     let mut attachment_session_log_id = session_log_id.clone();
-    let mut total_frames = 0_u64;
-    let mut total_dropped = 0_u64;
     let session_started_at = std::time::Instant::now();
+    crate::session_end::begin(
+        emitter.clone(),
+        log_controller.clone(),
+        session_log_id.clone(),
+        &windows_session.user,
+        &peer,
+        session_started_at,
+    );
     // This agent exists only for an authenticated Windows session; its first
     // log id names the session for its whole life, across resumes.
     let lifecycle_key = session_log_id.to_string();
@@ -3918,199 +4609,228 @@ where
     // attachment cleanup or a failed reattach, so the shared table never
     // keeps a session this agent has abandoned.
     let lifecycle_end = LifecycleEnd(Some(lifecycle_key.as_str()));
-    let final_result = loop {
-        let prepared_media = if let Some(prepared) = initial_media.take() {
-            prepared
-        } else {
-            if let Some((multi_plan, carrier)) = multi_monitor_committed.as_ref() {
-                prepare_multi_monitor_media(
-                    &cfg,
-                    display_encoder,
-                    multi_plan,
-                    *carrier,
-                    authoritative_cursor,
-                    &attachment_session_log_id,
-                    &multi_monitor_quality,
-                    &emitter,
-                )
-                .await?
-            } else {
-                let (prepared, selected_encoder) = prepare_attachment_media(
-                    &cfg,
-                    display_encoder,
-                    display
-                        .single_mut()
-                        .expect("single-monitor media requires a single display lease"),
-                    authoritative_cursor,
-                    &attachment_session_log_id,
-                    deskside_capture_binding,
-                    false,
-                )
-                .await?;
-                display_encoder = selected_encoder;
+    // Every way out of the attachments, an early error included, comes back
+    // here before the desk is touched: a desk the broker locks first stays
+    // private until the session is locked (`hold_desk_until_locked`).
+    let attachments: Result<Result<(), String>, String> = async {
+        Ok(loop {
+            let prepared_media = if let Some(prepared) = initial_media.take() {
                 prepared
-            }
-        };
-        let media_plan = prepared_media.video.primary_plan();
-        let aggregate_backend = prepared_media.video.aggregate_accelerator_class();
-        let pen_available = prepared_media.pen.is_some();
-        let region_input_available = prepared_media.region_input.is_some();
-        let multi_monitor_capability = prepared_media.video.multi_capability().cloned();
-        let refine_plan = prepared_media.video.refine_plan(&cfg);
-        tracing::info!(
-            target: SESSION,
-            state = if refine_plan.is_on() { "on" } else { "off" },
-            reason = match refine_plan {
-                arcen_media::refine::RefinePlan::Off(reason) => reason.token(),
-                arcen_media::refine::RefinePlan::On { .. } => "",
-            },
-            deck_asked = cfg.deck_refine.is_some(),
-            "{}",
-            arcen_telemetry::names::refine::PLAN
-        );
-        let refine_status = cfg
-            .deck_refine
-            .is_some()
-            .then(|| refine_plan.hello_status());
-        // Canvas (ADR 0028): what the capture was started with, told only
-        // to a Deck that offered it.
-        let canvas_status = cfg.deck_canvas.as_ref().and_then(|_| {
-            let canvas_plan = prepared_media.video.canvas_plan();
+            } else {
+                if let Some((multi_plan, carrier)) = multi_monitor_committed.as_ref() {
+                    prepare_multi_monitor_media(
+                        &cfg,
+                        display_encoder,
+                        multi_plan,
+                        *carrier,
+                        authoritative_cursor,
+                        &attachment_session_log_id,
+                        &multi_monitor_quality,
+                        &emitter,
+                    )
+                    .await?
+                } else {
+                    let (prepared, selected_encoder) = prepare_attachment_media(
+                        &cfg,
+                        display_encoder,
+                        display
+                            .single_mut()
+                            .expect("single-monitor media requires a single display lease"),
+                        authoritative_cursor,
+                        &attachment_session_log_id,
+                        deskside_capture_binding,
+                        false,
+                    )
+                    .await?;
+                    display_encoder = selected_encoder;
+                    prepared
+                }
+            };
+            let media_plan = prepared_media.video.primary_plan();
+            let aggregate_backend = prepared_media.video.aggregate_accelerator_class();
+            let pen_available = prepared_media.pen.is_some();
+            let region_input_available = prepared_media.region_input.is_some();
+            let multi_monitor_capability = prepared_media.video.multi_capability().cloned();
+            let refine_plan = prepared_media.video.refine_plan(&cfg);
             tracing::info!(
                 target: SESSION,
-                state = if canvas_plan.is_on() { "on" } else { "off" },
-                reason = if canvas_plan.is_on() { "" } else { canvas_plan.off_reason() },
-                "canvas plan"
+                state = if refine_plan.is_on() { "on" } else { "off" },
+                reason = match refine_plan {
+                    arcen_media::refine::RefinePlan::Off(reason) => reason.token(),
+                    arcen_media::refine::RefinePlan::On { .. } => "",
+                },
+                deck_asked = cfg.deck_refine.is_some(),
+                "{}",
+                arcen_telemetry::names::refine::PLAN
             );
-            canvas_plan.status
-        });
-        let preferences = run_attachment_handshake(
-            &mut ws,
-            &cfg,
-            &peer,
-            &plan,
-            &windows_session,
-            &agent_log_path,
-            &authoritative_timezone,
-            authoritative_cursor,
-            requested,
-            display.report(),
-            &attachment_session_log_id,
-            &media_plan,
-            aggregate_backend,
-            pen_available,
-            region_input_available,
-            active_transport,
-            multi_monitor_capability.as_ref(),
-            refine_status,
-            canvas_status,
+            let refine_status = cfg
+                .deck_refine
+                .is_some()
+                .then(|| refine_plan.hello_status());
+            // Canvas (ADR 0028): what the capture was started with, told only
+            // to a Deck that offered it.
+            let canvas_status = cfg.deck_canvas.as_ref().and_then(|_| {
+                let canvas_plan = prepared_media.video.canvas_plan();
+                tracing::info!(
+                    target: SESSION,
+                    state = if canvas_plan.is_on() { "on" } else { "off" },
+                    reason = if canvas_plan.is_on() { "" } else { canvas_plan.off_reason() },
+                    "canvas plan"
+                );
+                canvas_plan.status
+            });
+            let preferences = run_attachment_handshake(
+                &mut ws,
+                &cfg,
+                &peer,
+                &plan,
+                &windows_session,
+                &agent_log_path,
+                &authoritative_timezone,
+                authoritative_cursor,
+                requested,
+                display.report(),
+                &attachment_session_log_id,
+                &media_plan,
+                aggregate_backend,
+                pen_available,
+                region_input_available,
+                active_transport,
+                multi_monitor_capability.as_ref(),
+                refine_status,
+                canvas_status,
+            )
+            .await;
+            let preferences = match preferences {
+                Ok(preferences) => preferences,
+                Err(error) => {
+                    drop(prepared_media);
+                    return Err(error);
+                }
+            };
+            tracing::info!(
+                target: INPUT,
+                sid = %attachment_session_log_id,
+                requested = ?preferences.tablet_mode_result.requested,
+                active = ?preferences.tablet_mode_result.active,
+                accepted = preferences.tablet_mode_result.accepted,
+                reason = preferences.tablet_mode_result.reason.as_str(),
+                reconnect_required = preferences.tablet_mode_result.reconnect_required,
+                "tablet mode negotiation resolved"
+            );
+            let path_signal_connection = None;
+            let attachment = stream_session(
+                ws,
+                path_signal_connection,
+                &cfg,
+                &peer,
+                &windows_session.user,
+                preferences.audio,
+                preferences.microphone,
+                preferences.cursor_mode,
+                // The Deck draws host cursor images only when it declared so at
+                // sign-in and again in this attachment's hello.
+                authoritative_cursor_images && preferences.deck_cursor_images,
+                preferences.deck_text_commit,
+                preferences.clipboard,
+                NativeTabletPlan {
+                    tablet: preferences.native_tablet,
+                    result: preferences.tablet_mode_result.clone(),
+                    deck_cursor_positions: preferences.deck_cursor_positions,
+                },
+                &mut display,
+                prepared_media,
+                &attachment_session_log_id,
+                log_controller.clone(),
+                initial_reopen_generation,
+                initial_applied_reopen_generation,
+                initial_qos_targets,
+                deskside_hooks
+                    .as_ref()
+                    .map(crate::deskside::InputHookGuard::proof),
+                deskside_capture_binding,
+                &emitter,
+                &lifecycle_key,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            ws = attachment.ws;
+            crate::session_end::close_attachment(attachment.sent_frames, attachment.dropped_frames);
+            match attachment_disposition(attachment.detached, attachment.result) {
+                // The Deck left: a desk the broker locks first (shared
+                // `hand_back_order`, `privacy.desk = "required"`) stays private
+                // here until the broker has locked the session and closes.
+                AttachmentDisposition::Finish(Ok(())) if desk_locks_first => {
+                    tracing::info!(
+                        target: SESSION,
+                        "the Deck left; the desk stays private until the session is locked"
+                    );
+                }
+                AttachmentDisposition::Finish(result) => break result,
+                AttachmentDisposition::Terminate(error) => {
+                    return Err(format!("fatal attachment cleanup: {error}"));
+                }
+                AttachmentDisposition::Reattach => {
+                    log_lifecycle(
+                        &lifecycle_key,
+                        "transport_lost",
+                        LIFECYCLES.transport_lost(&lifecycle_key),
+                    );
+                    if let Some(protection) = deskside_protection.as_mut() {
+                        let _ = protection.apply(DesksideEvent::TransportLost { resumable: true });
+                    }
+                    send_json(
+                        &mut ws,
+                        &AgentAttachmentStatus::detached(),
+                        AgentAttachmentStatus::TYPE,
+                    )
+                    .await?;
+                }
+            }
+            match await_attachment_command(
+                &mut ws,
+                &cfg,
+                display_encoder,
+                display.report(),
+                &log_controller,
+                deskside_hooks
+                    .as_ref()
+                    .map(crate::deskside::InputHookGuard::proof),
+                deskside_capture_binding,
+            )
+            .await?
+            {
+                Some(next_attachment) => {
+                    if let Some(protection) = deskside_protection.as_mut() {
+                        let _ = protection.apply(DesksideEvent::Reconnected);
+                    }
+                    attachment_session_log_id = next_attachment.session_log_id;
+                    crate::session_end::set_attachment(attachment_session_log_id.clone());
+                    active_transport = next_attachment.transport_capability;
+                    log_lifecycle(
+                        &lifecycle_key,
+                        "resumed",
+                        LIFECYCLES.authenticated(&lifecycle_key),
+                    );
+                }
+                None => break Ok(()),
+            }
+        })
+    }
+    .await;
+    if desk_locks_first {
+        hold_desk_until_locked(
+            || async {
+                tokio::task::spawn_blocking(crate::windows_session::lock_own_session)
+                    .await
+                    .map_err(|_| "session lock task failed".to_string())
+                    .and_then(|locked| locked)
+            },
+            1,
         )
         .await;
-        let preferences = match preferences {
-            Ok(preferences) => preferences,
-            Err(error) => {
-                drop(prepared_media);
-                return Err(error);
-            }
-        };
-        tracing::info!(
-            target: INPUT,
-            sid = %attachment_session_log_id,
-            requested = ?preferences.tablet_mode_result.requested,
-            active = ?preferences.tablet_mode_result.active,
-            accepted = preferences.tablet_mode_result.accepted,
-            reason = preferences.tablet_mode_result.reason.as_str(),
-            reconnect_required = preferences.tablet_mode_result.reconnect_required,
-            "tablet mode negotiation resolved"
-        );
-        let path_signal_connection = None;
-        let attachment = stream_session(
-            ws,
-            path_signal_connection,
-            &cfg,
-            &peer,
-            &windows_session.user,
-            preferences.audio,
-            preferences.microphone,
-            preferences.cursor_mode,
-            // The Deck draws host cursor images only when it declared so at
-            // sign-in and again in this attachment's hello.
-            authoritative_cursor_images && preferences.deck_cursor_images,
-            preferences.deck_text_commit,
-            preferences.clipboard,
-            NativeTabletPlan {
-                tablet: preferences.native_tablet,
-                result: preferences.tablet_mode_result.clone(),
-                deck_cursor_positions: preferences.deck_cursor_positions,
-            },
-            &mut display,
-            prepared_media,
-            &attachment_session_log_id,
-            log_controller.clone(),
-            initial_reopen_generation,
-            initial_applied_reopen_generation,
-            initial_qos_targets,
-            deskside_hooks
-                .as_ref()
-                .map(crate::deskside::InputHookGuard::proof),
-            deskside_capture_binding,
-            &emitter,
-            &lifecycle_key,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        ws = attachment.ws;
-        total_frames = total_frames.saturating_add(attachment.sent_frames);
-        total_dropped = total_dropped.saturating_add(attachment.dropped_frames);
-        match attachment_disposition(attachment.detached, attachment.result) {
-            AttachmentDisposition::Finish(result) => break result,
-            AttachmentDisposition::Terminate(error) => {
-                return Err(format!("fatal attachment cleanup: {error}"));
-            }
-            AttachmentDisposition::Reattach => {}
-        }
-        log_lifecycle(
-            &lifecycle_key,
-            "transport_lost",
-            LIFECYCLES.transport_lost(&lifecycle_key),
-        );
-        if let Some(protection) = deskside_protection.as_mut() {
-            let _ = protection.apply(DesksideEvent::TransportLost { resumable: true });
-        }
-        send_json(
-            &mut ws,
-            &AgentAttachmentStatus::detached(),
-            AgentAttachmentStatus::TYPE,
-        )
-        .await?;
-        match await_attachment_command(
-            &mut ws,
-            &cfg,
-            display_encoder,
-            display.report(),
-            &log_controller,
-            deskside_hooks
-                .as_ref()
-                .map(crate::deskside::InputHookGuard::proof),
-            deskside_capture_binding,
-        )
-        .await?
-        {
-            Some(next_attachment) => {
-                if let Some(protection) = deskside_protection.as_mut() {
-                    let _ = protection.apply(DesksideEvent::Reconnected);
-                }
-                attachment_session_log_id = next_attachment.session_log_id;
-                active_transport = next_attachment.transport_capability;
-                log_lifecycle(
-                    &lifecycle_key,
-                    "resumed",
-                    LIFECYCLES.authenticated(&lifecycle_key),
-                );
-            }
-            None => break Ok(()),
-        }
-    };
+    }
+    let final_result = attachments?;
     lifecycle_end.finish();
 
     if let Some(protection) = deskside_protection.as_mut() {
@@ -4161,16 +4881,19 @@ where
         }
     }
     let duration_ms = i64::try_from(session_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
-    emit_session_end_or_interrupted(
-        &emitter,
-        attachment_session_log_id.clone(),
-        &windows_session.user,
-        &peer,
-        &final_result,
-        duration_ms,
-        total_frames,
-        total_dropped,
-    );
+    // `None` once Windows' own end of the session was recorded.
+    if let Some(totals) = crate::session_end::end() {
+        emit_session_end_or_interrupted(
+            &emitter,
+            attachment_session_log_id.clone(),
+            &windows_session.user,
+            &peer,
+            &final_result,
+            duration_ms,
+            totals.frames_sent,
+            totals.frames_dropped,
+        );
+    }
     emit_display_restore_outcome(
         &emitter,
         attachment_session_log_id,
@@ -4384,23 +5107,16 @@ where
             "client_hello session_log_id echo does not match attachment id"
         );
     }
-    if let Some(initial) = cfg.auth_video_request.as_ref() {
-        if arcen_protocol::messages::ClientVideoCapabilitiesMsg::from_client_hello(&client_hello)
-            != initial.capabilities
-        {
-            return Err(
-                "ClientHello video capabilities differ from the authenticated setup request"
-                    .to_string(),
-            );
-        }
-    }
+    check_setup_request_echo(
+        cfg,
+        Some(
+            &arcen_protocol::messages::ClientVideoCapabilitiesMsg::from_client_hello(&client_hello),
+        ),
+        None,
+    )?;
     let quality: QualitySettings =
         recv_typed(ws, "quality_settings", HANDSHAKE_MESSAGE_TIMEOUT).await?;
-    if let Some(initial) = cfg.auth_video_request.as_ref() {
-        if quality != initial.quality {
-            return Err("quality_settings differ from the authenticated setup request".to_string());
-        }
-    }
+    check_setup_request_echo(cfg, None, Some(&quality))?;
     // Resolve the client's requested colour contract against host policy and
     // its own `client_hello` decode capability. New Decks already supplied
     // this request at auth time, before display/encoder creation; this copy is
@@ -4893,9 +5609,20 @@ where
             crate::deskside::desk_watch_verdict().map_err(|refusal| refusal.deck_reason())?;
         }
         _ = supervision.tick() => {
+            // Behind its lock screen (the hold locks the session) the desk's
+            // input is the lock screen's, and no canary reaches the session.
+            let locked = tokio::task::spawn_blocking(crate::windows_session::own_session_locked)
+                .await
+                .ok()
+                .flatten();
+            let input_proof =
+                arcen_session::console_session::held_lock::DeskInputProof::while_held(locked);
             verify_deskside_supervision(
                 cfg,
-                deskside_hook_proof.as_ref(),
+                deskside_hook_proof.as_ref().filter(|_| {
+                    input_proof
+                        == arcen_session::console_session::held_lock::DeskInputProof::Probe
+                }),
                 deskside_capture_binding,
             )
             .await?;
@@ -5207,6 +5934,149 @@ fn serve_admitted_topology(
             Err(SetupRefusal::multi_monitor(ServedTopology::deck_reason(&reason)).message())
         }
     }
+}
+
+/// Proves a multi-display session's desktop is still its plan once its
+/// displays' colour state is set, puts the plan back once if Windows moved
+/// it (`MultiDisplayLease::hold_applied_plan`), and then proves the displays
+/// kept that colour state. A single display is isolated by its own
+/// transaction and is not checked here.
+#[cfg(windows)]
+fn hold_multi_display_layout(
+    display: &mut ActiveDisplayLease,
+    desired_hdr: bool,
+) -> Result<(), String> {
+    let ActiveDisplayLease::Multi(lease) = display else {
+        return Ok(());
+    };
+    let outputs = lease.applied_plan().map_or_else(Vec::new, |plan| {
+        plan.monitors
+            .iter()
+            .map(
+                |monitor| arcen_outputs::windows_topology::ActiveOutputPlacement {
+                    adapter_luid: monitor.adapter_luid,
+                    target_id: monitor.target_id,
+                    x: monitor.x,
+                    y: monitor.y,
+                    width: monitor.width,
+                    height: monitor.height,
+                },
+            )
+            .collect::<Vec<_>>()
+    });
+    tokio::task::block_in_place(|| {
+        let Some(drift) = lease.hold_applied_plan()? else {
+            return Ok(());
+        };
+        match crate::advanced_color::prove_held(&outputs, desired_hdr) {
+            Ok(()) => {
+                tracing::info!(
+                    target: DISPLAY,
+                    %drift,
+                    desired = if desired_hdr { "hdr" } else { "sdr" },
+                    "session layout applied again after Windows moved the desktop; colour state held"
+                );
+                Ok(())
+            }
+            Err(error) if desired_hdr => Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    target: DISPLAY,
+                    %error,
+                    "continuing SDR session after the session layout was applied again"
+                );
+                Ok(())
+            }
+        }
+    })
+}
+
+/// Brings the session's displays (`device_names`) to the HDR state it needs
+/// (`arcen_display_identity`: per display, Arcen wrote its EDID or created
+/// it). An SDR session goes on without targets it cannot resolve.
+#[cfg(windows)]
+fn advanced_color_for_session(
+    device_names: &[String],
+    desired_hdr: bool,
+    arcen_display_identity: &[bool],
+    session_log_id: &CorrelationId,
+) -> Result<
+    crate::advanced_color::AdvancedColorSessionGuard,
+    crate::advanced_color::AdvancedColorSetupError,
+> {
+    let targets = match crate::advanced_color::targets_for_device_names(device_names) {
+        Ok(targets) => targets,
+        Err(error) if !desired_hdr => {
+            tracing::warn!(
+                target: DISPLAY,
+                %error,
+                "continuing SDR session after failing to resolve Windows HDR targets"
+            );
+            return Ok(crate::advanced_color::AdvancedColorSessionGuard::empty());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    crate::advanced_color::apply_for_session(
+        &targets,
+        desired_hdr,
+        arcen_display_identity,
+        session_log_id,
+    )
+}
+
+/// Resolves this session's HDR request again as Grading
+/// ([`arcen_media::video::hdr_request_as_grading`]), for displays that offer
+/// no HDR: the served plan, hello and `served_pipeline` then say Grading,
+/// with the reason.
+pub(crate) fn serve_hdr_request_as_grading(
+    cfg: &mut HostConfig,
+    display_encoder: arcen_media::video::EncoderRequest,
+) -> Result<(), String> {
+    let request = cfg
+        .auth_video_request
+        .as_ref()
+        .ok_or_else(|| "the session has no auth-time video request".to_string())?;
+    let grading = arcen_media::video::hdr_request_as_grading(request);
+    // The HDR resolution left its BT.2020 matrix as this session's colour
+    // ceiling; Grading's own matrix replaces it (depth and range stay the
+    // ten-bit full range HDR was admitted at).
+    cfg.color_matrix = arcen_media::VideoConfiguration::grading_reference().matrix;
+    let cause = (cfg.encoder == arcen_media::video::EncoderRequest::Auto
+        && display_encoder == arcen_media::video::EncoderRequest::SoftwareH264)
+        .then(auto_software_cause);
+    let asked = cfg.auth_video_request.clone();
+    let served =
+        cfg.apply_initial_video_request_for_encoder_after(&grading, display_encoder, cause);
+    // `auth_video_request` stays what the Deck asked for: the attachment
+    // handshake checks the Deck's echoed `quality_settings` against it, and
+    // the Deck echoes its HDR request, not the Grading one served.
+    cfg.auth_video_request = asked;
+    served?;
+    cfg.hdr_served_as_grading = true;
+    Ok(())
+}
+
+/// The attachment handshake's check that the Deck's `client_hello` decode
+/// capabilities and `quality_settings` echo the request it authenticated
+/// with (`cfg.auth_video_request`).
+pub(crate) fn check_setup_request_echo(
+    cfg: &HostConfig,
+    capabilities: Option<&arcen_protocol::messages::ClientVideoCapabilitiesMsg>,
+    quality: Option<&QualitySettings>,
+) -> Result<(), String> {
+    let Some(initial) = cfg.auth_video_request.as_ref() else {
+        return Ok(());
+    };
+    if capabilities.is_some_and(|capabilities| *capabilities != initial.capabilities) {
+        return Err(
+            "ClientHello video capabilities differ from the authenticated setup request"
+                .to_string(),
+        );
+    }
+    if quality.is_some_and(|quality| *quality != initial.quality) {
+        return Err("quality_settings differ from the authenticated setup request".to_string());
+    }
+    Ok(())
 }
 
 fn session_display_plan(response: &AuthResponse) -> Result<SessionDisplayPlan, String> {
@@ -5912,14 +6782,27 @@ fn served_pipeline_message(
     primary: &ResolvedMediaPlan,
     aggregate: Option<arcen_media::video::AcceleratorClass>,
 ) -> ServedPipelineMsg {
-    ServedPipelineMsg::new(
+    let message = ServedPipelineMsg::new(
         served_stream_pipeline(cfg, primary, aggregate),
         aggregate.map_or("unknown", arcen_media::video::AcceleratorClass::token),
         aggregate
             .is_none()
             .then_some("Windows encoder acceleration is unknown".to_string()),
     )
-    .with_encoder(served_encoder_backend_label(primary, aggregate))
+    .with_encoder(served_encoder_backend_label(primary, aggregate));
+    if cfg.hdr_served_as_grading {
+        ServedPipelineMsg {
+            reason: Some(
+                arcen_media::video::AdmissionReason::HdrDisplayUnsupported
+                    .token()
+                    .to_owned(),
+            ),
+            ..message
+        }
+        .with_detail(arcen_protocol::messages::HDR_DISPLAY_UNSUPPORTED_DETAIL)
+    } else {
+        message
+    }
 }
 
 fn qp_map_policy_for_capenc(
@@ -7599,12 +8482,44 @@ async fn prepare_multi_monitor_media(
             qp_map: pipeline.qp_map,
         });
     }
+    let mut region_reasons = Vec::new();
+    for (monitor, reason) in decision.region_encoder_degradations() {
+        tracing::warn!(
+            target: SESSION,
+            sid = %session_log_id,
+            session_monitor_id = monitor.get(),
+            reason,
+            "display served on another encoder than the others"
+        );
+        region_reasons.push(crate::multi_monitor_gate::RegionReason {
+            session_monitor_id: monitor,
+            reason,
+            degraded: true,
+        });
+    }
+    for spec in &specs {
+        if let Some(reason) = spec.chroma_reason {
+            tracing::info!(
+                target: SESSION,
+                sid = %session_log_id,
+                session_monitor_id = spec.session_monitor_id.get(),
+                reason,
+                "display's 4:2:0 request refused: the session's contract is 4:4:4"
+            );
+            region_reasons.push(crate::multi_monitor_gate::RegionReason {
+                session_monitor_id: spec.session_monitor_id,
+                reason,
+                degraded: false,
+            });
+        }
+    }
     let capability = crate::multi_monitor_gate::build_applied_capability(
         plan,
         carrier,
         &media,
         &negotiated_media,
         fps_stepdown.map(|step| step.reason),
+        &region_reasons,
     )
     .map_err(|error| format!("build applied multi-monitor capability: {error}"))?;
     let region_input = RegionInputAdapter::from_plan(plan)
@@ -8136,6 +9051,19 @@ where
     // The rate the rate task last asked the encoder for (Detail shedding or
     // the governor's), which the governor judges against.
     let asked_fps = Arc::new(AtomicU32::new(media_plan.fps));
+    if cfg.hdr_served_as_grading {
+        // The hello says Grading; this says why, for the Deck to show.
+        if let Err(error) = send_served_pipeline_update(
+            &control_tx,
+            cfg,
+            &media_plan,
+            video_pipelines.aggregate_accelerator_class(),
+        )
+        .await
+        {
+            tracing::warn!(target: SESSION, %error, "the Deck could not be told why HDR is served as Grading");
+        }
+    }
     let mut governor = arcen_media::video::PipelineId::from_served_wire(&served_stream_pipeline(
         cfg,
         &media_plan,
@@ -9432,6 +10360,7 @@ where
                 };
                 let timestamp_ms = monotonic_ms_since(health_started_at);
                 let (sent_frames, bytes_sent) = video_stats.snapshot();
+                crate::session_end::observe_attachment(sent_frames, dropped_frames);
                 let pipeline = video_pipelines.primary_pipeline_telemetry();
                 // capenc's latest second: what it encoded against what the
                 // capture delivered. A multi-monitor session is not governed.
@@ -9602,6 +10531,9 @@ where
                 if let Ok(text) = serde_json::to_string(&stats) {
                     let _ = control_tx
                         .try_send(WriterControl::Message(Message::Text(text.into())));
+                }
+                if let Ok(text) = serde_json::to_string(&AgentHealth::new(observation.committed)) {
+                    let _ = control_tx.try_send(WriterControl::Message(Message::Text(text)));
                 }
                 if let Some(audio_stats) = audio_capture.telemetry() {
                     if audio_health_ticks.is_multiple_of(MICROPHONE_STATS_HEALTH_TICKS) {
@@ -10029,7 +10961,7 @@ fn emit_session_stream_start(
     );
 }
 
-fn local_hostname() -> Option<String> {
+pub(crate) fn local_hostname() -> Option<String> {
     std::env::var("COMPUTERNAME")
         .ok()
         .filter(|value| !value.is_empty() && value.len() <= arcen_telemetry::MAX_IDENTITY_BYTES)
@@ -11834,6 +12766,7 @@ async fn relay_client_and_agent<C, CE, A>(
     lanes: Option<arcen_transport::quic::LaneConnection>,
     path_signal_connection: Option<quinn::Connection>,
     refine_grant: bool,
+    service_health: &arcen_observability::ServiceHealth,
     departure: &mut Departure,
 ) -> Result<(), String>
 where
@@ -11853,6 +12786,7 @@ where
         lanes,
         path_signal_connection,
         refine_grant,
+        service_health,
     )
     .await;
     *departure = match &outcome {
@@ -12000,6 +12934,7 @@ async fn relay_resumable_client_and_agent<A>(
     session_shutdown: &mut watch::Receiver<bool>,
     incumbent: Option<&arcen_transport::quic::IncumbentRegistration>,
     refine_grant: bool,
+    service_health: &arcen_observability::ServiceHealth,
     departure: &mut Departure,
     hold_report: &mut Option<ResumeHoldReport>,
 ) -> Result<(), String>
@@ -12038,6 +12973,7 @@ where
             lanes,
             path_signal_connection,
             refine_grant,
+            service_health,
         )
         .await
         {
@@ -12095,27 +13031,44 @@ where
                 registry
                     .mark_detached(&active_session_id)
                     .map_err(|error| format!("could not expose detached resume slot: {error:?}"))?;
-                send_json(
-                    agent,
-                    &AgentAttachmentCommand::detach(),
-                    AgentAttachmentCommand::TYPE,
-                )
-                .await?;
-                await_agent_attachment_status(
-                    agent,
-                    AgentAttachmentState::Detached,
-                    AGENT_ATTACHMENT_TIMEOUT,
-                )
-                .await?;
-                held_since = Some(std::time::Instant::now());
-                hold_end = ResumeHoldEnd::OwnerFailed;
-                tracing::info!(
-                    target: SESSION,
-                    reason_class = reason,
-                    "external direct transport detached; restore leases and broker-agent process retained"
-                );
+                // Every departure locks, a lost transport too (ADR 0025 §4,
+                // GAP-044): the agent stays, keeping the desk private behind
+                // the lock, until the Deck resumes or the hold ends.
+                for step in HOLD_STEPS {
+                    match step {
+                        HoldStep::DetachAgent => {
+                            send_json(
+                                agent,
+                                &AgentAttachmentCommand::detach(),
+                                AgentAttachmentCommand::TYPE,
+                            )
+                            .await?;
+                            await_agent_attachment_status(
+                                agent,
+                                AgentAttachmentState::Detached,
+                                AGENT_ATTACHMENT_TIMEOUT,
+                            )
+                            .await?;
+                            held_since = Some(std::time::Instant::now());
+                            hold_end = ResumeHoldEnd::OwnerFailed;
+                            tracing::info!(
+                                target: SESSION,
+                                reason_class = reason,
+                                "external direct transport detached; restore leases and broker-agent process retained"
+                            );
+                        }
+                        HoldStep::LockSession => {
+                            let windows_session_id = windows_session.session_id;
+                            lock_held_session(windows_session_id, || {
+                                lock_session_task(windows_session_id, &native_user_sid)
+                            })
+                            .await;
+                        }
+                        HoldStep::Watch => {}
+                    }
+                }
 
-                loop {
+                'held: loop {
                     let (deadline, timer_generation) = match reconnect.state() {
                         ReconnectState::Detached {
                             deadline,
@@ -12181,27 +13134,53 @@ where
                                     );
                                     let identity = windows_session.clone();
                                     let sid = native_user_sid.clone();
-                                    let observed = tokio::task::spawn_blocking(move || {
-                                        crate::windows_session::observe_resumable_bound(&identity, &sid)
+                                    let reading = tokio::task::spawn_blocking(move || {
+                                        crate::windows_session::observe_held(&identity, &sid)
                                     })
                                     .await
-                                    .map_err(|_| "Windows resume observation task failed".to_string())
-                                    .and_then(|result| result);
-                                    if let Err(error) = observed {
-                                        let refusal = ConsoleRefusal::SessionChanged;
-                                        tracing::warn!(
-                                            target: SESSION,
-                                            reason_class = refusal.token(),
-                                            %error,
-                                            "the returning Deck is refused: its session is no longer the one it joined"
-                                        );
-                                        let _ = send_resume_rejection(
-                                            &mut handoff.socket,
-                                            refusal.deck_reason(),
-                                            ResumeErrorCode::NativeIdentityChanged,
-                                        ).await;
-                                        *departure = Departure::SessionChanged;
-                                        break 'session Err("native session identity changed".to_string());
+                                    .unwrap_or(HeldReading::Changed);
+                                    match held_resume(reading, UnlockAuthority::OwnersPassword) {
+                                        HeldResume::Attach => {}
+                                        HeldResume::Refuse => {
+                                            let refusal = ConsoleRefusal::SessionChanged;
+                                            tracing::warn!(
+                                                target: SESSION,
+                                                reason_class = refusal.token(),
+                                                "the returning Deck is refused: its session is no longer the one it joined"
+                                            );
+                                            let _ = send_resume_rejection(
+                                                &mut handoff.socket,
+                                                refusal.deck_reason(),
+                                                ResumeErrorCode::NativeIdentityChanged,
+                                            ).await;
+                                            *departure = Departure::SessionChanged;
+                                            break 'session Err("native session identity changed".to_string());
+                                        }
+                                        HeldResume::SignInAgain => {
+                                            // Only the password unlocks it: the Deck signs
+                                            // in again, which unlocks the same session and
+                                            // takes this held desktop over.
+                                            tracing::info!(
+                                                target: SESSION,
+                                                sid = %handoff.session_log_id,
+                                                reason_class = HELD_SESSION_LOCKED,
+                                                "the returning Deck is asked to sign in again: its session is locked, and only its password unlocks it; the hold continues"
+                                            );
+                                            let _ = send_resume_rejection(
+                                                &mut handoff.socket,
+                                                HELD_SESSION_LOCKED_REASON,
+                                                HELD_SESSION_LOCKED_CODE,
+                                            ).await;
+                                            let _ = reconnect.apply(
+                                                ReconnectEvent::ResumeFailed,
+                                                registry.monotonic_now(),
+                                            );
+                                            registry.mark_detached(&active_session_id).map_err(|error| {
+                                                format!("could not keep the held resume slot: {error:?}")
+                                            })?;
+                                            hold_end = ResumeHoldEnd::OwnerFailed;
+                                            continue 'held;
+                                        }
                                     }
                                     send_json(
                                         agent,
@@ -12329,29 +13308,31 @@ where
                                 Some(Err(_)) => {
                                     break 'session Err("session agent IPC failed while detached".to_string());
                                 }
+                                Some(Ok(message)) if held_agent_message_is_harmless(&message) => {}
                                 Some(Ok(_)) => {
                                     break 'session Err("session agent sent unexpected data while detached".to_string());
                                 }
                             }
                         }
                         _ = monitor.tick() => {
+                            // Locked or not, a session that is still the Deck's
+                            // keeps its hold (shared `held_lock`).
                             let identity = windows_session.clone();
                             let sid = native_user_sid.clone();
-                            let observed = tokio::task::spawn_blocking(move || {
-                                crate::windows_session::observe_resumable_bound(&identity, &sid)
+                            let reading = tokio::task::spawn_blocking(move || {
+                                crate::windows_session::observe_held(&identity, &sid)
                             })
                             .await
                             .map_err(|_| "Windows detached-session monitor task failed".to_string())?;
-                            if let Err(error) = observed {
+                            if !reading.keeps_hold() {
                                 tracing::info!(
                                     target: SESSION,
                                     reason_class = ConsoleRefusal::SessionChanged.token(),
-                                    %error,
                                     "the held session changed at the workstation; its resume ends"
                                 );
                                 *departure = Departure::SessionChanged;
                                 hold_end = ResumeHoldEnd::NativeSessionEnded;
-                                break 'session Err(error);
+                                break 'session Err("the held Windows session changed".to_string());
                             }
                         }
                         changed = session_shutdown.changed() => {
@@ -12474,6 +13455,7 @@ async fn relay_one_attachment<C, CE, A>(
     // Exact still image (ADR 0016 R7): the refine role is granted, and the
     // relay carries refinement, only for `refine_lane_grant`.
     refine_grant: bool,
+    service_health: &arcen_observability::ServiceHealth,
 ) -> RelayOutcome
 where
     C: Sink<Message> + Stream<Item = Result<Message, CE>> + Unpin,
@@ -12628,6 +13610,7 @@ where
                 Some(Ok(Message::Text(text))) => {
                     if AgentControl::is_reserved(text.as_ref())
                         || AgentStreamingReady::is(text.as_ref())
+                        || AgentHealth::decode(text.as_ref()).is_some()
                         || AgentAttachmentCommand::is_reserved(text.as_ref())
                         || serde_json::from_str::<serde_json::Value>(text.as_ref())
                             .ok()
@@ -12654,10 +13637,10 @@ where
                         return RelayOutcome::UnexpectedLoss("client_transport");
                     }
                 }
-                Some(Ok(Message::Close(frame))) => {
-                    let _ = send_ws_with_timeout(agent, Message::Close(frame), write_timeout).await;
-                    return RelayOutcome::ExplicitClose;
-                }
+                // The Deck closed on purpose. The agent is not closed here:
+                // the hand-back decides when it goes, after the lock when the
+                // desk must stay private until then (shared `hand_back_order`).
+                Some(Ok(Message::Close(_))) => return RelayOutcome::ExplicitClose,
                 Some(Ok(_)) => {}
                 Some(Err(_)) => return RelayOutcome::UnexpectedLoss("client_transport"),
                 None => return RelayOutcome::UnexpectedLoss("client_eof"),
@@ -12718,6 +13701,10 @@ where
                             "session agent returned an unexpected attachment status".to_string()
                         );
                     }
+                    if let Some(health) = AgentHealth::decode(text.as_ref()) {
+                        service_health.record(health.committed);
+                        continue;
+                    }
                     let text = match path_signal_connection.as_ref().and_then(|connection| {
                         arcen_observability::health_stats_with_path(text.as_ref(), || {
                             path_quality.sample(path_signal_started.elapsed(), connection)
@@ -12775,6 +13762,18 @@ where
             },
         }
     }
+}
+
+/// Whether a message from a held (detached) attachment's agent leaves the
+/// hold standing. Only its committed-health report ([`AgentHealth`]) does:
+/// it is information for the service snapshot, and the one line an agent
+/// writes on its own clock, so a report that reached the socket around the
+/// detach must never cost the Deck its resume. The agent closes its writer
+/// before it answers `detached`, so none is expected; the report is dropped,
+/// not recorded, because a held session is not streaming. Anything else
+/// still ends the hold.
+fn held_agent_message_is_harmless(message: &Message) -> bool {
+    matches!(message, Message::Text(text) if AgentHealth::decode(text.as_ref()).is_some())
 }
 
 /// Tells the agent how many video frames of this attachment the lane relay
@@ -13827,6 +14826,7 @@ mod tests {
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            hdr_served_as_grading: false,
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
@@ -14852,6 +15852,7 @@ mod tests {
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            hdr_served_as_grading: false,
             requested_pipeline: None,
             active_pipeline: None,
             fps: 60,
@@ -15084,6 +16085,7 @@ mod tests {
             codec_pinned: false,
             variant_pinned: true,
             auth_video_request: None,
+            hdr_served_as_grading: false,
             requested_pipeline: Some(arcen_media::video::PipelineId::Hdr),
             active_pipeline: Some(arcen_protocol::messages::ServedStreamPipeline::Grading),
             fps: 30,
@@ -15162,6 +16164,7 @@ mod tests {
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            hdr_served_as_grading: false,
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
@@ -15979,6 +16982,7 @@ mod tests {
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            hdr_served_as_grading: false,
             requested_pipeline: None,
             active_pipeline: None,
             fps: 60,
@@ -16228,6 +17232,7 @@ mod tests {
             codec_pinned: false,
             variant_pinned: false,
             auth_video_request: None,
+            hdr_served_as_grading: false,
             requested_pipeline: None,
             active_pipeline: None,
             fps: 30,
@@ -18077,6 +19082,7 @@ mod lane_relay_tests {
                 lanes,
                 None,
                 false,
+                &arcen_observability::ServiceHealth::new(),
             )
             .await;
             matches!(outcome, RelayOutcome::ExplicitClose)
@@ -18185,5 +19191,433 @@ mod lane_relay_tests {
             .await
             .unwrap();
         assert!(tokio::time::timeout(STEP, relay).await.unwrap().unwrap());
+    }
+    /// The service's minute `HEALTH_SNAPSHOT` read `unavailable` while a
+    /// session streamed critical: the agent's health never reached the
+    /// broker. Now the agent reports its committed state, the broker keeps
+    /// it, and the Deck never sees the report.
+    #[tokio::test]
+    async fn the_broker_keeps_the_agents_committed_health_for_the_service_snapshot() {
+        let (deck_end, client_end) = tokio::io::duplex(64 * 1024);
+        let (broker_end, agent_end) = tokio::io::duplex(64 * 1024);
+        let mut deck = WebSocketStream::from_raw_socket(deck_end, Role::Client, None).await;
+        let mut agent = WebSocketStream::from_raw_socket(agent_end, Role::Server, None).await;
+        let service_health = Arc::new(arcen_observability::ServiceHealth::new());
+        let relay_health = Arc::clone(&service_health);
+        let relay = tokio::spawn(async move {
+            let mut client = WebSocketStream::from_raw_socket(client_end, Role::Server, None).await;
+            let mut broker = WebSocketStream::from_raw_socket(broker_end, Role::Client, None).await;
+            let (_controls_tx, mut controls) = watch::channel(AgentControl::new(
+                1,
+                arcen_telemetry::OperationalProfile::Info,
+                arcen_telemetry::QosTargets::default(),
+                false,
+                0,
+            ));
+            let (_shutdown_tx, mut shutdown) = watch::channel(false);
+            let identity = WindowsSessionIdentity {
+                session_id: 7,
+                user_sid: "S-1-5-21-1000".to_string(),
+                user: "artist".to_string(),
+                domain: "STUDIO".to_string(),
+                state: "active".to_string(),
+                launch_backend: "wts".to_string(),
+            };
+            let outcome = relay_one_attachment(
+                &mut client,
+                &mut broker,
+                &identity,
+                "S-1-5-21-1000",
+                &mut controls,
+                None,
+                &mut shutdown,
+                None,
+                None,
+                false,
+                &relay_health,
+            )
+            .await;
+            matches!(outcome, RelayOutcome::ExplicitClose)
+        });
+
+        assert_eq!(service_health.take(), None, "no session has reported");
+        let report = serde_json::to_string(&AgentHealth::new(Some(
+            arcen_telemetry::HealthState::Degraded,
+        )))
+        .unwrap();
+        agent.send(Message::Text(report.clone())).await.unwrap();
+        agent
+            .send(Message::Text(r#"{"type":"server_hello"}"#.into()))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(STEP, deck.next())
+            .await
+            .expect("in time")
+            .expect("message")
+            .expect("valid");
+        assert!(
+            matches!(&first, Message::Text(text) if text.contains("server_hello")),
+            "the health report stays with the broker: {first:?}"
+        );
+        assert_eq!(
+            service_health.take(),
+            Some(arcen_telemetry::HealthState::Degraded)
+        );
+
+        // A Deck may not speak for the agent.
+        deck.send(Message::Text(report)).await.unwrap();
+        assert!(!tokio::time::timeout(STEP, relay).await.unwrap().unwrap());
+    }
+    /// A health tick racing a detach: a report written before, and one
+    /// after, the agent's `detached` answer. The broker still reaches the
+    /// hold, and a report while held leaves the hold standing; any other
+    /// agent data still ends it.
+    #[tokio::test]
+    async fn a_health_report_racing_a_detach_never_ends_the_hold() {
+        let (broker_end, agent_end) = tokio::io::duplex(64 * 1024);
+        let mut agent = WebSocketStream::from_raw_socket(agent_end, Role::Server, None).await;
+        let mut broker = WebSocketStream::from_raw_socket(broker_end, Role::Client, None).await;
+        let report = serde_json::to_string(&AgentHealth::new(Some(
+            arcen_telemetry::HealthState::Degraded,
+        )))
+        .unwrap();
+        for text in [
+            report.clone(),
+            serde_json::to_string(&AgentAttachmentStatus::detached()).unwrap(),
+            report.clone(),
+        ] {
+            agent.send(Message::Text(text)).await.unwrap();
+        }
+        let status =
+            await_agent_attachment_status(&mut broker, AgentAttachmentState::Detached, STEP)
+                .await
+                .expect("the report before the answer is passed over");
+        assert_eq!(status.state, AgentAttachmentState::Detached);
+        let late = tokio::time::timeout(STEP, broker.next())
+            .await
+            .expect("in time")
+            .expect("message")
+            .expect("valid");
+        assert!(
+            held_agent_message_is_harmless(&late),
+            "a late report leaves the hold standing: {late:?}"
+        );
+        for ends_the_hold in [
+            Message::Text(r#"{"type":"health_stats","fps_actual":30.0}"#.to_owned()),
+            Message::Text(r#"{"kind":"arcen_private_agent_health"}"#.to_owned()),
+            Message::Binary(vec![1, 2, 3]),
+        ] {
+            assert!(
+                !held_agent_message_is_harmless(&ends_the_hold),
+                "{ends_the_hold:?}"
+            );
+        }
+    }
+
+    /// A session agent that answers every detach with `detached`; its task
+    /// returns whether the broker closed it (it must not, while the desk
+    /// waits for the lock).
+    fn held_agent(
+        mut agent: WebSocketStream<tokio::io::DuplexStream>,
+    ) -> (Arc<AtomicU32>, tokio::task::JoinHandle<bool>) {
+        let detaches = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&detaches);
+        let task = tokio::spawn(async move {
+            while let Some(Ok(message)) = agent.next().await {
+                match message {
+                    Message::Text(text) => {
+                        let detach = AgentAttachmentCommand::decode(text.as_ref())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|command| command.action == AgentAttachmentAction::Detach);
+                        if detach {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            let status =
+                                serde_json::to_string(&AgentAttachmentStatus::detached()).unwrap();
+                            if agent.send(Message::Text(status)).await.is_err() {
+                                return false;
+                            }
+                        }
+                    }
+                    Message::Close(_) => return true,
+                    _ => {}
+                }
+            }
+            false
+        });
+        (detaches, task)
+    }
+
+    /// A lock that is refused `refusals` times, then locks; counts asks.
+    fn refused_then_locked(
+        refusals: u32,
+    ) -> (
+        Arc<AtomicU32>,
+        impl FnMut() -> std::future::Ready<Result<crate::windows_session::LockOutcome, String>>,
+    ) {
+        let asked = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&asked);
+        let lock = move || {
+            let ask = counter.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(if ask < refusals {
+                Err("the session lock helper exited with 1".to_string())
+            } else {
+                Ok(crate::windows_session::LockOutcome::Locked)
+            })
+        };
+        (asked, lock)
+    }
+
+    async fn held_agent_pair() -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        Arc<AtomicU32>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        let (broker_end, agent_end) = tokio::io::duplex(64 * 1024);
+        let agent = WebSocketStream::from_raw_socket(agent_end, Role::Server, None).await;
+        let broker = WebSocketStream::from_raw_socket(broker_end, Role::Client, None).await;
+        let (detaches, task) = held_agent(agent);
+        (broker, detaches, task)
+    }
+
+    /// `privacy.desk = "required"`: the desk gets nothing back before the
+    /// session locks; the agent holds it, asked to stop streaming once.
+    #[tokio::test]
+    async fn a_required_desk_gets_nothing_back_before_its_session_locks() {
+        let (mut broker, detaches, agent) = held_agent_pair().await;
+        let (_stop, mut shutdown) = watch::channel(false);
+        let (asked, lock) = refused_then_locked(3);
+        let locked = lock_before_agent_exit(
+            &mut broker,
+            7,
+            WaitingDesk::Required,
+            Departure::DeckLeft,
+            &mut shutdown,
+            lock,
+            |_| {},
+            1_000,
+        )
+        .await;
+        assert!(locked, "locked while the agent held the desk");
+        assert_eq!(asked.load(Ordering::SeqCst), 4);
+        assert_eq!(detaches.load(Ordering::SeqCst), 1);
+        drop(broker);
+        assert!(!agent.await.unwrap(), "the wait never closes the agent");
+    }
+
+    /// A required desk whose session never locks stays dark with its input
+    /// blocked (the agent is never closed); the lock is asked for again at a
+    /// bounded rate, faster within the first minute, until the Pier stops.
+    #[tokio::test]
+    async fn a_required_desk_whose_session_never_locks_is_never_given_back() {
+        let (mut broker, detaches, agent) = held_agent_pair().await;
+        let (stop, mut shutdown) = watch::channel(false);
+        let (asked, lock) = refused_then_locked(u32::MAX);
+        let holds = std::sync::Mutex::new(Vec::new());
+        let gave_up = {
+            let wait = lock_before_agent_exit(
+                &mut broker,
+                7,
+                WaitingDesk::Required,
+                Departure::DeckLeft,
+                &mut shutdown,
+                lock,
+                |held| holds.lock().unwrap().push(held),
+                100,
+            );
+            tokio::pin!(wait);
+            // 150 s of the schedule: past the minute's grace, into the slower
+            // re-asks of a held desk.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1_500), &mut wait)
+                    .await
+                    .is_err(),
+                "a required desk is never given back unlocked"
+            );
+            let asks = asked.load(Ordering::SeqCst);
+            assert!(
+                (6..=20).contains(&asks),
+                "bounded, not a tight loop: {asks}"
+            );
+            assert_eq!(detaches.load(Ordering::SeqCst), 1);
+            stop.send(true).unwrap();
+            wait.await
+        };
+        assert!(!gave_up, "a stopping Pier gives the wait up");
+        // The slot said why it was held, once.
+        assert_eq!(*holds.lock().unwrap(), [true]);
+        drop(broker);
+        assert!(!agent.await.unwrap(), "the agent was never closed");
+    }
+
+    /// `privacy.desk = "required"`: an agent whose attachments ended on an
+    /// error (a desk check refused the desk while streaming) or because the
+    /// broker went away locks its own session and gives the desk back only
+    /// once the lock is confirmed.
+    #[tokio::test]
+    async fn a_required_agent_leaving_on_a_desk_refusal_or_broker_loss_locks_before_the_desk_returns(
+    ) {
+        let asked = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&asked);
+        tokio::time::timeout(
+            STEP,
+            hold_desk_until_locked(
+                move || {
+                    let ask = counter.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(if ask < 3 {
+                        Err("LockWorkStation refused".to_string())
+                    } else {
+                        Ok(true)
+                    })
+                },
+                1_000,
+            ),
+        )
+        .await
+        .expect("returns once the session is locked");
+        assert_eq!(asked.load(Ordering::SeqCst), 4);
+    }
+
+    /// A required agent whose session never locks never gives the desk back.
+    #[tokio::test]
+    async fn a_required_agent_whose_session_never_locks_keeps_the_desk() {
+        let asked = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&asked);
+        let held = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            hold_desk_until_locked(
+                move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err::<bool, _>("refused".to_string()))
+                },
+                100,
+            ),
+        )
+        .await;
+        assert!(held.is_err(), "never returns while unlocked");
+        let asks = asked.load(Ordering::SeqCst);
+        assert!(
+            (6..=20).contains(&asks),
+            "bounded, not a tight loop: {asks}"
+        );
+    }
+
+    /// Every way out of the agent's attachments (`?`, a desk-watch refusal,
+    /// a closed broker channel) passes the lock before the desk is restored.
+    #[test]
+    fn the_agent_restores_the_desk_only_after_the_required_lock() {
+        let source = include_str!("session.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("tests")];
+        let attachments = production
+            .find("let attachments: Result<Result<(), String>, String> = async {")
+            .expect("attachments block");
+        let hold = production[attachments..]
+            .find("hold_desk_until_locked(")
+            .expect("hold")
+            + attachments;
+        let restore = production[hold..]
+            .find("display.restore_with_advanced_color")
+            .expect("restore")
+            + hold;
+        let hooks = production[hold..].find("hooks.shutdown()").expect("hooks") + hold;
+        let early_return = production[attachments..hold].find("attachments?");
+        assert!(early_return.is_none(), "no early return before the lock");
+        assert!(hold < restore && hold < hooks);
+    }
+
+    /// "on" and "off": one ask; a refusal hands the desk back as before.
+    #[tokio::test]
+    async fn a_desk_that_is_not_required_is_asked_once() {
+        let (mut broker, _detaches, _agent) = held_agent_pair().await;
+        let (_stop, mut shutdown) = watch::channel(false);
+        let (asked, lock) = refused_then_locked(u32::MAX);
+        let locked = lock_before_agent_exit(
+            &mut broker,
+            7,
+            WaitingDesk::Private,
+            Departure::DeckLeft,
+            &mut shutdown,
+            lock,
+            |_| {},
+            1_000,
+        )
+        .await;
+        assert!(!locked);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// A Pier that stops asks once: the stop path stays fast.
+    #[tokio::test]
+    async fn a_stopping_pier_asks_a_refusing_session_once() {
+        let (mut broker, _detaches, _agent) = held_agent_pair().await;
+        let (_stop, mut shutdown) = watch::channel(false);
+        let (asked, lock) = refused_then_locked(u32::MAX);
+        let locked = tokio::time::timeout(
+            STEP,
+            lock_before_agent_exit(
+                &mut broker,
+                7,
+                WaitingDesk::Required,
+                Departure::HostStopping,
+                &mut shutdown,
+                lock,
+                |_| {},
+                1,
+            ),
+        )
+        .await
+        .expect("no wait while stopping");
+        assert!(!locked);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    /// An agent that is gone cannot hold the desk: nothing is asked, and
+    /// the hand-back goes on in the usual order.
+    #[tokio::test]
+    async fn a_failed_agent_cannot_hold_the_desk_for_the_lock() {
+        let (broker_end, agent_end) = tokio::io::duplex(64 * 1024);
+        drop(agent_end);
+        let mut broker = WebSocketStream::from_raw_socket(broker_end, Role::Client, None).await;
+        let (_stop, mut shutdown) = watch::channel(false);
+        let (asked, lock) = refused_then_locked(0);
+        let locked = lock_before_agent_exit(
+            &mut broker,
+            7,
+            WaitingDesk::Required,
+            Departure::AgentFailed,
+            &mut shutdown,
+            lock,
+            |_| {},
+            1,
+        )
+        .await;
+        assert!(!locked);
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// GAP-044 option A: a lost transport's hold locks the session; a
+    /// session already locked or taken off the console is secured, one that
+    /// is no longer on the console is not, and a refusal is an error.
+    #[tokio::test]
+    async fn a_held_session_is_locked_as_its_transport_is_lost() {
+        use crate::windows_session::LockOutcome;
+        for (outcome, secured) in [
+            (Ok(LockOutcome::Locked), true),
+            (Ok(LockOutcome::AlreadySecured), true),
+            (Ok(LockOutcome::Disconnected), true),
+            (Ok(LockOutcome::Elsewhere), false),
+            (Err("LockWorkStation refused".to_string()), false),
+        ] {
+            let label = format!("{outcome:?}");
+            let asked = Arc::new(AtomicU32::new(0));
+            let counter = Arc::clone(&asked);
+            let got = lock_held_session(7, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(outcome)
+            })
+            .await;
+            assert_eq!(got, secured, "{label}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{label}");
+        }
     }
 }

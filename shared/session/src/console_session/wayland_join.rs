@@ -938,20 +938,23 @@ mod tests {
         }
     }
 
+    fn creating_step_with(
+        read: &crate::console_session::SessionRead,
+        proof: CompositorProof,
+        adapter: WaylandJoinAdapter,
+    ) -> CreatingStep {
+        let decision = decide_before_creating_read(read, ANA);
+        let join = match &decision {
+            BeforeCreating::JoinWayland(target) => Some(decide_join(target, proof, adapter)),
+            _ => None,
+        };
+        creating_step(&decision, join.as_ref())
+    }
+
     #[test]
     fn a_wayland_creating_pier_creates_only_when_the_account_proved_to_hold_nothing() {
         use crate::console_session::SessionsUnreadable;
-        let step_with = |read: &crate::console_session::SessionRead,
-                         proof: CompositorProof,
-                         adapter: WaylandJoinAdapter| {
-            let decision = decide_before_creating_read(read, ANA);
-            let join = match &decision {
-                BeforeCreating::JoinWayland(target) => Some(decide_join(target, proof, adapter)),
-                _ => None,
-            };
-            creating_step(&decision, join.as_ref())
-        };
-        let refusal = |read: &crate::console_session::SessionRead| match step_with(
+        let refusal = |read: &crate::console_session::SessionRead| match creating_step_with(
             read,
             CompositorProof::Verified { pid: 2345 },
             WaylandJoinAdapter::NotYetAvailable,
@@ -1026,6 +1029,10 @@ mod tests {
         for (row, read, expected) in rows {
             assert_eq!(refusal(&read), expected, "{row}");
         }
+    }
+
+    #[test]
+    fn with_the_adapter_a_wayland_creating_pier_joins_the_proven_session() {
         // With the adapter, the account's own proven session is joined as a
         // console session, in front or locked; never a desktop beside it.
         let mut locked = wayland("7", ANA, true);
@@ -1033,7 +1040,7 @@ mod tests {
         for session in [wayland("7", ANA, true), locked] {
             let read = Ok(vec![session]);
             assert_eq!(
-                step_with(
+                creating_step_with(
                     &read,
                     CompositorProof::Verified { pid: 2345 },
                     WaylandJoinAdapter::Available
@@ -1041,7 +1048,7 @@ mod tests {
                 CreatingStep::JoinConsole
             );
             assert_eq!(
-                step_with(
+                creating_step_with(
                     &read,
                     CompositorProof::Mismatch(CompositorMismatch::NotMutter),
                     WaylandJoinAdapter::Available

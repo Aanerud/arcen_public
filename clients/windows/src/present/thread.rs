@@ -465,7 +465,7 @@ impl Drop for PresenterThread {
 fn poll(owned: &mut Owned, shared: &Shared) {
     let _context = owned.gpu.lock_context();
     let swapchain = &owned.swapchain;
-    let (confirmed, unconfirmed) = owned.composer.poll(&owned.gpu, |id| swapchain.confirm(id));
+    let (confirmed, unconfirmed) = owned.composer.poll(&owned.gpu, || swapchain.statistics());
     shared
         .counters
         .confirmed

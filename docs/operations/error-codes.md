@@ -166,7 +166,7 @@ Deck asks for the password again; nothing is lost but the shortcut.
 
 | Code | Meaning | What to do |
 | --- | --- | --- |
-| `unsupported` | The Pier does not offer resume (`auth.reconnect_window_secs` is 0, or an older Pier). | Sign in again. Raise `auth.reconnect_window_secs` if resume is wanted. |
+| `unsupported` | The Pier does not offer resume (`auth.reconnect_window_secs` is 0, or an older Pier), or, on a Windows Pier, the session it holds was locked when the connection dropped and only the password unlocks it ("The session was locked when the connection dropped. Sign in again to unlock it."). | Sign in again: a Windows Pier unlocks the same session. Raise `auth.reconnect_window_secs` if resume is wanted. |
 | `expired` | The grant outlived the reconnect window. | Sign in again; the desktop is still there if it has not idled out. |
 | `replayed` | The grant was already used once. | Sign in again. Repeated occurrences without a second Deck point at a replayed packet; check the network. |
 | `native_identity_changed` | The account or OS session behind the grant changed (signed out, switched user). | Sign in again. |
@@ -412,13 +412,20 @@ it under Session as "last connection ended". The Pier logs the GPU's own
 
 A Windows Pier sets up an HDR session's display before it answers the Deck,
 inside the broker's 30-second readiness wait. When HDR cannot be shown it
-restores the display and its HDR state and refuses with one of these codes,
-instead of being stopped by the broker (which the Deck saw as
+tries to restore the display and its HDR state and refuses with one of these
+codes, instead of being stopped by the broker (which the Deck saw as
 "connection timed out" and the Pier logged as `WATCHDOG_RESTORE`, 1204).
+
+When Windows reports that a session display has no HDR of its own (an SDR
+monitor, or a dummy plug whose EDID claims none), the session is not refused
+for that: it is served as Grading (10-bit SDR), and the Deck shows that it
+asked for HDR and got Grading, with the reason `hdr_display_unsupported`.
+Grading needs a GPU encoder that can encode it; without one the session is
+refused.
 
 | Code | Meaning | What to do |
 | --- | --- | --- |
-| `hdr_not_activated` | Windows did not activate HDR on the session display within the setup budget (25 s from the agent's start, 5 s short of the broker's wait). The display and its HDR state were restored. | Connect with Grading, or try HDR again. If it persists, check that Windows HDR can be switched on for the virtual display (Settings › Display) and read the agent log at `logging.level` 3 for `advanced colour state verification`. |
+| `hdr_not_activated` | Windows did not activate HDR on a session display that reports HDR support, or one Arcen created or wrote an HDR EDID for, within the setup budget (25 s from the agent's start, 5 s short of the broker's wait). The Pier tries to restore the display and its HDR state; a failed restore is named in the error. | Connect with Grading, or try HDR again. If it persists, check that Windows HDR can be switched on for the display (Settings › Display) and read the agent log at `logging.level` 3 for `advanced colour state verification`. |
 | `hdr_link_exceeded` | The requested display size cannot carry ten-bit HDR10 at or above the HDR stream rate over the virtual display's link (550 MHz). A single display is instead created at a lower refresh; this refusal is for sizes no such refresh fits — at sign-in or on a live resize, which keeps the current size — and for a multi-monitor monitor whose exact refresh does not fit. | Use a smaller Deck size (turn off Retina streaming for this connection), a single display, or Grading. |
 
 ## Linux installer refusals

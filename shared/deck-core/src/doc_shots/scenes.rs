@@ -42,7 +42,7 @@ use crate::trusted_pins::{StoredPin, TrustedPinStore};
 
 /// Every scene of the manual (`deck-shots/manifest.json`, release 0.20.7),
 /// in its order, then the scenes added since (not in the manifest yet).
-pub const SCENE_IDS: [&str; 19] = [
+pub const SCENE_IDS: [&str; 21] = [
     "home",
     "home-empty",
     "add-menu",
@@ -62,6 +62,8 @@ pub const SCENE_IDS: [&str; 19] = [
     "import-review",
     "home-own-settings",
     "sign-in-refused",
+    "settings-privacy",
+    "connecting-one-display",
 ];
 
 /// The first machine: Grade 1.
@@ -109,6 +111,8 @@ enum Screen {
     Settings,
     Certificate(CertificateFacts),
     CertificateChanged(IdentityChange, CertificateChangedStep),
+    /// Connecting, with the attempt's status line.
+    Connecting(ConnectionDraft, String),
 }
 
 /// Home's state, owned (the shells keep the same fields).
@@ -253,6 +257,7 @@ impl Scene {
             }
             "settings-logs" => scene.settings_on(SettingsTab::Logs),
             "settings-advanced" => scene.settings_on(SettingsTab::Advanced),
+            "settings-privacy" => scene.settings_on(SettingsTab::Privacy),
             "verify-host" => {
                 scene.select_first();
                 let presented = certificate(&grade_draft(), "verify-host presented");
@@ -261,6 +266,10 @@ impl Scene {
             "identity-changed" => {
                 scene.select_first();
                 scene.screen = identity_changed(&mut scene.pins);
+            }
+            "connecting-one-display" => {
+                scene.select_first();
+                scene.screen = connecting_one_display();
             }
             "import-review" => {
                 scene.home = HomeModel::new(three_machines().into_iter().take(2).collect());
@@ -432,6 +441,9 @@ impl Scene {
                 Screen::CertificateChanged(change, step) => {
                     let _ = render_certificate_changed(ui, change, step);
                 }
+                Screen::Connecting(draft, status) => {
+                    let _ = crate::screens::connecting::render_connecting(ui, draft, status, None);
+                }
             }
         });
     }
@@ -551,6 +563,25 @@ fn grade_draft() -> ConnectionDraft {
     draft.port = saved.port;
     USER.clone_into(&mut draft.username);
     draft
+}
+
+/// Connecting to Grade 1 after "Use Primary Display Only": the retry is on
+/// one display, for this session only, and the status says so.
+fn connecting_one_display() -> Screen {
+    use crate::connect_plan::{
+        SessionDisplaysOrigin, connecting_status, displays_mode_source, displays_unsupported_retry,
+        resolve_attempt_displays_mode,
+    };
+    let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine)
+        .for_saved(&saved_connection(0, "Grade 1", GRADE_HOST));
+    USER.clone_into(&mut draft.username);
+    let endpoint = draft.endpoint();
+    let mut pending = displays_unsupported_retry(&endpoint).displays_override;
+    let source = displays_mode_source(pending.as_ref(), &endpoint, None);
+    let mode = resolve_attempt_displays_mode(&mut pending, &endpoint, None);
+    let origin = SessionDisplaysOrigin::for_attempt(source, mode);
+    let status = connecting_status(&draft, origin.connecting_note());
+    Screen::Connecting(draft, status)
 }
 
 /// SHA-256 of a fixed seed: a fingerprint no real host has.

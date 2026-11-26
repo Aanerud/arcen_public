@@ -45,6 +45,7 @@
         "services",
         "session_truth",
         "settings",
+        "smoke_contract",
         "support_bundle",
         "trusted_pins"
       ],
@@ -188,6 +189,22 @@
             "macos-deck-av-input-lab",
             "macos-deck-apple-silicon-sdr-lab",
             "macos-deck-apple-silicon-10bit-lab"
+          ],
+          "owner": "macOS Client"
+        },
+        {
+          "id": "macos-deck-smoke",
+          "entry_points": [
+            "clients/macos/src/main.rs"
+          ],
+          "build_profiles": [
+            "macos-deck-apple-silicon",
+            "macos-deck-intel"
+          ],
+          "validation": [
+            "macos-deck-test-apple-silicon",
+            "macos-deck-build-intel",
+            "macos-deck-session-lab"
           ],
           "owner": "macOS Client"
         }

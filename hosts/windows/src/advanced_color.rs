@@ -31,8 +31,8 @@ use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use crate::logging::DISPLAY;
 use crate::recovery::AdvancedColorRecoveryEntry;
 use arcen_outputs::windows_advanced_colour::{
-    hdr_toggle, restore_toggle, setup_poll, AdmittedAs, ColourReading, CompositionMode, SetupPoll,
-    TargetObservation,
+    hdr_toggle, hdr_unsupported_targets, restore_toggle, setup_poll, AdmittedAs, ColourReading,
+    CompositionMode, SetupPoll, TargetObservation,
 };
 
 const WINDOWS_11_FIRST_BUILD: u32 = 22_000;
@@ -445,6 +445,28 @@ pub(crate) fn targets_for_device_names(
     Ok(targets)
 }
 
+fn targets_for_outputs(
+    outputs: &[arcen_outputs::windows_topology::ActiveOutputPlacement],
+) -> Result<Vec<AdvancedColorTarget>, String> {
+    let paths = active_paths()?;
+    outputs
+        .iter()
+        .map(|output| {
+            let path = paths
+                .iter()
+                .find(|path| {
+                    path.targetInfo.adapterId.LowPart == output.adapter_luid.low_part
+                        && path.targetInfo.adapterId.HighPart == output.adapter_luid.high_part
+                        && path.targetInfo.id == output.target_id
+                })
+                .ok_or_else(|| {
+                    format!("session display target {} is not active", output.target_id)
+                })?;
+            AdvancedColorTarget::from_path(path)
+        })
+        .collect()
+}
+
 fn query() -> Result<Vec<AdvancedColorState>, String> {
     let distinct_hdr = windows_11_or_later()?;
     let paths = active_paths()?;
@@ -561,11 +583,43 @@ impl Drop for AdvancedColorSessionGuard {
     }
 }
 
+/// Why Windows Advanced Color setup did not admit a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdvancedColorSetupError {
+    /// An HDR session's display offers no HDR of its own (a dummy plug, an
+    /// SDR monitor) and Arcen did not write its EDID: HDR can never be
+    /// activated there, so the session is served as Grading instead.
+    HdrUnsupported(String),
+    /// Anything else.
+    Failed(String),
+}
+
+impl std::fmt::Display for AdvancedColorSetupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HdrUnsupported(message) | Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for AdvancedColorSetupError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// Brings the session's `required_targets` to the HDR state it needs.
+/// `arcen_display_identity` says, per required target (same order), that
+/// Arcen wrote that target's EDID or created its display this session, so
+/// Windows may still publish HDR support for it; on any other target an
+/// HDR session reading no HDR support stops with
+/// [`AdvancedColorSetupError::HdrUnsupported`] instead of waiting.
 pub(crate) fn apply_for_session(
     required_targets: &[AdvancedColorTarget],
     desired_hdr: bool,
+    arcen_display_identity: &[bool],
     session_log_id: &arcen_telemetry::CorrelationId,
-) -> Result<AdvancedColorSessionGuard, String> {
+) -> Result<AdvancedColorSessionGuard, AdvancedColorSetupError> {
     let original = query_targets(required_targets)?;
     let mut entries = recovery_entries_for_states(&original, desired_hdr);
     persist_recovery_entries(&entries, session_log_id)?;
@@ -573,25 +627,96 @@ pub(crate) fn apply_for_session(
         required_targets,
         desired_hdr,
         desired_hdr,
+        arcen_display_identity,
         &mut entries,
         session_log_id,
     );
     if let Err(error) = applied {
         let restore = restore_entries(&entries, "session_end");
-        return Err(match rollback_restored(&restore) {
-            true => match clear_recovery_entries() {
-                Ok(()) => error,
-                Err(clear) => {
-                    format!("{error}; Advanced Color journal clear failed after rollback: {clear}")
-                }
-            },
-            false => {
-                let restore = restore.expect_err("checked failed restore");
-                format!("{error}; Advanced Color rollback failed: {restore}")
-            }
-        });
+        let clear = rollback_restored(&restore).then(clear_recovery_entries);
+        return Err(failure_after_rollback(error, restore, clear));
     }
     Ok(AdvancedColorSessionGuard { entries })
+}
+
+/// How long [`prove_held`] waits for a mode change Windows has in progress.
+const HOLD_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Proves, without changing anything, that the session's displays still
+/// hold the colour state setup reached: after Windows laid the desktop out
+/// again and the session put its layout back. A state that does not come
+/// back within [`HOLD_SETTLE`] is a failure; switching HDR again would only
+/// make Windows lay the desktop out again.
+///
+/// The displays are named by their stable identity (adapter LUID and target
+/// id), not their `\\.\DISPLAYn` names: Windows can renumber those when it
+/// lays the desktop out again.
+pub(crate) fn prove_held(
+    outputs: &[arcen_outputs::windows_topology::ActiveOutputPlacement],
+    desired_hdr: bool,
+) -> Result<(), String> {
+    let targets = targets_for_outputs(outputs)?;
+    let started = std::time::Instant::now();
+    let deadline = crate::session::AGENT_SETUP.wait_deadline(started, HOLD_SETTLE);
+    loop {
+        let states = query_targets(&targets)?;
+        let observations = targets
+            .iter()
+            .map(|target| {
+                states
+                    .iter()
+                    .find(|state| target.matches(state))
+                    .map(|state| TargetObservation {
+                        reading: state.reading(),
+                        arcen_toggled: true,
+                        arcen_display_identity: true,
+                    })
+            })
+            .collect::<Vec<_>>();
+        match setup_poll(desired_hdr, Ok(&observations)) {
+            SetupPoll::Admitted(_) | SetupPoll::ContinueUnverified(_) => return Ok(()),
+            SetupPoll::Refuse(reason) => return Err(reason),
+            SetupPoll::Pending { .. } if std::time::Instant::now() < deadline => {
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            SetupPoll::Pending { .. } => {
+                let detail = format!(
+                    "the session displays left {} when the session layout was applied again ({})",
+                    if desired_hdr { "HDR" } else { "SDR" },
+                    state_summary(&states)
+                );
+                return Err(if desired_hdr {
+                    arcen_session::setup_budget::HdrSetupRefusal::NotActivated.message(&detail)
+                } else {
+                    detail
+                });
+            }
+        }
+    }
+}
+
+/// The error a failed setup ends with, once its HDR toggles were rolled
+/// back (`restore`) and, after a good rollback, the journal cleared
+/// (`clear`). Only a clean rollback leaves `HdrUnsupported` standing: the
+/// caller then serves Grading and journals the targets afresh. A target
+/// left in HDR, or a journal still holding its original state, must not
+/// be journalled again from what it reads now (its original would become
+/// "HDR on", and teardown would turn HDR back on), so that is a plain
+/// failure: the session's display is restored and the session refused.
+fn failure_after_rollback(
+    error: AdvancedColorSetupError,
+    restore: Result<(), String>,
+    clear: Option<Result<(), String>>,
+) -> AdvancedColorSetupError {
+    let message = match (restore, clear) {
+        (Ok(()), Some(Ok(()))) => return error,
+        (Err(restore), _) => format!("{error}; Advanced Color rollback failed: {restore}"),
+        (Ok(()), Some(Err(clear))) => {
+            format!("{error}; Advanced Color journal clear failed after rollback: {clear}")
+        }
+        (Ok(()), None) => format!("{error}; Advanced Color journal was not cleared after rollback"),
+    };
+    AdvancedColorSetupError::Failed(message)
 }
 
 fn query_targets(
@@ -642,9 +767,10 @@ fn set_required_targets(
     required_targets: &[AdvancedColorTarget],
     desired_hdr: bool,
     fail_on_verify: bool,
+    arcen_display_identity: &[bool],
     entries: &mut Vec<AdvancedColorRecoveryEntry>,
     session_log_id: &arcen_telemetry::CorrelationId,
-) -> Result<(), String> {
+) -> Result<(), AdvancedColorSetupError> {
     let started = std::time::Instant::now();
     let deadline = crate::session::AGENT_SETUP.wait_deadline(started, ENGAGE_TIMEOUT);
     let mut last_summary = String::new();
@@ -671,10 +797,15 @@ fn set_required_targets(
                 let observations = matched
                     .iter()
                     .zip(&arcen_toggled)
-                    .map(|(state, &arcen_toggled)| {
+                    .enumerate()
+                    .map(|(index, (state, &arcen_toggled))| {
                         state.as_ref().map(|state| TargetObservation {
                             reading: state.reading(),
                             arcen_toggled,
+                            arcen_display_identity: arcen_display_identity
+                                .get(index)
+                                .copied()
+                                .unwrap_or(true),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -682,6 +813,22 @@ fn set_required_targets(
             }
             Err(error) => (Vec::new(), Err(error)),
         };
+        if let Ok(observations) = observations.as_deref() {
+            let unsupported = hdr_unsupported_targets(desired_hdr, observations, started.elapsed());
+            if !unsupported.is_empty() {
+                let target_ids = unsupported
+                    .iter()
+                    .filter_map(|index| matched.get(*index).and_then(Option::as_ref))
+                    .map(|state| state.target)
+                    .collect::<Vec<_>>();
+                return Err(AdvancedColorSetupError::HdrUnsupported(format!(
+                    "{} of {} session display target(s) offer no HDR (targets {target_ids:?}; \
+                     {last_summary})",
+                    unsupported.len(),
+                    required_targets.len()
+                )));
+            }
+        }
         let toggles = match setup_poll(desired_hdr, observations.as_deref().map_err(String::as_str))
         {
             SetupPoll::Admitted(admitted) => {
@@ -715,7 +862,7 @@ fn set_required_targets(
                 );
                 return Ok(());
             }
-            SetupPoll::Refuse(reason) => return Err(reason),
+            SetupPoll::Refuse(reason) => return Err(reason.into()),
             SetupPoll::Pending { toggles } => toggles,
         };
         for (index, from_hdr, to_hdr) in toggles {
@@ -744,7 +891,7 @@ fn set_required_targets(
                 &last_summary,
             );
             if fail_on_verify {
-                return Err(message);
+                return Err(message.into());
             }
             tracing::warn!(
                 target: DISPLAY,
@@ -912,6 +1059,35 @@ mod tests {
     use super::*;
     use arcen_outputs::windows_advanced_colour::{target_step, TargetStep};
 
+    /// A display without HDR serves Grading only after a clean rollback. A
+    /// rollback or journal clear that failed leaves a toggled target in HDR
+    /// or its original journalled, so the session is refused instead of
+    /// journalling that target again as "originally HDR".
+    #[test]
+    fn hdr_unsupported_stands_only_after_a_clean_rollback() {
+        let unsupported = || AdvancedColorSetupError::HdrUnsupported("1 of 2 offer no HDR".into());
+        assert_eq!(
+            failure_after_rollback(unsupported(), Ok(()), Some(Ok(()))),
+            unsupported()
+        );
+        assert!(matches!(
+            failure_after_rollback(unsupported(), Err("set HDR off".into()), None),
+            AdvancedColorSetupError::Failed(message) if message.contains("rollback failed")
+        ));
+        assert!(matches!(
+            failure_after_rollback(unsupported(), Ok(()), Some(Err("journal locked".into()))),
+            AdvancedColorSetupError::Failed(message) if message.contains("journal clear failed")
+        ));
+        assert_eq!(
+            failure_after_rollback(
+                AdvancedColorSetupError::Failed("timeout".into()),
+                Ok(()),
+                Some(Ok(()))
+            ),
+            AdvancedColorSetupError::Failed("timeout".into())
+        );
+    }
+
     const COLOR_MODE_WCG: i32 = 1;
 
     fn is_genuinely_hdr(state: &AdvancedColorState) -> bool {
@@ -1067,6 +1243,7 @@ mod tests {
                     .map(|state| TargetObservation {
                         reading: state.reading(),
                         arcen_toggled: false,
+                        arcen_display_identity: false,
                     })
             })
             .collect::<Vec<_>>();

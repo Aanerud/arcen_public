@@ -1403,14 +1403,33 @@ fn another_products_client_now() -> Option<String> {
 /// udev and, once a device could be another product's, every process's
 /// descriptors). A check that could not run counts as a client: one remote
 /// product at a time is kept when in doubt.
+pub(crate) async fn another_products_client() -> Option<String> {
+    match foreign_client().await {
+        (model::guest_layout::ForeignClient::Absent, _) => None,
+        (_, detail) => Some(detail.unwrap_or_default()),
+    }
+}
+
+/// Whether another product's client is attached now, typed for the shared
+/// guest layout decision (`console_session::guest_layout`), with the device
+/// or the reason the check did not complete. Unreadable holders of
+/// `/dev/uinput` or `/dev/uhid` already count as attached
+/// ([`another_products_client_now`]); a check that could not run is
+/// unknown.
 #[allow(
     clippy::disallowed_methods,
     reason = "plain file reads that finish; nothing is left running when the caller stops waiting"
 )]
-pub(crate) async fn another_products_client() -> Option<String> {
-    tokio::task::spawn_blocking(another_products_client_now)
-        .await
-        .unwrap_or_else(|error| Some(format!("the check could not run: {error}")))
+pub(crate) async fn foreign_client() -> (model::guest_layout::ForeignClient, Option<String>) {
+    use model::guest_layout::ForeignClient;
+    match tokio::task::spawn_blocking(another_products_client_now).await {
+        Ok(Some(device)) => (ForeignClient::Attached, Some(device)),
+        Ok(None) => (ForeignClient::Absent, None),
+        Err(error) => (
+            ForeignClient::Unknown,
+            Some(format!("the check could not run: {error}")),
+        ),
+    }
 }
 
 impl GrabbedInput {
@@ -1507,6 +1526,10 @@ pub(crate) struct ConsolePrivacy {
     /// The layout is kept through a hand-back while a Deck is held for its
     /// resume ([`Self::hold_layout`]).
     layout_held: bool,
+    /// What happens to the Deck's layout when the Deck leaves (shared
+    /// `guest_layout::layout_departure`): another product's desktop keeps
+    /// it ([`Self::leave_layout_on_departure`]).
+    layout_departure: model::guest_layout::LayoutDeparture,
     /// The session agent's audio lease (the desk's speakers silent while a
     /// Deck is attached), given back with the desk ([`DetachStep::RestoreAudio`]).
     ///
@@ -1792,15 +1815,22 @@ impl ConsolePrivacy {
     ) -> Result<(), super::console_layout::LayoutFailure> {
         self.layout_held = false;
         if let Some(previous) = self.layout.take() {
-            previous.restore().await;
-            self.enforce();
+            // A layout that stays keeps its journal: the next one is laid
+            // over it and the record of the layout before stays the first.
+            if !previous.leaves_decks() {
+                previous.restore().await;
+                self.enforce();
+            }
         }
+        let departure = self.layout_departure;
         let work = async {
             super::console_layout::wait_for_desktop_settled(uid).await;
-            let mut applied = super::console_layout::apply(display, session_id, requests).await?;
+            let mut applied =
+                super::console_layout::apply(display, session_id, requests, departure).await?;
             let settled = applied.settle().await;
             if settled.is_ok() {
                 applied.note_settled_windows();
+                applied.note_proven();
             }
             match settled {
                 Ok(0) => {}
@@ -1881,14 +1911,21 @@ impl ConsolePrivacy {
         self.layout_held = false;
     }
 
+    /// The Deck's layout, once laid, stays when the Deck leaves (another
+    /// product's desktop, ADR 0025 §8). Set before the layout is laid.
+    pub(crate) fn leave_layout_on_departure(&mut self) {
+        self.layout_departure = model::guest_layout::LayoutDeparture::LeaveDecks;
+    }
+
     /// Puts the console's own layout back (journalled; a failure leaves the
-    /// journal for the Pier's recovery). A layout held for a resume stays.
+    /// journal for the Pier's recovery), or keeps the Deck's on a desktop
+    /// that keeps it. A layout held for a resume stays.
     pub(crate) async fn restore_layout(&mut self) {
         if self.layout_held {
             return;
         }
         if let Some(layout) = self.layout.take() {
-            layout.restore().await;
+            layout.depart().await;
         }
     }
 

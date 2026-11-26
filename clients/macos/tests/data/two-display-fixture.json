@@ -1,0 +1,10 @@
+{
+ "monitors": [
+  {"id": 1, "x": 0, "y": 0, "logical_width": 1920, "logical_height": 1080, "backing_width": 1920, "backing_height": 1080,
+   "rotation_degrees": 0, "refresh_hz": 60, "primary": true, "name": "Fixture Left", "width_mm": 527.0, "height_mm": 296.0,
+   "vendor": 1552, "model": 1, "serial": 11},
+  {"id": 2, "x": 1920, "y": 0, "logical_width": 1920, "logical_height": 1080, "backing_width": 1920, "backing_height": 1080,
+   "rotation_degrees": 0, "refresh_hz": 60, "primary": false, "name": "Fixture Right", "width_mm": 527.0, "height_mm": 296.0,
+   "vendor": 1552, "model": 1, "serial": 12}
+ ]
+}

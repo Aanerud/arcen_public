@@ -2032,6 +2032,57 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_refused_for_a_locked_session_keeps_the_hold_for_the_password_sign_in() {
+        // GAP-044 option A: the held session is locked, a credential-free
+        // resume cannot unlock it, so the owner refuses it and marks the
+        // slot detached again; the Deck's password sign-in then unlocks the
+        // session and takes the held desktop over.
+        let registry = ResumeRegistry::with_clock(FakeClock::new(2_000)).unwrap();
+        let mut response = AuthResponse::resume("03".repeat(32), "placeholder");
+        let mut expected = bindings("held-locked");
+        expected.topology = TopologyBinding::from_response(&response).unwrap();
+        let active_session_id = expected.active_session_id.clone();
+        let principal = expected.native_principal.clone();
+        let (owner, mut commands) = mpsc::unbounded_channel();
+        let grant = registry
+            .issue_initial(
+                expected.clone(),
+                ReconnectPolicy::new(60).unwrap(),
+                owner,
+                &arcen_telemetry::CorrelationId::from_uuid_v4_bytes([1; 16]),
+            )
+            .unwrap();
+        response.resume_grant = Some(grant.expose_for_transport().to_string());
+        registry.mark_detached(&active_session_id).unwrap();
+
+        let _permit = registry
+            .prepare_resume(
+                &response,
+                &expected.host_identity,
+                &arcen_telemetry::CorrelationId::from_uuid_v4_bytes([2; 16]),
+            )
+            .expect("a valid grant reaches the owner");
+        // Resuming: a fresh sign-in may not take it over mid-resume.
+        assert_eq!(
+            registry.fresh_authentication_decision(&principal).unwrap(),
+            FreshAuthenticatedReconnectDecision::StartNewSession
+        );
+        // The owner finds the session locked: refused, still held.
+        registry.mark_detached(&active_session_id).unwrap();
+        assert!(registry.resume_handshake_available().unwrap());
+
+        // The password sign-in of the same account takes the hold over.
+        assert_eq!(
+            registry.fresh_authentication_decision(&principal).unwrap(),
+            FreshAuthenticatedReconnectDecision::TakeOverDetached
+        );
+        registry
+            .begin_fresh_authenticated_takeover(&principal)
+            .unwrap();
+        assert!(matches!(commands.try_recv(), Ok(OwnerCommand::TakenOver)));
+    }
+
+    #[test]
     fn holder_nonce_is_exact_lower_hex_and_topology_is_stable() {
         assert_eq!(
             decode_holder_nonce(&"01".repeat(32)).unwrap().as_bytes(),

@@ -18,11 +18,14 @@
 //! and macOS Piers reach the same model through their own console APIs.
 
 pub mod account_desktop;
+pub mod connect_layout;
 pub mod desk_privacy;
 pub mod detached_hold;
 pub mod domain_logon;
 pub mod foreign_service;
 pub mod greeter_token;
+pub mod guest_layout;
+pub mod held_lock;
 pub mod local_login_screen;
 pub mod lock_wait;
 pub mod login_screen;
@@ -1127,6 +1130,33 @@ pub const DETACH_STEPS_OUTPUTS_FIRST: [DetachStep; 5] = [
     DetachStep::RestoreAudio,
 ];
 
+/// The order one departure hands the console back in, on a host whose own
+/// order is `host_order` ([`DETACH_STEPS`] or [`DETACH_STEPS_OUTPUTS_FIRST`]).
+///
+/// The lock comes first ([`DETACH_STEPS`]) whenever the desk must not get
+/// its outputs or input back before the lock screen is up: the
+/// administrator requires desk privacy for the attachment (`plan`,
+/// [`desk_privacy::DeskPrivacyPlan::fails_closed`]; ADR 0025 §4, amended
+/// 2026-11-25), or the session is already locked (`locked`: held for its
+/// Deck's resume, [`held_lock`]). A host whose session cannot restore its
+/// own displays once locked restores them behind the lock screen then.
+#[must_use]
+pub const fn hand_back_order(
+    host_order: [DetachStep; 5],
+    plan: Option<desk_privacy::DeskPrivacyPlan>,
+    locked: bool,
+) -> [DetachStep; 5] {
+    let required = match plan {
+        Some(plan) => plan.fails_closed(),
+        None => false,
+    };
+    if required || locked {
+        DETACH_STEPS
+    } else {
+        host_order
+    }
+}
+
 /// Why a Deck's attachment to the user's session ended for good.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Departure {
@@ -1417,7 +1447,12 @@ mod tests {
     fn a_returning_deck_rejoins_only_its_own_session_and_is_told_why_not() {
         let held = session("7", TIM, "user", "x11", true);
         assert_eq!(
-            decide_reattach(&[held.clone()], TIM, "7", ConsoleHost::default()),
+            decide_reattach(
+                std::slice::from_ref(&held),
+                TIM,
+                "7",
+                ConsoleHost::default()
+            ),
             Ok(false)
         );
         assert_eq!(
@@ -2151,6 +2186,41 @@ mod tests {
     }
 
     #[test]
+    fn a_required_desk_or_a_locked_session_is_locked_before_the_desk_gets_anything_back() {
+        use desk_privacy::DeskPrivacyPlan as Plan;
+        for (plan, locked) in [
+            (Some(Plan::Required), false),
+            (Some(Plan::Required), true),
+            (Some(Plan::BestEffort), true),
+            (None, true),
+        ] {
+            assert_eq!(
+                hand_back_order(DETACH_STEPS_OUTPUTS_FIRST, plan, locked),
+                DETACH_STEPS,
+                "{plan:?} {locked}"
+            );
+        }
+        // "on" and "off" keep the host's own order.
+        for plan in [
+            None,
+            Some(Plan::BestEffort),
+            Some(Plan::DeckVisible),
+            Some(Plan::OperatorOff),
+            Some(Plan::NotShown),
+        ] {
+            assert_eq!(
+                hand_back_order(DETACH_STEPS_OUTPUTS_FIRST, plan, false),
+                DETACH_STEPS_OUTPUTS_FIRST,
+                "{plan:?}"
+            );
+        }
+        assert_eq!(
+            hand_back_order(DETACH_STEPS, Some(Plan::OperatorOff), false),
+            DETACH_STEPS
+        );
+    }
+
+    #[test]
     fn a_failed_console_read_never_skips_the_lock_of_a_session_on_screen() {
         // A failed console-user read looks like the login screen; the
         // session's own record still says it is on screen.
@@ -2249,7 +2319,7 @@ mod tests {
             SignInSettlement::BringForward("7".into())
         );
         assert_eq!(
-            settle_sign_in(&[mine.clone()], TIM, "c1"),
+            settle_sign_in(std::slice::from_ref(&mine), TIM, "c1"),
             SignInSettlement::Pending,
             "nothing in front yet: the VT switch is still under way"
         );

@@ -759,6 +759,7 @@ mod harness {
                     FirstLoginSetup::from_token(&token).expect("--first-login-setup run|skip")
                 }),
             desktop_mode: arcen_session::console_session::DesktopMode::Dedicated,
+            guest_layout: Default::default(),
         };
         let permit = Arc::new(tokio::sync::Semaphore::new(1))
             .acquire_owned()

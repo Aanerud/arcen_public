@@ -122,7 +122,11 @@ pub(crate) fn run(
     }
     let mut acl_reset_failures = 0usize;
     let mut first_acl_reset_error = None;
-    for entry in &discovery.logs {
+    for (index, entry) in discovery.logs.iter().enumerate() {
+        // At start-up this pass runs before the service reports running.
+        if index % 32 == 31 {
+            crate::service::report_start_progress();
+        }
         if entry.active.is_none() && entry.kind == LogFileKind::Session {
             if let Err(error) = crate::windows_session::reset_session_log_access(&entry.path) {
                 acl_reset_failures += 1;

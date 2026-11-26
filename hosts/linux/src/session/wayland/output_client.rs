@@ -33,6 +33,10 @@ pub enum OutputClientError {
     ForeignPeer,
     #[error("the session did not answer in time")]
     Timeout,
+    /// The desktop's streams stayed closed (it is locked) for as long as an
+    /// attachment waits.
+    #[error("the desktop stayed locked: its streams were not recorded again in time")]
+    StreamsUnavailable,
     #[error("the session's answer is malformed")]
     Malformed,
     /// The session refused; `live` is what it kept.
@@ -114,6 +118,45 @@ pub async fn current(
     }
 }
 
+/// The session's current outputs once their streams are live. A desktop
+/// that was locked records its streams again after the unlock; an
+/// attachment waits for that as long as the shared
+/// [`attach_wait`](arcen_session::desktop_session::remote_access::attach_wait)
+/// allows.
+///
+/// # Errors
+///
+/// [`OutputClientError::StreamsUnavailable`] when they stay closed, or what
+/// [`current`] returns.
+pub async fn current_live(
+    ready: &WaylandAgentReady,
+    uid: u32,
+    agent_pid: u32,
+) -> Result<OutputReply, OutputClientError> {
+    use arcen_session::desktop_session::remote_access::{attach_wait, AttachWait};
+
+    let started = tokio::time::Instant::now();
+    let mut logged = false;
+    loop {
+        let reply = current(ready, uid, agent_pid).await?;
+        match attach_wait(reply.streams_unavailable, started.elapsed()) {
+            AttachWait::Proceed => return Ok(reply),
+            AttachWait::Refuse => return Err(OutputClientError::StreamsUnavailable),
+            AttachWait::Poll(delay) => {
+                if !logged {
+                    logged = true;
+                    tracing::info!(
+                        target: crate::logging::target::DISPLAY,
+                        generation = reply.generation,
+                        "the desktop's streams are closed (locked); waiting for them to be recorded again"
+                    );
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 /// Moves the session to `outputs` as output generation `generation`. On
 /// refusal the session kept its previous outputs, which the error's reply
 /// reports through [`current`].
@@ -190,5 +233,85 @@ pub async fn wide_streams(
                 .unwrap_or_else(|| "the generation moved on".to_owned()),
             live: Box::new(reply),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::wayland::{ReadyOutput, ReadyStream, StreamCursorMode};
+
+    fn reply(generation: u64, node_id: u32, streams_unavailable: bool) -> OutputReply {
+        OutputReply {
+            ok: true,
+            error: None,
+            generation,
+            outputs: vec![ReadyOutput {
+                connector: "Meta-0".into(),
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            }],
+            streams: vec![ReadyStream {
+                connector: "Meta-0".into(),
+                node_id,
+                width: 1920,
+                height: 1080,
+                x: 0,
+                y: 0,
+            }],
+            streams_unavailable,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attachment_waits_for_a_locked_desktops_streams_to_be_recorded_again() {
+        let runtime_dir =
+            std::env::temp_dir().join(format!("arcen-output-client-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let socket = runtime_dir.join("arcen-output.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        // The agent answers from its snapshot: closed streams twice (the
+        // desktop is still locked), then the next generation's new nodes.
+        let agent = tokio::spawn(async move {
+            let answers = [reply(1, 41, true), reply(1, 41, true), reply(2, 57, false)];
+            for answer in answers {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader).read_line(&mut line).await.unwrap();
+                assert!(line.contains("hello"));
+                let mut encoded = serde_json::to_vec(&answer).unwrap();
+                encoded.push(b'\n');
+                writer.write_all(&encoded).await.unwrap();
+            }
+        });
+        let ready = WaylandAgentReady {
+            compositor: "gnome-shell".into(),
+            input_socket: runtime_dir.join("arcen-input.sock"),
+            runtime_dir: runtime_dir.clone(),
+            wayland_display: "wayland-0".into(),
+            outputs: reply(1, 41, false).outputs,
+            streams: reply(1, 41, false).streams,
+            input_device_types: 7,
+            generation: 1,
+            compositor_render_node: None,
+            compositor_gpu_pci: None,
+            compositor_gpu_vendor: None,
+            output_mode: arcen_session::wayland_outputs::VirtualOutputMode::RemoteMonitors,
+            output_socket: Some(socket),
+            x11: None,
+            cursor_mode: StreamCursorMode::Embedded,
+            clipboard: None,
+        };
+        let live = current_live(&ready, nix::unistd::getuid().as_raw(), std::process::id())
+            .await
+            .unwrap();
+        assert_eq!(live.generation, 2);
+        assert_eq!(live.streams[0].node_id, 57);
+        assert!(!live.streams_unavailable);
+        agent.await.unwrap();
+        let _ = std::fs::remove_dir_all(&runtime_dir);
     }
 }

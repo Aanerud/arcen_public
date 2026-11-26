@@ -1064,8 +1064,9 @@ does not ship. On the Mac host (preview) it is built but not yet qualified.
 
 A host that cannot match your layout says "Match My Layout could not be
 negotiated with this host" and offers **Use Primary Display Only**: one
-display for that session only, and the next connection asks for your
-whole layout again. To keep that host on one display, edit the connection
+display for that session only. The session says so when it starts and in
+Stream Statistics, and the next connection asks for your whole layout
+again. To keep that host on one display, edit the connection
 and set its **Displays** to **Primary display only**; other connections
 keep the default.
 
@@ -1175,6 +1176,11 @@ password**, as long as you are back within the host's reconnect window
 - On a Linux host you do not have to wait: signing in again with your
   password, from this Mac or another, takes your waiting desktop over at
   once.
+- A host locks your session as soon as the connection drops. A Windows
+  host can unlock it only with your password, so there the Deck returns to
+  your connections and asks for it: **Your session ended. Sign in again to
+  continue.** Signing in unlocks the same session, with your applications
+  and windows as you left them.
 
 ## 12. Disconnecting, quitting and signing out
 

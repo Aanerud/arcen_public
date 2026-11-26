@@ -107,6 +107,24 @@
           "gate": 4,
           "symbol": "SessionLifecycles",
           "reason": "Each Pier reports its session steps to the shared lifecycle, which enforces ordering and readiness evidence the same way on every host."
+        },
+        {
+          "id": "linux-guest-console-layout",
+          "gate": 4,
+          "symbol": "guest_layout_policy",
+          "reason": "Whether another product's desktop takes the Deck's layout on attach is the shared decision from the console's owner, that product's client and platform.session.guest_layout, so the launcher never lays out a desktop whose client is attached or unknown."
+        },
+        {
+          "id": "linux-guest-layout-departure",
+          "gate": 4,
+          "symbol": "LeaveDecks",
+          "reason": "The Linux layout journal keeps the Deck's layout on another product's desktop through the shared LayoutDeparture, so the hand-back and the recovery never put back a layout under that product."
+        },
+        {
+          "id": "linux-created-desktop-detach-lock",
+          "gate": 4,
+          "symbol": "DetachLock::on_detach",
+          "reason": "Whether a desktop the Linux Pier created locks when its Deck leaves (kept, held for resume, handed over, ending, or without a lock screen) is the shared decision, so every departure that leaves it running locks it the same way."
         }
       ],
       "paths": [
@@ -620,6 +638,7 @@
         "desktop_provider",
         "direct_reconnect",
         "host_lifecycle",
+        "host_shutdown",
         "local_playback",
         "pier_config",
         "restore_lease",
@@ -653,10 +672,28 @@
           "reason": "The Windows Pier proves its own speakers silent with the shared endpoint-mute evidence and admits the session through local_playback::admit, as every Pier does."
         },
         {
+          "id": "windows-host-shutdown",
+          "gate": 4,
+          "symbol": "DrainDeadline",
+          "reason": "When Windows shuts down or restarts, the service drains its sessions within the shared shutdown budget and the agent writes the session's one end record through the shared SessionTally, so both records land before Windows ends the processes."
+        },
+        {
           "id": "windows-hand-back",
           "gate": 4,
           "symbol": "DETACH_STEPS_OUTPUTS_FIRST",
           "reason": "A departing Deck's session is handed back in the shared order and locked per the shared Departure rule (ADR 0025, disconnect locks)."
+        },
+        {
+          "id": "windows-held-lock",
+          "gate": 4,
+          "symbol": "HOLD_STEPS",
+          "reason": "A session held for its Deck's resume is locked at once in the shared hold order, and a returning Deck that finds it locked is asked to sign in again (held_resume), since only the password unlocks it (GAP-044)."
+        },
+        {
+          "id": "windows-lock-first-hand-back",
+          "gate": 4,
+          "symbol": "hand_back_order",
+          "reason": "With privacy.desk required, or a session already locked, the hand-back locks before the desk gets its displays and input back, and a refused lock is asked again through the shared lock wait without giving the desk back (ADR 0025 §4)."
         },
         {
           "id": "windows-console-notice",
@@ -795,6 +832,7 @@
       "package": "arcen-pier-windows-installer",
       "dependency_kind": "normal",
       "contracts": [
+        "host_shutdown",
         "install_lifecycle"
       ],
       "production_uses": [
@@ -803,6 +841,18 @@
           "gate": 4,
           "symbol": "InstallTransaction",
           "reason": "Every installer's exit status comes from the shared transaction's finish(), so a Pier that is not running is never reported installed."
+        },
+        {
+          "gate": 4,
+          "id": "service-start-watch",
+          "reason": "The Windows installer waits for the Pier while it reports start progress and reports it installed only once the shared watch proves it running, so a slow start is not a failed install and a stalled, stopped or unreadable one is never success.",
+          "symbol": "ServiceStartWatch"
+        },
+        {
+          "gate": 4,
+          "id": "windows-preshutdown-grant",
+          "reason": "The installer gives the Pier's service the shared shutdown grant as its preshutdown timeout on every install and upgrade, the time inside which the Pier records a session Windows ends and its own stop.",
+          "symbol": "SHUTDOWN_GRANT"
         }
       ],
       "paths": [
