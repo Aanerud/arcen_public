@@ -326,8 +326,10 @@ fn watch(
         let now = std::time::Instant::now();
         if now.duration_since(console_read) >= CONSOLE_CHECK {
             console_read = now;
-            let ours = crate::console::console_holder()
-                == arcen_session::agent_relay::ConsoleHolder::User(serving_uid);
+            // Read fail-closed, as the lock wait reads it: a failed
+            // console-user read looks like the login window, and a desk held
+            // for a lock that will not come must not be given back for it.
+            let ours = crate::console::console_is_ours(serving_uid);
             if verdicts.console(ours) == WatchVerdict::ConsoleLeft {
                 if let Some(handle) = filter {
                     handle.suspend();

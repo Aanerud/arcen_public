@@ -1925,6 +1925,11 @@ pub struct OutputReply {
     pub outputs: Vec<ReadyOutput>,
     /// Current streams (one per output; a recreated set has new nodes).
     pub streams: Vec<ReadyStream>,
+    /// The streams are closed and not recorded again yet: the desktop is
+    /// locked (shared `desktop_session::remote_access`). `outputs` and
+    /// `streams` are then the last live ones and must not be captured.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub streams_unavailable: bool,
 }
 
 impl OutputReply {

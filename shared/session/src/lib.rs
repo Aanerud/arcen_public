@@ -15,6 +15,7 @@ pub mod desktop_provider;
 pub mod desktop_session;
 pub mod direct_reconnect;
 pub mod host_lifecycle;
+pub mod host_shutdown;
 pub mod install_lifecycle;
 pub mod install_provider;
 pub mod local_playback;

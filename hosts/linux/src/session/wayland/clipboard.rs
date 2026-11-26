@@ -9,8 +9,11 @@
 //! through GNOME 51. The agent creates one `RemoteDesktop` session for the
 //! clipboard alone and never starts it. Its lifetime is the desktop's, so
 //! reconfiguring or re-recording outputs never touches the clipboard, and a
-//! resize loses nothing. Mutter serves the clipboard on a session that has not
-//! been started; this was proven on GNOME 49 and 40 before relying on it.
+//! resize loses nothing. A lock is the exception: the shell inhibits remote
+//! access and Mutter closes every `RemoteDesktop` session, so
+//! [`RenewableClipboard`] creates a new one after the unlock. Mutter serves
+//! the clipboard on a session that has not been started; this was proven on
+//! GNOME 49 and 40 before relying on it.
 //!
 //! The Pier connects to `arcen-clipboard.sock` and proves it the same way as
 //! the input socket. It then speaks the same bridge protocol as the
@@ -305,6 +308,69 @@ impl CompositorClipboard for MutterClipboard {
         self.call("SelectionWriteDone", &(serial, ok))
             .await
             .map(|_| ())
+    }
+}
+
+/// A desktop's clipboard session, replaced when Mutter closed it.
+///
+/// A lock inhibits remote access, and Mutter then closes every
+/// `RemoteDesktop` session, the clipboard's own one included. Once the
+/// streams are recorded again after the unlock, [`Self::renew`] creates and
+/// proves a new clipboard session; the next Pier connection reads and
+/// writes through it.
+#[derive(Debug)]
+pub struct RenewableClipboard {
+    current: tokio::sync::RwLock<MutterClipboard>,
+}
+
+impl RenewableClipboard {
+    /// Serves `clipboard` until it is renewed.
+    #[must_use]
+    pub fn new(clipboard: MutterClipboard) -> Self {
+        Self {
+            current: tokio::sync::RwLock::new(clipboard),
+        }
+    }
+
+    /// Creates a new clipboard session on `connection` and serves it from
+    /// now on.
+    ///
+    /// # Errors
+    ///
+    /// [`MutterError`] when the new session cannot be created or proven;
+    /// the previous one is kept.
+    pub async fn renew(&self, connection: &Connection) -> Result<(), MutterError> {
+        let renewed = MutterClipboard::create(connection).await?;
+        *self.current.write().await = renewed;
+        Ok(())
+    }
+}
+
+impl CompositorClipboard for RenewableClipboard {
+    type Error = MutterError;
+
+    async fn events(&self) -> Result<BoxStream<'static, ClipboardEvent>, MutterError> {
+        self.current.read().await.events().await
+    }
+
+    async fn release(&self) -> Result<(), MutterError> {
+        self.current.read().await.release().await
+    }
+
+    async fn set_selection(&self, names: &[&str]) -> Result<(), MutterError> {
+        self.current.read().await.set_selection(names).await
+    }
+
+    async fn read(&self, name: &str) -> Result<OwnedFd, MutterError> {
+        self.current.read().await.read(name).await
+    }
+
+    async fn write(&self, serial: u32) -> Result<OwnedFd, MutterError> {
+        self.current.read().await.write(serial).await
+    }
+
+    async fn write_done(&self, serial: u32, ok: bool) -> Result<(), MutterError> {
+        self.current.read().await.write_done(serial, ok).await
     }
 }
 

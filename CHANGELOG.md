@@ -6,6 +6,72 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.21.4] — 2026-11-25
+
+Your desktop keeps running while it is locked and locks when your Deck
+leaves, and Match My Layout fits every connection to your Deck's monitors,
+on a desktop another product owns too. On Windows, HDR on a PC without HDR
+displays opens as Grading instead of failing.
+
+### Linux Pier
+
+- Match My Layout on a desktop that another remote-desktop product owns now
+  sets it to your monitors' own sizes on every connection, with one monitor
+  or several, instead of showing black bars or an earlier connection's
+  layout (to keep its layout, set `platform.session.guest_layout` to
+  `"keep"`).
+- Match My Layout and Primary Display Only now connect to a desktop whose
+  monitor another tool scaled, instead of failing.
+- A GNOME Wayland desktop that locks, after idle or by hand, keeps running
+  with its applications open, and your next connection unlocks it and
+  shows it again.
+- A desktop the Pier started for you now locks as soon as your Deck
+  disconnects, instead of staying open until its idle lock.
+- The service's minute health record reads critical only when a session
+  was, not for one brief dip as a stream starts or ends, and the log says
+  at the default level why capture or encoding could not start.
+
+### Windows Pier
+
+- HDR on a PC whose displays have no HDR, such as dummy plugs, opens as
+  Grading and the Deck says why, and HDR with Match My Layout on two
+  displays opens too, instead of failing.
+- A Grading or HDR display that a Deck leaves at 4:2:0 streams in 4:4:4
+  instead of ending the session, and Match My Layout names any display it
+  encodes in software, and why.
+- The installer waits while the Pier service is still starting, so a slow
+  start no longer fails the install, and the service starts sooner on a
+  PC with many session logs.
+- The logs record the session's end and the Pier's stop when Windows
+  restarts or shuts down, and the service's minute health record shows how
+  its session is doing instead of always reading unavailable.
+- A Deck that drops leaves its session locked, and coming back asks for
+  your password; with `privacy.desk = "required"`, the session locks before
+  the PC's own monitors come back.
+
+### macOS Pier (preview)
+
+- With `privacy.desk = "required"`, a Mac whose session will not lock
+  after your Deck leaves keeps its desk dark and its keyboard and mouse
+  blocked until it locks, instead of giving it back unlocked after a minute.
+
+### macOS Deck and Windows Deck
+
+- After **Use Primary Display Only**, the session says it is on one display
+  for this session only.
+- On the Windows Deck, Stream Statistics shows the frame rate that reaches
+  the screen (60 for a 60 fps stream, not 70), and a smooth stream no
+  longer reads as degraded or critical in the session's health, on one
+  display or several.
+- On the macOS Deck, `arcen-deck multi-monitor-smoke --pipeline
+  grading|hdr` streams every display in that preset, reports what the host
+  serves and why, and names any display the host leaves out.
+
+### Every Deck and Pier
+
+- A frame-rate health warning in the log names the lowest rate that
+  passes, so the rate that failed is always below it.
+
 ## [0.21.3] — 2026-11-25
 
 Desk privacy is now a Deck setting, and a Pier keeps your session when the
@@ -1412,7 +1478,8 @@ exist.
   and SmartScreen prompts.
 - The macOS Pier, a Linux Deck and a Windows Deck do not exist yet.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.3...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.4...HEAD
+[0.21.4]: https://github.com/Aanerud/arcen_public/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/Aanerud/arcen_public/compare/v0.21.2...v0.21.3
 [0.21.2]: https://github.com/Aanerud/arcen_public/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/Aanerud/arcen_public/compare/v0.21.0...v0.21.1

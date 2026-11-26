@@ -110,6 +110,52 @@ the server with `--socketpath=PATH`, then run
 `ARCEN_EIS_DEMO_SOCKET=PATH cargo test -p arcen-pier-linux --features
 wayland-provider --lib -- --ignored libei_demo_server`.
 
+### Pipelines and colour
+
+`media-smoke` and `multi-monitor-smoke` take `--pipeline auto|speed|grading|hdr`
+and ask for that preset exactly as the Deck app does; a multi-monitor run
+with Grading or HDR asks for 4:4:4 on every display. Each run prints what it
+asked for and what the Pier serves, with the Pier's reason for any
+difference:
+
+```text
+pipeline requested=hdr served=grading degraded=true reason=hdr_display_unsupported detail="…"
+```
+
+A degraded pipeline is reported, not failed. Add `--require-served-pipeline`
+to fail any run the Pier does not serve as requested, for example an HDR
+qualification. It refuses an explicit video axis (`--codec`, `--max-fps`,
+`--transfer` and the like), which turns the request into custom axes with no
+pipeline. Every run fails when the Pier's hello states a served Grading
+or HDR pipeline without that preset's colour (depth, chroma, range, matrix,
+primaries, transfer), when Auto or Speed states an HDR transfer, or when a
+decoded frame's depth, range or matrix differs from the hello. Without
+`--pipeline` the smoke asks for its own fixed axes and reports
+`requested=custom`.
+
+### Multi-monitor smoke
+
+`multi-monitor-smoke` asks for the Deck's displays, or the layout in
+`--monitor-fixture PATH` (for example
+[`two-display-fixture.json`](../../clients/macos/tests/data/two-display-fixture.json)),
+with Match My Layout and passes only when
+every requested display is served, every served display decodes video, and
+pen or pointer input reaches each of the first two regions. A Pier that keeps
+its own layout, or has fewer monitors, fails the run by default and the
+error names the omitted displays. `--accept-host-layout` (or
+`ARCEN_MULTI_MONITOR_SMOKE_HOST_LAYOUT=1`) accepts the Pier's layout: the
+omitted displays are printed with the Pier's reason (`host_layout_kept`,
+`host_max_monitors=N` or `unstated`), and every display it does serve must
+still decode. A served display the Deck did not ask for always fails.
+
+```sh
+printf '%s\n%s\n' "$ARCEN_TEST_USERNAME" "$ARCEN_TEST_PASSWORD" |
+  ARCEN_MEDIA_SMOKE_SECONDS=15 ARCEN_AUDIO_SINK=discard \
+  arcen-deck multi-monitor-smoke HOST 18444 --credentials-stdin \
+    --pin-sha256 FINGERPRINT --monitor-fixture two-display-fixture.json \
+    --pipeline hdr --require-served-pipeline
+```
+
 `media-smoke` can drive the clipboard:
 
 - `ARCEN_MEDIA_SMOKE_CLIPBOARD_SEND=a.txt,b.png` offers each file as the

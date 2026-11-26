@@ -536,6 +536,33 @@ fn client_presentation_loss_reports_unpresented_rather_than_zero_host_loss() {
 }
 
 #[test]
+fn fps_transitions_report_a_threshold_above_the_failing_rate() {
+    let sample = |actual, content| QosSample {
+        fps_actual: Some(actual),
+        fps_target: Some(30),
+        fps_content: Some(content),
+        frames_sent: Some(u64::from(actual) * 2),
+        frames_dropped: Some(0),
+        ..QosSample::default()
+    };
+    let targets = QosTargets::default();
+    let reported = |state, sample: &QosSample| {
+        cause_value_threshold(
+            HealthCause::Fps,
+            HealthSideKind::HostDelivery,
+            state,
+            sample,
+            &targets,
+        )
+    };
+    assert_eq!(reported(HealthState::Critical, &sample(5, 8)), (5, Some(6)));
+    assert_eq!(
+        reported(HealthState::Degraded, &sample(13, 15)),
+        (13, Some(14))
+    );
+}
+
+#[test]
 fn host_delivery_loss_still_reports_transport_counters() {
     let sample = QosSample {
         frames_sent: Some(900),

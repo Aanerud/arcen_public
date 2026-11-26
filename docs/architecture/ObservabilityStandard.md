@@ -219,9 +219,18 @@ Emitted by the client for attach/forward and by the host for inject failures
 | 1805 | `EFFECTIVE_PROFILE` | 0 | profile_level, profile_name, profile_source | — |
 | 1806 | `HEALTH_SNAPSHOT` | 0 | overall_state | host_state, client_state, QoS summary fields (fps_actual, fps_target, fps_content, rtt_ms, drop_basis_points, heartbeat_misses), client network (client_network_kind, client_network_scope, client_link_mbps, client_mtu) |
 
+For `fps`, `threshold` is the lowest whole frame rate that passes
+(`arcen_telemetry::fps_threshold` rounds up), so a failing `value` is always
+below it.
+
 1804 is the "counted loss" escape valve (§7): any sink that dropped since the last
 heartbeat reports it here and resets its counter. 1806 is the mandatory compact
-60-second proof-of-life even when no state transition occurs.
+60-second proof-of-life even when no state transition occurs. Each session
+writes its own; the Linux and Windows Piers also write one for the service,
+whose `overall_state` is the worst state any session committed in the minute
+(after the two-window hysteresis, as its 1800–1802 events report it, never one
+tick's assessment) and `unavailable` only when no session reported a committed
+state (`arcen_observability::ServiceHealth`).
 
 ### 1900–1999 · Permission / entitlement
 

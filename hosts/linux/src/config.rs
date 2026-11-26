@@ -68,6 +68,10 @@ pub struct LinuxSessionConfig {
     /// `dedicated`: a private desktop per sign-in, for a host without a
     /// display manager.
     pub mode: Option<String>,
+    /// Another product's desktop: `deck` (default) lays it out to the
+    /// Deck's monitors on attach while that product has no client
+    /// attached; `keep` never changes its layout (ADR 0025 §8).
+    pub guest_layout: Option<arcen_session::console_session::guest_layout::GuestLayoutSetting>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -400,8 +400,8 @@ async fn main() {
                   arcen-client\n\
                   arcen-client --connect <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--codec h264|h265|av1] [--chroma yuv420|yuv444] [--video-selection exact|adaptive-performance|color-fidelity] [--bit-depth 8|10|12] [--color-range limited|full] [--color-matrix bt709|identity|bt601|bt2020ncl] [--transfer bt709|srgb|pq|hlg] [--color-primaries bt709|bt2020|display_p3] [--encode-intent interactive|quality] [--max-fps N] [--microphone]\n\
                   arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT]\n\
-                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT]\n\
-                  arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--monitor-fixture PATH] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT] [--full-color-display ID] [--tablet-mode light|hard|off]\n\
+                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr [--require-served-pipeline]] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT]\n\
+                  arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--pipeline auto|speed|grading|hdr [--require-served-pipeline]] [--accept-host-layout] [--monitor-fixture PATH] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT] [--full-color-display ID] [--tablet-mode light|hard|off]\n\
                   arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off] [--pen | --pen-full [--pen-wait-ms MS] [--pen-end-in-contact] | --pen-file PATH [--pen-go-file PATH]] [--text STRING]... [--keys SCRIPT | --keys-file PATH (quiet: tokens never printed) [--keyboard-shortcuts automatic|windows_app|swap_command_control|command_is_control] [--left-option-altgr]]... [--paste-file PATH [--paste-rate CHARS_PER_SECOND] [--paste-wait-ms MS] [--paste-click] [--paste-return]] [--magnify SCALE]\n\
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
                   arcen-client multi-monitor-window-diagnostic [1|2|4] [--timeout-secs N]\n\
@@ -464,11 +464,19 @@ async fn main() {
     // without the GUI. Synchronous here is fine — these are one-shot tools.
     arcen_deck::logging::diagnostics::log_usb_inventory();
     if matches!(subcommand, Some("media-smoke" | "multi-monitor-smoke")) {
+        let contract = match SmokeContract::from_args(&args) {
+            Ok(contract) => contract,
+            Err(error) => {
+                eprintln!("{error}");
+                shutdown_and_exit(2);
+            }
+        };
         if let Err(error) = media_smoke(
             options,
             subcommand == Some("multi-monitor-smoke"),
             args.iter().any(|arg| arg == "--accept-disclaimer"),
             !args.iter().any(|arg| arg == "--video-only"),
+            contract,
         )
         .await
         {
@@ -916,22 +924,30 @@ fn stream_profile_for_pipeline(pipeline: arcen_media::video::PipelineId) -> Stre
     }
 }
 
+/// Explicit video axes: any of them makes the request custom, with no
+/// pipeline.
+const PROFILE_OVERRIDE_FLAGS: [&str; 11] = [
+    "--codec",
+    "--chroma",
+    "--video-selection",
+    "--max-fps",
+    "--bit-depth",
+    "--color-range",
+    "--color-matrix",
+    "--transfer",
+    "--color-primaries",
+    "--encode-intent",
+    "--motion-priority",
+];
+
+fn profile_override_flag(args: &[String]) -> Option<&'static str> {
+    PROFILE_OVERRIDE_FLAGS
+        .into_iter()
+        .find(|flag| flag_value(args, flag).is_some())
+}
+
 fn has_profile_override_flags(args: &[String]) -> bool {
-    [
-        "--codec",
-        "--chroma",
-        "--video-selection",
-        "--max-fps",
-        "--bit-depth",
-        "--color-range",
-        "--color-matrix",
-        "--transfer",
-        "--color-primaries",
-        "--encode-intent",
-        "--motion-priority",
-    ]
-    .iter()
-    .any(|flag| flag_value(args, flag).is_some())
+    profile_override_flag(args).is_some()
 }
 
 fn active_chroma_from_pixel_format(
@@ -1204,7 +1220,7 @@ fn connect_options_from_parts_with_monitors(
                 remote_ui_scale,
                 hidpi_mask,
             );
-            let full_color_display_ids = match flag_value(args, "--full-color-display") {
+            let mut full_color_display_ids = match flag_value(args, "--full-color-display") {
                 Some(value) if value.eq_ignore_ascii_case("all") => topology
                     .monitors()
                     .iter()
@@ -1213,6 +1229,17 @@ fn connect_options_from_parts_with_monitors(
                 Some(value) => vec![value],
                 None => Vec::new(),
             };
+            // A 4:4:4 request (Grading, HDR, `--chroma yuv444`) streams every
+            // display at 4:4:4, as the Deck app asks for it.
+            if let Some(chroma) = arcen_media::ChromaSubsampling::from_token(&profile.chroma) {
+                for id in arcen_deck_core::connect_plan::full_color_display_ids_for_chroma(
+                    &topology, chroma, 0,
+                ) {
+                    if !full_color_display_ids.contains(&id) {
+                        full_color_display_ids.push(id);
+                    }
+                }
+            }
             Ok(
                 arcen_deck::transport::multi_monitor::RequestedMultiMonitorSelection {
                     topology,
@@ -2719,11 +2746,51 @@ fn unix_ms_f64() -> f64 {
         * 1000.0
 }
 
+/// What a smoke run requires beyond decoded video
+/// (`arcen_deck_core::smoke_contract`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SmokeContract {
+    /// `--accept-host-layout` (or `ARCEN_MULTI_MONITOR_SMOKE_HOST_LAYOUT=1`):
+    /// a multi-monitor host may serve fewer displays than asked for.
+    layout: arcen_deck_core::smoke_contract::LayoutAcceptance,
+    /// `--require-served-pipeline`: fail unless the host serves the
+    /// `--pipeline` asked for.
+    require_served_pipeline: bool,
+}
+
+impl SmokeContract {
+    fn from_args(args: &[String]) -> Result<Self, String> {
+        let accept_host_layout = args.iter().any(|arg| arg == "--accept-host-layout")
+            || std::env::var("ARCEN_MULTI_MONITOR_SMOKE_HOST_LAYOUT")
+                .is_ok_and(|value| value == "1");
+        let require_served_pipeline = args.iter().any(|arg| arg == "--require-served-pipeline");
+        if require_served_pipeline {
+            if flag_value(args, "--pipeline").is_none() {
+                return Err("--require-served-pipeline needs --pipeline".to_string());
+            }
+            if let Some(flag) = profile_override_flag(args) {
+                return Err(format!(
+                    "--require-served-pipeline cannot be combined with {flag}: an explicit video axis replaces --pipeline with a custom request"
+                ));
+            }
+        }
+        Ok(Self {
+            layout: if accept_host_layout {
+                arcen_deck_core::smoke_contract::LayoutAcceptance::HostLayout
+            } else {
+                arcen_deck_core::smoke_contract::LayoutAcceptance::FullLayout
+            },
+            require_served_pipeline,
+        })
+    }
+}
+
 async fn media_smoke(
     mut options: ConnectOptions,
     require_multi_monitor: bool,
     accept_disclaimer: bool,
     verify_audio: bool,
+    contract: SmokeContract,
 ) -> Result<(), String> {
     let deck_build = arcen_deck::build_identity::current();
     println!(
@@ -2740,6 +2807,7 @@ async fn media_smoke(
     let requested_chroma = options.profile.chroma.clone();
     let requested_displays_mode = options.displays_mode.clone();
     let requested_multi_monitor_topology = options.multi_monitor_topology.clone();
+    let requested_pipeline = options.profile.pipeline.clone();
     let microphone_requested = options.microphone_enabled;
     let tablet_input_requested = options.tablet_input_enabled;
     // ARCEN_MEDIA_SMOKE_EXACT=1 asks for exact still image; the smoke treats
@@ -2858,6 +2926,13 @@ async fn media_smoke(
     let mut server_active_codec = None;
     let mut server_active_chroma = None;
     let mut host_active_pipeline = "absent".to_string();
+    let mut pipeline_report = arcen_deck_core::smoke_contract::PipelineReport {
+        requested: requested_pipeline.clone(),
+        ..Default::default()
+    };
+    // The colour the hello states, which every decoded frame must carry.
+    let mut hello_colour: Option<arcen_media::colour_check::ColourAxes> = None;
+    let mut monitors_omitted = 0_usize;
     let mut decoded_summary: Option<String> = None;
     let mut decoded_resolution: Option<(usize, usize)> = None;
     let mut full_frame_requests = FullFrameRequestGate::default();
@@ -3234,6 +3309,17 @@ async fn media_smoke(
                         arcen_protocol::messages::ServedStreamPipeline::token,
                     )
                     .to_string();
+                pipeline_report = arcen_deck_core::smoke_contract::PipelineReport::from_hello(
+                    requested_pipeline.clone(),
+                    &hello,
+                );
+                println!("{}", pipeline_report.line());
+                let colour = arcen_media::colour_check::ColourAxes::from_hello(&hello);
+                arcen_deck_core::smoke_contract::verify_served_colour(
+                    hello.active_pipeline.as_ref(),
+                    &colour,
+                )?;
+                hello_colour = Some(colour);
                 server_active_codec = match hello.codec.as_str() {
                     "h264" => Some(arcen_deck::protocol::VideoCodec::H264),
                     "h265" => Some(arcen_deck::protocol::VideoCodec::H265),
@@ -3263,14 +3349,22 @@ async fn media_smoke(
                         .ok_or_else(|| {
                             "host did not return a multi_monitor_v1 capability".to_string()
                         })?;
+                    let requested = requested_multi_monitor_topology.as_ref().ok_or_else(|| {
+                        "multi-monitor smoke lost its requested topology".to_string()
+                    })?;
+                    // Every requested display must be served unless the run
+                    // accepts the host's layout; then the omitted ones are
+                    // named, and every served one must still decode.
+                    let served_layout = arcen_deck_core::smoke_contract::verify_applied_layout(
+                        &requested.topology,
+                        &capability,
+                        contract.layout,
+                    )?;
                     let applied = capability.applied_topology().ok_or_else(|| {
                         "host did not return an applied multi-monitor topology".to_string()
                     })?;
-                    expected_monitor_ids = applied
-                        .monitors()
-                        .iter()
-                        .map(|monitor| monitor.session_monitor_id)
-                        .collect();
+                    expected_monitor_ids = served_layout.served.iter().copied().collect();
+                    monitors_omitted = served_layout.omitted.len();
                     expected_wire_profiles = applied
                         .monitors()
                         .iter()
@@ -3295,9 +3389,6 @@ async fn media_smoke(
                             Ok((monitor.session_monitor_id, (codec, chroma)))
                         })
                         .collect::<Result<BTreeMap<_, _>, String>>()?;
-                    let requested = requested_multi_monitor_topology.as_ref().ok_or_else(|| {
-                        "multi-monitor smoke lost its requested topology".to_string()
-                    })?;
                     input_probe_points = applied
                         .monitors()
                         .iter()
@@ -3331,44 +3422,44 @@ async fn media_smoke(
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?;
-                    // A host that keeps its own layout (another product's
-                    // desktop) may show fewer monitors than asked, and says
-                    // which; a smoke of such a host opts in with
-                    // ARCEN_MULTI_MONITOR_SMOKE_HOST_LAYOUT=1, so no other
-                    // host passes with a monitor lost.
                     let layout_note = arcen_deck_core::multi_window::layout_note::applied_layout_note(
                         &requested.topology,
                         applied,
                     );
-                    let host_layout_kept = std::env::var("ARCEN_MULTI_MONITOR_SMOKE_HOST_LAYOUT")
-                        .is_ok_and(|value| value == "1")
-                        && layout_note.is_some();
-                    if expected_monitor_ids.len() < 2 && !host_layout_kept {
-                        return Err(format!(
-                            "host applied only {} monitor(s)",
-                            expected_monitor_ids.len()
-                        ));
-                    }
                     for monitor_id in &expected_monitor_ids {
                         decoders.insert(*monitor_id, decoder_for(session_color));
                     }
                     println!(
-                        "multi-monitor applied monitors={} desktop={}x{} carrier={}",
+                        "multi-monitor applied monitors={} requested={} omitted={} desktop={}x{} carrier={}",
                         expected_monitor_ids.len(),
+                        served_layout.requested,
+                        served_layout.omitted.len(),
                         applied.desktop_width_px(),
                         applied.desktop_height_px(),
                         applied.selected_carrier()
                     );
                     for monitor in applied.monitors() {
                         println!(
-                            "multi-monitor monitor {} session_monitor={} {}x{} fps={} refresh_hz={}",
+                            "multi-monitor monitor {} session_monitor={} {}x{} fps={} refresh_hz={} codec={} chroma={} encoder={} degraded={} reason={}",
                             monitor.client_display_id.as_str(),
                             monitor.session_monitor_id,
                             monitor.media_plan.width_px,
                             monitor.media_plan.height_px,
                             monitor.media_plan.fps,
-                            monitor.refresh_hz
+                            monitor.refresh_hz,
+                            monitor.media_plan.codec,
+                            monitor.media_plan.chroma,
+                            monitor.media_plan.encoder_backend,
+                            monitor.media_plan.degraded,
+                            if monitor.media_plan.degradation_reason.is_empty() {
+                                "-"
+                            } else {
+                                monitor.media_plan.degradation_reason.as_str()
+                            }
                         );
+                    }
+                    for line in served_layout.omitted_lines() {
+                        println!("{line}");
                     }
                     if let Some(note) = layout_note {
                         println!("multi-monitor layout note: {note}");
@@ -3634,6 +3725,11 @@ async fn media_smoke(
                         }
                     };
                     if let Some(frame) = decoded {
+                        if let Some(colour) = &hello_colour {
+                            arcen_deck_core::smoke_contract::verify_frame_colour(
+                                monitor_id, colour, &header,
+                            )?;
+                        }
                         if is_keyframe {
                             full_frame_requests.cancel_pending();
                         }
@@ -3733,13 +3829,26 @@ async fn media_smoke(
                         && input_probe_confirmed
                         && decoders.values().all(|decoder| !decoder.wants_keyframe())
                     {
+                        if let Some(colour) = &hello_colour {
+                            arcen_deck_core::smoke_contract::verify_served_colour(
+                                pipeline_report.served.as_ref(),
+                                colour,
+                            )?;
+                        }
+                        println!("{}", pipeline_report.line());
+                        if contract.require_served_pipeline {
+                            pipeline_report.require_requested()?;
+                        }
                         println!("{summary}");
                         if let Some(health) = &last_health {
                             println!("health-stats {health}");
                         }
                         println!(
-                            "media-smoke complete displays_mode={} active_pipeline={} monitors_decoded={} stream_resolution={}x{} video_packets={} audio_packets={} audio_nonzero_samples={} audio_peak={} elapsed_ms={} packet_fps={:.2} input_sent={input_sequence}",
+                            "media-smoke complete displays_mode={} requested_pipeline={} active_pipeline={} monitors_decoded={} monitors_omitted={monitors_omitted} stream_resolution={}x{} video_packets={} audio_packets={} audio_nonzero_samples={} audio_peak={} elapsed_ms={} packet_fps={:.2} input_sent={input_sequence}",
                             requested_displays_mode,
+                            requested_pipeline
+                                .as_ref()
+                                .map_or("custom", arcen_protocol::messages::StreamPipeline::token),
                             host_active_pipeline,
                             decoded_monitor_ids.len().max(1),
                             decoded_resolution.map_or(0, |resolution| resolution.0),
@@ -3813,6 +3922,7 @@ async fn media_smoke(
                             served.detail.as_deref().unwrap_or("-")
                         );
                         host_active_pipeline = served.served.token().to_string();
+                        pipeline_report.apply_served(&served);
                     }
                 } else if msg_type(&value) == Some("display_update_result") {
                     println!(
@@ -4598,6 +4708,84 @@ mod tests {
             arcen_protocol::messages::VideoSelectionIntent::AdaptivePerformance
         );
         assert_eq!(options.profile.pipeline, None);
+    }
+
+    #[test]
+    fn a_four_four_four_pipeline_streams_every_smoke_display_at_full_colour() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/two-display-fixture.json"
+        );
+        for (pipeline, full_colour) in [("grading", 2), ("hdr", 2), ("auto", 0)] {
+            let mut args = base_smoke_args();
+            args[1] = "multi-monitor-smoke".to_string();
+            args.extend([
+                "--monitor-fixture".to_string(),
+                fixture.to_string(),
+                "--pipeline".to_string(),
+                pipeline.to_string(),
+            ]);
+            let options = connect_options_from_cli_args(&args).expect("fixture smoke options");
+            let selection = options
+                .multi_monitor_topology
+                .as_ref()
+                .expect("multi-monitor selection");
+            assert_eq!(
+                selection.full_color_display_ids.len(),
+                full_colour,
+                "{pipeline}"
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_contract_flags_are_explicit() {
+        use arcen_deck_core::smoke_contract::LayoutAcceptance;
+        let mut args = base_smoke_args();
+        args[1] = "multi-monitor-smoke".to_string();
+        if std::env::var_os("ARCEN_MULTI_MONITOR_SMOKE_HOST_LAYOUT").is_none() {
+            assert_eq!(
+                SmokeContract::from_args(&args),
+                Ok(SmokeContract::default())
+            );
+        }
+        args.push("--require-served-pipeline".to_string());
+        assert_eq!(
+            SmokeContract::from_args(&args),
+            Err("--require-served-pipeline needs --pipeline".to_string())
+        );
+        args.extend([
+            "--pipeline".to_string(),
+            "hdr".to_string(),
+            "--accept-host-layout".to_string(),
+        ]);
+        assert_eq!(
+            SmokeContract::from_args(&args),
+            Ok(SmokeContract {
+                layout: LayoutAcceptance::HostLayout,
+                require_served_pipeline: true,
+            })
+        );
+        args.extend(["--max-fps".to_string(), "60".to_string()]);
+        assert_eq!(
+            SmokeContract::from_args(&args),
+            Err("--require-served-pipeline cannot be combined with --max-fps: an explicit video axis replaces --pipeline with a custom request".to_string())
+        );
+        // An override flag drops the pipeline, so the conflict is refused.
+        let mut custom = base_smoke_args();
+        custom.extend([
+            "--pipeline".to_string(),
+            "hdr".to_string(),
+            "--max-fps".to_string(),
+            "60".to_string(),
+        ]);
+        assert_eq!(
+            connect_options_from_cli_args(&custom)
+                .expect("custom smoke options")
+                .profile
+                .pipeline,
+            None
+        );
     }
 
     #[test]

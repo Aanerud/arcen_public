@@ -1374,6 +1374,16 @@ impl AdmissionGuard {
             .as_ref()
             .is_some_and(|lease| self.runtime.yield_requested(lease))
     }
+
+    /// The session has ended and its private desk is held because it
+    /// refuses to lock under `privacy.desk = "required"` (`refused`;
+    /// shared `SessionAdmissionRuntime::set_lock_refused`): a Deck that
+    /// finds the slot taken is told why.
+    pub fn set_lock_refused(&self, refused: bool) {
+        if let Some(lease) = self.lease.as_ref() {
+            let _ = self.runtime.set_lock_refused(lease, refused);
+        }
+    }
 }
 
 /// Takes the host's session slot for an authenticated Deck. When a session
@@ -2676,6 +2686,10 @@ async fn authenticate(
                 }),
                 video,
             )),
+            // A slot held for a session that refuses to lock says so.
+            Err(_) if runtime.holder_lock_refused() => {
+                Err(crate::auth::AuthFailure::HostLockRefused)
+            }
             Err(_) => Err(crate::auth::AuthFailure::HostBusy),
         },
         (Err(failure), _) => Err(failure),

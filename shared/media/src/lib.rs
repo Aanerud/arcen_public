@@ -51,12 +51,13 @@ pub use applied_topology::{
 };
 pub use arcen_protocol::messages::ClientDisplayId;
 pub use encoder_admission::{
-    ENCODER_CAPACITY_FPS_DEGRADATION_REASON, EncoderAdmissionError, EncoderAdmissionThresholds,
-    EncoderBindingId, EncoderFpsStepdown, EncoderMeasurementAdapter, EncoderProbeFailure,
-    EncoderProbeFailureKind, EncoderProbeRequest, EncoderProbeSample, EncoderProbeTrace,
-    EncoderSetAttempt, EncoderSetAttemptOutcome, EncoderSetCandidate, EncoderSetDecision,
-    EncoderSetMeasurements, EncoderThresholdViolation, MAX_ENCODER_BINDING_ID_BYTES,
-    MAX_ENCODER_PROBE_DURATION, MAX_ENCODER_PROBE_FRAMES_PER_REGION,
+    ENCODER_CAPACITY_FPS_DEGRADATION_REASON, ENCODER_CAPACITY_REASSIGN_DEGRADATION_REASON,
+    ENCODER_CEILING_DEGRADATION_REASON, ENCODER_PROBE_REASSIGN_DEGRADATION_REASON,
+    EncoderAdmissionError, EncoderAdmissionThresholds, EncoderBindingId, EncoderFpsStepdown,
+    EncoderMeasurementAdapter, EncoderProbeFailure, EncoderProbeFailureKind, EncoderProbeRequest,
+    EncoderProbeSample, EncoderProbeTrace, EncoderSetAttempt, EncoderSetAttemptOutcome,
+    EncoderSetCandidate, EncoderSetDecision, EncoderSetMeasurements, EncoderThresholdViolation,
+    MAX_ENCODER_BINDING_ID_BYTES, MAX_ENCODER_PROBE_DURATION, MAX_ENCODER_PROBE_FRAMES_PER_REGION,
     MAX_ENCODER_PROBE_WARMUP_FRAMES, MAX_ENCODER_PROBE_WINDOW, MAX_ENCODER_SET_CANDIDATES,
     RegionActivityProfile, RegionActivityProfiles, RegionAdmissionPriority, RegionEncoderBinding,
     RegionEncoderMeasurements, RegionProbeFailure, RepresentativeFrame, RepresentativeFrameKind,
@@ -64,9 +65,10 @@ pub use encoder_admission::{
 };
 pub use multi_monitor::{
     AggregateMediaBudget, AggregateMediaPlan, AppliedMonitor, AppliedMonitorTopology,
-    BitrateBudgetKbps, LayoutBounds, LayoutRect, LayoutTranslation, MAX_MULTI_MONITOR_COUNT,
-    MediaStreamEpoch, PerMonitorMediaPlan, RegionMediaPlan, RegionMediaRoster, RequestedMonitor,
-    RequestedMonitorTopology, SessionMonitorId, TopologyGeneration,
+    BitrateBudgetKbps, DisplayChromaRefusal, LayoutBounds, LayoutRect, LayoutTranslation,
+    MAX_MULTI_MONITOR_COUNT, MediaStreamEpoch, PerMonitorMediaPlan, RegionChroma, RegionMediaPlan,
+    RegionMediaRoster, RequestedMonitor, RequestedMonitorTopology, SessionMonitorId,
+    TopologyGeneration, region_chroma,
 };
 pub use presentation::{
     NewestPresentDepth, PacedOffer, PresentationWindow, PresentationWindowReport, RefreshPacedSlot,

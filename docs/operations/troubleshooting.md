@@ -219,7 +219,7 @@ See [Clipboard redirection](../security/clipboard-redirection.md) for the policy
 | A QUIC bind failure | Another process owns the UDP port, or the listen address does not resolve. | Free UDP 18444 or change `listen.port`/`listen.host`. |
 | Linux: `DESKTOP_PROVIDER_UNAVAILABLE` (2005) | No desktop provider it can serve (no Xorg, Wayland not qualified). | See [Wayland provider blockers](error-codes.md#wayland-provider-blockers). |
 | Capture or encode fails at the first session | The capenc READY line and `SESSION_STREAM_START` (1102) fields. `not_built` means the backend was not compiled in; `capenc READY protocol error: missing cursor` means an old Pier binary. | Reinstall the matching Pier build. Exact codec or `video.variant` pins refuse substitution by design. |
-| The health snapshot says `overall_state: unavailable` during a working session | `HEALTH_SNAPSHOT` (1806). | Known: do not alert on `overall_state` yet; use `SESSION_STREAM_START` and the QoS fields. |
+| The service's health snapshot says `overall_state: unavailable` | The minute `HEALTH_SNAPSHOT` (1806) without a session's `sid`: the worst state any session settled on that minute (its `HEALTH_OK`/`HEALTH_DEGRADED`/`HEALTH_CRITICAL`). `unavailable` means no session was streaming, or the one that was had only just started. | Nothing to fix. A session's own snapshot, with its `sid`, carries its QoS fields. The macOS Pier writes only the session's own. |
 
 ## macOS Pier (preview)
 

@@ -337,6 +337,10 @@ impl OutputProvider for Reconfigure<'_> {
     }
 }
 
+/// Why outputs are not changed or recorded while the streams are closed.
+const STREAMS_UNAVAILABLE_REFUSAL: &str =
+    "the desktop is locked: its outputs are recorded again after the unlock";
+
 /// The session-bound output socket and what reconfiguration needs.
 pub struct OutputService {
     listener: UnixListener,
@@ -359,19 +363,36 @@ pub struct OutputService {
 }
 
 /// The live outputs as last committed, answered without waiting for a
-/// running reconfiguration.
+/// running reconfiguration, and whether their streams are unavailable
+/// (closed by a lock and not recorded again yet: shared
+/// `desktop_session::remote_access`).
 #[derive(Debug)]
-pub struct OutputSnapshot(std::sync::RwLock<(u64, Vec<ReadyOutput>, Vec<ReadyStream>)>);
+pub struct OutputSnapshot(
+    std::sync::RwLock<(u64, Vec<ReadyOutput>, Vec<ReadyStream>)>,
+    std::sync::atomic::AtomicBool,
+);
 
 impl OutputSnapshot {
     /// The snapshot of `set` at `generation`.
     #[must_use]
     pub fn new(generation: u64, set: &RemoteSet) -> Self {
-        Self(std::sync::RwLock::new((
-            generation,
-            set.ready_outputs(),
-            set.ready_streams(),
-        )))
+        Self(
+            std::sync::RwLock::new((generation, set.ready_outputs(), set.ready_streams())),
+            std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    /// Marks the streams unavailable (closed, not recorded again yet) or
+    /// live again.
+    pub fn set_streams_unavailable(&self, unavailable: bool) {
+        self.1
+            .store(unavailable, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the streams are unavailable.
+    #[must_use]
+    pub fn streams_unavailable(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Records `set` as live at `generation`.
@@ -402,6 +423,7 @@ impl OutputSnapshot {
             generation,
             outputs,
             streams,
+            streams_unavailable: self.streams_unavailable(),
         }
     }
 }
@@ -545,6 +567,11 @@ impl OutputService {
                 "the session's compositor does not compose in a wide colour state".to_owned(),
             ));
         }
+        if self.snapshot.streams_unavailable() {
+            return self
+                .snapshot
+                .reply(Some(STREAMS_UNAVAILABLE_REFUSAL.to_owned()));
+        }
         let (current, outputs, streams) = self.snapshot.current();
         if generation != current {
             return self.snapshot.reply(Some(format!(
@@ -561,6 +588,7 @@ impl OutputService {
                     generation: current,
                     outputs,
                     streams: casts.streams().to_vec(),
+                    streams_unavailable: false,
                 };
             }
         }
@@ -606,6 +634,7 @@ impl OutputService {
                     generation: current,
                     outputs,
                     streams: casts.streams().to_vec(),
+                    streams_unavailable: false,
                 };
                 tracing::info!(
                     target: target::SESSION,
@@ -636,6 +665,11 @@ impl OutputService {
         generation: u64,
         outputs: &[OutputPlacement],
     ) -> Result<(), ReconfigureFailure> {
+        if self.snapshot.streams_unavailable() {
+            return Err(ReconfigureFailure::Transaction(
+                STREAMS_UNAVAILABLE_REFUSAL.to_owned(),
+            ));
+        }
         let current = self.facts.snapshot().generation;
         check_next_generation(current, generation)?;
         // Wide streams record the outputs being replaced.

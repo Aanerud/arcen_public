@@ -167,6 +167,9 @@ pub struct LauncherConfig {
     /// `platform.session.mode`: join the user's console session (the
     /// default, ADR 0025) or create a dedicated desktop.
     pub desktop_mode: arcen_session::console_session::DesktopMode,
+    /// `platform.session.guest_layout`: another product's desktop takes the
+    /// Deck's monitors on attach (default) or keeps its layout.
+    pub guest_layout: arcen_session::console_session::guest_layout::GuestLayoutSetting,
 }
 
 #[derive(Serialize)]
@@ -262,6 +265,17 @@ struct OpenRequest {
     /// what it cannot do is reported (`LauncherResponse::desk_privacy`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     desk_required: bool,
+    /// `platform.session.guest_layout`: another product's desktop takes the
+    /// Deck's monitors on attach while that product has no client attached
+    /// (`deck`, also what an absent field means) or keeps its layout
+    /// (`keep`).
+    #[serde(default)]
+    guest_layout: arcen_session::console_session::guest_layout::GuestLayoutSetting,
+    /// The Deck matches its layout (Match My Layout) with the one display
+    /// it is served: another product's desktop takes that display's layout
+    /// too (shared `connect_layout::console_layout_ask`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    match_layout: bool,
 }
 
 /// A served Deck display's facts, carried to the privileged launcher.
@@ -573,6 +587,8 @@ impl OpenRequest {
             console: false,
             desk_live: false,
             desk_required: false,
+            guest_layout: arcen_session::console_session::guest_layout::GuestLayoutSetting::Deck,
+            match_layout: false,
         }
     }
 
@@ -939,9 +955,12 @@ pub struct AuthenticatedLauncher {
     provider: arcen_session::desktop_provider::DesktopProvider,
     audio: AgentAudioArguments,
     desktop_mode: arcen_session::console_session::DesktopMode,
+    guest_layout: arcen_session::console_session::guest_layout::GuestLayoutSetting,
     /// A host that creates its own Wayland desktops found the account's own
     /// proven Wayland session: this sign-in joins it instead (S4b).
     joins_wayland_console: bool,
+    /// The Deck matches its layout with its one served display.
+    match_layout: bool,
 }
 
 impl AuthenticatedLauncher {
@@ -1005,6 +1024,13 @@ impl AuthenticatedLauncher {
     /// [`AuthenticatedLauncher::open`] to take effect.
     pub(crate) fn set_session_display(&mut self, display: Option<SessionDisplayMsg>) {
         self.session_display = display;
+    }
+
+    /// Whether the Deck matches its layout (Match My Layout) with its one
+    /// served display. Must be called before [`AuthenticatedLauncher::open`]
+    /// to take effect.
+    pub(crate) fn set_match_layout(&mut self, match_layout: bool) {
+        self.match_layout = match_layout;
     }
 
     /// Sets how a headless Wayland desktop opened by this launcher records
@@ -1215,7 +1241,9 @@ impl AuthenticatedLauncher {
                 provider: config.provider,
                 audio: config.audio.clone(),
                 desktop_mode: config.desktop_mode,
+                guest_layout: config.guest_layout,
                 joins_wayland_console: false,
+                match_layout: false,
             }),
             "rejected" => Err(LauncherError::Rejected),
             status => arcen_session::console_session::ConsoleNotice::from_status(status, None)
@@ -1370,6 +1398,8 @@ impl AuthenticatedLauncher {
         request.console = true;
         request.desk_live = !desk_plan.protects();
         request.desk_required = desk_plan.fails_closed();
+        request.guest_layout = self.guest_layout;
+        request.match_layout = self.match_layout;
         // A joined Wayland session's streams report the cursor as the
         // Deck asked.
         request.stream_cursor = self.stream_cursor;
@@ -1977,23 +2007,55 @@ const CONSOLE_LAYOUT_SHOWN: &str = "shown";
 #[cfg(target_os = "linux")]
 fn console_layout_requests(
     open: &OpenRequest,
+    origin: arcen_session::console_session::ConsoleOrigin,
+) -> Option<Vec<arcen_outputs::console_layout::ConsoleHeadRequest>> {
+    deck_console_layout(
+        open.multi_monitor.as_ref(),
+        open.display.as_ref(),
+        open.match_layout,
+        origin,
+    )
+}
+
+/// The layout a joined console started by `origin` takes for a Deck that
+/// asked for `plan` (several monitors) or `display` (one), matching its
+/// layout or not: the shared `connect_layout::console_layout_ask`, in
+/// requests.
+#[cfg(target_os = "linux")]
+fn deck_console_layout(
+    plan: Option<&MultiHeadPlanMsg>,
+    display: Option<&SessionDisplayMsg>,
+    match_layout: bool,
+    origin: arcen_session::console_session::ConsoleOrigin,
 ) -> Option<Vec<arcen_outputs::console_layout::ConsoleHeadRequest>> {
     use super::console_layout;
-    if let Some(plan) = open.multi_monitor.clone() {
-        let plan = plan.into_plan().ok()?;
-        if plan.backend == crate::display::topology::LinuxTopologyBackend::ConsoleOutputs {
-            return console_layout::requests_from_plan(&plan);
-        }
-        return None;
+    use arcen_session::console_session::connect_layout::{
+        console_layout_ask, ConsoleLayoutAsk, DeckLayout,
+    };
+    let plan = plan.cloned().map(|plan| plan.into_plan().ok()).map(|plan| {
+        plan.filter(|plan| {
+            plan.backend == crate::display::topology::LinuxTopologyBackend::ConsoleOutputs
+        })
+    });
+    let deck = match (&plan, display) {
+        (Some(Some(_)), _) => DeckLayout::Monitors,
+        // A plan for outputs that are not the console's never falls back to
+        // one display.
+        (Some(None), _) | (None, None) => DeckLayout::Nothing,
+        (None, Some(_)) if match_layout => DeckLayout::MatchOneDisplay,
+        (None, Some(_)) => DeckLayout::OneDisplay,
+    };
+    match console_layout_ask(origin, deck, console_layout::virtual_outputs_installed()) {
+        ConsoleLayoutAsk::Monitors => console_layout::requests_from_plan(&plan??),
+        ConsoleLayoutAsk::OneDisplay => display.map(|display| {
+            vec![console_layout::request_for_display(
+                display.width,
+                display.height,
+                display.refresh_hz,
+            )]
+        }),
+        ConsoleLayoutAsk::Keep => None,
     }
-    let display = open.display.as_ref()?;
-    console_layout::virtual_outputs_installed().then(|| {
-        vec![console_layout::request_for_display(
-            display.width,
-            display.height,
-            display.refresh_hz,
-        )]
-    })
 }
 
 /// A console launcher's answer that a returning Deck is attached.
@@ -3382,6 +3444,45 @@ pub async fn run_launcher(args: &[String]) -> Result<(), LauncherError> {
     deskside_restore.map_err(|_| LauncherError::Deskside)
 }
 
+/// Maps the Deck's monitors onto another product's desktop shown as it is
+/// (read, never changed): each Deck monitor shows the output in the same
+/// place of that desktop's own layout. The `console_layout` answer and the
+/// mapping, or the reason nothing could be mapped.
+#[cfg(target_os = "linux")]
+async fn show_guest_desktop(
+    display: &super::console::SessionDisplay,
+    requests: &[arcen_outputs::console_layout::ConsoleHeadRequest],
+) -> (String, Option<super::console_layout::GuestLayout>) {
+    match super::console_layout::match_shown(display, requests).await {
+        Ok(shown) => {
+            if shown.exact {
+                tracing::info!(
+                    target: target::SESSION,
+                    mapping = %shown.note,
+                    "another product's desktop has the Deck's layout; each monitor is captured as it is shown"
+                );
+            } else {
+                tracing::warn!(
+                    target: target::SESSION,
+                    mapping = %shown.note,
+                    "another product's desktop is laid out differently from the Deck's monitors; each Deck monitor shows the output in its place, fitted"
+                );
+            }
+            (CONSOLE_LAYOUT_SHOWN.to_owned(), Some(shown))
+        }
+        Err(failure) => {
+            tracing::warn!(
+                target: target::SESSION,
+                reason_class = failure.token,
+                detail = %failure.detail,
+                monitors = requests.len(),
+                "another product's desktop shows nothing the Deck's monitors can be mapped to; it is not changed"
+            );
+            (failure.token.to_owned(), None)
+        }
+    }
+}
+
 /// Joins the user's console session (ADR 0025) and keeps it private until
 /// the broker lets go; then hands the console back locked. Never starts or
 /// ends a session of its own: a remote-first sign-in is completed by GDM's
@@ -3666,52 +3767,77 @@ async fn run_console(
     // The Deck's layout, while the monitors are blank and the session not
     // yet open (ADR 0025 §6). A console that cannot take it is left as it
     // is, and the Pier is told why (it ends the sign-in with the reason).
-    let layout_requests = if guest {
-        // Shown as it is: never laid out; a single picture never asks.
-        open.multi_monitor
-            .clone()
-            .and_then(|plan| plan.into_plan().ok())
-            .and_then(|plan| super::console_layout::requests_from_plan(&plan))
-    } else {
-        console_layout_requests(open)
-    };
+    // Another product's desktop (§8) takes it only while that product has
+    // no client attached, looked at again just before (shared
+    // `guest_layout`), and keeps it when the Deck leaves; otherwise, or
+    // when it cannot take it, it is shown as it is.
+    // Whoever connects is asked for their own Deck's layout, whatever an
+    // earlier connection left (shared `connect_layout`): on another
+    // product's desktop a Deck that matches its layout with one display
+    // too.
+    let layout_requests = console_layout_requests(open, origin);
     let mut console_outputs = None;
     let mut console_shown = None;
     let console_layout = match layout_requests.as_deref() {
-        // Read, never changed: each Deck monitor is shown by the output in
-        // the same place of the desktop's own layout.
-        Some(requests) if guest => Some(
-            match super::console_layout::match_shown(&session_display, requests).await {
-                Ok(shown) => {
-                    if shown.exact {
+        Some(requests) if guest => {
+            let (foreign_client, detail) = console::foreign_client().await;
+            let policy =
+                model::guest_layout::guest_layout_policy(model::guest_layout::GuestLayoutFacts {
+                    origin,
+                    foreign_client,
+                    setting: open.guest_layout,
+                });
+            let laid_out = if policy == Some(model::guest_layout::GuestLayoutPolicy::ApplyOnAttach)
+            {
+                privacy.leave_layout_on_departure();
+                match privacy
+                    .apply_layout(&session_display, &session_id, identity.uid, requests)
+                    .await
+                {
+                    Ok(()) => {
                         tracing::info!(
                             target: target::SESSION,
-                            mapping = %shown.note,
-                            "another product's desktop has the Deck's layout; each monitor is captured as it is shown"
+                            monitors = requests.len(),
+                            "another product's desktop, with no client of its own attached, takes the Deck's layout; it stays when the Deck leaves"
                         );
-                    } else {
+                        true
+                    }
+                    Err(failure) => {
                         tracing::warn!(
                             target: target::SESSION,
-                            mapping = %shown.note,
-                            "another product's desktop is laid out differently from the Deck's monitors; it is never changed, each Deck monitor shows the output in its place, fitted"
+                            reason_class = failure.token,
+                            detail = %failure.detail,
+                            monitors = requests.len(),
+                            "another product's desktop cannot take the Deck's layout; it is shown as it is"
                         );
+                        false
                     }
+                }
+            } else {
+                tracing::info!(
+                    target: target::SESSION,
+                    policy = policy.map_or("none", model::guest_layout::GuestLayoutPolicy::token),
+                    foreign_client = foreign_client.token(),
+                    detail = detail.as_deref().unwrap_or(""),
+                    "another product's desktop is shown as it is; its layout is not changed"
+                );
+                false
+            };
+            if laid_out {
+                Some(CONSOLE_LAYOUT_APPLIED.to_owned())
+            } else if open.multi_monitor.is_none() {
+                // One display left as it is is served as it always was:
+                // the output its primary maps to.
+                None
+            } else {
+                let (token, shown) = show_guest_desktop(&session_display, requests).await;
+                if let Some(shown) = shown {
                     console_outputs = Some(shown.outputs());
                     console_shown = Some(shown);
-                    CONSOLE_LAYOUT_SHOWN.to_owned()
                 }
-                Err(failure) => {
-                    tracing::warn!(
-                        target: target::SESSION,
-                        reason_class = failure.token,
-                        detail = %failure.detail,
-                        monitors = requests.len(),
-                        "another product's desktop shows nothing the Deck's monitors can be mapped to; it is never changed"
-                    );
-                    failure.token.to_owned()
-                }
-            },
-        ),
+                Some(token)
+            }
+        }
         Some(requests) => Some(
             match privacy
                 .apply_layout(&session_display, &session_id, identity.uid, requests)
@@ -6349,6 +6475,115 @@ pub async fn unlock_logind_session_id(session_id: &str) -> Result<(), LauncherEr
     Err(LauncherError::LogindUnlock)
 }
 
+/// GDM's version on the system bus, as GNOME Shell's `canLock` asks it
+/// (shared `desktop_session::lock::LockPolicy`).
+#[cfg(target_os = "linux")]
+pub(crate) async fn gdm_version() -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let connection = zbus::Connection::system().await.ok()?;
+        let proxy = zbus::Proxy::new(
+            &connection,
+            "org.gnome.DisplayManager",
+            "/org/gnome/DisplayManager/Manager",
+            "org.gnome.DisplayManager.Manager",
+        )
+        .await
+        .ok()?;
+        proxy.get_property::<String>("Version").await.ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn gdm_version() -> Option<String> {
+    None
+}
+
+/// Why a desktop's logind session did not lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogindLockFailure {
+    /// The session id is not one logind issues.
+    InvalidSession,
+    /// `loginctl lock-session` failed or did not answer.
+    Refused,
+    /// logind took the request, but the session never reported its lock
+    /// screen (`LockedHint`).
+    NoLockScreen,
+    /// logind no longer has the session (it ended): nothing is left to lock.
+    SessionGone,
+}
+
+impl LogindLockFailure {
+    /// Stable token for logs.
+    pub(crate) const fn token(self) -> &'static str {
+        match self {
+            Self::InvalidSession => "invalid_session",
+            Self::Refused => "lock_refused",
+            Self::NoLockScreen => "no_lock_screen",
+            Self::SessionGone => "session_gone",
+        }
+    }
+}
+
+/// Locks a desktop's logind session and waits, bounded, until the session
+/// reports its lock screen (`LockedHint=yes`).
+#[cfg(target_os = "linux")]
+pub(crate) async fn lock_logind_session_id(session_id: &str) -> Result<(), LogindLockFailure> {
+    if !safe_session_id(session_id) {
+        return Err(LogindLockFailure::InvalidSession);
+    }
+    let mut lock = Command::new("/usr/bin/loginctl");
+    lock.args(["lock-session", session_id]);
+    let failure = match command_status_with_timeout(lock, LauncherError::LogindUnlock).await {
+        Ok(status) if status.success() => {
+            for _ in 0..25 {
+                if locked_hint(session_id).await == Some(true) {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            LogindLockFailure::NoLockScreen
+        }
+        _ => LogindLockFailure::Refused,
+    };
+    if locked_hint(session_id).await.is_none() {
+        let mut show = Command::new("/usr/bin/loginctl");
+        show.args(["show-session", session_id, "-p", "Id", "--value"]);
+        if matches!(
+            command_output_with_timeout(show, LauncherError::LogindUnlock).await,
+            Ok(output) if !output.status.success()
+        ) {
+            return Err(LogindLockFailure::SessionGone);
+        }
+    }
+    Err(failure)
+}
+
+/// The session's `LockedHint`, or `None` when logind does not answer it.
+#[cfg(target_os = "linux")]
+async fn locked_hint(session_id: &str) -> Option<bool> {
+    let mut show = Command::new("/usr/bin/loginctl");
+    show.args(["show-session", session_id, "-p", "LockedHint", "--value"]);
+    let output = command_output_with_timeout(show, LauncherError::LogindUnlock)
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn lock_logind_session_id(_session_id: &str) -> Result<(), LogindLockFailure> {
+    Err(LogindLockFailure::Refused)
+}
+
 #[cfg(target_os = "linux")]
 pub async fn validate_active_logind_session(
     session_id: &str,
@@ -7589,6 +7824,56 @@ mod tests {
         let inventory =
             HeadInventory::uniform(VALID_HEAD_TOKENS.iter().take(2).copied()).expect("inventory");
         plan_topology(&requested, generation, &inventory).expect("plan")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_products_desktop_is_asked_for_a_one_display_decks_own_layout() {
+        use arcen_session::console_session::ConsoleOrigin;
+        let laptop = SessionDisplayMsg {
+            width: 2560,
+            height: 1600,
+            refresh_hz: 60,
+            width_mm: 0.0,
+            height_mm: 0.0,
+            scale: 2.0,
+            product_id: 1,
+            serial: 0,
+            color: None,
+        };
+        let guest = ConsoleOrigin::OtherProduct;
+        // Match My Layout with one display: that display, whatever layout an
+        // earlier client or Deck left on the desktop.
+        assert_eq!(
+            deck_console_layout(None, Some(&laptop), true, guest),
+            Some(vec![crate::session::console_layout::request_for_display(
+                2560, 1600, 60
+            )])
+        );
+        // Primary Display Only: the desktop is shown as it is.
+        assert_eq!(deck_console_layout(None, Some(&laptop), false, guest), None);
+        // Several monitors: every one of them, never only the served display.
+        let mut plan = sample_topology_plan();
+        plan.backend = crate::display::topology::LinuxTopologyBackend::ConsoleOutputs;
+        let requests = deck_console_layout(
+            Some(&MultiHeadPlanMsg::from_plan(&plan)),
+            Some(&laptop),
+            true,
+            guest,
+        )
+        .expect("the plan's layout");
+        assert_eq!(requests.len(), 2);
+        // A plan for outputs that are not the console's asks for nothing.
+        plan.backend = crate::display::topology::LinuxTopologyBackend::DedicatedXorg;
+        assert_eq!(
+            deck_console_layout(
+                Some(&MultiHeadPlanMsg::from_plan(&plan)),
+                Some(&laptop),
+                true,
+                guest
+            ),
+            None
+        );
     }
 
     #[test]

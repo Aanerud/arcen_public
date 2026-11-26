@@ -1426,8 +1426,45 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Runs `test` again in a fresh copy of this test binary, alone, and
+    /// returns `true` once it passed there; returns `false` in that copy,
+    /// where the caller runs its body.
+    ///
+    /// An `flock` belongs to the open file description, and spawning a
+    /// process copies every descriptor (close-on-exec ones too) into the
+    /// child until it execs. While a test holds the lock, any other test
+    /// thread that spawns a process takes a copy of it, so the test's own
+    /// next acquisition, after it released the lock, can find it still held
+    /// for a few milliseconds. Releasing and taking the lock again is only
+    /// deterministic in a process where nothing else spawns.
+    fn rerun_alone(test: &str) -> bool {
+        const ALONE: &str = "ARCEN_HOST_CERT_TEST_ALONE";
+        if std::env::var_os(ALONE).is_some() {
+            return false;
+        }
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, path)| path);
+        let name = format!("{module}::{test}");
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([name.as_str(), "--exact", "--test-threads=1"])
+            .env(ALONE, "1")
+            .output()
+            .expect("run the test alone");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{name} alone:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     #[test]
     fn a_second_concurrent_run_refuses_cleanly_and_changes_nothing() {
+        if rerun_alone("a_second_concurrent_run_refuses_cleanly_and_changes_nothing") {
+            return;
+        }
         let dir = temp_dir("locked");
         provision(
             &dir,

@@ -143,6 +143,46 @@ pub(crate) fn attach_input_desktop() -> Result<String, String> {
     platform::attach_input_desktop()
 }
 
+/// What [`restore_behind_lock`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BehindLock {
+    /// No journal was left: the session agent or its watchdog restored.
+    NothingLeft,
+    /// The console recovery replayed the journal behind the lock screen.
+    Restored,
+    /// It ran and did not restore (exit code); the journal waits for the
+    /// next console change.
+    NotRestored(u32),
+    /// It could not run.
+    Failed(String),
+}
+
+/// Gives the desk its displays back behind a lock screen that is already
+/// up (ADR 0025 §4, the lock-first hand-back): a locked session's own
+/// processes may not change its displays, so a journal the session agent
+/// left is replayed now by `restore-display --console`, LocalSystem on the
+/// console's input desktop (the secure desktop while the session is
+/// locked), rather than at the next console change.
+pub(crate) async fn restore_behind_lock(journal: PathBuf) -> BehindLock {
+    if !journal.exists() {
+        return BehindLock::NothingLeft;
+    }
+    let exclusive = gate().write_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _exclusive = exclusive;
+        if !journal.exists() {
+            return BehindLock::NothingLeft;
+        }
+        match platform::run_in_console() {
+            Ok(0) => BehindLock::Restored,
+            Ok(code) => BehindLock::NotRestored(code),
+            Err(error) => BehindLock::Failed(error),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| BehindLock::Failed("console display recovery task failed".to_string()))
+}
+
 #[cfg(windows)]
 mod platform {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};

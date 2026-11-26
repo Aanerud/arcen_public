@@ -91,8 +91,7 @@ mod tests {
         fn new() -> Self {
             let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let base = std::env::var_os("CARGO_TARGET_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("target"));
+                .map_or_else(|| PathBuf::from("target"), PathBuf::from);
             let root = base
                 .join("arcen-test-fixtures")
                 .join(format!("zoneinfo-{}-{id}", std::process::id()));

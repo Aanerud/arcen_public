@@ -127,7 +127,8 @@ pub use host_converted_capture::{
     host_converted_capture_fits,
 };
 pub use intent::{
-    ClientVideoRequestError, ResolvedClientVideoRequest, resolve_client_video_request,
+    ClientVideoRequestError, ResolvedClientVideoRequest, hdr_request_as_grading,
+    resolve_client_video_request,
 };
 pub use obu::av1_low_overhead_has_sequence_header;
 pub use pipeline::{

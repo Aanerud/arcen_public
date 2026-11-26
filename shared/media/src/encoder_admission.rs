@@ -7,6 +7,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+use crate::video::AcceleratorClass;
 use crate::{
     ActivityClass, BitrateBudgetKbps, ChromaSubsampling, DirtyRatio, MAX_MULTI_MONITOR_COUNT,
     MediaContractError, RegionActivityDiagnostics, RegionGeneration, RegionId, RegionMediaPlan,
@@ -23,6 +24,20 @@ const FPS_STEPDOWN_LADDER: [u32; 6] = [60, 50, 45, 40, 30, 24];
 /// Shared degradation reason published when measured encoder capacity reduces
 /// a preset's requested frame-rate ceiling.
 pub const ENCODER_CAPACITY_FPS_DEGRADATION_REASON: &str = "fps_reduced_by_encoder_capacity";
+
+/// Degradation reason for a display moved to another encoder because the
+/// preferred set was measured and did not keep up (or did not finish its
+/// measurement in time).
+pub const ENCODER_CAPACITY_REASSIGN_DEGRADATION_REASON: &str = "encoder_reassigned_by_capacity";
+
+/// Degradation reason for a display moved to another encoder because the
+/// preferred set could not be started.
+pub const ENCODER_PROBE_REASSIGN_DEGRADATION_REASON: &str =
+    "encoder_reassigned_after_probe_failure";
+
+/// Degradation reason for a display on a software encoder beside hardware
+/// ones because the host allows fewer hardware encode sessions than displays.
+pub const ENCODER_CEILING_DEGRADATION_REASON: &str = "hardware_encoder_ceiling";
 
 /// Maximum number of exact encoder-set candidates admitted in one bounded run.
 ///
@@ -611,6 +626,73 @@ impl EncoderSetDecision {
             | Self::StepDown { attempts, .. }
             | Self::Reject { attempts } => attempts,
         }
+    }
+
+    /// The displays of the selected encoder set that are served on another
+    /// encoder than they should be, each with why:
+    ///
+    /// - a display the preferred set (candidate 0) gave another backend, after
+    ///   that set was measured and did not keep up, or did not finish its
+    ///   measurement in time ([`ENCODER_CAPACITY_REASSIGN_DEGRADATION_REASON`]),
+    ///   or could not be started or encode
+    ///   ([`ENCODER_PROBE_REASSIGN_DEGRADATION_REASON`]);
+    /// - a display on a software encoder beside a hardware one in the same
+    ///   set, because the host allows fewer hardware sessions than displays
+    ///   ([`ENCODER_CEILING_DEGRADATION_REASON`]).
+    ///
+    /// A host that encodes every display in software has no such display.
+    /// Empty when no candidate was selected.
+    #[must_use]
+    pub fn region_encoder_degradations(&self) -> Vec<(SessionMonitorId, &'static str)> {
+        let Some(selected_index) = self.selected_candidate_index() else {
+            return Vec::new();
+        };
+        let attempts = self.attempts();
+        let (Some(preferred), Some(selected)) = (
+            attempts.iter().find(|attempt| attempt.candidate_index == 0),
+            attempts
+                .iter()
+                .find(|attempt| attempt.candidate_index == selected_index),
+        ) else {
+            return Vec::new();
+        };
+        // A probe that ran past its deadline is an encoder too slow to finish
+        // the measurement: capacity, not a failure to start.
+        let reassigned = match &preferred.outcome {
+            EncoderSetAttemptOutcome::ProbeFailed { failures }
+                if failures.iter().any(|region| {
+                    region.failure.kind != EncoderProbeFailureKind::DeadlineExceeded
+                }) =>
+            {
+                ENCODER_PROBE_REASSIGN_DEGRADATION_REASON
+            }
+            EncoderSetAttemptOutcome::Passed(_)
+            | EncoderSetAttemptOutcome::ThresholdFailed { .. }
+            | EncoderSetAttemptOutcome::ProbeFailed { .. } => {
+                ENCODER_CAPACITY_REASSIGN_DEGRADATION_REASON
+            }
+        };
+        let plans = selected.candidate.roster().plans();
+        let mixed = plans
+            .iter()
+            .any(|plan| plan.backend.accelerator_class() == AcceleratorClass::Hardware);
+        plans
+            .iter()
+            .filter_map(|plan| {
+                let preferred_backend = preferred
+                    .candidate
+                    .roster()
+                    .plan(plan.session_monitor_id)
+                    .map(|preferred| preferred.backend);
+                if selected_index != 0 && preferred_backend.is_some_and(|b| b != plan.backend) {
+                    Some((plan.session_monitor_id, reassigned))
+                } else if mixed && plan.backend.accelerator_class() == AcceleratorClass::Software {
+                    Some((plan.session_monitor_id, ENCODER_CEILING_DEGRADATION_REASON))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[must_use]
@@ -1718,6 +1800,91 @@ mod tests {
                 EncoderThresholdViolation::EncodeLatency { .. }
             ))
         );
+    }
+
+    #[test]
+    fn a_display_moved_off_the_preferred_encoder_carries_why() {
+        let candidates = || {
+            vec![
+                candidate(&[
+                    (EncoderBackend::NativeNvenc, ChromaSubsampling::Yuv420, 30),
+                    (EncoderBackend::NativeNvenc, ChromaSubsampling::Yuv420, 30),
+                ]),
+                candidate(&[
+                    (EncoderBackend::NativeNvenc, ChromaSubsampling::Yuv420, 30),
+                    (EncoderBackend::OpenH264, ChromaSubsampling::Yuv420, 30),
+                ]),
+            ]
+        };
+        let profiles = || {
+            profiles(vec![
+                profile(
+                    1,
+                    ActivityClass::FullMotion,
+                    30,
+                    RegionAdmissionPriority::Standard,
+                ),
+                profile(
+                    2,
+                    ActivityClass::FullMotion,
+                    30,
+                    RegionAdmissionPriority::Standard,
+                ),
+            ])
+        };
+        let second = SessionMonitorId::new(2).expect("monitor id");
+        for (behavior, reason) in [
+            (
+                Behavior::Stall865Ms,
+                ENCODER_CAPACITY_REASSIGN_DEGRADATION_REASON,
+            ),
+            (
+                Behavior::FailOpen,
+                ENCODER_PROBE_REASSIGN_DEGRADATION_REASON,
+            ),
+        ] {
+            let adapter = FakeAdapter::new(BTreeMap::from([((0, 2), behavior)]));
+            let decision = admit_encoder_sets(candidates(), &profiles(), thresholds(), &adapter)
+                .expect("decision");
+            assert_eq!(decision.selected_candidate_index(), Some(1));
+            assert_eq!(
+                decision.region_encoder_degradations(),
+                vec![(second, reason)]
+            );
+        }
+        let accepted = admit_encoder_sets(
+            candidates(),
+            &profiles(),
+            thresholds(),
+            &FakeAdapter::new(BTreeMap::new()),
+        )
+        .expect("decision");
+        assert!(accepted.region_encoder_degradations().is_empty());
+
+        // A host allowing one hardware session: the preferred set is already
+        // mixed, and its software display says why.
+        let ceiling = admit_encoder_sets(
+            vec![candidates().remove(1)],
+            &profiles(),
+            thresholds(),
+            &FakeAdapter::new(BTreeMap::new()),
+        )
+        .expect("decision");
+        assert_eq!(
+            ceiling.region_encoder_degradations(),
+            vec![(second, ENCODER_CEILING_DEGRADATION_REASON)]
+        );
+        let software_only = admit_encoder_sets(
+            vec![candidate(&[
+                (EncoderBackend::OpenH264, ChromaSubsampling::Yuv420, 30),
+                (EncoderBackend::OpenH264, ChromaSubsampling::Yuv420, 30),
+            ])],
+            &profiles(),
+            thresholds(),
+            &FakeAdapter::new(BTreeMap::new()),
+        )
+        .expect("decision");
+        assert!(software_only.region_encoder_degradations().is_empty());
     }
 
     #[test]

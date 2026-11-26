@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use tokio::sync::Notify;
@@ -21,12 +21,15 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-    SC_MANAGER_CONNECT, SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
+    SC_MANAGER_CONNECT, SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_SESSIONCHANGE,
+    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_PRESHUTDOWN,
     SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
     SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
     SERVICE_WIN32_OWN_PROCESS,
 };
+
+use arcen_session::host_shutdown::{StopCause, SHUTDOWN_GRANT};
 
 pub const SERVICE_NAME: &str = "ArcenPier";
 pub const SERVICE_CONTROL_TEMPORARY_DEBUG: u32 = 200;
@@ -87,6 +90,12 @@ pub(crate) fn query_installed_service_state() -> InstalledServiceState {
 static STOP_SIGNAL: OnceLock<Arc<StopSignal>> = OnceLock::new();
 static STATUS_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static CHECKPOINT: AtomicU32 = AtomicU32::new(1);
+/// The state last reported to the SCM (0 before the first report). Held
+/// while a status is reported, so a progress report never follows another
+/// thread's report of a different state.
+static REPORTED_STATE: Mutex<u32> = Mutex::new(0);
+/// How long each start step may take before the next progress report.
+const START_WAIT_HINT_MS: u32 = 10_000;
 static SERVICE_LOG: OnceLock<WindowsLogFile> = OnceLock::new();
 static CONTROL_REQUEST: AtomicU8 = AtomicU8::new(0);
 static CONTROL_NOTIFY: OnceLock<Notify> = OnceLock::new();
@@ -136,35 +145,74 @@ fn take_control_request() -> Option<ServiceControlRequest> {
     }
 }
 
+const STOP_NONE: u8 = 0;
+const STOP_REQUESTED: u8 = 1;
+const STOP_HOST_SHUTDOWN: u8 = 2;
+
+/// The service's stop request and its cause. A shutdown notice that follows
+/// a stop request upgrades it: the departure then fits the shutdown budget.
 struct StopSignal {
-    requested: AtomicBool,
+    cause: AtomicU8,
     notify: Notify,
 }
 
 impl StopSignal {
     fn new() -> Self {
         Self {
-            requested: AtomicBool::new(false),
+            cause: AtomicU8::new(STOP_NONE),
             notify: Notify::new(),
         }
     }
 
-    fn request(&self) {
-        self.requested.store(true, Ordering::Release);
+    fn request(&self, cause: StopCause) {
+        let code = match cause {
+            StopCause::Requested => STOP_REQUESTED,
+            StopCause::HostShutdown => STOP_HOST_SHUTDOWN,
+        };
+        self.cause.fetch_max(code, Ordering::AcqRel);
         self.notify.notify_waiters();
     }
 
-    async fn wait(&self) {
+    fn cause(&self) -> Option<StopCause> {
+        match self.cause.load(Ordering::Acquire) {
+            STOP_REQUESTED => Some(StopCause::Requested),
+            STOP_HOST_SHUTDOWN => Some(StopCause::HostShutdown),
+            _ => None,
+        }
+    }
+
+    async fn wait_for(&self, done: impl Fn(Option<StopCause>) -> bool) {
         loop {
-            if self.requested.load(Ordering::Acquire) {
+            if done(self.cause()) {
                 return;
             }
             let notified = self.notify.notified();
-            if self.requested.load(Ordering::Acquire) {
+            if done(self.cause()) {
                 return;
             }
             notified.await;
         }
+    }
+
+    async fn wait(&self) {
+        self.wait_for(|cause| cause.is_some()).await;
+    }
+}
+
+/// Why the service is stopping; `None` while it runs, and outside a service.
+pub(crate) fn stop_cause() -> Option<StopCause> {
+    STOP_SIGNAL.get().and_then(|stop| stop.cause())
+}
+
+/// Completes once Windows has said it is shutting down or restarting; never
+/// outside a service.
+pub(crate) async fn host_shutdown() {
+    match STOP_SIGNAL.get() {
+        Some(stop) => {
+            stop.wait_for(|cause| cause == Some(StopCause::HostShutdown))
+                .await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -403,7 +451,7 @@ fn service_main_impl() {
         report_status(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR.0, 3, 0);
         return;
     }
-    report_status(SERVICE_START_PENDING, NO_ERROR.0, 0, 10_000);
+    report_status(SERVICE_START_PENDING, NO_ERROR.0, 0, START_WAIT_HINT_MS);
 
     let args = match timezone_recovery_before_init(
         || {
@@ -470,7 +518,11 @@ fn service_main_impl() {
     ));
     match result {
         Ok(()) => {
-            emit_service_stop(&emitter, started_at.elapsed());
+            emit_service_stop(
+                &emitter,
+                stop.cause().unwrap_or(StopCause::Requested),
+                started_at.elapsed(),
+            );
             if let Err(error) = log_controller.flush_log() {
                 eprintln!("service observability flush failed: {error}");
             }
@@ -523,8 +575,13 @@ fn emit_service_start(emitter: &crate::eventlog::LifecycleEmitter) {
     );
 }
 
-/// Emits `SERVICE_STOP` (1001) after a clean stop/shutdown and host drain.
-fn emit_service_stop(emitter: &crate::eventlog::LifecycleEmitter, uptime: std::time::Duration) {
+/// Emits `SERVICE_STOP` (1001) after a clean stop/shutdown and host drain;
+/// `host_shutdown` when Windows was shutting down or restarting.
+fn emit_service_stop(
+    emitter: &crate::eventlog::LifecycleEmitter,
+    cause: StopCause,
+    uptime: std::time::Duration,
+) {
     let mut fields = arcen_telemetry::StructuredFields::default();
     let _ = fields.insert(
         "component",
@@ -532,7 +589,7 @@ fn emit_service_stop(emitter: &crate::eventlog::LifecycleEmitter, uptime: std::t
     );
     let _ = fields.insert(
         "reason_class",
-        arcen_telemetry::FieldValue::String("clean_shutdown".to_string()),
+        arcen_telemetry::FieldValue::String(cause.service_stop_reason().to_string()),
     );
     let uptime_ms = i64::try_from(uptime.as_millis()).unwrap_or(i64::MAX);
     let _ = fields.insert("uptime_ms", arcen_telemetry::FieldValue::Integer(uptime_ms));
@@ -600,6 +657,25 @@ pub(crate) async fn next_control_request() -> ServiceControlRequest {
     }
 }
 
+/// How long a requested stop may take before the SCM considers it hung.
+const STOP_WAIT_HINT_MS: u32 = 30_000;
+
+fn shutdown_grant_ms() -> u32 {
+    u32::try_from(SHUTDOWN_GRANT.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// Windows tells a service it is shutting down with PRESHUTDOWN, which it
+/// waits for up to the service's preshutdown timeout (the installer sets it
+/// to the shared `SHUTDOWN_GRANT`), and then SHUTDOWN, which a service
+/// shares with every other one in about five seconds.
+const fn stop_control_cause(control: u32) -> Option<StopCause> {
+    match control {
+        SERVICE_CONTROL_STOP => Some(StopCause::Requested),
+        SERVICE_CONTROL_PRESHUTDOWN | SERVICE_CONTROL_SHUTDOWN => Some(StopCause::HostShutdown),
+        _ => None,
+    }
+}
+
 const fn decode_service_control(control: u32) -> Option<ServiceControlRequest> {
     match control {
         SERVICE_CONTROL_TEMPORARY_DEBUG => Some(ServiceControlRequest::TemporaryDebug),
@@ -616,10 +692,14 @@ unsafe extern "system" fn control_handler(
     _event_data: *mut core::ffi::c_void,
     _context: *mut core::ffi::c_void,
 ) -> u32 {
-    if control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN {
-        report_status(SERVICE_STOP_PENDING, NO_ERROR.0, 0, 30_000);
+    if let Some(cause) = stop_control_cause(control) {
+        let wait_hint = match cause {
+            StopCause::Requested => STOP_WAIT_HINT_MS,
+            StopCause::HostShutdown => shutdown_grant_ms(),
+        };
+        report_status(SERVICE_STOP_PENDING, NO_ERROR.0, 0, wait_hint);
         if let Some(stop) = STOP_SIGNAL.get() {
-            stop.request();
+            stop.request(cause);
         }
     } else if let Some(request) = decode_service_control(control) {
         CONTROL_REQUEST.fetch_or(request.encoded(), Ordering::AcqRel);
@@ -628,7 +708,46 @@ unsafe extern "system" fn control_handler(
     NO_ERROR.0
 }
 
+/// Tells the SCM the start is still making progress (the next checkpoint).
+///
+/// Installers and `sc`/`net start` judge a start by its checkpoint: one that
+/// does not rise within the wait hint reads as a hung start. A no-op once the
+/// service runs, and outside a service.
+pub(crate) fn report_start_progress() {
+    let mut reported = REPORTED_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *reported == SERVICE_START_PENDING.0 {
+        report_status_locked(
+            &mut reported,
+            SERVICE_START_PENDING,
+            NO_ERROR.0,
+            0,
+            START_WAIT_HINT_MS,
+        );
+    }
+}
+
 fn report_status(
+    current_state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE,
+    win32_exit_code: u32,
+    service_exit_code: u32,
+    wait_hint: u32,
+) {
+    let mut reported = REPORTED_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    report_status_locked(
+        &mut reported,
+        current_state,
+        win32_exit_code,
+        service_exit_code,
+        wait_hint,
+    );
+}
+
+fn report_status_locked(
+    reported: &mut u32,
     current_state: windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE,
     win32_exit_code: u32,
     service_exit_code: u32,
@@ -643,7 +762,10 @@ fn report_status(
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: current_state,
         dwControlsAccepted: if current_state == SERVICE_RUNNING {
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE
+            SERVICE_ACCEPT_STOP
+                | SERVICE_ACCEPT_PRESHUTDOWN
+                | SERVICE_ACCEPT_SHUTDOWN
+                | SERVICE_ACCEPT_SESSIONCHANGE
         } else {
             0
         },
@@ -656,6 +778,7 @@ fn report_status(
         },
         dwWaitHint: wait_hint,
     };
+    *reported = current_state.0;
     // SAFETY: the status handle was returned for this service and `status`
     // remains live for the duration of the call.
     let _ = unsafe {
@@ -716,6 +839,36 @@ mod tests {
             *adapter.calls.lock().expect("calls"),
             [("stdout", 30), ("stderr", 30), ("stdout", 10)]
         );
+    }
+
+    #[test]
+    fn windows_shutdown_notices_stop_the_service_as_a_host_shutdown() {
+        assert_eq!(
+            stop_control_cause(SERVICE_CONTROL_PRESHUTDOWN),
+            Some(StopCause::HostShutdown)
+        );
+        assert_eq!(
+            stop_control_cause(SERVICE_CONTROL_SHUTDOWN),
+            Some(StopCause::HostShutdown)
+        );
+        assert_eq!(
+            stop_control_cause(SERVICE_CONTROL_STOP),
+            Some(StopCause::Requested)
+        );
+        assert_eq!(stop_control_cause(SERVICE_CONTROL_SESSIONCHANGE), None);
+        assert_eq!(stop_control_cause(SERVICE_CONTROL_TEMPORARY_DEBUG), None);
+    }
+
+    #[test]
+    fn a_shutdown_notice_upgrades_a_stop_already_under_way() {
+        let stop = StopSignal::new();
+        assert_eq!(stop.cause(), None);
+        stop.request(StopCause::Requested);
+        assert_eq!(stop.cause(), Some(StopCause::Requested));
+        stop.request(StopCause::HostShutdown);
+        assert_eq!(stop.cause(), Some(StopCause::HostShutdown));
+        stop.request(StopCause::Requested);
+        assert_eq!(stop.cause(), Some(StopCause::HostShutdown));
     }
 
     #[test]

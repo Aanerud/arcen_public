@@ -15,6 +15,10 @@ use std::sync::Arc;
 
 use arcen_outputs::{OutputContext, OutputProvider, OutputTransaction, OutputTransactionError};
 use arcen_session::desktop_session::first_login::FirstLoginSetup;
+use arcen_session::desktop_session::remote_access::{
+    refusal_is_inhibited, DesktopEnd, StreamsAction, StreamsEvent, StreamsLifetime,
+    SUSPENDED_PROBE_INTERVAL,
+};
 use arcen_session::wayland_outputs::{PlacedOutput, VirtualOutputMode};
 use arcen_session::wayland_session::{ReadinessError, WaylandSessionReadiness};
 use arcen_telemetry::CorrelationId;
@@ -23,7 +27,9 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use super::audio::WaylandSessionAudio;
-use super::clipboard::{ClipboardService, MutterClipboard, CLIPBOARD_INTERFACE};
+use super::clipboard::{
+    ClipboardService, MutterClipboard, RenewableClipboard, CLIPBOARD_INTERFACE,
+};
 use super::input::{InputService, SessionFacts};
 use super::mutter::{MutterError, MutterSessions};
 use super::output::{MutterOutputBinding, MutterOutputError, MutterVirtualOutputProvider};
@@ -617,7 +623,7 @@ async fn serve(
         // (libei 1.6); whether it offers one is read from its EIS seat.
         let eis_text = (eis_offered == Some(true)).then(|| {
             session_text.set_utf8(super::text::Utf8Route::NotOffered, None);
-            tokio::spawn(follow_eis_text(live.clone(), Arc::clone(&session_text)))
+            EisTextFollower::start(live.clone(), Arc::clone(&session_text))
         });
         let facts = Arc::new(SessionFacts::new(InputSessionFacts {
             generation: INITIAL_OUTPUT_GENERATION,
@@ -697,7 +703,9 @@ async fn serve(
             }
         }
         let clipboard =
-            prove_clipboard(&connection, &arguments.runtime_dir, uid, identity.username).await;
+            prove_clipboard(&connection, &arguments.runtime_dir, uid, identity.username)
+                .await
+                .map(|(service, compositor)| (service, RenewableClipboard::new(compositor)));
         let compositor_gpu = binding.stack_mut().compositor_gpu();
         tracing::info!(
             target: target::SESSION,
@@ -775,9 +783,9 @@ async fn serve(
             () = clipboard_served => {}
             () = outputs_served => {}
             member = stack.wait_for_member_exit() => {
-                tracing::warn!(target: target::SESSION, member, "headless stack member exited; ending the session");
+                tracing::warn!(target: target::SESSION, member, reason = DesktopEnd::CompositorExited.token(), "headless stack member exited; ending the session");
             }
-            () = recover_closed_streams(StreamRecovery {
+            end = recover_closed_streams(StreamRecovery {
                 live: &live,
                 connection: &connection,
                 runtime_dir: &arguments.runtime_dir,
@@ -786,14 +794,16 @@ async fn serve(
                 input: &input,
                 placement: &placement,
                 snapshot: &snapshot,
+                clipboard: clipboard.as_ref().map(|(_, compositor)| compositor),
+                eis_text: eis_text.as_ref(),
             }) => {
-                tracing::warn!(target: target::SESSION, "Mutter closed the RemoteDesktop/ScreenCast session and it could not be replaced; ending the session");
+                tracing::warn!(target: target::SESSION, reason = end.token(), "Mutter closed the RemoteDesktop/ScreenCast session and it could not be recorded again although nothing inhibits remote access; ending the session");
             }
             () = logout_confirmed(logout.as_mut()) => {
-                tracing::info!(target: target::SESSION, reason = "user_logout", "the user logged out inside the session; ending the desktop");
+                tracing::info!(target: target::SESSION, reason = DesktopEnd::LoggedOut.token(), "the user logged out inside the session; ending the desktop");
             }
             () = stop.recv() => {
-                tracing::info!(target: target::SESSION, "headless Wayland session stop requested");
+                tracing::info!(target: target::SESSION, reason = DesktopEnd::Stopped.token(), "headless Wayland session stop requested");
             }
             () = audio.watch() => {}
         }
@@ -801,8 +811,8 @@ async fn serve(
         if let Some(service) = &output_service {
             service.stop_wide().await;
         }
-        if let Some(eis_text) = eis_text {
-            eis_text.abort();
+        if let Some(eis_text) = &eis_text {
+            eis_text.stop();
         }
         Ok(())
     }
@@ -873,6 +883,42 @@ const EIS_TEXT_BACKOFF: [std::time::Duration; 3] = [
     std::time::Duration::from_secs(10),
 ];
 
+/// The task that follows the session's EIS text device, started again when
+/// the streams were recorded again after a lock (the old `RemoteDesktop`
+/// session's EIS connection went with it).
+struct EisTextFollower {
+    live: LiveOutputs,
+    text: Arc<super::text::SessionText>,
+    task: std::sync::Mutex<tokio::task::JoinHandle<()>>,
+}
+
+impl EisTextFollower {
+    fn start(live: LiveOutputs, text: Arc<super::text::SessionText>) -> Self {
+        let task = tokio::spawn(follow_eis_text(live.clone(), Arc::clone(&text)));
+        Self {
+            live,
+            text,
+            task: std::sync::Mutex::new(task),
+        }
+    }
+
+    fn restart(&self) {
+        let mut task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        task.abort();
+        *task = tokio::spawn(follow_eis_text(self.live.clone(), Arc::clone(&self.text)));
+    }
+
+    fn stop(&self) {
+        self.task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .abort();
+    }
+}
+
 /// Keeps the session's EIS text device for as long as the compositor
 /// offers one, reconnecting a bounded number of times when the connection
 /// ends (the `RemoteDesktop` session was replaced, the compositor
@@ -936,14 +982,20 @@ struct StreamRecovery<'a> {
     input: &'a InputService,
     placement: &'a tokio::sync::watch::Sender<super::remote::DesiredPlacement>,
     snapshot: &'a OutputSnapshot,
+    clipboard: Option<&'a RenewableClipboard>,
+    eis_text: Option<&'a EisTextFollower>,
 }
 
-/// Replaces the paired sessions when Mutter closes them while the compositor
-/// runs (a remote-monitor session only): the same outputs are recorded
-/// again by a new session, with new `PipeWire` nodes, as the next output
-/// generation, so the Pier's next capture epoch finds them through the
-/// output socket. Returns when they are closed and cannot be replaced.
-async fn recover_closed_streams(recovery: StreamRecovery<'_>) {
+/// Keeps the desktop when Mutter closes its paired sessions (a
+/// remote-monitor session only), as the shared
+/// [`StreamsLifetime`] decides: the same outputs are recorded again by a new
+/// session, with new `PipeWire` nodes, as the next output generation, so the
+/// Pier's next capture epoch finds them through the output socket. While
+/// the shell inhibits remote access (the desktop is locked) the desktop, its
+/// applications and its services stay; capture and input are suspended
+/// and the outputs are recorded again once the shield goes down or a probe
+/// succeeds. Returns only when the desktop must end.
+async fn recover_closed_streams(recovery: StreamRecovery<'_>) -> DesktopEnd {
     let StreamRecovery {
         live,
         connection,
@@ -953,38 +1005,157 @@ async fn recover_closed_streams(recovery: StreamRecovery<'_>) {
         input,
         placement,
         snapshot,
+        clipboard,
+        eis_text,
     } = recovery;
+    let mut lifetime = StreamsLifetime::new();
+    let mut shield: Option<super::session_manager::ShieldWatch> = None;
     loop {
         live_closed(live).await;
-        if !mode.reconfigurable() {
-            return;
+        snapshot.set_streams_unavailable(true);
+        let shield_active = shield_now(connection, &mut shield).await;
+        tracing::warn!(
+            target: target::SESSION,
+            shield_active = ?shield_active,
+            "Mutter closed the RemoteDesktop/ScreenCast session; the desktop stays and its outputs are recorded again"
+        );
+        if mode.reconfigurable() {
+            input.release_held(live).await;
+            placement.send_replace(None);
         }
-        tracing::warn!(target: target::SESSION, "Mutter closed the RemoteDesktop/ScreenCast session; recording the outputs again");
-        input.release_held(live).await;
-        placement.send_replace(None);
-        let mut set = live.0.write().await;
-        let placed = set.placed.clone();
-        let cursor_mode = set.cursor_mode;
-        match super::remote::establish(connection, runtime_dir, &placed, cursor_mode).await {
-            Ok(replacement) => {
-                let mut previous = std::mem::replace(&mut *set, replacement);
-                previous.sessions.stop().await;
-                let generation = facts.snapshot().generation.saturating_add(1);
-                facts.advance(generation, set.ready_streams());
-                snapshot.update(generation, &set);
-                placement.send_replace(Some(set.placements()));
-                tracing::info!(
-                    target: target::SESSION,
-                    generation,
-                    nodes = ?set.sessions.node_ids(),
-                    "outputs recorded again by a new ScreenCast session"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(target: target::SESSION, %error, "outputs could not be recorded again");
-                return;
-            }
+        let mut event = StreamsEvent::Closed {
+            replaceable: mode.reconfigurable(),
+            shield_active,
+        };
+        let mut reported = None;
+        loop {
+            event = match lifetime.on(event) {
+                StreamsAction::Establish { after } => {
+                    tokio::time::sleep(after).await;
+                    match replace_streams(live, connection, runtime_dir, facts, snapshot, placement)
+                        .await
+                    {
+                        Ok(()) => StreamsEvent::Established,
+                        Err(error) => {
+                            let message = error.to_string();
+                            let inhibited = refusal_is_inhibited(&message);
+                            let shield_active = shield_now(connection, &mut shield).await;
+                            if !inhibited && shield_active != Some(true) {
+                                tracing::warn!(target: target::SESSION, error = %message, "outputs could not be recorded again");
+                            }
+                            StreamsEvent::Refused {
+                                inhibited,
+                                shield_active,
+                            }
+                        }
+                    }
+                }
+                StreamsAction::Suspend(suspension) => {
+                    if reported != Some(suspension) {
+                        reported = Some(suspension);
+                        tracing::info!(
+                            target: target::SESSION,
+                            suspension = suspension.token(),
+                            "remote access is inhibited while the desktop is locked: the desktop and its applications stay, capture and input wait for the unlock"
+                        );
+                    }
+                    suspended_event(connection, &mut shield).await
+                }
+                StreamsAction::Continue => suspended_event(connection, &mut shield).await,
+                StreamsAction::Resume => {
+                    snapshot.set_streams_unavailable(false);
+                    if reported.is_some() {
+                        tracing::info!(
+                            target: target::SESSION,
+                            generation = facts.snapshot().generation,
+                            "the desktop was unlocked: its outputs are recorded again"
+                        );
+                        if let Some(clipboard) = clipboard {
+                            match clipboard.renew(connection).await {
+                                Ok(()) => {
+                                    tracing::info!(target: target::SESSION, event = "clipboard_bridge_proven", "compositor clipboard proven again on a new RemoteDesktop session")
+                                }
+                                Err(error) => {
+                                    tracing::info!(target: target::SESSION, event = "clipboard_bridge_unavailable", %error, "compositor clipboard could not be created again; clipboard unavailable until the next unlock")
+                                }
+                            }
+                        }
+                    }
+                    if let Some(eis_text) = eis_text {
+                        eis_text.restart();
+                    }
+                    break;
+                }
+                StreamsAction::End(end) => return end,
+            };
         }
+    }
+}
+
+/// Records the live outputs again on a new paired session and advances the
+/// output generation.
+async fn replace_streams(
+    live: &LiveOutputs,
+    connection: &zbus::Connection,
+    runtime_dir: &std::path::Path,
+    facts: &SessionFacts,
+    snapshot: &OutputSnapshot,
+    placement: &tokio::sync::watch::Sender<super::remote::DesiredPlacement>,
+) -> Result<(), super::remote::RemoteOutputError> {
+    let mut set = live.0.write().await;
+    let placed = set.placed.clone();
+    let cursor_mode = set.cursor_mode;
+    let replacement =
+        super::remote::establish(connection, runtime_dir, &placed, cursor_mode).await?;
+    let mut previous = std::mem::replace(&mut *set, replacement);
+    previous.sessions.stop().await;
+    let generation = facts.snapshot().generation.saturating_add(1);
+    facts.advance(generation, set.ready_streams());
+    snapshot.update(generation, &set);
+    placement.send_replace(Some(set.placements()));
+    tracing::info!(
+        target: target::SESSION,
+        generation,
+        nodes = ?set.sessions.node_ids(),
+        "outputs recorded again by a new ScreenCast session"
+    );
+    Ok(())
+}
+
+/// The screen shield now, following it from the first answer on.
+async fn shield_now(
+    connection: &zbus::Connection,
+    shield: &mut Option<super::session_manager::ShieldWatch>,
+) -> Option<bool> {
+    if shield.is_none() {
+        *shield = super::session_manager::ShieldWatch::connect(connection).await;
+    }
+    shield.as_ref()?.active().await
+}
+
+/// What ends a suspended wait: the shield changing, or the probe interval.
+async fn suspended_event(
+    connection: &zbus::Connection,
+    shield: &mut Option<super::session_manager::ShieldWatch>,
+) -> StreamsEvent {
+    if shield.is_none() {
+        *shield = super::session_manager::ShieldWatch::connect(connection).await;
+    }
+    let changed = async {
+        match shield.as_mut() {
+            Some(watch) => watch.changed().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        changed = changed => match changed {
+            Some(active) => StreamsEvent::ShieldChanged(active),
+            None => {
+                *shield = None;
+                StreamsEvent::ProbeDue
+            }
+        },
+        () = tokio::time::sleep(SUSPENDED_PROBE_INTERVAL) => StreamsEvent::ProbeDue,
     }
 }
 

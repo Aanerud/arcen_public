@@ -647,11 +647,25 @@ pub fn full_color_display_ids(
     color_fidelity: crate::settings::ColorFidelitySettings,
     full_color_display_mask: u8,
 ) -> Vec<String> {
-    let require_full_color_roster =
+    full_color_display_ids_for_chroma(
+        topology,
         crate::settings::effective_color_fidelity_variant(color_fidelity)
             .video
-            .chroma
-            == arcen_media::ChromaSubsampling::Yuv444;
+            .chroma,
+        full_color_display_mask,
+    )
+}
+
+/// [`full_color_display_ids`] for a request whose chroma is already known
+/// (a command-line profile): every display when `chroma` is 4:4:4, otherwise
+/// the displays in `full_color_display_mask`.
+#[must_use]
+pub fn full_color_display_ids_for_chroma(
+    topology: &arcen_media::RequestedMonitorTopology,
+    chroma: arcen_media::ChromaSubsampling,
+    full_color_display_mask: u8,
+) -> Vec<String> {
+    let require_full_color_roster = chroma == arcen_media::ChromaSubsampling::Yuv444;
     topology
         .monitors()
         .iter()
@@ -871,11 +885,10 @@ pub struct DisplaysRecoveryRetry {
     /// Ask the host to replace the incompatible desktop.
     pub replace_desktop: bool,
     /// A one-shot Displays mode for this endpoint's next attempt.
+    /// Nothing is saved on the connection: a host's failure decides one
+    /// retry, never the connection's later sessions (a host that recovers
+    /// gets the whole layout again).
     pub displays_override: Option<(String, DisplaysMode)>,
-    /// Persist this mode on the saved connection. Neither recovery sets
-    /// it: a host's failure decides one retry, never the connection's
-    /// later sessions (a host that recovers gets the whole layout again).
-    pub remember: Option<DisplaysMode>,
     pub status: &'static str,
 }
 
@@ -889,14 +902,12 @@ pub fn topology_conflict_retry(endpoint: &str, replace: bool) -> DisplaysRecover
         DisplaysRecoveryRetry {
             replace_desktop: true,
             displays_override: None,
-            remember: None,
             status: "Starting a fresh session with your layout…",
         }
     } else {
         DisplaysRecoveryRetry {
             replace_desktop: false,
             displays_override: Some((endpoint.to_owned(), DisplaysMode::SinglePrimary)),
-            remember: None,
             status: "Reconnecting to your existing session…",
         }
     }
@@ -912,7 +923,6 @@ pub fn displays_unsupported_retry(endpoint: &str) -> DisplaysRecoveryRetry {
     DisplaysRecoveryRetry {
         replace_desktop: false,
         displays_override: Some((endpoint.to_owned(), DisplaysMode::SinglePrimary)),
-        remember: None,
         status: "Connecting with one display for this session\u{2026}",
     }
 }
@@ -921,13 +931,79 @@ pub fn displays_unsupported_retry(endpoint: &str) -> DisplaysRecoveryRetry {
 /// ([`displays_mode_source`] "recovery") holds the attempt to one display.
 pub const RECOVERY_ONE_DISPLAY_NOTE: &str = "One display, for this session only.";
 
-/// The note for an attempt whose Displays mode came from `source` and is
-/// `mode`: [`RECOVERY_ONE_DISPLAY_NOTE`] for a recovery's one display,
-/// otherwise none.
+/// What the running session says, with the session's other notes (Stream
+/// Statistics and the note shown when the picture arrives), while a display
+/// recovery holds it to one display.
+pub const RECOVERY_ONE_DISPLAY_SESSION_NOTE: &str =
+    "One display for this session only. The next connection asks for all your displays.";
+
+/// The Connecting screen's status for `draft`, with the attempt's note
+/// (a display recovery's [`SessionDisplaysOrigin::connecting_note`], or the
+/// stream sizing's own) after it.
 #[must_use]
-pub fn attempt_displays_note(source: &str, mode: Option<DisplaysMode>) -> Option<&'static str> {
-    (source == "recovery" && mode == Some(DisplaysMode::SinglePrimary))
-        .then_some(RECOVERY_ONE_DISPLAY_NOTE)
+pub fn connecting_status(
+    draft: &crate::connection_draft::ConnectionDraft,
+    note: Option<&str>,
+) -> String {
+    match note {
+        Some(note) => format!("Connecting to {}... {note}", draft.display_name()),
+        None => format!("Connecting to {}...", draft.display_name()),
+    }
+}
+
+/// Why a session shows the displays it does, as far as the Deck has to say
+/// so. A Deck resolves it with each attempt's Displays mode, keeps it for
+/// the session that attempt starts (resumes included), and replaces it at
+/// the next attempt, so an ordinary connection after a recovery says
+/// nothing. Never saved.
+///
+/// Three cases look alike on screen and only one is announced here:
+/// - the user's own Primary display only (the connection's choice or
+///   Settings › Displays) is [`Self::Chosen`] and needs no note;
+/// - a host that shows the asked layout only in part says so itself, in
+///   [`crate::multi_window::layout_note`], whatever the origin;
+/// - a display recovery's retry to one display is
+///   [`Self::RecoveryOneDisplay`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionDisplaysOrigin {
+    /// The connection's own Displays choice or Settings › Displays.
+    #[default]
+    Chosen,
+    /// A display recovery's one-shot held the attempt to one display, for
+    /// this session only.
+    RecoveryOneDisplay,
+}
+
+impl SessionDisplaysOrigin {
+    /// The origin of an attempt whose Displays mode came from `source`
+    /// ([`displays_mode_source`]) and resolved to `mode`
+    /// ([`resolve_attempt_displays_mode`]).
+    #[must_use]
+    pub fn for_attempt(source: &str, mode: Option<DisplaysMode>) -> Self {
+        if source == "recovery" && mode == Some(DisplaysMode::SinglePrimary) {
+            Self::RecoveryOneDisplay
+        } else {
+            Self::Chosen
+        }
+    }
+
+    /// What the Connecting status adds: [`RECOVERY_ONE_DISPLAY_NOTE`].
+    #[must_use]
+    pub const fn connecting_note(self) -> Option<&'static str> {
+        match self {
+            Self::Chosen => None,
+            Self::RecoveryOneDisplay => Some(RECOVERY_ONE_DISPLAY_NOTE),
+        }
+    }
+
+    /// What the running session says: [`RECOVERY_ONE_DISPLAY_SESSION_NOTE`].
+    #[must_use]
+    pub const fn session_note(self) -> Option<&'static str> {
+        match self {
+            Self::Chosen => None,
+            Self::RecoveryOneDisplay => Some(RECOVERY_ONE_DISPLAY_SESSION_NOTE),
+        }
+    }
 }
 
 /// Writes the streaming preset's wire profile (codec, chroma, depth, range,
@@ -1125,27 +1201,84 @@ mod tests {
             unsupported.displays_override,
             Some((endpoint.to_owned(), DisplaysMode::SinglePrimary))
         );
-        assert_eq!(unsupported.remember, None);
-        for replace in [false, true] {
-            assert_eq!(topology_conflict_retry(endpoint, replace).remember, None);
-        }
         // The retry consumes it; the next attempt reads the connection's
         // own choice (or Settings) again.
         let mut pending = unsupported.displays_override;
         let source = displays_mode_source(pending.as_ref(), endpoint, None);
         let mode = resolve_attempt_displays_mode(&mut pending, endpoint, None);
         assert_eq!(
-            attempt_displays_note(source, mode),
+            SessionDisplaysOrigin::for_attempt(source, mode).connecting_note(),
             Some(RECOVERY_ONE_DISPLAY_NOTE)
         );
         let source = displays_mode_source(pending.as_ref(), endpoint, None);
         let mode = resolve_attempt_displays_mode(&mut pending, endpoint, None);
         assert_eq!((source, mode), ("settings", None));
-        assert_eq!(attempt_displays_note(source, mode), None);
-        // A connection that chose one display itself needs no note.
         assert_eq!(
-            attempt_displays_note("connection", Some(DisplaysMode::SinglePrimary)),
+            SessionDisplaysOrigin::for_attempt(source, mode).connecting_note(),
             None
+        );
+    }
+
+    /// Each way into a session, and what the running session says about
+    /// its displays.
+    #[test]
+    fn only_a_recovery_retry_says_its_one_display_is_for_this_session() {
+        let endpoint = "pier.example:18444";
+        let attempt = |pending: &mut Option<(String, DisplaysMode)>,
+                       endpoint: &str,
+                       saved: Option<DisplaysMode>| {
+            let source = displays_mode_source(pending.as_ref(), endpoint, saved);
+            let mode = resolve_attempt_displays_mode(pending, endpoint, saved);
+            SessionDisplaysOrigin::for_attempt(source, mode)
+        };
+
+        // "Use Primary Display Only" and "Reconnect to your session" both
+        // hold the retry to one display, and the running session says so.
+        for retry in [
+            displays_unsupported_retry(endpoint),
+            topology_conflict_retry(endpoint, false),
+        ] {
+            let mut pending = retry.displays_override;
+            let origin = attempt(&mut pending, endpoint, None);
+            assert_eq!(origin, SessionDisplaysOrigin::RecoveryOneDisplay);
+            assert_eq!(
+                origin.session_note(),
+                Some(RECOVERY_ONE_DISPLAY_SESSION_NOTE)
+            );
+            // The next ordinary connection resets it.
+            let next = attempt(&mut pending, endpoint, None);
+            assert_eq!(next, SessionDisplaysOrigin::Chosen);
+            assert_eq!(next.session_note(), None);
+        }
+
+        // Starting fresh with the whole layout pins nothing.
+        let mut pending = topology_conflict_retry(endpoint, true).displays_override;
+        assert_eq!(
+            attempt(&mut pending, endpoint, None),
+            SessionDisplaysOrigin::Chosen
+        );
+
+        // The user's own Primary display only needs no note, from the
+        // connection or from Settings › Displays.
+        let mut pending = None;
+        let own = attempt(&mut pending, endpoint, Some(DisplaysMode::SinglePrimary));
+        assert_eq!(own, SessionDisplaysOrigin::Chosen);
+        assert_eq!((own.connecting_note(), own.session_note()), (None, None));
+        assert_eq!(
+            SessionDisplaysOrigin::for_attempt("settings", Some(DisplaysMode::SinglePrimary)),
+            SessionDisplaysOrigin::Chosen
+        );
+
+        // A one-shot made for another host is dropped, and says nothing.
+        let mut pending = displays_unsupported_retry("other.example:18444").displays_override;
+        assert_eq!(
+            attempt(&mut pending, endpoint, None),
+            SessionDisplaysOrigin::Chosen
+        );
+        assert_eq!(pending, None);
+        assert_eq!(
+            SessionDisplaysOrigin::default(),
+            SessionDisplaysOrigin::Chosen
         );
     }
 

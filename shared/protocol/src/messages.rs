@@ -723,6 +723,12 @@ pub const EIGHT_BIT_DESKTOP_DETAIL: &str = "This remote desktop was started for 
 Sign out of it and reconnect with Grading or HDR for a 10-bit desktop, or ask the host's \
 administrator to set video.x11_desktop_depth to 30.";
 
+/// [`ServedPipelineMsg::detail`] for an HDR request a host serves as
+/// Grading because its displays offer no HDR (reason
+/// `hdr_display_unsupported`).
+pub const HDR_DISPLAY_UNSUPPORTED_DETAIL: &str = "This host's displays do not support HDR \
+(a dummy plug, for example), so it shows Grading: 10-bit colour without HDR.";
+
 impl StreamPipeline {
     /// Stable wire token.
     #[must_use]

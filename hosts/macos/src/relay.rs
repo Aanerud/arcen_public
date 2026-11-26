@@ -1428,6 +1428,7 @@ mod tests {
             AuthFailure::PolicyUnavailable,
             AuthFailure::NotConsoleOwner,
             AuthFailure::HostBusy,
+            AuthFailure::HostLockRefused,
             AuthFailure::TooManyAttempts,
         ] {
             assert_eq!(

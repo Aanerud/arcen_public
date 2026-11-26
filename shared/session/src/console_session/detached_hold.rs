@@ -7,13 +7,14 @@
 //! desk its monitors, its sound (the session's audio lease ends, so the
 //! default sink and every mute are what they were, or what the user chose
 //! since) and its input back. Arcen's input devices go with the attachment,
-//! and a guest console was never laid out.
+//! and a guest console laid out to the Deck keeps that layout, as the
+//! other product leaves its own ([`super::guest_layout`]).
 //!
 //! What may stay is the Pier's hold for the Deck's resume — after a lost
 //! transport only, never after the Deck closed — and nothing of it is the
-//! desk's: an idle launcher and session agent, no audio lease, no device,
-//! no layout of a guest console. The hold lasts at most the resume window
-//! ([`crate::direct_reconnect`]) and ends at once ([`DetachedHold::observe`])
+//! desk's: an idle launcher and session agent, no audio lease, no device.
+//! The hold lasts at most the resume window ([`crate::direct_reconnect`])
+//! and ends at once ([`DetachedHold::observe`])
 //! when another remote-desktop product's client takes the desktop, that
 //! product starts a desktop of its own, or the person at the desk unlocks
 //! the session or signs in.

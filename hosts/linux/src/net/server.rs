@@ -12,7 +12,7 @@
 //! WS ping) are dispatched; resolution ingest + PAM land in later stages.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -600,7 +600,7 @@ async fn current_wayland_session(
     if ready.output_socket.is_none() {
         return Ok(Some(ready.clone()));
     }
-    crate::session::wayland::output_client::current(
+    crate::session::wayland::output_client::current_live(
         ready,
         lease.metadata.uid,
         lease.metadata.agent_pid,
@@ -609,9 +609,19 @@ async fn current_wayland_session(
     .map(|reply| Some(ready.with_outputs(&reply)))
     .map_err(|error| {
         warn!(target: DISPLAY, %error, "Wayland session outputs could not be read");
-        "the desktop's displays could not be read on the host"
+        match error {
+            crate::session::wayland::output_client::OutputClientError::StreamsUnavailable => {
+                DESKTOP_STAYED_LOCKED_REASON
+            }
+            _ => "the desktop's displays could not be read on the host",
+        }
     })
 }
+
+/// Why an attachment ends when a locked desktop did not show its displays
+/// again after the unlock.
+const DESKTOP_STAYED_LOCKED_REASON: &str =
+    "the desktop on the host stayed locked; connect again to unlock it";
 
 /// Moves a reconfigurable headless Wayland desktop to the outputs its
 /// latest sign-in asked for (`SessionMetadata::requested_outputs`) before
@@ -718,14 +728,21 @@ async fn wayland_capture_source(
 ) -> Result<crate::session::wayland::WaylandAgentReady, &'static str> {
     const ENDED: &str = DESKTOP_ENDED_REASON;
     if ready.output_socket.is_some() {
-        return crate::session::wayland::output_client::current(
+        return crate::session::wayland::output_client::current_live(
             ready,
             lease.metadata.uid,
             lease.metadata.agent_pid,
         )
         .await
         .map(|reply| ready.with_outputs(&reply))
-        .map_err(|_| ENDED);
+        .map_err(|error| match error {
+            // A desktop locked while attached keeps running; only this
+            // attachment ends.
+            crate::session::wayland::output_client::OutputClientError::StreamsUnavailable => {
+                DESKTOP_STAYED_LOCKED_REASON
+            }
+            _ => ENDED,
+        });
     }
     if std::path::Path::new(&format!("/proc/{}", lease.metadata.agent_pid)).exists() {
         Ok(ready.clone())
@@ -986,6 +1003,70 @@ async fn hand_over_displaced_session(
     }
     if let Err(error) = resume.complete_drain(active_session_id) {
         tracing::error!(target: SESSION, ?error, "displaced resume slot drain completion failed");
+    }
+}
+
+/// Locks a desktop the Pier created as its Deck leaves it running (shared
+/// `desktop_session::lock::DetachLock::on_detach`, ADR 0025 §4), before the
+/// session slot is given back, so a newcomer's authenticated unlock always
+/// comes after this lock (a displacing newcomer's too: it may still be
+/// refused before that unlock). A joined console is left to its launcher, which
+/// hands it back locked. A lock that is not confirmed is recorded at error
+/// level; the desktop is never ended for it.
+async fn lock_created_desktop(
+    lease: &SessionLease,
+    detach: arcen_session::desktop_session::lock::CreatedDetach,
+) {
+    use arcen_session::desktop_session::lock::{DetachLock, DetachLockSkip, LockFacts, LockPolicy};
+    if lease.metadata.console {
+        return;
+    }
+    let session_id = lease.metadata.session_id.as_str();
+    // GDM is asked only when the desktop stays: the decision needs it then.
+    let policy = if detach.keeps_desktop() {
+        LockPolicy::resolve(&LockFacts {
+            gdm_version: crate::session::launcher::gdm_version().await,
+        })
+    } else {
+        LockPolicy::HonourUserSettings
+    };
+    let decision = DetachLock::on_detach(detach, policy);
+    match decision {
+        DetachLock::Lock => {
+            match crate::session::launcher::lock_logind_session_id(session_id).await {
+                Ok(()) => info!(
+                    target: SESSION,
+                    session_id,
+                    detach = detach.token(),
+                    "the desktop is locked as its Deck left (it keeps running)"
+                ),
+                Err(crate::session::launcher::LogindLockFailure::SessionGone) => info!(
+                    target: SESSION,
+                    session_id,
+                    detach = detach.token(),
+                    "the desktop's session has ended; there is nothing to lock"
+                ),
+                Err(failure) => error!(
+                    target: SESSION,
+                    session_id,
+                    detach = detach.token(),
+                    reason_class = failure.token(),
+                    "the desktop could not be locked as its Deck left; it keeps running unlocked, reachable only through an authenticated sign-in"
+                ),
+            }
+        }
+        DetachLock::Leave(DetachLockSkip::CannotLock) => warn!(
+            target: SESSION,
+            session_id,
+            detach = detach.token(),
+            "the desktop has no lock screen (no GDM to unlock through), so it is not locked as its Deck left; only an authenticated sign-in reaches it"
+        ),
+        DetachLock::Leave(_) => debug!(
+            target: SESSION,
+            session_id,
+            decision = decision.token(),
+            "the desktop's lock is left as it is"
+        ),
     }
 }
 
@@ -2474,6 +2555,7 @@ where
         },
         first_login_setup: cfg.first_login_setup,
         desktop_mode: cfg.desktop_mode,
+        guest_layout: cfg.guest_layout,
     };
     let launcher_result = tokio::time::timeout(
         CREDENTIAL_CHECK_TIMEOUT,
@@ -3518,9 +3600,8 @@ fn emit_effective_profile(emitter: &LifecycleEmitter, log_controller: &LogContro
     );
 }
 
-/// Maps a `HealthState` to its rank for the shared `service_health` atomic
-/// (higher = worse), so concurrent sessions can be combined with a single
-/// lock-free `fetch_max`.
+/// Maps a `HealthState` to its rank (higher = worse), for the 10-second
+/// window's worst tick.
 fn health_state_rank(state: arcen_telemetry::HealthState) -> u8 {
     match state {
         arcen_telemetry::HealthState::Ok => 1,
@@ -3558,30 +3639,19 @@ fn accumulate_health_window(
     }
 }
 
-/// Emits a service-level `HEALTH_SNAPSHOT` (1806, always delivered at
-/// `Critical`/Level0) summarizing the worst per-session overall health
-/// observed since the previous 60-second tick, read-and-reset so a session
-/// that has already ended cannot leave the service view stuck at a stale
-/// severity. `overall_state` is `"unavailable"` — never a stand-in healthy
-/// value — when no session reported a health tick in the window.
-fn emit_service_health_snapshot(emitter: &LifecycleEmitter, service_health: &AtomicU8) {
-    let rank = service_health.swap(0, Ordering::Relaxed);
-    let overall_state = match rank {
-        1 => "ok",
-        2 => "degraded",
-        3 => "critical",
-        _ => "unavailable",
-    };
-    let mut fields = StructuredFields::default();
-    let _ = fields.insert(
-        "overall_state",
-        FieldValue::String(overall_state.to_string()),
-    );
+/// Emits the service-level `HEALTH_SNAPSHOT` (1806, always delivered at
+/// `Critical`/Level0): the worst state any session committed since the
+/// previous 60-second tick, by the shared rule
+/// ([`arcen_observability::ServiceHealth`]).
+fn emit_service_health_snapshot(
+    emitter: &LifecycleEmitter,
+    service_health: &arcen_observability::ServiceHealth,
+) {
     crate::emit_lifecycle_event(
         emitter,
         LifecycleEventKind::HealthSnapshot,
         eventlog::random_correlation_id(),
-        fields,
+        service_health.take_snapshot_fields(),
     );
 }
 
@@ -3699,7 +3769,7 @@ pub async fn serve(
     let preauth_slots = Arc::new(PreauthAdmission::default());
     let pam_slots = Arc::new(Semaphore::new(PAM_OPERATION_CAPACITY));
     let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
-    let service_health = Arc::new(AtomicU8::new(0));
+    let service_health = Arc::new(arcen_observability::ServiceHealth::new());
     let qos_targets = Arc::new(RwLock::new(
         log_controller
             .qos_targets()
@@ -4024,7 +4094,7 @@ struct ServerState {
     /// critical). Read-and-reset every 60s in `serve`'s main select loop so a
     /// session that already ended cannot leave the service snapshot stuck at
     /// a stale severity.
-    service_health: Arc<AtomicU8>,
+    service_health: Arc<arcen_observability::ServiceHealth>,
     /// Validated QoS/hysteresis thresholds, refreshed atomically on a
     /// successful SIGHUP reload (`sighup_reload_loop`). Every session reads
     /// this shared cell on each health tick rather than a config snapshot
@@ -4215,7 +4285,7 @@ async fn run_ws(
     remote_scope_id: Option<u32>,
     current_host_identity: HostIdentity,
     mut shutdown: watch::Receiver<bool>,
-    service_health: Arc<AtomicU8>,
+    service_health: Arc<arcen_observability::ServiceHealth>,
     qos_targets: Arc<RwLock<QosTargets>>,
     admission_runtime: Arc<SessionAdmissionRuntime>,
     incumbent: Arc<arcen_transport::quic::IncumbentAttachment>,
@@ -4564,6 +4634,12 @@ async fn run_ws(
                         );
                     }
                     let mut xorg_head_refresh_hz = None;
+                    // A Deck that matches its layout with one display: a
+                    // joined console another product owns takes that
+                    // display's layout too (shared `connect_layout`).
+                    launcher.set_match_layout(
+                        display_plan.mode == auth::SessionDisplayMode::MatchLayout,
+                    );
                     launcher.set_session_display(served.map(|monitor| {
                         let served_display = crate::session::launcher::SessionDisplayMsg::served(
                             monitor,
@@ -5276,6 +5352,20 @@ async fn run_ws(
         )
         .await;
         log_lifecycle(&key, "ended", LIFECYCLES.ended(&key));
+        if let Some(lease) = session_lease.as_ref() {
+            // Locked while the session slot is still this attachment's.
+            let detach = non_resumable_created_detach(
+                incumbent_registration
+                    .as_ref()
+                    .is_some_and(arcen_transport::quic::IncumbentRegistration::displaced),
+                multi_monitor_attachment_must_terminate_desktop(
+                    end.reached_usable,
+                    lease.multi_monitor_ever_usable(),
+                    lease.metadata.multi_monitor_plan.as_ref(),
+                ),
+            );
+            lock_created_desktop(lease, detach).await;
+        }
         if let Some(resources) = display_resources.as_mut() {
             resources.restore().await;
         }
@@ -5438,6 +5528,23 @@ fn created_desktop_kept_after(
             ever_usable,
             committed_multi_monitor_plan,
         )
+}
+
+/// How a non-resumable attachment left a desktop the Pier created: taken
+/// over by a same-account newcomer, ended with a multi-monitor plan that
+/// never worked, or kept for the next sign-in.
+fn non_resumable_created_detach(
+    displaced: bool,
+    terminates: bool,
+) -> arcen_session::desktop_session::lock::CreatedDetach {
+    use arcen_session::desktop_session::lock::CreatedDetach;
+    if displaced {
+        CreatedDetach::HandedOver
+    } else if terminates {
+        CreatedDetach::Ends
+    } else {
+        CreatedDetach::KeptForSignIn
+    }
 }
 
 fn attachment_requires_fresh_idr(resumed: bool) -> bool {
@@ -5627,7 +5734,7 @@ async fn run_resumable_session(
     mut shutdown: watch::Receiver<bool>,
     remote_host: &str,
     remote_scope_id: Option<u32>,
-    service_health: Arc<AtomicU8>,
+    service_health: Arc<arcen_observability::ServiceHealth>,
     qos_targets: Arc<RwLock<QosTargets>>,
     incumbent: Option<&arcen_transport::quic::IncumbentRegistration>,
 ) {
@@ -5685,6 +5792,11 @@ async fn run_resumable_session(
                 ReconnectEvent::ExplicitDisconnect,
                 session_registry.resume().monotonic_now(),
             );
+            lock_created_desktop(
+                &lease,
+                arcen_session::desktop_session::lock::CreatedDetach::HandedOver,
+            )
+            .await;
             hand_over_displaced_session(
                 session_registry.resume(),
                 &active_session_id,
@@ -5767,6 +5879,13 @@ async fn run_resumable_session(
             );
             break;
         }
+        // A created desktop is locked too, before any resume is read (one
+        // that arrives meanwhile waits in `commands`).
+        lock_created_desktop(
+            &lease,
+            arcen_session::desktop_session::lock::CreatedDetach::HeldForResume,
+        )
+        .await;
         held_since = Some(std::time::Instant::now());
         hold_end = ResumeHoldEnd::OwnerFailed;
         tracing::info!(
@@ -5970,6 +6089,22 @@ async fn run_resumable_session(
                                 break 'session;
                             }
                         }
+                        // A created desktop the hold locked is unlocked for
+                        // the resumed Deck, as a sign-in unlocks it; one that
+                        // stays locked is served its lock screen (Xorg), or
+                        // ends only this attachment (Wayland).
+                        if !lease.metadata.console {
+                            if let Err(error) =
+                                unlock_logind_session_id(&lease.metadata.session_id).await
+                            {
+                                warn!(
+                                    target: SESSION,
+                                    session_id = %lease.metadata.session_id,
+                                    %error,
+                                    "the resumed desktop could not be unlocked"
+                                );
+                            }
+                        }
                         if let Err(error) =
                             session_registry.resume().mark_attached(&active_session_id)
                         {
@@ -6098,6 +6233,13 @@ async fn run_resumable_session(
             ?error,
             "terminal resume slot drain failed"
         );
+    }
+    if keep_desktop {
+        lock_created_desktop(
+            &lease,
+            arcen_session::desktop_session::lock::CreatedDetach::KeptForSignIn,
+        )
+        .await;
     }
     let unheld = if display_is_held {
         None
@@ -6261,7 +6403,7 @@ async fn run_attachment(
     shutdown: &mut watch::Receiver<bool>,
     remote_host: &str,
     remote_scope_id: Option<u32>,
-    service_health: Arc<AtomicU8>,
+    service_health: Arc<arcen_observability::ServiceHealth>,
     qos_targets: Arc<RwLock<QosTargets>>,
 ) -> AttachmentEnd {
     // Authenticated top-level identity for every session-scoped lifecycle
@@ -6696,9 +6838,12 @@ async fn run_attachment(
             let mut supervisor = match MultiCapencSupervisor::start(specs).await {
                 Ok(supervisor) => supervisor,
                 Err(error) => {
-                    warn!(
+                    // An error, not a warning: at the default log level this
+                    // line is the only record of why the stream never started.
+                    error!(
                         target: CAPENC,
                         %error,
+                        reason_class = multi_capenc_start_close_reason(&error),
                         "multi-monitor capenc pipelines failed before READY — closing connection"
                     );
                     send_critical_control(
@@ -6799,9 +6944,12 @@ async fn run_attachment(
         None => match capenc::spawn(initial_capenc.clone()).await {
             Ok((session, plan)) => (CapencHandle::Single(session), plan),
             Err(error) => {
-                warn!(
+                // An error, not a warning: at the default log level this
+                // line is the only record of why the stream never started.
+                error!(
                     target: CAPENC,
                     %error,
+                    reason_class = capenc_start_close_reason(&error),
                     "capenc failed before READY — closing connection"
                 );
                 send_critical_control(
@@ -10195,9 +10343,7 @@ async fn run_attachment(
                 if let Ok(j) = serde_json::to_string(&stats) {
                     health_ctrl.send_best_effort(Message::Text(j), "health_stats");
                 }
-                if let Some(state) = observation.assessment.overall {
-                    health_service_health.fetch_max(health_state_rank(state), Ordering::Relaxed);
-                }
+                health_service_health.record(observation.committed);
                 // Built before any emit below so both the state transition
                 // and the 60s snapshot carry the same explicit top-level
                 // session identity (`user`/`peer_addr`) — never a nested
@@ -15281,6 +15427,37 @@ mod tests {
     }
 
     #[test]
+    fn a_non_resumable_departure_locks_the_created_desktop_it_keeps() {
+        use arcen_session::desktop_session::lock::{CreatedDetach, DetachLock, LockPolicy};
+        let lock = |displaced, terminates| {
+            DetachLock::on_detach(
+                non_resumable_created_detach(displaced, terminates),
+                LockPolicy::HonourUserSettings,
+            )
+        };
+        // A clean leave, a Deck crash or a host failure keeps the desktop:
+        // it is locked.
+        assert_eq!(
+            non_resumable_created_detach(false, false),
+            CreatedDetach::KeptForSignIn
+        );
+        assert_eq!(lock(false, false), DetachLock::Lock);
+        // A same-account newcomer that displaced it may still be refused
+        // before its own unlock: locked too.
+        assert_eq!(
+            non_resumable_created_detach(true, false),
+            CreatedDetach::HandedOver
+        );
+        assert_eq!(lock(true, false), DetachLock::Lock);
+        // A never-usable multi-monitor desktop ends: nothing to lock.
+        assert_eq!(
+            non_resumable_created_detach(false, true),
+            CreatedDetach::Ends
+        );
+        assert_ne!(lock(false, true), DetachLock::Lock);
+    }
+
+    #[test]
     fn multi_monitor_attachment_must_terminate_desktop_is_false_once_usable() {
         // Once the attachment genuinely reached a usable state, an
         // ordinary end (client closed, transport loss, media ended mid
@@ -18317,9 +18494,9 @@ mod tests {
     }
 
     #[test]
-    fn service_health_snapshot_reports_worst_state_since_last_tick_and_resets() {
+    fn service_health_snapshot_reports_worst_committed_state_since_last_tick_and_resets() {
         let (emitter, recorded) = LifecycleEmitter::recording();
-        let service_health = AtomicU8::new(0);
+        let service_health = arcen_observability::ServiceHealth::new();
 
         // Nothing observed yet: never a stand-in healthy value.
         emit_service_health_snapshot(&emitter, &service_health);
@@ -18335,14 +18512,8 @@ mod tests {
             Some(&FieldValue::String("unavailable".to_string()))
         );
 
-        service_health.fetch_max(
-            health_state_rank(arcen_telemetry::HealthState::Ok),
-            Ordering::Relaxed,
-        );
-        service_health.fetch_max(
-            health_state_rank(arcen_telemetry::HealthState::Critical),
-            Ordering::Relaxed,
-        );
+        service_health.record(Some(arcen_telemetry::HealthState::Ok));
+        service_health.record(Some(arcen_telemetry::HealthState::Critical));
         emit_service_health_snapshot(&emitter, &service_health);
         let events = recorded.lock().unwrap();
         assert_eq!(
@@ -18356,8 +18527,8 @@ mod tests {
             "the worst of the two sessions observed in the window must win"
         );
         assert_eq!(
-            service_health.load(Ordering::Relaxed),
-            0,
+            service_health.take(),
+            None,
             "read-and-reset must not leave a stale severity for the next 60s window"
         );
     }

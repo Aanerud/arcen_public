@@ -16,8 +16,9 @@ the image, from the rectangle egui reports for that widget.
 ## What is in a scene
 
 The scene list is the website's `deck-shots/manifest.json` (17 scenes), then
-two scenes the manifest does not list yet: `home-own-settings` and
-`sign-in-refused` (a run says each "is not in the manifest" and goes on).
+four scenes the manifest does not list yet: `home-own-settings`,
+`sign-in-refused`, `settings-privacy` and `connecting-one-display` (a run
+says each "is not in the manifest" and goes on).
 Each scene is built in `shared/deck-core/src/doc_shots/scenes.rs` from the
 real shared types, and its outcomes come from the real shared mappers:
 
@@ -28,6 +29,7 @@ real shared types, and its outcomes come from the real shared mappers:
 | Sign-in error | Connect, then the engine's session end for a refused password, `SignInFailure::after_end`, `end_detail`, `SignInState::return_home` |
 | Home's own-settings line | a saved connection with its own Typing and Displays, selected; the summary under Connect and **Use app defaults** |
 | Sign-in refused | Connect, then the engine's session end for a Pier whose desk has nobody signed in (`ConsoleRefusal::NoConsoleSession`); its headline in the acknowledgement box |
+| Connecting on one display | **Use Primary Display Only** for Grade 1: `displays_unsupported_retry`, the attempt's `SessionDisplaysOrigin`, `connecting_status`, `render_connecting` |
 | Verify this host, identity changed | `CertInfo` with fingerprints from a fixed seed, `identity_change_outcome` |
 | Import review | an exported `.arcen` file read back with `ConnectionProfile::parse` and reviewed |
 | Settings pages | `SettingsValues` from the default settings, `render_settings` |

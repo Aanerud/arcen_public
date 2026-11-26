@@ -262,6 +262,38 @@ pub fn resolve_client_video_request(
     })
 }
 
+/// The Grading request a host serves an HDR request as when it cannot show
+/// HDR (its displays offer none): the Deck's own request with the Grading
+/// pipeline and Grading's SDR colour (BT.709 transfer, primaries and matrix),
+/// 4:4:4 and full range where the Deck decodes them, and its codec, depth
+/// and rate kept. The host then resolves it as any Grading request, so the
+/// served plan, hello and `served_pipeline` all say Grading and the Deck
+/// presents it as Grading (10-bit, no EDR).
+#[must_use]
+pub fn hdr_request_as_grading(request: &InitialVideoRequestMsg) -> InitialVideoRequestMsg {
+    let grading = VideoConfiguration::grading_reference();
+    let mut served = request.clone();
+    served.pipeline = Some(arcen_protocol::messages::StreamPipeline::Grading);
+    let quality = &mut served.quality;
+    quality.video_selection = VideoSelectionIntent::ColorFidelity;
+    grading.transfer.token().clone_into(&mut quality.transfer);
+    grading
+        .primaries
+        .token()
+        .clone_into(&mut quality.color_primaries);
+    grading.matrix.token().clone_into(&mut quality.color_matrix);
+    if request.capabilities.yuv444 {
+        grading.chroma.token().clone_into(&mut quality.chroma);
+    }
+    if request.capabilities.full_range {
+        grading.range.token().clone_into(&mut quality.color_range);
+    }
+    if request.capabilities.main10 {
+        grading.bit_depth.token().clone_into(&mut quality.bit_depth);
+    }
+    served
+}
+
 #[cfg(test)]
 mod tests {
     use arcen_protocol::messages::{
@@ -292,6 +324,32 @@ mod tests {
             },
             pipeline: None,
         }
+    }
+
+    /// An HDR10 request served as Grading resolves as Grading: SDR BT.709
+    /// colour at ten bits, the Grading pipeline, the Deck's codec kept.
+    #[test]
+    fn an_hdr_request_served_as_grading_resolves_as_grading() {
+        let mut hdr = request(VideoSelectionIntent::ColorFidelity);
+        hdr.pipeline = Some(arcen_protocol::messages::StreamPipeline::Hdr);
+        hdr.quality.codec = "h265".to_string();
+        hdr.quality.bit_depth = "10".to_string();
+        hdr.quality.color_matrix = "bt2020ncl".to_string();
+        hdr.quality.color_primaries = "bt2020".to_string();
+        hdr.quality.transfer = "pq".to_string();
+        hdr.capabilities.bt2020_ncl_matrix = true;
+        assert_eq!(
+            resolve_client_video_request(&hdr).unwrap().pipeline,
+            Some(PipelineId::Hdr)
+        );
+        let grading = resolve_client_video_request(&hdr_request_as_grading(&hdr)).unwrap();
+        assert_eq!(grading.pipeline, Some(PipelineId::Grading));
+        assert_eq!(grading.video.transfer, TransferCharacteristics::Bt709);
+        assert_eq!(grading.video.primaries, ColorPrimaries::Bt709);
+        assert_eq!(grading.video.matrix, ColorMatrix::Bt709);
+        assert_eq!(grading.video.bit_depth, BitDepth::Ten);
+        assert_eq!(grading.video.chroma, ChromaSubsampling::Yuv444);
+        assert_eq!(grading.video.codec, VideoCodec::H265);
     }
 
     #[test]

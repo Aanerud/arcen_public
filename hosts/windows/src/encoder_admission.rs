@@ -557,9 +557,17 @@ pub fn emit_admission_telemetry(decision: &EncoderSetDecision) {
                 tracing::warn!(
                     candidate = attempt.candidate_index,
                     failures = failures.len(),
+                    detail = ?failures,
                     "aggregate encoder admission probe failed"
                 );
             }
+        }
+        if let EncoderSetAttemptOutcome::ThresholdFailed { violations, .. } = &attempt.outcome {
+            tracing::warn!(
+                candidate = attempt.candidate_index,
+                violations = ?violations,
+                "aggregate encoder admission candidate did not keep up"
+            );
         }
     }
     tracing::info!(
@@ -630,15 +638,19 @@ fn specs_for_hardware_count(
                     monitor_id: monitor.session_monitor_id.get(),
                 });
             }
+            // Grading and HDR are 4:4:4 on every display: a display sent as
+            // 4:2:0 there is refused, served 4:4:4, and says why.
+            let served = arcen_media::region_chroma(
+                intent,
+                media_chroma(template.chroma),
+                template.bit_depth,
+            );
             spec.set_media_policy(
                 EncoderRequest::NativeNvenc,
                 template.codec,
-                if intent == MonitorQualityIntentMsg::BandwidthOptimized {
-                    ChromaSubsampling::Yuv420
-                } else {
-                    template.chroma
-                },
+                protocol_chroma(served.chroma),
             );
+            spec.chroma_reason = served.refusal.map(arcen_media::DisplayChromaRefusal::token);
             continue;
         }
         if intent.is_full_color() {
@@ -763,6 +775,14 @@ const fn media_codec(codec: VideoCodec) -> MediaVideoCodec {
         VideoCodec::H265 => MediaVideoCodec::H265,
         VideoCodec::Vp9 => MediaVideoCodec::Vp9,
         VideoCodec::Av1 => MediaVideoCodec::Av1,
+    }
+}
+
+const fn protocol_chroma(chroma: MediaChromaSubsampling) -> ChromaSubsampling {
+    match chroma {
+        MediaChromaSubsampling::Yuv420 => ChromaSubsampling::Yuv420,
+        MediaChromaSubsampling::Yuv422 => ChromaSubsampling::Yuv422,
+        MediaChromaSubsampling::Yuv444 => ChromaSubsampling::Yuv444,
     }
 }
 
@@ -926,6 +946,45 @@ mod tests {
             min_delivered_fps_basis_points: 9_000,
             min_fairness_basis_points: 9_500,
         }
+    }
+
+    #[test]
+    fn a_420_display_in_a_grading_session_is_refused_and_planned_444() {
+        let mut grading = template();
+        grading.bit_depth = BitDepth::Ten;
+        let plan = plan_encoder_sets(
+            &topology("Approved GPU"),
+            &grading,
+            &intents(),
+            &["approved gpu".to_owned()],
+            None,
+            false,
+        )
+        .expect("plan");
+        let specs = &plan.sets[0].specs;
+        assert!(specs
+            .iter()
+            .all(|spec| spec.chroma == Some(ChromaSubsampling::Yuv444)));
+        assert_eq!(
+            specs[0].chroma_reason,
+            Some(arcen_media::DisplayChromaRefusal::OutsideFullColorContract.token())
+        );
+        assert_eq!(specs[1].chroma_reason, None);
+
+        let eight_bit = plan_encoder_sets(
+            &topology("Approved GPU"),
+            &template(),
+            &intents(),
+            &["approved gpu".to_owned()],
+            None,
+            false,
+        )
+        .expect("plan");
+        assert_eq!(
+            eight_bit.sets[0].specs[0].chroma,
+            Some(ChromaSubsampling::Yuv420)
+        );
+        assert_eq!(eight_bit.sets[0].specs[0].chroma_reason, None);
     }
 
     #[test]

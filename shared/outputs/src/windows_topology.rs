@@ -1429,6 +1429,137 @@ pub fn plan_topology(
     })
 }
 
+/// One output Windows reports active, with the desktop rectangle of its
+/// source, as the Pier reads it back after a plan was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveOutputPlacement {
+    pub adapter_luid: AdapterLuid,
+    pub target_id: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ActiveOutputPlacement {
+    fn is(&self, monitor: &WindowsMonitorPlan) -> bool {
+        self.adapter_luid == monitor.adapter_luid && self.target_id == monitor.target_id
+    }
+}
+
+/// How the active Windows desktop differs from the plan the session applied.
+///
+/// A physical plan owns the whole desktop: every output it does not name was
+/// made inactive, so an output Windows brings back is drift, not a neighbour.
+/// Windows does this on its own when a session display's HDR state changes:
+/// it lays the desktop out again and can reactivate a display the plan
+/// turned off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TopologyDrift {
+    /// Active outputs the plan does not contain.
+    pub unplanned: Vec<ActiveOutputPlacement>,
+    /// Planned monitors with no active output.
+    pub missing: Vec<SessionMonitorId>,
+    /// Planned monitors active at another position or size.
+    pub displaced: Vec<SessionMonitorId>,
+}
+
+impl std::fmt::Display for TopologyDrift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        if !self.unplanned.is_empty() {
+            let outputs = self
+                .unplanned
+                .iter()
+                .map(|output| {
+                    format!(
+                        "target {} {}x{}@{},{}",
+                        output.target_id, output.width, output.height, output.x, output.y
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("unplanned active output(s): {outputs}"));
+        }
+        let ids = |monitors: &[SessionMonitorId]| {
+            monitors
+                .iter()
+                .map(|monitor| monitor.get().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if !self.missing.is_empty() {
+            parts.push(format!("missing monitor(s): {}", ids(&self.missing)));
+        }
+        if !self.displaced.is_empty() {
+            parts.push(format!("moved monitor(s): {}", ids(&self.displaced)));
+        }
+        formatter.write_str(&parts.join("; "))
+    }
+}
+
+/// Compares what Windows reports active with the applied `plan`. `None` when
+/// the desktop is exactly the plan: its monitors at their rectangles and no
+/// other output active.
+#[must_use]
+pub fn topology_drift(
+    plan: &WindowsTopologyPlan,
+    active: &[ActiveOutputPlacement],
+) -> Option<TopologyDrift> {
+    let mut drift = TopologyDrift {
+        unplanned: active
+            .iter()
+            .filter(|output| !plan.monitors.iter().any(|monitor| output.is(monitor)))
+            .copied()
+            .collect(),
+        ..TopologyDrift::default()
+    };
+    for monitor in &plan.monitors {
+        match active.iter().find(|output| output.is(monitor)) {
+            None => drift.missing.push(monitor.session_monitor_id),
+            Some(output)
+                if (output.x, output.y, output.width, output.height)
+                    != (monitor.x, monitor.y, monitor.width, monitor.height) =>
+            {
+                drift.displaced.push(monitor.session_monitor_id);
+            }
+            Some(_) => {}
+        }
+    }
+    let exact =
+        drift.unplanned.is_empty() && drift.missing.is_empty() && drift.displaced.is_empty();
+    (!exact).then_some(drift)
+}
+
+/// How many times a session puts its applied plan back after Windows moved
+/// the desktop under it, before it refuses.
+pub const MAX_TOPOLOGY_REASSERTIONS: u32 = 1;
+
+/// What the Pier does with the desktop it reads back after a change Windows
+/// may answer by laying the desktop out again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftResponse {
+    /// The desktop is the plan.
+    Kept,
+    /// Apply the plan again, then read the desktop back again.
+    Reassert,
+    /// The plan did not hold after [`MAX_TOPOLOGY_REASSERTIONS`]; the
+    /// session must not start on a desktop its input and capture do not
+    /// describe.
+    Refuse,
+}
+
+/// Decides [`DriftResponse`] from the drift read back and how many times the
+/// plan was already put back.
+#[must_use]
+pub fn drift_response(drift: Option<&TopologyDrift>, reassertions: u32) -> DriftResponse {
+    match drift {
+        None => DriftResponse::Kept,
+        Some(_) if reassertions < MAX_TOPOLOGY_REASSERTIONS => DriftResponse::Reassert,
+        Some(_) => DriftResponse::Refuse,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1740,6 +1871,82 @@ mod tests {
             .expect("second monitor");
         assert_eq!(second.x, 1_920);
         assert_eq!(second.y, 0);
+    }
+
+    fn two_display_plan() -> WindowsTopologyPlan {
+        let inventory = PhysicalOutputInventory::new(vec![
+            output(luid(1), 1, 1_920, 1_080),
+            output(luid(1), 2, 1_920, 1_080),
+        ])
+        .expect("inventory");
+        let requested = RequestedMonitorTopology::new(vec![
+            monitor("a", (0, 0), (1_920, 1_080), true, Rotation::Degrees0),
+            monitor("b", (1_920, 0), (1_920, 1_080), false, Rotation::Degrees0),
+        ])
+        .expect("requested topology");
+        plan_topology(&requested, generation(), &inventory).expect("plan")
+    }
+
+    fn placed(monitor: &WindowsMonitorPlan) -> ActiveOutputPlacement {
+        ActiveOutputPlacement {
+            adapter_luid: monitor.adapter_luid,
+            target_id: monitor.target_id,
+            x: monitor.x,
+            y: monitor.y,
+            width: monitor.width,
+            height: monitor.height,
+        }
+    }
+
+    #[test]
+    fn a_desktop_that_is_exactly_the_plan_has_no_drift() {
+        let plan = two_display_plan();
+        let active = plan.monitors.iter().map(placed).collect::<Vec<_>>();
+        assert_eq!(topology_drift(&plan, &active), None);
+        assert_eq!(drift_response(None, 0), DriftResponse::Kept);
+    }
+
+    // The lab regression: switching HDR on for both session displays made
+    // Windows bring the desk's display back beside them, so the desktop grew
+    // from 3840x1080 to 6400x1600 before input started.
+    #[test]
+    fn a_display_windows_brings_back_after_an_hdr_change_is_drift_and_is_put_back_once() {
+        let plan = two_display_plan();
+        let mut active = plan.monitors.iter().map(placed).collect::<Vec<_>>();
+        let desk = ActiveOutputPlacement {
+            adapter_luid: luid(1),
+            target_id: 0,
+            x: 3_840,
+            y: 0,
+            width: 2_560,
+            height: 1_600,
+        };
+        active.push(desk);
+        let drift = topology_drift(&plan, &active).expect("drift");
+        assert_eq!(drift.unplanned, vec![desk]);
+        assert!(drift.missing.is_empty() && drift.displaced.is_empty());
+        assert_eq!(
+            drift.to_string(),
+            "unplanned active output(s): target 0 2560x1600@3840,0"
+        );
+        assert_eq!(drift_response(Some(&drift), 0), DriftResponse::Reassert);
+        assert_eq!(
+            drift_response(Some(&drift), MAX_TOPOLOGY_REASSERTIONS),
+            DriftResponse::Refuse
+        );
+    }
+
+    #[test]
+    fn a_moved_or_missing_planned_monitor_is_drift() {
+        let plan = two_display_plan();
+        let first = placed(&plan.monitors[0]);
+        let mut moved = placed(&plan.monitors[1]);
+        moved.x += 1;
+        let drift = topology_drift(&plan, &[first, moved]).expect("drift");
+        assert_eq!(drift.displaced, vec![plan.monitors[1].session_monitor_id]);
+        let drift = topology_drift(&plan, &[first]).expect("drift");
+        assert_eq!(drift.missing, vec![plan.monitors[1].session_monitor_id]);
+        assert!(drift.unplanned.is_empty());
     }
 
     #[test]
@@ -3436,16 +3643,19 @@ mod tests {
     }
 
     fn shown_rects(monitors: Vec<RequestedMonitor>) -> WindowsTopologyPlan {
-        let inventory =
-            PhysicalOutputInventory::new((0..monitors.len() as u32).map(any_mode_output).collect())
-                .expect("inventory");
+        let inventory = PhysicalOutputInventory::new(
+            (0..u32::try_from(monitors.len()).expect("monitor count"))
+                .map(any_mode_output)
+                .collect(),
+        )
+        .expect("inventory");
         let requested = RequestedMonitorTopology::new(monitors).expect("requested topology");
         let plan = plan_shown_topology(&requested, generation(), &inventory).expect("plans");
         assert_connected_without_overlap(&plan);
         plan
     }
 
-    fn rect_of<'a>(plan: &'a WindowsTopologyPlan, id: &str) -> (i32, i32, u32, u32) {
+    fn rect_of(plan: &WindowsTopologyPlan, id: &str) -> (i32, i32, u32, u32) {
         let monitor = plan
             .monitors
             .iter()

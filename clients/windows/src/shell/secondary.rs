@@ -346,12 +346,19 @@ impl Secondaries {
 
     /// What each window's presenter thread put up since the last pass, as
     /// the root window counts its own: a frame handed over and then
-    /// replaced before its present, or a re-present, is no new frame.
+    /// replaced before its present is superseded, and a re-present is no
+    /// new frame.
     fn report_new_frames(&self, connection: &Connection) {
         for window in &self.windows {
-            let new_frames = window.eight_bit.take_telemetry().new_frames_submitted()
-                + window.ten_bit.take_telemetry().new_frames_submitted();
-            connection.note_secondary_presented(window.monitor, new_frames);
+            let (mut new_frames, mut superseded) = (0, 0);
+            for delta in [
+                window.eight_bit.take_telemetry(),
+                window.ten_bit.take_telemetry(),
+            ] {
+                new_frames += delta.new_frames_submitted();
+                superseded += delta.dropped_overflow + delta.dropped_stale;
+            }
+            connection.note_secondary_presented(window.monitor, new_frames, superseded);
         }
     }
 

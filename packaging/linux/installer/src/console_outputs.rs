@@ -224,10 +224,10 @@ fn nvidia_monitor_connected(options: &Options) -> Option<bool> {
             continue;
         };
         let driver = std::fs::read_link(root.join(card).join("device/driver")).ok();
-        if !driver
+        if driver
             .as_deref()
             .and_then(std::path::Path::file_name)
-            .is_some_and(|driver| driver == "nvidia")
+            .is_none_or(|driver| driver != "nvidia")
         {
             continue;
         }

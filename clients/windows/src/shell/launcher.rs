@@ -22,8 +22,9 @@ use arcen_deck_core::config::{
 };
 use arcen_deck_core::connect_plan::tls_trust_for;
 use arcen_deck_core::connect_plan::{
-    DisplaysRecovery, DisplaysRecoveryRetry, display_fit_gate, displays_recovery_for,
-    displays_unsupported_retry, resolve_attempt_displays_mode, topology_conflict_retry,
+    DisplaysRecovery, DisplaysRecoveryRetry, SessionDisplaysOrigin, display_fit_gate,
+    displays_recovery_for, displays_unsupported_retry, resolve_attempt_displays_mode,
+    topology_conflict_retry,
 };
 use arcen_deck_core::connection_draft::ConnectionDraft;
 use arcen_deck_core::display::{SessionFullscreen, SessionFullscreenStep};
@@ -273,6 +274,12 @@ pub(super) struct Launcher {
     /// A recovery's one-shot Displays mode for the next attempt to that
     /// endpoint (the Mac's `pending_displays_override`).
     pending_displays_override: Option<(String, DisplaysMode)>,
+    /// Why this attempt, and the session it starts, shows the displays it
+    /// does (shared `SessionDisplaysOrigin`, the Mac's `displays_origin`):
+    /// one display for this session only after a display recovery. Set
+    /// with each attempt's Displays mode, so the next ordinary connection
+    /// resets it; never saved.
+    displays_origin: SessionDisplaysOrigin,
     /// The Windows Ink hint was shown this run
     /// (`arcen_input::deck_pen::TABLET_AS_MOUSE_HINT`).
     tablet_hint_shown: bool,
@@ -424,6 +431,7 @@ impl Launcher {
             submitted_auth: None,
             login_window_handover: None,
             pending_displays_override: None,
+            displays_origin: SessionDisplaysOrigin::Chosen,
             tablet_hint_shown: false,
             pending_desktop_replacement: false,
             recovery_auth: None,
@@ -630,7 +638,7 @@ impl Launcher {
         {
             self.stats_reported_at = Some(now);
             let elapsed = now.duration_since(since).as_secs();
-            for line in connection.stream_stats_lines() {
+            for line in connection.stream_stats_lines(self.displays_origin.session_note()) {
                 eprintln!("[stats +{elapsed}s] {line}");
             }
         }
@@ -1078,7 +1086,7 @@ impl Launcher {
             &endpoint,
             saved_mode,
         );
-        let displays_note = arcen_deck_core::connect_plan::attempt_displays_note(source, resolved);
+        self.displays_origin = SessionDisplaysOrigin::for_attempt(source, resolved);
         let mode = resolved.unwrap_or(self.settings.displays_mode);
         tracing::info!(
             target: "arcen::display",
@@ -1129,10 +1137,10 @@ impl Launcher {
             .map(|selection| selection.topology.clone());
         self.display_fit.reset();
         self.generation = self.generation.wrapping_add(1);
-        self.status = match displays_note {
-            Some(note) => format!("Connecting to {}... {note}", draft.display_name()),
-            None => format!("Connecting to {}...", draft.display_name()),
-        };
+        self.status = arcen_deck_core::connect_plan::connecting_status(
+            &draft,
+            self.displays_origin.connecting_note(),
+        );
         draft.display_name().clone_into(&mut self.session_title);
         self.configure_reconnect(&draft, &options);
         let holder_nonce = self
@@ -1239,6 +1247,14 @@ impl Launcher {
                 let layout_note = connection.layout_note().map(str::to_owned);
                 let display_note = connection.display_note();
                 let desk_note = connection.desk_note().map(str::to_owned);
+                let displays_note = self.displays_origin.session_note();
+                if let Some(note) = displays_note {
+                    tracing::info!(
+                        target: "arcen::display",
+                        note,
+                        "display recovery holds one display"
+                    );
+                }
                 if let Some(note) = &display_note {
                     tracing::warn!(
                         target: "arcen::display",
@@ -1282,6 +1298,7 @@ impl Launcher {
                 });
                 let notes: Vec<String> = desk_note
                     .into_iter()
+                    .chain(displays_note.map(str::to_owned))
                     .chain(layout_note)
                     .chain(display_note)
                     .chain(tablet_hint)
@@ -1625,9 +1642,8 @@ impl Launcher {
     }
 
     /// Retries `draft` with a display recovery's choice (the shared
-    /// `DisplaysRecoveryRetry`): the one-shot Displays mode, the desktop
-    /// replacement, and a choice to remember on the saved connection
-    /// should a recovery ever ask for one (none does).
+    /// `DisplaysRecoveryRetry`): the one-shot Displays mode and the desktop
+    /// replacement. Nothing is saved on the connection.
     fn retry_display_recovery(
         &mut self,
         draft: ConnectionDraft,
@@ -1637,16 +1653,6 @@ impl Launcher {
         self.pending_desktop_replacement = retry.replace_desktop;
         if let Some(pending) = retry.displays_override.clone() {
             self.pending_displays_override = Some(pending);
-        }
-        if let (Some(mode), Some(id)) = (retry.remember, draft.saved_connection_id.as_ref()) {
-            match self.repository.set_displays_mode(id, Some(mode)) {
-                Ok(store) => self.reconcile(store),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "could not persist the Displays choice for this connection; it still \
-                     applies to this attempt",
-                ),
-            }
         }
         retry.status.clone_into(&mut self.status);
         let auth = self.recovery_auth.take();
@@ -2356,10 +2362,11 @@ impl Launcher {
             return;
         };
         if self.show_stream_stats {
+            let displays_note = self.displays_origin.session_note();
             let lines = self
                 .stream_stats_text
                 .get_or_refresh(std::time::Instant::now(), || {
-                    connection.stream_stats_lines()
+                    connection.stream_stats_lines(displays_note)
                 });
             paint_stream_stats(ui, rect, lines);
         }
@@ -2433,7 +2440,8 @@ impl Launcher {
             };
             arcen_deck_core::support_bundle::snapshot::SessionSnapshot {
                 captured_unix_seconds: 0,
-                stream_statistics: connection.stream_stats_lines(),
+                stream_statistics: connection
+                    .stream_stats_lines(self.displays_origin.session_note()),
                 negotiated_truth: truth.unwrap_or_default(),
                 health: Vec::new(),
                 decoder_refusal,

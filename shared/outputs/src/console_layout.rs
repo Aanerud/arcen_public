@@ -19,6 +19,13 @@
 //! shows the Deck's size through a scaling viewport (`ViewPortIn`), so a
 //! desk monitor is never driven with a timing it did not offer. Outputs
 //! the layout does not use are switched off.
+//!
+//! Another product's desktop (ADR 0025 §8) is never scaled
+//! ([`plan_native_console_layout`], [`HeadScaling::NativeOnly`]): every
+//! head drives a mode of its Deck monitor's own size with an identity
+//! transform. A size an output does not list is added as a reduced-blanking
+//! mode ([`missing_native_modes`], [`cvt_reduced_blanking`]); one that still
+//! cannot be driven leaves the desktop as it is.
 
 use std::fmt::Write as _;
 
@@ -158,6 +165,9 @@ pub struct ConsoleOutput {
     pub connected: bool,
     /// Modes it lists.
     pub modes: Vec<OutputMode>,
+    /// The `RandR` name of each of `modes`, in the same order; empty when
+    /// not read.
+    pub mode_names: Vec<String>,
     /// Index into `modes` of the preferred mode, if any.
     pub preferred: Option<usize>,
 }
@@ -204,6 +214,10 @@ pub struct ConsoleHeadPlan {
     pub primary: bool,
     /// Whether the mode differs from the viewport (the output scales).
     pub scaled: bool,
+    /// For a native layout, the `RandR` name of the mode, which the
+    /// `MetaMode` names (a size alone does not find a mode another product
+    /// or Arcen added under its own name: the driver turns the head off).
+    pub mode_name: Option<String>,
 }
 
 impl ConsoleHeadPlan {
@@ -217,6 +231,21 @@ impl ConsoleHeadPlan {
     }
 }
 
+/// Whether a head may show a Deck monitor through a mode of another size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadScaling {
+    /// A console Arcen lays out and puts back (ADR 0025 §6): an output that
+    /// does not list the monitor's size keeps a mode it offers and scales
+    /// (`ViewPortIn`).
+    ViewPortIn,
+    /// Another product's desktop (ADR 0025 §8): only a mode of the
+    /// monitor's own size, and an identity transform on every head. A
+    /// scaled head is a `RandR` transform on its CRTC, which that product
+    /// keeps when it lays the desktop out again (a later monitor shrank
+    /// to a corner) and which the desktop's own mapping misreads.
+    NativeOnly,
+}
+
 /// The console's layout while the Deck is attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsoleLayoutPlan {
@@ -226,6 +255,8 @@ pub struct ConsoleLayoutPlan {
     pub heads: Vec<ConsoleHeadPlan>,
     /// Connected outputs the layout switches off.
     pub unused: Vec<String>,
+    /// How its heads were chosen.
+    pub scaling: HeadScaling,
 }
 
 /// Why the console cannot take the Deck's layout.
@@ -242,6 +273,13 @@ pub enum ConsoleLayoutError {
     /// A console shown as it is (another product's desktop) shows no
     /// output a Deck monitor could be mapped to; Arcen does not change it.
     ShownLayoutDiffers { requested: usize, shown: usize },
+    /// Another product's desktop: an output has no mode of the Deck
+    /// monitor's own size, and such a desktop is never scaled.
+    NoNativeMode {
+        output: String,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl ConsoleLayoutError {
@@ -254,6 +292,7 @@ impl ConsoleLayoutError {
             Self::NoModes { .. } => "console_output_without_modes",
             Self::PrimaryCount(_) => "console_layout_primary",
             Self::ShownLayoutDiffers { .. } => "console_layout_differs",
+            Self::NoNativeMode { .. } => "console_layout_no_native_mode",
         }
     }
 }
@@ -280,14 +319,24 @@ impl std::fmt::Display for ConsoleLayoutError {
                 formatter,
                 "the desktop shows {shown} monitors for the Deck's {requested}, and is not changed"
             ),
+            Self::NoNativeMode {
+                output,
+                width,
+                height,
+            } => write!(
+                formatter,
+                "output {output} has no {width}x{height} mode and would not take one; another product's desktop is never scaled"
+            ),
         }
     }
 }
 
 impl std::error::Error for ConsoleLayoutError {}
 
-/// One output of a console's X server that shows a picture now: its mode's
-/// native size, rotation, refresh and place in the X screen.
+/// One output of a console's X server that shows a picture now: the size of
+/// the desktop area it shows before rotation ([`shown_size`]: its mode's
+/// size unless the head is scaled), rotation, refresh and place in the X
+/// screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShownOutput {
     pub name: String,
@@ -327,6 +376,21 @@ impl ShownOutput {
             across(self.x, width, x, screen.0),
             across(self.y, height, y, screen.1),
         )
+    }
+}
+
+/// The pre-rotation size of the desktop area an output shows, from the
+/// area its CRTC covers in the X screen (`RandR`'s CRTC width and height,
+/// after rotation and any transform) and its rotation. On an unscaled head
+/// this is its mode's size; on a scaled one (a `ViewPortIn` smaller than
+/// the mode, a `RandR` transform) it is the smaller area, which is what a
+/// capture of the output delivers. Reading the mode's size there placed
+/// the output beyond the screen's edge (field, 2026-11-25).
+#[must_use]
+pub const fn shown_size(scanout: (u32, u32), rotation: Rotation) -> (u32, u32) {
+    match rotation {
+        Rotation::Degrees90 | Rotation::Degrees270 => (scanout.1, scanout.0),
+        Rotation::Degrees0 | Rotation::Degrees180 => scanout,
     }
 }
 
@@ -648,6 +712,145 @@ pub fn plan_console_layout(
     requests: &[ConsoleHeadRequest],
     outputs: &[ConsoleOutput],
 ) -> Result<ConsoleLayoutPlan, ConsoleLayoutError> {
+    plan_layout(requests, outputs, HeadScaling::ViewPortIn)
+}
+
+/// [`plan_console_layout`] for another product's desktop: every head
+/// drives a mode of exactly its Deck monitor's size
+/// ([`HeadScaling::NativeOnly`]); nothing is scaled.
+///
+/// # Errors
+///
+/// As [`plan_console_layout`], and [`ConsoleLayoutError::NoNativeMode`]
+/// for the first output without a mode of its monitor's size (the adapter
+/// adds the [`missing_native_modes`] and plans again).
+pub fn plan_native_console_layout(
+    requests: &[ConsoleHeadRequest],
+    outputs: &[ConsoleOutput],
+) -> Result<ConsoleLayoutPlan, ConsoleLayoutError> {
+    plan_layout(requests, outputs, HeadScaling::NativeOnly)
+}
+
+/// The outputs a native layout would use (the i-th Deck monitor on the
+/// i-th output that can show one) that list no mode of their monitor's
+/// size, each with the reduced-blanking mode to add for it: at the Deck
+/// monitor's refresh, at most [`MAX_ADDED_MODE_REFRESH_HZ`].
+#[must_use]
+pub fn missing_native_modes(
+    requests: &[ConsoleHeadRequest],
+    outputs: &[ConsoleOutput],
+) -> Vec<NativeModeNeed> {
+    requests
+        .iter()
+        .zip(outputs.iter().filter(|output| takes_a_monitor(output)))
+        .filter(|(request, output)| native_mode(output, request).is_none())
+        .filter_map(|(request, output)| {
+            let refresh_hz = request.refresh_hz.clamp(1, MAX_ADDED_MODE_REFRESH_HZ);
+            Some(NativeModeNeed {
+                output: output.name.clone(),
+                timing: cvt_reduced_blanking(request.width, request.height, refresh_hz)?,
+            })
+        })
+        .collect()
+}
+
+/// The fastest refresh of a mode Arcen adds to another product's output:
+/// the rate such products drive their own client-sized modes at, which a
+/// head's EDID accepts.
+pub const MAX_ADDED_MODE_REFRESH_HZ: u32 = 60;
+
+/// A mode to add to one output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeModeNeed {
+    pub output: String,
+    pub timing: ModeTiming,
+}
+
+/// One video mode's timing, as `RandR` creates a mode (`RRCreateMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeTiming {
+    pub width: u32,
+    pub height: u32,
+    /// Pixel clock in kilohertz.
+    pub dot_clock_khz: u32,
+    pub hsync_start: u32,
+    pub hsync_end: u32,
+    pub htotal: u32,
+    pub vsync_start: u32,
+    pub vsync_end: u32,
+    pub vtotal: u32,
+    /// The refresh it was computed for.
+    pub refresh_hz: u32,
+}
+
+impl ModeTiming {
+    /// The name Arcen gives a mode it adds (`2560x1600_60_arcen`).
+    #[must_use]
+    pub fn name(&self) -> String {
+        format!("{}x{}_{}_arcen", self.width, self.height, self.refresh_hz)
+    }
+}
+
+/// VESA CVT reduced-blanking (version 1) timing for a progressive mode of
+/// exactly `width`x`height` at `refresh_hz`: horizontal blanking 160 pixels
+/// (front porch 48, sync 32), vertical front porch 3 lines, a sync width by
+/// aspect ratio, at least 460 µs of vertical blanking, the pixel clock in
+/// 0.25 MHz steps; `+HSync -VSync`. `None` for an empty size or refresh, or
+/// one whose clock does not fit.
+#[must_use]
+pub fn cvt_reduced_blanking(width: u32, height: u32, refresh_hz: u32) -> Option<ModeTiming> {
+    const H_BLANK: u32 = 160;
+    const H_FRONT_PORCH: u32 = 48;
+    const H_SYNC: u32 = 32;
+    const V_FRONT_PORCH: u32 = 3;
+    const MIN_V_BACK_PORCH: u32 = 6;
+    const MIN_V_BLANK_PS: u64 = 460_000_000;
+    const CLOCK_STEP_HZ: u64 = 250_000;
+    if width == 0 || height == 0 || refresh_hz == 0 {
+        return None;
+    }
+    let (w, h) = (u64::from(width), u64::from(height));
+    let v_sync = if w * 3 == h * 4 {
+        4
+    } else if w * 9 == h * 16 {
+        5
+    } else if w * 10 == h * 16 {
+        6
+    } else if w * 4 == h * 5 || w * 9 == h * 15 {
+        7
+    } else {
+        10
+    };
+    let frame_ps = 1_000_000_000_000 / u64::from(refresh_hz);
+    let line_ps = frame_ps.checked_sub(MIN_V_BLANK_PS)? / h;
+    if line_ps == 0 {
+        return None;
+    }
+    let blank_lines = u32::try_from(MIN_V_BLANK_PS / line_ps + 1).ok()?;
+    let blank_lines = blank_lines.max(V_FRONT_PORCH + v_sync + MIN_V_BACK_PORCH);
+    let vtotal = height.checked_add(blank_lines)?;
+    let htotal = width.checked_add(H_BLANK)?;
+    let clock_hz = u64::from(refresh_hz) * u64::from(vtotal) * u64::from(htotal);
+    let dot_clock_khz = u32::try_from(clock_hz / CLOCK_STEP_HZ * CLOCK_STEP_HZ / 1000).ok()?;
+    Some(ModeTiming {
+        width,
+        height,
+        dot_clock_khz,
+        hsync_start: width + H_FRONT_PORCH,
+        hsync_end: width + H_FRONT_PORCH + H_SYNC,
+        htotal,
+        vsync_start: height + V_FRONT_PORCH,
+        vsync_end: height + V_FRONT_PORCH + v_sync,
+        vtotal,
+        refresh_hz,
+    })
+}
+
+fn plan_layout(
+    requests: &[ConsoleHeadRequest],
+    outputs: &[ConsoleOutput],
+    scaling: HeadScaling,
+) -> Result<ConsoleLayoutPlan, ConsoleLayoutError> {
     if requests.is_empty() {
         return Err(ConsoleLayoutError::Empty);
     }
@@ -667,7 +870,22 @@ pub fn plan_console_layout(
     }
     let mut heads = Vec::with_capacity(requests.len());
     for (request, output) in requests.iter().zip(&connected) {
-        let mode = choose_mode(output, request.width, request.height, request.refresh_hz)?;
+        let (mode, mode_name) = match scaling {
+            HeadScaling::ViewPortIn => (
+                choose_mode(output, request.width, request.height, request.refresh_hz)?,
+                None,
+            ),
+            HeadScaling::NativeOnly => {
+                let (mode, name) = native_mode(output, request).ok_or_else(|| {
+                    ConsoleLayoutError::NoNativeMode {
+                        output: output.name.clone(),
+                        width: request.width,
+                        height: request.height,
+                    }
+                })?;
+                (mode, Some(name))
+            }
+        };
         heads.push(ConsoleHeadPlan {
             output: output.name.clone(),
             mode,
@@ -677,6 +895,7 @@ pub fn plan_console_layout(
             rotation: request.rotation,
             primary: request.primary,
             scaled: (mode.width, mode.height) != (request.width, request.height),
+            mode_name,
         });
     }
     let unused = connected
@@ -684,7 +903,60 @@ pub fn plan_console_layout(
         .skip(requests.len())
         .map(|output| output.name.clone())
         .collect();
-    Ok(ConsoleLayoutPlan { heads, unused })
+    Ok(ConsoleLayoutPlan {
+        heads,
+        unused,
+        scaling,
+    })
+}
+
+/// Whether a mode name may stand in a `MetaMode`: a plain token
+/// (`2560x1600`, `2560x1600_60_arcen`), never one that could end the mode
+/// or the head (another product names its modes; its X server reports
+/// them).
+#[must_use]
+pub fn metamode_mode_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// The mode of exactly the monitor's size an output lists under a name a
+/// `MetaMode` can carry, the refresh nearest the monitor's.
+fn native_mode(
+    output: &ConsoleOutput,
+    request: &ConsoleHeadRequest,
+) -> Option<(OutputMode, String)> {
+    let wanted_mhz = request.refresh_hz.saturating_mul(1000);
+    output
+        .modes
+        .iter()
+        .zip(&output.mode_names)
+        .filter(|(mode, name)| {
+            (mode.width, mode.height) == (request.width, request.height)
+                && metamode_mode_token(name)
+        })
+        .min_by_key(|(mode, _)| mode.refresh_mhz.abs_diff(wanted_mhz))
+        .map(|(mode, name)| (*mode, name.clone()))
+}
+
+/// The mode of exactly `width`x`height` an output lists, the refresh
+/// nearest `refresh_hz`.
+fn exact_mode(
+    output: &ConsoleOutput,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+) -> Option<OutputMode> {
+    let wanted_mhz = refresh_hz.saturating_mul(1000);
+    output
+        .modes
+        .iter()
+        .filter(|mode| mode.width == width && mode.height == height)
+        .min_by_key(|mode| mode.refresh_mhz.abs_diff(wanted_mhz))
+        .copied()
 }
 
 /// The mode an output drives for a monitor of native `width`x`height`:
@@ -696,14 +968,8 @@ fn choose_mode(
     height: u32,
     refresh_hz: u32,
 ) -> Result<OutputMode, ConsoleLayoutError> {
-    let wanted_mhz = refresh_hz.saturating_mul(1000);
-    let exact = output
-        .modes
-        .iter()
-        .filter(|mode| mode.width == width && mode.height == height)
-        .min_by_key(|mode| mode.refresh_mhz.abs_diff(wanted_mhz));
-    if let Some(mode) = exact {
-        return Ok(*mode);
+    if let Some(mode) = exact_mode(output, width, height, refresh_hz) {
+        return Ok(mode);
     }
     output
         .preferred
@@ -720,6 +986,9 @@ fn choose_mode(
         })
 }
 
+/// The `MetaMode` attribute that gives a head the identity transform.
+const IDENTITY_TRANSFORM_ATTRIBUTE: &str = ", Transform=(1.000000,0.000000,0.000000,0.000000,1.000000,0.000000,0.000000,0.000000,1.000000)";
+
 /// NVIDIA's `MetaMode` rotation token for a clockwise display rotation (a
 /// clockwise quarter turn is NVIDIA's `right`).
 #[must_use]
@@ -735,18 +1004,27 @@ pub const fn nvidia_rotation_token(rotation: Rotation) -> &'static str {
 impl ConsoleLayoutPlan {
     /// The whole layout as one NVIDIA `CurrentMetaMode` value: every used
     /// output's mode, X-screen viewport, position and rotation. Outputs
-    /// the `MetaMode` does not name are switched off.
+    /// the `MetaMode` does not name are switched off. A native layout
+    /// ([`HeadScaling::NativeOnly`]) also states an identity `Transform`
+    /// on every head, so none keeps a transform an earlier layout left on
+    /// its CRTC.
     #[must_use]
     pub fn nvidia_metamode(&self) -> String {
+        let transform = match self.scaling {
+            HeadScaling::ViewPortIn => "",
+            HeadScaling::NativeOnly => IDENTITY_TRANSFORM_ATTRIBUTE,
+        };
         self.heads
             .iter()
             .map(|head| {
                 let (screen_w, screen_h) = head.screen_extent();
+                let mode = head
+                    .mode_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}x{}", head.mode.width, head.mode.height));
                 format!(
-                    "{}: {}x{} @{}x{} {:+}{:+} {{ViewPortIn={}x{}, ViewPortOut={}x{}+0+0, Rotation={}}}",
+                    "{}: {mode} @{}x{} {:+}{:+} {{ViewPortIn={}x{}, ViewPortOut={}x{}+0+0, Rotation={}{transform}}}",
                     head.output,
-                    head.mode.width,
-                    head.mode.height,
                     screen_w,
                     screen_h,
                     head.x,
@@ -857,6 +1135,10 @@ mod tests {
                     refresh_mhz,
                 })
                 .collect(),
+            mode_names: modes
+                .iter()
+                .map(|&(width, height, _)| format!("{width}x{height}"))
+                .collect(),
             preferred: Some(0),
         }
     }
@@ -913,6 +1195,172 @@ mod tests {
             "DVI-D-0: 2560x1600 @2560x1600 +1920+0 {ViewPortIn=2560x1600, ViewPortOut=2560x1600+0+0, Rotation=normal}, \
              DVI-D-1: 1920x1200 @1920x1200 +0+400 {ViewPortIn=1920x1200, ViewPortOut=1920x1200+0+0, Rotation=normal}"
         );
+    }
+
+    /// The field layout of 2026-11-25: the other product left DP-0 in a
+    /// 4K mode and DP-2 at 2560x1440, and both list the modes it made for
+    /// earlier clients; the Deck has 2560x1600 and a 1920x1200 on its left.
+    fn left_by_another_product() -> [ConsoleOutput; 4] {
+        let mut outputs = [
+            output("DP-0", true, &[(3840, 2160, 60_000), (2560, 1600, 59_972)]),
+            output("DP-2", true, &[(2560, 1440, 59_951), (1920, 1200, 59_950)]),
+            output("DP-4", true, &[]),
+            output("DP-6", true, &[]),
+        ];
+        // Modes the product made under its own names.
+        outputs[0].mode_names[1] = "2560x1600_55400rkqnm_541".to_owned();
+        outputs[1].mode_names[1] = "1920x1200_70645jbvjy_545".to_owned();
+        outputs
+    }
+
+    #[test]
+    fn another_products_desktop_takes_the_decks_sizes_natively_with_identity_transforms() {
+        let plan = plan_native_console_layout(
+            &[
+                request(2560, 1600, 1920, 0, true),
+                request(1920, 1200, 0, 400, false),
+            ],
+            &left_by_another_product(),
+        )
+        .expect("plan");
+        assert_eq!(plan.scaling, HeadScaling::NativeOnly);
+        assert!(plan.heads.iter().all(|head| !head.scaled
+            && (head.mode.width, head.mode.height) == head.viewport_in));
+        assert!(plan.unused.is_empty(), "heads without modes are left alone");
+        let identity = "Transform=(1.000000,0.000000,0.000000,0.000000,1.000000,0.000000,0.000000,0.000000,1.000000)";
+        assert_eq!(
+            plan.nvidia_metamode(),
+            format!(
+                "DP-0: 2560x1600_55400rkqnm_541 @2560x1600 +1920+0 {{ViewPortIn=2560x1600, ViewPortOut=2560x1600+0+0, Rotation=normal, {identity}}}, \
+                 DP-2: 1920x1200_70645jbvjy_545 @1920x1200 +0+400 {{ViewPortIn=1920x1200, ViewPortOut=1920x1200+0+0, Rotation=normal, {identity}}}"
+            )
+        );
+    }
+
+    #[test]
+    fn no_head_of_another_products_desktop_is_ever_scaled() {
+        // A size neither output lists: a console Arcen owns scales it, a
+        // guest desktop names the output and the mode it needs instead.
+        let requests = [
+            request(1728, 1117, 0, 0, true),
+            request(1920, 1200, 1728, 0, false),
+        ];
+        let outputs = left_by_another_product();
+        assert!(
+            plan_console_layout(&requests, &outputs)
+                .expect("own console")
+                .heads[0]
+                .scaled
+        );
+        assert_eq!(
+            plan_native_console_layout(&requests, &outputs),
+            Err(ConsoleLayoutError::NoNativeMode {
+                output: "DP-0".to_owned(),
+                width: 1728,
+                height: 1117,
+            })
+        );
+        // The mode to add, at no more than 60 Hz for a 120 Hz Deck.
+        let mut fast = requests;
+        fast[0].refresh_hz = 120;
+        let needs = missing_native_modes(&fast, &outputs);
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].output, "DP-0");
+        assert_eq!(
+            needs[0].timing,
+            cvt_reduced_blanking(1728, 1117, 60).expect("timing")
+        );
+        assert_eq!(needs[0].timing.name(), "1728x1117_60_arcen");
+        // Once the output lists it, the layout is native.
+        // A mode whose name could not stand in a MetaMode counts as missing.
+        let mut added = outputs;
+        added[0].modes.push(OutputMode {
+            width: 1728,
+            height: 1117,
+            refresh_mhz: 60_000,
+        });
+        added[0]
+            .mode_names
+            .push("1728x1117, DP-4: 640x480".to_owned());
+        assert_eq!(missing_native_modes(&requests, &added).len(), 1);
+        added[0].mode_names[2] = "1728x1117_60_arcen".to_owned();
+        let plan = plan_native_console_layout(&requests, &added).expect("plan");
+        assert!(plan.heads.iter().all(|head| !head.scaled));
+        assert_eq!(
+            plan.heads[0].mode_name.as_deref(),
+            Some("1728x1117_60_arcen")
+        );
+        assert!(
+            plan.nvidia_metamode()
+                .starts_with("DP-0: 1728x1117_60_arcen @1728x1117 +0+0")
+        );
+        assert!(missing_native_modes(&requests, &added).is_empty());
+    }
+
+    #[test]
+    fn reduced_blanking_matches_the_vesa_timings() {
+        let timing = |w, h| {
+            let t = cvt_reduced_blanking(w, h, 60).expect("timing");
+            (
+                t.dot_clock_khz,
+                [t.hsync_start, t.hsync_end, t.htotal],
+                [t.vsync_start, t.vsync_end, t.vtotal],
+            )
+        };
+        // `cvt -r` / the VESA CVT 1.2 spreadsheet.
+        assert_eq!(
+            timing(2560, 1600),
+            (268_500, [2608, 2640, 2720], [1603, 1609, 1646])
+        );
+        assert_eq!(
+            timing(1920, 1200),
+            (154_000, [1968, 2000, 2080], [1203, 1209, 1235])
+        );
+        assert_eq!(
+            timing(1920, 1080),
+            (138_500, [1968, 2000, 2080], [1083, 1088, 1111])
+        );
+        assert_eq!(cvt_reduced_blanking(0, 1080, 60), None);
+        assert_eq!(cvt_reduced_blanking(1920, 1080, 0), None);
+    }
+
+    #[test]
+    fn a_scaled_head_is_shown_as_the_area_it_covers_not_its_mode() {
+        // The field's hand fix of 2026-11-25: DP-0 drove its 3840x2160
+        // mode with ViewPortIn 2560x1600 (a RandR transform), so its CRTC
+        // covered 2560x1600 at +1920+0 of a 4480x1600 screen.
+        let dp0 = shown_size((2560, 1600), Rotation::Degrees0);
+        assert_eq!(dp0, (2560, 1600));
+        let outputs = [
+            primary(shown("DP-0", dp0, (1920, 0))),
+            shown(
+                "DP-2",
+                shown_size((1920, 1200), Rotation::Degrees0),
+                (0, 400),
+            ),
+        ];
+        for output in &outputs {
+            let (width, height) = output.screen_extent();
+            assert!(
+                output.x + i32::try_from(width).unwrap() <= 4480
+                    && output.y + i32::try_from(height).unwrap() <= 1600,
+                "{} lies inside the screen",
+                output.name
+            );
+        }
+        let requests = [
+            request(2560, 1600, 1920, 0, true),
+            request(1920, 1200, 0, 400, false),
+        ];
+        assert!(
+            match_shown_layout(&requests, &outputs)
+                .expect("mapped")
+                .exact(&requests)
+        );
+        // A portrait head: RandR reports the rotated area, the output's
+        // own size is the other way round.
+        assert_eq!(shown_size((1200, 1920), Rotation::Degrees90), (1920, 1200));
+        assert_eq!(shown_size((1920, 1200), Rotation::Degrees180), (1920, 1200));
     }
 
     #[test]

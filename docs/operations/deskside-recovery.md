@@ -14,6 +14,18 @@ Desk privacy needs no recovery of its own on Windows. The desk's keyboard and
 mouse hooks belong to the session agent and end with it; the display lease and
 its journal are the ordinary display recovery.
 
+With `privacy.desk = "required"`, the desk stays dark, with its keyboard and
+mouse blocked, after a Deck leaves a session that will neither lock nor
+disconnect from the console; the Pier log says `privacy.desk is required and
+the session will not lock`. Check that the session's lock screen is not
+turned off by policy (the Pier asks for the lock every 30 s and gives the desk
+back once the session is locked), or sign the user out. At the desk,
+Ctrl+Alt+Delete still reaches Windows: choose Lock (the first entry), and the
+desk gets its monitors back on the lock screen, where signing in is a normal
+unlock. Stopping the Pier
+instead hands the session to its session guard, which locks it once the
+displays are back.
+
 When the protected `display-recovery.json` remains after a session:
 
 1. Stop new sessions.
@@ -45,6 +57,14 @@ If a desk stays dark, end the helper
 (`launchctl kickstart -k gui/<uid>/pier.arcen.tech.agent`) or sign out.
 `arcen-pier-macos probe-desk-privacy`, run in that session, shows whether any
 display still reads dark.
+
+With `privacy.desk = "required"`, the desk also stays dark, with its input
+blocked, after a Deck leaves a session that will not lock; the agent log says
+`the session would not lock after its Deck left`. Turn the session's lock
+screen back on (the Pier asks for the lock every 30 s and gives the desk back
+once it is locked), or sign the user out. Ending the helper instead hands the
+desk to its lock guard, which tries to lock it for a minute and then gives it
+back, unlocked if it still will not lock.
 
 The key was `platform.desktop.deskside.enabled` before `privacy.desk`; see the
 [configuration reference](config-reference.md).

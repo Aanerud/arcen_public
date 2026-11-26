@@ -260,16 +260,16 @@ impl VideoSwapchain {
         unsafe { self.swapchain.GetLastPresentCount() }.ok()
     }
 
-    /// Whether present number `id` was displayed, from DXGI frame
-    /// statistics (`PresentCount` is the last present shown).
-    pub fn confirm(&self, id: u32) -> super::compose::Confirmation {
-        use super::compose::Confirmation;
+    /// DXGI's frame statistics now (`PresentCount` is the last present
+    /// shown), `None` while it has none to give (disjoint).
+    pub fn statistics(&self) -> Option<arcen_deck_core::present::confirmation::PresentStatistics> {
         let mut stats = DXGI_FRAME_STATISTICS::default();
-        match unsafe { self.swapchain.GetFrameStatistics(&mut stats) } {
-            Ok(()) if stats.PresentCount.wrapping_sub(id) < u32::MAX / 2 => Confirmation::Displayed,
-            Ok(()) => Confirmation::Pending,
-            Err(_) => Confirmation::Unconfirmed,
-        }
+        unsafe { self.swapchain.GetFrameStatistics(&mut stats) }.ok()?;
+        Some(arcen_deck_core::present::confirmation::PresentStatistics {
+            present_count: stats.PresentCount,
+            present_refresh_count: stats.PresentRefreshCount,
+            sync_refresh_count: stats.SyncRefreshCount,
+        })
     }
 
     /// DWM's composition path for the last presents, with the raw reading.

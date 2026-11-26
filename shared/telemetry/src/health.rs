@@ -41,7 +41,11 @@ pub struct QosSample {
     pub frames_sent: Option<u64>,
     /// Frames dropped by the host.
     pub frames_dropped: Option<u64>,
-    /// Frames decoded by the client.
+    /// Frames decoded by the client, counted up to the client's last look
+    /// at its presenters in the window, so they are the frames
+    /// [`Self::frames_presented`] and [`Self::frames_superseded`] account
+    /// for. A frame decoded after that look is still on its way to the
+    /// screen and counts in the next window.
     pub frames_decoded: Option<u64>,
     /// Frames presented by the client.
     pub frames_presented: Option<u64>,
@@ -497,9 +501,14 @@ fn idle_content(sample: &QosSample) -> bool {
         .is_some_and(|content| content <= IDLE_CONTENT_FPS)
 }
 
-/// The frame rate below which `state` applies to this sample, for reporting
-/// the threshold a health transition crossed. `None` when frame rate cannot
-/// be judged.
+/// The lowest whole frame rate this sample could have and not be judged
+/// `state` or worse, for reporting the threshold a health transition
+/// crossed. `None` when frame rate cannot be judged.
+///
+/// A rate fails when it is below a percentage of [`fps_expected`], so the
+/// threshold rounds up: at 8 fps expected and 70 %, 5 fps fails and the
+/// threshold is 6, never 5. A failing rate is always strictly below it,
+/// including where the one-frame quantisation slack lets a rate pass sooner.
 #[must_use]
 pub fn fps_threshold(sample: &QosSample, targets: &QosTargets, state: HealthState) -> Option<u32> {
     let percent = if state == HealthState::Critical {
@@ -507,7 +516,14 @@ pub fn fps_threshold(sample: &QosSample, targets: &QosTargets, state: HealthStat
     } else {
         targets.fps_degraded_percent
     };
-    fps_expected(sample).map(|expected| expected.saturating_mul(u32::from(percent)) / 100)
+    fps_expected(sample).map(|expected| {
+        let by_percent = u64::from(expected)
+            .saturating_mul(u64::from(percent))
+            .div_ceil(100);
+        u32::try_from(by_percent)
+            .unwrap_or(u32::MAX)
+            .min(expected.saturating_sub(FPS_QUANTISATION_SLACK))
+    })
 }
 
 /// Whole frames per second a window may fall short of [`fps_expected`] by
@@ -573,8 +589,10 @@ fn assess_drop(
 
 /// Decoded frames a window may leave unpresented before supersession counts.
 ///
-/// A frame decoded just before the window closed is presented just after it,
-/// and a presenter on a composed display keeps a second picture in flight
+/// Decoded frames are counted up to the client's last look at its
+/// presenters ([`QosSample::frames_decoded`]), but at that look a frame
+/// just decoded is still on its way to the presenter, and a presenter on a
+/// composed display keeps a second picture in flight
 /// (`arcen_media::presentation::NewestPresentDepth`). On a busy stream those
 /// frames are noise; on a still desktop sending three frames a window one of
 /// them read as a third of the stream lost, and raised a critical
@@ -1363,6 +1381,57 @@ mod tests {
             fps_threshold(&sample, &targets, HealthState::Degraded),
             Some(18)
         );
+    }
+
+    /// Seen live: `HEALTH_CRITICAL fps value 5 threshold 5`, because the
+    /// threshold rounded 5.6 down.
+    #[test]
+    fn a_failing_frame_rate_is_reported_below_its_threshold() {
+        let targets = QosTargets::default();
+        let critical = host_sample(5, 30, Some(8));
+        assert_eq!(fps_expected(&critical), Some(8));
+        assert_eq!(
+            host_state(&critical),
+            (Some(HealthState::Critical), Some(HealthCause::Fps))
+        );
+        assert_eq!(
+            fps_threshold(&critical, &targets, HealthState::Critical),
+            Some(6)
+        );
+        let degraded = host_sample(13, 30, Some(15));
+        assert_eq!(
+            host_state(&degraded),
+            (Some(HealthState::Degraded), Some(HealthCause::Fps))
+        );
+        assert_eq!(
+            fps_threshold(&degraded, &targets, HealthState::Degraded),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn the_fps_threshold_is_the_lowest_rate_that_passes() {
+        let targets = QosTargets::default();
+        for expected in 1..=120 {
+            for state in [HealthState::Degraded, HealthState::Critical] {
+                let threshold = fps_threshold(
+                    &host_sample(expected, expected, Some(expected)),
+                    &targets,
+                    state,
+                )
+                .expect("a judged rate has a threshold");
+                for actual in 0..=expected {
+                    let judged = host_state(&host_sample(actual, expected, Some(expected)))
+                        .0
+                        .expect("frame rate is judged");
+                    assert_eq!(
+                        judged >= state,
+                        actual < threshold,
+                        "{actual} of {expected} fps judged {judged:?}, {state:?} threshold {threshold}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

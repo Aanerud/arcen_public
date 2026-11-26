@@ -2348,6 +2348,63 @@ impl MultiDisplayLease {
             None
         }
     }
+
+    /// Proves a physical session desktop is still the applied plan after a
+    /// change Windows may answer by laying the desktop out again (switching
+    /// a session display's HDR on or off), and puts the plan back as the
+    /// shared [`arcen_outputs::windows_topology::drift_response`] decides.
+    /// Returns the drift that was put back. An `IddCx` desktop adds its
+    /// displays beside the console's and is not checked here.
+    ///
+    /// # Errors
+    ///
+    /// The desktop cannot be read, the plan cannot be applied again, or it
+    /// did not hold.
+    pub fn hold_applied_plan(
+        &mut self,
+    ) -> Result<Option<arcen_outputs::windows_topology::TopologyDrift>, String> {
+        #[cfg(windows)]
+        {
+            use arcen_outputs::windows_topology::{drift_response, topology_drift, DriftResponse};
+            let MultiDisplayTransaction::Physical(inner) = &self.inner else {
+                return Ok(None);
+            };
+            let plan = inner.evidence().applied_plan().clone();
+            let mut reassertions = 0_u32;
+            let mut reasserted = None;
+            loop {
+                let active = windows_backend::active_output_placements()?;
+                let drift = topology_drift(&plan, &active);
+                match drift_response(drift.as_ref(), reassertions) {
+                    DriftResponse::Kept => return Ok(reasserted),
+                    DriftResponse::Reassert => {
+                        tracing::warn!(
+                            target: DISPLAY,
+                            drift = %drift.as_ref().map(ToString::to_string).unwrap_or_default(),
+                            desktop_width = plan.desktop_width,
+                            desktop_height = plan.desktop_height,
+                            "Windows laid the session desktop out again; applying the session \
+                             layout again"
+                        );
+                        windows_backend::reassert_physical_plan(&plan)
+                            .map_err(|error| format!("apply the session layout again: {error}"))?;
+                        reassertions += 1;
+                        reasserted = drift;
+                    }
+                    DriftResponse::Refuse => {
+                        return Err(format!(
+                            "the session desktop did not keep its layout: {}",
+                            drift.map(|drift| drift.to_string()).unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(None)
+        }
+    }
 }
 
 impl Drop for MultiDisplayLease {
@@ -2590,9 +2647,12 @@ impl NativeBackend {
             }
             Err(error) => return Err(error),
         };
+        // This transaction writes the target's exact EDID, so Windows may
+        // still publish HDR support for it: an HDR session keeps waiting.
         let guard = match crate::advanced_color::apply_for_session(
             &targets,
             desired_hdr,
+            &[true],
             &self.session_log_id,
         ) {
             Ok(guard) => guard,
@@ -2605,7 +2665,7 @@ impl NativeBackend {
                 );
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.to_string()),
         };
         self.advanced_color_prepared = true;
         self.advanced_color_desired_hdr = Some(desired_hdr);
@@ -3632,6 +3692,168 @@ mod windows_backend {
         }
     }
 
+    /// Applies a physical multi-monitor `plan` over `working`, the active
+    /// topology it was planned against: the planned outputs at their
+    /// rectangles and every other active output made inactive.
+    fn apply_physical_plan(
+        working: &TopologySnapshot,
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
+    ) -> Result<(), String> {
+        let mut paths = working.paths.clone();
+        let mut modes = working.modes.clone();
+        let mut matched = std::collections::BTreeSet::new();
+
+        for path in &mut paths {
+            let planned = plan.monitors.iter().find(|monitor| {
+                monitor.adapter_luid.low_part == path.targetInfo.adapterId.LowPart
+                    && monitor.adapter_luid.high_part == path.targetInfo.adapterId.HighPart
+                    && monitor.target_id == path.targetInfo.id
+            });
+            let Some(monitor) = planned else {
+                path.flags &= !PATH_ACTIVE_FLAG;
+                path.sourceInfo.Anonymous.modeInfoIdx = PATH_MODE_INDICES_INVALID;
+                path.targetInfo.Anonymous.modeInfoIdx = PATH_MODE_INDICES_INVALID;
+                continue;
+            };
+            matched.insert(monitor.session_monitor_id.get());
+            let source_mode_index =
+                virtual_source_mode_index(unsafe { path.sourceInfo.Anonymous.Anonymous._bitfield })
+                    .ok_or_else(|| {
+                        format!(
+                            "selected output {} has no virtual source mode",
+                            monitor.device_name
+                        )
+                    })?;
+            let source_mode = modes.get_mut(source_mode_index).ok_or_else(|| {
+                format!(
+                    "selected output {} source mode index is outside the topology",
+                    monitor.device_name
+                )
+            })?;
+            if source_mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                return Err(format!(
+                    "selected output {} mode is not a source mode",
+                    monitor.device_name
+                ));
+            }
+            source_mode.Anonymous.sourceMode.width = monitor.width;
+            source_mode.Anonymous.sourceMode.height = monitor.height;
+            source_mode.Anonymous.sourceMode.position = POINTL {
+                x: monitor.x,
+                y: monitor.y,
+            };
+            // SAFETY: the working topology was queried with
+            // QDC_VIRTUAL_MODE_AWARE, so the union carries the bitfield.
+            let target_bits = unsafe { path.targetInfo.Anonymous.Anonymous._bitfield };
+            let target_active = modes
+                .get((target_bits >> 16) as usize)
+                .filter(|mode| mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
+                // SAFETY: the info type says this union holds a target mode.
+                .map(|mode| unsafe {
+                    let size = mode.Anonymous.targetMode.targetVideoSignalInfo.activeSize;
+                    (size.cx, size.cy)
+                });
+            let desktop_source = modes
+                .get((target_bits & 0xFFFF) as usize)
+                .filter(|mode| mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE)
+                // SAFETY: the info type says this union holds a desktop image.
+                .and_then(|mode| unsafe {
+                    let size = mode.Anonymous.desktopImageInfo.PathSourceSize;
+                    Some((u32::try_from(size.x).ok()?, u32::try_from(size.y).ok()?))
+                });
+            let retargeted = retargeted_mode_bits(
+                target_bits,
+                target_active,
+                desktop_source,
+                (monitor.width, monitor.height),
+                (monitor.mode_width, monitor.mode_height),
+            );
+            if retargeted != target_bits {
+                tracing::debug!(
+                    target: DISPLAY,
+                    device = %monitor.device_name,
+                    ?target_active,
+                    ?desktop_source,
+                    source_width = monitor.width,
+                    source_height = monitor.height,
+                    "output timing and desktop image left to Windows for the planned source"
+                );
+            }
+            path.targetInfo.Anonymous.Anonymous._bitfield = retargeted;
+            path.targetInfo.rotation = rotation_to_display_config(monitor.rotation);
+            path.flags |= PATH_ACTIVE_FLAG;
+        }
+        if matched.len() != plan.monitors.len() {
+            return Err(format!(
+                "only {} of {} requested outputs exist in the active topology",
+                matched.len(),
+                plan.monitors.len()
+            ));
+        }
+        let flags = SET_DISPLAY_CONFIG_FLAGS(
+            SDC_APPLY.0
+                | SDC_USE_SUPPLIED_DISPLAY_CONFIG.0
+                | SDC_ALLOW_CHANGES.0
+                | SDC_VIRTUAL_MODE_AWARE.0,
+        );
+        let rc = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
+        if rc != 0 {
+            return Err(format!(
+                "SetDisplayConfig multi-monitor apply returned {rc}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every output Windows reports active, with its source's desktop
+    /// rectangle, for the shared [`arcen_outputs::windows_topology::topology_drift`].
+    pub(super) fn active_output_placements(
+    ) -> Result<Vec<arcen_outputs::windows_topology::ActiveOutputPlacement>, String> {
+        let topology = query_active_topology()?;
+        topology
+            .paths
+            .iter()
+            .map(|path| {
+                // SAFETY: query_active_topology asks for QDC_VIRTUAL_MODE_AWARE,
+                // so the union carries the bitfield.
+                let bits = unsafe { path.sourceInfo.Anonymous.Anonymous._bitfield };
+                let source = virtual_source_mode_index(bits)
+                    .and_then(|index| topology.modes.get(index))
+                    .filter(|mode| mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+                    .ok_or_else(|| {
+                        format!(
+                            "active display target {} has no source mode",
+                            path.targetInfo.id
+                        )
+                    })?;
+                // SAFETY: the info type says this union holds a source mode.
+                let source = unsafe { source.Anonymous.sourceMode };
+                Ok(arcen_outputs::windows_topology::ActiveOutputPlacement {
+                    adapter_luid: arcen_outputs::windows_topology::AdapterLuid {
+                        low_part: path.targetInfo.adapterId.LowPart,
+                        high_part: path.targetInfo.adapterId.HighPart,
+                    },
+                    target_id: path.targetInfo.id,
+                    x: source.position.x,
+                    y: source.position.y,
+                    width: source.width,
+                    height: source.height,
+                })
+            })
+            .collect()
+    }
+
+    /// Applies a bound physical `plan` again over the topology Windows has
+    /// now, and waits for it. The recovery journal armed at bind still holds
+    /// the pre-session topology, so rollback is unchanged.
+    pub(super) fn reassert_physical_plan(
+        plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
+    ) -> Result<(), String> {
+        let working = query_active_topology()?;
+        apply_physical_plan(&working, plan)?;
+        wait_for_multi_display_plan(plan, MODE_SETTLE_TIMEOUT)
+    }
+
     impl PhysicalOutputBinding {
         fn plan(&self) -> &arcen_outputs::windows_topology::WindowsTopologyPlan {
             self.evidence.applied_plan()
@@ -3850,111 +4072,7 @@ mod windows_backend {
             &mut self,
             plan: &arcen_outputs::windows_topology::WindowsTopologyPlan,
         ) -> Result<(), String> {
-            let mut paths = self.working.paths.clone();
-            let mut modes = self.working.modes.clone();
-            let mut matched = std::collections::BTreeSet::new();
-
-            for path in &mut paths {
-                let planned = plan.monitors.iter().find(|monitor| {
-                    monitor.adapter_luid.low_part == path.targetInfo.adapterId.LowPart
-                        && monitor.adapter_luid.high_part == path.targetInfo.adapterId.HighPart
-                        && monitor.target_id == path.targetInfo.id
-                });
-                let Some(monitor) = planned else {
-                    path.flags &= !PATH_ACTIVE_FLAG;
-                    path.sourceInfo.Anonymous.modeInfoIdx = PATH_MODE_INDICES_INVALID;
-                    path.targetInfo.Anonymous.modeInfoIdx = PATH_MODE_INDICES_INVALID;
-                    continue;
-                };
-                matched.insert(monitor.session_monitor_id.get());
-                let source_mode_index = virtual_source_mode_index(unsafe {
-                    path.sourceInfo.Anonymous.Anonymous._bitfield
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "selected output {} has no virtual source mode",
-                        monitor.device_name
-                    )
-                })?;
-                let source_mode = modes.get_mut(source_mode_index).ok_or_else(|| {
-                    format!(
-                        "selected output {} source mode index is outside the topology",
-                        monitor.device_name
-                    )
-                })?;
-                if source_mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
-                    return Err(format!(
-                        "selected output {} mode is not a source mode",
-                        monitor.device_name
-                    ));
-                }
-                source_mode.Anonymous.sourceMode.width = monitor.width;
-                source_mode.Anonymous.sourceMode.height = monitor.height;
-                source_mode.Anonymous.sourceMode.position = POINTL {
-                    x: monitor.x,
-                    y: monitor.y,
-                };
-                // SAFETY: the working topology was queried with
-                // QDC_VIRTUAL_MODE_AWARE, so the union carries the bitfield.
-                let target_bits = unsafe { path.targetInfo.Anonymous.Anonymous._bitfield };
-                let target_active = modes
-                    .get((target_bits >> 16) as usize)
-                    .filter(|mode| mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET)
-                    // SAFETY: the info type says this union holds a target mode.
-                    .map(|mode| unsafe {
-                        let size = mode.Anonymous.targetMode.targetVideoSignalInfo.activeSize;
-                        (size.cx, size.cy)
-                    });
-                let desktop_source = modes
-                    .get((target_bits & 0xFFFF) as usize)
-                    .filter(|mode| mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_DESKTOP_IMAGE)
-                    // SAFETY: the info type says this union holds a desktop image.
-                    .and_then(|mode| unsafe {
-                        let size = mode.Anonymous.desktopImageInfo.PathSourceSize;
-                        Some((u32::try_from(size.x).ok()?, u32::try_from(size.y).ok()?))
-                    });
-                let retargeted = retargeted_mode_bits(
-                    target_bits,
-                    target_active,
-                    desktop_source,
-                    (monitor.width, monitor.height),
-                    (monitor.mode_width, monitor.mode_height),
-                );
-                if retargeted != target_bits {
-                    tracing::debug!(
-                        target: DISPLAY,
-                        device = %monitor.device_name,
-                        ?target_active,
-                        ?desktop_source,
-                        source_width = monitor.width,
-                        source_height = monitor.height,
-                        "output timing and desktop image left to Windows for the planned source"
-                    );
-                }
-                path.targetInfo.Anonymous.Anonymous._bitfield = retargeted;
-                path.targetInfo.rotation = rotation_to_display_config(monitor.rotation);
-                path.flags |= PATH_ACTIVE_FLAG;
-            }
-            if matched.len() != plan.monitors.len() {
-                return Err(format!(
-                    "only {} of {} requested outputs exist in the active topology",
-                    matched.len(),
-                    plan.monitors.len()
-                ));
-            }
-            let flags = SET_DISPLAY_CONFIG_FLAGS(
-                SDC_APPLY.0
-                    | SDC_USE_SUPPLIED_DISPLAY_CONFIG.0
-                    | SDC_ALLOW_CHANGES.0
-                    | SDC_VIRTUAL_MODE_AWARE.0,
-            );
-            let rc = unsafe { SetDisplayConfig(Some(&paths), Some(&modes), flags) };
-            if rc != 0 {
-                return Err(format!(
-                    "SetDisplayConfig multi-monitor apply returned {rc}"
-                ));
-            }
-            Ok(())
+            apply_physical_plan(&self.working, plan)
         }
 
         fn commit(&mut self) -> Result<(), String> {

@@ -9,6 +9,7 @@
 
 mod runtime;
 mod sampler;
+mod service_health;
 pub mod session_health;
 mod sink;
 #[cfg(feature = "support-bundle")]
@@ -22,6 +23,7 @@ pub use runtime::{
 pub use sampler::{
     CallerQosSnapshot, HeartbeatCounters, HeartbeatSnapshot, QosCounters, QosSampler,
 };
+pub use service_health::ServiceHealth;
 pub use session_health::monitor_rates::{
     MONITOR_LIMITED_HOST_SHORTFALL, MonitorCounters, MonitorRateChange, MonitorRates,
     log_monitor_rate_change,

@@ -1860,6 +1860,7 @@ fn qualification_launcher_config(
         first_login_setup: arcen_session::desktop_session::first_login::FirstLoginSetup::Skip,
         // Qualification creates headless desktops of its own.
         desktop_mode: arcen_session::console_session::DesktopMode::Dedicated,
+        guest_layout: arcen_session::console_session::guest_layout::GuestLayoutSetting::Deck,
         // Only the X11 qualification session asks for Xwayland.
         x11_apps: false,
     })

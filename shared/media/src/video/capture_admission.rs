@@ -249,6 +249,9 @@ pub enum AdmissionReason {
     NoSharedConversion,
     /// The output is not proven to be in an active HDR state.
     HdrOutputNotProven,
+    /// The host's display offers no HDR at all (an SDR monitor or a dummy
+    /// plug whose own EDID claims none), so HDR can never be activated.
+    HdrDisplayUnsupported,
     /// The source samples are SDR.
     SdrSource,
     /// Linear or PQ samples without an authoritative SDR white.
@@ -293,6 +296,7 @@ impl AdmissionReason {
         Self::HdrOnEightBitSource,
         Self::NoSharedConversion,
         Self::HdrOutputNotProven,
+        Self::HdrDisplayUnsupported,
         Self::SdrSource,
         Self::ReferenceWhiteUnknown,
         Self::ReferenceWhiteUnsupported,
@@ -337,6 +341,7 @@ impl AdmissionReason {
             Self::HdrOnEightBitSource => "hdr_on_eight_bit_source",
             Self::NoSharedConversion => "no_shared_conversion",
             Self::HdrOutputNotProven => "hdr_output_not_proven",
+            Self::HdrDisplayUnsupported => "hdr_display_unsupported",
             Self::SdrSource => "sdr_source",
             Self::ReferenceWhiteUnknown => "reference_white_unknown",
             Self::ReferenceWhiteUnsupported => "reference_white_unsupported",

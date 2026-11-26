@@ -15,6 +15,14 @@ If `ArcenPier` is running, a real upgrade stops it before replacing executable
 payloads and starts it after installation. `--dry-run` reports that same plan
 without requiring the operator to stop the live service first.
 
+The installer succeeds only once the service control manager shows `ArcenPier`
+running, and still running two seconds later. A starting Pier reports progress,
+and the installer waits while that progress continues, for up to two minutes.
+Otherwise it exits non-zero and names what it found: the start failed (the
+service stopped, stopped reporting progress, or its process was replaced), the
+Pier is still starting, or the service's state could not be read. The files are
+installed in every case.
+
 The future GUI and signed-driver-capable installer should present one explicit
 optional component: **Arcen Microphone input driver**. The current CLI installer
 does not install that optional driver.

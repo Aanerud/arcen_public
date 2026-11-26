@@ -266,7 +266,7 @@ session.
 | The account is signed in (GDM, X11) | joins that session: the same desktop and applications; unlocks it if it was locked |
 | The account's session waits behind the login screen (switch user) | brings it forward, then joins it |
 | Nobody is signed in, GDM's login screen shows | the login screen signs the account in (a one-time token, below); GDM owns the session, so a later sign-in at the desk resumes it |
-| The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it as a guest: its screens are streamed as they are and never changed (below); the other product is never stopped or reconfigured |
+| The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it as a guest: the desktop takes the Deck's monitors and keeps them after the Deck leaves, as that product does for its own client (below); the other product is never stopped or reconfigured |
 | The same, while that product's own client is connected | refused, `console_in_use_other_product`: one remote-desktop product at a time |
 | Another account is signed in (or holds the console through another product) | refused, `console_other_user` or `console_other_user_other_product` |
 | The account is signed in to GNOME on Wayland | joins that session: its own monitors and applications, nothing of it changed; locked when the Deck leaves. A session that shows on a monitor at the desk cannot be blanked (a Wayland desk cannot be): with desk privacy `on` it is served with the desk's input disabled and the Deck is told its screens are visible; refused `console_privacy_unavailable` when desk privacy is `required`. A disconnected Deck signs in again rather than resuming |
@@ -320,17 +320,45 @@ manager restarted since, are offered as they are now. It never starts a
 probe X server while another X server holds the GPU; the start-time probe
 runs only on a host where no X server runs yet.
 
-**Another product's desktop is shown as it is.** On a session another
-remote-desktop product started (its own X server, a logind session whose PAM
-service is not the display manager's), Arcen changes nothing on the X
-server: no MetaMode, no RandR change, no hidden outputs. That product lays
-the desktop out for its own client when the client connects and leaves it
-so; a Deck that matches its layout then gets one window per monitor that
-desktop shows, mapped by arrangement: the Deck's primary display shows the
+**Another product's desktop takes the Deck's monitors.** On a session
+another remote-desktop product started (its own X server, a logind session
+whose PAM service is not the display manager's), a Deck that matches its
+layout lays the desktop out to its own monitors when it attaches, as that
+product does for its own client when the client connects: the same MetaMode,
+primary and journal as above, but never scaled. Each monitor drives a mode
+of exactly the Deck display's size: one the output lists, or one the Pier
+adds (a standard reduced-blanking timing at the Deck's refresh, at most
+60 Hz, named like `2560x1600_60_arcen`, left on the X server as the product
+leaves its own modes), and every monitor's transform is reset to none. Just
+before, the Pier checks again that the
+product's own client is not connected; it changes nothing while that client
+is connected or when it cannot tell. When the Deck leaves, the session is
+locked as on every disconnect and the Deck's layout stays, as the product
+leaves its own: the product lays the desktop out again when its client next
+connects. The layout the desktop had before is recorded in
+`/run/arcen/console-layout-before-deck.json` (MetaMode and primary), and the
+Pier logs the join with `layout` `applied`; it is not put back. Monitors the
+Deck does not use are switched off and stay off until the product lays the
+desktop out again. A desktop that cannot take the layout (too few outputs, an
+output that refuses a mode of the Deck's size, a MetaMode refused or not
+proved) is put back as it was and shown as it is; the Pier log says why
+("another product's desktop cannot take the Deck's layout", with the reason
+`console_layout_no_native_mode`, `console_outputs_insufficient` or
+`console_layout_unproven`). To
+keep the product's layout always, set `platform.session.guest_layout` to
+`keep`.
+
+**Shown as it is.** With `platform.session.guest_layout` `keep`, on a
+desktop that cannot take the Deck's layout, and for a Deck that asks for one
+display, Arcen changes nothing on another product's X server: no MetaMode,
+no RandR change, no hidden outputs. A Deck that matches its layout then gets
+one window per monitor that desktop shows, mapped by arrangement: the Deck's primary display shows the
 desktop's primary monitor, and each further display the monitor in the same
 direction from it (left, right, above, below). Each monitor is captured, by
 name, at its own size and fitted into the Deck's window: 1:1 when the sizes
-match, scaled otherwise, letterboxed only when the shapes differ. A desktop
+match, scaled otherwise, letterboxed only when the shapes differ. A monitor
+that desktop scales (a mode larger than the area it shows) is captured as the
+area it shows; the Pier logs "an output of this desktop is scaled". A desktop
 with more monitors than the Deck has displays shows the nearest ones; with
 fewer, the Deck's other displays get no window. A Deck that asks for one
 display (Primary Display Only, Windowed) is shown the monitor its primary
@@ -512,7 +540,7 @@ workstation; one of them serves the console at a time.
 
 | Situation | What Arcen does |
 | --- | --- |
-| The product runs, and the account's desktop in it exists, nobody connected through the product | joins that desktop as a guest (shown as it is, never changed) |
+| The product runs, and the account's desktop in it exists, nobody connected through the product | joins that desktop as a guest; the desktop takes the Deck's monitors (see [Joining the user's session](#joining-the-users-session-console-mode)) |
 | The product's client is connected | refuses `console_in_use_other_product` |
 | The product's client connects while a Deck is attached to that desktop | ends the Deck's attachment with `console_in_use_other_product`; the session is locked as on every disconnect |
 | The product is the host's display manager (`display-manager.service` points at its unit) and is stopped; GDM is not running | starts the account's real login session (a host without a display manager); a reconnect joins the same session |
@@ -1856,12 +1884,12 @@ Key lifecycle event IDs:
 | ID | Name | Meaning |
 | --- | --- | --- |
 | 1000 | `SERVICE_START` | Pier process running. |
-| 1001 | `SERVICE_STOP` | Clean stop. |
+| 1001 | `SERVICE_STOP` | Clean stop; `reason_class` `host_shutdown` when the host is shutting down or restarting, `clean_shutdown` otherwise. |
 | 1002 | `SERVICE_FAILED` | Startup or runtime failure. |
 | 1100 | `SESSION_AUTH_OK` | OS authentication and identity binding succeeded. |
 | 1101 | `SESSION_AUTH_FAIL` | Authentication failed. |
 | 1102 | `SESSION_STREAM_START` | Media/input streaming active. |
-| 1103 | `SESSION_END` | Clean session end. |
+| 1103 | `SESSION_END` | Clean session end; on a Windows Pier `reason_class` `signed_out` or `host_shutdown` when Windows ended the session under a live Deck. |
 | 1104 | `SESSION_INTERRUPTED` | Transport or component failure. |
 | 1108 | `RESUME_HOLD_ENDED` | A desktop held for its Deck's resume was let go without a resume; `reason_class` says why (`resume_window_expired`, `resume_refused`, `native_session_ended`, `same_user_reattached`, `fresh_sign_in`, `pier_stopping`, `owner_failed`, `other_product_client`, `other_product_started`, `desk_took_over`), `held_ms` for how long. |
 | 1200-1204 | Display events | Display arm, restore, degraded restore, failed restore, watchdog restore. |
@@ -2016,7 +2044,7 @@ leaving it unlocked at the desk; the session itself keeps running (see
 | TLS keys | Operator-managed PEM. Windows refuses private keys without restrictive DACL. Linux requires root-owned restrictive files. Self-signed certificates issued by either installer are valid for 825 days; ordinary installer upgrades reissue only positively classified unmarked legacy-Arcen pairs over the existing key, preserving SANs, and leave operator self-signed or CA-issued material alone. Same-key renewal uses the host-cert helpers (`new-host-cert.ps1 -Renew`, `arcen-pier new-host-cert --renew`, or `arcen-new-host-cert --renew`); installer `--force` is a trust-changing key replacement. |
 | Password attempts | Every Pier (Linux, Windows, macOS) applies the shared `arcen_session::auth_throttle` back-off: three free failures per source address (IPv6 by /64) and per account name (case- and `DOMAIN\`/`@realm`-insensitive), then a refusal without checking the password, with a wait doubling from 2 s to 5 min; a success clears the address's count, an account's failures expire after 15 min without another; at most two checks in flight per address or account; state is per Pier process and in memory (up to 65,536 keys; a key that is backing off is never dropped to make room, so a flood that fills the table delays new sign-ins instead). Only a credential or account the OS refused counts (PAM `authenticate`/`acct_mgmt`, `LogonUserW`); a verifier timeout or outage does not. The Deck is told "too many failed sign-ins; wait a few minutes before trying again", and the Pier logs `SESSION_AUTH_FAIL` with `reason_class=too_many_attempts`. The back-off also lets anyone who can reach the port delay one account's sign-in by failing on purpose; it is not a lockout. Configure `pam_faillock` (Linux) or the account-lockout policy (Windows) for one. The Deck has 15 s to send each handshake message and 60 s to answer the sign-in prompt on every Pier (10 min when a disclaimer is shown); the OS has 30 s to check the password, after which the attempt fails without counting against anyone. At most 16 connections wait at the prompt at once on Linux and Windows (on macOS, one per agent sign-in slot, three), and at most two of them from one source address (IPv6 by /64); a third connection from that address is refused before TLS. On macOS the TLS handshakes themselves take those limits (16 at once, two per address, side by side) before a Deck reaches one of the three slots. Because a UDP source address can be forged, every Pier first sends a QUIC Retry (one extra round trip, which a forger cannot answer) to a connection from an address that already holds a place, and to every new connection once half the places are held. |
 | Logs and support bundles | Sensitive operational data. Bundles pseudonymize selected identities but are not anonymous. Protect them in storage and transit. |
-| Known gaps | SEC-364 arbitrary live resize still depends on a retarget-capable display backend; Windows headless multi-monitor requires display paths supplied by hardware, the hypervisor, or a separately installed signed virtual-display driver; Linux Wayland serves Speed, Grading and HDR only where qualification proves them (see [Which desktop a Linux Pier serves](#which-desktop-a-linux-pier-serves)); ERR-366 `overall_state` unreliable. |
+| Known gaps | SEC-364 arbitrary live resize still depends on a retarget-capable display backend; Windows headless multi-monitor requires display paths supplied by hardware, the hypervisor, or a separately installed signed virtual-display driver; Linux Wayland serves Speed, Grading and HDR only where qualification proves them (see [Which desktop a Linux Pier serves](#which-desktop-a-linux-pier-serves)). |
 
 ## Proving a host actually streams
 
@@ -2624,9 +2652,6 @@ These are open findings, listed so an administrator is not surprised by them.
   Keep `max_monitors` at 2 or lower when enabling
   `platform.multi_monitor.nvidia_headless_enabled`; three-output support
   remains a release blocker.
-- **ERR-366** — `HEALTH_SNAPSHOT` reports `overall_state: unavailable`
-  throughout an otherwise healthy streaming session, so it cannot currently be
-  used as a health signal.
 - **SEC-367** — after a clean disconnect, the session launcher, `Xorg` and the
   session agent have been observed still running well beyond the reconnect
   window. Check for orphaned `Xorg` processes when decommissioning a host.

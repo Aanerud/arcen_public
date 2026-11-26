@@ -138,7 +138,10 @@ mod imp {
     use crate::diagnosis::is_tls_failure;
     use crate::scm_state::{ScmState, parse_state};
     use crate::service_outcome::{ServiceOutcome, finish_install};
-    use arcen_session::install_lifecycle::{InstallEvent, InstallTransaction};
+    use arcen_session::install_lifecycle::{
+        InstallEvent, InstallTransaction, ServiceStartFailure, ServiceStartPolicy,
+        ServiceStartStanding, ServiceStartVerdict, ServiceStartWatch, ServiceStatusReading,
+    };
 
     /// Set by `--verbose`. Off by default, so an administrator sees what
     /// changed, not every icacls and reg.exe line behind it.
@@ -450,15 +453,15 @@ mod imp {
         // `install_files`. This only has to repair the failure case: leaving a
         // machine that was serving sessions with a stopped service, because an
         // unrelated later step failed, is a worse outcome than the failure.
-        if restart_service && outcome.is_err() {
+        if restart_service && outcome.is_err() && !service_coming_up(&opts.service_name) {
             println!(
                 "install failed; restarting service {} as it was found",
                 opts.service_name
             );
             match start_service(opts) {
                 Ok(ServiceOutcome::Running | ServiceOutcome::NotRequested) => {}
-                Ok(ServiceOutcome::NotRunning(state)) => println!(
-                    "warning: {} did not come back after the failed install (state: {state})",
+                Ok(ServiceOutcome::NotRunning(failure)) => println!(
+                    "warning: {} did not come back after the failed install ({failure})",
                     opts.service_name
                 ),
                 Err(error) => {
@@ -761,69 +764,75 @@ mod imp {
         }
     }
 
-    /// Bring the service up after installation.
+    /// Bring the service up after installation, and report what the service
+    /// control manager says came of it.
+    ///
+    /// The service is waited for while it reports progress (a rising
+    /// checkpoint within its own wait hint), up to the shared ceiling. A
+    /// fixed 30 s poll reported a Pier still starting as a failed install,
+    /// while it was running a few seconds later. Pending, stalled, stopped
+    /// and unreadable are all reported as not running, by name.
     fn start_service(opts: &Options) -> Result<ServiceOutcome, String> {
         if opts.dry_run || opts.staging() {
             println!("staging or dry-run: service not started");
             return Ok(ServiceOutcome::NotRequested);
         }
-        // Capture rather than inherit: sc.exe prints a status block that is
-        // noise in an installer transcript.
-        let _ = Command::new("sc.exe")
-            .arg("start")
-            .arg(&opts.service_name)
-            .output()
-            .map_err(|error| format!("start {}: {error}", opts.service_name))?;
-        // Ask the service control manager what actually happened. sc.exe start
-        // succeeds once the start is accepted, so reporting on its exit status
-        // claims a running service for one that is about to fail.
-        // Wait as long as the service control manager itself does before it
-        // gives up on a start (30 s by default): a Pier that reads its
-        // configuration, certificate and display inventory legitimately takes
-        // longer than a few seconds, and reporting that as a failed install
-        // is as untruthful as reporting a failed start as success.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut state = String::new();
-        while std::time::Instant::now() < deadline {
-            let query = Command::new("sc.exe")
-                .arg("query")
-                .arg(&opts.service_name)
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-                .unwrap_or_default();
-            state = if query.contains("RUNNING") {
-                "running".to_string()
-            } else if query.contains("START_PENDING") {
-                "start_pending".to_string()
-            } else if query.contains("STOPPED") {
-                "stopped".to_string()
-            } else {
-                "unknown".to_string()
-            };
-            if state != "start_pending" {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let confirm = Command::new("sc.exe")
-                    .arg("query")
-                    .arg(&opts.service_name)
-                    .output()
-                    .map(|output| String::from_utf8_lossy(&output.stdout).contains("RUNNING"))
-                    .unwrap_or(false);
-                if confirm == (state == "running") {
-                    break;
+        let failed = |failure: ServiceStartFailure| {
+            match failure.standing() {
+                ServiceStartStanding::Failed => {
+                    println!("service: registered; its start failed ({failure})");
                 }
-                state = if confirm { "running" } else { "stopped" }.to_string();
-                break;
+                ServiceStartStanding::StillStarting => {
+                    println!("service: registered; {failure}, not yet proven to run");
+                }
+                ServiceStartStanding::Unknown => {
+                    println!("service: registered; its state is not known ({failure})");
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            Ok(ServiceOutcome::NotRunning(failure))
+        };
+        let service = match crate::scm_state::native::Service::open(&opts.service_name) {
+            Ok(service) => service,
+            Err(error) => return failed(ServiceStartFailure::Unreadable(error)),
+        };
+        let started = std::time::Instant::now();
+        if let Err(error) = service.start() {
+            return failed(ServiceStartFailure::Refused(error));
         }
-        if state == "running" {
-            println!("service: registered and running");
-            Ok(ServiceOutcome::Running)
-        } else {
-            println!("service: registered but not running (state: {state})");
-            Ok(ServiceOutcome::NotRunning(state))
+        let mut watch = ServiceStartWatch::new(ServiceStartPolicy::DEFAULT);
+        let mut told_still_starting = false;
+        loop {
+            match watch.observe(started.elapsed(), service.query()) {
+                ServiceStartVerdict::Wait(pause) => {
+                    if !told_still_starting && started.elapsed() >= STILL_STARTING_NOTICE {
+                        told_still_starting = true;
+                        println!("service: still starting; waiting while it reports progress");
+                    }
+                    std::thread::sleep(pause);
+                }
+                ServiceStartVerdict::Running => {
+                    println!("service: registered and running");
+                    return Ok(ServiceOutcome::Running);
+                }
+                ServiceStartVerdict::Failed(failure) => return failed(failure),
+            }
         }
     }
+
+    /// Whether the service is starting or running already, so a failed
+    /// install that ended while it was still coming up does not start it
+    /// again and wait a second time.
+    fn service_coming_up(name: &str) -> bool {
+        crate::scm_state::native::Service::open(name).is_ok_and(|service| {
+            matches!(
+                service.query(),
+                ServiceStatusReading::Starting { .. } | ServiceStatusReading::Running { .. }
+            )
+        })
+    }
+
+    /// When a slow start is first mentioned in the transcript.
+    const STILL_STARTING_NOTICE: std::time::Duration = std::time::Duration::from_secs(10);
 
     /// Stop the service and wait for it to actually be gone.
     ///
@@ -2088,6 +2097,35 @@ mod imp {
             opts.service_name,
             binary_path
         );
+        set_preshutdown_timeout(opts)
+    }
+
+    /// Gives the service the shared shutdown grant as its preshutdown
+    /// timeout on every install and upgrade (0.21.3 and earlier left
+    /// Windows' default), and reads it back: inside it the Pier records a
+    /// session Windows ends under a live Deck, and its own stop.
+    fn set_preshutdown_timeout(opts: &Options) -> Result<(), String> {
+        let timeout_ms = u32::try_from(arcen_session::host_shutdown::SHUTDOWN_GRANT.as_millis())
+            .unwrap_or(u32::MAX);
+        if opts.dry_run {
+            println!(
+                "dry-run: set service {} preshutdown timeout to {timeout_ms} ms",
+                opts.service_name
+            );
+            return Ok(());
+        }
+        crate::scm_state::native::Service::set_preshutdown_timeout(&opts.service_name, timeout_ms)?;
+        let applied = crate::scm_state::native::Service::preshutdown_timeout(&opts.service_name)?;
+        if applied != timeout_ms {
+            return Err(format!(
+                "service {} preshutdown timeout reads {applied} ms after setting {timeout_ms} ms",
+                opts.service_name
+            ));
+        }
+        detail!(
+            "service {} preshutdown timeout: {applied} ms",
+            opts.service_name
+        );
         Ok(())
     }
 
@@ -2690,6 +2728,37 @@ mod imp {
             atomic_write_with_acl(&opts, &path, b"replacement", true, AclClass::PublicFile)
                 .expect("dry-run must not query or require stopping the live service");
             assert!(!path.exists(), "dry-run must not write the payload");
+        }
+
+        #[test]
+        fn dry_run_prints_the_shutdown_grant_without_touching_the_service() {
+            let opts = Options {
+                prefix: PathBuf::from(r"C:\absent\prefix"),
+                programdata: PathBuf::from(r"C:\absent\programdata"),
+                dry_run: true,
+                uninstall: false,
+                purge: false,
+                version: false,
+                force: false,
+                adopt_legacy: false,
+                renew: false,
+                tls_only: false,
+                service_name: "invalid\0service".to_string(),
+                extra_sans: Vec::new(),
+            };
+            set_preshutdown_timeout(&opts).expect("dry-run must not open the service");
+        }
+
+        #[test]
+        fn a_services_preshutdown_timeout_reads_back() {
+            // Every service has one, Windows' default when nobody set it.
+            let timeout = crate::scm_state::native::Service::preshutdown_timeout("EventLog")
+                .expect("read the Event Log service's preshutdown timeout");
+            assert!(timeout > 0);
+            assert!(
+                crate::scm_state::native::Service::preshutdown_timeout("arcen-no-such-service")
+                    .is_err()
+            );
         }
 
         #[test]

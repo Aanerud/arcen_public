@@ -29,6 +29,9 @@ pub struct ClientTelemetry {
     /// Frames the media worker replaced before a presenter took them,
     /// cumulative as the worker counts them.
     worker_superseded: AtomicU64,
+    /// The frame counts as of the last time the Deck observed its
+    /// presenters ([`PresentationPass`]).
+    presentation_pass: Mutex<PresentationPass>,
     frames_dropped: AtomicU64,
     decode_time_ms: AtomicU32,
     display_time_ms: AtomicU32,
@@ -58,6 +61,7 @@ impl Default for ClientTelemetry {
             presenter_superseded: AtomicU64::new(0),
             presenter_untimed: AtomicU64::new(0),
             worker_superseded: AtomicU64::new(0),
+            presentation_pass: Mutex::new(PresentationPass::default()),
             frames_dropped: AtomicU64::new(0),
             decode_time_ms: AtomicU32::new(0),
             display_time_ms: AtomicU32::new(0),
@@ -76,11 +80,45 @@ impl Default for ClientTelemetry {
     }
 }
 
+/// The frame counts when the Deck last observed what its root presenters
+/// did (a UI pass that took their outcomes, or a frame it presented
+/// itself): what a health window judges.
+///
+/// The presenters' outcomes reach the telemetry only when the Deck looks:
+/// the Windows Deck takes them a few times a second, in batches of a dozen
+/// frames at 60 fps. Frames decoded after that look have had no chance to
+/// be counted as presented. A health window that compared every frame
+/// decoded up to its end with the frames presented up to the last look read
+/// a steady stream as 295 of 300 presented, then 309 of 300: "unpresented"
+/// one window in two. Counting decoded, presented, superseded and untimed
+/// frames up to the same look counts each frame in the window that saw its
+/// outcome; a frame decoded after it counts in the next.
+///
+/// Only a whole look counts as one: a multi-window session's further
+/// windows report their frames at every media wake, between the root's
+/// looks. A look marked there counted the root's frames decoded since its
+/// last look, frames nobody had yet looked for; and the further windows'
+/// frames reported after the root's last look are counted with the next.
+#[derive(Debug, Default, Clone, Copy)]
+struct PresentationPass {
+    /// Looks so far, so a window can tell whether it saw one.
+    passes: u64,
+    frames_decoded: u64,
+    frames_presented: u64,
+    /// Presenter- and worker-superseded frames.
+    frames_superseded: u64,
+    frames_untimed: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TelemetryWindow {
     timestamp_ms: u64,
     frames_received: u64,
+    /// Decoded, presented, superseded and untimed frames counted so far: up
+    /// to the last presentation pass, or all of them when the window saw no
+    /// pass ([`PresentationPass`]).
     frames_decoded: u64,
+    presentation_passes: u64,
     frames_presented: u64,
     frames_superseded: u64,
     frames_untimed: u64,
@@ -132,11 +170,14 @@ impl ClientTelemetry {
         self.display_time_ms
             .store(duration_ms(display), Ordering::Relaxed);
         self.presentation_observed.store(true, Ordering::Release);
+        self.note_presentation_pass();
     }
 
     /// Frames a multi-window session's further windows put on screen. The
     /// decoded count covers every monitor's stream, so these count as
     /// presented too, or every multi-window session reads as unpresented.
+    ///
+    /// They are no look at the root presenters ([`PresentationPass`]).
     pub fn record_frames_presented(&self, frames: u64) {
         if frames == 0 {
             return;
@@ -149,14 +190,18 @@ impl ClientTelemetry {
     /// same way on both Decks
     /// ([`arcen_media::presentation::presented_frames_for_health`]):
     /// `confirmed` frames carry a presentation timestamp, `unconfirmed` ones
-    /// do not and count only until a presenter has reported a timestamp.
-    /// After that an unconfirmed frame is superseded, not lost: the
-    /// compositor showed a later drawable, or kept the same picture (a
-    /// still desktop's keepalives on macOS mostly come back this way).
+    /// do not and count only while `timestamp_ever_reported` is false: until
+    /// a presenter has reported a timestamp, or on Windows while its frame
+    /// statistics are not live
+    /// ([`crate::present::confirmation::PresentStatisticsLive`]). Otherwise
+    /// an unconfirmed frame is superseded, not lost: the compositor showed a
+    /// later drawable, or kept the same picture (a still desktop's
+    /// keepalives on macOS mostly come back this way).
     ///
     /// Call it as the outcomes are observed (every UI pass), not when they
-    /// are logged: the health window compares them with frames decoded in
-    /// the same five seconds.
+    /// are logged: the health window compares them with frames decoded up
+    /// to this look ([`PresentationPass`]). A pass that resolved nothing may
+    /// call it with zeros: it still marks the look.
     pub fn record_presenter_frames(
         &self,
         confirmed: u64,
@@ -173,13 +218,13 @@ impl ClientTelemetry {
             self.presenter_untimed
                 .fetch_add(unconfirmed, Ordering::Relaxed);
         }
-        if presented == 0 {
-            return;
+        if presented != 0 {
+            self.frames_presented
+                .fetch_add(presented, Ordering::Relaxed);
+            self.display_time_ms.store(0, Ordering::Relaxed);
+            self.presentation_observed.store(true, Ordering::Release);
         }
-        self.frames_presented
-            .fetch_add(presented, Ordering::Relaxed);
-        self.display_time_ms.store(0, Ordering::Relaxed);
-        self.presentation_observed.store(true, Ordering::Release);
+        self.note_presentation_pass();
     }
 
     /// Frames a presenter dropped for a newer one before submitting them
@@ -187,11 +232,58 @@ impl ClientTelemetry {
     /// only as far as bunching explains
     /// ([`arcen_telemetry::NEWEST_WINS_EXCUSED_BASIS_POINTS`]); they are no
     /// proof the presenter reached the compositor. Report them as they are
-    /// observed, like the presented frames.
+    /// observed, like the presented frames (before
+    /// [`Self::record_presenter_frames`], which marks the look).
     pub fn record_presenter_superseded(&self, frames: u64) {
         if frames != 0 {
             self.presenter_superseded
                 .fetch_add(frames, Ordering::Relaxed);
+        }
+    }
+
+    /// The Deck has observed its presenters now: frames decoded so far
+    /// have had their chance to be counted ([`PresentationPass`]).
+    fn note_presentation_pass(&self) {
+        let mut pass = self
+            .presentation_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pass = PresentationPass {
+            passes: pass.passes.saturating_add(1),
+            ..self.frame_counts()
+        };
+    }
+
+    /// The frame counts now, with no pass.
+    fn frame_counts(&self) -> PresentationPass {
+        PresentationPass {
+            passes: 0,
+            frames_decoded: self.frames_decoded.load(Ordering::Relaxed),
+            frames_presented: self.frames_presented.load(Ordering::Relaxed),
+            frames_superseded: self
+                .presenter_superseded
+                .load(Ordering::Relaxed)
+                .saturating_add(self.worker_superseded.load(Ordering::Relaxed)),
+            frames_untimed: self.presenter_untimed.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The frame counts a window ending now judges: as of the last
+    /// presentation pass if one happened since `passes_seen`, else
+    /// everything so far (a Deck that never observes a presenter, or one
+    /// that stopped looking, is judged on all it decoded).
+    fn judged_counts(&self, passes_seen: u64) -> PresentationPass {
+        let pass = *self
+            .presentation_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pass.passes > passes_seen {
+            pass
+        } else {
+            PresentationPass {
+                passes: pass.passes,
+                ..self.frame_counts()
+            }
         }
     }
 
@@ -257,13 +349,15 @@ impl ClientTelemetry {
 
     pub fn window(&self, timestamp_ms: u64) -> TelemetryWindow {
         let (received, decoded, presented, dropped) = self.counters();
+        let judged = self.judged_counts(0);
         TelemetryWindow {
             timestamp_ms,
             frames_received: received,
-            frames_decoded: decoded,
-            frames_presented: presented,
-            frames_superseded: self.superseded(),
-            frames_untimed: self.presenter_untimed.load(Ordering::Relaxed),
+            frames_decoded: judged.frames_decoded,
+            presentation_passes: judged.passes,
+            frames_presented: judged.frames_presented,
+            frames_superseded: judged.frames_superseded,
+            frames_untimed: judged.frames_untimed,
             frames_dropped: dropped,
             ever_streamed: decoded != 0 || presented != 0,
             stalled_windows: 0,
@@ -277,25 +371,32 @@ impl ClientTelemetry {
         target_fps: u32,
         misses: u32,
     ) -> (QosSample, u64, u64) {
-        let (received, decoded, presented, dropped) = self.counters();
+        let (received, raw_decoded, raw_presented, dropped) = self.counters();
+        // Decoded, presented, superseded and untimed over the same frames:
+        // up to the last time the Deck observed its presenters
+        // ([`PresentationPass`]).
+        let judged = self.judged_counts(window.presentation_passes);
         let received_delta = received.saturating_sub(window.frames_received);
-        let decoded_delta = decoded.saturating_sub(window.frames_decoded);
-        let presented_delta = presented.saturating_sub(window.frames_presented);
-        let superseded = self.superseded();
-        let superseded_delta = superseded.saturating_sub(window.frames_superseded);
-        let untimed = self.presenter_untimed.load(Ordering::Relaxed);
-        let untimed_delta = untimed.saturating_sub(window.frames_untimed);
+        let decoded_delta = judged.frames_decoded.saturating_sub(window.frames_decoded);
+        let presented_delta = judged
+            .frames_presented
+            .saturating_sub(window.frames_presented);
+        let superseded_delta = judged
+            .frames_superseded
+            .saturating_sub(window.frames_superseded);
+        let untimed_delta = judged.frames_untimed.saturating_sub(window.frames_untimed);
         let dropped_delta = dropped.saturating_sub(window.frames_dropped);
         let elapsed_ms = timestamp_ms.saturating_sub(window.timestamp_ms).max(1);
 
         window.timestamp_ms = timestamp_ms;
         window.frames_received = received;
-        window.frames_decoded = decoded;
-        window.frames_presented = presented;
-        window.frames_superseded = superseded;
-        window.frames_untimed = untimed;
+        window.frames_decoded = judged.frames_decoded;
+        window.presentation_passes = judged.passes;
+        window.frames_presented = judged.frames_presented;
+        window.frames_superseded = judged.frames_superseded;
+        window.frames_untimed = judged.frames_untimed;
         window.frames_dropped = dropped;
-        window.ever_streamed |= decoded_delta != 0 || presented_delta != 0;
+        window.ever_streamed |= raw_decoded != 0 || raw_presented != 0;
 
         let experience_delta = if self.presentation_observed.load(Ordering::Acquire) {
             presented_delta
@@ -431,12 +532,6 @@ impl ClientTelemetry {
         )
     }
 
-    fn superseded(&self) -> u64 {
-        self.presenter_superseded
-            .load(Ordering::Relaxed)
-            .saturating_add(self.worker_superseded.load(Ordering::Relaxed))
-    }
-
     /// The session's committed health (after the two-window hysteresis),
     /// for the session summary's `worst_health`: one window outside its
     /// targets is not what the session was reported as, and the summary
@@ -566,21 +661,23 @@ mod tests {
         let telemetry = warmed_telemetry();
         let mut window = telemetry.window(0);
         telemetry.record_media(40, 40, 0, 0, Duration::from_millis(2));
+        // The further window's frames are counted with the root's next
+        // look ([`PresentationPass`]).
         for _ in 0..20 {
+            telemetry.record_frames_presented(1);
             telemetry.record_presented(Duration::from_millis(1));
         }
-        telemetry.record_frames_presented(20);
         telemetry.record_frames_presented(0);
         let (_, _, sample) = telemetry.snapshot(&mut window, None, 5_000, 30, 0);
         assert_eq!(sample.frames_presented, Some(40));
         assert_eq!(arcen_telemetry::unpresented_basis_points(&sample), Some(0));
     }
 
-    /// Thirty frames a second for twenty seconds, each reported as it is
-    /// presented (as the Decks now take presenter outcomes every UI pass):
-    /// every five-second window balances. Reported in 1.175 s batches, as
-    /// the macOS Deck did with its log, the same stream read 140 of 150
-    /// presented ("Critical") three windows in four.
+    /// Thirty frames a second for twenty seconds, reported as each is
+    /// presented, and the same stream reported in 1.175 s batches (as the
+    /// macOS Deck once did with its log): every five-second window
+    /// balances either way, because decoded frames are counted up to the
+    /// same look that counted the presents.
     #[test]
     fn presents_reported_as_observed_balance_every_window() {
         let telemetry = warmed_telemetry();
@@ -589,7 +686,7 @@ mod tests {
         let batched = warmed_telemetry();
         batched.record_presenter_frames(1, 0, true);
         let mut batched_window = batched.window(0);
-        let (mut decoded, mut pending_batch, mut alarms) = (0_u64, 0_u64, 0);
+        let (mut decoded, mut pending_batch) = (0_u64, 0_u64);
         for frame in 1..=600_u64 {
             let at_ms = frame * 1_000 / 30;
             decoded += 1;
@@ -605,11 +702,326 @@ mod tests {
                 let (_, health, sample) = telemetry.snapshot(&mut window, None, at_ms, 30, 0);
                 assert_eq!(sample.frames_decoded, sample.frames_presented);
                 assert_eq!(health.client_experience.state, Some(HealthState::Ok));
-                let (_, health, _) = batched.snapshot(&mut batched_window, None, at_ms, 30, 0);
-                alarms += usize::from(health.client_experience.state != Some(HealthState::Ok));
+                let (_, health, sample) = batched.snapshot(&mut batched_window, None, at_ms, 30, 0);
+                assert_eq!(sample.frames_decoded, sample.frames_presented);
+                assert_eq!(health.client_experience.state, Some(HealthState::Ok));
             }
         }
-        assert!(alarms > 0, "batched reports misattribute presents");
+    }
+
+    /// One simulated Deck: the source sends `fps` frames a second, the
+    /// media worker decodes each at once, and every `pass_ms` the UI takes
+    /// the presenters' outcomes, which confirm frames `lag` frames behind
+    /// the newest decoded (`present` says how many of them reached the
+    /// glass). A health snapshot every five seconds, off the passes' phase,
+    /// against a 60 fps target.
+    struct Simulated {
+        telemetry: ClientTelemetry,
+        window: TelemetryWindow,
+        decoded: u64,
+        confirmed_through: u64,
+    }
+
+    impl Simulated {
+        fn new() -> Self {
+            let telemetry = warmed_telemetry();
+            telemetry.record_presenter_frames(1, 0, true);
+            let window = telemetry.window(0);
+            Self {
+                telemetry,
+                window,
+                decoded: 0,
+                confirmed_through: 0,
+            }
+        }
+
+        /// Runs `windows` five-second windows; returns each window's
+        /// sample, health and the frames decoded in it by the old rule
+        /// (everything up to the snapshot).
+        fn run(
+            &mut self,
+            windows: u64,
+            fps: u64,
+            pass_ms: u64,
+            lag: u64,
+            present: impl Fn(u64) -> u64,
+        ) -> Vec<(QosSample, HealthAssessment, u64)> {
+            let mut out = Vec::new();
+            let mut raw_at_snapshot = self.decoded;
+            let start_ms = self.window.timestamp_ms;
+            let mut next_pass = start_ms + pass_ms;
+            let mut next_snapshot = start_ms + 5_000;
+            let end_ms = start_ms + windows * 5_000;
+            let mut next_frame = 0_u64;
+            for at_ms in start_ms + 1..=end_ms {
+                while (start_ms + next_frame * 1_000 / fps) < at_ms {
+                    next_frame += 1;
+                    self.decoded += 1;
+                    self.telemetry.record_media(
+                        self.decoded,
+                        self.decoded,
+                        0,
+                        0,
+                        Duration::from_millis(2),
+                    );
+                }
+                if at_ms == next_pass {
+                    next_pass += pass_ms;
+                    let through = self.decoded.saturating_sub(lag);
+                    let resolved = through.saturating_sub(self.confirmed_through);
+                    self.confirmed_through = through;
+                    let shown = present(resolved).min(resolved);
+                    self.telemetry.record_presenter_superseded(0);
+                    self.telemetry.record_presenter_frames(shown, 0, true);
+                }
+                if at_ms == next_snapshot {
+                    next_snapshot += 5_000;
+                    let (_, health, sample) =
+                        self.telemetry
+                            .snapshot(&mut self.window, None, at_ms + 7, 60, 0);
+                    out.push((sample, health, self.decoded - raw_at_snapshot));
+                    raw_at_snapshot = self.decoded;
+                }
+            }
+            out
+        }
+    }
+
+    /// The live Windows Deck at a steady 60 fps: its UI takes the
+    /// presenters' outcomes about four times a second, so they arrive a
+    /// dozen frames at a time. Counted against everything decoded up to
+    /// the snapshot, two windows in three read 295 of 300 presented
+    /// ("Degraded, unpresented 100") and the next 309. Counted up to the
+    /// same look, every window balances.
+    #[test]
+    fn smooth_sixty_fps_seen_in_batches_is_healthy_every_window() {
+        let mut deck = Simulated::new();
+        let windows = deck.run(12, 60, 233, 2, |frames| frames);
+        let mut old_rule_alarms = 0;
+        for (sample, health, raw_decoded) in &windows[1..] {
+            assert_eq!(arcen_telemetry::unpresented_basis_points(sample), Some(0));
+            assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+            assert!(sample.fps_actual.is_some_and(|fps| fps >= 57));
+            let old = QosSample {
+                frames_decoded: Some(*raw_decoded),
+                ..*sample
+            };
+            old_rule_alarms +=
+                usize::from(arcen_telemetry::unpresented_basis_points(&old) >= Some(50));
+        }
+        assert!(old_rule_alarms > 0, "the batched looks misattribute frames");
+        let decoded: u64 = windows
+            .iter()
+            .filter_map(|(s, _, _)| s.frames_decoded)
+            .sum();
+        let presented: u64 = windows
+            .iter()
+            .filter_map(|(s, _, _)| s.frames_presented)
+            .sum();
+        assert!(
+            decoded.abs_diff(presented) <= 2 + 1,
+            "{decoded} vs {presented}"
+        );
+    }
+
+    /// Frames decoded but never shown still read as lost, however the
+    /// looks are batched: a presenter that shows nine in ten, and one that
+    /// shows nothing while the UI keeps looking.
+    #[test]
+    fn a_genuine_presentation_stall_is_still_degraded_or_critical() {
+        let mut deck = Simulated::new();
+        let lossy = deck.run(4, 60, 233, 2, |frames| frames * 9 / 10);
+        for (sample, health, _) in &lossy[1..] {
+            assert!(arcen_telemetry::unpresented_basis_points(sample) >= Some(500));
+            assert_eq!(health.client_experience.state, Some(HealthState::Critical));
+        }
+        let stalled = deck.run(4, 60, 233, 2, |_| 0);
+        for (sample, health, _) in &stalled[1..] {
+            assert_eq!(sample.frames_presented, Some(0));
+            // All but the two frames a window allows in flight.
+            assert!(arcen_telemetry::unpresented_basis_points(sample) >= Some(9_900));
+            // The first stalled windows are a short stall's grace
+            // (`snapshot`); the state never reads Ok.
+            assert!(health.client_experience.state >= Some(HealthState::Degraded));
+        }
+        assert_eq!(
+            stalled
+                .last()
+                .and_then(|(_, health, _)| health.client_experience.state),
+            Some(HealthState::Critical)
+        );
+    }
+
+    /// An idle desktop's keepalive a second, seen in batches: healthy.
+    #[test]
+    fn an_idle_desktop_seen_in_batches_is_healthy() {
+        let mut deck = Simulated::new();
+        for (sample, health, _) in deck.run(6, 1, 233, 0, |frames| frames) {
+            assert_eq!(arcen_telemetry::unpresented_basis_points(&sample), Some(0));
+            assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+        }
+    }
+
+    /// A Deck that stops looking at its presenters is judged on every
+    /// frame it decoded: a frozen UI pass is a stall, not a pass.
+    #[test]
+    fn a_deck_that_stops_looking_still_reads_as_a_stall() {
+        let mut deck = Simulated::new();
+        let _ = deck.run(2, 60, 233, 2, |frames| frames);
+        let stopped = deck.run(4, 60, u64::MAX / 4, 2, |frames| frames);
+        for (sample, health, raw_decoded) in &stopped[1..] {
+            assert_eq!(sample.frames_decoded, Some(*raw_decoded));
+            assert_eq!(sample.frames_presented, Some(0));
+            assert!(health.client_experience.state >= Some(HealthState::Degraded));
+        }
+        assert_eq!(
+            stopped
+                .last()
+                .and_then(|(_, health, _)| health.client_experience.state),
+            Some(HealthState::Critical)
+        );
+    }
+
+    /// Match My Layout on two displays at 60 fps: the further window
+    /// reports each frame as it presents it (every media wake), the root's
+    /// outcomes arrive a dozen frames at a time. Only the root's looks mark
+    /// the decoded count; a look marked at a further window's report counted
+    /// root frames nobody had looked for yet, and a smooth session read up
+    /// to 14 of 600 frames unpresented ("Degraded") in some windows.
+    #[test]
+    fn further_window_reports_between_root_looks_keep_every_window_balanced() {
+        let telemetry = warmed_telemetry();
+        telemetry.record_presenter_frames(1, 0, true);
+        let mut window = telemetry.window(0);
+        let (mut decoded, mut root_decoded, mut root_confirmed) = (0_u64, 0_u64, 0_u64);
+        let mut secondary_pending = 0_u64;
+        let mut next_pass = 233_u64;
+        let mut next_snapshot = 5_007_u64;
+        let mut samples = Vec::new();
+        let mut next_frame = 0_u64;
+        for at_ms in 1..=60_000_u64 {
+            // One frame per display every 1/60 s.
+            while next_frame * 1_000 / 60 < at_ms {
+                next_frame += 1;
+                decoded += 2;
+                root_decoded += 1;
+                telemetry.record_media(decoded, decoded, 0, 0, Duration::from_millis(2));
+                // The further window shows the frame decoded before.
+                telemetry.record_frames_presented(secondary_pending);
+                secondary_pending = 1;
+            }
+            if at_ms == next_pass {
+                next_pass += 233;
+                let through = root_decoded.saturating_sub(2);
+                telemetry.record_presenter_superseded(0);
+                telemetry.record_presenter_frames(through - root_confirmed, 0, true);
+                root_confirmed = through;
+            }
+            if at_ms == next_snapshot {
+                next_snapshot += 5_000;
+                let (_, health, sample) = telemetry.snapshot(&mut window, None, at_ms, 60, 0);
+                samples.push((sample, health));
+            }
+        }
+        for (sample, health) in &samples[1..] {
+            assert!(
+                sample
+                    .frames_decoded
+                    .is_some_and(|frames| (560..=640).contains(&frames)),
+                "{sample:?}"
+            );
+            assert_eq!(arcen_telemetry::unpresented_basis_points(sample), Some(0));
+            assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+        }
+    }
+
+    /// The lab's Windows Deck: frame statistics confirm frames, then stop
+    /// (its window flipped independently) while it goes on presenting 60
+    /// frames a second; each present resolves unconfirmed at the shared
+    /// deadline. Shown with their time unknown, they count as presented
+    /// while the statistics are not live. Taken as superseded for good (the
+    /// latch once set), the stream read 0 fps: "Critical".
+    #[test]
+    fn presents_without_statistics_count_while_the_statistics_are_not_live() {
+        use crate::present::confirmation::PresentStatisticsLive;
+        let live_telemetry = warmed_telemetry();
+        let latched_telemetry = warmed_telemetry();
+        let mut live = PresentStatisticsLive::default();
+        let mut latched = false;
+        let mut live_window = live_telemetry.window(0);
+        let mut latched_window = latched_telemetry.window(0);
+        let (mut decoded, mut resolved) = (0_u64, 0_u64);
+        let mut states = (Vec::new(), Vec::new());
+        for pass in 1..=130_u64 {
+            let at_ms = pass * 233;
+            decoded = at_ms * 60 / 1_000;
+            // Confirmed for six seconds; then unconfirmed, a second late.
+            let through = if at_ms <= 6_000 {
+                decoded.saturating_sub(2)
+            } else {
+                decoded.saturating_sub(60)
+            };
+            let batch = through.saturating_sub(resolved);
+            resolved = through;
+            let (confirmed, unconfirmed) = if at_ms <= 6_000 {
+                (batch, 0)
+            } else {
+                (0, batch)
+            };
+            for (telemetry, ever) in [
+                (&live_telemetry, live.observe(confirmed, unconfirmed)),
+                (&latched_telemetry, {
+                    latched |= confirmed > 0;
+                    latched
+                }),
+            ] {
+                telemetry.record_media(decoded, decoded, 0, 0, Duration::from_millis(2));
+                telemetry.record_presenter_superseded(0);
+                telemetry.record_presenter_frames(confirmed, unconfirmed, ever);
+            }
+            if pass % 21 == 0 {
+                let (_, health, sample) =
+                    live_telemetry.snapshot(&mut live_window, None, at_ms + 7, 60, 0);
+                states.0.push((sample, health));
+                let (_, health, _) =
+                    latched_telemetry.snapshot(&mut latched_window, None, at_ms + 7, 60, 0);
+                states.1.push(health.client_experience.state);
+            }
+        }
+        assert!(decoded > 1_800);
+        // From the first whole window after the statistics stopped.
+        for (sample, health) in &states.0[2..] {
+            assert!(sample.fps_actual.is_some_and(|fps| fps >= 57), "{sample:?}");
+            assert_eq!(arcen_telemetry::unpresented_basis_points(sample), Some(0));
+            assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+        }
+        assert_eq!(states.1.last(), Some(&Some(HealthState::Critical)));
+    }
+
+    /// Frames the worker replaced before a presenter took them are counted
+    /// with the frames decoded at the same look: handled, and the window
+    /// balances.
+    #[test]
+    fn worker_superseded_frames_are_counted_at_the_same_look() {
+        let telemetry = warmed_telemetry();
+        telemetry.record_presenter_frames(1, 0, true);
+        let mut window = telemetry.window(0);
+        // 300 decoded, 4 of them replaced in the worker's slot; the UI
+        // looked after 296 were shown; 12 more decoded (2 replaced) since.
+        telemetry.record_media(300, 300, 0, 4, Duration::from_millis(2));
+        telemetry.record_presenter_frames(296, 0, true);
+        telemetry.record_media(312, 312, 0, 6, Duration::from_millis(2));
+        let (_, health, sample) = telemetry.snapshot(&mut window, None, 5_000, 60, 0);
+        assert_eq!(sample.frames_decoded, Some(300));
+        assert_eq!(sample.frames_superseded, Some(4));
+        assert_eq!(arcen_telemetry::unpresented_basis_points(&sample), Some(0));
+        assert_eq!(health.client_experience.state, Some(HealthState::Ok));
+        // The next look counts the rest.
+        telemetry.record_presenter_frames(10, 0, true);
+        let (_, _, sample) = telemetry.snapshot(&mut window, None, 10_000, 60, 0);
+        assert_eq!(sample.frames_decoded, Some(12));
+        assert_eq!(sample.frames_superseded, Some(2));
+        assert_eq!(sample.frames_presented, Some(10));
     }
 
     /// What is genuinely lost still raises the alarm, and a presenter that

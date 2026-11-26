@@ -12,12 +12,62 @@
 //! waits for the host's one session slot ends the wait, and the desk is
 //! reported unlocked. Every ending that leaves the desk unlocked is reported
 //! as an error ([`LockWaitEnd::leaves_desk_unlocked`]).
+//!
+//! The administrator's `privacy.desk = "required"` fails closed here too
+//! ([`WaitingDesk::Required`], ADR 0025 §4, amended 2026-11-25): a private
+//! desk whose session still refuses to lock after the grace is **not**
+//! given back. It stays dark with its input blocked, the slot stays held,
+//! the refusal is reported once ([`LockWaitVerdict::HoldPrivate`]), and the
+//! lock is asked for again every [`HELD_LOCK_RETRY`] until the session
+//! locks or the console leaves the account. `"on"` and `"off"` keep the
+//! grace.
 
 use std::time::Duration;
 
 use super::desk_privacy::{
-    CONSOLE_CHECK, LOCK_RETRY, PrivacyWatch, UnlockedHandBack, WatchVerdict, hand_back_unlocked,
+    CONSOLE_CHECK, DeskPrivacyPlan, LOCK_RETRY, PrivacyWatch, UnlockedHandBack, WatchVerdict,
+    hand_back_unlocked,
 };
+
+/// How often a private desk held under `privacy.desk = "required"` asks a
+/// session that has refused to lock for [`super::UNLOCKED_GRACE`] again:
+/// slower than [`LOCK_RETRY`] (a lock screen turned off by policy will not
+/// come back by itself), and never given up, so the session locks once an
+/// administrator turns its lock screen back on.
+pub const HELD_LOCK_RETRY: Duration = Duration::from_secs(30);
+
+/// The desk a hand-back waits with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitingDesk {
+    /// Not private: it shows the session anyway.
+    Live,
+    /// Private, and given back unlocked after [`super::UNLOCKED_GRACE`]
+    /// (`privacy.desk` `"on"`: the Deck's user asked for it).
+    Private,
+    /// Private because the administrator requires it (`privacy.desk =
+    /// "required"`): never given back unlocked.
+    Required,
+}
+
+impl WaitingDesk {
+    /// The desk of an attachment served under `plan`, whose desk the host
+    /// made private (`private`). A required plan whose desk is not private
+    /// (nothing at the desk shows the session) has nothing to hold.
+    #[must_use]
+    pub const fn new(private: bool, plan: Option<DeskPrivacyPlan>) -> Self {
+        match (private, plan) {
+            (false, _) => Self::Live,
+            (true, Some(plan)) if plan.fails_closed() => Self::Required,
+            (true, _) => Self::Private,
+        }
+    }
+
+    /// Whether the desk is kept private while the wait runs.
+    #[must_use]
+    pub const fn private(self) -> bool {
+        !matches!(self, Self::Live)
+    }
+}
 
 /// What one attempt to lock the session did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +119,12 @@ impl LockWaitEnd {
 pub enum LockWaitVerdict {
     /// Ask for the lock again after this pause.
     RetryAfter(Duration),
+    /// [`WaitingDesk::Required`]: the session has refused to lock for
+    /// [`super::UNLOCKED_GRACE`]. The desk stays private and the slot held;
+    /// ask again after `retry_after` ([`HELD_LOCK_RETRY`]). `first`: the
+    /// first such verdict, when the host reports the refusal as an error
+    /// (and tells a Deck that asks for the slot why it is held).
+    HoldPrivate { retry_after: Duration, first: bool },
     /// Stop waiting.
     Done(LockWaitEnd),
 }
@@ -76,18 +132,38 @@ pub enum LockWaitVerdict {
 /// The wait for one hand-back's lock screen.
 #[derive(Debug, Clone, Copy)]
 pub struct LockWait {
-    private: bool,
+    desk: WaitingDesk,
     console: PrivacyWatch,
+    held: bool,
 }
 
 impl LockWait {
-    /// A wait for a desk that is private (`private`) or not.
+    /// A wait for a desk that is private (`private`) or not, given back
+    /// after the grace either way.
     #[must_use]
     pub fn new(private: bool) -> Self {
+        Self::for_desk(if private {
+            WaitingDesk::Private
+        } else {
+            WaitingDesk::Live
+        })
+    }
+
+    /// A wait for `desk`.
+    #[must_use]
+    pub fn for_desk(desk: WaitingDesk) -> Self {
         Self {
-            private,
+            desk,
             console: PrivacyWatch::default(),
+            held: false,
         }
+    }
+
+    /// Whether the desk is being held private past the grace
+    /// ([`LockWaitVerdict::HoldPrivate`] was given).
+    #[must_use]
+    pub const fn held(&self) -> bool {
+        self.held
     }
 
     /// Decides what follows `attempt`, `elapsed` after the hand-back's
@@ -107,6 +183,18 @@ impl LockWait {
             }
         }
         if hand_back_unlocked(elapsed) == UnlockedHandBack::GiveBack {
+            if self.desk == WaitingDesk::Required {
+                let first = !self.held;
+                self.held = true;
+                return LockWaitVerdict::HoldPrivate {
+                    retry_after: if attempt == LockAttempt::NotOurs {
+                        CONSOLE_CHECK
+                    } else {
+                        HELD_LOCK_RETRY
+                    },
+                    first,
+                };
+            }
             return LockWaitVerdict::Done(LockWaitEnd::GraceExpired);
         }
         LockWaitVerdict::RetryAfter(if attempt == LockAttempt::NotOurs {
@@ -118,10 +206,11 @@ impl LockWait {
 
     /// An authenticated Deck waits for the host's session slot: a desk that
     /// was not private stops waiting so the Deck is served; a private desk
-    /// keeps the session hidden until it locks or the grace ends.
+    /// keeps the session hidden until it locks or the grace ends (a
+    /// required one, until it locks).
     #[must_use]
     pub const fn on_new_deck(&self) -> Option<LockWaitEnd> {
-        if self.private {
+        if self.desk.private() {
             None
         } else {
             Some(LockWaitEnd::YieldedToNewDeck)
@@ -151,6 +240,9 @@ mod tests {
                 .unwrap_or(LockAttempt::NotLocked);
             match wait.next(attempt, elapsed) {
                 LockWaitVerdict::Done(end) => return (end, index + 1),
+                LockWaitVerdict::HoldPrivate { .. } => {
+                    panic!("only a required desk is held past the grace")
+                }
                 LockWaitVerdict::RetryAfter(pause) => {
                     if deck_after == Some(index)
                         && let Some(end) = wait.on_new_deck()
@@ -200,6 +292,7 @@ mod tests {
                         assert_eq!(pause, LOCK_RETRY);
                         elapsed += pause;
                     }
+                    LockWaitVerdict::HoldPrivate { .. } => panic!("on and off keep the grace"),
                 }
             };
             assert_eq!(end, LockWaitEnd::GraceExpired);
@@ -263,5 +356,107 @@ mod tests {
             wait.next(LockAttempt::NotOurs, Duration::ZERO),
             LockWaitVerdict::RetryAfter(CONSOLE_CHECK)
         );
+    }
+
+    #[test]
+    fn only_a_desk_private_by_requirement_is_held() {
+        use super::super::desk_privacy::DeskPrivacyPlan;
+        let required = Some(DeskPrivacyPlan::Required);
+        assert_eq!(WaitingDesk::new(true, required), WaitingDesk::Required);
+        assert_eq!(
+            WaitingDesk::new(true, Some(DeskPrivacyPlan::BestEffort)),
+            WaitingDesk::Private
+        );
+        assert_eq!(WaitingDesk::new(true, None), WaitingDesk::Private);
+        // Nothing at the desk was made private: nothing to hold.
+        assert_eq!(WaitingDesk::new(false, required), WaitingDesk::Live);
+        assert_eq!(
+            WaitingDesk::new(false, Some(DeskPrivacyPlan::OperatorOff)),
+            WaitingDesk::Live
+        );
+    }
+
+    /// Asks a required desk's wait about `attempts` (refusals after the last
+    /// one) every pause it names, as a host's loop does, until it ends or
+    /// `limit` has passed; returns how it ended, the `first` flags of its
+    /// holds, and their pauses.
+    fn run_required(
+        attempts: &[LockAttempt],
+        limit: Duration,
+    ) -> (Option<LockWaitEnd>, Vec<bool>, Vec<Duration>) {
+        let mut wait = LockWait::for_desk(WaitingDesk::Required);
+        let mut elapsed = Duration::ZERO;
+        let (mut firsts, mut pauses) = (Vec::new(), Vec::new());
+        for index in 0.. {
+            if elapsed > limit {
+                return (None, firsts, pauses);
+            }
+            let attempt = attempts
+                .get(index)
+                .copied()
+                .unwrap_or(LockAttempt::NotLocked);
+            match wait.next(attempt, elapsed) {
+                LockWaitVerdict::Done(end) => return (Some(end), firsts, pauses),
+                LockWaitVerdict::RetryAfter(pause) => elapsed += pause,
+                LockWaitVerdict::HoldPrivate { retry_after, first } => {
+                    assert!(elapsed >= UNLOCKED_GRACE);
+                    assert!(wait.held());
+                    // A newcomer never ends a held wait.
+                    assert_eq!(wait.on_new_deck(), None);
+                    firsts.push(first);
+                    pauses.push(retry_after);
+                    elapsed += retry_after;
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn a_required_desk_is_never_given_back_unlocked() {
+        // A lock screen off by policy: an hour of refusals, still held.
+        let (end, firsts, pauses) = run_required(&[], Duration::from_secs(3_600));
+        assert_eq!(end, None);
+        assert_eq!(firsts.first(), Some(&true));
+        assert_eq!(firsts.iter().filter(|first| **first).count(), 1);
+        assert!(pauses.iter().all(|pause| *pause == HELD_LOCK_RETRY));
+        // Bounded: about two asks a minute once held.
+        let asks_after_grace = pauses.len();
+        assert!(
+            (110..=120).contains(&asks_after_grace),
+            "{asks_after_grace}"
+        );
+    }
+
+    #[test]
+    fn a_held_required_desk_ends_when_its_session_locks_or_the_console_leaves() {
+        let refusals = |count: usize| vec![LockAttempt::NotLocked; count];
+        // Locked on the first ask after the grace was held.
+        // The ask at the grace is the first one held.
+        let held_until =
+            usize::try_from(UNLOCKED_GRACE.as_secs() / LOCK_RETRY.as_secs()).expect("a few asks");
+        let mut attempts = refusals(held_until + 3);
+        attempts.push(LockAttempt::Locked);
+        let (end, firsts, _) = run_required(&attempts, Duration::from_secs(3_600));
+        assert_eq!(end, Some(LockWaitEnd::Locked));
+        assert_eq!(firsts, [true, false, false]);
+        assert!(!LockWaitEnd::Locked.leaves_desk_unlocked());
+
+        // Another account took the console while it was held.
+        let mut attempts = refusals(held_until + 2);
+        attempts.extend([LockAttempt::NotOurs; 3]);
+        let (end, _, pauses) = run_required(&attempts, Duration::from_secs(3_600));
+        assert_eq!(end, Some(LockWaitEnd::ConsoleLeft));
+        assert_eq!(pauses.last(), Some(&CONSOLE_CHECK));
+    }
+
+    #[test]
+    fn a_required_desk_locked_within_the_grace_is_not_held() {
+        let (end, firsts, _) = run_required(
+            &[LockAttempt::NotLocked, LockAttempt::Locked],
+            Duration::from_secs(3_600),
+        );
+        assert_eq!(end, Some(LockWaitEnd::Locked));
+        assert!(firsts.is_empty());
     }
 }

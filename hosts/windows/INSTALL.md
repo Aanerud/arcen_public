@@ -676,6 +676,12 @@ New-Service -Name ArcenPier `
   -StartupType Automatic
 
 sc.exe failure ArcenPier reset= 86400 actions= restart/5000/restart/15000/none/0
+
+# Windows waits up to 10 s for the Pier when it shuts down or restarts, so
+# the Pier records the session's end and its own stop (the installer sets
+# the same preshutdown timeout; it applies from the next restart).
+New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\ArcenPier' `
+  -Name PreshutdownTimeout -PropertyType DWord -Value 10000 -Force | Out-Null
 ```
 
 Allow the direct QUIC port if no equivalent managed firewall rule exists:

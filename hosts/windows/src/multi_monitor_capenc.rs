@@ -175,6 +175,10 @@ pub struct MonitorPipelineSpec {
     pub encoder: Option<EncoderRequest>,
     pub codec: Option<VideoCodec>,
     pub chroma: Option<ChromaSubsampling>,
+    /// Why the display's own chroma request was refused under the session's
+    /// contract (`arcen_media::region_chroma`), published on its applied
+    /// media plan.
+    pub chroma_reason: Option<&'static str>,
 }
 
 impl MonitorPipelineSpec {
@@ -222,6 +226,7 @@ pub fn build_pipeline_specs(
             encoder: None,
             codec: None,
             chroma: None,
+            chroma_reason: None,
         })
         .collect())
 }
@@ -1114,6 +1119,7 @@ mod tests {
                 encoder: None,
                 codec: None,
                 chroma: None,
+                chroma_reason: None,
             },
             MonitorPipelineSpec {
                 session_monitor_id: sid(2),
@@ -1124,6 +1130,7 @@ mod tests {
                 encoder: None,
                 codec: None,
                 chroma: None,
+                chroma_reason: None,
             },
         ];
         let outputs = vec![

@@ -13,7 +13,6 @@ use arcen_session::wayland_qualification::{
     QUALIFY_TEMPORARY_USER, QUALIFY_TEMPORARY_USER_GECOS, QualificationTarget, RECORD_PATH,
 };
 use arcen_transport::cert_issuance::{HostKey, IssuanceProfile, IssuerKey, issue};
-use arcen_transport::cert_marker;
 use arcen_transport::cert_provisioning::{
     MaterialOwnership, MaterialState, ProvisioningAction, ProvisioningRefusal, ProvisioningRequest,
     plan,
@@ -2680,7 +2679,7 @@ fn uninstall(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the `subjectAltName` extension for the generated host certificate.
+/// The `subjectAltName` entries for the generated host certificate.
 ///
 /// A certificate with no SAN is rejected outright by the Pier's own TLS
 /// validation with `MissingServerSubjectAlternativeName`, whatever
@@ -2691,13 +2690,6 @@ fn uninstall(options: &Options) -> Result<(), String> {
 /// Every name a client might plausibly dial is included: the short hostname,
 /// the FQDN, `localhost`, the loopback address, and each non-loopback IPv4
 /// address the host currently has.
-fn subject_alt_name(extra: &[String]) -> String {
-    format!(
-        "subjectAltName={}",
-        subject_alt_name_entries(extra).join(",")
-    )
-}
-
 fn subject_alt_name_entries(extra: &[String]) -> Vec<String> {
     let mut dns: Vec<String> = vec!["localhost".to_string()];
     let mut ips: Vec<String> = vec!["127.0.0.1".to_string()];
@@ -2769,6 +2761,13 @@ fn tls_paths(options: &Options) -> MaterialPaths {
     MaterialPaths::in_directory(&map_path(&options.prefix, "/etc/arcen"))
 }
 
+/// `O_NOFOLLOW | O_CLOEXEC` as the C `int` `OpenOptionsExt::custom_flags`
+/// takes: the same bits, reinterpreted.
+fn no_follow_close_on_exec() -> i32 {
+    let bits = (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC).bits();
+    i32::from_ne_bytes(bits.to_ne_bytes())
+}
+
 /// Where a file is written before it is renamed into place.
 fn installing_path(path: &Path) -> PathBuf {
     let name = path.file_name().map_or_else(
@@ -2793,11 +2792,7 @@ impl TlsDirectoryLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(
-                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC)
-                    .bits()
-                    .cast_signed(),
-            )
+            .custom_flags(no_follow_close_on_exec())
             .open(&path)
             .map_err(|error| format!("open {}: {error}", path.display()))?;
         if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
@@ -2876,11 +2871,7 @@ fn read_no_follow(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
 
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(
-            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC)
-                .bits()
-                .cast_signed(),
-        )
+        .custom_flags(no_follow_close_on_exec())
         .open(path)
         .map_err(|error| format!("read {}: {error}", path.display()))?;
     let mut bytes = zeroize::Zeroizing::new(Vec::new());
@@ -3125,11 +3116,7 @@ fn create_exclusive(path: &Path, mode: u32) -> Result<fs::File, String> {
         .write(true)
         .create_new(true)
         .mode(mode)
-        .custom_flags(
-            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC)
-                .bits()
-                .cast_signed(),
-        )
+        .custom_flags(no_follow_close_on_exec())
         .open(path)
         .map_err(|error| format!("create {}: {error}", path.display()))?;
     // The umask may have narrowed `mode`; set it exactly, on the open file.
@@ -3562,6 +3549,7 @@ fn current_euid() -> Result<u32, String> {
 mod tests {
     use super::*;
 
+    use arcen_transport::cert_marker;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -4768,8 +4756,11 @@ mod tests {
     /// connect.
     #[test]
     fn extra_sans_are_classified_as_addresses_or_names() {
-        let rendered =
-            subject_alt_name(&["203.0.113.133".to_string(), "arcen.example.com".to_string()]);
+        let rendered = subject_alt_name_entries(&[
+            "203.0.113.133".to_string(),
+            "arcen.example.com".to_string(),
+        ])
+        .join(",");
         assert!(
             rendered.contains("IP:203.0.113.133"),
             "address must be an IP SAN: {rendered}"
@@ -4787,7 +4778,8 @@ mod tests {
     /// A duplicate of something already discovered must not be emitted twice.
     #[test]
     fn extra_sans_do_not_duplicate_discovered_entries() {
-        let rendered = subject_alt_name(&["localhost".to_string(), "127.0.0.1".to_string()]);
+        let rendered =
+            subject_alt_name_entries(&["localhost".to_string(), "127.0.0.1".to_string()]).join(",");
         assert_eq!(rendered.matches("DNS:localhost").count(), 1, "{rendered}");
         assert_eq!(rendered.matches("IP:127.0.0.1").count(), 1, "{rendered}");
     }

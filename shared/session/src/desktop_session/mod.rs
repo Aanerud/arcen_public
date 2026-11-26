@@ -22,7 +22,10 @@
 //!   presence, logout) and the policy constants where Arcen deliberately
 //!   differs from `gnome-session`.
 //! - [`lock`]: whether the screen may lock (only with an in-session unlock
-//!   path).
+//!   path), and the lock a Deck's departure applies.
+//! - [`remote_access`]: how a desktop outlives its remote-access streams
+//!   when the shell inhibits them (a lock suspends capture and input; it
+//!   never ends the desktop).
 //! - [`settings_overlay`]: the few settings a session pins, rendered for a
 //!   per-session dconf database.
 //! - [`login_environment`]: which variables a user's login shell may add.
@@ -37,6 +40,7 @@ pub mod keyring_control;
 pub mod lock;
 pub mod login_environment;
 pub mod manager;
+pub mod remote_access;
 pub mod restart;
 pub mod settings_overlay;
 pub mod version;

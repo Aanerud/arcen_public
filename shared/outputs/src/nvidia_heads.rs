@@ -169,9 +169,9 @@ fn parse_decimal_tenths(token: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// A synthetic NVIDIA Xorg log: six outputs, alternating DisplayPort
+    /// A synthetic NVIDIA Xorg log: six outputs, alternating `DisplayPort`
     /// (high pixel clock) and TMDS (low), two of them connected.
-    const QUADRO_XORG_EXCERPT: &str = r#"
+    const QUADRO_XORG_EXCERPT: &str = r"
         [    42.017] (--) NVIDIA(GPU-0): ACME Panel (DFP-0): connected
         [    42.017] (--) NVIDIA(GPU-0): ACME Panel (DFP-0): Internal DisplayPort
         [    42.017] (--) NVIDIA(GPU-0): ACME Panel (DFP-0): 1200.0 MHz maximum pixel clock
@@ -193,7 +193,7 @@ mod tests {
         [    42.017] (--) NVIDIA(GPU-0): DFP-6: disconnected
         [    42.017] (--) NVIDIA(GPU-0): DFP-6: Internal DisplayPort
         [    42.017] (--) NVIDIA(GPU-0): DFP-6: 1200.0 MHz maximum pixel clock
-    "#;
+    ";
 
     #[test]
     fn parses_nvidia_xorg_output_facts() {
@@ -217,22 +217,22 @@ mod tests {
 
     #[test]
     fn keeps_k_series_style_fewer_than_four_heads() {
-        let excerpt = r#"
+        let excerpt = r"
             [ 11.100] (--) NVIDIA(GPU-0): Quadro K2200 (DFP-0): connected
             [ 11.100] (--) NVIDIA(GPU-0): Quadro K2200 (DFP-0): 540.0 MHz maximum pixel clock
             [ 11.100] (--) NVIDIA(GPU-0): DFP-1: disconnected
             [ 11.100] (--) NVIDIA(GPU-0): DFP-1: 330.0 MHz maximum pixel clock
-        "#;
+        ";
         assert_eq!(choose_nvidia_xorg_heads(excerpt, 4), ["DFP-0", "DFP-1"]);
     }
 
     #[test]
     fn ignores_disconnected_outputs_without_pixel_clock() {
-        let excerpt = r#"
+        let excerpt = r"
             [ 1.0] (--) NVIDIA(GPU-0): DFP-0: disconnected
             [ 1.0] (--) NVIDIA(GPU-0): DFP-1: connected
             [ 1.0] (--) NVIDIA(GPU-0): DFP-1: 165.0 MHz maximum pixel clock
-        "#;
+        ";
         assert_eq!(choose_nvidia_xorg_heads(excerpt, 4), ["DFP-1"]);
     }
 
@@ -240,14 +240,14 @@ mod tests {
     fn a_vgpu_log_without_pixel_clocks_keeps_its_connected_heads_in_order() {
         // Shape of a GRID vGPU probe that asked for DFP-0..7: the profile
         // provides four heads and the driver logs no pixel clocks.
-        let excerpt = r#"
+        let excerpt = r"
             [ 9.1] (--) NVIDIA(GPU-0): NVIDIA VGX (DFP-2): connected
             [ 9.1] (--) NVIDIA(GPU-0): NVIDIA VGX (DFP-2): External TMDS
             [ 9.1] (--) NVIDIA(GPU-0): NVIDIA VGX (DFP-0): connected
             [ 9.1] (--) NVIDIA(GPU-0): NVIDIA VGX (DFP-1): connected
             [ 9.1] (--) NVIDIA(GPU-0): NVIDIA VGX (DFP-3): connected
             [ 9.1] (**) NVIDIA(GPU-0): Mode Validation Overrides for NVIDIA VGX (DFP-4):
-        "#;
+        ";
         assert_eq!(
             choose_nvidia_xorg_heads(excerpt, 4),
             ["DFP-0", "DFP-1", "DFP-2", "DFP-3"]
