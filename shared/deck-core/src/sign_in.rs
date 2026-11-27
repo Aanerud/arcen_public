@@ -39,6 +39,10 @@ pub enum SignInFailure {
     Unreachable,
     /// A signed-in session ended and cannot resume: sign in again.
     SessionEnded,
+    /// The connection dropped and this Deck's displays changed before it
+    /// could resume. The resume was bound to the old displays; signing in
+    /// again negotiates the current ones on the same host desktop.
+    DisplaysChanged,
     /// The host closed the connection before the session started.
     HostClosedConnection,
     /// The host ended a signed-in session.
@@ -83,6 +87,9 @@ pub enum SignInFailure {
     /// The host refused the sign-in for a reason this Deck does not know;
     /// the reason is under Details.
     HostRefused,
+    /// A change of account stopped without a desktop
+    /// ([`crate::account_switch`]).
+    AccountSwitch(crate::account_switch::AccountSwitchStop),
 }
 
 /// A host's refusal about its own state, never about the credentials:
@@ -183,6 +190,7 @@ impl SignInFailure {
             | Self::CredentialsRefused
             | Self::Unreachable
             | Self::SessionEnded
+            | Self::DisplaysChanged
             | Self::TooManyAttempts
             | Self::NoticeDeclined
             | Self::NoticeRequired
@@ -204,9 +212,13 @@ impl SignInFailure {
                 | ConsoleRefusal::PrivacyUnavailable
                 | ConsoleRefusal::InUseOtherProduct
                 | ConsoleRefusal::OtherProductStarted
-                | ConsoleRefusal::SignInOtherProduct => None,
+                | ConsoleRefusal::SignInOtherProduct
+                | ConsoleRefusal::RemoteStateUnknown
+                | ConsoleRefusal::SwitchInProgress
+                | ConsoleRefusal::SigningOut => None,
             },
             Self::ConsoleRefused { ended: true, .. }
+            | Self::AccountSwitch(_)
             | Self::HostBusy
             | Self::SignInUnavailable
             | Self::HostClosedConnection
@@ -243,7 +255,10 @@ impl SignInFailure {
             | Self::HostIdentityChanged
             | Self::NoticeDeclined
             | Self::NoticeRequired
-            | Self::HostRefused => true,
+            | Self::HostRefused
+            // Only the user can start another change of account; a retry
+            // would ask again.
+            | Self::AccountSwitch(_) => true,
             Self::ConsoleRefused { refusal, .. } => match refusal {
                 ConsoleRefusal::OtherUser
                 | ConsoleRefusal::OtherUserOtherProduct
@@ -258,10 +273,14 @@ impl SignInFailure {
                 | ConsoleRefusal::SignInFailed
                 | ConsoleRefusal::SessionUnreachable
                 | ConsoleRefusal::PrivacyUnavailable
-                | ConsoleRefusal::SessionChanged => false,
+                | ConsoleRefusal::SessionChanged
+                | ConsoleRefusal::RemoteStateUnknown
+                | ConsoleRefusal::SwitchInProgress
+                | ConsoleRefusal::SigningOut => false,
             },
             Self::Unreachable
             | Self::SessionEnded
+            | Self::DisplaysChanged
             | Self::HostClosedConnection
             | Self::HostEndedSession
             | Self::HostRestarted
@@ -287,6 +306,7 @@ impl SignInFailure {
             Self::ConsoleRefused { refusal, ended } => {
                 console_message(refusal, ended, host, detail)
             }
+            Self::AccountSwitch(stop) => stop.message(host),
             Self::TooManyAttempts => {
                 "Too many failed sign-ins. Wait a few minutes, then try again.".to_owned()
             }
@@ -314,6 +334,10 @@ impl SignInFailure {
                  running there."
             ),
             Self::SessionEnded => "Your session ended. Sign in again to continue.".to_owned(),
+            Self::DisplaysChanged => {
+                "Your displays changed. Sign in again to continue on the same desktop with them."
+                    .to_owned()
+            }
             Self::HostClosedConnection => {
                 format!("{host} closed the connection before your session started.")
             }
@@ -561,6 +585,16 @@ fn console_message(
         ConsoleRefusal::OtherProductStarted => {
             format!("Another remote-desktop app took over {host}.")
         }
+        ConsoleRefusal::RemoteStateUnknown => format!(
+            "Someone else is signed in at {host}, and it couldn\u{2019}t tell whether they are \
+             using it remotely, so they weren\u{2019}t signed out."
+        ),
+        ConsoleRefusal::SwitchInProgress => {
+            format!("A change of account is already in progress on {host}.")
+        }
+        ConsoleRefusal::SigningOut => {
+            format!("This account is being signed out on {host}. Try again in a moment.")
+        }
         ConsoleRefusal::SignInOtherProduct => match detail.and_then(sign_in_product) {
             Some(product) => format!(
                 "{product} runs sign-in on {host}. Sign in with {product} once, disconnect it, \
@@ -794,6 +828,9 @@ impl SignInFailure {
             DisconnectReason::Terminal(TerminalDisconnect::HostRefused(refusal)) => {
                 refusal.sign_in_failure(stage)
             }
+            DisconnectReason::Terminal(TerminalDisconnect::AccountSwitch(stop)) => {
+                Self::AccountSwitch(stop)
+            }
             DisconnectReason::Terminal(TerminalDisconnect::Protocol) => Self::ConnectionFailed,
         };
         Some(failure)
@@ -920,6 +957,21 @@ mod tests {
             "Couldn\u{2019}t reach studio.example.internal. Check that it\u{2019}s on and that Arcen is \
              running there."
         );
+    }
+
+    #[test]
+    fn changed_displays_ask_for_the_password_under_the_field() {
+        let mut state = SignInState::default();
+        let _ = state.return_home(SignInFailure::DisplaysChanged, selected("typed"), None);
+        assert!(state.acknowledgement().is_none());
+        assert_eq!(
+            state
+                .under_field(Some("studio"), SignInField::Password)
+                .unwrap()
+                .message,
+            "Your displays changed. Sign in again to continue on the same desktop with them."
+        );
+        assert!(!SignInFailure::DisplaysChanged.is_definite());
     }
 
     #[cfg(feature = "runtime")]
@@ -1073,6 +1125,32 @@ mod tests {
             SignInFailure::SessionNotStarted,
         ] {
             assert_eq!(failure.field(), None, "{failure:?} is acknowledged");
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn a_stopped_change_of_account_returns_home_in_its_own_words_and_is_not_retried() {
+        use crate::account_switch::AccountSwitchStop;
+        use crate::runtime::session::{ConnectSmokeError, session_end_for};
+        for stop in [
+            AccountSwitchStop::Cancelled,
+            AccountSwitchStop::Expired,
+            AccountSwitchStop::LogoutVetoed,
+            AccountSwitchStop::NewLoginFailed,
+        ] {
+            let end = session_end_for(&ConnectSmokeError::AccountSwitch {
+                stop,
+                detail: "console_sign_in_failed: the login screen refused".to_owned(),
+            });
+            let failure = SignInFailure::from_end(&end, SignInStage::Attempt).unwrap();
+            assert_eq!(failure, SignInFailure::AccountSwitch(stop));
+            assert_eq!(failure.field(), None, "{stop:?} is acknowledged");
+            assert!(failure.is_definite(), "{stop:?} never asks again by itself");
+            let mut state = SignInState::default();
+            let _ = state.return_home(failure, selected("secret"), Some(end_detail(&end)));
+            let shown = state.acknowledgement().unwrap();
+            assert_eq!(shown.message, stop.message("studio.example.internal"));
         }
     }
 

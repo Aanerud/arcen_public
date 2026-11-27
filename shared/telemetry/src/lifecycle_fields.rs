@@ -56,6 +56,35 @@ pub fn resume_hold_ended(reason_class: &str, held_ms: u64) -> Option<StructuredF
     Some(fields)
 }
 
+/// Builds the fields for `SESSION_HANDOVER`.
+///
+/// `reason_class` says what became of the sign-in or the change of account;
+/// `attachment` how the Deck came (`connect`, `transport_resume`,
+/// `account_switch`, `login_handover`); `remote_client` which client a
+/// refusal names (`arcen`, `foreign`). Never an account name.
+#[must_use]
+pub fn session_handover(
+    reason_class: &str,
+    attachment: Option<&str>,
+    remote_client: Option<&str>,
+) -> Option<StructuredFields> {
+    let mut fields = StructuredFields::default();
+    fields
+        .insert("reason_class", FieldValue::String(reason_class.to_owned()))
+        .ok()?;
+    if let Some(attachment) = attachment {
+        fields
+            .insert("attachment", FieldValue::String(attachment.to_owned()))
+            .ok()?;
+    }
+    if let Some(client) = remote_client {
+        fields
+            .insert("remote_client", FieldValue::String(client.to_owned()))
+            .ok()?;
+    }
+    Some(fields)
+}
+
 /// Builds the fields for `SESSION_AUTH_OK`.
 ///
 /// `identity_binding` says what the authenticated account was tied to — the

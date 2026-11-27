@@ -26,6 +26,7 @@ pub mod foreign_service;
 pub mod greeter_token;
 pub mod guest_layout;
 pub mod held_lock;
+pub mod holder;
 pub mod local_login_screen;
 pub mod lock_wait;
 pub mod login_screen;
@@ -38,7 +39,7 @@ pub mod wayland_attach;
 pub mod wayland_join;
 
 pub use foreign_service::{ConsoleNotice, ForeignService, other_product_holder};
-pub use local_login_screen::LoginScreen;
+pub use local_login_screen::{LoginScreen, LoginSessionProof};
 pub use logind_read::{SessionRead, SessionsUnreadable};
 
 /// How a Linux Pier serves a sign-in (`platform.session.mode`).
@@ -244,9 +245,12 @@ pub enum ConsoleDecision {
     /// the sign-in through it, so the display manager creates (or, when the
     /// user already has a session it started, resumes) the session.
     SignInThroughGreeter { greeter: String },
-    /// Nobody holds the console and the host has no display manager: Arcen
-    /// signs the account in itself, a real login session on `seat0` at
-    /// virtual terminal `vt` ([`login_session`]).
+    /// Nobody holds the console and no login screen can complete the
+    /// sign-in: the host has no display manager, or another product
+    /// withholds its login screen and the Pier proved Arcen's own session
+    /// can stand beside it ([`LoginSessionProof`]). Arcen signs the account
+    /// in itself, a real login session on `seat0` at virtual terminal `vt`
+    /// ([`login_session`]).
     StartLoginSession { vt: u32 },
     /// The sign-in is refused, with a code the Deck shows.
     Refuse(ConsoleRefusal),
@@ -263,6 +267,10 @@ pub struct ConsoleHost {
     /// [`LoginScreen::Withheld`] when another product is the display
     /// manager and runs GDM without its local login screen.
     pub login_screen: LoginScreen,
+    /// Where the login screen is [`LoginScreen::Withheld`]: what the Pier
+    /// proved about starting Arcen's own login session there. Nothing
+    /// proved ([`LoginSessionProof::NONE`]) refuses as before.
+    pub login_session_proof: LoginSessionProof,
 }
 
 impl Default for ConsoleHost {
@@ -270,6 +278,7 @@ impl Default for ConsoleHost {
         Self {
             display_manager: true,
             login_screen: LoginScreen::Shown,
+            login_session_proof: LoginSessionProof::NONE,
         }
     }
 }
@@ -307,6 +316,7 @@ impl ConsoleHost {
         Self {
             display_manager,
             login_screen: LoginScreen::Shown,
+            login_session_proof: LoginSessionProof::NONE,
         }
     }
 
@@ -346,8 +356,11 @@ pub fn decide(sessions: &[ConsoleSessionFact], uid: u32) -> ConsoleDecision {
 /// Arcen's own login session for the account; one with a display manager
 /// whose login screen is missing refuses. Where another product runs the
 /// console's sign-in ([`LoginScreen::Withheld`]) nothing is signed in
-/// through a login screen, not even one left on the seat: the sign-in is
-/// refused with [`ConsoleRefusal::SignInOtherProduct`].
+/// through a login screen, not even one left on the seat: Arcen's own
+/// login session starts only when the Pier proved it can stand beside the
+/// product ([`LoginSessionProof`]) and logind lists nothing graphical;
+/// otherwise the sign-in is refused with
+/// [`ConsoleRefusal::SignInOtherProduct`].
 #[must_use]
 pub fn decide_on(sessions: &[ConsoleSessionFact], uid: u32, host: ConsoleHost) -> ConsoleDecision {
     let desktops = || sessions.iter().filter(|s| s.is_console_desktop());
@@ -377,7 +390,7 @@ pub fn decide_on(sessions: &[ConsoleSessionFact], uid: u32, host: ConsoleHost) -
         return attach(mine, true);
     }
     if host.login_screen.refuses_sign_in() {
-        return ConsoleDecision::Refuse(ConsoleRefusal::SignInOtherProduct);
+        return beside_product(sessions, host.login_session_proof);
     }
     match sessions.iter().find(|s| s.is_console_greeter()) {
         Some(greeter) if greeter.is_wayland() => {
@@ -387,18 +400,120 @@ pub fn decide_on(sessions: &[ConsoleSessionFact], uid: u32, host: ConsoleHost) -
             greeter: greeter.id.clone(),
         },
         None if host.display_manager => ConsoleDecision::Refuse(ConsoleRefusal::NoConsoleSession),
-        None => {
-            let used: Vec<u32> = sessions
-                .iter()
-                .filter(|s| s.seat == CONSOLE_SEAT && s.state != "closing")
-                .map(|s| s.vtnr)
-                .collect();
-            login_session::choose_vt(&used).map_or(
-                ConsoleDecision::Refuse(ConsoleRefusal::NoConsoleSession),
-                |vt| ConsoleDecision::StartLoginSession { vt },
-            )
+        None => start_login_session(sessions)
+            .unwrap_or(ConsoleDecision::Refuse(ConsoleRefusal::NoConsoleSession)),
+    }
+}
+
+/// Arcen's own login session at the first free virtual terminal of
+/// `seat0`; `None` when every one is taken.
+fn start_login_session(sessions: &[ConsoleSessionFact]) -> Option<ConsoleDecision> {
+    let used: Vec<u32> = sessions
+        .iter()
+        .filter(|s| s.seat == CONSOLE_SEAT && s.state != "closing")
+        .map(|s| s.vtnr)
+        .collect();
+    login_session::choose_vt(&used).map(|vt| ConsoleDecision::StartLoginSession { vt })
+}
+
+/// Nobody's desktop to join where another product withholds the login
+/// screen (ADR 0025 §8): Arcen's own login session (§10), only when the
+/// Pier proved every fact of `proof` and logind lists no graphical session
+/// at all, of any class, account, state or seat: a login screen left on
+/// `seat0` holds the GPU too, and a graphical session with no seat is the
+/// product's own (its sign-ins arrive over XDMCP). Otherwise, as before,
+/// the product runs the sign-in.
+///
+/// This is the console's half of the shared contract's
+/// [`crate::session_handover::HandoverDecision::SignInFresh`]: Arcen's
+/// login session is the platform's own login here, and a console counts
+/// as nobody's only on this proof.
+fn beside_product(sessions: &[ConsoleSessionFact], proof: LoginSessionProof) -> ConsoleDecision {
+    let refused = ConsoleDecision::Refuse(ConsoleRefusal::SignInOtherProduct);
+    if !proof.qualifies() || sessions.iter().any(ConsoleSessionFact::graphical) {
+        return refused;
+    }
+    start_login_session(sessions).unwrap_or(refused)
+}
+
+/// The sign-in decision read again immediately before Arcen's own login
+/// session starts beside the product: the start goes ahead only when it is
+/// still [`ConsoleDecision::StartLoginSession`] on the same virtual
+/// terminal `vt`. Anything else (the product's client attached, its X
+/// server started, a session appeared, the terminal changed, logind could
+/// not be read) refuses [`ConsoleRefusal::SignInOtherProduct`], and nothing
+/// starts.
+///
+/// # Errors
+///
+/// [`ConsoleRefusal::SignInOtherProduct`] unless the decision still starts
+/// the session on `vt`.
+pub fn confirm_start_beside_product(
+    rechecked: &ConsoleDecision,
+    vt: u32,
+) -> Result<(), ConsoleRefusal> {
+    match rechecked {
+        ConsoleDecision::StartLoginSession { vt: again } if *again == vt => Ok(()),
+        _ => Err(ConsoleRefusal::SignInOtherProduct),
+    }
+}
+
+/// What appeared beside Arcen's own login session while it started next
+/// to the product ([`started_alone_beside_product`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BesideProductIntruder {
+    /// An X server other than the session's own listens, or the socket
+    /// table could not be read.
+    XServer,
+    /// logind lists another graphical session, or could not be read.
+    GraphicalSession,
+    /// A client of the product is connected, or that could not be ruled
+    /// out.
+    ProductClient,
+}
+
+impl BesideProductIntruder {
+    /// Stable token for logs.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::XServer => "x_server_running",
+            Self::GraphicalSession => "graphical_session",
+            Self::ProductClient => "product_client",
         }
     }
+}
+
+/// Whether Arcen's login session `ours`, just active on X display
+/// `our_display` beside the product, stands alone there: the only X
+/// display listening is its own, logind lists no graphical session but
+/// `ours`, and no client of the product is connected. Each fact must be
+/// read and proved; the product may have started between the decision
+/// and the session taking its terminal.
+///
+/// # Errors
+///
+/// The first [`BesideProductIntruder`] found.
+pub fn started_alone_beside_product(
+    read: &SessionRead,
+    ours: &str,
+    x_displays: Option<&[u32]>,
+    our_display: u32,
+    product_client: guest_layout::ForeignClient,
+) -> Result<(), BesideProductIntruder> {
+    if x_displays != Some(&[our_display][..]) {
+        return Err(BesideProductIntruder::XServer);
+    }
+    let Ok(sessions) = read else {
+        return Err(BesideProductIntruder::GraphicalSession);
+    };
+    if sessions.iter().any(|s| s.id != ours && s.graphical()) {
+        return Err(BesideProductIntruder::GraphicalSession);
+    }
+    if product_client != guest_layout::ForeignClient::Absent {
+        return Err(BesideProductIntruder::ProductClient);
+    }
+    Ok(())
 }
 
 /// [`decide_on`] from a read of logind's sessions: a read that is not
@@ -589,11 +704,24 @@ pub enum ConsoleRefusal {
     /// login screen off the console ([`LoginScreen::Withheld`]). Signing
     /// in with that product once gives the account a desktop Arcen joins.
     SignInOtherProduct,
+    /// Another account holds the workstation, and whether a remote client
+    /// is attached to its session could not be proved, so no sign-out was
+    /// offered or made (ADR 0025 §13: unknown is never read as detached).
+    /// It only ever blocks a change of account: the account's own session
+    /// is joined whatever is attached to it.
+    RemoteStateUnknown,
+    /// Another account holds the workstation, and a change of account
+    /// another Deck asked for is waiting for its confirmation or its logout
+    /// (ADR 0025 §13: one at a time).
+    SwitchInProgress,
+    /// The account's own session is being signed out by a change of
+    /// account another Deck confirmed; it is not joined (ADR 0025 §13).
+    SigningOut,
 }
 
 impl ConsoleRefusal {
     /// Every refusal (the error-code reference checks each has a row).
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 17] = [
         Self::OtherUser,
         Self::OtherUserOtherProduct,
         Self::WaylandSession,
@@ -608,7 +736,22 @@ impl ConsoleRefusal {
         Self::InUseOtherProduct,
         Self::OtherProductStarted,
         Self::SignInOtherProduct,
+        Self::RemoteStateUnknown,
+        Self::SwitchInProgress,
+        Self::SigningOut,
     ];
+
+    /// The codes that came with `account_switch_v1` (ADR 0025 §13). A Pier
+    /// sends them only to a Deck that negotiated it; an older Deck gets the
+    /// refusal it already knows
+    /// (`session_handover::HandoverRefusal::console_refusal`).
+    #[must_use]
+    pub const fn since_account_switch_v1(self) -> bool {
+        matches!(
+            self,
+            Self::RemoteStateUnknown | Self::SwitchInProgress | Self::SigningOut
+        )
+    }
 
     /// The refusal for another account's session of `origin`.
     #[must_use]
@@ -638,6 +781,9 @@ impl ConsoleRefusal {
             Self::InUseOtherProduct => "console_in_use_other_product",
             Self::OtherProductStarted => "console_other_product_started",
             Self::SignInOtherProduct => "console_sign_in_other_product",
+            Self::RemoteStateUnknown => "console_remote_state_unknown",
+            Self::SwitchInProgress => "console_switch_in_progress",
+            Self::SigningOut => "console_signing_out",
         }
     }
 
@@ -687,6 +833,15 @@ impl ConsoleRefusal {
             }
             Self::SignInOtherProduct => {
                 "console_sign_in_other_product: another remote-desktop product runs this workstation's sign-in; sign in with it first."
+            }
+            Self::RemoteStateUnknown => {
+                "console_remote_state_unknown: another account is signed in; the workstation could not tell if it is in use remotely."
+            }
+            Self::SwitchInProgress => {
+                "console_switch_in_progress: a change of account is already in progress on this workstation."
+            }
+            Self::SigningOut => {
+                "console_signing_out: this account is being signed out on this workstation; try again in a moment."
             }
         }
     }
@@ -1637,6 +1792,198 @@ mod tests {
     }
 
     #[test]
+    fn a_proved_host_starts_arcens_own_session_beside_the_product_only_on_a_free_seat() {
+        use guest_layout::ForeignClient;
+        let proved = LoginSessionProof {
+            gdm_answers: true,
+            login_service: true,
+            x_server_free: true,
+            product_client: ForeignClient::Absent,
+        };
+        let on = |login_screen, proof| ConsoleHost {
+            display_manager: true,
+            login_screen,
+            login_session_proof: proof,
+        };
+        let withheld = |proof| on(LoginScreen::Withheld, proof);
+        let refused = ConsoleDecision::Refuse(ConsoleRefusal::SignInOtherProduct);
+        assert!(proved.qualifies());
+        assert_eq!(
+            decide_on(&[], TIM, withheld(proved)),
+            ConsoleDecision::StartLoginSession { vt: 7 }
+        );
+        let mut text_login = session("c2", OTHER, "user", "tty", true);
+        text_login.vtnr = 7;
+        assert_eq!(
+            decide_on(&[text_login], TIM, withheld(proved)),
+            ConsoleDecision::StartLoginSession { vt: 8 }
+        );
+        // Every fact must be proved; a client that could not be ruled out
+        // counts as one.
+        let missing: [fn(&mut LoginSessionProof); 5] = [
+            |p| p.gdm_answers = false,
+            |p| p.login_service = false,
+            |p| p.x_server_free = false,
+            |p| p.product_client = ForeignClient::Attached,
+            |p| p.product_client = ForeignClient::Unknown,
+        ];
+        for unset in missing {
+            let mut proof = proved;
+            unset(&mut proof);
+            assert_eq!(
+                decide_on(&[], TIM, withheld(proof)),
+                refused,
+                "{}",
+                proof.token()
+            );
+        }
+        assert_eq!(LoginSessionProof::default(), LoginSessionProof::NONE);
+        assert!(!LoginSessionProof::NONE.qualifies());
+        // Anything graphical keeps the console busy: a login screen left
+        // on seat0, another account's desktop in the background, one
+        // closing, and the product's own sessions, which have no seat (the
+        // account's own too: it is never given a second session).
+        let background = session("8", OTHER, "user", "x11", false);
+        let mut closing = session("9", OTHER, "user", "x11", false);
+        closing.state = "closing".into();
+        let seatless = |uid, class| {
+            let mut product = session("p1", uid, class, "x11", false);
+            product.seat = String::new();
+            product.vtnr = 0;
+            product.remote = true;
+            product
+        };
+        for sessions in [
+            vec![greeter(false)],
+            vec![background],
+            vec![closing],
+            vec![seatless(TIM, "user")],
+            vec![seatless(OTHER, "user")],
+            vec![seatless(42, "greeter")],
+        ] {
+            assert_eq!(decide_on(&sessions, TIM, withheld(proved)), refused);
+        }
+        // The account's own session is joined first, as before; another
+        // account's Arcen session refuses.
+        assert_eq!(
+            decide_on(&[arcen_login("40", TIM, 7)], TIM, withheld(proved)),
+            ConsoleDecision::Attach {
+                session: "40".into(),
+                activate: false,
+                origin: ConsoleOrigin::Arcen
+            }
+        );
+        assert_eq!(
+            decide_on(&[arcen_login("41", OTHER, 7)], TIM, withheld(proved)),
+            ConsoleDecision::Refuse(ConsoleRefusal::OtherUser)
+        );
+        // The proof counts only where the login screen is withheld.
+        assert_eq!(
+            decide_on(&[], TIM, on(LoginScreen::Unproven, proved)),
+            ConsoleDecision::Refuse(ConsoleRefusal::NoConsoleSession)
+        );
+        assert_eq!(
+            decide_on(&[greeter(true)], TIM, on(LoginScreen::Shown, proved)),
+            ConsoleDecision::SignInThroughGreeter {
+                greeter: "c1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_start_beside_the_product_is_decided_again_just_before_it_happens() {
+        use guest_layout::ForeignClient;
+        let proved = LoginSessionProof {
+            gdm_answers: true,
+            login_service: true,
+            x_server_free: true,
+            product_client: ForeignClient::Absent,
+        };
+        let host = |proof| ConsoleHost {
+            display_manager: true,
+            login_screen: LoginScreen::Withheld,
+            login_session_proof: proof,
+        };
+        let again = |read: &SessionRead, proof| {
+            confirm_start_beside_product(&decide_on_read(read, TIM, host(proof)), 7)
+        };
+        assert_eq!(again(&Ok(vec![]), proved), Ok(()));
+        let refused = Err(ConsoleRefusal::SignInOtherProduct);
+        // The product attached, or started its X server, meanwhile.
+        let attached = LoginSessionProof {
+            product_client: ForeignClient::Attached,
+            ..proved
+        };
+        let x_server = LoginSessionProof {
+            x_server_free: false,
+            ..proved
+        };
+        assert_eq!(again(&Ok(vec![]), attached), refused);
+        assert_eq!(again(&Ok(vec![]), x_server), refused);
+        // A seatless session of the product appeared, or logind cannot be
+        // read.
+        let mut product = session("p1", OTHER, "user", "x11", true);
+        product.seat = String::new();
+        product.vtnr = 0;
+        assert_eq!(again(&Ok(vec![product]), proved), refused);
+        assert_eq!(again(&Err(SessionsUnreadable::ListFailed), proved), refused);
+        // The terminal chosen earlier was taken.
+        let mut text_login = session("c2", OTHER, "user", "tty", true);
+        text_login.vtnr = 7;
+        assert_eq!(again(&Ok(vec![text_login]), proved), refused);
+    }
+
+    #[test]
+    fn a_login_session_started_beside_the_product_must_stand_alone() {
+        use guest_layout::ForeignClient::{Absent, Attached, Unknown};
+        let ours = arcen_login("40", TIM, 7);
+        let text = session("c2", OTHER, "user", "tty", true);
+        let read: SessionRead = Ok(vec![ours.clone(), text]);
+        assert_eq!(
+            started_alone_beside_product(&read, "40", Some(&[1]), 1, Absent),
+            Ok(())
+        );
+        let intruder = |read: &SessionRead, x: Option<&[u32]>, client| {
+            started_alone_beside_product(read, "40", x, 1, client).unwrap_err()
+        };
+        // Another X server, or none readable.
+        assert_eq!(
+            intruder(&read, Some(&[1, 100]), Absent),
+            BesideProductIntruder::XServer
+        );
+        assert_eq!(
+            intruder(&read, Some(&[]), Absent),
+            BesideProductIntruder::XServer
+        );
+        assert_eq!(
+            intruder(&read, None, Absent),
+            BesideProductIntruder::XServer
+        );
+        // Another graphical session, with or without a seat, or logind
+        // unreadable.
+        let mut product = session("p1", TIM, "user", "x11", false);
+        product.seat = String::new();
+        let crowded: SessionRead = Ok(vec![ours, product]);
+        assert_eq!(
+            intruder(&crowded, Some(&[1]), Absent),
+            BesideProductIntruder::GraphicalSession
+        );
+        assert_eq!(
+            intruder(&Err(SessionsUnreadable::ListFailed), Some(&[1]), Absent),
+            BesideProductIntruder::GraphicalSession
+        );
+        // The product's client attached, or could not be ruled out.
+        assert_eq!(
+            intruder(&read, Some(&[1]), Attached),
+            BesideProductIntruder::ProductClient
+        );
+        assert_eq!(
+            intruder(&read, Some(&[1]), Unknown),
+            BesideProductIntruder::ProductClient
+        );
+    }
+
+    #[test]
     fn a_session_that_did_not_lock_is_kept_private_where_gdm_may_not_be_asked() {
         let front = session("26", TIM, "user", "x11", true);
         let behind = unlocked_hand_back(SessionLookup::Known {
@@ -1667,6 +2014,7 @@ mod tests {
         let no_dm = ConsoleHost {
             display_manager: false,
             login_screen: LoginScreen::Shown,
+            login_session_proof: LoginSessionProof::NONE,
         };
         assert_eq!(
             decide_on(&[], TIM, no_dm),

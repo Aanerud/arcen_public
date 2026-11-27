@@ -12,9 +12,11 @@
 //! A transient login screen asked of that GDM has no terminal to reach: it
 //! waits until the product's X server leaves its terminal and then takes
 //! the GPU the product needs. So on such a host Arcen neither signs in
-//! through a login screen nor asks GDM for one ([`LoginScreen`]); a
-//! sign-in with nobody signed in is refused with the product named
-//! ([`super::ConsoleRefusal::SignInOtherProduct`]).
+//! through a login screen nor asks GDM for one ([`LoginScreen`]). With
+//! nobody signed in, Arcen starts the account's own login session (ADR
+//! 0025 §10) only when the Pier has proved it can stand beside the product
+//! ([`LoginSessionProof`]); otherwise the sign-in is refused with the
+//! product named ([`super::ConsoleRefusal::SignInOtherProduct`]).
 //!
 //! The rule follows GDM: the runtime settings (`/run/gdm/custom.conf`)
 //! answer for each key they hold, the administrator's (`/etc/gdm/custom.conf`)
@@ -35,6 +37,7 @@
 //! the host.
 
 use super::DISPLAY_MANAGER_UNITS;
+use super::guest_layout::ForeignClient;
 
 /// GDM's settings group for XDMCP, which held `ShowLocalGreeter` until
 /// GDM 49.
@@ -216,8 +219,10 @@ impl LoginScreen {
         }
     }
 
-    /// A sign-in with nobody at the console is refused, and a login screen
-    /// left on the console is never signed in through.
+    /// No sign-in goes through a login screen, not even one left on the
+    /// console; with nobody at the console only Arcen's own login session
+    /// may sign the account in, when the Pier proved it
+    /// ([`LoginSessionProof`]).
     #[must_use]
     pub const fn refuses_sign_in(self) -> bool {
         matches!(self, Self::Withheld)
@@ -237,6 +242,73 @@ impl LoginScreen {
             Self::Shown => "shown",
             Self::Withheld => "withheld",
             Self::Unproven => "unproven",
+        }
+    }
+}
+
+/// What the Pier proved, on a console whose login screen another product
+/// withholds ([`LoginScreen::Withheld`]), before Arcen's own login session
+/// (ADR 0025 §10) may sign an account in there. Every fact must hold; the
+/// default proves nothing, and the sign-in is refused as before. A fact the
+/// Pier could not read is not proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoginSessionProof {
+    /// GDM answers on the system bus. GNOME Shell offers its lock screen
+    /// only then, and GDM unlocks a session it did not start through a
+    /// temporary re-authentication channel: the session locks when the
+    /// Deck leaves and is unlocked at the desk with the password.
+    pub gdm_answers: bool,
+    /// Arcen's login service (`arcen-login`) is installed.
+    pub login_service: bool,
+    /// No X server listens: neither the product's nor a login screen's
+    /// holds the GPU or a virtual terminal. An unreadable socket table is
+    /// not proof.
+    pub x_server_free: bool,
+    /// Whether a client of the product is connected. Only
+    /// [`ForeignClient::Absent`], proved, lets Arcen start a session: the
+    /// product is then not part way through a sign-in of its own.
+    pub product_client: ForeignClient,
+}
+
+impl Default for LoginSessionProof {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl LoginSessionProof {
+    /// Nothing proved.
+    pub const NONE: Self = Self {
+        gdm_answers: false,
+        login_service: false,
+        x_server_free: false,
+        product_client: ForeignClient::Unknown,
+    };
+
+    /// Every fact holds.
+    #[must_use]
+    pub const fn qualifies(self) -> bool {
+        self.gdm_answers
+            && self.login_service
+            && self.x_server_free
+            && matches!(self.product_client, ForeignClient::Absent)
+    }
+
+    /// Stable token for logs: `qualified`, or the first fact missing.
+    #[must_use]
+    pub const fn token(self) -> &'static str {
+        if !self.gdm_answers {
+            "gdm_silent"
+        } else if !self.login_service {
+            "login_service_missing"
+        } else if !self.x_server_free {
+            "x_server_running"
+        } else {
+            match self.product_client {
+                ForeignClient::Attached => "product_client_connected",
+                ForeignClient::Unknown => "product_client_unknown",
+                ForeignClient::Absent => "qualified",
+            }
         }
     }
 }

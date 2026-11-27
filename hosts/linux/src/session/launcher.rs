@@ -297,6 +297,26 @@ pub(crate) struct SessionDisplayMsg {
     color: Option<arcen_protocol::messages::DisplayColorMsg>,
 }
 
+/// What a joined console is laid out for besides a committed plan: its one
+/// display's size and refresh, and whether the Deck matches its layout.
+/// Two sign-ins asking for the same one may share an attachment; any
+/// other is attached afresh (shared `session_handover::reattach_displays`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConsoleDisplayRequest {
+    display: Option<(u32, u32, u32)>,
+    match_layout: bool,
+}
+
+#[cfg(test)]
+impl ConsoleDisplayRequest {
+    pub(crate) const fn new(display: Option<(u32, u32, u32)>, match_layout: bool) -> Self {
+        Self {
+            display,
+            match_layout,
+        }
+    }
+}
+
 impl SessionDisplayMsg {
     /// The served display, at the size the session streams.
     pub(crate) fn served(
@@ -1031,6 +1051,18 @@ impl AuthenticatedLauncher {
     /// to take effect.
     pub(crate) fn set_match_layout(&mut self, match_layout: bool) {
         self.match_layout = match_layout;
+    }
+
+    /// The one-display part of the request a joined console is laid out
+    /// for ([`ConsoleDisplayRequest`]).
+    pub(crate) fn console_display_request(&self) -> ConsoleDisplayRequest {
+        ConsoleDisplayRequest {
+            display: self
+                .session_display
+                .as_ref()
+                .map(|display| (display.width, display.height, display.refresh_hz)),
+            match_layout: self.match_layout,
+        }
     }
 
     /// Sets how a headless Wayland desktop opened by this launcher records
@@ -3523,7 +3555,7 @@ async fn run_console(
     };
     let ready_by = tokio::time::Instant::now() + CONSOLE_OPEN_TIMEOUT - CONSOLE_READY_MARGIN;
     let sessions = console::read_sessions().await;
-    let host = super::login_session::console_host();
+    let host = super::login_session::console_host_for_sign_in();
     // Only a complete read of logind's sessions proves the account has
     // none; an unreadable one refuses rather than start a second session.
     let decision = model::decide_on_read(&sessions, identity.uid, host);
@@ -3699,29 +3731,21 @@ async fn run_console(
             )))
         }
     };
-    // Another product's desktop is joined only while that product's own
-    // client is not using it: one remote product at a time (ADR 0025 §8).
+    // The account's own desktop in another product is joined whatever that
+    // product's client does (ADR 0025 §13, shared
+    // `session_handover::HandoverDecision::JoinOwnSession`): with its client
+    // attached, or when that cannot be told, the desktop keeps its layout
+    // (`guest_layout`, below).
     let guest = origin == model::ConsoleOrigin::OtherProduct;
     if guest {
         if let Some(device) = console::another_products_client().await {
-            tracing::warn!(
+            tracing::info!(
                 target: target::SESSION,
                 session_id = %session_id,
                 device = %device,
-                "another remote-desktop product's client is using this desktop"
+                reason_class = arcen_session::session_handover::HandoverReason::ReusedDesktop.token(),
+                "another remote-desktop product's client is using the account's own desktop; it is joined and keeps its layout"
             );
-            if privacy.is_brought_forward() {
-                secure_before_leaving(&mut privacy, None, &session_id).await;
-            } else {
-                privacy.release_input();
-            }
-            let service = console::session_fact(&session_id)
-                .await
-                .map(|fact| console::foreign_service(&fact));
-            return Err(refuse(model::ConsoleNotice::naming(
-                ConsoleRefusal::InUseOtherProduct,
-                service,
-            )));
         }
     }
     // A session this sign-in brought to the desk's monitors (started by
@@ -4007,22 +4031,17 @@ async fn run_console(
                         }
                     }
                     Some("attach") => {
+                        // The account's own desktop is rejoined whatever
+                        // another product's client does (ADR 0025 §13); its
+                        // layout is the held one.
                         if guest {
                             if let Some(device) = console::another_products_client().await {
-                                tracing::warn!(
+                                tracing::info!(
                                     target: target::SESSION,
                                     device = %device,
-                                    "another remote-desktop product's client is using this desktop; the returning Deck is refused"
+                                    reason_class = arcen_session::session_handover::HandoverReason::ReusedDesktop.token(),
+                                    "another remote-desktop product's client is using the account's own desktop; the returning Deck joins it"
                                 );
-                                let service = console::session_fact(&session_id)
-                                    .await
-                                    .map(|fact| console::foreign_service(&fact));
-                                let notice = model::ConsoleNotice::naming(
-                                    ConsoleRefusal::InUseOtherProduct,
-                                    service,
-                                );
-                                let _ = write_response(&LauncherResponse::console_refusal(&notice));
-                                break;
                             }
                         }
                         // The desk's speakers are silent again before

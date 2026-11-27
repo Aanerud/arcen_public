@@ -526,7 +526,11 @@ impl ControlSender {
     }
 }
 
-async fn send_critical_control<S>(sink: &mut S, message: Message, kind: &'static str) -> bool
+pub(super) async fn send_critical_control<S>(
+    sink: &mut S,
+    message: Message,
+    kind: &'static str,
+) -> bool
 where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
@@ -1201,7 +1205,7 @@ fn desk_change(
     }
 }
 
-fn close_with_reason(reason: &str) -> Message {
+pub(super) fn close_with_reason(reason: &str) -> Message {
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
@@ -4348,6 +4352,33 @@ async fn run_ws(
                 .await;
                 return;
             }
+            // A Deck is never resumed into a session being signed out, nor
+            // before the requester of a completed change of account signed
+            // in (ADR 0025 §13). Read without changing anything: only an
+            // authenticated resume may withdraw an offer (below).
+            let held = {
+                use arcen_session::session_handover::consent::ConsoleHold;
+                let connection = session_registry.next_handover_connection();
+                let handover = session_registry.handover();
+                matches!(
+                    handover.ledger.hold(connection),
+                    ConsoleHold::SigningOut(_) | ConsoleHold::Entering(_)
+                )
+            };
+            if held {
+                warn!(
+                    target: SESSION,
+                    "a change of account holds the console; the resume is refused"
+                );
+                clear_resume_secrets(&mut response);
+                send_resume_rejection(
+                    &mut ws,
+                    "the console is changing account",
+                    ResumeErrorCode::SessionGone,
+                )
+                .await;
+                return;
+            }
             let prepared = session_registry.resume().prepare_resume(
                 &response,
                 &current_host_identity,
@@ -4361,6 +4392,40 @@ async fn run_ws(
                 );
             match prepared {
                 Ok(permit) => {
+                    // The resume authenticated: a returning Deck withdraws an
+                    // open offer to sign its session out.
+                    // A logout or sign-in that started since the check
+                    // above still refuses it: the withdrawal and this
+                    // check are one ledger call.
+                    {
+                        use arcen_session::session_handover::consent::ClientReturn;
+                        let returned = session_registry.handover().ledger.remote_client_returned();
+                        if matches!(
+                            returned,
+                            ClientReturn::LogoutInFlight | ClientReturn::EntryPending
+                        ) {
+                            warn!(
+                                target: SESSION,
+                                "a change of account began meanwhile; the resume is refused"
+                            );
+                            drop(permit);
+                            send_resume_rejection(
+                                &mut ws,
+                                "the console is changing account",
+                                ResumeErrorCode::SessionGone,
+                            )
+                            .await;
+                            return;
+                        }
+                        session_registry.note_attachment();
+                        if returned == ClientReturn::OfferWithdrawn {
+                            info!(
+                                target: SESSION,
+                                reason_class = arcen_session::session_handover::HandoverReason::SwitchStale.token(),
+                                "a returning Deck withdrew the open change-of-account offer"
+                            );
+                        }
+                    }
                     if let Err((socket, rejection)) = session_registry.resume().handoff(
                         permit,
                         ws,
@@ -4722,9 +4787,45 @@ async fn run_ws(
                         carrier,
                     )
                 });
-                let acquired = session_registry
-                    .acquire(launcher, planned, response.replace_incompatible_desktop)
-                    .await;
+                // A console sign-in is decided against the change-of-account
+                // ledger first (ADR 0025 §13): it may be refused, or offered
+                // a confirmed sign-out of another account's session.
+                let identity = launcher.identity.clone();
+                let requester = super::account_switch::Requester {
+                    identity: &identity,
+                    session_log_id: &session_log_id,
+                    remote_host: &remote_host,
+                    emitter: &emitter,
+                    deck_switch: response.account_switch_v1,
+                };
+                let admission = if launcher.joins_console() {
+                    let connection = session_registry.next_handover_connection();
+                    super::account_switch::admit(&mut ws, &session_registry, connection, &requester)
+                        .await
+                } else {
+                    super::account_switch::Admission::Proceed(None)
+                };
+                let (acquired, permit) = match admission {
+                    super::account_switch::Admission::Closed => return,
+                    super::account_switch::Admission::Refused(notice) => (
+                        Err(LifecycleError::Launcher(LauncherError::Console(notice))),
+                        None,
+                    ),
+                    super::account_switch::Admission::Proceed(permit) => (
+                        session_registry
+                            .acquire(launcher, planned, response.replace_incompatible_desktop)
+                            .await,
+                        permit,
+                    ),
+                };
+                if let Some(permit) = permit {
+                    super::account_switch::login_finished(
+                        &session_registry,
+                        &requester,
+                        permit,
+                        acquired.is_ok(),
+                    );
+                }
                 if let Err(error) = &acquired {
                     record_desktop_failure(
                         &emitter,
@@ -10510,10 +10611,12 @@ async fn run_attachment(
     let mut input_status = lock_recover(&input_controller)
         .as_ref()
         .and_then(PierInput::wayland_status);
-    // A desktop another product owns is shared with nobody: its own client
-    // connecting ends this attachment, with the reason (ADR 0025 §8).
-    // Any other joined console steps aside when another product starts a
-    // desktop of its own on the console (it is the display manager again).
+    // The account's own desktop in another product is entered from either
+    // side (ADR 0025 §13): its client connecting is logged, and this
+    // attachment stays. Any other joined console steps aside when another
+    // product starts a desktop of its own on the console (it is the display
+    // manager again).
+    let mut guest_client_seen = false;
     let console_guest = session_lease.is_some_and(|lease| lease.metadata.console_guest);
     let console_joined = session_lease
         .filter(|lease| lease.metadata.console)
@@ -10587,15 +10690,17 @@ async fn run_attachment(
             _ = guest_check.tick(), if console_joined.is_some() => {
                 use arcen_session::console_session::{other_product_started, ConsoleRefusal};
                 let refusal = if console_guest {
-                    let Some(device) = crate::session::console::another_products_client().await else {
-                        continue;
-                    };
-                    error!(
-                        target: SESSION,
-                        %device,
-                        "another remote-desktop product's client connected to this desktop; the attachment ends"
-                    );
-                    ConsoleRefusal::InUseOtherProduct
+                    let device = crate::session::console::another_products_client().await;
+                    if device.is_some() != guest_client_seen {
+                        guest_client_seen = device.is_some();
+                        info!(
+                            target: SESSION,
+                            device = device.as_deref().unwrap_or(""),
+                            attached = guest_client_seen,
+                            "another remote-desktop product's client on the account's own desktop; the attachment continues"
+                        );
+                    }
+                    continue;
                 } else {
                     // An unreadable logind concludes nothing.
                     let Ok(sessions) = crate::session::console::read_sessions().await else {

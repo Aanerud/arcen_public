@@ -27,9 +27,9 @@ takeover rule applies only to this state.
 | Requested account owns the active console, **locked** | Unlock it through the Credential Provider | Credential Provider failures are reported separately |
 | Nobody owns the console, nothing else competes for it | Sign the account in at the console | Credential Provider failures are reported separately |
 | Requested account has exactly one disconnected session elsewhere, console otherwise free | Move that session onto the console, then bind | `…: the account's existing session could not be moved to the physical console.` |
-| **Another account owns the console, WTS reports `Active`** | **Refuse.** A locked console counts as active | `console_other_user: another account is signed in at this workstation.` |
+| **Another account owns the console, WTS reports `Active`** | **Refuse.** A locked console counts as active. No sign-out is offered yet (see below) | `console_other_user: another account is signed in at this workstation.` |
 | **Another account's session is attached through another remote-desktop service** (an RDP or ICA client is connected to it) | **Refuse** | `console_other_user_other_product: another remote-desktop service (RDP-Tcp, rdp) uses this workstation.` — the session's WinStation listener and client protocol, as Windows reports them |
-| The requested account's own desktop is attached through another remote-desktop service | Refuse; one remote product at a time | `console_in_use_other_product: this desktop is in use through another remote-desktop product.` |
+| The requested account's own desktop is attached through another remote-desktop service | **Join it**: move it onto the console, as a sign-in at the desk does. Windows shows a session at one station, so the other service's client loses it | — |
 | **Another account owns the console, WTS reports `Disconnected`, and this account has a parked session** | **Take over**: move this account's session onto the console | — unless a later Windows operation fails |
 | Another account owns the console, WTS reports `Disconnected`, and this account has nothing to move | Refuse | `…: another account holds the console and this account has no session to move onto it.` |
 | The console owner cannot be verified | Refuse; Arcen does not guess ownership | `…: active console account could not be verified.` |
@@ -48,6 +48,41 @@ abbreviated above with `…` for width. The Pier log records the code as
 Client-facing messages name the situation, not the other account. Operators need to know that
 another account owns or is using the console; naming the account would expose avoidable user
 identity information to a remote client and is not needed to resolve the policy decision.
+
+## Another account's idle desktop: no sign-out offered yet
+
+ADR 0025 §13 and `arcen_session::session_handover` decide; the Windows Pier
+supplies the facts. Who holds the desktop is the account's SID, the WTS
+session id, its logon id (new for every sign-in, so a reused session id is
+another session) and the boot. A client is attached when an Arcen Deck's
+agent serves that account, or when Windows reports the session `Active` or
+`Connected` off the console (another remote-desktop service). Every Arcen
+attachment moves the desktop's epoch on, and none attaches to a session a
+confirmed change of account is signing out.
+
+The Pier has the whole confirmed change of account: the offer after the
+password, Cancel as the default, the facts read again before anything
+happens, the ordinary sign-out asked from inside the target session
+(`arcen-pier sign-out-session`, `ExitWindowsEx(EWX_LOGOFF)` without a
+force flag) and the exact WTS session and logon read back gone before the
+requester signs in through the Credential Provider. It does not offer it
+(`SwitchRoute::PierCannotSignOut`), so another account is refused as before:
+Windows carries that sign-out out only for an unlocked session. A locked
+session, which is every session a Deck has left, or a disconnected one
+stays signed in and Windows drops the request without an error (Windows 11
+Pro build 26300, measured 2026-11-26: the same request signed an unlocked
+session out in three seconds). The routes that would work on a locked
+session force the sign-out and lose unsaved work (`EWX_FORCE`,
+`WTSLogoffSession`); Arcen never uses them. Unlocking the session first
+would need its owner's password and would show their desktop.
+
+The Pier also never claims that nothing is attached to a session: a
+product that serves the console session itself, rather than a session of
+its own (an agent that captures the console, as remote-access servers do),
+leaves no trace in WTS, and the Pier does not yet prove those routes (for
+example by the known remote-access server processes and their established
+connections). Such a session counts as unknown: its own account joins it,
+keeping its layout, and another account is refused.
 
 ## When the Deck leaves
 

@@ -46,9 +46,15 @@ use std::io::{BufRead as _, Write as _};
 /// remove.
 #[derive(Debug)]
 pub struct VirtualDisplay {
-    display: Retained<AnyObject>,
+    /// `Some` for the display's whole life; taken in `drop` so the object is
+    /// released before the restore is proved.
+    display: Option<Retained<AnyObject>>,
     width: u32,
     height: u32,
+    /// The Mac's displays before this one existed, proved again once it is
+    /// gone (ADR 0025 §14); `None` in the owner child, whose parent proves
+    /// it for every display the child holds.
+    restore_check: Option<crate::display_truth::RestoreCheck>,
 }
 
 impl VirtualDisplayChild {
@@ -66,6 +72,7 @@ impl VirtualDisplayChild {
     pub fn start(
         requests: &[VirtualDisplayChildRequest],
     ) -> Result<(Self, Vec<VirtualDisplayChildSnapshot>), String> {
+        let restore_check = crate::display_truth::RestoreCheck::capture();
         let exe =
             std::env::current_exe().map_err(|error| format!("current executable: {error}"))?;
         let child = std::process::Command::new(exe)
@@ -78,7 +85,11 @@ impl VirtualDisplayChild {
         // Owned from the moment it exists: every early return below drops
         // `owner`, whose `Drop` closes the pipe and reaps the child, so a
         // failed start never leaves a process behind.
-        let mut owner = Self { child, stdin: None };
+        let mut owner = Self {
+            child,
+            stdin: None,
+            restore_check,
+        };
         let mut stdin = owner
             .child
             .stdin
@@ -126,16 +137,19 @@ impl Drop for VirtualDisplayChild {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => break,
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Ok(None) | Err(_) => {
                     let _ = self.child.kill();
                     let _ = self.child.wait();
-                    return;
+                    break;
                 }
             }
+        }
+        if let Some(check) = self.restore_check.take() {
+            let _ = check.verify();
         }
     }
 }
@@ -192,7 +206,7 @@ fn child_create_and_hold(
         } else {
             VirtualPanel::Sdr
         };
-        let display = VirtualDisplay::create_panel(
+        let display = VirtualDisplay::create_panel_unproved(
             request.width,
             request.height,
             request.refresh_hz,
@@ -288,6 +302,9 @@ pub struct VirtualDisplayChildRequest {
 pub struct VirtualDisplayChild {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
+    /// The Mac's displays before the child created any, proved again once
+    /// it has exited (ADR 0025 §14).
+    restore_check: Option<crate::display_truth::RestoreCheck>,
 }
 
 /// One display reported by the child after creation and arrangement.
@@ -443,20 +460,46 @@ const BT2020_PRIMARIES: [(f64, f64); 4] = [
 
 impl Drop for VirtualDisplay {
     fn drop(&mut self) {
-        objc2::rc::autoreleasepool(|_| {
-            if self
-                .display
-                .class()
-                .instance_method(sel!(invalidate))
-                .is_some()
-            {
-                // SAFETY: `invalidate` is an instance selector on this live
-                // CGVirtualDisplay object when the runtime reports it exists.
-                unsafe {
-                    let _: () = msg_send![&*self.display, invalidate];
-                }
-            }
-        });
+        release_then_verify(
+            &mut self.display,
+            self.restore_check.take(),
+            |display| {
+                objc2::rc::autoreleasepool(|_| {
+                    if display.class().instance_method(sel!(invalidate)).is_some() {
+                        // SAFETY: `invalidate` is an instance selector on this
+                        // live CGVirtualDisplay object when the runtime reports
+                        // it exists.
+                        unsafe {
+                            let _: () = msg_send![&*display, invalidate];
+                        }
+                    }
+                    // Released inside the pool, so nothing of it is left to
+                    // drain once the pool closes.
+                    drop(display);
+                });
+            },
+            |check| {
+                let _ = check.verify();
+            },
+        );
+    }
+}
+
+/// Releases `display` before the restore is proved: a macOS without
+/// `invalidate` removes a virtual display only when its object is released,
+/// and a proof taken while it is still held reads it as still there (a false
+/// `display_restore_incomplete`, and the physical displays never put back).
+fn release_then_verify<D, C>(
+    display: &mut Option<D>,
+    check: Option<C>,
+    release: impl FnOnce(D),
+    verify: impl FnOnce(C),
+) {
+    if let Some(display) = display.take() {
+        release(display);
+    }
+    if let Some(check) = check {
+        verify(check);
     }
 }
 
@@ -491,6 +534,24 @@ impl VirtualDisplay {
     /// As [`Self::create`], and [`VirtualDisplayError::Unsupported`] when an
     /// HDR panel is asked of a macOS whose modes take no transfer function.
     pub fn create_panel(
+        width: u32,
+        height: u32,
+        refresh_hz: f64,
+        panel: VirtualPanel,
+        identity: Option<&PanelIdentity>,
+    ) -> Result<Self, VirtualDisplayError> {
+        let restore_check = crate::display_truth::RestoreCheck::capture();
+        Self::create_panel_unproved(width, height, refresh_hz, panel, identity).map(
+            |mut display| {
+                display.restore_check = restore_check;
+                display
+            },
+        )
+    }
+
+    /// [`Self::create_panel`] without the restore proof, which the owner
+    /// child's parent makes for every display the child holds.
+    fn create_panel_unproved(
         width: u32,
         height: u32,
         refresh_hz: f64,
@@ -629,9 +690,10 @@ impl VirtualDisplay {
                 return Err(VirtualDisplayError::SettingsNotApplied(request));
             }
             Ok(Self {
-                display,
+                display: Some(display),
                 width,
                 height,
+                restore_check: None,
             })
         }
     }
@@ -639,8 +701,10 @@ impl VirtualDisplay {
     /// The `CoreGraphics` display id to capture.
     #[must_use]
     pub fn display_id(&self) -> u32 {
-        // SAFETY: `displayID` is a property on the live object held here.
-        unsafe { msg_send![&*self.display, displayID] }
+        self.display.as_ref().map_or(0, |display| {
+            // SAFETY: `displayID` is a property on the live object held here.
+            unsafe { msg_send![&**display, displayID] }
+        })
     }
 
     /// The size this display was created at.
@@ -825,7 +889,35 @@ fn class_named(name: &str) -> Result<&'static AnyClass, VirtualDisplayError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_EDGE, VirtualDisplay, VirtualDisplayError};
+    use super::{MAX_EDGE, VirtualDisplay, VirtualDisplayError, release_then_verify};
+
+    // The review finding: the restore was proved inside `drop` while the
+    // display object was still held, so on a macOS without `invalidate` the
+    // proof saw the display still there and never put the Mac's back.
+    #[test]
+    fn the_display_is_released_before_the_restore_is_proved() {
+        struct FakeDisplay(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+        impl Drop for FakeDisplay {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("released");
+            }
+        }
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut display = Some(FakeDisplay(std::rc::Rc::clone(&events)));
+        release_then_verify(&mut display, Some(()), drop, |()| {
+            events.borrow_mut().push("verified");
+        });
+        assert!(display.is_none());
+        assert_eq!(*events.borrow(), ["released", "verified"]);
+
+        // No proof to make: the display is still released.
+        events.borrow_mut().clear();
+        let mut display = Some(FakeDisplay(std::rc::Rc::clone(&events)));
+        release_then_verify(&mut display, None::<()>, drop, |()| {
+            events.borrow_mut().push("verified");
+        });
+        assert_eq!(*events.borrow(), ["released"]);
+    }
 
     #[test]
     fn an_impossible_size_is_refused_before_anything_is_allocated() {

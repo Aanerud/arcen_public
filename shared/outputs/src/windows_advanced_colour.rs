@@ -33,6 +33,18 @@ pub enum CompositionMode {
 }
 
 impl CompositionMode {
+    /// The shared display-truth colour mode.
+    #[must_use]
+    pub const fn colour_mode(self) -> crate::display_truth::ColourMode {
+        use crate::display_truth::ColourMode;
+        match self {
+            Self::Sdr => ColourMode::Sdr,
+            Self::Wcg => ColourMode::Wcg,
+            Self::Hdr => ColourMode::Hdr,
+            Self::Unknown => ColourMode::Unknown,
+        }
+    }
+
     /// Maps `DISPLAYCONFIG_ADVANCED_COLOR_MODE` (`0` SDR, `1` WCG, `2` HDR).
     #[must_use]
     pub fn from_raw(mode: i32) -> Self {
@@ -185,12 +197,49 @@ pub enum DisplayIdentity {
     ArcenCreated,
 }
 
+/// The EDID this session wrote on a display, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdidWrite {
+    /// The session wrote no EDID on it.
+    None,
+    /// An SDR EDID (the multi-display NVIDIA exact path, or an SDR session's
+    /// headless display).
+    Sdr,
+    /// An EDID that declares HDR10.
+    Hdr,
+}
+
 impl DisplayIdentity {
     /// Whether Windows may still publish HDR support for the display during
     /// setup, so an HDR session waits for it instead of serving Grading.
     #[must_use]
     pub const fn may_gain_hdr(self) -> bool {
         matches!(self, Self::ArcenHdrEdid | Self::ArcenCreated)
+    }
+
+    /// A session display's identity from what this session did to it and the
+    /// EDID it carries now, never from configuration: a host configured for
+    /// NVIDIA headless whose display NVAPI could not rebuild (a `GeForce`, a
+    /// display another adapter owns) keeps its own EDID, and its "no HDR
+    /// support" is final.
+    ///
+    /// An HDR EDID the session wrote counts until the display is seen to
+    /// carry a monitor's own EDID instead (the write did not land there); an
+    /// unread EDID, or an Arcen EDID Windows has not re-enumerated yet, keeps
+    /// the wait.
+    #[must_use]
+    pub fn of_session_display(created: bool, wrote: EdidWrite, edid_now: Option<&[u8]>) -> Self {
+        if created {
+            return Self::ArcenCreated;
+        }
+        match wrote {
+            EdidWrite::Hdr if edid_now.is_some_and(|edid| !crate::edid::is_arcen(edid)) => {
+                Self::Own
+            }
+            EdidWrite::Hdr => Self::ArcenHdrEdid,
+            EdidWrite::Sdr => Self::ArcenSdrEdid,
+            EdidWrite::None => Self::Own,
+        }
     }
 }
 
@@ -300,6 +349,63 @@ pub fn restore_toggle(reading: ColourReading, original_hdr_enabled: bool) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The audit finding: a host configured for NVIDIA headless whose display
+    // NVAPI did not rebuild (a GeForce, or a display another adapter owns)
+    // was counted as Arcen-created from configuration alone, so an HDR
+    // session waited the whole setup budget and was refused instead of
+    // serving Grading.
+    #[test]
+    fn the_session_display_identity_follows_what_the_session_wrote_not_configuration() {
+        use crate::edid::{EdidRequest, generate, generate_hdr10};
+        let request = EdidRequest {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            width_mm: 0.0,
+            height_mm: 0.0,
+            scale: 1.0,
+            product_id: 1,
+            serial: 0,
+            color: None,
+        };
+        let hdr_edid = generate_hdr10(request).expect("edid");
+        let sdr_edid = generate(request).expect("edid");
+        let mut plug = sdr_edid;
+        plug[8..10].copy_from_slice(&[0x10, 0xac]);
+        let identity = DisplayIdentity::of_session_display;
+        assert_eq!(
+            identity(false, EdidWrite::None, Some(&plug)),
+            DisplayIdentity::Own
+        );
+        assert_eq!(identity(false, EdidWrite::None, None), DisplayIdentity::Own);
+        assert_eq!(
+            identity(false, EdidWrite::Hdr, Some(&hdr_edid)),
+            DisplayIdentity::ArcenHdrEdid
+        );
+        // Windows has not re-enumerated the new EDID yet, or it is unread.
+        assert_eq!(
+            identity(false, EdidWrite::Hdr, Some(&sdr_edid)),
+            DisplayIdentity::ArcenHdrEdid
+        );
+        assert_eq!(
+            identity(false, EdidWrite::Hdr, None),
+            DisplayIdentity::ArcenHdrEdid
+        );
+        // The write did not land on this display: its own EDID decides.
+        assert_eq!(
+            identity(false, EdidWrite::Hdr, Some(&plug)),
+            DisplayIdentity::Own
+        );
+        assert_eq!(
+            identity(false, EdidWrite::Sdr, Some(&sdr_edid)),
+            DisplayIdentity::ArcenSdrEdid
+        );
+        assert_eq!(
+            identity(true, EdidWrite::None, None),
+            DisplayIdentity::ArcenCreated
+        );
+    }
 
     // The lab regression: a Match My Layout display on the multi-display
     // NVIDIA exact path got an SDR EDID from Arcen, was counted as an Arcen

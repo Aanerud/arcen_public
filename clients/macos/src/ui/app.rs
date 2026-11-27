@@ -1494,6 +1494,8 @@ pub struct ArcenApp {
     /// The last sign-in outcome Home shows under the selected connection's
     /// field, or in an acknowledgement box (`arcen_deck_core::sign_in`).
     sign_in: SignInState,
+    /// The host's offer to sign another account out, then its progress.
+    account_switch: arcen_deck_core::account_switch::AccountSwitchPrompt,
     /// Per-secondary-monitor fractional relative-motion accumulator, keyed
     /// by the negotiated `SessionMonitorId` that owns `secondary_pointer_lock`
     /// -- entirely separate from root's own `relative_motion` above, for the
@@ -2377,6 +2379,7 @@ impl ArcenApp {
             pointer_surfaces: Vec::new(),
             pending_desktop_replacement: false,
             sign_in: SignInState::default(),
+            account_switch: Default::default(),
             secondary_relative_motion: BTreeMap::new(),
             secondary_last_known_local_fraction: BTreeMap::new(),
             secondary_pointer_contained: BTreeMap::new(),
@@ -2867,6 +2870,18 @@ impl eframe::App for ArcenApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // macOS "Reduce motion" makes every animation instant.
         theme::set_reduce_motion(ui.ctx(), system_reduce_motion());
+        // Over every screen, and first, so its Escape is the question's.
+        if let Some(choice) = arcen_deck_core::screens::account_switch::render_account_switch(
+            ui.ctx(),
+            &mut self.account_switch,
+        ) {
+            let sent = self.session_commands.as_ref().is_some_and(|commands| {
+                commands.send(SessionCommand::AccountSwitch(choice)).is_ok()
+            });
+            if !sent {
+                self.account_switch.reset();
+            }
+        }
         self.ui_layout_load.note();
         self.lead_cursor_wanted = false;
         let available = ui.available_size();
@@ -3410,13 +3425,17 @@ impl ArcenApp {
             return;
         }
         self.connection_status_hint = connection_status_hint;
-        let (text_results, host_keymap) = {
+        let (text_results, host_keymap, account_switch) = {
             let mut state = media.lock().expect("media state poisoned");
             (
                 std::mem::take(&mut state.text_commit_results),
                 state.host_keymap.take(),
+                std::mem::take(&mut state.account_switch),
             )
         };
+        for news in account_switch {
+            self.account_switch.on_news(news, Instant::now());
+        }
 
         let native_replacement_presented = native_metadata.is_some();
         if let Some(metadata) = native_metadata {
@@ -3494,6 +3513,7 @@ impl ArcenApp {
                 self.text_input.notify(notes.join(" "));
             }
             self.session_hello_handled = true;
+            self.account_switch.reset();
             // A current Pier serves Auto and Speed at this Deck display's
             // refresh, not the legacy rate the request carried.
             self.active_stream_max_fps = arcen_deck_core::screens::statistics::served_max_fps(
@@ -3773,9 +3793,16 @@ impl ArcenApp {
             {
                 return;
             }
-            if let Some(note) =
-                arcen_deck_core::display_note::display_negotiation_note(&hello.device_capabilities)
-            {
+            // The host's own account of the size first; else this Deck's
+            // check of every display it asked for against what is served.
+            let served_layout = media
+                .lock()
+                .ok()
+                .and_then(|state| state.served_layout.clone());
+            if let Some(note) = arcen_deck_core::display_note::attachment_display_note(
+                &hello,
+                served_layout.as_ref(),
+            ) {
                 self.status.push_str(" · ");
                 self.status.push_str(&note);
                 self.display_note = Some(note.clone());
@@ -6670,6 +6697,7 @@ impl ArcenApp {
     }
 
     fn drop_session_handles_preserving_native_hold(&mut self, preserve_native_hold: bool) {
+        self.account_switch.reset();
         // A recovery screen stores it after this teardown; a recovery choice
         // takes it before the next attempt tears down.
         self.recovery_auth = None;
@@ -7954,8 +7982,8 @@ impl ArcenApp {
             self.reconnect_options.as_ref(),
         ) {
             ResumeLaunch::Idle => {}
-            ResumeLaunch::Abandon => {
-                self.return_home(SignInFailure::SessionEnded, None);
+            ResumeLaunch::Abandon(failure) => {
+                self.return_home(failure, None);
                 return;
             }
             ResumeLaunch::Launch {
@@ -14678,6 +14706,9 @@ fn connect_options_from_draft(draft: &ConnectionDraft) -> ConnectOptions {
         exact_still_image: false,
         keep_desk_private: true,
         canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
+        // The window asks its user about a host's offer to sign another
+        // account out.
+        account_switch: arcen_deck_core::account_switch::AccountSwitchMode::Interactive,
     }
 }
 
@@ -14976,7 +15007,8 @@ fn connection_identity(
     // The stored reconnect baseline for a negotiated multi-monitor session
     // hashes the already-scaled options; this fresh live re-enumeration goes
     // through the same Remote UI Scale transform and is reduced to what this
-    // session negotiated (task item 7), by the shared rule.
+    // session negotiated (task item 7), by the shared rule; with Match My
+    // Layout every display counts.
     let (live_monitors, live_topology) = arcen_deck_core::connect_plan::identity_display_state(
         crate::display::enumerate(),
         crate::display::topology::build_requested_topology(
@@ -14986,7 +15018,10 @@ fn connection_identity(
         .ok(),
         remote_ui_scale_percent,
         hidpi_display_mask,
-        options.multi_monitor_topology.is_some(),
+        arcen_deck_core::connect_plan::identity_covers_every_display(
+            &options.displays_mode,
+            options.multi_monitor_topology.is_some(),
+        ),
     );
     let safe_area_policy = if fullscreen_uses_notch_area {
         crate::protocol::messages::SafeAreaPolicyMsg::FullFrame
@@ -17450,6 +17485,7 @@ mod tests {
                 SessionCommand::Json(value) => return value,
                 SessionCommand::SubmitAuth(_)
                 | SessionCommand::AcceptAuthentication
+                | SessionCommand::AccountSwitch(_)
                 | SessionCommand::DeclineDisclaimer
                 | SessionCommand::Binary(_)
                 | SessionCommand::HardUsbPen(_)
@@ -17468,6 +17504,7 @@ mod tests {
                 }
                 SessionCommand::SubmitAuth(_)
                 | SessionCommand::AcceptAuthentication
+                | SessionCommand::AccountSwitch(_)
                 | SessionCommand::DeclineDisclaimer
                 | SessionCommand::Binary(_)
                 | SessionCommand::HardUsbPen(_)

@@ -106,6 +106,7 @@ mod cursor_watcher;
 mod deskside;
 mod diagnostics;
 mod display;
+mod display_truth;
 mod edid;
 mod encoder_admission;
 #[cfg(windows)]
@@ -208,6 +209,7 @@ mod service {
 mod session;
 mod session_admission;
 mod session_end;
+mod session_handover;
 #[cfg(windows)]
 mod support_bundle;
 mod timezone;
@@ -856,12 +858,22 @@ enum MaintenanceCommand {
     Capenc,
     /// Started by the broker in a departing Deck's session: lock it.
     LockSession,
+    /// Started by the broker in the session a confirmed change of account
+    /// signs out: the ordinary sign-out, without force.
+    SignOutSession,
     /// Started by the broker for each attachment: lock the session if the
     /// broker dies before handing it back.
     SessionGuard(owner_guard::GuardArguments),
     RestoreDisplay {
         journal: Option<std::path::PathBuf>,
         console: bool,
+        /// An administrator's word that the displays are as they should be:
+        /// the pending journal is kept aside and stops refusing sessions.
+        set_aside: bool,
+    },
+    /// Prints the displays as Windows reads them (shared display truth).
+    DiagnoseDisplays {
+        json: bool,
     },
     MigrateDisplayJournal {
         journal: Option<std::path::PathBuf>,
@@ -959,15 +971,23 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
             }
             Ok(Some(MaintenanceCommand::LockSession))
         }
+        "sign-out-session" => {
+            if arguments.next().is_some() {
+                return Err("sign-out-session accepts no arguments".to_string());
+            }
+            Ok(Some(MaintenanceCommand::SignOutSession))
+        }
         owner_guard::SUBCOMMAND => Ok(Some(MaintenanceCommand::SessionGuard(
             owner_guard::parse_arguments(&mut arguments)?,
         ))),
         "restore-display" => {
             let mut journal = None;
             let mut console = false;
+            let mut set_aside = false;
             while let Some(argument) = arguments.next() {
                 match argument.as_str() {
                     "--console" => console = true,
+                    "--set-aside" => set_aside = true,
                     "--journal" => {
                         journal = Some(std::path::PathBuf::from(
                             arguments
@@ -978,17 +998,42 @@ fn parse_maintenance_command() -> Result<Option<MaintenanceCommand>, String> {
                     "-h" | "--help" => {
                         eprintln!(
                             "USAGE:\n  arcen-pier restore-display \
-                             [--journal <PATH>] [--console]"
+                             [--journal <PATH>] [--console] [--set-aside]\n\n\
+                             --set-aside keeps a journal that cannot be applied as a \
+                             set-aside record, once the displays are as they should be, so \
+                             sessions start again."
                         );
                         std::process::exit(0);
                     }
                     other => return Err(format!("unknown restore-display argument: {other}")),
                 }
             }
+            if set_aside && console {
+                return Err("restore-display --set-aside does not take --console".to_string());
+            }
             Ok(Some(MaintenanceCommand::RestoreDisplay {
                 journal,
                 console,
+                set_aside,
             }))
+        }
+        "diagnose" => {
+            use arcen_outputs::display_truth::{parse_diagnose, DiagnoseRequest, DIAGNOSE_USAGE};
+            let rest = arguments.collect::<Vec<_>>();
+            match parse_diagnose(&rest)? {
+                DiagnoseRequest::Help => {
+                    eprintln!(
+                        "USAGE:\n  {DIAGNOSE_USAGE}\n\n\
+                         Prints every connected display as Windows reads it. Read-only. \
+                         Windows answers only on the interactive desktop, so run it there \
+                         (not from a service or over SSH)."
+                    );
+                    std::process::exit(0);
+                }
+                DiagnoseRequest::Displays { json } => {
+                    Ok(Some(MaintenanceCommand::DiagnoseDisplays { json }))
+                }
+            }
         }
         "migrate-display-journal" => {
             let mut journal = None;
@@ -2559,10 +2604,11 @@ fn print_help() {
     eprintln!(
         "arcen-pier\n\n\
          USAGE:\n  arcen-pier [--config <JSON>] [options]\n\n\
-         RECOVERY:\n  arcen-pier restore-display [--journal <PATH>]\n\
+         RECOVERY:\n  arcen-pier restore-display [--journal <PATH>] [--set-aside]\n\
                    arcen-pier migrate-display-journal [--journal <PATH>]\n\
                    arcen-pier restore-timezone [--journal <PATH>]\n\n\
-         SUPPORT:\n  arcen-pier support-bundle [--out <DIR>]\n\n\
+         SUPPORT:\n  arcen-pier support-bundle [--out <DIR>]\n\
+                   arcen-pier diagnose displays [--json]\n\n\
          VALIDATE:\n  arcen-pier validate-config [--schema-only] [--config <JSON>] [overrides]\n\n\
          OPTIONS:\n\
            --config <PATH>        JSON settings (default %ProgramData%\\Arcen\\pier.json)\n\
@@ -2623,6 +2669,15 @@ fn main() {
         }
         Ok(Some(MaintenanceCommand::LockSession)) => {
             std::process::exit(match windows_session::lock_workstation() {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            });
+        }
+        Ok(Some(MaintenanceCommand::SignOutSession)) => {
+            std::process::exit(match windows_session::sign_out_own_session() {
                 Ok(()) => 0,
                 Err(error) => {
                     eprintln!("{error}");
@@ -2918,7 +2973,23 @@ fn main() {
             #[cfg(not(windows))]
             let emitter = LifecycleEmitter::disabled();
             let result = match command {
-                MaintenanceCommand::RestoreDisplay { journal, console } => {
+                MaintenanceCommand::RestoreDisplay {
+                    journal,
+                    set_aside: true,
+                    ..
+                } => {
+                    let path = journal.unwrap_or_else(recovery::default_path);
+                    display::set_aside_journal(&path).map(|aside| match aside {
+                        Some(aside) => println!("set aside: {}", aside.display()),
+                        None => println!("no display journal is pending"),
+                    })
+                }
+                MaintenanceCommand::DiagnoseDisplays { json } => {
+                    display_truth::read().map(|truth| print!("{}", truth.render(json)))
+                }
+                MaintenanceCommand::RestoreDisplay {
+                    journal, console, ..
+                } => {
                     // Started by the service in the console session: take the
                     // console's input desktop, and move windows only on the
                     // user's own desktop, never on the sign-in screen's.
@@ -3057,7 +3128,9 @@ fn main() {
                 MaintenanceCommand::NvapiHeadlessProbe { .. } => unreachable!("handled above"),
                 #[cfg(windows)]
                 MaintenanceCommand::SupportBundle(_) => unreachable!("handled above"),
-                MaintenanceCommand::Capenc | MaintenanceCommand::LockSession => {
+                MaintenanceCommand::Capenc
+                | MaintenanceCommand::LockSession
+                | MaintenanceCommand::SignOutSession => {
                     unreachable!("handled above")
                 }
             };

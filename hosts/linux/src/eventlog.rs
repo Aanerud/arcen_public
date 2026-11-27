@@ -722,7 +722,8 @@ fn target_for_kind(kind: LifecycleEventKind) -> TelemetryTarget {
         LifecycleEventKind::SessionStreamStart
         | LifecycleEventKind::SessionEnd
         | LifecycleEventKind::SessionInterrupted
-        | LifecycleEventKind::ResumeHoldEnded => arcen_telemetry::names::target::SESSION,
+        | LifecycleEventKind::ResumeHoldEnded
+        | LifecycleEventKind::SessionHandover => arcen_telemetry::names::target::SESSION,
         LifecycleEventKind::DisplayArmed
         | LifecycleEventKind::DisplayRestored
         | LifecycleEventKind::DisplayRestoreDegraded

@@ -77,6 +77,17 @@ pub const TEXT_COMMIT_RESULT: &str = "text_commit_result";
 /// Pier notice of which characters the session's keyboard layout types at
 /// each key position. See [`HostKeymapMsg`].
 pub const HOST_KEYMAP: &str = "host_keymap";
+/// Pier offer to sign another account out. See [`AccountSwitchOfferMsg`].
+pub const ACCOUNT_SWITCH_OFFER: &str = "account_switch_offer";
+/// Deck answer to an offer. See [`AccountSwitchReplyMsg`].
+pub const ACCOUNT_SWITCH_REPLY: &str = "account_switch_reply";
+/// Pier notice of how an offer ended. See [`AccountSwitchResultMsg`].
+pub const ACCOUNT_SWITCH_RESULT: &str = "account_switch_result";
+/// Characters in an account-switch `offer_id` (32 bytes as lowercase
+/// hexadecimal).
+pub const ACCOUNT_SWITCH_OFFER_ID_CHARS: usize = 64;
+/// The longest an account-switch offer may stand, in seconds.
+pub const MAX_ACCOUNT_SWITCH_OFFER_SECS: u32 = 600;
 pub const BUILD_IDENTITY_CAPABILITY: &str = "build_identity";
 pub const CLIPBOARD_DATA: &str = "clipboard_data";
 /// Host notice that a host-to-client clipboard transfer was abandoned.
@@ -1273,6 +1284,12 @@ pub struct AuthResponse {
     /// and the administrator's `privacy.desk` decides whether it is asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desk_privacy_request: Option<String>,
+    /// The Deck can show a confirmed change of account
+    /// ([`AccountSwitchOfferMsg`]) and answer it. Only a Deck that sets it
+    /// is ever sent an offer; a Pier refuses every other Deck exactly as
+    /// before. Absent and `false` for every older Deck.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub account_switch_v1: bool,
 }
 
 /// The most displays [`DeckDisplayRefreshMsg::displays`] is read for; any
@@ -1364,6 +1381,7 @@ impl std::fmt::Debug for AuthResponse {
             .field("canvas_v1", &self.canvas_v1)
             .field("display_refresh_v1", &self.display_refresh_v1)
             .field("desk_privacy_request", &self.desk_privacy_request)
+            .field("account_switch_v1", &self.account_switch_v1)
             .finish()
     }
 }
@@ -1416,6 +1434,7 @@ impl AuthResponse {
             canvas_v1: None,
             display_refresh_v1: None,
             desk_privacy_request: None,
+            account_switch_v1: false,
         }
     }
 
@@ -1446,6 +1465,7 @@ impl AuthResponse {
             canvas_v1: None,
             display_refresh_v1: None,
             desk_privacy_request: None,
+            account_switch_v1: false,
         }
     }
 
@@ -1476,6 +1496,7 @@ impl AuthResponse {
             canvas_v1: None,
             display_refresh_v1: None,
             desk_privacy_request: None,
+            account_switch_v1: false,
         }
     }
 
@@ -1507,6 +1528,7 @@ impl AuthResponse {
             canvas_v1: None,
             display_refresh_v1: None,
             desk_privacy_request: None,
+            account_switch_v1: false,
         }
     }
 
@@ -1713,6 +1735,14 @@ impl AuthResponse {
     #[must_use]
     pub fn with_display_refresh(mut self, refresh: Option<DeckDisplayRefreshMsg>) -> Self {
         self.display_refresh_v1 = refresh;
+        self
+    }
+
+    /// Declares that this Deck can confirm a change of account
+    /// ([`Self::account_switch_v1`]).
+    #[must_use]
+    pub const fn with_account_switch_v1(mut self, supported: bool) -> Self {
+        self.account_switch_v1 = supported;
         self
     }
 }
@@ -5130,6 +5160,253 @@ impl DeskPrivacyUpdateMsg {
     }
 }
 
+/// Why an account-switch message is malformed. A Deck or Pier that reads
+/// one treats it as a protocol error; a malformed reply never confirms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSwitchValidationError {
+    /// The `type` is not this message's.
+    MessageType,
+    /// `offer_id` is not [`ACCOUNT_SWITCH_OFFER_ID_CHARS`] lowercase
+    /// hexadecimal characters.
+    OfferId,
+    /// `expires_in_secs` is zero or above [`MAX_ACCOUNT_SWITCH_OFFER_SECS`].
+    Lifetime,
+}
+
+impl fmt::Display for AccountSwitchValidationError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MessageType => "account switch message has the wrong type",
+            Self::OfferId => "account switch offer_id is not 64 lowercase hexadecimal characters",
+            Self::Lifetime => "account switch offer lifetime is out of range",
+        })
+    }
+}
+
+impl std::error::Error for AccountSwitchValidationError {}
+
+fn valid_offer_id(offer_id: &str) -> bool {
+    offer_id.len() == ACCOUNT_SWITCH_OFFER_ID_CHARS
+        && offer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn redacted_offer_id(offer_id: &str) -> &'static str {
+    if offer_id.is_empty() {
+        ""
+    } else {
+        "<redacted>"
+    }
+}
+
+/// Pier → Deck, control lane, `account_switch_v1` only: another account's
+/// session holds the workstation, no remote client is attached to it, and
+/// the Deck's account authenticated. The Deck asks its user to choose
+/// Cancel (the default) or Sign out and continue, and answers with
+/// [`AccountSwitchReplyMsg`] before `expires_in_secs` pass. It shows no
+/// content of the other session; the offer names none.
+///
+/// Sent in place of `auth_result`; the Pier sends `auth_result` only after
+/// [`AccountSwitchResultMsg`].
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSwitchOfferMsg {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// The offer's one-use id: 64 lowercase hexadecimal characters.
+    pub offer_id: String,
+    /// Seconds until the offer expires, `1..=MAX_ACCOUNT_SWITCH_OFFER_SECS`.
+    pub expires_in_secs: u32,
+}
+
+impl AccountSwitchOfferMsg {
+    /// An offer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed id or lifetime.
+    pub fn new(
+        offer_id: impl Into<String>,
+        expires_in_secs: u32,
+    ) -> Result<Self, AccountSwitchValidationError> {
+        let message = Self {
+            msg_type: ACCOUNT_SWITCH_OFFER.to_owned(),
+            offer_id: offer_id.into(),
+            expires_in_secs,
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    /// Checks a received offer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first malformed field.
+    pub fn validate(&self) -> Result<(), AccountSwitchValidationError> {
+        if self.msg_type != ACCOUNT_SWITCH_OFFER {
+            return Err(AccountSwitchValidationError::MessageType);
+        }
+        if !valid_offer_id(&self.offer_id) {
+            return Err(AccountSwitchValidationError::OfferId);
+        }
+        if self.expires_in_secs == 0 || self.expires_in_secs > MAX_ACCOUNT_SWITCH_OFFER_SECS {
+            return Err(AccountSwitchValidationError::Lifetime);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AccountSwitchOfferMsg {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountSwitchOfferMsg")
+            .field("msg_type", &self.msg_type)
+            .field("offer_id", &redacted_offer_id(&self.offer_id))
+            .field("expires_in_secs", &self.expires_in_secs)
+            .finish()
+    }
+}
+
+/// The Deck user's choice. There is no other value: anything else fails to
+/// parse, and a reply that does not parse never confirms.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSwitchChoiceMsg {
+    /// Sign the other account out gracefully, then sign in.
+    Confirm,
+    /// Change nothing.
+    Cancel,
+}
+
+/// Deck → Pier, control lane: the user's answer to the offer `offer_id`,
+/// on the connection that received it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSwitchReplyMsg {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// The offer answered.
+    pub offer_id: String,
+    /// The user's choice.
+    pub choice: AccountSwitchChoiceMsg,
+}
+
+impl AccountSwitchReplyMsg {
+    /// A reply to `offer`.
+    #[must_use]
+    pub fn new(offer: &AccountSwitchOfferMsg, choice: AccountSwitchChoiceMsg) -> Self {
+        Self {
+            msg_type: ACCOUNT_SWITCH_REPLY.to_owned(),
+            offer_id: offer.offer_id.clone(),
+            choice,
+        }
+    }
+
+    /// Checks a received reply.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first malformed field.
+    pub fn validate(&self) -> Result<(), AccountSwitchValidationError> {
+        if self.msg_type != ACCOUNT_SWITCH_REPLY {
+            return Err(AccountSwitchValidationError::MessageType);
+        }
+        if !valid_offer_id(&self.offer_id) {
+            return Err(AccountSwitchValidationError::OfferId);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AccountSwitchReplyMsg {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountSwitchReplyMsg")
+            .field("msg_type", &self.msg_type)
+            .field("offer_id", &redacted_offer_id(&self.offer_id))
+            .field("choice", &self.choice)
+            .finish()
+    }
+}
+
+/// How an offer ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountSwitchOutcomeMsg {
+    /// The other account was signed out and its session ended; the Pier
+    /// now signs the Deck's account in and answers with `auth_result`.
+    SignedOut,
+    /// The user cancelled, or the Pier withdrew the offer as the Deck left.
+    Cancelled,
+    /// The offer expired.
+    Expired,
+    /// The facts changed before the confirmation (a remote client
+    /// returned, the session changed).
+    Stale,
+    /// The reply named no live offer (replayed, mismatched).
+    Rejected,
+    /// An application or the other account's user refused the logout.
+    LogoutVetoed,
+    /// The logout did not finish in time.
+    LogoutTimedOut,
+    /// The logout failed, or its end could not be proved.
+    LogoutFailed,
+    /// A newer outcome this Deck does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Pier → Deck, control lane: how the offer `offer_id` ended. Every outcome
+/// but [`AccountSwitchOutcomeMsg::SignedOut`] means nothing was signed out
+/// or the logout stopped; the Pier closes the connection after it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSwitchResultMsg {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// The offer that ended.
+    pub offer_id: String,
+    /// How it ended.
+    pub outcome: AccountSwitchOutcomeMsg,
+}
+
+impl AccountSwitchResultMsg {
+    /// The result for `offer_id`.
+    #[must_use]
+    pub fn new(offer_id: impl Into<String>, outcome: AccountSwitchOutcomeMsg) -> Self {
+        Self {
+            msg_type: ACCOUNT_SWITCH_RESULT.to_owned(),
+            offer_id: offer_id.into(),
+            outcome,
+        }
+    }
+
+    /// Checks a received result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first malformed field.
+    pub fn validate(&self) -> Result<(), AccountSwitchValidationError> {
+        if self.msg_type != ACCOUNT_SWITCH_RESULT {
+            return Err(AccountSwitchValidationError::MessageType);
+        }
+        if !valid_offer_id(&self.offer_id) {
+            return Err(AccountSwitchValidationError::OfferId);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for AccountSwitchResultMsg {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountSwitchResultMsg")
+            .field("msg_type", &self.msg_type)
+            .field("offer_id", &redacted_offer_id(&self.offer_id))
+            .field("outcome", &self.outcome)
+            .finish()
+    }
+}
+
 /// Host notice for one `text_commit` that was not fully typed, or typed
 /// without proof that the session's layout has every character. Sent only
 /// to a client that advertised `text_commit`, and only when there is
@@ -5470,6 +5747,126 @@ mod tests {
             crate::lanes::lane_for_message_type(DESK_PRIVACY_UPDATE),
             crate::lanes::LaneRole::Control
         );
+    }
+
+    const OFFER_ID: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn account_switch_messages_round_trip_on_the_control_lane() {
+        let offer = AccountSwitchOfferMsg::new(OFFER_ID, 120).unwrap();
+        let json = serde_json::to_value(&offer).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "account_switch_offer",
+                "offer_id": OFFER_ID,
+                "expires_in_secs": 120,
+            })
+        );
+        let parsed: AccountSwitchOfferMsg = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, offer);
+        parsed.validate().unwrap();
+
+        for (choice, token) in [
+            (AccountSwitchChoiceMsg::Confirm, "confirm"),
+            (AccountSwitchChoiceMsg::Cancel, "cancel"),
+        ] {
+            let reply = AccountSwitchReplyMsg::new(&offer, choice);
+            let json = serde_json::to_value(&reply).unwrap();
+            assert_eq!(json["type"], ACCOUNT_SWITCH_REPLY);
+            assert_eq!(json["offer_id"], OFFER_ID);
+            assert_eq!(json["choice"], token);
+            let parsed: AccountSwitchReplyMsg = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed, reply);
+            parsed.validate().unwrap();
+        }
+
+        let result = AccountSwitchResultMsg::new(OFFER_ID, AccountSwitchOutcomeMsg::LogoutVetoed);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["type"], ACCOUNT_SWITCH_RESULT);
+        assert_eq!(json["outcome"], "logout_vetoed");
+        let parsed: AccountSwitchResultMsg = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, result);
+        parsed.validate().unwrap();
+
+        for message_type in [
+            ACCOUNT_SWITCH_OFFER,
+            ACCOUNT_SWITCH_REPLY,
+            ACCOUNT_SWITCH_RESULT,
+        ] {
+            assert_eq!(
+                crate::lanes::lane_for_message_type(message_type),
+                crate::lanes::LaneRole::Control
+            );
+        }
+        let shown = format!("{offer:?}{result:?}");
+        assert!(!shown.contains(OFFER_ID) && shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn a_malformed_account_switch_message_is_refused() {
+        for bad in [
+            "",
+            &OFFER_ID[..62],
+            &OFFER_ID.to_uppercase(),
+            "g0112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        ] {
+            assert_eq!(
+                AccountSwitchOfferMsg::new(bad, 60).err(),
+                Some(AccountSwitchValidationError::OfferId)
+            );
+        }
+        for lifetime in [0, MAX_ACCOUNT_SWITCH_OFFER_SECS + 1] {
+            assert_eq!(
+                AccountSwitchOfferMsg::new(OFFER_ID, lifetime).err(),
+                Some(AccountSwitchValidationError::Lifetime)
+            );
+        }
+        let mut offer = AccountSwitchOfferMsg::new(OFFER_ID, 60).unwrap();
+        offer.msg_type = ACCOUNT_SWITCH_REPLY.to_owned();
+        assert_eq!(
+            offer.validate(),
+            Err(AccountSwitchValidationError::MessageType)
+        );
+        // A choice that is neither confirm nor cancel never parses, so it
+        // never confirms.
+        for choice in ["\"yes\"", "\"CONFIRM\"", "null", "1"] {
+            let text = format!(
+                r#"{{"type":"account_switch_reply","offer_id":"{OFFER_ID}","choice":{choice}}}"#
+            );
+            assert!(serde_json::from_str::<AccountSwitchReplyMsg>(&text).is_err());
+        }
+        // A newer outcome reads as unknown, never as signed out.
+        let newer: AccountSwitchResultMsg = serde_json::from_str(&format!(
+            r#"{{"type":"account_switch_result","offer_id":"{OFFER_ID}","outcome":"queued"}}"#
+        ))
+        .unwrap();
+        assert_eq!(newer.outcome, AccountSwitchOutcomeMsg::Unknown);
+    }
+
+    #[test]
+    fn only_a_deck_that_asks_is_offered_a_change_of_account() {
+        let older = AuthResponse::password("bob", "pw");
+        let json = serde_json::to_value(&older).unwrap();
+        assert!(
+            json.get("account_switch_v1").is_none(),
+            "an older Pier sees nothing new"
+        );
+        let legacy = serde_json::json!({
+            "type": "auth_response",
+            "method": "password",
+            "username": "bob",
+            "credential": "pw",
+            "screen_width": 1920,
+            "screen_height": 1080,
+        });
+        let parsed: AuthResponse = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.account_switch_v1, "an older Deck is never offered");
+        let newer = AuthResponse::password("bob", "pw").with_account_switch_v1(true);
+        let json = serde_json::to_value(&newer).unwrap();
+        assert_eq!(json["account_switch_v1"], true);
+        let parsed: AuthResponse = serde_json::from_value(json).unwrap();
+        assert!(parsed.account_switch_v1);
     }
 
     #[test]

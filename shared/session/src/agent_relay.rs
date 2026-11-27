@@ -135,6 +135,17 @@ pub enum ServiceMessage {
         /// Frames this attachment's relay has released so far.
         released: u64,
     },
+    /// Sent to a *parked* agent of the session a confirmed change of
+    /// account signs out (`session_handover`): ask the operating system
+    /// for a graceful logout of this agent's own session, answer with
+    /// [`AgentMessage::SignOutRequested`] and park again. Only the
+    /// session's own account asks; the service never signs a session out
+    /// itself. Old agents end the parking connection on it.
+    SignOut {
+        /// The relayed Deck that confirmed the change, for the records.
+        #[serde(default)]
+        session: u64,
+    },
     /// The registration was refused; the service closes the connection.
     Refused {
         /// Why, in words an operator can act on.
@@ -144,11 +155,12 @@ pub enum ServiceMessage {
 
 impl ServiceMessage {
     /// Every `type` this enum is tagged with.
-    pub const TYPES: [&'static str; 5] = [
+    pub const TYPES: [&'static str; 6] = [
         "registered",
         "attach",
         "path_signal",
         "video_released",
+        "sign_out",
         "refused",
     ];
 
@@ -168,6 +180,29 @@ impl ServiceMessage {
 pub enum AgentMessage {
     /// The agent accepted the Deck and is ready to read its stream.
     Attached,
+    /// Sent on an attached Deck's stream instead of `auth_result`, to the
+    /// service only: the Deck's account (`uid`, short name `user`) proved
+    /// its password but is not this agent's, and the Deck can confirm a
+    /// change of account (`account_switch_v1`). The service decides
+    /// (`session_handover`) and answers the Deck; the agent shows the Deck
+    /// nothing. `logout_route`: this agent may ask the operating system for
+    /// a graceful logout of its session without asking anybody first.
+    SwitchCandidate {
+        /// The authenticated account's numeric id.
+        uid: u32,
+        /// Its short name.
+        user: String,
+        /// The graceful logout route is proved available.
+        logout_route: bool,
+    },
+    /// The answer to [`ServiceMessage::SignOut`]: whether the operating
+    /// system accepted the request (`status` 0) or the native error. An
+    /// accepted request is not a logout: the service proves the session's
+    /// end itself.
+    SignOutRequested {
+        /// The native status of the request.
+        status: i32,
+    },
 }
 
 /// Why a registration is refused.
@@ -354,6 +389,7 @@ mod tests {
                 session: 7,
                 released: 2,
             },
+            ServiceMessage::SignOut { session: 7 },
             ServiceMessage::Refused {
                 reason: "no".to_string(),
             },

@@ -53,6 +53,7 @@
 )]
 
 pub mod about;
+pub mod account_switch;
 pub mod canvas;
 pub mod client_telemetry;
 pub mod clipboard;

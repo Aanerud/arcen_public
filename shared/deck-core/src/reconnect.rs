@@ -213,6 +213,11 @@ pub enum ControllerError {
     Expired,
     RandomnessUnavailable,
     GenerationMismatch,
+    /// The Deck's displays (its layout, a display's size, place, rotation
+    /// or scale) changed since the session attached. The grant was bound to
+    /// the old request, so it is not used: the Deck signs in afresh with
+    /// its current displays, into the same desktop on the host.
+    DisplaysChanged,
 }
 
 pub struct ReconnectController {
@@ -568,8 +573,15 @@ impl ReconnectController {
             _ => return Ok(None),
         };
         if generation != self.generation || identity != &self.identity {
+            let displays_only = generation == self.generation
+                && identity.endpoint == self.identity.endpoint
+                && identity.security == self.identity.security;
             self.terminal();
-            return Err(ControllerError::GenerationMismatch);
+            return Err(if displays_only {
+                ControllerError::DisplaysChanged
+            } else {
+                ControllerError::GenerationMismatch
+            });
         }
         if !due {
             return Ok(None);
@@ -923,6 +935,24 @@ mod tests {
         assert!(matches!(
             controller.take_due(Duration::from_millis(125), 8, &identity("new-pier")),
             Err(ControllerError::GenerationMismatch)
+        ));
+        assert_eq!(controller.phase(), &ReconnectPhase::Terminal);
+        assert!(!controller.has_credential());
+    }
+
+    #[test]
+    fn changed_displays_are_named_and_never_resume_the_old_request() {
+        let (mut controller, clock) = controller(Duration::from_secs(10));
+        let mut jitter = EdgeJitter { maximum: false };
+        controller
+            .schedule("timeout".to_string(), clock.now(), &mut jitter)
+            .unwrap();
+        let mut moved = controller.identity().clone();
+        moved.topology = "one display now".to_owned();
+        let generation = controller.generation();
+        assert!(matches!(
+            controller.take_due(Duration::from_millis(125), generation, &moved),
+            Err(ControllerError::DisplaysChanged)
         ));
         assert_eq!(controller.phase(), &ReconnectPhase::Terminal);
         assert!(!controller.has_credential());

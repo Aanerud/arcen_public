@@ -43,9 +43,11 @@ pub mod console;
 pub mod cursor_probe;
 /// The desk kept private while a Deck is attached (ADR 0025 §5).
 pub mod desk_privacy;
+pub mod display_truth;
 pub mod displays;
 #[cfg(target_os = "macos")]
 pub mod encode;
+pub mod handover;
 pub mod hdr_white;
 pub mod host_cert;
 #[cfg(target_os = "macos")]

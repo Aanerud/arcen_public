@@ -38,6 +38,7 @@
         "admission",
         "applied",
         "atomic_start",
+        "display_truth",
         "edid",
         "fairness",
         "nvidia_heads",
@@ -165,7 +166,7 @@
     {
       "package": "arcen-pier-macos",
       "dependency_kind": "normal",
-      "contracts": ["edid"],
+      "contracts": ["display_truth", "edid"],
       "paths": [
         {
           "id": "macos-pier-auto",
@@ -212,6 +213,7 @@
         "applied",
         "atomic_start",
         "display_lease",
+        "display_truth",
         "edid",
         "edid_provisioning",
         "fairness",

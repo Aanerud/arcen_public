@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Usage: arcen-pier-macos [--config PATH] [daemon|agent|serve|install-service|uninstall-service|validate-config|inventory|permissions|diagnostics|probe-media|probe-input|probe-keyboard|probe-keymap|probe-clipboard|probe-cursor|probe-desk-privacy|probe-modes|probe-scroll|probe-audio|register-audio-consent|core-audio-ready|request-permissions|new-host-cert|support-bundle]"
+            "Usage: arcen-pier-macos [--config PATH] [daemon|agent|serve|install-service|uninstall-service|validate-config|inventory|diagnose displays [--json]|permissions|diagnostics|probe-media|probe-input|probe-keyboard|probe-keymap|probe-clipboard|probe-cursor|probe-desk-privacy|probe-modes|probe-scroll|probe-audio|register-audio-consent|core-audio-ready|request-permissions|new-host-cert|support-bundle]"
         );
         return ExitCode::SUCCESS;
     }
@@ -30,6 +30,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if command == "diagnose" {
+        return diagnose(&support_args);
+    }
     if command == "inventory" {
         return match arcen_pier_macos::displays::probe() {
             Ok(displays) => {
@@ -1442,6 +1445,9 @@ fn run_serve(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
 /// crash; short enough that a Deck asking for a desktop nobody is logged in to
 /// is told so while the person is still looking at it.
 const AGENT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a Deck whose change of account signed the other account out
+/// waits for the login window's agent (within the shared `ENTRY_DEADLINE`).
+const LOGIN_WINDOW_AGENT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Runs the network service: the listener, the TLS key and admission, and no
 /// desktop.
@@ -1554,6 +1560,7 @@ async fn daemon_loop(
         (own_uid != 0).then_some(own_uid),
         expected_agent,
     );
+    registry.set_telemetry(telemetry.clone());
     tokio::spawn(std::sync::Arc::clone(&registry).run(agent_listener));
     match arcen_pier_macos::microphone_input::MicrophoneHub::start() {
         Ok(hub) => {
@@ -1680,7 +1687,7 @@ async fn serve_decks(
             // than the whole host.
             match relays.try_enter(peer.ip()) {
                 Ok(held) => {
-                    relay_one(deck, peer, &registry, refine_allowed).await;
+                    relay_one(deck, peer, registry, refine_allowed).await;
                     drop(held);
                 }
                 Err(refusal) => {
@@ -1703,77 +1710,126 @@ async fn serve_decks(
 const RELAY_LIMIT: usize = AGENT_SIGN_IN_SLOTS;
 
 /// Hands one admitted Deck to the console session's agent and relays it.
+///
+/// A confirmed change of account (`handover`) signs the other account out
+/// and hands the same Deck to the login window's agent next, with the
+/// credentials it already gave.
 async fn relay_one(
     mut deck: arcen_transport::quic::SessionLaneSocket,
     peer: std::net::SocketAddr,
-    registry: &arcen_pier_macos::relay::AgentRegistry,
+    registry: std::sync::Arc<arcen_pier_macos::relay::AgentRegistry>,
     refine_allowed: bool,
 ) {
-    let attached = registry
-        .attach(
-            arcen_pier_macos::console::console_holder,
-            &peer.to_string(),
-            AGENT_WAIT,
-        )
-        .await;
-    match attached {
-        Ok(attached) => {
-            let arcen_pier_macos::relay::AttachedAgent {
-                stream: agent,
-                agent: parked,
-                session,
-                audio_channel,
-            } = attached;
-            tracing::info!(
-                target: "arcen::relay",
-                %peer,
-                session,
-                uid = parked.uid,
-                kind = ?parked.kind,
-                "relaying a Deck to its desktop agent"
-            );
-            // One lane per role; the lane setup already keeps the send
-            // window interactive, so the agent's writes feel the path.
-            let relayed = arcen_pier_macos::relay::relay_lanes_gated(
-                deck,
-                agent,
-                session,
-                Some(audio_channel),
-                true,
-                refine_allowed,
-                Some(arcen_pier_macos::relay::SignInGate::new(
-                    &arcen_pier_macos::relay::SERVICE_AUTH_THROTTLE,
-                    Some(peer.ip()),
-                )),
+    let mut connection = None;
+    let mut replay = None;
+    loop {
+        // After a sign-out the login window's agent starts with the login
+        // window's new session, which takes longer than a returning one.
+        let wait = if replay.is_some() {
+            LOGIN_WINDOW_AGENT_WAIT
+        } else {
+            AGENT_WAIT
+        };
+        let attached = registry
+            .attach(
+                arcen_pier_macos::console::console_holder,
+                &peer.to_string(),
+                wait,
             )
             .await;
-            registry.end_session(session);
-            match relayed {
-                Ok(stats) => tracing::info!(
-                    target: "arcen::relay",
-                    %peer,
-                    to_agent = stats.to_agent,
-                    to_deck = stats.to_deck,
-                    side_channel_audio = stats.side_channel_audio,
-                    video_dropped = stats.lanes.video_dropped,
-                    audio_dropped = stats.lanes.audio_dropped,
-                    keyframe_requests = stats.lanes.keyframe_requests,
-                    bulk_dropped = stats.lanes.bulk_dropped,
-                    clipboard_failed = stats.lanes.clipboard_failed,
-                    "relay ended"
-                ),
-                Err(error) => tracing::info!(
-                    target: "arcen::relay",
-                    %peer,
-                    %error,
-                    "relay ended by the transport"
-                ),
+        let attached = match attached {
+            Ok(attached) => attached,
+            Err(reason) => {
+                if let Some(connection) = connection {
+                    let _ = registry.handover().login_finished(connection, false);
+                }
+                eprintln!("refused {peer}: {reason}");
+                let _ = arcen_pier_macos::net::refuse_lanes(&mut deck, &reason).await;
+                return;
             }
+        };
+        let arcen_pier_macos::relay::AttachedAgent {
+            stream: agent,
+            agent: parked,
+            session,
+            audio_channel,
+        } = attached;
+        tracing::info!(
+            target: "arcen::relay",
+            %peer,
+            session,
+            uid = parked.uid,
+            kind = ?parked.kind,
+            "relaying a Deck to its desktop agent"
+        );
+        let agent_uid = (parked.kind == arcen_session::agent_relay::DesktopSessionKind::User)
+            .then_some(parked.uid);
+        // The Deck's first sign-in passes the service's throttle; the
+        // credentials it gave again at the login window were counted then.
+        let gate = replay.is_none().then(|| {
+            arcen_pier_macos::relay::SignInGate::new(
+                &arcen_pier_macos::relay::SERVICE_AUTH_THROTTLE,
+                Some(peer.ip()),
+            )
+        });
+        // One lane per role; the lane setup already keeps the send
+        // window interactive, so the agent's writes feel the path.
+        let relayed = arcen_pier_macos::relay::relay_lanes_handover(
+            deck,
+            agent,
+            session,
+            Some(audio_channel),
+            true,
+            refine_allowed,
+            gate,
+            Some(arcen_pier_macos::relay::HandoverRelay {
+                registry: std::sync::Arc::clone(&registry),
+                agent_uid,
+                connection: *connection.get_or_insert(session),
+                peer: peer.to_string(),
+                replay: replay.take(),
+            }),
+        )
+        .await;
+        registry.end_session(session);
+        let relayed = match relayed {
+            arcen_pier_macos::relay::RelayOutcome::SignIn {
+                deck: continuing,
+                auth_response,
+            } => {
+                tracing::info!(
+                    target: "arcen::relay",
+                    %peer,
+                    "the other account signed out; the Deck signs in at the login window"
+                );
+                deck = continuing;
+                replay = Some(auth_response);
+                continue;
+            }
+            arcen_pier_macos::relay::RelayOutcome::Ended(relayed) => relayed,
+        };
+        match relayed {
+            Ok(stats) => tracing::info!(
+                target: "arcen::relay",
+                %peer,
+                to_agent = stats.to_agent,
+                to_deck = stats.to_deck,
+                side_channel_audio = stats.side_channel_audio,
+                video_dropped = stats.lanes.video_dropped,
+                audio_dropped = stats.lanes.audio_dropped,
+                keyframe_requests = stats.lanes.keyframe_requests,
+                bulk_dropped = stats.lanes.bulk_dropped,
+                clipboard_failed = stats.lanes.clipboard_failed,
+                "relay ended"
+            ),
+            Err(error) => tracing::info!(
+                target: "arcen::relay",
+                %peer,
+                %error,
+                "relay ended by the transport"
+            ),
         }
-        Err(reason) => {
-            eprintln!("refused {peer}: {reason}");
-            let _ = arcen_pier_macos::net::refuse_lanes(&mut deck, &reason).await;
-        }
+        return;
     }
 }
 
@@ -1837,6 +1893,8 @@ fn run_agent(arguments: &[String], config_path: &std::path::Path) -> ExitCode {
         .then(arcen_pier_macos::service::current_uid);
     session_policy.login_window =
         kind == arcen_session::agent_relay::DesktopSessionKind::LoginWindow;
+    session_policy.account_switch_relay =
+        kind == arcen_session::agent_relay::DesktopSessionKind::User;
 
     // At the login window launchd starts this agent as soon as the session
     // exists, which can be before its window server does. Measured on the lab:
@@ -2150,6 +2208,9 @@ async fn agent_slot(
                 ))
                 .await;
             }
+            // A confirmed change of account asked for this session's logout
+            // through this parked slot: park again at once.
+            Err(arcen_pier_macos::relay::RelayError::SignOutRequested(_)) => {}
             Err(error) => {
                 // Said once per outage, not once per retry or per slot: the
                 // service being down for a restart is ordinary, and a line
@@ -4397,6 +4458,29 @@ fn probe_desk_privacy(args: &[String]) -> ExitCode {
     }
 }
 
+/// `diagnose displays [--json]`: every online display as CoreGraphics reads
+/// it (shared display truth). Read-only; run it in the signed-in user's
+/// session, where the window server answers.
+fn diagnose(args: &[String]) -> ExitCode {
+    use arcen_outputs::display_truth::{DIAGNOSE_USAGE, DiagnoseRequest, parse_diagnose};
+    let printed = parse_diagnose(args).and_then(|request| match request {
+        DiagnoseRequest::Help => Ok(format!("Usage: {DIAGNOSE_USAGE}\n")),
+        DiagnoseRequest::Displays { json } => arcen_pier_macos::display_truth::read()
+            .map(|truth| truth.render(json))
+            .map_err(|error| format!("diagnose displays: {error}")),
+    });
+    printed.map_or_else(
+        |error| {
+            eprintln!("{error}\nUsage: {DIAGNOSE_USAGE}");
+            ExitCode::FAILURE
+        },
+        |text| {
+            print!("{text}");
+            ExitCode::SUCCESS
+        },
+    )
+}
+
 fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
     let mut command = "run";
     let mut config = PathBuf::from(arcen_pier_macos::DEFAULT_CONFIG_PATH);
@@ -4418,6 +4502,7 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
                 | "register-audio-consent"
                 | "hid-injector"
         ) || command == "probe-desk-privacy"
+            || command == "diagnose"
             || command == "probe-cursor"
             || command == "lock-guard"
             || (cfg!(feature = "lab-pen-probe") && command == "probe-pen")
@@ -4429,6 +4514,7 @@ fn parse_args(args: &[String]) -> Result<(&str, PathBuf, Vec<String>), String> {
         match args[index].as_str() {
             "validate-config" => command = "validate-config",
             "inventory" => command = "inventory",
+            "diagnose" => command = "diagnose",
             "permissions" => command = "permissions",
             "diagnostics" => command = "diagnostics",
             "probe-media" => command = "probe-media",

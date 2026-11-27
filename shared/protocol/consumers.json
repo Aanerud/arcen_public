@@ -112,13 +112,14 @@
         "crate",
         "messages",
         "refine",
+        "served_layout",
         "wire"
       ]
     },
     {
       "package": "arcen-deck-macos",
       "dependency_kind": "normal",
-      "contracts": ["auth", "build_identity", "clipboard", "crate", "cursor", "cursor_position", "fsm", "lanes", "messages", "wire"],
+      "contracts": ["auth", "build_identity", "clipboard", "crate", "cursor", "cursor_position", "fsm", "lanes", "messages", "served_layout", "wire"],
       "paths": [
         {
           "id": "macos-deck-apple-silicon-sdr",
@@ -266,7 +267,7 @@
     {
       "package": "arcen-pier-linux",
       "dependency_kind": "normal",
-      "contracts": ["build_identity", "canvas", "clipboard", "crate", "cursor", "cursor_position", "lanes", "messages", "wire"],
+      "contracts": ["build_identity", "canvas", "clipboard", "crate", "cursor", "cursor_position", "lanes", "messages", "served_layout", "wire"],
       "paths": [
         {
           "id": "linux-wayland-input",
@@ -501,7 +502,7 @@
     {
       "package": "arcen-pier-windows",
       "dependency_kind": "normal",
-      "contracts": ["auth", "build_identity", "canvas", "clipboard", "crate", "fsm", "messages", "wire"],
+      "contracts": ["auth", "build_identity", "canvas", "clipboard", "crate", "fsm", "messages", "served_layout", "wire"],
       "paths": [
         {
           "id": "windows-auto",

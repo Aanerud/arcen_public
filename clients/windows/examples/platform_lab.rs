@@ -872,6 +872,8 @@ mod lab {
             keep_desk_private: true,
             canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
             services: dyn_services,
+            // A tool that cannot answer keeps the host's refusal.
+            account_switch: arcen_deck_core::account_switch::AccountSwitchMode::Off,
         };
         let mut auth = Some(AuthSubmission { username, password });
         let mut handle = spawn_session(options);

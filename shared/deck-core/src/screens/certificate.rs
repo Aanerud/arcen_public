@@ -848,6 +848,20 @@ mod tests {
                 }),
             ),
             (
+                "account switch",
+                Box::new(|ui| {
+                    let mut prompt = crate::account_switch::AccountSwitchPrompt::default();
+                    prompt.on_news(
+                        crate::account_switch::AccountSwitchNews::Offered {
+                            expires_in: std::time::Duration::from_secs(120),
+                        },
+                        std::time::Instant::now(),
+                    );
+                    let _ =
+                        super::super::account_switch::render_account_switch(ui.ctx(), &mut prompt);
+                }),
+            ),
+            (
                 "disclaimer",
                 Box::new(|ui| {
                     let _ = super::super::sign_in::render_disclaimer(

@@ -267,15 +267,17 @@ session.
 | The account's session waits behind the login screen (switch user) | brings it forward, then joins it |
 | Nobody is signed in, GDM's login screen shows | the login screen signs the account in (a one-time token, below); GDM owns the session, so a later sign-in at the desk resumes it |
 | The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it as a guest: the desktop takes the Deck's monitors and keeps them after the Deck leaves, as that product does for its own client (below); the other product is never stopped or reconfigured |
-| The same, while that product's own client is connected | refused, `console_in_use_other_product`: one remote-desktop product at a time |
-| Another account is signed in (or holds the console through another product) | refused, `console_other_user` or `console_other_user_other_product` |
+| The same, while that product's own client is connected | joins it too: the desktop keeps the layout that product gave it, and each Deck monitor shows the output in its place |
+| Another account is signed in, and a remote client (a Deck, or another product's client) is connected to it | refused, `console_other_user` or `console_other_user_other_product` |
+| Another account is signed in with no remote client connected, and the Deck offers the choice | after the password is checked, the Deck asks whether to sign that account out; Cancel changes nothing. A remote client counts as connected when it is a Deck, when another product's virtual keyboard or pointer exists, when a VNC server (`x11vnc`, `x0vncserver`, TigerVNC's `x0tigervncserver` and `Xtigervnc`, `Xvnc`, `vncserver`), GNOME Remote Desktop, `xrdp` or an NX server holds any established network connection (a reverse or tunnelled one included), or when GNOME is sharing or remote-controlling the screen. While a remote-support tool that connects through its own relay (`anydesk`, `teamviewerd`, `rustdesk`) runs, the Pier cannot tell whether anyone is connected through it: the change of account is refused with `console_remote_state_unknown`, and the log names the tool. Anything the Pier cannot read is refused the same way. A remote-access tool not in this list, with no virtual input device, is not detected. "Sign out and continue" asks GNOME to log that account out as its own Log Out does: an application that blocks logout stops it, and nothing is forced. Once that session has ended, the account signs in through the login screen as above |
+| The same, with an older Deck, or when that account's GNOME session manager does not answer | refused, `console_other_user` or `console_other_user_other_product` |
 | The account is signed in to GNOME on Wayland | joins that session: its own monitors and applications, nothing of it changed; locked when the Deck leaves. A session that shows on a monitor at the desk cannot be blanked (a Wayland desk cannot be): with desk privacy `on` it is served with the desk's input disabled and the Deck is told its screens are visible; refused `console_privacy_unavailable` when desk privacy is `required`. A disconnected Deck signs in again rather than resuming |
 | GDM's login screen is Wayland, nobody signed in | refused, `console_wayland_session`: set `WaylandEnable=false` in `/etc/gdm/custom.conf` and restart GDM while nobody is signed in |
 | No display manager on the host, nobody signed in | starts the account's real login session (below), then joins it |
 | The account's session that Arcen started | joins it (same desktop, same applications) |
 | Another account's session that Arcen started | refused, `console_other_user` (one account at a time without a display manager) |
 | A display manager is configured but its login screen is not running | refused, `console_no_session` |
-| Another remote-desktop product is the running display manager and keeps GDM's login screen off the console (GDM 49 and earlier: `[xdmcp]` `Enable=true` with `ShowLocalGreeter=false`; GDM 51 and later: `[daemon]` `ShowLocalGreeter=false`; GDM 50 always shows it), nobody signed in | refused, `console_sign_in_other_product`: sign in with that product once and disconnect it; Arcen then joins that desktop. Arcen never signs in through a login screen left on such a console |
+| Another remote-desktop product is the running display manager and keeps GDM's login screen off the console (GDM 49 and earlier: `[xdmcp]` `Enable=true` with `ShowLocalGreeter=false`; GDM 51 and later: `[daemon]` `ShowLocalGreeter=false`; GDM 50 always shows it), nobody signed in | starts the account's real login session (below), then joins it, when logind lists no graphical session (on `seat0` or with no seat), no X server runs, GDM answers on the system bus (its lock screen and desk unlock serve that session), Arcen's login service is installed and no client of the product is connected. Otherwise refused, `console_sign_in_other_product`: sign in with that product once and disconnect it; Arcen then joins that desktop. Arcen never signs in through a login screen left on such a console |
 | logind's sessions cannot be read (`loginctl` fails, times out, or answers incompletely) | refused, `console_sessions_unreadable`: whether the account already has a session is unknown, so Arcen neither joins nor starts one |
 | `display-manager.service` points at another remote-desktop product's unit, and that unit is stopped | nothing will show a login screen: served like a host without a display manager (Arcen's real login session) |
 
@@ -376,10 +378,11 @@ all is answered "its console cannot take this layout" (the Pier logs
 `console_layout_differs`) and offered Primary Display Only. Heads the
 product forces connected without a picture are ignored. The desk's physical monitors are
 blanked and its physical keyboards and mice disabled as on any console; the
-product's own virtual keyboards and mice are never touched. While Arcen is
-attached, that product's client connecting (its virtual keyboard or pointer
-appears) ends Arcen's attachment with `console_in_use_other_product`, and
-the session is locked as on every disconnect. Arcen recognises that client
+product's own virtual keyboards and mice are never touched. The account
+reaches its desktop from either product: a sign-in joins it while that
+product's client is connected, and an attachment stays when that client
+connects; the desktop then keeps the layout that product gave it. Arcen
+recognises that client
 by a keyboard or pointer made in user space (through `/dev/uinput` or
 `/dev/uhid`) while a process that is not Arcen's holds that interface; the
 machine's own firmware devices, such as HP's WMI hotkeys, and Bluetooth
@@ -541,11 +544,11 @@ workstation; one of them serves the console at a time.
 | Situation | What Arcen does |
 | --- | --- |
 | The product runs, and the account's desktop in it exists, nobody connected through the product | joins that desktop as a guest; the desktop takes the Deck's monitors (see [Joining the user's session](#joining-the-users-session-console-mode)) |
-| The product's client is connected | refuses `console_in_use_other_product` |
-| The product's client connects while a Deck is attached to that desktop | ends the Deck's attachment with `console_in_use_other_product`; the session is locked as on every disconnect |
+| The product's client is connected | joins the account's own desktop as it is; its layout stays the one that product gave it |
+| The product's client connects while a Deck is attached to that desktop | both stay connected; the session is locked when the Deck leaves, as on every disconnect |
 | The product is the host's display manager (`display-manager.service` points at its unit) and is stopped; GDM is not running | starts the account's real login session (a host without a display manager); a reconnect joins the same session |
 | The product starts again while a Deck is attached to Arcen's session | ends the attachment with `console_other_product_started`; Arcen's session is not ended by Arcen |
-| The product is the running display manager and keeps GDM's login screen off the console; nobody is signed in | refuses `console_sign_in_other_product`, naming the product as its system service describes itself (else by its unit) |
+| The product is the running display manager and keeps GDM's login screen off the console; nobody is signed in | starts the account's real login session when the seat, the GPU and GDM are free for it and the product's client is not connected (see [Joining the user's session](#joining-the-users-session-console-mode)); otherwise refuses `console_sign_in_other_product`, naming the product as its system service describes itself (else by its unit) |
 | The same, and the joined desktop does not lock when the Deck leaves | keeps the desk private (monitors blank, its input disabled) and retries the lock; it never asks GDM for a login screen there |
 
 GNOME runs one graphical session per account: two desktops of the same
@@ -553,6 +556,18 @@ account (Arcen's login session and the product's) share the account's
 systemd user manager and its GNOME services. When measured, the account's
 Arcen login session ended when the product's desktop of the same account
 ended. Treat the account's desktop as belonging to one product at a time.
+
+With and without the other product, a Deck user sees the same things: the
+first sign-in starts their desktop, a later sign-in from any Deck joins it,
+it locks when the Deck leaves, it unlocks at the desk with the password,
+it takes the Deck's displays, and with nobody connected to it another
+account can sign it out from the Deck. Three things differ beside the product.
+Arcen starts the desktop itself (PAM service `arcen-login`) because no GDM
+login screen is there. The first sign-in is refused
+(`console_sign_in_other_product`) while the product's client is
+connected, its X server runs or any graphical session exists. A desktop
+the product started keeps its layout while the product's client is
+attached.
 
 To move a workstation from the other product to Arcen:
 
@@ -1892,6 +1907,7 @@ Key lifecycle event IDs:
 | 1103 | `SESSION_END` | Clean session end; on a Windows Pier `reason_class` `signed_out` or `host_shutdown` when Windows ended the session under a live Deck. |
 | 1104 | `SESSION_INTERRUPTED` | Transport or component failure. |
 | 1108 | `RESUME_HOLD_ENDED` | A desktop held for its Deck's resume was let go without a resume; `reason_class` says why (`resume_window_expired`, `resume_refused`, `native_session_ended`, `same_user_reattached`, `fresh_sign_in`, `pier_stopping`, `owner_failed`, `other_product_client`, `other_product_started`, `desk_took_over`), `held_ms` for how long. |
+| 1109 | `SESSION_HANDOVER` | What became of a sign-in to a desktop that another connection or account held, and of a confirmed change of account; `reason_class` says which (`reused_desktop`, `remote_busy`, `state_unknown`, `switch_unsupported`, `switch_offered`, `switch_in_progress`, `switch_cancelled`, `switch_stale`, `switch_expired`, `switch_rejected`, `logout_requested`, `logout_vetoed`, `logout_timed_out`, `logout_failed`, `logout_completed`, `new_login_failed`), `attachment` how the Deck came (`connect`, `transport_resume`, `account_switch`, `login_handover`) and `remote_client` which client a refusal names (`arcen`, `foreign`). A logout request is never logged as a completed logout. |
 | 1200-1204 | Display events | Display arm, restore, degraded restore, failed restore, watchdog restore. |
 | 1300-1301 | CP events | Windows Credential Provider logon outcome. |
 | 1400-1404 | TLS events | Active, expiring, reloaded, reload failed, expired. |

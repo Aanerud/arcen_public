@@ -22,6 +22,7 @@ use arcen_media::{RequestedMonitorTopology, TransferCharacteristics, VideoCodec}
 use arcen_protocol::messages::{
     ServedPipelineMsg, ServedStreamPipeline, ServerHelloMsg, ServerMultiMonitorMsg, StreamPipeline,
 };
+use arcen_protocol::served_layout::ServedLayoutReport;
 use arcen_protocol::wire::VideoHeader;
 
 /// Whether a multi-monitor smoke accepts a host that serves fewer displays
@@ -169,6 +170,70 @@ pub fn verify_applied_layout(
         ));
     }
     Ok(layout)
+}
+
+/// Checks the layout the host serves against the request this attachment
+/// sent, every display's size, rotation, primary and side
+/// ([`arcen_protocol::served_layout`]). Returns the lines to print: the
+/// summary, then each difference a run that accepts the host's layout
+/// accepted.
+///
+/// # Errors
+///
+/// Any difference, unless `acceptance` is [`LayoutAcceptance::HostLayout`].
+pub fn verify_served_layout(
+    report: &ServedLayoutReport,
+    acceptance: LayoutAcceptance,
+) -> Result<Vec<String>, String> {
+    let summary = report.summary();
+    if report.matches() {
+        return Ok(vec![summary]);
+    }
+    if acceptance == LayoutAcceptance::FullLayout {
+        return Err(format!(
+            "the host did not serve the displays this Deck asked for: {summary}; \
+             pass --accept-host-layout to accept the host's layout"
+        ));
+    }
+    let mut lines = vec![summary];
+    lines.extend(
+        report
+            .mismatches
+            .iter()
+            .map(|mismatch| format!("served-layout accepted-difference {mismatch}")),
+    );
+    Ok(lines)
+}
+
+/// Checks a monitor's first decoded frame against the size its stream was
+/// served at. Returns a line to print for a difference a run that accepts
+/// the host's layout accepted.
+///
+/// # Errors
+///
+/// A decoded size other than the served one, unless `acceptance` is
+/// [`LayoutAcceptance::HostLayout`].
+pub fn verify_decoded_size(
+    report: &ServedLayoutReport,
+    acceptance: LayoutAcceptance,
+    session_monitor_id: u16,
+    width: usize,
+    height: usize,
+) -> Result<Option<String>, String> {
+    let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+        return Err(format!(
+            "monitor {session_monitor_id} decoded an impossible {width}x{height} frame"
+        ));
+    };
+    match report.check_decoded(session_monitor_id, width, height) {
+        Ok(()) => Ok(None),
+        Err(mismatch) if acceptance == LayoutAcceptance::HostLayout => Ok(Some(format!(
+            "served-layout accepted-difference {mismatch}"
+        ))),
+        Err(mismatch) => Err(format!(
+            "a decoded frame is not the size the host served: {mismatch}"
+        )),
+    }
 }
 
 /// The pipeline a smoke asked for and the one the host serves, with the
@@ -566,6 +631,71 @@ mod tests {
         )
         .expect_err("an unrequested monitor");
         assert!(error.contains("did not request"), "{error}");
+    }
+
+    fn layout_report(
+        mismatches: Vec<arcen_protocol::served_layout::LayoutMismatch>,
+    ) -> ServedLayoutReport {
+        ServedLayoutReport {
+            requested: 2,
+            served: 2,
+            host_kept_layout: false,
+            streams: vec![
+                arcen_protocol::served_layout::ExpectedStream {
+                    session_monitor_id: Some(1),
+                    width_px: 2560,
+                    height_px: 1440,
+                },
+                arcen_protocol::served_layout::ExpectedStream {
+                    session_monitor_id: Some(2),
+                    width_px: 1920,
+                    height_px: 1080,
+                },
+            ],
+            mismatches,
+        }
+    }
+
+    #[test]
+    fn a_served_layout_must_equal_the_request_unless_the_run_accepts_the_hosts() {
+        use arcen_protocol::served_layout::LayoutMismatch;
+        let exact = layout_report(Vec::new());
+        assert_eq!(
+            verify_served_layout(&exact, LayoutAcceptance::FullLayout)
+                .unwrap()
+                .len(),
+            1
+        );
+        let fitted = layout_report(vec![LayoutMismatch::Size {
+            display: "2".into(),
+            requested: [2560, 1440],
+            served: [1920, 1080],
+        }]);
+        let error = verify_served_layout(&fitted, LayoutAcceptance::FullLayout).unwrap_err();
+        assert!(
+            error.contains("size display=2 requested=2560x1440 served=1920x1080"),
+            "{error}"
+        );
+        let lines = verify_served_layout(&fitted, LayoutAcceptance::HostLayout).unwrap();
+        assert_eq!(
+            lines[1],
+            "served-layout accepted-difference size display=2 requested=2560x1440 served=1920x1080"
+        );
+    }
+
+    #[test]
+    fn every_monitor_decodes_at_its_served_size() {
+        let report = layout_report(Vec::new());
+        assert_eq!(
+            verify_decoded_size(&report, LayoutAcceptance::FullLayout, 2, 1920, 1080),
+            Ok(None)
+        );
+        assert!(verify_decoded_size(&report, LayoutAcceptance::FullLayout, 2, 1280, 720).is_err());
+        assert!(
+            verify_decoded_size(&report, LayoutAcceptance::HostLayout, 2, 1280, 720)
+                .unwrap()
+                .is_some()
+        );
     }
 
     fn served_msg(served: ServedStreamPipeline, reason: Option<&str>) -> ServedPipelineMsg {

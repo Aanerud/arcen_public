@@ -14,6 +14,7 @@
 )]
 
 pub mod about;
+pub mod account_switch;
 pub mod certificate;
 pub mod colour_check;
 pub mod connecting;

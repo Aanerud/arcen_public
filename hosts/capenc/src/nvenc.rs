@@ -90,10 +90,9 @@ use crate::nvenc_sys::nvEncodeAPI::NV_ENC_TUNING_INFO::*;
 
 use arcen_keel::{BgraFrame, PendingExternalDamage};
 use arcen_media::video::{
-    convert_bgra_to_i444, convert_bgra_to_i444_p16_rows, convert_bgra_to_nv12,
-    convert_scrgb_to_pq_i444_p16, convert_scrgb_to_sdr_i444_p16, ColorTransform, I444FrameMut,
-    I444P16FrameMut, Nv12FrameMut, QpMapGeometry, ScrgbPqTransform, ScrgbSdrTransform,
-    SCRGB_CONVERSION_TEST_VECTORS,
+    convert_bgra_to_i444, convert_bgra_to_i444_p16_rows, convert_bgra_to_nv12, ColorTransform,
+    I444FrameMut, I444P16FrameMut, Nv12FrameMut, QpMapGeometry, ScrgbConversion, ScrgbShaderMode,
+    ScrgbShaderParams, SCRGB_CONVERSION_TEST_VECTORS,
 };
 use arcen_media::{
     BitDepth, ChromaSubsampling, ColorMatrix, ColorPrimaries, ColorRange, EncodeIntent,
@@ -417,12 +416,14 @@ pub struct Encoder {
     wide_gpu: Option<WideGpuConverter>,
     format: PixelFormat,
     transform: ColorTransform,
-    /// Linear scRGB primaries, absolute PQ transfer, YCbCr matrix/range and
-    /// NVENC P16 packing bound into one immutable transform.
+    /// The session's one FP16 scRGB conversion (primaries, SDR white, transfer,
+    /// YCbCr matrix/range, NVENC P16 packing), built with its SDR white before
+    /// anything below existed.
     ///
-    /// Held rather than derived per frame so no colour axis can drift from the
-    /// session contract.
-    wide_transform: Option<WideScrgbTransform>,
+    /// The GPU shader's constants, the CPU conversion and the exact tiles all
+    /// read it, and nothing changes it: a new white needs a new encoder, so no
+    /// copy of an older value can survive.
+    wide_transform: Option<ScrgbConversion>,
     /// Damage-driven QP biasing, when the session asked for it and the driver
     /// accepted `qpMapMode` at init.
     ///
@@ -510,29 +511,20 @@ pub(crate) enum RefineReadbackPoll {
     Landed,
 }
 
-#[derive(Clone, Copy)]
-enum WideScrgbTransform {
-    Pq(ScrgbPqTransform),
-    Sdr(ScrgbSdrTransform),
+/// The pixels capture hands [`Encoder`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EncoderSource {
+    /// Eight-bit BGRA.
+    Bgra8,
+    /// FP16 linear scRGB. `sdr_white_nits` is where Windows composes SDR
+    /// content on an HDR output (its SDR white level); an HDR stream places it
+    /// at 203 nits. `None` leaves an HDR frame as composed.
+    Scrgb { sdr_white_nits: Option<f64> },
 }
 
-impl WideScrgbTransform {
-    const fn shader_mode(self) -> WideShaderMode {
-        match self {
-            Self::Sdr(transform) => match transform.transfer() {
-                // `ScrgbSdrTransform::new` admits only the two SDR transfers.
-                TransferCharacteristics::Srgb => WideShaderMode::SdrSrgb,
-                _ => WideShaderMode::SdrBt709,
-            },
-            Self::Pq(_) => WideShaderMode::PqBt2020,
-        }
-    }
-
-    const fn white_gain(self) -> f32 {
-        match self {
-            Self::Pq(transform) => transform.white_gain(),
-            Self::Sdr(_) => 1.0,
-        }
+impl EncoderSource {
+    const fn is_wide(self) -> bool {
+        matches!(self, Self::Scrgb { .. })
     }
 }
 
@@ -558,17 +550,9 @@ enum GpuSlotFormat {
     Abgr10,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WideShaderMode {
-    SdrBt709,
-    PqBt2020,
-    /// The inverse of the IEC 61966-2-1 decode DWM applies to SDR surfaces:
-    /// desktop code values survive (`arcen_media::video::sdr_desktop_transfer`).
-    SdrSrgb,
-}
-
+/// The wide shader's constant buffer, byte for byte.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct WideShaderParams {
     width: u32,
     height: u32,
@@ -577,6 +561,58 @@ struct WideShaderParams {
     output_kind: u32,
     white_gain: f32,
     _pad: [f32; 2],
+}
+
+impl WideShaderParams {
+    /// Geometry and output from the encoder, every colour value from the
+    /// shared conversion.
+    fn new(
+        width: u32,
+        height: u32,
+        output_format: GpuSlotFormat,
+        colour: ScrgbShaderParams,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            mode: colour.mode.code(),
+            range_full: u32::from(matches!(colour.range, ColorRange::Full)),
+            output_kind: u32::from(output_format == GpuSlotFormat::Abgr10),
+            white_gain: colour.white_gain,
+            _pad: [0.0; 2],
+        }
+    }
+
+    /// The colour values these constants make the shader apply.
+    fn colour(self) -> Option<ScrgbShaderParams> {
+        Some(ScrgbShaderParams {
+            mode: ScrgbShaderMode::from_code(self.mode)?,
+            range: if self.range_full != 0 {
+                ColorRange::Full
+            } else {
+                ColorRange::Limited
+            },
+            white_gain: self.white_gain,
+        })
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let word = |index: usize| {
+            let at = index * 4;
+            bytes
+                .get(at..at + 4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        };
+        Some(Self {
+            width: word(0)?,
+            height: word(1)?,
+            mode: word(2)?,
+            range_full: word(3)?,
+            output_kind: word(4)?,
+            white_gain: f32::from_bits(word(5)?),
+            _pad: [f32::from_bits(word(6)?), f32::from_bits(word(7)?)],
+        })
+    }
 }
 
 struct WideGpuConverter {
@@ -701,8 +737,7 @@ impl WideGpuConverter {
         device: &ID3D11Device,
         width: u32,
         height: u32,
-        transform: WideScrgbTransform,
-        range: ColorRange,
+        conversion: ScrgbConversion,
         output_format: GpuSlotFormat,
     ) -> Result<Self, String> {
         let shader = compile_wide_shader(device)?;
@@ -715,19 +750,8 @@ impl WideGpuConverter {
             .CreateShaderResourceView(&source_res, None, Some(&mut source_srv))
             .map_err(|error| format!("CreateShaderResourceView(wide source): {error:?}"))?;
         let source_srv = source_srv.ok_or_else(|| "wide source SRV null".to_string())?;
-        let params = WideShaderParams {
-            width,
-            height,
-            mode: match transform.shader_mode() {
-                WideShaderMode::SdrBt709 => 0,
-                WideShaderMode::PqBt2020 => 1,
-                WideShaderMode::SdrSrgb => 2,
-            },
-            range_full: u32::from(matches!(range, ColorRange::Full)),
-            output_kind: u32::from(output_format == GpuSlotFormat::Abgr10),
-            white_gain: transform.white_gain(),
-            _pad: [0.0; 2],
-        };
+        let params =
+            WideShaderParams::new(width, height, output_format, conversion.shader_params());
         let desc = D3D11_BUFFER_DESC {
             ByteWidth: std::mem::size_of::<WideShaderParams>() as u32,
             Usage: D3D11_USAGE_DEFAULT,
@@ -801,6 +825,181 @@ impl WideGpuConverter {
         context.CSSetConstantBuffers(0, Some(&[None]));
         context.CSSetShader(None::<&ID3D11ComputeShader>, None);
         Ok(())
+    }
+
+    /// The constants the shader runs with, read back from the GPU buffer
+    /// itself rather than from any CPU copy.
+    unsafe fn read_constants(
+        &self,
+        context: &ID3D11DeviceContext,
+    ) -> Result<WideShaderParams, String> {
+        let device = context
+            .GetDevice()
+            .map_err(|error| format!("wide constants GetDevice: {error:?}"))?;
+        let size = std::mem::size_of::<WideShaderParams>();
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: size as u32,
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let mut staging = None;
+        device
+            .CreateBuffer(&desc, None, Some(&mut staging))
+            .map_err(|error| format!("CreateBuffer(wide constants readback): {error:?}"))?;
+        let staging = staging.ok_or_else(|| "wide constants readback null".to_string())?;
+        let staging_res: ID3D11Resource = staging
+            .cast()
+            .map_err(|error| format!("cast wide constants readback: {error:?}"))?;
+        let constants_res: ID3D11Resource = self
+            .constants
+            .cast()
+            .map_err(|error| format!("cast wide constants: {error:?}"))?;
+        context.CopyResource(&staging_res, &constants_res);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context
+            .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .map_err(|error| format!("Map(wide constants readback): {error:?}"))?;
+        let bytes = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), size).to_vec();
+        context.Unmap(&staging_res, 0);
+        WideShaderParams::from_bytes(&bytes)
+            .ok_or_else(|| "wide constants readback too short".to_string())
+    }
+
+    /// Runs this converter, with its own constant buffer, over the shared
+    /// FP16 test vectors and returns the largest code difference from what
+    /// `conversion` gives the same pixels on the CPU: the stream's R′G′B′
+    /// codes for an ABGR10 output (the exact tiles' codes), its Y′CbCr for
+    /// a YUV444 output. The vectors go in the top-left row of a frame of the
+    /// converter's own size.
+    unsafe fn vector_error(
+        &self,
+        context: &ID3D11DeviceContext,
+        conversion: ScrgbConversion,
+    ) -> Result<u16, String> {
+        let device = context
+            .GetDevice()
+            .map_err(|error| format!("wide vectors GetDevice: {error:?}"))?;
+        let (width, height) = (self.params.width, self.params.height);
+        let samples = SCRGB_CONVERSION_TEST_VECTORS.len();
+        if (width as usize) < samples || height == 0 {
+            return Err(format!(
+                "a {width}x{height} converter cannot hold {samples} test vectors"
+            ));
+        }
+        let row_bytes = width as usize * 8;
+        let vectors = scrgb_vector_source_bytes();
+        let mut source = vec![0u8; row_bytes * height as usize];
+        source[..vectors.len()].copy_from_slice(&vectors);
+        let source_desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let source_data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: source.as_ptr().cast(),
+            SysMemPitch: row_bytes as u32,
+            SysMemSlicePitch: 0,
+        };
+        let mut source_tex = None;
+        device
+            .CreateTexture2D(&source_desc, Some(&source_data), Some(&mut source_tex))
+            .map_err(|error| format!("CreateTexture2D(wide vectors source): {error:?}"))?;
+        let source_tex = source_tex.ok_or_else(|| "wide vectors source null".to_string())?;
+        let output_format = if self.params.output_kind == 0 {
+            GpuSlotFormat::Yuv444P16
+        } else {
+            GpuSlotFormat::Abgr10
+        };
+        let output = Encoder::make_gpu_input_texture(&device, width, height, output_format)?;
+        self.convert(context, &source_tex, &output)?;
+
+        let mut staging_desc = D3D11_TEXTURE2D_DESC::default();
+        output.GetDesc(&mut staging_desc);
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging = None;
+        device
+            .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+            .map_err(|error| format!("CreateTexture2D(wide vectors readback): {error:?}"))?;
+        let staging = staging.ok_or_else(|| "wide vectors readback null".to_string())?;
+        let output_res: ID3D11Resource = output
+            .cast()
+            .map_err(|error| format!("cast wide vectors output: {error:?}"))?;
+        let staging_res: ID3D11Resource = staging
+            .cast()
+            .map_err(|error| format!("cast wide vectors readback: {error:?}"))?;
+        context.CopyResource(&staging_res, &output_res);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context
+            .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .map_err(|error| format!("Map(wide vectors readback): {error:?}"))?;
+        let pitch = mapped.RowPitch as usize;
+        let base = mapped.pData.cast::<u8>();
+        let (actual, expected) = if output_format == GpuSlotFormat::Abgr10 {
+            let row = std::slice::from_raw_parts(base.cast::<u32>(), samples);
+            let actual = row
+                .iter()
+                .flat_map(|packed| {
+                    [
+                        packed & 0x3ff,
+                        (packed >> 10) & 0x3ff,
+                        (packed >> 20) & 0x3ff,
+                    ]
+                    .map(|code| (code as u16) << 6)
+                })
+                .collect::<Vec<_>>();
+            let expected = vectors
+                .chunks_exact(8)
+                .flat_map(|pixel| {
+                    let half = |at: usize| u16::from_le_bytes([pixel[at], pixel[at + 1]]);
+                    conversion
+                        .rgb_codes(half(0), half(2), half(4))
+                        .map(|code| code << 6)
+                })
+                .collect::<Vec<_>>();
+            (actual, expected)
+        } else {
+            let mut actual = Vec::with_capacity(samples * 3);
+            for plane in 0..3 {
+                let row = std::slice::from_raw_parts(
+                    base.add(pitch * plane * height as usize).cast::<u16>(),
+                    samples,
+                );
+                actual.extend_from_slice(row);
+            }
+            let (mut y, mut u, mut v) = (
+                vec![0u16; samples],
+                vec![0u16; samples],
+                vec![0u16; samples],
+            );
+            conversion
+                .convert_i444_p16(
+                    &vectors,
+                    samples * 8,
+                    [&mut y, &mut u, &mut v],
+                    [samples; 3],
+                    samples,
+                    1,
+                )
+                .map_err(|error| error.to_string())?;
+            (actual, [y, u, v].concat())
+        };
+        context.Unmap(&staging_res, 0);
+        Ok(max_code_error(&actual, &expected))
     }
 }
 
@@ -921,177 +1120,43 @@ fn max_code_error(actual: &[u16], expected: &[u16]) -> u16 {
         .unwrap_or(0)
 }
 
+/// The largest code difference between the GPU shader and the shared CPU
+/// conversion over the shared FP16 test vectors, per conversion: BT.709 and
+/// sRGB SDR, HDR as composed, and HDR with Windows' default 240-nit SDR white
+/// placed at 203 nits.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShaderVectorErrors {
+    pub(crate) sdr: u16,
+    pub(crate) srgb: u16,
+    pub(crate) hdr: u16,
+    pub(crate) hdr_white: u16,
+}
+
 pub(crate) unsafe fn wide_shader_vector_selftest(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
-) -> Result<(u16, u16, u16), String> {
+) -> Result<ShaderVectorErrors, String> {
     let width = u32::try_from(SCRGB_CONVERSION_TEST_VECTORS.len()).unwrap_or(0);
-    let height = 1u32;
-    let source = scrgb_vector_source_bytes();
-    let source_desc = D3D11_TEXTURE2D_DESC {
-        Width: width,
-        Height: height,
-        MipLevels: 1,
-        ArraySize: 1,
-        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Usage: D3D11_USAGE_DEFAULT,
-        BindFlags: 0,
-        CPUAccessFlags: 0,
-        MiscFlags: 0,
-    };
-    let source_data = D3D11_SUBRESOURCE_DATA {
-        pSysMem: source.as_ptr().cast(),
-        SysMemPitch: width * 8,
-        SysMemSlicePitch: 0,
-    };
-    let mut source_tex = None;
-    device
-        .CreateTexture2D(&source_desc, Some(&source_data), Some(&mut source_tex))
-        .map_err(|error| format!("CreateTexture2D(shader vector source): {error:?}"))?;
-    let source_tex = source_tex.ok_or_else(|| "shader vector source null".to_string())?;
-
-    unsafe fn run_one(
-        device: &ID3D11Device,
-        context: &ID3D11DeviceContext,
-        source_tex: &ID3D11Texture2D,
-        source: &[u8],
-        width: u32,
-        transform: WideScrgbTransform,
-    ) -> Result<u16, String> {
-        let converter = WideGpuConverter::new(
-            device,
-            width,
-            1,
-            transform,
+    let run = |transfer, matrix, primaries, sdr_white_nits| -> Result<u16, String> {
+        let conversion = ScrgbConversion::for_stream(
+            matrix,
+            primaries,
             ColorRange::Full,
-            GpuSlotFormat::Yuv444P16,
-        )?;
-        let output = Encoder::make_gpu_input_texture(device, width, 1, GpuSlotFormat::Yuv444P16)?;
-        converter.convert(context, source_tex, &output)?;
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: 3,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R16_UINT,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-        };
-        let mut staging = None;
-        device
-            .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-            .map_err(|error| format!("CreateTexture2D(shader vector readback): {error:?}"))?;
-        let staging = staging.ok_or_else(|| "shader vector readback null".to_string())?;
-        let output_res: ID3D11Resource = output
-            .cast()
-            .map_err(|error| format!("cast shader vector output: {error:?}"))?;
-        let staging_res: ID3D11Resource = staging
-            .cast()
-            .map_err(|error| format!("cast shader vector staging: {error:?}"))?;
-        context.CopyResource(&staging_res, &output_res);
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        context
-            .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .map_err(|error| format!("Map(shader vector readback): {error:?}"))?;
-        let samples = width as usize;
-        let mut actual = vec![0u16; samples * 3];
-        for plane in 0..3 {
-            let row = std::slice::from_raw_parts(
-                (mapped.pData.cast::<u8>())
-                    .add(mapped.RowPitch as usize * plane)
-                    .cast::<u16>(),
-                samples,
-            );
-            actual[plane * samples..(plane + 1) * samples].copy_from_slice(row);
-        }
-        context.Unmap(&staging_res, 0);
-
-        let mut y = vec![0u16; samples];
-        let mut u = vec![0u16; samples];
-        let mut v = vec![0u16; samples];
-        match transform {
-            WideScrgbTransform::Sdr(transform) => convert_scrgb_to_sdr_i444_p16(
-                source,
-                samples * 8,
-                [&mut y, &mut u, &mut v],
-                [samples, samples, samples],
-                samples,
-                1,
-                transform,
-            ),
-            WideScrgbTransform::Pq(transform) => convert_scrgb_to_pq_i444_p16(
-                source,
-                samples * 8,
-                [&mut y, &mut u, &mut v],
-                [samples, samples, samples],
-                samples,
-                1,
-                transform,
-            ),
-        }
-        .map_err(|error| error.to_string())?;
-        let mut expected = Vec::with_capacity(samples * 3);
-        expected.extend_from_slice(&y);
-        expected.extend_from_slice(&u);
-        expected.extend_from_slice(&v);
-        Ok(max_code_error(&actual, &expected))
-    }
-
-    let sdr = ScrgbSdrTransform::new(
-        ColorMatrix::Bt709,
-        ColorRange::Full,
-        BitDepth::Ten,
-        TransferCharacteristics::Bt709,
-    )
-    .expect("BT.709 SDR transform");
-    let hdr = ScrgbPqTransform::new(
-        ColorMatrix::Bt2020Ncl,
-        ColorPrimaries::Bt2020,
-        ColorRange::Full,
-        BitDepth::Ten,
-    );
-    let sdr_error = run_one(
-        device,
-        context,
-        &source_tex,
-        &source,
-        width,
-        WideScrgbTransform::Sdr(sdr),
-    )?;
-    let srgb = ScrgbSdrTransform::new(
-        ColorMatrix::Bt709,
-        ColorRange::Full,
-        BitDepth::Ten,
-        TransferCharacteristics::Srgb,
-    )
-    .expect("sRGB SDR transform");
-    let srgb_error = run_one(
-        device,
-        context,
-        &source_tex,
-        &source,
-        width,
-        WideScrgbTransform::Sdr(srgb),
-    )?;
-    let hdr_error = run_one(
-        device,
-        context,
-        &source_tex,
-        &source,
-        width,
-        WideScrgbTransform::Pq(hdr),
-    )?;
-    Ok((sdr_error, srgb_error, hdr_error))
+            transfer,
+            sdr_white_nits,
+        )
+        .map_err(|refusal| refusal.to_string())?;
+        WideGpuConverter::new(device, width, 1, conversion, GpuSlotFormat::Yuv444P16)?
+            .vector_error(context, conversion)
+    };
+    let sdr = (ColorMatrix::Bt709, ColorPrimaries::Bt709);
+    let hdr = (ColorMatrix::Bt2020Ncl, ColorPrimaries::Bt2020);
+    Ok(ShaderVectorErrors {
+        sdr: run(TransferCharacteristics::Bt709, sdr.0, sdr.1, None)?,
+        srgb: run(TransferCharacteristics::Srgb, sdr.0, sdr.1, None)?,
+        hdr: run(TransferCharacteristics::Pq, hdr.0, hdr.1, None)?,
+        hdr_white: run(TransferCharacteristics::Pq, hdr.0, hdr.1, Some(240.0))?,
+    })
 }
 
 /// Two-phase staging state: whether the CPU-readable staging texture currently
@@ -1886,20 +1951,6 @@ pub(crate) fn ensure_reconfigure_preserves_pixel_format(
 }
 
 impl Encoder {
-    /// Places SDR content, composed at `sdr_white_nits`, at BT.2408's 203-nit
-    /// graphics white in a PQ stream, the rule every Pier follows
-    /// (`arcen_media::video::pq_white`). Returns the linear gain applied, or
-    /// `None` when this encoder is not converting FP16 scRGB to PQ.
-    pub fn place_sdr_white(&mut self, sdr_white_nits: f64) -> Option<f32> {
-        match self.wide_transform.as_mut() {
-            Some(WideScrgbTransform::Pq(transform)) => {
-                *transform = transform.with_sdr_white_nits(sdr_white_nits);
-                Some(transform.white_gain())
-            }
-            Some(WideScrgbTransform::Sdr(_)) | None => None,
-        }
-    }
-
     /// codec: "h264", "h265" or "av1" (parsed once into `NvencCodec`; see its
     /// doc). `color` selects chroma, bit depth, range and matrix;
     /// `resolve_pixel_format` turns it into a concrete NVENC buffer format
@@ -1921,11 +1972,12 @@ impl Encoder {
         fps: u32,
         max_bitrate_bps: Option<u32>,
         keyframe_policy: arcen_media::video::KeyframePolicy,
-        // `wide_source` is true when the capture delivers FP16 scRGB rather
-        // than 8-bit BGRA. It drives the staging texture format, which
-        // `CopyResource` requires to match the source exactly.
-        wide_source: bool,
+        // What capture delivers. FP16 scRGB drives the staging texture
+        // format, which `CopyResource` requires to match the source exactly,
+        // and carries the SDR white the whole conversion is built with.
+        source: EncoderSource,
     ) -> Result<Self, NvencInitError> {
+        let wide_source = source.is_wide();
         let nvenc_codec = NvencCodec::parse(codec).ok_or_else(|| {
             NvencInitError::unsupported(format!(
                 "unrecognized capenc codec token {codec:?}; NVENC handles \"h264\", \"h265\" or \"av1\""
@@ -1933,40 +1985,20 @@ impl Encoder {
         })?;
         let format = resolve_pixel_format(nvenc_codec, color)
             .map_err(|rejection| NvencInitError::unsupported(rejection.to_string()))?;
-        let wide_transform = if wide_source {
-            match color.transfer {
-                TransferCharacteristics::Pq => Some(WideScrgbTransform::Pq(ScrgbPqTransform::new(
+        // Built once, white included, before the shader, the CPU path or the
+        // exact tiles can take a copy of it.
+        let wide_transform = match source {
+            EncoderSource::Scrgb { sdr_white_nits } => Some(
+                ScrgbConversion::for_stream(
                     color.matrix,
                     color.primaries,
                     color.range,
-                    arcen_media::BitDepth::Ten,
-                ))),
-                TransferCharacteristics::Bt709 | TransferCharacteristics::Srgb
-                    if color.primaries == ColorPrimaries::Bt709 =>
-                {
-                    let transform = ScrgbSdrTransform::new(
-                        color.matrix,
-                        color.range,
-                        arcen_media::BitDepth::Ten,
-                        color.transfer,
-                    )
-                    .ok_or_else(|| {
-                        NvencInitError::unsupported(format!(
-                            "FP16 scRGB capture cannot serve {:?} SDR transfer",
-                            color.transfer
-                        ))
-                    })?;
-                    Some(WideScrgbTransform::Sdr(transform))
-                }
-                _ => {
-                    return Err(NvencInitError::unsupported(format!(
-                        "FP16 scRGB capture cannot serve {:?} primaries with {:?} transfer",
-                        color.primaries, color.transfer
-                    )));
-                }
-            }
-        } else {
-            None
+                    color.transfer,
+                    sdr_white_nits,
+                )
+                .map_err(|refusal| NvencInitError::unsupported(refusal.to_string()))?,
+            ),
+            EncoderSource::Bgra8 => None,
         };
         // 1. Load the runtime DLL + the single entry point (rest is a fn table).
         let lib = load_nvenc_runtime().map_err(|error| {
@@ -2433,7 +2465,6 @@ impl Encoder {
                         width,
                         height,
                         transform,
-                        color.range,
                         GpuSlotFormat::Yuv444P16,
                     ) {
                         Ok(converter) => {
@@ -2491,14 +2522,7 @@ impl Encoder {
             cleanup_slots(resources.fl, resources.enc, &mut resources.slots);
             match wide_transform
                 .map(|transform| {
-                    WideGpuConverter::new(
-                        device,
-                        width,
-                        height,
-                        transform,
-                        color.range,
-                        GpuSlotFormat::Abgr10,
-                    )
+                    WideGpuConverter::new(device, width, height, transform, GpuSlotFormat::Abgr10)
                 })
                 .transpose()
             {
@@ -2639,7 +2663,7 @@ impl Encoder {
         resources.enc = std::ptr::null_mut();
         drop(resources);
 
-        Ok(Self {
+        let encoder = Self {
             _library: library,
             fl,
             enc,
@@ -2676,18 +2700,73 @@ impl Encoder {
             last_mirror_ms: 0.0,
             last_stage_timing: StageTiming::default(),
             refine_readback: None,
-        })
+        };
+        match encoder.verify_wide_shader() {
+            Ok(Some(colour)) => crate::log(&format!(
+                "wide FP16 shader constants: {:?} range={:?} white_gain={:.3} (read back; the \
+                 CPU path and the exact tiles use the same conversion)",
+                colour.mode, colour.range, colour.white_gain
+            )),
+            Ok(None) => {}
+            Err(error) => crate::log(&format!("wide FP16 shader constants: {error}")),
+        }
+        Ok(encoder)
     }
 
-    /// The R′G′B′ code transform this session's FP16 conversion applies
-    /// before its matrix: the exact-still-image source's codes (ADR 0016
-    /// §1). `None` for an eight-bit session.
-    pub(crate) fn refine_codes(&self) -> Option<arcen_media::refine::scrgb::ScrgbCodes> {
-        use arcen_media::refine::scrgb::ScrgbCodes;
-        self.wide_transform.map(|transform| match transform {
-            WideScrgbTransform::Sdr(transform) => ScrgbCodes::Sdr(transform),
-            WideScrgbTransform::Pq(transform) => ScrgbCodes::Pq(transform),
-        })
+    /// This session's one FP16 scRGB conversion: what the video is
+    /// converted with on either backend, and the exact-still-image source's
+    /// codes (ADR 0016 §1). `None` for an eight-bit session.
+    pub(crate) fn wide_conversion(&self) -> Option<ScrgbConversion> {
+        self.wide_transform
+    }
+
+    /// Proves that the GPU shader runs [`Self::wide_conversion`]: its
+    /// constant buffer, read back from the GPU, carries exactly that
+    /// conversion's colour values. `Ok(None)` when no shader converts this
+    /// session (eight-bit, or the CPU conversion).
+    ///
+    /// # Safety
+    ///
+    /// D3D11 calls on the encoder's device.
+    pub(crate) unsafe fn verify_wide_shader(&self) -> Result<Option<ScrgbShaderParams>, String> {
+        let (Some(converter), Some(conversion)) = (self.wide_gpu.as_ref(), self.wide_transform)
+        else {
+            return Ok(None);
+        };
+        let live = converter.read_constants(&self.context)?;
+        let expected = WideShaderParams::new(
+            self.width,
+            self.height,
+            if live.output_kind == 0 {
+                GpuSlotFormat::Yuv444P16
+            } else {
+                GpuSlotFormat::Abgr10
+            },
+            conversion.shader_params(),
+        );
+        if live != expected {
+            return Err(format!(
+                "the GPU conversion's constants {live:?} are not the session's conversion \
+                 {expected:?}"
+            ));
+        }
+        Ok(live.colour())
+    }
+
+    /// The live shader's largest code difference from
+    /// [`Self::wide_conversion`] over the shared FP16 test vectors
+    /// (`None` without a shader).
+    ///
+    /// # Safety
+    ///
+    /// D3D11 calls on the encoder's device.
+    pub(crate) unsafe fn wide_shader_vector_error(&self) -> Result<Option<u16>, String> {
+        match (self.wide_gpu.as_ref(), self.wide_transform) {
+            (Some(converter), Some(conversion)) => {
+                converter.vector_error(&self.context, conversion).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Prepares the GPU path's exact-still-image readback (two FP16
@@ -4251,32 +4330,21 @@ struct ScrgbConversionJob<'source, 'destination> {
     strides: [usize; 3],
     width: usize,
     height: usize,
-    transform: WideScrgbTransform,
+    transform: ScrgbConversion,
 }
 
 impl ScrgbConversionJob<'_, '_> {
     fn run(self) -> Result<(), String> {
-        match self.transform {
-            WideScrgbTransform::Pq(transform) => convert_scrgb_to_pq_i444_p16(
+        self.transform
+            .convert_i444_p16(
                 self.source,
                 self.source_stride,
                 self.planes,
                 self.strides,
                 self.width,
                 self.height,
-                transform,
-            ),
-            WideScrgbTransform::Sdr(transform) => convert_scrgb_to_sdr_i444_p16(
-                self.source,
-                self.source_stride,
-                self.planes,
-                self.strides,
-                self.width,
-                self.height,
-                transform,
-            ),
-        }
-        .map_err(|error| error.to_string())
+            )
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -4288,7 +4356,7 @@ fn convert_scrgb_to_i444_p16_parallel(
     strides: [usize; 3],
     width: usize,
     height: usize,
-    transform: WideScrgbTransform,
+    transform: ScrgbConversion,
     workers: usize,
 ) -> Result<(), String> {
     let row_bytes = width
@@ -4756,6 +4824,10 @@ mod staged_capture_tests {
 #[cfg(test)]
 mod pixel_format_tests {
     use super::*;
+    use arcen_media::video::{
+        convert_scrgb_to_pq_i444_p16, convert_scrgb_to_sdr_i444_p16, ScrgbPqTransform,
+        ScrgbSdrTransform,
+    };
     use arcen_media::{ColorPrimaries, ColorRange, TransferCharacteristics};
 
     fn color(chroma: ChromaSubsampling, bit_depth: BitDepth) -> crate::ColorSpec {
@@ -5534,6 +5606,7 @@ mod pixel_format_tests {
             ColorPrimaries::Bt2020,
             ColorRange::Full,
             BitDepth::Ten,
+            None,
         );
 
         let (serial_y, serial_rest) = serial.split_at_mut(plane_samples);
@@ -5557,7 +5630,7 @@ mod pixel_format_tests {
             [stride, stride, stride],
             width,
             height,
-            WideScrgbTransform::Pq(transform),
+            ScrgbConversion::Pq(transform),
             4,
         )
         .unwrap();
@@ -5616,7 +5689,7 @@ mod pixel_format_tests {
             [stride, stride, stride],
             width,
             height,
-            WideScrgbTransform::Sdr(transform),
+            ScrgbConversion::Sdr(transform),
             4,
         )
         .unwrap();
@@ -5651,6 +5724,7 @@ mod pixel_format_tests {
             ColorPrimaries::Bt2020,
             ColorRange::Full,
             BitDepth::Ten,
+            None,
         );
         let available = std::thread::available_parallelism().map_or(1, usize::from);
         for workers in [1, 4, 8, 12, 16, 24, 32] {
@@ -5667,7 +5741,7 @@ mod pixel_format_tests {
                     [stride, stride, stride],
                     width,
                     height,
-                    WideScrgbTransform::Pq(transform),
+                    ScrgbConversion::Pq(transform),
                     workers,
                 )
                 .expect("valid throughput fixture");
@@ -5925,5 +5999,87 @@ mod reconfigure_lifecycle_tests {
             color(ChromaSubsampling::Yuv444, BitDepth::Ten, ColorMatrix::Bt709),
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod live_wide_shader_tests {
+    use super::*;
+
+    /// Windows HDR once built the GPU shader with a white gain of 1, before
+    /// it read the SDR white, and moved only the CPU copy of the conversion
+    /// to 203 nits afterwards: the exact tiles sat at 203 nits and the video
+    /// around them at 240. A live encoder's shader must run, from its own
+    /// constant buffer on the GPU, the conversion the tiles take.
+    #[test]
+    fn a_live_hdr_encoder_shader_runs_the_conversion_its_tiles_use() {
+        let Ok((device, context)) = (unsafe { crate::win::create_headless_selftest_device() })
+        else {
+            eprintln!("skipped: no NVIDIA adapter on this machine");
+            return;
+        };
+        let color = crate::ColorSpec {
+            chroma: ChromaSubsampling::Yuv444,
+            bit_depth: BitDepth::Ten,
+            range: ColorRange::Full,
+            matrix: ColorMatrix::Bt2020Ncl,
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferCharacteristics::Pq,
+        };
+        let encoder = unsafe {
+            Encoder::new(
+                &device,
+                &context,
+                256,
+                64,
+                "h265",
+                color,
+                EncodeIntent::default(),
+                MotionPriority::Detail,
+                crate::qp_map::QpMapPolicy::Off,
+                60,
+                None,
+                arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
+                EncoderSource::Scrgb {
+                    sdr_white_nits: Some(240.0),
+                },
+            )
+        }
+        .expect("HDR NVENC encoder");
+        assert_eq!(encoder.conversion_backend(), ConversionBackend::Gpu);
+
+        let tiles = encoder.wide_conversion().expect("an FP16 conversion");
+        let gain = tiles.white_gain();
+        assert!(
+            (f64::from(gain) - 203.0 / 240.0).abs() < 1e-6,
+            "the tiles place 240-nit white at 203 nits, gain {gain}"
+        );
+        let live = unsafe { encoder.verify_wide_shader() }
+            .expect("the shader's constants are the conversion's")
+            .expect("a GPU shader converts this session");
+        assert_eq!(live, tiles.shader_params());
+        assert!((live.white_gain - gain).abs() < f32::EPSILON);
+
+        // The constants are not only stored but run: the live shader's codes
+        // for the shared vectors are the tiles' codes.
+        let error = unsafe { encoder.wide_shader_vector_error() }
+            .expect("live shader vectors")
+            .expect("a GPU shader converts this session");
+        assert!(error <= 1, "live shader is {error} codes from the tiles");
+
+        // A gain of 1 (the old shader) is many codes away on the same
+        // vectors, so the check above would have caught it.
+        let composed = ScrgbConversion::for_stream(
+            color.matrix,
+            color.primaries,
+            color.range,
+            color.transfer,
+            None,
+        )
+        .expect("HDR conversion");
+        let white = 0x3c00;
+        let placed = tiles.rgb_codes(white, white, white)[0];
+        let unplaced = composed.rgb_codes(white, white, white)[0];
+        assert!(unplaced.abs_diff(placed) > 1, "{unplaced} vs {placed}");
     }
 }

@@ -153,6 +153,10 @@ pub struct SessionPolicy {
     pub serving_uid: Option<u32>,
     /// This process serves the login window rather than a user's desktop.
     pub login_window: bool,
+    /// A user's agent under the network service: a Deck that proves another
+    /// account is handed to the service's change-of-account decision
+    /// (`crate::handover`) instead of being refused here.
+    pub account_switch_relay: bool,
     /// `video.lossless_refinement`: the administrator's exact-still-image
     /// switch (on unless turned off).
     pub lossless_refinement: bool,
@@ -186,6 +190,7 @@ impl SessionPolicy {
             encoder: encoder_capabilities(),
             serving_uid: None,
             login_window: false,
+            account_switch_relay: false,
             lossless_refinement: arcen_session::pier_config::LosslessRefinementSetting::resolve(
                 config.video.lossless_refinement,
             ),
@@ -223,6 +228,7 @@ impl Default for SessionPolicy {
             encoder: encoder_capabilities(),
             serving_uid: None,
             login_window: false,
+            account_switch_relay: false,
             lossless_refinement: true,
             fps_ceiling: None,
             desk_privacy: arcen_session::console_session::desk_privacy::DeskPrivacyPolicy::default(
@@ -518,6 +524,7 @@ impl RequestedDesktop {
                     width,
                     height,
                     %error,
+                    reason_code = arcen_outputs::display_truth::DisplayTruthReason::DisplayNotCreated.code(),
                     "serving this host's own display instead"
                 );
                 None
@@ -1240,6 +1247,26 @@ fn admit_serving_account(
     }
 }
 
+/// What this agent tells the service instead of `auth_result` when the
+/// Deck proved another account than the one it serves and can confirm a
+/// change of account (`switch`: a Deck with `account_switch_v1`, under the
+/// service). `None` leaves the sign-in to [`admit_serving_account`].
+fn switch_candidate(
+    checked: &Result<crate::auth::Authenticated, crate::auth::AuthFailure>,
+    serving_uid: Option<u32>,
+    switch: bool,
+) -> Option<arcen_session::agent_relay::AgentMessage> {
+    let (Ok(authenticated), Some(serving), true) = (checked, serving_uid, switch) else {
+        return None;
+    };
+    let uid = authenticated.uid.filter(|uid| *uid != serving)?;
+    Some(arcen_session::agent_relay::AgentMessage::SwitchCandidate {
+        uid,
+        user: authenticated.user.clone(),
+        logout_route: crate::handover::logout_route_present(),
+    })
+}
+
 static AUTHENTICATION_SLOT: crate::blocking::BlockingSlot = crate::blocking::BlockingSlot::new();
 
 async fn authenticate_credentials(
@@ -1469,6 +1496,7 @@ async fn perform_application_handshake(
         &advertised,
         advertised.multi_monitor_v1.clone(),
         policy.serving_uid,
+        policy.account_switch_relay,
         peer,
         admission,
     )
@@ -2541,6 +2569,7 @@ async fn authenticate(
     capabilities: &AdvertisedCapabilities,
     multi_monitor_v1: Option<arcen_protocol::messages::AuthMultiMonitorOfferMsg>,
     serving_uid: Option<u32>,
+    account_switch_relay: bool,
     peer: Option<std::net::IpAddr>,
     admission: Option<&std::sync::Arc<arcen_session::session_admission::SessionAdmissionRuntime>>,
 ) -> Result<
@@ -2636,6 +2665,24 @@ async fn authenticate(
         },
         None => Err(crate::auth::AuthFailure::InvalidCredentials),
     };
+    // Another account proved its password and its Deck can confirm a change
+    // of account: the service decides (`crate::handover`), not this agent,
+    // which shows that account nothing and ends here.
+    if let Some(candidate) = switch_candidate(
+        &outcome,
+        serving_uid,
+        account_switch_relay && response.account_switch_v1,
+    ) {
+        let candidate = serde_json::to_string(&candidate).map_err(|error| {
+            HandshakeError::Transport(format!("encode switch candidate: {error}"))
+        })?;
+        net::send_json(socket, candidate)
+            .await
+            .map_err(HandshakeError::Transport)?;
+        return Err(HandshakeError::Rejected(
+            crate::auth::AuthFailure::NotConsoleOwner,
+        ));
+    }
     let outcome =
         outcome.and_then(|authenticated| admit_serving_account(authenticated, serving_uid));
     // The video request, only once the account is proved and before the Deck
@@ -2844,6 +2891,36 @@ mod tests {
             admit_serving_account(person(None), Some(501)),
             Err(crate::auth::AuthFailure::NotConsoleOwner)
         );
+    }
+
+    #[test]
+    fn only_another_account_from_a_confirming_deck_goes_to_the_service() {
+        use arcen_session::agent_relay::AgentMessage;
+        let person = |uid| {
+            Ok(crate::auth::Authenticated {
+                user: "someone".to_owned(),
+                uid,
+            })
+        };
+        // The agent's own account joins its own session as before.
+        assert!(switch_candidate(&person(Some(501)), Some(501), true).is_none());
+        // An older Deck, `serve` or the login window: today's refusal.
+        assert!(switch_candidate(&person(Some(502)), Some(501), false).is_none());
+        assert!(switch_candidate(&person(Some(502)), None, true).is_none());
+        // A failed password or an unresolved account is never a candidate.
+        assert!(switch_candidate(&person(None), Some(501), true).is_none());
+        assert!(
+            switch_candidate(
+                &Err(crate::auth::AuthFailure::InvalidCredentials),
+                Some(501),
+                true
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            switch_candidate(&person(Some(502)), Some(501), true),
+            Some(AgentMessage::SwitchCandidate { uid: 502, ref user, .. }) if user == "someone"
+        ));
     }
 
     #[test]
@@ -4288,7 +4365,7 @@ mod tests {
             serde_json::from_str::<AuthResult>(&result).expect("auth_result parses")
         };
         let capabilities = capabilities();
-        let pier_side = authenticate(&mut pier, &capabilities, None, None, None, None);
+        let pier_side = authenticate(&mut pier, &capabilities, None, None, false, None, None);
         let (result, outcome) = tokio::join!(deck_side, pier_side);
         (result, outcome.map(|_| ()))
     }
@@ -4321,7 +4398,7 @@ mod tests {
         };
         // This host offered no multi-monitor support at all.
         let capabilities = capabilities();
-        let pier_side = authenticate(&mut pier, &capabilities, None, None, None, None);
+        let pier_side = authenticate(&mut pier, &capabilities, None, None, false, None, None);
         let (result, outcome) = tokio::join!(deck_side, pier_side);
         assert!(!result.success);
         assert!(result.session_setup_failed, "{result:?}");

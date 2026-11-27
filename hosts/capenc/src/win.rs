@@ -1401,7 +1401,18 @@ unsafe fn create_nvenc_encoder(
     fps: u32,
     max_bitrate_bps: Option<u32>,
 ) -> Result<crate::nvenc::Encoder, crate::nvenc::NvencInitError> {
-    crate::nvenc::Encoder::new(
+    let sdr_white = hdr_sdr_white(cap, color);
+    let source = if cap.is_wide() {
+        // From the pool that was actually created, so staging and conversion
+        // follow the concrete source format rather than the request. The
+        // white is read first: the conversion is built with it, once.
+        crate::nvenc::EncoderSource::Scrgb {
+            sdr_white_nits: sdr_white.map(|white| white.nits),
+        }
+    } else {
+        crate::nvenc::EncoderSource::Bgra8
+    };
+    let encoder = crate::nvenc::Encoder::new(
         cap.device(),
         cap.context(),
         cap.width(),
@@ -1414,53 +1425,63 @@ unsafe fn create_nvenc_encoder(
         fps,
         max_bitrate_bps,
         arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
-        // From the pool that was actually created, so staging and conversion
-        // follow the concrete source format rather than the request.
-        cap.is_wide(),
-    )
-    .map(|mut encoder| {
-        place_hdr_sdr_white(cap, &mut encoder, color);
-        encoder
-    })
+        source,
+    )?;
+    if let (Some(white), Some(conversion)) = (sdr_white, encoder.wide_conversion()) {
+        // What the encoder's own conversion does with the white, which its
+        // shader, its CPU path and the exact tiles all run.
+        let gain = conversion.white_gain();
+        log(&format!(
+            "HDR SDR white: host {:.0} nits (level {}) placed at {:.0} nits in the video and \
+             the exact tiles, linear gain {gain:.3}",
+            white.nits,
+            white.level,
+            white.nits * f64::from(gain)
+        ));
+    }
+    Ok(encoder)
 }
 
-/// Puts the desktop's SDR white at 203 nits in an HDR stream.
+/// Where Windows composes the desktop's SDR white on an HDR output.
+#[cfg(feature = "nvenc")]
+#[derive(Clone, Copy)]
+struct HdrSdrWhite {
+    level: u32,
+    nits: f64,
+}
+
+/// Reads where Windows composes SDR content on the captured HDR output, so
+/// the encoder can place it at 203 nits.
 ///
 /// Windows composes SDR content in scRGB at the output's SDR white level,
 /// set by its "SDR content brightness" slider: 240 nits by default, measured
 /// on the lab. The macOS Pier places the same content at BT.2408's 203 nits,
 /// and a Deck should see one host's desktop as bright as another's. An
-/// unreadable level leaves the frame as composed, and says so.
+/// unreadable level leaves the frame as composed, and says so. `None` for
+/// anything but an FP16 HDR capture.
 #[cfg(feature = "nvenc")]
-unsafe fn place_hdr_sdr_white(
-    cap: &Source,
-    encoder: &mut crate::nvenc::Encoder,
-    color: crate::ColorSpec,
-) {
+unsafe fn hdr_sdr_white(cap: &Source, color: crate::ColorSpec) -> Option<HdrSdrWhite> {
     if color.transfer != arcen_media::TransferCharacteristics::Pq || !cap.is_wide() {
-        return;
+        return None;
     }
     let Source::Wgc(wgc) = cap else {
-        return;
+        return None;
     };
     match sdr_white_level(wgc.monitor()) {
         Ok(level) => {
             let Some(nits) = arcen_media::video::pq_white::windows_sdr_white_level_nits(level)
             else {
                 log("HDR SDR white: Windows reported level 0; frame left as composed");
-                return;
+                return None;
             };
-            if let Some(gain) = encoder.place_sdr_white(nits) {
-                log(&format!(
-                    "HDR SDR white: host {nits:.0} nits (level {level}) placed at {:.0} nits, \
-                     linear gain {gain:.3}",
-                    arcen_media::video::pq_white::GRAPHICS_WHITE_NITS
-                ));
-            }
+            Some(HdrSdrWhite { level, nits })
         }
-        Err(error) => log(&format!(
-            "HDR SDR white: level unreadable ({error}); frame left as composed"
-        )),
+        Err(error) => {
+            log(&format!(
+                "HDR SDR white: level unreadable ({error}); frame left as composed"
+            ));
+            None
+        }
     }
 }
 
@@ -2291,7 +2312,7 @@ unsafe fn create_encode_device(
 /// Preserve the standalone headless self-test contract: it diagnoses the first
 /// usable NVIDIA adapter without requiring an attached desktop output.
 #[cfg(feature = "nvenc")]
-unsafe fn create_headless_selftest_device(
+pub(crate) unsafe fn create_headless_selftest_device(
 ) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
     let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
     let mut adapter_index = 0u32;
@@ -2383,9 +2404,10 @@ unsafe fn run_selftest(
                 .and_then(|result| result)
         });
     match vector_result {
-        Ok((sdr, srgb, hdr)) => log(&format!(
-            "FP16 shader vectors: sdr_max_code_error={sdr} srgb_max_code_error={srgb} \
-             hdr_max_code_error={hdr}"
+        Ok(errors) => log(&format!(
+            "FP16 shader vectors: sdr_max_code_error={} srgb_max_code_error={} \
+             hdr_max_code_error={} hdr_240_white_max_code_error={}",
+            errors.sdr, errors.srgb, errors.hdr, errors.hdr_white
         )),
         Err(error) => log(&format!("FP16 shader vectors unavailable: {error}")),
     }
@@ -2408,7 +2430,16 @@ unsafe fn run_selftest(
         60,
         None,
         arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
-        wide_source,
+        if wide_source {
+            // Windows' default SDR white, so an HDR selftest's live shader
+            // check below runs a white gain other than 1.
+            crate::nvenc::EncoderSource::Scrgb {
+                sdr_white_nits: (color.transfer == arcen_media::TransferCharacteristics::Pq)
+                    .then_some(240.0),
+            }
+        } else {
+            crate::nvenc::EncoderSource::Bgra8
+        },
     ) {
         Ok(e) => e,
         Err(e) => {
@@ -2421,6 +2452,14 @@ unsafe fn run_selftest(
          (synthetic content)",
         color.chroma, color.bit_depth, color.range, color.matrix
     ));
+    match encoder.wide_shader_vector_error() {
+        Ok(Some(error)) => log(&format!(
+            "live FP16 shader vectors: max_code_error={error} (the encoder's own shader against \
+             its conversion)"
+        )),
+        Ok(None) => {}
+        Err(error) => log(&format!("live FP16 shader vectors unavailable: {error}")),
+    }
 
     // CPU-writable staging texture; mutate it each frame then CopyResource into
     // the encoder's registered input (same GPU copy the live path does).
@@ -2606,7 +2645,7 @@ unsafe fn run_admission_probe(
         fps,
         None,
         arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
-        false,
+        crate::nvenc::EncoderSource::Bgra8,
     ) {
         Ok(encoder) => encoder,
         Err(error) => {
@@ -2989,7 +3028,7 @@ fn nvenc_attempt_for_row(
             60,
             None,
             arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
-            false,
+            crate::nvenc::EncoderSource::Bgra8,
         )
     } {
         Ok(encoder) => encoder,
@@ -3200,7 +3239,7 @@ fn write_roundtrip_bitstream_for_row(
             60,
             None,
             arcen_media::video::KeyframePolicy::ON_DEMAND_ONLY,
-            false,
+            crate::nvenc::EncoderSource::Bgra8,
         )
     }
     .map_err(|error| format!("Encoder::new: {error}"))?;

@@ -552,6 +552,43 @@ answered while somebody is logged in.
   `CGSessionCopyCurrentDictionary`'s `kCGSSessionIDKey`: that dictionary
   does not carry it (macOS 26), and no record would be written. Between the death and the lock screen the desk's input
   is not filtered, because the tap's Accessibility grant is the agent's.
+* **A change of account goes through the service** (`handover.rs`, shared
+  `session_handover`, ADR 0025 §13). An agent serves only its own account,
+  as before; when another account proves its password from a Deck that
+  sent `account_switch_v1`, the agent answers the service with
+  `AgentMessage::SwitchCandidate` instead of `auth_result` and shows that
+  account nothing. The service (`_arcen`, never root) keeps the one
+  `SwitchLedger` and decides from the facts: the console user record
+  `State:/Users/ConsoleUser` through `scutil` (account, window-server
+  session, audit session, unique session id), `kern.bootsessionuuid`,
+  Arcen's attached Decks, and from `netstat` established connections to
+  Screen Sharing, Remote Management and VNC servers (TCP 5900-5909), the
+  remote workstation protocol (TCP/UDP 4172) and third-party relay ports
+  (5938, 7070, 21115-21119); a product on another port is not seen.
+  Every sign-in an agent accepts is checked against the ledger before its
+  lanes are granted, and every grant and every end of an attached relay
+  moves the attachment epoch.
+* **The graceful logout is not offered yet** (`GRACEFUL_LOGOUT_ROUTE` is
+  off): another account is refused with the shared `PierCannotSignOut`
+  (`console_other_user`). The route is built — `ServiceMessage::SignOut`
+  to a *parked* agent of the target account, `kAEReallyLogOut` to its own
+  `loginwindow` addressed by pid (by bundle id the Apple Event daemon
+  answers `procNotFound`), the exact session's absence from the console
+  user record as proof, then the same Deck at the login window's agent
+  with the `auth_response` it sent — but on macOS 26.5.2 it has not yet
+  logged a session out. Without `com.apple.security.automation.apple-events`
+  on the helper, tccd refuses its Apple events and `loginwindow` ignores
+  them. With it (lab build only), `loginwindow` received
+  `kAEReallyLogOut` and a new account's first-login session (Setup
+  Assistant and system dialogs open) was still there after two minutes,
+  reported as `logout_vetoed`; its owner's Deck was refused meanwhile with
+  `console_session_changed`. `osascript` got `errAEEventNotHandled`
+  (-1708) from `loginwindow` for `kAEReallyLogOut` and `kAELogOut` against
+  a locked session. Turning the route on needs that entitlement (a
+  Release/Security change) and a lab proof on an ordinary session. `AEDesc` is
+  two-byte packed (`AEDataModel.h`): a naturally aligned copy killed the
+  agent on its first request. Never `bootout gui/`, never kill a process,
+  never force.
 * **Awake while serving.** Every connection declares user activity first (a
   sleeping display is not an active one, and the inventory would be empty),
   and a session holds a `PreventUserIdleSystemSleep` assertion (`power`).

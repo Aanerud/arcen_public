@@ -16,6 +16,10 @@ pub(crate) mod console_layout;
 pub(crate) mod console_wayland;
 #[cfg(target_os = "linux")]
 pub(crate) mod console_windows;
+#[cfg(target_os = "linux")]
+pub mod diagnose;
+#[cfg(target_os = "linux")]
+pub(crate) mod handover;
 pub mod handshake;
 pub mod identity;
 pub mod launcher;

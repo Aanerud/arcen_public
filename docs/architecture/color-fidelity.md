@@ -201,6 +201,13 @@ Likewise, writing an unshifted code such as `0x0200` where NVENC expects
 `ScrgbSdrTransform`, `ScrgbPqTransform`, and the wide-conversion tests pin these
 invariants.
 
+HDR also places the desktop's SDR white, which Windows composes at its SDR
+white level (240 nits by default), at BT.2408's 203 nits. The white is read
+before the encoder exists and goes into the one `ScrgbConversion` of the
+stream. The GPU shader's constants, the CPU conversion and the exact tiles all
+come from that value, and capenc reads the shader's constants back from the
+GPU to prove it.
+
 The conversion runs on the CPU, but not as a per-pixel `powf` path. A
 process-wide table stores the 1023 PQ half-code boundaries, each component uses
 a binary search, and the frame is split across up to eight row workers. An

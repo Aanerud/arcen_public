@@ -71,6 +71,10 @@ fn main() -> ExitCode {
                 &args[2..],
             )),
             #[cfg(target_os = "linux")]
+            "diagnose" => Some(arcen_pier_linux::session::diagnose::diagnose_main(
+                &args[2..],
+            )),
+            #[cfg(target_os = "linux")]
             "repair-x11-unix-dir" => {
                 Some(arcen_pier_linux::session::socket_dirs::cli_main(&args[2..]))
             }
@@ -520,6 +524,7 @@ fn print_help() {
          \x20  arcen-pier new-host-cert [--directory <DIR>]\n\
          \x20  arcen-pier wayland qualify [--write] [--user <NAME> --password-file <FILE>]\n\
          \x20  arcen-pier repair-x11-unix-dir [--check | [--requalify] [--record PATH]]\n\
+         \x20  arcen-pier diagnose displays [--json]\n\
          \n\
          FLAGS:\n\
          \x20   -V, --version    Print version and exit\n\

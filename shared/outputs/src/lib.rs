@@ -32,6 +32,11 @@
 //!   changes are returned, which displays are removed or restored (never a
 //!   display Arcen did not create), and which windows move back to a
 //!   display the local user can see.
+//! - [`display_truth`]: what a Pier's displays are as the OS reads them
+//!   back, and the three-part display contract judged on it: a Deck's
+//!   departure leaves exactly what was there before it attached, a display
+//!   is reused only when it already serves the request (refresh included),
+//!   and HDR is claimed only on outputs that read back HDR.
 //! - [`virtual_topology`]: placement of a requested topology onto virtual
 //!   outputs a compositor creates on demand (no head inventory).
 //! - [`ui_scale`]: the desktop UI scale for one virtual output, decided from
@@ -77,6 +82,7 @@ pub mod applied;
 pub mod atomic_start;
 pub mod console_layout;
 pub mod display_lease;
+pub mod display_truth;
 pub mod edid;
 pub mod edid_provisioning;
 pub mod fairness;

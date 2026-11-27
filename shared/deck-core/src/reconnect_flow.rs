@@ -252,9 +252,13 @@ pub enum ResumeLaunch {
         attempt: ResumeAttempt,
         deadline: Instant,
     },
-    /// The resume cannot continue (identity changed, window closed): the
-    /// shell returns to its credentials screen.
-    Abandon,
+    /// The resume cannot continue: the shell returns to its credentials
+    /// screen and says this. [`SignInFailure::DisplaysChanged`] when the
+    /// Deck's displays changed since the session attached (the grant was
+    /// bound to the old request and is not used; signing in negotiates the
+    /// current displays on the same host desktop), else
+    /// [`SignInFailure::SessionEnded`] (identity changed, window closed).
+    Abandon(SignInFailure),
 }
 
 /// Takes the controller's due resume attempt, if any, against the live
@@ -266,8 +270,18 @@ pub fn next_resume_launch(
     identity: &ConnectionIdentity,
     snapshot: Option<&ConnectOptions>,
 ) -> ResumeLaunch {
-    let Ok(attempt) = controller.take_due(clock.now(), generation, identity) else {
-        return ResumeLaunch::Abandon;
+    let attempt = match controller.take_due(clock.now(), generation, identity) {
+        Ok(attempt) => attempt,
+        Err(ControllerError::DisplaysChanged) => {
+            tracing::info!(
+                target: crate::log_target::SESSION,
+                event = "displays_changed_before_resume",
+                "this Deck's displays changed since the session attached; its resume grant \
+                 is not used, and signing in negotiates the current displays",
+            );
+            return ResumeLaunch::Abandon(SignInFailure::DisplaysChanged);
+        }
+        Err(_) => return ResumeLaunch::Abandon(SignInFailure::SessionEnded),
     };
     let Some(attempt) = attempt else {
         return ResumeLaunch::Idle;
@@ -277,10 +291,10 @@ pub fn next_resume_launch(
         .ok()
         .and_then(|_| clock.instant_at(controller.resume_deadline().ok()?));
     let Some(deadline) = deadline else {
-        return ResumeLaunch::Abandon;
+        return ResumeLaunch::Abandon(SignInFailure::SessionEnded);
     };
     let Some(options) = snapshot.map(|options| Box::new(options.credential_free_clone())) else {
-        return ResumeLaunch::Abandon;
+        return ResumeLaunch::Abandon(SignInFailure::SessionEnded);
     };
     ResumeLaunch::Launch {
         options,
@@ -335,6 +349,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         }
     }
 
@@ -483,6 +498,109 @@ mod tests {
         assert_eq!(retries, usize::from(MAX_ATTEMPTS));
     }
 
+    fn monitor(id: u32, x: i32, primary: bool) -> ClientMonitor {
+        ClientMonitor {
+            id,
+            x,
+            y: 0,
+            width_px: 2560,
+            height_px: 1440,
+            scale: 1.0,
+            refresh_hz: 60,
+            is_primary: primary,
+            name: format!("Display {id}"),
+            width_mm: 0.0,
+            height_mm: 0.0,
+            vendor: 0,
+            model: 0,
+            serial: id,
+            edid: String::new(),
+            color: None,
+            rotation_degrees: 0,
+        }
+    }
+
+    /// The identity of a one-display Match My Layout session (no
+    /// multi-monitor topology negotiated) over this Deck's `live` displays.
+    fn match_layout_identity(
+        options: &ConnectOptions,
+        live: Vec<ClientMonitor>,
+    ) -> ConnectionIdentity {
+        let mut draft = crate::connection_draft::ConnectionDraft::new(
+            crate::config::ConnectionKind::DirectMachine,
+        );
+        draft.host = options.host.clone();
+        let (monitors, topology) = crate::connect_plan::identity_display_state(
+            live,
+            None,
+            100,
+            0,
+            crate::connect_plan::identity_covers_every_display(
+                &options.displays_mode,
+                options.multi_monitor_topology.is_some(),
+            ),
+        );
+        connection_identity_with_live_monitors(
+            &draft,
+            options,
+            SecurityMode::High,
+            &monitors,
+            topology.as_ref(),
+            SafeAreaPolicyMsg::StandardFullscreen,
+        )
+    }
+
+    #[test]
+    fn a_display_added_to_a_one_display_match_my_layout_session_signs_in_afresh() {
+        let clock = SystemClock::default();
+        let mut options = options();
+        options.displays_mode = crate::settings::DisplaysMode::MatchLayout
+            .as_wire()
+            .to_owned();
+        options.monitors = vec![monitor(1, 0, true)];
+        let attached = match_layout_identity(&options, vec![monitor(1, 0, true)]);
+        assert_eq!(
+            attached,
+            match_layout_identity(&options, vec![monitor(1, 0, true)])
+        );
+        let mut controller = ReconnectController::new(7, attached, "nonce".to_owned());
+        let mut authentication = SessionAuthentication {
+            kind: AuthenticationKind::InitialOptIn,
+            resume_grant: Some("grant".to_owned()),
+            resume_window: Some(Duration::from_secs(60)),
+            resumed: false,
+            session_log_id: "sid".to_owned(),
+        };
+        accept_authentication(&mut controller, &mut authentication, clock.now()).unwrap();
+        let lost = end(DisconnectReason::Transient(
+            TransientTransportError::TimedOut,
+        ));
+        assert!(schedule_after_end(
+            Some(&mut controller),
+            7,
+            &lost,
+            &clock,
+            &mut Fixed
+        ));
+        std::thread::sleep(Duration::from_millis(150));
+        // A second display appeared while the Deck was away: the grant for
+        // the one-display request is not used.
+        let now =
+            match_layout_identity(&options, vec![monitor(1, 0, true), monitor(2, 2560, false)]);
+        assert!(matches!(
+            next_resume_launch(&mut controller, &clock, 7, &now, Some(&options)),
+            ResumeLaunch::Abandon(SignInFailure::DisplaysChanged)
+        ));
+        // Primary Display Only still ignores a secondary display.
+        options.displays_mode = crate::settings::DisplaysMode::SinglePrimary
+            .as_wire()
+            .to_owned();
+        assert_eq!(
+            match_layout_identity(&options, vec![monitor(1, 0, true)]),
+            match_layout_identity(&options, vec![monitor(1, 0, true), monitor(2, 2560, false)])
+        );
+    }
+
     #[test]
     fn a_manual_end_or_a_changed_identity_never_resumes() {
         let clock = SystemClock::default();
@@ -509,8 +627,22 @@ mod tests {
         moved.topology = "another layout".to_owned();
         assert!(matches!(
             next_resume_launch(&mut controller, &clock, 7, &moved, None),
-            ResumeLaunch::Abandon
+            ResumeLaunch::Abandon(SignInFailure::DisplaysChanged)
         ));
         assert_eq!(controller.phase(), &ReconnectPhase::Terminal);
+        let mut controller = granted(&clock);
+        assert!(schedule_after_end(
+            Some(&mut controller),
+            7,
+            &lost,
+            &clock,
+            &mut Fixed
+        ));
+        let mut elsewhere = identity();
+        elsewhere.endpoint = "quic://other.example.internal:18444".to_owned();
+        assert!(matches!(
+            next_resume_launch(&mut controller, &clock, 7, &elsewhere, None),
+            ResumeLaunch::Abandon(SignInFailure::SessionEnded)
+        ));
     }
 }

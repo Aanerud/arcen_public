@@ -26,7 +26,6 @@ use arcen_session::direct_reconnect::{
 use arcen_transport::{ConnectionId, DirectResumeTransportBinding};
 use futures_util::{Sink, Stream};
 use ring::hmac;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -274,28 +273,23 @@ impl fmt::Debug for TopologyBinding {
     }
 }
 
-impl TopologyBinding {
-    pub(crate) fn from_response(response: &AuthResponse) -> Result<Self, ResumeRegistryError> {
-        #[derive(serde::Serialize)]
-        struct Topology<'a> {
-            screen_width: u32,
-            screen_height: u32,
-            monitors: &'a [arcen_protocol::messages::ClientMonitor],
-            displays_mode: &'a str,
-            timezone: &'a Option<String>,
-            cursor_preference: arcen_protocol::messages::CursorMode,
-        }
+/// Whether a grant bound to `bound` authorizes `current` (shared
+/// `session_handover::displays::resume_grant_authority`): only the exact
+/// request it was issued for. Any other takes `topology_changed`, and the
+/// Deck signs in afresh into the same session.
+fn grant_covers(bound: &TopologyBinding, current: &TopologyBinding) -> bool {
+    arcen_session::session_handover::displays::resume_grant_authority(current, Some(bound))
+        .is_some()
+}
 
-        let bytes = serde_json::to_vec(&Topology {
-            screen_width: response.screen_width,
-            screen_height: response.screen_height,
-            monitors: &response.monitors,
-            displays_mode: &response.displays_mode,
-            timezone: &response.timezone,
-            cursor_preference: response.cursor_preference,
-        })
-        .map_err(|_| ResumeRegistryError::Topology)?;
-        Ok(Self(Sha256::digest(bytes).into()))
+impl TopologyBinding {
+    /// The whole request a grant is bound to (shared
+    /// `arcen_protocol::served_layout::resume_request_digest`): every
+    /// monitor of a Match My Layout request too.
+    pub(crate) fn from_response(response: &AuthResponse) -> Result<Self, ResumeRegistryError> {
+        arcen_protocol::served_layout::resume_request_digest(response)
+            .map(Self)
+            .map_err(|_| ResumeRegistryError::Topology)
     }
 }
 
@@ -798,7 +792,7 @@ impl ResumeRegistry {
             }
             if exact_predecessor {
                 if entry.bindings.host_identity != *current_host_identity
-                    || entry.bindings.topology != topology
+                    || !grant_covers(&entry.bindings.topology, &topology)
                 {
                     return Err(ResumeRejection::new(
                         ResumeErrorCode::TopologyChanged,
@@ -816,7 +810,7 @@ impl ResumeRegistry {
                 ));
             }
             if entry.bindings.host_identity != *current_host_identity
-                || entry.bindings.topology != topology
+                || !grant_covers(&entry.bindings.topology, &topology)
             {
                 entry.slot.revoke();
                 entry.state = EntryState::Draining;

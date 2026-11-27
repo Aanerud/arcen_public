@@ -74,6 +74,8 @@ pub(super) enum SessionNews {
     /// The host authenticated the attachment (with its resume grant, if
     /// any): the reconnect controller records it before it is accepted.
     Authenticated(SessionAuthentication),
+    /// A change of account: the host's offer, then its progress.
+    AccountSwitch(arcen_deck_core::account_switch::AccountSwitchNews),
     /// The desktop is up; `login_window` when it is the host's sign-in
     /// screen.
     Streaming { login_window: bool },
@@ -300,6 +302,9 @@ pub(super) fn connect_options(
             settings.canvas,
             settings.canvas_cache_mib,
         ),
+        // The window asks its user about a host's offer to sign another
+        // account out.
+        account_switch: arcen_deck_core::account_switch::AccountSwitchMode::Interactive,
     };
     let plan = super::displays::apply_display_plan(&mut options, settings, mode, approved);
     // Only the root window's presenter executes the canvas: a secondary
@@ -446,6 +451,9 @@ impl Connection {
         if let Some(authentication) = state.pending_authentication.take() {
             return SessionNews::Authenticated(authentication);
         }
+        if !state.account_switch.is_empty() {
+            return SessionNews::AccountSwitch(state.account_switch.remove(0));
+        }
         if state.closed {
             let end = state.end.clone().unwrap_or_else(|| SessionEnd {
                 reason: DisconnectReason::Terminal(TerminalDisconnect::Protocol),
@@ -539,6 +547,17 @@ impl Connection {
     pub(super) fn frame_fresh(&self) -> bool {
         self.last_frame_at
             .is_some_and(|at| at.elapsed() < Duration::from_secs(4))
+    }
+
+    /// The user's answer to the host's offer to sign another account out.
+    pub(super) fn answer_account_switch(
+        &self,
+        choice: arcen_protocol::messages::AccountSwitchChoiceMsg,
+    ) -> bool {
+        self.media
+            .commands()
+            .send(SessionCommand::AccountSwitch(choice))
+            .is_ok()
     }
 
     /// Lets the session continue after the host authenticated it.
@@ -1029,7 +1048,9 @@ impl Connection {
 
     /// What the host did with the requested display size and UI scale,
     /// when it did not do exactly that (shared
-    /// `arcen_deck_core::display_note`, the Mac's words).
+    /// `arcen_deck_core::display_note`, the Mac's words); else what this
+    /// Deck's check of every requested display against the served layout
+    /// found (`display_note::attachment_display_note`).
     pub(super) fn display_note(&self) -> Option<String> {
         let state = self
             .media
@@ -1037,7 +1058,10 @@ impl Connection {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         state.server_hello.as_ref().and_then(|hello| {
-            arcen_deck_core::display_note::display_negotiation_note(&hello.device_capabilities)
+            arcen_deck_core::display_note::attachment_display_note(
+                hello,
+                state.served_layout.as_ref(),
+            )
         })
     }
 

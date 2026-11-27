@@ -6,10 +6,11 @@
 //! linear scRGB. Half-floats have no integer truth, so the exact codes of a
 //! still block are the stream's own quantisation of them: the R′G′B′
 //! ten-bit codes the shared conversion hands the matrix
-//! ([`ScrgbSdrTransform::rgb_codes`] for Grading, [`ScrgbPqTransform::rgb_codes`]
-//! for HDR). [`ScrgbHalfSource`] mirrors the half-floats exactly (compare and
-//! copy, 8 bytes per pixel) and converts only the rectangles it extracts, so
-//! a still picture costs one conversion per tile, never one per frame.
+//! ([`ScrgbConversion::rgb_codes`], the very conversion the encoder converts
+//! the video with, so a tile and the video around it come from one value).
+//! [`ScrgbHalfSource`] mirrors the half-floats exactly (compare and copy, 8
+//! bytes per pixel) and converts only the rectangles it extracts, so a still
+//! picture costs one conversion per tile, never one per frame.
 //!
 //! A capture whose pixels reach the CPU only through a readback that lags the
 //! encoder (a GPU conversion path) cannot use the mirror's own damage for the
@@ -22,32 +23,11 @@
 
 use super::source::{RefineSource, SourceMirror};
 use super::tile::{RefineGrid, TileCodes, TileError, TileRect};
-use crate::video::{ScrgbPqTransform, ScrgbSdrTransform};
+use crate::video::ScrgbConversion;
 use arcen_protocol::refine::RefineDomain;
 
 /// Bytes of one FP16 RGBA pixel.
 pub const SCRGB_PIXEL_BYTES: usize = 8;
-
-/// The code transform of one FP16 scRGB stream: the same transform its
-/// encoder conversion was built with.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ScrgbCodes {
-    /// Grading: SDR clamp and the served SDR transfer.
-    Sdr(ScrgbSdrTransform),
-    /// HDR: target primaries, SDR white placement and PQ.
-    Pq(ScrgbPqTransform),
-}
-
-impl ScrgbCodes {
-    /// The ten-bit R′G′B′ codes of one pixel given as half-float bits.
-    #[must_use]
-    pub fn rgb(self, r: u16, g: u16, b: u16) -> [u16; 3] {
-        match self {
-            Self::Sdr(transform) => transform.rgb_codes(r, g, b),
-            Self::Pq(transform) => transform.rgb_codes(r, g, b),
-        }
-    }
-}
 
 /// The codes of `rect` of an FP16 RGBA frame whose rows are `stride` bytes
 /// apart, planar R, G, B.
@@ -60,7 +40,7 @@ pub fn extract_scrgb(
     stride: usize,
     grid: RefineGrid,
     rect: TileRect,
-    codes: ScrgbCodes,
+    codes: ScrgbConversion,
 ) -> Result<TileCodes, TileError> {
     grid.check(rect)?;
     let needed = stride
@@ -80,7 +60,7 @@ pub fn extract_scrgb(
         for pixel in row_bytes.chunks_exact(SCRGB_PIXEL_BYTES) {
             let half = |at: usize| u16::from_le_bytes([pixel[at], pixel[at + 1]]);
             // RGBA order; alpha is ignored, as the encoder conversion does.
-            let [r, g, b] = codes.rgb(half(0), half(2), half(4));
+            let [r, g, b] = codes.rgb_codes(half(0), half(2), half(4));
             r_plane[out] = r;
             g_plane[out] = g;
             b_plane[out] = b;
@@ -95,14 +75,14 @@ pub fn extract_scrgb(
 #[derive(Debug, Clone)]
 pub struct ScrgbHalfSource {
     mirror: SourceMirror,
-    codes: ScrgbCodes,
+    codes: ScrgbConversion,
     stale: bool,
 }
 
 impl ScrgbHalfSource {
     /// A source of `grid` pixels carrying `codes`' codes.
     #[must_use]
-    pub fn new(grid: RefineGrid, codes: ScrgbCodes) -> Self {
+    pub fn new(grid: RefineGrid, codes: ScrgbConversion) -> Self {
         Self {
             mirror: SourceMirror::with_pixel_bytes(grid, SCRGB_PIXEL_BYTES),
             codes,
@@ -271,9 +251,7 @@ impl DamageWitness {
 )]
 mod tests {
     use super::*;
-    use crate::video::{
-        ColorTransform, convert_scrgb_to_pq_i444_p16, convert_scrgb_to_sdr_i444_p16,
-    };
+    use crate::video::{ColorTransform, ScrgbPqTransform, ScrgbSdrTransform};
     use crate::{BitDepth, ColorMatrix, ColorPrimaries, ColorRange, TransferCharacteristics};
 
     fn half(value: f32) -> u16 {
@@ -320,8 +298,8 @@ mod tests {
             ColorPrimaries::Bt2020,
             ColorRange::Full,
             BitDepth::Ten,
+            Some(240.0),
         )
-        .with_sdr_white_nits(240.0)
     }
 
     #[test]
@@ -339,34 +317,23 @@ mod tests {
             height: 20,
         };
         let cases = [
-            (ScrgbCodes::Sdr(sdr()), ColorMatrix::Bt709),
-            (ScrgbCodes::Pq(pq()), ColorMatrix::Bt2020Ncl),
+            (ScrgbConversion::Sdr(sdr()), ColorMatrix::Bt709),
+            (ScrgbConversion::Pq(pq()), ColorMatrix::Bt2020Ncl),
         ];
         for (codes, matrix) in cases {
             let mut luma = vec![0_u16; width * height];
             let mut cb = vec![0_u16; width * height];
             let mut cr = vec![0_u16; width * height];
-            match codes {
-                ScrgbCodes::Sdr(transform) => convert_scrgb_to_sdr_i444_p16(
+            codes
+                .convert_i444_p16(
                     &bytes,
                     width * 8,
                     [&mut luma, &mut cb, &mut cr],
                     [width; 3],
                     width,
                     height,
-                    transform,
-                ),
-                ScrgbCodes::Pq(transform) => convert_scrgb_to_pq_i444_p16(
-                    &bytes,
-                    width * 8,
-                    [&mut luma, &mut cb, &mut cr],
-                    [width; 3],
-                    width,
-                    height,
-                    transform,
-                ),
-            }
-            .expect("encoder conversion");
+                )
+                .expect("encoder conversion");
             // The encoder's matrix, as the conversions build it.
             let ycbcr = ColorTransform::for_input_max(
                 matrix,
@@ -416,7 +383,7 @@ mod tests {
             width: 40,
             height: 20,
         };
-        let mut source = ScrgbHalfSource::new(grid, ScrgbCodes::Sdr(sdr()));
+        let mut source = ScrgbHalfSource::new(grid, ScrgbConversion::Sdr(sdr()));
         let mut bytes = frame(40, 20);
         let whole = TileRect {
             x: 0,

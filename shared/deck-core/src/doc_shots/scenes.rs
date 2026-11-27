@@ -42,7 +42,7 @@ use crate::trusted_pins::{StoredPin, TrustedPinStore};
 
 /// Every scene of the manual (`deck-shots/manifest.json`, release 0.20.7),
 /// in its order, then the scenes added since (not in the manifest yet).
-pub const SCENE_IDS: [&str; 21] = [
+pub const SCENE_IDS: [&str; 22] = [
     "home",
     "home-empty",
     "add-menu",
@@ -64,6 +64,7 @@ pub const SCENE_IDS: [&str; 21] = [
     "sign-in-refused",
     "settings-privacy",
     "connecting-one-display",
+    "account-switch",
 ];
 
 /// The first machine: Grade 1.
@@ -113,6 +114,13 @@ enum Screen {
     CertificateChanged(IdentityChange, CertificateChangedStep),
     /// Connecting, with the attempt's status line.
     Connecting(ConnectionDraft, String),
+    /// Connecting, with the host's offer to sign another account out over
+    /// it.
+    AccountSwitch(
+        ConnectionDraft,
+        String,
+        crate::account_switch::AccountSwitchPrompt,
+    ),
 }
 
 /// Home's state, owned (the shells keep the same fields).
@@ -270,6 +278,10 @@ impl Scene {
             "connecting-one-display" => {
                 scene.select_first();
                 scene.screen = connecting_one_display();
+            }
+            "account-switch" => {
+                scene.select_first();
+                scene.screen = account_switch_question();
             }
             "import-review" => {
                 scene.home = HomeModel::new(three_machines().into_iter().take(2).collect());
@@ -444,6 +456,10 @@ impl Scene {
                 Screen::Connecting(draft, status) => {
                     let _ = crate::screens::connecting::render_connecting(ui, draft, status, None);
                 }
+                Screen::AccountSwitch(draft, status, prompt) => {
+                    let _ = crate::screens::connecting::render_connecting(ui, draft, status, None);
+                    let _ = crate::screens::account_switch::render_account_switch(ui.ctx(), prompt);
+                }
             }
         });
     }
@@ -582,6 +598,25 @@ fn connecting_one_display() -> Screen {
     let origin = SessionDisplaysOrigin::for_attempt(source, mode);
     let status = connecting_status(&draft, origin.connecting_note());
     Screen::Connecting(draft, status)
+}
+
+/// Grade 1 signing in as Alice while another user is signed in there, and
+/// the Pier's offer to sign them out.
+fn account_switch_question() -> Screen {
+    let mut draft = ConnectionDraft::new(ConnectionKind::DirectMachine)
+        .for_saved(&saved_connection(0, "Grade 1", GRADE_HOST));
+    USER.clone_into(&mut draft.username);
+    let status = crate::connect_plan::connecting_status(&draft, None);
+    let mut prompt = crate::account_switch::AccountSwitchPrompt::default();
+    prompt.on_news(
+        crate::account_switch::AccountSwitchNews::Offered {
+            expires_in: std::time::Duration::from_secs(
+                arcen_session::session_handover::consent::DEFAULT_OFFER_LIFETIME_SECS.into(),
+            ),
+        },
+        std::time::Instant::now(),
+    );
+    Screen::AccountSwitch(draft, status, prompt)
 }
 
 /// SHA-256 of a fixed seed: a fingerprint no real host has.
