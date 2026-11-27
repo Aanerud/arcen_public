@@ -3731,21 +3731,30 @@ async fn run_console(
             )))
         }
     };
-    // The account's own desktop in another product is joined whatever that
-    // product's client does (ADR 0025 §13, shared
-    // `session_handover::HandoverDecision::JoinOwnSession`): with its client
-    // attached, or when that cannot be told, the desktop keeps its layout
-    // (`guest_layout`, below).
+    // Another product's desktop is joined only while that product's own
+    // client is not using it: one remote product at a time (ADR 0025 §8;
+    // shared `session_handover::HandoverRefusal::InUseOtherProduct`).
     let guest = origin == model::ConsoleOrigin::OtherProduct;
     if guest {
         if let Some(device) = console::another_products_client().await {
-            tracing::info!(
+            tracing::warn!(
                 target: target::SESSION,
                 session_id = %session_id,
                 device = %device,
-                reason_class = arcen_session::session_handover::HandoverReason::ReusedDesktop.token(),
-                "another remote-desktop product's client is using the account's own desktop; it is joined and keeps its layout"
+                "another remote-desktop product's client is using this desktop"
             );
+            if privacy.is_brought_forward() {
+                secure_before_leaving(&mut privacy, None, &session_id).await;
+            } else {
+                privacy.release_input();
+            }
+            let service = console::session_fact(&session_id)
+                .await
+                .map(|fact| console::foreign_service(&fact));
+            return Err(refuse(model::ConsoleNotice::naming(
+                ConsoleRefusal::InUseOtherProduct,
+                service,
+            )));
         }
     }
     // A session this sign-in brought to the desk's monitors (started by
@@ -4031,17 +4040,22 @@ async fn run_console(
                         }
                     }
                     Some("attach") => {
-                        // The account's own desktop is rejoined whatever
-                        // another product's client does (ADR 0025 §13); its
-                        // layout is the held one.
                         if guest {
                             if let Some(device) = console::another_products_client().await {
-                                tracing::info!(
+                                tracing::warn!(
                                     target: target::SESSION,
                                     device = %device,
-                                    reason_class = arcen_session::session_handover::HandoverReason::ReusedDesktop.token(),
-                                    "another remote-desktop product's client is using the account's own desktop; the returning Deck joins it"
+                                    "another remote-desktop product's client is using this desktop; the returning Deck is refused"
                                 );
+                                let service = console::session_fact(&session_id)
+                                    .await
+                                    .map(|fact| console::foreign_service(&fact));
+                                let notice = model::ConsoleNotice::naming(
+                                    ConsoleRefusal::InUseOtherProduct,
+                                    service,
+                                );
+                                let _ = write_response(&LauncherResponse::console_refusal(&notice));
+                                break;
                             }
                         }
                         // The desk's speakers are silent again before

@@ -267,7 +267,7 @@ session.
 | The account's session waits behind the login screen (switch user) | brings it forward, then joins it |
 | Nobody is signed in, GDM's login screen shows | the login screen signs the account in (a one-time token, below); GDM owns the session, so a later sign-in at the desk resumes it |
 | The account's own session in another remote-desktop product (its own X server on `seat0`) | joins it as a guest: the desktop takes the Deck's monitors and keeps them after the Deck leaves, as that product does for its own client (below); the other product is never stopped or reconfigured |
-| The same, while that product's own client is connected | joins it too: the desktop keeps the layout that product gave it, and each Deck monitor shows the output in its place |
+| The same, while that product's own client is connected | refused, `console_in_use_other_product`: one remote-desktop product at a time |
 | Another account is signed in, and a remote client (a Deck, or another product's client) is connected to it | refused, `console_other_user` or `console_other_user_other_product` |
 | Another account is signed in with no remote client connected, and the Deck offers the choice | after the password is checked, the Deck asks whether to sign that account out; Cancel changes nothing. A remote client counts as connected when it is a Deck, when another product's virtual keyboard or pointer exists, when a VNC server (`x11vnc`, `x0vncserver`, TigerVNC's `x0tigervncserver` and `Xtigervnc`, `Xvnc`, `vncserver`), GNOME Remote Desktop, `xrdp` or an NX server holds any established network connection (a reverse or tunnelled one included), or when GNOME is sharing or remote-controlling the screen. While a remote-support tool that connects through its own relay (`anydesk`, `teamviewerd`, `rustdesk`) runs, the Pier cannot tell whether anyone is connected through it: the change of account is refused with `console_remote_state_unknown`, and the log names the tool. Anything the Pier cannot read is refused the same way. A remote-access tool not in this list, with no virtual input device, is not detected. "Sign out and continue" asks GNOME to log that account out as its own Log Out does: an application that blocks logout stops it, and nothing is forced. Once that session has ended, the account signs in through the login screen as above |
 | The same, with an older Deck, or when that account's GNOME session manager does not answer | refused, `console_other_user` or `console_other_user_other_product` |
@@ -378,11 +378,14 @@ all is answered "its console cannot take this layout" (the Pier logs
 `console_layout_differs`) and offered Primary Display Only. Heads the
 product forces connected without a picture are ignored. The desk's physical monitors are
 blanked and its physical keyboards and mice disabled as on any console; the
-product's own virtual keyboards and mice are never touched. The account
-reaches its desktop from either product: a sign-in joins it while that
-product's client is connected, and an attachment stays when that client
-connects; the desktop then keeps the layout that product gave it. Arcen
-recognises that client
+product's own virtual keyboards and mice are never touched. One remote
+product encodes a desktop at a time: two products streaming the same session
+would compete for the GPU's hardware encoder (NVENC) sessions and degrade or
+fail each other. So Arcen refuses while that product's client is connected,
+and joins as soon as it leaves. While Arcen is
+attached, that product's client connecting (its virtual keyboard or pointer
+appears) ends Arcen's attachment with `console_in_use_other_product`, and
+the session is locked as on every disconnect. Arcen recognises that client
 by a keyboard or pointer made in user space (through `/dev/uinput` or
 `/dev/uhid`) while a process that is not Arcen's holds that interface; the
 machine's own firmware devices, such as HP's WMI hotkeys, and Bluetooth
@@ -544,8 +547,8 @@ workstation; one of them serves the console at a time.
 | Situation | What Arcen does |
 | --- | --- |
 | The product runs, and the account's desktop in it exists, nobody connected through the product | joins that desktop as a guest; the desktop takes the Deck's monitors (see [Joining the user's session](#joining-the-users-session-console-mode)) |
-| The product's client is connected | joins the account's own desktop as it is; its layout stays the one that product gave it |
-| The product's client connects while a Deck is attached to that desktop | both stay connected; the session is locked when the Deck leaves, as on every disconnect |
+| The product's client is connected | refuses `console_in_use_other_product` |
+| The product's client connects while a Deck is attached to that desktop | ends the Deck's attachment with `console_in_use_other_product`; the session is locked as on every disconnect |
 | The product is the host's display manager (`display-manager.service` points at its unit) and is stopped; GDM is not running | starts the account's real login session (a host without a display manager); a reconnect joins the same session |
 | The product starts again while a Deck is attached to Arcen's session | ends the attachment with `console_other_product_started`; Arcen's session is not ended by Arcen |
 | The product is the running display manager and keeps GDM's login screen off the console; nobody is signed in | starts the account's real login session when the seat, the GPU and GDM are free for it and the product's client is not connected (see [Joining the user's session](#joining-the-users-session-console-mode)); otherwise refuses `console_sign_in_other_product`, naming the product as its system service describes itself (else by its unit) |
@@ -566,8 +569,8 @@ Arcen starts the desktop itself (PAM service `arcen-login`) because no GDM
 login screen is there. The first sign-in is refused
 (`console_sign_in_other_product`) while the product's client is
 connected, its X server runs or any graphical session exists. A desktop
-the product started keeps its layout while the product's client is
-attached.
+the product started is refused (`console_in_use_other_product`) while the
+product's client is connected to it.
 
 To move a workstation from the other product to Arcen:
 
@@ -1907,7 +1910,7 @@ Key lifecycle event IDs:
 | 1103 | `SESSION_END` | Clean session end; on a Windows Pier `reason_class` `signed_out` or `host_shutdown` when Windows ended the session under a live Deck. |
 | 1104 | `SESSION_INTERRUPTED` | Transport or component failure. |
 | 1108 | `RESUME_HOLD_ENDED` | A desktop held for its Deck's resume was let go without a resume; `reason_class` says why (`resume_window_expired`, `resume_refused`, `native_session_ended`, `same_user_reattached`, `fresh_sign_in`, `pier_stopping`, `owner_failed`, `other_product_client`, `other_product_started`, `desk_took_over`), `held_ms` for how long. |
-| 1109 | `SESSION_HANDOVER` | What became of a sign-in to a desktop that another connection or account held, and of a confirmed change of account; `reason_class` says which (`reused_desktop`, `remote_busy`, `state_unknown`, `switch_unsupported`, `switch_offered`, `switch_in_progress`, `switch_cancelled`, `switch_stale`, `switch_expired`, `switch_rejected`, `logout_requested`, `logout_vetoed`, `logout_timed_out`, `logout_failed`, `logout_completed`, `new_login_failed`), `attachment` how the Deck came (`connect`, `transport_resume`, `account_switch`, `login_handover`) and `remote_client` which client a refusal names (`arcen`, `foreign`). A logout request is never logged as a completed logout. |
+| 1109 | `SESSION_HANDOVER` | What became of a sign-in to a desktop that another connection or account held, and of a confirmed change of account; `reason_class` says which (`reused_desktop`, `remote_busy`, `state_unknown`, `switch_unsupported`, `switch_offered`, `switch_in_progress`, `switch_cancelled`, `switch_stale`, `switch_expired`, `switch_rejected`, `logout_requested`, `logout_vetoed`, `logout_timed_out`, `logout_failed`, `logout_completed`, `new_login_failed`), `attachment` how the Deck came (`connect`, `transport_resume`, `account_switch`, `login_handover`) and `remote_client` which client a refusal names (`arcen`, `foreign`, or `owning_product` for the client of the product that holds the desktop). A logout request is never logged as a completed logout. |
 | 1200-1204 | Display events | Display arm, restore, degraded restore, failed restore, watchdog restore. |
 | 1300-1301 | CP events | Windows Credential Provider logon outcome. |
 | 1400-1404 | TLS events | Active, expiring, reloaded, reload failed, expired. |

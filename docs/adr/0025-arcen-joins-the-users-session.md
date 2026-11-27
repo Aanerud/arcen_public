@@ -1,6 +1,6 @@
 # ADR 0025: Arcen joins the user's session
 
-**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`); amended 2026-11-24 (§5: desk privacy is the Deck user's choice, best effort unless the administrator sets `privacy.desk = "required"`); amended 2026-11-25 (§8: another product's desktop takes the Deck's monitors on attach while that product has no client attached, and keeps them when the Deck leaves; §4 and §12: under `privacy.desk = "required"` a desk whose session will not lock stays private until it locks; §4 and §12 again: the Windows Pier locks a session held for its Deck's resume at once, and locks first under `required`); amended 2026-11-26 (§13: same-account continuity from any Deck, a confirmed and graceful change of account when no remote client is attached, and fresh display negotiation on every attachment; §7: `console_remote_state_unknown`, `console_switch_in_progress` and `console_signing_out`, which only ever block a change of account and reach only a Deck that negotiated `account_switch_v1`; §8: Arcen's own login session on a console whose login screen another product withholds, when the Pier proves the seat, the GPU and GDM free for it). Product-wide; the Linux Pier is its main
+**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`); amended 2026-11-24 (§5: desk privacy is the Deck user's choice, best effort unless the administrator sets `privacy.desk = "required"`); amended 2026-11-25 (§8: another product's desktop takes the Deck's monitors on attach while that product has no client attached, and keeps them when the Deck leaves; §4 and §12: under `privacy.desk = "required"` a desk whose session will not lock stays private until it locks; §4 and §12 again: the Windows Pier locks a session held for its Deck's resume at once, and locks first under `required`); amended 2026-11-26 (§13: same-account continuity from any Deck, a confirmed and graceful change of account when no remote client is attached, and fresh display negotiation on every attachment; §7: `console_remote_state_unknown`, `console_switch_in_progress` and `console_signing_out`, which only ever block a change of account and reach only a Deck that negotiated `account_switch_v1`; §8: Arcen's own login session on a console whose login screen another product withholds, when the Pier proves the seat, the GPU and GDM free for it); amended 2026-11-27 (§7, §8, §13: the account's own desktop is refused `console_in_use_other_product` again while the product that holds it uses it, as before 0.21.5). Product-wide; the Linux Pier is its main
 part. Builds on [ADR 0005](0005-direct-transport-resume-authority.md)
 (resume), [ADR 0008](0008-virtual-display-for-windows-hosts.md) and
 [ADR 0014](0014-quic-lanes-and-capture-contracts.md); changes the Linux
@@ -758,9 +758,10 @@ The codes and what an administrator does about them are in
 `console_sign_in_other_product` (§8), `console_remote_state_unknown`,
 `console_switch_in_progress` and `console_signing_out` (§13). The last
 three only ever concern a change of account: a sign-in as the account that
-holds the session is never refused for what is attached to it, or for not
-knowing, and is refused only while a confirmed change of account is
-signing that session out. They reach only a Deck that negotiated
+holds the session is never refused for not knowing what is attached to it,
+and is refused only while a confirmed change of account is signing that
+session out, or with `console_in_use_other_product` while the product that
+holds its desktop uses it (§8). They reach only a Deck that negotiated
 `account_switch_v1`; an older Deck gets the code it already knows
 (`console_other_user*`, or `console_session_changed` for its own session
 being signed out). A sign-in of
@@ -924,13 +925,16 @@ product owned):*
   lays out the console session's displays and puts them back when the
   Deck leaves, and another product's client there holds a session of its
   own; the macOS Pier adds displays of its own (PD-043).
-- **One remote product at a time.** While that product's client is connected
-  the sign-in is refused `console_in_use_other_product`; when it connects
-  during an attachment the attachment ends with that code.
-  *Superseded on Linux in 0.21.5 (§13):* the account's own desktop is
-  joined whatever that product's client does, and an attachment stays when
-  the client connects; the desktop then keeps its layout (`Shown`). The
-  rule below still tells whether a client is connected. A connected
+- **One remote product at a time.** One remote product encodes a desktop
+  at a time: two products streaming the same session compete for the GPU's
+  few hardware encoder (NVENC) sessions and degrade or fail each other.
+  While that product's client is connected the sign-in is refused
+  `console_in_use_other_product`; when it connects during an attachment
+  the attachment ends with that code; once it leaves, the next sign-in
+  joins. 0.21.5 joined
+  the account's own desktop while that client was connected and kept the
+  attachment when it connected; that change is reverted (amended
+  2026-11-27, §13). A connected
   client shows as a keyboard or pointer made in user space (shared
   `another_products_client_input`): a udev keyboard or pointer without a
   parent device, neither on the host-platform bus (`BUS_HOST`) nor a
@@ -1430,20 +1434,27 @@ restart, a sign-in as the account that holds the desktop joins that same OS
 session and its applications; it is never logged out to let the account in.
 A new endpoint may still need the password: the transport resume grant and
 the OS session's lifetime are different things. The session is entered from
-either side (§1), so what is attached to it never refuses its own account:
-another Arcen Deck keeps the existing same-account rule
-(`direct_reconnect::fresh_sign_in`); with another product's client
-attached, or when that cannot be told, the account still joins its session
-and the session keeps its layout (`GuestLayoutPolicy::Shown`, the rule §8
-already applies to another product's desktop); with none attached, proved,
-the desktop takes the Deck's layout (`ApplyOnAttach`). The decision carries
-which (`HandoverDecision::JoinOwnSession { layout }`). This is the shared
-rule. The Linux Pier adopted it in 0.21.5 (another product's desktop is
-joined, and stays joined, while that product's client is attached). The
-Windows Pier joins it too: Windows shows a session at one station, so the
-session moves onto the console (`WTSConnectSessionW`) and the other
-product's client loses it, as when the account signs in at the desk; the
-Deck's layout then applies as on any console attachment (PD-043).
+either side (§1), one remote product at a time: another Arcen Deck keeps
+the existing same-account rule (`direct_reconnect::fresh_sign_in`); a
+desktop another product holds is refused `console_in_use_other_product`
+while that product's own client uses it, and joined as soon as it leaves:
+both products would encode the session and compete for the GPU's hardware
+encoder sessions (§8; `RemoteClient::OwningProduct`, `HandoverRefusal::InUseOtherProduct`, a
+code every Deck knows). On Linux that is a desktop the product started
+(`ConsoleOrigin::OtherProduct`) with that product's client input
+(`another_products_client`, with its exclusions for drivers at the desk);
+on Windows, the account's session shown at another service's station
+instead of the console, which is never moved off that client. With any
+other foreign client attached (a VNC, RDP, NX or GNOME Remote Desktop
+connection, a compositor's screen cast), or when that cannot be told, the
+account still joins its session and the session keeps its layout
+(`GuestLayoutPolicy::Shown`, the rule §8 applies to another product's
+desktop); with none attached, proved, the desktop takes the Deck's layout
+(`ApplyOnAttach`). The decision carries which
+(`HandoverDecision::JoinOwnSession { layout }`). 0.21.5 also joined the
+desktop the product's own client used (Linux kept the attachment, Windows
+moved the session onto the console); that change is reverted (amended
+2026-11-27), and the refusal is again the one 0.21.4 gave.
 
 **Another account while a remote client is attached is refused.** Arcen's or
 another product's client, locked or unlocked at the desk: the refusal codes
@@ -1455,7 +1466,8 @@ holds the desktop refuses with `console_sessions_unreadable`. One that
 cannot prove whether a remote client is attached to another account's
 session refuses that account's change with `console_remote_state_unknown`:
 no offer and nothing committed. Neither is read as "nobody is connected".
-The account that holds the session joins it whatever is unknown.
+The account that holds the session joins it whatever is unknown; only a
+proved client of the product that holds its desktop refuses it (above).
 
 **Another account with no remote client attached: authenticate, then
 confirm.** Only after the newcomer's credentials and account policy passed
@@ -1626,7 +1638,13 @@ so while one runs the attachment is `Unknown`, logged as "cannot tell
 whether someone is connected through <tool>"; a capable Deck is told
 `console_remote_state_unknown`. Any source that cannot be read makes the
 attachment `Unknown` too, which refuses a change of account. A tool that
-is not listed and makes no input device is not seen. The attachment epoch advances on every Arcen attach and detach,
+is not listed and makes no input device is not seen. On a desktop the
+product started, the input rule's client is that product using its desktop
+(`RemoteClient::OwningProduct`): the account's own sign-in is refused
+`console_in_use_other_product`, and the launcher looks again at the
+sign-in and on a returning Deck, and an attachment ends when that client
+appears, as before 0.21.5. The other sources only keep the account's own
+desktop as it is. The attachment epoch advances on every Arcen attach and detach,
 when the account's own sign-in or an authenticated resume is about to
 attach, and whenever what those sources show changes between two readings,
 so an offer made before is stale. The route is `Available` only

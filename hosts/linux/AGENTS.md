@@ -405,8 +405,11 @@ older deployments may be removed from `/opt/arcen/bin/`.
   still put back and the desktop shown as it is).
 - A console sign-in is decided by the shared `SwitchLedger::decide` before
   the launcher runs (ADR 0025 §13, `net/account_switch.rs`, facts in
-  `session/handover.rs`). The account's own desktop is always joined,
-  another product's client attached or not. Another account's session is
+  `session/handover.rs`). The account's own desktop is joined, except a
+  desktop another product started while that product's own client uses it
+  (`console::another_products_client`, refused
+  `console_in_use_other_product` at sign-in, on re-attach and during an
+  attachment, as before 0.21.5). Another account's session is
   signed out only after a confirmed offer, by
   `org.gnome.SessionManager.Logout` mode 1 asked as that account on its own
   bus, after `IsInhibited(1)` found no inhibitor; never mode 2,

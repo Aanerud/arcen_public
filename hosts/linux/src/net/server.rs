@@ -10611,12 +10611,10 @@ async fn run_attachment(
     let mut input_status = lock_recover(&input_controller)
         .as_ref()
         .and_then(PierInput::wayland_status);
-    // The account's own desktop in another product is entered from either
-    // side (ADR 0025 §13): its client connecting is logged, and this
-    // attachment stays. Any other joined console steps aside when another
-    // product starts a desktop of its own on the console (it is the display
-    // manager again).
-    let mut guest_client_seen = false;
+    // A desktop another product owns is shared with nobody: its own client
+    // connecting ends this attachment, with the reason (ADR 0025 §8).
+    // Any other joined console steps aside when another product starts a
+    // desktop of its own on the console (it is the display manager again).
     let console_guest = session_lease.is_some_and(|lease| lease.metadata.console_guest);
     let console_joined = session_lease
         .filter(|lease| lease.metadata.console)
@@ -10690,17 +10688,15 @@ async fn run_attachment(
             _ = guest_check.tick(), if console_joined.is_some() => {
                 use arcen_session::console_session::{other_product_started, ConsoleRefusal};
                 let refusal = if console_guest {
-                    let device = crate::session::console::another_products_client().await;
-                    if device.is_some() != guest_client_seen {
-                        guest_client_seen = device.is_some();
-                        info!(
-                            target: SESSION,
-                            device = device.as_deref().unwrap_or(""),
-                            attached = guest_client_seen,
-                            "another remote-desktop product's client on the account's own desktop; the attachment continues"
-                        );
-                    }
-                    continue;
+                    let Some(device) = crate::session::console::another_products_client().await else {
+                        continue;
+                    };
+                    error!(
+                        target: SESSION,
+                        %device,
+                        "another remote-desktop product's client connected to this desktop; the attachment ends"
+                    );
+                    ConsoleRefusal::InUseOtherProduct
                 } else {
                     // An unreadable logind concludes nothing.
                     let Ok(sessions) = crate::session::console::read_sessions().await else {

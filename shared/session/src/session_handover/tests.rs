@@ -204,6 +204,45 @@ fn the_same_account_joins_its_session_while_another_product_is_attached_or_unkno
 }
 
 #[test]
+fn the_same_account_is_refused_while_the_product_that_holds_its_desktop_uses_it() {
+    for desk in [DeskState::Locked, DeskState::Unlocked, DeskState::Unknown] {
+        for route in [
+            SwitchRoute::Available,
+            SwitchRoute::DeckCannotConfirm,
+            SwitchRoute::PierCannotSignOut,
+        ] {
+            let facts = occupant(
+                alice_session(),
+                RemoteAttachment::Attached(RemoteClient::OwningProduct),
+                4,
+                desk,
+            );
+            let decision = decide(&signed_in(ALICE), &facts, route);
+            assert_eq!(
+                decision,
+                HandoverDecision::Refuse(HandoverRefusal::InUseOtherProduct)
+            );
+            assert_eq!(decision.layout(), None);
+            assert_eq!(decision.reason(), Some(HandoverReason::RemoteBusy));
+        }
+    }
+    // The code every Deck has known since before account_switch_v1.
+    for deck_switch in [false, true] {
+        for origin in [ConsoleOrigin::OtherProduct, ConsoleOrigin::DisplayManager] {
+            assert_eq!(
+                HandoverRefusal::InUseOtherProduct.console_refusal(origin, deck_switch),
+                ConsoleRefusal::InUseOtherProduct
+            );
+        }
+    }
+    assert!(!ConsoleRefusal::InUseOtherProduct.since_account_switch_v1());
+    assert_eq!(
+        RemoteAttachment::Attached(RemoteClient::OwningProduct).foreign_client(),
+        ForeignClient::Attached
+    );
+}
+
+#[test]
 fn an_alias_or_a_reused_name_is_not_the_same_account() {
     let renamed = AccountPrincipal {
         name: "alice",
@@ -224,6 +263,10 @@ fn another_account_is_refused_while_arcen_or_another_product_is_attached() {
     for (client, code) in [
         (RemoteClient::Arcen, ConsoleRefusal::OtherUser),
         (RemoteClient::Foreign, ConsoleRefusal::OtherUserOtherProduct),
+        (
+            RemoteClient::OwningProduct,
+            ConsoleRefusal::OtherUserOtherProduct,
+        ),
     ] {
         for desk in [DeskState::Locked, DeskState::Unlocked] {
             let facts = occupant(alice_session(), RemoteAttachment::Attached(client), 2, desk);

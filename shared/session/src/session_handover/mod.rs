@@ -21,13 +21,16 @@
 //!   attached by Arcen or by another remote-desktop product, proved
 //!   detached, or unknown.
 //!
-//! "Busy" means a remote client is attached, and it matters only to a
-//! different account. An account that is signed in, or even unlocked, at
-//! the desk is not busy ([`DeskState`] is recorded, never decisive). The
-//! account's own session is joined whatever is attached to it; only its
-//! layout is then left alone when another product's client is attached or
-//! that cannot be told ([`GuestLayoutPolicy`]). Unknown is never read as
-//! detached: it refuses a change of account.
+//! "Busy" means a remote client is attached, and it matters to a different
+//! account. An account that is signed in, or even unlocked, at the desk is
+//! not busy ([`DeskState`] is recorded, never decisive). The account's own
+//! session is joined, with one exception: a desktop another product started
+//! is refused while that product's own client uses it
+//! ([`RemoteClient::OwningProduct`], [`HandoverRefusal::InUseOtherProduct`]),
+//! one remote product at a time as before 0.21.5. Any other foreign client,
+//! or an attachment that cannot be told, only leaves its layout alone
+//! ([`GuestLayoutPolicy`]). Unknown is never read as detached: it refuses a
+//! change of account.
 //!
 //! [`decide_handover`] turns the facts into a [`HandoverDecision`]. An offer
 //! to sign another account out becomes a transaction in
@@ -242,8 +245,16 @@ pub enum RemoteClient {
     /// An Arcen Deck.
     Arcen,
     /// Another remote-desktop product's client, as the platform proves it
-    /// (a session's remote protocol, another product's connected client).
+    /// (a screen-sharing or remote-access server's connection, a
+    /// compositor's remote session).
     Foreign,
+    /// The client of the remote-desktop product that holds this desktop,
+    /// using it now: a desktop that product started (Linux: its own
+    /// client's input on a `ConsoleOrigin::OtherProduct` desktop), or a
+    /// session Windows shows on that product's station instead of the
+    /// console. The desktop is in use through that product, so even its
+    /// own account is refused ([`HandoverRefusal::InUseOtherProduct`]).
+    OwningProduct,
 }
 
 impl RemoteClient {
@@ -253,6 +264,7 @@ impl RemoteClient {
         match self {
             Self::Arcen => "arcen",
             Self::Foreign => "foreign",
+            Self::OwningProduct => "owning_product",
         }
     }
 }
@@ -281,7 +293,9 @@ impl RemoteAttachment {
     #[must_use]
     pub const fn foreign_client(self) -> ForeignClient {
         match self {
-            Self::Attached(RemoteClient::Foreign) => ForeignClient::Attached,
+            Self::Attached(RemoteClient::Foreign | RemoteClient::OwningProduct) => {
+                ForeignClient::Attached
+            }
             Self::Attached(RemoteClient::Arcen) | Self::ProvedDetached => ForeignClient::Absent,
             Self::Unknown => ForeignClient::Unknown,
         }
@@ -461,6 +475,10 @@ pub enum HandoverRefusal {
     /// The requester's own session is being signed out by a confirmed
     /// change of account; it is not attached to.
     SigningOut,
+    /// The requester's own session is a desktop another product holds,
+    /// and that product's client is using it
+    /// ([`RemoteClient::OwningProduct`]): one remote product at a time.
+    InUseOtherProduct,
 }
 
 impl HandoverRefusal {
@@ -470,12 +488,14 @@ impl HandoverRefusal {
         match self {
             Self::Busy(RemoteClient::Arcen) => "busy_arcen",
             Self::Busy(RemoteClient::Foreign) => "busy_foreign",
+            Self::Busy(RemoteClient::OwningProduct) => "busy_owning_product",
             Self::OccupantUnknown => "occupant_unknown",
             Self::AttachmentUnknown => "attachment_unknown",
             Self::DeckCannotConfirm => "deck_cannot_confirm",
             Self::PierCannotSignOut => "pier_cannot_sign_out",
             Self::SwitchInProgress => "switch_in_progress",
             Self::SigningOut => "signing_out",
+            Self::InUseOtherProduct => "in_use_other_product",
         }
     }
 
@@ -485,7 +505,8 @@ impl HandoverRefusal {
     /// ([`ConsoleRefusal::since_account_switch_v1`]); an older Deck gets the
     /// refusal it has always had instead (`console_other_user*` for another
     /// account's session, `console_session_changed` for its own session
-    /// being signed out).
+    /// being signed out). `console_in_use_other_product` is older than the
+    /// capability, so every Deck gets it.
     #[must_use]
     pub const fn console_refusal(
         self,
@@ -493,7 +514,10 @@ impl HandoverRefusal {
         deck_account_switch_v1: bool,
     ) -> ConsoleRefusal {
         match (self, deck_account_switch_v1) {
-            (Self::Busy(RemoteClient::Foreign), _) => ConsoleRefusal::OtherUserOtherProduct,
+            (Self::Busy(RemoteClient::Foreign | RemoteClient::OwningProduct), _) => {
+                ConsoleRefusal::OtherUserOtherProduct
+            }
+            (Self::InUseOtherProduct, _) => ConsoleRefusal::InUseOtherProduct,
             (Self::OccupantUnknown, _) => ConsoleRefusal::SessionsUnreadable,
             (Self::AttachmentUnknown, true) => ConsoleRefusal::RemoteStateUnknown,
             (Self::SwitchInProgress, true) => ConsoleRefusal::SwitchInProgress,
@@ -514,7 +538,7 @@ impl HandoverRefusal {
     #[must_use]
     pub const fn reason(self) -> HandoverReason {
         match self {
-            Self::Busy(_) => HandoverReason::RemoteBusy,
+            Self::Busy(_) | Self::InUseOtherProduct => HandoverReason::RemoteBusy,
             Self::OccupantUnknown | Self::AttachmentUnknown => HandoverReason::StateUnknown,
             Self::DeckCannotConfirm | Self::PierCannotSignOut => HandoverReason::SwitchUnsupported,
             Self::SwitchInProgress | Self::SigningOut => HandoverReason::SwitchInProgress,
@@ -525,8 +549,9 @@ impl HandoverRefusal {
 /// What an authenticated sign-in does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandoverDecision {
-    /// The account's own session: join it, whatever is attached to it or
-    /// unknown. The same OS session and its applications; the Deck's
+    /// The account's own session: join it, unless the product that holds
+    /// it is using it ([`HandoverRefusal::InUseOtherProduct`]). The same OS
+    /// session and its applications; the Deck's
     /// current displays are negotiated afresh ([`displays`]), and `layout`
     /// says whether the desktop may be laid out to them
     /// ([`RemoteAttachment::own_session_layout`]).
@@ -590,9 +615,10 @@ impl HandoverDecision {
 /// out, joins it as ever (the requester's new session seen from another
 /// connection, or an account that signed in at the desk meanwhile).
 ///
-/// The account's own session is always joined, never replaced, whatever is
-/// attached to it: an attached or unknown foreign client only keeps its
-/// layout as it is. Another account's session is refused while a remote
+/// The account's own session is joined, never replaced. It is refused only
+/// while the product that holds it uses it ([`RemoteClient::OwningProduct`]:
+/// `console_in_use_other_product`, as before 0.21.5); any other attached or
+/// unknown foreign client only keeps its layout as it is. Another account's session is refused while a remote
 /// client is attached or that is unknown, and offered for a graceful
 /// sign-out only when none is, proved. An unreadable occupant refuses. The
 /// desk's lock state takes no part.
@@ -639,6 +665,9 @@ pub fn decide_handover(
     match (own, facts.attachment) {
         (true, RemoteAttachment::Attached(RemoteClient::Arcen)) => {
             HandoverDecision::JoinOwnSessionAfterIncumbent(facts.identity.clone())
+        }
+        (true, RemoteAttachment::Attached(RemoteClient::OwningProduct)) => {
+            HandoverDecision::Refuse(HandoverRefusal::InUseOtherProduct)
         }
         (
             true,

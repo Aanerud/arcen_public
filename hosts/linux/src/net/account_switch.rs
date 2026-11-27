@@ -175,11 +175,17 @@ where
                 tracing::warn!(target: SESSION, refusal = refusal.token(), "the console sign-in is refused before anything changes");
             }
             requester.record(refusal.reason(), client);
-            Admission::Refused(
-                refusal
-                    .console_refusal(origin, requester.deck_switch)
-                    .into(),
-            )
+            let code = refusal.console_refusal(origin, requester.deck_switch);
+            if refusal == HandoverRefusal::InUseOtherProduct {
+                // The refusal the launcher gave before 0.21.5, naming the
+                // service as it did.
+                let service = reading
+                    .session
+                    .as_ref()
+                    .map(crate::session::console::foreign_service);
+                return Admission::Refused(ConsoleNotice::naming(code, service));
+            }
+            Admission::Refused(code.into())
         }
         HandoverDecision::OfferSwitch(candidate) => {
             let Some(fact) = reading.session else {

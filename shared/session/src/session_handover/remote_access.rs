@@ -23,6 +23,7 @@
 use std::collections::BTreeSet;
 
 use super::{RemoteAttachment, RemoteClient};
+use crate::console_session::ConsoleOrigin;
 
 /// What tells that someone is connected through a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,11 +235,18 @@ impl ForeignEvidence {
 
     /// Another product's client is attached when any source shows one; no
     /// client is proved only when every source was read and showed none;
-    /// otherwise it is unknown.
+    /// otherwise it is unknown. On a desktop another product started
+    /// (`origin`), that product's own client input is the product using its
+    /// desktop ([`RemoteClient::OwningProduct`]); every other source, and
+    /// that input on any other desktop, is [`RemoteClient::Foreign`].
     #[must_use]
-    pub fn attachment(&self) -> RemoteAttachment {
+    pub fn attachment(&self, origin: ConsoleOrigin) -> RemoteAttachment {
         let sources = self.sources();
-        if sources
+        if origin == ConsoleOrigin::OtherProduct
+            && matches!(self.product_client, Evidence::Present(_))
+        {
+            RemoteAttachment::Attached(RemoteClient::OwningProduct)
+        } else if sources
             .iter()
             .any(|source| matches!(source, Evidence::Present(_)))
         {
@@ -435,15 +443,15 @@ mod tests {
         use Evidence::{Absent, Present, Undecidable, Unreadable};
         let vnc = || Present(vec!["x11vnc[42] 1".to_owned()]);
         assert_eq!(
-            evidence(Absent, Absent, Absent).attachment(),
+            evidence(Absent, Absent, Absent).attachment(ConsoleOrigin::DisplayManager),
             RemoteAttachment::ProvedDetached
         );
         assert_eq!(
-            evidence(Absent, vnc(), Absent).attachment(),
+            evidence(Absent, vnc(), Absent).attachment(ConsoleOrigin::DisplayManager),
             RemoteAttachment::Attached(RemoteClient::Foreign)
         );
         assert_eq!(
-            evidence(Unreadable, vnc(), Absent).attachment(),
+            evidence(Unreadable, vnc(), Absent).attachment(ConsoleOrigin::DisplayManager),
             RemoteAttachment::Attached(RemoteClient::Foreign)
         );
         let relay = evidence(
@@ -451,7 +459,10 @@ mod tests {
             Undecidable(vec!["cannot tell … teamviewerd".into()]),
             Absent,
         );
-        assert_eq!(relay.attachment(), RemoteAttachment::Unknown);
+        assert_eq!(
+            relay.attachment(ConsoleOrigin::DisplayManager),
+            RemoteAttachment::Unknown
+        );
         assert_eq!(
             relay.unknown_reasons(),
             vec!["cannot tell … teamviewerd".to_owned()]
@@ -461,9 +472,46 @@ mod tests {
             evidence(Absent, Unreadable, Absent),
             evidence(Absent, Absent, Unreadable),
         ] {
-            assert_eq!(unreadable.attachment(), RemoteAttachment::Unknown);
+            assert_eq!(
+                unreadable.attachment(ConsoleOrigin::DisplayManager),
+                RemoteAttachment::Unknown
+            );
             assert_eq!(unreadable.unknown_reasons().len(), 1);
         }
+    }
+
+    #[test]
+    fn the_owning_products_client_is_only_its_input_on_its_own_desktop() {
+        use Evidence::{Absent, Present, Undecidable, Unreadable};
+        let device = || Present(vec!["event7 (virtual keyboard)".to_owned()]);
+        let vnc = || Present(vec!["x11vnc[42] 1".to_owned()]);
+        assert_eq!(
+            evidence(device(), Absent, Absent).attachment(ConsoleOrigin::OtherProduct),
+            RemoteAttachment::Attached(RemoteClient::OwningProduct)
+        );
+        assert_eq!(
+            evidence(device(), vnc(), Unreadable).attachment(ConsoleOrigin::OtherProduct),
+            RemoteAttachment::Attached(RemoteClient::OwningProduct)
+        );
+        assert_eq!(
+            evidence(device(), Absent, Absent).attachment(ConsoleOrigin::DisplayManager),
+            RemoteAttachment::Attached(RemoteClient::Foreign)
+        );
+        // Only the other remote tools: a foreign client, never the owning
+        // product's, even on its desktop.
+        assert_eq!(
+            evidence(Absent, vnc(), Absent).attachment(ConsoleOrigin::OtherProduct),
+            RemoteAttachment::Attached(RemoteClient::Foreign)
+        );
+        assert_eq!(
+            evidence(Unreadable, Absent, Absent).attachment(ConsoleOrigin::OtherProduct),
+            RemoteAttachment::Unknown
+        );
+        assert_eq!(
+            evidence(Absent, Undecidable(vec!["relay".into()]), Absent)
+                .attachment(ConsoleOrigin::OtherProduct),
+            RemoteAttachment::Unknown
+        );
     }
 
     #[test]
