@@ -29,7 +29,7 @@ takeover rule applies only to this state.
 | Requested account has exactly one disconnected session elsewhere, console otherwise free | Move that session onto the console, then bind | `…: the account's existing session could not be moved to the physical console.` |
 | **Another account owns the console, WTS reports `Active`** | **Refuse.** A locked console counts as active. No sign-out is offered yet (see below) | `console_other_user: another account is signed in at this workstation.` |
 | **Another account's session is attached through another remote-desktop service** (an RDP or ICA client is connected to it) | **Refuse** | `console_other_user_other_product: another remote-desktop service (RDP-Tcp, rdp) uses this workstation.` — the session's WinStation listener and client protocol, as Windows reports them |
-| The requested account's own desktop is attached through another remote-desktop service | **Join it**: move it onto the console, as a sign-in at the desk does. Windows shows a session at one station, so the other service's client loses it | — |
+| The requested account's own desktop is attached through another remote-desktop service | Refuse; one remote product at a time | `console_in_use_other_product: this desktop is in use through another remote-desktop product.` |
 | **Another account owns the console, WTS reports `Disconnected`, and this account has a parked session** | **Take over**: move this account's session onto the console | — unless a later Windows operation fails |
 | Another account owns the console, WTS reports `Disconnected`, and this account has nothing to move | Refuse | `…: another account holds the console and this account has no session to move onto it.` |
 | The console owner cannot be verified | Refuse; Arcen does not guess ownership | `…: active console account could not be verified.` |
@@ -56,7 +56,10 @@ supplies the facts. Who holds the desktop is the account's SID, the WTS
 session id, its logon id (new for every sign-in, so a reused session id is
 another session) and the boot. A client is attached when an Arcen Deck's
 agent serves that account, or when Windows reports the session `Active` or
-`Connected` off the console (another remote-desktop service). Every Arcen
+`Connected` off the console (another remote-desktop service). That
+service is using the session, so the account's own sign-in is refused
+`console_in_use_other_product`, and the session is never moved off its
+client (`RemoteClient::OwningProduct`), as before 0.21.5. Every Arcen
 attachment moves the desktop's epoch on, and none attaches to a session a
 confirmed change of account is signing out.
 

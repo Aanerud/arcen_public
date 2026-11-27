@@ -837,18 +837,6 @@ fn is_parked_session(candidate: &SessionCandidate, relation: AccountMatch) -> bo
         && matches!(relation, AccountMatch::Match | AccountMatch::Other)
 }
 
-/// Whether this candidate is the account's own session with another
-/// remote-desktop product's client attached to it (Active or Connected, off
-/// the console).
-fn is_own_session_held_elsewhere(candidate: &SessionCandidate, relation: AccountMatch) -> bool {
-    relation == AccountMatch::Match
-        && !candidate.user.is_empty()
-        && matches!(
-            candidate.state,
-            SessionState::Active | SessionState::Connected
-        )
-}
-
 /// Who holds the desktop, as `arcen_session::session_handover` reads it on
 /// Windows, from one WTS enumeration: the console's signed-in session; else,
 /// at the sign-in screen, the requester's own session elsewhere (parked, or
@@ -965,11 +953,7 @@ enum ConsoleApproach {
 /// The rules are deliberately narrow:
 ///
 /// - an **attached** session other than the console (Active or Connected) means
-///   somebody is really using a desktop we did not account for, so refuse --
-///   unless it is the account's own: another product's client shows the
-///   account's session, and the account always joins its own session (ADR 0025
-///   §13). Windows shows a session on one station at a time, so the move
-///   takes it off that client, as a sign-in at the desk would;
+///   somebody is really using a desktop we did not account for, so refuse;
 /// - a session whose owner could not be verified means refuse, because the
 ///   whole point of this classifier is to never guess whose desktop it is;
 /// - the account may own at most **one** parked session, since with two there is
@@ -985,9 +969,7 @@ fn classify_console_takeover(
         if candidate.id == active_console_id || is_known_local_wts_extra(candidate, *relation) {
             continue;
         }
-        if !is_parked_session(candidate, *relation)
-            && !is_own_session_held_elsewhere(candidate, *relation)
-        {
+        if !is_parked_session(candidate, *relation) {
             return ConsoleApproach::Blocked;
         }
         if *relation == AccountMatch::Match && source.replace(candidate.id).is_some() {
@@ -1099,24 +1081,27 @@ fn classify_cp_bind(
 }
 
 /// The typed refusal for a console bind `classify_cp_bind` rejected, when
-/// the cause is another account or another remote-desktop service: another
-/// account's session other than the console's that a client is attached to
-/// (`console_other_user_other_product`), with its id so its service can be
-/// named; else another account active at the console
-/// (`console_other_user`). The account's own session is never refused for
-/// another product's client (ADR 0025 §13): it is moved onto the console.
+/// the cause is another account or another remote-desktop service: a
+/// session other than the console's that a client is attached to (another
+/// account's: `console_other_user_other_product`; the account's own:
+/// `console_in_use_other_product`, shared
+/// `session_handover::HandoverRefusal::InUseOtherProduct`), with its id so
+/// its service can be named; else another account active at the console
+/// (`console_other_user`).
 fn console_refusal(
     candidates: &[(SessionCandidate, AccountMatch)],
     active_console_id: u32,
 ) -> Option<(ConsoleRefusal, Option<u32>)> {
-    let remote = candidates.iter().find(|(candidate, relation)| {
-        candidate.id != active_console_id
-            && !candidate.user.is_empty()
-            && *relation != AccountMatch::Match
-            && is_attached(candidate)
+    let remote = candidates.iter().find(|(candidate, _)| {
+        candidate.id != active_console_id && !candidate.user.is_empty() && is_attached(candidate)
     });
-    if let Some((candidate, _)) = remote {
-        return Some((ConsoleRefusal::OtherUserOtherProduct, Some(candidate.id)));
+    if let Some((candidate, relation)) = remote {
+        let refusal = if *relation == AccountMatch::Match {
+            ConsoleRefusal::InUseOtherProduct
+        } else {
+            ConsoleRefusal::OtherUserOtherProduct
+        };
+        return Some((refusal, Some(candidate.id)));
     }
     let (console, relation) = candidates
         .iter()
@@ -3703,8 +3688,7 @@ mod tests {
             console_refusal(&candidates, 1),
             Some((ConsoleRefusal::OtherUserOtherProduct, Some(3)))
         );
-        // The account's own desktop in use through another product is not
-        // refused: it is moved onto the console (ADR 0025 §13).
+        // The account's own desktop is in use through another product.
         let candidates = vec![
             logon_ui,
             cp_candidate(
@@ -3716,7 +3700,10 @@ mod tests {
                 AccountMatch::Match,
             ),
         ];
-        assert_eq!(console_refusal(&candidates, 1), None);
+        assert_eq!(
+            console_refusal(&candidates, 1),
+            Some((ConsoleRefusal::InUseOtherProduct, Some(3)))
+        );
         // Another account at the console itself.
         let candidates = vec![cp_candidate(
             1,
@@ -3757,7 +3744,7 @@ mod tests {
     }
 
     #[test]
-    fn the_own_session_another_product_shows_is_joined_not_refused() {
+    fn the_own_session_another_product_shows_is_refused_not_taken_over() {
         let logon_ui = cp_candidate(
             1,
             "",
@@ -3771,12 +3758,14 @@ mod tests {
                 logon_ui.clone(),
                 cp_candidate(3, "artist", state, true, Some(2), AccountMatch::Match),
             ];
-            assert_eq!(
+            // As before 0.21.5: nothing is moved off that product's client.
+            assert!(matches!(
                 classify_cp_bind(&candidates, 1),
-                CpBindDecision::Reconnect {
-                    source: 3,
-                    target: 1
-                }
+                CpBindDecision::Reject(_)
+            ));
+            assert_eq!(
+                console_refusal(&candidates, 1),
+                Some((ConsoleRefusal::InUseOtherProduct, Some(3)))
             );
             assert_eq!(
                 desktop_holder(&candidates, 1),

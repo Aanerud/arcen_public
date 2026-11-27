@@ -141,7 +141,10 @@ pub(crate) fn session_identity(
 /// Who holds the desktop, in the shared vocabulary. `arcen_attached`: an
 /// Arcen Deck's agent serves that account now (attached, or held for its
 /// resume). Another product's client is the WTS fact `foreign` (a session
-/// off the console that Windows reports `Active` or `Connected`); anything
+/// off the console that Windows reports `Active` or `Connected`): that
+/// product's station shows the session, so it is in use through that
+/// product ([`RemoteClient::OwningProduct`]; its own account is refused
+/// with `console_in_use_other_product`, as before 0.21.5). Anything
 /// unreadable, the boot included, is unknown.
 ///
 /// Nothing attached is never claimed: a product that serves the console
@@ -174,7 +177,7 @@ pub(crate) fn occupant(
             let attachment = if arcen_attached {
                 RemoteAttachment::Attached(RemoteClient::Arcen)
             } else if *foreign {
-                RemoteAttachment::Attached(RemoteClient::Foreign)
+                RemoteAttachment::Attached(RemoteClient::OwningProduct)
             } else {
                 RemoteAttachment::Unknown
             };
@@ -247,21 +250,36 @@ mod tests {
     }
 
     #[test]
-    fn the_own_session_is_joined_whatever_is_attached() {
+    fn the_own_session_is_joined_unless_another_products_client_shows_it() {
         let desk = HandoverDesk::new();
         let connection = desk.connection();
-        for (foreign, because) in [
-            (true, ShownBecause::ClientAttached),
-            (false, ShownBecause::ClientUnknown),
-        ] {
-            let occupant = read(&desk, &held(ARTIST, true, foreign), false);
-            assert!(matches!(
-                decide(&desk, connection, ARTIST, &occupant, route(true)),
-                HandoverDecision::JoinOwnSession {
-                    layout: GuestLayoutPolicy::Shown(shown),
-                    ..
-                } if shown == because
-            ));
+        let unknown = read(&desk, &held(ARTIST, true, false), false);
+        assert!(matches!(
+            decide(&desk, connection, ARTIST, &unknown, route(true)),
+            HandoverDecision::JoinOwnSession {
+                layout: GuestLayoutPolicy::Shown(ShownBecause::ClientUnknown),
+                ..
+            }
+        ));
+        // As before 0.21.5: the session another product's client shows is
+        // refused, never moved off that client.
+        let shown = read(&desk, &held(ARTIST, true, true), false);
+        let decision = decide(&desk, connection, ARTIST, &shown, route(true));
+        assert_eq!(
+            decision,
+            HandoverDecision::Refuse(HandoverRefusal::InUseOtherProduct)
+        );
+        let HandoverDecision::Refuse(refusal) = decision else {
+            unreachable!()
+        };
+        for deck_switch in [false, true] {
+            assert_eq!(
+                refusal.console_refusal(
+                    arcen_session::console_session::ConsoleOrigin::DisplayManager,
+                    deck_switch
+                ),
+                arcen_session::console_session::ConsoleRefusal::InUseOtherProduct
+            );
         }
     }
 
@@ -300,7 +318,7 @@ mod tests {
                 &read(&desk, &held(EDITOR, false, true), false),
                 route(true)
             ),
-            HandoverDecision::Refuse(HandoverRefusal::Busy(RemoteClient::Foreign))
+            HandoverDecision::Refuse(HandoverRefusal::Busy(RemoteClient::OwningProduct))
         );
         assert_eq!(route(true), SwitchRoute::PierCannotSignOut);
     }

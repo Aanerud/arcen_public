@@ -339,7 +339,7 @@ async fn attachment_of(
     if registry.arcen_attached(fact.uid) {
         return (RemoteAttachment::Attached(RemoteClient::Arcen), Vec::new());
     }
-    let attachment = evidence.attachment();
+    let attachment = evidence.attachment(fact.origin());
     match attachment {
         RemoteAttachment::Attached(_) => tracing::info!(
             target: target::SESSION,

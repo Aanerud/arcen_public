@@ -6,6 +6,26 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.21.6] — 2026-11-27
+
+On a Linux or Windows Pier, Arcen again waits while another remote-desktop
+product's client is connected to your desktop, and joins as soon as that
+client leaves. One product streams a desktop at a time, so the two never
+compete for the graphics card's video encoder.
+
+### Linux Pier
+
+- Your own desktop in another remote-desktop product is again refused while
+  that product's client is connected, as before 0.21.5; Arcen joins it as
+  soon as that client leaves.
+
+### Windows Pier
+
+- Your own desktop in another remote-desktop product is again refused while
+  that product's client is connected, as before 0.21.5; Arcen joins it as
+  soon as that client leaves. After a Remote Desktop client leaves, joining
+  that desktop can stop at the lock screen.
+
 ## [0.21.5] — 2026-11-27
 
 Every connection now fits the desktop to the displays your Deck has, and
@@ -1543,7 +1563,8 @@ exist.
   and SmartScreen prompts.
 - The macOS Pier, a Linux Deck and a Windows Deck do not exist yet.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.5...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.6...HEAD
+[0.21.6]: https://github.com/Aanerud/arcen_public/compare/v0.21.5...v0.21.6
 [0.21.5]: https://github.com/Aanerud/arcen_public/compare/v0.21.4...v0.21.5
 [0.21.4]: https://github.com/Aanerud/arcen_public/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/Aanerud/arcen_public/compare/v0.21.2...v0.21.3

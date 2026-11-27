@@ -708,7 +708,7 @@ pub enum ConsoleRefusal {
     /// is attached to its session could not be proved, so no sign-out was
     /// offered or made (ADR 0025 §13: unknown is never read as detached).
     /// It only ever blocks a change of account: the account's own session
-    /// is joined whatever is attached to it.
+    /// is joined when that cannot be told.
     RemoteStateUnknown,
     /// Another account holds the workstation, and a change of account
     /// another Deck asked for is waiting for its confirmation or its logout

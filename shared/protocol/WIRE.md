@@ -1125,7 +1125,8 @@ The capability also gates three refusal codes that came with it (ADR 0025
 only to a Deck that set `account_switch_v1`. An older Deck never sets it
 and keeps the refusal it has always had: `console_other_user*` for another
 account's session, whatever is attached to it and whether a change of
-account is pending, and `console_session_changed` when its own session is
+account is pending, `console_in_use_other_product` (older than the
+capability) for its own desktop while the product that holds it uses it, and `console_session_changed` when its own session is
 being signed out (`HandoverRefusal::console_refusal`).
 
 | Rust type | Wire `type` | Direction, lane | Fields |
