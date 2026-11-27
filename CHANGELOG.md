@@ -6,6 +6,71 @@ All notable changes to Arcen are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.21.5] — 2026-11-27
+
+Every connection now fits the desktop to the displays your Deck has, and
+signing in to an account whose desktop already runs joins that desktop.
+On a Linux Pier, your Deck can also sign out another account that nobody
+is connected to, once you confirm.
+
+### Linux Pier
+
+- On a workstation where another remote-desktop product runs the sign-in
+  and hides GDM's login screen, Arcen now signs you in with nobody signed
+  in, as on a workstation without it: your desktop locks when you leave
+  and unlocks at the desk with your password. Keep each account's desktop
+  in one product: GNOME runs one desktop per account.
+- Reconnecting to your own desktop at the workstation with a different
+  Deck display, or after your Deck's primary display changed, now lays the
+  desktop out for the display you have now instead of the earlier
+  connection's, with your applications still open.
+- Signing in as the account whose desktop another remote-desktop product
+  uses now joins that desktop while the product is connected, and keeps
+  its layout, instead of refusing.
+- When another account is signed in and nobody is connected to it, your
+  Deck can sign that account out and let you in; Cancel changes nothing,
+  and an application that blocks logout stops it. GNOME 40 still closes an
+  application that objects only during its 60-second logout notice.
+  Arcen refuses while a VNC, RDP, NX or GNOME Remote Desktop client is
+  connected, and while a relay-based remote-support tool runs; a tool it
+  does not list is not detected (see the administration guide).
+- When your Deck leaves, the Pier checks that the desk's monitors are back
+  as they were and says which one differs; `arcen-pier diagnose displays`
+  shows them.
+
+### Windows Pier
+
+- Signing in as the account whose desktop another remote-desktop service
+  shows now joins that desktop on the console instead of being refused.
+- HDR shows your desktop's white at the HDR standard of 203 nits, as the
+  other Piers do, instead of about 240, and Exact still image no longer
+  shows lighter blocks in HDR.
+- When your Deck leaves, the Pier checks that every display is back as it
+  was, refresh and HDR included, and if an earlier session's displays could
+  not be put back your Deck says so and connects anyway; `arcen-pier
+  diagnose displays` shows them.
+- HDR on a display that cannot show it opens as Grading at once, instead of
+  waiting 25 seconds and failing.
+
+### macOS Pier
+
+- A Deck that asks to sign another account out is told plainly whether
+  another remote client is using the Mac; signing that account out from a
+  Deck is not available on a Mac yet.
+- When your Deck leaves, the Pier puts the Mac's displays back in their
+  places and checks that they are as they were; `arcen-pier-macos diagnose
+  displays` shows them.
+
+### macOS Deck and Windows Deck
+
+- When your displays change while the Deck reconnects, it asks you to sign
+  in again and then shows the same desktop on the displays you have now.
+- The Deck says when a host serves a different set, size or arrangement of
+  displays from the one you asked for, instead of showing it as a match.
+- When another user is still signed in at a host that offers it, the Deck
+  asks whether to sign them out and continue, Cancel being the default,
+  and says plainly why a sign-out stopped.
+
 ## [0.21.4] — 2026-11-25
 
 Your desktop keeps running while it is locked and locks when your Deck
@@ -1478,7 +1543,8 @@ exist.
   and SmartScreen prompts.
 - The macOS Pier, a Linux Deck and a Windows Deck do not exist yet.
 
-[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.4...HEAD
+[Unreleased]: https://github.com/Aanerud/arcen_public/compare/v0.21.5...HEAD
+[0.21.5]: https://github.com/Aanerud/arcen_public/compare/v0.21.4...v0.21.5
 [0.21.4]: https://github.com/Aanerud/arcen_public/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/Aanerud/arcen_public/compare/v0.21.2...v0.21.3
 [0.21.2]: https://github.com/Aanerud/arcen_public/compare/v0.21.1...v0.21.2

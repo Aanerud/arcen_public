@@ -649,6 +649,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
+            account_switch: arcen_deck_core::account_switch::AccountSwitchMode::Off,
         }
     }
 

@@ -184,6 +184,8 @@ pub(super) struct Launcher {
     /// The last sign-in outcome Home shows under the selected connection's
     /// field, or in an acknowledgement box (`arcen_deck_core::sign_in`).
     sign_in: SignInState,
+    /// The host's offer to sign another account out, then its progress.
+    account_switch: arcen_deck_core::account_switch::AccountSwitchPrompt,
     /// Help ▸ About and Help ▸ Keyboard Shortcuts: modal over a session.
     help: HelpWindows,
     native_tablet: NativeTabletComponent,
@@ -386,6 +388,7 @@ impl Launcher {
             form_overrides: ConnectionOverrides::default(),
             remember_username: true,
             sign_in: SignInState::default(),
+            account_switch: Default::default(),
             help: HelpWindows::default(),
             native_tablet: NativeTabletComponent::default(),
             support_bundle: arcen_deck_core::screens::support_bundle::SupportBundlePanel::default(),
@@ -701,6 +704,7 @@ impl Launcher {
         let _ = self.help.take_dismiss_key(ui.ctx());
         self.bar_regions = OverlayPointerRegions::default();
         self.drive_connection(ui.ctx());
+        self.answer_account_switch(ui.ctx());
         let mut show_connection_bar = false;
         if let Some(connection) = self.connection.as_mut() {
             let bridged_pen = self.settings.tablet_mode_requested == TabletModeMsg::UsbTabletBridge;
@@ -1211,7 +1215,11 @@ impl Launcher {
             SessionNews::Authenticated(authentication) => {
                 self.handle_authentication(authentication);
             }
+            SessionNews::AccountSwitch(news) => {
+                self.account_switch.on_news(news, std::time::Instant::now());
+            }
             SessionNews::Streaming { login_window } => {
+                self.account_switch.reset();
                 self.deferred_auth = None;
                 // The lost picture goes. Presenters share one owner per
                 // pipeline, so its teardown may hide a frame the resumed
@@ -1435,7 +1443,27 @@ impl Launcher {
     /// The Mac's `handle_connection_closed`, for what this Deck serves: a
     /// sign-in screen is followed, a lost transport is resumed, anything
     /// else ends the connection with its reason.
+    /// The change-of-account question over every screen; its answer goes
+    /// to the session. Without a connection there is nothing to ask.
+    fn answer_account_switch(&mut self, ctx: &egui::Context) {
+        if self.connection.is_none() {
+            self.account_switch.reset();
+            return;
+        }
+        if let Some(choice) = arcen_deck_core::screens::account_switch::render_account_switch(
+            ctx,
+            &mut self.account_switch,
+        ) && !self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.answer_account_switch(choice))
+        {
+            self.account_switch.reset();
+        }
+    }
+
     fn handle_connection_closed(&mut self, end: &SessionEnd, ctx: &egui::Context) {
+        self.account_switch.reset();
         self.clipboard.detach();
         self.deferred_auth = None;
         self.preedit = None;
@@ -1746,8 +1774,8 @@ impl Launcher {
             self.reconnect_options.as_ref(),
         ) {
             ResumeLaunch::Idle => {}
-            ResumeLaunch::Abandon => {
-                self.return_home(SignInFailure::SessionEnded, None);
+            ResumeLaunch::Abandon(failure) => {
+                self.return_home(failure, None);
                 return;
             }
             ResumeLaunch::Launch {

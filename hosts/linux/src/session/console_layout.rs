@@ -39,6 +39,10 @@ use arcen_outputs::console_layout::{
     ConsoleLayoutError, ConsoleLayoutPlan, ConsoleOutput, HeadScaling, ModeTiming, NativeModeNeed,
     OutputMode, ShownLayoutMatch, ShownOutput,
 };
+use arcen_outputs::display_truth::{
+    restore_differences, ColourMode, DisplayTruth, DisplayTruthReason, ModeTruth, OutputTruth,
+    RestoreDifference,
+};
 use arcen_session::console_session::guest_layout::LayoutDeparture;
 use serde::{Deserialize, Serialize};
 use x11rb::connection::Connection as _;
@@ -88,6 +92,96 @@ struct LayoutJournal {
     /// journal) restores the console's own.
     #[serde(default)]
     departure: LayoutDeparture,
+    /// Every output as RandR read it before the layout (shared
+    /// `display_truth`): what the restore is proved against. Empty in an
+    /// older journal, or when it could not be read; the restore is then not
+    /// proved.
+    #[serde(default)]
+    before: Vec<OutputRecord>,
+    /// Set when a restore put the MetaMode back but the outputs still read
+    /// back differently from `before`: the journal stays as the record of the
+    /// console's own displays, the next layout starts from it rather than
+    /// from what was left, and nothing retries it in a loop.
+    #[serde(default)]
+    restore_incomplete: Option<String>,
+}
+
+/// One output of [`LayoutJournal::before`]: the shared `OutputTruth` as the
+/// journal stores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct OutputRecord {
+    id: String,
+    active: bool,
+    primary: bool,
+    x: i32,
+    y: i32,
+    /// Width, height and refresh in millihertz.
+    mode: Option<(u32, u32, u32)>,
+    rotation_degrees: u16,
+    edid: Option<Vec<u8>>,
+    bits_per_channel: Option<u8>,
+}
+
+impl OutputRecord {
+    fn of(output: &OutputTruth) -> Self {
+        Self {
+            id: output.id.clone(),
+            active: output.active,
+            primary: output.primary,
+            x: output.x,
+            y: output.y,
+            mode: output
+                .mode
+                .map(|mode| (mode.width, mode.height, mode.refresh_mhz)),
+            rotation_degrees: match output.rotation {
+                Rotation::Degrees0 => 0,
+                Rotation::Degrees90 => 90,
+                Rotation::Degrees180 => 180,
+                Rotation::Degrees270 => 270,
+            },
+            edid: output.edid.clone(),
+            bits_per_channel: output.bits_per_channel,
+        }
+    }
+
+    fn truth(&self) -> OutputTruth {
+        OutputTruth {
+            active: self.active,
+            primary: self.primary,
+            x: self.x,
+            y: self.y,
+            mode: self.mode.map(|(width, height, refresh_mhz)| ModeTruth {
+                width,
+                height,
+                refresh_mhz,
+            }),
+            rotation: match self.rotation_degrees {
+                90 => Rotation::Degrees90,
+                180 => Rotation::Degrees180,
+                270 => Rotation::Degrees270,
+                _ => Rotation::Degrees0,
+            },
+            edid: self.edid.clone(),
+            colour: if self.active {
+                ColourMode::Sdr
+            } else {
+                ColourMode::Unknown
+            },
+            bits_per_channel: self.bits_per_channel,
+            ..OutputTruth::new(self.id.clone(), self.id.clone())
+        }
+    }
+}
+
+fn records(truth: &DisplayTruth) -> Vec<OutputRecord> {
+    truth.outputs.iter().map(OutputRecord::of).collect()
+}
+
+fn truth_of(records: &[OutputRecord]) -> DisplayTruth {
+    DisplayTruth {
+        source: TRUTH_SOURCE,
+        outputs: records.iter().map(OutputRecord::truth).collect(),
+    }
 }
 
 impl LayoutJournal {
@@ -103,6 +197,13 @@ impl LayoutJournal {
 
     fn remove() {
         let _ = std::fs::remove_file(LAYOUT_JOURNAL);
+    }
+
+    /// Whether a restore is still owed. A journal whose restore was
+    /// incomplete is a record: the next layout of the console starts from
+    /// it, and nothing retries it in a loop.
+    fn pending(&self) -> bool {
+        self.restore_incomplete.is_none()
     }
 }
 
@@ -291,15 +392,7 @@ fn read_shown(
         let Some(mode) = resources.modes.iter().find(|mode| mode.id == crtc.mode) else {
             continue;
         };
-        let rotation = if crtc.rotation.contains(randr::Rotation::ROTATE270) {
-            Rotation::Degrees90
-        } else if crtc.rotation.contains(randr::Rotation::ROTATE180) {
-            Rotation::Degrees180
-        } else if crtc.rotation.contains(randr::Rotation::ROTATE90) {
-            Rotation::Degrees270
-        } else {
-            Rotation::Degrees0
-        };
+        let rotation = crtc_rotation(crtc.rotation);
         let (width, height) = shown_size((u32::from(crtc.width), u32::from(crtc.height)), rotation);
         if (width, height) != (u32::from(mode.width), u32::from(mode.height)) {
             tracing::warn!(
@@ -322,6 +415,142 @@ fn read_shown(
         });
     }
     Ok(shown)
+}
+
+/// A CRTC's rotation as the Deck's picture turns (`RandR` counts the
+/// other way).
+fn crtc_rotation(rotation: randr::Rotation) -> Rotation {
+    if rotation.contains(randr::Rotation::ROTATE270) {
+        Rotation::Degrees90
+    } else if rotation.contains(randr::Rotation::ROTATE180) {
+        Rotation::Degrees180
+    } else if rotation.contains(randr::Rotation::ROTATE90) {
+        Rotation::Degrees270
+    } else {
+        Rotation::Degrees0
+    }
+}
+
+/// The shared display truth's source name for an Xorg console.
+const TRUTH_SOURCE: &str = "xorg-randr";
+
+/// Every output of the console's X server that is connected or shows a
+/// picture, as `RandR` reads it now (shared `display_truth`): name, place,
+/// mode and refresh, rotation, primary, EDID, and the screen's bits per
+/// channel. Xorg composes SDR only, so an active output reads `sdr` and no
+/// output has an HDR switch.
+fn read_truth(connection: &RustConnection, root: xproto::Window) -> Result<DisplayTruth, String> {
+    let resources = connection
+        .randr_get_screen_resources_current(root)
+        .map_err(|error| format!("request RandR resources: {error}"))?
+        .reply()
+        .map_err(|error| format!("RandR resources: {error}"))?;
+    let (_, facts) = read_outputs(connection, root)?;
+    let primary = primary_name(connection, root, &facts);
+    let edid_atom = atom(connection, b"EDID")?;
+    let bits_per_channel = connection
+        .setup()
+        .roots
+        .iter()
+        .find(|screen| screen.root == root)
+        .and_then(|screen| match screen.root_depth {
+            24 => Some(8),
+            30 => Some(10),
+            _ => None,
+        });
+    let mut truth = DisplayTruth::new(TRUTH_SOURCE);
+    for fact in &facts {
+        let info = connection
+            .randr_get_output_info(fact.id, resources.config_timestamp)
+            .map_err(|error| format!("request RandR output: {error}"))?
+            .reply()
+            .map_err(|error| format!("RandR output: {error}"))?;
+        if info.connection != randr::Connection::CONNECTED && fact.crtc == 0 {
+            continue;
+        }
+        let mut output = OutputTruth::new(fact.name.clone(), fact.name.clone());
+        output.edid = connection
+            .randr_get_output_property(
+                fact.id,
+                edid_atom,
+                xproto::AtomEnum::ANY,
+                0,
+                256,
+                false,
+                false,
+            )
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.data)
+            .filter(|edid| !edid.is_empty());
+        if fact.crtc != 0 {
+            let crtc = connection
+                .randr_get_crtc_info(fact.crtc, resources.config_timestamp)
+                .map_err(|error| format!("request RandR CRTC: {error}"))?
+                .reply()
+                .map_err(|error| format!("RandR CRTC: {error}"))?;
+            if let Some(mode) = resources.modes.iter().find(|mode| mode.id == crtc.mode) {
+                output.active = true;
+                output.primary = primary.as_deref() == Some(fact.name.as_str());
+                output.x = i32::from(crtc.x);
+                output.y = i32::from(crtc.y);
+                output.mode = Some(ModeTruth {
+                    width: u32::from(mode.width),
+                    height: u32::from(mode.height),
+                    refresh_mhz: refresh_mhz(mode),
+                });
+                output.rotation = crtc_rotation(crtc.rotation);
+                output.colour = ColourMode::Sdr;
+                output.bits_per_channel = bits_per_channel;
+            }
+        }
+        truth.outputs.push(output);
+    }
+    Ok(truth)
+}
+
+/// The console's displays as `RandR` reads them, for `arcen-pier diagnose
+/// displays`: the `seat0` X11 desktop in front, as [`live_console`] finds
+/// it.
+///
+/// # Errors
+///
+/// When no console X server answers.
+pub(crate) async fn console_truth() -> Result<DisplayTruth, String> {
+    let mut last_error = "no X11 session on the console seat".to_owned();
+    for (fact, display) in console_candidates().await? {
+        match read_live(&display, read_truth).await {
+            Ok(truth) => return Ok(truth),
+            Err(error) => last_error = format!("session {}: {error}", fact.id),
+        }
+    }
+    Err(last_error)
+}
+
+/// How long the outputs may take to read back as they were after a restore.
+const RESTORE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Reads the outputs after a restore until they equal `before`, for at most
+/// [`RESTORE_SETTLE`]; the provable differences left, or the read error.
+async fn restore_left(
+    display: &SessionDisplay,
+    before: &DisplayTruth,
+) -> Result<Vec<RestoreDifference>, String> {
+    let deadline = tokio::time::Instant::now() + RESTORE_SETTLE;
+    loop {
+        let differences = read_live(display, read_truth)
+            .await
+            .map(|after| restore_differences(before, &after))?;
+        let provable = differences
+            .iter()
+            .filter(|difference| difference.provable)
+            .cloned()
+            .collect::<Vec<_>>();
+        if provable.is_empty() || tokio::time::Instant::now() >= deadline {
+            return Ok(provable);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 /// Reads `display`'s outputs off the async runtime, bounded: an X server
@@ -699,15 +928,20 @@ pub(crate) struct LiveConsole {
     pub(crate) outputs: Vec<String>,
 }
 
-/// Reads the console's live X server: the `seat0` X11 desktop in front
-/// (any account's, a login screen's too), else any on `seat0`.
+/// The `seat0` X11 desktops Arcen can open, the one in front first (any
+/// account's, a login screen's too), each with its display.
 ///
 /// # Errors
 ///
-/// When no console X server answers (nothing graphical runs, or its
-/// display cannot be opened).
-pub(crate) async fn live_console() -> Result<LiveConsole, String> {
-    use arcen_session::console_session::{ConsoleOrigin, ARCEN_TTY, CONSOLE_SEAT};
+/// When logind's sessions cannot be read, or none of them can be opened.
+async fn console_candidates() -> Result<
+    Vec<(
+        arcen_session::console_session::ConsoleSessionFact,
+        SessionDisplay,
+    )>,
+    String,
+> {
+    use arcen_session::console_session::{ARCEN_TTY, CONSOLE_SEAT};
     let sessions = super::console::read_sessions()
         .await
         .map_err(|unreadable| {
@@ -727,6 +961,7 @@ pub(crate) async fn live_console() -> Result<LiveConsole, String> {
         .collect();
     candidates.sort_by_key(|fact| (!fact.active, fact.class != "user"));
     let mut last_error = "no X11 session on the console seat".to_owned();
+    let mut found = Vec::new();
     for fact in candidates {
         let Some(home) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(fact.uid))
             .ok()
@@ -735,10 +970,28 @@ pub(crate) async fn live_console() -> Result<LiveConsole, String> {
         else {
             continue;
         };
-        let Some(display) = super::console::find_session_display(&fact.id, fact.uid, &home) else {
-            last_error = format!("session {} has no display Arcen can open", fact.id);
-            continue;
-        };
+        match super::console::find_session_display(&fact.id, fact.uid, &home) {
+            Some(display) => found.push((fact, display)),
+            None => last_error = format!("session {} has no display Arcen can open", fact.id),
+        }
+    }
+    if found.is_empty() {
+        return Err(last_error);
+    }
+    Ok(found)
+}
+
+/// Reads the console's live X server: the `seat0` X11 desktop in front
+/// (any account's, a login screen's too), else any on `seat0`.
+///
+/// # Errors
+///
+/// When no console X server answers (nothing graphical runs, or its
+/// display cannot be opened).
+pub(crate) async fn live_console() -> Result<LiveConsole, String> {
+    use arcen_session::console_session::ConsoleOrigin;
+    let mut last_error = "no X11 session on the console seat".to_owned();
+    for (fact, display) in console_candidates().await? {
         let origin = if fact.class == "user" {
             fact.origin()
         } else {
@@ -1285,13 +1538,27 @@ pub(crate) async fn apply(
     }
     // A journal left by an earlier attachment of this console holds the
     // console's own layout; never replace it with Arcen's.
+    // That includes one whose restore left the outputs different from
+    // before (`restore_incomplete`): the layout starts from the console's
+    // own, never from what was left.
     let mut journal = match LayoutJournal::read() {
         // Its windows settle afresh in this layout.
-        Some(journal) if journal.display == *display => LayoutJournal {
-            windows_after: None,
-            departure: LayoutDeparture::RestoreOwn,
-            ..journal
-        },
+        Some(journal) if journal.display == *display => {
+            if let Some(left) = &journal.restore_incomplete {
+                tracing::warn!(
+                    target: target::SESSION,
+                    reason_code = DisplayTruthReason::RestoreIncomplete.code(),
+                    left = %left,
+                    "an earlier restore left the console's outputs different; this layout is restored to the console's own as journalled before it"
+                );
+            }
+            LayoutJournal {
+                windows_after: None,
+                departure: LayoutDeparture::RestoreOwn,
+                restore_incomplete: None,
+                ..journal
+            }
+        }
         _ => LayoutJournal {
             session_id: session_id.to_owned(),
             display: display.clone(),
@@ -1303,6 +1570,23 @@ pub(crate) async fn apply(
             windows_before: read_windows(&connection, root, session_id),
             windows_after: None,
             departure: LayoutDeparture::RestoreOwn,
+            before: read_truth(&connection, root).map_or_else(
+                |error| {
+                    tracing::warn!(
+                        target: target::SESSION,
+                        %error,
+                        "the console's outputs could not be read before the layout; its restore cannot be proved"
+                    );
+                    Vec::new()
+                },
+                |truth| {
+                    for output in truth.to_text().lines().skip(1) {
+                        tracing::info!(target: target::SESSION, output, "the console's outputs before the layout");
+                    }
+                    records(&truth)
+                },
+            ),
+            restore_incomplete: None,
         },
     };
     journal
@@ -1466,15 +1750,55 @@ async fn restore_journal(journal: &LayoutJournal) -> bool {
         &departing,
     )
     .await;
+    if !journal.before.is_empty() {
+        let left = restore_left(&journal.display, &truth_of(&journal.before)).await;
+        if let Some(left) = restore_incomplete(&left) {
+            tracing::error!(
+                target: target::SESSION,
+                session_id = %journal.session_id,
+                reason_code = DisplayTruthReason::RestoreIncomplete.code(),
+                left = %left,
+                "the console's outputs do not read back as before the layout; the journal is kept as the record of its own"
+            );
+            for difference in left.split("; ") {
+                tracing::error!(target: target::SESSION, difference, "console output restore difference");
+            }
+            let kept = LayoutJournal {
+                restore_incomplete: Some(left),
+                ..journal.clone()
+            };
+            if let Err(error) = kept.write() {
+                tracing::warn!(target: target::SESSION, %error, "the console layout journal could not record the incomplete restore");
+            }
+            return true;
+        }
+    }
     LayoutJournal::remove();
     tracing::info!(
         target: target::SESSION,
         session_id = %journal.session_id,
         metamode = %journal.metamode,
         primary = journal.primary.as_deref().unwrap_or(""),
+        proved = !journal.before.is_empty(),
         "the console's own layout is restored"
     );
     true
+}
+
+/// What a restore left different, as the journal records it; `None` when
+/// the outputs read back as before.
+fn restore_incomplete(left: &Result<Vec<RestoreDifference>, String>) -> Option<String> {
+    match left {
+        Ok(differences) if differences.is_empty() => None,
+        Ok(differences) => Some(
+            differences
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+        Err(error) => Some(format!("the outputs could not be read: {error}")),
+    }
 }
 
 /// How long a desktop that is still starting may take before the layout
@@ -1649,7 +1973,9 @@ impl AppliedLayout {
 /// The session a layout journal left by a launcher that did not restore it
 /// belongs to.
 pub(crate) fn journalled_session() -> Option<String> {
-    LayoutJournal::read().map(|journal| journal.session_id)
+    LayoutJournal::read()
+        .filter(LayoutJournal::pending)
+        .map(|journal| journal.session_id)
 }
 
 /// Restores a layout a launcher left applied (it died, or was killed):
@@ -1667,7 +1993,7 @@ pub(crate) async fn recover() -> bool {
 /// in front of the session, as after a killed launcher), so a session that
 /// is not on screen keeps its journal and is restored when it is again.
 async fn try_recover(announce: bool) -> bool {
-    let Some(journal) = LayoutJournal::read() else {
+    let Some(journal) = LayoutJournal::read().filter(LayoutJournal::pending) else {
         return true;
     };
     // A launcher that died leaves a proved Deck layout as any departure
@@ -1739,7 +2065,7 @@ fn restore_when_shown() {
     runtime.spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            if LayoutJournal::read().is_none() {
+            if !LayoutJournal::read().is_some_and(|journal| journal.pending()) {
                 break;
             }
             if ATTACHMENTS.load(Ordering::SeqCst) != RESTORE_ARMED_AT.load(Ordering::SeqCst) {
@@ -1751,7 +2077,7 @@ fn restore_when_shown() {
         }
         RESTORE_WAITING.store(false, Ordering::SeqCst);
         // A restore asked for while this one was finishing found it busy.
-        if LayoutJournal::read().is_some()
+        if LayoutJournal::read().is_some_and(|journal| journal.pending())
             && ATTACHMENTS.load(Ordering::SeqCst) == RESTORE_ARMED_AT.load(Ordering::SeqCst)
         {
             restore_when_shown();
@@ -1791,6 +2117,43 @@ mod tests {
         let written = serde_json::to_string(&applied.journal).expect("journal");
         let read: LayoutJournal = serde_json::from_str(&written).expect("read back");
         assert_eq!(read.departure, LayoutDeparture::LeaveDecks);
+    }
+
+    // The audit finding: the restore put the MetaMode back and removed the
+    // journal without reading the outputs again, so a refresh, rotation or
+    // primary left different went unseen and the next layout started from
+    // it.
+    #[test]
+    fn a_restore_is_proved_against_the_journalled_outputs_and_an_incomplete_one_is_kept() {
+        let mut output = OutputTruth::new("DP-0", "DP-0");
+        output.active = true;
+        output.primary = true;
+        output.x = 1920;
+        output.mode = Some(ModeTruth::at_hz(2560, 1440, 60));
+        output.rotation = Rotation::Degrees90;
+        output.edid = Some(vec![0, 0xff, 0xff]);
+        output.colour = ColourMode::Sdr;
+        output.bits_per_channel = Some(10);
+        let mut before = DisplayTruth::new(TRUTH_SOURCE);
+        before.outputs = vec![output, OutputTruth::new("DP-1", "DP-1")];
+        let journalled = truth_of(&records(&before));
+        assert!(restore_differences(&before, &journalled).is_empty());
+
+        let mut after = before.clone();
+        after.outputs[0].mode = Some(ModeTruth::at_hz(2560, 1440, 30));
+        let left = restore_incomplete(&Ok(restore_differences(&journalled, &after)));
+        assert_eq!(
+            left.as_deref(),
+            Some("DP-0 mode: 2560x1440@60000mHz -> 2560x1440@30000mHz")
+        );
+        assert_eq!(restore_incomplete(&Ok(Vec::new())), None);
+        assert!(restore_incomplete(&Err("gone".into())).is_some());
+
+        let older = r#"{"session_id":"7","display":{"display":":100","number":100,"xauthority":"/run/user/1000/xauth"},"metamode":"","primary":null,"hidden":[]}"#;
+        let mut journal: LayoutJournal = serde_json::from_str(older).expect("older journal");
+        assert!(journal.before.is_empty() && journal.pending());
+        journal.restore_incomplete = left;
+        assert!(!journal.pending(), "a record is not retried in a loop");
     }
 
     #[test]

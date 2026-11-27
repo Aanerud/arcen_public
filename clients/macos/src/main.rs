@@ -400,9 +400,9 @@ async fn main() {
                   arcen-client\n\
                   arcen-client --connect <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--codec h264|h265|av1] [--chroma yuv420|yuv444] [--video-selection exact|adaptive-performance|color-fidelity] [--bit-depth 8|10|12] [--color-range limited|full] [--color-matrix bt709|identity|bt601|bt2020ncl] [--transfer bt709|srgb|pq|hlg] [--color-primaries bt709|bt2020|display_p3] [--encode-intent interactive|quality] [--max-fps N] [--microphone]\n\
                   arcen-client connect-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr] [--video-selection exact|adaptive-performance|color-fidelity] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT]\n\
-                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--pipeline auto|speed|grading|hdr [--require-served-pipeline]] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT]\n\
-                  arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--pipeline auto|speed|grading|hdr [--require-served-pipeline]] [--accept-host-layout] [--monitor-fixture PATH] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT] [--full-color-display ID] [--tablet-mode light|hard|off]\n\
-                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off] [--pen | --pen-full [--pen-wait-ms MS] [--pen-end-in-contact] | --pen-file PATH [--pen-go-file PATH]] [--text STRING]... [--keys SCRIPT | --keys-file PATH (quiet: tokens never printed) [--keyboard-shortcuts automatic|windows_app|swap_command_control|command_is_control] [--left-option-altgr]]... [--paste-file PATH [--paste-rate CHARS_PER_SECOND] [--paste-wait-ms MS] [--paste-click] [--paste-return]] [--magnify SCALE]\n\
+                  arcen-client media-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--account-switch confirm|cancel (test only)] [--pipeline auto|speed|grading|hdr [--require-served-pipeline]] [--video-selection exact|adaptive-performance|color-fidelity] [--video-only] [--microphone] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT]\n\
+                  arcen-client multi-monitor-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--accept-disclaimer] [--account-switch confirm|cancel (test only)] [--pipeline auto|speed|grading|hdr [--require-served-pipeline]] [--accept-host-layout] [--monitor-fixture PATH] [--hidpi-displays MASK] [--remote-ui-scale auto|PCT] [--full-color-display ID] [--tablet-mode light|hard|off]\n\
+                  arcen-client input-smoke <host> [port] [--ca-bundle PATH] [--pin-sha256 FP] [--insecure-skip-verify] [--username USER] [--password PASS | --password-file PATH] [--credentials-stdin] [--account-switch confirm|cancel (test only)] [--cursor-mode local|host] [--displays-mode match_layout|single_primary|windowed] [--tablet-mode light|hard|off] [--pen | --pen-full [--pen-wait-ms MS] [--pen-end-in-contact] | --pen-file PATH [--pen-go-file PATH]] [--text STRING]... [--keys SCRIPT | --keys-file PATH (quiet: tokens never printed) [--keyboard-shortcuts automatic|windows_app|swap_command_control|command_is_control] [--left-option-altgr]]... [--paste-file PATH [--paste-rate CHARS_PER_SECOND] [--paste-wait-ms MS] [--paste-click] [--paste-return]] [--magnify SCALE]\n\
                   arcen-client multi-monitor-harness [1|2|4] [--frames N]\n\
                   arcen-client multi-monitor-window-diagnostic [1|2|4] [--timeout-secs N]\n\
                   arcen-client platform-report\n\
@@ -1315,7 +1315,26 @@ fn connect_options_from_parts_with_monitors(
         keep_desk_private: !args.iter().any(|arg| arg == "--desk-visible"),
         // The command-line smokes present nothing: no canvas executor.
         canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
+        account_switch: account_switch_from_args(args)?,
     })
+}
+
+/// `--account-switch confirm|cancel`, test only: the answer a smoke gives a
+/// host's offer to sign another account out. Without it the smoke never
+/// asks for the offer and keeps the refusal it always had.
+fn account_switch_from_args(
+    args: &[String],
+) -> Result<arcen_deck_core::account_switch::AccountSwitchMode, String> {
+    use arcen_deck_core::account_switch::AccountSwitchMode;
+    use arcen_protocol::messages::AccountSwitchChoiceMsg;
+    match flag_value(args, "--account-switch").as_deref() {
+        None => Ok(AccountSwitchMode::Off),
+        Some("confirm") => Ok(AccountSwitchMode::Scripted(AccountSwitchChoiceMsg::Confirm)),
+        Some("cancel") => Ok(AccountSwitchMode::Scripted(AccountSwitchChoiceMsg::Cancel)),
+        Some(value) => Err(format!(
+            "invalid --account-switch '{value}'; accepted values: confirm, cancel"
+        )),
+    }
 }
 
 fn displays_mode_from_args(args: &[String]) -> Result<DisplaysMode, String> {
@@ -1503,6 +1522,7 @@ async fn input_smoke(
                     .send(SessionCommand::AcceptAuthentication)
                     .map_err(|_| "session closed before authentication acceptance".to_string())?;
             }
+            SessionEvent::AccountSwitch(news) => println!("account-switch {news:?}"),
             SessionEvent::CertificateUntrusted(_) => {
                 return Err("server certificate requires interactive trust".to_string());
             }
@@ -1540,6 +1560,7 @@ async fn input_smoke(
                     }
                 }
             }
+            SessionEvent::ServedLayout(report) => println!("{}", report.summary()),
             SessionEvent::MicrophoneActive(_)
             | SessionEvent::ConnectionStatusHint(_)
             | SessionEvent::CursorUpdate(_)
@@ -2932,6 +2953,9 @@ async fn media_smoke(
     };
     // The colour the hello states, which every decoded frame must carry.
     let mut hello_colour: Option<arcen_media::colour_check::ColourAxes> = None;
+    // Every display this attachment asked for against what the host serves
+    // (shared `arcen_protocol::served_layout`), and each stream's size.
+    let mut served_layout: Option<arcen_protocol::served_layout::ServedLayoutReport> = None;
     let mut monitors_omitted = 0_usize;
     let mut decoded_summary: Option<String> = None;
     let mut decoded_resolution: Option<(usize, usize)> = None;
@@ -3209,6 +3233,15 @@ async fn media_smoke(
             }
             SessionEvent::CertificateChanged(_) => {
                 return Err("this host's identity changed since it was trusted".to_string());
+            }
+            SessionEvent::ServedLayout(report) => {
+                for line in arcen_deck_core::smoke_contract::verify_served_layout(
+                    &report,
+                    contract.layout,
+                )? {
+                    println!("{line}");
+                }
+                served_layout = Some(report);
             }
             SessionEvent::ServerHello(hello) => {
                 if canvas_smoke.is_some() {
@@ -3489,6 +3522,7 @@ async fn media_smoke(
                 authentication_accepted = true;
                 last_health_ping = Instant::now();
             }
+            SessionEvent::AccountSwitch(news) => println!("account-switch {news:?}"),
             SessionEvent::MediaReady => {
                 let batch = session.media.take_batch();
                 if let Some(smoke) = canvas_smoke.as_mut() {
@@ -3793,6 +3827,19 @@ async fn media_smoke(
                             video_packets,
                             audio_packets
                         ));
+                        if let Some(report) =
+                            served_layout.as_ref().filter(|_| first_decoded_for_monitor)
+                        {
+                            if let Some(line) = arcen_deck_core::smoke_contract::verify_decoded_size(
+                                report,
+                                contract.layout,
+                                monitor_id,
+                                frame.width,
+                                frame.height,
+                            )? {
+                                println!("{line}");
+                            }
+                        }
                         if first_decoded_for_monitor {
                             println!(
                                 "media-smoke decoder: first frame monitor={} {}x{} backend={} pixfmt={}",
@@ -4736,6 +4783,27 @@ mod tests {
                 "{pipeline}"
             );
         }
+    }
+
+    #[test]
+    fn only_an_explicit_flag_makes_a_smoke_answer_a_change_of_account() {
+        use arcen_deck_core::account_switch::AccountSwitchMode;
+        use arcen_protocol::messages::AccountSwitchChoiceMsg;
+        let options = |extra: &[&str]| {
+            let mut args = base_smoke_args();
+            args.extend(extra.iter().map(|arg| (*arg).to_string()));
+            connect_options_from_cli_args(&args).map(|options| options.account_switch)
+        };
+        assert_eq!(options(&[]), Ok(AccountSwitchMode::Off));
+        assert_eq!(
+            options(&["--account-switch", "confirm"]),
+            Ok(AccountSwitchMode::Scripted(AccountSwitchChoiceMsg::Confirm))
+        );
+        assert_eq!(
+            options(&["--account-switch", "cancel"]),
+            Ok(AccountSwitchMode::Scripted(AccountSwitchChoiceMsg::Cancel))
+        );
+        assert!(options(&["--account-switch", "yes"]).is_err());
     }
 
     #[test]

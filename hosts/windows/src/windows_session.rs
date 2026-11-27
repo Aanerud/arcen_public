@@ -837,6 +837,109 @@ fn is_parked_session(candidate: &SessionCandidate, relation: AccountMatch) -> bo
         && matches!(relation, AccountMatch::Match | AccountMatch::Other)
 }
 
+/// Whether this candidate is the account's own session with another
+/// remote-desktop product's client attached to it (Active or Connected, off
+/// the console).
+fn is_own_session_held_elsewhere(candidate: &SessionCandidate, relation: AccountMatch) -> bool {
+    relation == AccountMatch::Match
+        && !candidate.user.is_empty()
+        && matches!(
+            candidate.state,
+            SessionState::Active | SessionState::Connected
+        )
+}
+
+/// Who holds the desktop, as `arcen_session::session_handover` reads it on
+/// Windows, from one WTS enumeration: the console's signed-in session; else,
+/// at the sign-in screen, the requester's own session elsewhere (parked, or
+/// shown by another product's client), or another account's session another
+/// product's client shows; else nobody. `foreign` is another product's
+/// client attached to the session (a session off the console that Windows
+/// reports Active or Connected). A session whose owner could not be read,
+/// or a console Windows did not list, is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopHolder {
+    Nobody,
+    Session {
+        session_id: u32,
+        own: bool,
+        foreign: bool,
+        locked: Option<bool>,
+    },
+    Unknown,
+}
+
+fn desktop_holder(
+    candidates: &[(SessionCandidate, AccountMatch)],
+    active_console_id: u32,
+) -> DesktopHolder {
+    let Some((console, console_match)) = candidates
+        .iter()
+        .find(|(candidate, _)| candidate.id == active_console_id)
+    else {
+        return DesktopHolder::Unknown;
+    };
+    let held = |candidate: &SessionCandidate, relation: AccountMatch, foreign: bool| {
+        DesktopHolder::Session {
+            session_id: candidate.id,
+            own: relation == AccountMatch::Match,
+            foreign,
+            locked: match candidate.state {
+                SessionState::Active => Some(!candidate.unlocked),
+                _ => None,
+            },
+        }
+    };
+    if *console_match == AccountMatch::Unknown {
+        return DesktopHolder::Unknown;
+    }
+    let console_signed_in = !console.user.is_empty()
+        && matches!(console_match, AccountMatch::Match | AccountMatch::Other);
+    if console_signed_in
+        && matches!(
+            console.state,
+            SessionState::Active | SessionState::Connected
+        )
+    {
+        return held(console, *console_match, false);
+    }
+    let mut own = None;
+    let mut other_attached = None;
+    for (candidate, relation) in candidates.iter().filter(|(candidate, relation)| {
+        candidate.id != active_console_id
+            && !is_known_local_wts_extra(candidate, *relation)
+            && !candidate.user.is_empty()
+    }) {
+        match relation {
+            AccountMatch::Unknown => return DesktopHolder::Unknown,
+            AccountMatch::Match if own.replace(candidate).is_some() => {
+                return DesktopHolder::Unknown;
+            }
+            AccountMatch::Other if is_attached(candidate) => {
+                other_attached.get_or_insert(candidate);
+            }
+            _ => {}
+        }
+    }
+    if let Some(candidate) = own {
+        return held(candidate, AccountMatch::Match, is_attached(candidate));
+    }
+    if let Some(candidate) = other_attached {
+        return held(candidate, AccountMatch::Other, true);
+    }
+    if console_signed_in {
+        return held(console, *console_match, false);
+    }
+    DesktopHolder::Nobody
+}
+
+fn is_attached(candidate: &SessionCandidate) -> bool {
+    matches!(
+        candidate.state,
+        SessionState::Active | SessionState::Connected
+    )
+}
+
 /// What the broker should do about the physical console, given everything else
 /// that is signed in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -862,7 +965,11 @@ enum ConsoleApproach {
 /// The rules are deliberately narrow:
 ///
 /// - an **attached** session other than the console (Active or Connected) means
-///   somebody is really using a desktop we did not account for, so refuse;
+///   somebody is really using a desktop we did not account for, so refuse --
+///   unless it is the account's own: another product's client shows the
+///   account's session, and the account always joins its own session (ADR 0025
+///   §13). Windows shows a session on one station at a time, so the move
+///   takes it off that client, as a sign-in at the desk would;
 /// - a session whose owner could not be verified means refuse, because the
 ///   whole point of this classifier is to never guess whose desktop it is;
 /// - the account may own at most **one** parked session, since with two there is
@@ -878,7 +985,9 @@ fn classify_console_takeover(
         if candidate.id == active_console_id || is_known_local_wts_extra(candidate, *relation) {
             continue;
         }
-        if !is_parked_session(candidate, *relation) {
+        if !is_parked_session(candidate, *relation)
+            && !is_own_session_held_elsewhere(candidate, *relation)
+        {
             return ConsoleApproach::Blocked;
         }
         if *relation == AccountMatch::Match && source.replace(candidate.id).is_some() {
@@ -990,31 +1099,24 @@ fn classify_cp_bind(
 }
 
 /// The typed refusal for a console bind `classify_cp_bind` rejected, when
-/// the cause is another account or another remote-desktop service: a
-/// session other than the console's that a client is attached to (another
-/// account's: `console_other_user_other_product`; the account's own:
-/// `console_in_use_other_product`), with its id so its service can be
+/// the cause is another account or another remote-desktop service: another
+/// account's session other than the console's that a client is attached to
+/// (`console_other_user_other_product`), with its id so its service can be
 /// named; else another account active at the console
-/// (`console_other_user`).
+/// (`console_other_user`). The account's own session is never refused for
+/// another product's client (ADR 0025 §13): it is moved onto the console.
 fn console_refusal(
     candidates: &[(SessionCandidate, AccountMatch)],
     active_console_id: u32,
 ) -> Option<(ConsoleRefusal, Option<u32>)> {
-    let remote = candidates.iter().find(|(candidate, _)| {
+    let remote = candidates.iter().find(|(candidate, relation)| {
         candidate.id != active_console_id
             && !candidate.user.is_empty()
-            && matches!(
-                candidate.state,
-                SessionState::Active | SessionState::Connected
-            )
+            && *relation != AccountMatch::Match
+            && is_attached(candidate)
     });
-    if let Some((candidate, relation)) = remote {
-        let refusal = if *relation == AccountMatch::Match {
-            ConsoleRefusal::InUseOtherProduct
-        } else {
-            ConsoleRefusal::OtherUserOtherProduct
-        };
-        return Some((refusal, Some(candidate.id)));
+    if let Some((candidate, _)) = remote {
+        return Some((ConsoleRefusal::OtherUserOtherProduct, Some(candidate.id)));
     }
     let (console, relation) = candidates
         .iter()
@@ -1132,6 +1234,53 @@ pub(crate) fn session_owner(session_id: u32) -> Result<Option<SessionOwner>, Str
 /// interactive desktop).
 pub(crate) fn lock_workstation() -> Result<(), String> {
     platform::lock_workstation()
+}
+
+/// Who holds the desktop now, for `arcen_session::session_handover`
+/// ([`desktop_holder`]), with the owner (SID and logon id) of that session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HolderReading {
+    Nobody,
+    Session {
+        session_id: u32,
+        owner: SessionOwner,
+        /// The authenticated account's own session.
+        own: bool,
+        /// Another remote-desktop product's client is attached to it.
+        foreign: bool,
+        locked: Option<bool>,
+    },
+    Unknown,
+}
+
+/// Who holds the desktop now, read for `account`.
+pub(crate) fn read_desktop_holder(
+    account: &crate::auth::AuthenticatedAccount,
+) -> Result<HolderReading, String> {
+    platform::read_desktop_holder(account)
+}
+
+/// Whether the exact session (`session_id` signed in by `owner`'s logon)
+/// still exists: gone once the id is free or belongs to another logon.
+pub(crate) fn session_presence(
+    session_id: u32,
+    owner: &SessionOwner,
+) -> arcen_session::session_handover::logout::SessionPresence {
+    platform::session_presence(session_id, owner)
+}
+
+/// Asks Windows for the ordinary sign-out of the exact session: starts
+/// `arcen-pier sign-out-session` as its user, in it, which calls
+/// `ExitWindowsEx(EWX_LOGOFF)` without a force flag. It returns once the
+/// sign-out was asked for; applications may still refuse it.
+pub(crate) fn request_sign_out(session_id: u32, owner: &SessionOwner) -> Result<(), String> {
+    platform::request_sign_out(session_id, owner)
+}
+
+/// `arcen-pier sign-out-session`, started by the broker in the session it
+/// signs out: the ordinary sign-out of this process's own session.
+pub(crate) fn sign_out_own_session() -> Result<(), String> {
+    platform::sign_out_own_session()
 }
 
 pub struct LaunchedAgent {
@@ -1491,20 +1640,20 @@ mod platform {
         TokenErrors(Vec<String>),
     }
 
-    /// Single source of truth for SID-to-WTS binding. Both the attach-only path
-    /// and the first-login re-bind poll go through this so they can never
-    /// disagree about what counts as a match.
-    fn bind_matching_session(
-        account: &crate::auth::AuthenticatedAccount,
-    ) -> Result<BindOutcome, String> {
+    /// One WTS enumeration, each signed-in session's relation to the
+    /// account (by token SID), and the matching sessions' tokens.
+    struct Observed {
+        all_candidates: Vec<SessionCandidate>,
+        active_console_id: u32,
+        observed: Vec<(SessionCandidate, AccountMatch)>,
+        token_errors: Vec<String>,
+        matching_tokens: std::collections::HashMap<u32, OwnedHandle>,
+    }
+
+    fn observe_sessions(account: &crate::auth::AuthenticatedAccount) -> Result<Observed, String> {
         let all_candidates = enumerate_sessions()?;
+        // SAFETY: WTSGetActiveConsoleSessionId takes no arguments and cannot fail.
         let active_console_id = unsafe { WTSGetActiveConsoleSessionId() };
-        if active_console_id == u32::MAX {
-            return Ok(BindOutcome::Rejected(
-                "Windows did not report an active physical console",
-                None,
-            ));
-        }
         let candidates = ordered_supported_candidates(all_candidates.clone());
 
         let mut token_errors = Vec::new();
@@ -1543,6 +1692,34 @@ mod platform {
                 (candidate, relation)
             })
             .collect::<Vec<_>>();
+        Ok(Observed {
+            all_candidates,
+            active_console_id,
+            observed,
+            token_errors,
+            matching_tokens,
+        })
+    }
+
+    /// Single source of truth for SID-to-WTS binding. Both the attach-only path
+    /// and the first-login re-bind poll go through this so they can never
+    /// disagree about what counts as a match.
+    fn bind_matching_session(
+        account: &crate::auth::AuthenticatedAccount,
+    ) -> Result<BindOutcome, String> {
+        let Observed {
+            all_candidates,
+            active_console_id,
+            observed,
+            token_errors,
+            mut matching_tokens,
+        } = observe_sessions(account)?;
+        if active_console_id == u32::MAX {
+            return Ok(BindOutcome::Rejected(
+                "Windows did not report an active physical console",
+                None,
+            ));
+        }
         match classify_cp_bind(&observed, active_console_id) {
             CpBindDecision::Bound(id) => {
                 let candidate = all_candidates
@@ -2720,9 +2897,112 @@ mod platform {
         })
     }
 
+    pub fn read_desktop_holder(
+        account: &crate::auth::AuthenticatedAccount,
+    ) -> Result<super::HolderReading, String> {
+        let observed = observe_sessions(account)?;
+        if observed.active_console_id == u32::MAX {
+            return Ok(super::HolderReading::Unknown);
+        }
+        Ok(
+            match super::desktop_holder(&observed.observed, observed.active_console_id) {
+                super::DesktopHolder::Nobody => super::HolderReading::Nobody,
+                super::DesktopHolder::Unknown => super::HolderReading::Unknown,
+                super::DesktopHolder::Session {
+                    session_id,
+                    own,
+                    foreign,
+                    locked,
+                } => match owner_of(session_id) {
+                    Ok(owner) => super::HolderReading::Session {
+                        session_id,
+                        owner,
+                        own,
+                        foreign,
+                        locked,
+                    },
+                    Err(error) => {
+                        tracing::info!(
+                            target: crate::logging::SESSION,
+                            windows_session_id = session_id,
+                            %error,
+                            "the desktop's session owner could not be read"
+                        );
+                        super::HolderReading::Unknown
+                    }
+                },
+            },
+        )
+    }
+
+    pub fn session_presence(
+        session_id: u32,
+        owner: &super::SessionOwner,
+    ) -> arcen_session::session_handover::logout::SessionPresence {
+        use arcen_session::session_handover::logout::SessionPresence;
+        // A session WTS reports resetting or down (7, 8) is ending: its
+        // logon is gone even before the id leaves the list.
+        match enumerate_sessions() {
+            Ok(sessions) => match sessions.iter().find(|candidate| candidate.id == session_id) {
+                None => return SessionPresence::Gone,
+                Some(candidate)
+                    if candidate.user.is_empty()
+                        || matches!(candidate.state, SessionState::Unsupported(7 | 8)) =>
+                {
+                    return SessionPresence::Gone;
+                }
+                Some(_) => {}
+            },
+            Err(_) => return SessionPresence::Unknown,
+        }
+        match session_owner(session_id) {
+            Ok(None) => SessionPresence::Gone,
+            Ok(Some(current)) if current == *owner => SessionPresence::Present,
+            // The id now belongs to another logon: the exact session ended.
+            Ok(Some(_)) => SessionPresence::Gone,
+            Err(_) => SessionPresence::Unknown,
+        }
+    }
+
+    pub fn request_sign_out(session_id: u32, owner: &super::SessionOwner) -> Result<(), String> {
+        let mut token = HANDLE::default();
+        // SAFETY: token is a valid out-param; WTS validates the session id.
+        unsafe { WTSQueryUserToken(session_id, &mut token) }
+            .map_err(|error| format!("WTSQueryUserToken({session_id}): {error}"))?;
+        let token = own(token);
+        if owner_of(session_id)? != *owner {
+            return Err(format!(
+                "session {session_id} no longer belongs to the confirmed logon"
+            ));
+        }
+        run_session_helper(&token, "sign-out-session")
+    }
+
+    pub fn sign_out_own_session() -> Result<(), String> {
+        use windows::Win32::System::Shutdown::{
+            ExitWindowsEx, EWX_LOGOFF, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OTHER,
+        };
+        // Neither EWX_FORCE nor EWX_FORCEIFHUNG: every application is asked
+        // and any of them may refuse, which stops the sign-out.
+        // SAFETY: plain flags; Windows signs out this process's own session.
+        unsafe {
+            ExitWindowsEx(
+                EWX_LOGOFF,
+                SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED,
+            )
+        }
+        .map_err(|error| format!("ExitWindowsEx(EWX_LOGOFF): {error}"))
+    }
+
     /// Starts `arcen-pier lock-session` as the session's user on its
     /// interactive desktop and waits for it.
     fn run_lock_helper(user_token: &OwnedHandle) -> Result<(), String> {
+        run_session_helper(user_token, "lock-session")
+    }
+
+    /// Starts `arcen-pier <command>` as the session's user on its
+    /// interactive desktop and waits for it.
+    fn run_session_helper(user_token: &OwnedHandle, command: &str) -> Result<(), String> {
         let mut primary = HANDLE::default();
         // SAFETY: the user token is live; the output is a valid out-param.
         unsafe {
@@ -2735,7 +3015,7 @@ mod platform {
                 &mut primary,
             )
         }
-        .map_err(|error| format!("DuplicateTokenEx(lock helper): {error}"))?;
+        .map_err(|error| format!("DuplicateTokenEx({command} helper): {error}"))?;
         let primary = own(primary);
         let executable = std::env::current_exe()
             .map_err(|error| format!("resolve the Pier executable: {error}"))?;
@@ -2743,10 +3023,7 @@ mod platform {
             .to_str()
             .ok_or_else(|| "the Pier executable path is not valid UTF-8".to_string())?;
         let executable_wide = wide(executable);
-        let mut command_wide = wide(&format!(
-            "{} lock-session",
-            quote_windows_argument(executable)
-        ));
+        let mut command_wide = wide(&format!("{} {command}", quote_windows_argument(executable)));
         let mut desktop = wide(r"winsta0\default");
         let startup = windows::Win32::System::Threading::STARTUPINFOW {
             cb: std::mem::size_of::<windows::Win32::System::Threading::STARTUPINFOW>() as u32,
@@ -2771,7 +3048,7 @@ mod platform {
                 &mut process_info,
             )
         }
-        .map_err(|error| format!("CreateProcessAsUserW(lock helper): {error}"))?;
+        .map_err(|error| format!("CreateProcessAsUserW({command} helper): {error}"))?;
         let process = own(process_info.hProcess);
         drop(own(process_info.hThread));
         // SAFETY: the process handle is live.
@@ -2780,16 +3057,16 @@ mod platform {
             unsafe {
                 let _ = TerminateProcess(raw(&process), 1);
             }
-            return Err("the session lock helper timed out".to_string());
+            return Err(format!("the session {command} helper timed out"));
         }
         let mut code = 0u32;
         // SAFETY: the handle is live and the out-parameter is valid.
         unsafe { windows::Win32::System::Threading::GetExitCodeProcess(raw(&process), &mut code) }
-            .map_err(|error| format!("GetExitCodeProcess(lock helper): {error}"))?;
+            .map_err(|error| format!("GetExitCodeProcess({command} helper): {error}"))?;
         if code == 0 {
             Ok(())
         } else {
-            Err(format!("the session lock helper exited with {code}"))
+            Err(format!("the session {command} helper exited with {code}"))
         }
     }
 
@@ -3114,6 +3391,27 @@ mod platform {
         Err("LockWorkStation is only available on Windows".to_string())
     }
 
+    pub fn read_desktop_holder(
+        _account: &crate::auth::AuthenticatedAccount,
+    ) -> Result<super::HolderReading, String> {
+        Err("Windows WTS sessions are unavailable on this platform".to_string())
+    }
+
+    pub fn session_presence(
+        _session_id: u32,
+        _owner: &super::SessionOwner,
+    ) -> arcen_session::session_handover::logout::SessionPresence {
+        arcen_session::session_handover::logout::SessionPresence::Unknown
+    }
+
+    pub fn request_sign_out(_session_id: u32, _owner: &super::SessionOwner) -> Result<(), String> {
+        Err("signing a Windows session out is only available on Windows".to_string())
+    }
+
+    pub fn sign_out_own_session() -> Result<(), String> {
+        Err("ExitWindowsEx is only available on Windows".to_string())
+    }
+
     pub fn still_unlocked_session_of(_session_id: u32, _expected_sid: &str) -> bool {
         false
     }
@@ -3405,7 +3703,8 @@ mod tests {
             console_refusal(&candidates, 1),
             Some((ConsoleRefusal::OtherUserOtherProduct, Some(3)))
         );
-        // The account's own desktop is in use through another product.
+        // The account's own desktop in use through another product is not
+        // refused: it is moved onto the console (ADR 0025 §13).
         let candidates = vec![
             logon_ui,
             cp_candidate(
@@ -3417,10 +3716,7 @@ mod tests {
                 AccountMatch::Match,
             ),
         ];
-        assert_eq!(
-            console_refusal(&candidates, 1),
-            Some((ConsoleRefusal::InUseOtherProduct, Some(3)))
-        );
+        assert_eq!(console_refusal(&candidates, 1), None);
         // Another account at the console itself.
         let candidates = vec![cp_candidate(
             1,
@@ -3458,6 +3754,144 @@ mod tests {
             ),
         ];
         assert_eq!(console_refusal(&candidates, 1), None);
+    }
+
+    #[test]
+    fn the_own_session_another_product_shows_is_joined_not_refused() {
+        let logon_ui = cp_candidate(
+            1,
+            "",
+            SessionState::Active,
+            false,
+            Some(0),
+            AccountMatch::NoUser,
+        );
+        for state in [SessionState::Active, SessionState::Connected] {
+            let candidates = vec![
+                logon_ui.clone(),
+                cp_candidate(3, "artist", state, true, Some(2), AccountMatch::Match),
+            ];
+            assert_eq!(
+                classify_cp_bind(&candidates, 1),
+                CpBindDecision::Reconnect {
+                    source: 3,
+                    target: 1
+                }
+            );
+            assert_eq!(
+                desktop_holder(&candidates, 1),
+                DesktopHolder::Session {
+                    session_id: 3,
+                    own: true,
+                    foreign: true,
+                    locked: (state == SessionState::Active).then_some(false),
+                }
+            );
+        }
+        // Two sessions of one account stay ambiguous: nothing is moved.
+        let candidates = vec![
+            logon_ui,
+            cp_candidate(
+                3,
+                "artist",
+                SessionState::Active,
+                true,
+                Some(2),
+                AccountMatch::Match,
+            ),
+            cp_candidate(
+                4,
+                "artist",
+                SessionState::Disconnected,
+                true,
+                Some(0),
+                AccountMatch::Match,
+            ),
+        ];
+        assert!(matches!(
+            classify_cp_bind(&candidates, 1),
+            CpBindDecision::Reject(_)
+        ));
+        assert_eq!(desktop_holder(&candidates, 1), DesktopHolder::Unknown);
+    }
+
+    #[test]
+    fn the_desktop_holder_is_read_from_the_wts_topology() {
+        let logon_ui = cp_candidate(
+            1,
+            "",
+            SessionState::Connected,
+            false,
+            Some(0),
+            AccountMatch::NoUser,
+        );
+        // Another account at the console, locked: it holds the desktop and
+        // no other product's client is attached to it.
+        let console = vec![cp_candidate(
+            1,
+            "editor",
+            SessionState::Active,
+            false,
+            Some(0),
+            AccountMatch::Other,
+        )];
+        assert_eq!(
+            desktop_holder(&console, 1),
+            DesktopHolder::Session {
+                session_id: 1,
+                own: false,
+                foreign: false,
+                locked: Some(true),
+            }
+        );
+        // Another account shown by another product while the console waits.
+        let remote = vec![
+            logon_ui.clone(),
+            cp_candidate(
+                3,
+                "editor",
+                SessionState::Active,
+                true,
+                Some(2),
+                AccountMatch::Other,
+            ),
+        ];
+        assert!(matches!(
+            desktop_holder(&remote, 1),
+            DesktopHolder::Session {
+                session_id: 3,
+                own: false,
+                foreign: true,
+                ..
+            }
+        ));
+        // Only another account's parked session: nobody holds the desktop.
+        let parked = vec![
+            logon_ui.clone(),
+            cp_candidate(
+                3,
+                "editor",
+                SessionState::Disconnected,
+                true,
+                Some(0),
+                AccountMatch::Other,
+            ),
+        ];
+        assert_eq!(desktop_holder(&parked, 1), DesktopHolder::Nobody);
+        // An owner that could not be read is unknown, never nobody.
+        let unread = vec![
+            logon_ui,
+            cp_candidate(
+                3,
+                "editor",
+                SessionState::Disconnected,
+                true,
+                Some(0),
+                AccountMatch::Unknown,
+            ),
+        ];
+        assert_eq!(desktop_holder(&unread, 1), DesktopHolder::Unknown);
+        assert_eq!(desktop_holder(&console, 2), DesktopHolder::Unknown);
     }
 
     #[test]

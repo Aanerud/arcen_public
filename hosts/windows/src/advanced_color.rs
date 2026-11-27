@@ -147,6 +147,19 @@ impl AdvancedColorTarget {
 }
 
 impl AdvancedColorState {
+    /// What the shared display truth records of this target's colour state:
+    /// the composition, the user's HDR switch and the link's bits per
+    /// channel (`None` when Windows reports none).
+    pub(crate) fn truth(&self) -> (arcen_outputs::display_truth::ColourMode, bool, Option<u8>) {
+        (
+            CompositionMode::from_raw(self.active_colour_mode).colour_mode(),
+            self.hdr_user_enabled,
+            u8::try_from(self.bits_per_colour_channel)
+                .ok()
+                .filter(|bits| *bits != 0),
+        )
+    }
+
     fn reading(&self) -> ColourReading {
         ColourReading {
             hdr_supported: self.hdr_supported,
@@ -170,7 +183,7 @@ impl AdvancedColorState {
     }
 }
 
-fn windows_11_or_later() -> Result<bool, String> {
+pub(crate) fn windows_11_or_later() -> Result<bool, String> {
     let mut version = OSVERSIONINFOW {
         dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
         ..Default::default()
@@ -187,7 +200,7 @@ fn windows_11_or_later() -> Result<bool, String> {
     Ok(version.dwMajorVersion >= 10 && version.dwBuildNumber >= WINDOWS_11_FIRST_BUILD)
 }
 
-fn query_distinct_hdr(
+pub(crate) fn query_distinct_hdr(
     adapter: LUID,
     target: u32,
     adapter_device_path: String,
@@ -231,7 +244,7 @@ fn query_distinct_hdr(
     })
 }
 
-fn query_legacy(
+pub(crate) fn query_legacy(
     adapter: LUID,
     target: u32,
     adapter_device_path: String,
@@ -318,7 +331,7 @@ fn active_paths() -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, String> {
     Ok(paths)
 }
 
-fn source_gdi_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, String> {
+pub(crate) fn source_gdi_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, String> {
     let mut request = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
             r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
@@ -353,7 +366,7 @@ fn utf16_nul_terminated(value: &[u16]) -> String {
     String::from_utf16_lossy(&value[..end])
 }
 
-fn target_monitor_device_path(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, String> {
+pub(crate) fn target_monitor_device_path(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, String> {
     let mut request = DISPLAYCONFIG_TARGET_DEVICE_NAME {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
             r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
@@ -382,7 +395,7 @@ fn target_monitor_device_path(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, 
     Ok(value)
 }
 
-fn adapter_device_path(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, String> {
+pub(crate) fn adapter_device_path(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, String> {
     let mut request = DISPLAYCONFIG_ADAPTER_NAME {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
             r#type: DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME,

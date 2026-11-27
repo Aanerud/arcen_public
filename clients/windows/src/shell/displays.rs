@@ -222,7 +222,10 @@ pub(super) fn identity_display_state(
         topology,
         settings.remote_ui_scale_percent,
         settings.hidpi_display_mask,
-        options.multi_monitor_topology.is_some(),
+        arcen_deck_core::connect_plan::identity_covers_every_display(
+            &options.displays_mode,
+            options.multi_monitor_topology.is_some(),
+        ),
     );
     (monitors, topology, SafeAreaPolicyMsg::StandardFullscreen)
 }
@@ -319,6 +322,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
+            account_switch: arcen_deck_core::account_switch::AccountSwitchMode::Off,
         }
     }
 

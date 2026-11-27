@@ -26,13 +26,27 @@ unlock. Stopping the Pier
 instead hands the session to its session guard, which locks it once the
 displays are back.
 
-When the protected `display-recovery.json` remains after a session:
+When the protected `display-recovery.json` remains after a session, the
+next session first applies it. If it cannot be applied, the Pier sets it
+aside untouched as `display-recovery.unrestorable.<time>.json`, logs
+`display_restore_pending`, tells the Deck ("The displays could not be put
+back after an earlier session."), and serves the session from the displays as
+they are, with a journal of its own:
 
-1. Stop new sessions.
-2. Run `arcen-pier restore-display` as LocalSystem.
-3. Do not weaken the journal's SYSTEM/Administrators ACL, follow reparse
-   points, or delete a failed journal before the display topology is
-   restored.
+1. Connect and set the displays as they should be in Windows display
+   settings, or replay the set-aside journal on the desktop with
+   `arcen-pier restore-display --journal <file>` as LocalSystem.
+2. `arcen-pier diagnose displays`, run on the desktop, shows the displays as
+   the Pier reads them.
+3. `arcen-pier restore-display --set-aside` sets a pending journal aside by
+   hand; it works over SSH.
+4. Do not weaken the journal's SYSTEM/Administrators ACL, follow reparse
+   points, or delete a set-aside journal: it is the only record of what the
+   stranded session changed.
+
+After every session the Pier reads every display again and logs
+`the displays are back exactly as they were before the session`, or
+`display_restore_incomplete` with each display and value that differs.
 
 A journal left on a GeForce by a 0.20.4 or 0.20.5 session, whose only failure
 was the driver refusing the EDID purge, needs no manual step after upgrading:
@@ -58,6 +72,12 @@ If a desk stays dark, end the helper
 `arcen-pier-macos probe-desk-privacy`, run in that session, shows whether any
 display still reads dark.
 
+When a Deck leaves, the Pier waits for its virtual displays to go, puts a
+display macOS moved back in its place, and logs `display_restore_incomplete`
+for anything it could not put back. `arcen-pier-macos diagnose displays`,
+run in the signed-in user's session, prints the displays as the Pier reads
+them.
+
 With `privacy.desk = "required"`, the desk also stays dark, with its input
 blocked, after a Deck leaves a session that will not lock; the agent log says
 `the session would not lock after its Deck left`. Turn the session's lock
@@ -74,6 +94,17 @@ The key was `platform.desktop.deskside.enabled` before `privacy.desk`; see the
 A joined console's blanking is recorded in the console privacy journal
 (`/run/arcen/console-privacy.json`;
 [ADR 0025 §4](../adr/0025-arcen-joins-the-users-session.md)).
+
+A joined X11 console's layout journal (`/run/arcen/console-layout.json`)
+also holds every output as RandR read it before the Deck's layout. When the
+Deck leaves, the Pier puts the layout back and reads the outputs again. If
+they differ, it logs `display_restore_incomplete` with each output and value
+and keeps the journal as the record: the next Deck's layout of that console
+is put back to it, not to what was left. `arcen-pier diagnose displays`, run
+as root, prints the console's outputs as the Pier reads them. Another
+product's desktop keeps the Deck's layout when the Deck leaves, as that
+product keeps its own; its layout before the Deck is recorded in
+`/run/arcen/console-layout-before-deck.json`, not put back.
 
 With pinned deskside, stop the Pier and keep
 `/run/arcen/deskside-recovery.json` owned by root, mode 0600, in a mode-0700

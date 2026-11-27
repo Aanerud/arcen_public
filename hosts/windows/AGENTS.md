@@ -29,14 +29,23 @@ identical to Linux `/etc/arcen/pier.json`, with Windows-only values under
   tagged `srgb` (VUI 13) for a Deck that claims `srgb_transfer`
   (`arcen_media::video::serve_sdr_desktop`, decided in
   `HostConfig::apply_initial_video_request`); an older Deck keeps the
-  BT.709 OETF and tag. The GPU shader and the CPU table must apply the same
-  transfer (`WideShaderMode` follows `ScrgbSdrTransform::transfer`). HDR converts linear
-  scRGB to absolute BT.2020/PQ using 80-nit Windows reference white.
+  BT.709 OETF and tag. HDR converts linear scRGB to absolute BT.2020/PQ
+  using 80-nit Windows reference white.
+- One conversion per stream: the shared `ScrgbConversion` is built once,
+  before the encoder, and the GPU shader's constant buffer
+  (`ScrgbConversion::shader_params`), the CPU conversion and the exact
+  tiles all read it. Never copy a colour value into the shader from
+  anywhere else, and never change the conversion after the encoder is
+  built: a new value needs a new encoder. Through 0.21.4 the shader was
+  built before the white was known, and the video sat at 240 nits around
+  203-nit exact tiles.
 - HDR places the desktop's SDR white at BT.2408's 203 nits, as every Pier
   does: capenc reads the captured output's `DISPLAYCONFIG_SDR_WHITE_LEVEL`
-  (Windows composes SDR there; 240 nits by default) and the shared
-  `ScrgbPqTransform::with_sdr_white_nits` rescales in linear light, keeping
-  highlights in proportion. The helper logs `HDR SDR white: host N nits ...`.
+  (Windows composes SDR there; 240 nits by default) before it builds the
+  encoder, and `ScrgbPqTransform::new` rescales in linear light, keeping
+  highlights in proportion. capenc logs `HDR SDR white: host N nits ...`
+  from the encoder's own conversion, and `wide FP16 shader constants: ...`
+  read back from the GPU.
 - The broker serves every attachment on isolated QUIC lanes (ADR 0014,
   protocol v5): it grants the attachment before relaying anything the agent
   says, keeps control on the control lane and hands every other agent

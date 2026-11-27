@@ -403,6 +403,17 @@ older deployments may be removed from `/opt/arcen/bin/`.
   scaling), and leave it when the Deck goes (`LayoutDeparture::LeaveDecks`:
   the hand-back and the recovery keep it; a failed or unproved layout is
   still put back and the desktop shown as it is).
+- A console sign-in is decided by the shared `SwitchLedger::decide` before
+  the launcher runs (ADR 0025 §13, `net/account_switch.rs`, facts in
+  `session/handover.rs`). The account's own desktop is always joined,
+  another product's client attached or not. Another account's session is
+  signed out only after a confirmed offer, by
+  `org.gnome.SessionManager.Logout` mode 1 asked as that account on its own
+  bus, after `IsInhibited(1)` found no inhibitor; never mode 2,
+  `loginctl terminate-session`, a signal or a kill. Only logind's read-back
+  that exactly that session (id and `TimestampMonotonic`) is gone lets the
+  requester in. Advance the registry's attachment epoch on every attach and
+  detach, and never attach anyone the ledger holds out.
 - Whoever connects gets their own layout (ADR 0025 §6): which layout a
   console is asked to take is the shared `connect_layout::console_layout_ask`
   (a one-display Deck that matches its layout too, on another product's

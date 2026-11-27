@@ -1110,6 +1110,52 @@ credential; logs and support bundles must not contain them. See
 
 ---
 
+### Confirmed change of account (protocol v3, additive, capability-gated)
+
+A Deck whose account authenticated may find another account's session
+holding the workstation with no remote client attached to it. Such a Pier
+may offer to sign that account out gracefully (ADR 0025 §13). The offer
+reaches only a Deck that asked for it: `AuthResponse.account_switch_v1 =
+true` (`#[serde(default)]`, omitted when false). An older Pier ignores it.
+Nothing destructive is inferred from silence. No version bump.
+
+The capability also gates three refusal codes that came with it (ADR 0025
+§7, `ConsoleRefusal::since_account_switch_v1`): `console_remote_state_unknown`,
+`console_switch_in_progress` and `console_signing_out`. A Pier sends them
+only to a Deck that set `account_switch_v1`. An older Deck never sets it
+and keeps the refusal it has always had: `console_other_user*` for another
+account's session, whatever is attached to it and whether a change of
+account is pending, and `console_session_changed` when its own session is
+being signed out (`HandoverRefusal::console_refusal`).
+
+| Rust type | Wire `type` | Direction, lane | Fields |
+|---|---|---|---|
+| `AccountSwitchOfferMsg` | `account_switch_offer` | Pier → Deck, control | `offer_id` (64 lowercase hexadecimal characters: a one-use 32-byte nonce), `expires_in_secs` (`1..=600`). Sent in place of `auth_result`, after the Deck's credentials and account policy passed. Names no account and shows nothing of the other session. |
+| `AccountSwitchReplyMsg` | `account_switch_reply` | Deck → Pier, control | `offer_id`, `choice`: `confirm` or `cancel`. Any other choice fails to parse and never confirms. |
+| `AccountSwitchResultMsg` | `account_switch_result` | Pier → Deck, control | `offer_id`, `outcome`: `signed_out`, `cancelled`, `expired`, `stale`, `rejected`, `logout_vetoed`, `logout_timed_out`, `logout_failed`, or `unknown` (`#[serde(other)]`). |
+
+`validate()` on each checks its `type` and `offer_id`, and the offer its
+lifetime; `Debug` redacts `offer_id`.
+
+The exchange, on one connection:
+
+1. Deck → `auth_response` with `account_switch_v1 = true`.
+2. Pier → `account_switch_offer`. The Deck shows Cancel (the default) and
+   Sign out and continue.
+3. Deck → `account_switch_reply`. Leaving, or not answering before the
+   offer expires, cancels.
+4. Pier → `account_switch_result`. On `signed_out` the other account's
+   session ended (proved) and the Pier signs the Deck's account in, then
+   sends `auth_result`; every other outcome changes no session, or stops a
+   logout an application refused, and the Pier closes the connection.
+
+A Pier revalidates immediately before it asks for the logout: the same
+native session (account, id, boot, generation), still no remote client
+attached, the same ownership epoch. A returning client, an expired, replayed
+or mismatched `offer_id`, a reply from another connection, or a Pier restart
+makes the offer void. The logout is the operating system's graceful one; it
+is never forced (`arcen_session::session_handover`).
+
 ### QUIC lane preface v1 (dormant, ADR 0014)
 
 `arcen_protocol::lanes` defines the target transport layout: one QUIC stream
@@ -1337,6 +1383,14 @@ legacy `common/session_fsm.py` contract.
 ---
 
 ## Changelog
+
+- **2026-11-26 — confirmed change of account (additive, capability-gated)**
+  — Add `AuthResponse.account_switch_v1` (default `false`, omitted when
+  false) and the control messages `account_switch_offer`,
+  `account_switch_reply` and `account_switch_result`. Only a Deck that sets
+  the capability is ever sent an offer; older peers keep today's refusal.
+  No product sends them yet. No version bump. Needs Shared/Architecture
+  review.
 
 - **2026-11-19 — PC keys a host injects (additive)** — Add
   `InputCapabilitiesMsg.pc_keys` (`PcKeysMsg`, omitted while unknown):

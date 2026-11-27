@@ -14,6 +14,9 @@ use arcen_session::restore_lease::RestorePhase;
 use arcen_session::restore_lease::{
     IanaTimeZone, LeaseOwnerId, RestoreEvent, RestoreLease, RestoreResource, StateFingerprint,
 };
+use arcen_session::session_handover::displays::{
+    reattach_displays, AttachmentKind, HeldDesktop, ReattachDisplays,
+};
 use arcen_telemetry::CorrelationId;
 use thiserror::Error;
 use tokio::sync::{watch, OwnedSemaphorePermit};
@@ -145,22 +148,23 @@ impl MultiMonitorEverUsable {
     }
 }
 
-/// Whether a reconnect to a disconnected desktop must replace it because the
-/// current client layout differs from the desktop's committed topology.
-///
-/// A desktop's committed topology is fixed for its whole lifetime (see
-/// [`SessionMetadata::multi_monitor_plan`]): a desktop created by a
-/// single-primary or capability-probe connect commits `None`, and every
-/// later Match My Layout connect reattaches to that same `None`. ADR-0009
-/// forbids silently serving the primary-only subset, so the only remaining
-/// Match My Layout is current-layout authoritative: moving between locations,
-/// adding/removing displays, or switching to Primary Display Only must create
-/// a desktop matching that request instead of reattaching a stale roster.
-///
-/// Extracted to exactly the three inputs the decision depends on so it is
-/// directly unit-testable without a live registry.
-fn reconnect_must_replace_desktop(topology_matches: bool) -> bool {
-    !topology_matches
+/// The request an attachment to a held desktop was made for, as
+/// [`reattach_displays`] compares it: the committed plan (by
+/// [`LinuxTopologyPlan::same_desktop`]) and, for a joined console, its one
+/// display ([`super::launcher::ConsoleDisplayRequest`]).
+struct AttachRequest<'a> {
+    plan: Option<&'a LinuxTopologyPlan>,
+    console: Option<super::launcher::ConsoleDisplayRequest>,
+}
+
+impl PartialEq for AttachRequest<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let plans = match (self.plan, other.plan) {
+            (Some(held), Some(current)) => held.same_desktop(current),
+            (held, current) => held.is_none() && current.is_none(),
+        };
+        plans && self.console == other.console
+    }
 }
 
 /// Before a Wayland-creating launcher creates a desktop: the refusal, or
@@ -189,30 +193,6 @@ fn wayland_console_refusal(
     join: &arcen_session::console_session::wayland_join::WaylandJoin,
 ) -> Option<arcen_session::console_session::ConsoleRefusal> {
     join.refusal()
-}
-
-/// What a reconnect does with the account's own desktop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplaceStep {
-    /// The desktop serves the requested layout: reattach it.
-    Reattach,
-    /// Tear it down and create one for the requested layout.
-    Replace,
-    /// Replacing it would create a desktop, which is refused (ADR 0025,
-    /// `wayland_join::creating_step`): the desktop the account
-    /// already has is kept, never torn down for nothing, and the sign-in
-    /// is refused.
-    KeepAndRefuse,
-}
-
-fn reconnect_replacement(topology_matches: bool, creation_refused: bool) -> ReplaceStep {
-    if !reconnect_must_replace_desktop(topology_matches) {
-        ReplaceStep::Reattach
-    } else if creation_refused {
-        ReplaceStep::KeepAndRefuse
-    } else {
-        ReplaceStep::Replace
-    }
 }
 
 /// Whether a disconnected persistent desktop has exceeded the operator
@@ -266,6 +246,10 @@ struct DesktopSession {
     multi_monitor_ever_usable: MultiMonitorEverUsable,
     /// See [`SessionMetadata::requested_outputs`].
     requested_outputs: Option<Vec<arcen_session::wayland_outputs::PlacedOutput>>,
+    /// A joined console's one-display request it was attached for; `None`
+    /// for a desktop of the Pier's own, which resizes its one display at
+    /// every attachment.
+    console_display: Option<super::launcher::ConsoleDisplayRequest>,
     /// logind removed this desktop's session while an attachment held it:
     /// the desktop is torn down when that attachment ends, never retained.
     logind_session_removed: bool,
@@ -396,6 +380,22 @@ pub struct SessionRegistry {
     cleanup: Mutex<Option<CleanupTask>>,
     resume: Arc<ResumeRegistry>,
     disconnected_idle_lifetime: Option<Duration>,
+    handover: Mutex<HandoverState>,
+}
+
+/// The desktop's change-of-account state (ADR 0025 §13), in Pier memory
+/// only: a restart forgets every offer.
+#[derive(Debug, Default)]
+pub(crate) struct HandoverState {
+    /// The shared transaction ledger.
+    pub(crate) ledger: arcen_session::session_handover::consent::SwitchLedger,
+    /// Advanced on every attach and detach of an Arcen client, and on
+    /// every change of what another product's client shows.
+    epoch: u64,
+    next_connection: u64,
+    /// What another product's client showed when last read
+    /// (`remote_access::ForeignEvidence::fingerprint`).
+    foreign: Option<String>,
 }
 
 #[derive(Default)]
@@ -434,11 +434,60 @@ impl SessionRegistry {
             cleanup: Mutex::new(None),
             resume: ResumeRegistry::new()?,
             disconnected_idle_lifetime,
+            handover: Mutex::new(HandoverState::default()),
         }))
     }
 
     pub(crate) fn resume(&self) -> &ResumeRegistry {
         &self.resume
+    }
+
+    /// The change-of-account ledger, locked. Never held across an await.
+    pub(crate) fn handover(&self) -> std::sync::MutexGuard<'_, HandoverState> {
+        self.handover.lock().unwrap()
+    }
+
+    /// A connection's own id in the ledger.
+    pub(crate) fn next_handover_connection(
+        &self,
+    ) -> arcen_session::session_handover::consent::ConnectionId {
+        let mut handover = self.handover();
+        handover.next_connection += 1;
+        arcen_session::session_handover::consent::ConnectionId::new(handover.next_connection)
+    }
+
+    /// The attachment epoch now.
+    pub(crate) fn attachment_epoch(&self) -> arcen_session::session_handover::AttachmentEpoch {
+        arcen_session::session_handover::AttachmentEpoch::new(self.handover().epoch)
+    }
+
+    /// A client attached or detached: an offer made before is stale.
+    pub(crate) fn note_attachment(&self) {
+        let mut handover = self.handover();
+        handover.epoch = handover.epoch.wrapping_add(1);
+    }
+
+    /// What another product's client shows now: any change since the last
+    /// reading (a client that came, went or was replaced) advances the
+    /// epoch, so an offer made before it is stale.
+    pub(crate) fn observe_foreign(&self, fingerprint: &str) {
+        let mut handover = self.handover();
+        if handover.foreign.as_deref() != Some(fingerprint) {
+            if handover.foreign.is_some() {
+                handover.epoch = handover.epoch.wrapping_add(1);
+            }
+            handover.foreign = Some(fingerprint.to_owned());
+        }
+    }
+
+    /// Whether an Arcen Deck is attached to the desktop of `uid` now.
+    pub(crate) fn arcen_attached(&self, uid: u32) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .session
+            .as_ref()
+            .is_some_and(|session| session.connected && session.launcher.identity.uid == uid)
     }
 
     pub async fn acquire(
@@ -465,7 +514,7 @@ impl SessionRegistry {
             let refusal = match decide_on_read(
                 &sessions,
                 pending.identity.uid,
-                super::login_session::console_host(),
+                super::login_session::console_host_for_sign_in(),
             ) {
                 ConsoleDecision::Refuse(refusal) => Some(refusal),
                 ConsoleDecision::JoinWayland(target) => wayland_console_refusal(
@@ -582,13 +631,52 @@ impl SessionRegistry {
                                         plan.backend
                                             == crate::display::topology::LinuxTopologyBackend::VirtualOutputs
                                     });
-                                    let in_place = requested_virtual
-                                        && existing.wayland_output_mode().is_some_and(|mode| {
-                                            arcen_session::wayland_outputs::reattach_topology_action(
-                                                mode,
-                                                topology_matches,
-                                            ) == arcen_session::wayland_outputs::TopologyReattach::ReconfigureInPlace
-                                        });
+                                    let pending_launcher =
+                                        pending.as_ref().expect("pending launcher");
+                                    // A joined Wayland session serves its own
+                                    // monitors whatever is asked (it is not
+                                    // laid out for a Deck yet): only its
+                                    // committed plan is compared, as before.
+                                    let xorg_console = existing.launcher.is_console()
+                                        && existing.launcher.wayland.is_none();
+                                    let held = if xorg_console {
+                                        HeldDesktop::JoinedConsole
+                                    } else if requested_virtual
+                                        && existing
+                                            .wayland_output_mode()
+                                            .is_some_and(|mode| mode.reconfigurable())
+                                    {
+                                        HeldDesktop::OwnReconfigurable
+                                    } else {
+                                        HeldDesktop::OwnFixed
+                                    };
+                                    let held_request = AttachRequest {
+                                        plan: existing
+                                            .requested_multi_monitor_plan
+                                            .as_ref()
+                                            .or(existing.multi_monitor_plan.as_ref()),
+                                        console: existing.console_display,
+                                    };
+                                    let current_request = AttachRequest {
+                                        plan: requested_plan,
+                                        console: (pending_launcher.joins_console()
+                                            && !pending_launcher.joins_wayland_console())
+                                        .then(|| pending_launcher.console_display_request()),
+                                    };
+                                    let displays = reattach_displays(
+                                        held,
+                                        &held_request,
+                                        &current_request,
+                                        replacement_refusal.is_some(),
+                                    );
+                                    tracing::info!(
+                                        target: crate::logging::target::SESSION,
+                                        attachment = AttachmentKind::Connect.token(),
+                                        action = displays.token(),
+                                        topology_matches,
+                                        "the account's held desktop takes this Deck's current display request"
+                                    );
+                                    let in_place = displays == ReattachDisplays::ReconfigureInPlace;
                                     if in_place {
                                         tracing::info!(
                                             target: crate::logging::target::SESSION,
@@ -613,14 +701,12 @@ impl SessionRegistry {
                                             .requested_wayland_outputs();
                                     }
                                     // The current client layout is
-                                    // authoritative. A disconnected desktop
-                                    // with a different frozen topology is
-                                    // replaced rather than silently reattached.
-                                    let step = reconnect_replacement(
-                                        topology_matches || in_place,
-                                        replacement_refusal.is_some(),
-                                    );
-                                    if step == ReplaceStep::KeepAndRefuse {
+                                    // authoritative, never served from an
+                                    // earlier attachment: a joined console is
+                                    // attached afresh in the same session; a
+                                    // desktop of the Pier's own that cannot
+                                    // take it in place is replaced.
+                                    if displays == ReattachDisplays::KeepAndRefuse {
                                         existing.requested_outputs = previous_outputs;
                                         tracing::warn!(
                                             target: crate::logging::target::SESSION,
@@ -631,7 +717,11 @@ impl SessionRegistry {
                                             "the account's desktop cannot serve the requested layout, and a new one may not be created; the desktop is kept and the sign-in refused"
                                         );
                                         ExistingDecision::Busy(replacement_refusal.clone())
-                                    } else if step == ReplaceStep::Replace {
+                                    } else if matches!(
+                                        displays,
+                                        ReattachDisplays::FreshAttachment
+                                            | ReattachDisplays::ReplaceDesktop
+                                    ) {
                                         guard.draining = true;
                                         ExistingDecision::Replace(Box::new(
                                             guard.session.take().expect("existing session"),
@@ -775,6 +865,7 @@ impl SessionRegistry {
                         generation = metadata.generation,
                         "reattached to persistent authenticated desktop"
                     );
+                    self.note_attachment();
                     return Ok(SessionLease::new(Arc::downgrade(self), metadata, execution));
                 }
                 ExistingDecision::Busy(console) => {
@@ -816,6 +907,9 @@ impl SessionRegistry {
         );
         pending.set_timezone(timezone.clone());
         let requested_outputs = pending.requested_wayland_outputs();
+        let console_display = pending
+            .joins_console()
+            .then(|| pending.console_display_request());
         let launcher = match pending.open().await {
             Ok(launcher) => launcher,
             Err(error) => {
@@ -835,6 +929,7 @@ impl SessionRegistry {
             return Err(LifecycleError::TimezoneLease);
         }
         let launcher_is_wayland = launcher.wayland.is_some();
+        let launcher_is_console = launcher.is_console();
         // A joined console that could not take the plan's layout commits no
         // plan; the Pier then ends the sign-in with the reason (ADR 0025 §6).
         let multi_monitor = multi_monitor.filter(|_| launcher.serves_committed_monitors());
@@ -870,6 +965,8 @@ impl SessionRegistry {
             } else {
                 None
             },
+            console_display: console_display
+                .filter(|_| launcher_is_console && !launcher_is_wayland),
             logind_session_removed: false,
             _removal_watch: None,
         };
@@ -896,6 +993,7 @@ impl SessionRegistry {
             agent_pid = metadata.agent_pid,
             "persistent authenticated graphical session created"
         );
+        self.note_attachment();
         Ok(SessionLease::new(Arc::downgrade(self), metadata, execution))
     }
 
@@ -1177,6 +1275,7 @@ impl SessionRegistry {
     }
 
     fn disconnect(self: &Arc<Self>, generation: u64, username: &str) {
+        self.note_attachment();
         let mut guard = self.inner.lock().unwrap();
         let state = &mut *guard;
         let Some(session) = state.session.as_mut().filter(|session| {
@@ -1686,6 +1785,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn any_change_of_another_products_clients_makes_an_earlier_offer_stale() {
+        let registry = SessionRegistry::new(None).unwrap();
+        registry.observe_foreign("-|-|-");
+        let offered = registry.attachment_epoch();
+        registry.observe_foreign("-|-|-");
+        assert_eq!(registry.attachment_epoch(), offered);
+        registry.observe_foreign("-|x11vnc[42] 9|-");
+        let came = registry.attachment_epoch();
+        assert_ne!(came, offered);
+        registry.observe_foreign("-|-|-");
+        assert_ne!(registry.attachment_epoch(), came);
+        registry.note_attachment();
+        assert!(registry.attachment_epoch() > came);
+    }
+
+    #[test]
     fn a_console_pier_lets_a_joinable_wayland_session_through_to_the_join() {
         use arcen_session::console_session::wayland_join::{CompositorProof, WaylandJoin};
         use arcen_session::console_session::ConsoleRefusal;
@@ -1723,31 +1838,47 @@ mod tests {
     }
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// A desktop's committed topology is frozen for its lifetime, so a
-    /// desktop created without one can never grow into Match My Layout on a
-    /// later reconnect. Replacing it loses the user's running applications,
-    /// so it must happen only on an explicit client instruction -- never
-    /// inferred from the mismatch itself.
-    ///
-    /// The 2026-08-11 pier-linux.example.internal case is the first row: a desktop created
-    /// without a plan, still alive and disconnected 85 minutes later,
-    /// refusing a two-monitor Match My Layout connect.
+    /// A joined console held for an earlier Deck's one display is never
+    /// reattached for another: the new request is laid out by a fresh
+    /// attachment to the same session.
     #[test]
-    fn every_topology_mismatch_replaces_the_disconnected_desktop() {
-        assert!(reconnect_must_replace_desktop(false));
-
-        // Exact topology matches always reattach, regardless of permission.
-        assert!(!reconnect_must_replace_desktop(true));
-    }
-
-    #[test]
-    fn a_refused_creation_keeps_the_desktop_a_replacement_would_tear_down() {
-        assert_eq!(reconnect_replacement(true, false), ReplaceStep::Reattach);
-        assert_eq!(reconnect_replacement(true, true), ReplaceStep::Reattach);
-        assert_eq!(reconnect_replacement(false, false), ReplaceStep::Replace);
+    fn a_console_held_for_another_display_is_attached_afresh() {
+        use super::super::launcher::ConsoleDisplayRequest;
+        let held = AttachRequest {
+            plan: None,
+            console: Some(ConsoleDisplayRequest::new(Some((3024, 1964, 120)), false)),
+        };
+        let same = AttachRequest {
+            plan: None,
+            console: Some(ConsoleDisplayRequest::new(Some((3024, 1964, 120)), false)),
+        };
+        let other = AttachRequest {
+            plan: None,
+            console: Some(ConsoleDisplayRequest::new(Some((2560, 1440, 60)), false)),
+        };
+        let matched = AttachRequest {
+            plan: None,
+            console: Some(ConsoleDisplayRequest::new(Some((3024, 1964, 120)), true)),
+        };
         assert_eq!(
-            reconnect_replacement(false, true),
-            ReplaceStep::KeepAndRefuse
+            reattach_displays(HeldDesktop::JoinedConsole, &held, &same, true),
+            ReattachDisplays::Reattach
+        );
+        for current in [&other, &matched] {
+            assert_eq!(
+                reattach_displays(HeldDesktop::JoinedConsole, &held, current, true),
+                ReattachDisplays::FreshAttachment
+            );
+        }
+        // A desktop of the Pier's own resizes its one display at every
+        // attachment: only its committed plan is compared.
+        let own = AttachRequest {
+            plan: None,
+            console: None,
+        };
+        assert_eq!(
+            reattach_displays(HeldDesktop::OwnFixed, &own, &own, false),
+            ReattachDisplays::Reattach
         );
     }
 

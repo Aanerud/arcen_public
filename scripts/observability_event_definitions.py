@@ -226,6 +226,17 @@ EVENT_DEFINITIONS = {
         (("reason_class", STRING),),
         (("held_ms", INTEGER),),
     ),
+    # Level 0. What became of a sign-in to a desktop another connection or
+    # account held, and of a confirmed change of account (ADR 0025 §13).
+    1109: _event(
+        "SESSION_HANDOVER",
+        0,
+        "info",
+        "reconnect",
+        "succeeded",
+        (("reason_class", STRING),),
+        (("attachment", STRING), ("remote_client", STRING)),
+    ),
     1200: _event(
         "DISPLAY_ARMED",
         2,

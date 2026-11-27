@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH LicenseRef-Arcen-Store-Exception
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! Arcen's real login session on a host without a display manager (ADR
-//! 0025 §10): the Linux adapter.
+//! 0025 §10), or beside another product that runs the console's sign-in
+//! and withholds GDM's login screen once the Pier has proved it can (§8):
+//! the Linux adapter.
 //!
 //! Every decision is `arcen_session::console_session::login_session`'s.
 //! The console launcher asks systemd to start `arcen-pier login-session`
@@ -242,6 +244,65 @@ pub(crate) fn console_host() -> model::ConsoleHost {
     host
 }
 
+/// [`console_host`] for a sign-in's decision: where another product
+/// withholds GDM's login screen, also what proves Arcen's own login
+/// session may start beside it ([`login_session_proof`]).
+pub(crate) fn console_host_for_sign_in() -> model::ConsoleHost {
+    let mut host = console_host();
+    if host.login_screen == model::LoginScreen::Withheld {
+        host.login_session_proof = login_session_proof();
+    }
+    host
+}
+
+/// Whether GDM answers on the system bus (its manager's `Version`), asked
+/// with a bound: GNOME Shell offers its lock screen only then, and GDM
+/// unlocks a session it did not start through it.
+fn gdm_answers() -> bool {
+    bounded_output(
+        "/usr/bin/busctl",
+        &[
+            "--system",
+            "get-property",
+            "org.gnome.DisplayManager",
+            "/org/gnome/DisplayManager/Manager",
+            "org.gnome.DisplayManager.Manager",
+            "Version",
+        ],
+    )
+    .is_some_and(|answer| answer.starts_with("s \""))
+}
+
+/// What proves, on a console whose login screen another product
+/// withholds, that Arcen's own login session can stand beside it
+/// (shared `LoginSessionProof`). A fact that cannot be read is not proved.
+fn login_session_proof() -> model::LoginSessionProof {
+    use model::guest_layout::ForeignClient;
+    let x_servers = listening_x_displays();
+    let (product_client, client_detail) = match super::console::another_products_client_read() {
+        Ok(None) => (ForeignClient::Absent, String::new()),
+        Ok(Some(device)) => (ForeignClient::Attached, device),
+        Err(error) => (ForeignClient::Unknown, format!("/sys/class/input: {error}")),
+    };
+    let proof = model::LoginSessionProof {
+        gdm_answers: gdm_answers(),
+        login_service: stack_installed(),
+        x_server_free: x_servers.as_ref().is_some_and(Vec::is_empty),
+        product_client,
+    };
+    tracing::info!(
+        target: target::SESSION,
+        proof = proof.token(),
+        gdm_answers = proof.gdm_answers,
+        login_service = proof.login_service,
+        x_displays = ?x_servers,
+        product_client = product_client.token(),
+        product_client_detail = %client_detail,
+        "console host: Arcen's own login session beside the product that runs the sign-in"
+    );
+    proof
+}
+
 /// What the console launcher passes on to a new login session.
 #[derive(Debug, Clone)]
 pub(crate) struct LoginLaunch {
@@ -271,19 +332,29 @@ fn stack_installed() -> bool {
         .is_ok_and(|text| policy::pam_stack_is_arcen(&text))
 }
 
+/// The X displays whose server listens now (`/proc/net/unix`: abstract
+/// and path sockets alike, held only while a server runs); `None` when the
+/// table cannot be read.
+fn listening_x_displays() -> Option<Vec<u32>> {
+    let table = std::fs::read_to_string("/proc/net/unix").ok()?;
+    let mut displays: Vec<u32> = table
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(7))
+        .filter_map(|path| {
+            path.strip_prefix("@/tmp/.X11-unix/X")
+                .or_else(|| path.strip_prefix("/tmp/.X11-unix/X"))
+        })
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    displays.sort_unstable();
+    displays.dedup();
+    Some(displays)
+}
+
 fn taken_displays() -> Vec<u32> {
     // Abstract sockets too: an X server needs no file in /tmp to hold a
     // display, and clients try the abstract name first.
-    let mut taken: Vec<u32> = std::fs::read_to_string("/proc/net/unix")
-        .map(|table| {
-            table
-                .lines()
-                .filter_map(|line| line.split_whitespace().nth(7))
-                .filter_map(|path| path.strip_prefix("@/tmp/.X11-unix/X"))
-                .filter_map(|n| n.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut taken: Vec<u32> = listening_x_displays().unwrap_or_default();
     if let Ok(entries) = std::fs::read_dir("/tmp/.X11-unix") {
         for entry in entries.flatten() {
             if let Some(n) = entry
@@ -358,6 +429,29 @@ pub(crate) async fn start(
         return Err(ConsoleRefusal::SignInFailed);
     };
     let unit = unit_name(identity.uid);
+    // Beside a product that withholds GDM's login screen, the product may
+    // have attached, started its X server or signed someone in since the
+    // decision: decide again now, and start nothing unless it still holds.
+    let beside_product = {
+        let host = console_host_for_sign_in();
+        if host.login_screen == model::LoginScreen::Withheld {
+            let sessions = super::console::read_sessions().await;
+            let decision = model::decide_on_read(&sessions, identity.uid, host);
+            if let Err(refusal) = model::confirm_start_beside_product(&decision, vt) {
+                tracing::error!(
+                    target: target::SESSION,
+                    vt,
+                    login_session_proof = host.login_session_proof.token(),
+                    decision = ?decision,
+                    "the console changed before Arcen's own login session could start beside the product; nothing is started"
+                );
+                return Err(refusal);
+            }
+            true
+        } else {
+            false
+        }
+    };
     let mut run = Command::new("/usr/bin/systemd-run");
     run.args([
         "--quiet",
@@ -412,7 +506,7 @@ pub(crate) async fn start(
         unit,
         vt,
         x_display = %format!(":{display_number}"),
-        "starting the account's login session (no display manager on this host)"
+        "starting the account's login session (no login screen on this host completes the sign-in)"
     );
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     let mut polls: u32 = 0;
@@ -447,6 +541,19 @@ pub(crate) async fn start(
                 vt = session.vtnr,
                 "the login session is active on seat0"
             );
+            if beside_product {
+                if let Err(intruder) = alone_beside_product(&session.id, display_number).await {
+                    tracing::error!(
+                        target: target::SESSION,
+                        unit,
+                        session_id = %session.id,
+                        intruder = intruder.token(),
+                        "the product became active while Arcen's own login session started beside it; the new session is stopped"
+                    );
+                    stop_unit(&unit).await;
+                    return Err(ConsoleRefusal::SignInOtherProduct);
+                }
+            }
             return Ok(session.id);
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -456,10 +563,38 @@ pub(crate) async fn start(
         unit,
         "the login session did not become active in time; it is stopped (journalctl -u {unit})"
     );
-    let mut stop = Command::new("/usr/bin/systemctl");
-    stop.args(["stop", &unit]);
-    let _ = bounded(stop).await;
+    stop_unit(&unit).await;
     Err(ConsoleRefusal::SignInFailed)
+}
+
+async fn stop_unit(unit: &str) {
+    let mut stop = Command::new("/usr/bin/systemctl");
+    stop.args(["stop", unit]);
+    let _ = bounded(stop).await;
+}
+
+/// Whether the login session `ours`, just active on X display
+/// `display_number` beside the product, stands alone there (shared
+/// `started_alone_beside_product`).
+async fn alone_beside_product(
+    ours: &str,
+    display_number: u32,
+) -> Result<(), model::BesideProductIntruder> {
+    use model::guest_layout::ForeignClient;
+    let sessions = super::console::read_sessions().await;
+    let x_displays = listening_x_displays();
+    let product_client = match super::console::another_products_client_read() {
+        Ok(None) => ForeignClient::Absent,
+        Ok(Some(_)) => ForeignClient::Attached,
+        Err(_) => ForeignClient::Unknown,
+    };
+    model::started_alone_beside_product(
+        &sessions,
+        ours,
+        x_displays.as_deref(),
+        display_number,
+        product_client,
+    )
 }
 
 async fn unit_active(unit: &str) -> bool {

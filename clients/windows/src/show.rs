@@ -485,6 +485,8 @@ fn show(args: &[String]) -> Result<bool, String> {
         exact_still_image: args.exact_still_image,
         keep_desk_private: true,
         canvas: arcen_deck_core::canvas::CanvasRequest::Unavailable,
+        // A tool that cannot answer keeps the host's refusal.
+        account_switch: arcen_deck_core::account_switch::AccountSwitchMode::Off,
     };
     let mut auth = Some(AuthSubmission { username, password });
     let requested_video = arcen_deck_core::connect_plan::profile_video(&options.profile);

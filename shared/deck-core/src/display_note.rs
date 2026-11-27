@@ -6,6 +6,14 @@
 
 use std::collections::BTreeMap;
 
+/// The host's notice that an earlier session's displays could not be put
+/// back (shared `display_truth::DisplayTruthReason::RestorePending`).
+pub const DISPLAY_RESTORE_PENDING: &str = "display_restore_pending";
+
+/// What the Deck shows for [`DISPLAY_RESTORE_PENDING`].
+pub const RESTORE_PENDING_NOTE: &str =
+    "The displays could not be put back after an earlier session.";
+
 /// Report what the host actually did with the requested display size and
 /// UI scale.
 ///
@@ -20,6 +28,16 @@ pub fn display_negotiation_note(
     let display = capabilities.get("display_resolution")?;
     let dimension = |key: &str, axis: &str| display.get(key)?.get(axis)?.as_u64();
     let mut notes: Vec<String> = Vec::new();
+
+    // A Windows Pier whose earlier session's displays it could not put back
+    // says so (`display_restore_pending`) and serves this session anyway.
+    if display
+        .get("restore_notice")
+        .and_then(serde_json::Value::as_str)
+        == Some(DISPLAY_RESTORE_PENDING)
+    {
+        notes.push(RESTORE_PENDING_NOTE.to_owned());
+    }
 
     if let (Some(rw), Some(rh), Some(aw), Some(ah)) = (
         dimension("requested", "width"),
@@ -53,6 +71,66 @@ pub fn display_negotiation_note(
     notes.extend(display_scale_notes(display));
 
     (!notes.is_empty()).then(|| notes.join(" "))
+}
+
+/// The display line a Deck shows for an attachment: the host's own account
+/// of the size ([`display_negotiation_note`]) first; else this Deck's
+/// check of every display it asked for against what is served
+/// ([`served_layout_note`]).
+#[must_use]
+pub fn attachment_display_note(
+    hello: &arcen_protocol::messages::ServerHelloMsg,
+    served_layout: Option<&arcen_protocol::served_layout::ServedLayoutReport>,
+) -> Option<String> {
+    display_negotiation_note(&hello.device_capabilities).or_else(|| {
+        served_layout
+            .and_then(served_layout_note)
+            .map(str::to_owned)
+    })
+}
+
+/// What the session says when the host did not serve the displays this
+/// attachment asked for (`arcen_protocol::served_layout`); `None` when it
+/// served them exactly. A host that keeps its desktop's own layout is said
+/// as such, never as a match.
+#[must_use]
+pub fn served_layout_note(
+    report: &arcen_protocol::served_layout::ServedLayoutReport,
+) -> Option<&'static str> {
+    use arcen_protocol::served_layout::LayoutMismatch;
+    if report.matches() {
+        return None;
+    }
+    if report.host_kept_layout {
+        return Some("This desktop keeps its own layout; your displays show it as it is.");
+    }
+    let mismatches = &report.mismatches;
+    let any = |test: fn(&LayoutMismatch) -> bool| mismatches.iter().any(test);
+    Some(
+        if any(|mismatch| {
+            matches!(
+                mismatch,
+                LayoutMismatch::Omitted { .. }
+                    | LayoutMismatch::Unrequested { .. }
+                    | LayoutMismatch::LayoutNotApplied { .. }
+                    | LayoutMismatch::Unreadable { .. }
+            )
+        }) {
+            "The host serves a different set of displays from yours."
+        } else if any(|mismatch| {
+            matches!(
+                mismatch,
+                LayoutMismatch::Size { .. }
+                    | LayoutMismatch::ScreenSize { .. }
+                    | LayoutMismatch::StreamScaled { .. }
+                    | LayoutMismatch::Decoded { .. }
+            )
+        }) {
+            "The host couldn\u{2019}t match your display sizes; the picture is scaled to fit."
+        } else {
+            "The host arranges the displays differently from yours."
+        },
+    )
 }
 
 /// Report any display whose UI scale is not the one the Deck asked for.
@@ -109,10 +187,59 @@ fn display_scale_notes(display: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_served_layout_is_said_only_when_it_differs() {
+        use arcen_protocol::served_layout::{LayoutMismatch, ServedLayoutReport};
+        let mut report = ServedLayoutReport {
+            requested: 2,
+            served: 2,
+            host_kept_layout: false,
+            streams: Vec::new(),
+            mismatches: Vec::new(),
+        };
+        assert_eq!(served_layout_note(&report), None);
+        report.mismatches.push(LayoutMismatch::Size {
+            display: "b".into(),
+            requested: [1920, 1080],
+            served: [1280, 720],
+        });
+        assert_eq!(
+            served_layout_note(&report),
+            Some(
+                "The host couldn\u{2019}t match your display sizes; the picture is scaled to fit."
+            )
+        );
+        report.host_kept_layout = true;
+        assert_eq!(
+            served_layout_note(&report),
+            Some("This desktop keeps its own layout; your displays show it as it is.")
+        );
+    }
+
     use super::*;
 
     fn display_capabilities(value: serde_json::Value) -> BTreeMap<String, serde_json::Value> {
         BTreeMap::from([("display_resolution".to_string(), value)])
+    }
+
+    #[test]
+    fn display_note_says_when_an_earlier_session_s_displays_were_not_put_back() {
+        let capabilities = display_capabilities(serde_json::json!({
+            "requested": {"width": 2560, "height": 1440},
+            "applied": {"width": 2560, "height": 1440, "refresh_hz": 60},
+            "restore_notice": "display_restore_pending",
+            "resize": {"available": true, "explanation": ""},
+        }));
+        assert_eq!(
+            display_negotiation_note(&capabilities).as_deref(),
+            Some(RESTORE_PENDING_NOTE)
+        );
+        let quiet = display_capabilities(serde_json::json!({
+            "requested": {"width": 2560, "height": 1440},
+            "applied": {"width": 2560, "height": 1440, "refresh_hz": 60},
+            "restore_notice": null,
+        }));
+        assert_eq!(display_negotiation_note(&quiet), None);
     }
 
     #[test]

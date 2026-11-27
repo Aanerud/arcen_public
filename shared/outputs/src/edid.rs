@@ -87,6 +87,49 @@ pub const EDID_MANUFACTURER_ID: u16 = manufacturer_id(MANUFACTURER_ID);
 /// The monitor name descriptor of an Arcen display.
 pub const MONITOR_NAME: &str = "Arcen";
 
+/// The packed manufacturer ID (bytes 8..10) an EDID names; `None` for one
+/// too short to carry it.
+#[must_use]
+pub fn manufacturer(edid: &[u8]) -> Option<u16> {
+    edid.get(8..10)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+/// Whether an EDID is one Arcen synthesized ([`EDID_MANUFACTURER_ID`]).
+#[must_use]
+pub fn is_arcen(edid: &[u8]) -> bool {
+    manufacturer(edid) == Some(EDID_MANUFACTURER_ID)
+}
+
+/// Whether an EDID declares HDR10: a CTA-861 extension whose HDR Static
+/// Metadata Data Block (extended tag 0x06) lists SMPTE ST 2084 (PQ), the bit
+/// Windows reads to offer HDR on an output. A base block alone, a truncated
+/// extension or a malformed block collection declares nothing.
+#[must_use]
+pub fn declares_hdr10(edid: &[u8]) -> bool {
+    edid.chunks_exact(EDID_LEN)
+        .skip(1)
+        .filter(|block| block[0] == 0x02)
+        .any(|ext| {
+            let end = usize::from(ext[2]).min(EDID_LEN - 1);
+            let mut offset = 4usize;
+            while offset < end {
+                let header = ext[offset];
+                let len = usize::from(header & 0x1f);
+                let payload = ext.get(offset + 1..offset + 1 + len);
+                if let Some(payload) = payload
+                    && header >> 5 == 7
+                    && payload.first() == Some(&0x06)
+                    && payload.get(1).is_some_and(|eotf| eotf & 0x04 != 0)
+                {
+                    return true;
+                }
+                offset += 1 + len;
+            }
+            false
+        })
+}
+
 pub fn generate(request: EdidRequest) -> Result<[u8; EDID_LEN], String> {
     generate_named(request, MONITOR_NAME)
 }
@@ -841,6 +884,33 @@ mod hdr10_tests {
         assert_eq!(edid[20] & 0x0f, 0b0010, "HDMI-a interface");
         // The plain generator must be left alone: SDR outputs still use it.
         assert_eq!(generate(request()).expect("base")[20], 0x80);
+    }
+
+    /// What a display's EDID says decides whether Windows may still offer
+    /// HDR on it, so the reader must agree with the writer and refuse to
+    /// read HDR out of an SDR or a damaged EDID.
+    #[test]
+    fn an_edid_declares_hdr10_only_with_the_st_2084_bit() {
+        let hdr = generate_hdr10(request()).expect("hdr10 edid");
+        let sdr = generate(request()).expect("base");
+        assert!(declares_hdr10(&hdr));
+        assert!(!declares_hdr10(&sdr));
+        assert!(is_arcen(&hdr) && is_arcen(&sdr));
+
+        let mut pq_off = hdr;
+        let at = EDID_LEN + 29;
+        assert_eq!(pq_off[at - 1], 0x06, "HDR static metadata tag");
+        pq_off[at] &= !0x04;
+        assert!(!declares_hdr10(&pq_off));
+        assert!(
+            !declares_hdr10(&hdr[..EDID_LEN + 20]),
+            "truncated extension"
+        );
+
+        let mut other = sdr;
+        other[8..10].copy_from_slice(&[0x10, 0xac]);
+        assert!(!is_arcen(&other));
+        assert_eq!(manufacturer(&[0; 4]), None);
     }
 
     #[test]

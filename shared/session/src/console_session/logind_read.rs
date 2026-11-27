@@ -146,8 +146,8 @@ pub fn assemble(
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ConsoleDecision, ConsoleHost, ConsoleRefusal, LoginScreen, decide_on_read,
-        decide_reattach_read,
+        ConsoleDecision, ConsoleHost, ConsoleRefusal, LoginScreen, LoginSessionProof,
+        decide_on_read, decide_reattach_read,
         detached_hold::{DetachedHold, HoldEnd},
         wayland_join::{BeforeCreating, decide_before_creating_read},
     };
@@ -157,10 +157,12 @@ mod tests {
     const NO_DISPLAY_MANAGER: ConsoleHost = ConsoleHost {
         display_manager: false,
         login_screen: LoginScreen::Shown,
+        login_session_proof: LoginSessionProof::NONE,
     };
     const DISPLAY_MANAGER: ConsoleHost = ConsoleHost {
         display_manager: true,
         login_screen: LoginScreen::Shown,
+        login_session_proof: LoginSessionProof::NONE,
     };
 
     fn listed(id: &str, uid: u32) -> ListedSession {

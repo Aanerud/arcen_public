@@ -87,11 +87,14 @@ impl WinRefine {
         dirty_regions: bool,
     ) -> Result<Self, String> {
         let codes = encoder
-            .refine_codes()
+            .wide_conversion()
             .ok_or_else(|| "refinement needs the FP16 capture".to_string())?;
         let feed = match encoder.conversion_backend() {
             ConversionBackend::Cpu => Feed::CpuStaging,
             ConversionBackend::Gpu => {
+                // A tile is exact only if the video around it was converted
+                // the same way: the shader's own constants must be `codes`.
+                encoder.verify_wide_shader()?;
                 encoder.enable_refine_readback()?;
                 if dirty_regions {
                     Feed::GpuDirtyRegions

@@ -77,7 +77,7 @@ const DISPLAY_TIMEOUT: Duration = Duration::from_secs(15);
 /// come back regardless.
 const LOCK_SCREEN_TIMEOUT: Duration = Duration::from_secs(4);
 
-fn safe_session_id(session_id: &str) -> bool {
+pub(crate) fn safe_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.len() <= 64
         && session_id
@@ -89,7 +89,7 @@ async fn bounded_output(command: Command) -> Option<std::process::Output> {
     bounded_output_within(command, COMMAND_TIMEOUT).await
 }
 
-async fn bounded_output_within(
+pub(crate) async fn bounded_output_within(
     mut command: Command,
     timeout: Duration,
 ) -> Option<std::process::Output> {
@@ -310,12 +310,16 @@ pub(crate) fn notice_for(refusal: ConsoleRefusal, read: &SessionRead, uid: u32) 
         let description = unit
             .as_deref()
             .and_then(super::login_session::unit_description);
-        tracing::warn!(
+        // Recorded at every profile: which fact kept Arcen's own login
+        // session from starting beside the product.
+        let proof = super::login_session::console_host_for_sign_in().login_session_proof;
+        tracing::error!(
             target: target::SESSION,
             reason_class = refusal.token(),
             display_manager_unit = unit.as_deref().unwrap_or("unknown"),
             display_manager_description = description.as_deref().unwrap_or("unknown"),
-            "another remote-desktop product is the display manager and keeps GDM's login screen off the console; sign in with it first"
+            login_session_proof = proof.token(),
+            "another remote-desktop product is the display manager and keeps GDM's login screen off the console, and Arcen's own login session cannot start beside it; sign in with the product first"
         );
         return ConsoleNotice::sign_in_other_product(unit.as_deref(), description.as_deref());
     }
@@ -1355,7 +1359,13 @@ fn device_interface(event: &str) -> Option<model::UserSpaceInputInterface> {
 /// a desktop another product owns: there, that product's client is using
 /// it now.
 fn another_products_client_now() -> Option<String> {
-    let entries = std::fs::read_dir("/sys/class/input").ok()?;
+    another_products_client_read().unwrap_or(None)
+}
+
+/// [`another_products_client_now`], telling a sysfs input class that cannot
+/// be read apart from one that shows no client of another product.
+pub(crate) fn another_products_client_read() -> std::io::Result<Option<String>> {
+    let entries = std::fs::read_dir("/sys/class/input")?;
     let mut creators: Option<(Option<Vec<InputCreator>>, Option<String>)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -1389,14 +1399,14 @@ fn another_products_client_now() -> Option<String> {
             let device_name = std::fs::read_to_string(entry.path().join("device/name"))
                 .map(|name| name.trim().to_owned())
                 .unwrap_or_default();
-            return Some(format!(
+            return Ok(Some(format!(
                 "{event} ({device_name}; bus {:#06x}; {})",
                 fact.bus,
                 outside_creators(holders.as_deref(), own_exe.as_deref(), interface)
-            ));
+            )));
         }
     }
-    None
+    Ok(None)
 }
 
 /// [`another_products_client_now`] off the async runtime (it reads sysfs,
@@ -4783,6 +4793,7 @@ esac
                 model::ConsoleHost {
                     display_manager: false,
                     login_screen: model::LoginScreen::Shown,
+                    login_session_proof: model::LoginSessionProof::NONE,
                 },
             )
         }

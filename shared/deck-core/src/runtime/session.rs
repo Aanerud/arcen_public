@@ -92,10 +92,13 @@ use arcen_protocol::messages::{
     TabletModeCapabilitiesMsg, TabletModeMsg, VideoSelectionIntent, msg_type,
     supports_region_input_v1,
 };
+use arcen_protocol::served_layout::{LayoutRequest, served_layout};
 use arcen_protocol::wire::{
     CLIPBOARD_CHUNK_PAYLOAD_BYTES, ClipboardChunkHeader, FrameType, MicrophoneHeader,
     decode_clipboard_chunk, encode_clipboard_chunk, encode_microphone_header,
 };
+
+mod account_switch;
 
 const MAX_INCOMING_CONTROL_SIZE: usize = 1024 * 1024;
 const MAX_RESUME_GRANT_BYTES: usize = 8_192;
@@ -502,6 +505,11 @@ pub struct ConnectOptions {
     /// The platform's services (ADR 0024): decode capabilities, microphone,
     /// network facts, build identity, pen capture, Native tablet.
     pub services: Arc<dyn crate::DeckServices>,
+    /// Whether this connection answers a host's offer to sign another
+    /// account out (`account_switch_v1`): only the Decks' windows, which ask
+    /// the user, and a test tool told what to answer. Every other
+    /// connection keeps the refusal it always had.
+    pub account_switch: crate::account_switch::AccountSwitchMode,
 }
 
 impl fmt::Debug for ConnectOptions {
@@ -526,6 +534,7 @@ impl fmt::Debug for ConnectOptions {
             .field("tablet_mode_requested", &self.tablet_mode_requested)
             .field("display_refresh", &self.display_refresh)
             .field("canvas", &self.canvas)
+            .field("account_switch", &self.account_switch)
             .field("telemetry", &"<atomic counters>")
             .finish()
     }
@@ -565,6 +574,7 @@ impl ConnectOptions {
             canvas: self.canvas.clone(),
             display_refresh: self.display_refresh.clone(),
             services: Arc::clone(&self.services),
+            account_switch: self.account_switch,
         }
     }
 }
@@ -583,7 +593,14 @@ pub enum SessionEvent {
     /// session never started and no credentials were sent.
     CertificateChanged(CertInfo),
     AuthRequired(AuthRequest),
+    /// A change of account: the host's offer, then its progress
+    /// ([`crate::account_switch::AccountSwitchPrompt`]).
+    AccountSwitch(crate::account_switch::AccountSwitchNews),
     Authenticated(SessionAuthentication),
+    /// The layout the host serves compared with the one this Deck asked
+    /// for in this attachment (`arcen_protocol::served_layout`). Sent just
+    /// before [`Self::ServerHello`].
+    ServedLayout(arcen_protocol::served_layout::ServedLayoutReport),
     ServerHello(ServerHelloMsg),
     Json(Value),
     /// A host cursor image record (`FrameType::CursorUpdate`) from the
@@ -1225,6 +1242,8 @@ where
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SubmitAuth(AuthSubmission),
+    /// The user's answer to the host's offer to sign another account out.
+    AccountSwitch(arcen_protocol::messages::AccountSwitchChoiceMsg),
     AcceptAuthentication,
     DeclineDisclaimer,
     Json(Value),
@@ -1370,6 +1389,8 @@ pub enum TerminalDisconnect {
     /// The host refused for its own state (busy, its seat or console held),
     /// not for the credentials.
     HostRefused(crate::sign_in::HostRefusal),
+    /// A change of account stopped without a desktop.
+    AccountSwitch(crate::account_switch::AccountSwitchStop),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1627,6 +1648,16 @@ pub enum ConnectSmokeError {
     NonTextMessage,
     #[error("host closed the connection during setup{0}")]
     ClosedByHost(String),
+    /// A change of account stopped without a desktop; `detail` is what the
+    /// host or the connection said, if anything.
+    #[error("the change of account stopped ({}){}", .stop.reason_class(), detail_suffix(.detail))]
+    AccountSwitch {
+        stop: crate::account_switch::AccountSwitchStop,
+        detail: String,
+    },
+    /// The host broke the change-of-account exchange.
+    #[error("change-of-account protocol error: {0}")]
+    AccountSwitchProtocol(crate::account_switch::AccountSwitchProtocolError),
     #[error("incoming control message is {size} bytes; limit is {limit} bytes")]
     ControlMessageTooLarge { size: usize, limit: usize },
     #[error("clipboard protocol error: {0}")]
@@ -1701,6 +1732,8 @@ async fn connect_smoke_correlated(
     session_log_id: CorrelationId,
 ) -> Result<ConnectSmokeResult, ConnectSmokeError> {
     keep_session_decodable(&mut options);
+    // The handshake check reads `auth_result` and cannot answer an offer.
+    options.account_switch = crate::account_switch::AccountSwitchMode::Off;
     let (mut ws, uri, mut fsm) = open_websocket(&options, None, &session_log_id).await?;
 
     let first = recv_json(&mut ws, options.timeout).await?;
@@ -1969,6 +2002,37 @@ fn sign_in_screen_end(
     })
 }
 
+/// Says whether the host served the displays this attachment asked for:
+/// one line when it did, a warning naming every difference when not.
+fn log_served_layout(
+    report: &arcen_protocol::served_layout::ServedLayoutReport,
+    session_log_id: &CorrelationId,
+) {
+    if report.matches() {
+        tracing::info!(
+            target: crate::log_target::SESSION,
+            event = "served_layout",
+            sid = %session_log_id,
+            verdict = "exact",
+            requested = report.requested,
+            served = report.served,
+            summary = %report.summary(),
+            "the host serves the displays this Deck asked for",
+        );
+    } else {
+        tracing::warn!(
+            target: crate::log_target::SESSION,
+            event = "served_layout",
+            sid = %session_log_id,
+            verdict = if report.host_kept_layout { "host_layout_kept" } else { "mismatch" },
+            requested = report.requested,
+            served = report.served,
+            summary = %report.summary(),
+            "the host serves a different layout from the one this Deck asked for",
+        );
+    }
+}
+
 fn publish_session_result(
     result: Result<SessionEnd, ConnectSmokeError>,
     tx: &mpsc::UnboundedSender<SessionEvent>,
@@ -2028,6 +2092,9 @@ async fn run_session_correlated(
         &mut close_receiver,
     )
     .await?;
+    // What this attachment asks for, read from this Deck's displays when
+    // the attempt started; never an earlier connection's request.
+    let mut layout_request = None;
     let hello = match msg_type(&first).unwrap_or("<missing>") {
         AUTH_REQUEST => {
             tracing::info!(
@@ -2038,7 +2105,7 @@ async fn run_session_correlated(
             validate_disclaimer(&auth_request)?;
             if matches!(auth, SessionAuth::Resume(_)) {
                 validate_resume_request(&auth_request)?;
-                send_resume_auth(
+                layout_request = send_resume_auth(
                     &mut ws,
                     &options,
                     &auth,
@@ -2051,7 +2118,7 @@ async fn run_session_correlated(
             } else if auth_request.auth_mode.as_deref() == Some("none")
                 && auth_request.disclaimer.is_none()
             {
-                send_auth(
+                layout_request = send_auth(
                     &mut ws,
                     &options,
                     &auth_request,
@@ -2069,7 +2136,7 @@ async fn run_session_correlated(
                 let _ = tx.send(SessionEvent::AuthRequired(auth_request.clone()));
                 match next_sign_in_answer(&mut commands).await? {
                     SessionCommand::SubmitAuth(submission) => {
-                        send_auth(
+                        layout_request = send_auth(
                             &mut ws,
                             &options,
                             &auth_request,
@@ -2090,6 +2157,7 @@ async fn run_session_correlated(
                         return Err(ConnectSmokeError::SessionClosed);
                     }
                     SessionCommand::AcceptAuthentication
+                    | SessionCommand::AccountSwitch(_)
                     | SessionCommand::Json(_)
                     | SessionCommand::Binary(_)
                     | SessionCommand::HardUsbPen(_) => {
@@ -2098,20 +2166,40 @@ async fn run_session_correlated(
                     }
                 }
             }
-            let auth_result: AuthResult = serde_json::from_value(
-                cancellable_setup(
-                    recv_json(&mut ws, options.timeout),
+            let mut answer = cancellable_setup(
+                recv_json(&mut ws, options.timeout),
+                &cancellation,
+                &mut close_receiver,
+            )
+            .await?;
+            // A resume never asked for a change of account
+            // (`send_auth` alone sets `account_switch_v1`); an offer this
+            // connection did not ask for is a protocol error.
+            let switched_account =
+                !matches!(auth, SessionAuth::Resume(_)) && account_switch::is_offer(&answer);
+            if switched_account {
+                answer = account_switch::follow_offer(
+                    &mut ws,
+                    answer,
+                    options.account_switch,
+                    &tx,
+                    &mut commands,
                     &cancellation,
                     &mut close_receiver,
+                    options.timeout,
                 )
-                .await?,
-            )?;
+                .await?;
+            }
+            let auth_result: AuthResult = serde_json::from_value(answer)?;
             if !auth_result.success {
                 tracing::warn!(
                     target: crate::log_target::TRANSPORT,
                     message = %auth_result.message,
                     "authentication rejected",
                 );
+                if switched_account {
+                    return Err(account_switch::new_login_failed(&auth_result.message));
+                }
                 return match &auth {
                     SessionAuth::Resume(_) => Err(ConnectSmokeError::ResumeRejected {
                         message: bounded_message(&auth_result.message),
@@ -2245,6 +2333,11 @@ async fn run_session_correlated(
             {
                 host_experimental_raw_hid = server_hello.experimental_raw_hid;
             }
+            if let Some(request) = &layout_request {
+                let report = served_layout(request, &server_hello);
+                log_served_layout(&report, &session_log_id);
+                let _ = tx.send(SessionEvent::ServedLayout(report));
+            }
             *sign_in_screen = server_hello.login_window;
             let _ = tx.send(SessionEvent::ServerHello(server_hello));
         }
@@ -2359,6 +2452,7 @@ async fn run_session_correlated(
                 match command {
                     SessionCommand::SubmitAuth(_)
                     | SessionCommand::AcceptAuthentication
+                    | SessionCommand::AccountSwitch(_)
                     | SessionCommand::DeclineDisclaimer => {
                         tracing::warn!(
                             target: crate::log_target::TRANSPORT,
@@ -3888,7 +3982,7 @@ async fn send_auth<S>(
     session_auth: &SessionAuth,
     cancellation: Option<&SessionCancellation>,
     close_receiver: Option<&mut watch::Receiver<bool>>,
-) -> Result<(), ConnectSmokeError>
+) -> Result<Option<LayoutRequest>, ConnectSmokeError>
 where
     S: Sink<Message> + Unpin,
     S::Error: Into<tokio_tungstenite::tungstenite::Error>,
@@ -3910,6 +4004,8 @@ where
         auth_request.disclaimer.as_deref().map(disclaimer_digest);
     response = apply_multi_monitor_negotiation(response, options, auth_request)?;
     response = apply_resume_opt_in(response, auth_request, session_auth);
+    response = response.with_account_switch_v1(options.account_switch.advertises());
+    let layout = LayoutRequest::from_auth_response(&response);
     submission.clear_sensitive();
     if response.monitors.is_empty() {
         tracing::info!(
@@ -3929,7 +4025,8 @@ where
     }
 
     let json = serde_json::to_string(&response)?;
-    send_setup_message(ws, Message::Text(json), cancellation, close_receiver).await
+    send_setup_message(ws, Message::Text(json), cancellation, close_receiver).await?;
+    Ok(layout)
 }
 
 fn apply_resume_opt_in(
@@ -3986,7 +4083,7 @@ async fn send_resume_auth<S>(
     session_log_id: &CorrelationId,
     cancellation: Option<&SessionCancellation>,
     close_receiver: Option<&mut watch::Receiver<bool>>,
-) -> Result<(), ConnectSmokeError>
+) -> Result<Option<LayoutRequest>, ConnectSmokeError>
 where
     S: Sink<Message> + Unpin,
     S::Error: Into<tokio_tungstenite::tungstenite::Error>,
@@ -4013,7 +4110,8 @@ where
         cancellation,
         close_receiver,
     )
-    .await
+    .await?;
+    Ok(LayoutRequest::from_auth_response(&response))
 }
 
 #[allow(clippy::result_large_err)]
@@ -4215,6 +4313,7 @@ where
         }
         SessionCommand::DeclineDisclaimer
         | SessionCommand::SubmitAuth(_)
+        | SessionCommand::AccountSwitch(_)
         | SessionCommand::Json(_)
         | SessionCommand::Binary(_)
         | SessionCommand::HardUsbPen(_) => {
@@ -5194,6 +5293,14 @@ fn emit_auth_fail(
     );
 }
 
+fn detail_suffix(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    }
+}
+
 /// Tells a refused sign-in from a host that signed the user in and then
 /// failed to start the session; both arrive as an unsuccessful `auth_result`.
 ///
@@ -5245,6 +5352,7 @@ fn connect_error_class(error: &ConnectSmokeError) -> &'static str {
     match error {
         ConnectSmokeError::Timeout => "timeout",
         ConnectSmokeError::HostRefused { refusal, .. } => refusal.reason_class(),
+        ConnectSmokeError::AccountSwitch { stop, .. } => stop.reason_class(),
         ConnectSmokeError::NetworkReachability(failure) => failure.reason_class(),
         ConnectSmokeError::Tls(_)
         | ConnectSmokeError::TlsIdentity(_)
@@ -5278,6 +5386,7 @@ fn disconnect_reason_class(reason: DisconnectReason) -> &'static str {
         DisconnectReason::Terminal(TerminalDisconnect::HostRefused(refusal)) => {
             refusal.reason_class()
         }
+        DisconnectReason::Terminal(TerminalDisconnect::AccountSwitch(stop)) => stop.reason_class(),
         DisconnectReason::Terminal(TerminalDisconnect::Protocol) => "protocol",
     }
 }
@@ -5826,6 +5935,7 @@ fn microphone_teardown_reason(outcome: &Result<SessionEnd, ConnectSmokeError>) -
         DisconnectReason::Terminal(TerminalDisconnect::Resume(_)) => "resume_failure",
         DisconnectReason::Terminal(TerminalDisconnect::Configuration) => "configuration_failure",
         DisconnectReason::Terminal(TerminalDisconnect::HostRefused(_)) => "host_refused",
+        DisconnectReason::Terminal(TerminalDisconnect::AccountSwitch(_)) => "account_switch",
         DisconnectReason::Terminal(TerminalDisconnect::Protocol) => "protocol_failure",
     }
 }
@@ -5907,6 +6017,9 @@ fn classify_disconnect_at(error: &ConnectSmokeError, observed_at: Instant) -> Se
         ConnectSmokeError::HostRefused { refusal, .. } => {
             DisconnectReason::Terminal(TerminalDisconnect::HostRefused(*refusal))
         }
+        ConnectSmokeError::AccountSwitch { stop, .. } => {
+            DisconnectReason::Terminal(TerminalDisconnect::AccountSwitch(*stop))
+        }
         ConnectSmokeError::Url(_)
         | ConnectSmokeError::Randomness(_)
         | ConnectSmokeError::TransportUnavailable(_)
@@ -5922,6 +6035,7 @@ fn classify_disconnect_at(error: &ConnectSmokeError, observed_at: Instant) -> Se
         | ConnectSmokeError::NonTextMessage
         | ConnectSmokeError::ControlMessageTooLarge { .. }
         | ConnectSmokeError::ResumeProtocol(_)
+        | ConnectSmokeError::AccountSwitchProtocol(_)
         | ConnectSmokeError::Microphone(_)
         | ConnectSmokeError::WebSocket(_) => {
             DisconnectReason::Terminal(TerminalDisconnect::Protocol)
@@ -6264,6 +6378,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         }
     }
 
@@ -6420,6 +6535,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         };
         let started = Instant::now();
         let error = match open_quic_socket(&options, None, None).await {
@@ -7305,6 +7421,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         };
         let mut ws = open_quic_socket(&options, None, None).await.unwrap();
         // `lane_attachment` is consumed by the socket, never seen here.
@@ -8430,6 +8547,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         };
         let debug = format!("{options:?}");
         assert!(debug.contains("<redacted>"));
@@ -8594,6 +8712,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         };
         let auth = auth_response_with_metadata(AuthResponse::none(), &options);
         let hello =
@@ -8659,6 +8778,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         };
         let hello =
             client_hello_with_metadata(&options, &CorrelationId::from_uuid_v4_bytes([0; 16]));
@@ -9018,6 +9138,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         })
         .await
         .unwrap();
@@ -9075,6 +9196,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         });
 
         let event = next_session_event(&mut handle).await;
@@ -9167,6 +9289,7 @@ mod tests {
                 exact_still_image: false,
                 keep_desk_private: true,
                 canvas: crate::canvas::CanvasRequest::Unavailable,
+                account_switch: crate::account_switch::AccountSwitchMode::Off,
             },
             "03".repeat(32),
         );
@@ -9297,6 +9420,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         });
         let auth_request = next_session_event(&mut handle).await;
         match auth_request {
@@ -9377,6 +9501,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         });
         assert!(matches!(
             next_session_event(&mut handle).await,
@@ -9440,6 +9565,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         })
         .await
         .unwrap_err();
@@ -9510,6 +9636,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         });
         let _ = next_session_event(&mut handle).await;
         handle
@@ -9518,6 +9645,371 @@ mod tests {
                 "type": "request_full_frame"
             })))
             .unwrap();
+        server.await.unwrap();
+    }
+
+    const SWITCH_OFFER_ID: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn switch_options(port: u16, tls: TlsTrustConfig) -> ConnectOptions {
+        ConnectOptions {
+            display_refresh: None,
+            services: crate::runtime::test_services(),
+            host: "127.0.0.1".to_string(),
+            port,
+            use_tls: true,
+            username: String::new(),
+            password: String::new(),
+            timeout: Duration::from_secs(5),
+            tls,
+            profile: StreamProfile::default(),
+            monitors: Vec::new(),
+            displays_mode: String::new(),
+            multi_monitor_topology: None,
+            replace_incompatible_desktop: false,
+            timezone: None,
+            cursor_preference: CursorMode::Local,
+            clipboard_enabled: false,
+            microphone_enabled: false,
+            tablet_input_enabled: true,
+            tablet_mode_requested: TabletModeMsg::LocalTermination,
+            telemetry: Arc::new(ClientTelemetry::default()),
+            exact_still_image: false,
+            keep_desk_private: true,
+            canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Interactive,
+        }
+    }
+
+    /// The Pier's half up to its offer: a PAM sign-in whose
+    /// `auth_response` must ask for `account_switch_v1`, answered with an
+    /// offer instead of `auth_result`.
+    async fn pier_offers_switch(ws: &mut LoopbackPierControl, expires_in_secs: u32) {
+        pier_offers_switch_to(ws, expires_in_secs, true).await;
+    }
+
+    /// [`pier_offers_switch`] to a Deck that `asked` for it, or not.
+    async fn pier_offers_switch_to(
+        ws: &mut LoopbackPierControl,
+        expires_in_secs: u32,
+        asked: bool,
+    ) {
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": AUTH_REQUEST,
+                "auth_methods": ["pam"],
+                "challenge": "",
+                "salt": "",
+                "auth_mode": "pam"
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        let Some(Ok(Message::Text(text))) = ws.next().await else {
+            panic!("expected auth_response");
+        };
+        let response: AuthResponse = serde_json::from_str(&text).unwrap();
+        assert_eq!(response.account_switch_v1, asked);
+        let offer =
+            arcen_protocol::messages::AccountSwitchOfferMsg::new(SWITCH_OFFER_ID, expires_in_secs)
+                .unwrap();
+        ws.send(Message::Text(serde_json::to_string(&offer).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    async fn pier_reads_reply(
+        ws: &mut LoopbackPierControl,
+    ) -> arcen_protocol::messages::AccountSwitchReplyMsg {
+        let Some(Ok(Message::Text(text))) = ws.next().await else {
+            panic!("expected account_switch_reply");
+        };
+        let reply: arcen_protocol::messages::AccountSwitchReplyMsg =
+            serde_json::from_str(&text).unwrap();
+        reply.validate().unwrap();
+        assert_eq!(reply.offer_id, SWITCH_OFFER_ID);
+        reply
+    }
+
+    async fn pier_sends_result(
+        ws: &mut LoopbackPierControl,
+        outcome: arcen_protocol::messages::AccountSwitchOutcomeMsg,
+    ) {
+        let result =
+            arcen_protocol::messages::AccountSwitchResultMsg::new(SWITCH_OFFER_ID, outcome);
+        ws.send(Message::Text(serde_json::to_string(&result).unwrap()))
+            .await
+            .unwrap();
+    }
+
+    /// Signs in through the session engine until the offer reaches the UI.
+    async fn deck_sees_offer(handle: &mut SessionHandle, expires_in_secs: u64) {
+        assert!(matches!(
+            next_session_event(handle).await,
+            SessionEvent::AuthRequired(_)
+        ));
+        handle
+            .commands
+            .send(SessionCommand::SubmitAuth(AuthSubmission {
+                username: "bob".to_string(),
+                password: "dummy-password".to_string(),
+            }))
+            .unwrap();
+        assert_eq!(
+            match next_session_event(handle).await {
+                SessionEvent::AccountSwitch(news) => news,
+                other => panic!("expected the offer, got {other:?}"),
+            },
+            crate::account_switch::AccountSwitchNews::Offered {
+                expires_in: Duration::from_secs(expires_in_secs)
+            }
+        );
+    }
+
+    async fn ended(handle: &mut SessionHandle) -> SessionEnd {
+        loop {
+            match next_session_event(handle).await {
+                SessionEvent::Ended(end) => return end,
+                SessionEvent::AccountSwitch(_) => {}
+                other => panic!("expected the end, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_switch_reports_its_progress_then_signs_in_on_the_same_connection() {
+        use crate::account_switch::AccountSwitchNews;
+        use arcen_protocol::messages::{AccountSwitchChoiceMsg, AccountSwitchOutcomeMsg};
+        let pier = LoopbackPier::bind();
+        let (pier_port, pier_tls) = (pier.port(), pier.tls());
+        let server = tokio::spawn(async move {
+            let mut ws = pier.accept().await;
+            pier_offers_switch(&mut ws, 120).await;
+            assert!(
+                timeout(Duration::from_millis(100), ws.next())
+                    .await
+                    .is_err(),
+                "nothing is answered before the user chooses"
+            );
+            let reply = pier_reads_reply(&mut ws).await;
+            assert_eq!(reply.choice, AccountSwitchChoiceMsg::Confirm);
+            pier_sends_result(&mut ws, AccountSwitchOutcomeMsg::SignedOut).await;
+            ws.send(Message::Text(
+                serde_json::json!({"type": "auth_result", "success": true, "message": "ok"})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": SERVER_HELLO,
+                    "server_name": "Switched",
+                    "version": "3.0.0",
+                    "codec": "h264",
+                    "negotiated_transport": arcen_protocol::CAPABILITY_TRANSPORT_QUIC
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            let _client_hello = ws.next().await;
+            let _quality = ws.next().await;
+        });
+        let mut handle = spawn_session(switch_options(pier_port, pier_tls));
+        deck_sees_offer(&mut handle, 120).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle
+            .commands
+            .send(SessionCommand::AccountSwitch(
+                AccountSwitchChoiceMsg::Confirm,
+            ))
+            .unwrap();
+        for expected in [AccountSwitchNews::SigningOut, AccountSwitchNews::SignedOut] {
+            assert!(matches!(
+                next_session_event(&mut handle).await,
+                SessionEvent::AccountSwitch(news) if news == expected
+            ));
+        }
+        assert!(matches!(
+            next_session_event(&mut handle).await,
+            SessionEvent::ServerHello(hello) if hello.server_name == "Switched"
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_the_deck_during_the_question_answers_cancel() {
+        use arcen_protocol::messages::AccountSwitchChoiceMsg;
+        let pier = LoopbackPier::bind();
+        let (pier_port, pier_tls) = (pier.port(), pier.tls());
+        let server = tokio::spawn(async move {
+            let mut ws = pier.accept().await;
+            pier_offers_switch(&mut ws, 120).await;
+            assert_eq!(
+                pier_reads_reply(&mut ws).await.choice,
+                AccountSwitchChoiceMsg::Cancel
+            );
+        });
+        let mut handle = spawn_session(switch_options(pier_port, pier_tls));
+        deck_sees_offer(&mut handle, 120).await;
+        handle.commands.send(SessionCommand::Close).unwrap();
+        assert_eq!(
+            ended(&mut handle).await.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::Manual)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_offer_cancels_when_it_expires() {
+        use crate::account_switch::AccountSwitchStop;
+        use arcen_protocol::messages::AccountSwitchChoiceMsg;
+        let pier = LoopbackPier::bind();
+        let (pier_port, pier_tls) = (pier.port(), pier.tls());
+        let server = tokio::spawn(async move {
+            let mut ws = pier.accept().await;
+            pier_offers_switch(&mut ws, 1).await;
+            assert_eq!(
+                pier_reads_reply(&mut ws).await.choice,
+                AccountSwitchChoiceMsg::Cancel
+            );
+        });
+        let mut handle = spawn_session(switch_options(pier_port, pier_tls));
+        deck_sees_offer(&mut handle, 1).await;
+        assert_eq!(
+            ended(&mut handle).await.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::AccountSwitch(
+                AccountSwitchStop::Expired
+            ))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pier_that_withdraws_the_offer_ends_it_with_its_outcome() {
+        use crate::account_switch::AccountSwitchStop;
+        use arcen_protocol::messages::AccountSwitchOutcomeMsg;
+        let pier = LoopbackPier::bind();
+        let (pier_port, pier_tls) = (pier.port(), pier.tls());
+        let server = tokio::spawn(async move {
+            let mut ws = pier.accept().await;
+            pier_offers_switch(&mut ws, 120).await;
+            pier_sends_result(&mut ws, AccountSwitchOutcomeMsg::Stale).await;
+            let _ = ws.next().await;
+        });
+        let mut handle = spawn_session(switch_options(pier_port, pier_tls));
+        deck_sees_offer(&mut handle, 120).await;
+        assert_eq!(
+            ended(&mut handle).await.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::AccountSwitch(AccountSwitchStop::Stale))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_sign_in_after_the_sign_out_is_a_failed_new_login() {
+        use crate::account_switch::AccountSwitchStop;
+        use arcen_protocol::messages::{AccountSwitchChoiceMsg, AccountSwitchOutcomeMsg};
+        let pier = LoopbackPier::bind();
+        let (pier_port, pier_tls) = (pier.port(), pier.tls());
+        let server = tokio::spawn(async move {
+            let mut ws = pier.accept().await;
+            pier_offers_switch(&mut ws, 120).await;
+            let _ = pier_reads_reply(&mut ws).await;
+            pier_sends_result(&mut ws, AccountSwitchOutcomeMsg::SignedOut).await;
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "auth_result",
+                    "success": false,
+                    "message": "console_sign_in_failed: the login screen did not start a session"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            let _ = ws.next().await;
+        });
+        let mut handle = spawn_session(switch_options(pier_port, pier_tls));
+        deck_sees_offer(&mut handle, 120).await;
+        handle
+            .commands
+            .send(SessionCommand::AccountSwitch(
+                AccountSwitchChoiceMsg::Confirm,
+            ))
+            .unwrap();
+        let end = ended(&mut handle).await;
+        assert_eq!(
+            end.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::AccountSwitch(
+                AccountSwitchStop::NewLoginFailed
+            ))
+        );
+        assert!(
+            end.message.contains("console_sign_in_failed"),
+            "{}",
+            end.message
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_did_not_opt_in_never_asks_and_refuses_an_offer() {
+        let pier = LoopbackPier::bind();
+        let (pier_port, pier_tls) = (pier.port(), pier.tls());
+        let server = tokio::spawn(async move {
+            let mut ws = pier.accept().await;
+            pier_offers_switch_to(&mut ws, 120, false).await;
+            let _ = ws.next().await;
+        });
+        let mut options = switch_options(pier_port, pier_tls);
+        options.account_switch = crate::account_switch::AccountSwitchMode::Off;
+        let mut handle = spawn_session(options);
+        assert!(matches!(
+            next_session_event(&mut handle).await,
+            SessionEvent::AuthRequired(_)
+        ));
+        handle
+            .commands
+            .send(SessionCommand::SubmitAuth(AuthSubmission {
+                username: "bob".to_string(),
+                password: "dummy-password".to_string(),
+            }))
+            .unwrap();
+        // No question, no wait for one: the offer ends the attempt at once.
+        assert_eq!(
+            ended(&mut handle).await.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::Protocol)
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scripted_tool_answers_with_its_own_choice_without_a_window() {
+        use crate::account_switch::{AccountSwitchMode, AccountSwitchStop};
+        use arcen_protocol::messages::{AccountSwitchChoiceMsg, AccountSwitchOutcomeMsg};
+        let pier = LoopbackPier::bind();
+        let (pier_port, pier_tls) = (pier.port(), pier.tls());
+        let server = tokio::spawn(async move {
+            let mut ws = pier.accept().await;
+            pier_offers_switch(&mut ws, 120).await;
+            assert_eq!(
+                pier_reads_reply(&mut ws).await.choice,
+                AccountSwitchChoiceMsg::Confirm
+            );
+            pier_sends_result(&mut ws, AccountSwitchOutcomeMsg::LogoutVetoed).await;
+            let _ = ws.next().await;
+        });
+        let mut options = switch_options(pier_port, pier_tls);
+        options.account_switch = AccountSwitchMode::Scripted(AccountSwitchChoiceMsg::Confirm);
+        let mut handle = spawn_session(options);
+        deck_sees_offer(&mut handle, 120).await;
+        assert_eq!(
+            ended(&mut handle).await.reason,
+            DisconnectReason::Terminal(TerminalDisconnect::AccountSwitch(
+                AccountSwitchStop::LogoutVetoed
+            ))
+        );
         server.await.unwrap();
     }
 }

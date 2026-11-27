@@ -628,7 +628,7 @@ pub fn decide_join(
 mod tests {
     use super::*;
     use crate::console_session::{
-        CONSOLE_SEAT, ConsoleDecision, ConsoleHost, LoginScreen, decide_on,
+        CONSOLE_SEAT, ConsoleDecision, ConsoleHost, LoginScreen, LoginSessionProof, decide_on,
     };
 
     const ANA: u32 = 1001;
@@ -742,6 +742,7 @@ mod tests {
         let no_dm = ConsoleHost {
             display_manager: false,
             login_screen: LoginScreen::Shown,
+            login_session_proof: LoginSessionProof::NONE,
         };
         let mut locked = wayland("7", ANA, true);
         locked.locked = true;

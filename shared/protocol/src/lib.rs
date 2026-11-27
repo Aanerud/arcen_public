@@ -21,6 +21,7 @@
 //! - [`keys`]     — `key_event` key identifiers and modifier bits.
 //! - [`refine`]   — lossless refinement records (ADR 0016).
 //! - [`canvas`]   — canvas records for damage-first software streaming (ADR 0028).
+//! - [`served_layout`] — whether a host served the displays a client asked for.
 //!
 //! Byte-compatibility and any change to the wire is governed by `WIRE.md` in this
 //! crate. See it for the authoritative layout + dated changelog.
@@ -41,6 +42,7 @@ pub mod messages;
 mod multi_monitor;
 pub mod refine;
 mod region_input;
+pub mod served_layout;
 pub mod wire;
 
 pub use wire::{

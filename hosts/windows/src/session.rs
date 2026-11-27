@@ -171,6 +171,9 @@ pub struct BrokerAgentLease {
     /// last minute `HEALTH_SNAPSHOT`, reported by their agents
     /// ([`AgentHealth`]).
     service_health: arcen_observability::ServiceHealth,
+    /// The desktop's change-of-account ledger and attachment epoch
+    /// (`arcen_session::session_handover`), shared by every connection.
+    handover: crate::session_handover::HandoverDesk,
 }
 
 /// A same-account sign-in waiting to take the session over; withdrawn when
@@ -405,6 +408,7 @@ impl BrokerAgentLease {
             incumbent: Arc::new(arcen_transport::quic::IncumbentAttachment::new()),
             successors: Arc::new(std::sync::Mutex::new(Vec::new())),
             service_health: arcen_observability::ServiceHealth::new(),
+            handover: crate::session_handover::HandoverDesk::new(),
         }
     }
 
@@ -618,6 +622,7 @@ impl Drop for ActiveAgentLog {
                 *active = None;
             }
         }
+        self.lease.handover.detached();
     }
 }
 
@@ -771,6 +776,568 @@ fn rejected_bind_message(
             || rejected_console_client_message(reason),
             arcen_session::console_session::ConsoleNotice::deck_reason,
         ),
+    }
+}
+
+/// How long the requester's sign-in waits for Windows to show the sign-in
+/// screen again after a confirmed sign-out ended the session.
+const ENTRY_SETTLE: Duration = Duration::from_secs(30);
+
+/// What a sign-in does after `arcen_session::session_handover` decided
+/// (ADR 0025 §13).
+enum HandoverGate {
+    /// The account's own session, a fresh sign-in, or a refusal the console
+    /// classifier words as before: carry on with it.
+    Proceed,
+    /// A confirmed change of account signed the other account out; the
+    /// requester now signs in, holding the console's reservation.
+    Entered(EntryGuard),
+    /// The Deck was answered (a refusal, a cancelled, stale or blocked
+    /// change of account); nothing more happens.
+    Done,
+}
+
+/// The requester's reservation of the console after a completed sign-out
+/// (`EntryPermit`); dropping it unfinished is a failed sign-in.
+struct EntryGuard {
+    lease: Arc<BrokerAgentLease>,
+    permit: Option<arcen_session::session_handover::logout::EntryPermit>,
+}
+
+impl EntryGuard {
+    fn finish(mut self, signed_in: bool) {
+        self.release(signed_in);
+    }
+
+    fn release(&mut self, signed_in: bool) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        if let Some(reason) = self
+            .lease
+            .handover
+            .with_ledger(|ledger| ledger.login_finished(permit, signed_in))
+        {
+            tracing::warn!(
+                target: SESSION,
+                reason_class = reason.token(),
+                "the sign-in after a change of account did not finish"
+            );
+        }
+    }
+}
+
+impl Drop for EntryGuard {
+    fn drop(&mut self) {
+        self.release(false);
+    }
+}
+
+fn emit_session_handover(
+    emitter: &LifecycleEmitter,
+    session_log_id: &CorrelationId,
+    user: &str,
+    peer: &str,
+    reason: arcen_session::session_handover::HandoverReason,
+    remote_client: Option<arcen_session::session_handover::RemoteClient>,
+) {
+    tracing::info!(
+        target: SESSION,
+        %peer,
+        reason_class = reason.token(),
+        remote_client = remote_client.map_or("", |client| client.token()),
+        "session handover"
+    );
+    let Some(fields) = reason.fields(
+        Some(arcen_session::session_handover::displays::AttachmentKind::Connect),
+        remote_client,
+    ) else {
+        return;
+    };
+    crate::emit_lifecycle_event_with_context(
+        emitter,
+        LifecycleEventKind::SessionHandover,
+        session_log_id.clone(),
+        fields,
+        Some(user.to_owned()),
+        local_hostname(),
+        Some(peer.to_owned()),
+        None,
+    );
+}
+
+/// Who holds the desktop now, as the shared contract reads it.
+fn read_occupant(
+    agent_lease: &BrokerAgentLease,
+    account: &crate::auth::AuthenticatedAccount,
+) -> (
+    arcen_session::session_handover::ConsoleOccupant,
+    crate::windows_session::HolderReading,
+) {
+    let reading = crate::windows_session::read_desktop_holder(account).unwrap_or_else(|error| {
+        tracing::info!(target: SESSION, %error, "who holds the desktop could not be read");
+        crate::windows_session::HolderReading::Unknown
+    });
+    let boot = crate::owner_guard::boot_id()
+        .map_err(|error| {
+            tracing::info!(target: SESSION, %error, "the boot identifier could not be read");
+        })
+        .ok();
+    let arcen_attached = match &reading {
+        crate::windows_session::HolderReading::Session { owner, .. } => agent_lease
+            .active_log_matches_user(&owner.sid)
+            .unwrap_or(true),
+        _ => false,
+    };
+    let occupant = crate::session_handover::occupant(
+        &reading,
+        boot.as_deref(),
+        agent_lease.handover.epoch(),
+        arcen_attached,
+    );
+    (occupant, reading)
+}
+
+/// Sends the shared refusal `refusal` (its code first) and logs it.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_handover(
+    ws: &mut crate::resume::DirectSessionSocket,
+    refusal: arcen_session::session_handover::HandoverRefusal,
+    deck_account_switch_v1: bool,
+    emitter: &LifecycleEmitter,
+    session_log_id: &CorrelationId,
+    user: &str,
+    peer: &str,
+) -> Result<(), String> {
+    let code = refusal.console_refusal(
+        arcen_session::console_session::ConsoleOrigin::DisplayManager,
+        deck_account_switch_v1,
+    );
+    emit_session_handover(emitter, session_log_id, user, peer, refusal.reason(), None);
+    emit_session_auth_fail(
+        emitter,
+        session_log_id.clone(),
+        Some(user),
+        peer,
+        "desktop",
+        code.token(),
+    );
+    send_session_setup_failure(
+        ws,
+        &arcen_session::console_session::ConsoleNotice::from(code).deck_reason(),
+    )
+    .await
+}
+
+/// The shared change-of-account decision for an authenticated sign-in,
+/// taken before any session is moved, unlocked or signed in: a confirmed
+/// change of account in flight refuses everyone it holds off, and another
+/// account's idle session is offered for a graceful sign-out to a Deck
+/// that can confirm it.
+#[allow(clippy::too_many_arguments)]
+async fn handover_gate(
+    ws: &mut crate::resume::DirectSessionSocket,
+    agent_lease: &Arc<BrokerAgentLease>,
+    connection: arcen_session::session_handover::consent::ConnectionId,
+    account: &crate::auth::AuthenticatedAccount,
+    deck_account_switch_v1: bool,
+    emitter: &LifecycleEmitter,
+    session_log_id: &CorrelationId,
+    peer: &str,
+) -> Result<HandoverGate, String> {
+    use arcen_session::session_handover::{HandoverDecision, HandoverRefusal};
+    let user = account.requested_name().to_string();
+    let Some(requester) = account
+        .string_sid()
+        .ok()
+        .and_then(|sid| crate::session_handover::principal(&sid))
+        .map(arcen_session::session_handover::AuthenticatedPrincipal::after_authentication)
+    else {
+        return Ok(HandoverGate::Proceed);
+    };
+    let (occupant, reading) = read_occupant(agent_lease, account);
+    let route = crate::session_handover::route(deck_account_switch_v1);
+    let handover = &agent_lease.handover;
+    let decided = handover.with_ledger(|ledger| {
+        ledger.decide(connection, &requester, &occupant, route, handover.now())
+    });
+    if let Some(lapse) = decided.lapsed {
+        emit_session_handover(emitter, session_log_id, &user, peer, lapse.reason(), None);
+    }
+    match decided.decision {
+        HandoverDecision::Refuse(
+            refusal @ (HandoverRefusal::SwitchInProgress | HandoverRefusal::SigningOut),
+        ) => {
+            refuse_handover(
+                ws,
+                refusal,
+                deck_account_switch_v1,
+                emitter,
+                session_log_id,
+                &user,
+                peer,
+            )
+            .await?;
+            Ok(HandoverGate::Done)
+        }
+        // The console classifier words these as it always has.
+        HandoverDecision::Refuse(refusal) => {
+            let remote_client = match refusal {
+                HandoverRefusal::Busy(client) => Some(client),
+                _ => None,
+            };
+            emit_session_handover(
+                emitter,
+                session_log_id,
+                &user,
+                peer,
+                refusal.reason(),
+                remote_client,
+            );
+            Ok(HandoverGate::Proceed)
+        }
+        HandoverDecision::SignInFresh => Ok(HandoverGate::Proceed),
+        decision @ (HandoverDecision::JoinOwnSession { .. }
+        | HandoverDecision::JoinOwnSessionAfterIncumbent(_)) => {
+            // Before the slow attach: an open offer to sign this session out
+            // is withdrawn now, not when the agent starts. The decided layout
+            // is logged only: this Pier's display lease lays out the console
+            // for every attachment and puts it back on leave (PD-032, PD-043).
+            let returned = handover.with_ledger(|ledger| ledger.remote_client_returned());
+            tracing::info!(
+                target: SESSION,
+                %peer,
+                layout = ?decision.layout(),
+                ledger = ?returned,
+                "the account joins its own session"
+            );
+            emit_session_handover(
+                emitter,
+                session_log_id,
+                &user,
+                peer,
+                arcen_session::session_handover::HandoverReason::ReusedDesktop,
+                None,
+            );
+            Ok(HandoverGate::Proceed)
+        }
+        HandoverDecision::OfferSwitch(candidate) => {
+            let crate::windows_session::HolderReading::Session { session_id, .. } = reading else {
+                return Ok(HandoverGate::Proceed);
+            };
+            run_account_switch(
+                ws,
+                agent_lease,
+                connection,
+                candidate,
+                session_id,
+                account,
+                &requester,
+                emitter,
+                session_log_id,
+                peer,
+            )
+            .await
+        }
+    }
+}
+
+/// Offer, answer, read again, sign out gracefully, prove the exact session
+/// ended: `arcen_session::session_handover::consent`, on Windows.
+#[allow(clippy::too_many_arguments)]
+async fn run_account_switch(
+    ws: &mut crate::resume::DirectSessionSocket,
+    agent_lease: &Arc<BrokerAgentLease>,
+    connection: arcen_session::session_handover::consent::ConnectionId,
+    candidate: arcen_session::session_handover::SwitchCandidate,
+    target_session_id: u32,
+    account: &crate::auth::AuthenticatedAccount,
+    requester: &arcen_session::session_handover::AuthenticatedPrincipal,
+    emitter: &LifecycleEmitter,
+    session_log_id: &CorrelationId,
+    peer: &str,
+) -> Result<HandoverGate, String> {
+    use arcen_protocol::messages::{
+        AccountSwitchChoiceMsg, AccountSwitchOfferMsg, AccountSwitchOutcomeMsg,
+        AccountSwitchReplyMsg, AccountSwitchResultMsg, ACCOUNT_SWITCH_REPLY,
+    };
+    use arcen_session::session_handover::consent::{
+        ReplyRejection, SwitchNonce, DEFAULT_OFFER_LIFETIME_SECS,
+    };
+    use arcen_session::session_handover::logout::{
+        LogoutBlock, LogoutOutcome, LogoutVerdict, SessionExitProof, SessionPresence,
+        LOGOUT_COMPLETION_TIMEOUT,
+    };
+    use arcen_session::session_handover::HandoverReason;
+    let user = account.requested_name().to_string();
+    let handover = &agent_lease.handover;
+    let mut bytes = [0u8; arcen_session::session_handover::consent::SWITCH_NONCE_BYTES];
+    getrandom::getrandom(&mut bytes).map_err(|error| format!("offer nonce: {error}"))?;
+    let nonce = SwitchNonce::from_random(bytes).ok_or("offer nonce was rejected")?;
+    let opened = handover.with_ledger(|ledger| {
+        ledger.open(
+            candidate,
+            connection,
+            nonce,
+            handover.now(),
+            DEFAULT_OFFER_LIFETIME_SECS,
+        )
+    });
+    let ticket = match opened {
+        Ok(opened) => {
+            if let Some(lapse) = opened.lapsed {
+                emit_session_handover(emitter, session_log_id, &user, peer, lapse.reason(), None);
+            }
+            opened.ticket
+        }
+        Err(refusal) => {
+            tracing::warn!(target: SESSION, %peer, ?refusal, "no change of account was offered");
+            match refusal.handover_refusal() {
+                Some(refusal) => {
+                    refuse_handover(ws, refusal, true, emitter, session_log_id, &user, peer)
+                        .await?;
+                }
+                None => {
+                    send_session_setup_failure(ws, "A change of account could not be offered.")
+                        .await?;
+                }
+            }
+            return Ok(HandoverGate::Done);
+        }
+    };
+    let offer_id = ticket.nonce.to_hex();
+    let result = |outcome| AccountSwitchResultMsg::new(offer_id.clone(), outcome);
+    let offer = AccountSwitchOfferMsg::new(offer_id.clone(), ticket.expires_in_secs)
+        .map_err(|error| format!("account switch offer: {error}"))?;
+    send_json(ws, &offer, "account_switch_offer").await?;
+    emit_session_handover(
+        emitter,
+        session_log_id,
+        &user,
+        peer,
+        HandoverReason::SwitchOffered,
+        None,
+    );
+    let reply: Result<AccountSwitchReplyMsg, String> = recv_typed(
+        ws,
+        ACCOUNT_SWITCH_REPLY,
+        Duration::from_secs(u64::from(ticket.expires_in_secs) + 1),
+    )
+    .await;
+    let reply = match reply.and_then(|reply| {
+        reply
+            .validate()
+            .map(|()| reply)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(reply) => reply,
+        Err(error) => {
+            let now = handover.now();
+            let reason = handover.with_ledger(|ledger| {
+                ledger
+                    .expire(now)
+                    .map(|lapse| lapse.reason())
+                    .or_else(|| ledger.requester_left(connection))
+            });
+            tracing::info!(target: SESSION, %peer, %error, "no answer to the change of account");
+            if let Some(reason) = reason {
+                emit_session_handover(emitter, session_log_id, &user, peer, reason, None);
+            }
+            let outcome = if reason == Some(HandoverReason::SwitchExpired) {
+                AccountSwitchOutcomeMsg::Expired
+            } else {
+                AccountSwitchOutcomeMsg::Rejected
+            };
+            let _ = send_json(ws, &result(outcome), "account_switch_result").await;
+            return Ok(HandoverGate::Done);
+        }
+    };
+    let presented = SwitchNonce::parse_hex(&reply.offer_id);
+    let rejected = |rejection: ReplyRejection| match rejection {
+        ReplyRejection::Expired => AccountSwitchOutcomeMsg::Expired,
+        ReplyRejection::Stale(_) => AccountSwitchOutcomeMsg::Stale,
+        _ => AccountSwitchOutcomeMsg::Rejected,
+    };
+    let Some(presented) = presented else {
+        let reason = handover.with_ledger(|ledger| ledger.requester_left(connection));
+        if let Some(reason) = reason {
+            emit_session_handover(emitter, session_log_id, &user, peer, reason, None);
+        }
+        send_json(
+            ws,
+            &result(AccountSwitchOutcomeMsg::Rejected),
+            "account_switch_result",
+        )
+        .await?;
+        return Ok(HandoverGate::Done);
+    };
+    if reply.choice == AccountSwitchChoiceMsg::Cancel {
+        let cancelled =
+            handover.with_ledger(|ledger| ledger.cancel(connection, &presented, handover.now()));
+        let (reason, outcome) = match cancelled {
+            Ok(()) => (
+                HandoverReason::SwitchCancelled,
+                AccountSwitchOutcomeMsg::Cancelled,
+            ),
+            Err(rejection) => (rejection.reason(), rejected(rejection)),
+        };
+        emit_session_handover(emitter, session_log_id, &user, peer, reason, None);
+        send_json(ws, &result(outcome), "account_switch_result").await?;
+        return Ok(HandoverGate::Done);
+    }
+    // Read the facts again immediately before asking for the sign-out.
+    let (fresh, reading) = read_occupant(agent_lease, account);
+    let authority = match handover
+        .with_ledger(|ledger| ledger.confirm(connection, &presented, handover.now(), &fresh))
+    {
+        Ok(authority) => authority,
+        Err(rejection) => {
+            tracing::info!(target: SESSION, %peer, ?rejection, "the change of account was not confirmed");
+            emit_session_handover(
+                emitter,
+                session_log_id,
+                &user,
+                peer,
+                rejection.reason(),
+                None,
+            );
+            send_json(ws, &result(rejected(rejection)), "account_switch_result").await?;
+            return Ok(HandoverGate::Done);
+        }
+    };
+    let crate::windows_session::HolderReading::Session {
+        session_id, owner, ..
+    } = reading
+    else {
+        // `confirm` matched the exact identity, so this cannot be.
+        return Err("the confirmed session was not read".to_string());
+    };
+    debug_assert_eq!(session_id, target_session_id);
+    emit_session_handover(
+        emitter,
+        session_log_id,
+        &user,
+        peer,
+        HandoverReason::LogoutRequested,
+        None,
+    );
+    tracing::info!(
+        target: SESSION,
+        %peer,
+        windows_session_id = session_id,
+        "asking Windows for the ordinary sign-out of the confirmed session"
+    );
+    let target = authority.target().clone();
+    let sign_out = tokio::task::spawn_blocking(move || {
+        if let Err(error) = crate::windows_session::request_sign_out(session_id, &owner) {
+            tracing::warn!(
+                target: SESSION,
+                windows_session_id = session_id,
+                %error,
+                "the sign-out could not be asked for"
+            );
+            return LogoutOutcome::Failed;
+        }
+        let deadline = std::time::Instant::now() + LOGOUT_COMPLETION_TIMEOUT;
+        let last = loop {
+            let presence = crate::windows_session::session_presence(session_id, &owner);
+            if let Some(proof) = SessionExitProof::read_back(&target, presence) {
+                return LogoutOutcome::Completed(proof);
+            }
+            if std::time::Instant::now() >= deadline {
+                break presence;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        // Still signed in when the time ran out: an application refused.
+        if last == SessionPresence::Present {
+            LogoutOutcome::Vetoed
+        } else {
+            LogoutOutcome::TimedOut
+        }
+    });
+    // The sign-out runs to its end whatever the requester does; a requester
+    // that leaves meanwhile is noticed at once and is not signed in after it.
+    tokio::pin!(sign_out);
+    let mut requester_gone = false;
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut sign_out => break outcome.unwrap_or(LogoutOutcome::Failed),
+            message = ws.next(), if !requester_gone => {
+                if matches!(message, None | Some(Err(_)) | Some(Ok(Message::Close(_)))) {
+                    requester_gone = true;
+                    handover.with_ledger(|ledger| ledger.requester_left(connection));
+                    tracing::info!(
+                        target: SESSION,
+                        %peer,
+                        "the requester left while the confirmed session signs out"
+                    );
+                }
+            }
+        }
+    };
+    let verdict =
+        handover.with_ledger(|ledger| ledger.finish_logout(authority, outcome, handover.now()));
+    emit_session_handover(emitter, session_log_id, &user, peer, verdict.reason(), None);
+    match verdict {
+        LogoutVerdict::Completed { permit, ended } => {
+            debug_assert_eq!(permit.requester(), requester);
+            tracing::info!(
+                target: SESSION,
+                %peer,
+                ended_session = ended.session().as_str(),
+                "the confirmed session ended; the requester signs in"
+            );
+            send_json(
+                ws,
+                &result(AccountSwitchOutcomeMsg::SignedOut),
+                "account_switch_result",
+            )
+            .await?;
+            // Windows takes a moment to bring the sign-in screen back to the
+            // console once the session ended.
+            let settle = std::time::Instant::now() + ENTRY_SETTLE;
+            while std::time::Instant::now() < settle
+                && matches!(
+                    crate::windows_session::classify_bind(account),
+                    Ok(crate::windows_session::BindStatus::Rejected(..)) | Err(_)
+                )
+            {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    message = ws.next() => {
+                        if matches!(message, None | Some(Err(_)) | Some(Ok(Message::Close(_)))) {
+                            if let Some(reason) =
+                                handover.with_ledger(|ledger| ledger.requester_left(connection))
+                            {
+                                emit_session_handover(
+                                    emitter, session_log_id, &user, peer, reason, None,
+                                );
+                            }
+                            drop(permit);
+                            return Ok(HandoverGate::Done);
+                        }
+                    }
+                }
+            }
+            Ok(HandoverGate::Entered(EntryGuard {
+                lease: Arc::clone(agent_lease),
+                permit: Some(permit),
+            }))
+        }
+        LogoutVerdict::CompletedRequesterGone { .. } => Ok(HandoverGate::Done),
+        LogoutVerdict::Blocked(block) => {
+            let outcome = match block {
+                LogoutBlock::Vetoed => AccountSwitchOutcomeMsg::LogoutVetoed,
+                LogoutBlock::TimedOut => AccountSwitchOutcomeMsg::LogoutTimedOut,
+                LogoutBlock::Failed | LogoutBlock::ExitUnproven | LogoutBlock::NotCommitting => {
+                    AccountSwitchOutcomeMsg::LogoutFailed
+                }
+            };
+            tracing::warn!(target: SESSION, %peer, ?block, "the change of account stopped");
+            send_json(ws, &result(outcome), "account_switch_result").await?;
+            Ok(HandoverGate::Done)
+        }
     }
 }
 
@@ -1107,6 +1674,23 @@ async fn run_correlated_broker(
         );
     }
     let refine_grant = refine_lane_grant(&cfg, &response);
+    let handover_connection = agent_lease.handover.connection();
+    let entry = match handover_gate(
+        &mut ws,
+        &agent_lease,
+        handover_connection,
+        &account,
+        response.account_switch_v1,
+        emitter,
+        &session_log_id,
+        peer,
+    )
+    .await?
+    {
+        HandoverGate::Proceed => None,
+        HandoverGate::Entered(entry) => Some(entry),
+        HandoverGate::Done => return Ok(()),
+    };
     // Existing active-session attach is unchanged. Only when no SID-matching
     // session exists (or a matching one is locked) do we hand the credential to
     // the Credential Provider for a remote first-login / unlock.
@@ -1272,6 +1856,9 @@ async fn run_correlated_broker(
                 return Err(error);
             }
         };
+    if let Some(entry) = entry {
+        entry.finish(true);
+    }
     if !identity.state.eq_ignore_ascii_case("active") {
         resume_opt_in = None;
     }
@@ -1515,6 +2102,42 @@ async fn run_correlated_broker(
     };
     let (agent_log_path, agent_log_user_sid) =
         crate::windows_session::agent_log_registration(&selected, &session_log_id)?;
+    // An Arcen Deck attaches (ADR 0025 §13): never to a session a confirmed
+    // change of account is signing out; the epoch moves and an open offer to
+    // sign another account out is withdrawn.
+    let attaching = crate::windows_session::session_owner(identity.session_id)
+        .ok()
+        .flatten()
+        .zip(crate::owner_guard::boot_id().ok())
+        .and_then(|(owner, boot)| {
+            crate::session_handover::session_identity(
+                &owner.sid,
+                identity.session_id,
+                owner.logon_id,
+                &boot,
+            )
+        });
+    match agent_lease.handover.attach(attaching.as_ref()) {
+        Ok(arcen_session::session_handover::consent::ClientReturn::NoOffer) => {}
+        Ok(returned) => tracing::info!(
+            target: SESSION,
+            ledger = ?returned,
+            "an Arcen Deck attached while a change of account was pending"
+        ),
+        Err(_) => {
+            refuse_handover(
+                &mut ws,
+                arcen_session::session_handover::HandoverRefusal::SigningOut,
+                response.account_switch_v1,
+                emitter,
+                &session_log_id,
+                &response.username,
+                peer,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     let mut active_log = agent_lease.register_active_log(agent_log_path, agent_log_user_sid)?;
     crate::console_recovery::wait_until_idle().await;
     let mut launched = match crate::windows_session::spawn(
@@ -3110,40 +3733,83 @@ impl ActiveDisplayLease {
     }
 
     /// Per display in [`Self::device_names`] order: whether Windows may still
-    /// publish HDR support for it (shared `DisplayIdentity::may_gain_hdr`).
-    /// Arcen created it (`created_outputs`: `IddCx`, NVIDIA headless), or a
-    /// single display's NVAPI exact timing wrote an HDR EDID for an HDR
-    /// request. A multi-display exact timing writes an SDR EDID, which claims
-    /// no HDR, so that display's "no HDR support" is final.
-    fn arcen_display_identity(&self, created_outputs: bool) -> Vec<bool> {
-        use arcen_outputs::windows_advanced_colour::DisplayIdentity;
+    /// publish HDR support for it (shared `DisplayIdentity::may_gain_hdr`),
+    /// decided from what this session did to the display and the EDID it
+    /// carries now (`DisplayIdentity::of_session_display`), never from
+    /// configuration: Arcen created it (`IddCx`), NVIDIA headless
+    /// provisioning wrote its EDID (`headless`), or a single display's NVAPI
+    /// exact timing wrote one for the request. A multi-display exact timing
+    /// writes an SDR EDID, which claims no HDR, so that display's "no HDR
+    /// support" is final, as is a display whose own EDID it still is.
+    fn arcen_display_identity(
+        &self,
+        iddcx: bool,
+        headless: arcen_outputs::windows_advanced_colour::EdidWrite,
+        desired_hdr: bool,
+    ) -> Vec<bool> {
+        use arcen_outputs::windows_advanced_colour::{DisplayIdentity, EdidWrite};
+        let measured = crate::display_truth::read()
+            .map_err(|error| {
+                tracing::debug!(
+                    target: DISPLAY,
+                    %error,
+                    "session display EDIDs could not be read; the identity follows what the session wrote"
+                );
+            })
+            .ok();
+        let edid_now = |device_name: &str| {
+            measured.as_ref().and_then(|truth| {
+                truth
+                    .outputs
+                    .iter()
+                    .find(|output| output.active && output.label.eq_ignore_ascii_case(device_name))
+                    .and_then(|output| output.edid.clone())
+            })
+        };
+        let identity = |device_name: &str, wrote: EdidWrite| {
+            let edid = edid_now(device_name);
+            let identity = DisplayIdentity::of_session_display(iddcx, wrote, edid.as_deref());
+            tracing::debug!(
+                target: DISPLAY,
+                device = device_name,
+                wrote = ?wrote,
+                edid = edid.as_deref().map(arcen_outputs::display_truth::edid_fingerprint),
+                edid_hdr10 = edid.as_deref().map(arcen_outputs::edid::declares_hdr10),
+                ?identity,
+                "session display identity"
+            );
+            identity
+        };
         let identities = match self {
-            Self::Single(display) => vec![if created_outputs {
-                DisplayIdentity::ArcenCreated
-            } else if display.report().retarget_capable {
-                DisplayIdentity::ArcenHdrEdid
-            } else {
-                DisplayIdentity::Own
-            }],
-            Self::Multi(display) => display.applied_plan().map_or_else(
-                || {
-                    vec![if created_outputs {
-                        DisplayIdentity::ArcenCreated
+            Self::Single(display) => {
+                let report = display.report();
+                let wrote = if headless != EdidWrite::None {
+                    headless
+                } else if report.retarget_capable {
+                    if desired_hdr {
+                        EdidWrite::Hdr
                     } else {
-                        DisplayIdentity::Own
-                    }]
-                },
+                        EdidWrite::Sdr
+                    }
+                } else {
+                    EdidWrite::None
+                };
+                vec![identity(&report.device_name, wrote)]
+            }
+            Self::Multi(display) => display.applied_plan().map_or_else(
+                || vec![identity(&display.report().device_name, headless)],
                 |plan| {
                     plan.monitors
                         .iter()
                         .map(|monitor| {
-                            if created_outputs {
-                                DisplayIdentity::ArcenCreated
+                            let wrote = if headless != EdidWrite::None {
+                                headless
                             } else if monitor.custom_timing {
-                                DisplayIdentity::ArcenSdrEdid
+                                EdidWrite::Sdr
                             } else {
-                                DisplayIdentity::Own
-                            }
+                                EdidWrite::None
+                            };
+                            identity(&monitor.device_name, wrote)
                         })
                         .collect()
                 },
@@ -3473,6 +4139,27 @@ where
         other => other.cloned(),
     };
     let mut nvidia_headless_planning = None;
+    // Contract part 1 (ADR 0025 §14): a journal an earlier session left is
+    // applied before anything is read or changed here. One that cannot be
+    // applied is set aside untouched and the Deck is told
+    // (`display_restore_pending`); this session then starts from the
+    // displays as they are, reads them, and proves its own restore against
+    // that reading when the Deck leaves.
+    or_report!(
+        ws,
+        tokio::task::spawn_blocking(crate::display::recover_pending_display_journal)
+            .await
+            .map_err(|error| format!("display journal recovery task failed: {error}"))
+            .and_then(|recovered| recovered)
+    );
+    let display_truth_before = tokio::task::spawn_blocking(crate::display_truth::read_before)
+        .await
+        .ok()
+        .flatten();
+    // What NVIDIA headless provisioning actually wrote on the session's
+    // displays, never what the configuration allows (shared
+    // `DisplayIdentity::of_session_display`).
+    let mut headless_edid_write = arcen_outputs::windows_advanced_colour::EdidWrite::None;
     let mut multi_monitor_committed = if let Some(requested_multi_monitor) =
         served_multi_monitor.as_ref()
     {
@@ -3575,6 +4262,11 @@ where
             });
             let lease = or_report!(ws, lease);
             nvidia_headless_planning = Some(lease);
+            headless_edid_write = if hdr10 {
+                arcen_outputs::windows_advanced_colour::EdidWrite::Hdr
+            } else {
+                arcen_outputs::windows_advanced_colour::EdidWrite::Sdr
+            };
         }
         if cfg.iddcx.enabled || cfg.multi_monitor.nvidia_headless_effective() {
             // These providers create the outputs they plan on: a plan that
@@ -3932,6 +4624,11 @@ where
         match single_display_reconciliation(reconciled) {
             SingleDisplayReconciliation::Reconciled(lease) => {
                 nvidia_headless_planning = Some(lease);
+                headless_edid_write = if desired_display_hdr {
+                    arcen_outputs::windows_advanced_colour::EdidWrite::Hdr
+                } else {
+                    arcen_outputs::windows_advanced_colour::EdidWrite::Sdr
+                };
                 or_report!(
                     ws,
                     wait_for_previous_physical_topology_settle(
@@ -4196,6 +4893,22 @@ where
     if multi_monitor_committed.is_none() {
         cfg.output_index = display.report().capture_output_index;
     }
+    {
+        // Contract part 2: what the Pier serves against what was asked, with
+        // the typed reason whenever they differ.
+        let report = display.report();
+        if let Some(reason) = report.degradation() {
+            tracing::warn!(
+                target: DISPLAY,
+                reason_code = reason.code(),
+                requested = %report.requested,
+                served = %report.applied,
+                served_refresh_hz = report.applied_refresh_hz,
+                backend = report.backend,
+                "the display is not served at the requested size"
+            );
+        }
+    }
     if let (Some(applied_plan), Some((committed_plan, _))) = (
         match &display {
             ActiveDisplayLease::Multi(display) => display.applied_plan().cloned(),
@@ -4238,9 +4951,8 @@ where
                 "Windows Advanced Color was applied inside the exact display transaction"
             );
         } else {
-            let identity = display.arcen_display_identity(
-                cfg.iddcx.enabled || cfg.multi_monitor.nvidia_headless_effective(),
-            );
+            let identity =
+                display.arcen_display_identity(cfg.iddcx.enabled, headless_edid_write, desired_hdr);
             let session_log_id_for_advanced_color = session_log_id.clone();
             let names = device_names.clone();
             let marks = identity.clone();
@@ -4856,6 +5568,17 @@ where
         };
         let _ = protection.apply(display_event);
     }
+    // The restore is proved by reading every display back (shared
+    // `restore_differences`), not by the active set and primary alone.
+    let restore_truth = match (&restore, display_truth_before) {
+        (Ok(()), Some(before)) => {
+            tokio::task::spawn_blocking(move || crate::display_truth::verify_restored(&before))
+                .await
+                .map_err(|error| format!("display truth task failed: {error}"))
+                .and_then(|verified| verified)
+        }
+        _ => Ok(()),
+    };
     crate::deskside::hold_dark_desk(
         None,
         arcen_session::console_session::desk_privacy::DeskWatchOnRefusal::End,
@@ -4901,6 +5624,7 @@ where
         &peer,
         &final_display_report,
         &restore,
+        &restore_truth,
     );
     let restore = match (restore, input_restore) {
         (Ok(()), Ok(())) => Ok(()),
@@ -6916,6 +7640,9 @@ fn build_server_hello_with_aggregate(
         },
         "exact": display.exact,
         "changed": display.changed,
+        // `display_restore_pending` when an earlier session's displays could
+        // not be put back (shared `display_note` words it for the Deck).
+        "restore_notice": crate::display::restore_pending_notice(),
         "backend": display.backend,
         "restore_backend": display.restore_backend,
         "device_name": display.device_name,
@@ -11074,7 +11801,39 @@ fn emit_display_restore_outcome(
     peer: &str,
     display_report: &DisplayReport,
     restore: &Result<(), String>,
+    restore_truth: &Result<(), String>,
 ) {
+    if let (Ok(()), Err(_difference)) = (restore, restore_truth) {
+        let mut fields = StructuredFields::default();
+        let _ = fields.insert(
+            "restore_backend",
+            FieldValue::String(display_report.restore_backend.to_string()),
+        );
+        let _ = fields.insert(
+            "stage",
+            FieldValue::String("session_cleanup_readback".to_string()),
+        );
+        let _ = fields.insert(
+            "reason_class",
+            FieldValue::String(
+                arcen_outputs::display_truth::DisplayTruthReason::RestoreIncomplete
+                    .code()
+                    .to_string(),
+            ),
+        );
+        let _ = fields.insert("journal_pending", FieldValue::Boolean(false));
+        crate::emit_lifecycle_event_with_context(
+            emitter,
+            LifecycleEventKind::DisplayRestoreFailed,
+            session_log_id,
+            fields,
+            Some(user.to_owned()),
+            local_hostname(),
+            Some(peer.to_owned()),
+            None,
+        );
+        return;
+    }
     if !display_report.changed {
         return;
     }

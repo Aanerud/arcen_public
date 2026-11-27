@@ -1216,9 +1216,13 @@ pub fn scrgb_component_to_pq_code(linear: f32) -> u16 {
 
 /// Complete colour transform for Windows FP16 scRGB capture into PQ YCbCr.
 ///
-/// Construction binds target primaries, matrix, range and depth together once
-/// so the per-frame conversion cannot accidentally apply PQ with a transform
-/// built for 8-bit RGB input or for a different matrix.
+/// Construction binds target primaries, matrix, range, depth and SDR white
+/// together once so the per-frame conversion cannot accidentally apply PQ
+/// with a transform built for 8-bit RGB input, for a different matrix, or for
+/// a different white. There is no way to change a built transform: a new
+/// white is a new transform, and everything derived from the old one (a GPU
+/// shader's constants, exact-still-image tiles) has to be built again from
+/// the new one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScrgbPqTransform {
     output_primaries: ColorPrimaries,
@@ -1229,30 +1233,29 @@ pub struct ScrgbPqTransform {
 }
 
 impl ScrgbPqTransform {
+    /// `sdr_white_nits` is where the source composes SDR content. The
+    /// transform places it at BT.2408's 203-nit graphics white, scaling HDR
+    /// highlights in proportion, as every Pier does. Windows composes SDR at
+    /// the output's SDR white level
+    /// ([`super::pq_white::windows_sdr_white_level_nits`]). `None`, or a
+    /// non-positive or non-finite white, leaves the frame as composed.
     #[must_use]
     pub fn new(
         matrix: ColorMatrix,
         output_primaries: ColorPrimaries,
         range: ColorRange,
         depth: BitDepth,
+        sdr_white_nits: Option<f64>,
     ) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        let white_gain = sdr_white_nits.map_or(1.0, |nits| {
+            super::pq_white::reference_white_gain(nits) as f32
+        });
         Self {
             output_primaries,
             ycbcr: ColorTransform::for_input_max(matrix, range, depth, f64::from(WIDE_INPUT_MAX)),
-            white_gain: 1.0,
+            white_gain,
         }
-    }
-
-    /// Places SDR content, composed at `sdr_white_nits`, at BT.2408's 203-nit
-    /// graphics white, scaling HDR highlights in proportion, as every Pier
-    /// does. Windows composes SDR at the output's SDR white level
-    /// ([`super::pq_white::windows_sdr_white_level_nits`]); a non-positive or
-    /// unknown white leaves the frame as composed.
-    #[must_use]
-    pub fn with_sdr_white_nits(self, sdr_white_nits: f64) -> Self {
-        #[allow(clippy::cast_possible_truncation)]
-        let white_gain = super::pq_white::reference_white_gain(sdr_white_nits) as f32;
-        Self { white_gain, ..self }
     }
 
     /// The linear-light gain this transform applies before PQ.
@@ -1385,6 +1388,206 @@ impl ScrgbSdrTransform {
             self.ycbcr.pack_p16(self.ycbcr.cb_wide(b, g, r)),
             self.ycbcr.pack_p16(self.ycbcr.cr_wide(b, g, r)),
         ]
+    }
+}
+
+/// Which conversion a GPU implementation of [`ScrgbConversion`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrgbShaderMode {
+    /// SDR clamp and the BT.709 OETF (Grading for an older Deck).
+    SdrBt709,
+    /// BT.2020 primaries, white gain and PQ (HDR).
+    PqBt2020,
+    /// SDR clamp and the sRGB encode DWM linearised with (Grading).
+    SdrSrgb,
+}
+
+impl ScrgbShaderMode {
+    /// The value a shader's constant buffer carries for this mode.
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::SdrBt709 => 0,
+            Self::PqBt2020 => 1,
+            Self::SdrSrgb => 2,
+        }
+    }
+
+    /// The mode a constant-buffer value names, if any.
+    #[must_use]
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::SdrBt709),
+            1 => Some(Self::PqBt2020),
+            2 => Some(Self::SdrSrgb),
+            _ => None,
+        }
+    }
+}
+
+/// The colour parameters a GPU implementation of an FP16 scRGB conversion
+/// takes, read from the [`ScrgbConversion`] the CPU path and the
+/// exact-still-image tiles use. A shader built from anything else can drift
+/// from them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrgbShaderParams {
+    pub mode: ScrgbShaderMode,
+    pub range: ColorRange,
+    /// Linear-light gain before PQ; `1.0` for SDR.
+    pub white_gain: f32,
+}
+
+/// Why FP16 scRGB capture cannot serve a colour contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrgbConversionRefusal {
+    pub primaries: ColorPrimaries,
+    pub transfer: TransferCharacteristics,
+}
+
+impl Display for ScrgbConversionRefusal {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "FP16 scRGB capture cannot serve {:?} primaries with {:?} transfer",
+            self.primaries, self.transfer
+        )
+    }
+}
+
+impl Error for ScrgbConversionRefusal {}
+
+/// The one conversion of an FP16 scRGB stream (Windows Grading and HDR).
+///
+/// A Pier builds it once, with its SDR white, before anything that encodes
+/// or refines the stream exists. The CPU conversion, a GPU shader's
+/// constants ([`Self::shader_params`]) and the exact-still-image tiles
+/// ([`Self::rgb_codes`]) all read this one value, so the video and the tiles
+/// cannot disagree about white, transfer or range. It cannot be changed: a
+/// different white is a new conversion, and a new encoder.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScrgbConversion {
+    /// Grading: SDR clamp and the served SDR transfer.
+    Sdr(ScrgbSdrTransform),
+    /// HDR: target primaries, SDR white placement and PQ.
+    Pq(ScrgbPqTransform),
+}
+
+impl ScrgbConversion {
+    /// The ten-bit conversion of FP16 scRGB that serves `transfer` with
+    /// `primaries`, `matrix` and `range`. PQ places SDR content composed at
+    /// `sdr_white_nits` at 203 nits ([`ScrgbPqTransform::new`]); SDR ignores
+    /// it, since an SDR output has no white to place.
+    ///
+    /// # Errors
+    ///
+    /// [`ScrgbConversionRefusal`] for HLG, and for an SDR transfer with
+    /// primaries other than BT.709, which scRGB carries as it is.
+    pub fn for_stream(
+        matrix: ColorMatrix,
+        primaries: ColorPrimaries,
+        range: ColorRange,
+        transfer: TransferCharacteristics,
+        sdr_white_nits: Option<f64>,
+    ) -> Result<Self, ScrgbConversionRefusal> {
+        let refusal = ScrgbConversionRefusal {
+            primaries,
+            transfer,
+        };
+        match transfer {
+            TransferCharacteristics::Pq => Ok(Self::Pq(ScrgbPqTransform::new(
+                matrix,
+                primaries,
+                range,
+                BitDepth::Ten,
+                sdr_white_nits,
+            ))),
+            TransferCharacteristics::Bt709 | TransferCharacteristics::Srgb
+                if primaries == ColorPrimaries::Bt709 =>
+            {
+                ScrgbSdrTransform::new(matrix, range, BitDepth::Ten, transfer)
+                    .map(Self::Sdr)
+                    .ok_or(refusal)
+            }
+            _ => Err(refusal),
+        }
+    }
+
+    /// The ten-bit R′G′B′ codes of one pixel given as half-float bits: what
+    /// the conversion hands its matrix, and an exact tile's codes.
+    #[must_use]
+    pub fn rgb_codes(self, r: u16, g: u16, b: u16) -> [u16; 3] {
+        match self {
+            Self::Sdr(transform) => transform.rgb_codes(r, g, b),
+            Self::Pq(transform) => transform.rgb_codes(r, g, b),
+        }
+    }
+
+    /// The linear-light gain applied before the transfer: `1.0` for SDR.
+    #[must_use]
+    pub const fn white_gain(self) -> f32 {
+        match self {
+            Self::Sdr(_) => 1.0,
+            Self::Pq(transform) => transform.white_gain(),
+        }
+    }
+
+    /// Everything a GPU shader needs to run this conversion.
+    #[must_use]
+    pub const fn shader_params(self) -> ScrgbShaderParams {
+        match self {
+            Self::Sdr(transform) => ScrgbShaderParams {
+                mode: match transform.transfer {
+                    TransferCharacteristics::Srgb => ScrgbShaderMode::SdrSrgb,
+                    // `ScrgbSdrTransform::new` admits only the two SDR transfers.
+                    _ => ScrgbShaderMode::SdrBt709,
+                },
+                range: transform.ycbcr.range(),
+                white_gain: 1.0,
+            },
+            Self::Pq(transform) => ScrgbShaderParams {
+                mode: ScrgbShaderMode::PqBt2020,
+                range: transform.ycbcr.range(),
+                white_gain: transform.white_gain,
+            },
+        }
+    }
+
+    /// Converts one frame into planar ten-bit 4:4:4, MSB-aligned for NVENC
+    /// ([`convert_scrgb_to_sdr_i444_p16`], [`convert_scrgb_to_pq_i444_p16`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ConversionError`] when a source row or a destination plane is too
+    /// small for the stated geometry, checked before any write.
+    pub fn convert_i444_p16(
+        self,
+        src: &[u8],
+        src_stride: usize,
+        planes: [&mut [u16]; 3],
+        plane_strides: [usize; 3],
+        width: usize,
+        height: usize,
+    ) -> Result<(), ConversionError> {
+        match self {
+            Self::Sdr(transform) => convert_scrgb_to_sdr_i444_p16(
+                src,
+                src_stride,
+                planes,
+                plane_strides,
+                width,
+                height,
+                transform,
+            ),
+            Self::Pq(transform) => convert_scrgb_to_pq_i444_p16(
+                src,
+                src_stride,
+                planes,
+                plane_strides,
+                width,
+                height,
+                transform,
+            ),
+        }
     }
 }
 
@@ -2259,8 +2462,8 @@ mod tests {
             ColorPrimaries::Bt2020,
             ColorRange::Full,
             BitDepth::Ten,
-        )
-        .with_sdr_white_nits(white_nits);
+            Some(white_nits),
+        );
         let white = transform.pq_rgb(3.0, 3.0, 3.0);
         let nits = super::super::pq_white::pq_code_to_nits(white[0]);
         assert!(
@@ -2275,17 +2478,111 @@ mod tests {
             (highlight / nits - 4.0).abs() < 0.1,
             "{highlight:.0} / {nits:.0}"
         );
-        // Unknown white changes nothing.
-        let untouched = ScrgbPqTransform::new(
+        // An unknown or unusable white changes nothing.
+        let untouched = |white| {
+            ScrgbPqTransform::new(
+                ColorMatrix::Bt2020Ncl,
+                ColorPrimaries::Bt2020,
+                ColorRange::Full,
+                BitDepth::Ten,
+                white,
+            )
+        };
+        assert_eq!(
+            untouched(Some(0.0)).pq_rgb(1.0, 1.0, 1.0),
+            untouched(None).pq_rgb(1.0, 1.0, 1.0)
+        );
+        assert!((untouched(None).white_gain() - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// The video's shader constants, its CPU conversion and its exact tiles
+    /// are all read from one `ScrgbConversion`: a white given at
+    /// construction reaches every one of them, and nothing can change it
+    /// later (Windows HDR once placed the tiles at 203 nits and the shader's
+    /// video at 240).
+    #[test]
+    fn one_conversion_gives_the_shader_the_cpu_path_and_the_tiles_the_same_white() {
+        let conversion = ScrgbConversion::for_stream(
             ColorMatrix::Bt2020Ncl,
             ColorPrimaries::Bt2020,
             ColorRange::Full,
-            BitDepth::Ten,
+            TransferCharacteristics::Pq,
+            Some(240.0),
+        )
+        .expect("HDR is an scRGB contract");
+        let gain = 203.0 / 240.0;
+        let params = conversion.shader_params();
+        assert_eq!(params.mode, ScrgbShaderMode::PqBt2020);
+        assert_eq!(params.range, ColorRange::Full);
+        assert!((f64::from(params.white_gain) - gain).abs() < 1e-6);
+        assert!((params.white_gain - conversion.white_gain()).abs() < f32::EPSILON);
+
+        // Windows composes SDR white at 3.0 scRGB for 240 nits: the tile
+        // code is BT.2408's 203 nits, and the video gets the same code.
+        let white = half_code(3.0);
+        let tile = conversion.rgb_codes(white, white, white);
+        let nits = super::super::pq_white::pq_code_to_nits(tile[0]);
+        assert!((nits - 203.0).abs() < 3.0, "tile white at {nits:.1} nits");
+        let (mut y, mut u, mut v) = ([0u16; 1], [0u16; 1], [0u16; 1]);
+        conversion
+            .convert_i444_p16(
+                &scrgb_pixel(3.0, 3.0, 3.0),
+                8,
+                [&mut y, &mut u, &mut v],
+                [1, 1, 1],
+                1,
+                1,
+            )
+            .expect("geometry is valid");
+        assert_eq!(y[0] >> 6, tile[0], "video luma code of a neutral white");
+
+        // The shader formula over the shared parameters lands on the same
+        // code: the gain the constants carry is the one the tiles used.
+        let shader_code = |gain: f32| {
+            let bt2020 =
+                convert_scrgb_primaries(3.0 * gain, 3.0 * gain, 3.0 * gain, ColorPrimaries::Bt2020);
+            scrgb_component_to_pq_code(bt2020[0])
+        };
+        assert_eq!(shader_code(params.white_gain), tile[0]);
+        assert_ne!(
+            shader_code(1.0),
+            tile[0],
+            "a gain of 1 is the 240-nit video"
         );
-        assert_eq!(
-            untouched.with_sdr_white_nits(0.0).pq_rgb(1.0, 1.0, 1.0),
-            untouched.pq_rgb(1.0, 1.0, 1.0)
+
+        // Grading carries no gain, and its mode follows the served transfer.
+        let grading = ScrgbConversion::for_stream(
+            ColorMatrix::Bt709,
+            ColorPrimaries::Bt709,
+            ColorRange::Full,
+            TransferCharacteristics::Srgb,
+            Some(240.0),
+        )
+        .expect("Grading is an scRGB contract");
+        assert_eq!(grading.shader_params().mode, ScrgbShaderMode::SdrSrgb);
+        assert!((grading.shader_params().white_gain - 1.0).abs() < f32::EPSILON);
+        for mode in [
+            ScrgbShaderMode::SdrBt709,
+            ScrgbShaderMode::PqBt2020,
+            ScrgbShaderMode::SdrSrgb,
+        ] {
+            assert_eq!(ScrgbShaderMode::from_code(mode.code()), Some(mode));
+        }
+        assert!(
+            ScrgbConversion::for_stream(
+                ColorMatrix::Bt2020Ncl,
+                ColorPrimaries::Bt2020,
+                ColorRange::Full,
+                TransferCharacteristics::Bt709,
+                None,
+            )
+            .is_err(),
+            "scRGB carries SDR only in BT.709 primaries"
         );
+    }
+
+    fn half_code(value: f32) -> u16 {
+        u16::from_le_bytes(half_bits(value))
     }
 
     #[test]
@@ -2295,6 +2592,7 @@ mod tests {
             ColorPrimaries::Bt2020,
             ColorRange::Full,
             BitDepth::Ten,
+            None,
         );
         let mut src = Vec::new();
         src.extend_from_slice(&scrgb_pixel(0.0, 0.0, 0.0));
@@ -2518,6 +2816,7 @@ mod tests {
             ColorPrimaries::Bt2020,
             ColorRange::Full,
             BitDepth::Ten,
+            None,
         );
         let src = [0u8; 8];
         let (mut y, mut u, mut v) = ([0u16; 1], [0u16; 1], [0u16; 1]);

@@ -82,6 +82,17 @@
 # shared arcen_input::joined_input proof and JoinedInputGuard, mirrors the guard into the
 # uinput devices' gate and releases held input through the session's injector. It holds
 # no policy of its own.
+# hosts/linux/src/net/account_switch.rs is the Linux Pier's glue for a change of account
+# (ADR 0025 §13): it feeds session/handover.rs's logind, boot-id and GNOME facts to the
+# shared SwitchLedger, runs the offer, reply and result over the Pier's control socket and
+# records SESSION_HANDOVER through the Pier's LifecycleEmitter. Every decision is a shared
+# call; only the mapping of a ledger outcome onto the wire result is its own, because
+# arcen-session does not depend on arcen-protocol. It moves to shared/ with an emitter and
+# control-socket seam, as net/setup_watch.rs does.
+# hosts/windows/src/session_handover.rs translates the Windows facts (SID, WTS session id,
+# logon id, the volatile boot id) into the shared session_handover identity and keeps the
+# broker's one SwitchLedger with its attachment epoch; every decision is a shared call.
+# Its desk wrapper moves to shared/ when a second Pier keeps the same one.
 hosts/capenc/src/annexb.rs 80
 hosts/capenc/src/wayland/cursor.rs 126
 hosts/capenc/src/wayland/evidence.rs 190
@@ -106,6 +117,7 @@ hosts/linux/src/input/region_adapter.rs 221
 hosts/linux/src/media/annexb.rs 124
 hosts/linux/src/media/mod.rs 57
 hosts/linux/src/media/wayland_cursor.rs 83
+hosts/linux/src/net/account_switch.rs 398
 hosts/linux/src/net/joined_input.rs 226
 hosts/linux/src/net/joined_pen.rs 293
 hosts/linux/src/net/setup_watch.rs 83
@@ -145,3 +157,4 @@ hosts/windows/src/multi_monitor_gate.rs 426
 hosts/windows/src/multi_monitor_input.rs 398
 hosts/windows/src/observability.rs 430
 hosts/windows/src/resume.rs 956
+hosts/windows/src/session_handover.rs 131

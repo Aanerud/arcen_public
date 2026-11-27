@@ -383,6 +383,9 @@ pub struct SharedMediaState<M: MediaPlatform> {
     pub certificate_changed: Option<CertInfo>,
     pub pending_auth: Option<AuthRequest>,
     pub pending_authentication: Option<SessionAuthentication>,
+    /// A change of account's news, in order, for the shell's
+    /// [`crate::account_switch::AccountSwitchPrompt`]; the shell drains it.
+    pub account_switch: Vec<crate::account_switch::AccountSwitchNews>,
     pub connection_status_hint: Option<String>,
     /// Newest decoded frame, taken (and uploaded) by the UI thread.
     pub latest_frame: Option<DecodedVideoFrame<M::NativeFrame>>,
@@ -423,6 +426,9 @@ pub struct SharedMediaState<M: MediaPlatform> {
     /// pre-session answer.
     pub decoder_hardware_accelerated: Option<bool>,
     pub server_hello: Option<ServerHelloMsg>,
+    /// The layout the host serves against this attachment's request
+    /// (`SessionEvent::ServedLayout`), there before `server_hello`.
+    pub served_layout: Option<arcen_protocol::served_layout::ServedLayoutReport>,
     pub served_pipeline: Option<ServedPipelineMsg>,
     /// The desk's state from the host's latest `desk_privacy_update`, which
     /// supersedes the hello's (`session_truth::desk_privacy_note_now`); a
@@ -625,6 +631,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             certificate_changed: Default::default(),
             pending_auth: Default::default(),
             pending_authentication: Default::default(),
+            account_switch: Default::default(),
             connection_status_hint: Default::default(),
             latest_frame: Default::default(),
             eight_bit_video_presenter: Default::default(),
@@ -647,6 +654,7 @@ impl<M: MediaPlatform> Default for SharedMediaState<M> {
             decoder_backend_name: Default::default(),
             decoder_hardware_accelerated: Default::default(),
             server_hello: Default::default(),
+            served_layout: None,
             served_pipeline: Default::default(),
             desk_privacy_update: Default::default(),
             served_source_fps: Default::default(),
@@ -1012,12 +1020,23 @@ pub fn spawn_media_worker<M, F>(
                         shared.lock().expect("media state poisoned").pending_auth = Some(request);
                         repaint.request_repaint();
                     }
+                    SessionEvent::AccountSwitch(news) => {
+                        shared
+                            .lock()
+                            .expect("media state poisoned")
+                            .account_switch
+                            .push(news);
+                        repaint.request_repaint();
+                    }
                     SessionEvent::Authenticated(authentication) => {
                         shared
                             .lock()
                             .expect("media state poisoned")
                             .pending_authentication = Some(authentication);
                         repaint.request_repaint();
+                    }
+                    SessionEvent::ServedLayout(report) => {
+                        shared.lock().expect("media state poisoned").served_layout = Some(report);
                     }
                     SessionEvent::ServerHello(hello) => {
                         tracing::info!(

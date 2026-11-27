@@ -2,6 +2,8 @@
 // Copyright (C) 2026 TUTTIFRUTTI AS
 //! Network layer: the TLS/WebSocket listener + per-connection relay.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod account_switch;
 pub(crate) mod joined_input;
 pub(crate) mod joined_pen;
 pub mod server;

@@ -26,6 +26,7 @@ pub mod pier_config;
 pub mod polkit_remote;
 pub mod restore_lease;
 pub mod session_admission;
+pub mod session_handover;
 pub mod session_locale;
 pub mod session_setup;
 pub mod setup_budget;

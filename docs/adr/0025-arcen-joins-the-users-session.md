@@ -1,6 +1,6 @@
 # ADR 0025: Arcen joins the user's session
 
-**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`); amended 2026-11-24 (§5: desk privacy is the Deck user's choice, best effort unless the administrator sets `privacy.desk = "required"`); amended 2026-11-25 (§8: another product's desktop takes the Deck's monitors on attach while that product has no client attached, and keeps them when the Deck leaves; §4 and §12: under `privacy.desk = "required"` a desk whose session will not lock stays private until it locks; §4 and §12 again: the Windows Pier locks a session held for its Deck's resume at once, and locks first under `required`). Product-wide; the Linux Pier is its main
+**Status:** Accepted 2026-11-16 (proposed and proved the same day); amended 2026-11-17 (§10: a real login session on hosts without a display manager; §3 domain accounts; §4 stop safety; §8: outputs from the live X server, guest mode on another product's desktop; §8 again in the 0.20.2 re-issue: a guest desktop is mapped onto the Deck by arrangement); amended 2026-11-18 (§5: desk privacy on by default on every Pier, `privacy.desk`); amended 2026-11-24 (§5: desk privacy is the Deck user's choice, best effort unless the administrator sets `privacy.desk = "required"`); amended 2026-11-25 (§8: another product's desktop takes the Deck's monitors on attach while that product has no client attached, and keeps them when the Deck leaves; §4 and §12: under `privacy.desk = "required"` a desk whose session will not lock stays private until it locks; §4 and §12 again: the Windows Pier locks a session held for its Deck's resume at once, and locks first under `required`); amended 2026-11-26 (§13: same-account continuity from any Deck, a confirmed and graceful change of account when no remote client is attached, and fresh display negotiation on every attachment; §7: `console_remote_state_unknown`, `console_switch_in_progress` and `console_signing_out`, which only ever block a change of account and reach only a Deck that negotiated `account_switch_v1`; §8: Arcen's own login session on a console whose login screen another product withholds, when the Pier proves the seat, the GPU and GDM free for it). Product-wide; the Linux Pier is its main
 part. Builds on [ADR 0005](0005-direct-transport-resume-authority.md)
 (resume), [ADR 0008](0008-virtual-display-for-windows-hosts.md) and
 [ADR 0014](0014-quic-lanes-and-capture-contracts.md); changes the Linux
@@ -122,6 +122,7 @@ Only a complete read proves that the account has no session.
 | The account's own session is Wayland | Identify it and prove its compositor read-only (`console_session::wayland_join`), then join it (§9, S4b); a Pier built without the Wayland adapter refuses `console_wayland_session` |
 | The login screen's next session is Wayland | Refuse `console_wayland_session` (§9) |
 | Nothing graphical on `seat0`, and the host has no display manager | Start the account's real login session (§10), then join it |
+| No graphical session at all, another product withholds GDM's login screen, and the Pier proved Arcen's own session can stand beside it (§8, amended 2026-11-26) | Start the account's real login session (§10), then join it; unproved, refuse `console_sign_in_other_product` |
 | Nothing graphical on `seat0`, and the display manager's login screen is not running | Refuse `console_no_session` |
 | logind's sessions could not be read completely | Refuse `console_sessions_unreadable`: nothing is joined and no session is started |
 
@@ -754,9 +755,18 @@ The codes and what an administrator does about them are in
 `console_wayland_session`, `console_no_session`, `console_sessions_unreadable`,
 `console_sign_in_unavailable`, `console_sign_in_failed`,
 `console_session_unreachable`, `console_privacy_unavailable`,
-`console_sign_in_other_product` (§8). A sign-in of
+`console_sign_in_other_product` (§8), `console_remote_state_unknown`,
+`console_switch_in_progress` and `console_signing_out` (§13). The last
+three only ever concern a change of account: a sign-in as the account that
+holds the session is never refused for what is attached to it, or for not
+knowing, and is refused only while a confirmed change of account is
+signing that session out. They reach only a Deck that negotiated
+`account_switch_v1`; an older Deck gets the code it already knows
+(`console_other_user*`, or `console_session_changed` for its own session
+being signed out). A sign-in of
 another account while a joined console waits for its Deck's resume gets the
-same `console_other_user*` refusal.
+same `console_other_user*` refusal; §13 says when such a sign-in may instead
+be offered a confirmed sign-out.
 
 ### 8. Coexistence with other remote-desktop products
 
@@ -916,7 +926,11 @@ product owned):*
   own; the macOS Pier adds displays of its own (PD-043).
 - **One remote product at a time.** While that product's client is connected
   the sign-in is refused `console_in_use_other_product`; when it connects
-  during an attachment the attachment ends with that code. A connected
+  during an attachment the attachment ends with that code.
+  *Superseded on Linux in 0.21.5 (§13):* the account's own desktop is
+  joined whatever that product's client does, and an attachment stays when
+  the client connects; the desktop then keeps its layout (`Shown`). The
+  rule below still tells whether a client is connected. A connected
   client shows as a keyboard or pointer made in user space (shared
   `another_products_client_input`): a udev keyboard or pointer without a
   parent device, neither on the host-platform bus (`BUS_HOST`) nor a
@@ -1007,6 +1021,57 @@ another product running GDM headless):*
   a host, or GDM's version is unknown and a `ShowLocalGreeter=false`
   appears, a sign-in is decided as before but no login screen is asked of
   GDM either.
+
+*Amended 2026-11-26 (first sign-in on that console, qualified on a GDM
+40.1 lab host shaped like the field workstation):*
+
+- **Arcen's own login session beside the product.** With nobody signed in
+  on a console whose login screen the product withholds, the Pier starts
+  the account's real login session (§10) instead of refusing, when it
+  proves every fact of the shared `LoginSessionProof` at the sign-in:
+  GDM answers on the system bus (`org.gnome.DisplayManager` Manager
+  `Version`), no X server listens (`/proc/net/unix`), Arcen's login
+  service is installed, and no client of the product is connected (the
+  guest-mode client check above). logind must also list no graphical
+  session at all, of any class, account, state or seat: a login screen
+  left on `seat0` counts, and so does a session with no seat, which is
+  how the product's own XDMCP sign-ins appear (the account's own
+  included, so it never gets a second desktop). A fact the Pier cannot
+  read is not proved: an unreadable socket table or input-device list
+  refuses. Any fact missing, or a graphical session, refuses
+  `console_sign_in_other_product` as before, and the refusal records the
+  missing fact (`login_session_proof`) at every log profile. The Pier
+  decides again immediately before it starts the session and starts it
+  only on the same virtual terminal. Once the session is active, the Pier
+  checks that its X server is the only one listening, that logind lists
+  no other graphical session and that no client of the product is
+  connected. If any check fails, it stops the new session, which has no
+  applications yet, and refuses the same way: the product may have
+  started in between. The host is
+  not taken for one without a display manager: GDM keeps running as the
+  product configured it, and nothing of GDM or the product is changed.
+- **Why GDM must answer.** GNOME Shell offers its lock screen only when
+  GDM's manager answers, and GDM 40 unlocks a session it did not start
+  through a temporary re-authentication channel
+  (`gdm-manager.c` `open_temporary_reauthentication_channel`, PAM
+  `gdm-password`), the same route the product's own sessions use. On the
+  lab host, Arcen's session (logind class `user`, type `x11`, `seat0`, VT
+  7, `Remote=no`, service `arcen-login`) locked when the Deck left, kept
+  its session and application processes across a Pier restart and a
+  reconnect, was unlocked by Arcen's sign-in, and was unlocked at the desk
+  with the password through GDM (a wrong password left it locked). GDM
+  created no display, login screen or transient display throughout
+  (XDMCP `Port=-1` opens no listener); one X server ran.
+- **Limit: one GNOME desktop per account.** If the product later starts a
+  desktop of its own for the same account, logind admits a second session
+  but GNOME's per-account services are already running: the product's
+  desktop stays empty, and when it ends it stops the account's GNOME
+  session, ending Arcen's too. Measured on the lab host with a session
+  shaped like the product's. Whether the product itself refuses that
+  sign-in is not proven without the product; an administrator should keep
+  one product per account's desktop. A different account's desktop from
+  the product needs a physical-GPU qualification before it is claimed to
+  coexist (the lab GPU is virtual).
 
 ### 9. Wayland GDM sessions
 
@@ -1334,6 +1399,317 @@ locked, so a returning Deck signs in again with its password), GAP-050 (Windows:
 are detached) and GAP-051 (Windows: desk pens and touch screens are not
 blocked). New Pier work adopts `console_session::DETACH_STEPS` and
 `disables_while_attached`.
+
+### 13. One session per account from any Deck; another account only by confirmed, graceful sign-out
+
+*Amended 2026-11-26.* A user expects one persistent desktop per account,
+entered from home or work. Field logs showed the same account rejoining its
+own OS session across three Arcen attachments, and another account refused
+after the first Arcen connection had closed while its desktop still
+existed: refused for a signed-in account, not for a connected one. This
+section records the owner's decisions for every Pier and both Decks. The
+OS-free half is `arcen_session::session_handover`; the wire half is
+`account_switch_v1` in `shared/protocol` (`WIRE.md`).
+
+**Two facts, kept apart.** Who holds the desktop is a native session
+identity: the account (a canonical principal, never a typed alias), the
+native session id, the boot it belongs to and a generation that changes
+when the id is reused (`NativeSessionIdentity`). Whether a remote client is
+attached to it is separate: attached by Arcen, attached by another
+remote-desktop product, proved detached, or unknown (`RemoteAttachment`).
+logind or WTS "active", an unlocked screen, a running service or an old
+resume reservation is none of these on its own.
+
+**Busy means a remote client is attached, and only to a different
+account.** An account that is signed in or unlocked at the desk is not
+busy. The desk's lock state is recorded and never decides (`DeskState`).
+
+**The same account always resumes its own session.** From any Deck, after a
+transport resume, a fresh password, an expired resume grant or a Pier
+restart, a sign-in as the account that holds the desktop joins that same OS
+session and its applications; it is never logged out to let the account in.
+A new endpoint may still need the password: the transport resume grant and
+the OS session's lifetime are different things. The session is entered from
+either side (§1), so what is attached to it never refuses its own account:
+another Arcen Deck keeps the existing same-account rule
+(`direct_reconnect::fresh_sign_in`); with another product's client
+attached, or when that cannot be told, the account still joins its session
+and the session keeps its layout (`GuestLayoutPolicy::Shown`, the rule §8
+already applies to another product's desktop); with none attached, proved,
+the desktop takes the Deck's layout (`ApplyOnAttach`). The decision carries
+which (`HandoverDecision::JoinOwnSession { layout }`). This is the shared
+rule. The Linux Pier adopted it in 0.21.5 (another product's desktop is
+joined, and stays joined, while that product's client is attached). The
+Windows Pier joins it too: Windows shows a session at one station, so the
+session moves onto the console (`WTSConnectSessionW`) and the other
+product's client loses it, as when the account signs in at the desk; the
+Deck's layout then applies as on any console attachment (PD-043).
+
+**Another account while a remote client is attached is refused.** Arcen's or
+another product's client, locked or unlocked at the desk: the refusal codes
+of §7, no displaced session, no invalidated grant, no layout change and no
+prompt that can commit.
+
+**Unknown only blocks a change of account.** A Pier that cannot read who
+holds the desktop refuses with `console_sessions_unreadable`. One that
+cannot prove whether a remote client is attached to another account's
+session refuses that account's change with `console_remote_state_unknown`:
+no offer and nothing committed. Neither is read as "nobody is connected".
+The account that holds the session joins it whatever is unknown.
+
+**Another account with no remote client attached: authenticate, then
+confirm.** Only after the newcomer's credentials and account policy passed
+may a Pier offer to sign the other account out. The offer reaches only a
+Deck that negotiated `account_switch_v1`; an older Deck, or a Pier that
+cannot sign an account out gracefully, keeps today's refusal. The Deck
+shows "Another user is still signed in. Signing them out will close their
+applications. Continue only after they have saved their work." with
+**Cancel** (the default) and **Sign out and continue**, and nothing of the
+other session. This is not `replace_incompatible_desktop`, which replaces a
+desktop of the same account.
+
+**The confirmation is one bounded transaction.** It is bound to the
+requesting connection, the authenticated requester, the exact target
+identity (account, id, boot, generation), the Pier's ownership epoch for
+that session and a one-use 32-byte nonce, and it expires (120 s by default,
+at most 600 s). A Pier holds at most one per desktop: a contender is
+refused with `console_switch_in_progress` while another waits, commits or
+signs in (`SwitchLedger`, reason `switch_in_progress`). Every stage is
+bounded: an offer by its lifetime, a confirmed logout by
+`LOGOUT_COMMIT_DEADLINE` (the two-minute logout timeout and 30 s to read
+the session back, after which the ledger lets go even if the Pier lost its
+authority, and logs `logout_timed_out`), and the requester's sign-in by
+`ENTRY_DEADLINE` (two minutes, `new_login_failed`). A ledger decision
+(`SwitchLedger::decide`) sweeps what ran out first. Cancelling,
+expiry, the requester leaving, wrong credentials, a replayed or mismatched
+nonce, a reply on another connection and a Pier restart change no session.
+Immediately before it asks for the logout the Pier reads the facts again:
+another identity, a reused id in another boot or generation, a remote
+client that returned (the old user, or another product), a client that came
+and went (a changed epoch) or anything unknown makes the offer stale. Arcen
+serializes its own requests; another product's activity is observed
+through native facts, never assumed to respect an Arcen lock.
+
+**Graceful logout only.** The Pier asks the operating system for its
+ordinary logout of exactly the confirmed session: the desktop's session
+manager on GNOME (never `loginctl terminate-session`), a normal logoff from
+the target user's own Windows session without force flags, loginwindow's
+logout event from the target user's own macOS agent. Applications that
+inhibit or cancel it stop the switch (`logout_vetoed`); a logout that does
+not finish within two minutes stops it too (`logout_timed_out`). Arcen never
+escalates to killing processes, forcing a session's end or restarting the
+machine. Applications may already have closed during an interrupted logout;
+the Deck is not told that cancelling brings them back.
+
+**The macOS Pier does not offer it yet.** Its route is built: the
+service asks a parked agent of the target account for that session's
+logout, the agent sends `kAEReallyLogOut` to its own `loginwindow`, the
+service proves the exact session gone, and the same Deck is given the
+`auth_response` it sent and signs in at the login window. On macOS 26 it
+has not ended a session in the lab, so the Pier answers
+`PierCannotSignOut`. Before it is enabled, two things must change besides
+that proof: the replayed credentials go only to the login window's agent
+(today the service hands them to whichever agent holds the console once
+the session ended), and the sign-in throttle applies to that post-sign-out
+attempt as to any other (today the replay passes the service's
+`SignInGate` uncounted).
+
+**Nobody slips in between.** While the confirmed session is being signed
+out, its own account is refused with `console_signing_out` rather than
+attached to a session that is ending, and every other account is told a
+change of account is in progress. Once it ended, the console is reserved
+for the requester's own sign-in: nobody else gets "nobody is signed in"
+until that sign-in finishes, fails, its connection closes or
+`ENTRY_DEADLINE` passes. A requester whose connection closes while the
+logout runs reserves nothing: the logout completes, `new_login_failed` is
+logged and the console is free at once. Neither reservation ever refuses an
+account whose own session holds the desktop, unless that session is the one
+being signed out: the requester's new session reached from another
+connection, or an account that signed in at the desk meanwhile, is joined as
+ever.
+
+**The next account enters only after proof.** Only a completed logout with
+a read-back that exactly the confirmed session no longer exists lets the
+requester sign in through the platform's own login (`SessionExitProof`,
+`EntryPermit`). A logout request is not that proof; nor is an empty console
+or a dropped stream. Every resume grant bound to the ended session is
+revoked and can never revive it.
+
+**Every attachment negotiates the Deck's current displays.** A new
+connection, a transport resume, the requester's sign-in after a change of
+account and the hand-over from the login screen to the desktop each send
+the Deck's displays as they are now: its primary display, or with Match My
+Layout its active monitors, up to four (`session_handover::displays`). The
+Deck reads them through `DeckServices` and plans them with `connect_plan`;
+the Pier applies them to the existing desktop as §6 decides, reads the
+native state back and serves what it measured. Negotiating is not always
+laying out: on a session another product's client uses, or may use, the
+request is negotiated and the Deck told truthfully what it is served, each
+monitor fitted to the output in its place, and the layout is not changed
+(`AttachmentDisplays::may_change_layout`). A layout journal, a
+satisfied flag or an earlier connection's monitors never skip this, and a
+one-display login surface never completes a request of several displays.
+A resume grant authorizes exactly the request it was bound to; a Deck whose
+displays changed has the grant refused with `topology_changed`, its binding
+untouched, and authenticates afresh into the same OS session. The
+account's session at the workstation is never ended to resize it.
+
+A Pier that holds a desktop between attachments reattaches it only for
+exactly the request it was attached for (`reattach_displays`): a joined
+console is otherwise attached afresh, which locks and unlocks the same
+session and lays it out for the new request; a desktop of the Pier's own
+moves in place when it can. Every Deck compares what it asked for with
+what the hello serves, monitor by monitor, and every decoded stream with
+the size promised (`arcen_protocol::served_layout`): a fitted, scaled,
+omitted or rearranged display is said as such, and the lab smoke tools
+fail on it unless a run accepts the host's layout. The one difference a
+user can see between a workstation with and without another remote-desktop
+product is §8's: while that product's client is attached, or its state
+cannot be read, the desktop keeps its layout and the Deck says it is shown
+as it is. A joined console includes Arcen's own login session (§10,
+`arcen-login-<uid>.service`): it is a console session like any other, so a
+new request is laid out on its X server and its applications stay. A Deck
+whose Match My Layout session had one display resumes only while it still
+has one: a display added while it was away signs it in afresh with its
+whole layout. Still open: a desktop the Linux Pier creates for itself on
+Xorg only with `platform.session.mode = "dedicated"` (never a default),
+whose heads are fixed when it starts, is replaced to serve another Match My
+Layout, which closes its applications; moving its heads in place needs the
+display backend to add and remove heads on a running server.
+
+**Lifecycle record.** `SESSION_HANDOVER` (1109) logs each outcome with a
+`reason_class`: `reused_desktop`, `remote_busy`, `state_unknown`,
+`switch_unsupported`, `switch_offered`, `switch_in_progress`,
+`switch_cancelled`, `switch_stale`, `switch_expired`, `switch_rejected`,
+`logout_requested`, `logout_vetoed`, `logout_timed_out`, `logout_failed`,
+`logout_completed` and `new_login_failed`, with how the Deck came
+(`attachment`) and which client a refusal names (`remote_client`). A
+logout request is never logged as a completed logout, and a stream drop is
+never a logout.
+
+**State of the work.** The shared contract and the wire messages exist.
+The Linux Pier adopted it in 0.21.5 (below); the other Piers send no
+offer yet. Each Pier adopts it as a
+thin adapter: Linux supplies the uid and logind session, its native
+evidence of a remote client and GNOME's graceful logout; Windows the SID,
+WTS session and logon, its remote-protocol evidence and a logoff from the
+user's own session; macOS the uid, audit and boot session, its console
+agent and loginwindow. First sign-in on a host whose display manager
+withholds its login screen (§8, `console_sign_in_other_product`) is a
+separate proof: a Pier offers no sign-out it cannot follow with a working
+sign-in.
+
+*Linux (0.21.5).* Every console sign-in is decided by `SwitchLedger::decide`
+before the launcher runs (`net/account_switch.rs`, facts in
+`session/handover.rs`). The occupant is the one console desktop logind
+names for the sign-in (shared `console_session::holder`: the account's own
+first, else exactly one other account's; several are left to `decide_on`).
+Its identity is `uid:name`, the logind id, `/proc/sys/kernel/random/boot_id`
+and logind's `TimestampMonotonic` for the session as its generation. Arcen
+is attached when the Pier's registry holds a connected Deck for that
+account. Another product's client is proved absent only when three sources
+were read and showed none (shared `session_handover::remote_access`): the
+input rule of §8; the listed remote-access servers
+(`REMOTE_ACCESS_SERVERS`, matched in `/proc` by process name, the
+kernel's 15-byte cut included, or by executable name, so an alternatives
+link such as TigerVNC's counts), whichever desktop they serve; and Mutter
+`RemoteDesktop` or `ScreenCast` sessions on that account's bus. A server
+(VNC, GNOME Remote Desktop, xrdp, NX) is attached when one of its
+processes holds any established TCP connection, IPv4 or IPv6, loopback
+included, inbound or outbound: a server started by inetd or systemd with
+its viewer's socket, a reverse connection to a listening viewer and a
+viewer tunnelled over SSH all count. A connection that is no viewer (an
+update check) refuses too; erring towards refusal is intended. A
+relay-based remote-support tool (`anydesk`, `teamviewerd`,
+`rustdesk`) keeps outbound connections whether or not anyone is connected,
+so while one runs the attachment is `Unknown`, logged as "cannot tell
+whether someone is connected through <tool>"; a capable Deck is told
+`console_remote_state_unknown`. Any source that cannot be read makes the
+attachment `Unknown` too, which refuses a change of account. A tool that
+is not listed and makes no input device is not seen. The attachment epoch advances on every Arcen attach and detach,
+when the account's own sign-in or an authenticated resume is about to
+attach, and whenever what those sources show changes between two readings,
+so an offer made before is stale. The route is `Available` only
+when the other account has exactly one graphical session and its GNOME
+session manager answers on that account's own bus, running as that
+account. The logout asks `IsInhibited(1)` first (an inhibitor stops the
+switch without a request), then `org.gnome.SessionManager.Logout(1)` as the
+account; never mode 2, `loginctl terminate-session` or a signal. logind is
+read back until exactly that session (id and generation) is gone, at most
+`LOGOUT_COMPLETION_TIMEOUT`; then GDM's new login screen, or §8's login
+session beside a product, signs the requester in through the existing path.
+A resume is refused while a logout or the requester's sign-in holds the
+console. *Limit:* GNOME 40 shows an application that objects only when the
+session manager asks (a session client answering `EndSessionResponse`
+false) in its end-session dialog, and that dialog confirms itself after 60
+seconds; the session then ends although that application objected
+(measured on GNOME 40.10). A registered inhibitor (what
+`gnome-session-inhibit` and `gtk_application_inhibit` make) stops the
+switch before anything is asked.
+
+**Alternatives considered.** Treating a signed-in or unlocked account as
+busy would block exactly the case the owner asked for: a workstation whose
+earlier user went home. Forcing the logout would lose unsaved work. A
+second, private desktop per account would contradict §1. Reusing the
+earlier connection's layout on a resume would serve the wrong monitors.
+
+### 14. The displays a Deck leaves behind
+
+*Added 2026-11-26.*
+
+Every Pier keeps three promises about its displays, judged by one shared
+rule (`arcen_outputs::display_truth`) on what the operating system reads
+back, not on what the Pier believes it set:
+
+1. **The Deck leaves only what was there.** The Pier reads every output
+   before a Deck changes anything and again after it leaves: presence,
+   active, primary, place, mode and refresh, rotation, EDID, colour mode,
+   HDR switch and bit depth, as far as the operating system reports each
+   (`restore_differences`). A value read on one side only is not a match.
+   A difference is logged and reported as `display_restore_incomplete`,
+   naming each output and field.
+   - **Windows** reads `DisplayConfig` (every connected target, active or
+     not, the EDID from the monitor's registry key, Advanced Color) in the
+     agent before NVIDIA headless provisioning and after the restore.
+     A recovery journal that cannot be applied is set aside untouched (never
+     overwritten or deleted), logged as an error and told to the Deck
+     (`display_restore_pending`: "The displays could not be put back after an
+     earlier session."). The session is not refused, since remote access is
+     how the displays get fixed: it starts from the displays as they are,
+     with a journal of its own, so its own restore stays exact against its
+     start. `arcen-pier restore-display --set-aside` remains for an
+     administrator.
+   - **Linux (Xorg console)** journals the `RandR` reading with the MetaMode
+     (§6) and proves the restore against it. A restore that is incomplete
+     keeps the journal as a record: the next layout of that console is
+     restored to it, not to what was left, and nothing retries it in a
+     loop. Another product's desktop keeps the Deck's layout when the Deck
+     leaves (§8, `LayoutDeparture::LeaveDecks`); its layout before the Deck
+     is recorded, not restored. That is the one place a host with another
+     product behaves differently from one without.
+   - **macOS** changes no physical display's mode. It reads CoreGraphics
+     before a virtual display exists and after it is gone, puts a physical
+     display's place (and so the main display) back when macOS did not, and
+     reports anything else. macOS has no HDR switch and CoreGraphics reports
+     no EDID or link depth, so those are not compared there.
+2. **The Pier sets what the Deck asks for.** A display is reused as it is
+   only when it already serves the request, refresh included
+   (`mode_already_serves`); a size match alone never skips the change.
+   A display served at another size says why: `display_mode_unavailable`
+   (no such mode; the nearest or current is served) or `display_not_created`
+   (macOS could not create the virtual display).
+3. **The Pier claims only the HDR it set up.** HDR is served only when every
+   streamed display reads back HDR on that exact output. Whether Windows may
+   still offer HDR on a display during setup follows what this session wrote
+   on it and the EDID it carries now
+   (`DisplayIdentity::of_session_display`), never configuration: a display
+   that keeps its own SDR EDID (a GeForce, whose modes come only from the
+   plug's EDID, or one NVAPI could not rebuild) is served as Grading with
+   `hdr_display_unsupported` after the two-second settle, not refused with
+   `hdr_not_activated` after the whole setup budget.
+
+`arcen-pier diagnose displays [--json]` prints the same reading on every
+Pier, so a lab or an operator compares one format before and after.
 
 ## Consequences
 

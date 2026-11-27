@@ -113,6 +113,7 @@ mod tests {
             exact_still_image: false,
             keep_desk_private: true,
             canvas: crate::canvas::CanvasRequest::Unavailable,
+            account_switch: crate::account_switch::AccountSwitchMode::Off,
         }
     }
 

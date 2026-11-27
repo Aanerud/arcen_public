@@ -80,7 +80,7 @@ pub fn this_session(uid: u32) -> Option<AttachmentRecord> {
 /// This boot's identifier (`kern.bootsessionuuid`). Not the boot time:
 /// `kern.boottime` moves when the clock is stepped (a time sync after
 /// waking), and a record must not read as another boot's for that.
-fn boot_session() -> Option<String> {
+pub(crate) fn boot_session() -> Option<String> {
     // A handful of C entry points, each with its SAFETY note below.
     #[allow(unsafe_code)]
     {

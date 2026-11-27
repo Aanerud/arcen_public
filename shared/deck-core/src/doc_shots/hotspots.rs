@@ -397,9 +397,18 @@ const CONNECTING_ONE_DISPLAY: &[Hotspot] = &[
     both(2, "Cancel", control("Cancel")),
 ];
 
+const ACCOUNT_SWITCH: &[Hotspot] = &[
+    both(
+        1,
+        "Another user is still signed in",
+        starts("Another user is still signed in."),
+    ),
+    both(2, "Sign out and continue", control("Sign out and continue")),
+];
+
 /// Every scene's hotspots, in the manifest's order, then the scenes added
 /// since.
-pub const TABLE: [(&str, &[Hotspot]); 21] = [
+pub const TABLE: [(&str, &[Hotspot]); 22] = [
     ("home", HOME),
     ("home-empty", HOME_EMPTY),
     ("add-menu", ADD_MENU),
@@ -421,6 +430,7 @@ pub const TABLE: [(&str, &[Hotspot]); 21] = [
     ("sign-in-refused", SIGN_IN_REFUSED),
     ("settings-privacy", SETTINGS_PRIVACY),
     ("connecting-one-display", CONNECTING_ONE_DISPLAY),
+    ("account-switch", ACCOUNT_SWITCH),
 ];
 
 /// `scene`'s hotspots.

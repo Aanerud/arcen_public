@@ -553,6 +553,12 @@ pub(crate) fn recover_at_start() -> ServiceStartupRecovery {
     recovery
 }
 
+/// This boot's identifier (a random value in a volatile registry key, gone
+/// at the next boot), the boot part of a native session identity.
+pub(crate) fn boot_id() -> Result<String, String> {
+    platform::boot_session()
+}
+
 #[cfg(windows)]
 mod platform {
     use std::io::{Read as _, Write as _};

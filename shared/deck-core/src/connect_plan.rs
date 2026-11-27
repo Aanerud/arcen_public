@@ -732,6 +732,22 @@ pub fn negotiated_live_display_state(
     (primary_only_monitors, primary_only_live_topology)
 }
 
+/// Whether a session's reconnect identity covers every live display, not
+/// only the primary: when it negotiated several monitors, or when it
+/// matches the Deck's layout (`displays_mode` `match_layout`) with one. A
+/// display added while a one-display Match My Layout session was away must
+/// end its resume ([`crate::sign_in::SignInFailure::DisplaysChanged`]), so
+/// the Deck signs in afresh with its whole layout instead of resuming the
+/// stale one-display request. Pass the result as
+/// [`identity_display_state`]'s `multi_monitor_topology_negotiated`.
+#[must_use]
+pub fn identity_covers_every_display(
+    displays_mode: &str,
+    multi_monitor_topology_negotiated: bool,
+) -> bool {
+    multi_monitor_topology_negotiated || displays_mode == DisplaysMode::MatchLayout.as_wire()
+}
+
 /// The live display state a reconnect identity hashes: this Deck's full
 /// roster and requested topology now, put through the same Remote UI Scale
 /// transform the connect options were built with (so a fixed percentage

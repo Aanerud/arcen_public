@@ -299,6 +299,7 @@ against Level-0 log output, you will never see it fire.
 | 1103 | `SESSION_END` | cleanup | succeeded | information | 0 | audit-only |
 | 1104 | `SESSION_INTERRUPTED` | reconnect | failed | warning | 0 | investigate |
 | 1108 | `RESUME_HOLD_ENDED` | reconnect | succeeded | information | 0 | audit-only |
+| 1109 | `SESSION_HANDOVER` | reconnect | succeeded | information | 0 | audit-only |
 | 1200 | `DISPLAY_ARMED` | health | started | information | 2 | audit-only |
 | 1201 | `DISPLAY_RESTORED` | cleanup | succeeded | information | 2 | audit-only |
 | 1202 | `DISPLAY_RESTORE_DEGRADED` | cleanup | succeeded | warning | 1 | investigate (gated, §3.2) |

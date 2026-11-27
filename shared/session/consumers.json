@@ -93,6 +93,7 @@
         "pier_config",
         "restore_lease",
         "session_admission",
+        "session_handover",
         "session_setup",
         "wayland_outputs",
         "wayland_qualification",
@@ -107,6 +108,12 @@
           "gate": 4,
           "symbol": "SessionLifecycles",
           "reason": "Each Pier reports its session steps to the shared lifecycle, which enforces ordering and readiness evidence the same way on every host."
+        },
+        {
+          "id": "linux-login-session-beside-product",
+          "gate": 4,
+          "symbol": "LoginSessionProof",
+          "reason": "Where another product runs the console's sign-in and withholds GDM's login screen, the Linux Pier starts the account's own login session only through the shared decision on the facts it proved (GDM answering, no X server, Arcen's login service, no product client) and a free seat0, so an unproved host keeps refusing and is never treated as one without a display manager."
         },
         {
           "id": "linux-guest-console-layout",
@@ -125,6 +132,12 @@
           "gate": 4,
           "symbol": "DetachLock::on_detach",
           "reason": "Whether a desktop the Linux Pier created locks when its Deck leaves (kept, held for resume, handed over, ending, or without a lock screen) is the shared decision, so every departure that leaves it running locks it the same way."
+        },
+        {
+          "id": "linux-session-handover",
+          "gate": 4,
+          "symbol": "SwitchLedger",
+          "reason": "Every Linux console sign-in is decided by the shared ledger before the launcher runs, so the account's own desktop is always joined, another account is refused while a remote client is attached, and a confirmed, graceful sign-out of another account follows the same transaction and exit proof on every Pier."
         }
       ],
       "paths": [
@@ -444,6 +457,21 @@
             "linux-pier-wayland-provider-test"
           ],
           "owner": "Linux Host"
+        },
+        {
+          "id": "linux-session-handover",
+          "entry_points": [
+            "hosts/linux/src/net/account_switch.rs",
+            "hosts/linux/src/session/handover.rs"
+          ],
+          "build_profiles": [
+            "linux-pier"
+          ],
+          "validation": [
+            "linux-pier-test",
+            "linux-console-session-lab"
+          ],
+          "owner": "Linux Host"
         }
       ]
     },
@@ -643,6 +671,7 @@
         "pier_config",
         "restore_lease",
         "session_admission",
+        "session_handover",
         "session_setup",
         "setup_budget"
       ],

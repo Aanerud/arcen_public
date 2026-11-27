@@ -328,6 +328,15 @@ pub struct DisplayReport {
     pub effective_scale_reports: Vec<DisplayScaleReport>,
 }
 
+impl DisplayReport {
+    /// Why the display is not served at the requested size: the display
+    /// offers no mode of that size, so it runs the nearest one it offers or
+    /// the one it had (shared `display_truth`, contract part 2).
+    pub fn degradation(&self) -> Option<arcen_outputs::display_truth::DisplayTruthReason> {
+        (!self.exact).then_some(arcen_outputs::display_truth::DisplayTruthReason::ModeUnavailable)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DisplayTarget {
     device_name: String,
@@ -350,6 +359,21 @@ impl ModeState {
         self.size == size
             && self.desktop_rect.width == size.width as i32
             && self.desktop_rect.height == size.height as i32
+    }
+
+    /// Whether the display already serves the request: its size, and the
+    /// requested refresh whenever the display offers it at that size
+    /// (`refresh`: the refresh the display offers at `size` for the
+    /// request, `None` when it offers none). A size match alone never skips
+    /// the change (shared `display_truth::mode_already_serves`).
+    fn serves(self, size: DisplaySize, refresh: Option<u32>) -> bool {
+        use arcen_outputs::display_truth::{mode_already_serves, ModeTruth};
+        self.is_settled_at(size)
+            && mode_already_serves(
+                ModeTruth::at_hz(size.width, size.height, refresh.unwrap_or(0)),
+                ModeTruth::at_hz(self.size.width, self.size.height, self.refresh_hz),
+                refresh.is_some(),
+            )
     }
 
     /// The exact-mirroring contract: the target output is the ONLY active
@@ -403,6 +427,13 @@ trait DisplayBackend {
         _size: DisplaySize,
     ) -> Result<bool, String> {
         Ok(false)
+    }
+    /// The refresh the request asks for at `size` when the display offers
+    /// it there, so an already-sized display at another refresh is set
+    /// rather than reused; `None` when it is not offered or the backend sets
+    /// the whole identity itself (an NVAPI EDID, a VMware resolution).
+    fn offered_refresh(&mut self, _target: &DisplayTarget, _size: DisplaySize) -> Option<u32> {
+        None
     }
     fn prepare_exact_retarget(
         &mut self,
@@ -568,6 +599,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
         let snapshot = backend.snapshot(&target)?;
         let original = backend.current(&target)?;
         let contract_refresh_required = backend.requires_contract_refresh(&target, requested)?;
+        let requested_refresh = backend.offered_refresh(&target, requested);
         let mut transaction = Self {
             backend,
             target: target.clone(),
@@ -587,10 +619,11 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
             ui_scale_restore: None,
         };
 
-        let already_satisfied = match policy {
-            DisplayPolicy::ExactIsolated => original.is_isolated_primary_at(requested),
-            DisplayPolicy::Negotiated => original.is_settled_at(requested),
-        };
+        let already_satisfied = original.serves(requested, requested_refresh)
+            && match policy {
+                DisplayPolicy::ExactIsolated => original.is_isolated_primary_at(requested),
+                DisplayPolicy::Negotiated => true,
+            };
         let mut bound_mode_prepared = false;
         if already_satisfied && !contract_refresh_required {
             if policy == DisplayPolicy::ExactIsolated
@@ -600,6 +633,11 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
             {
                 match transaction.prepare_bound_mode_armed(requested) {
                     Ok(true) => {
+                        // The display already carries exactly the EDID this
+                        // request needs (byte-compared by
+                        // `requires_contract_refresh`; normally NVIDIA
+                        // headless provisioning wrote it in this connection),
+                        // so only its Advanced Color was prepared.
                         bound_mode_prepared = true;
                         let current = transaction.backend.current(&target)?;
                         if current.is_isolated_primary_at(requested) {
@@ -609,7 +647,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
                                 current,
                                 true,
                                 true,
-                                "advanced-color-unchanged-display",
+                                "nvapi-exact-edid-in-place",
                                 transaction.backend.restore_backend(),
                                 &target,
                             );
@@ -662,7 +700,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
         // ExactIsolated with a matching mode but an un-isolated topology:
         // skip the mode apply and only isolate under the armed journal.
         if policy == DisplayPolicy::ExactIsolated
-            && original.is_settled_at(requested)
+            && original.serves(requested, requested_refresh)
             && !contract_refresh_required
             && !bound_mode_prepared
         {
@@ -799,6 +837,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
                 requested = %requested,
                 fallback = %fallback,
                 reason = %exact_failure,
+                reason_code = arcen_outputs::display_truth::DisplayTruthReason::ModeUnavailable.code(),
                 "exact client display mode rejected; testing safe driver fallback"
             );
             // The nearest mode the display offers may be the one it runs:
@@ -843,6 +882,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
                         current = %current.size,
                         refresh_hz = current.refresh_hz,
                         rejected = ?rejected,
+                        reason_code = arcen_outputs::display_truth::DisplayTruthReason::ModeUnavailable.code(),
                         "the nearest mode the display offers is the one it runs; serving it unchanged"
                     );
                     return Ok(transaction);
@@ -929,6 +969,7 @@ impl<B: DisplayBackend> DisplayTransaction<B> {
                 requested = %requested,
                 current = %current.size,
                 rejected = ?rejected,
+                reason_code = arcen_outputs::display_truth::DisplayTruthReason::ModeUnavailable.code(),
                 "requested and driver fallback modes were unavailable; continuing on healthy current display"
             );
             Ok(transaction)
@@ -1905,17 +1946,6 @@ impl DisplayManager {
     }
 }
 
-fn ensure_recovery_journal_clear(pending: bool, path: &std::path::Path) -> Result<(), String> {
-    if pending {
-        Err(format!(
-            "display recovery journal {path:?} is pending; run \
-             `arcen-pier restore-display` before starting another session"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 /// Clear a pending recovery journal by performing the restore it describes,
 /// rather than refusing every future session until somebody runs a command on
 /// the machine.
@@ -1923,20 +1953,14 @@ fn ensure_recovery_journal_clear(pending: bool, path: &std::path::Path) -> Resul
 /// The journal is armed before the display is mutated and removed once it has
 /// been put back. A session that ends without that happening -- a crash, or
 /// simply the user signing out, which kills the agent and the watchdog together
-/// because both live in that session -- leaves it behind.
-///
-/// Refusing on that is a trap. This is a remote access product: the operator
-/// told to "run `arcen-pier restore-display`" generally cannot reach the machine
-/// to run it, because the thing that would have let them reach it is what just
-/// refused. And the journal is not an obstacle to recovery, it is the recipe for
-/// it, so holding it while declining to act on it helps nobody.
+/// because both live in that session -- leaves it behind. The journal is the
+/// recipe for recovery, so the next session applies it first.
 ///
 /// This runs in the per-session agent, inside the signed-in user's session,
 /// after the agent has waited for that session's Default input desktop, so it
-/// has the desktop the restore needs. If the restore fails the journal is
-/// deliberately left in place and the original message is returned unchanged,
-/// so a genuinely stuck host still stops rather than looping over a broken
-/// display.
+/// has the desktop the restore needs. A journal that cannot be applied is set
+/// aside untouched and reported, and the session goes on from the displays as
+/// they are now (`display_restore_pending`); see [`set_aside_unrestorable_journal`].
 #[cfg(windows)]
 pub(crate) fn recover_pending_display_journal() -> Result<(), String> {
     recover_pending_journal(&crate::recovery::default_path())
@@ -1975,79 +1999,129 @@ fn recover_pending_journal(path: &std::path::Path) -> Result<(), String> {
             crate::window_layout::repatriate_pending(path);
             Ok(())
         }
-        Ok(outcome) => {
-            tracing::error!(
-                target: DISPLAY,
-                journal = %path.display(),
-                ?outcome,
-                "display restore reported success but did not clear the journal"
-            );
-            quarantine_unrestorable_journal(path, "restore_did_not_clear_journal")
-        }
+        Ok(outcome) => set_aside_unrestorable_journal(
+            path,
+            "restore_did_not_clear_journal",
+            &format!("the restore reported {outcome:?} but left the journal"),
+        ),
+        Err(error) => set_aside_unrestorable_journal(path, "restore_failed", &error),
+    }
+}
+
+/// A journal that cannot be applied is set aside, untouched, under a name of
+/// its own, and the session goes on from the displays as they are now, with a
+/// journal of its own, so its restore is exact against its own start (ADR 0025
+/// §14). Refusing would lock out the remote access an operator needs to put
+/// the displays right.
+///
+/// Measured on a vGPU host: `connected stable display id 0x82061080 has
+/// ambiguous all-path bindings`, after a sign-out recreated the console session
+/// under it. The set-aside file is the only record of the displays the
+/// stranded session changed: it is never overwritten or deleted, it is logged
+/// as an error, and the Deck is told (`display_restore_pending`, the hello's
+/// `display_resolution.restore_notice`). Only a rename that fails keeps the
+/// journal in place and refuses, because arming a fresh journal over it would
+/// overwrite exactly that record.
+#[cfg(windows)]
+fn set_aside_unrestorable_journal(
+    path: &std::path::Path,
+    reason: &'static str,
+    detail: &str,
+) -> Result<(), String> {
+    use arcen_outputs::display_truth::DisplayTruthReason;
+    let aside = match set_aside_as(path, "unrestorable") {
+        Ok(Some(aside)) => aside,
+        Ok(None) => return Ok(()),
         Err(error) => {
             tracing::error!(
                 target: DISPLAY,
                 journal = %path.display(),
+                reason,
+                %detail,
                 %error,
-                "could not restore the display from the pending recovery journal"
+                "display journal could not be applied or set aside; refusing the session"
             );
-            quarantine_unrestorable_journal(path, "restore_failed")
+            return Err(DisplayTruthReason::RestorePending.message(&format!(
+                "an earlier session's displays could not be put back ({detail}) and its \
+                 journal {path:?} could not be set aside ({error})"
+            )));
         }
-    }
+    };
+    tracing::error!(
+        target: DISPLAY,
+        journal = %path.display(),
+        set_aside = %aside.display(),
+        reason,
+        reason_code = DisplayTruthReason::RestorePending.code(),
+        %detail,
+        "display journal could not be applied; it is set aside untouched and this session starts from the displays as they are"
+    );
+    note_restore_pending(detail);
+    Ok(())
 }
 
-/// Move a journal that cannot be applied out of the way, so it stops blocking
-/// every future session, and continue.
-///
-/// A journal describes how to put the display back. When it cannot be applied
-/// -- measured on a vGPU host as `connected stable display id 0x82061080 has
-/// ambiguous all-path bindings`, after a sign-out recreated the console session
-/// under it -- the state it describes is one that can no longer be reached.
-/// Refusing for ever then protects nothing and costs everything: the host
-/// serves nobody, and the documented remedy is out of reach.
-///
-/// That remedy really is out of reach, which is why this does not simply tell
-/// the operator to run it. `arcen-pier restore-display` needs an interactive
-/// desktop; over SSH on the same host it fails with `QueryDisplayConfig
-/// returned Win32 error 5`. On a machine whose only interactive route in is the
-/// product that just refused, there is no way to run it at all.
-///
-/// The record is renamed rather than deleted. It is the only description of the
-/// display the stranded session changed, so it stays on disk for a later manual
-/// restore or a support bundle; what it stops doing is gating new sessions. If
-/// even the rename fails the original refusal stands, because arming a fresh
-/// journal over one still in place would overwrite exactly that record.
-#[cfg(windows)]
-fn quarantine_unrestorable_journal(
-    path: &std::path::Path,
-    reason: &'static str,
-) -> Result<(), String> {
+/// The notice this agent's Deck is given when an earlier session's displays
+/// could not be put back (one session per agent process).
+static RESTORE_PENDING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn note_restore_pending(detail: &str) {
+    *RESTORE_PENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail.to_owned());
+}
+
+/// `display_restore_pending` when an earlier session's displays could not be
+/// put back in this agent, for the hello's `display_resolution`.
+pub(crate) fn restore_pending_notice() -> Option<&'static str> {
+    RESTORE_PENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+        .then_some(arcen_outputs::display_truth::DisplayTruthReason::RestorePending.code())
+}
+
+/// Renames `path` to `<stem>.<label>.<seconds>[-n].json` beside it, never
+/// over an existing file. `None` when nothing is there.
+fn set_aside_as(path: &std::path::Path, label: &str) -> Result<Option<std::path::PathBuf>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    let aside = path.with_file_name(format!(
-        "{}.unrestorable.{stamp}.json",
-        path.file_stem()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or("display-recovery")
-    ));
-    if let Err(error) = std::fs::rename(path, &aside) {
-        tracing::error!(
+    let stem = path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("display-recovery");
+    let mut aside = path.with_file_name(format!("{stem}.{label}.{stamp}.json"));
+    let mut attempt = 1;
+    while aside.exists() {
+        aside = path.with_file_name(format!("{stem}.{label}.{stamp}-{attempt}.json"));
+        attempt += 1;
+    }
+    std::fs::rename(path, &aside)
+        .map_err(|error| format!("set the display journal {path:?} aside: {error}"))?;
+    Ok(Some(aside))
+}
+
+/// Moves a pending display journal aside on an administrator's word that the
+/// displays are as they should be (`restore-display --set-aside`), keeping it
+/// as `display-recovery.set-aside.<seconds>.json` for a later restore or a
+/// support bundle. Returns where it went; `None` when nothing was pending.
+pub(crate) fn set_aside_journal(
+    path: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let aside = set_aside_as(path, "set-aside")?;
+    if let Some(aside) = &aside {
+        tracing::warn!(
             target: DISPLAY,
             journal = %path.display(),
-            %error,
-            "could not set the unrestorable display journal aside; refusing the session"
+            set_aside = %aside.display(),
+            "an administrator set the pending display journal aside; the displays as they are now are the host's own"
         );
-        return ensure_recovery_journal_clear(true, path);
     }
-    tracing::warn!(
-        target: DISPLAY,
-        journal = %path.display(),
-        quarantined = %aside.display(),
-        reason,
-        "display journal could not be applied and was set aside; continuing without it"
-    );
-    Ok(())
+    Ok(aside)
 }
 
 #[cfg(not(windows))]
@@ -5551,6 +5625,21 @@ mod windows_backend {
             Ok(current != Some(desired.as_slice()))
         }
 
+        fn offered_refresh(&mut self, target: &DisplayTarget, size: DisplaySize) -> Option<u32> {
+            if target.vendor_id == VMWARE_VENDOR_ID
+                || nvapi_exact_available(
+                    target.vendor_id,
+                    self.nvapi_failed,
+                    self.nvapi.is_some(),
+                    self.nvapi_snapshot.is_some(),
+                )
+            {
+                return None;
+            }
+            let refresh = self.request.refresh_hz;
+            (refresh > 1 && offers_size_at(&target.device_name, size, refresh)).then_some(refresh)
+        }
+
         fn prepare_exact_retarget(
             &mut self,
             target: &DisplayTarget,
@@ -5709,12 +5798,13 @@ mod windows_backend {
                 return Ok(());
             }
             self.pending_nvapi = false;
-            change_mode(&target.device_name, size, CDS_TEST).map_err(|error| {
-                match &self.edid_limitation {
+            let refresh = self.offered_refresh(target, size);
+            change_mode_at(&target.device_name, size, refresh, CDS_TEST).map_err(
+                |error| match &self.edid_limitation {
                     Some(limitation) => format!("{error} ({limitation})"),
                     None => error,
-                }
-            })
+                },
+            )
         }
 
         fn needs_bound_mode_preparation(&self, target: &DisplayTarget, _size: DisplaySize) -> bool {
@@ -5892,7 +5982,8 @@ mod windows_backend {
                 self.dxgi.invalidate();
                 return wait_for_mode(&mut self.dxgi, target, size, MODE_SETTLE_TIMEOUT);
             }
-            change_mode(&target.device_name, size, CDS_FULLSCREEN)?;
+            let refresh = self.offered_refresh(target, size);
+            change_mode_at(&target.device_name, size, refresh, CDS_FULLSCREEN)?;
             // HDR prepared for an NVAPI attempt that failed was proved on
             // the old mode; the session proves it again on this one.
             self.advanced_color_prepared = false;
@@ -7531,12 +7622,59 @@ mod windows_backend {
     }
 
     fn change_mode(device_name: &str, size: DisplaySize, flags: CDS_TYPE) -> Result<(), String> {
+        change_mode_at(device_name, size, None, flags)
+    }
+
+    /// Whether Windows enumerates a mode of `size` at `refresh_hz` for the
+    /// display.
+    fn offers_size_at(device_name: &str, size: DisplaySize, refresh_hz: u32) -> bool {
         let device = wide(device_name);
+        for index in 0..MAX_ENUMERATED_MODES {
+            let mut mode = DEVMODEW {
+                dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+                ..DEVMODEW::default()
+            };
+            // SAFETY: the device string is null-terminated and mode is writable.
+            let found = unsafe {
+                EnumDisplaySettingsExW(
+                    PCWSTR(device.as_ptr()),
+                    ENUM_DISPLAY_SETTINGS_MODE(index),
+                    &mut mode,
+                    ENUM_DISPLAY_SETTINGS_FLAGS(0),
+                )
+            };
+            if !found.as_bool() {
+                return false;
+            }
+            if mode.dmPelsWidth == size.width
+                && mode.dmPelsHeight == size.height
+                && mode.dmDisplayFrequency == refresh_hz
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Sets `size`, at `refresh_hz` when given (a refresh the display offers
+    /// at that size), otherwise at the refresh the driver picks.
+    fn change_mode_at(
+        device_name: &str,
+        size: DisplaySize,
+        refresh_hz: Option<u32>,
+        flags: CDS_TYPE,
+    ) -> Result<(), String> {
+        let device = wide(device_name);
+        let mut fields = DM_PELSWIDTH.0 | DM_PELSHEIGHT.0;
+        if refresh_hz.is_some() {
+            fields |= DM_DISPLAYFREQUENCY.0;
+        }
         let mode = DEVMODEW {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
-            dmFields: DEVMODE_FIELD_FLAGS(DM_PELSWIDTH.0 | DM_PELSHEIGHT.0),
+            dmFields: DEVMODE_FIELD_FLAGS(fields),
             dmPelsWidth: size.width,
             dmPelsHeight: size.height,
+            dmDisplayFrequency: refresh_hz.unwrap_or(0),
             ..DEVMODEW::default()
         };
         // SAFETY: the device string is null-terminated and mode is initialized with the
@@ -10794,13 +10932,52 @@ mod tests {
         .unwrap());
     }
 
+    // A journal set aside is the only record of what a stranded session
+    // changed: a second one set aside in the same second never replaces it.
     #[test]
-    fn stale_recovery_journal_blocks_a_new_display_owner() {
-        let path = std::path::Path::new(r"C:\ProgramData\Arcen\runtime\display-recovery.json");
-        let error = ensure_recovery_journal_clear(true, path).unwrap_err();
-        assert!(error.contains("display recovery journal"));
-        assert!(error.contains("restore-display"));
-        assert!(ensure_recovery_journal_clear(false, path).is_ok());
+    fn a_journal_set_aside_never_overwrites_an_earlier_one() {
+        let directory = std::env::temp_dir().join(format!(
+            "arcen-set-aside-twice-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("display-recovery.json");
+        std::fs::write(&path, b"first").unwrap();
+        let first = set_aside_as(&path, "unrestorable").unwrap().expect("first");
+        std::fs::write(&path, b"second").unwrap();
+        let second = set_aside_as(&path, "unrestorable")
+            .unwrap()
+            .expect("second");
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+        assert!(!path.exists());
+        assert_eq!(set_aside_as(&path, "unrestorable").unwrap(), None);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn only_an_administrator_sets_a_pending_journal_aside_and_it_is_kept() {
+        let directory = std::env::temp_dir().join(format!(
+            "arcen-set-aside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("display-recovery.json");
+        assert_eq!(set_aside_journal(&path).unwrap(), None);
+        std::fs::write(&path, b"{}").unwrap();
+        let aside = set_aside_journal(&path).unwrap().expect("set aside");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{}");
+        assert!(aside
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("display-recovery.set-aside.")));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[cfg(windows)]
@@ -10826,12 +11003,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn an_unreadable_journal_is_set_aside_rather_than_blocking_for_ever() {
-        // A journal that cannot be applied must stop gating sessions, because
-        // the documented remedy needs an interactive desktop and is therefore
-        // unreachable on exactly the hosts this product exists to reach. It
-        // must still be kept: it is the only description of what the stranded
-        // session changed.
+    fn an_unreadable_journal_is_set_aside_untouched_and_the_session_goes_on() {
+        // A journal that cannot be applied must not lock out the remote
+        // access that would fix it. It is kept byte for byte under a name of
+        // its own, the session starts from the displays as they are, and
+        // the Deck is told (`display_restore_pending`).
         let directory = std::env::temp_dir().join(format!(
             "arcen-journal-bad-{}-{:?}",
             std::process::id(),
@@ -10841,15 +11017,21 @@ mod tests {
         let path = directory.join("display-recovery.json");
         std::fs::write(&path, b"{ not a journal").expect("write scratch journal");
 
-        recover_pending_journal(&path).expect("an unapplicable journal must not block");
-        assert!(!path.exists(), "the journal must stop gating new sessions");
-
+        recover_pending_journal(&path).expect("an unapplicable journal must not refuse");
+        assert!(!path.exists(), "a fresh journal can be armed");
         let kept = std::fs::read_dir(&directory)
             .expect("scratch directory")
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains("unrestorable"))
-            .count();
-        assert_eq!(kept, 1, "the record must be preserved, not deleted");
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("display-recovery.unrestorable.")
+            })
+            .map(|entry| std::fs::read(entry.path()).expect("set-aside journal"))
+            .collect::<Vec<_>>();
+        assert_eq!(kept, vec![b"{ not a journal".to_vec()]);
+        assert_eq!(restore_pending_notice(), Some("display_restore_pending"));
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -11317,6 +11499,8 @@ mod tests {
         topology_restores: VecDeque<Result<(), String>>,
         /// Readbacks of `current`, in order (`Ok` = the current mode).
         current_results: VecDeque<Result<(), String>>,
+        /// The refresh the display offers at the requested size.
+        offered_refresh: Option<u32>,
     }
 
     impl FakeBackend {
@@ -11342,6 +11526,7 @@ mod tests {
                 bound_mode_preparations: VecDeque::new(),
                 topology_restores: VecDeque::new(),
                 current_results: VecDeque::new(),
+                offered_refresh: None,
             }
         }
 
@@ -11405,6 +11590,10 @@ mod tests {
         fn test_mode(&mut self, _target: &DisplayTarget, size: DisplaySize) -> Result<(), String> {
             self.record(Call::Test(size));
             self.tests.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn offered_refresh(&mut self, _target: &DisplayTarget, _size: DisplaySize) -> Option<u32> {
+            self.offered_refresh
         }
 
         fn needs_bound_mode_preparation(
@@ -11569,6 +11758,32 @@ mod tests {
             *calls.lock().unwrap(),
             vec![Call::Select(3), Call::Snapshot, Call::Current]
         );
+    }
+
+    // The audit finding: a display of the right size was reused as it was,
+    // at whatever refresh it ran, on every backend but NVAPI's.
+    #[test]
+    fn a_same_size_display_at_another_offered_refresh_is_set_not_reused() {
+        let mut backend = FakeBackend::new(size(1920, 1080));
+        backend.offered_refresh = Some(120);
+        let calls = Arc::clone(&backend.calls);
+        let transaction = DisplayTransaction::acquire(backend, 3, size(1920, 1080)).unwrap();
+        assert!(transaction.report.changed);
+        assert!(transaction.report.exact);
+        assert_eq!(transaction.report.degradation(), None);
+        assert!(calls
+            .lock()
+            .unwrap()
+            .contains(&Call::Apply(size(1920, 1080))));
+
+        // The refresh the display already runs, or one it does not offer,
+        // keeps the display as it is.
+        for offered in [Some(60), None] {
+            let mut backend = FakeBackend::new(size(1920, 1080));
+            backend.offered_refresh = offered;
+            let transaction = DisplayTransaction::acquire(backend, 3, size(1920, 1080)).unwrap();
+            assert!(!transaction.report.changed, "{offered:?}");
+        }
     }
 
     #[test]
@@ -12038,10 +12253,7 @@ mod tests {
         let mut transaction =
             DisplayTransaction::acquire_isolated(backend, 3, size(1920, 1080)).unwrap();
         assert!(transaction.report.changed);
-        assert_eq!(
-            transaction.report.backend,
-            "advanced-color-unchanged-display"
-        );
+        assert_eq!(transaction.report.backend, "nvapi-exact-edid-in-place");
         transaction.restore().unwrap();
         drop(transaction);
         assert_eq!(

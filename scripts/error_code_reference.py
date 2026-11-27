@@ -352,6 +352,12 @@ SOURCES = [
         "code",
     ),
     Source(
+        "## Display restore and served displays",
+        "shared/outputs/src/display_truth.rs",
+        "DisplayTruthReason",
+        "code",
+    ),
+    Source(
         "## Linux installer refusals",
         "shared/session/src/install_provider.rs",
         "InstallRefusal",

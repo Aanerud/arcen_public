@@ -18,6 +18,7 @@
       "dependency_kind": "normal",
       "contracts": [
         "about",
+        "account_switch",
         "client_telemetry",
         "clipboard",
         "config",
@@ -214,6 +215,7 @@
       "package": "arcen-deck-windows",
       "dependency_kind": "normal",
       "contracts": [
+        "account_switch",
         "canvas",
         "clipboard",
         "config",

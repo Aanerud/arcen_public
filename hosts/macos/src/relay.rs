@@ -64,6 +64,9 @@ pub enum RelayError {
     Refused(String),
     /// The service went away.
     ServiceGone,
+    /// The service asked this parked agent to sign its session out, and the
+    /// request was made (`status`); the agent parks again.
+    SignOutRequested(i32),
 }
 
 impl std::fmt::Display for RelayError {
@@ -76,6 +79,12 @@ impl std::fmt::Display for RelayError {
                 write!(formatter, "the Pier service refused this agent: {reason}")
             }
             Self::ServiceGone => formatter.write_str("the Pier service closed the agent socket"),
+            Self::SignOutRequested(status) => {
+                write!(
+                    formatter,
+                    "asked for this session's logout (status {status})"
+                )
+            }
         }
     }
 }
@@ -156,6 +165,10 @@ pub struct AgentRegistry {
     service_uid: Option<u32>,
     /// The only executable allowed to register, when known.
     expected_program: Option<PathBuf>,
+    /// This desktop's change-of-account ledger and attachment epoch.
+    handover: Arc<crate::handover::HandoverDesk>,
+    /// Where `SESSION_HANDOVER` records go, once the service has a sink.
+    telemetry: std::sync::OnceLock<crate::observability::HostTelemetry>,
 }
 
 impl std::fmt::Debug for AgentRegistry {
@@ -183,7 +196,102 @@ impl AgentRegistry {
             active_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             service_uid,
             expected_program,
+            handover: Arc::new(crate::handover::HandoverDesk::new()),
+            telemetry: std::sync::OnceLock::new(),
         })
+    }
+
+    /// This desktop's change-of-account ledger.
+    #[must_use]
+    pub fn handover(&self) -> &Arc<crate::handover::HandoverDesk> {
+        &self.handover
+    }
+
+    /// Sends `SESSION_HANDOVER` records through `telemetry` from now on.
+    pub fn set_telemetry(&self, telemetry: crate::observability::HostTelemetry) {
+        let _ = self.telemetry.set(telemetry);
+    }
+
+    /// Records a change-of-account step for `peer`.
+    fn handover_event(
+        &self,
+        reason: arcen_session::session_handover::HandoverReason,
+        kind: Option<arcen_session::session_handover::displays::AttachmentKind>,
+        client: Option<arcen_session::session_handover::RemoteClient>,
+        peer: &str,
+    ) {
+        tracing::info!(
+            target: arcen_telemetry::names::target::SESSION,
+            "session handover: {} ({peer})",
+            reason.token()
+        );
+        let (Some(telemetry), Some(fields)) = (self.telemetry.get(), reason.fields(kind, client))
+        else {
+            return;
+        };
+        telemetry.emit(
+            arcen_telemetry::LifecycleEventKind::SessionHandover,
+            &crate::observability::SessionScope {
+                sid: arcen_telemetry::CorrelationId::from_uuid_v4_bytes(
+                    crate::observability::random_correlation_bytes(),
+                ),
+                user: None,
+                peer: Some(peer.to_owned()),
+            },
+            fields,
+            arcen_telemetry::names::target::SESSION,
+            "session handover",
+        );
+    }
+
+    /// Whether an agent of `uid`'s own session is parked, so it can be
+    /// asked for its logout.
+    #[must_use]
+    pub fn has_parked_user_agent(&self, uid: u32) -> bool {
+        self.parked.lock().is_ok_and(|mut parked| {
+            parked.retain(|entry| still_connected(&entry.stream));
+            parked
+                .iter()
+                .any(|entry| entry.agent.uid == uid && entry.agent.kind == DesktopSessionKind::User)
+        })
+    }
+
+    /// Asks a parked agent of `uid`'s own session to request that
+    /// session's graceful logout ([`ServiceMessage::SignOut`]). Returns the
+    /// native status of the request (0: delivered), never proof of a
+    /// logout.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no agent of that account could be asked.
+    pub async fn request_sign_out(&self, uid: u32, session: u64) -> Result<i32, String> {
+        let taken = self.parked.lock().ok().and_then(|mut parked| {
+            parked.retain(|entry| still_connected(&entry.stream));
+            let index = parked.iter().position(|entry| {
+                entry.agent.uid == uid && entry.agent.kind == DesktopSessionKind::User
+            })?;
+            Some(parked.swap_remove(index))
+        });
+        let Some(mut entry) = taken else {
+            return Err(format!(
+                "no parked agent of uid {uid} to sign its session out"
+            ));
+        };
+        write_line(&mut entry.stream, &ServiceMessage::SignOut { session })
+            .await
+            .map_err(|error| error.to_string())?;
+        let line = tokio::time::timeout(ATTACH_TIMEOUT, read_line(&mut entry.stream))
+            .await
+            .map_err(|_| "no answer to the sign-out request".to_owned())?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the agent left without answering".to_owned())?;
+        match serde_json::from_str::<AgentMessage>(&line) {
+            Ok(AgentMessage::SignOutRequested { status }) => Ok(status),
+            Ok(other) => Err(format!(
+                "unexpected answer to the sign-out request: {other:?}"
+            )),
+            Err(error) => Err(format!("sign-out answer: {error}")),
+        }
     }
 
     /// How many agents are parked.
@@ -490,6 +598,9 @@ async fn offer(stream: &mut UnixStream, peer: &str, session: u64) -> Result<(), 
         .ok_or(RelayError::ServiceGone)?;
     match serde_json::from_str::<AgentMessage>(&line) {
         Ok(AgentMessage::Attached) => Ok(()),
+        Ok(other) => Err(RelayError::Protocol(format!(
+            "attach answer: unexpected {other:?}"
+        ))),
         Err(error) => Err(RelayError::Protocol(format!("attach answer: {error}"))),
     }
 }
@@ -674,6 +785,14 @@ impl SignInGate {
         }
     }
 
+    /// The agent proved the Deck's password, for another account than its
+    /// own: a sign-in the throttle counts as accepted.
+    fn on_switch_candidate(&mut self) {
+        if let Some(attempt) = self.attempt.take() {
+            attempt.finish(arcen_session::auth_throttle::AttemptOutcome::Accepted);
+        }
+    }
+
     /// Reads an agent message before the attachment: its `auth_result`
     /// ends the attempt with what the agent learnt.
     fn on_agent_text(&mut self, text: &str) {
@@ -734,6 +853,98 @@ fn sign_in_outcome(
 ///
 /// Returns the first transport error when it was not a clean close.
 pub async fn relay_lanes_gated<A>(
+    deck: arcen_transport::quic::SessionLaneSocket,
+    agent: A,
+    session: u64,
+    audio_channel: Option<tokio::sync::oneshot::Receiver<UnixStream>>,
+    path_signal: bool,
+    refine_allowed: bool,
+    gate: Option<SignInGate>,
+) -> Result<MediaRelayStats, String>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match relay_lanes_handover(
+        deck,
+        agent,
+        session,
+        audio_channel,
+        path_signal,
+        refine_allowed,
+        gate,
+        None,
+    )
+    .await
+    {
+        RelayOutcome::Ended(result) => result,
+        RelayOutcome::SignIn { .. } => Ok(MediaRelayStats::default()),
+    }
+}
+
+/// The service's part in a relayed Deck's change of account
+/// (`crate::handover`): the desktop's ledger, the agent the Deck reached,
+/// and the connection the ledger knows the Deck by.
+pub struct HandoverRelay {
+    /// The registry, its ledger and its parked agents.
+    pub registry: Arc<AgentRegistry>,
+    /// The account the agent serves; `None` for the login window's.
+    pub agent_uid: Option<u32>,
+    /// The Deck's connection, kept across its hand-over to the login window.
+    pub connection: u64,
+    /// The Deck's address, for the records.
+    pub peer: String,
+    /// The Deck's own `auth_response`, given again to the login window's
+    /// agent after a completed sign-out. It carries the password and is
+    /// wiped when dropped.
+    pub replay: Option<zeroize::Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for HandoverRelay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HandoverRelay")
+            .field("agent_uid", &self.agent_uid)
+            .field("connection", &self.connection)
+            .field("peer", &self.peer)
+            .field("replay", &self.replay.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+/// How a relayed Deck ended.
+pub enum RelayOutcome {
+    /// The relay ended.
+    Ended(Result<MediaRelayStats, String>),
+    /// The other account was signed out: the Deck signs in at the login
+    /// window next, with the `auth_response` it already sent.
+    SignIn {
+        /// The Deck, still connected.
+        deck: arcen_transport::quic::SessionLaneSocket,
+        /// Its `auth_response`.
+        auth_response: zeroize::Zeroizing<String>,
+    },
+}
+
+impl std::fmt::Debug for RelayOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ended(result) => formatter.debug_tuple("Ended").field(result).finish(),
+            Self::SignIn { .. } => formatter.write_str("SignIn { .. }"),
+        }
+    }
+}
+
+/// [`relay_lanes_gated`], with the service's part in a change of account
+/// (`handover`): an agent's `switch_candidate` is answered by the service
+/// (offer, confirmation, the target's own graceful logout, the exit
+/// proof), and every sign-in an agent accepts is checked against the
+/// desktop's ledger before the Deck is attached.
+///
+/// # Errors
+///
+/// Returns the first transport error when it was not a clean close.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn relay_lanes_handover<A>(
     mut deck: arcen_transport::quic::SessionLaneSocket,
     agent: A,
     session: u64,
@@ -741,7 +952,8 @@ pub async fn relay_lanes_gated<A>(
     path_signal: bool,
     refine_allowed: bool,
     mut gate: Option<SignInGate>,
-) -> Result<MediaRelayStats, String>
+    mut handover: Option<HandoverRelay>,
+) -> RelayOutcome
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -790,6 +1002,15 @@ where
     // agent knows when video still waits here (`RateHints::video_backlog`).
     let mut video_released: Option<tokio::sync::watch::Receiver<u64>> = None;
     let mut video_released_reported = 0_u64;
+    // The Deck's `auth_response`, kept only while a change of account may
+    // still need it, and whether it can confirm one.
+    let mut credentials = SwitchCredentials::default();
+    let mut deck_account_switch = false;
+    let mut resend_auth = handover
+        .as_mut()
+        .and_then(|handover| handover.replay.take());
+    let replayed_sign_in = resend_auth.is_some();
+    let mut signed_out = false;
 
     let result = loop {
         tokio::select! {
@@ -828,11 +1049,19 @@ where
                         break Err("Deck sent a service-only message".to_string());
                     }
                     session_started |= is_client_hello(text);
+                    if relay.is_none()
+                        && handover.is_some()
+                        && let Some(switch) = credentials
+                            .on_deck_text(text, crate::handover::GRACEFUL_LOGOUT_ROUTE)
+                    {
+                        deck_account_switch = switch;
+                    }
                     if relay.is_none() {
                         refine_grant |= refine_allowed && asks_for_ycbcr_refinement(text);
                         match gate.as_mut().map_or(DeckVerdict::Forward, |gate| gate.on_deck_text(text)) {
                             DeckVerdict::Forward => {}
                             DeckVerdict::Refuse(refusal) => {
+                                credentials.release();
                                 let _ = deck.send(SessionRecord::Text(refusal)).await;
                                 break Ok(());
                             }
@@ -868,6 +1097,68 @@ where
                 }
                 stats.to_deck += 1;
                 if relay.is_none()
+                    && let (Some(handover), SessionRecord::Text(text)) = (handover.as_ref(), &record)
+                {
+                    // The login window's agent asks for the credentials the
+                    // Deck already gave: it gets them, and the Deck, which
+                    // waits for `auth_result`, sees no second prompt.
+                    if is_text_type(&record, arcen_protocol::messages::AUTH_REQUEST)
+                        && let Some(stored) = resend_auth.take()
+                    {
+                        let resend = tokio_tungstenite::tungstenite::Message::Text(
+                            stored.as_str().to_owned(),
+                        );
+                        drop(stored);
+                        if let Err(error) = agent_tx.send(resend).await {
+                            break Err(format!("to agent: {error}"));
+                        }
+                        continue;
+                    }
+                    if let Some(candidate) = switch_candidate(text) {
+                        if let Some(gate) = gate.as_mut() {
+                            gate.on_switch_candidate();
+                        }
+                        signed_out =
+                            run_switch(&mut deck, handover, session, candidate, deck_account_switch)
+                                .await;
+                        break Ok(());
+                    }
+                    // The sign-in ended another way: the credentials are not
+                    // needed again.
+                    if is_text_type(&record, arcen_protocol::messages::AUTH_RESULT) {
+                        credentials.release();
+                    }
+                    if is_successful_auth_result(&record) {
+                        let admitted = handover
+                            .registry
+                            .handover()
+                            .admit(handover.connection, handover.agent_uid);
+                        if replayed_sign_in {
+                            let _ = handover
+                                .registry
+                                .handover()
+                                .login_finished(handover.connection, admitted.is_ok());
+                        }
+                        if let Err(refusal) = admitted {
+                            handover.registry.handover_event(
+                                refusal.reason(),
+                                None,
+                                None,
+                                &handover.peer,
+                            );
+                            let refused =
+                                handover_refusal_result(refusal, deck_account_switch, None);
+                            let _ = deck.send(SessionRecord::Text(refused)).await;
+                            break Ok(());
+                        }
+                    } else if replayed_sign_in && is_text_type(&record, arcen_protocol::messages::AUTH_RESULT) {
+                        let _ = handover
+                            .registry
+                            .handover()
+                            .login_finished(handover.connection, false);
+                    }
+                }
+                if relay.is_none()
                     && let (Some(gate), SessionRecord::Text(text)) = (gate.as_mut(), &record)
                 {
                     gate.on_agent_text(text);
@@ -896,6 +1187,8 @@ where
                             let started = PierLaneRelay::start_with(&lanes, refine_grant);
                             video_released = Some(started.video_released());
                             relay = Some(started);
+                            credentials.release();
+                            attached_to_desktop(handover.as_ref(), session);
                         }
                         Err(error) => break Err(error),
                     }
@@ -913,6 +1206,8 @@ where
                             let started = PierLaneRelay::start_with(&lanes, refine_grant);
                             video_released = Some(started.video_released());
                             relay = Some(started);
+                            credentials.release();
+                            attached_to_desktop(handover.as_ref(), session);
                         }
                         Err(error) => break Err(error),
                     }
@@ -991,7 +1286,523 @@ where
         stats.lanes = relay.stats();
     }
     let _ = agent_tx.close().await;
-    result.map(|()| stats)
+    if let Some(handover) = handover.as_ref() {
+        let ledger_desk = handover.registry.handover();
+        ledger_desk.detached(session);
+        if !signed_out && let Some(reason) = ledger_desk.requester_left(handover.connection) {
+            handover
+                .registry
+                .handover_event(reason, None, None, &handover.peer);
+        }
+    }
+    match (signed_out, credentials.take()) {
+        (true, Some(auth_response)) => RelayOutcome::SignIn {
+            deck,
+            auth_response,
+        },
+        _ => RelayOutcome::Ended(result.map(|()| stats)),
+    }
+}
+
+/// A Deck's lanes were granted: one more attachment to this desktop.
+fn attached_to_desktop(handover: Option<&HandoverRelay>, session: u64) {
+    let Some(handover) = handover else {
+        return;
+    };
+    if let Some(returned) = handover.registry.handover().attached(session)
+        && returned != arcen_session::session_handover::consent::ClientReturn::NoOffer
+    {
+        tracing::info!(
+            target: arcen_telemetry::names::target::SESSION,
+            ?returned,
+            "a Deck attached while a change of account was open"
+        );
+    }
+}
+
+/// The Deck's `auth_response`, which carries its password, held only while
+/// a change of account may still need it: when this Pier offers one
+/// (`route`) and the Deck can confirm it (`account_switch_v1`), and only
+/// until the sign-in ends another way.
+#[derive(Default)]
+struct SwitchCredentials {
+    held: Option<zeroize::Zeroizing<String>>,
+}
+
+impl SwitchCredentials {
+    /// Reads a Deck message before the attachment. For its `auth_response`,
+    /// keeps it when a change of account could follow and returns whether
+    /// the Deck can confirm one.
+    fn on_deck_text(&mut self, text: &str, route: bool) -> Option<bool> {
+        let switch = account_switch_request(text)?;
+        self.held = (route && switch).then(|| zeroize::Zeroizing::new(text.to_owned()));
+        Some(switch)
+    }
+
+    /// The sign-in ended without a change of account: an `auth_result`, a
+    /// refusal or granted lanes.
+    fn release(&mut self) {
+        self.held = None;
+    }
+
+    /// Hands the credentials to the sign-in at the login window.
+    fn take(&mut self) -> Option<zeroize::Zeroizing<String>> {
+        self.held.take()
+    }
+}
+
+/// Whether `text` is the Deck's `auth_response`, and then whether it can
+/// confirm a change of account. Only those two fields are read.
+fn account_switch_request(text: &str) -> Option<bool> {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        #[serde(rename = "type")]
+        msg_type: String,
+        #[serde(default)]
+        account_switch_v1: bool,
+    }
+    serde_json::from_str::<Request>(text)
+        .ok()
+        .filter(|request| request.msg_type == arcen_protocol::messages::AUTH_RESPONSE)
+        .map(|request| request.account_switch_v1)
+}
+
+/// The agent's [`AgentMessage::SwitchCandidate`], when `text` is one.
+fn switch_candidate(text: &str) -> Option<(u32, String, bool)> {
+    match serde_json::from_str::<AgentMessage>(text).ok()? {
+        AgentMessage::SwitchCandidate {
+            uid,
+            user,
+            logout_route,
+        } => Some((uid, user, logout_route)),
+        AgentMessage::Attached | AgentMessage::SignOutRequested { .. } => None,
+    }
+}
+
+/// The `auth_result` that refuses a sign-in for `refusal`, worded by the
+/// shared code (`console_refusal`): a Deck without `account_switch_v1`
+/// never sees a code that came with it. Another account's session is
+/// named, as this Pier always did.
+fn handover_refusal_result(
+    refusal: arcen_session::session_handover::HandoverRefusal,
+    deck_account_switch: bool,
+    owner: Option<&str>,
+) -> String {
+    use arcen_session::console_session::{ConsoleOrigin, ConsoleRefusal};
+    // LoginWindow is the macOS display manager: every session is its.
+    let code = refusal.console_refusal(ConsoleOrigin::DisplayManager, deck_account_switch);
+    let message = if code == ConsoleRefusal::OtherUser {
+        crate::console::other_user_refusal(owner)
+    } else {
+        code.deck_reason().to_owned()
+    };
+    serde_json::to_string(&arcen_protocol::messages::AuthResult {
+        msg_type: arcen_protocol::messages::AUTH_RESULT.to_owned(),
+        success: false,
+        message,
+        resume_grant: None,
+        resume_window_secs: None,
+        resumed: false,
+        error_code: None,
+        session_setup_failed: false,
+    })
+    .unwrap_or_default()
+}
+
+/// Sends `message` to the Deck as one control text.
+async fn send_deck_json<T: serde::Serialize>(
+    deck: &mut arcen_transport::quic::SessionLaneSocket,
+    message: &T,
+) -> bool {
+    use futures_util::SinkExt as _;
+    match serde_json::to_string(message) {
+        Ok(text) => deck
+            .send(arcen_protocol::lanes::SessionRecord::Text(text))
+            .await
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// The one native read of the desktop's facts at a time; a second waits
+/// for nothing and reads as unknown, which refuses (fail closed).
+static HANDOVER_FACTS: crate::blocking::BlockingSlot = crate::blocking::BlockingSlot::new();
+
+/// How long a read of the facts may take before it counts as unknown.
+const FACTS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reads the desktop's facts off the async runtime.
+async fn read_occupant(
+    desk: &Arc<crate::handover::HandoverDesk>,
+    session: u64,
+) -> (
+    arcen_session::session_handover::ConsoleOccupant,
+    Option<crate::handover::ConsoleRecord>,
+) {
+    let desk = Arc::clone(desk);
+    let unknown = || {
+        (
+            arcen_session::session_handover::ConsoleOccupant::Unknown,
+            None,
+        )
+    };
+    tokio::time::timeout(
+        FACTS_TIMEOUT,
+        crate::blocking::run_exclusive(
+            "arcen-handover-facts",
+            &HANDOVER_FACTS,
+            |_| (),
+            move || desk.read_occupant(session),
+        ),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_else(unknown)
+}
+
+/// Reads whether `target` still exists, off the async runtime.
+async fn read_presence(
+    target: &arcen_session::session_handover::NativeSessionIdentity,
+) -> arcen_session::session_handover::logout::SessionPresence {
+    let target = target.clone();
+    tokio::time::timeout(
+        FACTS_TIMEOUT,
+        crate::blocking::run_exclusive(
+            "arcen-handover-facts",
+            &HANDOVER_FACTS,
+            |_| (),
+            move || {
+                let records = crate::handover::console_records();
+                crate::handover::presence_in(
+                    records.as_deref(),
+                    crate::handover::boot_id().as_ref(),
+                    &target,
+                )
+            },
+        ),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(arcen_session::session_handover::logout::SessionPresence::Unknown)
+}
+
+/// The service's half of a change of account (ADR 0025 §13), after the
+/// agent proved the Deck's account and found it is not its own: decide,
+/// offer, read the answer, have the target's own agent ask for its
+/// graceful logout, and prove the exact session ended. Returns whether it
+/// did, and the Deck signs in at the login window next; otherwise the Deck
+/// has been told why not.
+#[allow(clippy::too_many_lines)]
+async fn run_switch(
+    deck: &mut arcen_transport::quic::SessionLaneSocket,
+    handover: &HandoverRelay,
+    session: u64,
+    (uid, user, logout_route): (u32, String, bool),
+    deck_account_switch: bool,
+) -> bool {
+    use arcen_protocol::lanes::SessionRecord;
+    use arcen_protocol::messages::{
+        ACCOUNT_SWITCH_REPLY, AccountSwitchChoiceMsg, AccountSwitchOfferMsg,
+        AccountSwitchOutcomeMsg, AccountSwitchReplyMsg, AccountSwitchResultMsg,
+    };
+    use arcen_session::session_handover::consent::{
+        ConnectionId, DEFAULT_OFFER_LIFETIME_SECS, ReplyRejection, SwitchNonce,
+    };
+    use arcen_session::session_handover::logout::{
+        LOGOUT_COMPLETION_TIMEOUT, LogoutBlock, LogoutOutcome, LogoutVerdict, SessionExitProof,
+        SessionPresence,
+    };
+    use arcen_session::session_handover::{
+        AuthenticatedPrincipal, HandoverDecision, HandoverReason, HandoverRefusal, SwitchRoute,
+    };
+    use futures_util::{SinkExt as _, StreamExt as _};
+
+    let registry = &handover.registry;
+    let switch_desk = registry.handover();
+    let connection = ConnectionId::new(handover.connection);
+    let peer = handover.peer.as_str();
+    let refuse = |refusal: HandoverRefusal, owner: Option<&str>| {
+        registry.handover_event(refusal.reason(), None, None, peer);
+        handover_refusal_result(refusal, deck_account_switch, owner)
+    };
+    // Only a user's agent proves another account, and never its own.
+    let Some(agent_uid) = handover.agent_uid.filter(|agent| *agent != uid) else {
+        return false;
+    };
+    let Some(requester) = crate::handover::principal(uid)
+        .filter(|_| crate::handover::account_name(uid).as_deref() == Some(user.as_str()))
+        .map(AuthenticatedPrincipal::after_authentication)
+    else {
+        let text = refuse(HandoverRefusal::OccupantUnknown, None);
+        let _ = deck.send(SessionRecord::Text(text)).await;
+        return false;
+    };
+    let (occupant, record) = read_occupant(switch_desk, session).await;
+    let owner = record.as_ref().map(|record| record.name.clone());
+    // The agent that proved the Deck must be the desktop's own.
+    if record
+        .as_ref()
+        .is_some_and(|record| record.uid != agent_uid)
+    {
+        let text = refuse(HandoverRefusal::OccupantUnknown, None);
+        let _ = deck.send(SessionRecord::Text(text)).await;
+        return false;
+    }
+    let route = SwitchRoute::from_capabilities(
+        deck_account_switch,
+        logout_route
+            && crate::handover::GRACEFUL_LOGOUT_ROUTE
+            && registry.has_parked_user_agent(agent_uid),
+    );
+    let now = switch_desk.now();
+    let Some(decided) = switch_desk
+        .with_ledger(|ledger| ledger.decide(connection, &requester, &occupant, route, now))
+    else {
+        return false;
+    };
+    if let Some(lapsed) = decided.lapsed {
+        registry.handover_event(lapsed.reason(), None, None, peer);
+    }
+    let candidate = match decided.decision {
+        HandoverDecision::OfferSwitch(candidate) => candidate,
+        HandoverDecision::Refuse(refusal) => {
+            let client = match refusal {
+                HandoverRefusal::Busy(client) => Some(client),
+                _ => None,
+            };
+            registry.handover_event(refusal.reason(), None, client, peer);
+            let text = handover_refusal_result(refusal, deck_account_switch, owner.as_deref());
+            let _ = deck.send(SessionRecord::Text(text)).await;
+            return false;
+        }
+        // The console changed under the agent (the login window, or the
+        // account itself): this Deck starts again.
+        HandoverDecision::SignInFresh
+        | HandoverDecision::JoinOwnSession { .. }
+        | HandoverDecision::JoinOwnSessionAfterIncumbent(_) => {
+            let text = refuse(HandoverRefusal::SigningOut, None);
+            let _ = deck.send(SessionRecord::Text(text)).await;
+            return false;
+        }
+    };
+    let target_uid = agent_uid;
+
+    let mut entropy = [0_u8; arcen_session::session_handover::consent::SWITCH_NONCE_BYTES];
+    let Some(nonce) = getrandom::getrandom(&mut entropy)
+        .ok()
+        .and_then(|()| SwitchNonce::from_random(entropy))
+    else {
+        return false;
+    };
+    let opened = switch_desk.with_ledger(|ledger| {
+        ledger.open(
+            candidate,
+            connection,
+            nonce,
+            switch_desk.now(),
+            DEFAULT_OFFER_LIFETIME_SECS,
+        )
+    });
+    let ticket = match opened {
+        Some(Ok(opened)) => {
+            if let Some(lapsed) = opened.lapsed {
+                registry.handover_event(lapsed.reason(), None, None, peer);
+            }
+            opened.ticket
+        }
+        Some(Err(refusal)) => {
+            registry.handover_event(refusal.reason(), None, None, peer);
+            if let Some(refusal) = refusal.handover_refusal() {
+                let text = handover_refusal_result(refusal, deck_account_switch, None);
+                let _ = deck.send(SessionRecord::Text(text)).await;
+            }
+            return false;
+        }
+        None => return false,
+    };
+    let offer_id = ticket.nonce.to_hex();
+    let Ok(offer) = AccountSwitchOfferMsg::new(offer_id.clone(), ticket.expires_in_secs) else {
+        let _ = switch_desk.with_ledger(|ledger| ledger.requester_left(connection));
+        return false;
+    };
+    if !send_deck_json(deck, &offer).await {
+        let _ = switch_desk.with_ledger(|ledger| ledger.requester_left(connection));
+        return false;
+    }
+    registry.handover_event(HandoverReason::SwitchOffered, None, None, peer);
+    let result =
+        |outcome: AccountSwitchOutcomeMsg| AccountSwitchResultMsg::new(offer_id.clone(), outcome);
+
+    // The answer, before the offer expires.
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(u64::from(ticket.expires_in_secs));
+    let (nonce, choice) = loop {
+        let next = tokio::time::timeout_at(deadline, deck.next()).await;
+        let record = match next {
+            Err(_) => {
+                let lapsed = switch_desk
+                    .with_ledger(|ledger| ledger.expire(switch_desk.now()))
+                    .flatten();
+                registry.handover_event(
+                    lapsed.map_or(
+                        HandoverReason::SwitchExpired,
+                        arcen_session::session_handover::consent::Lapse::reason,
+                    ),
+                    None,
+                    None,
+                    peer,
+                );
+                let _ = send_deck_json(deck, &result(AccountSwitchOutcomeMsg::Expired)).await;
+                return false;
+            }
+            Ok(None | Some(Err(_))) => {
+                if let Some(reason) = switch_desk
+                    .with_ledger(|ledger| ledger.requester_left(connection))
+                    .flatten()
+                {
+                    registry.handover_event(reason, None, None, peer);
+                }
+                return false;
+            }
+            Ok(Some(Ok(record))) => record,
+        };
+        let SessionRecord::Text(text) = record else {
+            continue;
+        };
+        let Ok(reply) = serde_json::from_str::<AccountSwitchReplyMsg>(&text) else {
+            continue;
+        };
+        if reply.msg_type != ACCOUNT_SWITCH_REPLY {
+            continue;
+        }
+        let Some(nonce) = reply
+            .validate()
+            .ok()
+            .and_then(|()| SwitchNonce::parse_hex(&reply.offer_id))
+        else {
+            registry.handover_event(HandoverReason::SwitchRejected, None, None, peer);
+            let _ = send_deck_json(deck, &result(AccountSwitchOutcomeMsg::Rejected)).await;
+            let _ = switch_desk.with_ledger(|ledger| ledger.requester_left(connection));
+            return false;
+        };
+        break (nonce, reply.choice);
+    };
+
+    let rejected = |rejection: ReplyRejection| match rejection {
+        ReplyRejection::Expired => AccountSwitchOutcomeMsg::Expired,
+        ReplyRejection::Stale(_) => AccountSwitchOutcomeMsg::Stale,
+        ReplyRejection::NoOffer
+        | ReplyRejection::Replayed
+        | ReplyRejection::WrongConnection
+        | ReplyRejection::Mismatched => AccountSwitchOutcomeMsg::Rejected,
+    };
+    if choice == AccountSwitchChoiceMsg::Cancel {
+        let cancelled =
+            switch_desk.with_ledger(|ledger| ledger.cancel(connection, &nonce, switch_desk.now()));
+        let outcome = match cancelled {
+            Some(Ok(())) => {
+                registry.handover_event(HandoverReason::SwitchCancelled, None, None, peer);
+                AccountSwitchOutcomeMsg::Cancelled
+            }
+            Some(Err(rejection)) => {
+                registry.handover_event(rejection.reason(), None, None, peer);
+                rejected(rejection)
+            }
+            None => AccountSwitchOutcomeMsg::Rejected,
+        };
+        let _ = send_deck_json(deck, &result(outcome)).await;
+        return false;
+    }
+
+    // Confirmed: the facts again, immediately before anything changes.
+    let (fresh, _) = read_occupant(switch_desk, session).await;
+    let confirmed = switch_desk
+        .with_ledger(|ledger| ledger.confirm(connection, &nonce, switch_desk.now(), &fresh));
+    let authority = match confirmed {
+        Some(Ok(authority)) => authority,
+        Some(Err(rejection)) => {
+            registry.handover_event(rejection.reason(), None, None, peer);
+            let _ = send_deck_json(deck, &result(rejected(rejection))).await;
+            return false;
+        }
+        None => return false,
+    };
+    registry.handover_event(HandoverReason::LogoutRequested, None, None, peer);
+    let target = authority.target().clone();
+    let outcome = match registry.request_sign_out(target_uid, session).await {
+        Ok(0) => {
+            let deadline = tokio::time::Instant::now() + LOGOUT_COMPLETION_TIMEOUT;
+            let mut requester_here = true;
+            loop {
+                let presence = read_presence(&target).await;
+                if let Some(proof) = SessionExitProof::read_back(&target, presence) {
+                    break LogoutOutcome::Completed(proof);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    // Still there at the deadline: an application or the
+                    // person at the desk kept it. Never forced.
+                    break if presence == SessionPresence::Present {
+                        LogoutOutcome::Vetoed
+                    } else {
+                        LogoutOutcome::TimedOut
+                    };
+                }
+                // The logout runs on whether or not the requester stays;
+                // one who left is never signed in afterwards.
+                if requester_here {
+                    tokio::select! {
+                        next = deck.next() => if matches!(next, None | Some(Err(_))) {
+                            requester_here = false;
+                            let _ = switch_desk
+                                .with_ledger(|ledger| ledger.requester_left(connection));
+                        },
+                        () = tokio::time::sleep(crate::handover::EXIT_POLL) => {}
+                    }
+                } else {
+                    tokio::time::sleep(crate::handover::EXIT_POLL).await;
+                }
+            }
+        }
+        Ok(status) => {
+            eprintln!("the target session's agent could not ask for its logout: status {status}");
+            LogoutOutcome::Failed
+        }
+        Err(error) => {
+            eprintln!("the target session's agent could not be asked for its logout: {error}");
+            LogoutOutcome::Failed
+        }
+    };
+    let verdict = switch_desk
+        .with_ledger(|ledger| ledger.finish_logout(authority, outcome, switch_desk.now()));
+    let Some(verdict) = verdict else {
+        return false;
+    };
+    registry.handover_event(verdict.reason(), None, None, peer);
+    match verdict {
+        LogoutVerdict::Completed { permit, .. } => {
+            switch_desk.hold_permit(permit);
+            if send_deck_json(deck, &result(AccountSwitchOutcomeMsg::SignedOut)).await {
+                true
+            } else {
+                let _ = switch_desk.login_finished(handover.connection, false);
+                false
+            }
+        }
+        LogoutVerdict::CompletedRequesterGone { .. } => false,
+        LogoutVerdict::Blocked(block) => {
+            let outcome = match block {
+                LogoutBlock::Vetoed => AccountSwitchOutcomeMsg::LogoutVetoed,
+                LogoutBlock::TimedOut => AccountSwitchOutcomeMsg::LogoutTimedOut,
+                LogoutBlock::Failed | LogoutBlock::ExitUnproven | LogoutBlock::NotCommitting => {
+                    AccountSwitchOutcomeMsg::LogoutFailed
+                }
+            };
+            let _ = send_deck_json(deck, &result(outcome)).await;
+            false
+        }
+    }
 }
 
 /// Authorizes the attachment's lanes and tells the Deck, on the control
@@ -1221,7 +2032,7 @@ pub async fn park(
         ServiceMessage::Registered { .. } => {}
         ServiceMessage::PathSignal { .. } | ServiceMessage::VideoReleased { .. } => {}
         ServiceMessage::Refused { reason } => return Err(RelayError::Refused(reason)),
-        ServiceMessage::Attach { .. } => {
+        ServiceMessage::Attach { .. } | ServiceMessage::SignOut { .. } => {
             return Err(RelayError::Protocol(
                 "offered a Deck before registering".to_owned(),
             ));
@@ -1235,6 +2046,15 @@ pub async fn park(
                 peer,
                 session,
             })
+        }
+        ServiceMessage::SignOut { session } => {
+            let status = crate::handover::sign_out_on_request();
+            eprintln!(
+                "a confirmed change of account asked for this session's logout (Deck {session}, \
+                 status {status})"
+            );
+            write_line(&mut stream, &AgentMessage::SignOutRequested { status }).await?;
+            Err(RelayError::SignOutRequested(status))
         }
         ServiceMessage::Refused { reason } => Err(RelayError::Refused(reason)),
         ServiceMessage::PathSignal { .. } => Err(RelayError::Protocol(
@@ -1291,9 +2111,9 @@ pub async fn open_audio_channel(
         ServiceMessage::Registered { .. } => Ok(stream),
         ServiceMessage::PathSignal { .. } | ServiceMessage::VideoReleased { .. } => Ok(stream),
         ServiceMessage::Refused { reason } => Err(RelayError::Refused(reason)),
-        ServiceMessage::Attach { .. } => Err(RelayError::Protocol(
-            "offered a Deck on an audio channel".to_owned(),
-        )),
+        ServiceMessage::Attach { .. } | ServiceMessage::SignOut { .. } => Err(
+            RelayError::Protocol("offered a Deck on an audio channel".to_owned()),
+        ),
     }
 }
 
@@ -1390,6 +2210,96 @@ mod tests {
         let mut gate = SignInGate::new(fresh, Some(source));
         assert_eq!(gate.on_deck_text(ask), DeckVerdict::Forward);
         assert_eq!(gate.on_deck_text(ask), DeckVerdict::Close);
+    }
+
+    #[test]
+    fn the_service_reads_only_the_switch_capability_and_never_forwards_a_candidate() {
+        use arcen_protocol::messages::AuthResponse;
+        let response = |switch| {
+            serde_json::to_string(
+                &AuthResponse::password("someone", "secret").with_account_switch_v1(switch),
+            )
+            .expect("encode")
+        };
+        assert_eq!(account_switch_request(&response(true)), Some(true));
+        assert_eq!(account_switch_request(&response(false)), Some(false));
+        assert_eq!(account_switch_request(r#"{"type":"client_hello"}"#), None);
+        let candidate = serde_json::to_string(&AgentMessage::SwitchCandidate {
+            uid: 502,
+            user: "someone".to_owned(),
+            logout_route: true,
+        })
+        .expect("encode");
+        assert_eq!(
+            switch_candidate(&candidate),
+            Some((502, "someone".to_owned(), true))
+        );
+        assert_eq!(switch_candidate(r#"{"type":"auth_result"}"#), None);
+        // A Deck can never forge the service's request to sign out.
+        assert!(ServiceMessage::is_service_type("sign_out"));
+    }
+
+    #[test]
+    fn the_password_is_kept_only_for_a_change_of_account_the_pier_offers() {
+        use arcen_protocol::messages::AuthResponse;
+        let response = |switch| {
+            serde_json::to_string(
+                &AuthResponse::password("someone", "secret").with_account_switch_v1(switch),
+            )
+            .expect("encode")
+        };
+        // The route off, or a Deck that cannot confirm: nothing is kept,
+        // and the Deck's capability is still read.
+        let mut credentials = SwitchCredentials::default();
+        assert_eq!(credentials.on_deck_text(&response(true), false), Some(true));
+        assert!(credentials.take().is_none());
+        assert_eq!(
+            credentials.on_deck_text(&response(false), true),
+            Some(false)
+        );
+        assert!(credentials.take().is_none());
+        assert_eq!(
+            credentials.on_deck_text(r#"{"type":"client_hello"}"#, true),
+            None
+        );
+        assert!(credentials.take().is_none());
+        // Kept for a possible change of account, gone once the sign-in
+        // ended another way.
+        assert_eq!(credentials.on_deck_text(&response(true), true), Some(true));
+        credentials.release();
+        assert!(credentials.take().is_none());
+        assert_eq!(credentials.on_deck_text(&response(true), true), Some(true));
+        assert!(
+            credentials
+                .take()
+                .is_some_and(|kept| kept.contains("secret"))
+        );
+        assert!(credentials.take().is_none());
+    }
+
+    #[test]
+    fn an_older_deck_never_sees_a_code_that_came_with_the_switch() {
+        use arcen_session::session_handover::HandoverRefusal;
+        let message =
+            |refusal, switch| {
+                serde_json::from_str::<arcen_protocol::messages::AuthResult>(
+                    &handover_refusal_result(refusal, switch, Some("alice")),
+                )
+                .expect("auth_result")
+                .message
+            };
+        assert!(message(HandoverRefusal::SigningOut, true).starts_with("console_signing_out"));
+        assert!(message(HandoverRefusal::SigningOut, false).starts_with("console_session_changed"));
+        assert!(
+            message(HandoverRefusal::SwitchInProgress, true)
+                .starts_with("console_switch_in_progress")
+        );
+        // Another account's session is named, as this Pier always did.
+        let other = message(HandoverRefusal::PierCannotSignOut, true);
+        assert!(other.starts_with("console_other_user: alice"), "{other}");
+        assert!(
+            message(HandoverRefusal::AttachmentUnknown, false).starts_with("console_other_user:")
+        );
     }
 
     #[test]
@@ -1903,6 +2813,45 @@ mod tests {
         let (peer, greeting) = agent.await.expect("agent");
         assert_eq!(peer, "203.0.113.7:50000");
         assert_eq!(&greeting, b"hello");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_parked_agent_of_the_account_is_asked_for_its_logout_and_answers() {
+        let path = scratch_socket("signout");
+        let listener = AgentRegistry::bind(&path).expect("bind");
+        let own = crate::auth::resolve_account(
+            &std::env::var("USER").unwrap_or_else(|_| "root".to_owned()),
+        )
+        .map(|account| account.uid);
+        let registry = AgentRegistry::new(None, None);
+        tokio::spawn(std::sync::Arc::clone(&registry).run(listener));
+        let uid = own.expect("own uid");
+        // Another account's agent is never asked.
+        assert!(registry.request_sign_out(uid + 1, 7).await.is_err());
+
+        let agent_path = path.clone();
+        let agent =
+            tokio::spawn(async move { park(&agent_path, DesktopSessionKind::User, own).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !registry.has_parked_user_agent(uid) {
+            assert!(tokio::time::Instant::now() < deadline, "the agent parked");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // While this Pier offers no change of account the agent refuses the
+        // request itself and asks nobody.
+        let expected = if crate::handover::GRACEFUL_LOGOUT_ROUTE {
+            0
+        } else {
+            crate::handover::SIGN_OUT_REFUSED
+        };
+        assert_eq!(registry.request_sign_out(uid, 7).await, Ok(expected));
+        assert!(matches!(
+            agent.await.expect("agent"),
+            Err(RelayError::SignOutRequested(status)) if status == expected
+        ));
+        // The slot was used up; the agent parks a new one.
+        assert!(!registry.has_parked_user_agent(uid));
         let _ = std::fs::remove_file(&path);
     }
 
